@@ -31,6 +31,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import zipfile
@@ -12466,6 +12467,81 @@ def _ws_close_reason(text: str) -> str:
     return encoded[:120].decode("utf-8", "ignore") + "..."
 
 
+async def _register_browser_pty_owner(
+    app: "FastAPI",
+    *,
+    browser_id: str,
+    channel: str,
+    owner_id: str,
+    ws: WebSocket,
+) -> Optional[dict[str, Any]]:
+    """Register the current /api/pty owner and return any owner it replaced."""
+    browser_sessions, browser_lock = _get_pty_browser_state(app)
+    async with browser_lock:
+        previous = browser_sessions.get(browser_id)
+        browser_sessions[browser_id] = {
+            "channel": channel,
+            "started_at": time.time(),
+            "owner_id": owner_id,
+            "ws": ws,
+            "bridge": None,
+        }
+        return previous
+
+
+async def _browser_pty_owner_is_current(
+    app: "FastAPI", *, browser_id: str, owner_id: str
+) -> bool:
+    browser_sessions, browser_lock = _get_pty_browser_state(app)
+    async with browser_lock:
+        existing = browser_sessions.get(browser_id)
+        return existing is not None and existing.get("owner_id") == owner_id
+
+
+async def _attach_browser_pty_bridge(
+    app: "FastAPI", *, browser_id: str, owner_id: str, bridge: Any
+) -> bool:
+    """Attach a spawned bridge if this handler still owns the browser PTY."""
+    browser_sessions, browser_lock = _get_pty_browser_state(app)
+    async with browser_lock:
+        existing = browser_sessions.get(browser_id)
+        if existing is None or existing.get("owner_id") != owner_id:
+            return False
+        existing["bridge"] = bridge
+        return True
+
+
+async def _release_browser_pty_owner(
+    app: "FastAPI", *, browser_id: str, owner_id: str
+) -> None:
+    """Release browser PTY ownership using compare-and-delete semantics."""
+    browser_sessions, browser_lock = _get_pty_browser_state(app)
+    async with browser_lock:
+        existing = browser_sessions.get(browser_id)
+        if existing is not None and existing.get("owner_id") == owner_id:
+            browser_sessions.pop(browser_id, None)
+
+
+async def _close_replaced_browser_pty(owner: dict[str, Any]) -> None:
+    """Best-effort cleanup for a browser PTY owner superseded by a new socket."""
+    old_ws = owner.get("ws")
+    if old_ws is not None:
+        try:
+            await old_ws.close(
+                code=4409,
+                reason=_ws_close_reason("chat connection replaced by newer socket"),
+            )
+        except Exception:
+            _log.debug("failed to close replaced browser PTY websocket", exc_info=True)
+
+    old_bridge = owner.get("bridge")
+    if old_bridge is not None:
+        try:
+            await asyncio.to_thread(old_bridge.close)
+        except Exception:
+            _log.debug("failed to close replaced browser PTY bridge", exc_info=True)
+
+
 @app.websocket("/api/pty")
 async def pty_ws(ws: WebSocket) -> None:
     peer = ws.client.host if ws.client else "?"
@@ -12523,6 +12599,7 @@ async def pty_ws(ws: WebSocket) -> None:
     profile = ws.query_params.get("profile") or None
     browser_id = _browser_id_or_none(ws)
     browser_registered = False
+    browser_owner_id = uuid.uuid4().hex if browser_id else ""
     channel = _channel_or_close_code(ws)
     sidecar_url = _build_sidecar_url(channel) if channel else None
     force_fresh = (ws.query_params.get("fresh") or "").strip().lower() in {
@@ -12534,29 +12611,23 @@ async def pty_ws(ws: WebSocket) -> None:
     active_session_file: Optional[Path] = None
 
     if browser_id:
-        browser_sessions, browser_lock = _get_pty_browser_state(ws.app)
-        async with browser_lock:
-            existing = browser_sessions.get(browser_id)
-            current_channel = channel or ""
-            if existing is not None and existing.get("channel") == current_channel:
-                await ws.send_text(
-                    "\r\n\x1b[33mHermes chat is already open in this browser. "
-                    "Use the existing tab, or close it before opening another.\x1b[0m\r\n"
-                )
-                await ws.close(code=4409, reason="browser already has active chat")
-                return
-            if existing is not None:
-                _log.info(
-                    "pty browser registration replaced browser_id=%s old_channel=%s new_channel=%s",
-                    browser_id,
-                    existing.get("channel"),
-                    current_channel,
-                )
-            browser_sessions[browser_id] = {
-                "channel": current_channel,
-                "started_at": time.time(),
-            }
-            browser_registered = True
+        current_channel = channel or ""
+        replaced_owner = await _register_browser_pty_owner(
+            ws.app,
+            browser_id=browser_id,
+            channel=current_channel,
+            owner_id=browser_owner_id,
+            ws=ws,
+        )
+        browser_registered = True
+        if replaced_owner is not None:
+            _log.info(
+                "pty browser owner replaced browser_id=%s old_channel=%s new_channel=%s",
+                browser_id,
+                replaced_owner.get("channel"),
+                current_channel,
+            )
+            await _close_replaced_browser_pty(replaced_owner)
 
     if channel:
         active_session_file = _active_session_file_for_channel(ws.app, channel)
@@ -12580,25 +12651,72 @@ async def pty_ws(ws: WebSocket) -> None:
     except HTTPException as exc:
         # Unknown/invalid profile from _resolve_profile_dir.
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc.detail}\x1b[0m\r\n")
+        if browser_registered and browser_id:
+            await _release_browser_pty_owner(
+                ws.app, browser_id=browser_id, owner_id=browser_owner_id
+            )
         await ws.close(code=1011)
         return
     except SystemExit as exc:
         # _make_tui_argv calls sys.exit(1) when node/npm is missing.
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
+        if browser_registered and browser_id:
+            await _release_browser_pty_owner(
+                ws.app, browser_id=browser_id, owner_id=browser_owner_id
+            )
         await ws.close(code=1011)
         return
 
+    if browser_registered and browser_id:
+        try:
+            if not await _browser_pty_owner_is_current(
+                ws.app, browser_id=browser_id, owner_id=browser_owner_id
+            ):
+                await ws.close(
+                    code=4409,
+                    reason=_ws_close_reason("chat connection replaced before spawn"),
+                )
+                return
+        except Exception:
+            _log.debug("failed to check browser PTY owner before spawn", exc_info=True)
 
     try:
         bridge = await asyncio.to_thread(PtyBridge.spawn, argv, cwd=cwd, env=env)
     except PtyUnavailableError as exc:
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
+        if browser_registered and browser_id:
+            await _release_browser_pty_owner(
+                ws.app, browser_id=browser_id, owner_id=browser_owner_id
+            )
         await ws.close(code=1011)
         return
     except (FileNotFoundError, OSError) as exc:
         await ws.send_text(f"\r\n\x1b[31mChat failed to start: {exc}\x1b[0m\r\n")
+        if browser_registered and browser_id:
+            await _release_browser_pty_owner(
+                ws.app, browser_id=browser_id, owner_id=browser_owner_id
+            )
         await ws.close(code=1011)
         return
+
+    if browser_registered and browser_id:
+        try:
+            attached = await _attach_browser_pty_bridge(
+                ws.app, browser_id=browser_id, owner_id=browser_owner_id, bridge=bridge
+            )
+        except Exception:
+            attached = False
+            _log.debug("failed to attach browser PTY bridge", exc_info=True)
+        if not attached:
+            await asyncio.to_thread(bridge.close)
+            try:
+                await ws.close(
+                    code=4409,
+                    reason=_ws_close_reason("chat connection replaced after spawn"),
+                )
+            except Exception:
+                pass
+            return
 
     loop = asyncio.get_running_loop()
 
@@ -12682,11 +12800,9 @@ async def pty_ws(ws: WebSocket) -> None:
         await asyncio.to_thread(bridge.close)
         if browser_registered and browser_id:
             try:
-                browser_sessions, browser_lock = _get_pty_browser_state(ws.app)
-                async with browser_lock:
-                    existing = browser_sessions.get(browser_id)
-                    if existing is not None and existing.get("channel") == (channel or ""):
-                        browser_sessions.pop(browser_id, None)
+                await _release_browser_pty_owner(
+                    ws.app, browser_id=browser_id, owner_id=browser_owner_id
+                )
             except Exception:
                 _log.debug("failed to release browser PTY registration", exc_info=True)
 
