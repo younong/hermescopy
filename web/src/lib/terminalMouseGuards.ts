@@ -11,6 +11,10 @@ const MOUSE_DECSET_MODES = new Set([
   "2029",
 ]);
 
+export function isDashboardMouseMode(mode: number | string): boolean {
+  return MOUSE_DECSET_MODES.has(String(mode));
+}
+
 const OUTPUT_PENDING_LIMIT = 64;
 const INPUT_PENDING_LIMIT = 96;
 

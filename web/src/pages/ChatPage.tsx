@@ -39,6 +39,7 @@ import { normalizeSessionTitle } from "@/lib/chat-title";
 import {
   createTerminalInputMouseReportScrubber,
   createTerminalOutputMouseModeScrubber,
+  isDashboardMouseMode,
 } from "@/lib/terminalMouseGuards";
 import { PluginSlot } from "@/plugins";
 import { useTheme } from "@/themes";
@@ -666,6 +667,18 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
     term.loadAddon(new WebLinksAddon());
 
+    const suppressMouseEnableHandler = term.parser.registerCsiHandler(
+      { prefix: "?", final: "h" },
+      (params) => {
+        if (params.some((param) => Array.isArray(param)
+          ? param.some(isDashboardMouseMode)
+          : isDashboardMouseMode(param))) {
+          return true;
+        }
+        return false;
+      },
+    );
+
     term.open(host);
 
     // Keep dashboard chat on xterm's default renderer. The WebGL renderer is
@@ -965,6 +978,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     return () => {
       unmounting = true;
       syncMetricsRef.current = null;
+      suppressMouseEnableHandler.dispose();
       onDataDisposable?.dispose();
       onResizeDisposable?.dispose();
       if (metricsDebounce) clearTimeout(metricsDebounce);
