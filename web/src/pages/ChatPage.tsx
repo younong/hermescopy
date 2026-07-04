@@ -36,6 +36,10 @@ import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
 import { getHermesBrowserId } from "@/lib/browserIdentity";
 import { normalizeSessionTitle } from "@/lib/chat-title";
+import {
+  createTerminalInputMouseReportScrubber,
+  createTerminalOutputMouseModeScrubber,
+} from "@/lib/terminalMouseGuards";
 import { PluginSlot } from "@/plugins";
 import { useTheme } from "@/themes";
 import { useProfileScope } from "@/contexts/useProfileScope";
@@ -72,19 +76,12 @@ function buildTerminalTheme(background: string, foreground: string) {
   };
 }
 
-function isTerminalMouseReport(data: string): boolean {
-  // Dashboard chat owns text selection in the browser. If terminal mouse
-  // tracking gets enabled by an older TUI/config, keep those reports from
-  // reaching the PTY: they can otherwise be interpreted as input/control
-  // traffic. Cover SGR/SGR-pixels, urxvt decimal, X10/UTF-8 extended, and
-  // the visible/bare SGR fragments we scrub on the native CLI side.
-  return (
-    /^\x1b\[<\d+;\d+;\d+[Mm]$/.test(data) ||
-    /^\x1b\[\d+;\d+;\d+M$/.test(data) ||
-    /^\x1b\[M[\s\S]{3}$/.test(data) ||
-    /^\^\[\[<\d+;\d+;\d+[Mm]$/.test(data) ||
-    /^<\d+;\d+;\d+[Mm]$/.test(data)
-  );
+const DASHBOARD_NEW_SESSION_POINTER_GUARD_MS = 1200;
+const DASHBOARD_SELECTION_GUARD_MS = 2000;
+const POINTER_DRAG_THRESHOLD_PX = 3;
+
+interface DashboardNewSessionPayload {
+  reason?: string;
 }
 
 /**
@@ -125,6 +122,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const terminalPointerDownPosRef = useRef<{ x: number; y: number } | null>(null);
+  const terminalPointerDragRef = useRef(false);
+  const lastTerminalPointerUpAtRef = useRef(0);
+  const terminalSelectionGuardUntilRef = useRef(0);
   // Exposed to the main metrics-sync effect so it can refit the terminal
   // the moment `isActive` flips back to true (display:none → display:flex
   // collapses the host's box, so ResizeObserver never fires on return).
@@ -182,6 +183,51 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     setBanner(null);
     setReconnectNonce((n) => n + 1);
   }, [clearReconnectTimer, searchParams, setSearchParams]);
+
+  const markTerminalSelectionGuard = useCallback((ms = DASHBOARD_SELECTION_GUARD_MS) => {
+    terminalSelectionGuardUntilRef.current = Math.max(
+      terminalSelectionGuardUntilRef.current,
+      Date.now() + ms,
+    );
+  }, []);
+
+  const hasTerminalSelection = useCallback(() => {
+    if (termRef.current?.getSelection()) return true;
+
+    if (typeof window === "undefined") return false;
+    const selection = window.getSelection();
+    const host = hostRef.current;
+    if (!selection || selection.isCollapsed || !host) return false;
+
+    const anchor = selection.anchorNode;
+    const focus = selection.focusNode;
+    const insideHost = (node: Node | null) =>
+      !!node && (host === node || host.contains(node));
+
+    return insideHost(anchor) || insideHost(focus);
+  }, []);
+
+  const shouldIgnoreDashboardNewSessionRequest = useCallback(() => {
+    const now = Date.now();
+    if (hasTerminalSelection()) return true;
+    if (now < terminalSelectionGuardUntilRef.current) return true;
+    return now - lastTerminalPointerUpAtRef.current <= DASHBOARD_NEW_SESSION_POINTER_GUARD_MS;
+  }, [hasTerminalSelection]);
+
+  const guardedStartFreshDashboardChat = useCallback(
+    (payload?: DashboardNewSessionPayload) => {
+      if (shouldIgnoreDashboardNewSessionRequest()) {
+        console.warn(
+          "[dashboard chat] ignored dashboard.new_session_requested during terminal selection",
+          payload,
+        );
+        return;
+      }
+
+      startFreshDashboardChat();
+    },
+    [shouldIgnoreDashboardNewSessionRequest, startFreshDashboardChat],
+  );
   // Raw state for the mobile side-sheet + a derived value that force-
   // closes whenever the chat tab isn't active.  The *derived* value is
   // what side-effects (body-scroll lock, keydown listener, portal render)
@@ -307,6 +353,61 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     mql.addEventListener("change", sync);
     return () => mql.removeEventListener("change", sync);
   }, []);
+
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+
+    const clearPointer = () => {
+      terminalPointerDownPosRef.current = null;
+      terminalPointerDragRef.current = false;
+    };
+
+    const onPointerDown = (ev: PointerEvent) => {
+      if (ev.button !== 0) return;
+      terminalPointerDownPosRef.current = { x: ev.clientX, y: ev.clientY };
+      terminalPointerDragRef.current = false;
+    };
+
+    const onPointerMove = (ev: PointerEvent) => {
+      const start = terminalPointerDownPosRef.current;
+      if (!start) return;
+      const dx = ev.clientX - start.x;
+      const dy = ev.clientY - start.y;
+      if (Math.hypot(dx, dy) >= POINTER_DRAG_THRESHOLD_PX) {
+        terminalPointerDragRef.current = true;
+        markTerminalSelectionGuard();
+      }
+    };
+
+    const onPointerUp = () => {
+      lastTerminalPointerUpAtRef.current = Date.now();
+      if (terminalPointerDragRef.current || hasTerminalSelection()) {
+        markTerminalSelectionGuard();
+      }
+      clearPointer();
+    };
+
+    const onSelectionChange = () => {
+      if (hasTerminalSelection()) {
+        markTerminalSelectionGuard();
+      }
+    };
+
+    host.addEventListener("pointerdown", onPointerDown);
+    host.addEventListener("pointermove", onPointerMove);
+    host.addEventListener("pointerup", onPointerUp);
+    host.addEventListener("pointercancel", clearPointer);
+    document.addEventListener("selectionchange", onSelectionChange);
+
+    return () => {
+      host.removeEventListener("pointerdown", onPointerDown);
+      host.removeEventListener("pointermove", onPointerMove);
+      host.removeEventListener("pointerup", onPointerUp);
+      host.removeEventListener("pointercancel", clearPointer);
+      document.removeEventListener("selectionchange", onSelectionChange);
+    };
+  }, [hasTerminalSelection, markTerminalSelectionGuard]);
 
   useEffect(() => {
     if (!mobilePanelOpen) return;
@@ -677,6 +778,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     let unmounting = false;
     let onDataDisposable: { dispose(): void } | null = null;
     let onResizeDisposable: { dispose(): void } | null = null;
+    const outputMouseScrubber = createTerminalOutputMouseModeScrubber();
+    const inputMouseScrubber = createTerminalInputMouseReportScrubber();
     const forceFresh = forceFreshPtyRef.current;
     forceFreshPtyRef.current = false;
     const scheduleReconnect = (code: number) => {
@@ -742,9 +845,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
     ws.onmessage = (ev) => {
       if (typeof ev.data === "string") {
-        term.write(ev.data, scheduleTerminalRefresh);
+        const data = outputMouseScrubber.scrubString(ev.data);
+        if (data) term.write(data, scheduleTerminalRefresh);
       } else {
-        term.write(new Uint8Array(ev.data as ArrayBuffer), scheduleTerminalRefresh);
+        const data = outputMouseScrubber.scrubBytes(
+          new Uint8Array(ev.data as ArrayBuffer),
+        );
+        if (data.byteLength > 0) term.write(data, scheduleTerminalRefresh);
       }
     };
 
@@ -835,11 +942,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       onDataDisposable = term.onData((data) => {
         if (ws.readyState !== WebSocket.OPEN) return;
 
-        if (isTerminalMouseReport(data)) {
-          return;
-        }
+        const cleaned = inputMouseScrubber.scrub(data);
+        if (!cleaned) return;
 
-        ws.send(data);
+        ws.send(cleaned);
       });
 
       onResizeDisposable = term.onResize(({ cols, rows }) => {
@@ -1023,7 +1129,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               <ChatSidebar
                 channel={channel}
                 profile={scopedProfile}
-                onDashboardNewSessionRequest={startFreshDashboardChat}
+                onDashboardNewSessionRequest={guardedStartFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
               />
             </div>
@@ -1122,7 +1228,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               <ChatSidebar
                 channel={channel}
                 profile={scopedProfile}
-                onDashboardNewSessionRequest={startFreshDashboardChat}
+                onDashboardNewSessionRequest={guardedStartFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
               />
             </div>

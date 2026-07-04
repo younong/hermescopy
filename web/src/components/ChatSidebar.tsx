@@ -52,6 +52,16 @@ interface RpcEnvelope {
   params?: { type?: string; payload?: unknown };
 }
 
+interface DashboardNewSessionPayload {
+  reason?: string;
+}
+
+function dashboardNewSessionPayload(payload: unknown): DashboardNewSessionPayload | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const reason = (payload as { reason?: unknown }).reason;
+  return typeof reason === "string" ? { reason } : undefined;
+}
+
 const STATE_LABEL: Record<ConnectionState, string> = {
   idle: "idle",
   connecting: "connecting",
@@ -76,7 +86,7 @@ interface ChatSidebarProps {
   /** Management profile from the dashboard switcher — scopes session.create. */
   profile?: string;
   className?: string;
-  onDashboardNewSessionRequest?: () => void;
+  onDashboardNewSessionRequest?: (payload?: DashboardNewSessionPayload) => void;
   onSessionTitleChange?: (title: string | null) => void;
 }
 
@@ -277,7 +287,7 @@ export function ChatSidebar({
             onSessionTitleChange?.(title);
           }
         } else if (type === "dashboard.new_session_requested") {
-          onDashboardNewSessionRequest?.();
+          onDashboardNewSessionRequest?.(dashboardNewSessionPayload(payload));
         }
       });
     })();
