@@ -226,8 +226,9 @@ function createArchive(tag, { dryRun }) {
   if (!dryRun) {
     mkdirSync(buildDir, { recursive: true });
   }
-  run("git", ["archive", "--format=tar", "--output", sourceArchive, tag], { dryRun });
-  run("tar", ["-xf", sourceArchive, "-C", buildDir], { dryRun });
+  const archiveEnv = { COPYFILE_DISABLE: "1" };
+  run("git", ["archive", "--format=tar", "--output", sourceArchive, tag], { dryRun, env: archiveEnv });
+  run("tar", ["-xf", sourceArchive, "-C", buildDir], { dryRun, env: archiveEnv });
 
   buildArtifact(buildDir, { dryRun });
   run(
@@ -245,7 +246,7 @@ function createArchive(tag, { dryRun }) {
       buildDir,
       ".",
     ],
-    { dryRun },
+    { dryRun, env: archiveEnv },
   );
   return { tmp, archivePath };
 }
