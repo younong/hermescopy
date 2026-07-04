@@ -39,6 +39,7 @@ import { normalizeSessionTitle } from "@/lib/chat-title";
 import {
   createTerminalInputMouseReportScrubber,
   createTerminalOutputMouseModeScrubber,
+  DISABLE_DASHBOARD_MOUSE_MODES,
 } from "@/lib/terminalMouseGuards";
 import { PluginSlot } from "@/plugins";
 import { useTheme } from "@/themes";
@@ -363,8 +364,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       terminalPointerDragRef.current = false;
     };
 
+    const eventStartedInHost = (ev: PointerEvent) => {
+      const target = ev.target;
+      return target instanceof Node && host.contains(target);
+    };
+
     const onPointerDown = (ev: PointerEvent) => {
-      if (ev.button !== 0) return;
+      if (ev.button !== 0 || !eventStartedInHost(ev)) return;
       terminalPointerDownPosRef.current = { x: ev.clientX, y: ev.clientY };
       terminalPointerDragRef.current = false;
     };
@@ -394,17 +400,17 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       }
     };
 
-    host.addEventListener("pointerdown", onPointerDown);
-    host.addEventListener("pointermove", onPointerMove);
-    host.addEventListener("pointerup", onPointerUp);
-    host.addEventListener("pointercancel", clearPointer);
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("pointermove", onPointerMove, true);
+    document.addEventListener("pointerup", onPointerUp, true);
+    document.addEventListener("pointercancel", clearPointer, true);
     document.addEventListener("selectionchange", onSelectionChange);
 
     return () => {
-      host.removeEventListener("pointerdown", onPointerDown);
-      host.removeEventListener("pointermove", onPointerMove);
-      host.removeEventListener("pointerup", onPointerUp);
-      host.removeEventListener("pointercancel", clearPointer);
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("pointermove", onPointerMove, true);
+      document.removeEventListener("pointerup", onPointerUp, true);
+      document.removeEventListener("pointercancel", clearPointer, true);
       document.removeEventListener("selectionchange", onSelectionChange);
     };
   }, [hasTerminalSelection, markTerminalSelectionGuard]);
@@ -846,12 +852,18 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     ws.onmessage = (ev) => {
       if (typeof ev.data === "string") {
         const data = outputMouseScrubber.scrubString(ev.data);
-        if (data) term.write(data, scheduleTerminalRefresh);
+        if (data) {
+          term.write(data, scheduleTerminalRefresh);
+          term.write(DISABLE_DASHBOARD_MOUSE_MODES);
+        }
       } else {
         const data = outputMouseScrubber.scrubBytes(
           new Uint8Array(ev.data as ArrayBuffer),
         );
-        if (data.byteLength > 0) term.write(data, scheduleTerminalRefresh);
+        if (data.byteLength > 0) {
+          term.write(data, scheduleTerminalRefresh);
+          term.write(DISABLE_DASHBOARD_MOUSE_MODES);
+        }
       }
     };
 

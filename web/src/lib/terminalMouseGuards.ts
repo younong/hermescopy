@@ -14,6 +14,18 @@ const MOUSE_DECSET_MODES = new Set([
 const OUTPUT_PENDING_LIMIT = 64;
 const INPUT_PENDING_LIMIT = 96;
 
+export const DISABLE_DASHBOARD_MOUSE_MODES =
+  "\x1b[?2029l" +
+  "\x1b[?1016l" +
+  "\x1b[?1015l" +
+  "\x1b[?1006l" +
+  "\x1b[?1005l" +
+  "\x1b[?1003l" +
+  "\x1b[?1002l" +
+  "\x1b[?1001l" +
+  "\x1b[?1000l" +
+  "\x1b[?9l";
+
 function splitMouseDecsetTail(data: string): [string, string] {
   const match = data.match(/\x1b(?:\[\??[0-9;]*)?$/);
   if (!match?.index || data.length - match.index > OUTPUT_PENDING_LIMIT) {
@@ -40,19 +52,23 @@ export function stripMouseTrackingEnableDecset(data: string): string {
 function stripInputMouseReports(data: string): string {
   return data
     .replace(/\x1b\[<\d+;\d+;\d+[Mm]/g, "")
-    .replace(/\x1b\[\d+;\d+;\d+M/g, "")
+    .replace(/\x1b\[\d+;\d+;\d+[Mm]/g, "")
     .replace(/\x1b\[M[\s\S]{3}/g, "")
     .replace(/\^\[\[<\d+;\d+;\d+[Mm]/g, "")
-    .replace(/<\d+;\d+;\d+[Mm]/g, "");
+    .replace(/\^\[\[\d+;\d+;\d+[Mm]/g, "")
+    .replace(/<\d+;\d+;\d+[Mm]/g, "")
+    .replace(/\d+;\d+;\d+[Mm]/g, "");
 }
 
 function isIncompleteInputMouseReportPrefix(data: string): boolean {
   return (
     /^\x1b(?:\[)?$/.test(data) ||
     /^\x1b\[<\d*(?:;\d*){0,2}$/.test(data) ||
-    /^\x1b\[\d+(?:;\d*){0,2}$/.test(data) ||
+    /^\x1b\[\d*(?:;\d*){0,2}$/.test(data) ||
     /^\x1b\[M[\s\S]{0,2}$/.test(data) ||
-    /^\^\[\[<\d*(?:;\d*){0,2}$/.test(data)
+    /^\^\[\[<\d*(?:;\d*){0,2}$/.test(data) ||
+    /^\^\[\[\d*(?:;\d*){0,2}$/.test(data) ||
+    /^\d+(?:;\d*){0,2}$/.test(data)
   );
 }
 

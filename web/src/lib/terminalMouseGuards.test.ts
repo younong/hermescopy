@@ -74,9 +74,12 @@ describe("createTerminalInputMouseReportScrubber", () => {
     const scrubber = createTerminalInputMouseReportScrubber();
 
     expect(scrubber.scrub("\x1b[35;10;20M")).toBe("");
+    expect(scrubber.scrub("\x1b[35;10;20m")).toBe("");
     expect(scrubber.scrub("\x1b[Mabc")).toBe("");
     expect(scrubber.scrub("^[[<0;10;20M")).toBe("");
+    expect(scrubber.scrub("^[[35;10;20m")).toBe("");
     expect(scrubber.scrub("<0;10;20m")).toBe("");
+    expect(scrubber.scrub("35;10;20m")).toBe("");
   });
 
   it("preserves ordinary input and unrelated csi sequences", () => {

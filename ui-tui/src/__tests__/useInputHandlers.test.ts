@@ -67,15 +67,15 @@ describe('handleIdleHotkeyExit', () => {
     expect(actions.sys).not.toHaveBeenCalled()
   })
 
-  it('asks the dashboard for a fresh chat instead of leaving a ghost session', () => {
+  it('ignores idle exit hotkeys in dashboard chat', () => {
     const actions = { die: vi.fn(), sys: vi.fn() }
     const requestDashboardNewSession = vi.fn()
 
     handleIdleHotkeyExit(actions, true, requestDashboardNewSession)
 
     expect(actions.die).not.toHaveBeenCalled()
-    expect(requestDashboardNewSession).toHaveBeenCalledTimes(1)
-    expect(actions.sys).toHaveBeenCalledWith('starting a fresh dashboard chat...')
+    expect(requestDashboardNewSession).not.toHaveBeenCalled()
+    expect(actions.sys).not.toHaveBeenCalled()
   })
 })
 
