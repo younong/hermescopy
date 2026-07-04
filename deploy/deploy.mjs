@@ -2,13 +2,14 @@
 
 import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const DEFAULT_HOST = "106.15.186.104";
 const DEFAULT_USER = "root";
 const DEFAULT_REMOTE_ROOT = "/opt/hermes";
+const DEFAULT_IDENTITY_FILE = path.join(homedir(), ".ssh", "hermes_apiyi_ed25519");
 const TAG_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -28,7 +29,7 @@ Options:
   --host <host>            SSH host. Default: ${DEFAULT_HOST}
   --user <user>            SSH user. Default: ${DEFAULT_USER}
   --port <port>            SSH port. Default: 22
-  --identity-file <path>   SSH private key path.
+  --identity-file <path>   SSH private key path. Default: ~/.ssh/hermes_apiyi_ed25519
   --remote-root <path>     Remote release root. Default: ${DEFAULT_REMOTE_ROOT}
   --allow-non-main         Allow creating a tag away from main.
   --allow-dirty            Allow deploying an existing tag with a dirty worktree.
@@ -49,7 +50,7 @@ function parseArgs(argv) {
     user: process.env.HERMES_DEPLOY_USER || DEFAULT_USER,
     port: process.env.HERMES_DEPLOY_PORT || "22",
     remoteRoot: process.env.HERMES_DEPLOY_REMOTE_ROOT || DEFAULT_REMOTE_ROOT,
-    identityFile: process.env.HERMES_DEPLOY_IDENTITY_FILE || "",
+    identityFile: process.env.HERMES_DEPLOY_IDENTITY_FILE || DEFAULT_IDENTITY_FILE,
     allowNonMain: false,
     allowDirty: false,
     force: false,
