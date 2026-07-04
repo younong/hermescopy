@@ -70,7 +70,7 @@ RUN set -eu; \
         arm64) s6_arch="aarch64"; s6_arch_sha="${S6_OVERLAY_AARCH64_SHA256}" ;; \
         *) echo "Unsupported TARGETARCH=${TARGETARCH} for s6-overlay" >&2; exit 1 ;; \
     esac; \
-    curl -fsSL --retry 3 -o /tmp/s6-overlay-arch.tar.xz \
+    curl -fsSL --retry 10 --retry-all-errors --retry-delay 5 --connect-timeout 30 -o /tmp/s6-overlay-arch.tar.xz \
         "https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-${s6_arch}.tar.xz"; \
     { \
         printf '%s  %s\n' "${S6_OVERLAY_NOARCH_SHA256}" /tmp/s6-overlay-noarch.tar.xz; \
