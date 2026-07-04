@@ -72,6 +72,21 @@ function buildTerminalTheme(background: string, foreground: string) {
   };
 }
 
+function isTerminalMouseReport(data: string): boolean {
+  // Dashboard chat owns text selection in the browser. If terminal mouse
+  // tracking gets enabled by an older TUI/config, keep those reports from
+  // reaching the PTY: they can otherwise be interpreted as input/control
+  // traffic. Cover SGR/SGR-pixels, urxvt decimal, X10/UTF-8 extended, and
+  // the visible/bare SGR fragments we scrub on the native CLI side.
+  return (
+    /^\x1b\[<\d+;\d+;\d+[Mm]$/.test(data) ||
+    /^\x1b\[\d+;\d+;\d+M$/.test(data) ||
+    /^\x1b\[M[\s\S]{3}$/.test(data) ||
+    /^\^\[\[<\d+;\d+;\d+[Mm]$/.test(data) ||
+    /^<\d+;\d+;\d+[Mm]$/.test(data)
+  );
+}
+
 /**
  * CSS width for xterm font tiers.
  *
@@ -817,12 +832,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // mouse reporting, so we drop SGR mouse reports entirely instead of
     // forwarding them into Hermes. Keyboard input, paste, and resize still
     // behave normally.
-      // eslint-disable-next-line no-control-regex -- intentional ESC byte in xterm SGR mouse report parser
-      const SGR_MOUSE_RE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
       onDataDisposable = term.onData((data) => {
         if (ws.readyState !== WebSocket.OPEN) return;
 
-        if (SGR_MOUSE_RE.test(data)) {
+        if (isTerminalMouseReport(data)) {
           return;
         }
 
