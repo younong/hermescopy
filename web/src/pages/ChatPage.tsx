@@ -39,7 +39,6 @@ import { normalizeSessionTitle } from "@/lib/chat-title";
 import {
   createTerminalInputMouseReportScrubber,
   createTerminalOutputMouseModeScrubber,
-  DISABLE_DASHBOARD_MOUSE_MODES,
 } from "@/lib/terminalMouseGuards";
 import { PluginSlot } from "@/plugins";
 import { useTheme } from "@/themes";
@@ -852,18 +851,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     ws.onmessage = (ev) => {
       if (typeof ev.data === "string") {
         const data = outputMouseScrubber.scrubString(ev.data);
-        if (data) {
-          term.write(data, scheduleTerminalRefresh);
-          term.write(DISABLE_DASHBOARD_MOUSE_MODES);
-        }
+        if (data) term.write(data, scheduleTerminalRefresh);
       } else {
         const data = outputMouseScrubber.scrubBytes(
           new Uint8Array(ev.data as ArrayBuffer),
         );
-        if (data.byteLength > 0) {
-          term.write(data, scheduleTerminalRefresh);
-          term.write(DISABLE_DASHBOARD_MOUSE_MODES);
-        }
+        if (data.byteLength > 0) term.write(data, scheduleTerminalRefresh);
       }
     };
 

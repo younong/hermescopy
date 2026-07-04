@@ -1,6 +1,6 @@
 import { atom, computed } from 'nanostores'
 
-import { MOUSE_TRACKING } from '../config/env.js'
+import { DASHBOARD_TUI_MODE, MOUSE_TRACKING } from '../config/env.js'
 import { ZERO } from '../domain/usage.js'
 import { DEFAULT_THEME } from '../theme.js'
 
@@ -17,7 +17,7 @@ const buildUiState = (): UiState => ({
   info: null,
   liveSessionCount: 0,
   inlineDiffs: true,
-  mouseTracking: MOUSE_TRACKING,
+  mouseTracking: DASHBOARD_TUI_MODE ? 'off' : MOUSE_TRACKING,
   notice: null,
   pasteCollapseLines: 5,
   pasteCollapseChars: 2000,
