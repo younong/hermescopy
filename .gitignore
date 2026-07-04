@@ -14,12 +14,22 @@ __pycache__/
 .env.production.local
 .env.development
 .env.test
+.env.deploy
+.env.deploy.local
+deploy/*.local.env
 .hermes-docker/
 .notebooklm-home/
 .notebooklm-cli-venv/
 .notebooklm-playwright/
 .pip-cache/
 .uv-cache/
+
+# Keep local Claude settings/transcripts out of git, but allow the project release skill.
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/hermes-release/
+!.claude/skills/hermes-release/SKILL.md
 compose.hermes.local.yml
 export*
 __pycache__/model_tools.cpython-310.pyc
@@ -52,6 +62,7 @@ images/
 __pycache__/
 hermes_agent.egg-info/
 wandb/
+aliyun-cli-config/
 testlogs
 
 # CLI config (may contain sensitive SSH paths)

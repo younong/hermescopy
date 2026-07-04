@@ -7,7 +7,7 @@ sidebar_position: 6
 
 # Image Generation
 
-Hermes Agent generates images from text prompts via FAL.ai. Eleven models are supported out of the box, each with different speed, quality, and cost tradeoffs. The active model is user-configurable via `hermes tools` and persists in `config.yaml`.
+Hermes Agent generates images from text prompts via pluggable image backends including FAL.ai, OpenAI, APIYI, xAI, and more. The active backend/model is user-configurable via `hermes tools` and persists in `config.yaml`.
 
 ## Supported Models
 
@@ -39,6 +39,28 @@ If the managed gateway returns `HTTP 4xx` for a specific model, that model isn't
 
 1. Sign up at [fal.ai](https://fal.ai/)
 2. Generate an API key from your dashboard
+
+### APIYI GPT-Image-2 and Nano Banana 2
+
+Hermes also ships an APIYI image backend. Store the token in `.env`, not in `config.yaml`:
+
+```bash
+APIYI_API_KEY=...
+```
+
+Available APIYI model IDs:
+
+- `gpt-image-2-low`
+- `gpt-image-2-medium`
+- `gpt-image-2-high`
+- `nano-banana-2`
+
+Optional endpoint overrides:
+
+```bash
+APIYI_OPENAI_BASE_URL=https://api.apiyi.com/v1
+APIYI_GEMINI_BASE_URL=https://api.apiyi.com/v1beta
+```
 
 ### Configure and Pick a Model
 
@@ -111,6 +133,7 @@ Two inputs drive the edit:
 | Backend | Image-to-image | Reference cap | How |
 |---|---|---|---|
 | **FAL.ai** (edit-capable models below) | ✓ | up to 9 | routes to the model's `/edit` endpoint |
+| **APIYI** (`gpt-image-2`) | ✓ | up to 16 | OpenAI Images-compatible `/images/edits` via APIYI |
 | **OpenAI** (`gpt-image-2`) | ✓ | up to 16 | `images.edit()` |
 | **xAI** (Grok Imagine) | ✓ | 1 | `/v1/images/edits` (`grok-imagine-image-quality`) |
 | **Krea** (`Krea 2`) | ✓ | up to 10 | reference-guided generation (`image_style_references`) |

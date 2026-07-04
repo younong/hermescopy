@@ -1,0 +1,7 @@
+name: apiyi
+version: 1.0.0
+description: "APIYI aggregated image generation backend for GPT-Image-2 and Nano Banana 2."
+author: Hermes Agent
+kind: backend
+requires_env:
+  - APIYI_API_KEY

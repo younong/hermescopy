@@ -104,6 +104,23 @@ model:
   #       CF-Access-Client-Id: "xxxx.access"
   #       CF-Access-Client-Secret: "${CF_ACCESS_SECRET}"
   #       X-Client-Name: "hermes-agent"
+  #
+  # APIYI image generation example (secrets stay in ~/.hermes/.env or the
+  # server-only /opt/hermes/shared/.env, never in this config file):
+  #
+  # image_gen:
+  #   provider: "apiyi"
+  #   model: "gpt-image-2-medium"
+  #   apiyi:
+  #     openai_base_url: "https://api.apiyi.com/v1"
+  #     gemini_base_url: "https://api.apiyi.com/v1beta"
+  #     model_map:
+  #       gpt-image-2-low: "gpt-image-2"
+  #       gpt-image-2-medium: "gpt-image-2"
+  #       gpt-image-2-high: "gpt-image-2"
+  #       nano-banana-2: "gemini-3.1-flash-image-preview"
+  #
+  # APIYI_API_KEY=... belongs in an env file, not in config.yaml.
 
 # Named provider overrides (optional)
 # Use this for per-provider request timeouts, non-stream stale timeouts,

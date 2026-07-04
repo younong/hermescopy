@@ -1,0 +1,21 @@
+# Production override for deploying Hermes from a tagged source archive.
+# Use with the repository root compose file:
+#   docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml up -d --build
+#
+# The deploy script keeps runtime state outside release directories so switching
+# /opt/hermes/current between tags does not discard user/session data.
+
+services:
+  gateway:
+    volumes:
+      - ${HERMES_DATA_DIR:-/opt/hermes/shared/.hermes}:/opt/data
+    env_file:
+      - path: ${HERMES_ENV_FILE:-/opt/hermes/shared/.env}
+        required: false
+
+  dashboard:
+    volumes:
+      - ${HERMES_DATA_DIR:-/opt/hermes/shared/.hermes}:/opt/data
+    env_file:
+      - path: ${HERMES_ENV_FILE:-/opt/hermes/shared/.env}
+        required: false

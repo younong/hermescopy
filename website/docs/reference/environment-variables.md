@@ -147,6 +147,10 @@ For native Anthropic auth, Hermes prefers Claude Code's own credential files whe
 | `BROWSER_INACTIVITY_TIMEOUT` | Browser session inactivity timeout in seconds |
 | `AGENT_BROWSER_ARGS` | Extra Chromium launch flags (comma- or newline-separated). Hermes auto-injects `--no-sandbox,--disable-dev-shm-usage` when running as root or on AppArmor-restricted unprivileged user namespaces (Ubuntu 23.10+, DGX Spark, many container images); set this manually only to override or add other flags. |
 | `AGENT_BROWSER_ENGINE` | Browser engine for local mode: `auto` (default — Chromium-family via CDP), or a specific engine override. |
+| `APIYI_API_KEY` | APIYI image generation key for GPT-Image-2 and Nano Banana 2. Store in `~/.hermes/.env` or the server-only `/opt/hermes/shared/.env`; never commit the value. |
+| `APIYI_OPENAI_BASE_URL` | Optional override for APIYI's OpenAI Images-compatible endpoint (default: `https://api.apiyi.com/v1`) |
+| `APIYI_GEMINI_BASE_URL` | Optional override for APIYI's Gemini-style image endpoint (default: `https://api.apiyi.com/v1beta`) |
+| `APIYI_IMAGE_MODEL` | Optional runtime override for the Hermes-visible APIYI image model (`gpt-image-2-low`, `gpt-image-2-medium`, `gpt-image-2-high`, or `nano-banana-2`) |
 | `FAL_KEY` | Image generation ([fal.ai](https://fal.ai/)) |
 | `KREA_API_KEY` | Krea API key for Krea 2 image generation ([krea.ai](https://krea.ai/)) |
 | `GROQ_API_KEY` | Groq Whisper STT API key ([groq.com](https://groq.com/)) |
