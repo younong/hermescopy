@@ -80,6 +80,7 @@ function buildTerminalTheme(background: string, foreground: string) {
 const DASHBOARD_NEW_SESSION_POINTER_GUARD_MS = 1200;
 const DASHBOARD_SELECTION_GUARD_MS = 2000;
 const POINTER_DRAG_THRESHOLD_PX = 3;
+const MOUSE_EVENT_CLASS = "enable-mouse-events";
 
 interface DashboardNewSessionPayload {
   reason?: string;
@@ -364,7 +365,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       terminalPointerDragRef.current = false;
     };
 
-    const eventStartedInHost = (ev: PointerEvent) => {
+    const eventStartedInHost = (ev: MouseEvent) => {
       const target = ev.target;
       return target instanceof Node && host.contains(target);
     };
@@ -400,6 +401,37 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       }
     };
 
+    const forceXtermSelection = (ev: MouseEvent) => {
+      if (ev.button !== 0 || ev.shiftKey || ev.altKey || !eventStartedInHost(ev)) {
+        return;
+      }
+      const xtermRoot = host.querySelector(".xterm");
+      if (!xtermRoot?.classList.contains(MOUSE_EVENT_CLASS)) {
+        return;
+      }
+      const forced = new MouseEvent(ev.type, {
+        altKey: ev.altKey,
+        bubbles: true,
+        button: ev.button,
+        buttons: ev.buttons,
+        cancelable: true,
+        clientX: ev.clientX,
+        clientY: ev.clientY,
+        ctrlKey: ev.ctrlKey,
+        detail: ev.detail,
+        metaKey: ev.metaKey,
+        relatedTarget: ev.relatedTarget,
+        screenX: ev.screenX,
+        screenY: ev.screenY,
+        shiftKey: true,
+        view: window,
+      });
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      ev.target?.dispatchEvent(forced);
+    };
+
+    document.addEventListener("mousedown", forceXtermSelection, true);
     document.addEventListener("pointerdown", onPointerDown, true);
     document.addEventListener("pointermove", onPointerMove, true);
     document.addEventListener("pointerup", onPointerUp, true);
@@ -407,6 +439,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     document.addEventListener("selectionchange", onSelectionChange);
 
     return () => {
+      document.removeEventListener("mousedown", forceXtermSelection, true);
       document.removeEventListener("pointerdown", onPointerDown, true);
       document.removeEventListener("pointermove", onPointerMove, true);
       document.removeEventListener("pointerup", onPointerUp, true);
