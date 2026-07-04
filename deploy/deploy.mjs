@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,7 +15,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
 
 function usage() {
-  console.log(`Hermes tag-based deploy tool
+  console.log(`Hermes tag-based bare-metal deploy tool
 
 Usage:
   npm run deploy -- --create-tag v2026.7.3
@@ -123,7 +123,7 @@ function formatCommand(command, commandArgs) {
 }
 
 function run(command, commandArgs, options = {}) {
-  const { dryRun = false, input, env, quiet = false } = options;
+  const { dryRun = false, input, env, quiet = false, cwd = repoRoot } = options;
   if (dryRun) {
     console.log(`[dry-run] ${formatCommand(command, commandArgs)}`);
     return { stdout: "", stderr: "", status: 0 };
@@ -134,7 +134,7 @@ function run(command, commandArgs, options = {}) {
   }
 
   const result = spawnSync(command, commandArgs, {
-    cwd: repoRoot,
+    cwd,
     encoding: "utf8",
     input,
     stdio: input === undefined ? "pipe" : ["pipe", "pipe", "pipe"],
@@ -218,16 +218,59 @@ function createAnnotatedTag(tag, { dryRun }) {
 }
 
 function createArchive(tag, { dryRun }) {
-  if (dryRun) {
-    const archivePath = path.join(tmpdir(), `hermes-${tag}.tar.gz`);
-    run("git", ["archive", "--format=tar.gz", "--output", archivePath, tag], { dryRun });
-    return { tmp: null, archivePath };
-  }
+  const tmp = dryRun ? null : mkdtempSync(path.join(tmpdir(), "hermes-deploy-"));
+  const buildDir = dryRun ? path.join(tmpdir(), `hermes-${tag}-artifact`) : path.join(tmp, "artifact");
+  const archivePath = dryRun ? path.join(tmpdir(), `hermes-${tag}.tar.gz`) : path.join(tmp, `hermes-${tag}.tar.gz`);
+  const sourceArchive = dryRun ? path.join(tmpdir(), `hermes-${tag}.tar`) : path.join(tmp, `hermes-${tag}.tar`);
 
-  const tmp = mkdtempSync(path.join(tmpdir(), "hermes-deploy-"));
-  const archivePath = path.join(tmp, `hermes-${tag}.tar.gz`);
-  run("git", ["archive", "--format=tar.gz", "--output", archivePath, tag], { dryRun });
+  if (!dryRun) {
+    mkdirSync(buildDir, { recursive: true });
+  }
+  run("git", ["archive", "--format=tar", "--output", sourceArchive, tag], { dryRun });
+  run("tar", ["-xf", sourceArchive, "-C", buildDir], { dryRun });
+
+  buildArtifact(buildDir, { dryRun });
+  run(
+    "tar",
+    [
+      "-czf",
+      archivePath,
+      "--exclude=._*",
+      "--exclude=*/._*",
+      "--exclude=./node_modules",
+      "--exclude=./web/node_modules",
+      "--exclude=./ui-tui/node_modules",
+      "--exclude=./apps/*/node_modules",
+      "-C",
+      buildDir,
+      ".",
+    ],
+    { dryRun },
+  );
   return { tmp, archivePath };
+}
+
+function buildArtifact(buildDir, { dryRun }) {
+  run("npm", ["run", "build", "--workspace", "web"], { dryRun });
+  run("npm", ["run", "build", "--workspace", "ui-tui"], { dryRun });
+  copyBuiltDir("hermes_cli/web_dist", path.join(buildDir, "hermes_cli/web_dist"), { dryRun });
+  copyBuiltDir("ui-tui/dist", path.join(buildDir, "ui-tui/dist"), { dryRun });
+  run("test", ["-f", path.join(buildDir, "hermes_cli/web_dist/index.html")], { dryRun, cwd: buildDir });
+  run("test", ["-f", path.join(buildDir, "ui-tui/dist/entry.js")], { dryRun, cwd: buildDir });
+}
+
+function copyBuiltDir(relativeSource, dest, { dryRun }) {
+  const source = path.join(repoRoot, relativeSource);
+  if (dryRun) {
+    console.log(`[dry-run] copy ${relativeSource} -> ${dest}`);
+    return;
+  }
+  if (!existsSync(source)) {
+    throw new Error(`Missing build artifact: ${relativeSource}`);
+  }
+  rmSync(dest, { recursive: true, force: true });
+  mkdirSync(path.dirname(dest), { recursive: true });
+  cpSync(source, dest, { recursive: true });
 }
 
 function sshBaseArgs(args) {
@@ -301,12 +344,20 @@ archive="$remote_root/tmp/hermes-$tag.tar.gz"
 release="$remote_root/releases/$tag"
 current="$remote_root/current"
 shared="$remote_root/shared"
+env_file="$shared/.env"
+hermes_home="$shared/.hermes"
+runner="$shared/hermes-service-runner.sh"
 
-mkdir -p "$remote_root/releases" "$remote_root/tmp" "$shared/.hermes"
-if [ ! -f "$shared/.env" ]; then
+gateway_unit="/etc/systemd/system/hermes-gateway.service"
+dashboard_unit="/etc/systemd/system/hermes-dashboard.service"
+
+mkdir -p "$remote_root/releases" "$remote_root/tmp" "$hermes_home"
+if [ ! -f "$env_file" ]; then
   umask 077
-  : > "$shared/.env"
+  : > "$env_file"
 fi
+chmod 600 "$env_file" 2>/dev/null || true
+chmod 700 "$hermes_home" 2>/dev/null || true
 
 if [ -e "$release" ]; then
   if [ "$force" = "1" ]; then
@@ -321,16 +372,138 @@ if [ ! -e "$release" ]; then
   tar -xzf "$archive" -C "$release"
 fi
 
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+export UV_NO_CONFIG=1
+export HERMES_HOME="$hermes_home"
+
+for required in tar systemctl sha256sum; do
+  if ! command -v "$required" >/dev/null 2>&1; then
+    echo "Missing required command: $required" >&2
+    exit 1
+  fi
+done
+
+test -f "$release/hermes_cli/web_dist/index.html"
+test -f "$release/ui-tui/dist/entry.js"
+
+venv="$shared/venv"
+lock_hash="$(sha256sum "$release/uv.lock" | cut -d ' ' -f1)"
+lock_stamp="$venv/.hermes-uv-lock.sha256"
+installed_hash=""
+if [ -f "$lock_stamp" ]; then
+  installed_hash="$(cat "$lock_stamp")"
+fi
+
+if [ ! -x "$venv/bin/python" ] || [ "$installed_hash" != "$lock_hash" ]; then
+  echo "Python dependencies need bootstrap/update for uv.lock $lock_hash"
+  if ! command -v uv >/dev/null 2>&1; then
+    if ! command -v curl >/dev/null 2>&1; then
+      echo "Missing required command: curl (needed to install uv)" >&2
+      exit 1
+    fi
+    echo "Installing uv..."
+    uv_installer="$(mktemp)"
+    curl -LsSf https://astral.sh/uv/install.sh -o "$uv_installer"
+    sh "$uv_installer"
+    rm -f "$uv_installer"
+    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+  fi
+  uv python find 3.11 >/dev/null 2>&1 || uv python install 3.11
+  cd "$release"
+  UV_PROJECT_ENVIRONMENT="$venv" uv sync --extra all --locked
+  printf '%s\n' "$lock_hash" > "$lock_stamp"
+else
+  echo "Python dependencies unchanged; reusing $venv"
+fi
+
 ln -sfnT "$release" "$current"
+
+cat > "$runner" <<'RUNNER'
+#!/usr/bin/env bash
+set -euo pipefail
+remote_root="${"${"}HERMES_REMOTE_ROOT:-/opt/hermes}"
+current="$remote_root/current"
+shared="$remote_root/shared"
+env_file="${"${"}HERMES_ENV_FILE:-$shared/.env}"
+hermes_home="${"${"}HERMES_HOME:-$shared/.hermes}"
+venv="${"${"}VIRTUAL_ENV:-$shared/venv}"
+
+export HERMES_HOME="$hermes_home"
+export VIRTUAL_ENV="$venv"
+export PATH="$venv/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+export PYTHONUNBUFFERED=1
+
+if [ -f "$env_file" ]; then
+  set -a
+  . "$env_file"
+  set +a
+fi
+
 cd "$current"
+exec "$venv/bin/python" -m hermes_cli.main "$@"
+RUNNER
+chmod 0755 "$runner"
 
-export HERMES_DATA_DIR="$shared/.hermes"
-export HERMES_ENV_FILE="$shared/.env"
-export HERMES_UID="$(id -u)"
-export HERMES_GID="$(id -g)"
+cat > "$gateway_unit" <<UNIT
+[Unit]
+Description=Hermes Gateway
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
 
-docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml up -d --build
-docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml ps
+[Service]
+Type=simple
+Environment=HERMES_REMOTE_ROOT=$remote_root
+Environment=HERMES_HOME=$hermes_home
+Environment=HERMES_ENV_FILE=$env_file
+Environment=VIRTUAL_ENV=$shared/venv
+WorkingDirectory=$current
+ExecStart=$runner gateway run --replace
+ExecReload=/bin/kill -USR1 \$MAINPID
+Restart=always
+RestartSec=5
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat > "$dashboard_unit" <<UNIT
+[Unit]
+Description=Hermes Dashboard
+After=network-online.target hermes-gateway.service
+Wants=network-online.target hermes-gateway.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=HERMES_REMOTE_ROOT=$remote_root
+Environment=HERMES_HOME=$hermes_home
+Environment=HERMES_ENV_FILE=$env_file
+Environment=VIRTUAL_ENV=$shared/venv
+WorkingDirectory=$current
+ExecStart=$runner dashboard --host 127.0.0.1 --port 9119 --no-open --skip-build
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=60
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable hermes-gateway.service hermes-dashboard.service
+systemctl restart hermes-gateway.service hermes-dashboard.service
+systemctl is-active --quiet hermes-gateway.service
+systemctl is-active --quiet hermes-dashboard.service
+systemctl --no-pager --full status hermes-gateway.service hermes-dashboard.service || true
 
 echo "Hermes deployed from tag $tag at $release"
 `;
@@ -349,9 +522,14 @@ function deployArchive(args, archivePath) {
 
 function printSummary(args) {
   const remoteRoot = args.remoteRoot.replace(/\/+$/, "");
-  console.log(`\nDeploy target: ${args.user}@${args.host}:${remoteRoot}`);
+  const target = `${args.user}@${args.host}`;
+  console.log(`\nDeploy target: ${target}:${remoteRoot}`);
   console.log(`Tag: ${args.deployTag}`);
   console.log(`Current symlink: ${remoteRoot}/current -> ${remoteRoot}/releases/${args.deployTag}`);
+  console.log(`State dir: ${remoteRoot}/shared/.hermes`);
+  console.log(`Env file: ${remoteRoot}/shared/.env`);
+  console.log(`Services: hermes-gateway.service, hermes-dashboard.service`);
+  console.log(`Status: ssh ${target} 'systemctl status --no-pager hermes-gateway hermes-dashboard'`);
   console.log(`Rollback example: npm run deploy -- --tag <previous-tag>`);
 }
 

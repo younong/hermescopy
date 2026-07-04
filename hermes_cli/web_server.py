@@ -12243,7 +12243,18 @@ def _resolve_chat_argv(
     if requested and requested.lower() != "current":
         profile_dir = _resolve_profile_dir(requested)
 
-    argv, cwd = _make_tui_argv(PROJECT_ROOT / "ui-tui", tui_dev=False)
+    tui_dir = PROJECT_ROOT / "ui-tui"
+    prebuilt_tui_dir = tui_dir if (tui_dir / "dist" / "entry.js").is_file() else None
+    old_tui_dir = os.environ.get("HERMES_TUI_DIR")
+    try:
+        if prebuilt_tui_dir is not None:
+            os.environ["HERMES_TUI_DIR"] = str(prebuilt_tui_dir)
+        argv, cwd = _make_tui_argv(tui_dir, tui_dev=False)
+    finally:
+        if old_tui_dir is None:
+            os.environ.pop("HERMES_TUI_DIR", None)
+        else:
+            os.environ["HERMES_TUI_DIR"] = old_tui_dir
     env = os.environ.copy()
     try:
         from hermes_cli.config import apply_terminal_config_to_env
