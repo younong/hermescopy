@@ -10,7 +10,7 @@ services:
     build:
       context: .
       args:
-        APT_MIRROR: ${APT_MIRROR:-https://mirrors.aliyun.com/debian}
+        APT_MIRROR: ${APT_MIRROR:-http://mirrors.aliyun.com/debian}
     pull_policy: build
     volumes:
       - ${HERMES_DATA_DIR:-/opt/hermes/shared/.hermes}:/opt/data
