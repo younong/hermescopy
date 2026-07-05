@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Server-side smoke test for the APIYI image generation plugin.
 
-Run this after deploying on the server, ideally inside the gateway container so it
-uses the same environment as Hermes:
+Run this after deploying on the server from the current systemd release runtime:
 
-    docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml \
-      exec -T gateway python deploy/smoke-apiyi.py
+    set -a
+    [ ! -f /opt/hermes/shared/.env ] || . /opt/hermes/shared/.env
+    set +a
+    cd /opt/hermes/current
+    /opt/hermes/shared/venv/bin/python deploy/smoke-apiyi.py
 
 The script intentionally never prints API keys. It only reports model names,
 success/failure, and generated image paths/errors.

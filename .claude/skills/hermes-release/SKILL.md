@@ -105,10 +105,10 @@ APIYI_OPENAI_BASE_URL=https://api.apiyi.com/v1
 APIYI_GEMINI_BASE_URL=https://api.apiyi.com/v1beta
 ```
 
-- 发布后至少验证 `gpt-image-2-medium` 和 `nano-banana-2` 各一次：
+- 发布后如需真实调用模型，再额外验证 `gpt-image-2-medium` 和 `nano-banana-2`。这不是默认发布成功判定；默认收尾只检查 systemd 服务状态：
 
 ```bash
-ssh root@106.15.186.104 'cd /opt/hermes/current && docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml exec -T gateway python deploy/smoke-apiyi.py'
+ssh root@106.15.186.104 'set -a; [ ! -f /opt/hermes/shared/.env ] || . /opt/hermes/shared/.env; set +a; cd /opt/hermes/current && /opt/hermes/shared/venv/bin/python deploy/smoke-apiyi.py'
 ```
 
 ## 发布前检查
@@ -120,7 +120,8 @@ git status --short
 git branch --show-current
 git tag --list | tail -n 20
 node --check deploy/deploy.mjs
-docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml config
+node --check ui-tui/scripts/build.mjs
+npm run deploy -- --help
 ```
 
 注意：创建新 tag 时，发布工具默认要求当前分支为 `main` 且工作区干净。确实要从非 main 分支发布时，必须显式使用 `--allow-non-main`。
@@ -129,8 +130,9 @@ docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml config
 
 ```bash
 ssh root@106.15.186.104 'readlink /opt/hermes/current'
-ssh root@106.15.186.104 'cd /opt/hermes/current && docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml ps'
-ssh root@106.15.186.104 'cd /opt/hermes/current && docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml logs --tail=100 gateway'
+ssh root@106.15.186.104 'systemctl is-active hermes-gateway hermes-dashboard'
+ssh root@106.15.186.104 'systemctl status --no-pager hermes-gateway hermes-dashboard'
+ssh root@106.15.186.104 'journalctl -u hermes-gateway -u hermes-dashboard --since "10 min ago" --no-pager -n 200'
 ```
 
 Dashboard 默认只监听服务器本机 `127.0.0.1`。访问方式：
@@ -146,7 +148,8 @@ ssh -L 9119:localhost:9119 root@106.15.186.104
 - tag 创建失败：检查 tag 是否已存在、工作区是否干净。
 - push 失败：检查 Git remote 权限。
 - SSH 失败：检查 SSH key、密码、端口、安全组。
-- Docker build/up 失败：查看远端 `docker compose logs`。
+- Python 依赖/bootstrap 失败：查看部署输出中的 `uv`/系统依赖错误，按服务器缺失依赖补齐。
+- systemd 服务启动失败：查看 `systemctl status --no-pager hermes-gateway hermes-dashboard` 和 `journalctl -u hermes-gateway -u hermes-dashboard --since "10 min ago" --no-pager -n 200`。
 - 发布错版本：用 `npm run deploy -- --tag <previous-tag>` 回滚。
 
 ## 输出要求

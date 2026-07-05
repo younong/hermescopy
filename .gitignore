@@ -74,8 +74,9 @@ ignored/
 .worktrees/
 environments/benchmarks/evals/
 
-# Web UI build output
+# Web/TUI build output
 hermes_cli/web_dist/
+ui-tui/dist/
 apps/desktop/build/
 apps/desktop/dist/
 apps/desktop/release/

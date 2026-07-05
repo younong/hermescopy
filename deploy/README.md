@@ -5,7 +5,6 @@
 ## 文件
 
 - `deploy.mjs` — Node.js 发布脚本，按 Git tag 上传源码并在服务器裸机/systemd 方式部署。
-- `docker-compose.prod.yml` — Docker 部署的旧生产 override；当前阿里云发布路径不再依赖它。
 
 详细部署说明见：`docs/deployment/alicloud.md`。
 
@@ -22,7 +21,7 @@
 - 新发布：`--create-tag <tag>`
 - 重试/回滚：`--tag <existing-tag>`
 
-工具使用 `git archive <tag>` 生成干净源码，在本机安装 Node 依赖并构建 web/ui-tui 产物，然后把源码 + 构建产物打包上传到服务器。服务器只解包到 `/opt/hermes/releases/<tag>`、按需初始化/更新共享 Python venv、切换 `/opt/hermes/current`，最后重启 systemd 服务。
+工具使用 `git archive <tag>` 生成干净源码，在本机临时源码目录中安装 Node 依赖并构建 web/ui-tui 产物，然后把源码 + 构建产物打包上传到服务器。服务器只解包到 `/opt/hermes/releases/<tag>`、按需初始化/更新共享 Python venv、切换 `/opt/hermes/current`，最后重启 systemd 服务。发布成功后会清理本次上传的远端 tarball，并按保留策略回收旧 release。
 
 ## 服务器运行方式
 
@@ -63,7 +62,7 @@ ssh -L 9119:localhost:9119 root@106.15.186.104
 - 如果服务器没有 `uv`，部署脚本会用 `curl` 安装一次
 - 常见编译/运行依赖按服务器实际错误补充，例如 `gcc`、`g++`、`make`、`cmake`、`python3-dev`、`python3-venv`、`ffmpeg`、`ripgrep`
 
-Node.js/npm 只要求在本机可用。部署脚本会在本机执行根目录 `npm install --prefer-offline --no-audit` 并构建 `web`、`ui-tui`，服务器不再运行 npm install/build。
+Node.js/npm 只要求在本机可用。部署脚本会在从 Git tag 解出的本机临时源码目录中执行 `npm install --prefer-offline --no-audit`，并把 `web`、`ui-tui` 构建产物直接写入临时发布 artifact；服务器不再运行 npm install/build，当前 checkout 也不会留下发布构建产物。
 
 ## 常用命令
 
@@ -130,6 +129,17 @@ APIYI_GEMINI_BASE_URL=https://api.apiyi.com/v1beta
 ```
 
 部署脚本生成的 systemd runner 会读取 `/opt/hermes/shared/.env`，但不会打印其中内容。
+
+## Release 保留与清理
+
+发布成功后会删除本次上传的远端 tarball：`/opt/hermes/tmp/hermes-<tag>.tar.gz`。
+
+旧 release 目录默认保留最近 5 个，同时永远保护本次部署版本、部署前后 `/opt/hermes/current` 指向的版本。可按需调整：
+
+```bash
+npm run deploy -- --tag v2026.7.4 --keep-releases 8
+npm run deploy -- --tag v2026.7.4 --no-prune-releases
+```
 
 ## 发布后检查
 
