@@ -10,6 +10,14 @@ const DEFAULT_HOST = "106.15.186.104";
 const DEFAULT_USER = "root";
 const DEFAULT_REMOTE_ROOT = "/opt/hermes";
 const DEFAULT_IDENTITY_FILE = path.join(homedir(), ".ssh", "hermes_apiyi_ed25519");
+const SSH_CONNECTION_ARGS = [
+  "-o",
+  "ConnectTimeout=15",
+  "-o",
+  "ServerAliveInterval=15",
+  "-o",
+  "ServerAliveCountMax=3",
+];
 const TAG_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -276,7 +284,7 @@ function copyBuiltDir(relativeSource, dest, { dryRun }) {
 }
 
 function sshBaseArgs(args) {
-  const base = ["-p", args.port, "-o", "BatchMode=no"];
+  const base = ["-p", args.port, "-o", "BatchMode=no", ...SSH_CONNECTION_ARGS];
   if (args.identityFile) {
     base.push("-i", args.identityFile);
   }
@@ -284,7 +292,7 @@ function sshBaseArgs(args) {
 }
 
 function scpBaseArgs(args) {
-  const base = ["-P", args.port, "-o", "BatchMode=no"];
+  const base = ["-P", args.port, "-o", "BatchMode=no", ...SSH_CONNECTION_ARGS];
   if (args.identityFile) {
     base.push("-i", args.identityFile);
   }
