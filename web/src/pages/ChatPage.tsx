@@ -36,6 +36,11 @@ import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
 import { getHermesBrowserId } from "@/lib/browserIdentity";
 import { normalizeSessionTitle } from "@/lib/chat-title";
+import {
+  createTerminalInputMouseReportScrubber,
+  createTerminalOutputMouseModeScrubber,
+  isDashboardMouseMode,
+} from "@/lib/terminalMouseGuards";
 import { PluginSlot } from "@/plugins";
 import { useTheme } from "@/themes";
 import { useProfileScope } from "@/contexts/useProfileScope";
@@ -70,6 +75,15 @@ function buildTerminalTheme(background: string, foreground: string) {
     selectionBackground:
       foreground.length === 7 ? `${foreground}44` : foreground,
   };
+}
+
+const DASHBOARD_NEW_SESSION_POINTER_GUARD_MS = 1200;
+const DASHBOARD_SELECTION_GUARD_MS = 2000;
+const POINTER_DRAG_THRESHOLD_PX = 3;
+const MOUSE_EVENT_CLASS = "enable-mouse-events";
+
+interface DashboardNewSessionPayload {
+  reason?: string;
 }
 
 /**
@@ -110,6 +124,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const terminalPointerDownPosRef = useRef<{ x: number; y: number } | null>(null);
+  const terminalPointerDragRef = useRef(false);
+  const lastTerminalPointerUpAtRef = useRef(0);
+  const terminalSelectionGuardUntilRef = useRef(0);
   // Exposed to the main metrics-sync effect so it can refit the terminal
   // the moment `isActive` flips back to true (display:none → display:flex
   // collapses the host's box, so ResizeObserver never fires on return).
@@ -167,6 +185,51 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     setBanner(null);
     setReconnectNonce((n) => n + 1);
   }, [clearReconnectTimer, searchParams, setSearchParams]);
+
+  const markTerminalSelectionGuard = useCallback((ms = DASHBOARD_SELECTION_GUARD_MS) => {
+    terminalSelectionGuardUntilRef.current = Math.max(
+      terminalSelectionGuardUntilRef.current,
+      Date.now() + ms,
+    );
+  }, []);
+
+  const hasTerminalSelection = useCallback(() => {
+    if (termRef.current?.getSelection()) return true;
+
+    if (typeof window === "undefined") return false;
+    const selection = window.getSelection();
+    const host = hostRef.current;
+    if (!selection || selection.isCollapsed || !host) return false;
+
+    const anchor = selection.anchorNode;
+    const focus = selection.focusNode;
+    const insideHost = (node: Node | null) =>
+      !!node && (host === node || host.contains(node));
+
+    return insideHost(anchor) || insideHost(focus);
+  }, []);
+
+  const shouldIgnoreDashboardNewSessionRequest = useCallback(() => {
+    const now = Date.now();
+    if (hasTerminalSelection()) return true;
+    if (now < terminalSelectionGuardUntilRef.current) return true;
+    return now - lastTerminalPointerUpAtRef.current <= DASHBOARD_NEW_SESSION_POINTER_GUARD_MS;
+  }, [hasTerminalSelection]);
+
+  const guardedStartFreshDashboardChat = useCallback(
+    (payload?: DashboardNewSessionPayload) => {
+      if (shouldIgnoreDashboardNewSessionRequest()) {
+        console.warn(
+          "[dashboard chat] ignored dashboard.new_session_requested during terminal selection",
+          payload,
+        );
+        return;
+      }
+
+      startFreshDashboardChat();
+    },
+    [shouldIgnoreDashboardNewSessionRequest, startFreshDashboardChat],
+  );
   // Raw state for the mobile side-sheet + a derived value that force-
   // closes whenever the chat tab isn't active.  The *derived* value is
   // what side-effects (body-scroll lock, keydown listener, portal render)
@@ -292,6 +355,98 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     mql.addEventListener("change", sync);
     return () => mql.removeEventListener("change", sync);
   }, []);
+
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+
+    const clearPointer = () => {
+      terminalPointerDownPosRef.current = null;
+      terminalPointerDragRef.current = false;
+    };
+
+    const eventStartedInHost = (ev: MouseEvent) => {
+      const target = ev.target;
+      return target instanceof Node && host.contains(target);
+    };
+
+    const onPointerDown = (ev: PointerEvent) => {
+      if (ev.button !== 0 || !eventStartedInHost(ev)) return;
+      terminalPointerDownPosRef.current = { x: ev.clientX, y: ev.clientY };
+      terminalPointerDragRef.current = false;
+    };
+
+    const onPointerMove = (ev: PointerEvent) => {
+      const start = terminalPointerDownPosRef.current;
+      if (!start) return;
+      const dx = ev.clientX - start.x;
+      const dy = ev.clientY - start.y;
+      if (Math.hypot(dx, dy) >= POINTER_DRAG_THRESHOLD_PX) {
+        terminalPointerDragRef.current = true;
+        markTerminalSelectionGuard();
+      }
+    };
+
+    const onPointerUp = () => {
+      lastTerminalPointerUpAtRef.current = Date.now();
+      if (terminalPointerDragRef.current || hasTerminalSelection()) {
+        markTerminalSelectionGuard();
+      }
+      clearPointer();
+    };
+
+    const onSelectionChange = () => {
+      if (hasTerminalSelection()) {
+        markTerminalSelectionGuard();
+      }
+    };
+
+    const forceXtermSelection = (ev: MouseEvent) => {
+      if (ev.button !== 0 || ev.shiftKey || ev.altKey || !eventStartedInHost(ev)) {
+        return;
+      }
+      const xtermRoot = host.querySelector(".xterm");
+      if (!xtermRoot?.classList.contains(MOUSE_EVENT_CLASS)) {
+        return;
+      }
+      const forced = new MouseEvent(ev.type, {
+        altKey: ev.altKey,
+        bubbles: true,
+        button: ev.button,
+        buttons: ev.buttons,
+        cancelable: true,
+        clientX: ev.clientX,
+        clientY: ev.clientY,
+        ctrlKey: ev.ctrlKey,
+        detail: ev.detail,
+        metaKey: ev.metaKey,
+        relatedTarget: ev.relatedTarget,
+        screenX: ev.screenX,
+        screenY: ev.screenY,
+        shiftKey: true,
+        view: window,
+      });
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      ev.target?.dispatchEvent(forced);
+    };
+
+    document.addEventListener("mousedown", forceXtermSelection, true);
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("pointermove", onPointerMove, true);
+    document.addEventListener("pointerup", onPointerUp, true);
+    document.addEventListener("pointercancel", clearPointer, true);
+    document.addEventListener("selectionchange", onSelectionChange);
+
+    return () => {
+      document.removeEventListener("mousedown", forceXtermSelection, true);
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("pointermove", onPointerMove, true);
+      document.removeEventListener("pointerup", onPointerUp, true);
+      document.removeEventListener("pointercancel", clearPointer, true);
+      document.removeEventListener("selectionchange", onSelectionChange);
+    };
+  }, [hasTerminalSelection, markTerminalSelectionGuard]);
 
   useEffect(() => {
     if (!mobilePanelOpen) return;
@@ -545,6 +700,18 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
     term.loadAddon(new WebLinksAddon());
 
+    const suppressMouseEnableHandler = term.parser.registerCsiHandler(
+      { prefix: "?", final: "h" },
+      (params) => {
+        if (params.some((param) => Array.isArray(param)
+          ? param.some(isDashboardMouseMode)
+          : isDashboardMouseMode(param))) {
+          return true;
+        }
+        return false;
+      },
+    );
+
     term.open(host);
 
     // Keep dashboard chat on xterm's default renderer. The WebGL renderer is
@@ -662,6 +829,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     let unmounting = false;
     let onDataDisposable: { dispose(): void } | null = null;
     let onResizeDisposable: { dispose(): void } | null = null;
+    const outputMouseScrubber = createTerminalOutputMouseModeScrubber();
+    const inputMouseScrubber = createTerminalInputMouseReportScrubber();
     const forceFresh = forceFreshPtyRef.current;
     forceFreshPtyRef.current = false;
     const scheduleReconnect = (code: number) => {
@@ -727,9 +896,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
     ws.onmessage = (ev) => {
       if (typeof ev.data === "string") {
-        term.write(ev.data, scheduleTerminalRefresh);
+        const data = outputMouseScrubber.scrubString(ev.data);
+        if (data) term.write(data, scheduleTerminalRefresh);
       } else {
-        term.write(new Uint8Array(ev.data as ArrayBuffer), scheduleTerminalRefresh);
+        const data = outputMouseScrubber.scrubBytes(
+          new Uint8Array(ev.data as ArrayBuffer),
+        );
+        if (data.byteLength > 0) term.write(data, scheduleTerminalRefresh);
       }
     };
 
@@ -817,16 +990,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // mouse reporting, so we drop SGR mouse reports entirely instead of
     // forwarding them into Hermes. Keyboard input, paste, and resize still
     // behave normally.
-      // eslint-disable-next-line no-control-regex -- intentional ESC byte in xterm SGR mouse report parser
-      const SGR_MOUSE_RE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
       onDataDisposable = term.onData((data) => {
         if (ws.readyState !== WebSocket.OPEN) return;
 
-        if (SGR_MOUSE_RE.test(data)) {
-          return;
-        }
+        const cleaned = inputMouseScrubber.scrub(data);
+        if (!cleaned) return;
 
-        ws.send(data);
+        ws.send(cleaned);
       });
 
       onResizeDisposable = term.onResize(({ cols, rows }) => {
@@ -841,6 +1011,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     return () => {
       unmounting = true;
       syncMetricsRef.current = null;
+      suppressMouseEnableHandler.dispose();
       onDataDisposable?.dispose();
       onResizeDisposable?.dispose();
       if (metricsDebounce) clearTimeout(metricsDebounce);
@@ -1010,7 +1181,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               <ChatSidebar
                 channel={channel}
                 profile={scopedProfile}
-                onDashboardNewSessionRequest={startFreshDashboardChat}
+                onDashboardNewSessionRequest={guardedStartFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
               />
             </div>
@@ -1109,7 +1280,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               <ChatSidebar
                 channel={channel}
                 profile={scopedProfile}
-                onDashboardNewSessionRequest={startFreshDashboardChat}
+                onDashboardNewSessionRequest={guardedStartFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
               />
             </div>

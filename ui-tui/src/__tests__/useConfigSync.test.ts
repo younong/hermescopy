@@ -95,6 +95,25 @@ describe('applyDisplay', () => {
     expect($uiState.get().mouseTracking).toBe('all')
   })
 
+  it('keeps dashboard chat mouse tracking off even when config enables it', async () => {
+    vi.resetModules()
+    vi.stubEnv('HERMES_TUI_DASHBOARD', '1')
+
+    try {
+      const [{ applyDisplay: applyDashboardDisplay }, { $uiState: dashboardUiState, resetUiState: resetDashboardUiState }] =
+        await Promise.all([import('../app/useConfigSync.js'), import('../app/uiStore.js')])
+      const setBell = vi.fn()
+
+      resetDashboardUiState()
+      applyDashboardDisplay({ config: { display: { mouse_tracking: 'all' } } }, setBell)
+
+      expect(dashboardUiState.get().mouseTracking).toBe('off')
+    } finally {
+      vi.unstubAllEnvs()
+      vi.resetModules()
+    }
+  })
+
   it('parses display.sections into per-section overrides', () => {
     const setBell = vi.fn()
 

@@ -23,7 +23,6 @@ import { patchTurnState } from './turnStore.js'
 import { getUiState } from './uiStore.js'
 
 const isCtrl = (key: { ctrl: boolean }, ch: string, target: string) => key.ctrl && ch.toLowerCase() === target
-const DASHBOARD_NEW_SESSION_MESSAGE = 'starting a fresh dashboard chat...'
 
 export const shouldAllowIdleHotkeyExit = (dashboardTuiMode = DASHBOARD_TUI_MODE) => !dashboardTuiMode
 
@@ -33,9 +32,7 @@ export function handleIdleHotkeyExit(
   requestDashboardNewSession?: () => void
 ) {
   if (!shouldAllowIdleHotkeyExit(dashboardTuiMode)) {
-    requestDashboardNewSession?.()
-
-    return actions.sys(DASHBOARD_NEW_SESSION_MESSAGE)
+    return
   }
 
   return actions.die()
