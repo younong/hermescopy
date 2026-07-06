@@ -3,10 +3,11 @@ import { describe, expect, it } from "vitest";
 import { guiChatReducer } from "./reducer";
 import { initialGuiChatState } from "./types";
 
-function restoreWithMessage(text: string) {
+function restoreWithMessage(text: string, info?: { cwd?: string; model?: string }) {
   return guiChatReducer(initialGuiChatState, {
     type: "session.created",
     response: {
+      info,
       messages: [{ role: "assistant", text }],
       session_id: "sid",
     },
@@ -156,22 +157,31 @@ describe("guiChatReducer history image restoration", () => {
   });
 
   it("recognizes home and relative image paths", () => {
-    const home = restoreWithMessage("~/Downloads/a.jpg");
-    const relative = restoreWithMessage("./outputs/a.png");
-    const parent = restoreWithMessage("../images/a.jpg");
-    const nested = restoreWithMessage("outputs/a.webp");
+    const cwd = "/Users/me/project";
+    const home = restoreWithMessage("~/Downloads/a.jpg", { cwd });
+    const relative = restoreWithMessage("./outputs/a.png", { cwd });
+    const parent = restoreWithMessage("../images/a.jpg", { cwd });
+    const nested = restoreWithMessage("outputs/a.webp", { cwd });
 
     expect(home.artifacts[home.messages[0].artifactIds[0]].url).toBe(
       "/api/fs/read-data-url?path=~%2FDownloads%2Fa.jpg",
     );
     expect(relative.artifacts[relative.messages[0].artifactIds[0]].url).toBe(
-      "/api/fs/read-data-url?path=.%2Foutputs%2Fa.png",
+      "/api/fs/read-data-url?path=.%2Foutputs%2Fa.png&cwd=%2FUsers%2Fme%2Fproject",
     );
     expect(parent.artifacts[parent.messages[0].artifactIds[0]].url).toBe(
-      "/api/fs/read-data-url?path=..%2Fimages%2Fa.jpg",
+      "/api/fs/read-data-url?path=..%2Fimages%2Fa.jpg&cwd=%2FUsers%2Fme%2Fproject",
     );
     expect(nested.artifacts[nested.messages[0].artifactIds[0]].url).toBe(
-      "/api/fs/read-data-url?path=outputs%2Fa.webp",
+      "/api/fs/read-data-url?path=outputs%2Fa.webp&cwd=%2FUsers%2Fme%2Fproject",
+    );
+  });
+
+  it("keeps existing path semantics when no session cwd is available", () => {
+    const state = restoreWithMessage("./outputs/a.png");
+
+    expect(state.artifacts[state.messages[0].artifactIds[0]].url).toBe(
+      "/api/fs/read-data-url?path=.%2Foutputs%2Fa.png",
     );
   });
 
@@ -223,6 +233,35 @@ describe("guiChatReducer history image restoration", () => {
     expect(artifact).toMatchObject({
       url: "/api/fs/read-data-url?path=%2Fmnt%2Fdata%2Fcat.png",
     });
+  });
+
+  it("uses cwd from session info events for generated image artifact paths", () => {
+    const withCwd = guiChatReducer(initialGuiChatState, {
+      event: { payload: { cwd: "/Users/me/project" }, type: "session.info" },
+      type: "event",
+    });
+    const state = guiChatReducer(withCwd, {
+      event: {
+        payload: { id: "artifact-1", url: "outputs/a.png" },
+        type: "artifact.image",
+      },
+      type: "event",
+    });
+
+    expect(state.cwd).toBe("/Users/me/project");
+    expect(state.artifacts["artifact-1"].url).toBe(
+      "/api/fs/read-data-url?path=outputs%2Fa.png&cwd=%2FUsers%2Fme%2Fproject",
+    );
+  });
+
+  it("maps generated image cache paths to the static image endpoint", () => {
+    const state = restoreWithMessage(
+      "/opt/hermes/shared/.hermes/cache/images/apiyi_gpt-image-2-medium_20260705_130933_211cd48c.png",
+    );
+
+    expect(state.artifacts[state.messages[0].artifactIds[0]].url).toBe(
+      "/api/generated-images/apiyi_gpt-image-2-medium_20260705_130933_211cd48c.png",
+    );
   });
 
   it("does not treat non-image paths or unsafe schemes as images", () => {

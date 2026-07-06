@@ -66,13 +66,15 @@ function applySessionResponse(
   state: GuiChatState,
   response: SessionCreateResponse | SessionResumeResponse,
 ): GuiChatState {
+  const cwd = response.info?.cwd ?? (response.session_id === state.sessionId ? state.cwd : undefined);
   const history = Array.isArray(response.messages)
-    ? transcriptToHistoryState(response.messages)
+    ? transcriptToHistoryState(response.messages, cwd)
     : null;
 
   return {
     ...state,
     artifacts: history ? history.artifacts : state.artifacts,
+    cwd,
     error: undefined,
     isGenerating: !!("running" in response && response.running),
     messages: history ? history.messages : state.messages,
@@ -129,12 +131,13 @@ function applyGatewayEvent(state: GuiChatState, event: GatewayEvent): GuiChatSta
 
 function transcriptToHistoryState(
   transcript: GatewayTranscriptMessage[],
+  cwd?: string,
 ): { artifacts: Record<string, ImageArtifactState>; messages: ChatMessage[] } {
   const artifacts: Record<string, ImageArtifactState> = {};
   const messages: ChatMessage[] = [];
 
   for (const [index, entry] of transcript.entries()) {
-    const converted = transcriptToMessageWithArtifacts(entry, index);
+    const converted = transcriptToMessageWithArtifacts(entry, index, cwd);
     if (!converted) continue;
     messages.push(converted.message);
     for (const artifact of converted.artifacts) {
@@ -148,6 +151,7 @@ function transcriptToHistoryState(
 function transcriptToMessageWithArtifacts(
   message: GatewayTranscriptMessage,
   index: number,
+  cwd?: string,
 ): { artifacts: ImageArtifactState[]; message: ChatMessage } | null {
   if (message.role === "tool") {
     return null;
@@ -161,7 +165,7 @@ function transcriptToMessageWithArtifacts(
   }
 
   const artifacts = refs.map((ref, imageIndex): ImageArtifactState => {
-    const url = imagePreviewUrl(ref.url);
+    const url = imagePreviewUrl(ref.url, cwd);
     return {
       height: ref.height,
       id: `history-${index}-image-${imageIndex}`,
@@ -506,7 +510,7 @@ function applySessionInfo(
   payload: SessionInfoPayload | undefined,
 ): GuiChatState {
   if (!payload) return state;
-  return { ...state, model: payload.model ?? state.model };
+  return { ...state, cwd: payload.cwd ?? state.cwd, model: payload.model ?? state.model };
 }
 
 function startAssistantMessage(state: GuiChatState): GuiChatState {
@@ -661,7 +665,7 @@ function completeToolCall(
   if (!failed && isImageGenerationTool(payload?.name ?? existing.name)) {
     return addImageArtifact(
       nextState,
-      imageArtifactPayloadFromToolResult(id, result, payload?.name ?? existing.name),
+      imageArtifactPayloadFromToolResult(id, result, payload?.name ?? existing.name, nextState.cwd),
     );
   }
   return nextState;
@@ -722,6 +726,7 @@ function imageArtifactPayloadFromToolResult(
   toolCallId: string,
   result: unknown,
   toolName: string,
+  cwd?: string,
 ): ArtifactImagePayload | undefined {
   const record = recordFromUnknown(result);
   if (!record || record.success === false) return undefined;
@@ -732,7 +737,7 @@ function imageArtifactPayloadFromToolResult(
     mimeType: mimeTypeForImageSource(source),
     title: toolName === "image_generate" ? "Generated image" : "Image result",
     toolCallId,
-    url: imagePreviewUrl(source),
+    url: imagePreviewUrl(source, cwd),
   };
 }
 
@@ -755,18 +760,39 @@ function firstString(...values: unknown[]): string | undefined {
   return values.find((value): value is string => typeof value === "string" && value.trim().length > 0);
 }
 
-function imagePreviewUrl(source: string): string {
+function imagePreviewUrl(source: string, cwd?: string): string {
   if (/^(https?:|data:|blob:)/i.test(source) || source.startsWith("/api/")) {
     return source;
   }
+  const generatedImageUrl = generatedImagePreviewUrl(source);
+  if (generatedImageUrl) return generatedImageUrl;
   if (looksLikeFilesystemPath(source)) {
-    return `/api/fs/read-data-url?path=${encodeURIComponent(source)}`;
+    const pathParam = `path=${encodeURIComponent(source)}`;
+    const cwdParam = cwd && isRelativeFilesystemPath(source) ? `&cwd=${encodeURIComponent(cwd)}` : "";
+    return `/api/fs/read-data-url?${pathParam}${cwdParam}`;
   }
   return source;
 }
 
+function generatedImagePreviewUrl(source: string): string | null {
+  const path = source.split(/[?#]/, 1)[0] ?? source;
+  const match = path.match(/(?:^|[/\\])\.hermes[/\\](?:images|cache[/\\]images)[/\\]([^/\\]+)$/);
+  if (!match?.[1]) return null;
+  return `/api/generated-images/${encodeURIComponent(match[1])}`;
+}
+
 function looksLikeFilesystemPath(source: string): boolean {
   return source.startsWith("~") || /^[A-Za-z]:[\\/]/.test(source) || source.includes("/") || source.includes("\\");
+}
+
+function isRelativeFilesystemPath(source: string): boolean {
+  return (
+    !source.startsWith("~") &&
+    !source.startsWith("/") &&
+    !source.startsWith("\\\\") &&
+    !/^file:/i.test(source) &&
+    !/^[A-Za-z]:[\\/]/.test(source)
+  );
 }
 
 function mimeTypeForImageSource(source: string): string | undefined {
@@ -812,15 +838,14 @@ function addImageArtifact(
         : undefined);
   const id = String(payload?.id ?? rawUrl ?? createClientId("artifact"));
   if (!rawUrl) return state;
-  const url =
-    rawUrl.startsWith("/api/") ||
-    rawUrl.startsWith("http") ||
-    rawUrl.startsWith("data:") ||
-    rawUrl.startsWith("blob:")
+  const url = looksLikeFilesystemPath(rawUrl)
+    ? imagePreviewUrl(rawUrl, state.cwd)
+    : rawUrl.startsWith("/api/") ||
+        rawUrl.startsWith("http") ||
+        rawUrl.startsWith("data:") ||
+        rawUrl.startsWith("blob:")
       ? rawUrl
-      : looksLikeFilesystemPath(rawUrl)
-        ? `/api/fs/read-data-url?path=${encodeURIComponent(rawUrl)}`
-        : `/api/artifacts/${encodeURIComponent(rawUrl)}`;
+      : `/api/artifacts/${encodeURIComponent(rawUrl)}`;
   const messageId = payload?.messageId ?? payload?.message_id;
   const toolCallId = payload?.toolCallId ?? payload?.tool_call_id;
   const artifact: ImageArtifactState = {

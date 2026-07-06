@@ -347,10 +347,13 @@ def _has_valid_session_token(request: Request) -> bool:
 # links opened by the OS shell or a new browser tab where the session header
 # can't be set. Kept narrow — same query-token tradeoff as the /api/pty WS.
 _QUERY_TOKEN_API_PATHS: frozenset[str] = frozenset({"/api/files/download"})
+_QUERY_TOKEN_API_PREFIXES: tuple[str, ...] = ("/api/generated-images/",)
 
 
 def _has_valid_query_token(request: Request, path: str) -> bool:
-    if path not in _QUERY_TOKEN_API_PATHS:
+    if path not in _QUERY_TOKEN_API_PATHS and not any(
+        path.startswith(prefix) for prefix in _QUERY_TOKEN_API_PREFIXES
+    ):
         return False
     token = request.query_params.get("token", "")
     return bool(token) and hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode())
@@ -1263,7 +1266,7 @@ _FS_MIME_TYPES = {
 }
 
 
-def _fs_path(raw_path: str) -> Path:
+def _fs_path(raw_path: str, cwd: str | None = None) -> Path:
     raw = str(raw_path or "").strip()
     if not raw:
         raise HTTPException(status_code=400, detail="Path is required")
@@ -1277,7 +1280,13 @@ def _fs_path(raw_path: str) -> Path:
             raw = urllib.request.url2pathname(parsed.path)
         candidate = Path(raw).expanduser()
         if not candidate.is_absolute():
-            candidate = Path.cwd() / candidate
+            base = Path.cwd()
+            if cwd is not None:
+                raw_cwd = str(cwd or "").strip()
+                if not raw_cwd or "\0" in raw_cwd:
+                    raise ValueError
+                base = Path(raw_cwd).expanduser().resolve(strict=False)
+            candidate = base / candidate
         return candidate.resolve(strict=False)
     except (OSError, RuntimeError, ValueError):
         raise HTTPException(status_code=400, detail="Invalid path")
@@ -1964,8 +1973,8 @@ async def fs_write_text(payload: FsWriteText):
 
 
 @app.get("/api/fs/read-data-url")
-async def fs_read_data_url(path: str):
-    target, st = _fs_regular_file(_fs_path(path))
+async def fs_read_data_url(path: str, cwd: str | None = None):
+    target, st = _fs_regular_file(_fs_path(path, cwd=cwd))
     if st.st_size > _FS_DATA_URL_MAX_BYTES:
         raise HTTPException(status_code=413, detail="File too large")
     try:
@@ -1975,6 +1984,47 @@ async def fs_read_data_url(path: str):
     except OSError as exc:
         raise HTTPException(status_code=400, detail=str(exc) or "File read failed")
     return {"dataUrl": f"data:{_fs_mime_type(target)};base64,{encoded}"}
+
+
+@app.get("/api/generated-images/{filename}")
+async def generated_image_file(filename: str):
+    if not filename or filename in {".", ".."} or "/" in filename or "\\" in filename or "\0" in filename:
+        raise HTTPException(status_code=400, detail="Invalid image filename")
+    from hermes_constants import get_hermes_home
+
+    home = get_hermes_home()
+    roots = (home / "images", home / "cache" / "images")
+    for root in roots:
+        target = (root / filename).resolve(strict=False)
+        try:
+            target.relative_to(root.resolve(strict=False))
+        except ValueError:
+            continue
+        try:
+            st = target.stat()
+        except FileNotFoundError:
+            continue
+        except NotADirectoryError:
+            continue
+        except PermissionError:
+            raise HTTPException(status_code=403, detail="File is not readable")
+        except OSError as exc:
+            raise HTTPException(status_code=400, detail=str(exc) or "Invalid path")
+        if stat.S_ISDIR(st.st_mode):
+            raise HTTPException(status_code=400, detail="Path points to a directory")
+        if not stat.S_ISREG(st.st_mode):
+            raise HTTPException(status_code=400, detail="Only regular files can be read")
+        mime_type = _fs_mime_type(target)
+        if not mime_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail="File is not an image")
+        return FileResponse(
+            target,
+            media_type=mime_type,
+            filename=filename,
+            content_disposition_type="inline",
+            headers={"Cache-Control": "private, max-age=31536000, immutable"},
+        )
+    raise HTTPException(status_code=404, detail="File not found")
 
 
 @app.get("/api/fs/git-root")

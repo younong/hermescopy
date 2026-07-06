@@ -1,6 +1,6 @@
 import { Download, ExternalLink, Image as ImageIcon } from "lucide-react";
 import { useEffect, useState, type MouseEvent } from "react";
-import { fetchJSON } from "@/lib/api";
+import { fetchJSON, withHermesAssetAuth } from "@/lib/api";
 import type { ImageArtifactState } from "../types";
 
 export function ImageArtifactCard({ artifact }: { artifact: ImageArtifactState }) {
@@ -91,7 +91,9 @@ export function ImageArtifactCard({ artifact }: { artifact: ImageArtifactState }
 }
 
 function directDisplayUrl(url: string): string | null {
-  return url.startsWith("/api/fs/read-data-url?") ? null : url;
+  if (url.startsWith("/api/fs/read-data-url?")) return null;
+  if (url.startsWith("/api/")) return withHermesAssetAuth(url);
+  return url;
 }
 
 function filenameForArtifact(artifact: ImageArtifactState): string {
@@ -133,7 +135,8 @@ function extensionFromUrl(url: string): string | null {
 }
 
 async function downloadImageArtifact(url: string, filename: string): Promise<void> {
-  const direct = () => triggerDownload(url, filename);
+  const assetUrl = url.startsWith("/api/") ? withHermesAssetAuth(url) : url;
+  const direct = () => triggerDownload(assetUrl, filename);
   if (url.startsWith("data:") || url.startsWith("blob:")) {
     direct();
     return;
@@ -147,7 +150,7 @@ async function downloadImageArtifact(url: string, filename: string): Promise<voi
       return;
     }
 
-    const response = await fetch(url, { credentials: "include" });
+    const response = await fetch(assetUrl, { credentials: "include" });
     if (!response.ok) throw new Error(`download failed: ${response.status}`);
     const blob = await response.blob();
     const objectUrl = URL.createObjectURL(blob);
