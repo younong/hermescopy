@@ -10,7 +10,7 @@ export interface SessionInfoPayload {
 export interface GatewayTranscriptMessage {
   role: "assistant" | "system" | "tool" | "user";
   text?: string;
-  content?: string;
+  content?: unknown;
   name?: string;
   context?: string;
 }
@@ -115,5 +115,19 @@ export type GuiGatewayEvent = GatewayEvent<
 >;
 
 export function textFromTranscriptMessage(message: GatewayTranscriptMessage): string {
-  return message.text ?? message.content ?? "";
+  if (typeof message.text === "string") return message.text;
+  return textFromTranscriptContent(message.content);
+}
+
+function textFromTranscriptContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map(textFromTranscriptContent).filter(Boolean).join("\n");
+  }
+  if (!content || typeof content !== "object") return "";
+  const record = content as Record<string, unknown>;
+  const text = record.text ?? record.content ?? record.input_text;
+  if (typeof text === "string") return text;
+  if (Array.isArray(text)) return textFromTranscriptContent(text);
+  return "";
 }

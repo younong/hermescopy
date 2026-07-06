@@ -66,15 +66,16 @@ function applySessionResponse(
   state: GuiChatState,
   response: SessionCreateResponse | SessionResumeResponse,
 ): GuiChatState {
-  const messages = Array.isArray(response.messages)
-    ? response.messages.flatMap(transcriptToMessage)
-    : state.messages;
+  const history = Array.isArray(response.messages)
+    ? transcriptToHistoryState(response.messages)
+    : null;
 
   return {
     ...state,
+    artifacts: history ? history.artifacts : state.artifacts,
     error: undefined,
     isGenerating: !!("running" in response && response.running),
-    messages,
+    messages: history ? history.messages : state.messages,
     model: response.info?.model ?? state.model,
     sessionId: response.session_id,
     storedSessionId:
@@ -126,22 +127,374 @@ function applyGatewayEvent(state: GuiChatState, event: GatewayEvent): GuiChatSta
   }
 }
 
-function transcriptToMessage(message: GatewayTranscriptMessage, index: number): ChatMessage[] {
+function transcriptToHistoryState(
+  transcript: GatewayTranscriptMessage[],
+): { artifacts: Record<string, ImageArtifactState>; messages: ChatMessage[] } {
+  const artifacts: Record<string, ImageArtifactState> = {};
+  const messages: ChatMessage[] = [];
+
+  for (const [index, entry] of transcript.entries()) {
+    const converted = transcriptToMessageWithArtifacts(entry, index);
+    if (!converted) continue;
+    messages.push(converted.message);
+    for (const artifact of converted.artifacts) {
+      artifacts[artifact.id] = artifact;
+    }
+  }
+
+  return { artifacts, messages };
+}
+
+function transcriptToMessageWithArtifacts(
+  message: GatewayTranscriptMessage,
+  index: number,
+): { artifacts: ImageArtifactState[]; message: ChatMessage } | null {
   if (message.role === "tool") {
-    return [];
+    return null;
   }
-  const text = textFromTranscriptMessage(message);
-  if (!text.trim()) {
-    return [];
+
+  const id = `history-${index}`;
+  const refs = extractImageReferencesFromTranscriptMessage(message);
+  const text = stripRenderableImageReferencesFromText(textFromTranscriptMessage(message), refs);
+  if (!text.trim() && refs.length === 0) {
+    return null;
   }
-  return [
-    {
-      artifactIds: [],
-      id: `history-${index}`,
+
+  const artifacts = refs.map((ref, imageIndex): ImageArtifactState => {
+    const url = imagePreviewUrl(ref.url);
+    return {
+      height: ref.height,
+      id: `history-${index}-image-${imageIndex}`,
+      messageId: id,
+      mimeType: ref.mimeType ?? mimeTypeForImageSource(ref.url),
+      title: ref.title || "Historical image",
+      url,
+      width: ref.width,
+    };
+  });
+
+  return {
+    artifacts,
+    message: {
+      artifactIds: artifacts.map((artifact) => artifact.id),
+      id,
       role: message.role === "user" ? "user" : message.role === "assistant" ? "assistant" : "system",
       text,
     },
+  };
+}
+
+interface ExtractedImageReference {
+  end?: number;
+  height?: number;
+  mimeType?: string;
+  source: "markdown" | "structured" | "url";
+  start?: number;
+  title?: string;
+  url: string;
+  width?: number;
+}
+
+function extractImageReferencesFromTranscriptMessage(
+  message: GatewayTranscriptMessage,
+): ExtractedImageReference[] {
+  return dedupeImageReferences([
+    ...extractImageReferencesFromText(typeof message.text === "string" ? message.text : ""),
+    ...extractImageReferencesFromContent(message.content),
+  ]);
+}
+
+function extractImageReferencesFromContent(content: unknown): ExtractedImageReference[] {
+  if (typeof content === "string") {
+    return extractImageReferencesFromText(content);
+  }
+  if (Array.isArray(content)) {
+    return dedupeImageReferences(content.flatMap(extractImageReferencesFromContent));
+  }
+  if (!content || typeof content !== "object") {
+    return [];
+  }
+
+  const record = content as Record<string, unknown>;
+  const type = typeof record.type === "string" ? record.type : "";
+  const imageUrl = imageUrlFromUnknown(record.image_url);
+  const sourceUrl = imageUrlFromUnknown(record.source);
+  const directUrl = firstString(record.url, record.image, record.input_image);
+  const candidate = imageUrl ?? sourceUrl ?? directUrl;
+  const refs: ExtractedImageReference[] = [];
+
+  if (candidate && isImageContentType(type) && isLikelyImageReference(candidate)) {
+    refs.push({
+      height: numberFromUnknown(record.height),
+      mimeType: firstString(record.mimeType, record.mime_type) ?? mimeTypeForImageSource(candidate),
+      source: "structured",
+      title: firstString(record.title, record.name, record.alt),
+      url: candidate,
+      width: numberFromUnknown(record.width),
+    });
+  }
+
+  for (const key of ["content", "parts", "items"] as const) {
+    if (Array.isArray(record[key])) {
+      refs.push(...extractImageReferencesFromContent(record[key]));
+    }
+  }
+
+  return dedupeImageReferences(refs);
+}
+
+function imageUrlFromUnknown(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  return firstString(record.url, record.value, record.path);
+}
+
+function isImageContentType(type: string): boolean {
+  return type === "image" || type === "image_url" || type === "input_image" || type === "artifact.image";
+}
+
+function numberFromUnknown(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function extractImageReferencesFromText(text: string): ExtractedImageReference[] {
+  if (!text) return [];
+  const codeRanges = rangesForFencedCodeBlocks(text);
+  return dedupeImageReferences([
+    ...extractMarkdownImageReferences(text, codeRanges),
+    ...extractMarkdownLinkImageReferences(text, codeRanges),
+    ...extractBareImageReferences(text, codeRanges),
+  ]);
+}
+
+function extractMarkdownImageReferences(
+  text: string,
+  codeRanges: Array<{ end: number; start: number }>,
+): ExtractedImageReference[] {
+  return extractMarkdownReferences(text, codeRanges, true);
+}
+
+function extractMarkdownLinkImageReferences(
+  text: string,
+  codeRanges: Array<{ end: number; start: number }>,
+): ExtractedImageReference[] {
+  return extractMarkdownReferences(text, codeRanges, false);
+}
+
+function extractMarkdownReferences(
+  text: string,
+  codeRanges: Array<{ end: number; start: number }>,
+  imageOnly: boolean,
+): ExtractedImageReference[] {
+  const refs: ExtractedImageReference[] = [];
+  let cursor = 0;
+  while (cursor < text.length) {
+    const marker = imageOnly ? "![" : "[";
+    const start = text.indexOf(marker, cursor);
+    if (start < 0) break;
+    if (!imageOnly && start > 0 && text[start - 1] === "!") {
+      cursor = start + 1;
+      continue;
+    }
+    if (isIndexInRanges(start, codeRanges)) {
+      cursor = start + marker.length;
+      continue;
+    }
+    const labelStart = start + marker.length;
+    const labelEnd = text.indexOf("](", labelStart);
+    if (labelEnd < 0) break;
+    const parsed = parseMarkdownDestination(text, labelEnd + 2);
+    if (!parsed) {
+      cursor = labelEnd + 2;
+      continue;
+    }
+    const url = normalizeExtractedImageReference(parsed.destination);
+    if (url && isLikelyImageReference(url)) {
+      refs.push({
+        end: parsed.end,
+        source: imageOnly ? "markdown" : "url",
+        start,
+        title: text.slice(labelStart, labelEnd).trim() || undefined,
+        url,
+      });
+    }
+    cursor = parsed.end;
+  }
+  return refs;
+}
+
+function parseMarkdownDestination(
+  text: string,
+  start: number,
+): { destination: string; end: number } | null {
+  let index = start;
+  while (index < text.length && /\s/.test(text[index])) index += 1;
+  if (text[index] === "<") {
+    const close = text.indexOf(">", index + 1);
+    if (close < 0) return null;
+    const paren = text.indexOf(")", close + 1);
+    if (paren < 0) return null;
+    return { destination: text.slice(index + 1, close), end: paren + 1 };
+  }
+
+  let depth = 0;
+  for (; index < text.length; index += 1) {
+    const ch = text[index];
+    if (ch === "(") depth += 1;
+    if (ch === ")") {
+      if (depth === 0) {
+        const raw = text.slice(start, index).trim().replace(/\s+"[^"]*"\s*$/, "");
+        return { destination: raw, end: index + 1 };
+      }
+      depth -= 1;
+    }
+  }
+  return null;
+}
+
+function extractBareImageReferences(
+  text: string,
+  codeRanges: Array<{ end: number; start: number }>,
+): ExtractedImageReference[] {
+  const refs: ExtractedImageReference[] = [];
+  const bareReferenceRe = new RegExp(
+    String.raw`(?:https?:\/\/[^\s<>()]+|file:\/\/[^\n<>()]+|sandbox:\/{0,2}[^\n<>()]+|data:image\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+|\/api\/(?:fs\/read-data-url|artifacts)\?[^\s<>()]+|\/api\/artifacts\/[^\s<>()]+|(?:~|\.{1,2})\/[^\n<>()]+?\.(?:png|jpe?g|gif|webp|svg|avif|bmp|ico)(?:[?#][^\s<>()]+)?|\/[^\n<>()]+?\.(?:png|jpe?g|gif|webp|svg|avif|bmp|ico)(?:[?#][^\s<>()]+)?|[A-Za-z]:[\\/][^\n<>()]+?\.(?:png|jpe?g|gif|webp|svg|avif|bmp|ico)(?:[?#][^\s<>()]+)?|(?:[^\s<>()]+\/)+[^\n<>()]+?\.(?:png|jpe?g|gif|webp|svg|avif|bmp|ico)(?:[?#][^\s<>()]+)?)`,
+    "gi",
+  );
+  for (const match of text.matchAll(bareReferenceRe)) {
+    const start = match.index ?? 0;
+    if (isIndexInRanges(start, codeRanges)) continue;
+    const url = normalizeExtractedImageReference(match[0]);
+    if (!url || !isLikelyImageReference(url)) continue;
+    refs.push({
+      end: start + match[0].length,
+      source: "url",
+      start,
+      url,
+    });
+  }
+  return refs;
+}
+
+function normalizeExtractedImageReference(value: string): string | null {
+  const trimmed = trimImageReferenceBoundary(value);
+  if (!trimmed) return null;
+  const sandbox = trimmed.match(/^sandbox:\/{0,2}(\/.*)$/i);
+  if (sandbox?.[1] && IMAGE_EXTENSION_RE.test(sandbox[1])) {
+    return sandbox[1];
+  }
+  return trimmed;
+}
+
+function trimImageReferenceBoundary(value: string): string {
+  let next = value.trim();
+  next = next.replace(/^["'“‘「『《（([{<]+/g, "");
+  next = next.replace(/[.,;:!?。，、；：！？]+$/g, "");
+  next = trimUnbalancedClosingDelimiters(next);
+  return next;
+}
+
+function trimUnbalancedClosingDelimiters(value: string): string {
+  let next = value;
+  const pairs: Array<[string, string]> = [
+    ["(", ")"],
+    ["[", "]"],
+    ["{", "}"],
+    ["<", ">"],
+    ["（", "）"],
+    ["【", "】"],
+    ["《", "》"],
+    ["“", "”"],
+    ["‘", "’"],
+    ["「", "」"],
+    ["『", "』"],
   ];
+  let changed = true;
+  while (changed && next) {
+    changed = false;
+    for (const [open, close] of pairs) {
+      if (!next.endsWith(close)) continue;
+      const opens = countChar(next, open);
+      const closes = countChar(next, close);
+      if (closes > opens) {
+        next = next.slice(0, -close.length).trimEnd();
+        changed = true;
+      }
+    }
+  }
+  return next;
+}
+
+function countChar(value: string, char: string): number {
+  return Array.from(value).filter((candidate) => candidate === char).length;
+}
+
+function dedupeImageReferences(refs: ExtractedImageReference[]): ExtractedImageReference[] {
+  const seen = new Set<string>();
+  const deduped: ExtractedImageReference[] = [];
+  for (const ref of refs) {
+    const key = ref.url;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(ref);
+  }
+  return deduped;
+}
+
+function isLikelyImageReference(value: string): boolean {
+  const url = value.trim();
+  if (!url) return false;
+  if (/^(?:javascript|mailto):/i.test(url)) return false;
+  if (/^data:image\/[a-z0-9.+-]+;base64,/i.test(url)) return true;
+  if (/^data:/i.test(url)) return false;
+  if (url.startsWith("/api/fs/read-data-url?") || url.startsWith("/api/artifacts/")) {
+    return true;
+  }
+  if (isBareFilename(url)) return false;
+  return IMAGE_EXTENSION_RE.test(url);
+}
+
+function isBareFilename(value: string): boolean {
+  return /^[^\\/]+\.(?:png|jpe?g|gif|webp|svg|avif|bmp|ico)(?:[?#].*)?$/i.test(value);
+}
+
+const IMAGE_EXTENSION_RE = /\.(?:png|jpe?g|gif|webp|svg|avif|bmp|ico)(?=$|[\s?#&=/%]|[。。，、；：！？)\]}）】》]|$)/i;
+
+function stripRenderableImageReferencesFromText(
+  text: string,
+  refs: ExtractedImageReference[],
+): string {
+  if (!text || refs.length === 0) return text;
+  const markdownRanges = refs
+    .filter((ref) => ref.source === "markdown" && ref.start !== undefined && ref.end !== undefined)
+    .sort((a, b) => (b.start ?? 0) - (a.start ?? 0));
+  let next = text;
+  for (const ref of markdownRanges) {
+    next = `${next.slice(0, ref.start)}${next.slice(ref.end)}`;
+  }
+
+  const standaloneUrls = new Set(refs.filter((ref) => ref.source === "url").map((ref) => ref.url));
+  next = next
+    .split("\n")
+    .filter((line) => !standaloneUrls.has(trimImageReferenceBoundary(line.trim())))
+    .join("\n");
+
+  return next.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function rangesForFencedCodeBlocks(text: string): Array<{ end: number; start: number }> {
+  const ranges: Array<{ end: number; start: number }> = [];
+  const fenceRe = /```[\s\S]*?```/g;
+  for (const match of text.matchAll(fenceRe)) {
+    const start = match.index ?? 0;
+    ranges.push({ end: start + match[0].length, start });
+  }
+  return ranges;
+}
+
+function isIndexInRanges(index: number, ranges: Array<{ end: number; start: number }>): boolean {
+  return ranges.some((range) => index >= range.start && index < range.end);
 }
 
 function appendMessage(state: GuiChatState, message: ChatMessage): GuiChatState {
@@ -417,10 +770,20 @@ function looksLikeFilesystemPath(source: string): boolean {
 }
 
 function mimeTypeForImageSource(source: string): string | undefined {
+  const dataUrlMatch = source.match(/^data:([^;,]+)[;,]/i);
+  if (dataUrlMatch?.[1]?.toLowerCase().startsWith("image/")) {
+    return dataUrlMatch[1].toLowerCase();
+  }
   const ext = source.split(/[?#]/, 1)[0]?.split(".").pop()?.toLowerCase();
   switch (ext) {
+    case "avif":
+      return "image/avif";
+    case "bmp":
+      return "image/bmp";
     case "gif":
       return "image/gif";
+    case "ico":
+      return "image/x-icon";
     case "jpg":
     case "jpeg":
       return "image/jpeg";

@@ -240,6 +240,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // tabs because the dep wouldn't change on tab switch.
   const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false);
   const mobilePanelOpen = isActive && mobilePanelOpenRaw;
+  const headerEndRegisteredRef = useRef(false);
   const { setEnd, setTitle } = usePageHeader();
   const [sessionTitleState, setSessionTitleState] = useState<{
     scope: string;
@@ -473,15 +474,18 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
   useEffect(() => {
     // When hidden (non-chat tab) we must not register the header button —
-    // another page owns the header's end slot at that point.
-    if (!isActive) {
-      setEnd(null);
+    // another page owns the header's end slot at that point. ChatPage is kept
+    // mounted persistently, so only clear the slot if this effect actually
+    // registered ChatPage's mobile button; otherwise it can erase the active
+    // page's header actions (for example /chat-gui).
+    if (!isActive || !narrow) {
+      if (headerEndRegisteredRef.current) {
+        headerEndRegisteredRef.current = false;
+        setEnd(null);
+      }
       return;
     }
-    if (!narrow) {
-      setEnd(null);
-      return;
-    }
+    headerEndRegisteredRef.current = true;
     setEnd(
       <Button
         ghost
@@ -500,7 +504,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         </span>
       </Button>,
     );
-    return () => setEnd(null);
+    return () => {
+      if (headerEndRegisteredRef.current) {
+        headerEndRegisteredRef.current = false;
+        setEnd(null);
+      }
+    };
   }, [isActive, narrow, mobilePanelOpen, modelToolsLabel, setEnd]);
 
   const handleCopyLast = () => {

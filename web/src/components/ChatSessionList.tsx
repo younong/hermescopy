@@ -1,16 +1,16 @@
 /**
- * ChatSessionList — a ChatGPT-style conversation switcher that sits beside
- * the embedded TUI on the dashboard Chat tab.
+ * ChatSessionList — a ChatGPT-style conversation switcher for dashboard chat
+ * surfaces.
  *
  * It lists the most recent sessions for the active management profile and
- * lets the user swap between them without leaving the Chat page. Selecting
- * a row sets `/chat?resume=<id>`; ChatPage treats the resume target as part
- * of the PTY identity, so the change tears down the current terminal child
- * and respawns it resuming that conversation (see ChatPage.tsx). The
- * "New session" action clears the resume param, which spawns a fresh PTY.
+ * lets the user swap between them without leaving the current chat surface.
+ * Selecting a row sets the current route's `?resume=<id>` query param; the
+ * mounted chat surface treats that resume target as part of its connection
+ * identity and reconnects/resumes as needed. The "New session" action clears
+ * the resume param and can delegate to the surface's own force-fresh handler.
  *
  * Best-effort, like ChatSidebar: a failed fetch surfaces a small inline
- * error with a retry affordance and the terminal pane keeps working.
+ * error with a retry affordance and the active chat pane keeps working.
  *
  * This is a navigation surface, NOT a session-management one — delete,
  * rename, export, and bulk actions live on the Sessions page. Keeping this
@@ -31,7 +31,7 @@ import { cn, timeAgo } from "@/lib/utils";
 
 const SESSION_LIMIT = 30;
 interface ChatSessionListProps {
-  /** Active resume target (the session currently shown in the terminal). */
+  /** Active resume target (the session currently shown by the chat surface). */
   activeSessionId: string | null;
   /** Management profile from the dashboard switcher — scopes the listing. */
   profile?: string;
@@ -39,9 +39,9 @@ interface ChatSessionListProps {
   /** Optional callback fired after a row is picked (e.g. close mobile sheet). */
   onPicked?: () => void;
   /**
-   * Starts a fresh chat. ChatPage supplies its `startFreshDashboardChat`,
-   * which clears `?resume` AND bumps the reconnect nonce so a brand-new PTY
-   * spawns even when the user is already on an unsaved fresh session. When
+   * Starts a fresh chat. Chat surfaces can supply a handler that clears
+   * `?resume` AND bumps their reconnect nonce so a brand-new session starts
+   * even when the user is already on an unsaved fresh conversation. When
    * omitted, we fall back to clearing the resume param ourselves.
    */
   onNewChat?: () => void;
@@ -110,8 +110,8 @@ export function ChatSessionList({
 
   const reload = useCallback(() => setReloadNonce((n) => n + 1), []);
 
-  // Picking a row sets `/chat?resume=<id>`. Re-picking the row already in
-  // the terminal is a no-op (avoids a needless PTY teardown).
+  // Picking a row sets the current route's `?resume=<id>`. Re-picking the row
+  // already shown by the chat surface is a no-op (avoids a needless reconnect).
   const pick = useCallback(
     (id: string) => {
       onPicked?.();
@@ -128,11 +128,11 @@ export function ChatSessionList({
     [activeSessionId, onPicked, setSearchParams],
   );
 
-  // "New chat" prefers ChatPage's robust handler (clears resume + forces a
-  // PTY respawn even from an already-fresh session). Fallback: clear the
-  // resume param ourselves, which spawns a fresh PTY whenever one was being
-  // resumed. Session management (delete/rename/export) lives on the Sessions
-  // page; this panel only switches and starts conversations.
+  // "New chat" prefers the owning chat surface's robust handler (clears resume
+  // + forces a fresh connection even from an already-fresh session). Fallback:
+  // clear the resume param ourselves, which starts a fresh session whenever one
+  // was being resumed. Session management (delete/rename/export) lives on the
+  // Sessions page; this panel only switches and starts conversations.
   const startNew = useCallback(() => {
     onPicked?.();
     if (onNewChat) {
