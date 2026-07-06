@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 const DEFAULT_HOST = "106.15.186.104";
 const DEFAULT_USER = "root";
 const DEFAULT_REMOTE_ROOT = "/opt/hermes";
+const DEFAULT_NPM_REGISTRY = "https://registry.npmmirror.com";
 const DEFAULT_IDENTITY_FILE = path.join(homedir(), ".ssh", "hermes_apiyi_ed25519");
 const SSH_CONNECTION_ARGS = [
   "-o",
@@ -52,6 +53,10 @@ Authentication:
   Prefer SSH keys. For a temporary password-based deploy, set
   HERMES_DEPLOY_PASSWORD in your local environment and install sshpass.
   The password is never printed by this tool.
+
+Environment:
+  HERMES_DEPLOY_NPM_REGISTRY  npm registry used while building release artifacts.
+                              Default: ${DEFAULT_NPM_REGISTRY}
 `);
 }
 
@@ -285,7 +290,8 @@ function createArchive(tag, { dryRun }) {
 function buildArtifact(buildDir, { dryRun }) {
   const webOutDir = path.join(buildDir, "hermes_cli/web_dist");
   const tuiOutFile = path.join(buildDir, "ui-tui/dist/entry.js");
-  run("npm", ["install", "--prefer-offline", "--no-audit"], { dryRun, cwd: buildDir });
+  const npmRegistry = process.env.HERMES_DEPLOY_NPM_REGISTRY || DEFAULT_NPM_REGISTRY;
+  run("npm", ["install", "--prefer-offline", "--no-audit", "--registry", npmRegistry], { dryRun, cwd: buildDir });
   run("npm", ["run", "build", "--workspace", "web"], {
     dryRun,
     cwd: buildDir,
