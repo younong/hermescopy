@@ -21,6 +21,7 @@ const SSH_CONNECTION_ARGS = [
 ];
 const TAG_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const DEFAULT_KEEP_RELEASES = 5;
+const DEPLOY_NPM_WORKSPACES = ["web", "ui-tui"];
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
@@ -291,7 +292,19 @@ function buildArtifact(buildDir, { dryRun }) {
   const webOutDir = path.join(buildDir, "hermes_cli/web_dist");
   const tuiOutFile = path.join(buildDir, "ui-tui/dist/entry.js");
   const npmRegistry = process.env.HERMES_DEPLOY_NPM_REGISTRY || DEFAULT_NPM_REGISTRY;
-  run("npm", ["install", "--prefer-offline", "--no-audit", "--registry", npmRegistry], { dryRun, cwd: buildDir });
+  run(
+    "npm",
+    [
+      "install",
+      ...DEPLOY_NPM_WORKSPACES.flatMap((workspace) => ["--workspace", workspace]),
+      "--include-workspace-root=false",
+      "--prefer-offline",
+      "--no-audit",
+      "--registry",
+      npmRegistry,
+    ],
+    { dryRun, cwd: buildDir },
+  );
   run("npm", ["run", "build", "--workspace", "web"], {
     dryRun,
     cwd: buildDir,
