@@ -2,13 +2,16 @@
 // Bundles src/entry.tsx into a single self-contained dist/entry.js.
 // No runtime node_modules needed.
 import { build } from 'esbuild'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, '..')
-const out = resolve(root, 'dist/entry.js')
+const out = process.env.HERMES_TUI_OUTFILE
+  ? resolve(process.env.HERMES_TUI_OUTFILE)
+  : resolve(root, 'dist/entry.js')
+mkdirSync(dirname(out), { recursive: true })
 
 // `react-devtools-core` is only imported when DEV=true at runtime (Ink dev
 // mode). Stub it out so the bundle doesn't carry the dep.
