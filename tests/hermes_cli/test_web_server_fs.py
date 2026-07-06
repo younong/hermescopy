@@ -118,6 +118,55 @@ def test_fs_read_data_url_returns_capped_data_url(client, tmp_path, monkeypatch)
     assert response.json() == {"dataUrl": "data:image/png;base64," + base64.b64encode(b"pngbytes").decode("ascii")}
 
 
+def test_fs_read_data_url_accepts_cwd_for_relative_paths(client, tmp_path, monkeypatch):
+    process_cwd = tmp_path / "process-cwd"
+    process_cwd.mkdir()
+    monkeypatch.chdir(process_cwd)
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / "outputs" / "image.png"
+    target.parent.mkdir()
+    target.write_bytes(b"pngbytes")
+
+    response = client.get(
+        "/api/fs/read-data-url",
+        params={"path": "outputs/image.png", "cwd": str(project)},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"dataUrl": "data:image/png;base64," + base64.b64encode(b"pngbytes").decode("ascii")}
+
+
+def test_fs_read_data_url_rejects_invalid_cwd(client):
+    response = client.get(
+        "/api/fs/read-data-url",
+        params={"path": "outputs/image.png", "cwd": ""},
+    )
+
+    assert response.status_code == 400
+
+
+def test_generated_image_file_serves_persistent_images(client, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    images = home / "images"
+    images.mkdir(parents=True)
+    target = images / "generated.png"
+    target.write_bytes(b"pngbytes")
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: home)
+
+    response = client.get("/api/generated-images/generated.png")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("image/png")
+    assert response.content == b"pngbytes"
+
+
+def test_generated_image_file_rejects_nested_paths(client):
+    response = client.get("/api/generated-images/..%2Fsecret.png")
+
+    assert response.status_code == 404
+
+
 def test_fs_read_data_url_rejects_over_cap(client, tmp_path, monkeypatch):
     monkeypatch.setattr(web_server, "_FS_DATA_URL_MAX_BYTES", 3)
     target = tmp_path / "image.png"

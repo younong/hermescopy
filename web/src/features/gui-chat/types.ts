@@ -52,6 +52,7 @@ export interface GuiChatState {
   connection: GuiChatConnectionState;
   sessionId?: string;
   storedSessionId?: string;
+  cwd?: string;
   model?: string;
   messages: ChatMessage[];
   toolCalls: Record<string, ToolCallState>;

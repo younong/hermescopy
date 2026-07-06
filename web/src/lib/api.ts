@@ -91,6 +91,16 @@ function withManagementProfile(url: string): string {
   return `${url}${sep}profile=${encodeURIComponent(_managementProfile)}`;
 }
 
+export function withHermesAssetAuth(url: string): string {
+  const absolute = `${BASE}${url}`;
+  const token = window.__HERMES_SESSION_TOKEN__;
+  if (!token || window.__HERMES_AUTH_REQUIRED__ || !url.startsWith("/api/")) {
+    return absolute;
+  }
+  const sep = absolute.includes("?") ? "&" : "?";
+  return `${absolute}${sep}token=${encodeURIComponent(token)}`;
+}
+
 export async function fetchJSON<T>(
   url: string,
   init?: RequestInit,
