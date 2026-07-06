@@ -124,6 +124,27 @@ describe("guiChatReducer history image restoration", () => {
     });
   });
 
+  it("does not duplicate native image attachments restored from content plus path hint", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        messages: [
+          {
+            content: [
+              { text: "这张图片里面有什么\n\n[Image attached at: /opt/hermes/shared/.hermes/images/upload.png]", type: "text" },
+              { image_url: { url: "data:image/png;base64,iVBORw0KGgo=" }, type: "image_url" },
+            ],
+            role: "user",
+          },
+        ],
+        session_id: "sid",
+      },
+    });
+
+    expect(state.messages[0].text).toBe("这张图片里面有什么");
+    expect(state.messages[0].artifactIds).toHaveLength(1);
+  });
+
   it("recognizes file URLs as filesystem-backed image artifacts", () => {
     const state = restoreWithMessage("file:///tmp/cat.png");
 

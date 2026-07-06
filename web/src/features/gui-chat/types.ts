@@ -11,6 +11,18 @@ export interface ChatMessage {
   streaming?: boolean;
   status?: "complete" | "error" | "interrupted";
   artifactIds: string[];
+  attachments?: MessageAttachmentState[];
+}
+
+export interface MessageAttachmentState {
+  id: string;
+  kind: GuiComposerAttachmentKind;
+  name: string;
+  mimeType?: string;
+  sizeBytes: number;
+  previewUrl?: string;
+  pagesAttached?: number;
+  refText?: string;
 }
 
 export type ToolCallStatus = "running" | "succeeded" | "failed";
@@ -46,6 +58,26 @@ export interface ApprovalState {
   description?: string;
   payload: unknown;
   status: "pending" | "approved" | "denied";
+}
+
+export type GuiComposerAttachmentKind = "image" | "pdf" | "file";
+
+export type GuiComposerAttachmentStatus = "queued" | "uploading" | "uploaded" | "error";
+
+export interface GuiComposerAttachment {
+  id: string;
+  file: File;
+  kind: GuiComposerAttachmentKind;
+  name: string;
+  mimeType: string;
+  sizeBytes: number;
+  previewUrl?: string;
+  status: GuiComposerAttachmentStatus;
+  error?: string;
+  stagedSessionId?: string;
+  attachedPath?: string;
+  pagesAttached?: number;
+  refText?: string;
 }
 
 export interface GuiChatState {

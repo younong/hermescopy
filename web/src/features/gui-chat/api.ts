@@ -4,6 +4,7 @@ import {
   type GatewayEvent,
 } from "@/lib/gatewayClient";
 import { getHermesBrowserId } from "@/lib/browserIdentity";
+import { base64FromDataUrl, readFileAsDataUrl } from "./attachments";
 import type { SessionCreateResponse, SessionResumeResponse } from "./protocol";
 
 export interface ConnectGuiChatOptions {
@@ -16,10 +17,54 @@ export interface GuiChatEventSource {
   onState(handler: (state: ConnectionState) => void): () => void;
 }
 
+export interface ImageAttachResponse {
+  attached?: boolean;
+  path?: string;
+  count?: number;
+  remainder?: string;
+  text?: string;
+  bytes?: number;
+  name?: string;
+  width?: number;
+  height?: number;
+  token_estimate?: number;
+  message?: string;
+}
+
+export interface PdfAttachResponse {
+  attached?: boolean;
+  filename?: string;
+  pages_attached?: number;
+  pages?: Array<{
+    path?: string;
+    page?: number;
+    name?: string;
+    width?: number;
+    height?: number;
+    token_estimate?: number;
+  }>;
+  count?: number;
+  text?: string;
+  message?: string;
+}
+
+export interface FileAttachResponse {
+  attached?: boolean;
+  name?: string;
+  path?: string;
+  ref_path?: string;
+  ref_text?: string;
+  uploaded?: boolean;
+  message?: string;
+}
+
 export interface GuiChatConnection {
   client: GuiChatEventSource;
   close(): void;
   createOrResume(): Promise<SessionCreateResponse | SessionResumeResponse>;
+  attachImage(sessionId: string, file: File): Promise<ImageAttachResponse>;
+  attachPdf(sessionId: string, file: File): Promise<PdfAttachResponse>;
+  attachFile(sessionId: string, file: File): Promise<FileAttachResponse>;
   send(sessionId: string, text: string): Promise<void>;
   stop(sessionId: string): Promise<void>;
   respondToApproval(sessionId: string, request: unknown, approved: boolean): Promise<void>;
@@ -47,6 +92,35 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
         });
       }
       return client.request<SessionCreateResponse>("session.create", baseParams);
+    },
+    attachImage: async (sessionId, file) => {
+      const dataUrl = await readFileAsDataUrl(file);
+      const contentBase64 = base64FromDataUrl(dataUrl);
+      if (!contentBase64) throw new Error(`Could not read ${file.name}`);
+      return client.request<ImageAttachResponse>("image.attach_bytes", {
+        content_base64: contentBase64,
+        filename: file.name,
+        session_id: sessionId,
+      });
+    },
+    attachPdf: async (sessionId, file) => {
+      const dataUrl = await readFileAsDataUrl(file);
+      const contentBase64 = base64FromDataUrl(dataUrl);
+      if (!contentBase64) throw new Error(`Could not read ${file.name}`);
+      return client.request<PdfAttachResponse>("pdf.attach", {
+        content_base64: contentBase64,
+        filename: file.name,
+        session_id: sessionId,
+      });
+    },
+    attachFile: async (sessionId, file) => {
+      const dataUrl = await readFileAsDataUrl(file);
+      return client.request<FileAttachResponse>("file.attach", {
+        data_url: dataUrl,
+        name: file.name,
+        path: file.name,
+        session_id: sessionId,
+      });
     },
     respondToApproval: async (sessionId, _request, approved) => {
       await client.request("approval.respond", {

@@ -3,12 +3,7 @@ import { Markdown } from "@/components/Markdown";
 import { cn } from "@/lib/utils";
 import type { ChatMessage, ImageArtifactState } from "../types";
 import { ImageArtifactCard } from "./ImageArtifactCard";
-
-const ROLE_LABEL: Record<ChatMessage["role"], string> = {
-  assistant: "Assistant",
-  system: "System",
-  user: "User",
-};
+import { MessageAttachmentCard } from "./MessageAttachmentCard";
 
 export function MessageBubble({
   artifacts,
@@ -18,25 +13,50 @@ export function MessageBubble({
   message: ChatMessage;
 }) {
   const isUser = message.role === "user";
+
+  if (isUser) {
+    return (
+      <article className="flex w-full justify-end">
+        <div className="flex max-w-[min(34rem,92%)] flex-col items-end gap-3">
+          {message.attachments?.length ? (
+            <div className="flex flex-col items-end gap-3">
+              {message.attachments.map((attachment) => (
+                <MessageAttachmentCard
+                  attachment={attachment}
+                  key={attachment.id}
+                  variant="bubble"
+                />
+              ))}
+            </div>
+          ) : null}
+
+          {artifacts.length > 0 ? (
+            <div className="flex flex-col items-end gap-3">
+              {artifacts.map((artifact) => (
+                <ImageArtifactCard artifact={artifact} key={artifact.id} variant="bubble" />
+              ))}
+            </div>
+          ) : null}
+
+          {message.text ? (
+            <div className="rounded-3xl bg-current/[0.06] px-5 py-3 text-base leading-relaxed text-text-primary shadow-sm">
+              <Markdown content={message.text} streaming={message.streaming} />
+            </div>
+          ) : null}
+        </div>
+      </article>
+    );
+  }
+
   return (
-    <article
-      className={cn(
-        "flex w-full",
-        isUser ? "justify-end" : "justify-start",
-      )}
-    >
+    <article className="flex w-full justify-start">
       <div
         className={cn(
-          "max-w-[min(52rem,92%)] border px-4 py-3 shadow-sm",
-          isUser
-            ? "border-primary/25 bg-primary/10"
-            : message.role === "system"
-              ? "border-warning/25 bg-warning/10"
-              : "border-current/15 bg-midground/5",
+          "max-w-[min(52rem,92%)] px-1 py-1",
+          message.role === "system" ? "text-warning" : "text-text-primary",
         )}
       >
         <div className="mb-2 flex items-center gap-2 text-xs uppercase tracking-[0.12em] text-text-tertiary">
-          <span>{ROLE_LABEL[message.role]}</span>
           {message.streaming ? <Badge tone="warning">streaming</Badge> : null}
           {message.status === "error" ? <Badge tone="destructive">error</Badge> : null}
           {message.status === "interrupted" ? <Badge tone="secondary">stopped</Badge> : null}
@@ -45,6 +65,13 @@ export function MessageBubble({
           <Markdown content={message.text} streaming={message.streaming} />
         ) : message.streaming ? (
           <div className="text-sm text-text-secondary">Thinking…</div>
+        ) : null}
+        {message.attachments?.length ? (
+          <div className="mt-3 flex flex-wrap gap-2">
+            {message.attachments.map((attachment) => (
+              <MessageAttachmentCard attachment={attachment} key={attachment.id} />
+            ))}
+          </div>
         ) : null}
         {artifacts.map((artifact) => (
           <ImageArtifactCard artifact={artifact} key={artifact.id} />
