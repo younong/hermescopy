@@ -27,6 +27,7 @@ export function GuiChatShell() {
   const [state, dispatch] = useReducer(guiChatReducer, initialGuiChatState);
   const connectionRef = useRef<GuiChatConnection | null>(null);
   const [newChatNonce, setNewChatNonce] = useState(0);
+  const [sendScrollNonce, setSendScrollNonce] = useState(0);
   const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false);
   const [portalRoot] = useState<HTMLElement | null>(() =>
     typeof document !== "undefined" ? document.body : null,
@@ -39,6 +40,7 @@ export function GuiChatShell() {
   const mobilePanelOpen = mobilePanelOpenRaw;
   const activeSessionId = state.storedSessionId ?? resumeSessionId;
   const terminalResumeId = state.storedSessionId ?? resumeSessionId;
+  const forceBottomKey = `${activeSessionId ?? `new-${newChatNonce}`}:${sendScrollNonce}`;
 
   const closeMobilePanel = useCallback(() => setMobilePanelOpenRaw(false), []);
 
@@ -165,6 +167,7 @@ export function GuiChatShell() {
       const sessionId = state.sessionId;
       const connection = connectionRef.current;
       if (!sessionId || !connection) return;
+      setSendScrollNonce((n) => n + 1);
       dispatch({ type: "user.sent", id: createClientId("user"), text });
       void connection
         .send(sessionId, text)
@@ -188,6 +191,7 @@ export function GuiChatShell() {
       const connection = connectionRef.current;
       const approval = state.approvals[id];
       if (!sessionId || !connection || !approval) return;
+      setSendScrollNonce((n) => n + 1);
       dispatch({ type: "approval.resolved", approved, id });
       void connection
         .respondToApproval(sessionId, approval.payload, approved)
@@ -286,6 +290,7 @@ export function GuiChatShell() {
 
           <MessageList
             disabled={disabled}
+            forceBottomKey={forceBottomKey}
             onApprovalRespond={respondToApproval}
             state={state}
           />
