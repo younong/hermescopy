@@ -12,7 +12,11 @@ import { cn } from "@/lib/utils";
 import { connectGuiChat, type GuiChatConnection } from "../api";
 import { connectMockGuiChat } from "../mock";
 import { guiChatReducer } from "../reducer";
-import { initialGuiChatState } from "../types";
+import {
+  initialGuiChatState,
+  type GuiComposerAttachment,
+  type MessageAttachmentState,
+} from "../types";
 import { Composer } from "./Composer";
 import { MessageList } from "./MessageList";
 
@@ -163,15 +167,95 @@ export function GuiChatShell() {
   }, [state.connection]);
 
   const send = useCallback(
-    (text: string) => {
+    async (
+      text: string,
+      attachments: GuiComposerAttachment[],
+      updateAttachment: (id: string, patch: Partial<GuiComposerAttachment>) => void,
+    ) => {
       const sessionId = state.sessionId;
       const connection = connectionRef.current;
       if (!sessionId || !connection) return;
-      setSendScrollNonce((n) => n + 1);
-      dispatch({ type: "user.sent", id: createClientId("user"), text });
-      void connection
-        .send(sessionId, text)
-        .catch((error: Error) => dispatch({ type: "error", message: error.message }));
+
+      try {
+        const messageAttachments: MessageAttachmentState[] = [];
+        const fileRefs: string[] = [];
+
+        for (const attachment of attachments) {
+          let sentAttachment = attachment;
+          if (attachment.status === "uploaded" && attachment.stagedSessionId === sessionId) {
+            messageAttachments.push(toMessageAttachment(sentAttachment));
+            if (attachment.kind === "file" && attachment.refText) fileRefs.push(attachment.refText);
+            continue;
+          }
+
+          updateAttachment(attachment.id, { error: undefined, status: "uploading" });
+          try {
+            if (attachment.kind === "image") {
+              const result = await connection.attachImage(sessionId, attachment.file);
+              if (!result.attached) {
+                throw new Error(result.message || `Could not attach ${attachment.name}`);
+              }
+              sentAttachment = {
+                ...attachment,
+                attachedPath: result.path,
+                error: undefined,
+                stagedSessionId: sessionId,
+                status: "uploaded",
+              };
+              updateAttachment(attachment.id, sentAttachment);
+            } else if (attachment.kind === "pdf") {
+              const result = await connection.attachPdf(sessionId, attachment.file);
+              if (!result.attached) {
+                throw new Error(result.message || `Could not attach ${attachment.name}`);
+              }
+              sentAttachment = {
+                ...attachment,
+                error: undefined,
+                pagesAttached: result.pages_attached,
+                stagedSessionId: sessionId,
+                status: "uploaded",
+              };
+              updateAttachment(attachment.id, sentAttachment);
+            } else {
+              const result = await connection.attachFile(sessionId, attachment.file);
+              if (!result.attached || !result.ref_text) {
+                throw new Error(result.message || `Could not attach ${attachment.name}`);
+              }
+              sentAttachment = {
+                ...attachment,
+                attachedPath: result.path,
+                error: undefined,
+                refText: result.ref_text,
+                stagedSessionId: sessionId,
+                status: "uploaded",
+              };
+              fileRefs.push(result.ref_text);
+              updateAttachment(attachment.id, sentAttachment);
+            }
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            throw new AttachmentError(attachment.id, message);
+          }
+          messageAttachments.push(toMessageAttachment(sentAttachment));
+        }
+
+        const promptText = appendFileReferences(text, fileRefs);
+        setSendScrollNonce((n) => n + 1);
+        dispatch({
+          type: "user.sent",
+          attachments: messageAttachments,
+          id: createClientId("user"),
+          text,
+        });
+        await connection.send(sessionId, promptText);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (error instanceof AttachmentError) {
+          updateAttachment(error.attachmentId, { error: message, status: "error" });
+        }
+        dispatch({ type: "error", message });
+        throw error;
+      }
     },
     [state.sessionId],
   );
@@ -315,6 +399,34 @@ export function GuiChatShell() {
       </div>
     </div>
   );
+}
+
+class AttachmentError extends Error {
+  readonly attachmentId: string;
+
+  constructor(attachmentId: string, message: string) {
+    super(message);
+    this.attachmentId = attachmentId;
+    this.name = "AttachmentError";
+  }
+}
+
+function toMessageAttachment(attachment: GuiComposerAttachment): MessageAttachmentState {
+  return {
+    id: attachment.id,
+    kind: attachment.kind,
+    mimeType: attachment.mimeType,
+    name: attachment.name,
+    pagesAttached: attachment.pagesAttached,
+    previewUrl: attachment.previewUrl,
+    refText: attachment.refText,
+    sizeBytes: attachment.sizeBytes,
+  };
+}
+
+function appendFileReferences(text: string, fileRefs: string[]): string {
+  if (fileRefs.length === 0) return text;
+  return `${text.trim()}\n\n附件：\n${fileRefs.join("\n")}`.trim();
 }
 
 function createClientId(prefix: string): string {

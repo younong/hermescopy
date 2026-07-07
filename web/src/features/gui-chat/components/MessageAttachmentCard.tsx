@@ -1,0 +1,58 @@
+import { FileText } from "lucide-react";
+
+import { formatBytes } from "../attachments";
+import type { MessageAttachmentState } from "../types";
+
+export function MessageAttachmentCard({
+  attachment,
+  variant = "card",
+}: {
+  attachment: MessageAttachmentState;
+  variant?: "bubble" | "card";
+}) {
+  const isPdf = attachment.kind === "pdf";
+  const typeLabel = attachment.kind === "image" ? "Image" : isPdf ? "PDF" : "File";
+  const meta = [
+    typeLabel,
+    formatBytes(attachment.sizeBytes),
+    isPdf && attachment.pagesAttached ? `${attachment.pagesAttached} pages` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  if (variant === "bubble" && attachment.kind === "image" && attachment.previewUrl) {
+    return (
+      <img
+        alt={attachment.name}
+        className="max-h-[320px] w-[180px] rounded-3xl object-cover shadow-sm sm:w-[220px]"
+        draggable={false}
+        src={attachment.previewUrl}
+      />
+    );
+  }
+
+  return (
+    <div className="flex h-[64px] w-full max-w-[280px] items-center gap-3 rounded-2xl border border-current/10 bg-background-base/60 px-3 py-2 text-left shadow-sm sm:w-[260px]">
+      <div className="flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-current/[0.04]">
+        {attachment.kind === "image" && attachment.previewUrl ? (
+          <img
+            alt=""
+            className="h-full w-full object-cover"
+            draggable={false}
+            src={attachment.previewUrl}
+          />
+        ) : (
+          <div className="flex h-9 w-7 items-center justify-center rounded-md bg-destructive text-white">
+            <FileText className="h-4 w-4" />
+          </div>
+        )}
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="truncate text-sm font-medium leading-5" title={attachment.name}>
+          {attachment.name}
+        </div>
+        <div className="truncate text-xs leading-5 text-text-tertiary">{meta}</div>
+      </div>
+    </div>
+  );
+}

@@ -3288,6 +3288,32 @@ class TestListSessionsRich:
         assert "\n" not in sessions[0]["preview"]
         assert "Line one Line two" in sessions[0]["preview"]
 
+    def test_preview_omits_image_addresses(self, db):
+        db.create_session("s1", "cli")
+        db.append_message(
+            "s1",
+            "user",
+            "请看这张图 https://example.com/uploads/screenshot.png 然后总结",
+        )
+        sessions = db.list_sessions_rich()
+        assert "https://example.com" not in sessions[0]["preview"]
+        assert "screenshot.png" not in sessions[0]["preview"]
+        assert sessions[0]["preview"] == "请看这张图 然后总结"
+
+    def test_preview_uses_text_from_multimodal_content(self, db):
+        db.create_session("s1", "cli")
+        db.append_message(
+            "s1",
+            "user",
+            [
+                {"type": "text", "text": "描述这张图片"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+            ],
+        )
+        sessions = db.list_sessions_rich()
+        assert sessions[0]["preview"] == "描述这张图片"
+        assert "data:image" not in sessions[0]["preview"]
+
     def test_branch_session_visible_in_list(self, db):
         """Branch sessions (parent ended with 'branched') must appear in list_sessions_rich."""
         db.create_session("parent", "cli")

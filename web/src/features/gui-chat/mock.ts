@@ -81,6 +81,18 @@ export function connectMockGuiChat(): GuiChatConnection {
         stored_session_id: MOCK_STORED_SESSION_ID,
       };
     },
+    async attachImage() {
+      await wait(120);
+      return { attached: true, path: "/mock/image.png" };
+    },
+    async attachPdf() {
+      await wait(180);
+      return { attached: true, filename: "mock.pdf", pages_attached: 1 };
+    },
+    async attachFile() {
+      await wait(120);
+      return { attached: true, name: "mock.txt", ref_text: "@file:.hermes/desktop-attachments/mock.txt" };
+    },
     async respondToApproval(_sessionId, _request, approved) {
       emitEvent({
         type: "status.update",

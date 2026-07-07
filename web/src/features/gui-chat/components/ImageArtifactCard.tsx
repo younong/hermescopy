@@ -3,7 +3,13 @@ import { useEffect, useState, type MouseEvent } from "react";
 import { fetchJSON, withHermesAssetAuth } from "@/lib/api";
 import type { ImageArtifactState } from "../types";
 
-export function ImageArtifactCard({ artifact }: { artifact: ImageArtifactState }) {
+export function ImageArtifactCard({
+  artifact,
+  variant = "card",
+}: {
+  artifact: ImageArtifactState;
+  variant?: "bubble" | "card";
+}) {
   const filename = filenameForArtifact(artifact);
   const [remotePreview, setRemotePreview] = useState<{
     dataUrl: string | null;
@@ -44,6 +50,23 @@ export function ImageArtifactCard({ artifact }: { artifact: ImageArtifactState }
   };
 
   const openUrl = displayUrl ?? artifact.url;
+
+  if (variant === "bubble") {
+    return displayUrl ? (
+      <a href={openUrl} target="_blank" rel="noreferrer" className="block">
+        <img
+          alt={artifact.title ?? "Image artifact"}
+          className="max-h-[320px] w-[180px] rounded-3xl object-cover shadow-sm sm:w-[220px]"
+          loading="lazy"
+          src={displayUrl}
+        />
+      </a>
+    ) : (
+      <div className="flex h-[220px] w-[180px] items-center justify-center rounded-3xl bg-current/[0.04] px-4 text-center text-xs text-text-secondary sm:w-[220px]">
+        {loadError ? "Image preview failed" : "Loading image…"}
+      </div>
+    );
+  }
 
   return (
     <figure className="mt-3 overflow-hidden border border-current/15 bg-background-base/60">

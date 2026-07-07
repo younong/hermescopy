@@ -21,6 +21,7 @@ import {
   type GuiChatConnectionState,
   type GuiChatState,
   type ImageArtifactState,
+  type MessageAttachmentState,
   type ToolCallState,
 } from "./types";
 
@@ -28,7 +29,7 @@ export type GuiChatAction =
   | { type: "connection"; state: GuiChatConnectionState }
   | { type: "session.created"; response: SessionCreateResponse | SessionResumeResponse }
   | { type: "event"; event: GatewayEvent }
-  | { type: "user.sent"; id: string; text: string }
+  | { type: "user.sent"; attachments?: MessageAttachmentState[]; id: string; text: string }
   | { type: "error"; message: string }
   | { type: "approval.resolved"; id: string; approved: boolean }
   | { type: "reset" };
@@ -47,6 +48,7 @@ export function guiChatReducer(
     case "user.sent":
       return appendMessage(state, {
         artifactIds: [],
+        attachments: action.attachments,
         id: action.id,
         role: "user",
         text: action.text,
@@ -202,10 +204,13 @@ interface ExtractedImageReference {
 function extractImageReferencesFromTranscriptMessage(
   message: GatewayTranscriptMessage,
 ): ExtractedImageReference[] {
-  return dedupeImageReferences([
-    ...extractImageReferencesFromText(typeof message.text === "string" ? message.text : ""),
-    ...extractImageReferencesFromContent(message.content),
-  ]);
+  const text = typeof message.text === "string" ? message.text : "";
+  const contentRefs = extractImageReferencesFromContent(message.content);
+  const textRefs = extractImageReferencesFromText(text).filter(
+    (ref) => contentRefs.length === 0 || !isNativeImageAttachmentHintReference(text, ref),
+  );
+
+  return dedupeImageReferences([...textRefs, ...contentRefs]);
 }
 
 function extractImageReferencesFromContent(content: unknown): ExtractedImageReference[] {
@@ -252,6 +257,15 @@ function imageUrlFromUnknown(value: unknown): string | undefined {
   if (!value || typeof value !== "object") return undefined;
   const record = value as Record<string, unknown>;
   return firstString(record.url, record.value, record.path);
+}
+
+function isNativeImageAttachmentHintReference(text: string, ref: ExtractedImageReference): boolean {
+  if (ref.source !== "url" || ref.start === undefined || ref.end === undefined) return false;
+  const lineStart = text.lastIndexOf("\n", ref.start) + 1;
+  const nextNewline = text.indexOf("\n", ref.end);
+  const lineEnd = nextNewline < 0 ? text.length : nextNewline;
+  const line = text.slice(lineStart, lineEnd).trim();
+  return isNativeImageAttachmentHintLine(line);
 }
 
 function isImageContentType(type: string): boolean {
@@ -465,6 +479,10 @@ function isBareFilename(value: string): boolean {
 
 const IMAGE_EXTENSION_RE = /\.(?:png|jpe?g|gif|webp|svg|avif|bmp|ico)(?=$|[\s?#&=/%]|[。。，、；：！？)\]}）】》]|$)/i;
 
+function isNativeImageAttachmentHintLine(line: string): boolean {
+  return line.startsWith("[Image attached at:") && line.endsWith("]");
+}
+
 function stripRenderableImageReferencesFromText(
   text: string,
   refs: ExtractedImageReference[],
@@ -479,9 +497,15 @@ function stripRenderableImageReferencesFromText(
   }
 
   const standaloneUrls = new Set(refs.filter((ref) => ref.source === "url").map((ref) => ref.url));
+  const hasStructuredImage = refs.some((ref) => ref.source === "structured");
   next = next
     .split("\n")
-    .filter((line) => !standaloneUrls.has(trimImageReferenceBoundary(line.trim())))
+    .filter((line) => {
+      const trimmed = line.trim();
+      if (standaloneUrls.has(trimImageReferenceBoundary(trimmed))) return false;
+      if (hasStructuredImage && isNativeImageAttachmentHintLine(trimmed)) return false;
+      return true;
+    })
     .join("\n");
 
   return next.replace(/\n{3,}/g, "\n\n").trim();
