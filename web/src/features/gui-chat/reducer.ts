@@ -25,6 +25,12 @@ import {
   type ToolCallState,
 } from "./types";
 
+const MAX_RENDERED_TEXT_CHARS = 120_000;
+const RENDERED_TEXT_TRUNCATION_NOTICE =
+  "\n\n[… output truncated in Chat GUI to keep the browser responsive …]";
+const NON_RENDERED_TOOL_RESULT_NOTICE =
+  "[… non-rendered tool result omitted in Chat GUI to keep the browser responsive …]";
+
 export type GuiChatAction =
   | { type: "connection"; state: GuiChatConnectionState }
   | { type: "session.created"; response: SessionCreateResponse | SessionResumeResponse }
@@ -51,7 +57,7 @@ export function guiChatReducer(
         attachments: action.attachments,
         id: action.id,
         role: "user",
-        text: action.text,
+        text: clampRenderedText(action.text),
       });
     case "error":
       return { ...state, error: action.message };
@@ -161,7 +167,7 @@ function transcriptToMessageWithArtifacts(
 
   const id = `history-${index}`;
   const refs = extractImageReferencesFromTranscriptMessage(message);
-  const text = stripRenderableImageReferencesFromText(textFromTranscriptMessage(message), refs);
+  const text = clampRenderedText(stripRenderableImageReferencesFromText(textFromTranscriptMessage(message), refs));
   if (!text.trim() && refs.length === 0) {
     return null;
   }
@@ -525,6 +531,27 @@ function isIndexInRanges(index: number, ranges: Array<{ end: number; start: numb
   return ranges.some((range) => index >= range.start && index < range.end);
 }
 
+function appendRenderedText(current: string, delta: string): string {
+  if (!delta || current.endsWith(RENDERED_TEXT_TRUNCATION_NOTICE)) return current;
+  return clampRenderedText(`${current}${delta}`);
+}
+
+function clampRenderedText(text: string): string {
+  if (text.length <= MAX_RENDERED_TEXT_CHARS) return text;
+  return `${text.slice(0, MAX_RENDERED_TEXT_CHARS)}${RENDERED_TEXT_TRUNCATION_NOTICE}`;
+}
+
+function clampToolInput(input: unknown): unknown {
+  if (input === undefined || input === null) return input;
+  if (typeof input === "string") return clampRenderedText(input);
+  if (typeof input === "number" || typeof input === "boolean") return input;
+  return NON_RENDERED_TOOL_RESULT_NOTICE;
+}
+
+function preserveToolResult(name: string | undefined): boolean {
+  return isImageGenerationTool(name);
+}
+
 function appendMessage(state: GuiChatState, message: ChatMessage): GuiChatState {
   return { ...state, messages: [...state.messages, message] };
 }
@@ -562,7 +589,9 @@ function appendAssistantDelta(
   const working = state.messages.at(-1)?.role === "assistant" ? state : startAssistantMessage(state);
   const idx = working.messages.length - 1;
   const messages = working.messages.map((message, i) =>
-    i === idx ? { ...message, streaming: true, text: message.text + delta } : message,
+    i === idx
+      ? { ...message, streaming: true, text: appendRenderedText(message.text, delta) }
+      : message,
   );
   return { ...working, isGenerating: true, messages };
 }
@@ -584,7 +613,10 @@ function completeAssistantMessage(
           ...message,
           status,
           streaming: false,
-          text: finalText !== undefined && finalText !== message.text ? finalText : message.text,
+          text:
+            finalText !== undefined && finalText !== message.text
+              ? clampRenderedText(finalText)
+              : message.text,
         }
       : message,
   );
@@ -620,9 +652,9 @@ function startToolCall(
   const existing = state.toolCalls[id];
   const next: ToolCallState = {
     artifactIds: existing?.artifactIds ?? [],
-    argsText: payload?.args_text ?? existing?.argsText,
+    argsText: payload?.args_text ? clampRenderedText(payload.args_text) : existing?.argsText,
     id,
-    input: payload?.input ?? payload?.context ?? existing?.input,
+    input: clampToolInput(payload?.input ?? payload?.context ?? existing?.input),
     name: payload?.title ?? payload?.name ?? existing?.name ?? "Tool",
     output: existing?.output ?? "",
     status: "running",
@@ -647,7 +679,7 @@ function appendToolProgress(
     ...state,
     toolCalls: {
       ...state.toolCalls,
-      [id]: { ...tool, output: `${tool.output}${tool.output ? "\n" : ""}${text}` },
+      [id]: { ...tool, output: appendRenderedText(tool.output, `${tool.output ? "\n" : ""}${text}`) },
     },
   };
 }
@@ -665,13 +697,14 @@ function completeToolCall(
     status: "running" as const,
   };
   const failed = Boolean(payload?.error) || payload?.ok === false || payload?.status === "error";
-  const output = payload?.result_text ?? payload?.output ?? existing.output;
-  const result = payload?.result ?? existing.result;
+  const output = clampRenderedText(payload?.result_text ?? payload?.output ?? existing.output);
+  const toolName = payload?.name ?? existing.name;
+  const result = preserveToolResult(toolName) ? payload?.result ?? existing.result : existing.result;
   const nextTool: ToolCallState = {
     ...existing,
     durationSeconds: payload?.duration_s ?? existing.durationSeconds,
-    error: payload?.error ?? existing.error,
-    name: payload?.name ?? existing.name,
+    error: payload?.error ? clampRenderedText(payload.error) : existing.error,
+    name: toolName,
     output,
     result,
     status: failed ? "failed" : "succeeded",
@@ -686,10 +719,10 @@ function completeToolCall(
     toolCalls: nextToolCalls,
     toolOrder: state.toolOrder.includes(id) ? state.toolOrder : [...state.toolOrder, id],
   };
-  if (!failed && isImageGenerationTool(payload?.name ?? existing.name)) {
+  if (!failed && isImageGenerationTool(toolName)) {
     return addImageArtifact(
       nextState,
-      imageArtifactPayloadFromToolResult(id, result, payload?.name ?? existing.name, nextState.cwd),
+      imageArtifactPayloadFromToolResult(id, result, toolName, nextState.cwd),
     );
   }
   return nextState;

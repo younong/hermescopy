@@ -1006,6 +1006,7 @@ def write_json(obj: dict) -> bool:
 
 def _emit(event: str, sid: str, payload: dict | None = None):
     params = {"type": event, "session_id": sid}
+    payload = _compact_gui_payload_for_emit(event, sid, payload)
     if payload is not None:
         params["payload"] = payload
     write_json({"jsonrpc": "2.0", "method": "event", "params": params})
@@ -1501,6 +1502,44 @@ def _session_source(session: dict | None) -> str:
         if source:
             return source
     return "tui"
+
+
+def _compact_gui_tool_payload(sid: str) -> bool:
+    return _session_source(_sessions.get(sid)).lower() == "dashboard-gui"
+
+
+def _preserve_live_tool_result(sid: str, name: str) -> bool:
+    if not _compact_gui_tool_payload(sid):
+        return True
+    return name in {"image_generate", "image_generation"}
+
+
+def _compact_gui_text(sid: str, text: object, *, max_chars: int = 2_000) -> str:
+    value = str(text or "")
+    if not _compact_gui_tool_payload(sid):
+        return value
+    if len(value) <= max_chars:
+        return value
+    omitted = len(value) - max_chars
+    return f"{value[:max_chars]}\n[… omitted {omitted} chars for Chat GUI …]"
+
+
+def _compact_gui_payload_for_emit(event: str, sid: str, payload: dict | None) -> dict | None:
+    if payload is None or not _compact_gui_tool_payload(sid):
+        return payload
+    if event in {"message.delta", "thinking.delta", "reasoning.delta"}:
+        next_payload = dict(payload)
+        # The GUI markdown renderer consumes `text`; rich terminal `rendered` output
+        # is redundant there and can be much larger than the token delta.
+        next_payload.pop("rendered", None)
+        return next_payload
+    if event == "approval.request":
+        next_payload = dict(payload)
+        for key in ("command", "description"):
+            if key in next_payload:
+                next_payload[key] = _compact_gui_text(sid, next_payload.get(key))
+        return next_payload
+    return payload
 
 
 def _register_session_cwd(session: dict | None) -> None:
@@ -3377,7 +3416,10 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
 
 
 def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result: str):
-    payload = {"tool_id": tool_call_id, "name": name, "args": args}
+    compact_gui = _compact_gui_tool_payload(sid)
+    payload = {"tool_id": tool_call_id, "name": name}
+    if not compact_gui:
+        payload["args"] = args
     session = _sessions.get(sid)
     snapshot = None
     started_at = None
@@ -3387,10 +3429,15 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
     duration_s = time.time() - started_at if started_at else None
     if duration_s is not None:
         payload["duration_s"] = duration_s
+    parsed_result: object
     try:
-        payload["result"] = json.loads(result)
+        parsed_result = json.loads(result)
     except Exception:
-        payload["result"] = result
+        parsed_result = result
+    if _preserve_live_tool_result(sid, name):
+        payload["result"] = parsed_result
+    elif compact_gui:
+        payload["result_omitted"] = True
     summary = _tool_summary(name, result, duration_s)
     if summary:
         payload["summary"] = summary
@@ -3416,7 +3463,10 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
             snapshot=snapshot,
             print_fn=rendered.append,
         ):
-            payload["inline_diff"] = "\n".join(rendered)
+            inline_diff = "\n".join(rendered)
+            if compact_gui:
+                inline_diff = _cap_tui_verbose_text(inline_diff)
+            payload["inline_diff"] = inline_diff
     except Exception:
         pass
     if _tool_progress_enabled(sid) or payload.get("inline_diff"):

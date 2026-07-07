@@ -8,6 +8,7 @@ import { ChatSessionList } from "@/components/ChatSessionList";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useProfileScope } from "@/contexts/useProfileScope";
 import { useI18n } from "@/i18n";
+import type { GatewayEvent } from "@/lib/gatewayClient";
 import { cn } from "@/lib/utils";
 import { connectGuiChat, type GuiChatConnection } from "../api";
 import { connectMockGuiChat } from "../mock";
@@ -30,6 +31,8 @@ export function GuiChatShell() {
   const mockMode = searchParams.get("mock") === "1";
   const [state, dispatch] = useReducer(guiChatReducer, initialGuiChatState);
   const connectionRef = useRef<GuiChatConnection | null>(null);
+  const pendingStreamEventsRef = useRef<GatewayEvent[]>([]);
+  const streamFlushFrameRef = useRef<number | undefined>(undefined);
   const [newChatNonce, setNewChatNonce] = useState(0);
   const [sendScrollNonce, setSendScrollNonce] = useState(0);
   const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false);
@@ -48,6 +51,35 @@ export function GuiChatShell() {
 
   const closeMobilePanel = useCallback(() => setMobilePanelOpenRaw(false), []);
 
+  const flushStreamEvents = useCallback(() => {
+    streamFlushFrameRef.current = undefined;
+    const events = mergeBufferedStreamEvents(pendingStreamEventsRef.current);
+    pendingStreamEventsRef.current = [];
+    for (const event of events) {
+      dispatch({ type: "event", event });
+    }
+  }, []);
+
+  const dispatchGatewayEvent = useCallback(
+    (event: GatewayEvent) => {
+      if (isBufferedStreamEvent(event)) {
+        pendingStreamEventsRef.current.push(event);
+        if (streamFlushFrameRef.current === undefined) {
+          streamFlushFrameRef.current = requestAnimationFrame(flushStreamEvents);
+        }
+        return;
+      }
+
+      if (streamFlushFrameRef.current !== undefined) {
+        cancelAnimationFrame(streamFlushFrameRef.current);
+        streamFlushFrameRef.current = undefined;
+      }
+      flushStreamEvents();
+      dispatch({ type: "event", event });
+    },
+    [flushStreamEvents],
+  );
+
   const startNewGuiChat = useCallback(() => {
     setSearchParams(
       (prev) => {
@@ -62,6 +94,11 @@ export function GuiChatShell() {
 
   const connect = useCallback(() => {
     connectionRef.current?.close();
+    if (streamFlushFrameRef.current !== undefined) {
+      cancelAnimationFrame(streamFlushFrameRef.current);
+      streamFlushFrameRef.current = undefined;
+    }
+    pendingStreamEventsRef.current = [];
     dispatch({ type: "reset" });
     const connection = mockMode
       ? connectMockGuiChat()
@@ -70,9 +107,7 @@ export function GuiChatShell() {
     const offState = connection.client.onState((next) => {
       dispatch({ type: "connection", state: next });
     });
-    const offEvents = connection.client.onEvent((event) => {
-      dispatch({ type: "event", event });
-    });
+    const offEvents = connection.client.onEvent(dispatchGatewayEvent);
     void connection
       .createOrResume()
       .then((response) => dispatch({ type: "session.created", response }))
@@ -80,12 +115,17 @@ export function GuiChatShell() {
     return () => {
       offState();
       offEvents();
+      if (streamFlushFrameRef.current !== undefined) {
+        cancelAnimationFrame(streamFlushFrameRef.current);
+        streamFlushFrameRef.current = undefined;
+      }
+      pendingStreamEventsRef.current = [];
       connection.close();
       if (connectionRef.current === connection) {
         connectionRef.current = null;
       }
     };
-  }, [mockMode, profile, resumeSessionId]);
+  }, [dispatchGatewayEvent, mockMode, profile, resumeSessionId]);
 
   useEffect(() => connect(), [connect, newChatNonce]);
 
@@ -422,6 +462,67 @@ function toMessageAttachment(attachment: GuiComposerAttachment): MessageAttachme
     refText: attachment.refText,
     sizeBytes: attachment.sizeBytes,
   };
+}
+
+function isBufferedStreamEvent(event: GatewayEvent): boolean {
+  return (
+    event.type === "message.delta" ||
+    event.type === "thinking.delta" ||
+    event.type === "reasoning.delta"
+  );
+}
+
+function mergeBufferedStreamEvents(events: GatewayEvent[]): GatewayEvent[] {
+  const merged: GatewayEvent[] = [];
+  let pending: GatewayEvent | undefined;
+
+  const flush = () => {
+    if (pending) {
+      merged.push(pending);
+      pending = undefined;
+    }
+  };
+
+  for (const event of events) {
+    if (!isBufferedStreamEvent(event)) {
+      flush();
+      merged.push(event);
+      continue;
+    }
+
+    if (!pending || pending.type !== event.type || pending.session_id !== event.session_id) {
+      flush();
+      pending = event;
+      continue;
+    }
+
+    pending = mergeStreamEventPayload(pending, event);
+  }
+
+  flush();
+  return merged;
+}
+
+function mergeStreamEventPayload(base: GatewayEvent, next: GatewayEvent): GatewayEvent {
+  const basePayload = isRecord(base.payload) ? base.payload : undefined;
+  const nextPayload = isRecord(next.payload) ? next.payload : undefined;
+  if (!basePayload || !nextPayload) return next;
+
+  const payload: Record<string, unknown> = { ...basePayload, ...nextPayload };
+  for (const field of ["text", "rendered"] as const) {
+    const baseText = basePayload[field];
+    const nextText = nextPayload[field];
+    if (typeof baseText === "string" || typeof nextText === "string") {
+      payload[field] = `${typeof baseText === "string" ? baseText : ""}${
+        typeof nextText === "string" ? nextText : ""
+      }`;
+    }
+  }
+  return { ...next, payload };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 function appendFileReferences(text: string, fileRefs: string[]): string {

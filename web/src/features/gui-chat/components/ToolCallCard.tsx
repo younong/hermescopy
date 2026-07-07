@@ -12,6 +12,8 @@ const STATUS_TONE = {
   succeeded: "success",
 } as const;
 
+const MAX_TOOL_DETAILS_CHARS = 120_000;
+
 export function ToolCallCard({
   artifacts,
   tool,
@@ -21,6 +23,8 @@ export function ToolCallCard({
 }) {
   const [open, setOpen] = useState(tool.status !== "succeeded");
   const details = tool.output || tool.error || tool.argsText || stringifyInput(tool.input);
+  const displayedDetails = truncateForDisplay(details);
+  const detailsTruncated = details.length > MAX_TOOL_DETAILS_CHARS;
   return (
     <section className="border border-current/15 bg-background-base/70">
       <button
@@ -40,14 +44,21 @@ export function ToolCallCard({
         <div className="space-y-2 border-t border-current/10 px-3 py-2">
           {tool.summary ? <p className="text-sm text-text-secondary">{tool.summary}</p> : null}
           {details ? (
-            <pre
-              className={cn(
-                "max-h-72 overflow-auto whitespace-pre-wrap bg-secondary/50 px-3 py-2 text-xs leading-relaxed",
-                tool.error ? "text-destructive" : "text-text-secondary",
-              )}
-            >
-              {details}
-            </pre>
+            <>
+              <pre
+                className={cn(
+                  "max-h-72 overflow-auto whitespace-pre-wrap break-words bg-secondary/50 px-3 py-2 text-xs leading-relaxed [overflow-wrap:anywhere]",
+                  tool.error ? "text-destructive" : "text-text-secondary",
+                )}
+              >
+                {displayedDetails}
+              </pre>
+              {detailsTruncated ? (
+                <p className="text-xs text-text-tertiary">
+                  Output truncated in UI after {MAX_TOOL_DETAILS_CHARS.toLocaleString()} characters.
+                </p>
+              ) : null}
+            </>
           ) : (
             <p className="text-xs text-text-tertiary">No output yet.</p>
           )}
@@ -74,8 +85,15 @@ function stringifyInput(input: unknown): string {
   if (input === undefined || input === null) return "";
   if (typeof input === "string") return input;
   try {
-    return JSON.stringify(input, null, 2);
+    return truncateForDisplay(JSON.stringify(input, null, 2));
   } catch {
-    return String(input);
+    return truncateForDisplay(String(input));
   }
+}
+
+function truncateForDisplay(value: string): string {
+  if (value.length <= MAX_TOOL_DETAILS_CHARS) return value;
+  return `${value.slice(0, MAX_TOOL_DETAILS_CHARS)}\n\n[… truncated ${(
+    value.length - MAX_TOOL_DETAILS_CHARS
+  ).toLocaleString()} characters …]`;
 }

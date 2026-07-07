@@ -16,8 +16,8 @@ export function MessageBubble({
 
   if (isUser) {
     return (
-      <article className="flex w-full justify-end">
-        <div className="flex max-w-[min(34rem,92%)] flex-col items-end gap-3">
+      <article className="flex w-full min-w-0 justify-end">
+        <div className="flex min-w-0 max-w-[min(34rem,92%)] flex-col items-end gap-3">
           {message.attachments?.length ? (
             <div className="flex flex-col items-end gap-3">
               {message.attachments.map((attachment) => (
@@ -39,7 +39,7 @@ export function MessageBubble({
           ) : null}
 
           {message.text ? (
-            <div className="rounded-3xl bg-current/[0.06] px-5 py-3 text-base leading-relaxed text-text-primary shadow-sm">
+            <div className="min-w-0 max-w-full rounded-3xl bg-current/[0.06] px-5 py-3 text-base leading-relaxed break-words text-text-primary shadow-sm [overflow-wrap:anywhere]">
               <Markdown content={message.text} streaming={message.streaming} />
             </div>
           ) : null}
@@ -49,10 +49,10 @@ export function MessageBubble({
   }
 
   return (
-    <article className="flex w-full justify-start">
+    <article className="flex w-full min-w-0 justify-start">
       <div
         className={cn(
-          "max-w-[min(52rem,92%)] px-1 py-1",
+          "min-w-0 max-w-[min(52rem,92%)] px-1 py-1",
           message.role === "system" ? "text-warning" : "text-text-primary",
         )}
       >
@@ -62,7 +62,11 @@ export function MessageBubble({
           {message.status === "interrupted" ? <Badge tone="secondary">stopped</Badge> : null}
         </div>
         {message.text ? (
-          <Markdown content={message.text} streaming={message.streaming} />
+          message.streaming ? (
+            <StreamingPlainText text={message.text} />
+          ) : (
+            <Markdown content={message.text} streaming={message.streaming} />
+          )
         ) : message.streaming ? (
           <div className="text-sm text-text-secondary">Thinking…</div>
         ) : null}
@@ -78,5 +82,17 @@ export function MessageBubble({
         ))}
       </div>
     </article>
+  );
+}
+
+function StreamingPlainText({ text }: { text: string }) {
+  return (
+    <div className="min-w-0 whitespace-pre-wrap text-sm leading-relaxed break-words text-foreground [overflow-wrap:anywhere]">
+      {text}
+      <span
+        aria-hidden
+        className="ml-0.5 inline-block h-[1em] w-[0.5em] align-[-0.15em] bg-foreground/50 animate-pulse"
+      />
+    </div>
   );
 }

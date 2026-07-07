@@ -3,6 +3,9 @@ import { describe, expect, it } from "vitest";
 import { guiChatReducer } from "./reducer";
 import { initialGuiChatState } from "./types";
 
+const RENDERED_TEXT_TRUNCATION_NOTICE =
+  "\n\n[… output truncated in Chat GUI to keep the browser responsive …]";
+
 function restoreWithMessage(text: string, info?: { cwd?: string; model?: string }) {
   return guiChatReducer(initialGuiChatState, {
     type: "session.created",
@@ -15,6 +18,105 @@ function restoreWithMessage(text: string, info?: { cwd?: string; model?: string 
 }
 
 describe("guiChatReducer history image restoration", () => {
+  it("keeps a sent prompt with two WeChat article URLs as plain message text", () => {
+    const prompt =
+      "分析咿呀咿呀哟喂公众号的两篇文章的阅读量差异化，链接：https://mp.weixin.qq.com/s/Dl28D1x2ti1ZfqIBD_axYw https://mp.weixin.qq.com/s/ZglvujhgYZ7ggnPTlubaBA";
+    const state = guiChatReducer(initialGuiChatState, {
+      id: "user-1",
+      text: prompt,
+      type: "user.sent",
+    });
+
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0]).toMatchObject({
+      artifactIds: [],
+      id: "user-1",
+      role: "user",
+      text: prompt,
+    });
+    expect(state.artifacts).toEqual({});
+  });
+
+  it("caps streaming assistant text so large output stays responsive", () => {
+    const largeDelta = "x".repeat(130_000);
+    const state = guiChatReducer(initialGuiChatState, {
+      event: { payload: { text: largeDelta }, type: "message.delta" },
+      type: "event",
+    });
+
+    expect(state.messages[0].text).toHaveLength(120_000 + RENDERED_TEXT_TRUNCATION_NOTICE.length);
+    expect(state.messages[0].text.endsWith(RENDERED_TEXT_TRUNCATION_NOTICE)).toBe(true);
+
+    const afterMoreDelta = guiChatReducer(state, {
+      event: { payload: { text: "more" }, type: "message.delta" },
+      type: "event",
+    });
+    expect(afterMoreDelta.messages[0].text).toBe(state.messages[0].text);
+  });
+
+  it("caps tool progress output before rendering", () => {
+    const withTool = guiChatReducer(initialGuiChatState, {
+      event: { payload: { id: "tool-1", name: "WebFetch" }, type: "tool.start" },
+      type: "event",
+    });
+    const state = guiChatReducer(withTool, {
+      event: { payload: { text: "x".repeat(130_000) }, type: "tool.progress" },
+      type: "event",
+    });
+
+    expect(state.toolCalls["tool-1"].output).toHaveLength(
+      120_000 + RENDERED_TEXT_TRUNCATION_NOTICE.length,
+    );
+    expect(state.toolCalls["tool-1"].output.endsWith(RENDERED_TEXT_TRUNCATION_NOTICE)).toBe(true);
+  });
+
+  it("caps final tool output before rendering", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      event: {
+        payload: { id: "tool-1", name: "WebFetch", result_text: "x".repeat(130_000) },
+        type: "tool.complete",
+      },
+      type: "event",
+    });
+
+    expect(state.toolCalls["tool-1"].output).toHaveLength(
+      120_000 + RENDERED_TEXT_TRUNCATION_NOTICE.length,
+    );
+    expect(state.toolCalls["tool-1"].output.endsWith(RENDERED_TEXT_TRUNCATION_NOTICE)).toBe(true);
+  });
+
+  it("does not retain large non-rendered tool results in chat state", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      event: {
+        payload: {
+          id: "tool-1",
+          name: "terminal",
+          output: "done",
+          result: { html: "x".repeat(130_000) },
+        },
+        type: "tool.complete",
+      },
+      type: "event",
+    });
+
+    expect(state.toolCalls["tool-1"].output).toBe("done");
+    expect(state.toolCalls["tool-1"].result).toBeUndefined();
+  });
+
+  it("replaces object tool inputs with a lightweight display notice", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      event: {
+        payload: { context: { html: "x".repeat(130_000) }, id: "tool-1", name: "terminal" },
+        type: "tool.start",
+      },
+      type: "event",
+    });
+
+    expect(state.toolCalls["tool-1"].input).toBe(
+      "[… non-rendered tool result omitted in Chat GUI to keep the browser responsive …]",
+    );
+  });
+
   it("turns a standalone restored image URL into an image artifact", () => {
     const state = restoreWithMessage("生成完成：\nhttps://example.com/cat.png");
 

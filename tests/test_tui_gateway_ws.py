@@ -1,4 +1,5 @@
 import asyncio
+import json
 import threading
 import time
 
@@ -125,6 +126,41 @@ def test_ws_disconnect_preserves_and_repoints_reconnectable_session(monkeypatch)
         assert server._sessions["plain"]["transport"] is server._detached_ws_transport
     finally:
         server._sessions.clear()
+
+
+def test_ws_transport_merges_streaming_frames_in_one_flush():
+    lines = [
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {
+                    "payload": {"text": "hel"},
+                    "session_id": "sid",
+                    "type": "message.delta",
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {
+                    "payload": {"text": "lo", "rendered": "hello"},
+                    "session_id": "sid",
+                    "type": "message.delta",
+                },
+            }
+        ),
+        json.dumps({"jsonrpc": "2.0", "method": "event", "params": {"type": "tool.start"}}),
+    ]
+
+    merged = ws_mod._merge_streaming_lines(lines)
+
+    assert len(merged) == 2
+    first = json.loads(merged[0])
+    assert first["params"]["payload"] == {"text": "hello", "rendered": "hello"}
+    assert json.loads(merged[1])["params"]["type"] == "tool.start"
 
 
 def test_ws_write_loop_stall_does_not_latch_transport(monkeypatch):
