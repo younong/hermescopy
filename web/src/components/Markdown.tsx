@@ -1,5 +1,7 @@
 import { useMemo, type ReactNode } from "react";
 
+import { parseInline } from "./markdownInline";
+
 /**
  * Lightweight markdown renderer for LLM output.
  * Handles: code blocks, inline code, bold, italic, headers, links, lists, horizontal rules.
@@ -22,7 +24,7 @@ export function Markdown({
   const caret = streaming ? <StreamingCaret /> : null;
 
   return (
-    <div className="text-sm text-foreground leading-relaxed space-y-2">
+    <div className="min-w-0 space-y-2 text-sm leading-relaxed break-words text-foreground [overflow-wrap:anywhere]">
       {blocks.map((block, i) => (
         <Block
           key={i}
@@ -231,57 +233,6 @@ function Block({
 /*  Inline parser + renderer                                           */
 /* ------------------------------------------------------------------ */
 
-type InlineNode =
-  | { type: "text"; content: string }
-  | { type: "code"; content: string }
-  | { type: "bold"; content: string }
-  | { type: "italic"; content: string }
-  | { type: "link"; text: string; href: string }
-  | { type: "br" };
-
-function parseInline(text: string): InlineNode[] {
-  const nodes: InlineNode[] = [];
-  // Pattern priority: code > link > bold > italic > bare URL > line break
-  const pattern =
-    /(`[^`]+`)|(\[([^\]]+)\]\(([^)]+)\))|(\*\*([^*]+)\*\*)|(\*([^*]+)\*)|(\bhttps?:\/\/[^\s<>)\]]+)|(\n)/g;
-  let lastIndex = 0;
-  let match: RegExpExecArray | null;
-
-  while ((match = pattern.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      nodes.push({ type: "text", content: text.slice(lastIndex, match.index) });
-    }
-
-    if (match[1]) {
-      // Inline code
-      nodes.push({ type: "code", content: match[1].slice(1, -1) });
-    } else if (match[2]) {
-      // [text](url) link
-      nodes.push({ type: "link", text: match[3], href: match[4] });
-    } else if (match[5]) {
-      // **bold**
-      nodes.push({ type: "bold", content: match[6] });
-    } else if (match[7]) {
-      // *italic*
-      nodes.push({ type: "italic", content: match[8] });
-    } else if (match[9]) {
-      // Bare URL
-      nodes.push({ type: "link", text: match[9], href: match[9] });
-    } else if (match[10]) {
-      // Line break within paragraph
-      nodes.push({ type: "br" });
-    }
-
-    lastIndex = match.index + match[0].length;
-  }
-
-  if (lastIndex < text.length) {
-    nodes.push({ type: "text", content: text.slice(lastIndex) });
-  }
-
-  return nodes;
-}
-
 function InlineContent({
   text,
   highlightTerms,
@@ -344,7 +295,7 @@ function InlineContent({
                 href={href}
                 target="_blank"
                 rel="noreferrer"
-                className="text-primary underline underline-offset-2 decoration-primary/30 hover:decoration-primary/60 transition-colors"
+                className="break-words text-primary underline underline-offset-2 decoration-primary/30 transition-colors [overflow-wrap:anywhere] hover:decoration-primary/60"
               >
                 {node.text}
               </a>

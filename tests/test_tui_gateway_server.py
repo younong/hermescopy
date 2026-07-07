@@ -354,6 +354,95 @@ def test_tui_verbose_default_cap_stays_small(monkeypatch):
     assert capped.startswith("[showing verbose tail; omitted ")
 
 
+def test_dashboard_gui_emit_drops_rendered_stream_payload(monkeypatch):
+    frames: list[dict] = []
+    monkeypatch.setattr(server, "write_json", lambda obj: frames.append(obj) or True)
+    monkeypatch.setitem(server._sessions, "gui-test", {"source": "dashboard-gui"})
+    try:
+        server._emit(
+            "message.delta",
+            "gui-test",
+            {"rendered": "rich output" * 1000, "text": "token"},
+        )
+    finally:
+        server._sessions.pop("gui-test", None)
+
+    payload = frames[0]["params"]["payload"]
+    assert payload == {"text": "token"}
+
+
+def test_dashboard_gui_emit_compacts_approval_command(monkeypatch):
+    frames: list[dict] = []
+    monkeypatch.setattr(server, "write_json", lambda obj: frames.append(obj) or True)
+    monkeypatch.setitem(server._sessions, "gui-test", {"source": "dashboard-gui"})
+    try:
+        server._emit("approval.request", "gui-test", {"command": "x" * 3_000})
+    finally:
+        server._sessions.pop("gui-test", None)
+
+    command = frames[0]["params"]["payload"]["command"]
+    assert len(command) < 2_100
+    assert "omitted" in command
+
+
+def test_dashboard_gui_tool_complete_omits_large_live_result(monkeypatch):
+    events: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        server, "_emit", lambda event_type, sid, payload: events.append((event_type, sid, payload))
+    )
+    monkeypatch.setitem(
+        server._sessions,
+        "gui-test",
+        {
+            "source": "dashboard-gui",
+            "tool_progress_mode": "verbose",
+            "tool_started_at": {},
+        },
+    )
+    try:
+        server._on_tool_complete(
+            "gui-test",
+            "tool-1",
+            "terminal",
+            {"command": "python huge.py"},
+            json.dumps({"html": "x" * 130_000}),
+        )
+    finally:
+        server._sessions.pop("gui-test", None)
+
+    assert events[0][0] == "tool.complete"
+    payload = events[0][2]
+    assert "args" not in payload
+    assert "result" not in payload
+    assert payload["result_omitted"] is True
+    assert payload["result_text"].startswith("[showing verbose tail; omitted ")
+
+
+def test_non_gui_tool_complete_preserves_live_result(monkeypatch):
+    events: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        server, "_emit", lambda event_type, sid, payload: events.append((event_type, sid, payload))
+    )
+    monkeypatch.setitem(
+        server._sessions,
+        "tui-test",
+        {"source": "tui", "tool_progress_mode": "all", "tool_started_at": {}},
+    )
+    try:
+        server._on_tool_complete(
+            "tui-test",
+            "tool-1",
+            "terminal",
+            {"command": "pwd"},
+            json.dumps({"ok": True}),
+        )
+    finally:
+        server._sessions.pop("tui-test", None)
+
+    assert events[0][2]["args"] == {"command": "pwd"}
+    assert events[0][2]["result"] == {"ok": True}
+
+
 def test_tui_verbose_tool_events_omit_details_when_redaction_fails(monkeypatch):
     redact_module = types.ModuleType("agent.redact")
 

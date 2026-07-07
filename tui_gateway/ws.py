@@ -55,9 +55,70 @@ _STREAMING_EVENT_TYPES = frozenset({
     "reasoning.delta",
     "thinking.delta",
 })
-# Max time a streamed token waits in the buffer before flush (~30 fps). Short
-# enough to stay imperceptible to the live token cadence.
-_TOKEN_COALESCE_S = 0.033
+# Max time a streamed token waits in the buffer before flush (~20 fps). This
+# stays visibly live while cutting React/WebSocket churn on long GUI replies.
+_TOKEN_COALESCE_S = 0.05
+
+
+def _merge_streaming_lines(lines: list[str]) -> list[str]:
+    """Merge adjacent streaming JSON-RPC event frames into fewer UI updates."""
+    merged: list[str] = []
+    pending: dict[str, Any] | None = None
+    pending_key: tuple[Any, Any] | None = None
+
+    def flush_pending() -> None:
+        nonlocal pending, pending_key
+        if pending is not None:
+            merged.append(json.dumps(pending, ensure_ascii=False))
+            pending = None
+            pending_key = None
+
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except Exception:
+            flush_pending()
+            merged.append(line)
+            continue
+
+        if not WSTransport._is_streaming_frame(obj):
+            flush_pending()
+            merged.append(line)
+            continue
+
+        params = obj.get("params") if isinstance(obj, dict) else None
+        payload = params.get("payload") if isinstance(params, dict) else None
+        key = (params.get("type"), params.get("session_id")) if isinstance(params, dict) else None
+        if not isinstance(payload, dict) or key is None:
+            flush_pending()
+            merged.append(line)
+            continue
+
+        if pending is None or pending_key != key:
+            flush_pending()
+            pending = obj
+            pending_key = key
+            continue
+
+        pending_params = pending.get("params") if isinstance(pending, dict) else None
+        pending_payload = pending_params.get("payload") if isinstance(pending_params, dict) else None
+        if not isinstance(pending_payload, dict):
+            flush_pending()
+            pending = obj
+            pending_key = key
+            continue
+
+        for field in ("text", "rendered"):
+            value = payload.get(field)
+            if isinstance(value, str):
+                pending_payload[field] = f"{pending_payload.get(field, '')}{value}"
+        for field, value in payload.items():
+            if field not in {"text", "rendered"}:
+                pending_payload[field] = value
+
+    flush_pending()
+    return merged
+
 
 # Keep starlette optional at import time; handle_ws uses the real class when
 # it's available and falls back to a generic Exception sentinel otherwise.
@@ -233,7 +294,7 @@ class WSTransport:
     async def _safe_send_many(self, lines: list[str]) -> None:
         """Send a batch of pre-serialized frames in order on the loop thread."""
         try:
-            for line in lines:
+            for line in _merge_streaming_lines(lines):
                 await self._ws.send_text(line)
         except Exception as exc:
             self._closed = True

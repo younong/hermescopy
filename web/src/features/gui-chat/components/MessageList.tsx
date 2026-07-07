@@ -29,6 +29,7 @@ export function MessageList({
   const contentRef = useRef<HTMLDivElement | null>(null);
   const followBottomRef = useRef(true);
   const lastForceBottomKeyRef = useRef<string | undefined>(undefined);
+  const scrollFrameRef = useRef<number | undefined>(undefined);
 
   const scrollToBottom = useCallback((options?: { force?: boolean }) => {
     const container = containerRef.current;
@@ -41,6 +42,22 @@ export function MessageList({
     container.scrollTop = container.scrollHeight;
   }, []);
 
+  const scheduleScrollToBottom = useCallback(
+    (options?: { force?: boolean }) => {
+      if (options?.force) {
+        followBottomRef.current = true;
+      } else if (!followBottomRef.current) {
+        return;
+      }
+      if (scrollFrameRef.current !== undefined) return;
+      scrollFrameRef.current = requestAnimationFrame(() => {
+        scrollFrameRef.current = undefined;
+        scrollToBottom(options);
+      });
+    },
+    [scrollToBottom],
+  );
+
   const handleScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
     followBottomRef.current = isNearBottom(event.currentTarget);
   }, []);
@@ -49,15 +66,13 @@ export function MessageList({
     if (forceBottomKey === lastForceBottomKeyRef.current) return;
     lastForceBottomKeyRef.current = forceBottomKey;
     scrollToBottom({ force: true });
-
-    const frame = requestAnimationFrame(() => scrollToBottom({ force: true }));
-    return () => cancelAnimationFrame(frame);
-  }, [forceBottomKey, scrollToBottom]);
+    scheduleScrollToBottom({ force: true });
+  }, [forceBottomKey, scheduleScrollToBottom, scrollToBottom]);
 
   useLayoutEffect(() => {
-    scrollToBottom();
+    scheduleScrollToBottom();
   }, [
-    scrollToBottom,
+    scheduleScrollToBottom,
     state.approvalOrder,
     state.approvals,
     state.artifacts,
@@ -77,7 +92,7 @@ export function MessageList({
       if (frame !== undefined) cancelAnimationFrame(frame);
       frame = requestAnimationFrame(() => {
         frame = undefined;
-        scrollToBottom();
+        scheduleScrollToBottom();
       });
     });
     observer.observe(content);
@@ -86,7 +101,15 @@ export function MessageList({
       if (frame !== undefined) cancelAnimationFrame(frame);
       observer.disconnect();
     };
-  }, [scrollToBottom]);
+  }, [scheduleScrollToBottom]);
+
+  useEffect(() => {
+    return () => {
+      if (scrollFrameRef.current !== undefined) {
+        cancelAnimationFrame(scrollFrameRef.current);
+      }
+    };
+  }, []);
 
   return (
     <div
