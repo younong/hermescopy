@@ -2672,6 +2672,87 @@ class SessionDB:
             current = child_id
         return current
 
+    _IMAGE_EXT_RE = re.compile(
+        r"(?i)\.(?:png|jpe?g|gif|webp|bmp|svg|heic|heif)(?:[?#][^\s)]*)?$"
+    )
+    _MARKDOWN_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+    _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+    _DATA_IMAGE_RE = re.compile(r"(?i)data:image/[\w.+-]+;base64,[^\s)]+")
+    _URL_RE = re.compile(r"(?i)\b(?:https?|file)://[^\s)]+")
+    _ABS_IMAGE_PATH_RE = re.compile(
+        r"(?i)(?<!\S)(?:/[\w .@%+=:,~\-]+)+\.(?:png|jpe?g|gif|webp|bmp|svg|heic|heif)(?:[?#][^\s)]*)?"
+    )
+
+    @classmethod
+    def _build_message_preview(cls, content: Any, max_chars: int = 60) -> str:
+        """Return a compact text preview without leaking image addresses."""
+        decoded = cls._decode_content(content)
+        if isinstance(decoded, list):
+            text_parts = [
+                p.get("text", "") for p in decoded
+                if isinstance(p, dict) and p.get("type") == "text"
+            ]
+            preview = " ".join(t for t in text_parts if t).strip()
+        elif isinstance(decoded, str):
+            if decoded.startswith(cls._CONTENT_JSON_PREFIX):
+                preview = ""
+            else:
+                preview = cls._strip_image_references(decoded)
+        else:
+            preview = ""
+
+        preview = " ".join(preview.split())
+        if len(preview) > max_chars:
+            return preview[:max_chars] + "..."
+        return preview
+
+    @classmethod
+    def _strip_image_references(cls, text: str) -> str:
+        """Remove image URLs/paths while preserving surrounding prompt text."""
+        def replace_image(match: re.Match) -> str:
+            alt_text = match.group(1).strip()
+            return alt_text if alt_text else " "
+
+        def replace_link(match: re.Match) -> str:
+            label = match.group(1).strip()
+            target = match.group(2).strip().strip("'\"")
+            if cls._looks_like_image_reference(target):
+                return label if label else " "
+            return match.group(0)
+
+        text = cls._MARKDOWN_IMAGE_RE.sub(replace_image, text)
+        text = cls._MARKDOWN_LINK_RE.sub(replace_link, text)
+        text = cls._DATA_IMAGE_RE.sub(" ", text)
+        text = cls._URL_RE.sub(
+            lambda match: " " if cls._looks_like_image_reference(match.group(0)) else match.group(0),
+            text,
+        )
+        return cls._ABS_IMAGE_PATH_RE.sub(" ", text)
+
+    @classmethod
+    def _looks_like_image_reference(cls, value: str) -> bool:
+        value = value.strip().strip("'\"<>")
+        lower = value.lower()
+        return (
+            lower.startswith("data:image/")
+            or "/api/fs/read-data-url" in lower
+            or "/api/artifacts" in lower
+            or bool(cls._IMAGE_EXT_RE.search(lower))
+        )
+
+    def _content_for_preview(self, session_id: str, raw: Any) -> Any:
+        if isinstance(raw, str) and (not raw or raw.startswith(self._CONTENT_JSON_PREFIX)):
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT content FROM messages "
+                    "WHERE session_id = ? AND role = 'user' AND content IS NOT NULL "
+                    "ORDER BY timestamp, id LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+            if row:
+                return row["content"]
+        return raw
+
     def distinct_session_cwds(self, include_archived: bool = False) -> List[Dict[str, Any]]:
         """Distinct non-empty session cwds with usage stats, for repo discovery.
 
@@ -2898,13 +2979,9 @@ class SessionDB:
         sessions = []
         for row in rows:
             s = dict(row)
-            # Build the preview from the raw substring
-            raw = s.pop("_preview_raw", "").strip()
-            if raw:
-                text = raw[:60]
-                s["preview"] = text + ("..." if len(raw) > 60 else "")
-            else:
-                s["preview"] = ""
+            s["preview"] = self._build_message_preview(
+                self._content_for_preview(s["id"], s.pop("_preview_raw", "")), 60
+            )
             # Drop the internal ordering column so callers see a clean dict.
             s.pop("_effective_last_active", None)
             sessions.append(s)
@@ -3002,12 +3079,9 @@ class SessionDB:
         runs: List[Dict[str, Any]] = []
         for row in rows:
             s = dict(row)
-            raw = s.pop("_preview_raw", "").strip()
-            if raw:
-                text = raw[:60]
-                s["preview"] = text + ("..." if len(raw) > 60 else "")
-            else:
-                s["preview"] = ""
+            s["preview"] = self._build_message_preview(
+                self._content_for_preview(s["id"], s.pop("_preview_raw", "")), 60
+            )
             runs.append(s)
         return runs
 
@@ -3038,12 +3112,9 @@ class SessionDB:
         if not row:
             return None
         s = dict(row)
-        raw = s.pop("_preview_raw", "").strip()
-        if raw:
-            text = raw[:60]
-            s["preview"] = text + ("..." if len(raw) > 60 else "")
-        else:
-            s["preview"] = ""
+        s["preview"] = self._build_message_preview(
+            self._content_for_preview(s["id"], s.pop("_preview_raw", "")), 60
+        )
         return s
 
     # =========================================================================
@@ -4006,23 +4077,7 @@ class SessionDB:
 
         result: List[Dict[str, Any]] = []
         for row in rows:
-            decoded = self._decode_content(row["content"])
-            if isinstance(decoded, list):
-                # Multimodal — flatten text parts.
-                text_parts = [
-                    p.get("text", "") for p in decoded
-                    if isinstance(p, dict) and p.get("type") == "text"
-                ]
-                preview = " ".join(t for t in text_parts if t).strip()
-                if not preview:
-                    preview = "[multimodal content]"
-            elif isinstance(decoded, str):
-                preview = decoded
-            else:
-                preview = ""
-            preview = " ".join(preview.split())  # collapse whitespace
-            if len(preview) > 80:
-                preview = preview[:77] + "..."
+            preview = self._build_message_preview(row["content"], 77)
             result.append(
                 {
                     "id": row["id"],
@@ -4439,23 +4494,8 @@ class SessionDB:
                     )
                     context_msgs = []
                     for r in ctx_cursor.fetchall():
-                        raw = r["content"]
-                        decoded = self._decode_content(raw)
-                        # Multimodal context: render a compact text-only
-                        # summary for search previews.
-                        if isinstance(decoded, list):
-                            text_parts = [
-                                p.get("text", "") for p in decoded
-                                if isinstance(p, dict) and p.get("type") == "text"
-                            ]
-                            text = " ".join(t for t in text_parts if t).strip()
-                            preview = text or "[multimodal content]"
-                        elif isinstance(decoded, str):
-                            preview = decoded
-                        else:
-                            preview = ""
                         context_msgs.append(
-                            {"role": r["role"], "content": preview[:200]}
+                            {"role": r["role"], "content": self._build_message_preview(r["content"], 200)}
                         )
                 match["context"] = context_msgs
             except Exception:
@@ -5538,8 +5578,9 @@ class SessionDB:
         sessions: List[Dict[str, Any]] = []
         for row in rows:
             session = dict(row)
-            raw = str(session.pop("_preview_raw", "") or "").strip()
-            session["preview"] = raw[:60] + ("..." if len(raw) > 60 else "") if raw else ""
+            session["preview"] = self._build_message_preview(
+                self._content_for_preview(session["id"], session.pop("_preview_raw", "")), 60
+            )
             sessions.append(session)
         return sessions
 
