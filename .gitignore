@@ -30,6 +30,7 @@ deploy/*.local.env
 .claude/skills/*
 !.claude/skills/hermes-release/
 !.claude/skills/hermes-release/SKILL.md
+web/.playwright-cli
 compose.hermes.local.yml
 export*
 __pycache__/model_tools.cpython-310.pyc
