@@ -9,6 +9,7 @@ import { usePageHeader } from "@/contexts/usePageHeader";
 import { useProfileScope } from "@/contexts/useProfileScope";
 import { useI18n } from "@/i18n";
 import type { GatewayEvent } from "@/lib/gatewayClient";
+import { useDashboardAuthIdentity } from "@/lib/useDashboardAuthIdentity";
 import { cn } from "@/lib/utils";
 import { connectGuiChat, type GuiChatConnection } from "../api";
 import { connectMockGuiChat } from "../mock";
@@ -36,6 +37,7 @@ export function GuiChatShell() {
   const [newChatNonce, setNewChatNonce] = useState(0);
   const [sendScrollNonce, setSendScrollNonce] = useState(0);
   const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false);
+  const { ownerKey, ready: authIdentityReady } = useDashboardAuthIdentity();
   const [portalRoot] = useState<HTMLElement | null>(() =>
     typeof document !== "undefined" ? document.body : null,
   );
@@ -48,7 +50,6 @@ export function GuiChatShell() {
   const activeSessionId = state.storedSessionId ?? resumeSessionId;
   const terminalResumeId = state.storedSessionId ?? resumeSessionId;
   const forceBottomKey = `${activeSessionId ?? `new-${newChatNonce}`}:${sendScrollNonce}`;
-
   const closeMobilePanel = useCallback(() => setMobilePanelOpenRaw(false), []);
 
   const flushStreamEvents = useCallback(() => {
@@ -102,7 +103,7 @@ export function GuiChatShell() {
     dispatch({ type: "reset" });
     const connection = mockMode
       ? connectMockGuiChat()
-      : connectGuiChat({ profile, resumeSessionId });
+      : connectGuiChat({ ownerKey, profile, resumeSessionId });
     connectionRef.current = connection;
     const offState = connection.client.onState((next) => {
       dispatch({ type: "connection", state: next });
@@ -125,9 +126,12 @@ export function GuiChatShell() {
         connectionRef.current = null;
       }
     };
-  }, [dispatchGatewayEvent, mockMode, profile, resumeSessionId]);
+  }, [dispatchGatewayEvent, mockMode, ownerKey, profile, resumeSessionId]);
 
-  useEffect(() => connect(), [connect, newChatNonce]);
+  useEffect(() => {
+    if (!authIdentityReady) return;
+    return connect();
+  }, [authIdentityReady, connect, newChatNonce]);
 
   useEffect(() => {
     const mql = window.matchMedia("(max-width: 1023px)");

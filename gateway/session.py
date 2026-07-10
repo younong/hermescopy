@@ -156,6 +156,12 @@ class SessionSource:
     # namespacing and the per-turn config/credential scope.
     profile: Optional[str] = None
 
+    # Optional owner metadata persisted by authenticated owner workers.  These
+    # fields are metadata only; authorization still comes from the worker env.
+    owner_key: Optional[str] = None
+    tenant_id: Optional[str] = None
+    auth_provider: Optional[str] = None
+
     # Internal, wire-INVISIBLE trust signal: True when this event was delivered
     # to the gateway over the per-instance-authenticated relay WebSocket (the
     # Team Gateway connector). The connector authenticates the gateway's socket
@@ -229,6 +235,14 @@ class SessionSource:
             d["message_id"] = self.message_id
         if self.profile:
             d["profile"] = self.profile
+        owner_meta = current_owner_metadata()
+        for key, value in (
+            ("owner_key", self.owner_key or owner_meta.get("owner_key")),
+            ("tenant_id", self.tenant_id or owner_meta.get("tenant_id")),
+            ("auth_provider", self.auth_provider or owner_meta.get("auth_provider")),
+        ):
+            if value:
+                d[key] = value
         return d
 
     @classmethod
@@ -250,6 +264,9 @@ class SessionSource:
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
             profile=data.get("profile"),
+            owner_key=data.get("owner_key"),
+            tenant_id=data.get("tenant_id"),
+            auth_provider=data.get("auth_provider"),
         )
     
 
@@ -582,6 +599,42 @@ def build_session_context_prompt(
 PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
 
 
+
+
+def current_owner_metadata() -> Dict[str, str]:
+    """Return owner metadata from the authenticated owner worker environment.
+
+    Empty outside owner-worker mode.  These values are persisted as metadata only;
+    the legacy session key format intentionally stays unchanged.
+    """
+    mapping = {
+        "owner_key": os.environ.get("HERMES_OWNER_KEY", "").strip(),
+        "tenant_id": os.environ.get("HERMES_TENANT_ID", "").strip(),
+        "auth_provider": os.environ.get("HERMES_AUTH_PROVIDER", "").strip(),
+    }
+    return {key: value for key, value in mapping.items() if value}
+
+
+def _owner_worker_owner_key() -> Optional[str]:
+    value = os.environ.get("HERMES_OWNER_KEY", "").strip()
+    return value or None
+
+
+def owner_metadata_matches_current(data: Dict[str, Any]) -> bool:
+    """Fail closed on persisted owner mismatch when HERMES_OWNER_KEY is set."""
+    current = _owner_worker_owner_key()
+    if not current:
+        return True
+    owner_key = data.get("owner_key")
+    if owner_key is None and isinstance(data.get("origin"), dict):
+        owner_key = data["origin"].get("owner_key")
+    # Legacy records predate owner metadata.  They remain valid in local mode,
+    # but authenticated owner workers must not adopt them.
+    return bool(owner_key and str(owner_key) == current)
+
+
+_owner_metadata_matches_current = owner_metadata_matches_current
+
 def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
     """Return a copy of *override* containing only persistable, non-secret keys.
 
@@ -613,6 +666,12 @@ class SessionEntry:
     
     # Origin metadata for delivery routing
     origin: Optional[SessionSource] = None
+
+    # Owner metadata persisted by authenticated owner workers.  Optional for
+    # compatibility with legacy local sessions.json records.
+    owner_key: Optional[str] = None
+    tenant_id: Optional[str] = None
+    auth_provider: Optional[str] = None
     
     # Display metadata
     display_name: Optional[str] = None
@@ -709,6 +768,12 @@ class SessionEntry:
             "auto_reset_reason": self.auto_reset_reason,
             "reset_had_activity": self.reset_had_activity,
         }
+        if self.owner_key:
+            result["owner_key"] = self.owner_key
+        if self.tenant_id:
+            result["tenant_id"] = self.tenant_id
+        if self.auth_provider:
+            result["auth_provider"] = self.auth_provider
         if self.model_override:
             # Defence-in-depth: strip credentials even if a caller stored an
             # unsanitized dict directly on the entry.
@@ -774,6 +839,9 @@ class SessionEntry:
             was_auto_reset=data.get("was_auto_reset", False),
             auto_reset_reason=data.get("auto_reset_reason"),
             reset_had_activity=data.get("reset_had_activity", False),
+            owner_key=data.get("owner_key"),
+            tenant_id=data.get("tenant_id"),
+            auth_provider=data.get("auth_provider"),
             model_override=sanitize_model_override(data.get("model_override")),
         )
 
@@ -970,6 +1038,12 @@ class SessionStore:
                             key, type(entry_data).__name__,
                         )
                         continue
+                    if not owner_metadata_matches_current(entry_data):
+                        logger.debug(
+                            "Skipping session entry %r: owner metadata does not match current worker",
+                            key,
+                        )
+                        continue
                     try:
                         self._entries[key] = SessionEntry.from_dict(entry_data)
                     except (ValueError, KeyError, TypeError) as e:
@@ -1148,6 +1222,7 @@ class SessionStore:
             created_at = datetime.fromtimestamp(float(started_at)) if started_at else now
         except (TypeError, ValueError, OSError):
             created_at = now
+        owner_meta = current_owner_metadata()
         return SessionEntry(
             session_key=session_key,
             session_id=str(row["id"]),
@@ -1157,6 +1232,7 @@ class SessionStore:
             display_name=source.chat_name,
             platform=source.platform,
             chat_type=source.chat_type,
+            **owner_meta,
         )
 
     def _recover_session_from_db(
@@ -1518,6 +1594,7 @@ class SessionStore:
             # Create new session
             session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
+            owner_meta = current_owner_metadata()
             entry = SessionEntry(
                 session_key=session_key,
                 session_id=session_id,
@@ -1530,6 +1607,7 @@ class SessionStore:
                 was_auto_reset=was_auto_reset,
                 auto_reset_reason=auto_reset_reason,
                 reset_had_activity=reset_had_activity,
+                **owner_meta,
             )
 
             self._entries[session_key] = entry

@@ -267,6 +267,62 @@ class TestWebServerEndpoints:
         assert "active_sessions" in data
         assert data["can_update_hermes"] is True
 
+    def test_authenticated_mode_blocks_control_plane_git_routes(self, monkeypatch, tmp_path):
+        import hermes_cli.web_server as web_server
+        from fastapi import HTTPException
+
+        previous = getattr(web_server.app.state, "auth_required", None)
+        web_server.app.state.auth_required = True
+        called = False
+
+        async def fake_git_op(*_args, **_kwargs):
+            nonlocal called
+            called = True
+            return {}
+
+        monkeypatch.setattr(web_server, "_git_op", fake_git_op)
+        try:
+            with pytest.raises(HTTPException) as excinfo:
+                asyncio.run(web_server.git_status_route(SimpleNamespace(), path=str(tmp_path)))
+            assert excinfo.value.status_code == 403
+            assert not called
+        finally:
+            if previous is None:
+                try:
+                    delattr(web_server.app.state, "auth_required")
+                except AttributeError:
+                    pass
+            else:
+                web_server.app.state.auth_required = previous
+
+    def test_authenticated_mode_blocks_profile_scoped_management_helpers(self):
+        import hermes_cli.web_server as web_server
+        from fastapi import HTTPException
+
+        previous = getattr(web_server.app.state, "auth_required", None)
+        web_server.app.state.auth_required = True
+        try:
+            with pytest.raises(HTTPException) as excinfo:
+                with web_server._config_profile_scope("default"):
+                    pass
+            assert excinfo.value.status_code == 403
+
+            with pytest.raises(HTTPException) as excinfo:
+                with web_server._profile_scope("default"):
+                    pass
+            assert excinfo.value.status_code == 403
+
+            response = self.client.get("/api/status?profile=default")
+            assert response.status_code == 403
+        finally:
+            if previous is None:
+                try:
+                    delattr(web_server.app.state, "auth_required")
+                except AttributeError:
+                    pass
+            else:
+                web_server.app.state.auth_required = previous
+
     def test_gateway_drain_begin_writes_marker(self):
         from gateway import drain_control
 
@@ -2465,7 +2521,7 @@ class TestWebServerEndpoints:
         resp = unauth_client.get("/api/status")
         assert resp.status_code == 200
         resp = unauth_client.get("/api/dashboard/plugins")
-        assert resp.status_code == 200
+        assert resp.status_code == 401
         resp = unauth_client.get("/api/dashboard/plugins/rescan")
         assert resp.status_code == 401
         resp = self.client.get("/api/dashboard/plugins/rescan")
@@ -4429,8 +4485,20 @@ class TestModelInfoEndpoint:
             from starlette.testclient import TestClient
         except ImportError:
             pytest.skip("fastapi/starlette not installed")
-        from hermes_cli.web_server import app
-        self.client = TestClient(app)
+        import hermes_cli.web_server as ws
+
+        app = ws.app
+        had_auth_required = hasattr(app.state, "auth_required")
+        previous_auth_required = getattr(app.state, "auth_required", None)
+        app.state.auth_required = False
+        self.client = TestClient(app, headers={"X-Hermes-Session-Token": ws._SESSION_TOKEN})
+        try:
+            yield
+        finally:
+            if had_auth_required:
+                app.state.auth_required = previous_auth_required
+            else:
+                delattr(app.state, "auth_required")
 
     def test_model_info_returns_200(self):
         resp = self.client.get("/api/model/info")
@@ -5197,6 +5265,246 @@ class TestNormaliseThemeExtensions:
         assert r["componentStyles"]["card"] == {"opacity": "0.8", "zIndex": "5"}
 
 
+class TestAuthenticatedOwnerWorkerSessionProxy:
+    @pytest.fixture(autouse=True)
+    def _setup(self, monkeypatch, _isolate_hermes_home, tmp_path):
+        try:
+            from starlette.testclient import TestClient
+        except ImportError:
+            pytest.skip("fastapi/starlette not installed")
+
+        from hermes_cli.dashboard_auth.base import Session
+        from hermes_cli.web_server import app
+        import hermes_cli.dashboard_auth.middleware as auth_middleware
+
+        self.app = app
+        self.session = Session(
+            user_id="user-a",
+            email="a@example.test",
+            display_name="User A",
+            org_id="org-1",
+            provider="test",
+            expires_at=9999999999,
+            access_token="access",
+            refresh_token="refresh",
+        )
+
+        original_auth_required = getattr(app.state, "auth_required", False)
+        original_supervisor = getattr(app.state, "owner_worker_supervisor", None)
+        app.state.auth_required = True
+
+        class _Handle:
+            socket_path = "unused.sock"
+
+        class _Supervisor:
+            control_home = (_isolate_hermes_home or tmp_path / "hermes-home") / "control-plane"
+
+            def __init__(self):
+                self.owners = []
+
+            def get_or_start(self, owner):
+                self.owners.append(owner)
+                return _Handle()
+
+        self.supervisor = _Supervisor()
+        app.state.owner_worker_supervisor = self.supervisor
+
+        async def fake_gate(request, call_next):
+            request.state.session = self.session
+            return await call_next(request)
+
+        monkeypatch.setattr(auth_middleware, "gated_auth_middleware", fake_gate)
+        self.client = TestClient(app)
+
+        yield
+
+        app.state.auth_required = original_auth_required
+        app.state.owner_worker_supervisor = original_supervisor
+
+    def test_authenticated_sessions_are_proxied_to_owner_worker(self, monkeypatch):
+        import hermes_cli.owner_worker.client as owner_client
+
+        captured = {}
+
+        def fake_request(self, method, path, *, owner_key, headers=None, content=None):
+            import httpx
+
+            captured.update({"method": method, "path": path, "owner_key": owner_key, "content": content})
+            return httpx.Response(200, json={"sessions": [{"id": "owner-local"}], "total": 1, "limit": 5, "offset": 0})
+
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fake_request)
+
+        response = self.client.get("/api/sessions?limit=5&profile=default")
+
+        assert response.status_code == 200
+        assert response.json()["sessions"][0]["id"] == "owner-local"
+        assert captured["method"] == "GET"
+        assert captured["path"] == "/api/sessions?limit=5"
+        assert captured["owner_key"] == self.supervisor.owners[0].owner_key
+
+    def test_authenticated_owner_key_query_cannot_select_another_owner(self, monkeypatch):
+        import hermes_cli.owner_worker.client as owner_client
+
+        def fail_request(*args, **kwargs):
+            raise AssertionError("must not proxy an external owner selector")
+
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fail_request)
+
+        response = self.client.get("/api/sessions?owner_key=ok1_other")
+
+        assert response.status_code == 400
+        assert not self.supervisor.owners
+
+    def test_authenticated_profile_selection_rejects_legacy_profiles_before_proxy(self, monkeypatch):
+        import hermes_cli.owner_worker.client as owner_client
+
+        def fail_request(*args, **kwargs):
+            raise AssertionError("must not proxy arbitrary profile selection")
+
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fail_request)
+
+        response = self.client.get("/api/sessions?profile=other")
+
+        assert response.status_code == 400
+        assert not self.supervisor.owners
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/api/sessions/session-1?profile=other",
+            "/api/sessions/session-1/latest-descendant?profile=other",
+            "/api/sessions/session-1/messages?profile=other",
+        ],
+    )
+    def test_authenticated_templated_session_routes_reject_legacy_profiles_before_proxy(self, monkeypatch, path):
+        import hermes_cli.owner_worker.client as owner_client
+
+        def fail_request(*args, **kwargs):
+            raise AssertionError("must not proxy arbitrary profile selection")
+
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fail_request)
+
+        response = self.client.get(path)
+
+        assert response.status_code == 400
+        assert not self.supervisor.owners
+
+    def test_authenticated_profiles_sessions_fails_closed(self):
+        response = self.client.get("/api/profiles/sessions")
+
+        assert response.status_code == 403
+        assert not self.supervisor.owners
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/api/memory",
+            "/api/credentials/pool",
+            "/api/logs",
+            "/api/profiles",
+            "/api/media?path=/tmp/example.png",
+        ],
+    )
+    def test_authenticated_unmigrated_apis_fail_closed(self, path):
+        response = self.client.get(path)
+
+        assert response.status_code == 403
+        assert not self.supervisor.owners
+
+    def test_authenticated_fail_closed_gate_runs_after_session_attachment(self, monkeypatch):
+        def fail_reveal(*args, **kwargs):
+            raise AssertionError("unmigrated handler must not run in authenticated mode")
+
+        monkeypatch.setattr("hermes_cli.web_server.load_env", fail_reveal)
+
+        response = self.client.post("/api/env/reveal", json={"key": "OPENAI_API_KEY"})
+
+        assert response.status_code == 403
+        assert not self.supervisor.owners
+
+    def test_authenticated_usage_analytics_is_proxied_to_owner_worker(self, monkeypatch):
+        import hermes_cli.owner_worker.client as owner_client
+
+        captured = {}
+
+        def fake_request(self, method, path, *, owner_key, headers=None, content=None):
+            import httpx
+
+            captured.update({"method": method, "path": path, "owner_key": owner_key})
+            return httpx.Response(200, json={"daily": [], "by_model": [], "totals": {}, "period_days": 7})
+
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fake_request)
+
+        response = self.client.get("/api/analytics/usage?days=7&profile=default")
+
+        assert response.status_code == 200
+        assert response.json()["period_days"] == 7
+        assert captured["method"] == "GET"
+        assert captured["path"] == "/api/analytics/usage?days=7"
+        assert captured["owner_key"] == self.supervisor.owners[0].owner_key
+
+    def test_authenticated_model_info_is_proxied_to_owner_worker(self, monkeypatch):
+        import hermes_cli.owner_worker.client as owner_client
+
+        captured = {}
+
+        def fake_request(self, method, path, *, owner_key, headers=None, content=None):
+            import httpx
+
+            captured.update({"method": method, "path": path, "owner_key": owner_key})
+            return httpx.Response(200, json={"model": "owner-model", "provider": "test", "capabilities": {}})
+
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fake_request)
+
+        response = self.client.get("/api/model/info?profile=default")
+
+        assert response.status_code == 200
+        assert response.json()["model"] == "owner-model"
+        assert captured["method"] == "GET"
+        assert captured["path"] == "/api/model/info"
+        assert captured["owner_key"] == self.supervisor.owners[0].owner_key
+
+    def test_authenticated_model_set_fails_closed(self):
+        response = self.client.post("/api/model/set", json={"model": "x"})
+
+        assert response.status_code == 403
+        assert not self.supervisor.owners
+
+    def test_authenticated_model_analytics_is_proxied_to_owner_worker(self, monkeypatch):
+        import hermes_cli.owner_worker.client as owner_client
+
+        captured = {}
+
+        def fake_request(self, method, path, *, owner_key, headers=None, content=None):
+            import httpx
+
+            captured.update({"method": method, "path": path, "owner_key": owner_key})
+            return httpx.Response(200, json={"models": [], "totals": {}, "period_days": 7})
+
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fake_request)
+
+        response = self.client.get("/api/analytics/models?days=7&profile=default")
+
+        assert response.status_code == 200
+        assert response.json()["period_days"] == 7
+        assert captured["method"] == "GET"
+        assert captured["path"] == "/api/analytics/models?days=7"
+        assert captured["owner_key"] == self.supervisor.owners[0].owner_key
+
+    def test_authenticated_analytics_rejects_legacy_profile_before_proxy(self, monkeypatch):
+        import hermes_cli.owner_worker.client as owner_client
+
+        def fail_request(*args, **kwargs):
+            raise AssertionError("must not proxy arbitrary profile selection")
+
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fail_request)
+
+        response = self.client.get("/api/analytics/usage?profile=other")
+
+        assert response.status_code == 400
+        assert not self.supervisor.owners
+
+
 class TestDeleteSessionEndpoint:
     """Tests for ``DELETE /api/sessions/{session_id}`` — the single-row delete
     behind the desktop sidebar's per-session delete.
@@ -5872,7 +6180,7 @@ class TestPtyWebSocket:
         monkeypatch.setattr(
             self.ws_module,
             "_resolve_chat_argv",
-            lambda resume=None, sidecar_url=None, profile=None: (["/bin/cat"], None, None),
+            lambda resume=None, sidecar_url=None, profile=None, **kwargs: (["/bin/cat"], None, None),
         )
         from starlette.websockets import WebSocketDisconnect
 
@@ -5885,7 +6193,7 @@ class TestPtyWebSocket:
         monkeypatch.setattr(
             self.ws_module,
             "_resolve_chat_argv",
-            lambda resume=None, sidecar_url=None, profile=None: (["/bin/cat"], None, None),
+            lambda resume=None, sidecar_url=None, profile=None, **kwargs: (["/bin/cat"], None, None),
         )
         from starlette.websockets import WebSocketDisconnect
 
@@ -5897,10 +6205,12 @@ class TestPtyWebSocket:
     def test_resolve_chat_argv_async_uses_worker_thread(self, monkeypatch):
         captured: dict = {}
 
-        def fake_resolve(resume=None, sidecar_url=None, profile=None):
+        def fake_resolve(resume=None, sidecar_url=None, profile=None, browser_id=None, app_obj=None):
             captured["resume"] = resume
             captured["sidecar_url"] = sidecar_url
             captured["profile"] = profile
+            captured["browser_id"] = browser_id
+            captured["app_obj"] = app_obj
             return (["node", "dist/entry.js"], "/tmp/ui-tui", {"NODE_ENV": "production"})
 
         async def fake_to_thread(fn, *args, **kwargs):
@@ -5926,6 +6236,8 @@ class TestPtyWebSocket:
             "resume": "sess-42",
             "sidecar_url": "ws://127.0.0.1:9119/api/pub?channel=abc",
             "profile": "worker",
+            "browser_id": None,
+            "app_obj": None,
         }
         assert argv == ["node", "dist/entry.js"]
         assert cwd == "/tmp/ui-tui"
@@ -5933,14 +6245,18 @@ class TestPtyWebSocket:
         assert captured["resume"] == "sess-42"
         assert captured["sidecar_url"] == "ws://127.0.0.1:9119/api/pub?channel=abc"
         assert captured["profile"] == "worker"
+        assert captured["browser_id"] is None
+        assert captured["app_obj"] is None
 
     def test_pty_ws_resolves_argv_through_async_wrapper(self, monkeypatch):
         captured: dict = {}
 
-        async def fake_resolve_async(resume=None, sidecar_url=None, profile=None):
+        async def fake_resolve_async(resume=None, sidecar_url=None, profile=None, browser_id=None, app_obj=None):
             captured["resume"] = resume
             captured["sidecar_url"] = sidecar_url
             captured["profile"] = profile
+            captured["browser_id"] = browser_id
+            captured["app_obj"] = app_obj
             return (["/bin/sh", "-c", "printf async-resolve-ok"], None, None)
 
         monkeypatch.setattr(self.ws_module, "_resolve_chat_argv_async", fake_resolve_async)
@@ -5952,6 +6268,8 @@ class TestPtyWebSocket:
                 pass
 
         assert captured["resume"] == "sess-99"
+        assert captured["browser_id"] is None
+        assert captured["app_obj"] is self.ws_module.app
 
     def _assert_pty_propagates(self, monkeypatch, raising_resolver, *, profile=None, expect_detail=None):
         """Drive /api/pty with a resolver that raises, and assert the error
@@ -5978,7 +6296,7 @@ class TestPtyWebSocket:
         """SystemExit from _make_tui_argv (node/npm missing) propagates through
         the async wrapper and is caught by pty_ws's ``except SystemExit``."""
 
-        def boom(resume=None, sidecar_url=None, profile=None):
+        def boom(resume=None, sidecar_url=None, profile=None, **kwargs):
             raise SystemExit("node not found")
 
         self._assert_pty_propagates(monkeypatch, boom)
@@ -5988,7 +6306,7 @@ class TestPtyWebSocket:
         propagates through the wrapper and hits pty_ws's ``except HTTPException``."""
         from fastapi import HTTPException
 
-        def bad_profile(resume=None, sidecar_url=None, profile=None):
+        def bad_profile(resume=None, sidecar_url=None, profile=None, **kwargs):
             raise HTTPException(status_code=404, detail="unknown profile")
 
         self._assert_pty_propagates(
@@ -5999,7 +6317,7 @@ class TestPtyWebSocket:
         monkeypatch.setattr(
             self.ws_module,
             "_resolve_chat_argv",
-            lambda resume=None, sidecar_url=None, profile=None: (
+            lambda resume=None, sidecar_url=None, profile=None, **kwargs: (
                 ["/bin/sh", "-c", "printf hermes-ws-ok"],
                 None,
                 None,
@@ -6029,7 +6347,7 @@ class TestPtyWebSocket:
         monkeypatch.setattr(
             self.ws_module,
             "_resolve_chat_argv",
-            lambda resume=None, sidecar_url=None, profile=None: (["/bin/cat"], None, None),
+            lambda resume=None, sidecar_url=None, profile=None, **kwargs: (["/bin/cat"], None, None),
         )
         with self.client.websocket_connect(self._url()) as conn:
             conn.send_bytes(b"round-trip-payload\n")
@@ -6062,7 +6380,7 @@ class TestPtyWebSocket:
             self.ws_module,
             "_resolve_chat_argv",
             # sleep gives the test time to push the resize before the child reads the ioctl.
-            lambda resume=None, sidecar_url=None, profile=None: (
+            lambda resume=None, sidecar_url=None, profile=None, **kwargs: (
                 [sys.executable, "-c", winsize_script],
                 None,
                 None,
@@ -6098,7 +6416,7 @@ class TestPtyWebSocket:
         monkeypatch.setattr(
             self.ws_module,
             "_resolve_chat_argv",
-            lambda resume=None, sidecar_url=None, profile=None: (["/bin/cat"], None, None),
+            lambda resume=None, sidecar_url=None, profile=None, **kwargs: (["/bin/cat"], None, None),
         )
         # Patch PtyBridge.spawn at the web_server module's binding.
         import hermes_cli.web_server as ws_mod
@@ -6113,8 +6431,10 @@ class TestPtyWebSocket:
     def test_resume_parameter_is_forwarded_to_argv(self, monkeypatch):
         captured: dict = {}
 
-        def fake_resolve(resume=None, sidecar_url=None, profile=None):
+        def fake_resolve(resume=None, sidecar_url=None, profile=None, browser_id=None, app_obj=None):
             captured["resume"] = resume
+            captured["browser_id"] = browser_id
+            captured["app_obj"] = app_obj
             return (["/bin/sh", "-c", "printf resume-arg-ok"], None, None)
 
         monkeypatch.setattr(self.ws_module, "_resolve_chat_argv", fake_resolve)
@@ -6126,6 +6446,8 @@ class TestPtyWebSocket:
             except Exception:
                 pass
         assert captured.get("resume") == "sess-42"
+        assert captured["browser_id"] is None
+        assert captured["app_obj"] is self.ws_module.app
 
     def test_channel_param_propagates_sidecar_url(self, monkeypatch):
         """When /api/pty is opened with ?channel=, the PTY child gets a
@@ -6133,9 +6455,18 @@ class TestPtyWebSocket:
         same channel — which is how tool events reach the dashboard sidebar."""
         captured: dict = {}
 
-        def fake_resolve(resume=None, sidecar_url=None, profile=None, active_session_file=None):
+        def fake_resolve(
+            resume=None,
+            sidecar_url=None,
+            profile=None,
+            active_session_file=None,
+            browser_id=None,
+            app_obj=None,
+        ):
             captured["sidecar_url"] = sidecar_url
             captured["active_session_file"] = active_session_file
+            captured["browser_id"] = browser_id
+            captured["app_obj"] = app_obj
             return (["/bin/sh", "-c", "printf sidecar-ok"], None, None)
 
         monkeypatch.setattr(self.ws_module, "_resolve_chat_argv", fake_resolve)
@@ -6160,6 +6491,8 @@ class TestPtyWebSocket:
         assert "channel=abc-123" in url
         assert "token=" in url
         assert captured["active_session_file"]
+        assert captured["browser_id"] is None
+        assert captured["app_obj"] is self.ws_module.app
 
     def test_pub_broadcasts_to_events_subscribers(self):
         """A frame handed to _broadcast_event is sent verbatim to every

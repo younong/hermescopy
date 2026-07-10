@@ -120,7 +120,12 @@ def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
 
 T = TypeVar("T")
 
-DEFAULT_DB_PATH = get_hermes_home() / "state.db"
+
+def get_default_db_path() -> Path:
+    return get_hermes_home() / "state.db"
+
+
+DEFAULT_DB_PATH = get_default_db_path()
 
 SCHEMA_VERSION = 17
 
@@ -889,7 +894,7 @@ class SessionDB:
     _OPTIMIZE_EVERY_N_WRITES = 1000
 
     def __init__(self, db_path: Path = None, read_only: bool = False):
-        self.db_path = db_path or DEFAULT_DB_PATH
+        self.db_path = db_path or get_default_db_path()
         self.read_only = read_only
 
         self._lock = threading.Lock()
@@ -2692,7 +2697,7 @@ class SessionDB:
                 p.get("text", "") for p in decoded
                 if isinstance(p, dict) and p.get("type") == "text"
             ]
-            preview = " ".join(t for t in text_parts if t).strip()
+            preview = " ".join(t for t in text_parts if t).strip() or "[multimodal content]"
         elif isinstance(decoded, str):
             if decoded.startswith(cls._CONTENT_JSON_PREFIX):
                 preview = ""
@@ -4077,7 +4082,9 @@ class SessionDB:
 
         result: List[Dict[str, Any]] = []
         for row in rows:
-            preview = self._build_message_preview(row["content"], 77)
+            preview = self._build_message_preview(row["content"], 10_000)
+            if len(preview) > 80:
+                preview = preview[:77] + "..."
             result.append(
                 {
                     "id": row["id"],

@@ -108,10 +108,14 @@ def _merge_streaming_lines(lines: list[str]) -> list[str]:
             pending_key = key
             continue
 
-        for field in ("text", "rendered"):
-            value = payload.get(field)
-            if isinstance(value, str):
-                pending_payload[field] = f"{pending_payload.get(field, '')}{value}"
+        value = payload.get("text")
+        if isinstance(value, str):
+            pending_payload["text"] = f"{pending_payload.get('text', '')}{value}"
+        rendered = payload.get("rendered")
+        if isinstance(rendered, str):
+            # `rendered` is a renderer snapshot, not guaranteed to be an append-only
+            # delta. Keep the newest snapshot while text remains coalesced.
+            pending_payload["rendered"] = rendered
         for field, value in payload.items():
             if field not in {"text", "rendered"}:
                 pending_payload[field] = value

@@ -11,7 +11,8 @@ token — so this module provides two credential shapes:
    upgrade. Single-use, TTL = 30 seconds — a leaked ticket is uninteresting.
 
 2. **A process-lifetime internal credential** (``internal_ws_credential`` /
-   ``consume_internal_credential``). This authenticates *server-spawned*
+   ``consume_internal_credential``). This is channel authentication only,
+   not owner authorization. It authenticates *server-spawned*
    WS clients — specifically the embedded-TUI PTY child, which attaches to
    ``/api/ws`` (JSON-RPC gateway) and ``/api/pub`` (event sidecar) over
    loopback. A single-use 30s ticket is the wrong shape for that link: the
@@ -59,21 +60,35 @@ class TicketInvalid(Exception):
     """Ticket missing, expired, or already consumed."""
 
 
-def mint_ticket(*, user_id: str, provider: str) -> str:
-    """Generate a one-shot ticket bound to this user identity.
+def mint_ticket(
+    *,
+    user_id: str,
+    provider: str,
+    org_id: str = "",
+    tenant_id: str = "",
+    owner_key: str = "",
+) -> str:
+    """Generate a one-shot ticket bound to this user and owner identity.
 
     The returned token is base64url, 43 bytes of entropy (32-byte random
     seed). Stash returns the ``info`` dict to the caller on consume so the
-    WS handler can carry the identity forward into its session log.
+    WS handler can carry the identity forward into its session log and, in
+    authenticated mode, reconstruct the owner context from server-minted data.
     """
     ticket = secrets.token_urlsafe(32)
+    minted_at = int(time.time())
+    expires_at = minted_at + TTL_SECONDS
     info = {
         "user_id": user_id,
         "provider": provider,
-        "minted_at": int(time.time()),
+        "org_id": org_id,
+        "tenant_id": tenant_id,
+        "owner_key": owner_key,
+        "minted_at": minted_at,
+        "expires_at": expires_at,
     }
     with _lock:
-        _tickets[ticket] = (int(time.time()) + TTL_SECONDS, info)
+        _tickets[ticket] = (expires_at, info)
         _gc_expired_locked()
     return ticket
 

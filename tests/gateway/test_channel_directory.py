@@ -576,3 +576,62 @@ class TestChannelAliases:
                    }):
             _apply_channel_aliases(platforms)  # should not raise
         assert platforms["whatsapp"][0]["name"] == "1"
+
+
+
+def test_build_from_sessions_uses_dynamic_hermes_home(tmp_path, monkeypatch):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    TestBuildFromSessions()._write_sessions(first, {
+        "s1": {"origin": {"platform": "telegram", "chat_id": "1", "chat_name": "First"}}
+    })
+    TestBuildFromSessions()._write_sessions(second, {
+        "s2": {"origin": {"platform": "telegram", "chat_id": "2", "chat_name": "Second"}}
+    })
+
+    monkeypatch.setenv("HERMES_HOME", str(first))
+    assert _build_from_sessions("telegram")[0]["name"] == "First"
+    monkeypatch.setenv("HERMES_HOME", str(second))
+    assert _build_from_sessions("telegram")[0]["name"] == "Second"
+
+
+def test_build_from_sessions_ignores_owner_mismatch_in_worker(tmp_path, monkeypatch):
+    TestBuildFromSessions()._write_sessions(tmp_path, {
+        "mine": {
+            "owner_key": "ok_mine",
+            "origin": {"platform": "telegram", "chat_id": "1", "chat_name": "Mine"},
+        },
+        "other": {
+            "owner_key": "ok_other",
+            "origin": {"platform": "telegram", "chat_id": "2", "chat_name": "Other"},
+        },
+        "legacy": {
+            "origin": {"platform": "telegram", "chat_id": "3", "chat_name": "Legacy"},
+        },
+    })
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok_mine")
+
+    entries = _build_from_sessions("telegram")
+    assert [entry["name"] for entry in entries] == ["Mine"]
+
+
+def test_build_from_sessions_keeps_legacy_records_outside_owner_worker(tmp_path, monkeypatch):
+    TestBuildFromSessions()._write_sessions(tmp_path, {
+        "mine": {
+            "owner_key": "ok_mine",
+            "origin": {"platform": "telegram", "chat_id": "1", "chat_name": "Mine"},
+        },
+        "other": {
+            "owner_key": "ok_other",
+            "origin": {"platform": "telegram", "chat_id": "2", "chat_name": "Other"},
+        },
+        "legacy": {
+            "origin": {"platform": "telegram", "chat_id": "3", "chat_name": "Legacy"},
+        },
+    })
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_OWNER_KEY", raising=False)
+
+    entries = _build_from_sessions("telegram")
+    assert [entry["name"] for entry in entries] == ["Mine", "Other", "Legacy"]

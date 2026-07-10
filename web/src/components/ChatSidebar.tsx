@@ -85,6 +85,10 @@ interface ChatSidebarProps {
   channel: string;
   /** Management profile from the dashboard switcher — scopes session.create. */
   profile?: string;
+  /** Authenticated owner key for browser-id bucketing. Frontend-only UX state. */
+  ownerKey?: string;
+  /** Delay sidecar sockets until gated auth identity has resolved. */
+  disabled?: boolean;
   className?: string;
   onDashboardNewSessionRequest?: (payload?: DashboardNewSessionPayload) => void;
   onSessionTitleChange?: (title: string | null) => void;
@@ -93,6 +97,8 @@ interface ChatSidebarProps {
 export function ChatSidebar({
   channel,
   profile,
+  ownerKey,
+  disabled = false,
   className,
   onDashboardNewSessionRequest,
   onSessionTitleChange,
@@ -101,7 +107,7 @@ export function ChatSidebar({
   // for it inside an effect (React 19's set-state-in-effect rule). The
   // counter is the dependency on purpose — it's not read in the memo body,
   // it's the signal that says "rebuild the client".
-  const browserId = useMemo(() => getHermesBrowserId(), []);
+  const browserId = useMemo(() => (disabled ? "" : getHermesBrowserId(ownerKey)), [disabled, ownerKey]);
   const [version, setVersion] = useState(0);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const gw = useMemo(() => new GatewayClient(), [version]);
@@ -167,6 +173,7 @@ export function ChatSidebar({
   }, [scopeKey]);
 
   useEffect(() => {
+    if (disabled) return;
     let cancelled = false;
     queueMicrotask(() => {
       if (cancelled) return;
@@ -222,7 +229,7 @@ export function ChatSidebar({
       gw.close();
     };
     // `profile` is read from render; scope changes bump `version` → new `gw`.
-  }, [browserId, gw]);
+  }, [browserId, disabled, gw]);
 
   // Event subscriber WebSocket — receives the rebroadcast of every
   // dispatcher emit from the PTY child's gateway.  See /api/pub +
@@ -233,7 +240,7 @@ export function ChatSidebar({
   // JSON-RPC sidecar so the sidebar matches its documented best-effort
   // UX and the user always has a reconnect affordance.
   useEffect(() => {
-    if (!channel) {
+    if (disabled || !channel) {
       return;
     }
     // In loopback mode the legacy ?token=<session> path is fine; in gated
@@ -296,7 +303,7 @@ export function ChatSidebar({
       unmounting = true;
       ws?.close();
     };
-  }, [channel, onDashboardNewSessionRequest, onSessionTitleChange, version]);
+  }, [channel, disabled, onDashboardNewSessionRequest, onSessionTitleChange, version]);
 
   // Seed the badge on mount and re-read it whenever the sockets are rebuilt
   // (a profile/channel switch bumps `version`).

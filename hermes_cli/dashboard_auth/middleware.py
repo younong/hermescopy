@@ -354,7 +354,13 @@ async def gated_auth_middleware(
         if refreshed is not None:
             new_session, refreshing_provider = refreshed
             request.state.session = new_session
-            response = await call_next(request)
+            from hermes_cli.web_server import _authenticated_owner_control_plane_gate_response
+
+            gated = _authenticated_owner_control_plane_gate_response(request)
+            if gated is not None:
+                response = gated
+            else:
+                response = await call_next(request)
             # Persist the ROTATED tokens. Portal rotates the refresh token on
             # every refresh and runs reuse-detection, so writing the new RT
             # back is mandatory: a stale RT cookie would replay a rotated
@@ -400,6 +406,11 @@ async def gated_auth_middleware(
         return response
 
     request.state.session = session
+    from hermes_cli.web_server import _authenticated_owner_control_plane_gate_response
+
+    gated = _authenticated_owner_control_plane_gate_response(request)
+    if gated is not None:
+        return gated
     return await call_next(request)
 
 

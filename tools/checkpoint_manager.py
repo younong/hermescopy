@@ -69,7 +69,16 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-CHECKPOINT_BASE = get_hermes_home() / "checkpoints"
+def get_checkpoint_base() -> Path:
+    return get_hermes_home() / "checkpoints"
+
+
+CHECKPOINT_BASE = get_checkpoint_base()
+_DEFAULT_CHECKPOINT_BASE = CHECKPOINT_BASE
+
+
+def _effective_checkpoint_base() -> Path:
+    return CHECKPOINT_BASE if CHECKPOINT_BASE != _DEFAULT_CHECKPOINT_BASE else get_checkpoint_base()
 
 # Single shared store directory under CHECKPOINT_BASE.
 _STORE_DIRNAME = "store"
@@ -206,7 +215,7 @@ def _project_hash(working_dir: str) -> str:
 
 def _store_path(base: Optional[Path] = None) -> Path:
     """Return the single shared shadow store path."""
-    return (base or CHECKPOINT_BASE) / _STORE_DIRNAME
+    return (base or _effective_checkpoint_base()) / _STORE_DIRNAME
 
 
 def _shadow_repo_path(working_dir: str) -> Path:  # pragma: no cover — kept for BC
@@ -690,7 +699,7 @@ class CheckpointManager:
     def list_checkpoints(self, working_dir: str) -> List[Dict]:
         """List available checkpoints for a directory (most recent first)."""
         abs_dir = str(_normalize_path(working_dir))
-        store = _store_path(CHECKPOINT_BASE)
+        store = _store_path(_effective_checkpoint_base())
 
         if not (store / "HEAD").exists():
             return []
@@ -748,7 +757,7 @@ class CheckpointManager:
             return {"success": False, "error": hash_err}
 
         abs_dir = str(_normalize_path(working_dir))
-        store = _store_path(CHECKPOINT_BASE)
+        store = _store_path(_effective_checkpoint_base())
 
         if not (store / "HEAD").exists():
             return {"success": False, "error": "No checkpoints exist for this directory"}
@@ -804,7 +813,7 @@ class CheckpointManager:
             if path_err:
                 return {"success": False, "error": path_err}
 
-        store = _store_path(CHECKPOINT_BASE)
+        store = _store_path(_effective_checkpoint_base())
 
         if not (store / "HEAD").exists():
             return {"success": False, "error": "No checkpoints exist for this directory"}
@@ -872,7 +881,7 @@ class CheckpointManager:
 
     def _take(self, working_dir: str, reason: str) -> bool:
         """Take a snapshot.  Returns True on success."""
-        store = _store_path(CHECKPOINT_BASE)
+        store = _store_path(_effective_checkpoint_base())
 
         err = _init_store(store, working_dir)
         if err:
@@ -1281,7 +1290,7 @@ def prune_checkpoints(
 
     Never raises — maintenance must never block interactive startup.
     """
-    base = checkpoint_base or CHECKPOINT_BASE
+    base = checkpoint_base or _effective_checkpoint_base()
     result = {
         "scanned": 0,
         "deleted_orphan": 0,
@@ -1511,7 +1520,7 @@ def maybe_auto_prune_checkpoints(
     Returns ``{"skipped": bool, "result": prune_checkpoints-dict,
     "error": optional str}``.
     """
-    base = checkpoint_base or CHECKPOINT_BASE
+    base = checkpoint_base or _effective_checkpoint_base()
     out: Dict[str, object] = {"skipped": False}
 
     try:
@@ -1574,7 +1583,7 @@ def store_status(checkpoint_base: Optional[Path] = None) -> Dict:
        "total_size_bytes": N, "project_count": N, "projects": [...],
        "legacy_archives": [...]}``
     """
-    base = checkpoint_base or CHECKPOINT_BASE
+    base = checkpoint_base or _effective_checkpoint_base()
     out: Dict = {
         "base": str(base),
         "store_size_bytes": 0,
@@ -1639,7 +1648,7 @@ def clear_all(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
 
     Returns ``{"bytes_freed": N, "deleted": bool}``.
     """
-    base = checkpoint_base or CHECKPOINT_BASE
+    base = checkpoint_base or _effective_checkpoint_base()
     out = {"bytes_freed": 0, "deleted": False}
     if not base.exists():
         return out
@@ -1658,7 +1667,7 @@ def clear_legacy(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
 
     Returns ``{"bytes_freed": N, "deleted": count}``.
     """
-    base = checkpoint_base or CHECKPOINT_BASE
+    base = checkpoint_base or _effective_checkpoint_base()
     out = {"bytes_freed": 0, "deleted": 0}
     if not base.exists():
         return out

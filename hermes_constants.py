@@ -782,13 +782,19 @@ def get_subprocess_home(env: dict[str, str] | None = None) -> str | None:
 
 
 def apply_subprocess_home_env(env: dict[str, str]) -> None:
-    """Apply Hermes' subprocess HOME contract to *env* in-place."""
+    """Apply Hermes' subprocess HOME/owner-worker env contract in-place."""
     real_home = get_real_home(env)
     if real_home:
         env["HERMES_REAL_HOME"] = real_home
     home = get_subprocess_home(env)
     if home:
         env["HOME"] = home
+    try:
+        from hermes_cli.owner_runtime import propagate_owner_env
+
+        propagate_owner_env(env)
+    except Exception:
+        pass
 
 
 VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")

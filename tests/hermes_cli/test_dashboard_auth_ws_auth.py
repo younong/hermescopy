@@ -14,6 +14,7 @@ pre-existing regression unrelated to dashboard-auth.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -21,11 +22,22 @@ from fastapi.testclient import TestClient
 
 from hermes_cli import web_server
 from hermes_cli.dashboard_auth import clear_providers, register_provider
+from hermes_cli.dashboard_auth.base import Session
+from hermes_cli.dashboard_auth.owner_context import (
+    owner_context_from_session,
+    owner_context_from_ticket_payload,
+)
 from hermes_cli.dashboard_auth.ws_tickets import (
     _reset_for_tests,
-    consume_internal_credential,
+    consume_ticket,
     internal_ws_credential,
     mint_ticket,
+)
+from hermes_cli.owner_worker.tokens import (
+    AUD_CONTROL_PLANE_WS,
+    AUD_OWNER_WORKER_WS,
+    mint_internal_token,
+    validate_internal_token_payload,
 )
 from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
 
@@ -113,6 +125,10 @@ def _logged_in(client: TestClient) -> None:
 class TestWsTicketEndpoint:
     def test_authenticated_session_can_mint(self, gated_app):
         _logged_in(gated_app)
+        me = gated_app.get("/api/auth/me")
+        assert me.status_code == 200
+        me_body = me.json()
+
         r = gated_app.post("/api/auth/ws-ticket")
         assert r.status_code == 200
         body = r.json()
@@ -120,6 +136,20 @@ class TestWsTicketEndpoint:
         assert isinstance(body["ticket"], str)
         assert len(body["ticket"]) >= 32
         assert body["ttl_seconds"] == 30
+
+        payload = consume_ticket(body["ticket"])
+        assert payload["user_id"] == "stub-user-1"
+        assert payload["provider"] == "stub"
+        assert payload["org_id"] == "stub-org-1"
+        assert payload["tenant_id"] == "stub-org-1"
+        assert payload["owner_key"].startswith("ok1_")
+        assert payload["tenant_id"] == me_body["tenant_id"]
+        assert payload["owner_key"] == me_body["owner_key"]
+        assert "minted_at" in payload
+        assert "expires_at" in payload
+        owner = owner_context_from_ticket_payload(payload)
+        assert owner.owner_key == payload["owner_key"]
+        assert owner.tenant_id == payload["tenant_id"]
 
     def test_unauthenticated_returns_401_or_redirect(self, gated_app):
         r = gated_app.post("/api/auth/ws-ticket", follow_redirects=False)
@@ -181,8 +211,8 @@ def insecure_explicit_host_app():
     web_server.app.state.auth_required = prev_required
 
 
-def _fake_ws(*, query: dict, client_host: str = "127.0.0.1", path: str = "/api/pty"):
-    """Build a stand-in for starlette.WebSocket good enough for _ws_auth_ok."""
+def _fake_ws(*, query: dict, client_host: str = "127.0.0.1", path: str = "/api/pty", app=None):
+    """Build a stand-in for Starlette.WebSocket good enough for WS helpers."""
 
     class _QP:
         def __init__(self, q):
@@ -191,10 +221,12 @@ def _fake_ws(*, query: dict, client_host: str = "127.0.0.1", path: str = "/api/p
         def get(self, k, default=""):
             return self._q.get(k, default)
 
+    query_string = "&".join(f"{k}={v}" for k, v in query.items())
     return SimpleNamespace(
+        app=app or web_server.app,
         query_params=_QP(query),
         client=SimpleNamespace(host=client_host),
-        url=SimpleNamespace(path=path),
+        url=SimpleNamespace(path=path, query=query_string),
     )
 
 
@@ -274,20 +306,21 @@ class TestWsAuthOkGated:
             content = log_file.read_text()
             assert "ws_ticket_rejected" in content
 
-    def test_internal_credential_accepted(self, gated_app):
-        """Server-spawned children present the process-lifetime internal
-        credential via ?internal= and are accepted in gated mode."""
-        cred = internal_ws_credential()
-        ws = _fake_ws(query={"internal": cred})
-        assert web_server._ws_auth_ok(ws) is True
+    def test_process_global_internal_credential_requires_owner_context(self, gated_app):
+        """Gated mode never accepts a process-global internal credential."""
+        result = web_server._ws_auth_result(_fake_ws(query={"internal": internal_ws_credential()}))
 
-    def test_internal_credential_is_multi_use(self, gated_app):
-        """Unlike single-use tickets, the internal credential survives
-        repeated use so the child can reconnect."""
-        cred = internal_ws_credential()
+        assert result.reason == "internal_owner_context_required"
+        assert result.credential == "internal"
+        assert web_server._ws_auth_ok(_fake_ws(query={"internal": internal_ws_credential()})) is False
+
+    def test_process_global_internal_credential_remains_rejected_on_reuse(self, gated_app):
+        """Repeated legacy credentials cannot become an owner-auth bypass."""
+        credential = internal_ws_credential()
         for _ in range(3):
-            ws = _fake_ws(query={"internal": cred})
-            assert web_server._ws_auth_ok(ws) is True
+            result = web_server._ws_auth_result(_fake_ws(query={"internal": credential}))
+            assert result.reason == "internal_owner_context_required"
+            assert result.credential == "internal"
 
     def test_wrong_internal_credential_rejected(self, gated_app):
         # Mint the real one so the store is non-empty, then present a bogus value.
@@ -301,6 +334,300 @@ class TestWsAuthOkGated:
         cred = internal_ws_credential()
         ws = _fake_ws(query={"internal": cred})
         assert web_server._ws_auth_ok(ws) is False
+
+    def test_http_auth_me_and_ws_ticket_use_the_same_canonical_owner(self, gated_app):
+        _logged_in(gated_app)
+
+        auth_me = gated_app.get("/api/auth/me")
+        ticket_response = gated_app.post("/api/auth/ws-ticket")
+
+        assert auth_me.status_code == 200
+        assert ticket_response.status_code == 200
+        ws_owner = owner_context_from_ticket_payload(consume_ticket(ticket_response.json()["ticket"]))
+        assert ws_owner.owner_key == auth_me.json()["owner_key"]
+        assert ws_owner.tenant_id == auth_me.json()["tenant_id"]
+
+    def test_distinct_users_mint_distinct_owner_keys_for_ws_routing(self, gated_app, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_OWNER_SECRET", "test-owner-secret")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "global"))
+        owner_a = owner_context_from_session(Session(
+            user_id="user-a",
+            email="a@example.test",
+            display_name="A",
+            org_id="org1",
+            provider="stub",
+            expires_at=9999999999,
+            access_token="a",
+            refresh_token="ra",
+        ))
+        owner_b = owner_context_from_session(Session(
+            user_id="user-b",
+            email="b@example.test",
+            display_name="B",
+            org_id="org1",
+            provider="stub",
+            expires_at=9999999999,
+            access_token="b",
+            refresh_token="rb",
+        ))
+        ticket_a = mint_ticket(user_id="user-a", provider="stub", org_id="org1", tenant_id=owner_a.tenant_id, owner_key=owner_a.owner_key)
+        ticket_b = mint_ticket(user_id="user-b", provider="stub", org_id="org1", tenant_id=owner_b.tenant_id, owner_key=owner_b.owner_key)
+
+        result_a = web_server._ws_auth_result(_fake_ws(query={"ticket": ticket_a}))
+        result_b = web_server._ws_auth_result(_fake_ws(query={"ticket": ticket_b}))
+
+        assert result_a.reason is None
+        assert result_b.reason is None
+        assert result_a.payload["owner_key"] == owner_a.owner_key
+        assert result_b.payload["owner_key"] == owner_b.owner_key
+        assert result_a.payload["owner_key"] != result_b.payload["owner_key"]
+        assert owner_context_from_ticket_payload(result_a.payload).owner_home != owner_context_from_ticket_payload(result_b.payload).owner_home
+
+    def test_auth_result_retains_ticket_payload_for_owner_bridge(self, gated_app):
+        ticket = mint_ticket(
+            user_id="u1",
+            provider="stub",
+            org_id="org1",
+            tenant_id="org1",
+            owner_key="ok1_owner",
+        )
+        ws = _fake_ws(query={"ticket": ticket})
+
+        result = web_server._ws_auth_result(ws)
+
+        assert result.reason is None
+        assert result.credential == "ticket"
+        assert result.payload["user_id"] == "u1"
+        assert result.payload["owner_key"] == "ok1_owner"
+
+    def test_owner_worker_requires_owner_bound_internal_token(self, tmp_path):
+        worker_app = SimpleNamespace(
+            state=SimpleNamespace(
+                owner_worker_mode=True,
+                owner_worker_owner_key="ok1_worker",
+                owner_worker_control_home=tmp_path,
+                auth_required=False,
+            )
+        )
+        good = mint_internal_token("ok1_worker", audience=AUD_OWNER_WORKER_WS, path="/api/pty", control_home=tmp_path)
+        wrong = mint_internal_token("ok1_other", audience=AUD_OWNER_WORKER_WS, path="/api/pty", control_home=tmp_path)
+
+        assert web_server._ws_auth_ok(_fake_ws(query={"internal_owner_token": good}, app=worker_app)) is True
+        assert web_server._ws_auth_ok(_fake_ws(query={"internal_owner_token": wrong}, app=worker_app)) is False
+        assert web_server._ws_auth_ok(_fake_ws(query={"internal": internal_ws_credential()}, app=worker_app)) is False
+
+    def test_control_plane_internal_owner_token_uses_supervisor_control_home(self, gated_app, tmp_path):
+        control_a = tmp_path / "control-a"
+        control_b = tmp_path / "control-b"
+        previous = getattr(web_server.app.state, "owner_worker_supervisor", None)
+        web_server.app.state.owner_worker_supervisor = SimpleNamespace(control_home=control_a, global_home=tmp_path / "global-a")
+        try:
+            good = mint_internal_token("ok1_worker", audience=AUD_CONTROL_PLANE_WS, path="/api/pty", control_home=control_a)
+            wrong_secret = mint_internal_token("ok1_worker", audience=AUD_CONTROL_PLANE_WS, path="/api/pty", control_home=control_b)
+
+            good_result = web_server._ws_auth_result(_fake_ws(query={"internal_owner_token": good}))
+            wrong_result = web_server._ws_auth_result(_fake_ws(query={"internal_owner_token": wrong_secret}))
+        finally:
+            web_server.app.state.owner_worker_supervisor = previous
+
+        assert good_result.reason is None
+        assert good_result.credential == "internal_owner_token"
+        assert good_result.payload["owner_key"] == "ok1_worker"
+        assert wrong_result.reason == "internal_owner_invalid"
+
+    def test_control_plane_internal_owner_token_rejects_wrong_audience_or_path(self, gated_app, tmp_path):
+        previous = getattr(web_server.app.state, "owner_worker_supervisor", None)
+        web_server.app.state.owner_worker_supervisor = SimpleNamespace(control_home=tmp_path, global_home=tmp_path / "global")
+        try:
+            wrong_aud = mint_internal_token("ok1_worker", audience=AUD_OWNER_WORKER_WS, path="/api/pty", control_home=tmp_path)
+            wrong_path = mint_internal_token("ok1_worker", audience=AUD_CONTROL_PLANE_WS, path="/api/pub", control_home=tmp_path)
+            assert web_server._ws_auth_result(_fake_ws(query={"internal_owner_token": wrong_aud})).reason == "internal_owner_invalid"
+            assert web_server._ws_auth_result(_fake_ws(query={"internal_owner_token": wrong_path})).reason == "internal_owner_invalid"
+        finally:
+            web_server.app.state.owner_worker_supervisor = previous
+
+    def test_internal_owner_token_payload_routes_by_signed_owner_key(self, gated_app, tmp_path, monkeypatch):
+        global_home = tmp_path / "global"
+        control_home = global_home / "control-plane"
+        owner_key = "ok1_worker"
+        previous = getattr(web_server.app.state, "owner_worker_supervisor", None)
+        web_server.app.state.owner_worker_supervisor = SimpleNamespace(control_home=control_home, global_home=global_home)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "wrong-home"))
+        try:
+            token = mint_internal_token(owner_key, audience=AUD_CONTROL_PLANE_WS, path="/api/pty", control_home=control_home)
+            result = web_server._ws_auth_result(_fake_ws(query={"internal_owner_token": token}))
+            owner = web_server._owner_context_from_ws_auth_result(result)
+        finally:
+            web_server.app.state.owner_worker_supervisor = previous
+
+        assert owner.owner_key == owner_key
+        assert owner.owner_home == (global_home / "users" / owner_key)
+
+    def test_ws_close_reason_redacts_auth_query_values(self):
+        reason = web_server._ws_close_reason(
+            "failed ws://x/api/ws?ticket=abc&internal_owner_token=secret&channel=chan"
+        )
+
+        assert "abc" not in reason
+        assert "secret" not in reason
+        assert "ticket=<redacted>" in reason
+        assert "internal_owner_token=<redacted>" in reason
+
+    def test_owner_worker_query_strips_external_auth_credentials(self, loopback_app):
+        ws = _fake_ws(
+            query={
+                "ticket": "browser-ticket",
+                "token": "legacy",
+                "internal": "process",
+                "channel": "chan1",
+                "fresh": "1",
+            }
+        )
+
+        query = web_server._ws_query_for_owner_worker(ws, internal_owner_token="owner-token")
+
+        assert "ticket=" not in query
+        assert "token=legacy" not in query
+        assert "internal=process" not in query
+        assert "channel=chan1" in query
+        assert "fresh=1" in query
+        assert "internal_owner_token=owner-token" in query
+
+    def test_only_browser_tickets_bridge_from_control_plane(self, gated_app, tmp_path):
+        ticket = mint_ticket(
+            user_id="u1",
+            provider="stub",
+            org_id="org1",
+            tenant_id="org1",
+            owner_key="ok1_owner",
+        )
+        ticket_ws = _fake_ws(query={"ticket": ticket})
+        ticket_result = web_server._ws_auth_result(ticket_ws)
+        assert web_server._should_bridge_ws_to_owner_worker(ticket_ws, ticket_result) is True
+
+        internal_ws = _fake_ws(query={"internal": internal_ws_credential()})
+        internal_result = web_server._ws_auth_result(internal_ws)
+        assert internal_result.reason == "internal_owner_context_required"
+        assert internal_result.credential == "internal"
+        assert web_server._should_bridge_ws_to_owner_worker(internal_ws, internal_result) is False
+
+        web_server.app.state.auth_required = False
+        token_ws = _fake_ws(query={"token": web_server._SESSION_TOKEN})
+        token_result = web_server._ws_auth_result(token_ws)
+        assert token_result.reason is None
+        assert token_result.credential == "token"
+        assert web_server._should_bridge_ws_to_owner_worker(token_ws, token_result) is False
+
+        worker_app = SimpleNamespace(
+            state=SimpleNamespace(
+                owner_worker_mode=True,
+                owner_worker_owner_key="ok1_worker",
+                owner_worker_control_home=tmp_path,
+                auth_required=False,
+            )
+        )
+        owner_token = mint_internal_token("ok1_worker", audience=AUD_OWNER_WORKER_WS, path="/api/pty", control_home=tmp_path)
+        worker_ws = _fake_ws(query={"internal_owner_token": owner_token}, app=worker_app)
+        worker_result = web_server._ws_auth_result(worker_ws)
+        assert worker_result.reason is None
+        assert worker_result.credential == "internal_owner_token"
+        assert web_server._should_bridge_ws_to_owner_worker(worker_ws, worker_result) is False
+
+
+class TestWsUrlBuilders:
+    def test_child_urls_use_explicit_app_state_instead_of_module_global(self, monkeypatch):
+        monkeypatch.setattr(web_server.app.state, "bound_host", "global.example", raising=False)
+        monkeypatch.setattr(web_server.app.state, "bound_port", 9999, raising=False)
+        monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
+        worker_app = SimpleNamespace(
+            state=SimpleNamespace(
+                bound_host="owner-worker.local",
+                bound_port=1234,
+                auth_required=True,
+            )
+        )
+
+        gateway_url = web_server._build_gateway_ws_url(app_obj=worker_app)
+        sidecar_url = web_server._build_sidecar_url("chan1", app_obj=worker_app)
+
+        assert gateway_url is None
+        assert sidecar_url is None
+
+    def test_child_urls_return_none_when_explicit_app_has_no_bound_socket(self, monkeypatch):
+        monkeypatch.setattr(web_server.app.state, "bound_host", "global.example", raising=False)
+        monkeypatch.setattr(web_server.app.state, "bound_port", 9999, raising=False)
+        app_obj = SimpleNamespace(state=SimpleNamespace(auth_required=False))
+
+        assert web_server._build_gateway_ws_url(app_obj=app_obj) is None
+        assert web_server._build_sidecar_url("chan1", app_obj=app_obj) is None
+
+    def test_owner_worker_urls_use_path_bound_owner_tokens(self, monkeypatch, tmp_path):
+        control_home = tmp_path / "control-plane"
+        worker_app = SimpleNamespace(
+            state=SimpleNamespace(
+                owner_worker_mode=True,
+                owner_worker_owner_key="ok1_owner_a",
+                owner_worker_control_home=control_home,
+                auth_required=False,
+            )
+        )
+        monkeypatch.setenv("HERMES_OWNER_WORKER_CONTROL_WS_BASE", "wss://control.example")
+
+        gateway_url = web_server._build_gateway_ws_url(app_obj=worker_app)
+        sidecar_url = web_server._build_sidecar_url("chan-1", app_obj=worker_app)
+
+        assert gateway_url is not None
+        assert sidecar_url is not None
+        gateway = urlparse(gateway_url)
+        sidecar = urlparse(sidecar_url)
+        gateway_query = parse_qs(gateway.query)
+        sidecar_query = parse_qs(sidecar.query)
+        assert gateway.path == "/api/ws"
+        assert sidecar.path == "/api/pub"
+        assert set(gateway_query) == {"internal_owner_token"}
+        assert set(sidecar_query) == {"internal_owner_token", "channel"}
+        assert sidecar_query["channel"] == ["chan-1"]
+        for query in (gateway_query, sidecar_query):
+            assert "internal" not in query
+            assert "token" not in query
+
+        gateway_payload = validate_internal_token_payload(
+            gateway_query["internal_owner_token"][0],
+            audience=AUD_CONTROL_PLANE_WS,
+            path="/api/ws",
+            control_home=control_home,
+        )
+        sidecar_payload = validate_internal_token_payload(
+            sidecar_query["internal_owner_token"][0],
+            audience=AUD_CONTROL_PLANE_WS,
+            path="/api/pub",
+            control_home=control_home,
+        )
+        assert gateway_payload is not None
+        assert sidecar_payload is not None
+        assert gateway_payload["owner_key"] == "ok1_owner_a"
+        assert sidecar_payload["owner_key"] == "ok1_owner_a"
+
+        other_worker_app = SimpleNamespace(
+            state=SimpleNamespace(
+                owner_worker_mode=True,
+                owner_worker_owner_key="ok1_owner_b",
+                owner_worker_control_home=control_home,
+                auth_required=False,
+            )
+        )
+        other_gateway_url = web_server._build_gateway_ws_url(app_obj=other_worker_app)
+        assert other_gateway_url is not None
+        other_gateway_token = parse_qs(urlparse(other_gateway_url).query)["internal_owner_token"][0]
+        other_payload = validate_internal_token_payload(
+            other_gateway_token,
+            audience=AUD_CONTROL_PLANE_WS,
+            path="/api/ws",
+            control_home=control_home,
+        )
+        assert other_payload is not None
+        assert other_payload["owner_key"] == "ok1_owner_b"
+        assert other_payload["owner_key"] != gateway_payload["owner_key"]
 
 
 class TestWsRequestIsAllowedGated:
@@ -551,20 +878,9 @@ class TestSidecarUrl:
         assert f"token={web_server._SESSION_TOKEN}" in url
         assert "ticket=" not in url
 
-    def test_gated_uses_internal_credential(self, gated_app):
-        url = web_server._build_sidecar_url("ch-1")
-        assert url is not None
-        assert "token=" not in url
-        assert "ticket=" not in url
-        assert "internal=" in url
-        # The value should be the live process-lifetime internal credential,
-        # multi-use so the child can reconnect /api/pub.
-        cred = url.split("internal=")[1].split("&")[0]
-        info = consume_internal_credential(cred)
-        assert info["user_id"] == "server-internal"
-        assert info["provider"] == "server-internal"
-        # Multi-use: a second consume still succeeds (unlike a ticket).
-        assert consume_internal_credential(cred)["provider"] == "server-internal"
+    def test_gated_returns_no_control_plane_sidecar_url(self, gated_app):
+        """Authenticated Control Plane children must run inside an Owner Worker."""
+        assert web_server._build_sidecar_url("ch-1") is None
 
     def test_no_bound_host_returns_none(self, gated_app):
         web_server.app.state.bound_host = None
@@ -576,8 +892,8 @@ class TestSidecarUrl:
 
 # ---------------------------------------------------------------------------
 # _build_gateway_ws_url — the TUI child's primary JSON-RPC backend WS.
-# Loopback uses ?token=; gated mode uses the multi-use internal credential
-# (NOT a single-use ticket — the child reuses this URL across reconnects).
+# Loopback uses ?token=; authenticated Control Plane mode returns no URL because
+# the owner worker creates an owner-bound internal capability instead.
 # ---------------------------------------------------------------------------
 
 
@@ -589,27 +905,9 @@ class TestGatewayWsUrl:
         assert f"token={web_server._SESSION_TOKEN}" in url
         assert "internal=" not in url
 
-    def test_gated_uses_internal_credential(self, gated_app):
-        url = web_server._build_gateway_ws_url()
-        assert url is not None
-        assert "/api/ws?" in url
-        assert "token=" not in url
-        assert "ticket=" not in url
-        assert "internal=" in url
-        cred = url.split("internal=")[1].split("&")[0]
-        # The credential authenticates against _ws_auth_ok in gated mode.
-        ws = _fake_ws(query={"internal": cred})
-        assert web_server._ws_auth_ok(ws) is True
-
-    def test_gated_credential_matches_sidecar(self, gated_app):
-        """Both server-internal builders share one process credential, so a
-        single value authenticates /api/ws and /api/pub alike."""
-        gw = web_server._build_gateway_ws_url()
-        sc = web_server._build_sidecar_url("ch-1")
-        assert gw is not None and sc is not None
-        gw_cred = gw.split("internal=")[1].split("&")[0]
-        sc_cred = sc.split("internal=")[1].split("&")[0]
-        assert gw_cred == sc_cred
+    def test_gated_returns_no_control_plane_gateway_url(self, gated_app):
+        """Authenticated Control Plane children must run inside an Owner Worker."""
+        assert web_server._build_gateway_ws_url() is None
 
     def test_no_bound_host_returns_none(self, gated_app):
         web_server.app.state.bound_host = None

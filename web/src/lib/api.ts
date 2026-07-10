@@ -1216,8 +1216,13 @@ export interface AuthMeResponse {
   email: string;
   display_name: string;
   org_id: string;
+  tenant_id: string;
+  owner_key: string;
   provider: string;
   expires_at: number;
+  isolation_mode?: string;
+  legacy_sessions_imported?: boolean;
+  legacy_sessions_message?: string;
 }
 
 export interface ActionResponse {

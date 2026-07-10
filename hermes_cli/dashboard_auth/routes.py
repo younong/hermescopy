@@ -47,6 +47,10 @@ from hermes_cli.dashboard_auth.cookies import (
     set_session_cookies,
 )
 from hermes_cli.dashboard_auth.login_page import render_login_html
+from hermes_cli.dashboard_auth.owner_context import (
+    owner_context_from_session,
+    owner_public_summary,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -587,6 +591,7 @@ async def api_auth_me(request: Request):
     sess = getattr(request.state, "session", None)
     if sess is None:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    owner = owner_context_from_session(sess)
     return {
         "user_id": sess.user_id,
         "email": sess.email,
@@ -594,6 +599,10 @@ async def api_auth_me(request: Request):
         "org_id": sess.org_id,
         "provider": sess.provider,
         "expires_at": sess.expires_at,
+        "isolation_mode": "owner_worker",
+        "legacy_sessions_imported": False,
+        "legacy_sessions_message": "Authenticated owner isolation uses a separate owner home; legacy local sessions are not imported automatically.",
+        **owner_public_summary(owner),
     }
 
 
@@ -623,7 +632,14 @@ async def api_auth_ws_ticket(request: Request):
     # don't load the ticket store.
     from hermes_cli.dashboard_auth.ws_tickets import TTL_SECONDS, mint_ticket
 
-    ticket = mint_ticket(user_id=sess.user_id, provider=sess.provider)
+    owner = owner_context_from_session(sess)
+    ticket = mint_ticket(
+        user_id=sess.user_id,
+        provider=sess.provider,
+        org_id=sess.org_id,
+        tenant_id=owner.tenant_id,
+        owner_key=owner.owner_key,
+    )
     audit_log(
         AuditEvent.WS_TICKET_MINTED,
         provider=sess.provider,

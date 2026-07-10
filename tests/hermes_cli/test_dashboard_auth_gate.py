@@ -174,6 +174,7 @@ def test_start_server_loopback_sets_auth_required_false(monkeypatch):
         open_browser=False, allow_public=False,
     )
     assert web_server.app.state.auth_required is False
+    assert web_server.app.state.owner_worker_supervisor is None
 
 
 def test_start_server_insecure_public_no_longer_bypasses_gate(monkeypatch):
@@ -239,6 +240,7 @@ def test_start_server_gate_with_provider_proceeds_and_sets_proxy_headers(monkeyp
             open_browser=False, allow_public=False,
         )
         assert web_server.app.state.auth_required is True
+        assert web_server.app.state.owner_worker_supervisor is not None
         assert captured["kwargs"].get("host") == "0.0.0.0"
         assert captured["kwargs"].get("proxy_headers") is True
     finally:

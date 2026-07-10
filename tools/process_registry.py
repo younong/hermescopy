@@ -52,7 +52,16 @@ logger = logging.getLogger(__name__)
 
 
 # Checkpoint file for crash recovery (gateway only)
-CHECKPOINT_PATH = get_hermes_home() / "processes.json"
+def get_checkpoint_path():
+    return get_hermes_home() / "processes.json"
+
+
+CHECKPOINT_PATH = get_checkpoint_path()
+_DEFAULT_CHECKPOINT_PATH = CHECKPOINT_PATH
+
+
+def _effective_checkpoint_path():
+    return CHECKPOINT_PATH if CHECKPOINT_PATH != _DEFAULT_CHECKPOINT_PATH else get_checkpoint_path()
 
 # Limits
 MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
@@ -1786,7 +1795,7 @@ class ProcessRegistry:
             
             # Atomic write to avoid corruption on crash
             from utils import atomic_json_write
-            atomic_json_write(CHECKPOINT_PATH, entries)
+            atomic_json_write(_effective_checkpoint_path(), entries)
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 
@@ -1796,11 +1805,12 @@ class ProcessRegistry:
 
         Returns the number of processes recovered as detached.
         """
-        if not CHECKPOINT_PATH.exists():
+        checkpoint_path = _effective_checkpoint_path()
+        if not checkpoint_path.exists():
             return 0
 
         try:
-            entries = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+            entries = json.loads(checkpoint_path.read_text(encoding="utf-8"))
         except Exception:
             return 0
 

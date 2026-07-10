@@ -14,6 +14,7 @@ allowed-tools:
 
 - Host: `106.15.186.104`
 - SSH user: `root`
+- SSH identity file: `~/.ssh/hermes_apiyi_ed25519`
 - Remote root: `/opt/hermes`
 - 发布工具：`npm run deploy -- ...`
 - 详细文档：`docs/deployment/alicloud.md`
@@ -72,8 +73,10 @@ npm run deploy -- --tag <previous-tag>
 
 ### 使用 SSH key
 
+默认使用本机私钥文件 `~/.ssh/hermes_apiyi_ed25519`（只记录文件路径，不记录私钥内容）：
+
 ```bash
-npm run deploy -- --tag v2026.7.3 --identity-file ~/.ssh/hermes-alicloud
+npm run deploy -- --tag v2026.7.3 --identity-file ~/.ssh/hermes_apiyi_ed25519
 ```
 
 ### 临时密码登录

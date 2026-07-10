@@ -9,6 +9,7 @@ import type { SessionCreateResponse, SessionResumeResponse } from "./protocol";
 
 export interface ConnectGuiChatOptions {
   profile?: string;
+  ownerKey?: string;
   resumeSessionId?: string | null;
 }
 
@@ -72,7 +73,7 @@ export interface GuiChatConnection {
 
 export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnection {
   const client = new GatewayClient();
-  const browserId = getHermesBrowserId();
+  const browserId = getHermesBrowserId(options.ownerKey);
 
   return {
     client,

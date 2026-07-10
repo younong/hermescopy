@@ -1,11 +1,14 @@
 """Tests for the dashboard-managed file browser API."""
 
 from types import SimpleNamespace
+from urllib.parse import urlparse
 
 import pytest
 from starlette.testclient import TestClient
 
 from hermes_cli import web_server
+from hermes_cli.dashboard_auth import clear_providers, register_provider
+from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
 
 
 def _client_with_app_state():
@@ -64,6 +67,41 @@ def local_files_client(monkeypatch, tmp_path):
     finally:
         _close_client(client)
         _restore_app_state(prev_auth_required, prev_bound_host)
+
+
+@pytest.fixture
+def authenticated_files_client(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.delenv("HERMES_DASHBOARD_FILES_ROOT", raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(home / ".hermes"))
+    clear_providers()
+    register_provider(StubAuthProvider())
+    prev_auth_required = getattr(web_server.app.state, "auth_required", None)
+    prev_bound_host = getattr(web_server.app.state, "bound_host", None)
+    prev_bound_port = getattr(web_server.app.state, "bound_port", None)
+    web_server.app.state.auth_required = True
+    web_server.app.state.bound_host = "example.test"
+    web_server.app.state.bound_port = 443
+    client = TestClient(web_server.app, base_url="https://example.test")
+    try:
+        login = client.get("/auth/login?provider=stub", follow_redirects=False)
+        assert login.status_code == 302
+        location = login.headers["location"]
+        state = urlparse(location).query.split("state=", 1)[1]
+        callback = client.get(f"/auth/callback?code=stub_code&state={state}", follow_redirects=False)
+        assert callback.status_code == 302
+        yield client, home
+    finally:
+        _close_client(client)
+        clear_providers()
+        _restore_app_state(prev_auth_required, prev_bound_host)
+        if prev_bound_port is None:
+            if hasattr(web_server.app.state, "bound_port"):
+                delattr(web_server.app.state, "bound_port")
+        else:
+            web_server.app.state.bound_port = prev_bound_port
 
 
 def test_forced_root_file_upload_list_read_delete_roundtrip(forced_files_client):
@@ -218,6 +256,33 @@ def test_gated_local_mode_still_defaults_to_home(monkeypatch, tmp_path):
     assert policy.default_path == home.resolve()
     assert policy.locked_root is None
     assert policy.can_change_path is True
+
+
+def test_authenticated_mode_rejects_control_plane_file_apis(authenticated_files_client):
+    client, home = authenticated_files_client
+    existing = home / "existing.txt"
+    existing.write_text("keep")
+    upload_target = home / "upload.txt"
+    mkdir_target = home / "new-dir"
+
+    assert client.get("/api/files", params={"path": str(home)}).status_code == 403
+    assert client.get("/api/files/read", params={"path": str(existing)}).status_code == 403
+    assert client.get("/api/files/download", params={"path": str(existing)}).status_code == 403
+    assert client.post(
+        "/api/files/upload",
+        json={"path": str(upload_target), "data_url": "data:text/plain;base64,bm8="},
+    ).status_code == 403
+    assert client.post(
+        "/api/files/upload-stream",
+        data={"path": str(upload_target), "overwrite": "true"},
+        files={"file": ("upload.txt", b"no", "text/plain")},
+    ).status_code == 403
+    assert client.post("/api/files/mkdir", json={"path": str(mkdir_target)}).status_code == 403
+    assert client.request("DELETE", "/api/files", json={"path": str(existing)}).status_code == 403
+
+    assert existing.read_text() == "keep"
+    assert not upload_target.exists()
+    assert not mkdir_target.exists()
 
 
 def test_local_mode_upload_read_mkdir_delete_roundtrip(local_files_client):

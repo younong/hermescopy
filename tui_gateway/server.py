@@ -24,6 +24,7 @@ from hermes_constants import (
     set_hermes_home_override,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.owner_runtime import is_owner_worker_env, resolve_workspace_cwd
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
@@ -912,6 +913,10 @@ def _db_unavailable_error(rid, *, code: int):
 def _profile_home(profile: str | None) -> Path | None:
     """Resolve a named profile's home on THIS host, or None for the launch profile."""
     name = (profile or "").strip()
+    if os.environ.get("HERMES_OWNER_KEY", "").strip():
+        if not name or name.lower() in {"current", "default"}:
+            return None
+        raise ValueError("profile selection is not available in authenticated mode")
     if not name:
         return None
     try:
@@ -1367,6 +1372,26 @@ def _normalize_completion_path(path_part: str) -> str:
     return expanded
 
 
+def _owner_worker_mode() -> bool:
+    return is_owner_worker_env()
+
+
+def _owner_default_cwd() -> str:
+    return str(resolve_workspace_cwd(None, create_default=True))
+
+
+def _owner_cwd_is_omitted(raw: Any | None) -> bool:
+    return raw is None or not str(raw).strip()
+
+
+def _owner_workspace_cwd(raw: Any | None, *, fallback_default: bool = False) -> str:
+    if _owner_cwd_is_omitted(raw):
+        if fallback_default:
+            return _owner_default_cwd()
+        return str(resolve_workspace_cwd(None, create_default=False))
+    return str(resolve_workspace_cwd(raw, create_default=fallback_default))
+
+
 def _completion_cwd(params: dict | None = None) -> str:
     params = params or {}
     raw = (
@@ -1376,8 +1401,10 @@ def _completion_cwd(params: dict | None = None) -> str:
         # profile's config before falling back to the launch profile's env var.
         or _profile_configured_cwd(_profile_home(params.get("profile")))
         or os.environ.get("TERMINAL_CWD")
-        or os.getcwd()
     )
+    if _owner_worker_mode():
+        return _owner_workspace_cwd(raw, fallback_default=True)
+    raw = raw or os.getcwd()
     try:
         resolved = os.path.abspath(os.path.expanduser(str(raw)))
         if os.path.isdir(resolved):
@@ -1395,6 +1422,8 @@ def _terminal_task_cwd(session: dict | None) -> str:
     inside the target environment, so an SSH path like /home/user/workspace may
     not exist on the local macOS host but is still the correct execution cwd.
     """
+    if _owner_worker_mode():
+        return _session_cwd(session)
     backend = (os.environ.get("TERMINAL_ENV") or "").strip().lower()
     if backend and backend != "local":
         raw = os.environ.get("TERMINAL_CWD", "").strip()
@@ -1423,6 +1452,8 @@ _resolve_cwd_git = git_probe.resolve
 
 def _session_cwd(session: dict | None) -> str:
     if session and session.get("cwd"):
+        if _owner_worker_mode():
+            return _owner_workspace_cwd(session.get("cwd"), fallback_default=False)
         return str(session["cwd"])
     return _completion_cwd()
 
@@ -1756,9 +1787,15 @@ def _persist_session_git_meta(session: dict, cwd: str) -> None:
 
 
 def _set_session_cwd(session: dict, cwd: str) -> str:
-    resolved = os.path.abspath(os.path.expanduser(str(cwd)))
-    if not os.path.isdir(resolved):
-        raise ValueError(f"working directory does not exist: {cwd}")
+    if _owner_worker_mode():
+        try:
+            resolved = _owner_workspace_cwd(cwd, fallback_default=False)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+    else:
+        resolved = os.path.abspath(os.path.expanduser(str(cwd)))
+        if not os.path.isdir(resolved):
+            raise ValueError(f"working directory does not exist: {cwd}")
     session["cwd"] = resolved
     # An explicit user choice — persist it as the workspace (and let a later
     # lazy row creation persist it too, not the launch-dir fallback).
@@ -1791,6 +1828,15 @@ _INDICATOR_STYLES: tuple[str, ...] = ("ascii", "emoji", "kaomoji", "unicode")
 _INDICATOR_DEFAULT = "kaomoji"
 
 
+def _active_config_home() -> Path:
+    override = get_hermes_home_override()
+    if isinstance(override, str) and override:
+        return Path(override)
+    if _owner_worker_mode():
+        return get_hermes_home()
+    return _hermes_home
+
+
 def _load_cfg() -> dict:
     global _cfg_cache, _cfg_mtime, _cfg_path
     try:
@@ -1798,11 +1844,10 @@ def _load_cfg() -> dict:
 
         # Honor a per-session profile override (see session.resume) so a resumed
         # remote profile loads ITS config (model, skills, prompt); otherwise the
-        # launch profile's _hermes_home. Cache is keyed on the resolved path, so
-        # profiles don't clobber each other.
-        override = get_hermes_home_override()
-        home = override if isinstance(override, str) and override else _hermes_home
-        p = Path(home) / "config.yaml"
+        # launch profile's _hermes_home. In owner-worker mode, HERMES_HOME is the
+        # immutable owner home and must win over any import-time Control Plane home.
+        # Cache is keyed on the resolved path, so profiles/owners don't clobber each other.
+        p = _active_config_home() / "config.yaml"
         mtime = p.stat().st_mtime if p.exists() else None
         with _cfg_lock:
             if _cfg_cache is not None and _cfg_mtime == mtime and _cfg_path == p:
@@ -1847,7 +1892,7 @@ def _save_cfg(cfg: dict):
 
     from utils import atomic_yaml_write
 
-    path = _hermes_home / "config.yaml"
+    path = _active_config_home() / "config.yaml"
     atomic_yaml_write(path, cfg)
     with _cfg_lock:
         _cfg_cache = copy.deepcopy(cfg)
@@ -5408,7 +5453,17 @@ def _(rid, params: dict) -> dict:
         profile_home
     )
 
+    def _resume_fallback_cwd() -> str:
+        if profile_resume_cwd:
+            return _owner_workspace_cwd(profile_resume_cwd, fallback_default=False) if _owner_worker_mode() else profile_resume_cwd
+        if _owner_worker_mode():
+            return _owner_default_cwd()
+        return os.getenv("TERMINAL_CWD", os.getcwd())
+
     def _reuse_live_payload(sid: str, session: dict) -> dict:
+        source = str(params.get("source") or "").strip()
+        if source:
+            session["source"] = source
         payload = _live_session_payload(
             sid,
             session,
@@ -5452,7 +5507,7 @@ def _(rid, params: dict) -> dict:
             if lease is not None:
                 lease.release()
             return _err(rid, 5000, f"resume failed: {e}")
-        cwd = profile_resume_cwd or os.getenv("TERMINAL_CWD", os.getcwd())
+        cwd = _resume_fallback_cwd()
         record = _deferred_session_record(
             target,
             cols=cols,
@@ -5525,7 +5580,7 @@ def _(rid, params: dict) -> dict:
         # the build drops the provider ("No LLM provider configured").
         overrides = _stored_session_runtime_overrides(found) or {}
         model_override = overrides.get("model_override") or {}
-        cwd = profile_resume_cwd or os.getenv("TERMINAL_CWD", os.getcwd())
+        cwd = _resume_fallback_cwd()
         record = _deferred_session_record(
             target,
             cols=cols,
