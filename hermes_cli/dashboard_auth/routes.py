@@ -458,6 +458,10 @@ class _PasswordLoginBody(BaseModel):
     next: str = ""
 
 
+class _WsTicketBody(BaseModel):
+    audience: str
+
+
 @router.post("/auth/password-login", name="auth_password_login")
 async def auth_password_login(request: Request, body: _PasswordLoginBody):
     """Authenticate a username/password against a password provider.
@@ -552,20 +556,55 @@ async def auth_password_login(request: Request, body: _PasswordLoginBody):
 @router.post("/auth/logout", name="auth_logout")
 async def auth_logout(request: Request):
     _at, rt = read_session_cookies(request)
-    if rt:
-        # Best-effort revoke. Try every provider so a session minted by
-        # any registered provider is revoked correctly. Failures are
-        # logged but never raised.
+    sess = getattr(request.state, "session", None)
+    try:
+        from hermes_cli.dashboard_auth.middleware import (
+            revoke_session_authority,
+            verified_access_session,
+        )
+
+        # Logout is intentionally public so a stale/no-cookie request remains
+        # idempotent. Only a fresh provider verification authorizes revocation.
+        verified_session = verified_access_session(request)
+        if sess is None:
+            sess = verified_session
+        if verified_session is not None:
+            _scope, authority_state = revoke_session_authority(
+                verified_session, reason="logout"
+            )
+            from hermes_cli.web_server import close_authorized_bridges_by_changes
+
+            await close_authorized_bridges_by_changes(
+                request.app,
+                authority_state.changes,
+                reason="logout",
+            )
+    except Exception as exc:
+        if sess is not None:
+            # A verified session must not receive a successful logout response
+            # while its browser capabilities remain live. Cookie clearing is
+            # still included so a subsequent request cannot reuse the session.
+            _log.warning("dashboard-auth: logout authority revoke failed: %s", exc)
+            resp = JSONResponse(
+                {"detail": "Logout authorization revocation is unavailable"},
+                status_code=503,
+            )
+            clear_session_cookies(resp, prefix=_prefix(request))
+            clear_pkce_cookie(resp, prefix=_prefix(request))
+            return resp
+
+    if rt and sess is not None:
+        # Provider revocation follows the durable local authority revoke and is
+        # best effort: an IdP transport failure cannot resurrect capabilities.
         for provider in list_providers():
             try:
                 provider.revoke_session(refresh_token=rt)
-            except Exception as e:  # noqa: BLE001 — best-effort
+            except Exception as exc:  # noqa: BLE001 — best-effort
                 _log.warning(
                     "dashboard-auth: revoke on %r failed: %s",
-                    provider.name, e,
+                    provider.name, exc,
                 )
 
-    sess = getattr(request.state, "session", None)
     audit_log(
         AuditEvent.LOGOUT,
         provider=(sess.provider if sess else "unknown"),
@@ -612,7 +651,7 @@ async def api_auth_me(request: Request):
 
 
 @router.post("/api/auth/ws-ticket", name="auth_ws_ticket")
-async def api_auth_ws_ticket(request: Request):
+async def api_auth_ws_ticket(request: Request, body: _WsTicketBody):
     """Mint a short-lived single-use ticket for the authenticated session.
 
     Browsers cannot set ``Authorization`` on a WebSocket upgrade, so in
@@ -630,20 +669,53 @@ async def api_auth_ws_ticket(request: Request):
 
     # Import here so the routes module stays usable in test contexts that
     # don't load the ticket store.
-    from hermes_cli.dashboard_auth.ws_tickets import TTL_SECONDS, mint_ticket
-
-    owner = owner_context_from_session(sess)
-    ticket = mint_ticket(
-        user_id=sess.user_id,
-        provider=sess.provider,
-        org_id=sess.org_id,
-        tenant_id=owner.tenant_id,
-        owner_key=owner.owner_key,
+    from hermes_cli.dashboard_auth.audit import (
+        AuthorityAuditEvent,
+        audit_authority,
+        new_authority_correlation_id,
     )
-    audit_log(
-        AuditEvent.WS_TICKET_MINTED,
-        provider=sess.provider,
-        user_id=sess.user_id,
-        ip=_client_ip(request),
+    from hermes_cli.dashboard_auth.ws_tickets import (
+        TTL_SECONDS,
+        authority_store,
+        mint_ticket,
+    )
+    correlation_id = new_authority_correlation_id()
+
+    provider = get_provider(sess.provider)
+    if provider is None:
+        raise HTTPException(status_code=503, detail="Session provider is unavailable")
+    try:
+        session_id, membership_revision = provider.authorization_state(sess)
+        owner = owner_context_from_session(sess)
+        ticket = mint_ticket(
+            user_id=sess.user_id,
+            provider=sess.provider,
+            org_id=sess.org_id,
+            tenant_id=owner.tenant_id,
+            owner_key=owner.owner_key,
+            audience=body.audience,
+            session_id=session_id,
+            membership_revision=membership_revision,
+            store=authority_store(),
+        )
+    except ValueError as exc:
+        audit_authority(
+            AuthorityAuditEvent.TICKET_REJECTED,
+            correlation_id=correlation_id,
+            reason="unsupported_audience",
+        )
+        raise HTTPException(status_code=400, detail="Unsupported WebSocket audience") from exc
+    except Exception as exc:
+        _log.warning("dashboard-auth: WS ticket authority unavailable")
+        audit_authority(
+            AuthorityAuditEvent.AVAILABILITY_FAILURE,
+            correlation_id=correlation_id,
+            reason="ticket_mint_unavailable",
+        )
+        raise HTTPException(status_code=503, detail="WebSocket authorization is unavailable") from exc
+    audit_authority(
+        AuthorityAuditEvent.TICKET_MINTED,
+        correlation_id=correlation_id,
+        reason="minted",
     )
     return {"ticket": ticket, "ttl_seconds": TTL_SECONDS}

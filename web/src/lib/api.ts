@@ -228,10 +228,12 @@ async function getSessionToken(): Promise<string> {
  * Tickets are single-use and TTL=30s — every WS connect attempt must
  * fetch a fresh ticket.
  */
-export async function getWsTicket(): Promise<{ ticket: string; ttl_seconds: number }> {
+export async function getWsTicket(path: string): Promise<{ ticket: string; ttl_seconds: number }> {
   const res = await fetch(`${BASE}/api/auth/ws-ticket`, {
     method: "POST",
     credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ audience: `browser-ws:${path}` }),
   });
   if (!res.ok) {
     throw new Error(`/api/auth/ws-ticket: HTTP ${res.status}`);
@@ -244,9 +246,9 @@ export async function getWsTicket(): Promise<{ ticket: string; ttl_seconds: numb
  * connect. In gated mode mints a fresh single-use ticket; in loopback
  * mode returns the injected session token.
  */
-export async function buildWsAuthParam(): Promise<[string, string]> {
+export async function buildWsAuthParam(path: string): Promise<[string, string]> {
   if (window.__HERMES_AUTH_REQUIRED__) {
-    const { ticket } = await getWsTicket();
+    const { ticket } = await getWsTicket(path);
     return ["ticket", ticket];
   }
   const token = window.__HERMES_SESSION_TOKEN__ ?? "";
@@ -304,7 +306,7 @@ export async function buildWsUrl(
   params?: Record<string, string>,
 ): Promise<string> {
   return buildHermesWebSocketUrl({
-    authParam: await buildWsAuthParam(),
+    authParam: await buildWsAuthParam(path),
     basePath: BASE,
     params,
     path,

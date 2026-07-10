@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 from hermes_cli import web_server
 from hermes_cli.dashboard_auth import clear_providers, register_provider
 from hermes_cli.dashboard_auth.cookies import SESSION_AT_COOKIE
+from hermes_cli.dashboard_auth.ws_tickets import TicketInvalid, consume_ticket
 from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
 
 
@@ -353,6 +354,85 @@ def test_invalid_cookie_redirects_on_html(gated_app):
     assert r.status_code == 302
     # Phase 6: gate carries a ``next=`` so post-login bounces back to /.
     assert r.headers["location"] in ("/login", "/login?next=%2F")
+
+
+def test_logout_revokes_only_verified_sessions_ticket(gated_app):
+    _complete_stub_login(gated_app)
+    minted = gated_app.post(
+        "/api/auth/ws-ticket", json={"audience": "browser-ws:/api/pty"}
+    )
+    assert minted.status_code == 200
+
+    logged_out = gated_app.post("/auth/logout", follow_redirects=False)
+
+    assert logged_out.status_code == 302
+    with pytest.raises(TicketInvalid, match="session_revoked"):
+        consume_ticket(minted.json()["ticket"])
+
+
+def test_logout_without_a_trusted_session_is_idempotent(gated_app):
+    first = gated_app.post("/auth/logout", follow_redirects=False)
+    second = gated_app.post("/auth/logout", follow_redirects=False)
+
+    assert first.status_code == 302
+    assert second.status_code == 302
+
+
+def test_provider_outage_logout_does_not_revoke_unverified_cookie_ticket(gated_app, monkeypatch):
+    _complete_stub_login(gated_app)
+    minted = gated_app.post(
+        "/api/auth/ws-ticket", json={"audience": "browser-ws:/api/pty"}
+    )
+    assert minted.status_code == 200
+
+    from hermes_cli.dashboard_auth import get_provider
+    from hermes_cli.dashboard_auth.base import ProviderError
+
+    provider = get_provider("stub")
+    assert provider is not None
+    monkeypatch.setattr(
+        provider,
+        "verify_session",
+        lambda *, access_token: (_ for _ in ()).throw(ProviderError("unavailable")),
+    )
+
+    response = gated_app.post("/auth/logout", follow_redirects=False)
+
+    assert response.status_code == 302
+    assert consume_ticket(minted.json()["ticket"])["user_id"] == "stub-user-1"
+
+
+def test_membership_transition_revokes_old_ticket_and_accepts_new_ticket(gated_app, monkeypatch):
+    _complete_stub_login(gated_app)
+    old_ticket = gated_app.post(
+        "/api/auth/ws-ticket", json={"audience": "browser-ws:/api/pty"}
+    ).json()["ticket"]
+
+    from hermes_cli.dashboard_auth import get_provider
+
+    provider = get_provider("stub")
+    assert provider is not None
+    original = provider.authorization_state
+    access_token = next(
+        value.strip('"')
+        for name, value in dict(gated_app.cookies).items()
+        if name.endswith("hermes_session_at")
+    )
+    session_id, _revision = original(
+        provider.verify_session(access_token=access_token)
+    )
+    monkeypatch.setattr(
+        provider, "authorization_state", lambda _session: (session_id, "membership-v2")
+    )
+
+    assert gated_app.get("/api/auth/me").status_code == 200
+    with pytest.raises(TicketInvalid, match="membership_revision_mismatch"):
+        consume_ticket(old_ticket)
+
+    new_ticket = gated_app.post(
+        "/api/auth/ws-ticket", json={"audience": "browser-ws:/api/pty"}
+    ).json()["ticket"]
+    assert consume_ticket(new_ticket)["membership_revision"] == "membership-v2"
 
 
 def test_logout_clears_cookies_and_redirects_to_login(gated_app):

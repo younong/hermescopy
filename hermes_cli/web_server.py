@@ -174,6 +174,11 @@ async def _lifespan(app: "FastAPI"):
     app.state.pty_active_session_files = {}  # dict[str, Path]
     app.state.pty_browser_sessions = {}  # browser_id -> active /api/pty owner
     app.state.pty_browser_lock = asyncio.Lock()
+    app.state.authorized_ws_bridges = {}  # scope digest -> {(websocket, epoch)}
+    app.state.authorized_ws_bridge_lock = asyncio.Lock()
+    app.state.authority_change_sequence = 0
+    app.state.authority_change_stop = asyncio.Event()
+    app.state.authority_change_task = None
     # Serializes chat-argv resolution so concurrent /api/pty connections
     # don't trigger overlapping ``npm install`` / ``npm run build`` work.
     # On app.state (not a module global) so the Lock binds to the running
@@ -206,6 +211,16 @@ async def _lifespan(app: "FastAPI"):
     try:
         yield
     finally:
+        authority_change_stop = getattr(app.state, "authority_change_stop", None)
+        authority_change_task = getattr(app.state, "authority_change_task", None)
+        if authority_change_stop is not None:
+            authority_change_stop.set()
+        if authority_change_task is not None:
+            authority_change_task.cancel()
+            try:
+                await authority_change_task
+            except asyncio.CancelledError:
+                pass
         if cron_stop is not None:
             cron_stop.set()
 
@@ -12150,6 +12165,10 @@ class _WsAuthResult:
     reason: Optional[str]
     credential: str
     payload: Optional[dict[str, Any]] = None
+    # Ephemeral verified-session expiry. It is never signed ticket material and
+    # never forwarded to an Owner Worker; bridge admission uses it to terminate
+    # a browser connection when its current access session expires.
+    session_expires_at: Optional[int] = None
 
 
 def _ws_app_state(ws: "WebSocket") -> Any:
@@ -12213,10 +12232,24 @@ def _ws_auth_result(ws: "WebSocket") -> _WsAuthResult:
     if auth_required:
         # Lazy import — keeps this function importable in test harnesses
         # that don't bring in the dashboard_auth layer.
-        from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
+        from hermes_cli.dashboard_auth.audit import (
+            AuditEvent,
+            AuthorityAuditEvent,
+            audit_authority,
+            audit_log,
+            new_authority_correlation_id,
+        )
+        from hermes_cli.dashboard_auth.middleware import (
+            WebSocketSessionRejected,
+            WebSocketSessionUnavailable,
+            verify_websocket_ticket_session,
+        )
         from hermes_cli.dashboard_auth.ws_tickets import (
             TicketInvalid,
+            authority_store,
+            browser_ws_audience,
             consume_ticket,
+            verify_ticket,
         )
 
         # Owner-worker-spawned children use a short-lived owner-bound token;
@@ -12260,16 +12293,59 @@ def _ws_auth_result(ws: "WebSocket") -> _WsAuthResult:
         ticket = ws.query_params.get("ticket", "")
         if not ticket:
             return _WsAuthResult("no_credential", "none")
+        authority_correlation_id = new_authority_correlation_id()
 
         try:
-            payload = consume_ticket(ticket)
-            return _WsAuthResult(None, "ticket", payload)
+            audience = browser_ws_audience(ws.url.path)
+            # Validate the ticket first without consuming it, then revalidate
+            # its cookie-bound provider session and membership state.  The
+            # authority transaction remains last so rejected upgrades cannot
+            # burn a valid browser capability.
+            ticket_store = authority_store()
+            payload = verify_ticket(ticket, audience=audience, store=ticket_store)
+            # Reconstruct before worker start/accept so signed-but-inconsistent
+            # principal material cannot become an owner routing input.
+            from hermes_cli.dashboard_auth.owner_context import owner_context_from_ticket_payload
+            owner_context_from_ticket_payload(payload)
+            session = verify_websocket_ticket_session(ws, payload)
+            payload = consume_ticket(ticket, audience=audience, store=ticket_store)
+            audit_authority(
+                AuthorityAuditEvent.TICKET_ADMITTED,
+                correlation_id=authority_correlation_id,
+                reason="admitted",
+                epoch=int(payload["epoch"]),
+            )
+            return _WsAuthResult(
+                None,
+                "ticket",
+                payload,
+                session_expires_at=int(session.expires_at),
+            )
+        except WebSocketSessionUnavailable:
+            audit_authority(
+                AuthorityAuditEvent.AVAILABILITY_FAILURE,
+                correlation_id=authority_correlation_id,
+                reason="session_authority_unavailable",
+            )
+            return _WsAuthResult("authority_unavailable", "ticket")
         except TicketInvalid as exc:
-            audit_log(
-                AuditEvent.WS_TICKET_REJECTED,
-                reason=str(exc),
-                ip=(ws.client.host if ws.client else ""),
-                path=ws.url.path,
+            reason = str(exc)
+            audit_authority(
+                AuthorityAuditEvent.AVAILABILITY_FAILURE
+                if reason in {"authority_unavailable", "replay_continuity_unavailable"}
+                else AuthorityAuditEvent.TICKET_REJECTED,
+                correlation_id=authority_correlation_id,
+                reason=("authority_unavailable" if reason in {"authority_unavailable", "replay_continuity_unavailable"} else "ticket_rejected"),
+            )
+            return _WsAuthResult(
+                "authority_unavailable" if reason in {"authority_unavailable", "replay_continuity_unavailable"} else "ticket_invalid",
+                "ticket",
+            )
+        except (ValueError, WebSocketSessionRejected):
+            audit_authority(
+                AuthorityAuditEvent.TICKET_REJECTED,
+                correlation_id=authority_correlation_id,
+                reason="ticket_rejected",
             )
             return _WsAuthResult("ticket_invalid", "ticket")
 
@@ -12351,6 +12427,139 @@ async def _connect_owner_worker_ws(socket_path: Path, uri: str, *, open_timeout:
         return await unix_connect(uri=uri, path=str(socket_path), **kwargs)
     except TypeError:
         return await unix_connect(str(socket_path), uri=uri, **kwargs)
+
+
+def _authorized_ws_bridge_state(
+    app_obj: Any,
+) -> tuple[dict[str, set[tuple[Any, int]]], asyncio.Lock]:
+    """Return Control-Plane browser bridge state for ``app_obj``.
+
+    Each registration retains the admission epoch.  A later membership change
+    may keep the same scope digest, so closing by scope alone would incorrectly
+    terminate a newly admitted bridge carrying the new epoch.
+    """
+    try:
+        return app_obj.state.authorized_ws_bridges, app_obj.state.authorized_ws_bridge_lock
+    except AttributeError:
+        app_obj.state.authorized_ws_bridges = {}
+        app_obj.state.authorized_ws_bridge_lock = asyncio.Lock()
+        app_obj.state.authority_change_sequence = 0
+        app_obj.state.authority_change_stop = asyncio.Event()
+        app_obj.state.authority_change_task = None
+        return app_obj.state.authorized_ws_bridges, app_obj.state.authorized_ws_bridge_lock
+
+
+async def _close_authorized_bridge_targets(
+    app_obj: Any,
+    targets: tuple[Any, ...],
+    *,
+    reason: str,
+) -> None:
+    for ws in targets:
+        try:
+            await ws.close(code=4401, reason=_ws_close_reason(f"auth: {reason}"))
+        except Exception:
+            _log.debug("failed to close revoked browser websocket", exc_info=True)
+
+
+async def close_authorized_bridges_by_digest(
+    app_obj: Any,
+    scope_digests: tuple[str, ...],
+    *,
+    reason: str,
+) -> None:
+    """Close every local browser bridge for explicitly revoked scopes."""
+    bridges, lock = _authorized_ws_bridge_state(app_obj)
+    async with lock:
+        targets = tuple(
+            ws
+            for digest in scope_digests
+            for ws, _epoch in bridges.pop(str(digest), set())
+        )
+    await _close_authorized_bridge_targets(app_obj, targets, reason=reason)
+
+
+async def close_authorized_bridges_by_changes(
+    app_obj: Any,
+    changes: tuple[Any, ...],
+    *,
+    reason: str,
+) -> None:
+    """Apply shared authority transitions to locally registered bridges."""
+    if not changes:
+        return
+    bridges, lock = _authorized_ws_bridge_state(app_obj)
+    async with lock:
+        targets: list[Any] = []
+        for change in changes:
+            digest = str(change.scope_digest)
+            registrations = bridges.get(digest, set())
+            kept: set[tuple[Any, int]] = set()
+            for ws, admitted_epoch in registrations:
+                if bool(change.revoked) or admitted_epoch < int(change.epoch):
+                    targets.append(ws)
+                else:
+                    kept.add((ws, admitted_epoch))
+            if kept:
+                bridges[digest] = kept
+            else:
+                bridges.pop(digest, None)
+    await _close_authorized_bridge_targets(app_obj, tuple(targets), reason=reason)
+
+
+async def close_authorized_bridges(app_obj: Any, scope: Any, *, reason: str) -> None:
+    """Close local browser bridges for a revoked authority scope."""
+    await close_authorized_bridges_by_digest(
+        app_obj, (str(scope.digest),), reason=reason
+    )
+
+
+async def _watch_authority_changes(app_obj: Any) -> None:
+    """Dispatch shared authority transitions to this replica's bridge registry."""
+    from hermes_cli.dashboard_auth.ws_tickets import authority_store
+
+    state = app_obj.state
+    while not state.authority_change_stop.is_set():
+        try:
+            changes = await asyncio.to_thread(
+                authority_store().changes_since,
+                int(state.authority_change_sequence),
+            )
+        except Exception:
+            # A replica that cannot read the shared authority cannot safely keep
+            # authenticated long-lived connections alive. Admission is already
+            # fail-closed; end the local bridges too rather than retrying while
+            # they continue with stale authority.
+            _log.warning("authority change dispatch unavailable; closing local browser bridges")
+            bridges, lock = _authorized_ws_bridge_state(app_obj)
+            async with lock:
+                targets = tuple(
+                    ws for registrations in bridges.values() for ws, _epoch in registrations
+                )
+                bridges.clear()
+            await _close_authorized_bridge_targets(
+                app_obj, targets, reason="authority_unavailable"
+            )
+            return
+        if changes:
+            await close_authorized_bridges_by_changes(
+                app_obj, changes, reason="authority_transition"
+            )
+            state.authority_change_sequence = changes[-1].sequence
+        try:
+            await asyncio.wait_for(state.authority_change_stop.wait(), timeout=0.25)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def _ensure_authority_change_dispatcher(app_obj: Any) -> None:
+    """Start one shared-authority watcher for the local Control Plane."""
+    _authorized_ws_bridge_state(app_obj)
+    state = app_obj.state
+    task = getattr(state, "authority_change_task", None)
+    if task is None or task.done():
+        state.authority_change_stop = asyncio.Event()
+        state.authority_change_task = asyncio.create_task(_watch_authority_changes(app_obj))
 
 
 def _owner_context_from_ws_auth_result(auth_result: _WsAuthResult) -> Any:
@@ -12436,7 +12645,39 @@ async def _bridge_websocket_to_owner_worker(
         return
 
     await ws.accept()
+    bridge_scope: Any | None = None
+    bridge_scope_digest: str | None = None
+    if auth_result.credential == "ticket":
+        from hermes_cli.dashboard_auth.authority import AuthorizationScope
+
+        bridge_scope = AuthorizationScope(
+            provider=str(auth_result.payload["provider"]),
+            tenant_id=str(auth_result.payload["tenant_id"]),
+            user_id=str(auth_result.payload["user_id"]),
+            session_id=str(auth_result.payload["session_id"]),
+            membership_revision=str(auth_result.payload["membership_revision"]),
+        )
+        bridge_scope_digest = bridge_scope.digest
+        await _ensure_authority_change_dispatcher(ws.app)
+        bridges, bridge_lock = _authorized_ws_bridge_state(ws.app)
+        async with bridge_lock:
+            bridges.setdefault(bridge_scope_digest, set()).add(
+                (ws, int(auth_result.payload["epoch"]))
+            )
     _log.info("owner websocket bridged path=%s owner=%s", path, owner.owner_key)
+
+    async def expire_browser_session() -> None:
+        expires_at = auth_result.session_expires_at
+        if expires_at is None:
+            return
+        delay = max(0, expires_at - int(time.time()))
+        await asyncio.sleep(delay)
+        try:
+            await ws.close(code=4401, reason=_ws_close_reason("auth: session_expired"))
+        except Exception:
+            _log.debug("failed to close expired browser websocket", exc_info=True)
+
+    expiry_task = asyncio.create_task(expire_browser_session())
 
     async def browser_to_worker() -> None:
         try:
@@ -12495,6 +12736,25 @@ async def _bridge_websocket_to_owner_worker(
             except Exception:
                 pass
     finally:
+        expiry_task.cancel()
+        try:
+            await expiry_task
+        except asyncio.CancelledError:
+            pass
+        if bridge_scope_digest is not None:
+            bridges, bridge_lock = _authorized_ws_bridge_state(ws.app)
+            async with bridge_lock:
+                registered = bridges.get(bridge_scope_digest)
+                if registered is not None:
+                    registered = {
+                        (registered_ws, admitted_epoch)
+                        for registered_ws, admitted_epoch in registered
+                        if registered_ws is not ws
+                    }
+                    if registered:
+                        bridges[bridge_scope_digest] = registered
+                    else:
+                        bridges.pop(bridge_scope_digest, None)
         try:
             await worker_ws.close()
         except Exception:

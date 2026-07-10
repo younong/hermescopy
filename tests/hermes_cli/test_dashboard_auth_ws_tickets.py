@@ -30,10 +30,16 @@ from hermes_cli.dashboard_auth.owner_context import (
 )
 from hermes_cli.dashboard_auth.ws_tickets import (
     TTL_SECONDS,
+    begin_browser_ticket_key_rotation,
+    browser_ticket_keyring_backup_paths,
+    complete_browser_ticket_key_rotation,
+    complete_browser_ticket_replay_recovery,
     TicketInvalid,
     _reset_for_tests,
+    browser_ws_audience,
     consume_ticket,
     mint_ticket,
+    verify_ticket,
 )
 
 
@@ -353,6 +359,38 @@ class TestMintAndConsume:
 # ---------------------------------------------------------------------------
 
 
+class TestSignedClaims:
+    def test_ticket_carries_signed_epoch_jti_and_exact_audience(self):
+        ticket = mint_ticket(
+            user_id="u1",
+            provider="stub",
+            tenant_id="tenant-1",
+            owner_key="ok1_owner",
+            audience=browser_ws_audience("/api/ws"),
+        )
+
+        payload = verify_ticket(ticket, audience=browser_ws_audience("/api/ws"))
+
+        assert payload["typ"] == "browser-ws"
+        assert payload["iss"] == "bwt1"
+        assert payload["aud"] == "browser-ws:/api/ws"
+        assert isinstance(payload["jti"], str) and payload["jti"]
+        assert payload["epoch"] == 0
+        assert payload["recovery_generation"] == 0
+
+    def test_ticket_rejects_wrong_public_route_audience(self):
+        ticket = mint_ticket(
+            user_id="u1",
+            provider="stub",
+            tenant_id="tenant-1",
+            owner_key="ok1_owner",
+            audience=browser_ws_audience("/api/ws"),
+        )
+
+        with pytest.raises(TicketInvalid, match="ticket_audience_mismatch"):
+            verify_ticket(ticket, audience=browser_ws_audience("/api/pty"))
+
+
 class TestSingleUse:
     def test_second_consume_raises(self):
         ticket = mint_ticket(user_id="u1", provider="stub")
@@ -463,6 +501,63 @@ class TestConcurrency:
 # — _ws_auth_ok exercises these indirectly, but the mint-once, unminted, and
 # empty-value branches are only reachable via direct calls.
 # ---------------------------------------------------------------------------
+
+
+class TestBrowserTicketKeyring:
+    def test_rotation_retains_old_issuer_for_ticket_ttl(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        now = int(ws_tickets.time.time())
+        old_ticket = mint_ticket(user_id="u1", provider="stub", now=now)
+        assert verify_ticket(old_ticket, now=now)["iss"] == "bwt1"
+
+        begin_browser_ticket_key_rotation("next-ticket-secret", next_issuer="bwt2")
+        assert verify_ticket(old_ticket, now=now + 1)["iss"] == "bwt1"
+        complete_browser_ticket_key_rotation(now=now + 1)
+        new_ticket = mint_ticket(user_id="u1", provider="stub", now=now + 2)
+
+        assert verify_ticket(old_ticket, now=now + TTL_SECONDS)["iss"] == "bwt1"
+        assert verify_ticket(new_ticket, now=now + 2)["iss"] == "bwt2"
+        with pytest.raises(TicketInvalid, match="issuer_expired"):
+            verify_ticket(old_ticket, now=now + TTL_SECONDS + 2)
+
+    def test_owner_worker_uses_explicit_control_home_only(self, tmp_path, monkeypatch):
+        owner_home = tmp_path / "users" / "ok1_owner"
+        owner_home.mkdir(parents=True)
+        control_home = tmp_path / "control-plane"
+        control_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(owner_home))
+        monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_owner")
+        monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+
+        mint_ticket(user_id="u1", provider="stub")
+        assert browser_ticket_keyring_backup_paths() == (control_home / "browser_ws_ticket_keyring.json",)
+        assert not (owner_home / "control-plane").exists()
+
+    def test_owner_worker_without_control_home_fails_closed(self, tmp_path, monkeypatch):
+        owner_home = tmp_path / "users" / "ok1_owner"
+        owner_home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(owner_home))
+        monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_owner")
+        monkeypatch.delenv("HERMES_CONTROL_HOME", raising=False)
+
+        with pytest.raises((TicketInvalid, Exception)):
+            mint_ticket(user_id="u1", provider="stub")
+        assert not (owner_home / "control-plane").exists()
+
+    def test_replay_recovery_invalidates_old_ticket_and_allows_new_ticket(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        now = int(ws_tickets.time.time())
+        old_ticket = mint_ticket(user_id="u1", provider="stub", now=now)
+        from hermes_cli.dashboard_auth.ws_tickets import authority_store
+
+        authority_store().mark_replay_continuity_untrusted(reason="test")
+        with pytest.raises(TicketInvalid, match="continuity"):
+            consume_ticket(old_ticket, now=now + 1)
+
+        complete_browser_ticket_replay_recovery()
+        with pytest.raises(TicketInvalid, match="ticket_rejected"):
+            consume_ticket(old_ticket, now=now + 1)
+        assert consume_ticket(mint_ticket(user_id="u1", provider="stub", now=now + 1), now=now + 1)["user_id"] == "u1"
 
 
 class TestInternalCredential:

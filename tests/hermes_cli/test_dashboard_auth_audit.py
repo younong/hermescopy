@@ -9,7 +9,12 @@ from __future__ import annotations
 import json
 import pytest
 
-from hermes_cli.dashboard_auth.audit import audit_log, AuditEvent
+from hermes_cli.dashboard_auth.audit import (
+    AuditEvent,
+    AuthorityAuditEvent,
+    audit_authority,
+    audit_log,
+)
 
 
 @pytest.fixture
@@ -79,3 +84,59 @@ def test_audit_creates_logs_dir_if_missing(tmp_path, monkeypatch):
     audit_log(AuditEvent.LOGIN_START, provider="nous")
     assert (home / "logs").is_dir()
     assert (home / "logs" / "dashboard-auth.log").exists()
+
+
+def test_authority_audit_requires_correlation_id(profile_home):
+    with pytest.raises(ValueError, match="correlation_id"):
+        audit_authority(
+            AuthorityAuditEvent.TICKET_REJECTED,
+            correlation_id="",
+            reason="ticket_rejected",
+        )
+
+
+def test_authority_audit_is_allowlisted_and_control_plane_only(tmp_path, monkeypatch):
+    owner_home = tmp_path / "users" / "ok1_owner"
+    owner_home.mkdir(parents=True)
+    control_home = tmp_path / "control-plane"
+    control_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_owner")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+
+    audit_authority(
+        AuthorityAuditEvent.TICKET_REJECTED,
+        correlation_id="f" * 32,
+        reason="ticket_rejected",
+        epoch=4,
+        recovery_generation=2,
+        scope_digest="scope-digest",
+        credential_digest="credential-digest",
+        issuer_digest="issuer-digest",
+    )
+
+    path = control_home / "logs" / "authority.log"
+    assert path.exists()
+    assert not (owner_home / "logs" / "authority.log").exists()
+    entry = json.loads(path.read_text())
+    assert set(entry) == {
+        "ts", "event", "correlation_id", "reason", "audience_class",
+        "epoch", "recovery_generation", "scope_digest", "credential_digest",
+        "issuer_digest",
+    }
+    raw = path.read_text()
+    for forbidden in (str(owner_home), "ok1_owner", "HERMES_HOME"):
+        assert forbidden not in raw
+
+
+def test_authority_audit_has_no_sensitive_escape_hatch(profile_home):
+    audit_authority(
+        AuthorityAuditEvent.TICKET_REJECTED,
+        correlation_id="a" * 32,
+        reason="ticket_rejected",
+        audience_class="browser-ws",
+    )
+    raw = (profile_home / "control-plane" / "logs" / "authority.log").read_text()
+    assert "ticket_rejected" in raw
+    for forbidden in ("ticket=secret", "jti-value", "user@example.test", "/api/ws"):
+        assert forbidden not in raw

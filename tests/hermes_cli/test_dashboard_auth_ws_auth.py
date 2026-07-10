@@ -21,8 +21,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hermes_cli import web_server
-from hermes_cli.dashboard_auth import clear_providers, register_provider
-from hermes_cli.dashboard_auth.base import Session
+from hermes_cli.dashboard_auth import clear_providers, get_provider, register_provider
+from hermes_cli.dashboard_auth.base import ProviderError, Session
 from hermes_cli.dashboard_auth.owner_context import (
     owner_context_from_session,
     owner_context_from_ticket_payload,
@@ -32,6 +32,7 @@ from hermes_cli.dashboard_auth.ws_tickets import (
     consume_ticket,
     internal_ws_credential,
     mint_ticket,
+    verify_ticket,
 )
 from hermes_cli.owner_worker.tokens import (
     AUD_CONTROL_PLANE_WS,
@@ -129,7 +130,7 @@ class TestWsTicketEndpoint:
         assert me.status_code == 200
         me_body = me.json()
 
-        r = gated_app.post("/api/auth/ws-ticket")
+        r = gated_app.post("/api/auth/ws-ticket", json={"audience": "browser-ws:/api/pty"})
         assert r.status_code == 200
         body = r.json()
         assert "ticket" in body
@@ -159,8 +160,12 @@ class TestWsTicketEndpoint:
 
     def test_each_call_returns_a_distinct_ticket(self, gated_app):
         _logged_in(gated_app)
-        tickets = {gated_app.post("/api/auth/ws-ticket").json()["ticket"]
-                   for _ in range(5)}
+        tickets = {
+            gated_app.post(
+                "/api/auth/ws-ticket", json={"audience": "browser-ws:/api/pty"}
+            ).json()["ticket"]
+            for _ in range(5)
+        }
         assert len(tickets) == 5
 
     def test_get_method_is_not_allowed(self, gated_app):
@@ -211,7 +216,7 @@ def insecure_explicit_host_app():
     web_server.app.state.auth_required = prev_required
 
 
-def _fake_ws(*, query: dict, client_host: str = "127.0.0.1", path: str = "/api/pty", app=None):
+def _fake_ws(*, query: dict, client_host: str = "127.0.0.1", path: str = "/api/pty", app=None, cookies=None):
     """Build a stand-in for Starlette.WebSocket good enough for WS helpers."""
 
     class _QP:
@@ -227,6 +232,30 @@ def _fake_ws(*, query: dict, client_host: str = "127.0.0.1", path: str = "/api/p
         query_params=_QP(query),
         client=SimpleNamespace(host=client_host),
         url=SimpleNamespace(path=path, query=query_string),
+        cookies=cookies or {},
+    )
+
+
+def _browser_ticket_ws(gated_app, *, path: str = "/api/pty"):
+    """Mint a browser ticket through the verified HTTP session endpoint."""
+    _logged_in(gated_app)
+    response = gated_app.post(
+        "/api/auth/ws-ticket", json={"audience": f"browser-ws:{path}"}
+    )
+    assert response.status_code == 200
+    ticket = response.json()["ticket"]
+    return ticket, _fake_ws(
+        query={"ticket": ticket},
+        path=path,
+        cookies={name: value.strip('"') for name, value in dict(gated_app.cookies).items()},
+    )
+
+
+def _ws_from_browser_ticket(ticket: str, *, source_ws, path: str | None = None):
+    return _fake_ws(
+        query={"ticket": ticket},
+        path=path or source_ws.url.path,
+        cookies=dict(source_ws.cookies),
     )
 
 
@@ -257,14 +286,52 @@ class TestWsAuthOkGated:
     """Gate ON — ticket path only."""
 
     def test_valid_ticket_accepted(self, gated_app):
-        ticket = mint_ticket(user_id="u1", provider="stub")
-        ws = _fake_ws(query={"ticket": ticket})
+        _ticket, ws = _browser_ticket_ws(gated_app)
+
         assert web_server._ws_auth_ok(ws) is True
 
+    def test_upgrade_rejects_ticket_without_current_session_before_consume(self, gated_app):
+        ticket, _ws = _browser_ticket_ws(gated_app)
+        missing_session = _fake_ws(query={"ticket": ticket})
+
+        assert web_server._ws_auth_result(missing_session).reason == "ticket_invalid"
+        assert web_server._ws_auth_result(_ws).reason is None
+
+    def test_upgrade_rejects_provider_membership_revision_change_before_consume(self, gated_app, monkeypatch):
+        ticket, ws = _browser_ticket_ws(gated_app)
+        provider = get_provider("stub")
+        assert provider is not None
+        original = provider.authorization_state
+        monkeypatch.setattr(provider, "authorization_state", lambda session: (original(session)[0], "membership-v2"))
+
+        assert web_server._ws_auth_result(ws).reason == "ticket_invalid"
+        monkeypatch.setattr(provider, "authorization_state", original)
+        assert web_server._ws_auth_result(ws).reason is None
+
+    def test_upgrade_fails_closed_when_ticket_provider_is_unavailable(self, gated_app, monkeypatch):
+        ticket, ws = _browser_ticket_ws(gated_app)
+        provider = get_provider("stub")
+        assert provider is not None
+
+        def unavailable(*, access_token):
+            raise ProviderError("stub unavailable")
+
+        monkeypatch.setattr(provider, "verify_session", unavailable)
+        assert web_server._ws_auth_result(ws).reason == "authority_unavailable"
+
+    def test_ticket_is_rejected_before_consume_on_wrong_upgrade_route(self, gated_app):
+        ticket, ws = _browser_ticket_ws(gated_app, path="/api/ws")
+
+        result = web_server._ws_auth_result(
+            _ws_from_browser_ticket(ticket, source_ws=ws, path="/api/pty")
+        )
+
+        assert result.reason == "ticket_invalid"
+        assert web_server._ws_auth_result(ws).reason is None
+
     def test_consumed_ticket_rejected(self, gated_app):
-        ticket = mint_ticket(user_id="u1", provider="stub")
-        ws_one = _fake_ws(query={"ticket": ticket})
-        ws_two = _fake_ws(query={"ticket": ticket})
+        ticket, ws_one = _browser_ticket_ws(gated_app)
+        ws_two = _ws_from_browser_ticket(ticket, source_ws=ws_one)
         assert web_server._ws_auth_ok(ws_one) is True
         # Single-use — second consumption fails.
         assert web_server._ws_auth_ok(ws_two) is False
@@ -339,7 +406,9 @@ class TestWsAuthOkGated:
         _logged_in(gated_app)
 
         auth_me = gated_app.get("/api/auth/me")
-        ticket_response = gated_app.post("/api/auth/ws-ticket")
+        ticket_response = gated_app.post(
+            "/api/auth/ws-ticket", json={"audience": "browser-ws:/api/pty"}
+        )
 
         assert auth_me.status_code == 200
         assert ticket_response.status_code == 200
@@ -347,58 +416,22 @@ class TestWsAuthOkGated:
         assert ws_owner.owner_key == auth_me.json()["owner_key"]
         assert ws_owner.tenant_id == auth_me.json()["tenant_id"]
 
-    def test_distinct_users_mint_distinct_owner_keys_for_ws_routing(self, gated_app, monkeypatch, tmp_path):
-        monkeypatch.setenv("HERMES_OWNER_SECRET", "test-owner-secret")
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "global"))
-        owner_a = owner_context_from_session(Session(
-            user_id="user-a",
-            email="a@example.test",
-            display_name="A",
-            org_id="org1",
-            provider="stub",
-            expires_at=9999999999,
-            access_token="a",
-            refresh_token="ra",
-        ))
-        owner_b = owner_context_from_session(Session(
-            user_id="user-b",
-            email="b@example.test",
-            display_name="B",
-            org_id="org1",
-            provider="stub",
-            expires_at=9999999999,
-            access_token="b",
-            refresh_token="rb",
-        ))
-        ticket_a = mint_ticket(user_id="user-a", provider="stub", org_id="org1", tenant_id=owner_a.tenant_id, owner_key=owner_a.owner_key)
-        ticket_b = mint_ticket(user_id="user-b", provider="stub", org_id="org1", tenant_id=owner_b.tenant_id, owner_key=owner_b.owner_key)
+    def test_ticket_routes_only_its_verified_owner(self, gated_app):
+        ticket, ws = _browser_ticket_ws(gated_app)
+        payload = verify_ticket(ticket)
 
-        result_a = web_server._ws_auth_result(_fake_ws(query={"ticket": ticket_a}))
-        result_b = web_server._ws_auth_result(_fake_ws(query={"ticket": ticket_b}))
-
-        assert result_a.reason is None
-        assert result_b.reason is None
-        assert result_a.payload["owner_key"] == owner_a.owner_key
-        assert result_b.payload["owner_key"] == owner_b.owner_key
-        assert result_a.payload["owner_key"] != result_b.payload["owner_key"]
-        assert owner_context_from_ticket_payload(result_a.payload).owner_home != owner_context_from_ticket_payload(result_b.payload).owner_home
+        assert payload["user_id"] == "stub-user-1"
+        assert web_server._ws_auth_result(ws).reason is None
 
     def test_auth_result_retains_ticket_payload_for_owner_bridge(self, gated_app):
-        ticket = mint_ticket(
-            user_id="u1",
-            provider="stub",
-            org_id="org1",
-            tenant_id="org1",
-            owner_key="ok1_owner",
-        )
-        ws = _fake_ws(query={"ticket": ticket})
+        ticket, ws = _browser_ticket_ws(gated_app)
 
         result = web_server._ws_auth_result(ws)
 
         assert result.reason is None
         assert result.credential == "ticket"
-        assert result.payload["user_id"] == "u1"
-        assert result.payload["owner_key"] == "ok1_owner"
+        assert result.payload["user_id"] == "stub-user-1"
+        assert result.payload["owner_key"].startswith("ok1_")
 
     def test_owner_worker_requires_owner_bound_internal_token(self, tmp_path):
         worker_app = SimpleNamespace(
@@ -462,6 +495,219 @@ class TestWsAuthOkGated:
 
         assert owner.owner_key == owner_key
         assert owner.owner_home == (global_home / "users" / owner_key)
+
+    def test_authority_change_closes_only_stale_matching_bridge(self, gated_app):
+        import asyncio
+        from hermes_cli.dashboard_auth.authority import AuthorityChange, AuthorizationScope
+
+        class _Bridge:
+            def __init__(self):
+                self.calls = []
+
+            async def close(self, *, code, reason):
+                self.calls.append((code, reason))
+
+        scope_a = AuthorizationScope(
+            provider="stub", tenant_id="tenant-a", user_id="user-a",
+            session_id="session-a", membership_revision="v1",
+        )
+        scope_b = AuthorizationScope(
+            provider="stub", tenant_id="tenant-b", user_id="user-b",
+            session_id="session-b", membership_revision="v1",
+        )
+        old_a, current_a, bridge_b = _Bridge(), _Bridge(), _Bridge()
+
+        async def exercise():
+            bridges, lock = web_server._authorized_ws_bridge_state(web_server.app)
+            async with lock:
+                bridges.clear()
+                bridges.setdefault(scope_a.digest, set()).update({(old_a, 0), (current_a, 1)})
+                bridges.setdefault(scope_b.digest, set()).add((bridge_b, 0))
+            await web_server.close_authorized_bridges_by_changes(
+                web_server.app,
+                (AuthorityChange(sequence=1, scope_digest=scope_a.digest, epoch=1, revoked=False),),
+                reason="membership_change",
+            )
+
+        asyncio.run(exercise())
+
+        assert old_a.calls and old_a.calls[0][0] == 4401
+        assert current_a.calls == []
+        assert bridge_b.calls == []
+
+    def test_revoked_authority_change_closes_all_matching_bridge_epochs(self, gated_app):
+        import asyncio
+        from hermes_cli.dashboard_auth.authority import AuthorityChange, AuthorizationScope
+
+        class _Bridge:
+            def __init__(self):
+                self.calls = []
+
+            async def close(self, *, code, reason):
+                self.calls.append((code, reason))
+
+        scope_a = AuthorizationScope(
+            provider="stub", tenant_id="tenant-a", user_id="user-a",
+            session_id="session-a", membership_revision="v1",
+        )
+        bridge_a, bridge_a_new = _Bridge(), _Bridge()
+
+        async def exercise():
+            bridges, lock = web_server._authorized_ws_bridge_state(web_server.app)
+            async with lock:
+                bridges.clear()
+                bridges.setdefault(scope_a.digest, set()).update({(bridge_a, 0), (bridge_a_new, 4)})
+            await web_server.close_authorized_bridges_by_changes(
+                web_server.app,
+                (AuthorityChange(sequence=2, scope_digest=scope_a.digest, epoch=5, revoked=True),),
+                reason="logout",
+            )
+
+        asyncio.run(exercise())
+
+        assert bridge_a.calls and bridge_a.calls[0][0] == 4401
+        assert bridge_a_new.calls and bridge_a_new.calls[0][0] == 4401
+
+    def test_authority_dispatcher_closes_remote_revocation(self, gated_app, monkeypatch):
+        import asyncio
+        from hermes_cli.dashboard_auth.authority import AuthorityChange, AuthorizationScope
+
+        class _Bridge:
+            def __init__(self):
+                self.calls = []
+
+            async def close(self, *, code, reason):
+                self.calls.append((code, reason))
+
+        class _Store:
+            def __init__(self):
+                self.calls = 0
+
+            def changes_since(self, sequence):
+                self.calls += 1
+                if sequence == 0:
+                    return (
+                        AuthorityChange(
+                            sequence=7,
+                            scope_digest=scope.digest,
+                            epoch=1,
+                            revoked=True,
+                        ),
+                    )
+                return ()
+
+        scope = AuthorizationScope(
+            provider="stub", tenant_id="tenant-a", user_id="user-a",
+            session_id="session-a", membership_revision="v1",
+        )
+        bridge = _Bridge()
+        store = _Store()
+        monkeypatch.setattr(
+            "hermes_cli.dashboard_auth.ws_tickets.authority_store", lambda: store
+        )
+
+        async def exercise():
+            bridges, lock = web_server._authorized_ws_bridge_state(web_server.app)
+            async with lock:
+                bridges.clear()
+                bridges.setdefault(scope.digest, set()).add((bridge, 0))
+            await web_server._ensure_authority_change_dispatcher(web_server.app)
+            for _ in range(20):
+                if bridge.calls:
+                    break
+                await asyncio.sleep(0.01)
+            web_server.app.state.authority_change_stop.set()
+            await web_server.app.state.authority_change_task
+
+        asyncio.run(exercise())
+
+        assert store.calls >= 1
+        assert bridge.calls and bridge.calls[0][0] == 4401
+
+    def test_expired_browser_session_closes_worker_half_and_releases_lease(self, gated_app, monkeypatch):
+        import asyncio
+        import time
+
+        class _Browser:
+            def __init__(self):
+                self.app = web_server.app
+                self.query_params = SimpleNamespace(get=lambda *_args: "")
+                self.url = SimpleNamespace(query="")
+                self.accepted = False
+                self.closed = []
+                self._closed = asyncio.Event()
+
+            async def accept(self):
+                self.accepted = True
+
+            async def close(self, *, code=1000, reason=""):
+                self.closed.append((code, reason))
+                self._closed.set()
+
+            async def receive(self):
+                await self._closed.wait()
+                return {"type": "websocket.disconnect", "code": 4401}
+
+        class _Worker:
+            def __init__(self):
+                self.closed = []
+
+            async def close(self, **kwargs):
+                self.closed.append(kwargs)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.Future()
+
+        class _Lease:
+            def __init__(self):
+                self.released = False
+
+            def release(self):
+                self.released = True
+
+        browser, worker, lease = _Browser(), _Worker(), _Lease()
+        handle = SimpleNamespace(socket_path="/unused")
+        browser.app.state.owner_worker_supervisor = SimpleNamespace(
+            get_or_start=lambda _owner: handle,
+            control_home=None,
+        )
+        monkeypatch.setattr(
+            web_server,
+            "_owner_context_from_ws_auth_result",
+            lambda _result: SimpleNamespace(owner_key="ok1_owner"),
+        )
+        monkeypatch.setattr(web_server, "_acquire_owner_worker_use", lambda *_args: lease)
+        monkeypatch.setattr(web_server, "_connect_owner_worker_ws", lambda *_args, **_kwargs: asyncio.sleep(0, result=worker))
+        monkeypatch.setattr("hermes_cli.dashboard_auth.owner_context.ensure_owner_home", lambda _owner: None)
+        monkeypatch.setattr("hermes_cli.owner_worker.tokens.mint_internal_token", lambda *_args, **_kwargs: "internal")
+
+        auth_result = web_server._WsAuthResult(
+            None,
+            "ticket",
+            {
+                "provider": "stub",
+                "tenant_id": "tenant-a",
+                "user_id": "user-a",
+                "session_id": "session-a",
+                "membership_revision": "v1",
+                "epoch": 0,
+            },
+            session_expires_at=int(time.time()),
+        )
+
+        asyncio.run(
+            web_server._bridge_websocket_to_owner_worker(
+                browser, path="/api/pty", auth_result=auth_result
+            )
+        )
+
+        assert browser.accepted is True
+        assert browser.closed and browser.closed[0][0] == 4401
+        assert worker.closed
+        assert lease.released is True
 
     def test_ws_close_reason_redacts_auth_query_values(self):
         reason = web_server._ws_close_reason(

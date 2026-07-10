@@ -83,6 +83,140 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else ""
 
 
+class WebSocketSessionRejected(RuntimeError):
+    """A browser WS upgrade has no current, matching verified session."""
+
+
+class WebSocketSessionUnavailable(RuntimeError):
+    """The provider needed to revalidate a browser WS session is unavailable."""
+
+
+def verified_access_session(request):
+    """Return a freshly verified cookie session, or ``None`` if untrusted.
+
+    Public auth routes such as logout cannot rely on HTTP middleware state, but
+    they may only revoke authority after this same provider verification step.
+    A provider outage remains distinguishable from an unknown/expired cookie so
+    callers can fail closed without ever creating a wildcard revocation.
+    """
+    access_token, _refresh_token = read_session_cookies(request)
+    if not access_token:
+        return None
+    unreachable = False
+    for provider in list_session_providers():
+        try:
+            session = provider.verify_session(access_token=access_token)
+        except ProviderError:
+            unreachable = True
+            continue
+        if session is not None:
+            return session
+    if unreachable:
+        raise ProviderError("session provider is unavailable")
+    return None
+
+
+def authorization_scope_for_session(session):
+    """Build the authority scope from a current verified provider session."""
+    from hermes_cli.dashboard_auth import get_provider
+    from hermes_cli.dashboard_auth.authority import AuthorizationScope
+    from hermes_cli.dashboard_auth.owner_context import owner_context_from_session
+
+    provider = get_provider(session.provider)
+    if provider is None or not getattr(provider, "supports_session", True):
+        raise ProviderError("session provider is unavailable")
+    session_id, membership_revision = provider.authorization_state(session)
+    owner = owner_context_from_session(session)
+    return AuthorizationScope(
+        provider=session.provider,
+        tenant_id=owner.tenant_id,
+        user_id=session.user_id,
+        session_id=session_id,
+        membership_revision=membership_revision,
+    )
+
+
+def revoke_session_authority(
+    session, *, reason: str
+) -> tuple["AuthorizationScope", "AuthorizationState"]:
+    """Fail-close revoke all browser credentials bound to a verified session."""
+    from hermes_cli.dashboard_auth.authority import AuthorizationScope, AuthorizationState
+    from hermes_cli.dashboard_auth.ws_tickets import authority_store
+
+    scope = authorization_scope_for_session(session)
+    return scope, authority_store().revoke_and_bump(scope, reason=reason)
+
+
+async def activate_verified_session_authority(request: Request, session) -> None:
+    """Activate current provider authority and close locally superseded bridges."""
+    from hermes_cli.dashboard_auth.ws_tickets import authority_store
+
+    state = authority_store().activate(authorization_scope_for_session(session))
+    if state.changes:
+        from hermes_cli.web_server import close_authorized_bridges_by_changes
+
+        await close_authorized_bridges_by_changes(
+            request.app,
+            state.changes,
+            reason="session_transition",
+        )
+
+
+def verify_websocket_ticket_session(ws, payload: dict[str, object]):
+    """Revalidate the cookie session bound to a signed browser WS ticket.
+
+    WebSocket upgrades bypass FastAPI's HTTP middleware, so this deliberately
+    repeats the provider verification that the HTTP gate performs.  It never
+    refreshes a session during an upgrade: a missing or expired access-token
+    cookie requires the browser to re-establish its HTTP session and mint a
+    fresh ticket.  The returned session has been matched against every trusted
+    principal and authorization-state claim before the caller consumes the
+    ticket in the authority store.
+    """
+    from hermes_cli.dashboard_auth import get_provider
+    from hermes_cli.dashboard_auth.owner_context import owner_context_from_session
+
+    provider_name = str(payload.get("provider") or "").strip()
+    access_token, _refresh_token = read_session_cookies(ws)
+    if not provider_name or not access_token:
+        raise WebSocketSessionRejected("session_missing")
+
+    provider = get_provider(provider_name)
+    if provider is None or not getattr(provider, "supports_session", True):
+        raise WebSocketSessionRejected("provider_unavailable")
+    try:
+        session = provider.verify_session(access_token=access_token)
+    except ProviderError as exc:
+        raise WebSocketSessionUnavailable("provider_unavailable") from exc
+    if session is None:
+        raise WebSocketSessionRejected("session_invalid")
+    if session.provider != provider_name or session.user_id != str(payload.get("user_id") or ""):
+        raise WebSocketSessionRejected("session_principal_mismatch")
+    if session.org_id != str(payload.get("org_id") or ""):
+        raise WebSocketSessionRejected("session_tenant_mismatch")
+
+    try:
+        owner = owner_context_from_session(session)
+    except Exception as exc:
+        raise WebSocketSessionUnavailable("owner_context_unavailable") from exc
+    if (
+        owner.tenant_id != str(payload.get("tenant_id") or "")
+        or owner.owner_key != str(payload.get("owner_key") or "")
+    ):
+        raise WebSocketSessionRejected("session_owner_mismatch")
+
+    try:
+        session_id, membership_revision = provider.authorization_state(session)
+    except ProviderError as exc:
+        raise WebSocketSessionUnavailable("authorization_state_unavailable") from exc
+    if (
+        session_id != str(payload.get("session_id") or "")
+        or membership_revision != str(payload.get("membership_revision") or "")
+    ):
+        raise WebSocketSessionRejected("membership_revision_mismatch")
+    return session
+
+
 def _unauth_response(request: Request, *, reason: str) -> Response:
     """API routes → 401 JSON with ``login_url``; HTML routes → 302 → /login.
 
@@ -353,6 +487,23 @@ async def gated_auth_middleware(
         refreshed = _attempt_refresh(request, refresh_token=_rt)
         if refreshed is not None:
             new_session, refreshing_provider = refreshed
+            try:
+                # A rotating refresh can carry a new session, tenant, or
+                # membership revision. Activate the new scope before serving
+                # any request; AuthorityStore atomically invalidates the old
+                # active scope for the same principal when necessary.
+                await activate_verified_session_authority(request, new_session)
+            except Exception as exc:
+                _log.warning("dashboard-auth: refresh authority activation failed: %s", exc)
+                response = JSONResponse(
+                    {"detail": "Authorization state is unavailable"},
+                    status_code=503,
+                )
+                from hermes_cli.dashboard_auth.cookies import clear_session_cookies
+                from hermes_cli.dashboard_auth.prefix import prefix_from_request
+
+                clear_session_cookies(response, prefix=prefix_from_request(request))
+                return response
             request.state.session = new_session
             from hermes_cli.web_server import _authenticated_owner_control_plane_gate_response
 
@@ -405,6 +556,14 @@ async def gated_auth_middleware(
         clear_session_cookies(response, prefix=prefix_from_request(request))
         return response
 
+    try:
+        await activate_verified_session_authority(request, session)
+    except Exception as exc:
+        _log.warning("dashboard-auth: session authority activation failed: %s", exc)
+        return JSONResponse(
+            {"detail": "Authorization state is unavailable"},
+            status_code=503,
+        )
     request.state.session = session
     from hermes_cli.web_server import _authenticated_owner_control_plane_gate_response
 
