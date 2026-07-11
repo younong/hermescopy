@@ -34,11 +34,12 @@ from hermes_cli.dashboard_auth.ws_tickets import (
     mint_ticket,
     verify_ticket,
 )
+from hermes_cli.dashboard_auth.authority import AuthorityStore, WorkerGenerationState, WorkerLeaseState
 from hermes_cli.owner_worker.tokens import (
-    AUD_CONTROL_PLANE_WS,
     AUD_OWNER_WORKER_WS,
-    mint_internal_token,
-    validate_internal_token_payload,
+    SCOPE_OWNER_WORKER_WS,
+    mint_owner_worker_capability,
+    owner_worker_capability_public_config,
 )
 from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
 
@@ -46,6 +47,16 @@ from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+def _active_worker_lease(control_home, owner_key="ok1_worker", worker_id="worker-a"):
+    store = AuthorityStore(control_home)
+    claim = store.claim_worker_start(owner_key, worker_id=worker_id)
+    return store.transition_worker_lease(
+        claim.lease,
+        state=WorkerLeaseState.ACTIVE,
+        generation_state=WorkerGenerationState.ACTIVE,
+    )
 
 
 @pytest.fixture
@@ -433,68 +444,94 @@ class TestWsAuthOkGated:
         assert result.payload["user_id"] == "stub-user-1"
         assert result.payload["owner_key"].startswith("ok1_")
 
-    def test_owner_worker_requires_owner_bound_internal_token(self, tmp_path):
+    def test_owner_worker_requires_generation_bound_capability(self, tmp_path):
+        lease = _active_worker_lease(tmp_path)
+        verifier = owner_worker_capability_public_config(tmp_path)
         worker_app = SimpleNamespace(
             state=SimpleNamespace(
                 owner_worker_mode=True,
                 owner_worker_owner_key="ok1_worker",
                 owner_worker_control_home=tmp_path,
+                owner_worker_lease=lease,
+                owner_worker_capability_verifier=verifier,
                 auth_required=False,
             )
         )
-        good = mint_internal_token("ok1_worker", audience=AUD_OWNER_WORKER_WS, path="/api/pty", control_home=tmp_path)
-        wrong = mint_internal_token("ok1_other", audience=AUD_OWNER_WORKER_WS, path="/api/pty", control_home=tmp_path)
+        good = mint_owner_worker_capability(
+            lease, audience=AUD_OWNER_WORKER_WS, scope=SCOPE_OWNER_WORKER_WS,
+            path="/api/pty", control_home=tmp_path,
+        )
+        other = _active_worker_lease(tmp_path, owner_key="ok1_other", worker_id="worker-b")
+        wrong = mint_owner_worker_capability(
+            other, audience=AUD_OWNER_WORKER_WS, scope=SCOPE_OWNER_WORKER_WS,
+            path="/api/pty", control_home=tmp_path,
+        )
 
         assert web_server._ws_auth_ok(_fake_ws(query={"internal_owner_token": good}, app=worker_app)) is True
         assert web_server._ws_auth_ok(_fake_ws(query={"internal_owner_token": wrong}, app=worker_app)) is False
         assert web_server._ws_auth_ok(_fake_ws(query={"internal": internal_ws_credential()}, app=worker_app)) is False
 
-    def test_control_plane_internal_owner_token_uses_supervisor_control_home(self, gated_app, tmp_path):
-        control_a = tmp_path / "control-a"
-        control_b = tmp_path / "control-b"
-        previous = getattr(web_server.app.state, "owner_worker_supervisor", None)
-        web_server.app.state.owner_worker_supervisor = SimpleNamespace(control_home=control_a, global_home=tmp_path / "global-a")
-        try:
-            good = mint_internal_token("ok1_worker", audience=AUD_CONTROL_PLANE_WS, path="/api/pty", control_home=control_a)
-            wrong_secret = mint_internal_token("ok1_worker", audience=AUD_CONTROL_PLANE_WS, path="/api/pty", control_home=control_b)
+    def test_control_plane_rejects_retired_internal_owner_token_format(self, gated_app):
+        result = web_server._ws_auth_result(_fake_ws(query={"internal_owner_token": "ow2.retired.signature"}))
 
-            good_result = web_server._ws_auth_result(_fake_ws(query={"internal_owner_token": good}))
-            wrong_result = web_server._ws_auth_result(_fake_ws(query={"internal_owner_token": wrong_secret}))
-        finally:
-            web_server.app.state.owner_worker_supervisor = previous
+        assert result.reason == "internal_owner_invalid"
+        assert result.credential == "internal_owner_token"
 
-        assert good_result.reason is None
-        assert good_result.credential == "internal_owner_token"
-        assert good_result.payload["owner_key"] == "ok1_worker"
-        assert wrong_result.reason == "internal_owner_invalid"
+    def test_control_plane_does_not_route_bare_owner_capabilities(self, gated_app):
+        # Step 3 capabilities are Control Plane -> exact Worker only. Reverse
+        # worker-child admission is intentionally deferred to step 4 bootstrap.
+        result = web_server._ws_auth_result(_fake_ws(query={"internal_owner_token": "owc1.not-a-bootstrap"}))
 
-    def test_control_plane_internal_owner_token_rejects_wrong_audience_or_path(self, gated_app, tmp_path):
-        previous = getattr(web_server.app.state, "owner_worker_supervisor", None)
-        web_server.app.state.owner_worker_supervisor = SimpleNamespace(control_home=tmp_path, global_home=tmp_path / "global")
-        try:
-            wrong_aud = mint_internal_token("ok1_worker", audience=AUD_OWNER_WORKER_WS, path="/api/pty", control_home=tmp_path)
-            wrong_path = mint_internal_token("ok1_worker", audience=AUD_CONTROL_PLANE_WS, path="/api/pub", control_home=tmp_path)
-            assert web_server._ws_auth_result(_fake_ws(query={"internal_owner_token": wrong_aud})).reason == "internal_owner_invalid"
-            assert web_server._ws_auth_result(_fake_ws(query={"internal_owner_token": wrong_path})).reason == "internal_owner_invalid"
-        finally:
-            web_server.app.state.owner_worker_supervisor = previous
+        assert result.reason == "internal_owner_invalid"
+        assert result.credential == "internal_owner_token"
 
-    def test_internal_owner_token_payload_routes_by_signed_owner_key(self, gated_app, tmp_path, monkeypatch):
-        global_home = tmp_path / "global"
-        control_home = global_home / "control-plane"
-        owner_key = "ok1_worker"
-        previous = getattr(web_server.app.state, "owner_worker_supervisor", None)
-        web_server.app.state.owner_worker_supervisor = SimpleNamespace(control_home=control_home, global_home=global_home)
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "wrong-home"))
-        try:
-            token = mint_internal_token(owner_key, audience=AUD_CONTROL_PLANE_WS, path="/api/pty", control_home=control_home)
-            result = web_server._ws_auth_result(_fake_ws(query={"internal_owner_token": token}))
-            owner = web_server._owner_context_from_ws_auth_result(result)
-        finally:
-            web_server.app.state.owner_worker_supervisor = previous
+    def test_worker_change_closes_only_exact_generation_bridge(self, gated_app):
+        import asyncio
+        from hermes_cli.dashboard_auth.authority import WorkerGenerationState, WorkerLeaseChange, WorkerLeaseState
 
-        assert owner.owner_key == owner_key
-        assert owner.owner_home == (global_home / "users" / owner_key)
+        class _Bridge:
+            def __init__(self):
+                self.calls = []
+
+            async def close(self, *, code, reason):
+                self.calls.append((code, reason))
+
+        old, newer, different_lease = _Bridge(), _Bridge(), _Bridge()
+        old_change = WorkerLeaseChange(
+            sequence=1, owner_key="ok1_owner", worker_generation=1, worker_id="worker-a",
+            lease_version=1, recovery_generation=0, lease_state=WorkerLeaseState.DRAINING,
+            generation_state=WorkerGenerationState.DRAINING,
+        )
+        newer_change = WorkerLeaseChange(
+            sequence=2, owner_key="ok1_owner", worker_generation=2, worker_id="worker-b",
+            lease_version=2, recovery_generation=0, lease_state=WorkerLeaseState.ACTIVE,
+            generation_state=WorkerGenerationState.ACTIVE,
+        )
+        wrong_lease_change = WorkerLeaseChange(
+            sequence=3, owner_key="ok1_owner", worker_generation=1, worker_id="worker-a",
+            lease_version=9, recovery_generation=0, lease_state=WorkerLeaseState.ACTIVE,
+            generation_state=WorkerGenerationState.ACTIVE,
+        )
+
+        async def exercise():
+            bridges, lock = web_server._authorized_ws_bridge_state(web_server.app)
+            async with lock:
+                bridges.clear()
+                web_server.app.state.authorized_ws_bridges_by_worker.clear()
+                web_server.app.state.authorized_ws_bridges_by_worker.update({
+                    web_server._worker_bridge_identity(old_change): {old},
+                    web_server._worker_bridge_identity(newer_change): {newer},
+                    web_server._worker_bridge_identity(wrong_lease_change): {different_lease},
+                })
+            await web_server.close_authorized_bridges_by_worker_change(
+                web_server.app, (old_change,), reason="worker_generation_revoked"
+            )
+
+        asyncio.run(exercise())
+
+        assert old.calls and old.calls[0][0] == 4401
+        assert newer.calls == []
+        assert different_lease.calls == []
 
     def test_authority_change_closes_only_stale_matching_bridge(self, gated_app):
         import asyncio
@@ -596,6 +633,9 @@ class TestWsAuthOkGated:
                     )
                 return ()
 
+            def worker_changes_since(self, sequence):
+                return ()
+
         scope = AuthorizationScope(
             provider="stub", tenant_id="tenant-a", user_id="user-a",
             session_id="session-a", membership_revision="v1",
@@ -624,7 +664,7 @@ class TestWsAuthOkGated:
         assert store.calls >= 1
         assert bridge.calls and bridge.calls[0][0] == 4401
 
-    def test_expired_browser_session_closes_worker_half_and_releases_lease(self, gated_app, monkeypatch):
+    def test_expired_browser_session_closes_worker_half_and_releases_lease(self, gated_app, monkeypatch, tmp_path):
         import asyncio
         import time
 
@@ -651,6 +691,13 @@ class TestWsAuthOkGated:
         class _Worker:
             def __init__(self):
                 self.closed = []
+                self.sent = []
+
+            async def send(self, value):
+                self.sent.append(value)
+
+            async def recv(self):
+                return "ack"
 
             async def close(self, **kwargs):
                 self.closed.append(kwargs)
@@ -669,10 +716,17 @@ class TestWsAuthOkGated:
                 self.released = True
 
         browser, worker, lease = _Browser(), _Worker(), _Lease()
-        handle = SimpleNamespace(socket_path="/unused")
+        handle = SimpleNamespace(
+            socket_path="/unused",
+            owner_key="ok1_owner",
+            worker_generation=1,
+            worker_id="worker-a",
+            lease_version=1,
+            recovery_generation=0,
+        )
         browser.app.state.owner_worker_supervisor = SimpleNamespace(
             get_or_start=lambda _owner: handle,
-            control_home=None,
+            control_home=tmp_path / "control",
         )
         monkeypatch.setattr(
             web_server,
@@ -682,7 +736,7 @@ class TestWsAuthOkGated:
         monkeypatch.setattr(web_server, "_acquire_owner_worker_use", lambda *_args: lease)
         monkeypatch.setattr(web_server, "_connect_owner_worker_ws", lambda *_args, **_kwargs: asyncio.sleep(0, result=worker))
         monkeypatch.setattr("hermes_cli.dashboard_auth.owner_context.ensure_owner_home", lambda _owner: None)
-        monkeypatch.setattr("hermes_cli.owner_worker.tokens.mint_internal_token", lambda *_args, **_kwargs: "internal")
+        monkeypatch.setattr("hermes_cli.owner_worker.tokens.validate_owp1_control", lambda *_args, **_kwargs: None)
 
         auth_result = web_server._WsAuthResult(
             None,
@@ -730,14 +784,14 @@ class TestWsAuthOkGated:
             }
         )
 
-        query = web_server._ws_query_for_owner_worker(ws, internal_owner_token="owner-token")
+        query = web_server._ws_query_for_owner_worker(ws, internal_owner_bootstrap="bootstrap-token")
 
         assert "ticket=" not in query
         assert "token=legacy" not in query
         assert "internal=process" not in query
         assert "channel=chan1" in query
         assert "fresh=1" in query
-        assert "internal_owner_token=owner-token" in query
+        assert "internal_owner_bootstrap=bootstrap-token" in query
 
     def test_only_browser_tickets_bridge_from_control_plane(self, gated_app, tmp_path):
         ticket = mint_ticket(
@@ -772,10 +826,9 @@ class TestWsAuthOkGated:
                 auth_required=False,
             )
         )
-        owner_token = mint_internal_token("ok1_worker", audience=AUD_OWNER_WORKER_WS, path="/api/pty", control_home=tmp_path)
-        worker_ws = _fake_ws(query={"internal_owner_token": owner_token}, app=worker_app)
+        worker_ws = _fake_ws(query={"internal_owner_token": "ow2.retired"}, app=worker_app)
         worker_result = web_server._ws_auth_result(worker_ws)
-        assert worker_result.reason is None
+        assert worker_result.reason == "internal_owner_invalid"
         assert worker_result.credential == "internal_owner_token"
         assert web_server._should_bridge_ws_to_owner_worker(worker_ws, worker_result) is False
 
@@ -807,73 +860,19 @@ class TestWsUrlBuilders:
         assert web_server._build_gateway_ws_url(app_obj=app_obj) is None
         assert web_server._build_sidecar_url("chan1", app_obj=app_obj) is None
 
-    def test_owner_worker_urls_use_path_bound_owner_tokens(self, monkeypatch, tmp_path):
-        control_home = tmp_path / "control-plane"
+    def test_owner_workers_cannot_mint_control_plane_child_urls(self, monkeypatch, tmp_path):
         worker_app = SimpleNamespace(
             state=SimpleNamespace(
                 owner_worker_mode=True,
                 owner_worker_owner_key="ok1_owner_a",
-                owner_worker_control_home=control_home,
+                owner_worker_control_home=tmp_path / "control-plane",
                 auth_required=False,
             )
         )
         monkeypatch.setenv("HERMES_OWNER_WORKER_CONTROL_WS_BASE", "wss://control.example")
 
-        gateway_url = web_server._build_gateway_ws_url(app_obj=worker_app)
-        sidecar_url = web_server._build_sidecar_url("chan-1", app_obj=worker_app)
-
-        assert gateway_url is not None
-        assert sidecar_url is not None
-        gateway = urlparse(gateway_url)
-        sidecar = urlparse(sidecar_url)
-        gateway_query = parse_qs(gateway.query)
-        sidecar_query = parse_qs(sidecar.query)
-        assert gateway.path == "/api/ws"
-        assert sidecar.path == "/api/pub"
-        assert set(gateway_query) == {"internal_owner_token"}
-        assert set(sidecar_query) == {"internal_owner_token", "channel"}
-        assert sidecar_query["channel"] == ["chan-1"]
-        for query in (gateway_query, sidecar_query):
-            assert "internal" not in query
-            assert "token" not in query
-
-        gateway_payload = validate_internal_token_payload(
-            gateway_query["internal_owner_token"][0],
-            audience=AUD_CONTROL_PLANE_WS,
-            path="/api/ws",
-            control_home=control_home,
-        )
-        sidecar_payload = validate_internal_token_payload(
-            sidecar_query["internal_owner_token"][0],
-            audience=AUD_CONTROL_PLANE_WS,
-            path="/api/pub",
-            control_home=control_home,
-        )
-        assert gateway_payload is not None
-        assert sidecar_payload is not None
-        assert gateway_payload["owner_key"] == "ok1_owner_a"
-        assert sidecar_payload["owner_key"] == "ok1_owner_a"
-
-        other_worker_app = SimpleNamespace(
-            state=SimpleNamespace(
-                owner_worker_mode=True,
-                owner_worker_owner_key="ok1_owner_b",
-                owner_worker_control_home=control_home,
-                auth_required=False,
-            )
-        )
-        other_gateway_url = web_server._build_gateway_ws_url(app_obj=other_worker_app)
-        assert other_gateway_url is not None
-        other_gateway_token = parse_qs(urlparse(other_gateway_url).query)["internal_owner_token"][0]
-        other_payload = validate_internal_token_payload(
-            other_gateway_token,
-            audience=AUD_CONTROL_PLANE_WS,
-            path="/api/ws",
-            control_home=control_home,
-        )
-        assert other_payload is not None
-        assert other_payload["owner_key"] == "ok1_owner_b"
-        assert other_payload["owner_key"] != gateway_payload["owner_key"]
+        assert web_server._build_gateway_ws_url(app_obj=worker_app) is None
+        assert web_server._build_sidecar_url("chan-1", app_obj=worker_app) is None
 
 
 class TestWsRequestIsAllowedGated:

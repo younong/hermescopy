@@ -12,10 +12,18 @@ from typing import Any
 
 from starlette.requests import Request
 
+from hermes_cli.dashboard_auth.authority import (
+    AuthorityStore,
+    OwnerWorkerAuthorityLease,
+    WorkerGenerationState,
+    WorkerLeaseState,
+)
 from hermes_cli.owner_runtime import (
     assert_owner_runtime_paths,
     ensure_owner_runtime_dirs,
     owner_worker_env_for,
+    owner_worker_socket_path,
+    validate_owner_worker_runtime_environment,
 )
 
 
@@ -28,19 +36,43 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--owner-user-id", default="")
     parser.add_argument("--auth-provider", default="")
     parser.add_argument("--control-home", default="")
+    parser.add_argument("--worker-generation", required=True, type=int)
+    parser.add_argument("--worker-id", required=True)
     return parser.parse_args()
+
+
+def _worker_lease_from_env(owner_key: str) -> OwnerWorkerAuthorityLease:
+    try:
+        lease = OwnerWorkerAuthorityLease(
+            owner_key=owner_key,
+            worker_generation=int(os.environ["HERMES_WORKER_GENERATION"]),
+            worker_id=str(os.environ["HERMES_WORKER_ID"]),
+            state=WorkerLeaseState.STARTING,
+            lease_version=int(os.environ["HERMES_WORKER_LEASE_VERSION"]),
+            recovery_generation=int(os.environ["HERMES_WORKER_RECOVERY_GENERATION"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("owner worker lease environment is incomplete") from exc
+    if (
+        lease.worker_generation < 1
+        or lease.lease_version < 1
+        or lease.recovery_generation < 0
+        or not lease.worker_id
+    ):
+        raise RuntimeError("owner worker lease environment is invalid")
+    return lease
 
 
 def _prepare_owner_env(args: argparse.Namespace) -> tuple[str, Path, Path]:
     owner_key = str(args.owner_key).strip()
-    if not owner_key:
-        raise SystemExit("owner_key is required")
+    worker_generation = int(args.worker_generation)
+    worker_id = str(args.worker_id).strip()
+    if not owner_key or worker_generation < 1 or not worker_id:
+        raise SystemExit("owner_key, worker_generation, and worker_id are required")
     owner_home = Path(args.owner_home).expanduser().resolve()
     socket_path = Path(args.socket).expanduser().resolve()
-    if socket_path.parent != (owner_home / "runtime").resolve():
-        raise SystemExit("worker socket must live under owner_home/runtime")
-
-    ensure_owner_runtime_dirs(owner_home)
+    if socket_path != owner_worker_socket_path(owner_home, worker_generation):
+        raise SystemExit("worker socket does not match owner generation")
 
     existing_home = os.environ.get("HERMES_HOME", "").strip()
     if existing_home and Path(existing_home).expanduser().resolve() != owner_home:
@@ -48,22 +80,108 @@ def _prepare_owner_env(args: argparse.Namespace) -> tuple[str, Path, Path]:
     existing_owner = os.environ.get("HERMES_OWNER_KEY", "").strip()
     if existing_owner and existing_owner != owner_key:
         raise SystemExit("HERMES_OWNER_KEY does not match owner_key")
+    existing_generation = os.environ.get("HERMES_WORKER_GENERATION", "").strip()
+    if existing_generation and existing_generation != str(worker_generation):
+        raise SystemExit("HERMES_WORKER_GENERATION does not match worker_generation")
+    existing_worker_id = os.environ.get("HERMES_WORKER_ID", "").strip()
+    if existing_worker_id and existing_worker_id != worker_id:
+        raise SystemExit("HERMES_WORKER_ID does not match worker_id")
 
-    os.environ.update(
-        owner_worker_env_for(
-            owner_key=owner_key,
-            owner_home=owner_home,
-            tenant_id=str(args.tenant_id or ""),
-            owner_user_id=str(args.owner_user_id or ""),
-            auth_provider=str(args.auth_provider or ""),
-            control_home=args.control_home or None,
-        )
+    ensure_owner_runtime_dirs(owner_home)
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
+    bootstrap_env = owner_worker_env_for(
+        owner_key=owner_key,
+        owner_home=owner_home,
+        tenant_id=str(args.tenant_id or ""),
+        owner_user_id=str(args.owner_user_id or ""),
+        auth_provider=str(args.auth_provider or ""),
+        control_home=args.control_home or None,
+        worker_generation=worker_generation,
+        worker_id=worker_id,
     )
-
+    os.environ.update(bootstrap_env)
+    try:
+        validate_owner_worker_runtime_environment(
+            owner_home=owner_home,
+            owner_key=owner_key,
+            worker_generation=worker_generation,
+            worker_id=worker_id,
+            socket_path=socket_path,
+        )
+    except RuntimeError as exc:
+        raise SystemExit(f"owner worker runtime admission failed: {exc}") from exc
     return owner_key, owner_home, socket_path
 
 
-def create_app(owner_key: str, owner_home: Path):
+def create_app(
+    owner_key: str,
+    owner_home: Path,
+    *,
+    worker_generation: int = 1,
+    worker_id: str = "direct-test-worker",
+    socket_path: Path | None = None,
+):
+    if int(worker_generation) < 1 or not str(worker_id).strip():
+        raise ValueError("worker_generation and worker_id are required")
+    owner_home = Path(owner_home).expanduser().resolve()
+    # Direct in-process construction is retained only for isolated unit tests.
+    # Production entrypoint calls have already received this exact lease/env from
+    # the supervisor before imports. It never reconstructs a lease here.
+    fallback_lease: OwnerWorkerAuthorityLease | None = None
+    fallback_verifier: dict[str, str] | None = None
+    existing_home = os.environ.get("HERMES_HOME", "").strip()
+    if existing_home and Path(existing_home).expanduser().resolve() != owner_home:
+        raise RuntimeError("owner worker startup self-check failed: HERMES_HOME does not match owner_home")
+    existing_owner = os.environ.get("HERMES_OWNER_KEY", "").strip()
+    if existing_owner and existing_owner != owner_key:
+        raise RuntimeError("owner worker startup self-check failed: HERMES_OWNER_KEY does not match owner_key")
+    # Production passes the canonical UDS path and must use the supervisor's
+    # complete lease environment. Direct app construction is isolated-test-only
+    # and deliberately obtains a fresh complete lease instead of reusing ambient
+    # state left by another in-process test app.
+    if socket_path is None:
+        control_home = os.environ.get("HERMES_CONTROL_HOME", "").strip()
+        if not control_home:
+            raise RuntimeError("owner worker control home is required")
+        store = AuthorityStore(control_home)
+        claim = store.claim_worker_start(owner_key, worker_id=worker_id)
+        fallback_lease = store.transition_worker_lease(
+            claim.lease,
+            state=WorkerLeaseState.ACTIVE,
+            generation_state=WorkerGenerationState.ACTIVE,
+        )
+        from .tokens import owner_worker_capability_public_config
+
+        fallback_verifier = owner_worker_capability_public_config(control_home)
+        os.environ.update(
+            owner_worker_env_for(
+                owner_key=owner_key,
+                owner_home=owner_home,
+                control_home=control_home,
+                worker_generation=fallback_lease.worker_generation,
+                worker_id=fallback_lease.worker_id,
+                lease_version=fallback_lease.lease_version,
+                recovery_generation=fallback_lease.recovery_generation,
+                capability_issuer=fallback_verifier["HERMES_OWNER_WORKER_CAPABILITY_ISSUER"],
+                capability_public_key=fallback_verifier["HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY"],
+                capability_retained_public_keys=fallback_verifier[
+                    "HERMES_OWNER_WORKER_CAPABILITY_RETAINED_PUBLIC_KEYS"
+                ],
+            )
+        )
+        worker_generation = fallback_lease.worker_generation
+        worker_id = fallback_lease.worker_id
+    try:
+        runtime_paths = validate_owner_worker_runtime_environment(
+            owner_home=owner_home,
+            owner_key=owner_key,
+            worker_generation=worker_generation,
+            worker_id=worker_id,
+            socket_path=socket_path,
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(f"owner worker startup self-check failed: {exc}") from exc
+
     from fastapi import Depends, FastAPI, Header, HTTPException, Request
     from fastapi.responses import JSONResponse
     from hermes_constants import get_hermes_home
@@ -72,13 +190,27 @@ def create_app(owner_key: str, owner_home: Path):
 
     from hermes_cli import session_api
 
-    from .tokens import AUD_OWNER_WORKER_HTTP, validate_internal_token
-
+    from .tokens import (
+        AUD_OWNER_WORKER_HTTP,
+        SCOPE_OWNER_WORKER_HTTP,
+        OwnerWorkerCapabilityInvalid,
+        verify_owner_worker_capability,
+    )
     app = FastAPI(title="Hermes Owner Worker")
     app.state.owner_worker_mode = True
     app.state.owner_worker_owner_key = owner_key
     app.state.owner_worker_owner_home = owner_home
+    app.state.owner_worker_generation = worker_generation
+    app.state.owner_worker_id = worker_id
     app.state.owner_worker_control_home = os.environ.get("HERMES_CONTROL_HOME", "") or None
+    app.state.owner_worker_lease = fallback_lease or _worker_lease_from_env(owner_key)
+    app.state.owner_worker_capability_verifier = fallback_verifier or {
+        "HERMES_OWNER_WORKER_CAPABILITY_ISSUER": os.environ.get("HERMES_OWNER_WORKER_CAPABILITY_ISSUER", ""),
+        "HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY": os.environ.get("HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY", ""),
+        "HERMES_OWNER_WORKER_CAPABILITY_RETAINED_PUBLIC_KEYS": os.environ.get(
+            "HERMES_OWNER_WORKER_CAPABILITY_RETAINED_PUBLIC_KEYS", "{}"
+        ),
+    }
     app.state.auth_required = False
 
     class BulkDeleteSessions(BaseModel):
@@ -113,14 +245,26 @@ def create_app(owner_key: str, owner_home: Path):
         token = ""
         if authorization and authorization.lower().startswith("bearer "):
             token = authorization[7:].strip()
-        if not validate_internal_token(
-            token,
-            owner_key,
-            audience=AUD_OWNER_WORKER_HTTP,
-            path=request.url.path,
-            control_home=app.state.owner_worker_control_home,
-        ):
-            raise HTTPException(status_code=401, detail="invalid owner worker token")
+        try:
+            verify_owner_worker_capability(
+                token,
+                expected_lease=app.state.owner_worker_lease,
+                audience=AUD_OWNER_WORKER_HTTP,
+                scope=SCOPE_OWNER_WORKER_HTTP,
+                path=request.url.path,
+                authority_store=AuthorityStore(app.state.owner_worker_control_home),
+                public_key=getattr(app.state, "owner_worker_capability_verifier", {}).get(
+                    "HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY"
+                ),
+                issuer_key_version=getattr(app.state, "owner_worker_capability_verifier", {}).get(
+                    "HERMES_OWNER_WORKER_CAPABILITY_ISSUER"
+                ),
+                retained_public_keys=getattr(app.state, "owner_worker_capability_verifier", {}).get(
+                    "HERMES_OWNER_WORKER_CAPABILITY_RETAINED_PUBLIC_KEYS"
+                ),
+            )
+        except (OwnerWorkerCapabilityInvalid, RuntimeError):
+            raise HTTPException(status_code=401, detail="invalid owner worker capability") from None
 
     def _open_db() -> Any:
         return SessionDB()
@@ -131,6 +275,12 @@ def create_app(owner_key: str, owner_home: Path):
             raise RuntimeError("get_hermes_home() does not match owner_home")
         if os.environ.get("HERMES_OWNER_KEY") != owner_key:
             raise RuntimeError("HERMES_OWNER_KEY does not match owner_key")
+        configured_generation = os.environ.get("HERMES_WORKER_GENERATION", "").strip()
+        if configured_generation and configured_generation != str(worker_generation):
+            raise RuntimeError("HERMES_WORKER_GENERATION does not match worker_generation")
+        configured_worker_id = os.environ.get("HERMES_WORKER_ID", "").strip()
+        if configured_worker_id and configured_worker_id != worker_id:
+            raise RuntimeError("HERMES_WORKER_ID does not match worker_id")
         if get_default_db_path().resolve() != (owner_home / "state.db").resolve():
             raise RuntimeError("SessionDB default path is not owner-local")
         db = SessionDB()
@@ -139,38 +289,20 @@ def create_app(owner_key: str, owner_home: Path):
                 raise RuntimeError("SessionDB resolved outside owner_home")
         finally:
             db.close()
-        extra_paths: list[tuple[str, Path]] = []
-        try:
-            from tools import checkpoint_manager
+        from tools import checkpoint_manager, process_registry
+        from gateway import channel_directory, mirror
 
-            extra_paths.append(("checkpoint_base", checkpoint_manager._effective_checkpoint_base()))
-        except Exception:
-            pass
-        try:
-            from tools import process_registry
-
-            extra_paths.append(("process_registry", process_registry._effective_checkpoint_path()))
-        except Exception:
-            pass
-        try:
-            from gateway import channel_directory
-
-            extra_paths.extend(
-                [
-                    ("channel_directory", channel_directory._effective_directory_path()),
-                    ("channel_aliases", channel_directory._effective_channel_aliases_path()),
-                    ("sessions_index", channel_directory._effective_sessions_index_path()),
-                ]
-            )
-        except Exception:
-            pass
-        try:
-            from gateway import mirror
-
-            extra_paths.append(("mirror_sessions_index", mirror._effective_sessions_index_path()))
-        except Exception:
-            pass
-        assert_owner_runtime_paths(extra_paths)
+        assert_owner_runtime_paths(
+            [
+                ("checkpoints", checkpoint_manager._effective_checkpoint_base()),
+                ("process_registry", process_registry._effective_checkpoint_path()),
+                ("channel_directory", channel_directory._effective_directory_path()),
+                ("channel_aliases", channel_directory._effective_channel_aliases_path()),
+                ("sessions_index", channel_directory._effective_sessions_index_path()),
+                ("mirror_sessions_index", mirror._effective_sessions_index_path()),
+            ],
+            expected_paths=runtime_paths,
+        )
     except Exception as exc:
         raise RuntimeError(f"owner worker startup self-check failed: {exc}") from exc
 
@@ -182,6 +314,10 @@ def create_app(owner_key: str, owner_home: Path):
             "ready": True,
             "owner_key": owner_key,
             "owner_home": str(owner_home),
+            "worker_generation": worker_generation,
+            "worker_id": worker_id,
+            "lease_version": app.state.owner_worker_lease.lease_version,
+            "recovery_generation": app.state.owner_worker_lease.recovery_generation,
             "pid": os.getpid(),
             "hermes_home": str(get_hermes_home().resolve()),
             "workspace_root": str(get_workspace_root()),
@@ -381,7 +517,13 @@ def main() -> None:
         socket_path.unlink()
     except FileNotFoundError:
         pass
-    app = create_app(owner_key, owner_home)
+    app = create_app(
+        owner_key,
+        owner_home,
+        worker_generation=int(args.worker_generation),
+        worker_id=str(args.worker_id),
+        socket_path=socket_path,
+    )
     os.umask(0o077)
     uvicorn.run(app, uds=str(socket_path), log_level="warning", access_log=False)
 

@@ -7,20 +7,39 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from hermes_constants import get_hermes_home
-from hermes_cli.owner_runtime import ensure_owner_runtime_dirs, owner_worker_env_for
+from hermes_cli.dashboard_auth.authority import (
+    AuthorityStore,
+    AuthorizationRejected,
+    OwnerWorkerAuthorityLease,
+    WorkerGeneration,
+    WorkerGenerationState,
+    WorkerLeaseState,
+)
+from hermes_cli.owner_runtime import (
+    ensure_owner_runtime_dirs,
+    owner_worker_env_for,
+    owner_worker_runtime_paths,
+    owner_worker_socket_path,
+)
 
 from .client import OwnerWorkerClient, OwnerWorkerHealthError
+from .tokens import owner_worker_capability_public_config
 
 
 @dataclass
 class OwnerWorkerHandle:
     owner_key: str
     owner_home: Path
+    worker_generation: int
+    worker_id: str
+    lease_version: int
+    recovery_generation: int
     socket_path: Path
     process: subprocess.Popen[Any]
     pid: int
@@ -79,7 +98,6 @@ if os.name == "nt":
 
 _OWNER_WORKER_ENV_EXPLICIT_KEEP: frozenset[str] = frozenset({
     "HERMES_DISABLE_LAZY_INSTALLS",
-    "HERMES_OWNER_WORKER_TOKEN_SECRET",
 })
 
 
@@ -110,6 +128,8 @@ class OwnerWorkerSupervisor:
         startup_cooldown: float | None = None,
         idle_timeout: float | None = None,
         control_ws_base: str | None = None,
+        authority_store_factory: Callable[[Path], AuthorityStore] = AuthorityStore,
+        generation_bridge_revoker: Callable[[OwnerWorkerAuthorityLease], None] | None = None,
     ) -> None:
         self.global_home = Path(global_home).resolve() if global_home else get_hermes_home().resolve()
         self.control_home = Path(control_home).resolve() if control_home else self.global_home / "control-plane"
@@ -127,6 +147,8 @@ class OwnerWorkerSupervisor:
             float(idle_timeout if idle_timeout is not None else os.environ.get("HERMES_OWNER_WORKER_IDLE_TIMEOUT", "1800") or 1800),
         )
         self.control_ws_base = (control_ws_base or os.environ.get("HERMES_OWNER_WORKER_CONTROL_WS_BASE", "")).strip()
+        self.authority_store = authority_store_factory(self.control_home)
+        self.generation_bridge_revoker = generation_bridge_revoker
         self._handles: dict[str, OwnerWorkerHandle] = {}
         self._last_start_attempt: dict[str, float] = {}
         self._lock = threading.RLock()
@@ -135,7 +157,6 @@ class OwnerWorkerSupervisor:
         with self._lock:
             owner_key = self._owner_key(owner)
             owner_home = self._owner_home(owner)
-            socket_path = self.socket_path_for(owner)
             now = time.time()
             self._reap_exited()
             self._stop_idle(now=now)
@@ -146,15 +167,31 @@ class OwnerWorkerSupervisor:
                     raise RuntimeError("owner worker exact owner_home mismatch for owner_key")
                 existing.last_used_at = time.time()
                 if existing.process.poll() is None:
-                    health = self.client_cls(existing.socket_path, control_home=self.control_home).verify_health(
-                        owner_key=owner_key,
-                        owner_home=owner_home,
-                    )
-                    if int(health["pid"]) != existing.pid:
-                        raise RuntimeError("owner worker pid mismatch")
-                    existing.last_health = health
-                    return existing
-                self._handles.pop(owner_key, None)
+                    try:
+                        self.authority_store.assert_worker_lease(
+                            self._lease_for_handle(existing), states=frozenset({WorkerLeaseState.ACTIVE})
+                        )
+                        health = self.client_cls(existing.socket_path, control_home=self.control_home).verify_health(
+                            owner_key=owner_key,
+                            owner_home=owner_home,
+                            worker_generation=existing.worker_generation,
+                            worker_id=existing.worker_id,
+                            lease_version=existing.lease_version,
+                            recovery_generation=existing.recovery_generation,
+                            lease=self._lease_for_handle(existing),
+                        )
+                        if int(health["pid"]) != existing.pid:
+                            raise RuntimeError("owner worker pid mismatch")
+                    except (AuthorizationRejected, OwnerWorkerHealthError, RuntimeError):
+                        # A local cache never grants authority. Revoke and close
+                        # the exact local generation; its CAS can never mutate a
+                        # newer fence owned by another supervisor.
+                        self._terminate_handle(owner_key, existing)
+                    else:
+                        existing.last_health = health
+                        return existing
+                else:
+                    self._terminate_handle(owner_key, existing)
 
             last_attempt = self._last_start_attempt.get(owner_key, 0.0)
             if self.startup_cooldown and now - last_attempt < self.startup_cooldown:
@@ -166,14 +203,16 @@ class OwnerWorkerSupervisor:
 
             self._last_start_attempt[owner_key] = now
             ensure_owner_runtime_dirs(owner_home)
+            claim = self.authority_store.claim_worker_start(owner_key, worker_id=uuid.uuid4().hex)
+            generation = claim.generation
+            socket_path = self.socket_path_for(owner, generation.worker_generation)
+            socket_path.parent.mkdir(parents=True, exist_ok=True)
 
-            try:
-                socket_path.unlink()
-            except FileNotFoundError:
-                pass
-
-            env = self._env_for(owner)
-            cwd = (Path(env["HERMES_WORKSPACE_ROOT"]) / "default").resolve()
+            env = self._env_for(owner, generation, claim.lease)
+            cwd = owner_worker_runtime_paths(
+                owner_home=owner_home,
+                worker_generation=generation.worker_generation,
+            ).default_workspace
             stdout_path = owner_home / "runtime" / "logs" / "owner-worker.stdout.log"
             stderr_path = owner_home / "runtime" / "logs" / "owner-worker.stderr.log"
             stdout_handle = None
@@ -184,7 +223,7 @@ class OwnerWorkerSupervisor:
                 self._chmod_private_file(stdout_path)
                 self._chmod_private_file(stderr_path)
                 process = self.process_factory(
-                    self._argv_for(owner, socket_path),
+                    self._argv_for(owner, socket_path, generation),
                     env=env,
                     cwd=str(cwd),
                     stdin=subprocess.DEVNULL,
@@ -192,6 +231,16 @@ class OwnerWorkerSupervisor:
                     stderr=stderr_handle,
                     close_fds=True,
                 )
+            except Exception:
+                try:
+                    self.authority_store.transition_worker_lease(
+                        claim.lease,
+                        state=WorkerLeaseState.REVOKED,
+                        generation_state=WorkerGenerationState.FAILED,
+                    )
+                except AuthorizationRejected:
+                    pass
+                raise
             finally:
                 if stdout_handle is not None:
                     stdout_handle.close()
@@ -203,10 +252,26 @@ class OwnerWorkerSupervisor:
                     socket_path=socket_path,
                     owner_key=owner_key,
                     owner_home=owner_home,
+                    worker_generation=generation.worker_generation,
+                    worker_id=generation.worker_id,
+                    lease=claim.lease,
                 )
                 self._chmod_private_file(socket_path)
-                self._verify_socket_path(socket_path, owner_home)
+                self._verify_socket_path(socket_path, owner_home, generation.worker_generation)
+                active_lease = self.authority_store.transition_worker_lease(
+                    claim.lease,
+                    state=WorkerLeaseState.ACTIVE,
+                    generation_state=WorkerGenerationState.ACTIVE,
+                )
             except Exception:
+                try:
+                    self.authority_store.transition_worker_lease(
+                        claim.lease,
+                        state=WorkerLeaseState.REVOKED,
+                        generation_state=WorkerGenerationState.FAILED,
+                    )
+                except AuthorizationRejected:
+                    pass
                 if process.poll() is None:
                     process.terminate()
                     try:
@@ -222,6 +287,10 @@ class OwnerWorkerSupervisor:
             handle = OwnerWorkerHandle(
                 owner_key=owner_key,
                 owner_home=owner_home,
+                worker_generation=generation.worker_generation,
+                worker_id=generation.worker_id,
+                lease_version=active_lease.lease_version,
+                recovery_generation=active_lease.recovery_generation,
                 socket_path=socket_path,
                 process=process,
                 pid=int(health["pid"]),
@@ -236,6 +305,9 @@ class OwnerWorkerSupervisor:
             current = self._handles.get(handle.owner_key)
             if current is not handle:
                 raise RuntimeError("owner worker handle is no longer active")
+            self.authority_store.assert_worker_lease(
+                self._lease_for_handle(handle), states=frozenset({WorkerLeaseState.ACTIVE})
+            )
             handle.active_uses += 1
             handle.last_used_at = time.time()
         return OwnerWorkerLease(self, handle)
@@ -257,21 +329,91 @@ class OwnerWorkerSupervisor:
             pass
 
     @staticmethod
-    def _verify_socket_path(socket_path: Path, owner_home: Path) -> None:
-        runtime_dir = (owner_home / "runtime").resolve()
+    def _verify_socket_path(socket_path: Path, owner_home: Path, worker_generation: int) -> None:
+        expected = owner_worker_socket_path(owner_home, worker_generation)
+        if socket_path.resolve(strict=False) != expected.resolve(strict=False):
+            raise RuntimeError("owner worker socket does not match worker generation")
         resolved = socket_path.resolve()
-        try:
-            resolved.relative_to(runtime_dir)
-        except ValueError as exc:
-            raise RuntimeError("owner worker socket escaped owner runtime directory") from exc
+        if resolved != expected:
+            raise RuntimeError("owner worker socket escaped expected generation path")
         if os.name != "nt":
             mode = resolved.stat().st_mode
             if mode & (stat.S_IRWXG | stat.S_IRWXO):
                 raise RuntimeError("owner worker socket is group/world accessible")
 
+    @staticmethod
+    def _lease_for_handle(handle: OwnerWorkerHandle) -> OwnerWorkerAuthorityLease:
+        return OwnerWorkerAuthorityLease(
+            handle.owner_key,
+            handle.worker_generation,
+            handle.worker_id,
+            WorkerLeaseState.ACTIVE,
+            handle.lease_version,
+            handle.recovery_generation,
+        )
+
+    def _mark_handle_failed(self, handle: OwnerWorkerHandle) -> None:
+        try:
+            self.authority_store.transition_worker_lease(
+                self._lease_for_handle(handle),
+                state=WorkerLeaseState.REVOKED,
+                generation_state=WorkerGenerationState.FAILED,
+            )
+        except AuthorizationRejected:
+            # The handle may already be fenced/replaced by a different
+            # supervisor. A stale local cleanup must never affect it.
+            pass
+
+    def _drain_handle(self, handle: OwnerWorkerHandle) -> OwnerWorkerAuthorityLease | None:
+        try:
+            return self.authority_store.transition_worker_lease(
+                self._lease_for_handle(handle),
+                state=WorkerLeaseState.DRAINING,
+                generation_state=WorkerGenerationState.DRAINING,
+            )
+        except AuthorizationRejected:
+            return None
+
+    def _finalize_drained_handle(
+        self,
+        lease: OwnerWorkerAuthorityLease,
+        *,
+        generation_state: WorkerGenerationState = WorkerGenerationState.TERMINATED,
+    ) -> None:
+        try:
+            self.authority_store.transition_worker_lease(
+                lease,
+                state=WorkerLeaseState.REVOKED,
+                generation_state=generation_state,
+            )
+        except AuthorizationRejected:
+            pass
+
+    def _cleanup_generation_socket(self, handle: OwnerWorkerHandle) -> None:
+        expected = owner_worker_socket_path(handle.owner_home, handle.worker_generation)
+        if handle.socket_path.resolve(strict=False) != expected.resolve(strict=False):
+            raise RuntimeError("owner worker socket does not match worker generation")
+        try:
+            expected.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            expected.parent.rmdir()
+        except OSError:
+            pass
+
     def _terminate_handle(self, owner_key: str, handle: OwnerWorkerHandle) -> None:
-        self._handles.pop(owner_key, None)
-        if handle.process.poll() is None:
+        # Fence exact capability/bootstrap admission before closing bridge or
+        # touching the process. A stale local cleanup can never transition a
+        # replacement fence and therefore cannot revoke its authority.
+        draining = self._drain_handle(handle)
+        if self._handles.get(owner_key) is handle:
+            self._handles.pop(owner_key, None)
+        if self.generation_bridge_revoker is not None:
+            self.generation_bridge_revoker(draining or self._lease_for_handle(handle))
+
+        process_exited = handle.process.poll() is not None
+        if not process_exited:
             handle.process.terminate()
             try:
                 handle.process.wait(timeout=2)
@@ -281,16 +423,28 @@ class OwnerWorkerSupervisor:
                     handle.process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     pass
+            process_exited = handle.process.poll() is not None
+        if process_exited:
+            self._cleanup_generation_socket(handle)
+        if draining is not None:
+            self._finalize_drained_handle(
+                draining,
+                generation_state=(
+                    WorkerGenerationState.TERMINATED
+                    if process_exited
+                    else WorkerGenerationState.REVOKED
+                ),
+            )
 
     def _reap_exited(self) -> None:
         for owner_key, handle in list(self._handles.items()):
             if handle.process.poll() is not None:
-                self._handles.pop(owner_key, None)
+                self._terminate_handle(owner_key, handle)
 
     def _stop_idle(self, *, now: float) -> None:
         for owner_key, handle in list(self._handles.items()):
             if handle.process.poll() is not None:
-                self._handles.pop(owner_key, None)
+                self._terminate_handle(owner_key, handle)
                 continue
             if handle.active_uses > 0:
                 continue
@@ -309,8 +463,10 @@ class OwnerWorkerSupervisor:
         if now - handle.last_used_at >= self.idle_timeout:
             self._terminate_handle(owner_key, handle)
 
-    def socket_path_for(self, owner: Any) -> Path:
-        return self._owner_home(owner) / "runtime" / "worker.sock"
+    def socket_path_for(self, owner: Any, worker_generation: int | None = None) -> Path:
+        if worker_generation is None:
+            raise ValueError("worker_generation is required for authenticated owner workers")
+        return owner_worker_socket_path(self._owner_home(owner), worker_generation)
 
     def _wait_until_healthy(
         self,
@@ -319,6 +475,9 @@ class OwnerWorkerSupervisor:
         socket_path: Path,
         owner_key: str,
         owner_home: Path,
+        worker_generation: int,
+        worker_id: str,
+        lease: OwnerWorkerAuthorityLease,
     ) -> dict[str, Any]:
         deadline = time.monotonic() + self.startup_timeout
         last_error: Exception | None = None
@@ -330,6 +489,11 @@ class OwnerWorkerSupervisor:
                     return self.client_cls(socket_path, control_home=self.control_home).verify_health(
                         owner_key=owner_key,
                         owner_home=owner_home,
+                        worker_generation=worker_generation,
+                        worker_id=worker_id,
+                        lease_version=lease.lease_version,
+                        recovery_generation=lease.recovery_generation,
+                        lease=lease,
                     )
                 except OwnerWorkerHealthError as exc:
                     last_error = exc
@@ -338,7 +502,7 @@ class OwnerWorkerSupervisor:
             raise RuntimeError(f"owner worker failed health verification: {last_error}") from last_error
         raise TimeoutError("timed out waiting for owner worker socket")
 
-    def _argv_for(self, owner: Any, socket_path: Path) -> list[str]:
+    def _argv_for(self, owner: Any, socket_path: Path, generation: WorkerGeneration) -> list[str]:
         argv = [
             sys.executable,
             "-m",
@@ -351,6 +515,10 @@ class OwnerWorkerSupervisor:
             str(socket_path),
             "--control-home",
             str(self.control_home),
+            "--worker-generation",
+            str(generation.worker_generation),
+            "--worker-id",
+            generation.worker_id,
         ]
         optional = (
             ("--tenant-id", "tenant_id"),
@@ -363,9 +531,15 @@ class OwnerWorkerSupervisor:
                 argv.extend([flag, str(value)])
         return argv
 
-    def _env_for(self, owner: Any) -> dict[str, str]:
+    def _env_for(
+        self,
+        owner: Any,
+        generation: WorkerGeneration,
+        lease: OwnerWorkerAuthorityLease,
+    ) -> dict[str, str]:
         keep = _OWNER_WORKER_ENV_ALLOW | _OWNER_WORKER_ENV_EXPLICIT_KEEP | _configured_env_allowlist()
         env = {key: value for key, value in os.environ.items() if key in keep}
+        verifier = owner_worker_capability_public_config(self.control_home)
         env.update(
             owner_worker_env_for(
                 owner_key=self._owner_key(owner),
@@ -374,6 +548,15 @@ class OwnerWorkerSupervisor:
                 owner_user_id=str(self._get_attr(owner, "owner_user_id", "") or ""),
                 auth_provider=str(self._get_attr(owner, "auth_provider", "") or ""),
                 control_home=self.control_home,
+                worker_generation=generation.worker_generation,
+                worker_id=generation.worker_id,
+                lease_version=lease.lease_version,
+                recovery_generation=lease.recovery_generation,
+                capability_issuer=verifier["HERMES_OWNER_WORKER_CAPABILITY_ISSUER"],
+                capability_public_key=verifier["HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY"],
+                capability_retained_public_keys=verifier[
+                    "HERMES_OWNER_WORKER_CAPABILITY_RETAINED_PUBLIC_KEYS"
+                ],
             )
         )
         if self.control_ws_base:

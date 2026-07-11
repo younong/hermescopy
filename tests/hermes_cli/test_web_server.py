@@ -5295,6 +5295,13 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
 
         class _Handle:
             socket_path = "unused.sock"
+            worker_generation = 1
+            worker_id = "worker-test"
+            lease_version = 1
+            recovery_generation = 0
+
+            def __init__(self, owner_key):
+                self.owner_key = owner_key
 
         class _Supervisor:
             control_home = (_isolate_hermes_home or tmp_path / "hermes-home") / "control-plane"
@@ -5304,7 +5311,7 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
 
             def get_or_start(self, owner):
                 self.owners.append(owner)
-                return _Handle()
+                return _Handle(owner.owner_key)
 
         self.supervisor = _Supervisor()
         app.state.owner_worker_supervisor = self.supervisor
@@ -5326,10 +5333,10 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
 
         captured = {}
 
-        def fake_request(self, method, path, *, owner_key, headers=None, content=None):
+        def fake_request(self, method, path, *, lease, headers=None, content=None):
             import httpx
 
-            captured.update({"method": method, "path": path, "owner_key": owner_key, "content": content})
+            captured.update({"method": method, "path": path, "owner_key": lease.owner_key, "content": content})
             return httpx.Response(200, json={"sessions": [{"id": "owner-local"}], "total": 1, "limit": 5, "offset": 0})
 
         monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fake_request)
@@ -5427,10 +5434,10 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
 
         captured = {}
 
-        def fake_request(self, method, path, *, owner_key, headers=None, content=None):
+        def fake_request(self, method, path, *, lease, headers=None, content=None):
             import httpx
 
-            captured.update({"method": method, "path": path, "owner_key": owner_key})
+            captured.update({"method": method, "path": path, "owner_key": lease.owner_key})
             return httpx.Response(200, json={"daily": [], "by_model": [], "totals": {}, "period_days": 7})
 
         monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fake_request)
@@ -5448,10 +5455,10 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
 
         captured = {}
 
-        def fake_request(self, method, path, *, owner_key, headers=None, content=None):
+        def fake_request(self, method, path, *, lease, headers=None, content=None):
             import httpx
 
-            captured.update({"method": method, "path": path, "owner_key": owner_key})
+            captured.update({"method": method, "path": path, "owner_key": lease.owner_key})
             return httpx.Response(200, json={"model": "owner-model", "provider": "test", "capabilities": {}})
 
         monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fake_request)
@@ -5475,10 +5482,10 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
 
         captured = {}
 
-        def fake_request(self, method, path, *, owner_key, headers=None, content=None):
+        def fake_request(self, method, path, *, lease, headers=None, content=None):
             import httpx
 
-            captured.update({"method": method, "path": path, "owner_key": owner_key})
+            captured.update({"method": method, "path": path, "owner_key": lease.owner_key})
             return httpx.Response(200, json={"models": [], "totals": {}, "period_days": 7})
 
         monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fake_request)

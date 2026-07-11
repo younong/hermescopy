@@ -175,8 +175,11 @@ async def _lifespan(app: "FastAPI"):
     app.state.pty_browser_sessions = {}  # browser_id -> active /api/pty owner
     app.state.pty_browser_lock = asyncio.Lock()
     app.state.authorized_ws_bridges = {}  # scope digest -> {(websocket, epoch)}
+    app.state.authorized_ws_bridges_by_worker = {}  # exact worker fence -> {websocket}
     app.state.authorized_ws_bridge_lock = asyncio.Lock()
     app.state.authority_change_sequence = 0
+    app.state.worker_change_sequence = 0
+    app.state.server_event_loop = asyncio.get_running_loop()
     app.state.authority_change_stop = asyncio.Event()
     app.state.authority_change_task = None
     # Serializes chat-argv resolution so concurrent /api/pty connections
@@ -480,6 +483,20 @@ def _acquire_owner_worker_use(supervisor: Any, handle: Any) -> Any:
     return _NoopOwnerWorkerLease()
 
 
+def _owner_worker_authority_lease(handle: Any):
+    """Construct the exact durable fence without trusting a supervisor helper."""
+    from hermes_cli.dashboard_auth.authority import OwnerWorkerAuthorityLease, WorkerLeaseState
+
+    return OwnerWorkerAuthorityLease(
+        owner_key=str(handle.owner_key),
+        worker_generation=int(handle.worker_generation),
+        worker_id=str(handle.worker_id),
+        state=WorkerLeaseState.ACTIVE,
+        lease_version=int(handle.lease_version),
+        recovery_generation=int(handle.recovery_generation),
+    )
+
+
 def _release_owner_worker_iter(iterator: Any, lease: Any):
     try:
         yield from iterator
@@ -522,7 +539,7 @@ async def _proxy_authenticated_owner_http(request: Request) -> Response:
             OwnerWorkerClient(handle.socket_path, control_home=getattr(supervisor, "control_home", None)).request,
             request.method,
             worker_path,
-            owner_key=owner.owner_key,
+            lease=_owner_worker_authority_lease(handle),
             headers=forwarded_headers,
             content=content,
         )
@@ -12214,19 +12231,33 @@ def _ws_auth_result(ws: "WebSocket") -> _WsAuthResult:
         if not token:
             return _WsAuthResult("no_credential", "none")
         try:
-            from hermes_cli.owner_worker.tokens import AUD_OWNER_WORKER_WS, validate_internal_token
+            from hermes_cli.dashboard_auth.authority import AuthorityStore
+            from hermes_cli.owner_worker.tokens import (
+                AUD_OWNER_WORKER_WS,
+                SCOPE_OWNER_WORKER_WS,
+                OwnerWorkerCapabilityInvalid,
+                verify_owner_worker_capability,
+            )
+            lease = getattr(state, "owner_worker_lease", None)
+            verifier = getattr(state, "owner_worker_capability_verifier", {})
+            if lease is None:
+                raise OwnerWorkerCapabilityInvalid("capability_lease_invalid")
+            verify_owner_worker_capability(
+                token,
+                expected_lease=lease,
+                audience=AUD_OWNER_WORKER_WS,
+                scope=SCOPE_OWNER_WORKER_WS,
+                path=ws.url.path,
+                authority_store=AuthorityStore(getattr(state, "owner_worker_control_home", None)),
+                public_key=verifier.get("HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY"),
+                issuer_key_version=verifier.get("HERMES_OWNER_WORKER_CAPABILITY_ISSUER"),
+                retained_public_keys=verifier.get(
+                    "HERMES_OWNER_WORKER_CAPABILITY_RETAINED_PUBLIC_KEYS"
+                ),
+            )
         except Exception:
-            return _WsAuthResult("internal_owner_unavailable", "internal_owner_token")
-        control_home = getattr(state, "owner_worker_control_home", None)
-        if validate_internal_token(
-            token,
-            owner_key,
-            audience=AUD_OWNER_WORKER_WS,
-            path=ws.url.path,
-            control_home=control_home,
-        ):
-            return _WsAuthResult(None, "internal_owner_token", {"owner_key": owner_key})
-        return _WsAuthResult("internal_owner_invalid", "internal_owner_token")
+            return _WsAuthResult("internal_owner_invalid", "internal_owner_token")
+        return _WsAuthResult(None, "internal_owner_token", {"owner_key": owner_key})
 
     auth_required = bool(getattr(state, "auth_required", False))
     if auth_required:
@@ -12378,20 +12409,20 @@ def _should_bridge_ws_to_owner_worker(ws: "WebSocket", auth_result: _WsAuthResul
     )
 
 
-def _ws_query_for_owner_worker(ws: "WebSocket", *, internal_owner_token: str) -> str:
+def _ws_query_for_owner_worker(ws: "WebSocket", *, internal_owner_bootstrap: str) -> str:
     """Forward browser query params to the worker with external auth stripped."""
     # ``profile=default`` is a harmless management-profile hint in the Control
     # Plane, but inside an owner worker the legacy profile resolver would map it
     # back to the global default profile and overwrite HERMES_HOME. Strip all
     # auth/profile selectors before forwarding; owner identity is already fixed
-    # by the worker env and the short-lived internal_owner_token.
-    stripped_keys = {"ticket", "token", "internal", "internal_owner_token", "profile"}
+    # by the worker env and the one-use internal_owner_bootstrap.
+    stripped_keys = {"ticket", "token", "internal", "internal_owner_token", "internal_owner_bootstrap", "profile"}
     pairs = [
         (key, value)
         for key, value in urllib.parse.parse_qsl(str(ws.url.query or ""), keep_blank_values=True)
         if key not in stripped_keys
     ]
-    pairs.append(("internal_owner_token", internal_owner_token))
+    pairs.append(("internal_owner_bootstrap", internal_owner_bootstrap))
     return urllib.parse.urlencode(pairs, doseq=True)
 
 
@@ -12429,6 +12460,17 @@ async def _connect_owner_worker_ws(socket_path: Path, uri: str, *, open_timeout:
         return await unix_connect(str(socket_path), uri=uri, **kwargs)
 
 
+def _worker_bridge_identity(lease: Any) -> tuple[str, int, str, int, int]:
+    """Return the exact durable Worker fence used for bridge cleanup."""
+    return (
+        str(lease.owner_key),
+        int(lease.worker_generation),
+        str(lease.worker_id),
+        int(lease.lease_version),
+        int(lease.recovery_generation),
+    )
+
+
 def _authorized_ws_bridge_state(
     app_obj: Any,
 ) -> tuple[dict[str, set[tuple[Any, int]]], asyncio.Lock]:
@@ -12439,14 +12481,21 @@ def _authorized_ws_bridge_state(
     terminate a newly admitted bridge carrying the new epoch.
     """
     try:
-        return app_obj.state.authorized_ws_bridges, app_obj.state.authorized_ws_bridge_lock
+        bridges = app_obj.state.authorized_ws_bridges
+        lock = app_obj.state.authorized_ws_bridge_lock
     except AttributeError:
-        app_obj.state.authorized_ws_bridges = {}
-        app_obj.state.authorized_ws_bridge_lock = asyncio.Lock()
+        bridges = {}
+        lock = asyncio.Lock()
+        app_obj.state.authorized_ws_bridges = bridges
+        app_obj.state.authorized_ws_bridge_lock = lock
         app_obj.state.authority_change_sequence = 0
         app_obj.state.authority_change_stop = asyncio.Event()
         app_obj.state.authority_change_task = None
-        return app_obj.state.authorized_ws_bridges, app_obj.state.authorized_ws_bridge_lock
+    if not hasattr(app_obj.state, "authorized_ws_bridges_by_worker"):
+        app_obj.state.authorized_ws_bridges_by_worker = {}
+    if not hasattr(app_obj.state, "worker_change_sequence"):
+        app_obj.state.worker_change_sequence = 0
+    return bridges, lock
 
 
 async def _close_authorized_bridge_targets(
@@ -12476,6 +12525,14 @@ async def close_authorized_bridges_by_digest(
             for digest in scope_digests
             for ws, _epoch in bridges.pop(str(digest), set())
         )
+        if targets:
+            worker_bridges = app_obj.state.authorized_ws_bridges_by_worker
+            for identity, registered in tuple(worker_bridges.items()):
+                kept = registered.difference(targets)
+                if kept:
+                    worker_bridges[identity] = kept
+                else:
+                    worker_bridges.pop(identity, None)
     await _close_authorized_bridge_targets(app_obj, targets, reason=reason)
 
 
@@ -12504,6 +12561,44 @@ async def close_authorized_bridges_by_changes(
                 bridges[digest] = kept
             else:
                 bridges.pop(digest, None)
+        if targets:
+            worker_bridges = app_obj.state.authorized_ws_bridges_by_worker
+            for identity, registered in tuple(worker_bridges.items()):
+                kept = registered.difference(targets)
+                if kept:
+                    worker_bridges[identity] = kept
+                else:
+                    worker_bridges.pop(identity, None)
+    await _close_authorized_bridge_targets(app_obj, tuple(targets), reason=reason)
+
+
+async def close_authorized_bridges_by_worker_change(
+    app_obj: Any,
+    changes: tuple[Any, ...],
+    *,
+    reason: str,
+    close_active: bool = False,
+) -> None:
+    """Close only bridges bound to a non-admissible exact Worker fence."""
+    if not changes:
+        return
+    _authorized_ws_bridge_state(app_obj)
+    worker_bridges = app_obj.state.authorized_ws_bridges_by_worker
+    bridges, lock = _authorized_ws_bridge_state(app_obj)
+    targets: set[Any] = set()
+    async with lock:
+        for change in changes:
+            if not close_active and str(change.lease_state) in {"starting", "active"}:
+                continue
+            identity = _worker_bridge_identity(change)
+            targets.update(worker_bridges.pop(identity, set()))
+        if targets:
+            for digest, registrations in tuple(bridges.items()):
+                kept = {(ws, epoch) for ws, epoch in registrations if ws not in targets}
+                if kept:
+                    bridges[digest] = kept
+                else:
+                    bridges.pop(digest, None)
     await _close_authorized_bridge_targets(app_obj, tuple(targets), reason=reason)
 
 
@@ -12521,9 +12616,10 @@ async def _watch_authority_changes(app_obj: Any) -> None:
     state = app_obj.state
     while not state.authority_change_stop.is_set():
         try:
-            changes = await asyncio.to_thread(
-                authority_store().changes_since,
-                int(state.authority_change_sequence),
+            store = authority_store()
+            changes, worker_changes = await asyncio.gather(
+                asyncio.to_thread(store.changes_since, int(state.authority_change_sequence)),
+                asyncio.to_thread(store.worker_changes_since, int(state.worker_change_sequence)),
             )
         except Exception:
             # A replica that cannot read the shared authority cannot safely keep
@@ -12537,6 +12633,7 @@ async def _watch_authority_changes(app_obj: Any) -> None:
                     ws for registrations in bridges.values() for ws, _epoch in registrations
                 )
                 bridges.clear()
+                app_obj.state.authorized_ws_bridges_by_worker.clear()
             await _close_authorized_bridge_targets(
                 app_obj, targets, reason="authority_unavailable"
             )
@@ -12546,6 +12643,11 @@ async def _watch_authority_changes(app_obj: Any) -> None:
                 app_obj, changes, reason="authority_transition"
             )
             state.authority_change_sequence = changes[-1].sequence
+        if worker_changes:
+            await close_authorized_bridges_by_worker_change(
+                app_obj, worker_changes, reason="worker_generation_revoked"
+            )
+            state.worker_change_sequence = worker_changes[-1].sequence
         try:
             await asyncio.wait_for(state.authority_change_stop.wait(), timeout=0.25)
         except asyncio.TimeoutError:
@@ -12597,8 +12699,15 @@ async def _bridge_websocket_to_owner_worker(
         return
 
     from hermes_cli.dashboard_auth.owner_context import ensure_owner_home
-    from hermes_cli.owner_worker.tokens import AUD_OWNER_WORKER_WS, mint_internal_token
-
+    from hermes_cli.owner_worker.tokens import (
+        mint_owner_worker_bootstrap,
+        owner_worker_capability_public_config,
+        owp1_data,
+        parse_owner_worker_bootstrap,
+        owp1_hello,
+        parse_owp1_data,
+        validate_owp1_control,
+    )
     try:
         owner = _owner_context_from_ws_auth_result(auth_result)
         ensure_owner_home(owner)
@@ -12623,13 +12732,25 @@ async def _bridge_websocket_to_owner_worker(
         await ws.close(code=1013, reason=_ws_close_reason("owner worker unavailable"))
         return
 
-    token = mint_internal_token(
-        owner.owner_key,
-        audience=AUD_OWNER_WORKER_WS,
+    connection_id = secrets.token_urlsafe(18)
+    nonce = secrets.token_urlsafe(18)
+    bootstrap_claims = mint_owner_worker_bootstrap(
+        _owner_worker_authority_lease(handle),
         path=path,
+        connection_id=connection_id,
+        nonce=nonce,
         control_home=getattr(supervisor, "control_home", None),
     )
-    query = _ws_query_for_owner_worker(ws, internal_owner_token=token)
+    verifier = owner_worker_capability_public_config(getattr(supervisor, "control_home", None))
+    bootstrap = parse_owner_worker_bootstrap(
+        bootstrap_claims,
+        expected_lease=_owner_worker_authority_lease(handle),
+        path=path,
+        public_key=verifier["HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY"],
+        issuer_key_version=verifier["HERMES_OWNER_WORKER_CAPABILITY_ISSUER"],
+        retained_public_keys=verifier["HERMES_OWNER_WORKER_CAPABILITY_RETAINED_PUBLIC_KEYS"],
+    )
+    query = _ws_query_for_owner_worker(ws, internal_owner_bootstrap=bootstrap_claims)
     worker_uri = f"ws://owner-worker{path}"
     if query:
         worker_uri = f"{worker_uri}?{query}"
@@ -12637,6 +12758,8 @@ async def _bridge_websocket_to_owner_worker(
     worker_ws = None
     try:
         worker_ws = await _connect_owner_worker_ws(handle.socket_path, worker_uri)
+        await worker_ws.send(owp1_hello(bootstrap))
+        validate_owp1_control(await asyncio.wait_for(worker_ws.recv(), timeout=5), bootstrap, message_type="ack")
     except Exception as exc:
         if lease is not None:
             lease.release()
@@ -12647,20 +12770,24 @@ async def _bridge_websocket_to_owner_worker(
     await ws.accept()
     bridge_scope: Any | None = None
     bridge_scope_digest: str | None = None
-    if auth_result.credential == "ticket":
-        from hermes_cli.dashboard_auth.authority import AuthorizationScope
+    bridge_worker_identity = _worker_bridge_identity(_owner_worker_authority_lease(handle))
+    await _ensure_authority_change_dispatcher(ws.app)
+    bridges, bridge_lock = _authorized_ws_bridge_state(ws.app)
+    async with bridge_lock:
+        ws.app.state.authorized_ws_bridges_by_worker.setdefault(
+            bridge_worker_identity, set()
+        ).add(ws)
+        if auth_result.credential == "ticket":
+            from hermes_cli.dashboard_auth.authority import AuthorizationScope
 
-        bridge_scope = AuthorizationScope(
-            provider=str(auth_result.payload["provider"]),
-            tenant_id=str(auth_result.payload["tenant_id"]),
-            user_id=str(auth_result.payload["user_id"]),
-            session_id=str(auth_result.payload["session_id"]),
-            membership_revision=str(auth_result.payload["membership_revision"]),
-        )
-        bridge_scope_digest = bridge_scope.digest
-        await _ensure_authority_change_dispatcher(ws.app)
-        bridges, bridge_lock = _authorized_ws_bridge_state(ws.app)
-        async with bridge_lock:
+            bridge_scope = AuthorizationScope(
+                provider=str(auth_result.payload["provider"]),
+                tenant_id=str(auth_result.payload["tenant_id"]),
+                user_id=str(auth_result.payload["user_id"]),
+                session_id=str(auth_result.payload["session_id"]),
+                membership_revision=str(auth_result.payload["membership_revision"]),
+            )
+            bridge_scope_digest = bridge_scope.digest
             bridges.setdefault(bridge_scope_digest, set()).add(
                 (ws, int(auth_result.payload["epoch"]))
             )
@@ -12680,6 +12807,7 @@ async def _bridge_websocket_to_owner_worker(
     expiry_task = asyncio.create_task(expire_browser_session())
 
     async def browser_to_worker() -> None:
+        sequence = 1
         try:
             while True:
                 msg = await ws.receive()
@@ -12690,9 +12818,17 @@ async def _bridge_websocket_to_owner_worker(
                     await worker_ws.close(code=code, reason=_ws_close_reason(reason) if reason else "")
                     return
                 if "bytes" in msg and msg.get("bytes") is not None:
-                    await worker_ws.send(msg["bytes"])
+                    envelope = owp1_data(
+                        bootstrap, direction="control-to-worker", sequence=sequence, data=msg["bytes"],
+                    )
                 elif "text" in msg and msg.get("text") is not None:
-                    await worker_ws.send(msg["text"])
+                    envelope = owp1_data(
+                        bootstrap, direction="control-to-worker", sequence=sequence, text=msg["text"],
+                    )
+                else:
+                    continue
+                await worker_ws.send(envelope)
+                sequence += 1
         except WebSocketDisconnect:
             try:
                 await worker_ws.close(code=1000)
@@ -12706,12 +12842,20 @@ async def _bridge_websocket_to_owner_worker(
                 pass
 
     async def worker_to_browser() -> None:
+        sequence = 1
         try:
             async for message in worker_ws:
-                if isinstance(message, (bytes, bytearray, memoryview)):
-                    await ws.send_bytes(bytes(message))
+                kind, payload = parse_owp1_data(
+                    message,
+                    bootstrap,
+                    direction="worker-to-control",
+                    expected_sequence=sequence,
+                )
+                sequence += 1
+                if kind == "bytes":
+                    await ws.send_bytes(bytes(payload))
                 else:
-                    await ws.send_text(str(message))
+                    await ws.send_text(str(payload))
         except Exception as exc:
             code = _ws_bridge_close_code(getattr(exc, "code", None), default=1011)
             reason = str(getattr(exc, "reason", "") or "")
@@ -12741,20 +12885,31 @@ async def _bridge_websocket_to_owner_worker(
             await expiry_task
         except asyncio.CancelledError:
             pass
-        if bridge_scope_digest is not None:
+        if bridge_scope_digest is not None or bridge_worker_identity is not None:
             bridges, bridge_lock = _authorized_ws_bridge_state(ws.app)
             async with bridge_lock:
-                registered = bridges.get(bridge_scope_digest)
-                if registered is not None:
-                    registered = {
-                        (registered_ws, admitted_epoch)
-                        for registered_ws, admitted_epoch in registered
-                        if registered_ws is not ws
-                    }
-                    if registered:
-                        bridges[bridge_scope_digest] = registered
-                    else:
-                        bridges.pop(bridge_scope_digest, None)
+                if bridge_scope_digest is not None:
+                    registered = bridges.get(bridge_scope_digest)
+                    if registered is not None:
+                        registered = {
+                            (registered_ws, admitted_epoch)
+                            for registered_ws, admitted_epoch in registered
+                            if registered_ws is not ws
+                        }
+                        if registered:
+                            bridges[bridge_scope_digest] = registered
+                        else:
+                            bridges.pop(bridge_scope_digest, None)
+                if bridge_worker_identity is not None:
+                    worker_registered = ws.app.state.authorized_ws_bridges_by_worker.get(
+                        bridge_worker_identity
+                    )
+                    if worker_registered is not None:
+                        worker_registered.discard(ws)
+                        if not worker_registered:
+                            ws.app.state.authorized_ws_bridges_by_worker.pop(
+                                bridge_worker_identity, None
+                            )
         try:
             await worker_ws.close()
         except Exception:
@@ -12906,24 +13061,9 @@ def _build_gateway_ws_url(app_obj: Any | None = None) -> Optional[str]:
     """
     state = getattr(app_obj, "state", app.state) if app_obj is not None else app.state
     if getattr(state, "owner_worker_mode", False):
-        from hermes_cli.owner_worker.tokens import AUD_CONTROL_PLANE_WS, child_token_ttl_seconds, mint_internal_token
-
-        owner_key = str(getattr(state, "owner_worker_owner_key", "") or "").strip()
-        base = os.environ.get("HERMES_OWNER_WORKER_CONTROL_WS_BASE", "").strip()
-        if not owner_key or not base:
-            return None
-        qs = urllib.parse.urlencode(
-            {
-                "internal_owner_token": mint_internal_token(
-                    owner_key,
-                    audience=AUD_CONTROL_PLANE_WS,
-                    path="/api/ws",
-                    ttl_seconds=child_token_ttl_seconds(),
-                    control_home=getattr(state, "owner_worker_control_home", None),
-                )
-            }
-        )
-        return f"{base.rstrip('/')}/api/ws?{qs}"
+        # Workers only carry public verification material. Child bootstrap is
+        # intentionally deferred until the single-use handshake capability.
+        return None
 
     host = getattr(state, "bound_host", None)
     port = getattr(state, "bound_port", None)
@@ -12993,25 +13133,8 @@ def _build_sidecar_url(channel: str, app_obj: Any | None = None) -> Optional[str
     """
     state = getattr(app_obj, "state", app.state) if app_obj is not None else app.state
     if getattr(state, "owner_worker_mode", False):
-        from hermes_cli.owner_worker.tokens import AUD_CONTROL_PLANE_WS, child_token_ttl_seconds, mint_internal_token
-
-        owner_key = str(getattr(state, "owner_worker_owner_key", "") or "").strip()
-        base = os.environ.get("HERMES_OWNER_WORKER_CONTROL_WS_BASE", "").strip()
-        if not owner_key or not base:
-            return None
-        qs = urllib.parse.urlencode(
-            {
-                "internal_owner_token": mint_internal_token(
-                    owner_key,
-                    audience=AUD_CONTROL_PLANE_WS,
-                    path="/api/pub",
-                    ttl_seconds=child_token_ttl_seconds(),
-                    control_home=getattr(state, "owner_worker_control_home", None),
-                ),
-                "channel": channel,
-            }
-        )
-        return f"{base.rstrip('/')}/api/pub?{qs}"
+        del channel
+        return None
 
     host = getattr(state, "bound_host", None)
     port = getattr(state, "bound_port", None)
@@ -14888,10 +15011,27 @@ def start_server(
         worker_host = os.environ.get("HERMES_DASHBOARD_EXTERNAL_HOST", "").strip() or host
         worker_netloc = f"[{worker_host}]:{port}" if ":" in worker_host and not worker_host.startswith("[") else f"{worker_host}:{port}"
         global_home = get_hermes_home()
+
+        def revoke_generation_bridges(lease: Any) -> None:
+            loop = getattr(app.state, "server_event_loop", None)
+            if loop is None or loop.is_closed():
+                return
+            future = asyncio.run_coroutine_threadsafe(
+                close_authorized_bridges_by_worker_change(
+                    app,
+                    (lease,),
+                    reason="worker_generation_revoked",
+                    close_active=True,
+                ),
+                loop,
+            )
+            future.result()
+
         app.state.owner_worker_supervisor = OwnerWorkerSupervisor(
             global_home=global_home,
             control_home=global_home / "control-plane",
             control_ws_base=f"{worker_scheme}://{worker_netloc}",
+            generation_bridge_revoker=revoke_generation_bridges,
         )
 
     # ``--insecure`` no longer disables the auth gate (June 2026 hardening:

@@ -24,12 +24,14 @@ from fastapi import HTTPException, WebSocket, WebSocketDisconnect
 
 from hermes_cli.config import get_hermes_home
 from hermes_cli.owner_runtime import resolve_workspace_cwd
+from hermes_cli.dashboard_auth.authority import AuthorityStore
 from hermes_cli.owner_worker.tokens import (
-    AUD_CONTROL_PLANE_WS,
-    AUD_OWNER_WORKER_WS,
-    child_token_ttl_seconds,
-    mint_internal_token,
-    validate_internal_token,
+    OwnerWorkerCapabilityInvalid,
+    admit_owner_worker_bootstrap,
+    owp1_ack,
+    owp1_data,
+    parse_owp1_data,
+    validate_owp1_control,
 )
 
 try:
@@ -67,27 +69,90 @@ def _ws_close_reason(text: str) -> str:
     return encoded[:120].decode("utf-8", "ignore") + "..."
 
 
-def _owner_token_valid(ws: WebSocket) -> bool:
-    owner_key = _owner_key(ws.app)
-    token = ws.query_params.get("internal_owner_token", "")
-    return bool(
-        owner_key
-        and token
-        and validate_internal_token(
-            token,
-            owner_key,
-            audience=AUD_OWNER_WORKER_WS,
-            path=ws.url.path,
-            control_home=_control_home(ws.app),
+class _Owp1Peer:
+    """Expose framed UDS peer data as existing FastAPI WebSocket operations."""
+
+    def __init__(self, ws: WebSocket, claims: Any) -> None:
+        self._ws = ws
+        self._claims = claims
+        self._in_sequence = 1
+        self._out_sequence = 1
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._ws, name)
+
+    async def accept(self, *args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+
+    async def receive(self) -> dict[str, Any]:
+        message = await self._ws.receive()
+        if message.get("type") == "websocket.disconnect":
+            return message
+        framed = message.get("text")
+        if framed is None:
+            raise WebSocketDisconnect(code=4401)
+        kind, payload = parse_owp1_data(
+            framed,
+            self._claims,
+            direction="control-to-worker",
+            expected_sequence=self._in_sequence,
         )
-    )
+        self._in_sequence += 1
+        return {"type": "websocket.receive", kind: payload}
+
+    async def receive_text(self) -> str:
+        message = await self.receive()
+        if message.get("type") == "websocket.disconnect":
+            raise WebSocketDisconnect(code=1000)
+        if not isinstance(message.get("text"), str):
+            raise WebSocketDisconnect(code=4401)
+        return message["text"]
+
+    async def send_text(self, data: str) -> None:
+        await self._ws.send_text(owp1_data(
+            self._claims,
+            direction="worker-to-control",
+            sequence=self._out_sequence,
+            text=str(data),
+        ))
+        self._out_sequence += 1
+
+    async def send_bytes(self, data: bytes) -> None:
+        await self._ws.send_text(owp1_data(
+            self._claims,
+            direction="worker-to-control",
+            sequence=self._out_sequence,
+            data=bytes(data),
+        ))
+        self._out_sequence += 1
 
 
-async def _require_owner_token_or_close(ws: WebSocket) -> bool:
-    if _owner_token_valid(ws):
-        return True
-    await ws.close(code=4401, reason=_ws_close_reason("auth: internal_owner_invalid"))
-    return False
+async def _admit_bootstrap_or_close(ws: WebSocket) -> _Owp1Peer | None:
+    """Consume one bootstrap and complete `owp1` hello/ack before route work."""
+    token = ws.query_params.get("internal_owner_bootstrap", "")
+    lease = getattr(ws.app.state, "owner_worker_lease", None)
+    verifier = getattr(ws.app.state, "owner_worker_capability_verifier", {})
+    if not token or lease is None:
+        await ws.close(code=4401, reason=_ws_close_reason("auth: internal_owner_invalid"))
+        return False
+    try:
+        claims = admit_owner_worker_bootstrap(
+            token,
+            expected_lease=lease,
+            path=ws.url.path,
+            authority_store=AuthorityStore(_control_home(ws.app)),
+            public_key=verifier.get("HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY"),
+            issuer_key_version=verifier.get("HERMES_OWNER_WORKER_CAPABILITY_ISSUER"),
+            retained_public_keys=verifier.get("HERMES_OWNER_WORKER_CAPABILITY_RETAINED_PUBLIC_KEYS"),
+        )
+        await ws.accept()
+        hello = await asyncio.wait_for(ws.receive_text(), timeout=5)
+        validate_owp1_control(hello, claims, message_type="hello")
+        await ws.send_text(owp1_ack(claims))
+        return _Owp1Peer(ws, claims)
+    except (OwnerWorkerCapabilityInvalid, RuntimeError, TimeoutError):
+        await ws.close(code=4401, reason=_ws_close_reason("auth: internal_owner_invalid"))
+        return None
 
 
 def _get_event_state(app: Any) -> tuple[dict[str, set[WebSocket]], asyncio.Lock]:
@@ -240,42 +305,15 @@ def _latest_descendant(session_id: str) -> str | None:
 
 
 def _build_gateway_ws_url(app_obj: Any) -> Optional[str]:
-    owner_key = _owner_key(app_obj)
-    base = os.environ.get("HERMES_OWNER_WORKER_CONTROL_WS_BASE", "").strip()
-    if not owner_key or not base:
-        return None
-    qs = urllib_parse.urlencode(
-        {
-            "internal_owner_token": mint_internal_token(
-                owner_key,
-                audience=AUD_CONTROL_PLANE_WS,
-                path="/api/ws",
-                ttl_seconds=child_token_ttl_seconds(),
-                control_home=_control_home(app_obj),
-            )
-        }
-    )
-    return f"{base.rstrip('/')}/api/ws?{qs}"
+    # Worker-side child processes cannot mint Control-Plane capabilities. The
+    # dedicated single-use bootstrap flow is introduced in Iteration 3 / step 4.
+    del app_obj
+    return None
 
 
 def _build_sidecar_url(app_obj: Any, channel: str) -> Optional[str]:
-    owner_key = _owner_key(app_obj)
-    base = os.environ.get("HERMES_OWNER_WORKER_CONTROL_WS_BASE", "").strip()
-    if not owner_key or not base:
-        return None
-    qs = urllib_parse.urlencode(
-        {
-            "internal_owner_token": mint_internal_token(
-                owner_key,
-                audience=AUD_CONTROL_PLANE_WS,
-                path="/api/pub",
-                ttl_seconds=child_token_ttl_seconds(),
-                control_home=_control_home(app_obj),
-            ),
-            "channel": channel,
-        }
-    )
-    return f"{base.rstrip('/')}/api/pub?{qs}"
+    del app_obj, channel
+    return None
 
 
 def _resolve_chat_argv(
@@ -353,8 +391,10 @@ async def _broadcast_event(app: Any, channel: str, payload: str) -> None:
 
 
 async def pty_ws(ws: WebSocket) -> None:
-    if not await _require_owner_token_or_close(ws):
+    peer = await _admit_bootstrap_or_close(ws)
+    if peer is None:
         return
+    ws = peer
     await ws.accept()
 
     if not _PTY_BRIDGE_AVAILABLE:
@@ -492,7 +532,7 @@ async def pty_ws(ws: WebSocket) -> None:
 
 
 async def gateway_ws(ws: WebSocket) -> None:
-    if not await _require_owner_token_or_close(ws):
+    if not await _admit_bootstrap_or_close(ws):
         return
     from tui_gateway.ws import handle_ws
 
@@ -500,7 +540,7 @@ async def gateway_ws(ws: WebSocket) -> None:
 
 
 async def pub_ws(ws: WebSocket) -> None:
-    if not await _require_owner_token_or_close(ws):
+    if not await _admit_bootstrap_or_close(ws):
         return
     channel = _channel_or_none(ws)
     if not channel:
@@ -515,7 +555,7 @@ async def pub_ws(ws: WebSocket) -> None:
 
 
 async def events_ws(ws: WebSocket) -> None:
-    if not await _require_owner_token_or_close(ws):
+    if not await _admit_bootstrap_or_close(ws):
         return
     channel = _channel_or_none(ws)
     if not channel:

@@ -10,8 +10,11 @@ from hermes_cli.owner_runtime import (
     ensure_owner_runtime_dirs,
     get_default_workspace,
     get_workspace_root,
+    owner_worker_env_for,
+    owner_worker_runtime_paths,
     propagate_owner_env,
     resolve_workspace_cwd,
+    validate_owner_worker_runtime_environment,
 )
 
 
@@ -108,6 +111,64 @@ def test_propagate_owner_env_includes_workspace(monkeypatch, tmp_path):
     assert env["HERMES_HOME"] == str(tmp_path / "owner")
     assert env["HERMES_OWNER_KEY"] == "ok_owner"
     assert env["HERMES_WORKSPACE_ROOT"] == str(tmp_path / "owner" / "workspaces")
+
+
+def _worker_env(tmp_path) -> tuple[Path, dict[str, str]]:
+    owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
+    return owner_home, owner_worker_env_for(
+        owner_key="ok_owner",
+        owner_home=owner_home,
+        control_home=tmp_path / "control",
+        worker_generation=3,
+        worker_id="worker-3",
+        lease_version=2,
+        recovery_generation=0,
+        capability_issuer="owc1-1",
+        capability_public_key="public-key",
+        capability_retained_public_keys="{}",
+    )
+
+
+def test_owner_worker_runtime_contract_requires_exact_minimal_environment(tmp_path):
+    owner_home, env = _worker_env(tmp_path)
+
+    paths = validate_owner_worker_runtime_environment(
+        owner_home=owner_home,
+        owner_key="ok_owner",
+        worker_generation=3,
+        worker_id="worker-3",
+        source=env,
+    )
+
+    assert paths.workspace_root == owner_home / "workspaces"
+    assert paths.default_workspace == owner_home / "workspaces" / "default"
+    assert paths.worker_socket == owner_home / "runtime" / "workers" / "3" / "worker.sock"
+    assert paths.paths["channel_directory"] == owner_home / "channel_directory.json"
+    assert paths.paths["mirror_sessions_index"] == owner_home / "sessions" / "sessions.json"
+
+
+@pytest.mark.parametrize("key", ["HERMES_PROFILE", "HERMES_CONFIG", "HERMES_ENV", "TERMINAL_CWD"])
+def test_owner_worker_runtime_contract_rejects_forbidden_inherited_environment(tmp_path, key):
+    owner_home, env = _worker_env(tmp_path)
+    env[key] = "poisoned"
+
+    with pytest.raises(RuntimeError, match="forbidden"):
+        validate_owner_worker_runtime_environment(owner_home=owner_home, source=env)
+
+
+def test_owner_worker_runtime_contract_rejects_unknown_or_wrong_owner_local_path(tmp_path):
+    owner_home, env = _worker_env(tmp_path)
+    env["HERMES_UNEXPECTED_SELECTOR"] = "poisoned"
+    with pytest.raises(RuntimeError, match="unexpected"):
+        validate_owner_worker_runtime_environment(owner_home=owner_home, source=env)
+
+    env.pop("HERMES_UNEXPECTED_SELECTOR")
+    paths = validate_owner_worker_runtime_environment(owner_home=owner_home, source=env)
+    with pytest.raises(RuntimeError, match="canonical"):
+        assert_owner_runtime_paths(
+            [("process_registry", owner_home / "runtime" / "processes.json")],
+            expected_paths=paths,
+        )
 
 
 def test_assert_owner_runtime_paths_rejects_workspace_escape(tmp_path, monkeypatch):

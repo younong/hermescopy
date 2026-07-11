@@ -2,13 +2,20 @@
 
 from .client import OwnerWorkerClient, OwnerWorkerHealthError
 from .supervisor import OwnerWorkerHandle, OwnerWorkerSupervisor
-from .tokens import mint_internal_token, validate_internal_token
+from .tokens import (
+    OwnerWorkerCapabilityClaims,
+    OwnerWorkerCapabilityInvalid,
+    mint_owner_worker_capability,
+    verify_owner_worker_capability,
+)
 
 __all__ = [
     "OwnerWorkerClient",
     "OwnerWorkerHandle",
     "OwnerWorkerHealthError",
     "OwnerWorkerSupervisor",
-    "mint_internal_token",
-    "validate_internal_token",
+    "OwnerWorkerCapabilityClaims",
+    "OwnerWorkerCapabilityInvalid",
+    "mint_owner_worker_capability",
+    "verify_owner_worker_capability",
 ]

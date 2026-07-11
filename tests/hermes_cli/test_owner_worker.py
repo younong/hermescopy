@@ -11,17 +11,26 @@ from pathlib import Path
 import httpx
 import pytest
 
+from hermes_cli.dashboard_auth.authority import AuthorityStore, WorkerGenerationState, WorkerLeaseState
 from hermes_cli.dashboard_auth.base import Session
 from hermes_cli.dashboard_auth.owner_context import owner_context_from_session
-from hermes_cli.owner_runtime import REQUIRED_OWNER_DIRS, ensure_owner_runtime_dirs
+from hermes_cli.owner_runtime import REQUIRED_OWNER_DIRS, ensure_owner_runtime_dirs, owner_worker_socket_path
 from hermes_cli.owner_worker import OwnerWorkerClient, OwnerWorkerSupervisor
 from hermes_cli.owner_worker.tokens import (
-    AUD_CONTROL_PLANE_WS,
     AUD_OWNER_WORKER_HTTP,
     AUD_OWNER_WORKER_WS,
+    SCOPE_OWNER_WORKER_HTTP,
+    SCOPE_OWNER_WORKER_WS,
+    OwnerWorkerCapabilityInvalid,
     child_token_ttl_seconds,
-    mint_internal_token,
-    validate_internal_token,
+    admit_owner_worker_bootstrap,
+    mint_owner_worker_bootstrap,
+    mint_owner_worker_capability,
+    owner_worker_capability_public_config,
+    owp1_data,
+    parse_owp1_data,
+    parse_owner_worker_bootstrap,
+    verify_owner_worker_capability,
 )
 
 
@@ -64,80 +73,204 @@ class _FakeClient:
         self.socket_path = Path(socket_path)
         self.control_home = control_home
 
-    def verify_health(self, *, owner_key: str, owner_home):
+    def verify_health(self, *, owner_key: str, owner_home, worker_generation=None, worker_id=None, **_kwargs):
         return {
             "ready": True,
             "owner_key": owner_key,
             "owner_home": str(Path(owner_home).resolve()),
+            "worker_generation": worker_generation,
+            "worker_id": worker_id,
             "pid": 4321,
             "hermes_home": str(Path(owner_home).resolve()),
         }
 
 
-def test_internal_token_secret_env_must_match_persisted_secret(tmp_path, monkeypatch):
-    secret_path = tmp_path / "owner_worker_token_secret"
-    secret_path.write_bytes(b"persisted-secret")
-    monkeypatch.setenv("HERMES_OWNER_WORKER_TOKEN_SECRET", "different-secret")
+def _capability_for(
+    app,
+    path: str,
+    *,
+    audience=AUD_OWNER_WORKER_HTTP,
+    scope=SCOPE_OWNER_WORKER_HTTP,
+    control_home=None,
+) -> str:
+    return mint_owner_worker_capability(
+        app.state.owner_worker_lease,
+        audience=audience,
+        scope=scope,
+        path=path,
+        control_home=control_home or app.state.owner_worker_control_home,
+    )
 
-    with pytest.raises(RuntimeError, match="does not match persisted owner worker token secret"):
-        mint_internal_token("ok1_owner_a", control_home=tmp_path)
+
+def _active_lease(tmp_path, *, owner_key="ok1_owner_a", worker_id="worker-a"):
+    store = AuthorityStore(tmp_path / "control")
+    claim = store.claim_worker_start(owner_key, worker_id=worker_id)
+    active = store.transition_worker_lease(
+        claim.lease,
+        state=WorkerLeaseState.ACTIVE,
+        generation_state=WorkerGenerationState.ACTIVE,
+    )
+    return store, active
 
 
-def test_internal_token_is_owner_audience_path_bound_and_expires(tmp_path):
-    token = mint_internal_token(
-        "ok1_owner_a",
+def test_capability_is_exact_owner_generation_lease_scope_and_path_bound(tmp_path):
+    store, lease = _active_lease(tmp_path)
+    token = mint_owner_worker_capability(
+        lease,
         audience=AUD_OWNER_WORKER_WS,
+        scope=SCOPE_OWNER_WORKER_WS,
         path="/api/ws",
         ttl_seconds=2,
-        control_home=tmp_path,
+        control_home=tmp_path / "control",
     )
+    verifier = owner_worker_capability_public_config(tmp_path / "control")
+    kwargs = {
+        "authority_store": store,
+        "public_key": verifier["HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY"],
+        "issuer_key_version": verifier["HERMES_OWNER_WORKER_CAPABILITY_ISSUER"],
+    }
+    claims = verify_owner_worker_capability(
+        token, expected_lease=lease, audience=AUD_OWNER_WORKER_WS,
+        scope=SCOPE_OWNER_WORKER_WS, path="/api/ws", **kwargs,
+    )
+    assert claims.owner_key == lease.owner_key
+    assert claims.worker_generation == lease.worker_generation
+    assert claims.worker_id == lease.worker_id
 
-    now = int(time.time())
-    assert validate_internal_token(
-        token,
-        "ok1_owner_a",
-        audience=AUD_OWNER_WORKER_WS,
-        path="/api/ws",
-        now=now,
-        control_home=tmp_path,
-    )
-    assert not validate_internal_token(
-        token,
-        "ok1_owner_b",
-        audience=AUD_OWNER_WORKER_WS,
-        path="/api/ws",
-        now=now,
-        control_home=tmp_path,
-    )
-    assert not validate_internal_token(
-        token,
-        "ok1_owner_a",
-        audience=AUD_CONTROL_PLANE_WS,
-        path="/api/ws",
-        now=now,
-        control_home=tmp_path,
-    )
-    assert not validate_internal_token(
-        token,
-        "ok1_owner_a",
-        audience=AUD_OWNER_WORKER_WS,
-        path="/api/pub",
-        now=now,
-        control_home=tmp_path,
-    )
-    assert not validate_internal_token(
-        token,
-        "ok1_owner_a",
-        audience=AUD_OWNER_WORKER_WS,
-        path="/api/ws",
-        now=now + 5,
-        control_home=tmp_path,
-    )
+    for audience, scope, path in (
+        (AUD_OWNER_WORKER_HTTP, SCOPE_OWNER_WORKER_HTTP, "/api/ws"),
+        (AUD_OWNER_WORKER_WS, SCOPE_OWNER_WORKER_HTTP, "/api/ws"),
+        (AUD_OWNER_WORKER_WS, SCOPE_OWNER_WORKER_WS, "/api/pub"),
+    ):
+        with pytest.raises(OwnerWorkerCapabilityInvalid, match="binding_mismatch"):
+            verify_owner_worker_capability(token, expected_lease=lease, audience=audience, scope=scope, path=path, **kwargs)
 
 
-def test_internal_token_must_expire_for_server_spawned_children(tmp_path):
-    with pytest.raises(ValueError, match="must expire"):
-        mint_internal_token("ok1_owner_a", ttl_seconds=None, control_home=tmp_path)  # type: ignore[arg-type]
+def test_capability_rejects_legacy_ow2_and_stale_replacement(tmp_path):
+    store, lease = _active_lease(tmp_path)
+    token = mint_owner_worker_capability(
+        lease, audience=AUD_OWNER_WORKER_HTTP, scope=SCOPE_OWNER_WORKER_HTTP,
+        path="/internal/health", control_home=tmp_path / "control",
+    )
+    verifier = owner_worker_capability_public_config(tmp_path / "control")
+    kwargs = {
+        "authority_store": store,
+        "public_key": verifier["HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY"],
+        "issuer_key_version": verifier["HERMES_OWNER_WORKER_CAPABILITY_ISSUER"],
+    }
+    with pytest.raises(OwnerWorkerCapabilityInvalid):
+        verify_owner_worker_capability("ow2.invalid.signature", expected_lease=lease, audience=AUD_OWNER_WORKER_HTTP, scope=SCOPE_OWNER_WORKER_HTTP, path="/internal/health", **kwargs)
+    store.invalidate_outstanding_credentials(reason="replace")
+    store.claim_worker_start(lease.owner_key, worker_id="worker-b")
+    with pytest.raises(OwnerWorkerCapabilityInvalid, match="lease_invalid"):
+        verify_owner_worker_capability(token, expected_lease=lease, audience=AUD_OWNER_WORKER_HTTP, scope=SCOPE_OWNER_WORKER_HTTP, path="/internal/health", **kwargs)
+
+
+def test_bootstrap_is_exact_lease_bound_and_consumed_once(tmp_path):
+    store, lease = _active_lease(tmp_path)
+    control_home = tmp_path / "control"
+    verifier = owner_worker_capability_public_config(control_home)
+    token = mint_owner_worker_bootstrap(
+        lease,
+        path="/api/ws",
+        connection_id="connection_identifier_1234",
+        nonce="control_nonce_identifier_1234",
+        control_home=control_home,
+    )
+    kwargs = {
+        "expected_lease": lease,
+        "path": "/api/ws",
+        "authority_store": store,
+        "public_key": verifier["HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY"],
+        "issuer_key_version": verifier["HERMES_OWNER_WORKER_CAPABILITY_ISSUER"],
+    }
+    claims = admit_owner_worker_bootstrap(token, **kwargs)
+    assert claims.connection_id == "connection_identifier_1234"
+    assert claims.nonce == "control_nonce_identifier_1234"
+    with pytest.raises(OwnerWorkerCapabilityInvalid, match="replay"):
+        admit_owner_worker_bootstrap(token, **kwargs)
+    with pytest.raises(OwnerWorkerCapabilityInvalid, match="binding_mismatch"):
+        parse_owner_worker_bootstrap(
+            token,
+            expected_lease=lease,
+            path="/api/pub",
+            public_key=kwargs["public_key"],
+            issuer_key_version=kwargs["issuer_key_version"],
+        )
+
+
+def test_owp1_data_requires_exact_peer_and_monotonic_sequence(tmp_path):
+    _store, lease = _active_lease(tmp_path)
+    verifier = owner_worker_capability_public_config(tmp_path / "control")
+    claims = parse_owner_worker_bootstrap(
+        mint_owner_worker_bootstrap(
+            lease,
+            path="/api/ws",
+            connection_id="connection_identifier_1234",
+            nonce="control_nonce_identifier_1234",
+            control_home=tmp_path / "control",
+        ),
+        expected_lease=lease,
+        path="/api/ws",
+        public_key=verifier["HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY"],
+        issuer_key_version=verifier["HERMES_OWNER_WORKER_CAPABILITY_ISSUER"],
+    )
+    envelope = owp1_data(
+        claims, direction="control-to-worker", sequence=1, text="hello",
+    )
+    assert parse_owp1_data(
+        envelope, claims, direction="control-to-worker", expected_sequence=1,
+    ) == ("text", "hello")
+    with pytest.raises(OwnerWorkerCapabilityInvalid, match="data_mismatch"):
+        parse_owp1_data(envelope, claims, direction="control-to-worker", expected_sequence=2)
+    with pytest.raises(OwnerWorkerCapabilityInvalid, match="data_mismatch"):
+        parse_owp1_data(envelope, claims, direction="worker-to-control", expected_sequence=1)
+
+
+def test_capability_ttl_is_bounded(tmp_path):
+    _store, lease = _active_lease(tmp_path)
+    with pytest.raises(ValueError, match="ttl"):
+        mint_owner_worker_capability(
+            lease, audience=AUD_OWNER_WORKER_HTTP, scope=SCOPE_OWNER_WORKER_HTTP,
+            path="/internal/health", ttl_seconds=0, control_home=tmp_path / "control",
+        )
+
+
+def test_capability_accepts_only_configured_active_or_retained_verifier(tmp_path):
+    store, lease = _active_lease(tmp_path)
+    token = mint_owner_worker_capability(
+        lease,
+        audience=AUD_OWNER_WORKER_HTTP,
+        scope=SCOPE_OWNER_WORKER_HTTP,
+        path="/internal/health",
+        control_home=tmp_path / "control",
+    )
+    verifier = owner_worker_capability_public_config(tmp_path / "control")
+    claims = verify_owner_worker_capability(
+        token,
+        expected_lease=lease,
+        audience=AUD_OWNER_WORKER_HTTP,
+        scope=SCOPE_OWNER_WORKER_HTTP,
+        path="/internal/health",
+        authority_store=store,
+        public_key=verifier["HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY"],
+        issuer_key_version="replacement-key",
+        retained_public_keys={
+            "owc1-1": verifier["HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY"],
+        },
+    )
+    assert claims.issuer_key_version == "owc1-1"
+    with pytest.raises(OwnerWorkerCapabilityInvalid, match="issuer_mismatch"):
+        verify_owner_worker_capability(
+            token,
+            expected_lease=lease,
+            audience=AUD_OWNER_WORKER_HTTP,
+            scope=SCOPE_OWNER_WORKER_HTTP,
+            path="/internal/health",
+            authority_store=store,
+            public_key=verifier["HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY"],
+            issuer_key_version="replacement-key",
+        )
 
 
 def test_child_token_ttl_is_bounded(monkeypatch):
@@ -186,12 +319,47 @@ def test_supervisor_spawns_the_canonical_session_owner_context(tmp_path, monkeyp
     assert argv[argv.index("--auth-provider") + 1] == owner.auth_provider
     assert child_env["HERMES_OWNER_KEY"] == owner.owner_key
     assert child_env["HERMES_HOME"] == str(owner.owner_home)
+    assert child_env["HERMES_WORKER_GENERATION"] == "1"
+    assert child_env["HERMES_WORKER_ID"]
+    assert argv[argv.index("--worker-generation") + 1] == "1"
+    assert argv[argv.index("--worker-id") + 1] == child_env["HERMES_WORKER_ID"]
+
+
+def test_supervisor_restart_uses_new_generation_and_socket_with_reused_pid(tmp_path):
+    owner = _Owner("ok1_restart", tmp_path / "owner")
+    spawned: list[dict] = []
+
+    def fake_process_factory(*args, **kwargs):
+        spawned.append({"args": args, "kwargs": kwargs})
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess(pid=4321)
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+    first = supervisor.get_or_start(owner)
+    supervisor._terminate_handle(owner.owner_key, first)
+    second = supervisor.get_or_start(owner)
+
+    assert first.pid == second.pid == 4321
+    assert (first.worker_generation, second.worker_generation) == (1, 2)
+    assert first.worker_id != second.worker_id
+    assert first.socket_path != second.socket_path
+    assert supervisor.authority_store.read_worker_generation(owner.owner_key, 1).state.value == "terminated"
+    assert supervisor.authority_store.read_worker_generation(owner.owner_key, 2).state.value == "active"
 
 
 def test_supervisor_rejects_same_key_different_owner_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "control-home"))
     monkeypatch.setenv("HERMES_PROFILE", "control-profile")
     monkeypatch.setenv("HERMES_SESSION_PROFILE", "control-session-profile")
+    monkeypatch.setenv("HERMES_CONFIG", str(tmp_path / "control-config"))
+    monkeypatch.setenv("HERMES_ENV", "control-env")
     monkeypatch.setenv("HERMES_WORKSPACE_ROOT", str(tmp_path / "control-workspaces"))
     monkeypatch.setenv("TERMINAL_CWD", str(tmp_path / "control-cwd"))
     monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_control")
@@ -226,7 +394,10 @@ def test_supervisor_rejects_same_key_different_owner_home(tmp_path, monkeypatch)
     assert child_env["HERMES_WORKSPACE_ROOT"] == str(owner_a.owner_home.resolve() / "workspaces")
     assert child_env.get("HERMES_PROFILE") is None
     assert child_env.get("HERMES_SESSION_PROFILE") is None
+    assert child_env.get("HERMES_CONFIG") is None
+    assert child_env.get("HERMES_ENV") is None
     assert child_env.get("TERMINAL_CWD") is None
+    assert child_env.get("HERMES_OWNER_WORKER_ENV_ALLOWLIST") is None
     assert child_env.get("ANTHROPIC_API_KEY") is None
     assert child_env.get("OPENAI_API_KEY") is None
     assert child_env.get("HTTPS_PROXY") == "http://proxy.example"
@@ -314,6 +485,162 @@ def test_supervisor_serializes_concurrent_start_for_same_owner(tmp_path):
     assert len({id(result) for result in results}) == 1
 
 
+def test_competing_supervisors_admit_one_fenced_worker(tmp_path):
+    owner = _Owner("ok1_shared", tmp_path / "owner")
+    spawned: list[dict] = []
+    barrier = threading.Barrier(3)
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def fake_process_factory(*args, **kwargs):
+        spawned.append({"args": args, "kwargs": kwargs})
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    supervisors = [
+        OwnerWorkerSupervisor(
+            control_home=tmp_path / "control",
+            client_cls=_FakeClient,
+            process_factory=fake_process_factory,
+            startup_timeout=0.1,
+            startup_cooldown=0,
+        )
+        for _ in range(2)
+    ]
+
+    def start(supervisor):
+        try:
+            barrier.wait(timeout=5)
+            results.append(supervisor.get_or_start(owner))
+        except BaseException as exc:  # pragma: no cover - makes thread errors visible
+            errors.append(exc)
+
+    threads = [threading.Thread(target=start, args=(supervisor,)) for supervisor in supervisors]
+    for thread in threads:
+        thread.start()
+    barrier.wait(timeout=5)
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert len(spawned) == 1
+    assert len(results) == 1
+    assert len(errors) == 1
+    assert "already_owned" in str(errors[0])
+
+
+def test_stale_supervisor_handle_cannot_fail_replacement(tmp_path):
+    owner = _Owner("ok1_replaced", tmp_path / "owner")
+
+    def fake_process_factory(*args, **kwargs):
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    first_supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+    stale = first_supervisor.get_or_start(owner)
+    first_supervisor.authority_store.invalidate_outstanding_credentials(reason="replacement")
+    second_supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+    replacement = second_supervisor.get_or_start(owner)
+
+    first_supervisor._mark_handle_failed(stale)
+
+    current = second_supervisor.authority_store.read_owner_worker_lease(owner.owner_key)
+    assert current is not None
+    assert current.worker_generation == replacement.worker_generation
+    assert current.worker_id == replacement.worker_id
+    assert current.state.value == "active"
+
+
+def test_supervisor_fences_and_closes_bridges_before_terminating_exact_generation(tmp_path):
+    owner = _Owner("ok1_revoked", tmp_path / "owner")
+    events = []
+
+    class _OrderedProcess(_FakeProcess):
+        def terminate(self):
+            events.append("terminate")
+            super().terminate()
+
+    def fake_process_factory(*args, **kwargs):
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _OrderedProcess()
+
+    def revoke_bridges(lease):
+        events.append("bridges")
+        assert lease.state is WorkerLeaseState.DRAINING
+        with pytest.raises(Exception):
+            supervisor.authority_store.assert_worker_lease(
+                lease,
+                states=frozenset({WorkerLeaseState.ACTIVE}),
+            )
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+        generation_bridge_revoker=revoke_bridges,
+    )
+    handle = supervisor.get_or_start(owner)
+    socket_path = handle.socket_path
+
+    supervisor._terminate_handle(owner.owner_key, handle)
+
+    assert events == ["bridges", "terminate"]
+    assert not socket_path.exists()
+    assert not socket_path.parent.exists()
+    assert supervisor.authority_store.read_worker_generation(owner.owner_key, 1).state is WorkerGenerationState.TERMINATED
+    assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.REVOKED
+
+
+def test_supervisor_does_not_mark_unconfirmed_process_exit_terminated(tmp_path):
+    owner = _Owner("ok1_hung", tmp_path / "owner")
+
+    class _HungProcess(_FakeProcess):
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            raise subprocess.TimeoutExpired("owner-worker", timeout)
+
+    def fake_process_factory(*args, **kwargs):
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _HungProcess()
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+    handle = supervisor.get_or_start(owner)
+
+    supervisor._terminate_handle(owner.owner_key, handle)
+
+    assert handle.process.terminated and handle.process.killed
+    assert handle.socket_path.exists()
+    assert supervisor.authority_store.read_worker_generation(owner.owner_key, 1).state is WorkerGenerationState.REVOKED
+    assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.REVOKED
+
+
 def test_supervisor_active_use_skips_idle_stop_until_released(tmp_path):
     owner = _Owner("ok1_active", tmp_path / "owner")
 
@@ -345,6 +672,8 @@ def test_supervisor_active_use_skips_idle_stop_until_released(tmp_path):
     supervisor._stop_idle(now=10)
 
     assert handle.process.terminated
+    assert supervisor.authority_store.read_worker_generation(owner.owner_key, 1).state.value == "terminated"
+    assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state.value == "revoked"
 
 
 def test_supervisor_evicts_only_idle_workers(tmp_path):
@@ -385,9 +714,24 @@ def test_worker_health_over_unix_socket_reports_owner_env(tmp_path):
     socket_root.mkdir(mode=0o700, exist_ok=True)
     owner_home = socket_root / "u"
     control_home = socket_root / "c"
-    socket_path = owner_home / "runtime" / "worker.sock"
+    socket_path = owner_worker_socket_path(owner_home, 1)
     owner_home.mkdir(parents=True)
     control_home.mkdir(parents=True)
+    store = AuthorityStore(control_home)
+    claim = store.claim_worker_start("ok1_worker", worker_id="subprocess-test-worker")
+    verifier = owner_worker_capability_public_config(control_home)
+    worker_env = {
+        **os.environ,
+        "HERMES_HOME": str(owner_home),
+        "HERMES_OWNER_KEY": "ok1_worker",
+        "HERMES_WORKSPACE_ROOT": str(owner_home / "workspaces"),
+        "HERMES_CONTROL_HOME": str(control_home),
+        "HERMES_WORKER_GENERATION": str(claim.lease.worker_generation),
+        "HERMES_WORKER_ID": claim.lease.worker_id,
+        "HERMES_WORKER_LEASE_VERSION": str(claim.lease.lease_version),
+        "HERMES_WORKER_RECOVERY_GENERATION": str(claim.lease.recovery_generation),
+        **verifier,
+    }
 
     proc = subprocess.Popen(
         [
@@ -408,12 +752,16 @@ def test_worker_health_over_unix_socket_reports_owner_env(tmp_path):
             "test",
             "--control-home",
             str(control_home),
+            "--worker-generation",
+            "1",
+            "--worker-id",
+            "subprocess-test-worker",
         ],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        env={**os.environ, "HERMES_HOME": str(owner_home), "HERMES_OWNER_KEY": "ok1_worker"},
+        env=worker_env,
     )
     try:
         deadline = time.monotonic() + 10
@@ -425,9 +773,17 @@ def test_worker_health_over_unix_socket_reports_owner_env(tmp_path):
                 raise AssertionError(f"worker exited early: {proc.returncode}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}")
             if socket_path.exists():
                 try:
+                    store = AuthorityStore(control_home)
+                    lease = store.read_owner_worker_lease("ok1_worker")
+                    assert lease is not None
                     health = OwnerWorkerClient(socket_path, control_home=control_home).verify_health(
                         owner_key="ok1_worker",
                         owner_home=owner_home,
+                        worker_generation=1,
+                        worker_id="subprocess-test-worker",
+                        lease_version=lease.lease_version,
+                        recovery_generation=lease.recovery_generation,
+                        lease=lease,
                     )
                     break
                 except Exception as exc:
@@ -440,6 +796,8 @@ def test_worker_health_over_unix_socket_reports_owner_env(tmp_path):
         assert health["owner_key"] == "ok1_worker"
         assert Path(health["owner_home"]).resolve() == owner_home.resolve()
         assert Path(health["hermes_home"]).resolve() == owner_home.resolve()
+        assert health["worker_generation"] == 1
+        assert health["worker_id"] == "subprocess-test-worker"
         assert health["pid"] == proc.pid
         assert health["workspace_root"] == str((owner_home / "workspaces").resolve())
         assert health["forbidden_env_present"] == []
@@ -462,14 +820,44 @@ def test_worker_health_over_unix_socket_reports_owner_env(tmp_path):
             shutil.rmtree(socket_root)
 
 
+def test_worker_client_rejects_generation_or_identity_mismatch(tmp_path):
+    class _MismatchClient(OwnerWorkerClient):
+        def health(self, *, lease=None):
+            owner_key = lease.owner_key if lease is not None else None
+            return {
+                "ready": True, "owner_key": owner_key, "owner_home": str(tmp_path / "owner"),
+                "hermes_home": str(tmp_path / "owner"), "workspace_root": str(tmp_path / "owner" / "workspaces"),
+                "worker_generation": 2, "worker_id": "wrong", "pid": 1, "forbidden_env_present": [],
+            }
+
+    with pytest.raises(Exception, match="generation mismatch"):
+        _MismatchClient(tmp_path / "worker.sock").verify_health(
+            owner_key="ok1_worker", owner_home=tmp_path / "owner", worker_generation=1, worker_id="expected",
+            lease=type("Lease", (), {"owner_key": "ok1_worker"})(),
+        )
+
+
 def test_worker_create_app_fails_when_startup_self_check_fails(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "wrong-owner"))
     monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_worker_routes")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(tmp_path / "control"))
     from hermes_cli.owner_worker.entrypoint import create_app
 
     owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
 
     with pytest.raises(RuntimeError, match="startup self-check failed"):
+        create_app("ok1_worker_routes", owner_home)
+
+
+def test_worker_create_app_rejects_forbidden_environment_before_route_registration(tmp_path, monkeypatch):
+    owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_worker_routes")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(tmp_path / "control"))
+    monkeypatch.setenv("HERMES_CONFIG", str(tmp_path / "poisoned-config"))
+    from hermes_cli.owner_worker.entrypoint import create_app
+
+    with pytest.raises(RuntimeError, match="forbidden"):
         create_app("ok1_worker_routes", owner_home)
 
 
@@ -487,12 +875,20 @@ def test_worker_session_routes_require_owner_token(tmp_path, monkeypatch):
 
     assert client.get("/api/sessions").status_code == 401
 
-    token = mint_internal_token("ok1_worker_routes", audience=AUD_OWNER_WORKER_HTTP, path="/api/sessions", control_home=tmp_path / "control")
+    token = _capability_for(app, audience=AUD_OWNER_WORKER_HTTP, path="/api/sessions", control_home=tmp_path / "control")
     response = client.get("/api/sessions", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
     assert response.json()["sessions"] == []
 
-    wrong = mint_internal_token("ok1_other", audience=AUD_OWNER_WORKER_HTTP, path="/api/sessions", control_home=tmp_path / "control")
+    other_store, other_lease = _active_lease(tmp_path, owner_key="ok1_other", worker_id="worker-other")
+    del other_store
+    wrong = mint_owner_worker_capability(
+        other_lease,
+        audience=AUD_OWNER_WORKER_HTTP,
+        scope=SCOPE_OWNER_WORKER_HTTP,
+        path="/api/sessions",
+        control_home=tmp_path / "control",
+    )
     assert client.get("/api/sessions", headers={"Authorization": f"Bearer {wrong}"}).status_code == 401
 
 
@@ -511,8 +907,8 @@ def test_worker_http_token_validation_uses_stored_control_home(tmp_path, monkeyp
     client = TestClient(app)
     monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_b))
 
-    good = mint_internal_token("ok1_worker_routes", audience=AUD_OWNER_WORKER_HTTP, path="/internal/health", control_home=control_a)
-    wrong_secret = mint_internal_token("ok1_worker_routes", audience=AUD_OWNER_WORKER_HTTP, path="/internal/health", control_home=control_b)
+    good = _capability_for(app, audience=AUD_OWNER_WORKER_HTTP, path="/internal/health", control_home=control_a)
+    wrong_secret = _capability_for(app, audience=AUD_OWNER_WORKER_HTTP, path="/internal/health", control_home=control_b)
 
     assert client.get("/internal/health", headers={"Authorization": f"Bearer {good}"}).status_code == 200
     assert client.get("/internal/health", headers={"Authorization": f"Bearer {wrong_secret}"}).status_code == 401
@@ -529,7 +925,7 @@ def test_worker_http_token_rejects_wrong_path(tmp_path, monkeypatch):
     owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
     app = create_app("ok1_worker_routes", owner_home)
     client = TestClient(app)
-    wrong_path = mint_internal_token("ok1_worker_routes", audience=AUD_OWNER_WORKER_HTTP, path="/api/sessions", control_home=tmp_path / "control")
+    wrong_path = _capability_for(app, audience=AUD_OWNER_WORKER_HTTP, path="/api/sessions", control_home=tmp_path / "control")
 
     assert client.get("/internal/health", headers={"Authorization": f"Bearer {wrong_path}"}).status_code == 401
 
@@ -545,8 +941,8 @@ def test_worker_routes_reject_external_owner_selector(tmp_path, monkeypatch):
     owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
     app = create_app("ok1_worker_routes", owner_home)
     client = TestClient(app)
-    token = mint_internal_token(
-        "ok1_worker_routes",
+    token = _capability_for(
+        app,
         audience=AUD_OWNER_WORKER_HTTP,
         path="/api/sessions",
         control_home=tmp_path / "control",
@@ -569,7 +965,7 @@ def test_worker_session_routes_reject_legacy_profile_selection(tmp_path, monkeyp
     owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
     app = create_app("ok1_worker_routes", owner_home)
     client = TestClient(app)
-    token = mint_internal_token("ok1_worker_routes", audience=AUD_OWNER_WORKER_HTTP, path="/api/sessions", control_home=tmp_path / "control")
+    token = _capability_for(app, audience=AUD_OWNER_WORKER_HTTP, path="/api/sessions", control_home=tmp_path / "control")
 
     response = client.get("/api/sessions?profile=legacy", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 400
@@ -607,7 +1003,7 @@ def test_worker_sessions_route_reads_owner_db_not_global_sentinel(tmp_path, monk
     ensure_owner_runtime_dirs(owner_home)
     app = create_app("ok1_worker_routes", owner_home)
     client = TestClient(app)
-    token = mint_internal_token("ok1_worker_routes", audience=AUD_OWNER_WORKER_HTTP, path="/api/sessions", control_home=control_home)
+    token = _capability_for(app, audience=AUD_OWNER_WORKER_HTTP, path="/api/sessions", control_home=control_home)
 
     response = client.get("/api/sessions?limit=20&min_messages=0", headers={"Authorization": f"Bearer {token}"})
 
@@ -653,8 +1049,8 @@ def test_worker_analytics_routes_return_owner_local_data(tmp_path, monkeypatch):
 
     app = create_app("ok1_worker_routes", owner_home)
     client = TestClient(app)
-    usage_token = mint_internal_token("ok1_worker_routes", audience=AUD_OWNER_WORKER_HTTP, path="/api/analytics/usage", control_home=tmp_path / "control")
-    models_token = mint_internal_token("ok1_worker_routes", audience=AUD_OWNER_WORKER_HTTP, path="/api/analytics/models", control_home=tmp_path / "control")
+    usage_token = _capability_for(app, audience=AUD_OWNER_WORKER_HTTP, path="/api/analytics/usage", control_home=tmp_path / "control")
+    models_token = _capability_for(app, audience=AUD_OWNER_WORKER_HTTP, path="/api/analytics/models", control_home=tmp_path / "control")
 
     usage = client.get("/api/analytics/usage?days=36500", headers={"Authorization": f"Bearer {usage_token}"})
     models = client.get("/api/analytics/models?days=36500", headers={"Authorization": f"Bearer {models_token}"})
@@ -679,7 +1075,7 @@ def test_worker_model_info_returns_owner_local_config(tmp_path, monkeypatch):
     save_config({"model": {"default": "claude-test-owner", "provider": "anthropic", "context_length": 12345}})
     app = create_app("ok1_worker_routes", owner_home)
     client = TestClient(app)
-    token = mint_internal_token("ok1_worker_routes", audience=AUD_OWNER_WORKER_HTTP, path="/api/model/info", control_home=tmp_path / "control")
+    token = _capability_for(app, audience=AUD_OWNER_WORKER_HTTP, path="/api/model/info", control_home=tmp_path / "control")
 
     response = client.get("/api/model/info", headers={"Authorization": f"Bearer {token}"})
 
@@ -701,7 +1097,7 @@ def test_worker_analytics_routes_reject_legacy_profile_selection(tmp_path, monke
     owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
     app = create_app("ok1_worker_routes", owner_home)
     client = TestClient(app)
-    token = mint_internal_token("ok1_worker_routes", audience=AUD_OWNER_WORKER_HTTP, path="/api/analytics/usage", control_home=tmp_path / "control")
+    token = _capability_for(app, audience=AUD_OWNER_WORKER_HTTP, path="/api/analytics/usage", control_home=tmp_path / "control")
 
     response = client.get("/api/analytics/usage?profile=legacy", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 400
