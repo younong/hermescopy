@@ -971,7 +971,24 @@ def test_worker_session_routes_reject_legacy_profile_selection(tmp_path, monkeyp
     assert response.status_code == 400
 
 
-def test_worker_sessions_route_reads_owner_db_not_global_sentinel(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("request_path", "capability_path"),
+    [
+        ("/api/sessions?limit=20&min_messages=0", "/api/sessions"),
+        ("/api/sessions/search?q=owner", "/api/sessions/search"),
+        ("/api/sessions/owner-visible", "/api/sessions/owner-visible"),
+        ("/api/sessions/owner-visible/messages", "/api/sessions/owner-visible/messages"),
+        ("/api/sessions/stats", "/api/sessions/stats"),
+        ("/api/sessions/owner-visible/export", "/api/sessions/owner-visible/export"),
+        (
+            "/api/sessions/owner-visible/latest-descendant",
+            "/api/sessions/owner-visible/latest-descendant",
+        ),
+    ],
+)
+def test_worker_session_read_routes_use_owner_db_not_global_sentinel(
+    tmp_path, monkeypatch, request_path, capability_path
+):
     from fastapi.testclient import TestClient
     from hermes_state import SessionDB
 
@@ -1003,14 +1020,165 @@ def test_worker_sessions_route_reads_owner_db_not_global_sentinel(tmp_path, monk
     ensure_owner_runtime_dirs(owner_home)
     app = create_app("ok1_worker_routes", owner_home)
     client = TestClient(app)
-    token = _capability_for(app, audience=AUD_OWNER_WORKER_HTTP, path="/api/sessions", control_home=control_home)
+    token = _capability_for(
+        app,
+        audience=AUD_OWNER_WORKER_HTTP,
+        path=capability_path,
+        control_home=control_home,
+    )
 
-    response = client.get("/api/sessions?limit=20&min_messages=0", headers={"Authorization": f"Bearer {token}"})
+    response = client.get(request_path, headers={"Authorization": f"Bearer {token}"})
 
     assert response.status_code == 200
-    ids = {session["id"] for session in response.json()["sessions"]}
-    assert "owner-visible" in ids
-    assert "global-sentinel" not in ids
+    payload = response.json()
+    assert "global-sentinel" not in str(payload)
+    if request_path == "/api/sessions/stats":
+        assert payload["total"] == 1
+        assert payload["messages"] == 1
+    else:
+        assert "owner-visible" in str(payload)
+
+
+@pytest.mark.parametrize(
+    ("method", "request_path", "payload", "capability_path"),
+    [
+        ("PATCH", "/api/sessions/owner-visible", {"title": "Updated"}, "/api/sessions/owner-visible"),
+        ("DELETE", "/api/sessions/owner-visible", None, "/api/sessions/owner-visible"),
+        ("POST", "/api/sessions/prune", {"older_than_days": 1}, "/api/sessions/prune"),
+        ("POST", "/api/sessions/bulk-delete", {"ids": ["owner-visible"]}, "/api/sessions/bulk-delete"),
+        ("DELETE", "/api/sessions/empty", None, "/api/sessions/empty"),
+    ],
+)
+def test_worker_session_write_routes_mutate_only_owner_db(
+    tmp_path, monkeypatch, method, request_path, payload, capability_path
+):
+    from fastapi.testclient import TestClient
+    from hermes_state import SessionDB
+
+    global_home = tmp_path / "global"
+    owner_home = tmp_path / "users" / "ok1_worker_routes"
+    control_home = tmp_path / "control"
+    global_home.mkdir(parents=True)
+    owner_home.mkdir(parents=True)
+
+    global_db = SessionDB(db_path=global_home / "state.db")
+    try:
+        global_db.create_session("global-sentinel", "cli")
+        global_db.append_message("global-sentinel", "user", "must not mutate")
+    finally:
+        global_db.close()
+
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_worker_routes")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+    owner_db = SessionDB()
+    try:
+        owner_db.create_session("owner-visible", "cli")
+        owner_db.append_message("owner-visible", "user", "owner only")
+        if request_path == "/api/sessions/empty":
+            owner_db.create_session("empty-ended", "cli")
+            owner_db.end_session("empty-ended", "completed")
+        if request_path == "/api/sessions/prune":
+            owner_db.end_session("owner-visible", "completed")
+            owner_db._conn.execute("UPDATE sessions SET ended_at = 0 WHERE id = ?", ("owner-visible",))
+            owner_db._conn.commit()
+    finally:
+        owner_db.close()
+
+    from hermes_cli.owner_worker.entrypoint import create_app
+
+    ensure_owner_runtime_dirs(owner_home)
+    app = create_app("ok1_worker_routes", owner_home)
+    client = TestClient(app)
+    token = _capability_for(
+        app,
+        audience=AUD_OWNER_WORKER_HTTP,
+        path=capability_path,
+        control_home=control_home,
+    )
+
+    response = client.request(
+        method,
+        request_path,
+        json=payload,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 200, response.text
+    global_db = SessionDB(db_path=global_home / "state.db")
+    try:
+        assert global_db.get_session("global-sentinel") is not None
+    finally:
+        global_db.close()
+    owner_db = SessionDB()
+    try:
+        if method == "PATCH":
+            assert owner_db.get_session_title("owner-visible") == "Updated"
+        elif request_path == "/api/sessions/empty":
+            assert owner_db.get_session("empty-ended") is None
+        elif request_path == "/api/sessions/prune":
+            assert owner_db.get_session("owner-visible") is not None
+            assert response.json()["removed"] == 0
+        else:
+            assert owner_db.get_session("owner-visible") is None
+    finally:
+        owner_db.close()
+
+
+def test_worker_session_identifiers_are_resolved_only_within_owner_scope(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from hermes_state import SessionDB
+
+    owner_a_home = tmp_path / "users" / "ok1_owner_a"
+    owner_b_home = tmp_path / "users" / "ok1_owner_b"
+    control_home = tmp_path / "control"
+    owner_a_home.mkdir(parents=True)
+    owner_b_home.mkdir(parents=True)
+
+    owner_b_db = SessionDB(db_path=owner_b_home / "state.db")
+    try:
+        owner_b_db.create_session("b-session-unique", "cli")
+        owner_b_db.append_message("b-session-unique", "user", "owner B only")
+        owner_b_db.set_session_title("b-session-unique", "B private title")
+    finally:
+        owner_b_db.close()
+
+    monkeypatch.setenv("HERMES_HOME", str(owner_a_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_owner_a")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+    owner_a_db = SessionDB()
+    try:
+        owner_a_db.create_session("a-session-unique", "cli")
+        owner_a_db.append_message("a-session-unique", "user", "owner A only")
+        owner_a_db.set_session_title("a-session-unique", "A visible title")
+    finally:
+        owner_a_db.close()
+
+    from hermes_cli.owner_worker.entrypoint import create_app
+
+    ensure_owner_runtime_dirs(owner_a_home)
+    app = create_app("ok1_owner_a", owner_a_home)
+    client = TestClient(app)
+
+    for path in (
+        "/api/sessions/b-session",
+        "/api/sessions/b-session/messages",
+        "/api/sessions/b-session/export",
+        "/api/sessions/b-session/latest-descendant",
+    ):
+        token = _capability_for(app, path=path, control_home=control_home)
+        response = client.get(path, headers={"Authorization": f"Bearer {token}"})
+        assert response.status_code == 404
+
+    token = _capability_for(app, path="/api/sessions/search", control_home=control_home)
+    response = client.get("/api/sessions/search?q=B+private+title", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    assert response.json() == {"results": []}
+
+    token = _capability_for(app, path="/api/sessions/a-session", control_home=control_home)
+    response = client.get("/api/sessions/a-session", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    assert response.json()["id"] == "a-session-unique"
 
 
 def test_worker_analytics_and_model_info_routes_require_owner_token(tmp_path, monkeypatch):

@@ -10,7 +10,26 @@ import os
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel
 from starlette.requests import Request
+
+
+class BulkDeleteSessions(BaseModel):
+    ids: list[str]
+    profile: str | None = None
+
+
+class SessionRename(BaseModel):
+    title: str | None = None
+    archived: bool | None = None
+    profile: str | None = None
+
+
+class SessionPrune(BaseModel):
+    older_than_days: int = 90
+    source: str | None = None
+    profile: str | None = None
+
 
 from hermes_cli.dashboard_auth.authority import (
     AuthorityStore,
@@ -186,7 +205,6 @@ def create_app(
     from fastapi.responses import JSONResponse
     from hermes_constants import get_hermes_home
     from hermes_state import SessionDB, get_default_db_path
-    from pydantic import BaseModel
 
     from hermes_cli import session_api
 
@@ -212,20 +230,6 @@ def create_app(
         ),
     }
     app.state.auth_required = False
-
-    class BulkDeleteSessions(BaseModel):
-        ids: list[str]
-        profile: str | None = None
-
-    class SessionRename(BaseModel):
-        title: str | None = None
-        archived: bool | None = None
-        profile: str | None = None
-
-    class SessionPrune(BaseModel):
-        older_than_days: int = 90
-        source: str | None = None
-        profile: str | None = None
 
     def _reject_profile(profile: str | None) -> None:
         if profile and str(profile).strip().lower() not in {"default"}:

@@ -5328,26 +5328,186 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         app.state.auth_required = original_auth_required
         app.state.owner_worker_supervisor = original_supervisor
 
-    def test_authenticated_sessions_are_proxied_to_owner_worker(self, monkeypatch):
+    @pytest.mark.parametrize(
+        ("request_path", "worker_path"),
+        [
+            ("/api/sessions?limit=5&profile=default", "/api/sessions?limit=5"),
+            ("/api/sessions/search?q=needle&profile=default", "/api/sessions/search?q=needle"),
+            ("/api/sessions/session-1?profile=default", "/api/sessions/session-1"),
+            ("/api/sessions/session-1/messages?profile=default", "/api/sessions/session-1/messages"),
+            ("/api/sessions/stats?profile=default", "/api/sessions/stats"),
+            ("/api/sessions/session-1/export?profile=default", "/api/sessions/session-1/export"),
+            ("/api/sessions/session-1/latest-descendant", "/api/sessions/session-1/latest-descendant"),
+        ],
+    )
+    def test_authenticated_session_read_surfaces_proxy_without_control_plane_db_access(
+        self, monkeypatch, request_path, worker_path
+    ):
         import hermes_cli.owner_worker.client as owner_client
+        import hermes_cli.web_server as web_server
 
         captured = {}
+
+        def fail_open_db(*args, **kwargs):
+            raise AssertionError("authenticated Control Plane session read must not open a SessionDB")
+
+        def fail_latest_descendant(*args, **kwargs):
+            raise AssertionError("authenticated Control Plane lineage read must not resolve locally")
 
         def fake_request(self, method, path, *, lease, headers=None, content=None):
             import httpx
 
             captured.update({"method": method, "path": path, "owner_key": lease.owner_key, "content": content})
-            return httpx.Response(200, json={"sessions": [{"id": "owner-local"}], "total": 1, "limit": 5, "offset": 0})
+            return httpx.Response(200, json={"owner_worker": True})
 
+        monkeypatch.setattr(web_server, "_open_session_db_for_profile", fail_open_db)
+        monkeypatch.setattr(web_server, "_session_latest_descendant", fail_latest_descendant)
         monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fake_request)
 
-        response = self.client.get("/api/sessions?limit=5&profile=default")
+        response = self.client.get(request_path)
 
         assert response.status_code == 200
-        assert response.json()["sessions"][0]["id"] == "owner-local"
+        assert response.json() == {"owner_worker": True}
         assert captured["method"] == "GET"
-        assert captured["path"] == "/api/sessions?limit=5"
+        assert captured["path"] == worker_path
         assert captured["owner_key"] == self.supervisor.owners[0].owner_key
+
+    @pytest.mark.parametrize(
+        ("method", "request_path", "payload", "worker_path"),
+        [
+            ("PATCH", "/api/sessions/session-1", {"title": "Owner title", "profile": "default"}, "/api/sessions/session-1"),
+            ("DELETE", "/api/sessions/session-1?profile=default", None, "/api/sessions/session-1"),
+            ("POST", "/api/sessions/prune", {"older_than_days": 7, "profile": "default"}, "/api/sessions/prune"),
+            ("POST", "/api/sessions/bulk-delete", {"ids": ["session-1"], "profile": "default"}, "/api/sessions/bulk-delete"),
+            ("DELETE", "/api/sessions/empty?profile=default", None, "/api/sessions/empty"),
+        ],
+    )
+    def test_authenticated_session_write_surfaces_proxy_without_control_plane_db_access(
+        self, monkeypatch, method, request_path, payload, worker_path
+    ):
+        import hermes_cli.owner_worker.client as owner_client
+        import hermes_cli.web_server as web_server
+
+        captured = {}
+
+        def fail_open_db(*args, **kwargs):
+            raise AssertionError("authenticated Control Plane session write must not open a SessionDB")
+
+        def fake_request(self, method, path, *, lease, headers=None, content=None):
+            import httpx
+
+            captured.update({"method": method, "path": path, "owner_key": lease.owner_key, "content": content})
+            return httpx.Response(200, json={"ok": True, "owner_worker": True})
+
+        monkeypatch.setattr(web_server, "_open_session_db_for_profile", fail_open_db)
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fake_request)
+
+        response = self.client.request(method, request_path, json=payload)
+
+        assert response.status_code == 200
+        assert response.json() == {"ok": True, "owner_worker": True}
+        assert captured["method"] == method
+        assert captured["path"] == worker_path
+        assert captured["owner_key"] == self.supervisor.owners[0].owner_key
+        if payload is not None:
+            assert json.loads(captured["content"]) == payload
+
+    def test_authenticated_session_proxy_rejects_mismatched_owner_handle_before_request(self, monkeypatch):
+        import hermes_cli.owner_worker.client as owner_client
+
+        captured = {}
+        handle = type(
+            "_Handle",
+            (),
+            {
+                "owner_key": "ok1_wrong_owner",
+                "socket_path": "unused.sock",
+                "worker_generation": 9,
+                "worker_id": "worker-generation-9",
+                "lease_version": 7,
+                "recovery_generation": 3,
+            },
+        )()
+
+        class _Supervisor:
+            control_home = self.supervisor.control_home
+
+            def get_or_start(self, owner):
+                captured["derived_owner"] = owner
+                return handle
+
+            def acquire_use(self, requested_handle):
+                raise AssertionError("owner-mismatched handle must not acquire a lease")
+
+        def fail_request(*args, **kwargs):
+            raise AssertionError("owner-mismatched handle must not receive a request")
+
+        self.app.state.owner_worker_supervisor = _Supervisor()
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fail_request)
+
+        response = self.client.get("/api/sessions")
+
+        assert response.status_code == 502
+        assert captured["derived_owner"].owner_key != handle.owner_key
+
+    def test_authenticated_session_proxy_uses_exact_active_lease_and_releases_it(self, monkeypatch):
+        import hermes_cli.owner_worker.client as owner_client
+        from hermes_cli.dashboard_auth.owner_context import owner_context_from_session
+
+        owner = owner_context_from_session(self.session)
+        captured = {}
+
+        class _Lease:
+            released = False
+
+            def release(self):
+                self.released = True
+
+        lease = _Lease()
+        handle = type(
+            "_Handle",
+            (),
+            {
+                "owner_key": owner.owner_key,
+                "socket_path": "unused.sock",
+                "worker_generation": 9,
+                "worker_id": "worker-generation-9",
+                "lease_version": 7,
+                "recovery_generation": 3,
+            },
+        )()
+
+        class _Supervisor:
+            control_home = self.supervisor.control_home
+
+            def get_or_start(self, owner):
+                captured["derived_owner"] = owner
+                return handle
+
+            def acquire_use(self, requested_handle):
+                assert requested_handle is handle
+                return lease
+
+        def fake_request(self, method, path, *, lease, headers=None, content=None):
+            import httpx
+
+            captured["capability_lease"] = lease
+            return httpx.Response(200, json={"ok": True})
+
+        self.app.state.owner_worker_supervisor = _Supervisor()
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fake_request)
+
+        response = self.client.get("/api/sessions")
+
+        assert response.status_code == 200
+        assert captured["derived_owner"].owner_key == handle.owner_key
+        capability_lease = captured["capability_lease"]
+        assert capability_lease.owner_key == handle.owner_key
+        assert capability_lease.worker_generation == 9
+        assert capability_lease.worker_id == "worker-generation-9"
+        assert capability_lease.lease_version == 7
+        assert capability_lease.recovery_generation == 3
+        assert lease.released is True
 
     def test_authenticated_owner_key_query_cannot_select_another_owner(self, monkeypatch):
         import hermes_cli.owner_worker.client as owner_client
@@ -5400,6 +5560,16 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         response = self.client.get("/api/profiles/sessions")
 
         assert response.status_code == 403
+        assert not self.supervisor.owners
+
+    def test_authenticated_control_plane_session_db_helper_fails_closed(self):
+        import hermes_cli.web_server as web_server
+
+        with pytest.raises(web_server.HTTPException) as exc_info:
+            web_server._open_session_db_for_profile(None)
+
+        assert exc_info.value.status_code == 500
+        assert "Owner Worker" in str(exc_info.value.detail)
         assert not self.supervisor.owners
 
     @pytest.mark.parametrize(

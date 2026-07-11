@@ -522,6 +522,8 @@ async def _proxy_authenticated_owner_http(request: Request) -> Response:
     lease: Any | None = None
     try:
         handle = await asyncio.to_thread(supervisor.get_or_start, owner)
+        if str(handle.owner_key) != str(owner.owner_key):
+            raise RuntimeError("owner worker returned a mismatched owner handle")
         lease = _acquire_owner_worker_use(supervisor, handle)
         content = await request.body()
         worker_path = request.url.path
@@ -8205,8 +8207,12 @@ async def get_session_stats(request: Request, profile: Optional[str] = None):
         db.close()
 
 
-def _open_session_db_for_profile(profile: Optional[str]):
-    """Open a SessionDB for read paths, optionally for another profile.
+def _open_session_db_for_profile(profile: Optional[str], *, request: Request | None = None):
+    """Open a legacy-local SessionDB, never an authenticated owner's store.
+
+    Every authenticated session route must proxy before reaching this helper.
+    Passing its request makes a future route regression fail closed instead of
+    silently selecting the Control Plane/global default database.
 
     ``profile`` None/empty → this process's own ``state.db`` (the common,
     single-profile case). A named profile opens that profile's on-disk
