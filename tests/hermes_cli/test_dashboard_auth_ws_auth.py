@@ -529,9 +529,53 @@ class TestWsAuthOkGated:
 
         asyncio.run(exercise())
 
-        assert old.calls and old.calls[0][0] == 4401
+        assert old.calls and old.calls[0][0] == 1011
         assert newer.calls == []
         assert different_lease.calls == []
+
+    def test_worker_change_closes_both_relay_halves_and_releases_exact_lease(self, gated_app):
+        import asyncio
+        from hermes_cli.dashboard_auth.authority import WorkerGenerationState, WorkerLeaseChange, WorkerLeaseState
+
+        class _Peer:
+            def __init__(self):
+                self.calls = []
+
+            async def close(self, *, code, reason):
+                self.calls.append((code, reason))
+
+        class _Lease:
+            def __init__(self):
+                self.releases = 0
+
+            def release(self):
+                self.releases += 1
+
+        change = WorkerLeaseChange(
+            sequence=1, owner_key="ok1_owner", worker_generation=1, worker_id="worker-a",
+            lease_version=1, recovery_generation=0, lease_state=WorkerLeaseState.DRAINING,
+            generation_state=WorkerGenerationState.DRAINING,
+        )
+        browser, worker, lease = _Peer(), _Peer(), _Lease()
+        bridge = web_server._OwnerWorkerWsBridge(browser, worker, lease)
+
+        async def exercise():
+            bridges, lock = web_server._authorized_ws_bridge_state(web_server.app)
+            async with lock:
+                bridges.clear()
+                web_server.app.state.authorized_ws_bridges_by_worker.clear()
+                web_server.app.state.authorized_ws_bridges_by_worker[
+                    web_server._worker_bridge_identity(change)
+                ] = {bridge}
+            await web_server.close_authorized_bridges_by_worker_change(
+                web_server.app, (change,), reason="worker_generation_revoked"
+            )
+
+        asyncio.run(exercise())
+
+        assert browser.calls == [(1011, "auth: worker_generation_revoked")]
+        assert worker.calls == [(1011, "auth: worker_generation_revoked")]
+        assert lease.releases == 1
 
     def test_authority_change_closes_only_stale_matching_bridge(self, gated_app):
         import asyncio
@@ -762,6 +806,115 @@ class TestWsAuthOkGated:
         assert browser.closed and browser.closed[0][0] == 4401
         assert worker.closed
         assert lease.released is True
+
+    def test_bridge_close_propagates_to_worker_and_releases_exact_lease(self, gated_app, monkeypatch, tmp_path):
+        import asyncio
+
+        class _Browser:
+            def __init__(self):
+                self.app = web_server.app
+                self.query_params = SimpleNamespace(get=lambda *_args: "")
+                self.url = SimpleNamespace(query="")
+                self.accepted = False
+                self.closed = []
+                self._messages = iter(({"type": "websocket.disconnect", "code": 4409, "reason": "replaced"},))
+
+            async def accept(self):
+                self.accepted = True
+
+            async def close(self, *, code=1000, reason=""):
+                self.closed.append((code, reason))
+
+            async def receive(self):
+                return next(self._messages)
+
+        class _Worker:
+            def __init__(self):
+                self.closed = []
+                self.sent = []
+
+            async def send(self, value):
+                self.sent.append(value)
+
+            async def recv(self):
+                return "ack"
+
+            async def close(self, **kwargs):
+                self.closed.append(kwargs)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.Future()
+
+        class _Lease:
+            def __init__(self):
+                self.release_count = 0
+
+            def release(self):
+                self.release_count += 1
+
+        browser, worker, lease = _Browser(), _Worker(), _Lease()
+        handle = SimpleNamespace(socket_path="/unused", owner_key="ok1_owner", worker_generation=1, worker_id="worker-a", lease_version=1, recovery_generation=0)
+        browser.app.state.owner_worker_supervisor = SimpleNamespace(get_or_start=lambda _owner: handle, control_home=tmp_path / "control")
+        monkeypatch.setattr(web_server, "_owner_context_from_ws_auth_result", lambda _result: SimpleNamespace(owner_key="ok1_owner"))
+        monkeypatch.setattr(web_server, "_acquire_owner_worker_use", lambda *_args: lease)
+        monkeypatch.setattr(web_server, "_connect_owner_worker_ws", lambda *_args, **_kwargs: asyncio.sleep(0, result=worker))
+        monkeypatch.setattr("hermes_cli.dashboard_auth.owner_context.ensure_owner_home", lambda _owner: None)
+        monkeypatch.setattr("hermes_cli.owner_worker.tokens.validate_owp1_control", lambda *_args, **_kwargs: None)
+        auth_result = web_server._WsAuthResult(None, "ticket", {"provider": "stub", "tenant_id": "tenant-a", "user_id": "user-a", "session_id": "session-a", "membership_revision": "v1", "epoch": 0})
+
+        asyncio.run(web_server._bridge_websocket_to_owner_worker(browser, path="/api/pty", auth_result=auth_result))
+
+        assert browser.accepted is True
+        assert browser.closed and browser.closed[-1][0] == 4409
+        assert worker.closed and worker.closed[-1]["code"] == 4409
+        assert lease.release_count == 1
+
+    def test_bridge_connect_failure_releases_lease_before_browser_accept(self, gated_app, monkeypatch, tmp_path):
+        import asyncio
+
+        class _Browser:
+            def __init__(self):
+                self.app = web_server.app
+                self.query_params = SimpleNamespace(get=lambda *_args: "")
+                self.url = SimpleNamespace(query="")
+                self.accepted = False
+                self.closed = []
+
+            async def accept(self):
+                self.accepted = True
+
+            async def close(self, *, code=1000, reason=""):
+                self.closed.append((code, reason))
+
+        class _Lease:
+            def __init__(self):
+                self.release_count = 0
+
+            def release(self):
+                self.release_count += 1
+
+        browser, lease = _Browser(), _Lease()
+        handle = SimpleNamespace(socket_path="/unused", owner_key="ok1_owner", worker_generation=1, worker_id="worker-a", lease_version=1, recovery_generation=0)
+        browser.app.state.owner_worker_supervisor = SimpleNamespace(get_or_start=lambda _owner: handle, control_home=tmp_path / "control")
+        monkeypatch.setattr(web_server, "_owner_context_from_ws_auth_result", lambda _result: SimpleNamespace(owner_key="ok1_owner"))
+        monkeypatch.setattr(web_server, "_acquire_owner_worker_use", lambda *_args: lease)
+        monkeypatch.setattr("hermes_cli.dashboard_auth.owner_context.ensure_owner_home", lambda _owner: None)
+        monkeypatch.setattr("hermes_cli.owner_worker.tokens.validate_owp1_control", lambda *_args, **_kwargs: None)
+
+        async def fail_connect(*_args, **_kwargs):
+            raise RuntimeError("unavailable")
+
+        monkeypatch.setattr(web_server, "_connect_owner_worker_ws", fail_connect)
+        auth_result = web_server._WsAuthResult(None, "ticket", {"provider": "stub", "tenant_id": "tenant-a", "user_id": "user-a", "session_id": "session-a", "membership_revision": "v1", "epoch": 0})
+
+        asyncio.run(web_server._bridge_websocket_to_owner_worker(browser, path="/api/pty", auth_result=auth_result))
+
+        assert browser.accepted is False
+        assert browser.closed and browser.closed[-1][0] == 1013
+        assert lease.release_count == 1
 
     def test_ws_close_reason_redacts_auth_query_values(self):
         reason = web_server._ws_close_reason(

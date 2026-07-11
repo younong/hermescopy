@@ -1288,3 +1288,60 @@ def test_create_app_does_not_mutate_web_server_global_state(tmp_path, monkeypatc
     assert web_server.app.state.auth_required is True
     assert web_server.app.state.bound_host == "control.example"
     assert web_server.app.state.bound_port == 443
+
+
+def test_worker_live_state_is_app_local_and_stale_cleanup_is_fenced():
+    """Colliding browser IDs cannot share state or erase a newer owner record."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from hermes_cli.owner_worker.ws_routes import (
+        OwnerWorkerLiveState,
+        _attach_browser_pty_bridge,
+        _register_browser_pty_owner,
+        _release_browser_pty_owner,
+        _trusted_live_metadata,
+    )
+
+    def peer(*, owner_key: str, generation: int, worker_id: str):
+        return SimpleNamespace(
+            claims=SimpleNamespace(
+                owner_key=owner_key,
+                worker_generation=generation,
+                worker_id=worker_id,
+                lease_version=1,
+                recovery_generation=0,
+                audience="owner-worker-uds-bootstrap",
+                scope="owner-worker:bootstrap",
+                path="/api/pty",
+            )
+        )
+
+    async def exercise() -> None:
+        app_a = SimpleNamespace(state=SimpleNamespace(owner_worker_live_state=OwnerWorkerLiveState()))
+        app_b = SimpleNamespace(state=SimpleNamespace(owner_worker_live_state=OwnerWorkerLiveState()))
+        metadata_a = _trusted_live_metadata(peer(owner_key="owner-a", generation=1, worker_id="a"), "/api/pty")
+        metadata_b = _trusted_live_metadata(peer(owner_key="owner-b", generation=1, worker_id="b"), "/api/pty")
+
+        await _register_browser_pty_owner(
+            app_a, browser_id="shared-browser", channel="shared-channel", owner_id="old", ws=object(), metadata=metadata_a
+        )
+        await _register_browser_pty_owner(
+            app_b, browser_id="shared-browser", channel="shared-channel", owner_id="only", ws=object(), metadata=metadata_b
+        )
+        replaced = await _register_browser_pty_owner(
+            app_a, browser_id="shared-browser", channel="shared-channel", owner_id="new", ws=object(), metadata=metadata_a
+        )
+        assert replaced is not None
+        assert await _attach_browser_pty_bridge(
+            app_a, browser_id="shared-browser", owner_id="new", bridge="a-bridge", metadata=metadata_a
+        )
+        await _release_browser_pty_owner(
+            app_a, browser_id="shared-browser", owner_id="old", metadata=metadata_a
+        )
+
+        assert app_a.state.owner_worker_live_state.pty_browser_sessions["shared-browser"]["bridge"] == "a-bridge"
+        assert app_a.state.owner_worker_live_state.pty_browser_sessions["shared-browser"]["metadata"] == metadata_a
+        assert app_b.state.owner_worker_live_state.pty_browser_sessions["shared-browser"]["metadata"] == metadata_b
+
+    asyncio.run(exercise())

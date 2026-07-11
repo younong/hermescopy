@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import { api, type AuthMeResponse } from "@/lib/api";
 import { getHermesBrowserId } from "@/lib/browserIdentity";
+import { dashboardAuthTransition } from "@/lib/dashboardAuthTransition";
 
 interface DashboardAuthIdentity {
   authMe: AuthMeResponse | null;
@@ -54,13 +55,21 @@ export function useDashboardAuthIdentity(): DashboardAuthIdentity {
   }, [authRequired]);
 
   const ownerKey = authMe?.owner_key;
+  const [transitionReady, setTransitionReady] = useState(!authRequired);
+
+  useEffect(() => {
+    const nextOwnerKey = authRequired ? ownerKey : undefined;
+    dashboardAuthTransition.transition(nextOwnerKey);
+    setTransitionReady(!authRequired || !!nextOwnerKey);
+  }, [authRequired, ownerKey]);
+
   return {
     authMe,
     authRequired,
     error,
     loading,
     ownerKey,
-    ready: !authRequired || !!ownerKey,
+    ready: (!authRequired || !!ownerKey) && transitionReady,
   };
 }
 

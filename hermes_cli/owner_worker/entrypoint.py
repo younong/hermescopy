@@ -230,6 +230,11 @@ def create_app(
         ),
     }
     app.state.auth_required = False
+    # Long-lived browser/PTY/event records are allocated once per worker app,
+    # never in the Control Plane or a module-level singleton.
+    from hermes_cli.owner_worker.ws_routes import OwnerWorkerLiveState
+
+    app.state.owner_worker_live_state = OwnerWorkerLiveState()
 
     def _reject_profile(profile: str | None) -> None:
         if profile and str(profile).strip().lower() not in {"default"}:

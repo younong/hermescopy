@@ -54,6 +54,27 @@ _VALID_CHANNEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _VALID_BROWSER_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
 
 
+class OwnerWorkerLiveState:
+    """App-local authenticated browser, PTY, and event state."""
+
+    def __init__(self) -> None:
+        self.event_channels: dict[str, set[WebSocket]] = {}
+        self.event_lock = asyncio.Lock()
+        self.chat_argv_lock = asyncio.Lock()
+        self.pty_active_session_files: dict[str, Path] = {}
+        self.pty_browser_sessions: dict[str, dict[str, Any]] = {}
+        self.pty_browser_lock = asyncio.Lock()
+
+
+def _live_state(app: Any) -> OwnerWorkerLiveState:
+    try:
+        state = app.state.owner_worker_live_state
+    except AttributeError:
+        state = OwnerWorkerLiveState()
+        app.state.owner_worker_live_state = state
+    return state
+
+
 def _owner_key(app: Any) -> str:
     return str(getattr(app.state, "owner_worker_owner_key", "") or "").strip()
 
@@ -77,6 +98,11 @@ class _Owp1Peer:
         self._claims = claims
         self._in_sequence = 1
         self._out_sequence = 1
+
+    @property
+    def claims(self) -> Any:
+        """Immutable bootstrap claims trusted for this exact UDS connection."""
+        return self._claims
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._ws, name)
@@ -156,37 +182,39 @@ async def _admit_bootstrap_or_close(ws: WebSocket) -> _Owp1Peer | None:
 
 
 def _get_event_state(app: Any) -> tuple[dict[str, set[WebSocket]], asyncio.Lock]:
-    try:
-        return app.state.event_channels, app.state.event_lock
-    except AttributeError:
-        app.state.event_channels = {}
-        app.state.event_lock = asyncio.Lock()
-        return app.state.event_channels, app.state.event_lock
+    state = _live_state(app)
+    return state.event_channels, state.event_lock
 
 
 def _get_chat_argv_lock(app: Any) -> asyncio.Lock:
-    try:
-        return app.state.chat_argv_lock
-    except AttributeError:
-        app.state.chat_argv_lock = asyncio.Lock()
-        return app.state.chat_argv_lock
+    return _live_state(app).chat_argv_lock
 
 
 def _get_pty_browser_state(app: Any) -> tuple[dict[str, dict[str, Any]], asyncio.Lock]:
-    try:
-        return app.state.pty_browser_sessions, app.state.pty_browser_lock
-    except AttributeError:
-        app.state.pty_browser_sessions = {}
-        app.state.pty_browser_lock = asyncio.Lock()
-        return app.state.pty_browser_sessions, app.state.pty_browser_lock
+    state = _live_state(app)
+    return state.pty_browser_sessions, state.pty_browser_lock
 
 
 def _get_pty_active_session_files(app: Any) -> dict[str, Path]:
-    try:
-        return app.state.pty_active_session_files
-    except AttributeError:
-        app.state.pty_active_session_files = {}
-        return app.state.pty_active_session_files
+    return _live_state(app).pty_active_session_files
+
+
+def _trusted_live_metadata(peer: _Owp1Peer, path: str) -> tuple[str, int, str, int, int, str, str, str]:
+    """Freeze the exact trusted admission fence for a worker live record."""
+    claims = peer.claims
+    expected_path = str(path).split("?", 1)[0]
+    if claims.path != expected_path:
+        raise OwnerWorkerCapabilityInvalid("live_state_path_mismatch")
+    return (
+        claims.owner_key,
+        claims.worker_generation,
+        claims.worker_id,
+        claims.lease_version,
+        claims.recovery_generation,
+        claims.audience,
+        claims.scope,
+        claims.path,
+    )
 
 
 def _browser_id_or_none(ws: WebSocket) -> Optional[str]:
@@ -230,7 +258,15 @@ def _forget_active_session_file(path: Path) -> None:
         pass
 
 
-async def _register_browser_pty_owner(app: Any, *, browser_id: str, channel: str, owner_id: str, ws: WebSocket) -> Optional[dict[str, Any]]:
+async def _register_browser_pty_owner(
+    app: Any,
+    *,
+    browser_id: str,
+    channel: str,
+    owner_id: str,
+    ws: WebSocket,
+    metadata: tuple[str, int, str, int, int, str, str, str],
+) -> Optional[dict[str, Any]]:
     browser_sessions, browser_lock = _get_pty_browser_state(app)
     async with browser_lock:
         previous = browser_sessions.get(browser_id)
@@ -240,32 +276,43 @@ async def _register_browser_pty_owner(app: Any, *, browser_id: str, channel: str
             "owner_id": owner_id,
             "ws": ws,
             "bridge": None,
+            "metadata": metadata,
         }
         return previous
 
 
-async def _browser_pty_owner_is_current(app: Any, *, browser_id: str, owner_id: str) -> bool:
+async def _browser_pty_owner_is_current(
+    app: Any, *, browser_id: str, owner_id: str, metadata: tuple[str, int, str, int, int, str, str, str]
+) -> bool:
     browser_sessions, browser_lock = _get_pty_browser_state(app)
     async with browser_lock:
         existing = browser_sessions.get(browser_id)
-        return existing is not None and existing.get("owner_id") == owner_id
+        return existing is not None and existing.get("owner_id") == owner_id and existing.get("metadata") == metadata
 
 
-async def _attach_browser_pty_bridge(app: Any, *, browser_id: str, owner_id: str, bridge: Any) -> bool:
+async def _attach_browser_pty_bridge(
+    app: Any, *, browser_id: str, owner_id: str, bridge: Any, metadata: tuple[str, int, str, int, int, str, str, str]
+) -> bool:
     browser_sessions, browser_lock = _get_pty_browser_state(app)
     async with browser_lock:
         existing = browser_sessions.get(browser_id)
-        if existing is None or existing.get("owner_id") != owner_id:
+        if existing is None or existing.get("owner_id") != owner_id or existing.get("metadata") != metadata:
             return False
         existing["bridge"] = bridge
         return True
 
 
-async def _release_browser_pty_owner(app: Any, *, browser_id: str, owner_id: str) -> None:
+async def _release_browser_pty_owner(
+    app: Any, *, browser_id: str, owner_id: str, metadata: tuple[str, int, str, int, int, str, str, str]
+) -> None:
     browser_sessions, browser_lock = _get_pty_browser_state(app)
     async with browser_lock:
         existing = browser_sessions.get(browser_id)
-        if existing is not None and existing.get("owner_id") == owner_id:
+        if (
+            existing is not None
+            and existing.get("owner_id") == owner_id
+            and existing.get("metadata") == metadata
+        ):
             browser_sessions.pop(browser_id, None)
 
 
@@ -395,6 +442,7 @@ async def pty_ws(ws: WebSocket) -> None:
     if peer is None:
         return
     ws = peer
+    metadata = _trusted_live_metadata(peer, "/api/pty")
     await ws.accept()
 
     if not _PTY_BRIDGE_AVAILABLE:
@@ -413,7 +461,7 @@ async def pty_ws(ws: WebSocket) -> None:
 
     if browser_id:
         current_channel = channel or ""
-        replaced_owner = await _register_browser_pty_owner(ws.app, browser_id=browser_id, channel=current_channel, owner_id=browser_owner_id, ws=ws)
+        replaced_owner = await _register_browser_pty_owner(ws.app, browser_id=browser_id, channel=current_channel, owner_id=browser_owner_id, ws=ws, metadata=metadata)
         browser_registered = True
         if replaced_owner is not None:
             await _close_replaced_browser_pty(replaced_owner)
@@ -437,17 +485,19 @@ async def pty_ws(ws: WebSocket) -> None:
     except HTTPException as exc:
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc.detail}\x1b[0m\r\n")
         if browser_registered and browser_id:
-            await _release_browser_pty_owner(ws.app, browser_id=browser_id, owner_id=browser_owner_id)
+            await _release_browser_pty_owner(ws.app, browser_id=browser_id, owner_id=browser_owner_id, metadata=metadata)
         await ws.close(code=1011)
         return
     except SystemExit as exc:
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
         if browser_registered and browser_id:
-            await _release_browser_pty_owner(ws.app, browser_id=browser_id, owner_id=browser_owner_id)
+            await _release_browser_pty_owner(ws.app, browser_id=browser_id, owner_id=browser_owner_id, metadata=metadata)
         await ws.close(code=1011)
         return
 
-    if browser_registered and browser_id and not await _browser_pty_owner_is_current(ws.app, browser_id=browser_id, owner_id=browser_owner_id):
+    if browser_registered and browser_id and not await _browser_pty_owner_is_current(
+        ws.app, browser_id=browser_id, owner_id=browser_owner_id, metadata=metadata
+    ):
         await ws.close(code=4409, reason=_ws_close_reason("chat connection replaced before spawn"))
         return
 
@@ -456,18 +506,20 @@ async def pty_ws(ws: WebSocket) -> None:
     except PtyUnavailableError as exc:
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
         if browser_registered and browser_id:
-            await _release_browser_pty_owner(ws.app, browser_id=browser_id, owner_id=browser_owner_id)
+            await _release_browser_pty_owner(ws.app, browser_id=browser_id, owner_id=browser_owner_id, metadata=metadata)
         await ws.close(code=1011)
         return
     except (FileNotFoundError, OSError) as exc:
         await ws.send_text(f"\r\n\x1b[31mChat failed to start: {exc}\x1b[0m\r\n")
         if browser_registered and browser_id:
-            await _release_browser_pty_owner(ws.app, browser_id=browser_id, owner_id=browser_owner_id)
+            await _release_browser_pty_owner(ws.app, browser_id=browser_id, owner_id=browser_owner_id, metadata=metadata)
         await ws.close(code=1011)
         return
 
     if browser_registered and browser_id:
-        attached = await _attach_browser_pty_bridge(ws.app, browser_id=browser_id, owner_id=browser_owner_id, bridge=bridge)
+        attached = await _attach_browser_pty_bridge(
+            ws.app, browser_id=browser_id, owner_id=browser_owner_id, bridge=bridge, metadata=metadata
+        )
         if not attached:
             await asyncio.to_thread(bridge.close)
             await ws.close(code=4409, reason=_ws_close_reason("chat connection replaced after spawn"))
@@ -528,7 +580,7 @@ async def pty_ws(ws: WebSocket) -> None:
             pass
         await asyncio.to_thread(bridge.close)
         if browser_registered and browser_id:
-            await _release_browser_pty_owner(ws.app, browser_id=browser_id, owner_id=browser_owner_id)
+            await _release_browser_pty_owner(ws.app, browser_id=browser_id, owner_id=browser_owner_id, metadata=metadata)
 
 
 async def gateway_ws(ws: WebSocket) -> None:

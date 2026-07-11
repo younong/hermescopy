@@ -12437,12 +12437,92 @@ def _ws_bridge_close_code(value: Any, default: int = 1011) -> int:
         code = int(value)
     except (TypeError, ValueError):
         return default
-    if code == 1000 or 3000 <= code <= 4999:
+    if 1000 <= code <= 1014 or 3000 <= code <= 4999:
         return code
     return default
 
 
-async def _connect_owner_worker_ws(socket_path: Path, uri: str, *, open_timeout: float = 10.0) -> Any:
+_OWNER_WORKER_WS_CONNECT_TIMEOUT = 10.0
+_OWNER_WORKER_WS_HANDSHAKE_TIMEOUT = 5.0
+_OWNER_WORKER_WS_RELAY_QUEUE_SIZE = 16
+_OWNER_WORKER_WS_RELAY_OPERATION_TIMEOUT = 10.0
+
+
+class _OwnerWorkerWsRelayClosed(Exception):
+    """Stop a relay with a sanitized public close result."""
+
+    def __init__(self, code: int, reason: str = "") -> None:
+        self.code = _ws_bridge_close_code(code)
+        self.reason = _ws_close_reason(reason) if reason else ""
+        super().__init__(self.reason or f"websocket relay closed ({self.code})")
+
+
+class _OwnerWorkerWsBridge:
+    """Own the two relay halves and release the exact use lease once."""
+
+    def __init__(self, browser_ws: Any, worker_ws: Any, lease: Any) -> None:
+        self.browser_ws = browser_ws
+        self.worker_ws = worker_ws
+        self.lease = lease
+        self._tasks: tuple[asyncio.Task[Any], ...] = ()
+        self._closing = False
+        self._released = False
+        self._lock = asyncio.Lock()
+
+    def set_tasks(self, tasks: tuple[asyncio.Task[Any], ...]) -> None:
+        self._tasks = tasks
+
+    @property
+    def closing(self) -> bool:
+        return self._closing
+
+    async def close(self, *, code: int = 1011, reason: str = "") -> None:
+        """Cancel relay work, close both halves, and release the use lease."""
+        async with self._lock:
+            if self._closing:
+                return
+            self._closing = True
+            current = asyncio.current_task()
+            tasks = tuple(task for task in self._tasks if task is not current and not task.done())
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            close_code = _ws_bridge_close_code(code)
+            close_reason = _ws_close_reason(reason) if reason else ""
+            for peer in (self.browser_ws, self.worker_ws):
+                try:
+                    await peer.close(code=close_code, reason=close_reason)
+                except Exception:
+                    pass
+            if not self._released and self.lease is not None:
+                self._released = True
+                self.lease.release()
+
+
+async def _relay_queue_put(queue: asyncio.Queue[Any], value: Any) -> None:
+    try:
+        await asyncio.wait_for(
+            queue.put(value), timeout=_OWNER_WORKER_WS_RELAY_OPERATION_TIMEOUT
+        )
+    except TimeoutError as exc:
+        raise _OwnerWorkerWsRelayClosed(1013, "relay backpressure") from exc
+
+
+async def _relay_operation(
+    operation: Any, *, timeout: float = _OWNER_WORKER_WS_RELAY_OPERATION_TIMEOUT
+) -> None:
+    try:
+        await asyncio.wait_for(operation, timeout=timeout)
+    except TimeoutError as exc:
+        raise _OwnerWorkerWsRelayClosed(1013, "relay backpressure") from exc
+
+
+async def _relay_send(peer: Any, value: Any) -> None:
+    await _relay_operation(peer.send(value))
+
+
+async def _connect_owner_worker_ws(socket_path: Path, uri: str, *, open_timeout: float = _OWNER_WORKER_WS_CONNECT_TIMEOUT) -> Any:
     """Open a websocket client over a Unix-domain socket.
 
     ``websockets`` is a project dependency but isn't present in some system
@@ -12459,7 +12539,7 @@ async def _connect_owner_worker_ws(socket_path: Path, uri: str, *, open_timeout:
     if unix_connect is None:  # pragma: no cover - old/stripped installations
         raise RuntimeError("websockets.unix_connect is unavailable")
 
-    kwargs = {"open_timeout": open_timeout, "max_queue": 16}
+    kwargs = {"open_timeout": open_timeout, "max_queue": _OWNER_WORKER_WS_RELAY_QUEUE_SIZE}
     try:
         return await unix_connect(uri=uri, path=str(socket_path), **kwargs)
     except TypeError:
@@ -12509,10 +12589,11 @@ async def _close_authorized_bridge_targets(
     targets: tuple[Any, ...],
     *,
     reason: str,
+    code: int = 4401,
 ) -> None:
     for ws in targets:
         try:
-            await ws.close(code=4401, reason=_ws_close_reason(f"auth: {reason}"))
+            await ws.close(code=code, reason=_ws_close_reason(f"auth: {reason}"))
         except Exception:
             _log.debug("failed to close revoked browser websocket", exc_info=True)
 
@@ -12605,7 +12686,9 @@ async def close_authorized_bridges_by_worker_change(
                     bridges[digest] = kept
                 else:
                     bridges.pop(digest, None)
-    await _close_authorized_bridge_targets(app_obj, tuple(targets), reason=reason)
+    await _close_authorized_bridge_targets(
+        app_obj, tuple(targets), reason=reason, code=1011
+    )
 
 
 async def close_authorized_bridges(app_obj: Any, scope: Any, *, reason: str) -> None:
@@ -12764,9 +12847,17 @@ async def _bridge_websocket_to_owner_worker(
     worker_ws = None
     try:
         worker_ws = await _connect_owner_worker_ws(handle.socket_path, worker_uri)
-        await worker_ws.send(owp1_hello(bootstrap))
-        validate_owp1_control(await asyncio.wait_for(worker_ws.recv(), timeout=5), bootstrap, message_type="ack")
+        await _relay_send(worker_ws, owp1_hello(bootstrap))
+        ack = await asyncio.wait_for(
+            worker_ws.recv(), timeout=_OWNER_WORKER_WS_HANDSHAKE_TIMEOUT
+        )
+        validate_owp1_control(ack, bootstrap, message_type="ack")
     except Exception as exc:
+        if worker_ws is not None:
+            try:
+                await worker_ws.close(code=1011)
+            except Exception:
+                pass
         if lease is not None:
             lease.release()
         _log.warning("owner worker websocket connect failed path=%s owner=%s: %s", path, owner.owner_key, _redact_auth_secrets(exc))
@@ -12774,7 +12865,13 @@ async def _bridge_websocket_to_owner_worker(
         return
 
     await ws.accept()
-    bridge_scope: Any | None = None
+    bridge = _OwnerWorkerWsBridge(ws, worker_ws, lease)
+    if (
+        auth_result.session_expires_at is not None
+        and auth_result.session_expires_at <= int(time.time())
+    ):
+        await bridge.close(code=4401, reason="auth: session_expired")
+        return
     bridge_scope_digest: str | None = None
     bridge_worker_identity = _worker_bridge_identity(_owner_worker_authority_lease(handle))
     await _ensure_authority_change_dispatcher(ws.app)
@@ -12782,7 +12879,7 @@ async def _bridge_websocket_to_owner_worker(
     async with bridge_lock:
         ws.app.state.authorized_ws_bridges_by_worker.setdefault(
             bridge_worker_identity, set()
-        ).add(ws)
+        ).add(bridge)
         if auth_result.credential == "ticket":
             from hermes_cli.dashboard_auth.authority import AuthorizationScope
 
@@ -12795,7 +12892,7 @@ async def _bridge_websocket_to_owner_worker(
             )
             bridge_scope_digest = bridge_scope.digest
             bridges.setdefault(bridge_scope_digest, set()).add(
-                (ws, int(auth_result.payload["epoch"]))
+                (bridge, int(auth_result.payload["epoch"]))
             )
     _log.info("owner websocket bridged path=%s owner=%s", path, owner.owner_key)
 
@@ -12805,49 +12902,48 @@ async def _bridge_websocket_to_owner_worker(
             return
         delay = max(0, expires_at - int(time.time()))
         await asyncio.sleep(delay)
-        try:
-            await ws.close(code=4401, reason=_ws_close_reason("auth: session_expired"))
-        except Exception:
-            _log.debug("failed to close expired browser websocket", exc_info=True)
+        await bridge.close(code=4401, reason="auth: session_expired")
 
-    expiry_task = asyncio.create_task(expire_browser_session())
+    browser_to_worker: asyncio.Queue[Any] = asyncio.Queue(
+        maxsize=_OWNER_WORKER_WS_RELAY_QUEUE_SIZE
+    )
+    worker_to_browser: asyncio.Queue[tuple[str, Any]] = asyncio.Queue(
+        maxsize=_OWNER_WORKER_WS_RELAY_QUEUE_SIZE
+    )
 
-    async def browser_to_worker() -> None:
+    async def receive_browser() -> None:
         sequence = 1
-        try:
-            while True:
-                msg = await ws.receive()
-                msg_type = msg.get("type")
-                if msg_type == "websocket.disconnect":
-                    code = _ws_bridge_close_code(msg.get("code"), default=1000)
-                    reason = str(msg.get("reason") or "")
-                    await worker_ws.close(code=code, reason=_ws_close_reason(reason) if reason else "")
-                    return
-                if "bytes" in msg and msg.get("bytes") is not None:
-                    envelope = owp1_data(
-                        bootstrap, direction="control-to-worker", sequence=sequence, data=msg["bytes"],
-                    )
-                elif "text" in msg and msg.get("text") is not None:
-                    envelope = owp1_data(
-                        bootstrap, direction="control-to-worker", sequence=sequence, text=msg["text"],
-                    )
-                else:
-                    continue
-                await worker_ws.send(envelope)
-                sequence += 1
-        except WebSocketDisconnect:
-            try:
-                await worker_ws.close(code=1000)
-            except Exception:
-                pass
-        except Exception:
-            _log.debug("browser->worker websocket pump ended", exc_info=True)
-            try:
-                await worker_ws.close(code=1011)
-            except Exception:
-                pass
+        while True:
+            msg = await ws.receive()
+            if msg.get("type") == "websocket.disconnect":
+                raise _OwnerWorkerWsRelayClosed(
+                    _ws_bridge_close_code(msg.get("code"), default=1000),
+                    str(msg.get("reason") or ""),
+                )
+            if msg.get("bytes") is not None:
+                envelope = owp1_data(
+                    bootstrap,
+                    direction="control-to-worker",
+                    sequence=sequence,
+                    data=msg["bytes"],
+                )
+            elif msg.get("text") is not None:
+                envelope = owp1_data(
+                    bootstrap,
+                    direction="control-to-worker",
+                    sequence=sequence,
+                    text=msg["text"],
+                )
+            else:
+                continue
+            await _relay_queue_put(browser_to_worker, envelope)
+            sequence += 1
 
-    async def worker_to_browser() -> None:
+    async def send_worker() -> None:
+        while True:
+            await _relay_send(worker_ws, await browser_to_worker.get())
+
+    async def receive_worker() -> None:
         sequence = 1
         try:
             async for message in worker_ws:
@@ -12858,39 +12954,66 @@ async def _bridge_websocket_to_owner_worker(
                     expected_sequence=sequence,
                 )
                 sequence += 1
-                if kind == "bytes":
-                    await ws.send_bytes(bytes(payload))
-                else:
-                    await ws.send_text(str(payload))
+                await _relay_queue_put(worker_to_browser, (kind, payload))
+        except _OwnerWorkerWsRelayClosed:
+            raise
         except Exception as exc:
-            code = _ws_bridge_close_code(getattr(exc, "code", None), default=1011)
-            reason = str(getattr(exc, "reason", "") or "")
-            try:
-                await ws.close(code=code, reason=_ws_close_reason(reason) if reason else "")
-            except Exception:
-                pass
+            raise _OwnerWorkerWsRelayClosed(
+                _ws_bridge_close_code(getattr(exc, "code", None), default=1011),
+                str(getattr(exc, "reason", "") or ""),
+            ) from exc
+        raise _OwnerWorkerWsRelayClosed(1000)
 
-    pumps = [asyncio.create_task(browser_to_worker()), asyncio.create_task(worker_to_browser())]
+    async def send_browser() -> None:
+        while True:
+            kind, payload = await worker_to_browser.get()
+            if kind == "bytes":
+                await _relay_operation(ws.send_bytes(bytes(payload)))
+            else:
+                await _relay_operation(ws.send_text(str(payload)))
+
+    expiry_task = (
+        asyncio.create_task(expire_browser_session())
+        if auth_result.session_expires_at is not None
+        else None
+    )
+    relay_tasks = (
+        asyncio.create_task(receive_browser()),
+        asyncio.create_task(send_worker()),
+        asyncio.create_task(receive_worker()),
+        asyncio.create_task(send_browser()),
+    )
+    bridge.set_tasks((*relay_tasks, *((expiry_task,) if expiry_task is not None else ())))
+    # Let an already-expired browser session close the bridge before a relay
+    # task can race into its normal disconnect path.
+    await asyncio.sleep(0)
+    close_code, close_reason = 1011, "owner worker relay ended"
     try:
-        done, pending = await asyncio.wait(pumps, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        for task in pending:
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
-        for task in done:
-            try:
-                await task
-            except Exception:
-                pass
-    finally:
-        expiry_task.cancel()
-        try:
+        wait_targets = (*relay_tasks, *((expiry_task,) if expiry_task is not None else ()))
+        done, _pending = await asyncio.wait(wait_targets, return_when=asyncio.FIRST_COMPLETED)
+        if expiry_task is not None and expiry_task in done:
             await expiry_task
-        except asyncio.CancelledError:
-            pass
+            return
+        # Let all immediately-completing pumps report their close result before
+        # selecting the terminal state. This prevents a cancelled sibling from
+        # masking the browser's explicit close frame.
+        await asyncio.sleep(0)
+        done = {task for task in relay_tasks if task.done()}
+        for task in done:
+            if task.cancelled():
+                continue
+            try:
+                task.result()
+            except _OwnerWorkerWsRelayClosed as exc:
+                close_code, close_reason = exc.code, exc.reason
+                break
+            except Exception:
+                _log.debug("owner websocket relay ended", exc_info=True)
+                break
+    finally:
+        if expiry_task is not None:
+            expiry_task.cancel()
+            await asyncio.gather(expiry_task, return_exceptions=True)
         if bridge_scope_digest is not None or bridge_worker_identity is not None:
             bridges, bridge_lock = _authorized_ws_bridge_state(ws.app)
             async with bridge_lock:
@@ -12898,30 +13021,25 @@ async def _bridge_websocket_to_owner_worker(
                     registered = bridges.get(bridge_scope_digest)
                     if registered is not None:
                         registered = {
-                            (registered_ws, admitted_epoch)
-                            for registered_ws, admitted_epoch in registered
-                            if registered_ws is not ws
+                            (registered_bridge, admitted_epoch)
+                            for registered_bridge, admitted_epoch in registered
+                            if registered_bridge is not bridge
                         }
                         if registered:
                             bridges[bridge_scope_digest] = registered
                         else:
                             bridges.pop(bridge_scope_digest, None)
-                if bridge_worker_identity is not None:
-                    worker_registered = ws.app.state.authorized_ws_bridges_by_worker.get(
-                        bridge_worker_identity
-                    )
-                    if worker_registered is not None:
-                        worker_registered.discard(ws)
-                        if not worker_registered:
-                            ws.app.state.authorized_ws_bridges_by_worker.pop(
-                                bridge_worker_identity, None
-                            )
-        try:
-            await worker_ws.close()
-        except Exception:
-            pass
-        if lease is not None:
-            lease.release()
+                worker_registered = ws.app.state.authorized_ws_bridges_by_worker.get(
+                    bridge_worker_identity
+                )
+                if worker_registered is not None:
+                    worker_registered.discard(bridge)
+                    if not worker_registered:
+                        ws.app.state.authorized_ws_bridges_by_worker.pop(
+                            bridge_worker_identity, None
+                        )
+        if not bridge.closing:
+            await bridge.close(code=close_code, reason=close_reason)
 
 
 # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
@@ -13113,6 +13231,7 @@ async def _resolve_chat_argv_async(
         "sidecar_url": sidecar_url,
         "profile": profile,
         "browser_id": browser_id,
+        "app_obj": app_obj,
     }
     if active_session_file is not None:
         kwargs["active_session_file"] = active_session_file
@@ -13121,11 +13240,7 @@ async def _resolve_chat_argv_async(
 
     lock_app = app_obj or app
     async with _get_chat_argv_lock(lock_app):
-        return await asyncio.to_thread(
-            _resolve_chat_argv,
-            app_obj=app_obj,
-            **kwargs,
-        )
+        return await asyncio.to_thread(_resolve_chat_argv, **kwargs)
 
 
 def _build_sidecar_url(channel: str, app_obj: Any | None = None) -> Optional[str]:

@@ -34,6 +34,7 @@ import { ChatSessionList } from "@/components/ChatSessionList";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
+import { dashboardAuthTransition } from "@/lib/dashboardAuthTransition";
 import { useDashboardBrowserIdentity } from "@/lib/useDashboardAuthIdentity";
 import { normalizeSessionTitle } from "@/lib/chat-title";
 import {
@@ -281,6 +282,16 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // effect dep) so the user explicitly starts a fresh scoped session.
   const { profile: scopedProfile } = useProfileScope();
   const { browserId, ownerKey, ready: authIdentityReady } = useDashboardBrowserIdentity();
+
+  useEffect(() => dashboardAuthTransition.register(() => {
+    clearReconnectTimer();
+    reconnectAttemptRef.current = 0;
+    forceFreshPtyRef.current = true;
+    wsRef.current?.close(4401, "owner changed");
+    wsRef.current = null;
+    setBanner(null);
+    setSessionEnded(false);
+  }), [clearReconnectTimer]);
 
   const channel = useMemo(
     () => generateChannelId(`${resumeParam ?? ""}\0${scopedProfile}`),

@@ -9,6 +9,7 @@ import { usePageHeader } from "@/contexts/usePageHeader";
 import { useProfileScope } from "@/contexts/useProfileScope";
 import { useI18n } from "@/i18n";
 import type { GatewayEvent } from "@/lib/gatewayClient";
+import { dashboardAuthTransition } from "@/lib/dashboardAuthTransition";
 import { useDashboardAuthIdentity } from "@/lib/useDashboardAuthIdentity";
 import { cn } from "@/lib/utils";
 import { connectGuiChat, type GuiChatConnection } from "../api";
@@ -51,6 +52,17 @@ export function GuiChatShell() {
   const terminalResumeId = state.storedSessionId ?? resumeSessionId;
   const forceBottomKey = `${activeSessionId ?? `new-${newChatNonce}`}:${sendScrollNonce}`;
   const closeMobilePanel = useCallback(() => setMobilePanelOpenRaw(false), []);
+
+  useEffect(() => dashboardAuthTransition.register(() => {
+    connectionRef.current?.close();
+    connectionRef.current = null;
+    if (streamFlushFrameRef.current !== undefined) {
+      cancelAnimationFrame(streamFlushFrameRef.current);
+      streamFlushFrameRef.current = undefined;
+    }
+    pendingStreamEventsRef.current = [];
+    dispatch({ type: "reset" });
+  }), []);
 
   const flushStreamEvents = useCallback(() => {
     streamFlushFrameRef.current = undefined;

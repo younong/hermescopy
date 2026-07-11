@@ -24,6 +24,7 @@
  */
 
 import { api } from "@/lib/api";
+import { dashboardAuthTransition } from "@/lib/dashboardAuthTransition";
 import { useDashboardAuthIdentity } from "@/lib/useDashboardAuthIdentity";
 import { cn } from "@/lib/utils";
 import { LogOut } from "lucide-react";
@@ -77,6 +78,7 @@ export function AuthWidget({ className }: AuthWidgetProps) {
   }
 
   const handleLogout = () => {
+    dashboardAuthTransition.reset();
     void api.logout();
   };
 

@@ -33,6 +33,7 @@ import { ReasoningPicker } from "@/components/ReasoningPicker";
 import { GatewayClient, type ConnectionState } from "@/lib/gatewayClient";
 import { api, buildWsUrl } from "@/lib/api";
 import { getHermesBrowserId } from "@/lib/browserIdentity";
+import { dashboardAuthTransition } from "@/lib/dashboardAuthTransition";
 import { titleFromSessionInfoPayload } from "@/lib/chat-title";
 
 import { cn } from "@/lib/utils";
@@ -140,6 +141,12 @@ export function ChatSidebar({
   const [pendingReloadModel, setPendingReloadModel] = useState<string | null>(
     null,
   );
+
+  useEffect(() => dashboardAuthTransition.register(() => {
+    setError(null);
+    setInfo({});
+    setVersion((v) => v + 1);
+  }), []);
 
   const refreshEffectiveModel = useCallback(() => {
     void api
