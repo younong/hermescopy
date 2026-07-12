@@ -138,6 +138,34 @@ class TestRuntimeStaleGuard:
         # A brand-new session row must NOT have been created.
         db.create_session.assert_not_called()
 
+    def test_owner_scoped_recovery_rejects_foreign_candidate_without_reopen(self, tmp_path, monkeypatch):
+        source = _source()
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_owner")
+        monkeypatch.setenv("HERMES_WORKSPACE_ROOT", str(workspace))
+        monkeypatch.setenv("HERMES_WORKER_GENERATION", "7")
+        db = _db_returning({"sid_stale": {"end_reason": "agent_close", "id": "sid_stale"}})
+        db.find_latest_gateway_session_for_peer.return_value = {
+            "id": "foreign-session",
+            "owner_key": "ok1_other",
+            "workspace_root": str(workspace),
+            "worker_generation": 7,
+        }
+        store = _make_store_with_db(tmp_path, db)
+        key = store._generate_session_key(source)
+        store._entries[key] = _make_entry(key, "sid_stale")
+
+        result = store.get_or_create_session(source)
+
+        assert result.session_id != "foreign-session"
+        db.reopen_session.assert_not_called()
+        assert db.find_latest_gateway_session_for_peer.call_args.kwargs["recovery_scope"] == {
+            "owner_key": "ok1_owner",
+            "workspace_root": str(workspace.resolve()),
+            "worker_generation": 7,
+        }
+
     def test_stale_entry_creates_fresh_when_recovery_returns_none(self, tmp_path):
         """Stale entry, no recoverable row → brand-new session (no silent drop)."""
         source = _source()

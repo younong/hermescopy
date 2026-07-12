@@ -12,7 +12,9 @@ import asyncio
 import json
 import os
 import re
+import secrets
 import sys
+import threading
 import tempfile
 import time
 import uuid
@@ -52,6 +54,7 @@ _RESIZE_RE = re.compile(rb"\x1b\[RESIZE:(\d+);(\d+)\]")
 _PTY_READ_CHUNK_TIMEOUT = 0.2
 _VALID_CHANNEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _VALID_BROWSER_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
+_OWNER_TUI_ATTACH_TTL_SECONDS = 60
 
 
 class OwnerWorkerLiveState:
@@ -64,6 +67,12 @@ class OwnerWorkerLiveState:
         self.pty_active_session_files: dict[str, Path] = {}
         self.pty_browser_sessions: dict[str, dict[str, Any]] = {}
         self.pty_browser_lock = asyncio.Lock()
+        # Bound by create_app after the exact worker lease is available.  The
+        # Gateway route rejects rather than falling back to standalone globals
+        # when this worker-local binding is absent.
+        self.gateway_runtime: Any | None = None
+        self.gateway_attach_tokens: dict[str, float] = {}
+        self.gateway_attach_lock = threading.Lock()
 
 
 def _live_state(app: Any) -> OwnerWorkerLiveState:
@@ -197,6 +206,31 @@ def _get_pty_browser_state(app: Any) -> tuple[dict[str, dict[str, Any]], asyncio
 
 def _get_pty_active_session_files(app: Any) -> dict[str, Path]:
     return _live_state(app).pty_active_session_files
+
+
+def _mint_gateway_attach_token(app: Any) -> str:
+    """Mint a single-use owner-worker-local credential for one PTY child."""
+    state = _live_state(app)
+    token = secrets.token_urlsafe(32)
+    deadline = time.monotonic() + _OWNER_TUI_ATTACH_TTL_SECONDS
+    with state.gateway_attach_lock:
+        stale = [value for value, expires_at in state.gateway_attach_tokens.items() if expires_at <= time.monotonic()]
+        for value in stale:
+            state.gateway_attach_tokens.pop(value, None)
+        state.gateway_attach_tokens[token] = deadline
+    return token
+
+
+def _consume_gateway_attach_token(app: Any, token: str) -> bool:
+    state = _live_state(app)
+    with state.gateway_attach_lock:
+        expires_at = state.gateway_attach_tokens.pop(token, None)
+    return expires_at is not None and expires_at > time.monotonic()
+
+
+def _owner_tui_gateway_url(app: Any) -> str:
+    """Return a private UDS attach URL for the PTY child owned by *app*."""
+    return f"ws://owner-worker/api/ws?owner_tui_attach={_mint_gateway_attach_token(app)}"
 
 
 def _trusted_live_metadata(peer: _Owp1Peer, path: str) -> tuple[str, int, str, int, int, str, str, str]:
@@ -352,10 +386,10 @@ def _latest_descendant(session_id: str) -> str | None:
 
 
 def _build_gateway_ws_url(app_obj: Any) -> Optional[str]:
-    # Worker-side child processes cannot mint Control-Plane capabilities. The
-    # dedicated single-use bootstrap flow is introduced in Iteration 3 / step 4.
-    del app_obj
-    return None
+    """Build the one-use private Gateway endpoint for an owner-worker PTY child."""
+    if not bool(getattr(getattr(app_obj, "state", None), "owner_worker_mode", False)):
+        return None
+    return _owner_tui_gateway_url(app_obj)
 
 
 def _build_sidecar_url(app_obj: Any, channel: str) -> Optional[str]:
@@ -416,6 +450,7 @@ def _resolve_chat_argv(
         env["HERMES_TUI_BROWSER_ID"] = browser_id
     if gateway_ws_url := _build_gateway_ws_url(app_obj):
         env["HERMES_TUI_GATEWAY_URL"] = gateway_ws_url
+        env["HERMES_OWNER_WORKER_TUI_ATTACH"] = "1"
 
     return list(argv), str(cwd_path if cwd_path else cwd) if (cwd_path or cwd) else None, env
 
@@ -584,11 +619,24 @@ async def pty_ws(ws: WebSocket) -> None:
 
 
 async def gateway_ws(ws: WebSocket) -> None:
-    if not await _admit_bootstrap_or_close(ws):
+    """Attach either the exact Control Plane bridge or one owner-local TUI child."""
+    attach_token = str(ws.query_params.get("owner_tui_attach") or "")
+    if attach_token:
+        if not _consume_gateway_attach_token(ws.app, attach_token):
+            await ws.close(code=4401, reason=_ws_close_reason("auth: owner_tui_attach_invalid"))
+            return
+        peer: WebSocket | _Owp1Peer = ws
+    else:
+        peer = await _admit_bootstrap_or_close(ws)
+        if peer is None:
+            return
+    runtime = _live_state(ws.app).gateway_runtime
+    if runtime is None:
+        await peer.close(code=1011, reason=_ws_close_reason("owner gateway runtime unavailable"))
         return
     from tui_gateway.ws import handle_ws
 
-    await handle_ws(ws)
+    await handle_ws(peer, runtime=runtime, require_owner_runtime=True)
 
 
 async def pub_ws(ws: WebSocket) -> None:

@@ -59,6 +59,7 @@ class AuthorityAuditEvent(enum.Enum):
     SESSION_REVOKED = "authority_session_revoked"
     KEY_ROTATION_FAILURE = "authority_key_rotation_failure"
     BRIDGE_CLOSED = "authority_bridge_closed"
+    PERSISTED_SCOPE_REJECTED = "persisted_scope_rejected"
 
 
 def _resolve_log_path() -> Path:
@@ -113,6 +114,7 @@ def audit_authority(
     audience_class: str = "browser-ws",
     epoch: int | None = None,
     recovery_generation: int | None = None,
+    worker_generation: int | None = None,
     sequence: int | None = None,
     scope_digest: str | None = None,
     credential_digest: str | None = None,
@@ -130,7 +132,7 @@ def audit_authority(
     reason = str(reason or "").strip()
     if not reason:
         raise ValueError("authority audit reason is required")
-    if audience_class not in {"browser-ws", "none"}:
+    if audience_class not in {"browser-ws", "owner-persisted-scope", "none"}:
         raise ValueError("authority audit audience class is invalid")
     entry: dict[str, Any] = {
         "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
@@ -142,13 +144,14 @@ def audit_authority(
     for key, value in (
         ("epoch", epoch),
         ("recovery_generation", recovery_generation),
+        ("worker_generation", worker_generation),
         ("sequence", sequence),
         ("scope_digest", scope_digest),
         ("credential_digest", credential_digest),
         ("issuer_digest", issuer_digest),
     ):
         if value is not None:
-            entry[key] = int(value) if key in {"epoch", "recovery_generation", "sequence"} else str(value)
+            entry[key] = int(value) if key in {"epoch", "recovery_generation", "worker_generation", "sequence"} else str(value)
     try:
         path = _authority_log_path()
     except Exception as exc:

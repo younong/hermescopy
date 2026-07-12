@@ -41,6 +41,8 @@ const resolveGatewayAttachUrl = () => {
   return raw ? raw : null
 }
 
+const ownerWorkerAttachRequired = () => process.env.HERMES_OWNER_WORKER_TUI_ATTACH === '1'
+
 const resolveSidecarUrl = () => {
   const raw = process.env.HERMES_TUI_SIDECAR_URL?.trim()
 
@@ -540,6 +542,16 @@ export class GatewayClient extends EventEmitter {
 
     if (attachUrl) {
       this.startAttachedGateway(attachUrl)
+
+      return
+    }
+
+    if (ownerWorkerAttachRequired()) {
+      const line = '[startup] owner-worker gateway attach URL unavailable'
+
+      this.pushLog(line)
+      this.publish({ type: 'gateway.stderr', payload: { line } })
+      this.handleTransportExit(1, 'owner-worker gateway attach URL unavailable')
 
       return
     }

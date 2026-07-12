@@ -233,8 +233,17 @@ def create_app(
     # Long-lived browser/PTY/event records are allocated once per worker app,
     # never in the Control Plane or a module-level singleton.
     from hermes_cli.owner_worker.ws_routes import OwnerWorkerLiveState
+    from tui_gateway.server import OwnerWorkerGatewayRuntime
 
     app.state.owner_worker_live_state = OwnerWorkerLiveState()
+    lease = app.state.owner_worker_lease
+    app.state.owner_worker_live_state.gateway_runtime = OwnerWorkerGatewayRuntime(
+        owner_key=lease.owner_key,
+        worker_generation=lease.worker_generation,
+        worker_id=lease.worker_id,
+        lease_version=lease.lease_version,
+        recovery_generation=lease.recovery_generation,
+    )
 
     def _reject_profile(profile: str | None) -> None:
         if profile and str(profile).strip().lower() not in {"default"}:

@@ -13,6 +13,8 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Iterator, MutableMapping
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -25,6 +27,7 @@ from hermes_constants import (
 )
 from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_cli.owner_runtime import is_owner_worker_env, resolve_workspace_cwd
+from gateway.session import current_recovery_scope, owner_metadata_matches_current
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
@@ -126,21 +129,111 @@ except Exception:
 
 from tui_gateway.render import make_stream_renderer, render_diff, render_message
 
-_sessions: dict[str, dict] = {}
+
+@dataclass
+class _GatewayMutableState:
+    """All owner-sensitive in-memory Gateway indexes for one runtime."""
+
+    sessions: dict[str, dict] = field(default_factory=dict)
+    pending: dict[str, tuple[str, threading.Event]] = field(default_factory=dict)
+    pending_prompt_payloads: dict[str, tuple[str, dict]] = field(default_factory=dict)
+    answers: dict[str, str] = field(default_factory=dict)
+    child_mirrors: dict[str, dict] = field(default_factory=dict)
+    active_child_runs: dict[str, float] = field(default_factory=dict)
+    sessions_lock: threading.RLock = field(default_factory=threading.RLock)
+    prompt_lock: threading.Lock = field(default_factory=threading.Lock)
+    session_resume_lock: threading.Lock = field(default_factory=threading.Lock)
+    child_mirrors_lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+@dataclass(frozen=True)
+class OwnerWorkerGatewayRuntime:
+    """Exact immutable worker fence with a private mutable Gateway state."""
+
+    owner_key: str
+    worker_generation: int
+    worker_id: str
+    lease_version: int
+    recovery_generation: int
+    mutable_state: _GatewayMutableState = field(default_factory=_GatewayMutableState, compare=False, repr=False)
+
+
+_gateway_runtime: contextvars.ContextVar[OwnerWorkerGatewayRuntime | None] = contextvars.ContextVar(
+    "gateway_runtime", default=None
+)
+_standalone_gateway_state = _GatewayMutableState()
+
+
+def _gateway_state() -> _GatewayMutableState:
+    runtime = _gateway_runtime.get()
+    return runtime.mutable_state if runtime is not None else _standalone_gateway_state
+
+
+class _RuntimeMapping(MutableMapping[str, Any]):
+    """Route existing Gateway map call sites to the current owner runtime."""
+
+    def __init__(self, attribute: str) -> None:
+        self._attribute = attribute
+
+    def _mapping(self) -> dict[str, Any]:
+        return getattr(_gateway_state(), self._attribute)
+
+    def __getitem__(self, key: str) -> Any:
+        return self._mapping()[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self._mapping()[key] = value
+
+    def __delitem__(self, key: str) -> None:
+        del self._mapping()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._mapping())
+
+    def __len__(self) -> int:
+        return len(self._mapping())
+
+    def __repr__(self) -> str:
+        return repr(self._mapping())
+
+
+class _RuntimeLock:
+    """Expose the lock belonging to the current Gateway runtime."""
+
+    def __init__(self, attribute: str) -> None:
+        self._attribute = attribute
+
+    def _lock(self) -> Any:
+        return getattr(_gateway_state(), self._attribute)
+
+    def __enter__(self) -> Any:
+        return self._lock().__enter__()
+
+    def __exit__(self, *args: Any) -> Any:
+        return self._lock().__exit__(*args)
+
+    def acquire(self, *args: Any, **kwargs: Any) -> Any:
+        return self._lock().acquire(*args, **kwargs)
+
+    def release(self) -> None:
+        self._lock().release()
+
+
+_sessions: MutableMapping[str, dict] = _RuntimeMapping("sessions")
 _methods: dict[str, callable] = {}
-_pending: dict[str, tuple[str, threading.Event]] = {}
-_pending_prompt_payloads: dict[str, tuple[str, dict]] = {}
-_answers: dict[str, str] = {}
+_pending: MutableMapping[str, tuple[str, threading.Event]] = _RuntimeMapping("pending")
+_pending_prompt_payloads: MutableMapping[str, tuple[str, dict]] = _RuntimeMapping("pending_prompt_payloads")
+_answers: MutableMapping[str, str] = _RuntimeMapping("answers")
 _db = None
 _db_error: str | None = None
 _stdout_lock = threading.Lock()
 _cfg_lock = threading.Lock()
-_sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
-_prompt_lock = threading.Lock()
+_sessions_lock = _RuntimeLock("sessions_lock")
+_prompt_lock = _RuntimeLock("prompt_lock")
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
-_session_resume_lock = threading.Lock()
+_session_resume_lock = _RuntimeLock("session_resume_lock")
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -681,21 +774,26 @@ def _schedule_ws_orphan_reap(sid: str) -> None:
     """
     if _WS_ORPHAN_REAP_GRACE_S <= 0:
         return
+    runtime = current_owner_worker_gateway_runtime()
 
     def _reap() -> None:
-        # Serialize the orphan re-check against session.resume (which re-binds a
-        # live transport under _session_resume_lock and would make this session
-        # non-orphaned). The actual pop + teardown then goes through the shared
-        # _close_session_by_id funnel so the dict mutation happens under
-        # _sessions_lock — consistent with every other _sessions mutator
-        # (#39591: _reap previously popped under _session_resume_lock, giving no
-        # mutual exclusion against _init_session / _close_session_by_id, which
-        # guard with _sessions_lock). _sessions_lock is an RLock and the global
-        # ordering is always resume_lock -> sessions_lock, so nesting is safe.
-        with _session_resume_lock:
-            if not _ws_session_is_orphaned(_sessions.get(sid)):
-                return
-            _close_session_by_id(sid, end_reason="ws_orphan_reap")
+        runtime_token = _gateway_runtime.set(runtime)
+        try:
+            # Serialize the orphan re-check against session.resume (which re-binds a
+            # live transport under _session_resume_lock and would make this session
+            # non-orphaned). The actual pop + teardown then goes through the shared
+            # _close_session_by_id funnel so the dict mutation happens under
+            # _sessions_lock — consistent with every other _sessions mutator
+            # (#39591: _reap previously popped under _session_resume_lock, giving no
+            # mutual exclusion against _init_session / _close_session_by_id, which
+            # guard with _sessions_lock). _sessions_lock is an RLock and the global
+            # ordering is always resume_lock -> sessions_lock, so nesting is safe.
+            with _session_resume_lock:
+                if not _ws_session_is_orphaned(_sessions.get(sid)):
+                    return
+                _close_session_by_id(sid, end_reason="ws_orphan_reap")
+        finally:
+            _gateway_runtime.reset(runtime_token)
 
     timer = threading.Timer(_WS_ORPHAN_REAP_GRACE_S, _reap)
     timer.daemon = True
@@ -848,12 +946,16 @@ def _enforce_session_cap() -> None:
 
 def _schedule_session_cap_enforcement() -> None:
     """Run the LRU sweep off the response path (eviction can call agent.close)."""
+    runtime = current_owner_worker_gateway_runtime()
 
     def _run():
+        token = _gateway_runtime.set(runtime)
         try:
             _enforce_session_cap()
         except Exception:
             logger.debug("session cap enforcement failed", exc_info=True)
+        finally:
+            _gateway_runtime.reset(token)
 
     timer = threading.Timer(0.1, _run)
     timer.daemon = True
@@ -861,13 +963,23 @@ def _schedule_session_cap_enforcement() -> None:
 
 
 def _start_idle_reaper() -> None:
+    """Start the standalone-only idle reaper.
+
+    Owner-worker runtimes have independent state and schedule cap enforcement
+    from their bound request paths; this import-time daemon must never adopt
+    owner-local state through an ambient or stale context.
+    """
     def _loop():
-        while True:
-            time.sleep(_REAPER_SCAN_S)
-            try:
-                _reap_idle_sessions()
-            except Exception:
-                pass
+        runtime_token = _gateway_runtime.set(None)
+        try:
+            while True:
+                time.sleep(_REAPER_SCAN_S)
+                try:
+                    _reap_idle_sessions()
+                except Exception:
+                    pass
+        finally:
+            _gateway_runtime.reset(runtime_token)
 
     threading.Thread(target=_loop, daemon=True).start()
 
@@ -900,6 +1012,51 @@ def _get_db():
 def _db_unavailable_error(rid, *, code: int):
     detail = _db_error or "state.db unavailable"
     return _err(rid, code, f"state.db unavailable: {detail}")
+
+
+def _owner_scoped_resume_row(db, target: str) -> tuple[dict | None, dict | None]:
+    """Return a validated durable resume root before richer recovery reads.
+
+    Complete owner-worker environments must prove the requested ID/title belongs
+    to their trusted persisted scope before lineage, child liveness, live state,
+    prompt history, or a reopen can observe it. Local and owner-only legacy
+    compatibility environments retain their existing resume contract.
+    """
+    scope = current_recovery_scope()
+    if scope is None:
+        return None, None
+    scope_lookup = getattr(db, "find_resume_recovery_scope", None)
+    scoped_get = getattr(db, "get_session_for_recovery", None)
+    if not callable(scope_lookup) or not callable(scoped_get):
+        return None, scope
+    record = scope_lookup(target)
+    if not record or not owner_metadata_matches_current(record):
+        return None, scope
+    row = scoped_get(str(record.get("id") or ""), recovery_scope=scope)
+    if not row or not owner_metadata_matches_current(row):
+        return None, scope
+    return row, scope
+
+
+def _resume_history(db, target: str, *, include_ancestors: bool, recovery_scope: dict | None):
+    """Read resume history through the validated scope when one is required."""
+    kwargs = {"include_ancestors": include_ancestors}
+    if recovery_scope is not None:
+        kwargs["recovery_scope"] = recovery_scope
+    return db.get_messages_as_conversation(target, **kwargs)
+
+
+def _reopen_resume_session(db, target: str, *, recovery_scope: dict | None) -> None:
+    """Reopen only the previously validated durable resume target."""
+    if recovery_scope is None:
+        db.reopen_session(target)
+        return
+    try:
+        db.reopen_session(target, recovery_scope=recovery_scope)
+    except TypeError:
+        # An authenticated worker treats a missing scoped write API as absence;
+        # it must not fall back to an unscoped mutation.
+        raise RuntimeError("scoped session recovery is unavailable")
 
 
 # ── per-session profile scoping (global remote mode) ───────────────────────────
@@ -1121,7 +1278,26 @@ def handle_request(req: dict) -> dict | None:
     return fn(rid, params)
 
 
-def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
+def current_owner_worker_gateway_runtime() -> OwnerWorkerGatewayRuntime | None:
+    """Return the authenticated worker fence bound to this dispatch, if any."""
+    return _gateway_runtime.get()
+
+
+@contextlib.contextmanager
+def owner_worker_gateway_runtime(runtime: OwnerWorkerGatewayRuntime) -> Iterator[None]:
+    """Bind *runtime* while direct helpers need its isolated mutable state."""
+    token = _gateway_runtime.set(runtime)
+    try:
+        yield
+    finally:
+        _gateway_runtime.reset(token)
+
+
+def dispatch(
+    req: dict,
+    transport: Optional[Transport] = None,
+    runtime: OwnerWorkerGatewayRuntime | None = None,
+) -> dict | None:
     """Route inbound RPCs — long handlers to the pool, everything else inline.
 
     Returns a response dict when handled inline. Returns None when the
@@ -1135,6 +1311,7 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
     """
     t = transport or _stdio_transport
     token = bind_transport(t)
+    runtime_token = _gateway_runtime.set(runtime)
     try:
         normalized = _normalize_request(req)
         if isinstance(normalized, dict):
@@ -1159,6 +1336,7 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
 
         return None
     finally:
+        _gateway_runtime.reset(runtime_token)
         reset_transport(token)
 
 
@@ -1200,33 +1378,35 @@ def _start_agent_build(sid: str, session: dict) -> None:
         # its "still starting" eviction exemption.
         session.pop("lazy", None)
     key = session["session_key"]
+    runtime = current_owner_worker_gateway_runtime()
 
     def _build() -> None:
-        with _sessions_lock:
-            current = _sessions.get(sid)
-        if current is None:
-            ready.set()
-            return
-
+        runtime_token = _gateway_runtime.set(runtime)
+        current = None
         worker = None
         notify_registered = False
         home_token = None
-        profile_home = current.get("profile_home")
         try:
-            tokens = _set_session_context(key)
-            # Build against the session's profile (global-remote): bind its
-            # HERMES_HOME so config/skills/model resolve to it, and hand the
-            # agent that profile's db so turns persist to the right state.db.
-            session_db = None
-            if profile_home:
-                home_token = set_hermes_home_override(profile_home)
-                try:
-                    from hermes_state import SessionDB
+            with _sessions_lock:
+                current = _sessions.get(sid)
+            if current is None:
+                return
 
-                    session_db = SessionDB(db_path=Path(profile_home) / "state.db")
-                except Exception:
-                    session_db = None
+            profile_home = current.get("profile_home")
             try:
+                tokens = _set_session_context(key)
+                # Build against the session's profile (global-remote): bind its
+                # HERMES_HOME so config/skills/model resolve to it, and hand the
+                # agent that profile's db so turns persist to the right state.db.
+                session_db = None
+                if profile_home:
+                    home_token = set_hermes_home_override(profile_home)
+                    try:
+                        from hermes_state import SessionDB
+
+                        session_db = SessionDB(db_path=Path(profile_home) / "state.db")
+                    except Exception:
+                        session_db = None
                 # Lazy-resumed (watch) sessions carry the stored conversation
                 # id — pass it through so the upgrade continues that session
                 # instead of starting a fresh one under the same key.
@@ -1323,7 +1503,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # _schedule_mcp_late_refresh. Cache-safe (pre-first-turn only).
             _schedule_mcp_late_refresh(sid, agent)
         except Exception as e:
-            current["agent_error"] = str(e)
+            if current is not None:
+                current["agent_error"] = str(e)
             _emit("error", sid, {"message": f"agent init failed: {e}"})
         finally:
             if home_token is not None:
@@ -1341,6 +1522,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 except Exception:
                     pass
             ready.set()
+            _gateway_runtime.reset(runtime_token)
 
     threading.Thread(target=_build, daemon=True).start()
 
@@ -1683,6 +1865,7 @@ def _ensure_session_db_row(session: dict) -> None:
             model_config=model_config or None,
             parent_session_id=parent_session_id,
             cwd=_session_cwd(session) if session.get("explicit_cwd") else None,
+            **(current_recovery_scope() or {}),
         )
     except Exception:
         logger.debug("failed to persist desktop session row", exc_info=True)
@@ -3631,13 +3814,13 @@ def _on_tool_progress(
 # persists. Translate the relayed events into the native stream events the
 # window already renders — emitted on the CHILD sid, routed to its transport
 # by write_json — so the window shows a real midstream turn.
-_child_mirrors: dict[str, dict] = {}
-_child_mirrors_lock = threading.Lock()
+_child_mirrors: MutableMapping[str, dict] = _RuntimeMapping("child_mirrors")
+_child_mirrors_lock = _RuntimeLock("child_mirrors_lock")
 # Stored child session ids with a delegation run currently in flight (refreshed
 # on every relayed subagent.* event, popped on subagent.complete). Lets a lazy
 # watch resume report running=true so the window shows a busy indicator even
 # while the child is silent inside a long tool call (no events for 25s+).
-_active_child_runs: dict[str, float] = {}
+_active_child_runs: MutableMapping[str, float] = _RuntimeMapping("active_child_runs")
 # Staleness bound for the registry: entries refresh on every relayed event, so
 # anything this quiet means the completion event was lost (callback raised,
 # parent crashed) — don't let a leaked entry pin "running" forever.
@@ -4236,40 +4419,46 @@ def _schedule_mcp_late_refresh(sid: str, agent) -> None:
     if not mcp_discovery_in_flight():
         return
 
-    def _wait_then_refresh() -> None:
-        # Bounded but generous — a server still not connected after this is
-        # genuinely slow/dead; the user can /reload-mcp once it recovers.
-        if not join_mcp_discovery(timeout=30.0):
-            return
-        with _sessions_lock:
-            session = _sessions.get(sid)
-            # Session may have been closed/reset while we waited.
-            if session is None or session.get("agent") is not agent:
-                return
-            # Cache safety: never rebuild the tool list once the conversation
-            # has started — that would invalidate the cached prompt prefix.
-            if (
-                int(getattr(agent, "_user_turn_count", 0) or 0) > 0
-                or int(getattr(agent, "_api_call_count", 0) or 0) > 0
-            ):
-                return
-            try:
-                from tools.mcp_tool import refresh_agent_mcp_tools
+    runtime = current_owner_worker_gateway_runtime()
 
-                added = refresh_agent_mcp_tools(agent, quiet_mode=True)
-            except Exception as exc:
-                logger.warning(
-                    "Late MCP refresh: tool snapshot rebuild failed for %s: %s",
-                    sid,
-                    exc,
-                )
+    def _wait_then_refresh() -> None:
+        runtime_token = _gateway_runtime.set(runtime)
+        try:
+            # Bounded but generous — a server still not connected after this is
+            # genuinely slow/dead; the user can /reload-mcp once it recovers.
+            if not join_mcp_discovery(timeout=30.0):
                 return
-            # No new tools landed (discovery added nothing) → don't churn the client.
-            if not added:
-                return
-            info = _session_info(agent, session)
-        # Emit outside the lock — write_json must not block under _sessions_lock.
-        _emit("session.info", sid, info)
+            with _sessions_lock:
+                session = _sessions.get(sid)
+                # Session may have been closed/reset while we waited.
+                if session is None or session.get("agent") is not agent:
+                    return
+                # Cache safety: never rebuild the tool list once the conversation
+                # has started — that would invalidate the cached prompt prefix.
+                if (
+                    int(getattr(agent, "_user_turn_count", 0) or 0) > 0
+                    or int(getattr(agent, "_api_call_count", 0) or 0) > 0
+                ):
+                    return
+                try:
+                    from tools.mcp_tool import refresh_agent_mcp_tools
+
+                    added = refresh_agent_mcp_tools(agent, quiet_mode=True)
+                except Exception as exc:
+                    logger.warning(
+                        "Late MCP refresh: tool snapshot rebuild failed for %s: %s",
+                        sid,
+                        exc,
+                    )
+                    return
+                # No new tools landed (discovery added nothing) → don't churn the client.
+                if not added:
+                    return
+                info = _session_info(agent, session)
+            # Emit outside the lock — write_json must not block under _sessions_lock.
+            _emit("session.info", sid, info)
+        finally:
+            _gateway_runtime.reset(runtime_token)
     threading.Thread(
         target=_wait_then_refresh,
         name=f"tui-mcp-late-refresh-{sid}",
@@ -5372,11 +5561,16 @@ def _claim_or_reuse_live(
 def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
     """Pre-warm a deferred session's agent off the response path (session.create
     and cold resume both build through here; _sess() also builds on demand)."""
+    runtime = current_owner_worker_gateway_runtime()
 
     def _run():
-        session = _sessions.get(sid)
-        if session is not None:
-            _start_agent_build(sid, session)
+        runtime_token = _gateway_runtime.set(runtime)
+        try:
+            session = _sessions.get(sid)
+            if session is not None:
+                _start_agent_build(sid, session)
+        finally:
+            _gateway_runtime.reset(runtime_token)
 
     timer = threading.Timer(delay, _run)
     timer.daemon = True
@@ -5408,26 +5602,36 @@ def _(rid, params: dict) -> dict:
     if db is None:
         return _db_unavailable_error(rid, code=5000)
 
-    found = db.get_session(target)
-    if not found:
-        found = db.get_session_by_title(target)
-        if found:
-            target = found["id"]
-        elif is_truthy_value(params.get("lazy", False)) and _child_run_active(target):
-            # Race: a watch window opened on a freshly-spawned subagent. The
-            # child relays `subagent.start` (which carries child_session_id and
-            # triggers the window) BEFORE its first run_conversation() flushes
-            # the DB row via _ensure_db_session, so db.get_session(target) is
-            # momentarily empty. On slower hosts (notably WSL2, where SQLite +
-            # process scheduling widen the gap) the window's resume consistently
-            # lands inside this window and used to hard-fail "session not found"
-            # — the frontend then 404'd on the REST messages fallback and the
-            # window spun forever. The child is provably live (_child_run_active),
-            # so proceed into the lazy branch with empty history; the live mirror
-            # streams the whole turn anyway and the row exists by upgrade time.
-            found = {}
-        else:
+    recovery_scope = current_recovery_scope()
+    if recovery_scope is not None:
+        # Authenticated recovery starts with the scope-only row. Do not resolve
+        # a title to a full row, inspect live child state, or follow lineage until
+        # this owner/workspace/generation fence has succeeded.
+        found, recovery_scope = _owner_scoped_resume_row(db, target)
+        if not found:
             return _err(rid, 4007, "session not found")
+        target = str(found["id"])
+    else:
+        found = db.get_session(target)
+        if not found:
+            found = db.get_session_by_title(target)
+            if found:
+                target = found["id"]
+            elif is_truthy_value(params.get("lazy", False)) and _child_run_active(target):
+                # Race: a watch window opened on a freshly-spawned subagent. The
+                # child relays `subagent.start` (which carries child_session_id and
+                # triggers the window) BEFORE its first run_conversation() flushes
+                # the DB row via _ensure_db_session, so db.get_session(target) is
+                # momentarily empty. On slower hosts (notably WSL2, where SQLite +
+                # process scheduling widen the gap) the window's resume consistently
+                # lands inside this window and used to hard-fail "session not found"
+                # — the frontend then 404'd on the REST messages fallback and the
+                # window spun forever. The child is provably live (_child_run_active),
+                # so proceed into the lazy branch with empty history; the live mirror
+                # streams the whole turn anyway and the row exists by upgrade time.
+                found = {}
+            else:
+                return _err(rid, 4007, "session not found")
 
     # Follow the compression-continuation chain to the live tip so a resume on
     # a rotated-out parent id binds to the descendant that actually holds the
@@ -5442,12 +5646,24 @@ def _(rid, params: dict) -> dict:
     # to the exact child branch they were opened on.
     if found and not is_truthy_value(params.get("lazy", False)):
         try:
+            tip = db.resolve_resume_session_id(target, recovery_scope=recovery_scope)
+        except TypeError:
+            # Local test doubles and legacy local SessionDB implementations keep
+            # their existing call shape; authenticated workers never use this
+            # compatibility fallback because they require a complete scope.
+            if recovery_scope is not None:
+                return _err(rid, 4007, "session not found")
             tip = db.resolve_resume_session_id(target)
         except Exception:
             tip = target
         if tip and tip != target:
             target = tip
-            found = db.get_session(target) or found
+            if recovery_scope is not None:
+                found = db.get_session_for_recovery(target, recovery_scope=recovery_scope)
+                if not found or not owner_metadata_matches_current(found):
+                    return _err(rid, 4007, "session not found")
+            else:
+                found = db.get_session(target) or found
 
     profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
         profile_home
@@ -5499,10 +5715,12 @@ def _(rid, params: dict) -> dict:
         if limit_message is not None:
             return _err(rid, 4090, limit_message)
         try:
-            db.reopen_session(target)
+            _reopen_resume_session(db, target, recovery_scope=recovery_scope)
             # The child's OWN conversation only — include_ancestors would prepend
             # the parent's transcript onto the subagent's branch.
-            history = db.get_messages_as_conversation(target)
+            history = _resume_history(
+                db, target, include_ancestors=False, recovery_scope=recovery_scope
+            )
         except Exception as e:
             if lease is not None:
                 lease.release()
@@ -5563,9 +5781,13 @@ def _(rid, params: dict) -> dict:
         # the deferred build wires the remaining per-session callbacks.
         _enable_gateway_prompts()
         try:
-            db.reopen_session(target)
-            raw_history = db.get_messages_as_conversation(target)
-            display_history = db.get_messages_as_conversation(target, include_ancestors=True)
+            _reopen_resume_session(db, target, recovery_scope=recovery_scope)
+            raw_history = _resume_history(
+                db, target, include_ancestors=False, recovery_scope=recovery_scope
+            )
+            display_history = _resume_history(
+                db, target, include_ancestors=True, recovery_scope=recovery_scope
+            )
         except Exception as e:
             if lease is not None:
                 lease.release()
@@ -7910,6 +8132,7 @@ def _(rid, params: dict) -> dict:
             model_config={"_branched_from": old_key},
             parent_session_id=old_key,
             cwd=_session_cwd(session),
+            **(current_recovery_scope() or {}),
         )
         for msg in history:
             db.append_message(
@@ -8306,28 +8529,34 @@ def _(rid, params: dict) -> dict:
     _persist_branch_seed(session)
     _start_agent_build(sid, session)
 
+    runtime = current_owner_worker_gateway_runtime()
+
     def run_after_agent_ready() -> None:
-        err = _wait_agent(session, rid)
-        if err:
-            _emit(
-                "error",
-                sid,
-                {
-                    "message": err.get("error", {}).get(
-                        "message", "agent initialization failed"
-                    )
-                },
-            )
-            with session["history_lock"]:
-                session["running"] = False
-                _clear_inflight_turn(session)
-            return
-        with session["history_lock"]:
-            if session.get("_turn_cancel_requested") or not session.get("running"):
-                session["running"] = False
-                _clear_inflight_turn(session)
+        runtime_token = _gateway_runtime.set(runtime)
+        try:
+            err = _wait_agent(session, rid)
+            if err:
+                _emit(
+                    "error",
+                    sid,
+                    {
+                        "message": err.get("error", {}).get(
+                            "message", "agent initialization failed"
+                        )
+                    },
+                )
+                with session["history_lock"]:
+                    session["running"] = False
+                    _clear_inflight_turn(session)
                 return
-        _run_prompt_submit(rid, sid, session, text)
+            with session["history_lock"]:
+                if session.get("_turn_cancel_requested") or not session.get("running"):
+                    session["running"] = False
+                    _clear_inflight_turn(session)
+                    return
+            _run_prompt_submit(rid, sid, session, text)
+        finally:
+            _gateway_runtime.reset(runtime_token)
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
@@ -8405,7 +8634,10 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 
 
 def _notification_poller_loop(
-    stop_event: threading.Event, sid: str, session: dict
+    stop_event: threading.Event,
+    sid: str,
+    session: dict,
+    runtime: OwnerWorkerGatewayRuntime | None = None,
 ) -> None:
     """Poll completion_queue and dispatch notifications autonomously.
 
@@ -8420,6 +8652,19 @@ def _notification_poller_loop(
     """
     from tools.process_registry import process_registry, format_process_notification
 
+    runtime_token = _gateway_runtime.set(runtime)
+    try:
+        _notification_poller_loop_bound(
+            stop_event, sid, session, process_registry, format_process_notification
+        )
+    finally:
+        _gateway_runtime.reset(runtime_token)
+
+
+def _notification_poller_loop_bound(
+    stop_event: threading.Event, sid: str, session: dict, process_registry, format_process_notification
+) -> None:
+    """Run the notification poller with its owner-runtime context already bound."""
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
     while not stop_event.is_set() and not session.get("_finalized"):
         try:
@@ -8570,11 +8815,16 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     """Start the background notification poller for a TUI session."""
     _wire_agent_terminal_output()
     stop = threading.Event()
-    t = threading.Thread(
-        target=_notification_poller_loop,
-        args=(stop, sid, session),
-        daemon=True,
-    )
+    runtime = current_owner_worker_gateway_runtime()
+
+    def run() -> None:
+        runtime_token = _gateway_runtime.set(runtime)
+        try:
+            _notification_poller_loop(stop, sid, session, runtime)
+        finally:
+            _gateway_runtime.reset(runtime_token)
+
+    t = threading.Thread(target=run, daemon=True)
     t.start()
     return stop
 
@@ -8595,7 +8845,10 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             pass
     _emit("message.start", sid)
 
+    runtime = current_owner_worker_gateway_runtime()
+
     def run():
+        runtime_token = _gateway_runtime.set(runtime)
         approval_token = None
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
@@ -8994,6 +9247,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             if home_token is not None:
                 reset_hermes_home_override(home_token)
             _clear_session_context(session_tokens)
+            _gateway_runtime.reset(runtime_token)
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()
@@ -9690,7 +9944,10 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4012, "text required")
     task_id = f"bg_{uuid.uuid4().hex[:6]}"
 
+    runtime = current_owner_worker_gateway_runtime()
+
     def run():
+        runtime_token = _gateway_runtime.set(runtime)
         session_tokens = _set_session_context(task_id, cwd=_session_cwd(session))
         try:
             from run_agent import AIAgent
@@ -9721,6 +9978,7 @@ def _(rid, params: dict) -> dict:
             )
         finally:
             _clear_session_context(session_tokens)
+            _gateway_runtime.reset(runtime_token)
 
     threading.Thread(target=run, daemon=True).start()
     return _ok(rid, {"task_id": task_id})
@@ -9785,7 +10043,10 @@ def _(rid, params: dict) -> dict:
     except Exception:
         preview_cwd = ""
 
+    runtime = current_owner_worker_gateway_runtime()
+
     def run():
+        runtime_token = _gateway_runtime.set(runtime)
         # Pin the validated preview cwd, else the parent workspace — never an
         # invalid client path, which would silently fall back to the launch dir.
         session_tokens = _set_session_context(task_id, cwd=(preview_cwd or _session_cwd(session)))
@@ -9834,6 +10095,7 @@ def _(rid, params: dict) -> dict:
             except Exception:
                 pass
             _clear_session_context(session_tokens)
+            _gateway_runtime.reset(runtime_token)
 
     threading.Thread(target=run, daemon=True).start()
     return _ok(rid, {"task_id": task_id})

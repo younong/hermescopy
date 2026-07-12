@@ -103,10 +103,12 @@ describe('GatewayClient websocket attach mode', () => {
   const originalWebSocket = globalThis.WebSocket
   let originalGatewayUrl: string | undefined
   let originalSidecarUrl: string | undefined
+  let originalOwnerWorkerAttach: string | undefined
 
   beforeEach(() => {
     originalGatewayUrl = process.env.HERMES_TUI_GATEWAY_URL
     originalSidecarUrl = process.env.HERMES_TUI_SIDECAR_URL
+    originalOwnerWorkerAttach = process.env.HERMES_OWNER_WORKER_TUI_ATTACH
     FakeWebSocket.reset()
     ;(globalThis as { WebSocket?: unknown }).WebSocket = FakeWebSocket as unknown as typeof WebSocket
   })
@@ -124,6 +126,12 @@ describe('GatewayClient websocket attach mode', () => {
       process.env.HERMES_TUI_SIDECAR_URL = originalSidecarUrl
     }
 
+    if (originalOwnerWorkerAttach === undefined) {
+      delete process.env.HERMES_OWNER_WORKER_TUI_ATTACH
+    } else {
+      process.env.HERMES_OWNER_WORKER_TUI_ATTACH = originalOwnerWorkerAttach
+    }
+
     FakeWebSocket.reset()
 
     if (originalWebSocket) {
@@ -131,6 +139,19 @@ describe('GatewayClient websocket attach mode', () => {
     } else {
       delete (globalThis as { WebSocket?: unknown }).WebSocket
     }
+  })
+
+  it('fails closed instead of spawning a standalone gateway when owner attach is required', () => {
+    process.env.HERMES_OWNER_WORKER_TUI_ATTACH = '1'
+    delete process.env.HERMES_TUI_GATEWAY_URL
+    const spawnGateway = vi.spyOn(GatewayClient.prototype as any, 'startSpawnedGateway')
+    const gw = new GatewayClient()
+
+    gw.start()
+
+    expect(FakeWebSocket.instances).toHaveLength(0)
+    expect(spawnGateway).not.toHaveBeenCalled()
+    expect(gw.getLogTail(20)).toContain('[startup] owner-worker gateway attach URL unavailable')
   })
 
   it('waits for websocket open and resolves RPC requests', async () => {

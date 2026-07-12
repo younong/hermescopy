@@ -110,6 +110,7 @@ def test_authority_audit_is_allowlisted_and_control_plane_only(tmp_path, monkeyp
         reason="ticket_rejected",
         epoch=4,
         recovery_generation=2,
+        worker_generation=7,
         scope_digest="scope-digest",
         credential_digest="credential-digest",
         issuer_digest="issuer-digest",
@@ -121,12 +122,37 @@ def test_authority_audit_is_allowlisted_and_control_plane_only(tmp_path, monkeyp
     entry = json.loads(path.read_text())
     assert set(entry) == {
         "ts", "event", "correlation_id", "reason", "audience_class",
-        "epoch", "recovery_generation", "scope_digest", "credential_digest",
+        "epoch", "recovery_generation", "worker_generation", "scope_digest", "credential_digest",
         "issuer_digest",
     }
     raw = path.read_text()
     for forbidden in (str(owner_home), "ok1_owner", "HERMES_HOME"):
         assert forbidden not in raw
+
+
+def test_persisted_scope_audit_is_allowlisted(tmp_path, monkeypatch):
+    control_home = tmp_path / "control-plane"
+    control_home.mkdir()
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_owner")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+
+    audit_authority(
+        AuthorityAuditEvent.PERSISTED_SCOPE_REJECTED,
+        correlation_id="b" * 32,
+        reason="persisted_scope_assertion_mismatch",
+        audience_class="owner-persisted-scope",
+        worker_generation=7,
+    )
+
+    entry = json.loads((control_home / "logs" / "authority.log").read_text())
+    assert entry == {
+        "ts": entry["ts"],
+        "event": "persisted_scope_rejected",
+        "correlation_id": "b" * 32,
+        "reason": "persisted_scope_assertion_mismatch",
+        "audience_class": "owner-persisted-scope",
+        "worker_generation": 7,
+    }
 
 
 def test_authority_audit_has_no_sensitive_escape_hatch(profile_home):

@@ -710,6 +710,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     chat_id TEXT,
     chat_type TEXT,
     thread_id TEXT,
+    owner_key TEXT,
+    workspace_root TEXT,
+    worker_generation INTEGER,
     model TEXT,
     model_config TEXT,
     system_prompt TEXT,
@@ -800,6 +803,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_session_key
     ON sessions(session_key, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
     ON sessions(source, user_id, chat_id, chat_type, thread_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer_scope
+    ON sessions(owner_key, workspace_root, worker_generation, source, session_key, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
 """
@@ -1581,6 +1586,9 @@ class SessionDB:
         chat_id: str = None,
         chat_type: str = None,
         thread_id: str = None,
+        owner_key: str = None,
+        workspace_root: str = None,
+        worker_generation: int = None,
         parent_session_id: str = None,
         cwd: str = None,
     ) -> None:
@@ -1606,9 +1614,10 @@ class SessionDB:
             conn.execute(
                 """INSERT INTO sessions (
                    id, source, user_id, session_key, chat_id, chat_type, thread_id,
+                   owner_key, workspace_root, worker_generation,
                    model, model_config, system_prompt, parent_session_id, cwd, started_at
                 )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        model = COALESCE(sessions.model, excluded.model),
                        model_config = COALESCE(sessions.model_config, excluded.model_config),
@@ -1617,6 +1626,9 @@ class SessionDB:
                        chat_id = COALESCE(sessions.chat_id, excluded.chat_id),
                        chat_type = COALESCE(sessions.chat_type, excluded.chat_type),
                        thread_id = COALESCE(sessions.thread_id, excluded.thread_id),
+                       owner_key = COALESCE(sessions.owner_key, excluded.owner_key),
+                       workspace_root = COALESCE(sessions.workspace_root, excluded.workspace_root),
+                       worker_generation = COALESCE(sessions.worker_generation, excluded.worker_generation),
                        parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
                        cwd = COALESCE(sessions.cwd, excluded.cwd)""",
                 (
@@ -1627,6 +1639,9 @@ class SessionDB:
                     chat_id,
                     chat_type,
                     thread_id,
+                    owner_key,
+                    workspace_root,
+                    worker_generation,
                     model,
                     json.dumps(model_config) if model_config else None,
                     system_prompt,
@@ -1652,6 +1667,9 @@ class SessionDB:
         chat_id: str = None,
         chat_type: str = None,
         thread_id: str = None,
+        owner_key: str = None,
+        workspace_root: str = None,
+        worker_generation: int = None,
     ) -> None:
         """Persist the gateway routing peer for an existing session row."""
         if not session_id or not session_key:
@@ -1661,7 +1679,10 @@ class SessionDB:
             conn.execute(
                 """UPDATE sessions
                    SET session_key = ?, source = ?, user_id = ?, chat_id = ?,
-                       chat_type = ?, thread_id = ?
+                       chat_type = ?, thread_id = ?,
+                       owner_key = COALESCE(owner_key, ?),
+                       workspace_root = COALESCE(workspace_root, ?),
+                       worker_generation = COALESCE(worker_generation, ?)
                    WHERE id = ?""",
                 (
                     session_key,
@@ -1670,11 +1691,51 @@ class SessionDB:
                     chat_id,
                     chat_type,
                     thread_id,
+                    owner_key,
+                    workspace_root,
+                    worker_generation,
                     session_id,
                 ),
             )
 
         self._execute_write(_do)
+
+    @staticmethod
+    def _recovery_scope_clause(
+        recovery_scope: Optional[Dict[str, Any]], *, alias: str = "sessions"
+    ) -> Tuple[str, List[Any]]:
+        """Return an exact durable owner-scope predicate for recovery reads."""
+        if not recovery_scope:
+            return "", []
+        required = ("owner_key", "workspace_root", "worker_generation")
+        if any(recovery_scope.get(key) in (None, "") for key in required):
+            return " AND 1 = 0", []
+        return (
+            f" AND {alias}.owner_key = ? AND {alias}.workspace_root = ? "
+            f"AND {alias}.worker_generation = ?",
+            [
+                str(recovery_scope["owner_key"]),
+                str(recovery_scope["workspace_root"]),
+                int(recovery_scope["worker_generation"]),
+            ],
+        )
+
+    def find_resume_recovery_scope(self, session_id_or_title: str) -> Optional[Dict[str, Any]]:
+        """Resolve a resume selector to its minimal persisted scope record.
+
+        This deliberately returns no prompt, model, cwd, or lineage data. Callers
+        must validate this record before loading any richer session state.
+        """
+        if not session_id_or_title:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT id, owner_key, workspace_root, worker_generation
+                   FROM sessions WHERE id = ? OR title = ?
+                   ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END LIMIT 1""",
+                (session_id_or_title, session_id_or_title, session_id_or_title),
+            ).fetchone()
+        return dict(row) if row else None
 
     def find_latest_gateway_session_for_peer(
         self,
@@ -1685,6 +1746,7 @@ class SessionDB:
         chat_id: Optional[str] = None,
         chat_type: Optional[str] = None,
         thread_id: Optional[str] = None,
+        recovery_scope: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Find the latest recoverable gateway session for a routing peer.
 
@@ -1698,9 +1760,10 @@ class SessionDB:
         """
         if not session_key:
             return None
+        scope_clause, scope_params = self._recovery_scope_clause(recovery_scope)
         with self._lock:
             row = self._conn.execute(
-                """
+                f"""
                 SELECT * FROM sessions
                 WHERE session_key = ?
                   AND source = ?
@@ -1708,10 +1771,11 @@ class SessionDB:
                   AND (COALESCE(message_count, 0) > 0 OR EXISTS (
                       SELECT 1 FROM messages WHERE messages.session_id = sessions.id LIMIT 1
                   ))
+                  {scope_clause}
                 ORDER BY started_at DESC
                 LIMIT 1
                 """,
-                (session_key, source),
+                (session_key, source, *scope_params),
             ).fetchone()
             if row is not None:
                 return dict(row)
@@ -1722,7 +1786,7 @@ class SessionDB:
             if chat_id is None or chat_type is None:
                 return None
             row = self._conn.execute(
-                """
+                f"""
                 SELECT * FROM sessions
                 WHERE source = ?
                   AND COALESCE(user_id, '') = COALESCE(?, '')
@@ -1733,10 +1797,11 @@ class SessionDB:
                   AND (COALESCE(message_count, 0) > 0 OR EXISTS (
                       SELECT 1 FROM messages WHERE messages.session_id = sessions.id LIMIT 1
                   ))
+                  {scope_clause}
                 ORDER BY started_at DESC
                 LIMIT 1
                 """,
-                (source, user_id, chat_id, chat_type, thread_id),
+                (source, user_id, chat_id, chat_type, thread_id, *scope_params),
             ).fetchone()
         return dict(row) if row else None
 
@@ -1758,12 +1823,20 @@ class SessionDB:
             )
         self._execute_write(_do)
 
-    def reopen_session(self, session_id: str) -> None:
-        """Clear ended_at/end_reason so a session can be resumed."""
+    def reopen_session(
+        self,
+        session_id: str,
+        *,
+        recovery_scope: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Clear ended state, retaining the exact durable recovery scope."""
+        scope_clause, scope_params = self._recovery_scope_clause(recovery_scope)
+
         def _do(conn):
             conn.execute(
-                "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
-                (session_id,),
+                f"UPDATE sessions SET ended_at = NULL, end_reason = NULL "
+                f"WHERE id = ?{scope_clause}",
+                (session_id, *scope_params),
             )
         self._execute_write(_do)
 
@@ -2322,6 +2395,18 @@ class SessionDB:
             row = cursor.fetchone()
         return dict(row) if row else None
 
+    def get_session_for_recovery(
+        self, session_id: str, *, recovery_scope: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Load a full session row only after its durable scope was validated."""
+        scope_clause, scope_params = self._recovery_scope_clause(recovery_scope)
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT * FROM sessions WHERE id = ?{scope_clause}",
+                (session_id, *scope_params),
+            ).fetchone()
+        return dict(row) if row else None
+
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
 
@@ -2614,7 +2699,12 @@ class SessionDB:
 
         return f"{base} #{max_num + 1}"
 
-    def get_compression_tip(self, session_id: str) -> Optional[str]:
+    def get_compression_tip(
+        self,
+        session_id: str,
+        *,
+        recovery_scope: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
         """Walk the compression-continuation chain forward and return the tip.
 
         A compression continuation is a child of a session whose
@@ -2635,6 +2725,16 @@ class SessionDB:
         Returns the latest continuation tip, or the input id when no
         continuation exists.
         """
+        scope_clause, scope_params = self._recovery_scope_clause(
+            recovery_scope, alias="parent"
+        )
+        lineage_scope_clause = (
+            " AND child.owner_key = parent.owner_key "
+            "AND child.workspace_root = parent.workspace_root "
+            "AND child.worker_generation = parent.worker_generation"
+            if recovery_scope
+            else ""
+        )
         current = session_id
         seen = {current} if current else set()
         # Bound the walk defensively — compression chains this deep are
@@ -2642,14 +2742,16 @@ class SessionDB:
         for _ in range(100):
             with self._lock:
                 cursor = self._conn.execute(
-                    """
+                    f"""
                     SELECT child.id
                     FROM sessions parent
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.id = ?
                       AND parent.end_reason = 'compression'
-                      AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL
-                      AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL
+                      {scope_clause}
+                      {lineage_scope_clause}
+                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
+                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
                       AND COALESCE(child.source, '') != 'tool'
                     ORDER BY
                       CASE
@@ -2665,7 +2767,7 @@ class SessionDB:
                       child.id DESC
                     LIMIT 1
                     """,
-                    (current,),
+                    (current, *scope_params),
                 )
                 row = cursor.fetchone()
             if row is None:
@@ -3705,7 +3807,12 @@ class SessionDB:
             "bookend_end": [_hydrate(r) for r in bookend_end_rows],
         }
 
-    def resolve_resume_session_id(self, session_id: str) -> str:
+    def resolve_resume_session_id(
+        self,
+        session_id: str,
+        *,
+        recovery_scope: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """Redirect a resume target to the descendant session that holds the messages.
 
         Context compression ends the current session and forks a new child session
@@ -3743,23 +3850,34 @@ class SessionDB:
         # never hijack the resume. This is the fix for the desktop "I came back
         # and the reply isn't there" report on large sessions.
         try:
-            tip = self.get_compression_tip(session_id)
+            tip = self.get_compression_tip(session_id, recovery_scope=recovery_scope)
         except Exception:
             tip = session_id
         if tip and tip != session_id:
             session_id = tip
 
+        scope_clause, scope_params = self._recovery_scope_clause(recovery_scope)
+        lineage_scope_clause = (
+            "  AND parent.owner_key = child.owner_key "
+            "AND parent.workspace_root = child.workspace_root "
+            "AND parent.worker_generation = child.worker_generation "
+            if recovery_scope
+            else ""
+        )
         with self._lock:
             current = session_id
             seen = {current}
             best = None  # tracks the last (deepest) node with messages
 
             for _ in range(32):
-                # Check if the current node has messages.
+                # Check if the current node remains in the validated durable scope
+                # before any message read. This is deliberately a sessions-table
+                # predicate rather than trusting lineage IDs from a previous hop.
                 try:
                     row = self._conn.execute(
-                        "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
-                        (current,),
+                        f"SELECT 1 FROM sessions WHERE id = ?{scope_clause} "
+                        "AND EXISTS (SELECT 1 FROM messages WHERE session_id = sessions.id LIMIT 1)",
+                        (current, *scope_params),
                     ).fetchone()
                 except Exception:
                     return session_id
@@ -3774,13 +3892,16 @@ class SessionDB:
                 # run). This mirrors the child-exclusion in ``get_compression_tip``.
                 try:
                     child_row = self._conn.execute(
-                        "SELECT id FROM sessions "
-                        "WHERE parent_session_id = ? "
-                        "  AND json_extract(COALESCE(model_config, '{}'), '$._branched_from') IS NULL "
-                        "  AND json_extract(COALESCE(model_config, '{}'), '$._delegate_from') IS NULL "
-                        "  AND COALESCE(source, '') != 'tool' "
-                        "ORDER BY started_at DESC, id DESC LIMIT 1",
-                        (current,),
+                        f"SELECT child.id FROM sessions child "
+                        "JOIN sessions parent ON parent.id = child.parent_session_id "
+                        "WHERE child.parent_session_id = ? "
+                        f"  {scope_clause.replace('sessions.', 'child.')} "
+                        f"{lineage_scope_clause}"
+                        "  AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL "
+                        "  AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL "
+                        "  AND COALESCE(child.source, '') != 'tool' "
+                        "ORDER BY child.started_at DESC, child.id DESC LIMIT 1",
+                        (current, *scope_params),
                     ).fetchone()
                 except Exception:
                     return session_id
@@ -3799,6 +3920,8 @@ class SessionDB:
         session_id: str,
         include_ancestors: bool = False,
         include_inactive: bool = False,
+        *,
+        recovery_scope: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Load messages in the OpenAI conversation format (role + content dicts).
@@ -3810,16 +3933,22 @@ class SessionDB:
         """
         session_ids = [session_id]
         if include_ancestors:
-            session_ids = self._session_lineage_root_to_tip(session_id)
+            session_ids = self._session_lineage_root_to_tip(
+                session_id, recovery_scope=recovery_scope
+            )
 
         active_clause = "" if include_inactive else " AND active = 1"
+        session_scope_clause, session_scope_params = self._recovery_scope_clause(
+            recovery_scope, alias="s"
+        )
         with self._lock:
             placeholders = ",".join("?" for _ in session_ids)
             rows = self._conn.execute(
-                "SELECT role, content, tool_call_id, tool_calls, tool_name, "
-                "finish_reason, reasoning, reasoning_content, reasoning_details, "
-                "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp "
-                f"FROM messages WHERE session_id IN ({placeholders})"
+                "SELECT m.role, m.content, m.tool_call_id, m.tool_calls, m.tool_name, "
+                "m.finish_reason, m.reasoning, m.reasoning_content, m.reasoning_details, "
+                "m.codex_reasoning_items, m.codex_message_items, m.platform_message_id, m.observed, m.timestamp "
+                "FROM messages m JOIN sessions s ON s.id = m.session_id "
+                f"WHERE m.session_id IN ({placeholders}){session_scope_clause}"
                 # Order by AUTOINCREMENT id (true insertion order), NOT timestamp:
                 # append_message stamps rows with time.time(), which is not
                 # monotonic (WSL2, NTP steps, VM/laptop sleep resume). A later
@@ -3828,8 +3957,8 @@ class SessionDB:
                 # after its tool response, breaking tool-call/response adjacency
                 # and triggering an HTTP 400 on replay. This matches get_messages
                 # — see c03acca50 for the original fix.
-                f"{active_clause} ORDER BY id",
-                tuple(session_ids),
+                f"{active_clause.replace(' active', ' m.active')} ORDER BY m.id",
+                (*session_ids, *session_scope_params),
             ).fetchall()
 
         messages = []
@@ -3903,10 +4032,16 @@ class SessionDB:
         messages = _strip_background_review_harness(messages)
         return messages
 
-    def _session_lineage_root_to_tip(self, session_id: str) -> List[str]:
+    def _session_lineage_root_to_tip(
+        self,
+        session_id: str,
+        *,
+        recovery_scope: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
         if not session_id:
             return [session_id]
 
+        scope_clause, scope_params = self._recovery_scope_clause(recovery_scope)
         chain = []
         current = session_id
         seen = set()
@@ -3914,14 +4049,14 @@ class SessionDB:
             for _ in range(100):
                 if not current or current in seen:
                     break
-                seen.add(current)
-                chain.append(current)
                 row = self._conn.execute(
-                    "SELECT parent_session_id FROM sessions WHERE id = ?",
-                    (current,),
+                    f"SELECT parent_session_id FROM sessions WHERE id = ?{scope_clause}",
+                    (current, *scope_params),
                 ).fetchone()
                 if row is None:
                     break
+                seen.add(current)
+                chain.append(current)
                 current = row["parent_session_id"] if hasattr(row, "keys") else row[0]
         return list(reversed(chain)) or [session_id]
 

@@ -471,6 +471,129 @@ def test_tui_verbose_tool_events_omit_details_when_redaction_fails(monkeypatch):
     assert "result_text" not in events[1][2]
 
 
+def test_owner_gateway_runtimes_keep_live_maps_and_prompt_state_isolated():
+    """Identical session/request keys must never share owner-worker runtime state."""
+    runtime_a = server.OwnerWorkerGatewayRuntime("owner-a", 1, "worker-a", 1, 0)
+    runtime_b = server.OwnerWorkerGatewayRuntime("owner-b", 1, "worker-b", 1, 0)
+
+    with server.owner_worker_gateway_runtime(runtime_a):
+        server._sessions["same-session"] = {"owner": "a"}
+        server._pending["same-request"] = ("same-session", threading.Event())
+        server._answers["same-request"] = "answer-a"
+        server._active_child_runs["same-child"] = 1.0
+        server._child_mirrors["same-child"] = {"owner": "a"}
+
+    with server.owner_worker_gateway_runtime(runtime_b):
+        assert "same-session" not in server._sessions
+        assert "same-request" not in server._pending
+        assert "same-request" not in server._answers
+        assert "same-child" not in server._active_child_runs
+        assert "same-child" not in server._child_mirrors
+        server._sessions["same-session"] = {"owner": "b"}
+
+    with server.owner_worker_gateway_runtime(runtime_a):
+        assert server._sessions["same-session"] == {"owner": "a"}
+        assert server._answers["same-request"] == "answer-a"
+
+
+def test_owner_runtime_propagates_to_deferred_agent_build(monkeypatch):
+    runtime = server.OwnerWorkerGatewayRuntime("owner-a", 1, "worker-a", 1, 0)
+    seen = threading.Event()
+    captured: list[object] = []
+
+    def capture_build(_sid, _session):
+        captured.append(server.current_owner_worker_gateway_runtime())
+        seen.set()
+
+    monkeypatch.setattr(server, "_start_agent_build", capture_build)
+    with server.owner_worker_gateway_runtime(runtime):
+        server._sessions["same-session"] = {}
+        server._schedule_agent_build("same-session", delay=0)
+
+    assert seen.wait(timeout=1)
+    assert captured == [runtime]
+
+
+def test_owner_runtime_propagates_to_notification_poller(monkeypatch):
+    runtime = server.OwnerWorkerGatewayRuntime("owner-a", 1, "worker-a", 1, 0)
+    seen = threading.Event()
+    captured: list[object] = []
+
+    def capture_loop(_stop, _sid, _session, received_runtime=None):
+        captured.append((server.current_owner_worker_gateway_runtime(), received_runtime))
+        seen.set()
+
+    monkeypatch.setattr(server, "_notification_poller_loop", capture_loop)
+    with server.owner_worker_gateway_runtime(runtime):
+        server._start_notification_poller("same-session", {})
+
+    assert seen.wait(timeout=1)
+    assert captured == [(runtime, runtime)]
+
+
+def test_owner_runtime_propagates_to_late_mcp_refresh(monkeypatch):
+    runtime = server.OwnerWorkerGatewayRuntime("owner-a", 1, "worker-a", 1, 0)
+    agent = object()
+    seen = threading.Event()
+    captured: list[object] = []
+
+    monkeypatch.setattr("tui_gateway.entry.mcp_discovery_in_flight", lambda: True)
+
+    def join_mcp_discovery(*, timeout):
+        captured.append(server.current_owner_worker_gateway_runtime())
+        seen.set()
+        return False
+
+    monkeypatch.setattr("tui_gateway.entry.join_mcp_discovery", join_mcp_discovery)
+    with server.owner_worker_gateway_runtime(runtime):
+        server._schedule_mcp_late_refresh("same-session", agent)
+
+    assert seen.wait(timeout=1)
+    assert captured == [runtime]
+
+
+def test_owner_runtime_propagates_to_owner_scoped_timer_callbacks(monkeypatch):
+    runtime = server.OwnerWorkerGatewayRuntime("owner-a", 1, "worker-a", 1, 0)
+    captured: list[object] = []
+
+    class RunImmediately:
+        def __init__(self, _delay, callback):
+            self.callback = callback
+            self.daemon = False
+
+        def start(self):
+            self.callback()
+
+    monkeypatch.setattr(server.threading, "Timer", RunImmediately)
+    monkeypatch.setattr(server, "_enforce_session_cap", lambda: captured.append(server.current_owner_worker_gateway_runtime()))
+    monkeypatch.setattr(server, "_close_session_by_id", lambda *_args, **_kwargs: captured.append(server.current_owner_worker_gateway_runtime()))
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 1)
+
+    with server.owner_worker_gateway_runtime(runtime):
+        server._schedule_session_cap_enforcement()
+        server._sessions["same-session"] = {"transport": server._detached_ws_transport}
+        server._schedule_ws_orphan_reap("same-session")
+
+    assert captured == [runtime, runtime]
+
+
+def test_dispatch_binds_owner_runtime_for_registered_handler(monkeypatch):
+    runtime = server.OwnerWorkerGatewayRuntime("owner-a", 1, "worker-a", 1, 0)
+
+    def probe(rid, _params):
+        current = server.current_owner_worker_gateway_runtime()
+        server._sessions["shared-id"] = {"owner": current.owner_key if current else None}
+        return {"jsonrpc": "2.0", "id": rid, "result": {"owner": current.owner_key if current else None}}
+
+    monkeypatch.setitem(server._methods, "runtime.probe", probe)
+
+    response = server.dispatch({"id": "1", "method": "runtime.probe"}, runtime=runtime)
+
+    assert response == {"jsonrpc": "2.0", "id": "1", "result": {"owner": "owner-a"}}
+    assert runtime.mutable_state.sessions["shared-id"] == {"owner": "owner-a"}
+    assert "shared-id" not in server._sessions
+
+
 def test_dispatch_rejects_non_object_request():
     resp = server.dispatch([])
 
@@ -6686,6 +6809,7 @@ def test_browser_manage_connect_default_local_reports_launch_hint(monkeypatch):
     )
     with patch.dict(sys.modules, {"tools.browser_tool": fake}):
         _stub_urlopen(monkeypatch, ok=False)
+        monkeypatch.setattr("hermes_cli.browser_connect.manual_chrome_debug_command", lambda *_args, **_kwargs: None)
         with (
             patch(
                 "hermes_cli.browser_connect.try_launch_chrome_debug", return_value=False
@@ -6742,6 +6866,7 @@ def test_browser_manage_connect_no_session_skips_progress_events(monkeypatch):
     )
     with patch.dict(sys.modules, {"tools.browser_tool": fake}):
         _stub_urlopen(monkeypatch, ok=False)
+        monkeypatch.setattr("hermes_cli.browser_connect.manual_chrome_debug_command", lambda *_args, **_kwargs: None)
         with (
             patch(
                 "hermes_cli.browser_connect.try_launch_chrome_debug", return_value=False

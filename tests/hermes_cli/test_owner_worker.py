@@ -1345,3 +1345,101 @@ def test_worker_live_state_is_app_local_and_stale_cleanup_is_fenced():
         assert app_b.state.owner_worker_live_state.pty_browser_sessions["shared-browser"]["metadata"] == metadata_b
 
     asyncio.run(exercise())
+
+
+def test_worker_gateway_runtime_and_attach_tokens_are_app_local():
+    """An owner worker cannot reuse another worker's Gateway binding or child token."""
+    from types import SimpleNamespace
+
+    from hermes_cli.owner_worker.ws_routes import (
+        OwnerWorkerLiveState,
+        _consume_gateway_attach_token,
+        _mint_gateway_attach_token,
+    )
+    from tui_gateway.server import OwnerWorkerGatewayRuntime
+
+    app_a = SimpleNamespace(state=SimpleNamespace(owner_worker_live_state=OwnerWorkerLiveState()))
+    app_b = SimpleNamespace(state=SimpleNamespace(owner_worker_live_state=OwnerWorkerLiveState()))
+    runtime_a = OwnerWorkerGatewayRuntime("owner-a", 1, "worker-a", 1, 0)
+    runtime_b = OwnerWorkerGatewayRuntime("owner-b", 1, "worker-b", 1, 0)
+    app_a.state.owner_worker_live_state.gateway_runtime = runtime_a
+    app_b.state.owner_worker_live_state.gateway_runtime = runtime_b
+
+    assert app_a.state.owner_worker_live_state.gateway_runtime is runtime_a
+    assert app_b.state.owner_worker_live_state.gateway_runtime is runtime_b
+    assert runtime_a != runtime_b
+
+    consumed = _mint_gateway_attach_token(app_a)
+    assert _consume_gateway_attach_token(app_a, consumed)
+    assert not _consume_gateway_attach_token(app_a, consumed)
+
+    foreign = _mint_gateway_attach_token(app_a)
+    assert not _consume_gateway_attach_token(app_b, foreign)
+    assert _consume_gateway_attach_token(app_a, foreign)
+
+    expired = _mint_gateway_attach_token(app_a)
+    app_a.state.owner_worker_live_state.gateway_attach_tokens[expired] = time.monotonic() - 1
+    assert not _consume_gateway_attach_token(app_a, expired)
+
+
+def test_worker_gateway_ws_admits_one_owner_local_tui_attach(monkeypatch):
+    """The private child attach token bypasses neither worker identity nor replay fencing."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from hermes_cli.owner_worker import ws_routes
+    from hermes_cli.owner_worker.ws_routes import OwnerWorkerLiveState
+    from tui_gateway.server import OwnerWorkerGatewayRuntime
+    from tui_gateway import ws as gateway_ws_module
+
+    class FakeWebSocket:
+        def __init__(self, app, token):
+            self.app = app
+            self.query_params = {"owner_tui_attach": token}
+            self.closed: list[tuple[int, str]] = []
+
+        async def close(self, *, code=1000, reason=""):
+            self.closed.append((code, reason))
+
+    app_a = SimpleNamespace(state=SimpleNamespace(owner_worker_live_state=OwnerWorkerLiveState()))
+    app_b = SimpleNamespace(state=SimpleNamespace(owner_worker_live_state=OwnerWorkerLiveState()))
+    runtime = OwnerWorkerGatewayRuntime("owner-a", 1, "worker-a", 1, 0)
+    app_a.state.owner_worker_live_state.gateway_runtime = runtime
+    app_b.state.owner_worker_live_state.gateway_runtime = OwnerWorkerGatewayRuntime("owner-b", 1, "worker-b", 1, 0)
+    token = ws_routes._mint_gateway_attach_token(app_a)
+    admitted: list[tuple[object, object, bool]] = []
+
+    async def fake_handle_ws(ws, *, runtime, require_owner_runtime):
+        admitted.append((ws, runtime, require_owner_runtime))
+
+    monkeypatch.setattr(gateway_ws_module, "handle_ws", fake_handle_ws)
+
+    attached = FakeWebSocket(app_a, token)
+    asyncio.run(ws_routes.gateway_ws(attached))
+    assert admitted == [(attached, runtime, True)]
+    assert attached.closed == []
+
+    replay = FakeWebSocket(app_a, token)
+    asyncio.run(ws_routes.gateway_ws(replay))
+    assert admitted == [(attached, runtime, True)]
+    assert replay.closed and replay.closed[0][0] == 4401
+
+    foreign = FakeWebSocket(app_b, ws_routes._mint_gateway_attach_token(app_a))
+    asyncio.run(ws_routes.gateway_ws(foreign))
+    assert foreign.closed and foreign.closed[0][0] == 4401
+
+
+def test_worker_chat_argv_requires_owner_worker_gateway_attach(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from hermes_cli.owner_worker import ws_routes
+    from hermes_cli.owner_worker.ws_routes import OwnerWorkerLiveState
+
+    monkeypatch.setattr(ws_routes, "resolve_workspace_cwd", lambda *_args, **_kwargs: tmp_path)
+    monkeypatch.setattr("hermes_cli.main._make_tui_argv", lambda *_args, **_kwargs: (["node", "entry.js"], str(tmp_path)))
+    app = SimpleNamespace(state=SimpleNamespace(owner_worker_mode=True, owner_worker_live_state=OwnerWorkerLiveState()))
+
+    _argv, _cwd, env = ws_routes._resolve_chat_argv(app_obj=app)
+
+    assert env["HERMES_OWNER_WORKER_TUI_ATTACH"] == "1"
+    assert env["HERMES_TUI_GATEWAY_URL"].startswith("ws://owner-worker/api/ws?owner_tui_attach=")

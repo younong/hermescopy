@@ -64,6 +64,72 @@ class TestLoadDirectory:
 
 
 class TestBuildChannelDirectoryWrites:
+    def test_owner_worker_writes_scope_assertions(self, tmp_path, monkeypatch):
+        workspace = tmp_path / "workspaces"
+        workspace.mkdir()
+        cache_file = tmp_path / "channel_directory.json"
+        monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_mine")
+        monkeypatch.setenv("HERMES_WORKSPACE_ROOT", str(workspace))
+        monkeypatch.setenv("HERMES_WORKER_GENERATION", "5")
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            asyncio.run(build_channel_directory({}))
+
+        data = json.loads(cache_file.read_text())
+        assert data["owner_key"] == "ok1_mine"
+        assert data["workspace_root"] == str(workspace.resolve())
+        assert data["worker_generation"] == 5
+
+    def test_owner_worker_treats_stale_directory_as_absent_without_raw_audit(self, tmp_path, monkeypatch):
+        workspace = tmp_path / "workspaces"
+        workspace.mkdir()
+        cache_file = tmp_path / "channel_directory.json"
+        cache_file.write_text(json.dumps({
+            "updated_at": "2026-01-01T00:00:00",
+            "platforms": {"telegram": [{"id": "1", "name": "stale", "type": "dm"}]},
+            "owner_key": "ok1_mine",
+            "workspace_root": str(workspace),
+            "worker_generation": 4,
+        }))
+        events = []
+        monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_mine")
+        monkeypatch.setenv("HERMES_WORKSPACE_ROOT", str(workspace))
+        monkeypatch.setenv("HERMES_WORKER_GENERATION", "5")
+        monkeypatch.setattr(
+            "hermes_cli.dashboard_auth.audit.audit_authority",
+            lambda event, **fields: events.append((event, fields)),
+        )
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            assert load_directory() == {"updated_at": None, "platforms": {}}
+
+        assert events[0][0].value == "persisted_scope_rejected"
+        assert events[0][1]["reason"] == "persisted_scope_assertion_mismatch"
+        assert str(workspace) not in repr(events[0][1])
+
+    def test_owner_worker_treats_unscoped_aliases_as_absent_with_deidentified_audit(self, tmp_path, monkeypatch):
+        aliases_file = tmp_path / "channel_aliases.json"
+        aliases_file.write_text(json.dumps({"telegram": {"1": "stale"}}))
+        workspace = tmp_path / "workspaces"
+        workspace.mkdir()
+        events = []
+        monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_mine")
+        monkeypatch.setenv("HERMES_WORKSPACE_ROOT", str(workspace))
+        monkeypatch.setenv("HERMES_WORKER_GENERATION", "5")
+        monkeypatch.setattr(
+            "hermes_cli.dashboard_auth.audit.audit_authority",
+            lambda event, **fields: events.append((event, fields)),
+        )
+
+        with patch("gateway.channel_directory.CHANNEL_ALIASES_PATH", aliases_file):
+            platforms = {"telegram": []}
+            _apply_channel_aliases(platforms)
+
+        assert platforms == {"telegram": []}
+        assert events[0][0].value == "persisted_scope_rejected"
+        assert events[0][1]["reason"] == "persisted_scope_assertion_missing"
+        assert str(aliases_file) not in repr(events[0][1])
+
     def test_failed_write_preserves_previous_cache(self, tmp_path, monkeypatch):
         cache_file = _write_directory(tmp_path, {
             "telegram": [{"id": "123", "name": "Alice", "type": "dm"}]
@@ -611,6 +677,8 @@ def test_build_from_sessions_ignores_owner_mismatch_in_worker(tmp_path, monkeypa
     })
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_OWNER_KEY", "ok_mine")
+    monkeypatch.delenv("HERMES_WORKSPACE_ROOT", raising=False)
+    monkeypatch.delenv("HERMES_WORKER_GENERATION", raising=False)
 
     entries = _build_from_sessions("telegram")
     assert [entry["name"] for entry in entries] == ["Mine"]

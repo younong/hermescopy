@@ -169,6 +169,29 @@ def test_redirects_from_message_bearing_parent_to_child(db):
     assert db.resolve_resume_session_id("original") == "continued"
 
 
+def test_scoped_resume_does_not_follow_foreign_compression_child(db):
+    scope = {
+        "owner_key": "ok1_owner",
+        "workspace_root": "/workspace/owner",
+        "worker_generation": 7,
+    }
+    db.create_session("root", source="tui", **scope)
+    db.append_message("root", role="user", content="owner root")
+    db.end_session("root", "compression")
+    db.create_session(
+        "foreign-child",
+        source="tui",
+        parent_session_id="root",
+        owner_key="ok1_other",
+        workspace_root="/workspace/other",
+        worker_generation=7,
+    )
+    db.append_message("foreign-child", role="assistant", content="must stay private")
+
+    assert db.get_compression_tip("root", recovery_scope=scope) == "root"
+    assert db.resolve_resume_session_id("root", recovery_scope=scope) == "root"
+
+
 def test_compression_tip_handles_pre_ended_real_child_and_ws_orphan_sibling(db):
     # Real desktop repro shape from a long GUI session:
     #

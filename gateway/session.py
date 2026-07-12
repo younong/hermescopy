@@ -161,6 +161,8 @@ class SessionSource:
     owner_key: Optional[str] = None
     tenant_id: Optional[str] = None
     auth_provider: Optional[str] = None
+    workspace_root: Optional[str] = None
+    worker_generation: Optional[int] = None
 
     # Internal, wire-INVISIBLE trust signal: True when this event was delivered
     # to the gateway over the per-instance-authenticated relay WebSocket (the
@@ -240,6 +242,8 @@ class SessionSource:
             ("owner_key", self.owner_key or owner_meta.get("owner_key")),
             ("tenant_id", self.tenant_id or owner_meta.get("tenant_id")),
             ("auth_provider", self.auth_provider or owner_meta.get("auth_provider")),
+            ("workspace_root", self.workspace_root or owner_meta.get("workspace_root")),
+            ("worker_generation", self.worker_generation or owner_meta.get("worker_generation")),
         ):
             if value:
                 d[key] = value
@@ -267,6 +271,8 @@ class SessionSource:
             owner_key=data.get("owner_key"),
             tenant_id=data.get("tenant_id"),
             auth_provider=data.get("auth_provider"),
+            workspace_root=data.get("workspace_root"),
+            worker_generation=data.get("worker_generation"),
         )
     
 
@@ -601,36 +607,96 @@ PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
 
 
 
-def current_owner_metadata() -> Dict[str, str]:
-    """Return owner metadata from the authenticated owner worker environment.
+def current_owner_metadata() -> Dict[str, Any]:
+    """Return the persisted scope assertions for the current owner worker.
 
-    Empty outside owner-worker mode.  These values are persisted as metadata only;
-    the legacy session key format intentionally stays unchanged.
+    The workspace path is canonicalized before persistence.  It is owner-local
+    metadata, never an authorization input; authenticated reads still derive
+    their expected scope solely from the worker environment.
     """
-    mapping = {
-        "owner_key": os.environ.get("HERMES_OWNER_KEY", "").strip(),
+    owner_key = os.environ.get("HERMES_OWNER_KEY", "").strip()
+    if not owner_key:
+        return {}
+    workspace_root = os.environ.get("HERMES_WORKSPACE_ROOT", "").strip()
+    worker_generation = os.environ.get("HERMES_WORKER_GENERATION", "").strip()
+    try:
+        generation = int(worker_generation)
+    except (TypeError, ValueError):
+        generation = 0
+    mapping: Dict[str, Any] = {
+        "owner_key": owner_key,
         "tenant_id": os.environ.get("HERMES_TENANT_ID", "").strip(),
         "auth_provider": os.environ.get("HERMES_AUTH_PROVIDER", "").strip(),
+        "workspace_root": str(Path(workspace_root).expanduser().resolve()) if workspace_root else "",
+        "worker_generation": generation if generation > 0 else None,
     }
-    return {key: value for key, value in mapping.items() if value}
+    return {key: value for key, value in mapping.items() if value not in (None, "")}
 
 
-def _owner_worker_owner_key() -> Optional[str]:
-    value = os.environ.get("HERMES_OWNER_KEY", "").strip()
-    return value or None
+def current_recovery_scope() -> Dict[str, Any] | None:
+    """Return the complete trusted durable scope for owner-worker recovery."""
+    metadata = current_owner_metadata()
+    required = ("owner_key", "workspace_root", "worker_generation")
+    return metadata if all(metadata.get(key) not in (None, "") for key in required) else None
+
+
+def _persisted_scope_value(data: Dict[str, Any], key: str) -> Any:
+    value = data.get(key)
+    if value is None and isinstance(data.get("origin"), dict):
+        value = data["origin"].get(key)
+    return value
+
+
+def _audit_persisted_scope_rejection(reason: str) -> None:
+    """Record a fixed, de-identified persisted-scope rejection when possible."""
+    try:
+        from hermes_cli.dashboard_auth.audit import (
+            AuthorityAuditEvent,
+            audit_authority,
+            new_authority_correlation_id,
+        )
+
+        generation = current_owner_metadata().get("worker_generation")
+        audit_authority(
+            AuthorityAuditEvent.PERSISTED_SCOPE_REJECTED,
+            correlation_id=new_authority_correlation_id(),
+            reason=reason,
+            audience_class="owner-persisted-scope",
+            worker_generation=int(generation) if generation is not None else None,
+        )
+    except Exception:
+        logger.debug("persisted scope audit unavailable", exc_info=True)
 
 
 def owner_metadata_matches_current(data: Dict[str, Any]) -> bool:
-    """Fail closed on persisted owner mismatch when HERMES_OWNER_KEY is set."""
-    current = _owner_worker_owner_key()
-    if not current:
+    """Fail closed on owner/workspace/generation mismatch in owner-worker mode."""
+    expected = current_owner_metadata()
+    if not expected:
         return True
-    owner_key = data.get("owner_key")
-    if owner_key is None and isinstance(data.get("origin"), dict):
-        owner_key = data["origin"].get("owner_key")
-    # Legacy records predate owner metadata.  They remain valid in local mode,
-    # but authenticated owner workers must not adopt them.
-    return bool(owner_key and str(owner_key) == current)
+    if "workspace_root" not in expected or "worker_generation" not in expected:
+        # Compatibility for direct local helpers that deliberately set only an
+        # owner key. A real owner worker has a complete runtime environment and
+        # therefore always takes the full assertion path below.
+        return str(_persisted_scope_value(data, "owner_key") or "") == str(expected["owner_key"])
+    required = ("owner_key", "workspace_root", "worker_generation")
+    actual = {key: _persisted_scope_value(data, key) for key in required}
+    if any(value in (None, "") for value in actual.values()):
+        _audit_persisted_scope_rejection("persisted_scope_assertion_missing")
+        return False
+    try:
+        actual_workspace = str(Path(str(actual["workspace_root"])).expanduser().resolve())
+        actual_generation = int(actual["worker_generation"])
+    except (TypeError, ValueError):
+        _audit_persisted_scope_rejection("persisted_scope_assertion_invalid")
+        return False
+    if (
+        str(actual["owner_key"]) != str(expected["owner_key"])
+        or actual_workspace != str(expected["workspace_root"])
+        or actual_generation != int(expected["worker_generation"])
+    ):
+        _audit_persisted_scope_rejection("persisted_scope_assertion_mismatch")
+        return False
+    return True
 
 
 _owner_metadata_matches_current = owner_metadata_matches_current
@@ -672,7 +738,9 @@ class SessionEntry:
     owner_key: Optional[str] = None
     tenant_id: Optional[str] = None
     auth_provider: Optional[str] = None
-    
+    workspace_root: Optional[str] = None
+    worker_generation: Optional[int] = None
+
     # Display metadata
     display_name: Optional[str] = None
     platform: Optional[Platform] = None
@@ -768,12 +836,16 @@ class SessionEntry:
             "auto_reset_reason": self.auto_reset_reason,
             "reset_had_activity": self.reset_had_activity,
         }
-        if self.owner_key:
-            result["owner_key"] = self.owner_key
-        if self.tenant_id:
-            result["tenant_id"] = self.tenant_id
-        if self.auth_provider:
-            result["auth_provider"] = self.auth_provider
+        owner_meta = current_owner_metadata()
+        for key, value in (
+            ("owner_key", self.owner_key or owner_meta.get("owner_key")),
+            ("tenant_id", self.tenant_id or owner_meta.get("tenant_id")),
+            ("auth_provider", self.auth_provider or owner_meta.get("auth_provider")),
+            ("workspace_root", self.workspace_root or owner_meta.get("workspace_root")),
+            ("worker_generation", self.worker_generation or owner_meta.get("worker_generation")),
+        ):
+            if value not in (None, ""):
+                result[key] = int(value) if key == "worker_generation" else value
         if self.model_override:
             # Defence-in-depth: strip credentials even if a caller stored an
             # unsanitized dict directly on the entry.
@@ -842,6 +914,8 @@ class SessionEntry:
             owner_key=data.get("owner_key"),
             tenant_id=data.get("tenant_id"),
             auth_provider=data.get("auth_provider"),
+            workspace_root=data.get("workspace_root"),
+            worker_generation=data.get("worker_generation"),
             model_override=sanitize_model_override(data.get("model_override")),
         )
 
@@ -1256,11 +1330,12 @@ class SessionStore:
                 chat_id=source.chat_id,
                 chat_type=source.chat_type,
                 thread_id=source.thread_id,
+                recovery_scope=current_recovery_scope(),
             )
         except Exception as exc:
             logger.debug("Gateway session DB recovery failed for %s: %s", session_key, exc)
             return None
-        if not recovered:
+        if not recovered or not owner_metadata_matches_current(recovered):
             return None
         try:
             self._db.reopen_session(str(recovered["id"]))
@@ -1294,6 +1369,7 @@ class SessionStore:
                 chat_id=source.chat_id,
                 chat_type=source.chat_type,
                 thread_id=source.thread_id,
+                **(current_recovery_scope() or {}),
             )
         except Exception as exc:
             logger.debug("Gateway session peer record failed for %s: %s", session_key, exc)
@@ -1620,6 +1696,7 @@ class SessionStore:
                 "chat_id": source.chat_id,
                 "chat_type": source.chat_type,
                 "thread_id": source.thread_id,
+                **(current_recovery_scope() or {}),
             }
 
         # SQLite operations outside the lock
@@ -1879,6 +1956,7 @@ class SessionStore:
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
                 is_fresh_reset=True,
+                **current_owner_metadata(),
             )
 
             self._entries[session_key] = new_entry
@@ -1948,6 +2026,7 @@ class SessionStore:
                 display_name=old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
+                **current_owner_metadata(),
             )
 
             self._entries[session_key] = new_entry

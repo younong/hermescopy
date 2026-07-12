@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from hermes_cli.config import get_hermes_home
-from gateway.session import owner_metadata_matches_current
+from gateway.session import current_owner_metadata, owner_metadata_matches_current
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -60,6 +60,10 @@ def _effective_sessions_index_path():
     return get_sessions_index_path()
 
 
+def _scope_record_matches_current(data: Any) -> bool:
+    return isinstance(data, dict) and owner_metadata_matches_current(data)
+
+
 def _load_channel_aliases() -> Dict[str, Dict[str, str]]:
     aliases_path = _effective_channel_aliases_path()
     if not aliases_path.exists():
@@ -67,7 +71,19 @@ def _load_channel_aliases() -> Dict[str, Dict[str, str]]:
     try:
         with open(aliases_path, encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        if "aliases" not in data:
+            # The legacy raw-alias format is accepted only outside owner-worker
+            # mode. Authenticated workers require the persisted scope envelope.
+            if current_owner_metadata():
+                owner_metadata_matches_current(data)
+                return {}
+            return data
+        if not _scope_record_matches_current(data):
+            return {}
+        aliases = data.get("aliases")
+        return aliases if isinstance(aliases, dict) else {}
     except Exception:
         return {}
 
@@ -188,6 +204,7 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     directory = {
         "updated_at": datetime.now().isoformat(),
         "platforms": platforms,
+        **current_owner_metadata(),
     }
 
     try:
@@ -349,6 +366,8 @@ def load_directory() -> Dict[str, Any]:
     try:
         with open(directory_path, encoding="utf-8") as f:
             data = json.load(f)
+        if not _scope_record_matches_current(data):
+            return {"updated_at": None, "platforms": {}}
         # Re-apply aliases on read so friendly names take effect immediately,
         # even between timed rebuilds and for brand-new alias entries.
         _apply_channel_aliases(data.setdefault("platforms", {}))

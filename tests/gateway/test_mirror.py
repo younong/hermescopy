@@ -306,8 +306,38 @@ def test_find_session_id_ignores_owner_mismatch_in_worker(tmp_path, monkeypatch)
     })
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_OWNER_KEY", "ok_mine")
+    monkeypatch.delenv("HERMES_WORKSPACE_ROOT", raising=False)
+    monkeypatch.delenv("HERMES_WORKER_GENERATION", raising=False)
 
     assert _find_session_id("telegram", "1") == "sess_mine"
+
+
+def test_find_session_id_treats_workspace_generation_mismatch_as_absent(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspaces"
+    workspace.mkdir()
+    _setup_sessions(tmp_path, {
+        "stale": {
+            "session_id": "sess_stale",
+            "owner_key": "ok_mine",
+            "workspace_root": str(workspace),
+            "worker_generation": 4,
+            "origin": {"platform": "telegram", "chat_id": "1"},
+        },
+    })
+    events = []
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok_mine")
+    monkeypatch.setenv("HERMES_WORKSPACE_ROOT", str(workspace))
+    monkeypatch.setenv("HERMES_WORKER_GENERATION", "5")
+    monkeypatch.setattr(
+        "hermes_cli.dashboard_auth.audit.audit_authority",
+        lambda event, **fields: events.append((event, fields)),
+    )
+
+    assert _find_session_id("telegram", "1") is None
+    assert events[0][0].value == "persisted_scope_rejected"
+    assert events[0][1]["reason"] == "persisted_scope_assertion_mismatch"
+    assert "sess_stale" not in repr(events[0][1])
 
 
 def test_find_session_id_keeps_legacy_records_outside_owner_worker(tmp_path, monkeypatch):
