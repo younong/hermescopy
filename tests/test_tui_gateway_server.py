@@ -7806,6 +7806,65 @@ def test_session_save_writes_under_hermes_home_with_system_prompt(monkeypatch, t
     assert payload["messages"] == history
 
 
+def test_authenticated_process_event_requires_exact_owner_runtime():
+    from hermes_cli.dashboard_auth.authority import OwnerWorkerAuthorityLease, WorkerLeaseState
+    from hermes_cli.owner_worker.executor_identity import ExecutorIdentity
+
+    runtime = server.OwnerWorkerGatewayRuntime("owner-a", 1, "worker-a", 2, 3)
+    identity = ExecutorIdentity.for_task(
+        OwnerWorkerAuthorityLease("owner-a", 1, "worker-a", WorkerLeaseState.ACTIVE, 2, 3),
+        workspace_prefix="default", task_id="task-a", session_id="session-key", executor_id="executor-a",
+    )
+    session = _session()
+    event = {"session_key": "session-key", "executor_identity": identity.to_payload()}
+
+    assert server._authenticated_process_event_matches_runtime(session, event, runtime)
+    assert not server._authenticated_process_event_matches_runtime(
+        session, event, server.OwnerWorkerGatewayRuntime("owner-a", 1, "worker-a", 2, 4)
+    )
+    assert not server._authenticated_process_event_matches_runtime(
+        session, {"session_key": "session-key", "executor_identity": {"owner_key": "broken"}}, runtime
+    )
+    assert server._authenticated_process_event_matches_runtime(session, {"session_key": "session-key"}, None)
+
+
+def test_authenticated_terminal_output_requires_exact_owner_runtime(monkeypatch):
+    from hermes_cli.dashboard_auth.authority import OwnerWorkerAuthorityLease, WorkerLeaseState
+    from hermes_cli.owner_worker.executor_identity import ExecutorIdentity
+    from tools.process_registry import ProcessSession, process_registry
+
+    runtime = server.OwnerWorkerGatewayRuntime("owner-a", 1, "worker-a", 1, 0)
+    session_key = "session-key-auth-output"
+    identity = ExecutorIdentity.for_task(
+        OwnerWorkerAuthorityLease("owner-a", 1, "worker-a", WorkerLeaseState.ACTIVE, 1, 0),
+        workspace_prefix="default", task_id="task-a", session_id=session_key, executor_id="executor-a",
+    )
+    session = ProcessSession(
+        id="proc-auth-output", command="echo ok", task_id="task-a", session_key=session_key,
+        authenticated_executor=True, executor_identity=identity,
+    )
+    emitted = []
+    owner_session = _session()
+    owner_session["session_key"] = session_key
+    server._sessions["sid-auth-output"] = owner_session
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    previous_output, previous_close = process_registry.on_output, process_registry.on_close
+    process_registry.on_output = process_registry.on_close = None
+    try:
+        server._wire_agent_terminal_output(runtime)
+        process_registry.on_output(session, "ok")
+        assert emitted == [("agent.terminal.output", "sid-auth-output", {"process_id": session.id, "chunk": "ok"})]
+        from dataclasses import replace
+
+        emitted.clear()
+        session.executor_identity = replace(identity, recovery_generation=1)
+        process_registry.on_output(session, "stale")
+        assert emitted == []
+    finally:
+        process_registry.on_output, process_registry.on_close = previous_output, previous_close
+        server._sessions.pop("sid-auth-output", None)
+
+
 def test_notification_event_dedup_key_preserves_distinct_watch_matches():
     """Watch-match identity includes match content, not just session/type."""
     base = {

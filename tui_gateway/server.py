@@ -156,6 +156,7 @@ class OwnerWorkerGatewayRuntime:
     lease_version: int
     recovery_generation: int
     filesystem_context: Any | None = field(default=None, compare=False, repr=False)
+    tool_executor_supervisor: Any | None = field(default=None, compare=False, repr=False)
     mutable_state: _GatewayMutableState = field(default_factory=_GatewayMutableState, compare=False, repr=False)
 
 
@@ -8609,6 +8610,55 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"status": "streaming"})
 
 
+def _executor_identity_matches_runtime(identity, runtime, session_key: str) -> bool:
+    """Return whether a process identity belongs to this exact owner runtime."""
+    if runtime is None:
+        return False
+    return (
+        getattr(identity, "owner_key", None) == runtime.owner_key
+        and getattr(identity, "worker_id", None) == runtime.worker_id
+        and getattr(identity, "worker_generation", None) == runtime.worker_generation
+        and getattr(identity, "lease_version", None) == runtime.lease_version
+        and getattr(identity, "recovery_generation", None) == runtime.recovery_generation
+        and getattr(identity, "session_id", None) == session_key
+    )
+
+
+def _authenticated_process_event_matches_runtime(
+    session: dict, evt: dict, runtime: OwnerWorkerGatewayRuntime | None,
+) -> bool:
+    """Fail closed for authenticated process events outside their owner runtime.
+
+    Legacy process events have no executor identity and retain the established
+    session-key routing behavior. The payload is internal provenance only and
+    is never sent to formatting/model-delivery paths.
+    """
+    payload = evt.get("executor_identity")
+    if payload is None:
+        return True
+    try:
+        from hermes_cli.owner_worker.executor_identity import ExecutorIdentity
+
+        identity = ExecutorIdentity.from_payload(payload)
+    except (TypeError, ValueError):
+        return False
+    session_key = str(evt.get("session_key") or "")
+    return (
+        session_key == str(session.get("session_key") or "")
+        and _executor_identity_matches_runtime(identity, runtime, session_key)
+    )
+
+
+def _authenticated_process_session_matches_runtime(session, runtime: OwnerWorkerGatewayRuntime | None) -> bool:
+    """Fail closed for live authenticated terminal multiplexing."""
+    identity = getattr(session, "executor_identity", None)
+    if identity is None:
+        return not bool(getattr(session, "authenticated_executor", False))
+    return _executor_identity_matches_runtime(
+        identity, runtime, str(getattr(session, "session_key", "") or ""),
+    )
+
+
 def _notification_event_belongs_elsewhere(session: dict, evt: dict) -> bool:
     """True if ``evt`` is owned by a *different* live session.
 
@@ -8698,14 +8748,19 @@ def _notification_poller_loop(
     runtime_token = _gateway_runtime.set(runtime)
     try:
         _notification_poller_loop_bound(
-            stop_event, sid, session, process_registry, format_process_notification
+            stop_event, sid, session, process_registry, format_process_notification, runtime
         )
     finally:
         _gateway_runtime.reset(runtime_token)
 
 
 def _notification_poller_loop_bound(
-    stop_event: threading.Event, sid: str, session: dict, process_registry, format_process_notification
+    stop_event: threading.Event,
+    sid: str,
+    session: dict,
+    process_registry,
+    format_process_notification,
+    runtime: OwnerWorkerGatewayRuntime | None = None,
 ) -> None:
     """Run the notification poller with its owner-runtime context already bound."""
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
@@ -8723,6 +8778,8 @@ def _notification_poller_loop_bound(
         if _notification_event_belongs_elsewhere(session, evt):
             process_registry.completion_queue.put(evt)
             time.sleep(0.1)
+            continue
+        if not _authenticated_process_event_matches_runtime(session, evt, runtime):
             continue
 
         _evt_sid = evt.get("session_id", "")
@@ -8809,7 +8866,7 @@ def _notification_poller_loop_bound(
         process_registry.completion_queue.put(evt)
 
 
-def _wire_agent_terminal_output() -> None:
+def _wire_agent_terminal_output(runtime: OwnerWorkerGatewayRuntime | None = None) -> None:
     """Idempotently route background-process output (and tab-close requests) to
     the desktop, keyed by process id. Read-only agent terminal tabs stream
     `agent.terminal.output` chunks live instead of polling the output tail, and
@@ -8836,6 +8893,8 @@ def _wire_agent_terminal_output() -> None:
         return ""
 
     def _emit_agent_terminal_output(session, chunk):
+        if not _authenticated_process_session_matches_runtime(session, runtime):
+            return
         _emit(
             "agent.terminal.output",
             _owner_sid_for_process(session),
@@ -8845,6 +8904,8 @@ def _wire_agent_terminal_output() -> None:
     def _emit_agent_terminal_close(session, process_id):
         # session may be None (process already finished/pruned) — the tab can
         # still linger and be closed; route to the owning window when we can.
+        if session is not None and not _authenticated_process_session_matches_runtime(session, runtime):
+            return
         sid = _owner_sid_for_process(session) if session is not None else ""
         _emit("terminal.close", sid, {"process_id": process_id})
 
@@ -8856,9 +8917,9 @@ def _wire_agent_terminal_output() -> None:
 
 def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     """Start the background notification poller for a TUI session."""
-    _wire_agent_terminal_output()
-    stop = threading.Event()
     runtime = current_owner_worker_gateway_runtime()
+    _wire_agent_terminal_output(runtime)
+    stop = threading.Event()
 
     def run() -> None:
         runtime_token = _gateway_runtime.set(runtime)

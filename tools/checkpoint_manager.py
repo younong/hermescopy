@@ -76,12 +76,13 @@ def get_checkpoint_base() -> Path:
     return get_hermes_home() / "checkpoints"
 
 
-CHECKPOINT_BASE = get_checkpoint_base()
-_DEFAULT_CHECKPOINT_BASE = CHECKPOINT_BASE
+# Explicit test override only. Production callers resolve the active runtime
+# home at use time so a prior import cannot pin another owner's checkpoint base.
+CHECKPOINT_BASE: Path | None = None
 
 
 def _effective_checkpoint_base() -> Path:
-    return CHECKPOINT_BASE if CHECKPOINT_BASE != _DEFAULT_CHECKPOINT_BASE else get_checkpoint_base()
+    return CHECKPOINT_BASE if CHECKPOINT_BASE is not None else get_checkpoint_base()
 
 # Single shared store directory under CHECKPOINT_BASE.
 _STORE_DIRNAME = "store"
@@ -745,12 +746,14 @@ class CheckpointManager:
         max_file_size_mb: int = 10,
         authenticated_context: AuthenticatedWorkspaceContext | None = None,
         authenticated_mode: bool = False,
+        executor_identity: object | None = None,
     ):
         self.enabled = enabled
         self.max_snapshots = max(1, int(max_snapshots))
         self.max_total_size_mb = max(0, int(max_total_size_mb))
         self.max_file_size_mb = max(0, int(max_file_size_mb))
         self._authenticated_mode = authenticated_mode
+        self._executor_identity = executor_identity
         if authenticated_mode and authenticated_context is None:
             raise RuntimeError("authenticated checkpoint manager lacks filesystem capability")
         self._authenticated_target = (
@@ -806,8 +809,14 @@ class CheckpointManager:
             logger.debug("Checkpoint failed (non-fatal): %s", e)
             return False
 
-    def ensure_authenticated_checkpoint(self, reason: str = "auto") -> bool:
+    def _require_executor_identity(self, executor_identity: object | None) -> bool:
+        """Require an exact executor fence when this manager is executor-bound."""
+        return self._executor_identity is None or executor_identity == self._executor_identity
+
+    def ensure_authenticated_checkpoint(self, reason: str = "auto", *, executor_identity: object | None = None) -> bool:
         """Snapshot the fixed authenticated workspace without path authority."""
+        if not self._require_executor_identity(executor_identity):
+            return False
         if not self.enabled or self._authenticated_target is None:
             return False
         if self._git_available is None:
@@ -821,8 +830,10 @@ class CheckpointManager:
             logger.debug("Authenticated checkpoint failed (non-fatal): %s", exc)
             return False
 
-    def list_authenticated_checkpoints(self) -> List[Dict]:
+    def list_authenticated_checkpoints(self, *, executor_identity: object | None = None) -> List[Dict]:
         """List checkpoints for the fixed authenticated workspace only."""
+        if not self._require_executor_identity(executor_identity):
+            return []
         if self._authenticated_target is None:
             return []
         store = _store_path(_effective_checkpoint_base())
@@ -929,8 +940,10 @@ class CheckpointManager:
         )
         return ok
 
-    def diff_authenticated_checkpoint(self, commit_hash: str) -> Dict:
+    def diff_authenticated_checkpoint(self, commit_hash: str, *, executor_identity: object | None = None) -> Dict:
         """Diff one authorized checkpoint against the fixed workspace."""
+        if not self._require_executor_identity(executor_identity):
+            return {"success": False, "error": "executor checkpoint identity mismatch"}
         hash_err = _validate_commit_hash(commit_hash)
         if hash_err:
             return {"success": False, "error": hash_err}
@@ -956,8 +969,10 @@ class CheckpointManager:
             return {"success": False, "error": "Could not generate diff"}
         return {"success": True, "stat": stat_out if ok_stat else "", "diff": diff_out if ok_diff else ""}
 
-    def restore_authenticated_checkpoint(self, commit_hash: str) -> Dict:
+    def restore_authenticated_checkpoint(self, commit_hash: str, *, executor_identity: object | None = None) -> Dict:
         """Restore the fixed authenticated workspace from an authorized checkpoint."""
+        if not self._require_executor_identity(executor_identity):
+            return {"success": False, "error": "executor checkpoint identity mismatch"}
         hash_err = _validate_commit_hash(commit_hash)
         if hash_err:
             return {"success": False, "error": hash_err}

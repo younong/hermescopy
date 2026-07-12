@@ -143,10 +143,10 @@ def _confirm(prompt: str) -> bool:
 
 
 def cmd_clear(args: argparse.Namespace) -> int:
-    from tools.checkpoint_manager import CHECKPOINT_BASE, clear_all, store_status
+    from tools.checkpoint_manager import clear_all, store_status
 
     info = store_status()
-    if info["total_size_bytes"] == 0 and not Path(CHECKPOINT_BASE).exists():
+    if info["total_size_bytes"] == 0 and not Path(info["base"]).exists():
         print("Nothing to clear — checkpoint base does not exist.")
         return 0
 

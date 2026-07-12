@@ -43,7 +43,10 @@ import uuid
 _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_cli.owner_worker.executor_identity import ExecutorIdentity, ExecutorIdentityInvalid
+from hermes_cli.tool_executor_runtime.env import build_authenticated_child_environment
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hermes_cli.config import get_hermes_home
@@ -53,6 +56,12 @@ logger = logging.getLogger(__name__)
 
 # Checkpoint file for crash recovery (gateway only)
 def get_checkpoint_path():
+    # A restricted executor does not receive HERMES_HOME: registrations must
+    # remain inside its owner-private runtime rather than falling back to a
+    # process-global/default Hermes home.
+    executor_home = str(os.environ.get("HERMES_EXECUTOR_HOME", "") or "").strip()
+    if executor_home:
+        return Path(executor_home).resolve() / "processes.json"
     return get_hermes_home() / "processes.json"
 
 
@@ -103,6 +112,19 @@ class ProcessSession:
     command: str                                 # Original command string
     task_id: str = ""                           # Task/sandbox isolation key
     session_key: str = ""                       # Gateway session key (for reset protection)
+    # Empty values retain legacy/local behavior. Authenticated executor sessions
+    # require exact identity on every control and output-read path.
+    authenticated_executor: bool = False
+    executor_owner_digest: str = ""
+    executor_workspace_prefix: str = ""
+    executor_worker_id: str = ""
+    executor_worker_generation: int = 0
+    executor_id: str = ""
+    executor_generation: int = 0
+    executor_invocation_id: str = ""
+    # Canonical, complete authenticated fence. Scalar fields above remain for
+    # checkpoint compatibility and diagnostics, but authorization uses this.
+    executor_identity: ExecutorIdentity | None = None
     pid: Optional[int] = None                   # OS process ID
     process: Optional[subprocess.Popen] = None  # Popen handle (local only)
     env_ref: Any = None                         # Reference to the environment object
@@ -315,7 +337,7 @@ class ProcessRegistry:
             if should_disable:
                 # Emit exactly one "watch disabled, falling back to notify_on_complete"
                 # summary event so the agent/user sees why things went quiet.
-                self.completion_queue.put({
+                event = {
                     "session_id": session.id,
                     "session_key": session.session_key,
                     "command": session.command,
@@ -334,7 +356,11 @@ class ProcessRegistry:
                         f"Falling back to notify_on_complete semantics; you'll get "
                         f"exactly one notification when the process exits."
                     ),
-                })
+                }
+                identity_payload = self._event_executor_identity(session)
+                if identity_payload is not None:
+                    event["executor_identity"] = identity_payload
+                self.completion_queue.put(event)
             return
 
         # Trim matched output to a reasonable size
@@ -346,7 +372,7 @@ class ProcessRegistry:
         if not self._global_watch_admit(now):
             return
 
-        self.completion_queue.put({
+        event = {
             "session_id": session.id,
             "session_key": session.session_key,
             "command": session.command,
@@ -360,7 +386,11 @@ class ProcessRegistry:
             "user_name": session.watcher_user_name,
             "thread_id": session.watcher_thread_id,
             "message_id": session.watcher_message_id,
-        })
+        }
+        identity_payload = self._event_executor_identity(session)
+        if identity_payload is not None:
+            event["executor_identity"] = identity_payload
+        self.completion_queue.put(event)
 
     def _global_watch_admit(self, now: float) -> bool:
         """Return True if this watch_match event is allowed through the global breaker.
@@ -781,6 +811,7 @@ class ProcessRegistry:
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
+            close_fds=True,
             **_popen_kwargs,
         )
 
@@ -825,6 +856,89 @@ class ProcessRegistry:
                 pass
             raise
 
+        return session
+
+    def _require_executor_identity(self, session: ProcessSession, identity: Any | None) -> bool:
+        if not session.authenticated_executor:
+            return True
+        # Never reconstruct authority from partial compatibility projections.
+        # A canonical identity is mandatory for authenticated sessions so a
+        # damaged recovery record cannot silently become a legacy process.
+        return (
+            isinstance(session.executor_identity, ExecutorIdentity)
+            and isinstance(identity, ExecutorIdentity)
+            and session.executor_identity == identity
+        )
+
+    @staticmethod
+    def _event_executor_identity(session: ProcessSession) -> dict | None:
+        """Return internal routing provenance for canonical authenticated sessions."""
+        if isinstance(session.executor_identity, ExecutorIdentity):
+            return session.executor_identity.to_payload()
+        return None
+
+    def spawn_authenticated(
+        self,
+        command: str,
+        *,
+        cwd: str,
+        task_id: str,
+        session_key: str,
+        executor_identity: Any,
+        env_vars: dict,
+    ) -> ProcessSession:
+        """Spawn an executor-bound local child without ambient cwd/env authority."""
+        if executor_identity is None or not task_id or not session_key or not cwd:
+            raise PermissionError("authenticated executor spawn requires exact identity, task, session, and cwd")
+        if task_id != executor_identity.task_id or session_key != executor_identity.session_id:
+            raise PermissionError("authenticated executor task/session identity mismatch")
+        if not isinstance(executor_identity, ExecutorIdentity):
+            raise PermissionError("authenticated executor spawn requires a valid exact identity")
+        session = ProcessSession(
+            id=f"proc_{uuid.uuid4().hex[:12]}",
+            command=command,
+            task_id=task_id,
+            session_key=session_key,
+            authenticated_executor=True,
+            executor_owner_digest=executor_identity.owner_digest,
+            executor_workspace_prefix=executor_identity.workspace_prefix,
+            executor_worker_id=executor_identity.worker_id,
+            executor_worker_generation=executor_identity.worker_generation,
+            executor_id=executor_identity.executor_id,
+            executor_generation=executor_identity.executor_generation,
+            executor_identity=executor_identity,
+            cwd=_resolve_safe_cwd(cwd),
+            started_at=time.time(),
+        )
+        # Terminal descendants must receive a fresh, narrower mapping than the
+        # executor bootstrap environment: never forward env.env, authority,
+        # sockets, or the executor's own bootstrap descriptors.
+        child_env = build_authenticated_child_environment(env_vars)
+        user_shell = _find_shell()
+        proc = subprocess.Popen(
+            [user_shell, "-lic", f"set +m; {command}"],
+            text=True,
+            cwd=session.cwd,
+            env=child_env,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+            **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}),
+        )
+        session.process = proc
+        session.pid = proc.pid
+        session.host_start_time = self._safe_host_start_time(session.pid)
+        reader = threading.Thread(target=self._reader_loop, args=(session,), daemon=True, name=f"proc-reader-{session.id}")
+        session._reader_thread = reader
+        reader.start()
+        with self._lock:
+            self._prune_if_needed()
+            self._running[session.id] = session
+        self._write_checkpoint()
         return session
 
     def spawn_via_env(
@@ -1091,7 +1205,7 @@ class ProcessRegistry:
         if was_running and session.notify_on_complete:
             from tools.ansi_strip import strip_ansi
             output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
-            self.completion_queue.put({
+            event = {
                 "type": "completion",
                 "session_id": session.id,
                 "session_key": session.session_key,
@@ -1100,7 +1214,11 @@ class ProcessRegistry:
                 "completion_reason": session.completion_reason,
                 "termination_source": session.termination_source,
                 "output": output_tail,
-            })
+            }
+            identity_payload = self._event_executor_identity(session)
+            if identity_payload is not None:
+                event["executor_identity"] = identity_payload
+            self.completion_queue.put(event)
 
     # ----- Query Methods -----
 
@@ -1258,12 +1376,14 @@ class ProcessRegistry:
         )
         self._move_to_finished(session)
 
-    def poll(self, session_id: str) -> dict:
+    def poll(self, session_id: str, *, executor_identity: Any | None = None) -> dict:
         """Check status and get new output for a background process."""
         from tools.ansi_strip import strip_ansi
 
         session = self.get(session_id)
         if session is None:
+            return {"status": "not_found", "error": f"No process with ID {session_id}"}
+        if not self._require_executor_identity(session, executor_identity):
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
 
         # Reconcile against real child state before reading session.exited.
@@ -1301,12 +1421,14 @@ class ProcessRegistry:
             result["note"] = "Process recovered after restart -- output history unavailable"
         return result
 
-    def read_log(self, session_id: str, offset: int = 0, limit: int = 200) -> dict:
+    def read_log(self, session_id: str, offset: int = 0, limit: int = 200, *, executor_identity: Any | None = None) -> dict:
         """Read the full output log with optional pagination by lines."""
         from tools.ansi_strip import strip_ansi
 
         session = self.get(session_id)
         if session is None:
+            return {"status": "not_found", "error": f"No process with ID {session_id}"}
+        if not self._require_executor_identity(session, executor_identity):
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
 
         with session._lock:
@@ -1333,7 +1455,7 @@ class ProcessRegistry:
             self._completion_consumed.add(session_id)
         return result
 
-    def wait(self, session_id: str, timeout: int = None) -> dict:
+    def wait(self, session_id: str, timeout: int = None, *, executor_identity: Any | None = None) -> dict:
         """
         Block until a process exits, timeout, or interrupt.
 
@@ -1367,6 +1489,8 @@ class ProcessRegistry:
 
         session = self.get(session_id)
         if session is None:
+            return {"status": "not_found", "error": f"No process with ID {session_id}"}
+        if not self._require_executor_identity(session, executor_identity):
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
 
         deadline = time.monotonic() + effective_timeout
@@ -1420,10 +1544,12 @@ class ProcessRegistry:
             result["timeout_note"] = f"Waited {effective_timeout}s, process still running"
         return result
 
-    def kill_process(self, session_id: str, *, source: str = "process.kill") -> dict:
+    def kill_process(self, session_id: str, *, source: str = "process.kill", executor_identity: Any | None = None) -> dict:
         """Kill a background process."""
         session = self.get(session_id)
         if session is None:
+            return {"status": "not_found", "error": f"No process with ID {session_id}"}
+        if not self._require_executor_identity(session, executor_identity):
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
 
         if session.exited:
@@ -1486,10 +1612,12 @@ class ProcessRegistry:
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
-    def write_stdin(self, session_id: str, data: str) -> dict:
+    def write_stdin(self, session_id: str, data: str, *, executor_identity: ExecutorIdentity | None = None) -> dict:
         """Send raw data to a running process's stdin (no newline appended)."""
         session = self.get(session_id)
         if session is None:
+            return {"status": "not_found", "error": f"No process with ID {session_id}"}
+        if not self._require_executor_identity(session, executor_identity):
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
         if session.exited:
             return {"status": "already_exited", "error": "Process has already finished"}
@@ -1517,11 +1645,22 @@ class ProcessRegistry:
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
-    def submit_stdin(self, session_id: str, data: str = "") -> dict:
+    def submit_stdin(
+        self,
+        session_id: str,
+        data: str = "",
+        *,
+        executor_identity: ExecutorIdentity | None = None,
+    ) -> dict:
         """Send data + newline to a running process's stdin (like pressing Enter)."""
-        return self.write_stdin(session_id, data + "\n")
+        return self.write_stdin(session_id, data + "\n", executor_identity=executor_identity)
 
-    def request_close_terminal(self, session_id: str) -> dict:
+    def request_close_terminal(
+        self,
+        session_id: str,
+        *,
+        executor_identity: ExecutorIdentity | None = None,
+    ) -> dict:
         """Ask the desktop GUI to close the read-only terminal tab mirroring this
         background process.
 
@@ -1536,8 +1675,14 @@ class ProcessRegistry:
                 "error": "close_terminal is only available in the Hermes desktop app.",
             }
         # The session may already be finished (or pruned) — the tab can still
-        # linger and be closed, so a missing session is not an error here.
+        # linger and be closed, so a missing *legacy* session is not an error.
+        # A supplied executor identity may never turn an unknown ID into a UI
+        # event because it cannot be authenticated against a process record.
         session = self.get(session_id)
+        if session is None and executor_identity is not None:
+            return {"status": "not_found", "error": f"No process with ID {session_id}"}
+        if session is not None and not self._require_executor_identity(session, executor_identity):
+            return {"status": "not_found", "error": f"No process with ID {session_id}"}
         try:
             sink(session, session_id)
         except Exception as e:
@@ -1552,10 +1697,12 @@ class ProcessRegistry:
             ),
         }
 
-    def close_stdin(self, session_id: str) -> dict:
+    def close_stdin(self, session_id: str, *, executor_identity: ExecutorIdentity | None = None) -> dict:
         """Close a running process's stdin / send EOF without killing the process."""
         session = self.get(session_id)
         if session is None:
+            return {"status": "not_found", "error": f"No process with ID {session_id}"}
+        if not self._require_executor_identity(session, executor_identity):
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
         if session.exited:
             return {"status": "already_exited", "error": "Process has already finished"}
@@ -1708,6 +1855,20 @@ class ProcessRegistry:
         with self._lock:
             return any(not s.exited for s in self._running.values())
 
+    def kill_executor_generation(self, executor_identity: Any) -> int:
+        """Terminate descendants belonging to one exact executor generation only."""
+        with self._lock:
+            targets = [
+                session for session in self._running.values()
+                if session.authenticated_executor and self._require_executor_identity(session, executor_identity) and not session.exited
+            ]
+        killed = 0
+        for session in targets:
+            result = self.kill_process(session.id, source="executor_generation_revoke", executor_identity=executor_identity)
+            if result.get("status") in {"killed", "already_exited"}:
+                killed += 1
+        return killed
+
     def kill_all(self, task_id: str = None) -> int:
         """Kill all running processes, optionally filtered by task_id. Returns count killed."""
         with self._lock:
@@ -1791,6 +1952,12 @@ class ProcessRegistry:
                             "watcher_interval": s.watcher_interval,
                             "notify_on_complete": s.notify_on_complete,
                             "watch_patterns": s.watch_patterns,
+                            "authenticated_executor": s.authenticated_executor,
+                            "executor_identity": (
+                                s.executor_identity.to_payload()
+                                if isinstance(s.executor_identity, ExecutorIdentity)
+                                else None
+                            ),
                         })
             
             # Atomic write to avoid corruption on crash
@@ -1816,6 +1983,29 @@ class ProcessRegistry:
 
         recovered = 0
         for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            authenticated = bool(entry.get("authenticated_executor", False))
+            executor_identity = None
+            if authenticated:
+                try:
+                    executor_identity = ExecutorIdentity.from_payload(entry.get("executor_identity"))
+                except (ExecutorIdentityInvalid, TypeError, ValueError):
+                    logger.warning(
+                        "Skipping authenticated process checkpoint with invalid executor identity: %s",
+                        entry.get("session_id", "?"),
+                    )
+                    continue
+                if (
+                    executor_identity.task_id != str(entry.get("task_id", "") or "")
+                    or executor_identity.session_id != str(entry.get("session_key", "") or "")
+                ):
+                    logger.warning(
+                        "Skipping authenticated process checkpoint with mismatched executor identity: %s",
+                        entry.get("session_id", "?"),
+                    )
+                    continue
+
             pid = entry.get("pid")
             if not pid:
                 continue
@@ -1855,6 +2045,14 @@ class ProcessRegistry:
                 command=entry.get("command", "unknown"),
                 task_id=entry.get("task_id", ""),
                 session_key=entry.get("session_key", ""),
+                authenticated_executor=authenticated,
+                executor_owner_digest=(executor_identity.owner_digest if executor_identity else ""),
+                executor_workspace_prefix=(executor_identity.workspace_prefix if executor_identity else ""),
+                executor_worker_id=(executor_identity.worker_id if executor_identity else ""),
+                executor_worker_generation=(executor_identity.worker_generation if executor_identity else 0),
+                executor_id=(executor_identity.executor_id if executor_identity else ""),
+                executor_generation=(executor_identity.executor_generation if executor_identity else 0),
+                executor_identity=executor_identity,
                 pid=pid,
                 host_start_time=recorded_start,
                 pid_scope=pid_scope,
@@ -2182,6 +2380,7 @@ def _redact_process_result(result: dict) -> dict:
 
 def _handle_process(args, **kw):
     task_id = kw.get("task_id")
+    executor_identity = kw.get("executor_identity")
     action = args.get("action", "")
     # Coerce to string — some models send session_id as an integer
     session_id = str(args.get("session_id", "")) if args.get("session_id") is not None else ""
@@ -2203,20 +2402,30 @@ def _handle_process(args, **kw):
         if not session_id:
             return tool_error(f"session_id is required for {action}")
         if action == "poll":
-            return json.dumps(_redact_process_result(process_registry.poll(session_id)), ensure_ascii=False)
+            return json.dumps(_redact_process_result(
+                process_registry.poll(session_id, executor_identity=executor_identity)
+            ), ensure_ascii=False)
         elif action == "log":
             return json.dumps(_redact_process_result(process_registry.read_log(
-                session_id, offset=args.get("offset", 0), limit=args.get("limit", 200))), ensure_ascii=False)
+                session_id, offset=args.get("offset", 0), limit=args.get("limit", 200),
+                executor_identity=executor_identity,
+            )), ensure_ascii=False)
         elif action == "wait":
-            return json.dumps(_redact_process_result(process_registry.wait(session_id, timeout=args.get("timeout"))), ensure_ascii=False)
+            return json.dumps(_redact_process_result(process_registry.wait(
+                session_id, timeout=args.get("timeout"), executor_identity=executor_identity
+            )), ensure_ascii=False)
         elif action == "kill":
-            return json.dumps(process_registry.kill_process(session_id), ensure_ascii=False)
+            return json.dumps(process_registry.kill_process(session_id, executor_identity=executor_identity), ensure_ascii=False)
         elif action == "write":
-            return json.dumps(process_registry.write_stdin(session_id, str(args.get("data", ""))), ensure_ascii=False)
+            return json.dumps(process_registry.write_stdin(
+                session_id, str(args.get("data", "")), executor_identity=executor_identity
+            ), ensure_ascii=False)
         elif action == "submit":
-            return json.dumps(process_registry.submit_stdin(session_id, str(args.get("data", ""))), ensure_ascii=False)
+            return json.dumps(process_registry.submit_stdin(
+                session_id, str(args.get("data", "")), executor_identity=executor_identity
+            ), ensure_ascii=False)
         elif action == "close":
-            return json.dumps(process_registry.close_stdin(session_id), ensure_ascii=False)
+            return json.dumps(process_registry.close_stdin(session_id, executor_identity=executor_identity), ensure_ascii=False)
     return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close")
 
 

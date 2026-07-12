@@ -2343,7 +2343,26 @@ def terminal_tool(
                 default_cwd=cwd,
             )
             try:
-                if env_type == "local":
+                from hermes_cli.owner_worker.executor_identity import current_executor_identity
+
+                executor_identity = current_executor_identity()
+                if executor_identity is not None:
+                    # entrypoint fchdir() bound this process to a trusted
+                    # workspace descriptor; do not re-authorize request/env cwd.
+                    effective_cwd = os.getcwd()
+                    if env_type != "local":
+                        raise PermissionError("authenticated executor background processes require the local executor runtime")
+                    proc_session = process_registry.spawn_authenticated(
+                        command=command,
+                        cwd=effective_cwd,
+                        task_id=effective_task_id,
+                        session_key=session_key,
+                        executor_identity=executor_identity,
+                        # Do not forward env.env: ProcessRegistry constructs a
+                        # fresh executor-descendant allowlist and rejects injection.
+                        env_vars={},
+                    )
+                elif env_type == "local":
                     proc_session = process_registry.spawn_local(
                         command=command,
                         cwd=effective_cwd,

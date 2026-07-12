@@ -234,6 +234,12 @@ def create_app(
         try:
             yield
         finally:
+            supervisor = getattr(app.state, "tool_executor_supervisor", None)
+            if supervisor is not None:
+                supervisor.stop_generation()
+            broker = getattr(app.state, "tool_executor_credential_broker", None)
+            if broker is not None:
+                broker.close()
             controlled_roots.close()
     from hermes_constants import get_hermes_home
     from hermes_state import SessionDB, get_default_db_path
@@ -272,13 +278,25 @@ def create_app(
     lease = app.state.owner_worker_lease
     from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
 
+    workspace_context = AuthenticatedWorkspaceContext(controlled_roots)
+    from hermes_cli.owner_worker.credential_broker import CredentialBroker
+    from hermes_cli.owner_worker.tool_executor_supervisor import ToolExecutorSupervisor
+
+    app.state.tool_executor_credential_broker = CredentialBroker()
+    app.state.tool_executor_supervisor = ToolExecutorSupervisor(
+        owner_home=owner_home,
+        workspace_context=workspace_context,
+        lease=lease,
+        credential_broker=app.state.tool_executor_credential_broker,
+    )
     app.state.owner_worker_live_state.gateway_runtime = OwnerWorkerGatewayRuntime(
         owner_key=lease.owner_key,
         worker_generation=lease.worker_generation,
         worker_id=lease.worker_id,
         lease_version=lease.lease_version,
         recovery_generation=lease.recovery_generation,
-        filesystem_context=AuthenticatedWorkspaceContext(controlled_roots),
+        filesystem_context=workspace_context,
+        tool_executor_supervisor=app.state.tool_executor_supervisor,
     )
 
     def _reject_profile(profile: str | None) -> None:

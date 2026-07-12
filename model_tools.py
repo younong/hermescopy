@@ -1135,7 +1135,26 @@ def handle_function_call(
         except Exception:
             reset_current_observability_context = None
         try:
-            if function_name == "execute_code":
+            from tui_gateway.server import current_owner_worker_gateway_runtime
+
+            _owner_runtime = current_owner_worker_gateway_runtime()
+            _executor_supervisor = getattr(_owner_runtime, "tool_executor_supervisor", None)
+            if _executor_supervisor is not None:
+                # All existing middleware and policy hooks run before this
+                # terminal boundary. The executor itself dispatches directly to
+                # the registry after validating a private bootstrap, preventing
+                # recursive routing back through this function.
+                def _dispatch(next_args: Dict[str, Any]) -> Any:
+                    return _executor_supervisor.dispatch(
+                        function_name=function_name,
+                        function_args=next_args,
+                        task_id=task_id or "",
+                        session_id=session_id or "",
+                        tool_call_id=tool_call_id or "",
+                        turn_id=turn_id or "",
+                        api_request_id=api_request_id or "",
+                    )
+            elif function_name == "execute_code":
                 # Prefer the caller-provided list so subagents can't overwrite
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names

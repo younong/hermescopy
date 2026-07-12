@@ -89,6 +89,37 @@ class TestSkillsHubPathResolution:
         assert taps_b.path == prof_b / "skills" / ".hub" / "taps.json"
 
 
+class TestCheckpointBaseResolution:
+    """Checkpoint storage must resolve after the active profile is bound."""
+
+    def test_checkpoint_base_follows_override_without_module_reload(self, two_profiles, monkeypatch):
+        prof_a, prof_b = two_profiles
+        import tools.checkpoint_manager as checkpoint_manager
+
+        monkeypatch.setattr(checkpoint_manager, "CHECKPOINT_BASE", None)
+
+        a_seen = _under_override(prof_a, checkpoint_manager._effective_checkpoint_base)
+        b_seen = _under_override(prof_b, checkpoint_manager._effective_checkpoint_base)
+
+        assert a_seen == prof_a / "checkpoints"
+        assert b_seen == prof_b / "checkpoints"
+        assert a_seen != b_seen
+
+    def test_checkpoint_base_explicit_override_can_be_cleared(self, two_profiles, monkeypatch, tmp_path):
+        prof_a, prof_b = two_profiles
+        import tools.checkpoint_manager as checkpoint_manager
+
+        forced = tmp_path / "forced-checkpoints"
+        monkeypatch.setattr(checkpoint_manager, "CHECKPOINT_BASE", None)
+        assert _under_override(prof_a, checkpoint_manager._effective_checkpoint_base) == prof_a / "checkpoints"
+
+        monkeypatch.setattr(checkpoint_manager, "CHECKPOINT_BASE", forced)
+        assert _under_override(prof_b, checkpoint_manager._effective_checkpoint_base) == forced
+
+        monkeypatch.setattr(checkpoint_manager, "CHECKPOINT_BASE", None)
+        assert _under_override(prof_b, checkpoint_manager._effective_checkpoint_base) == prof_b / "checkpoints"
+
+
 class TestGatewayCacheDirResolution:
     """gateway/platforms/base.py cache getters must follow the active profile."""
 
