@@ -6,12 +6,17 @@ owner-sensitive modules such as ``hermes_state``.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
+import mimetypes
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
 from starlette.requests import Request
+from starlette.responses import StreamingResponse
 
 
 class BulkDeleteSessions(BaseModel):
@@ -31,12 +36,28 @@ class SessionPrune(BaseModel):
     profile: str | None = None
 
 
+class ManagedFileUpload(BaseModel):
+    path: str
+    data_url: str
+    overwrite: bool = True
+
+
+class ManagedDirectoryCreate(BaseModel):
+    path: str
+
+
+class ManagedFileDelete(BaseModel):
+    path: str
+    recursive: bool = False
+
+
 from hermes_cli.dashboard_auth.authority import (
     AuthorityStore,
     OwnerWorkerAuthorityLease,
     WorkerGenerationState,
     WorkerLeaseState,
 )
+from hermes_cli.controlled_roots import ControlledRoots, ExpectedType, RootKind, controlled_roots_for
 from hermes_cli.owner_runtime import (
     assert_owner_runtime_paths,
     ensure_owner_runtime_dirs,
@@ -200,9 +221,20 @@ def create_app(
         )
     except RuntimeError as exc:
         raise RuntimeError(f"owner worker startup self-check failed: {exc}") from exc
+    try:
+        controlled_roots = controlled_roots_for(runtime_paths)
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError(f"owner worker startup self-check failed: {exc}") from exc
 
-    from fastapi import Depends, FastAPI, Header, HTTPException, Request
+    from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
     from fastapi.responses import JSONResponse
+
+    @asynccontextmanager
+    async def _lifespan(_: FastAPI):
+        try:
+            yield
+        finally:
+            controlled_roots.close()
     from hermes_constants import get_hermes_home
     from hermes_state import SessionDB, get_default_db_path
 
@@ -214,12 +246,13 @@ def create_app(
         OwnerWorkerCapabilityInvalid,
         verify_owner_worker_capability,
     )
-    app = FastAPI(title="Hermes Owner Worker")
+    app = FastAPI(title="Hermes Owner Worker", lifespan=_lifespan)
     app.state.owner_worker_mode = True
     app.state.owner_worker_owner_key = owner_key
     app.state.owner_worker_owner_home = owner_home
     app.state.owner_worker_generation = worker_generation
     app.state.owner_worker_id = worker_id
+    app.state.owner_worker_controlled_roots = controlled_roots
     app.state.owner_worker_control_home = os.environ.get("HERMES_CONTROL_HOME", "") or None
     app.state.owner_worker_lease = fallback_lease or _worker_lease_from_env(owner_key)
     app.state.owner_worker_capability_verifier = fallback_verifier or {
@@ -237,17 +270,71 @@ def create_app(
 
     app.state.owner_worker_live_state = OwnerWorkerLiveState()
     lease = app.state.owner_worker_lease
+    from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
+
     app.state.owner_worker_live_state.gateway_runtime = OwnerWorkerGatewayRuntime(
         owner_key=lease.owner_key,
         worker_generation=lease.worker_generation,
         worker_id=lease.worker_id,
         lease_version=lease.lease_version,
         recovery_generation=lease.recovery_generation,
+        filesystem_context=AuthenticatedWorkspaceContext(controlled_roots),
     )
 
     def _reject_profile(profile: str | None) -> None:
         if profile and str(profile).strip().lower() not in {"default"}:
             raise HTTPException(status_code=400, detail="profile selection is not available in authenticated mode")
+
+    def _file_path(path: str | None, *, allow_empty: bool = False) -> str:
+        value = str(path or "").strip()
+        if allow_empty and not value:
+            return ""
+        if not value:
+            raise HTTPException(status_code=400, detail="Path is required")
+        try:
+            app.state.owner_worker_controlled_roots._require_linux()
+            components = value.split("/")
+            if value.startswith("/") or "\x00" in value or any(part in {"", ".", ".."} for part in components):
+                raise ValueError
+        except (TypeError, ValueError, RuntimeError):
+            raise HTTPException(status_code=400, detail="Path must be a relative workspace path")
+        return value
+
+    def _file_entry(relative_path: str):
+        roots = app.state.owner_worker_controlled_roots
+        fd = roots.open_relative(RootKind.WORKSPACE, relative_path, expected_type=ExpectedType.REGULAR_FILE)
+        try:
+            metadata = os.fstat(fd)
+        finally:
+            os.close(fd)
+        name = relative_path.rsplit("/", 1)[-1]
+        return {
+            "name": name,
+            "path": relative_path,
+            "is_directory": False,
+            "size": metadata.st_size,
+            "mtime": metadata.st_mtime,
+            "mime_type": mimetypes.guess_type(name)[0] or "application/octet-stream",
+        }
+
+    def _decode_data_url(data_url: str) -> bytes:
+        text = str(data_url or "").strip()
+        if not text.startswith("data:") or "," not in text or ";base64" not in text.split(",", 1)[0]:
+            raise HTTPException(status_code=400, detail="Upload payload must be a base64 data URL")
+        try:
+            data = base64.b64decode(text.split(",", 1)[1], validate=True)
+        except (binascii.Error, ValueError):
+            raise HTTPException(status_code=400, detail="Upload payload is not valid base64")
+        if len(data) > 100 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="File is too large")
+        return data
+
+    def _files_error(exc: Exception) -> HTTPException:
+        if isinstance(exc, FileNotFoundError):
+            return HTTPException(status_code=404, detail="Path not found")
+        if isinstance(exc, (PermissionError, RuntimeError, OSError)):
+            return HTTPException(status_code=400, detail="Unsafe or invalid filesystem path")
+        return HTTPException(status_code=500, detail="Filesystem operation failed")
 
     @app.middleware("http")
     async def _reject_external_owner_selectors(request: Request, call_next):
@@ -322,6 +409,7 @@ def create_app(
             expected_paths=runtime_paths,
         )
     except Exception as exc:
+        controlled_roots.close()
         raise RuntimeError(f"owner worker startup self-check failed: {exc}") from exc
 
     @app.get("/internal/health")
@@ -342,6 +430,154 @@ def create_app(
             "control_home": str(app.state.owner_worker_control_home or ""),
             "forbidden_env_present": [key for key in FORBIDDEN_OWNER_WORKER_ENV_KEYS if os.environ.get(key, "").strip()],
         }
+
+    @app.get("/api/files")
+    def list_files(path: str = "", _: None = Depends(_require_owner_token)) -> dict[str, Any]:
+        relative_path = _file_path(path, allow_empty=True)
+        try:
+            entries = [
+                {
+                    "name": entry.name,
+                    "path": entry.relative_path,
+                    "is_directory": entry.is_directory,
+                    "size": entry.size,
+                    "mtime": entry.mtime,
+                    "mime_type": None if entry.is_directory else mimetypes.guess_type(entry.name)[0] or "application/octet-stream",
+                }
+                for entry in app.state.owner_worker_controlled_roots.list_directory(RootKind.WORKSPACE, relative_path)
+            ]
+        except Exception as exc:
+            raise _files_error(exc) from exc
+        parent = None
+        if relative_path:
+            parent = relative_path.rsplit("/", 1)[0] if "/" in relative_path else ""
+        return {"path": relative_path, "parent": parent, "entries": entries, "root": "", "locked_root": "", "can_change_path": False}
+
+    @app.get("/api/files/read")
+    def read_file(path: str, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
+        relative_path = _file_path(path)
+        try:
+            fd = app.state.owner_worker_controlled_roots.open_relative(
+                RootKind.WORKSPACE, relative_path, expected_type=ExpectedType.REGULAR_FILE
+            )
+            try:
+                metadata = os.fstat(fd)
+                if metadata.st_size > 100 * 1024 * 1024:
+                    raise HTTPException(status_code=413, detail="File is too large")
+                data = bytearray()
+                while len(data) <= 100 * 1024 * 1024:
+                    chunk = os.read(fd, min(1024 * 1024, 100 * 1024 * 1024 + 1 - len(data)))
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+            finally:
+                os.close(fd)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise _files_error(exc) from exc
+        name = relative_path.rsplit("/", 1)[-1]
+        mime_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        return {"name": name, "path": relative_path, "size": len(data), "mime_type": mime_type, "data_url": f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}", "root": "", "locked_root": "", "can_change_path": False}
+
+    @app.get("/api/files/download")
+    def download_file(path: str, _: None = Depends(_require_owner_token)):
+        relative_path = _file_path(path)
+        try:
+            fd = app.state.owner_worker_controlled_roots.open_relative(
+                RootKind.WORKSPACE, relative_path, expected_type=ExpectedType.REGULAR_FILE
+            )
+            metadata = os.fstat(fd)
+            if metadata.st_size > 100 * 1024 * 1024:
+                os.close(fd)
+                raise HTTPException(status_code=413, detail="File is too large")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise _files_error(exc) from exc
+
+        def chunks():
+            try:
+                while chunk := os.read(fd, 1024 * 1024):
+                    yield chunk
+            finally:
+                os.close(fd)
+
+        name = relative_path.rsplit("/", 1)[-1]
+        return StreamingResponse(
+            chunks(),
+            media_type=mimetypes.guess_type(name)[0] or "application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="{name}"'},
+        )
+
+    @app.post("/api/files/upload")
+    def upload_file(payload: ManagedFileUpload, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
+        relative_path = _file_path(payload.path)
+        try:
+            app.state.owner_worker_controlled_roots.replace_bytes(
+                RootKind.WORKSPACE, relative_path, _decode_data_url(payload.data_url), overwrite=payload.overwrite
+            )
+            entry = _file_entry(relative_path)
+        except HTTPException:
+            raise
+        except FileExistsError as exc:
+            raise HTTPException(status_code=409, detail="A file already exists at that path") from exc
+        except Exception as exc:
+            raise _files_error(exc) from exc
+        return {"ok": True, "entry": entry, "path": relative_path, "root": "", "locked_root": "", "can_change_path": False}
+
+    @app.post("/api/files/upload-stream")
+    async def upload_file_stream(
+        file: UploadFile = File(...), path: str = Form(...), overwrite: bool = Form(True), _: None = Depends(_require_owner_token)
+    ) -> dict[str, Any]:
+        relative_path = _file_path(path)
+        writer = None
+        try:
+            writer = app.state.owner_worker_controlled_roots.begin_atomic_replace(
+                RootKind.WORKSPACE,
+                relative_path,
+                overwrite=overwrite,
+            )
+            while chunk := await file.read(1024 * 1024):
+                writer.write(chunk)
+                if writer.bytes_written > 100 * 1024 * 1024:
+                    raise HTTPException(status_code=413, detail="File is too large")
+            writer.commit()
+            writer = None
+            entry = _file_entry(relative_path)
+        except HTTPException:
+            raise
+        except FileExistsError as exc:
+            raise HTTPException(status_code=409, detail="A file already exists at that path") from exc
+        except Exception as exc:
+            raise _files_error(exc) from exc
+        finally:
+            if writer is not None:
+                writer.abort()
+            await file.close()
+        return {"ok": True, "entry": entry, "path": relative_path, "root": "", "locked_root": "", "can_change_path": False}
+
+    @app.post("/api/files/mkdir")
+    def create_directory(payload: ManagedDirectoryCreate, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
+        relative_path = _file_path(payload.path)
+        try:
+            app.state.owner_worker_controlled_roots.mkdirs(RootKind.WORKSPACE, relative_path)
+            entries = app.state.owner_worker_controlled_roots.list_directory(RootKind.WORKSPACE, relative_path.rsplit("/", 1)[0] if "/" in relative_path else "")
+            entry = next(item for item in entries if item.relative_path == relative_path)
+        except Exception as exc:
+            raise _files_error(exc) from exc
+        return {"ok": True, "entry": {"name": entry.name, "path": entry.relative_path, "is_directory": True, "size": None, "mtime": entry.mtime, "mime_type": None}, "path": relative_path, "root": "", "locked_root": "", "can_change_path": False}
+
+    @app.delete("/api/files")
+    def delete_file(payload: ManagedFileDelete, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
+        relative_path = _file_path(payload.path)
+        try:
+            app.state.owner_worker_controlled_roots.remove(RootKind.WORKSPACE, relative_path, recursive=payload.recursive)
+        except OSError as exc:
+            raise HTTPException(status_code=409 if not payload.recursive else 400, detail="Could not delete path") from exc
+        except Exception as exc:
+            raise _files_error(exc) from exc
+        return {"ok": True, "path": relative_path, "root": "", "locked_root": "", "can_change_path": False}
 
     @app.get("/api/sessions")
     def get_sessions(

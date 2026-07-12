@@ -11,6 +11,7 @@ from pathlib import Path
 from agent.file_safety import get_read_block_error
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
+    ControlledWorkspaceFileOperations,
     ShellFileOperations,
     normalize_read_pagination,
     normalize_search_pagination,
@@ -513,6 +514,18 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     except (OSError, ValueError):
         resolved = filepath
     normalized = os.path.normpath(_expand_tilde(filepath))
+    # Prevent agents from modifying the Hermes config file directly.
+    # approvals.mode and other security settings live here; a malicious or
+    # prompt-injected agent could silently disable exec approval by writing to
+    # this file. This check precedes broad system-prefix matching because a
+    # config path itself can live under a protected OS directory.
+    hermes_config = _get_hermes_config_resolved()
+    if hermes_config and (resolved == hermes_config or normalized == hermes_config):
+        return (
+            f"Refusing to write to Hermes config file: {filepath}\n"
+            "Agent cannot modify security-sensitive configuration. "
+            "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
+        )
     _err = (
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
@@ -522,17 +535,6 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             return _err
     if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
         return _err
-    # Prevent agents from modifying the Hermes config file directly.
-    # approvals.mode and other security settings live here; a malicious or
-    # prompt-injected agent could silently disable exec approval by writing to
-    # this file.
-    hermes_config = _get_hermes_config_resolved()
-    if hermes_config and (resolved == hermes_config or normalized == hermes_config):
-        return (
-            f"Refusing to write to Hermes config file: {filepath}\n"
-            "Agent cannot modify security-sensitive configuration. "
-            "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
-        )
     return None
 
 
@@ -877,8 +879,34 @@ def _is_internal_file_tool_content(content: str) -> bool:
     )
 
 
-def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
-    """Get or create ShellFileOperations for a terminal environment.
+def _authenticated_workspace_file_ops() -> ControlledWorkspaceFileOperations | None:
+    """Return the current dispatch's descriptor-backed workspace adapter.
+
+    The bound gateway runtime is the sole authority selector.  A runtime without
+    the fixed workspace capability is an owner-worker authority failure, never a
+    reason to inspect environment variables or fall back to a terminal backend.
+    """
+    try:
+        from tui_gateway.server import current_owner_worker_gateway_runtime
+
+        runtime = current_owner_worker_gateway_runtime()
+    except Exception as exc:
+        raise RuntimeError("could not determine authenticated workspace context") from exc
+    if runtime is None:
+        return None
+    context = getattr(runtime, "filesystem_context", None)
+    if context is None:
+        raise RuntimeError("authenticated owner worker lacks filesystem capability")
+    return ControlledWorkspaceFileOperations(context)
+
+
+def _get_file_ops(task_id: str = "default") -> ShellFileOperations | ControlledWorkspaceFileOperations:
+    """Get capability-bound file operations or a legacy terminal backend.
+
+    Authenticated owner-worker callers are selected before any terminal state,
+    path resolver, or ambient cwd lookup.  Legacy callers retain the existing
+    backend behavior below.
+
 
     Respects the TERMINAL_ENV setting -- if the task_id doesn't have an
     environment yet, creates one using the configured backend (local, docker,
@@ -892,6 +920,10 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     parent's container and its cached file_ops. RL/benchmark task_ids with
     a registered env override keep their isolation.
     """
+    authenticated_ops = _authenticated_workspace_file_ops()
+    if authenticated_ops is not None:
+        return authenticated_ops
+
     from tools.terminal_tool import (
         _active_environments, _env_lock, _create_environment,
         _get_env_config, _last_activity, _start_cleanup_thread,
@@ -1051,6 +1083,29 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
     """Read a file with pagination and line numbers."""
     try:
         offset, limit = normalize_read_pagination(offset, limit)
+        file_ops = _authenticated_workspace_file_ops()
+        if file_ops is not None:
+            # The adapter validates and opens the relative path below the fixed
+            # workspace descriptor.  Do not resolve, stat, or inspect a host
+            # pathname before that capability operation succeeds.
+            result = file_ops.read_file(path, offset, limit)
+            result_dict = result.to_dict()
+            content_len = len(result.content or "")
+            max_chars = _get_max_read_chars()
+            if content_len > max_chars:
+                return json.dumps({
+                    "error": (
+                        f"Read produced {content_len:,} characters which exceeds "
+                        f"the safety limit ({max_chars:,} chars). "
+                        "Use offset and limit to read a smaller range."
+                    ),
+                    "path": path,
+                    "total_lines": result_dict.get("total_lines", "unknown"),
+                    "file_size": result_dict.get("file_size", 0),
+                }, ensure_ascii=False)
+            if result.content:
+                result_dict["content"] = redact_sensitive_text(result.content, file_read=True)
+            return json.dumps(result_dict, ensure_ascii=False)
 
         # ── Device path guard ─────────────────────────────────────────
         # Block paths that would hang the process (infinite output,
@@ -1065,6 +1120,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
             })
 
         _resolved = _resolve_path_for_task(path, task_id)
+        file_ops = _get_file_ops(task_id)
 
         # ── Structured-document extraction ────────────────────────────
         # Try before the binary-extension guard so .docx/.xlsx can render as text.
@@ -1077,7 +1133,6 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
             except ExtractionError:
                 logger.debug("document extraction failed for %s", path, exc_info=True)
             else:
-                file_ops = _get_file_ops(task_id)
                 lines = extracted_text.splitlines()
                 total_lines = len(lines)
                 end_line = offset + limit - 1
@@ -1195,7 +1250,6 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 pass  # stat failed — fall through to full read
 
         # ── Perform the read ──────────────────────────────────────────
-        file_ops = _get_file_ops(task_id)
         result = file_ops.read_file(path, offset, limit)
         result_dict = result.to_dict()
 
@@ -1490,10 +1544,16 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     Pass ``True`` after explicit user direction — same shape as ``force``
     on the terminal tool.
     """
-    sensitive_err = _check_sensitive_path(path, task_id)
-    if sensitive_err:
-        return tool_error(sensitive_err)
-    if not cross_profile:
+    try:
+        file_ops = _authenticated_workspace_file_ops()
+        authenticated_ops = file_ops is not None
+    except Exception as exc:
+        return tool_error(str(exc))
+    if not authenticated_ops:
+        sensitive_err = _check_sensitive_path(path, task_id)
+        if sensitive_err:
+            return tool_error(sensitive_err)
+    if not authenticated_ops and not cross_profile:
         cross_warning = _check_cross_profile_path(path, task_id)
         if cross_warning:
             return tool_error(cross_warning)
@@ -1503,14 +1563,27 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             "Strip read_file line-number prefixes or reconstruct the intended "
             "file contents before writing."
         )
+    if authenticated_ops:
+        # The descriptor adapter is the entire authorization route.  In
+        # particular, do not resolve a host path, inspect a terminal cwd, or
+        # run legacy stale-state bookkeeping before the controlled write.
+        result_dict = file_ops.write_file(path, content).to_dict()
+        if not result_dict.get("error"):
+            diagnostic_path = file_ops.diagnostic_path(path)
+            result_dict["resolved_path"] = diagnostic_path
+            result_dict["files_modified"] = [diagnostic_path]
+        return json.dumps(result_dict, ensure_ascii=False)
     try:
-        # Resolve once for the registry lock + stale check.  Failures here
-        # fall back to the legacy path — write proceeds, per-task staleness
-        # check below still runs.
-        try:
-            _resolved = str(_resolve_path_for_task(path, task_id))
-        except Exception:
+        # Absolute paths are already valid terminal-backend inputs. Preserve
+        # their spelling for legacy adapters and tests; relative inputs still
+        # resolve once for locking, stale checks, and CWD diagnostics.
+        if Path(path).is_absolute():
             _resolved = None
+        else:
+            try:
+                _resolved = str(_resolve_path_for_task(path, task_id))
+            except Exception:
+                _resolved = None
 
         if _resolved is None:
             stale_warning = _check_file_staleness(path, task_id)
@@ -1524,6 +1597,11 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             _update_read_timestamp(path, task_id)
             return json.dumps(result_dict, ensure_ascii=False)
 
+        # The legacy adapter is created only after the legacy task path has
+        # been resolved. Authenticated dispatch returned above before any of
+        # this ambient-CWD or terminal-backed machinery can run.
+        file_ops = _get_file_ops(task_id)
+
         # Serialize the read→modify→write region per-path so concurrent
         # subagents can't interleave on the same file.  Different paths
         # remain fully parallel.
@@ -1535,8 +1613,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             # Workspace-divergence warning: relative path resolving outside the
             # terminal's cwd (the worktree-cwd bug). Lowest priority of the three.
             cwd_warning = _path_resolution_warning(path, Path(_resolved), task_id)
-            file_ops = _get_file_ops(task_id)
-            result = file_ops.write_file(_resolved, content)
+            result = file_ops.write_file(path if authenticated_ops else _resolved, content)
             result_dict = result.to_dict()
             effective_warning = cross_warning or stale_warning or cwd_warning
             if effective_warning:
@@ -1572,6 +1649,29 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     targets under another profile's skills/plugins/cron/memories
     directory. Same shape as ``write_file``'s flag.
     """
+    try:
+        file_ops = _authenticated_workspace_file_ops()
+    except Exception as exc:
+        return tool_error(str(exc))
+    if isinstance(file_ops, ControlledWorkspaceFileOperations):
+        if mode == "replace":
+            if not path:
+                return tool_error("path required")
+            if old_string is None or new_string is None:
+                return tool_error("old_string and new_string required")
+            result_dict = file_ops.patch_replace(path, old_string, new_string, replace_all).to_dict()
+            if not result_dict.get("error"):
+                diagnostic_path = file_ops.diagnostic_path(path)
+                result_dict["resolved_path"] = diagnostic_path
+                result_dict["files_modified"] = [diagnostic_path]
+            return json.dumps(result_dict, ensure_ascii=False)
+        if mode == "patch":
+            if not patch:
+                return tool_error("patch content required")
+            result_dict = file_ops.patch_v4a(patch).to_dict()
+            return json.dumps(result_dict, ensure_ascii=False)
+        return tool_error(f"Unknown mode: {mode}")
+
     # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
     _paths_to_check = []
     if path:
@@ -1681,6 +1781,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 # path would let the two layers disagree about which file is
                 # being edited.
                 _replace_target = _path_to_resolved.get(path) or path
+                if Path(path).is_absolute():
+                    _replace_target = path
                 result = file_ops.patch_replace(_replace_target, old_string, new_string, replace_all)
             elif mode == "patch":
                 if not patch:
@@ -1763,6 +1865,18 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
     """Search for content or files."""
     try:
         offset, limit = normalize_search_pagination(offset, limit)
+        file_ops = _authenticated_workspace_file_ops()
+        if file_ops is not None:
+            result = file_ops.search(
+                pattern=pattern, path=path, target=target, file_glob=file_glob,
+                limit=limit, offset=offset, output_mode=output_mode, context=context,
+            )
+            for match in result.matches:
+                if match.content:
+                    match.content = redact_sensitive_text(match.content, file_read=True)
+            return json.dumps(result.to_dict(densify=True), ensure_ascii=False)
+
+        file_ops = _get_file_ops(task_id)
 
         # Track searches to detect *consecutive* repeated search loops.
         # Include pagination args so users can page through truncated
@@ -1806,7 +1920,6 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         if block_error:
             return json.dumps({"error": block_error}, ensure_ascii=False)
 
-        file_ops = _get_file_ops(task_id)
         result = file_ops.search(
             pattern=pattern, path=path, target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context

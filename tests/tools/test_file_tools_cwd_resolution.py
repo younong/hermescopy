@@ -285,6 +285,13 @@ def test_write_file_reports_resolved_absolute_path(_isolated_cwd, monkeypatch):
     """write_file_tool must put the absolute on-disk path in files_modified."""
     workspace, decoy = _isolated_cwd
     monkeypatch.setattr(ft, "_get_live_tracking_cwd", lambda task_id="default": str(workspace))
+    # macOS pytest temp directories live under /private/var. Keep the production
+    # system-path guard intact while exercising legacy resolution behavior.
+    monkeypatch.setattr(
+        ft,
+        "_SENSITIVE_PATH_PREFIXES",
+        tuple(prefix for prefix in ft._SENSITIVE_PATH_PREFIXES if prefix != "/private/var/"),
+    )
 
     import json
     out = json.loads(ft.write_file_tool("newfile.txt", "hello\n", task_id="t1"))
@@ -299,6 +306,13 @@ def test_patch_reports_resolved_absolute_path(_isolated_cwd, monkeypatch):
     """patch_tool (replace mode) must put the absolute on-disk path in files_modified."""
     workspace, decoy = _isolated_cwd
     monkeypatch.setattr(ft, "_get_live_tracking_cwd", lambda task_id="default": str(workspace))
+    # macOS pytest temp directories live under /private/var. Keep the production
+    # system-path guard intact while exercising legacy resolution behavior.
+    monkeypatch.setattr(
+        ft,
+        "_SENSITIVE_PATH_PREFIXES",
+        tuple(prefix for prefix in ft._SENSITIVE_PATH_PREFIXES if prefix != "/private/var/"),
+    )
 
     import json
     out = json.loads(ft.patch_tool(

@@ -19,7 +19,9 @@ Usage examples::
     hermes logs --since 30m -f     # follow, starting 30 min ago
 """
 
+import os
 import re
+import stat
 import sys
 import time
 from datetime import datetime, timedelta
@@ -27,6 +29,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from hermes_constants import get_hermes_home, display_hermes_home
+from hermes_cli.controlled_roots import ControlledRoots, ExpectedType, RootKind
 
 # Known log files (name → filename)
 LOG_FILES = {
@@ -148,6 +151,7 @@ def tail_log(
     session: Optional[str] = None,
     since: Optional[str] = None,
     component: Optional[str] = None,
+    controlled_roots: ControlledRoots | None = None,
 ) -> None:
     """Read and display log lines, optionally following in real time.
 
@@ -174,7 +178,7 @@ def tail_log(
         sys.exit(1)
 
     log_path = get_hermes_home() / "logs" / filename
-    if not log_path.exists():
+    if controlled_roots is None and not log_path.exists():
         print(f"Log file not found: {log_path}")
         print(f"(Logs are created when Hermes runs — try 'hermes chat' first)")
         sys.exit(1)
@@ -210,11 +214,31 @@ def tail_log(
         or component_prefixes is not None
     )
 
-    # Read and display the tail
+    # Read and display the tail. Authenticated callers supply the app-owned
+    # root capability, so this branch never validates or reopens a pathname.
     try:
-        lines = _read_tail(log_path, num_lines, has_filters=has_filters,
-                           min_level=min_level, session_filter=session,
-                           since=since_dt, component_prefixes=component_prefixes)
+        if controlled_roots is not None:
+            if follow:
+                raise RuntimeError("following owner logs requires a descriptor-backed stream")
+            raw_lines = _read_owner_log_tail(controlled_roots, filename, max(num_lines * 20, 2000) if has_filters else num_lines)
+            lines = [
+                line
+                for line in raw_lines
+                if _matches_filters(
+                    line,
+                    min_level=min_level,
+                    session_filter=session,
+                    since=since_dt,
+                    component_prefixes=component_prefixes,
+                )
+            ][-num_lines:]
+        else:
+            lines = _read_tail(log_path, num_lines, has_filters=has_filters,
+                               min_level=min_level, session_filter=session,
+                               since=since_dt, component_prefixes=component_prefixes)
+    except FileNotFoundError:
+        print(f"Log file not found: {log_path}")
+        sys.exit(1)
     except PermissionError:
         print(f"Permission denied: {log_path}")
         sys.exit(1)
@@ -248,6 +272,27 @@ def tail_log(
                      since=since_dt, component_prefixes=component_prefixes)
     except KeyboardInterrupt:
         print("\n--- stopped ---")
+
+
+def _read_owner_log_tail(roots: ControlledRoots, filename: str, num_lines: int) -> list[str]:
+    """Read one allowlisted owner log by FD, never by a caller pathname."""
+    if filename not in LOG_FILES.values():
+        raise ValueError("unknown owner log filename")
+    fd = roots.open_relative(
+        RootKind.OWNER_WRITABLE,
+        f"logs/{filename}",
+        expected_type=ExpectedType.REGULAR_FILE,
+    )
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError("owner log is not a regular file")
+        chunks: list[bytes] = []
+        while chunk := os.read(fd, 1024 * 1024):
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8", errors="replace").splitlines(keepends=True)[-num_lines:]
+    finally:
+        os.close(fd)
 
 
 def _read_tail(

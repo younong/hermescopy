@@ -21,7 +21,9 @@ from hermes_cli.dashboard_auth.authority import (
     WorkerGenerationState,
     WorkerLeaseState,
 )
+from hermes_cli.controlled_roots import ControlledRoots, ExpectedType, RootKind, controlled_roots_for
 from hermes_cli.owner_runtime import (
+    OwnerWorkerRuntimePaths,
     ensure_owner_runtime_dirs,
     owner_worker_env_for,
     owner_worker_runtime_paths,
@@ -206,31 +208,59 @@ class OwnerWorkerSupervisor:
             claim = self.authority_store.claim_worker_start(owner_key, worker_id=uuid.uuid4().hex)
             generation = claim.generation
             socket_path = self.socket_path_for(owner, generation.worker_generation)
-            socket_path.parent.mkdir(parents=True, exist_ok=True)
-
             env = self._env_for(owner, generation, claim.lease)
-            cwd = owner_worker_runtime_paths(
+            runtime_paths = owner_worker_runtime_paths(
                 owner_home=owner_home,
                 worker_generation=generation.worker_generation,
-            ).default_workspace
-            stdout_path = owner_home / "runtime" / "logs" / "owner-worker.stdout.log"
-            stderr_path = owner_home / "runtime" / "logs" / "owner-worker.stderr.log"
+            )
+            controlled_roots = self._controlled_roots_for(runtime_paths)
+            try:
+                controlled_roots.mkdirs(
+                    RootKind.OWNER_WRITABLE,
+                    f"runtime/workers/{generation.worker_generation}",
+                )
+            except BaseException:
+                controlled_roots.close()
+                raise
+            cwd_fd = None
             stdout_handle = None
             stderr_handle = None
             try:
-                stdout_handle = stdout_path.open("ab")
-                stderr_handle = stderr_path.open("ab")
-                self._chmod_private_file(stdout_path)
-                self._chmod_private_file(stderr_path)
-                process = self.process_factory(
-                    self._argv_for(owner, socket_path, generation),
-                    env=env,
-                    cwd=str(cwd),
-                    stdin=subprocess.DEVNULL,
-                    stdout=stdout_handle,
-                    stderr=stderr_handle,
-                    close_fds=True,
+                cwd_fd = controlled_roots.open_relative(
+                    RootKind.WORKSPACE,
+                    "default",
+                    expected_type=ExpectedType.DIRECTORY,
                 )
+                stdout_handle = controlled_roots.open_append_file(
+                    RootKind.OWNER_WRITABLE,
+                    "runtime/logs/owner-worker.stdout.log",
+                )
+                stderr_handle = controlled_roots.open_append_file(
+                    RootKind.OWNER_WRITABLE,
+                    "runtime/logs/owner-worker.stderr.log",
+                )
+                os.fchmod(stdout_handle, stat.S_IRUSR | stat.S_IWUSR)
+                os.fchmod(stderr_handle, stat.S_IRUSR | stat.S_IWUSR)
+                inherited_cwd_fd = os.dup(cwd_fd)
+                os.set_inheritable(inherited_cwd_fd, True)
+
+                def _set_descriptor_cwd() -> None:
+                    os.fchdir(inherited_cwd_fd)
+                    os.close(inherited_cwd_fd)
+
+                try:
+                    process = self.process_factory(
+                        self._argv_for(owner, socket_path, generation),
+                        env=env,
+                        stdin=subprocess.DEVNULL,
+                        stdout=stdout_handle,
+                        stderr=stderr_handle,
+                        close_fds=True,
+                        preexec_fn=_set_descriptor_cwd,
+                        pass_fds=(inherited_cwd_fd,),
+                    )
+                finally:
+                    os.close(inherited_cwd_fd)
             except Exception:
                 try:
                     self.authority_store.transition_worker_lease(
@@ -242,10 +272,13 @@ class OwnerWorkerSupervisor:
                     pass
                 raise
             finally:
+                if cwd_fd is not None:
+                    os.close(cwd_fd)
                 if stdout_handle is not None:
-                    stdout_handle.close()
+                    os.close(stdout_handle)
                 if stderr_handle is not None:
-                    stderr_handle.close()
+                    os.close(stderr_handle)
+                controlled_roots.close()
             try:
                 health = self._wait_until_healthy(
                     process=process,
@@ -318,6 +351,11 @@ class OwnerWorkerSupervisor:
             if handle.active_uses > 0:
                 handle.active_uses -= 1
             handle.last_used_at = time.time()
+
+    @staticmethod
+    def _controlled_roots_for(runtime_paths: OwnerWorkerRuntimePaths) -> ControlledRoots:
+        """Open app-equivalent trusted roots before launching an owner worker."""
+        return controlled_roots_for(runtime_paths)
 
     @staticmethod
     def _chmod_private_file(path: Path) -> None:

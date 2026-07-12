@@ -383,9 +383,11 @@ def _has_valid_query_token(request: Request, path: str) -> bool:
 
 def _authenticated_owner_request(request: Request) -> bool:
     """Return True for dashboard-auth requests that must be owner-worker routed."""
+    app_obj = getattr(request, "app", None)
+    state = getattr(request, "state", None)
     return bool(
-        getattr(request.app.state, "auth_required", False)
-        and getattr(request.state, "session", None) is not None
+        getattr(getattr(app_obj, "state", None), "auth_required", False)
+        and getattr(state, "session", None) is not None
     )
 
 
@@ -1895,6 +1897,8 @@ def _decode_data_url(data_url: str) -> tuple[bytes, str]:
 
 @app.get("/api/files")
 async def list_managed_files(request: Request, path: Optional[str] = None):
+    if _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
     _reject_authenticated_filesystem_api(request)
     policy, target, display_path = _resolve_managed_path(path, request)
     if not target.exists():
@@ -1924,6 +1928,8 @@ async def list_managed_files(request: Request, path: Optional[str] = None):
 
 @app.get("/api/files/read")
 async def read_managed_file(request: Request, path: str):
+    if _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
     _reject_authenticated_filesystem_api(request)
     policy, target, display_path = _resolve_managed_path(path, request)
     if not target.exists():
@@ -1967,6 +1973,8 @@ async def download_managed_file(request: Request, path: str):
     (which can't set the session header) still authenticates. See ``/api/pty``
     for the same query-token precedent.
     """
+    if _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
     _reject_authenticated_filesystem_api(request)
     policy, target, _display_path = _resolve_managed_path(path, request)
     if not target.exists():
@@ -1993,6 +2001,8 @@ async def download_managed_file(request: Request, path: str):
 
 @app.post("/api/files/upload")
 async def upload_managed_file(payload: ManagedFileUpload, request: Request):
+    if _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
     _reject_authenticated_filesystem_api(request)
     policy, target, display_path = _resolve_managed_path(payload.path, request, for_write=True)
     if target.exists() and target.is_dir():
@@ -2034,6 +2044,8 @@ async def upload_managed_file_stream(
     path: str = Form(...),
     overwrite: bool = Form(True),
 ):
+    if hasattr(request, "app") and _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
     _reject_authenticated_filesystem_api(request)
     policy, target, display_path = _resolve_managed_path(path, request, for_write=True)
     if target.exists() and target.is_dir():
@@ -2094,6 +2106,8 @@ async def upload_managed_file_stream(
 
 @app.post("/api/files/mkdir")
 async def create_managed_directory(payload: ManagedDirectoryCreate, request: Request):
+    if _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
     _reject_authenticated_filesystem_api(request)
     policy, target, display_path = _resolve_managed_path(payload.path, request, for_write=True)
     if target.exists() and not target.is_dir():
@@ -2116,6 +2130,8 @@ async def create_managed_directory(payload: ManagedDirectoryCreate, request: Req
 
 @app.delete("/api/files")
 async def delete_managed_file(payload: ManagedFileDelete, request: Request):
+    if _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
     _reject_authenticated_filesystem_api(request)
     policy, target, display_path = _resolve_managed_path(payload.path, request)
     if policy.locked_root is not None and target == policy.locked_root:

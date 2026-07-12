@@ -14,6 +14,7 @@ import pytest
 from hermes_cli.dashboard_auth.authority import AuthorityStore, WorkerGenerationState, WorkerLeaseState
 from hermes_cli.dashboard_auth.base import Session
 from hermes_cli.dashboard_auth.owner_context import owner_context_from_session
+from hermes_cli.controlled_roots import RootKind, controlled_roots_for
 from hermes_cli.owner_runtime import REQUIRED_OWNER_DIRS, ensure_owner_runtime_dirs, owner_worker_socket_path
 from hermes_cli.owner_worker import OwnerWorkerClient, OwnerWorkerSupervisor
 from hermes_cli.owner_worker.tokens import (
@@ -66,6 +67,14 @@ class _FakeProcess:
     def wait(self, timeout=None):
         self.wait_calls += 1
         return self.returncode
+
+
+@pytest.fixture(autouse=True)
+def _simulate_linux_controlled_roots(monkeypatch):
+    import hermes_cli.controlled_roots as controlled_roots
+
+    monkeypatch.setattr(controlled_roots.ControlledRoots, "_require_linux", lambda _self: None)
+    monkeypatch.setattr(controlled_roots, "_openat2", lambda *_args: None)
 
 
 class _FakeClient:
@@ -407,7 +416,9 @@ def test_supervisor_rejects_same_key_different_owner_home(tmp_path, monkeypatch)
     assert (owner_a.owner_home / "runtime" / "logs" / "owner-worker.stdout.log").exists()
     assert (owner_a.owner_home / "runtime" / "logs" / "owner-worker.stderr.log").exists()
     expected_cwd = (owner_a.owner_home / "workspaces" / "default").resolve()
-    assert spawned[0]["kwargs"]["cwd"] == str(expected_cwd)
+    assert "cwd" not in spawned[0]["kwargs"]
+    assert spawned[0]["kwargs"]["pass_fds"]
+    assert callable(spawned[0]["kwargs"]["preexec_fn"])
     assert expected_cwd.relative_to(owner_a.owner_home.resolve())
     for rel in REQUIRED_OWNER_DIRS:
         assert (owner_a.owner_home / rel).is_dir()
@@ -439,8 +450,10 @@ def test_supervisor_closes_log_handles_when_spawn_fails(tmp_path):
     with pytest.raises(RuntimeError, match="spawn failed"):
         supervisor.get_or_start(owner)
 
-    assert getattr(captured["stdout"], "closed") is True
-    assert getattr(captured["stderr"], "closed") is True
+    with pytest.raises(OSError):
+        os.fstat(captured["stdout"])
+    with pytest.raises(OSError):
+        os.fstat(captured["stderr"])
 
 
 def test_supervisor_serializes_concurrent_start_for_same_owner(tmp_path):
@@ -861,6 +874,41 @@ def test_worker_create_app_rejects_forbidden_environment_before_route_registrati
         create_app("ok1_worker_routes", owner_home)
 
 
+def test_worker_app_owns_and_closes_controlled_roots(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from hermes_cli.owner_worker.entrypoint import create_app
+
+    owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_worker_roots")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(tmp_path / "control"))
+    app = create_app("ok1_worker_roots", owner_home)
+    roots = app.state.owner_worker_controlled_roots
+    workspace_fd = roots.get(RootKind.WORKSPACE).directory_fd
+
+    assert roots.get(RootKind.OWNER_WRITABLE).canonical_path == owner_home
+    assert roots.get(RootKind.WORKSPACE).canonical_path == owner_home / "workspaces"
+    assert roots.get(RootKind.TEMPORARY).canonical_path == owner_home / "runtime" / "tmp"
+    with TestClient(app):
+        assert os.fstat(workspace_fd)
+
+    with pytest.raises(OSError):
+        os.fstat(workspace_fd)
+
+
+def test_worker_create_app_fails_closed_when_controlled_roots_are_unavailable(tmp_path, monkeypatch):
+    import hermes_cli.owner_worker.entrypoint as entrypoint
+
+    owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_worker_roots")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(tmp_path / "control"))
+    monkeypatch.setattr(entrypoint, "controlled_roots_for", lambda _paths: (_ for _ in ()).throw(RuntimeError("unsupported")))
+
+    with pytest.raises(RuntimeError, match="startup self-check failed: unsupported"):
+        entrypoint.create_app("ok1_worker_roots", owner_home)
+
+
 def test_worker_session_routes_require_owner_token(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 
@@ -890,6 +938,56 @@ def test_worker_session_routes_require_owner_token(tmp_path, monkeypatch):
         control_home=tmp_path / "control",
     )
     assert client.get("/api/sessions", headers={"Authorization": f"Bearer {wrong}"}).status_code == 401
+
+
+def test_worker_managed_files_are_descriptor_scoped_to_its_owner(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from hermes_cli.owner_worker.entrypoint import create_app
+
+    import hermes_cli.controlled_roots as controlled_roots
+
+    monkeypatch.setattr(controlled_roots.sys, "platform", "linux")
+    monkeypatch.setattr(controlled_roots, "_openat2", lambda *_args: None)
+    control_home = tmp_path / "control"
+    owner_a = ensure_owner_runtime_dirs(tmp_path / "owner-a")
+    owner_b = ensure_owner_runtime_dirs(tmp_path / "owner-b")
+    (owner_b / "workspaces" / "secret.txt").write_text("owner-b-only")
+    monkeypatch.setenv("HERMES_HOME", str(owner_a))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_owner_a")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+    app = create_app("ok1_owner_a", owner_a)
+    client = TestClient(app)
+
+    def request(path: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {_capability_for(app, path, control_home=control_home)}"}
+
+    created = client.post(
+        "/api/files/upload",
+        headers=request("/api/files/upload"),
+        json={"path": "project/note.txt", "data_url": "data:text/plain;base64,b3duZXItYQ=="},
+    )
+    assert created.status_code == 200
+    assert (owner_a / "workspaces" / "project" / "note.txt").read_text() == "owner-a"
+    assert not (owner_b / "workspaces" / "project" / "note.txt").exists()
+
+    listed = client.get("/api/files", headers=request("/api/files"))
+    assert listed.status_code == 200
+    assert "project" in [entry["path"] for entry in listed.json()["entries"]]
+
+    leaked = client.get(
+        "/api/files/read",
+        headers=request("/api/files/read"),
+        params={"path": str(owner_b / "workspaces" / "secret.txt")},
+    )
+    assert leaked.status_code == 400
+    assert "owner-b-only" not in leaked.text
+
+    traversal = client.get(
+        "/api/files/read",
+        headers=request("/api/files/read"),
+        params={"path": "../secret.txt"},
+    )
+    assert traversal.status_code == 400
 
 
 def test_worker_http_token_validation_uses_stored_control_home(tmp_path, monkeypatch):
@@ -1427,6 +1525,73 @@ def test_worker_gateway_ws_admits_one_owner_local_tui_attach(monkeypatch):
     foreign = FakeWebSocket(app_b, ws_routes._mint_gateway_attach_token(app_a))
     asyncio.run(ws_routes.gateway_ws(foreign))
     assert foreign.closed and foreign.closed[0][0] == 4401
+
+
+def test_worker_active_session_records_are_descriptor_scoped_to_its_owner(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import hermes_cli.controlled_roots as controlled_roots
+    from hermes_cli.owner_runtime import owner_worker_runtime_paths
+    from hermes_cli.owner_worker import ws_routes
+    from hermes_cli.owner_worker.ws_routes import OwnerWorkerLiveState
+
+    monkeypatch.setattr(controlled_roots.sys, "platform", "linux")
+    monkeypatch.setattr(controlled_roots, "_openat2", lambda *_args: None)
+    owner_a = ensure_owner_runtime_dirs(tmp_path / "owner-a")
+    owner_b = ensure_owner_runtime_dirs(tmp_path / "owner-b")
+    roots_a = controlled_roots_for(owner_worker_runtime_paths(owner_home=owner_a, worker_generation=1))
+    roots_b = controlled_roots_for(owner_worker_runtime_paths(owner_home=owner_b, worker_generation=1))
+    app_a = SimpleNamespace(state=SimpleNamespace(owner_worker_controlled_roots=roots_a, owner_worker_live_state=OwnerWorkerLiveState()))
+    app_b = SimpleNamespace(state=SimpleNamespace(owner_worker_controlled_roots=roots_b, owner_worker_live_state=OwnerWorkerLiveState()))
+
+    try:
+        active_path = ws_routes._active_session_file_for_channel(app_a, "browser-a")
+        assert Path(active_path).is_file()
+        roots_a.replace_bytes(
+            RootKind.TEMPORARY,
+            ws_routes._active_session_relative_path(app_a, active_path),
+            b'{"session_id":"owner-a-session"}',
+        )
+        assert ws_routes._read_active_session_file(app_a, active_path) == "owner-a-session"
+        assert ws_routes._read_active_session_file(app_b, active_path) is None
+        with pytest.raises(RuntimeError, match="not owned"):
+            ws_routes._active_session_relative_path(app_a, "/tmp/untrusted-session.json")
+
+        ws_routes._forget_active_session_file(app_a, active_path)
+        assert not Path(active_path).exists()
+    finally:
+        roots_a.close()
+        roots_b.close()
+
+
+def test_worker_chat_argv_derives_cwd_from_workspace_descriptor(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import hermes_cli.controlled_roots as controlled_roots
+    from hermes_cli.owner_runtime import owner_worker_runtime_paths
+    from hermes_cli.owner_worker import ws_routes
+    from hermes_cli.owner_worker.ws_routes import OwnerWorkerLiveState
+
+    monkeypatch.setattr(controlled_roots.sys, "platform", "linux")
+    monkeypatch.setattr(controlled_roots, "_openat2", lambda *_args: None)
+    owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
+    roots = controlled_roots_for(owner_worker_runtime_paths(owner_home=owner_home, worker_generation=1))
+    monkeypatch.setattr("hermes_cli.main._make_tui_argv", lambda *_args, **_kwargs: (["node", "entry.js"], str(tmp_path)))
+    monkeypatch.setattr(ws_routes.os, "readlink", lambda _path: str(owner_home / "workspaces" / "default"))
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            owner_worker_mode=True,
+            owner_worker_controlled_roots=roots,
+            owner_worker_live_state=OwnerWorkerLiveState(),
+        )
+    )
+    try:
+        _argv, cwd, env = ws_routes._resolve_chat_argv(app_obj=app)
+        assert cwd == str(owner_home / "workspaces" / "default")
+        assert "HERMES_CWD" not in env
+        assert "TERMINAL_CWD" not in env
+    finally:
+        roots.close()
 
 
 def test_worker_chat_argv_requires_owner_worker_gateway_attach(tmp_path, monkeypatch):

@@ -81,8 +81,25 @@ def test_ensure_owner_runtime_dirs_uses_private_modes_on_posix(tmp_path):
         pytest.skip("POSIX mode bits unavailable")
     owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
 
-    for path in [owner_home, owner_home / "runtime", owner_home / "workspaces", owner_home / "workspaces" / "default"]:
+    for path in [
+        owner_home,
+        owner_home / "runtime",
+        owner_home / "runtime" / "tmp",
+        owner_home / "workspaces",
+        owner_home / "workspaces" / "default",
+    ]:
         assert path.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO) == 0
+
+
+def test_owner_runtime_temporary_root_is_canonical_and_ignores_tmpdir(tmp_path, monkeypatch):
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "shared-tmp"))
+    owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
+
+    paths = owner_worker_runtime_paths(owner_home=owner_home, worker_generation=1)
+
+    assert paths.paths["temporary_root"] == owner_home / "runtime" / "tmp"
+    assert paths.paths["temporary_root"].is_dir()
+    assert paths.paths["temporary_root"] != tmp_path / "shared-tmp"
 
 
 def test_ensure_owner_runtime_dirs_rejects_symlink_escape(tmp_path):

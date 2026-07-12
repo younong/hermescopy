@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import pytest
 
+from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
+from hermes_cli.controlled_roots import RootKind, controlled_roots_for
+from hermes_cli.owner_runtime import ensure_owner_runtime_dirs, owner_worker_runtime_paths
 from tui_gateway import server
 
 
@@ -20,10 +23,129 @@ def _owner_env(monkeypatch, tmp_path):
     return owner, root, default
 
 
+def _runtime_paths(tmp_path):
+    owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
+    return owner_worker_runtime_paths(owner_home=owner_home, worker_generation=1)
+
+
+@pytest.fixture
+def authenticated_runtime(monkeypatch, tmp_path):
+    import hermes_cli.controlled_roots as controlled_roots
+
+    monkeypatch.setattr(controlled_roots.sys, "platform", "linux")
+    monkeypatch.setattr(controlled_roots, "_openat2", lambda *_args: None)
+    roots = controlled_roots_for(_runtime_paths(tmp_path))
+    runtime = server.OwnerWorkerGatewayRuntime(
+        owner_key="owner-a",
+        worker_generation=1,
+        worker_id="worker-a",
+        lease_version=1,
+        recovery_generation=0,
+        filesystem_context=AuthenticatedWorkspaceContext(roots),
+    )
+    token = server._gateway_runtime.set(runtime)
+    try:
+        yield roots
+    finally:
+        server._gateway_runtime.reset(token)
+        roots.close()
+
+
 def test_owner_completion_cwd_defaults_when_omitted(monkeypatch, tmp_path):
     _owner, _root, default = _owner_env(monkeypatch, tmp_path)
 
     assert server._completion_cwd({}) == str(default.resolve())
+
+
+def test_authenticated_runtime_completion_cwd_uses_bound_capability(authenticated_runtime, monkeypatch, tmp_path):
+    selected = authenticated_runtime.get(RootKind.WORKSPACE).canonical_path / "default"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setenv("HERMES_WORKSPACE_ROOT", str(outside))
+    monkeypatch.setenv("TERMINAL_CWD", str(outside))
+    monkeypatch.setattr(server, "_profile_configured_cwd", lambda *_args: pytest.fail("profile cwd must not be read"))
+
+    assert server._completion_cwd({}) == str(selected)
+    for resolve in (
+        lambda: server._completion_cwd({"cwd": str(outside)}),
+        lambda: server._session_cwd({"cwd": str(outside)}),
+        lambda: server._terminal_task_cwd({"cwd": str(outside)}),
+    ):
+        with pytest.raises(ValueError, match="selected authenticated workspace"):
+            resolve()
+
+
+def test_authenticated_runtime_rejects_conflicting_cwd(authenticated_runtime, tmp_path):
+    sibling = authenticated_runtime.get(RootKind.WORKSPACE).canonical_path / "sibling"
+    sibling.mkdir()
+
+    with pytest.raises(ValueError, match="selected authenticated workspace"):
+        server._set_session_cwd({"session_key": "session"}, str(sibling))
+
+
+def test_authenticated_runtime_registers_only_selected_workspace(authenticated_runtime, monkeypatch):
+    selected = str(authenticated_runtime.get(RootKind.WORKSPACE).canonical_path / "default")
+    registered = []
+    monkeypatch.setattr(server, "_register_session_cwd", lambda session: registered.append(session["cwd"]))
+    monkeypatch.setattr(server, "_persist_session_git_meta", lambda *_args: None)
+    session = {"session_key": "session"}
+
+    assert server._set_session_cwd(session, selected) == selected
+    assert session["cwd"] == selected
+    assert registered == [selected]
+
+
+def test_authenticated_project_callback_cannot_bypass_selected_workspace(authenticated_runtime, monkeypatch):
+    selected = authenticated_runtime.get(RootKind.WORKSPACE).canonical_path / "default"
+    sibling = authenticated_runtime.get(RootKind.WORKSPACE).canonical_path / "sibling"
+    sibling.mkdir()
+    session = {"session_key": "session", "cwd": str(selected)}
+    server._sessions["sid"] = session
+    monkeypatch.setattr(
+        server,
+        "_register_session_cwd",
+        lambda *_args: pytest.fail("conflicting project path must not register a terminal cwd"),
+    )
+    try:
+        server._apply_project_workspace("session", str(sibling))
+        assert session["cwd"] == str(selected)
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_authenticated_project_callback_accepts_selected_workspace(authenticated_runtime, monkeypatch):
+    selected = str(authenticated_runtime.get(RootKind.WORKSPACE).canonical_path / "default")
+    session = {"session_key": "session"}
+    registered = []
+    emitted = []
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server, "_register_session_cwd", lambda value: registered.append(value["cwd"]))
+    monkeypatch.setattr(server, "_persist_session_git_meta", lambda *_args: None)
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    monkeypatch.setattr(server, "_git_branch_for_cwd", lambda *_args: "")
+    try:
+        server._apply_project_workspace("session", selected)
+        assert session["cwd"] == selected
+        assert registered == [selected]
+        assert emitted and emitted[0][2]["cwd"] == selected
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_authenticated_runtime_missing_capability_fails_closed():
+    runtime = server.OwnerWorkerGatewayRuntime(
+        owner_key="owner-a",
+        worker_generation=1,
+        worker_id="worker-a",
+        lease_version=1,
+        recovery_generation=0,
+    )
+    token = server._gateway_runtime.set(runtime)
+    try:
+        with pytest.raises(RuntimeError, match="filesystem capability"):
+            server._completion_cwd({})
+    finally:
+        server._gateway_runtime.reset(token)
 
 
 def test_owner_completion_cwd_allows_explicit_workspace_path(monkeypatch, tmp_path):

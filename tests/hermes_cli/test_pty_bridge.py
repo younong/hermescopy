@@ -54,6 +54,25 @@ class TestPtyBridgeSpawn:
         with pytest.raises((FileNotFoundError, OSError)):
             PtyBridge.spawn([str(tmp_path / "definitely-not-a-real-binary")])
 
+    def test_spawn_can_set_cwd_from_directory_fd(self, tmp_path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        cwd_fd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
+        bridge = PtyBridge.spawn(["/bin/sh", "-c", "pwd"], cwd_fd=cwd_fd)
+        try:
+            assert str(workspace).encode() in _read_until(bridge, str(workspace).encode())
+        finally:
+            os.close(cwd_fd)
+            bridge.close()
+
+    def test_spawn_rejects_string_and_descriptor_cwd_together(self, tmp_path):
+        cwd_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with pytest.raises(ValueError, match="mutually exclusive"):
+                PtyBridge.spawn(["true"], cwd=str(tmp_path), cwd_fd=cwd_fd)
+        finally:
+            os.close(cwd_fd)
+
 
 @skip_on_windows
 class TestPtyBridgeIO:

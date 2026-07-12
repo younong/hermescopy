@@ -258,27 +258,26 @@ def test_gated_local_mode_still_defaults_to_home(monkeypatch, tmp_path):
     assert policy.can_change_path is True
 
 
-def test_authenticated_mode_rejects_control_plane_file_apis(authenticated_files_client):
+def test_authenticated_mode_proxies_file_apis_to_owner_worker(authenticated_files_client):
     client, home = authenticated_files_client
     existing = home / "existing.txt"
     existing.write_text("keep")
     upload_target = home / "upload.txt"
     mkdir_target = home / "new-dir"
 
-    assert client.get("/api/files", params={"path": str(home)}).status_code == 403
-    assert client.get("/api/files/read", params={"path": str(existing)}).status_code == 403
-    assert client.get("/api/files/download", params={"path": str(existing)}).status_code == 403
-    assert client.post(
-        "/api/files/upload",
-        json={"path": str(upload_target), "data_url": "data:text/plain;base64,bm8="},
-    ).status_code == 403
-    assert client.post(
-        "/api/files/upload-stream",
-        data={"path": str(upload_target), "overwrite": "true"},
-        files={"file": ("upload.txt", b"no", "text/plain")},
-    ).status_code == 403
-    assert client.post("/api/files/mkdir", json={"path": str(mkdir_target)}).status_code == 403
-    assert client.request("DELETE", "/api/files", json={"path": str(existing)}).status_code == 403
+    # The Control Plane must proxy authenticated file routes instead of reading
+    # its own host filesystem. With no owner-worker supervisor installed, that
+    # proxy fails closed rather than falling back to the old handler.
+    for request in (
+        lambda: client.get("/api/files", params={"path": str(home)}),
+        lambda: client.get("/api/files/read", params={"path": str(existing)}),
+        lambda: client.get("/api/files/download", params={"path": str(existing)}),
+        lambda: client.post("/api/files/upload", json={"path": str(upload_target), "data_url": "data:text/plain;base64,bm8="}),
+        lambda: client.post("/api/files/upload-stream", data={"path": str(upload_target), "overwrite": "true"}, files={"file": ("upload.txt", b"no", "text/plain")}),
+        lambda: client.post("/api/files/mkdir", json={"path": str(mkdir_target)}),
+        lambda: client.request("DELETE", "/api/files", json={"path": str(existing)}),
+    ):
+        assert request().status_code == 503
 
     assert existing.read_text() == "keep"
     assert not upload_target.exists()

@@ -155,6 +155,7 @@ class OwnerWorkerGatewayRuntime:
     worker_id: str
     lease_version: int
     recovery_generation: int
+    filesystem_context: Any | None = field(default=None, compare=False, repr=False)
     mutable_state: _GatewayMutableState = field(default_factory=_GatewayMutableState, compare=False, repr=False)
 
 
@@ -1574,11 +1575,52 @@ def _owner_workspace_cwd(raw: Any | None, *, fallback_default: bool = False) -> 
     return str(resolve_workspace_cwd(raw, create_default=fallback_default))
 
 
+def _authenticated_workspace_compatibility_cwd(raw: Any | None = None) -> str | None:
+    """Return the bound worker's sole diagnostic CWD compatibility view.
+
+    A gateway runtime is the authenticated authority boundary. Once one is
+    bound, cwd strings may only echo its fixed descriptor-selected workspace;
+    they cannot select a different workspace or trigger ambient fallback.
+    """
+    runtime = current_owner_worker_gateway_runtime()
+    if runtime is None:
+        return None
+
+    from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
+    from hermes_cli.controlled_roots import ExpectedType, RootKind
+
+    context = runtime.filesystem_context
+    if not isinstance(context, AuthenticatedWorkspaceContext):
+        raise RuntimeError("authenticated owner worker lacks filesystem capability")
+
+    roots = context.roots
+    workspace_root = roots.get(RootKind.WORKSPACE)
+    fd = roots.open_relative(
+        RootKind.WORKSPACE,
+        context.workspace_prefix,
+        expected_type=ExpectedType.DIRECTORY,
+    )
+    try:
+        selected = str(workspace_root.canonical_path / context.workspace_prefix)
+    finally:
+        os.close(fd)
+
+    if not _owner_cwd_is_omitted(raw) and str(raw) != selected:
+        raise ValueError("cwd does not match the selected authenticated workspace")
+    return selected
+
+
 def _completion_cwd(params: dict | None = None) -> str:
     params = params or {}
+    session_cwd = _sessions.get(params.get("session_id") or "", {}).get("cwd")
+    authenticated_cwd = _authenticated_workspace_compatibility_cwd(
+        params.get("cwd") or session_cwd
+    )
+    if authenticated_cwd is not None:
+        return authenticated_cwd
     raw = (
         params.get("cwd")
-        or _sessions.get(params.get("session_id") or "", {}).get("cwd")
+        or session_cwd
         # A session bound to another profile resolves its workspace from THAT
         # profile's config before falling back to the launch profile's env var.
         or _profile_configured_cwd(_profile_home(params.get("profile")))
@@ -1604,6 +1646,11 @@ def _terminal_task_cwd(session: dict | None) -> str:
     inside the target environment, so an SSH path like /home/user/workspace may
     not exist on the local macOS host but is still the correct execution cwd.
     """
+    authenticated_cwd = _authenticated_workspace_compatibility_cwd(
+        session.get("cwd") if session else None
+    )
+    if authenticated_cwd is not None:
+        return authenticated_cwd
     if _owner_worker_mode():
         return _session_cwd(session)
     backend = (os.environ.get("TERMINAL_ENV") or "").strip().lower()
@@ -1633,6 +1680,11 @@ _resolve_cwd_git = git_probe.resolve
 
 
 def _session_cwd(session: dict | None) -> str:
+    authenticated_cwd = _authenticated_workspace_compatibility_cwd(
+        session.get("cwd") if session else None
+    )
+    if authenticated_cwd is not None:
+        return authenticated_cwd
     if session and session.get("cwd"):
         if _owner_worker_mode():
             return _owner_workspace_cwd(session.get("cwd"), fallback_default=False)
@@ -1970,7 +2022,10 @@ def _persist_session_git_meta(session: dict, cwd: str) -> None:
 
 
 def _set_session_cwd(session: dict, cwd: str) -> str:
-    if _owner_worker_mode():
+    authenticated_cwd = _authenticated_workspace_compatibility_cwd(cwd)
+    if authenticated_cwd is not None:
+        resolved = authenticated_cwd
+    elif _owner_worker_mode():
         try:
             resolved = _owner_workspace_cwd(cwd, fallback_default=False)
         except ValueError as exc:
@@ -3972,22 +4027,10 @@ def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
     if session is None:
         return
 
-    resolved = os.path.abspath(os.path.expanduser(str(path)))
-    if not os.path.isdir(resolved):
+    try:
+        resolved = _set_session_cwd(session, path)
+    except ValueError:
         return
-
-    session["cwd"] = resolved
-    session["explicit_cwd"] = True
-    _register_session_cwd(session)
-
-    with _session_db(session) as db:
-        if db is not None:
-            try:
-                db.update_session_cwd(session.get("session_key", ""), resolved)
-            except Exception:
-                logger.debug("failed to persist project workspace cwd", exc_info=True)
-
-    _persist_session_git_meta(session, resolved)
 
     try:
         agent = session.get("agent")

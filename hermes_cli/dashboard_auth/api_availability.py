@@ -38,6 +38,12 @@ OWNER_WORKER_PATHS: frozenset[str] = frozenset({
     "/api/sessions/empty",
     "/api/sessions/stats",
     "/api/sessions/prune",
+    "/api/files",
+    "/api/files/read",
+    "/api/files/download",
+    "/api/files/upload",
+    "/api/files/upload-stream",
+    "/api/files/mkdir",
 })
 _SESSION_ITEM_SUFFIXES: frozenset[str] = frozenset({
     "latest-descendant",

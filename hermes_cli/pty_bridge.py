@@ -115,6 +115,7 @@ class PtyBridge:
         argv: Sequence[str],
         *,
         cwd: Optional[str] = None,
+        cwd_fd: Optional[int] = None,
         env: Optional[dict] = None,
         cols: int = 80,
         rows: int = 24,
@@ -138,6 +139,8 @@ class PtyBridge:
                     "(or pip install -e '.[pty]')."
                 )
             raise PtyUnavailableError("Pseudo-terminals are unavailable.")
+        if cwd is not None and cwd_fd is not None:
+            raise ValueError("cwd and cwd_fd are mutually exclusive")
         # PTY-hosted programs expect TERM to describe the terminal type.
         # CI often runs without TERM in the parent process, which makes
         # simple terminal probes like `tput cols` fail before winsize reads.
@@ -146,12 +149,30 @@ class PtyBridge:
         spawn_env = (os.environ.copy() if env is None else env.copy())
         if not spawn_env.get("TERM"):
             spawn_env["TERM"] = "xterm-256color"
-        proc = ptyprocess.PtyProcess.spawn(  # type: ignore[union-attr]
-            list(argv),
-            cwd=cwd,
-            env=spawn_env,
-            dimensions=(rows, cols),
-        )
+        preexec_fn = None
+        pass_fds: tuple[int, ...] = ()
+        if cwd_fd is not None:
+            inherited_cwd_fd = os.dup(cwd_fd)
+            os.set_inheritable(inherited_cwd_fd, True)
+
+            def _set_descriptor_cwd() -> None:
+                os.fchdir(inherited_cwd_fd)
+                os.close(inherited_cwd_fd)
+
+            preexec_fn = _set_descriptor_cwd
+            pass_fds = (inherited_cwd_fd,)
+        try:
+            proc = ptyprocess.PtyProcess.spawn(  # type: ignore[union-attr]
+                list(argv),
+                cwd=cwd,
+                env=spawn_env,
+                dimensions=(rows, cols),
+                preexec_fn=preexec_fn,
+                pass_fds=pass_fds,
+            )
+        finally:
+            if cwd_fd is not None:
+                os.close(inherited_cwd_fd)
         return cls(proc)
 
     @property

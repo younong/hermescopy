@@ -15,7 +15,6 @@ import re
 import secrets
 import sys
 import threading
-import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -24,7 +23,7 @@ from urllib import parse as urllib_parse
 
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect
 
-from hermes_cli.config import get_hermes_home
+from hermes_cli.controlled_roots import ExpectedType, RootKind
 from hermes_cli.owner_runtime import resolve_workspace_cwd
 from hermes_cli.dashboard_auth.authority import AuthorityStore
 from hermes_cli.owner_worker.tokens import (
@@ -64,7 +63,7 @@ class OwnerWorkerLiveState:
         self.event_channels: dict[str, set[WebSocket]] = {}
         self.event_lock = asyncio.Lock()
         self.chat_argv_lock = asyncio.Lock()
-        self.pty_active_session_files: dict[str, Path] = {}
+        self.pty_active_session_files: dict[str, tuple[str, str]] = {}
         self.pty_browser_sessions: dict[str, dict[str, Any]] = {}
         self.pty_browser_lock = asyncio.Lock()
         # Bound by create_app after the exact worker lease is available.  The
@@ -204,7 +203,7 @@ def _get_pty_browser_state(app: Any) -> tuple[dict[str, dict[str, Any]], asyncio
     return state.pty_browser_sessions, state.pty_browser_lock
 
 
-def _get_pty_active_session_files(app: Any) -> dict[str, Path]:
+def _get_pty_active_session_files(app: Any) -> dict[str, tuple[str, str]]:
     return _live_state(app).pty_active_session_files
 
 
@@ -261,34 +260,69 @@ def _channel_or_none(ws: WebSocket) -> Optional[str]:
     return channel if _VALID_CHANNEL_RE.match(channel) else None
 
 
-def _active_session_file_for_channel(app: Any, channel: str) -> Path:
+def _active_session_file_for_channel(app: Any, channel: str) -> str:
+    """Create one owner-local active-session record under the temporary root.
+
+    The TUI requires a path-valued environment variable, so this returns a
+    descriptor-derived diagnostic location only after the controlled root has
+    created the file.  It is never accepted back as filesystem authority.
+    """
     files = _get_pty_active_session_files(app)
     existing = files.get(channel)
     if existing is not None:
-        return existing
+        return existing[1]
 
-    base = get_hermes_home() / "runtime" / "pty-active-sessions"
-    base.mkdir(parents=True, exist_ok=True)
-    fd, raw_path = tempfile.mkstemp(prefix="hermes-pty-active-", suffix=".json", dir=str(base))
-    os.close(fd)
-    path = Path(raw_path)
-    files[channel] = path
+    roots = getattr(getattr(app, "state", None), "owner_worker_controlled_roots", None)
+    if roots is None:
+        raise RuntimeError("authenticated owner worker requires controlled roots")
+    relative_path = f"pty-active-sessions/{secrets.token_hex(16)}.json"
+    roots.replace_bytes(RootKind.TEMPORARY, relative_path, b"{}", overwrite=False)
+    # This is strictly child-process diagnostics. Subsequent owner-worker
+    # operations recover the capability-relative name from app state, never by
+    # parsing this pathname as an authorization input.
+    path = str(roots.get(RootKind.TEMPORARY).canonical_path / relative_path)
+    files[channel] = (relative_path, path)
     return path
 
 
-def _read_active_session_file(path: Path) -> Optional[str]:
+def _active_session_relative_path(app: Any, path: str) -> str:
+    files = _get_pty_active_session_files(app)
+    for relative_path, diagnostic_path in files.values():
+        if diagnostic_path == path:
+            return relative_path
+    raise RuntimeError("active session record is not owned by this worker")
+
+
+def _read_active_session_file(app: Any, path: str) -> Optional[str]:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        roots = getattr(getattr(app, "state", None), "owner_worker_controlled_roots", None)
+        if roots is None:
+            raise RuntimeError("authenticated owner worker requires controlled roots")
+        fd = roots.open_relative(
+            RootKind.TEMPORARY,
+            _active_session_relative_path(app, path),
+            expected_type=ExpectedType.REGULAR_FILE,
+        )
+        try:
+            chunks: list[bytes] = []
+            while chunk := os.read(fd, 64 * 1024):
+                chunks.append(chunk)
+        finally:
+            os.close(fd)
+        data = json.loads(b"".join(chunks).decode("utf-8"))
+    except (OSError, RuntimeError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     session_id = str(data.get("session_id") or "").strip()
     return session_id or None
 
 
-def _forget_active_session_file(path: Path) -> None:
+def _forget_active_session_file(app: Any, path: str) -> None:
     try:
-        path.unlink(missing_ok=True)
-    except OSError:
+        roots = getattr(getattr(app, "state", None), "owner_worker_controlled_roots", None)
+        if roots is None:
+            raise RuntimeError("authenticated owner worker requires controlled roots")
+        roots.remove(RootKind.TEMPORARY, _active_session_relative_path(app, path))
+    except (OSError, RuntimeError):
         pass
 
 
@@ -432,12 +466,36 @@ def _resolve_chat_argv(
     env.setdefault("HERMES_TUI_INLINE", "1")
     env["HERMES_TUI_DASHBOARD"] = "1"
 
-    try:
-        cwd_path = resolve_workspace_cwd(None, create_default=True)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    env["HERMES_CWD"] = str(cwd_path)
-    env["TERMINAL_CWD"] = str(cwd_path)
+    state = getattr(app_obj, "state", None)
+    roots = getattr(state, "owner_worker_controlled_roots", None)
+    if roots is None:
+        # Direct unit construction retains the legacy resolver only outside an
+        # authenticated worker. Production owner workers always have the root.
+        try:
+            cwd_path = resolve_workspace_cwd(None, create_default=True)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        try:
+            cwd_fd = roots.open_relative(
+                RootKind.WORKSPACE,
+                "default",
+                expected_type=ExpectedType.DIRECTORY,
+            )
+            try:
+                cwd_path = Path(os.readlink(f"/proc/self/fd/{cwd_fd}"))
+            finally:
+                os.close(cwd_fd)
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(status_code=400, detail="default owner workspace is unavailable") from exc
+    if roots is None:
+        env["HERMES_CWD"] = str(cwd_path)
+        env["TERMINAL_CWD"] = str(cwd_path)
+    else:
+        # The authenticated child gets its cwd from the directory descriptor;
+        # never let a display/environment path become an alternate authority.
+        env.pop("HERMES_CWD", None)
+        env.pop("TERMINAL_CWD", None)
 
     if resume:
         resume = _latest_descendant(resume) or resume
@@ -492,7 +550,7 @@ async def pty_ws(ws: WebSocket) -> None:
     channel = _channel_or_none(ws)
     sidecar_url = _build_sidecar_url(ws.app, channel) if channel else None
     force_fresh = (ws.query_params.get("fresh") or "").strip().lower() in {"1", "true", "yes", "on"}
-    active_session_file: Optional[Path] = None
+    active_session_file: Optional[str] = None
 
     if browser_id:
         current_channel = channel or ""
@@ -505,15 +563,15 @@ async def pty_ws(ws: WebSocket) -> None:
         active_session_file = _active_session_file_for_channel(ws.app, channel)
         if force_fresh:
             resume = None
-            _forget_active_session_file(active_session_file)
+            _forget_active_session_file(ws.app, active_session_file)
         elif not resume:
-            resume = _read_active_session_file(active_session_file)
+            resume = _read_active_session_file(ws.app, active_session_file)
 
     try:
         argv, cwd, env = await _resolve_chat_argv_async(
             resume=resume,
             sidecar_url=sidecar_url,
-            active_session_file=str(active_session_file) if active_session_file is not None else None,
+            active_session_file=active_session_file,
             browser_id=browser_id,
             app_obj=ws.app,
         )
@@ -536,20 +594,33 @@ async def pty_ws(ws: WebSocket) -> None:
         await ws.close(code=4409, reason=_ws_close_reason("chat connection replaced before spawn"))
         return
 
+    cwd_fd: int | None = None
     try:
-        bridge = await asyncio.to_thread(PtyBridge.spawn, argv, cwd=cwd, env=env)  # type: ignore[union-attr]
+        roots = getattr(ws.app.state, "owner_worker_controlled_roots", None)
+        if roots is not None:
+            cwd_fd = roots.open_relative(
+                RootKind.WORKSPACE,
+                "default",
+                expected_type=ExpectedType.DIRECTORY,
+            )
+            bridge = await asyncio.to_thread(PtyBridge.spawn, argv, cwd_fd=cwd_fd, env=env)  # type: ignore[union-attr]
+        else:
+            bridge = await asyncio.to_thread(PtyBridge.spawn, argv, cwd=cwd, env=env)  # type: ignore[union-attr]
     except PtyUnavailableError as exc:
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
         if browser_registered and browser_id:
             await _release_browser_pty_owner(ws.app, browser_id=browser_id, owner_id=browser_owner_id, metadata=metadata)
         await ws.close(code=1011)
         return
-    except (FileNotFoundError, OSError) as exc:
-        await ws.send_text(f"\r\n\x1b[31mChat failed to start: {exc}\x1b[0m\r\n")
+    except (FileNotFoundError, OSError, RuntimeError) as exc:
+        await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
         if browser_registered and browser_id:
             await _release_browser_pty_owner(ws.app, browser_id=browser_id, owner_id=browser_owner_id, metadata=metadata)
         await ws.close(code=1011)
         return
+    finally:
+        if cwd_fd is not None:
+            os.close(cwd_fd)
 
     if browser_registered and browser_id:
         attached = await _attach_browser_pty_bridge(
