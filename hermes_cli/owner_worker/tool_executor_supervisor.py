@@ -7,18 +7,35 @@ import signal
 import stat
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
+from types import MappingProxyType
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
 from hermes_cli.controlled_roots import ExpectedType, RootKind
 from hermes_cli.owner_worker.credential_broker import CredentialBroker
-from hermes_cli.owner_worker.executor_identity import ExecutorIdentity, ExecutorInvocation
+from hermes_cli.owner_worker.executor_identity import (
+    EgressProfile,
+    ExecutorIdentity,
+    ExecutorIdentityInvalid,
+    ExecutorInvocation,
+    parse_egress_profile,
+)
 from hermes_cli.owner_worker.tool_executor_sandbox import (
     BubblewrapLaunchSpec,
     SandboxLaunchBinding,
+    SandboxMountPolicy,
+    SandboxSecurityPolicy,
+    SandboxSyscallFilter,
+    SandboxVerificationInvalid,
+    validate_sandbox_syscall_filter,
+    SandboxVerificationPolicy,
+    SandboxVerificationRecord,
+    default_readonly_global_mount_roots,
     build_bubblewrap_launch_spec,
+    validate_sandbox_verification_record,
 )
 from hermes_cli.tool_executor_runtime.env import build_executor_environment
 
@@ -38,6 +55,26 @@ class _LiveInvocation:
     invocation_id: str
     process: Any
     sandbox_binding: SandboxLaunchBinding | None = None
+    verification_record: SandboxVerificationRecord | None = None
+
+
+@dataclass(frozen=True)
+class ExecutorEgressPolicy:
+    """Owner-side tool-name selection with no child-controlled inputs."""
+
+    by_tool_name: Mapping[str, EgressProfile | str] = MappingProxyType({})
+    default: EgressProfile = EgressProfile.TOOL_NONE
+
+    def __post_init__(self) -> None:
+        selected = {str(name): parse_egress_profile(profile) for name, profile in dict(self.by_tool_name).items()}
+        if any(not name or "\x00" in name for name in selected):
+            raise ExecutorIdentityInvalid("executor egress tool mapping is invalid")
+        object.__setattr__(self, "by_tool_name", MappingProxyType(selected))
+        object.__setattr__(self, "default", parse_egress_profile(self.default))
+
+    def select(self, function_name: str) -> EgressProfile:
+        profile = self.by_tool_name.get(str(function_name), self.default)
+        return parse_egress_profile(profile, executor_admissible=True)
 
 
 class ToolExecutorSupervisor:
@@ -57,7 +94,14 @@ class ToolExecutorSupervisor:
         credential_broker: CredentialBroker | None = None,
         sandbox_builder: Callable[..., BubblewrapLaunchSpec] = build_bubblewrap_launch_spec,
         control_home: str | Path | None = None,
-        runtime_dependency_roots: tuple[str | Path, ...] | None = None,
+        readonly_global_mount_roots: tuple[str | Path, ...] | None = None,
+        root_tmpfs_bytes: int = 64 << 20,
+        executor_tmpfs_bytes: int = 32 << 20,
+        sandbox_verification_source: Callable[[SandboxLaunchBinding, SandboxMountPolicy, ExecutorInvocation], SandboxVerificationRecord | None] | None = None,
+        sandbox_verification_policy: SandboxVerificationPolicy | None = None,
+        sandbox_syscall_filter_source: Callable[[SandboxLaunchBinding, SandboxSecurityPolicy], SandboxSyscallFilter | None] | None = None,
+        egress_policy: ExecutorEgressPolicy | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self.owner_home = Path(owner_home).resolve()
         self.workspace_context = workspace_context
@@ -66,7 +110,16 @@ class ToolExecutorSupervisor:
         self.credential_broker = credential_broker or CredentialBroker()
         self.sandbox_builder = sandbox_builder
         self.control_home = Path(control_home).resolve() if control_home else None
-        self.runtime_dependency_roots = runtime_dependency_roots
+        self.readonly_global_mount_roots = readonly_global_mount_roots or default_readonly_global_mount_roots()
+        self.root_tmpfs_bytes = root_tmpfs_bytes
+        self.executor_tmpfs_bytes = executor_tmpfs_bytes
+        self.sandbox_verification_source = sandbox_verification_source
+        self.sandbox_verification_policy = sandbox_verification_policy
+        self.sandbox_syscall_filter_source = sandbox_syscall_filter_source
+        self.egress_policy = egress_policy or ExecutorEgressPolicy()
+        if not isinstance(self.egress_policy, ExecutorEgressPolicy):
+            raise ExecutorIdentityInvalid("executor egress policy is invalid")
+        self._clock = clock
         self._lock = threading.RLock()
         self._identities: dict[tuple[str, str], ExecutorIdentity] = {}
         self._live: dict[tuple[tuple, str], _LiveInvocation] = {}
@@ -100,8 +153,8 @@ class ToolExecutorSupervisor:
         tool_call_id: str,
         turn_id: str,
         api_request_id: str,
-        egress_profile: str = "tool-none",
     ) -> str:
+        egress_profile = self.egress_policy.select(function_name)
         identity = self.identity_for(task_id=task_id, session_id=session_id)
         invocation = ExecutorInvocation(
             identity=identity,
@@ -143,6 +196,52 @@ class ToolExecutorSupervisor:
             runtime_home=runtime_home,
         )
 
+    def _sandbox_mount_policy(self, binding: SandboxLaunchBinding) -> SandboxMountPolicy:
+        return SandboxMountPolicy(
+            binding=binding,
+            readonly_global_roots=tuple(self.readonly_global_mount_roots),
+            workspace_root=self.workspace_context.roots.get(RootKind.WORKSPACE).canonical_path,
+            control_home=self.control_home,
+            root_tmpfs_bytes=self.root_tmpfs_bytes,
+            executor_tmpfs_bytes=self.executor_tmpfs_bytes,
+        )
+
+    def _require_verified_sandbox(
+        self,
+        binding: SandboxLaunchBinding,
+        mount_policy: SandboxMountPolicy,
+        invocation: ExecutorInvocation,
+    ) -> SandboxVerificationRecord:
+        if self.sandbox_verification_source is None or self.sandbox_verification_policy is None:
+            raise SandboxVerificationInvalid("trusted sandbox verification is required")
+        try:
+            record = self.sandbox_verification_source(binding, mount_policy, invocation)
+        except SandboxVerificationInvalid:
+            raise
+        except Exception as exc:
+            raise SandboxVerificationInvalid("trusted sandbox verification is unavailable") from exc
+        return validate_sandbox_verification_record(
+            record,
+            binding=binding,
+            mount_policy=mount_policy,
+            egress_profile=invocation.egress_profile,
+            policy=self.sandbox_verification_policy,
+            now=int(self._clock()),
+        )
+
+    def _require_syscall_filter(self, binding: SandboxLaunchBinding) -> SandboxSyscallFilter:
+        if self.sandbox_verification_policy is None or self.sandbox_syscall_filter_source is None:
+            raise SandboxVerificationInvalid("trusted sandbox syscall filter is required")
+        try:
+            syscall_filter = self.sandbox_syscall_filter_source(binding, self.sandbox_verification_policy.security_policy)
+            return validate_sandbox_syscall_filter(
+                syscall_filter, policy=self.sandbox_verification_policy.security_policy
+            )
+        except SandboxVerificationInvalid:
+            raise
+        except Exception as exc:
+            raise SandboxVerificationInvalid("trusted sandbox syscall filter is unavailable") from exc
+
     def _workspace_fd(self) -> int:
         try:
             return self.workspace_context.roots.open_relative(
@@ -160,13 +259,27 @@ class ToolExecutorSupervisor:
     def _dispatch_invocation(self, invocation: ExecutorInvocation) -> str:
         identity = invocation.identity
         binding = self._sandbox_binding(identity)
+        mount_policy = self._sandbox_mount_policy(binding)
+        verification_record = self._require_verified_sandbox(binding, mount_policy, invocation)
+        syscall_filter = self._require_syscall_filter(binding)
+        try:
+            inherited_security_fd = os.dup(syscall_filter.fd)
+            os.set_inheritable(inherited_security_fd, True)
+            os.close(syscall_filter.fd)
+            syscall_filter = SandboxSyscallFilter(
+                inherited_security_fd, syscall_filter.syscall_policy_id, syscall_filter.syscall_policy_digest
+            )
+        except OSError as exc:
+            if inherited_security_fd >= 0:
+                try:
+                    os.close(inherited_security_fd)
+                except OSError:
+                    pass
+            raise SandboxVerificationInvalid("sandbox syscall filter descriptor is unavailable") from exc
         runtime_home = binding.runtime_home
-        tmp_dir = runtime_home / "tmp"
         runtime_home.mkdir(parents=True, exist_ok=True)
-        tmp_dir.mkdir(mode=0o700, exist_ok=True)
         if os.name != "nt":
             runtime_home.chmod(stat.S_IRWXU)
-            tmp_dir.chmod(stat.S_IRWXU)
 
         workspace_fd = inherited_workspace_fd = request_read = request_write = response_read = response_write = -1
         process: Any | None = None
@@ -182,7 +295,6 @@ class ToolExecutorSupervisor:
             environment = build_executor_environment(
                 identity,
                 runtime_home=runtime_home,
-                tmp_dir=tmp_dir,
                 workspace_fd=inherited_workspace_fd,
                 bootstrap_fd=request_read,
                 response_fd=response_write,
@@ -191,12 +303,14 @@ class ToolExecutorSupervisor:
             spec = self.sandbox_builder(
                 environment=environment,
                 workspace_fd=inherited_workspace_fd,
-                runtime_home=runtime_home,
-                owner_home=self.owner_home,
-                workspace_root=self.workspace_context.roots.get(RootKind.WORKSPACE).canonical_path,
                 binding=binding,
-                control_home=self.control_home,
-                runtime_dependency_roots=self.runtime_dependency_roots,
+                mount_policy=mount_policy,
+                security_policy=self.sandbox_verification_policy.security_policy,
+                syscall_filter=SandboxSyscallFilter(
+                    inherited_security_fd,
+                    syscall_filter.syscall_policy_id,
+                    syscall_filter.syscall_policy_digest,
+                ),
             )
             with self._lock:
                 if identity.stable_key in self._revoked:
@@ -208,10 +322,14 @@ class ToolExecutorSupervisor:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     close_fds=True,
-                    pass_fds=(inherited_workspace_fd, request_read, response_write),
+                    pass_fds=tuple(dict.fromkeys((
+                        inherited_workspace_fd, request_read, response_write, inherited_security_fd, *spec.inherited_security_fds,
+                    ))),
                     start_new_session=True,
                 )
-                self._live[live_key] = _LiveInvocation(identity, invocation.invocation_id, process, binding)
+                self._live[live_key] = _LiveInvocation(
+                    identity, invocation.invocation_id, process, binding, verification_record
+                )
             os.close(request_read)
             os.close(response_write)
             request_read = response_write = -1
@@ -237,7 +355,7 @@ class ToolExecutorSupervisor:
                     self._terminate(process)
                 with self._lock:
                     self._live.pop(live_key, None)
-            for fd in (workspace_fd, inherited_workspace_fd, request_read, request_write, response_read, response_write):
+            for fd in (workspace_fd, inherited_workspace_fd, request_read, request_write, response_read, response_write, inherited_security_fd):
                 if isinstance(fd, int) and fd >= 0:
                     try:
                         os.close(fd)

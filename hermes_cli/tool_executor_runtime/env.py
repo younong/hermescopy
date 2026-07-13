@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 from typing import Mapping
 
-from hermes_cli.owner_worker.executor_identity import ExecutorIdentity
+from hermes_cli.owner_worker.executor_identity import ExecutorIdentity, ExecutorIdentityInvalid, parse_egress_profile
 
 
 EXECUTOR_RUNTIME_FLAG = "HERMES_EXECUTOR_RUNTIME"
@@ -101,8 +101,10 @@ def validate_executor_environment(environment: Mapping[str, str]) -> None:
         value = str(environment.get(key, "") or "").strip()
         if not value or (expected is not None and value != expected):
             raise ExecutorEnvironmentInvalid(f"executor environment is missing {key}")
-    if not str(environment[EXECUTOR_EGRESS_PROFILE]).strip():
-        raise ExecutorEnvironmentInvalid("executor egress profile is required")
+    try:
+        parse_egress_profile(environment[EXECUTOR_EGRESS_PROFILE], executor_admissible=True)
+    except ExecutorIdentityInvalid as exc:
+        raise ExecutorEnvironmentInvalid("executor egress profile is invalid") from exc
     _validate_descriptor_numbers(environment)
 
 
@@ -110,7 +112,6 @@ def build_executor_environment(
     identity: ExecutorIdentity,
     *,
     runtime_home: str | Path,
-    tmp_dir: str | Path,
     workspace_fd: int,
     bootstrap_fd: int,
     response_fd: int,
@@ -119,10 +120,11 @@ def build_executor_environment(
     locale: str = "C.UTF-8",
 ) -> dict[str, str]:
     """Create the complete allowlisted environment for one executor child."""
-    home = Path(runtime_home).resolve()
-    _absolute_under(tmp_dir, home, field="executor tmp")
-    if not str(egress_profile or "").strip():
-        raise ExecutorEnvironmentInvalid("egress profile is required")
+    Path(runtime_home).resolve()
+    try:
+        egress_profile = parse_egress_profile(egress_profile, executor_admissible=True).value
+    except ExecutorIdentityInvalid as exc:
+        raise ExecutorEnvironmentInvalid("egress profile is invalid") from exc
     result = {
         "HOME": SANDBOX_EXECUTOR_HOME,
         "TMPDIR": SANDBOX_EXECUTOR_TMP,

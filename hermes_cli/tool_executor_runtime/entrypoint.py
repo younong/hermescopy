@@ -16,6 +16,7 @@ from hermes_cli.owner_worker.executor_identity import (
     ExecutorIdentityInvalid,
     ExecutorInvocation,
     install_executor_identity,
+    parse_egress_profile,
     reset_executor_identity,
 )
 from hermes_cli.tool_executor_runtime.env import (
@@ -62,7 +63,13 @@ def _admit_workspace_mount(workspace_fd: int) -> None:
 
 
 def _require_matching_egress_profile(invocation: ExecutorInvocation, environment: dict[str, str]) -> None:
-    if invocation.egress_profile != environment[EXECUTOR_EGRESS_PROFILE]:
+    try:
+        environment_profile = parse_egress_profile(
+            environment[EXECUTOR_EGRESS_PROFILE], executor_admissible=True
+        )
+    except ExecutorIdentityInvalid as exc:
+        raise ExecutorRuntimeInvalid("executor egress profile is invalid") from exc
+    if invocation.egress_profile != environment_profile:
         raise ExecutorRuntimeInvalid("executor egress profile does not match bootstrap")
 
 
@@ -77,7 +84,7 @@ def invocation_from_payload(payload: dict[str, Any]) -> ExecutorInvocation:
             turn_id=payload["turn_id"],
             api_request_id=payload["api_request_id"],
             invocation_id=payload["invocation_id"],
-            egress_profile=payload.get("egress_profile", "tool-none"),
+            egress_profile=payload["egress_profile"],
         )
     except (KeyError, ExecutorIdentityInvalid) as exc:
         raise ExecutorRuntimeInvalid("executor invocation is invalid") from exc

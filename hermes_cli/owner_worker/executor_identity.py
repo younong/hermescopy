@@ -10,6 +10,7 @@ import contextvars
 import hashlib
 import secrets
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Mapping
 
 from hermes_cli.dashboard_auth.authority import OwnerWorkerAuthorityLease, WorkerLeaseState
@@ -17,6 +18,39 @@ from hermes_cli.dashboard_auth.authority import OwnerWorkerAuthorityLease, Worke
 
 class ExecutorIdentityInvalid(ValueError):
     """Executor identity or invocation metadata was incomplete or unsafe."""
+
+
+class EgressProfile(str, Enum):
+    """Closed profile vocabulary selected by the trusted owner-side policy."""
+
+    CONTROL_ONLY = "control-only"
+    OWNER_PUBLIC = "owner-public"
+    TOOL_NONE = "tool-none"
+    TOOL_PUBLIC = "tool-public"
+    PROTECTED_TARGET = "protected-target"
+
+
+_EXECUTOR_EGRESS_PROFILES = frozenset({
+    EgressProfile.TOOL_NONE,
+    EgressProfile.TOOL_PUBLIC,
+    EgressProfile.PROTECTED_TARGET,
+})
+
+
+def parse_egress_profile(value: object, *, executor_admissible: bool = False) -> EgressProfile:
+    """Parse an exact profile name and optionally require executor admission."""
+    if isinstance(value, EgressProfile):
+        profile = value
+    elif isinstance(value, str):
+        try:
+            profile = EgressProfile(value)
+        except ValueError as exc:
+            raise ExecutorIdentityInvalid("executor egress profile is invalid") from exc
+    else:
+        raise ExecutorIdentityInvalid("executor egress profile is invalid")
+    if executor_admissible and profile not in _EXECUTOR_EGRESS_PROFILES:
+        raise ExecutorIdentityInvalid("executor egress profile is not allowed")
+    return profile
 
 
 def _required(value: str, field: str) -> str:
@@ -169,7 +203,7 @@ class ExecutorInvocation:
     turn_id: str
     api_request_id: str
     invocation_id: str
-    egress_profile: str = "tool-none"
+    egress_profile: EgressProfile | str = EgressProfile.TOOL_NONE
 
     def __post_init__(self) -> None:
         _required(self.tool_name, "tool_name")
@@ -177,7 +211,7 @@ class ExecutorInvocation:
         _required(self.turn_id, "turn_id")
         _required(self.api_request_id, "api_request_id")
         _required(self.invocation_id, "invocation_id")
-        _required(self.egress_profile, "egress_profile")
+        object.__setattr__(self, "egress_profile", parse_egress_profile(self.egress_profile, executor_admissible=True))
         if not isinstance(self.arguments, Mapping):
             raise ExecutorIdentityInvalid("arguments must be a mapping")
 
@@ -190,7 +224,7 @@ class ExecutorInvocation:
             "turn_id": self.turn_id,
             "api_request_id": self.api_request_id,
             "invocation_id": self.invocation_id,
-            "egress_profile": self.egress_profile,
+            "egress_profile": self.egress_profile.value,
         }
 
 
