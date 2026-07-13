@@ -4,6 +4,9 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
+from typing import Callable
+
+from hermes_cli.dashboard_auth.audit import AuthorityAuditEvent, AuthorityAuditReason
 
 from .executor_identity import ExecutorIdentity
 from .executor_tokens import ExecutorCapabilityClaims, ExecutorCapabilityInvalid
@@ -26,8 +29,14 @@ class CredentialBroker:
     registry that maps a random capability to its trusted identity.
     """
 
-    def __init__(self, *, clock=time.time) -> None:
+    def __init__(
+        self,
+        *,
+        clock=time.time,
+        audit_reporter: Callable[[AuthorityAuditEvent, AuthorityAuditReason, ExecutorIdentity], None] | None = None,
+    ) -> None:
         self._clock = clock
+        self._audit_reporter = audit_reporter
         self._lock = threading.RLock()
         self._grants: dict[str, ExecutorCapabilityClaims] = {}
         self._revoked_executor_keys: set[tuple] = set()
@@ -36,6 +45,15 @@ class CredentialBroker:
     @staticmethod
     def _worker_generation_key(identity: ExecutorIdentity) -> tuple[str, str, int]:
         return (identity.owner_key, identity.worker_id, identity.worker_generation)
+
+    def _report(self, event: AuthorityAuditEvent, reason: AuthorityAuditReason, identity: ExecutorIdentity) -> None:
+        if self._audit_reporter is None:
+            return
+        try:
+            self._audit_reporter(event, reason, identity)
+        except Exception:
+            # Audit delivery must never change capability enforcement.
+            pass
 
     def _is_revoked_locked(self, identity: ExecutorIdentity) -> bool:
         return (
@@ -57,6 +75,11 @@ class CredentialBroker:
         with self._lock:
             self._cleanup_locked(current)
             if self._is_revoked_locked(identity):
+                self._report(
+                    AuthorityAuditEvent.CREDENTIAL_LIFECYCLE,
+                    AuthorityAuditReason.CREDENTIAL_REJECTED,
+                    identity,
+                )
                 raise ExecutorCapabilityInvalid("executor_capability_revoked")
             claims = ExecutorCapabilityClaims.issue(
                 identity,
@@ -84,14 +107,27 @@ class CredentialBroker:
             self._cleanup_locked(current)
             claims = self._grants.get(str(capability or ""))
             if claims is None or self._is_revoked_locked(claims.identity):
+                self._report(
+                    AuthorityAuditEvent.CREDENTIAL_LIFECYCLE,
+                    AuthorityAuditReason.CREDENTIAL_REJECTED,
+                    identity,
+                )
                 raise ExecutorCapabilityInvalid("executor_capability_revoked_or_unknown")
-            claims.validate(
-                identity,
-                audience=audience,
-                operation=operation,
-                scope=scope,
-                now=current,
-            )
+            try:
+                claims.validate(
+                    identity,
+                    audience=audience,
+                    operation=operation,
+                    scope=scope,
+                    now=current,
+                )
+            except ExecutorCapabilityInvalid:
+                self._report(
+                    AuthorityAuditEvent.CREDENTIAL_LIFECYCLE,
+                    AuthorityAuditReason.CREDENTIAL_REJECTED,
+                    identity,
+                )
+                raise
             return claims
 
     def revoke(self, capability: str) -> bool:
@@ -102,7 +138,13 @@ class CredentialBroker:
         """Immediately invalidate all grants for this exact executor generation."""
         with self._lock:
             self._revoked_executor_keys.add(identity.stable_key)
-            return self._revoke_matching_locked(lambda claims: claims.identity == identity)
+            revoked = self._revoke_matching_locked(lambda claims: claims.identity == identity)
+        self._report(
+            AuthorityAuditEvent.CREDENTIAL_LIFECYCLE,
+            AuthorityAuditReason.CREDENTIAL_REVOKED_EXECUTOR,
+            identity,
+        )
+        return revoked
 
     def revoke_worker_generation(
         self,
@@ -124,7 +166,15 @@ class CredentialBroker:
             def matches(claims: ExecutorCapabilityClaims) -> bool:
                 return self._worker_generation_key(claims.identity) == generation_key
 
-            return self._revoke_matching_locked(matches)
+            identities = tuple({claims.identity for claims in self._grants.values() if matches(claims)})
+            revoked = self._revoke_matching_locked(matches)
+        for identity in identities:
+            self._report(
+                AuthorityAuditEvent.CREDENTIAL_LIFECYCLE,
+                AuthorityAuditReason.CREDENTIAL_REVOKED_GENERATION,
+                identity,
+            )
+        return revoked
 
     def cleanup(self, *, now: int | None = None) -> int:
         with self._lock:

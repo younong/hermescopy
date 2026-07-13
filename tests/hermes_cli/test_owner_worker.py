@@ -689,6 +689,110 @@ def test_supervisor_active_use_skips_idle_stop_until_released(tmp_path):
     assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state.value == "revoked"
 
 
+def test_supervisor_startup_throttle_is_per_owner(tmp_path):
+    owners = [_Owner("ok1_throttle_a", tmp_path / "a"), _Owner("ok1_throttle_b", tmp_path / "b")]
+    spawned = []
+
+    def fake_process_factory(*args, **kwargs):
+        spawned.append((args, kwargs))
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control", client_cls=_FakeClient, process_factory=fake_process_factory,
+        startup_timeout=0.1, startup_cooldown=3600,
+    )
+    first = supervisor.get_or_start(owners[0])
+    supervisor._terminate_handle(owners[0].owner_key, first)
+    with pytest.raises(RuntimeError, match="startup throttled"):
+        supervisor.get_or_start(owners[0])
+    second = supervisor.get_or_start(owners[1])
+
+    assert second.owner_key == owners[1].owner_key
+    assert len(spawned) == 2
+
+
+def test_supervisor_owner_concurrency_cap_is_exact_handle_scoped(tmp_path):
+    owners = [_Owner("ok1_concurrent_a", tmp_path / "a"), _Owner("ok1_concurrent_b", tmp_path / "b")]
+
+    def fake_process_factory(*args, **kwargs):
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control", client_cls=_FakeClient, process_factory=fake_process_factory,
+        startup_timeout=0.1, startup_cooldown=0, max_owner_concurrency=1,
+    )
+    first = supervisor.get_or_start(owners[0])
+    second = supervisor.get_or_start(owners[1])
+    lease = supervisor.acquire_use(first)
+
+    with pytest.raises(RuntimeError, match="concurrency limit"):
+        supervisor.acquire_use(first)
+    assert first.active_uses == 1
+    other_lease = supervisor.acquire_use(second)
+    assert second.active_uses == 1
+
+    other_lease.release()
+    assert first.active_uses == 1
+    lease.release()
+    assert first.active_uses == 0
+
+
+def test_supervisor_capacity_evicts_recent_idle_lru_and_cold_starts_new_owner(tmp_path):
+    owners = [_Owner("ok1_capacity_a", tmp_path / "a"), _Owner("ok1_capacity_b", tmp_path / "b")]
+    spawned = []
+
+    def fake_process_factory(*args, **kwargs):
+        spawned.append((args, kwargs))
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess(pid=4000 + len(spawned))
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control", client_cls=_FakeClient, process_factory=fake_process_factory,
+        startup_timeout=0.1, startup_cooldown=0, idle_timeout=3600, max_workers=1,
+    )
+    first = supervisor.get_or_start(owners[0])
+    first.last_used_at = time.time()
+    second = supervisor.get_or_start(owners[1])
+
+    assert first.process.terminated
+    assert second.owner_key == owners[1].owner_key
+    assert second.owner_home == owners[1].owner_home.resolve()
+    assert second.socket_path != first.socket_path
+    assert len(spawned) == 2
+    assert owners[0].owner_key not in supervisor._handles
+    assert supervisor._handles[owners[1].owner_key] is second
+
+
+def test_supervisor_capacity_with_only_active_workers_fails_closed_before_spawn(tmp_path):
+    owners = [_Owner("ok1_capacity_active", tmp_path / "a"), _Owner("ok1_capacity_blocked", tmp_path / "b")]
+    spawned = []
+
+    def fake_process_factory(*args, **kwargs):
+        spawned.append((args, kwargs))
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control", client_cls=_FakeClient, process_factory=fake_process_factory,
+        startup_timeout=0.1, startup_cooldown=0, max_workers=1,
+    )
+    active = supervisor.get_or_start(owners[0])
+    lease = supervisor.acquire_use(active)
+    try:
+        with pytest.raises(RuntimeError, match="limit reached"):
+            supervisor.get_or_start(owners[1])
+    finally:
+        lease.release()
+    assert len(spawned) == 1
+    assert owners[1].owner_key not in supervisor._handles
+
+
 def test_supervisor_evicts_only_idle_workers(tmp_path):
     owners = [_Owner("ok1_active", tmp_path / "active"), _Owner("ok1_idle", tmp_path / "idle")]
 
@@ -1546,19 +1650,29 @@ def test_worker_active_session_records_are_descriptor_scoped_to_its_owner(tmp_pa
 
     try:
         active_path = ws_routes._active_session_file_for_channel(app_a, "browser-a")
+        active_path_b = ws_routes._active_session_file_for_channel(app_b, "browser-a")
         assert Path(active_path).is_file()
+        assert Path(active_path_b).is_file()
         roots_a.replace_bytes(
             RootKind.TEMPORARY,
             ws_routes._active_session_relative_path(app_a, active_path),
             b'{"session_id":"owner-a-session"}',
         )
+        roots_b.replace_bytes(
+            RootKind.TEMPORARY,
+            ws_routes._active_session_relative_path(app_b, active_path_b),
+            b'{"session_id":"owner-b-session"}',
+        )
         assert ws_routes._read_active_session_file(app_a, active_path) == "owner-a-session"
         assert ws_routes._read_active_session_file(app_b, active_path) is None
+        assert ws_routes._read_active_session_file(app_b, active_path_b) == "owner-b-session"
         with pytest.raises(RuntimeError, match="not owned"):
             ws_routes._active_session_relative_path(app_a, "/tmp/untrusted-session.json")
 
         ws_routes._forget_active_session_file(app_a, active_path)
         assert not Path(active_path).exists()
+        assert Path(active_path_b).is_file()
+        assert ws_routes._read_active_session_file(app_b, active_path_b) == "owner-b-session"
     finally:
         roots_a.close()
         roots_b.close()

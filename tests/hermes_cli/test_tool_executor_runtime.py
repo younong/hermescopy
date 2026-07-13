@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from hermes_cli.dashboard_auth.authority import OwnerWorkerAuthorityLease, WorkerLeaseState
-from hermes_cli.owner_worker.executor_identity import EgressProfile, ExecutorIdentity, ExecutorIdentityInvalid, ExecutorInvocation, parse_egress_profile
+from hermes_cli.owner_worker.executor_identity import (
+    EgressProfile,
+    ExecutorIdentity,
+    ExecutorIdentityInvalid,
+    ExecutorInvocation,
+    ExecutorResourceDecision,
+    ExecutorResourceQuota,
+    parse_egress_profile,
+)
 from hermes_cli.tool_executor_runtime.entrypoint import (
     ExecutorRuntimeInvalid,
     _admit_workspace_mount,
@@ -146,6 +155,38 @@ def test_bootstrap_requires_explicit_canonical_egress_profile():
         payload["egress_profile"] = profile
         with pytest.raises(ExecutorRuntimeInvalid, match="invocation"):
             invocation_from_payload(payload)
+
+
+def test_executor_bootstrap_requires_matching_resource_decision():
+    invocation = ExecutorInvocation(_identity(), "read_file", {}, "call-a", "turn-a", "request-a", "invoke-a")
+    payload = invocation.to_payload()
+    assert invocation_from_payload(payload).resource_decision == invocation.resource_decision
+
+    missing = invocation.to_payload()
+    del missing["resource_decision"]
+    with pytest.raises(ExecutorRuntimeInvalid, match="invocation"):
+        invocation_from_payload(missing)
+
+    altered = invocation.to_payload()
+    altered["resource_decision"] = dict(altered["resource_decision"], policy_id="resource:" + "0" * 64)
+    with pytest.raises(ExecutorRuntimeInvalid, match="invocation"):
+        invocation_from_payload(altered)
+
+
+def test_resource_decision_rejects_foreign_identity_and_invalid_quota():
+    identity = _identity()
+    quota = ExecutorResourceQuota(**ExecutorInvocation(identity, "read_file", {}, "call-a", "turn-a", "request-a", "invoke-a").resource_decision.quota.to_payload())
+    foreign = ExecutorIdentity.for_task(
+        OwnerWorkerAuthorityLease("ok1_other", 3, "worker-3", WorkerLeaseState.ACTIVE, 2, 1),
+        workspace_prefix="default", task_id="task-a", session_id="session-a", executor_id="executor-a",
+    )
+    decision = ExecutorResourceDecision(identity, quota)
+    with pytest.raises(ExecutorIdentityInvalid, match="does not match"):
+        decision.require_identity(foreign)
+    with pytest.raises(ExecutorIdentityInvalid, match="policy id"):
+        replace(decision, policy_id="resource:" + "0" * 64)
+    with pytest.raises(ExecutorIdentityInvalid, match="output_bytes"):
+        ExecutorResourceQuota(**dict(quota.to_payload(), output_bytes=0))
 
 
 def test_workspace_descriptor_must_match_the_fixed_sandbox_mount(tmp_path, monkeypatch):

@@ -24,6 +24,12 @@ from urllib import parse as urllib_parse
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect
 
 from hermes_cli.controlled_roots import ExpectedType, RootKind
+from hermes_cli.dashboard_auth.audit import (
+    AuthorityAuditEvent,
+    AuthorityAuditReason,
+    audit_authority,
+    new_authority_correlation_id,
+)
 from hermes_cli.owner_runtime import resolve_workspace_cwd
 from hermes_cli.dashboard_auth.authority import AuthorityStore
 from hermes_cli.owner_worker.tokens import (
@@ -161,12 +167,33 @@ class _Owp1Peer:
         self._out_sequence += 1
 
 
+def _audit_bootstrap(reason: AuthorityAuditReason, lease: Any | None) -> None:
+    if lease is None:
+        return
+    try:
+        audit_authority(
+            (
+                AuthorityAuditEvent.CAPABILITY_ADMITTED
+                if reason is AuthorityAuditReason.ADMITTED
+                else AuthorityAuditEvent.CAPABILITY_REJECTED
+            ),
+            correlation_id=new_authority_correlation_id(),
+            reason=reason,
+            audience_class="none",
+            worker_generation=int(lease.worker_generation),
+            recovery_generation=int(lease.recovery_generation),
+        )
+    except Exception:
+        return
+
+
 async def _admit_bootstrap_or_close(ws: WebSocket) -> _Owp1Peer | None:
     """Consume one bootstrap and complete `owp1` hello/ack before route work."""
     token = ws.query_params.get("internal_owner_bootstrap", "")
     lease = getattr(ws.app.state, "owner_worker_lease", None)
     verifier = getattr(ws.app.state, "owner_worker_capability_verifier", {})
     if not token or lease is None:
+        _audit_bootstrap(AuthorityAuditReason.BOOTSTRAP_REJECTED, lease)
         await ws.close(code=4401, reason=_ws_close_reason("auth: internal_owner_invalid"))
         return False
     try:
@@ -183,8 +210,10 @@ async def _admit_bootstrap_or_close(ws: WebSocket) -> _Owp1Peer | None:
         hello = await asyncio.wait_for(ws.receive_text(), timeout=5)
         validate_owp1_control(hello, claims, message_type="hello")
         await ws.send_text(owp1_ack(claims))
+        _audit_bootstrap(AuthorityAuditReason.ADMITTED, lease)
         return _Owp1Peer(ws, claims)
     except (OwnerWorkerCapabilityInvalid, RuntimeError, TimeoutError):
+        _audit_bootstrap(AuthorityAuditReason.BOOTSTRAP_REJECTED, lease)
         await ws.close(code=4401, reason=_ws_close_reason("auth: internal_owner_invalid"))
         return None
 

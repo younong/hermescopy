@@ -439,6 +439,19 @@ def _owner_worker_query_string(raw_query: str) -> str:
 def _reject_authenticated_filesystem_api(request: Request) -> None:
     """Authenticated Control Plane must not serve host filesystem APIs."""
     if _authenticated_owner_request(request):
+        from hermes_cli.dashboard_auth.audit import (
+            AuthorityAuditEvent,
+            AuthorityAuditReason,
+            audit_authority,
+            new_authority_correlation_id,
+        )
+
+        audit_authority(
+            AuthorityAuditEvent.FILESYSTEM_DENIED,
+            correlation_id=new_authority_correlation_id(),
+            reason=AuthorityAuditReason.CONTROL_PLANE_FILESYSTEM_FORBIDDEN,
+            audience_class="none",
+        )
         raise HTTPException(
             status_code=403,
             detail="Filesystem APIs are not available in authenticated mode",
@@ -12286,10 +12299,9 @@ def _ws_auth_result(ws: "WebSocket") -> _WsAuthResult:
         # Lazy import — keeps this function importable in test harnesses
         # that don't bring in the dashboard_auth layer.
         from hermes_cli.dashboard_auth.audit import (
-            AuditEvent,
             AuthorityAuditEvent,
+            AuthorityAuditReason,
             audit_authority,
-            audit_log,
             new_authority_correlation_id,
         )
         from hermes_cli.dashboard_auth.middleware import (
@@ -12325,21 +12337,19 @@ def _ws_auth_result(ws: "WebSocket") -> _WsAuthResult:
                 payload = None
             if payload:
                 return _WsAuthResult(None, "internal_owner_token", payload)
-            audit_log(
-                AuditEvent.WS_TICKET_REJECTED,
-                reason="internal_owner_invalid",
-                ip=(ws.client.host if ws.client else ""),
-                path=ws.url.path,
+            audit_authority(
+                AuthorityAuditEvent.TICKET_REJECTED,
+                correlation_id=new_authority_correlation_id(),
+                reason=AuthorityAuditReason.INTERNAL_OWNER_INVALID,
             )
             return _WsAuthResult("internal_owner_invalid", "internal_owner_token")
 
         internal = ws.query_params.get("internal", "")
         if internal:
-            audit_log(
-                AuditEvent.WS_TICKET_REJECTED,
-                reason="internal credential unavailable in owner mode",
-                ip=(ws.client.host if ws.client else ""),
-                path=ws.url.path,
+            audit_authority(
+                AuthorityAuditEvent.TICKET_REJECTED,
+                correlation_id=new_authority_correlation_id(),
+                reason=AuthorityAuditReason.INTERNAL_OWNER_CONTEXT_REQUIRED,
             )
             return _WsAuthResult("internal_owner_context_required", "internal")
 
@@ -12365,7 +12375,7 @@ def _ws_auth_result(ws: "WebSocket") -> _WsAuthResult:
             audit_authority(
                 AuthorityAuditEvent.TICKET_ADMITTED,
                 correlation_id=authority_correlation_id,
-                reason="admitted",
+                reason=AuthorityAuditReason.ADMITTED,
                 epoch=int(payload["epoch"]),
             )
             return _WsAuthResult(
@@ -12378,7 +12388,7 @@ def _ws_auth_result(ws: "WebSocket") -> _WsAuthResult:
             audit_authority(
                 AuthorityAuditEvent.AVAILABILITY_FAILURE,
                 correlation_id=authority_correlation_id,
-                reason="session_authority_unavailable",
+                reason=AuthorityAuditReason.SESSION_AUTHORITY_UNAVAILABLE,
             )
             return _WsAuthResult("authority_unavailable", "ticket")
         except TicketInvalid as exc:
@@ -12388,7 +12398,11 @@ def _ws_auth_result(ws: "WebSocket") -> _WsAuthResult:
                 if reason in {"authority_unavailable", "replay_continuity_unavailable"}
                 else AuthorityAuditEvent.TICKET_REJECTED,
                 correlation_id=authority_correlation_id,
-                reason=("authority_unavailable" if reason in {"authority_unavailable", "replay_continuity_unavailable"} else "ticket_rejected"),
+                reason=(
+                    AuthorityAuditReason.AUTHORITY_UNAVAILABLE
+                    if reason in {"authority_unavailable", "replay_continuity_unavailable"}
+                    else AuthorityAuditReason.TICKET_REJECTED
+                ),
             )
             return _WsAuthResult(
                 "authority_unavailable" if reason in {"authority_unavailable", "replay_continuity_unavailable"} else "ticket_invalid",
@@ -12398,7 +12412,7 @@ def _ws_auth_result(ws: "WebSocket") -> _WsAuthResult:
             audit_authority(
                 AuthorityAuditEvent.TICKET_REJECTED,
                 correlation_id=authority_correlation_id,
-                reason="ticket_rejected",
+                reason=AuthorityAuditReason.TICKET_REJECTED,
             )
             return _WsAuthResult("ticket_invalid", "ticket")
 

@@ -12,6 +12,7 @@ import pytest
 from hermes_cli.dashboard_auth.audit import (
     AuditEvent,
     AuthorityAuditEvent,
+    AuthorityAuditReason,
     audit_authority,
     audit_log,
 )
@@ -91,7 +92,7 @@ def test_authority_audit_requires_correlation_id(profile_home):
         audit_authority(
             AuthorityAuditEvent.TICKET_REJECTED,
             correlation_id="",
-            reason="ticket_rejected",
+            reason=AuthorityAuditReason.TICKET_REJECTED,
         )
 
 
@@ -107,13 +108,13 @@ def test_authority_audit_is_allowlisted_and_control_plane_only(tmp_path, monkeyp
     audit_authority(
         AuthorityAuditEvent.TICKET_REJECTED,
         correlation_id="f" * 32,
-        reason="ticket_rejected",
+        reason=AuthorityAuditReason.TICKET_REJECTED,
         epoch=4,
         recovery_generation=2,
         worker_generation=7,
-        scope_digest="scope-digest",
-        credential_digest="credential-digest",
-        issuer_digest="issuer-digest",
+        scope_digest="a" * 64,
+        credential_digest="b" * 64,
+        issuer_digest="c" * 64,
     )
 
     path = control_home / "logs" / "authority.log"
@@ -139,7 +140,7 @@ def test_persisted_scope_audit_is_allowlisted(tmp_path, monkeypatch):
     audit_authority(
         AuthorityAuditEvent.PERSISTED_SCOPE_REJECTED,
         correlation_id="b" * 32,
-        reason="persisted_scope_assertion_mismatch",
+        reason=AuthorityAuditReason.PERSISTED_SCOPE_ASSERTION_MISMATCH,
         audience_class="owner-persisted-scope",
         worker_generation=7,
     )
@@ -155,14 +156,25 @@ def test_persisted_scope_audit_is_allowlisted(tmp_path, monkeypatch):
     }
 
 
-def test_authority_audit_has_no_sensitive_escape_hatch(profile_home):
+def test_authority_audit_rejects_unknown_reason_and_sensitive_escape_hatch(profile_home):
+    with pytest.raises(ValueError, match="reason"):
+        audit_authority(
+            AuthorityAuditEvent.TICKET_REJECTED,
+            correlation_id="d" * 32,
+            reason="ticket=secret",  # type: ignore[arg-type]
+        )
+
     audit_authority(
         AuthorityAuditEvent.TICKET_REJECTED,
         correlation_id="a" * 32,
-        reason="ticket_rejected",
+        reason=AuthorityAuditReason.TICKET_REJECTED,
         audience_class="browser-ws",
     )
     raw = (profile_home / "control-plane" / "logs" / "authority.log").read_text()
     assert "ticket_rejected" in raw
-    for forbidden in ("ticket=secret", "jti-value", "user@example.test", "/api/ws"):
+    for forbidden in (
+        "ticket=secret", "jti-value", "user@example.test", "/api/ws",
+        "ok1_owner", "/owner/home", "token=secret", "capability-value",
+        "prompt-body", "tool-arguments", "pty-bytes", "exception-detail",
+    ):
         assert forbidden not in raw

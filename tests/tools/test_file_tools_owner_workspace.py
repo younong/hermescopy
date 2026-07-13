@@ -72,6 +72,24 @@ def test_controlled_workspace_adapter_is_owner_isolated(owner_a_workspace, owner
     assert "workspace-relative" in denied.error
 
 
+def test_owner_a_denial_leaves_owner_b_workspace_and_checkpoint_state_intact(
+    owner_a_workspace, owner_b_workspace, monkeypatch, tmp_path
+):
+    owner_a = ControlledWorkspaceFileOperations(AuthenticatedWorkspaceContext(owner_a_workspace))
+    owner_b = ControlledWorkspaceFileOperations(AuthenticatedWorkspaceContext(owner_b_workspace))
+    checkpoint = owner_b_workspace.get(RootKind.TEMPORARY).canonical_path / "checkpoints" / "resume.json"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_text('{"owner":"b"}\n')
+    assert owner_b.write_file("project/keep.txt", "owner b\n").error is None
+    monkeypatch.chdir(tmp_path)
+
+    denied = owner_a.write_file(str(owner_b.diagnostic_path("project/keep.txt")), "overwrite")
+
+    assert denied.error is not None
+    assert owner_b.read_file_raw("project/keep.txt").content == "owner b\n"
+    assert checkpoint.read_text() == '{"owner":"b"}\n'
+
+
 def test_controlled_workspace_adapter_rejects_untrusted_path_forms(owner_a_workspace):
     adapter = ControlledWorkspaceFileOperations(AuthenticatedWorkspaceContext(owner_a_workspace))
 

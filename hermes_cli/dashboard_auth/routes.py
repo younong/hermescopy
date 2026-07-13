@@ -30,7 +30,14 @@ from hermes_cli.dashboard_auth import (
     list_providers,
     list_session_providers,
 )
-from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
+from hermes_cli.dashboard_auth.audit import (
+    AuditEvent,
+    AuthorityAuditEvent,
+    AuthorityAuditReason,
+    audit_authority,
+    audit_log,
+    new_authority_correlation_id,
+)
 from hermes_cli.dashboard_auth.base import (
     InvalidCodeError,
     InvalidCredentialsError,
@@ -572,6 +579,13 @@ async def auth_logout(request: Request):
             _scope, authority_state = revoke_session_authority(
                 verified_session, reason="logout"
             )
+            audit_authority(
+                AuthorityAuditEvent.EPOCH_REVOKED,
+                correlation_id=new_authority_correlation_id(),
+                reason=AuthorityAuditReason.LOGOUT,
+                epoch=authority_state.epoch,
+                recovery_generation=authority_state.recovery_generation,
+            )
             from hermes_cli.web_server import close_authorized_bridges_by_changes
 
             await close_authorized_bridges_by_changes(
@@ -669,11 +683,6 @@ async def api_auth_ws_ticket(request: Request, body: _WsTicketBody):
 
     # Import here so the routes module stays usable in test contexts that
     # don't load the ticket store.
-    from hermes_cli.dashboard_auth.audit import (
-        AuthorityAuditEvent,
-        audit_authority,
-        new_authority_correlation_id,
-    )
     from hermes_cli.dashboard_auth.ws_tickets import (
         TTL_SECONDS,
         authority_store,
@@ -702,7 +711,7 @@ async def api_auth_ws_ticket(request: Request, body: _WsTicketBody):
         audit_authority(
             AuthorityAuditEvent.TICKET_REJECTED,
             correlation_id=correlation_id,
-            reason="unsupported_audience",
+            reason=AuthorityAuditReason.UNSUPPORTED_AUDIENCE,
         )
         raise HTTPException(status_code=400, detail="Unsupported WebSocket audience") from exc
     except Exception as exc:
@@ -710,12 +719,12 @@ async def api_auth_ws_ticket(request: Request, body: _WsTicketBody):
         audit_authority(
             AuthorityAuditEvent.AVAILABILITY_FAILURE,
             correlation_id=correlation_id,
-            reason="ticket_mint_unavailable",
+            reason=AuthorityAuditReason.TICKET_MINT_UNAVAILABLE,
         )
         raise HTTPException(status_code=503, detail="WebSocket authorization is unavailable") from exc
     audit_authority(
         AuthorityAuditEvent.TICKET_MINTED,
         correlation_id=correlation_id,
-        reason="minted",
+        reason=AuthorityAuditReason.MINTED,
     )
     return {"ticket": ticket, "ttl_seconds": TTL_SECONDS}

@@ -123,6 +123,29 @@ def test_revoke_executor_removes_only_exact_grants_and_blocks_reminting():
     ).capability == surviving.capability
 
 
+def test_revoking_owner_a_executor_leaves_owner_b_grant_admissible():
+    broker = CredentialBroker(clock=lambda: 100)
+    owner_a = _identity(owner_key="ok1_owner_a", task_id="task-a", executor_id="executor-a")
+    owner_b = _identity(owner_key="ok1_owner_b", task_id="task-b", executor_id="executor-b")
+    grant_a = broker.issue(
+        owner_a, audience=AUD_PROCESS_REGISTRY, operation="process.read", scope="proc-a"
+    )
+    grant_b = broker.issue(
+        owner_b, audience=AUD_PROCESS_REGISTRY, operation="process.read", scope="proc-b"
+    )
+
+    assert broker.revoke_executor(owner_a) == 1
+    with pytest.raises(ExecutorCapabilityInvalid, match="revoked_or_unknown"):
+        broker.validate(
+            grant_a.capability, owner_a, audience=AUD_PROCESS_REGISTRY,
+            operation="process.read", scope="proc-a",
+        )
+    assert broker.validate(
+        grant_b.capability, owner_b, audience=AUD_PROCESS_REGISTRY,
+        operation="process.read", scope="proc-b",
+    ).capability == grant_b.capability
+
+
 def test_generation_stop_invalidates_existing_and_future_exact_generation_grants():
     broker = CredentialBroker(clock=lambda: 100)
     stopped = _identity()

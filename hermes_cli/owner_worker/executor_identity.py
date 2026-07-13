@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextvars
 import hashlib
+import json
 import secrets
 from dataclasses import dataclass
 from enum import Enum
@@ -193,6 +194,119 @@ class ExecutorIdentity:
 
 
 @dataclass(frozen=True)
+class ExecutorResourceQuota:
+    """Complete resource ceiling for one authenticated executor scope."""
+
+    workers: int
+    cpu_millis: int
+    memory_bytes: int
+    pids: int
+    disk_bytes: int
+    disk_inodes: int
+    file_descriptors: int
+    duration_seconds: int
+    concurrent_tools: int
+    pty_sessions: int
+    websocket_connections: int
+    gateway_channels: int
+    output_bytes: int
+    network_bytes: int
+    network_requests: int
+
+    def __post_init__(self) -> None:
+        for name, value in self.to_payload().items():
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ExecutorIdentityInvalid(f"executor resource quota {name} is invalid")
+
+    def to_payload(self) -> dict[str, int]:
+        return {
+            "workers": self.workers,
+            "cpu_millis": self.cpu_millis,
+            "memory_bytes": self.memory_bytes,
+            "pids": self.pids,
+            "disk_bytes": self.disk_bytes,
+            "disk_inodes": self.disk_inodes,
+            "file_descriptors": self.file_descriptors,
+            "duration_seconds": self.duration_seconds,
+            "concurrent_tools": self.concurrent_tools,
+            "pty_sessions": self.pty_sessions,
+            "websocket_connections": self.websocket_connections,
+            "gateway_channels": self.gateway_channels,
+            "output_bytes": self.output_bytes,
+            "network_bytes": self.network_bytes,
+            "network_requests": self.network_requests,
+        }
+
+    @classmethod
+    def from_payload(cls, value: Mapping[str, Any]) -> "ExecutorResourceQuota":
+        if not isinstance(value, Mapping) or set(value) != set(cls.__dataclass_fields__):
+            raise ExecutorIdentityInvalid("executor resource quota is incomplete")
+        try:
+            return cls(**{name: value[name] for name in cls.__dataclass_fields__})
+        except KeyError as exc:
+            raise ExecutorIdentityInvalid("executor resource quota is incomplete") from exc
+
+
+@dataclass(frozen=True)
+class ExecutorResourceDecision:
+    """De-identified immutable resource policy bound to one exact executor."""
+
+    identity: ExecutorIdentity
+    quota: ExecutorResourceQuota
+    policy_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.identity, ExecutorIdentity) or not isinstance(self.quota, ExecutorResourceQuota):
+            raise ExecutorIdentityInvalid("executor resource decision is invalid")
+        canonical = json.dumps(
+            {"identity": self.identity.to_payload(), "quota": self.quota.to_payload()},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        expected = f"resource:{hashlib.sha256(canonical).hexdigest()}"
+        if self.policy_id and self.policy_id != expected:
+            raise ExecutorIdentityInvalid("executor resource decision policy id is invalid")
+        object.__setattr__(self, "policy_id", expected)
+
+    def require_identity(self, identity: ExecutorIdentity) -> None:
+        if not isinstance(identity, ExecutorIdentity) or identity != self.identity:
+            raise ExecutorIdentityInvalid("executor resource decision identity does not match")
+
+    def to_payload(self) -> dict[str, Any]:
+        return {"policy_id": self.policy_id, "quota": self.quota.to_payload()}
+
+    @classmethod
+    def from_payload(cls, identity: ExecutorIdentity, value: Mapping[str, Any]) -> "ExecutorResourceDecision":
+        if not isinstance(value, Mapping) or set(value) != {"policy_id", "quota"}:
+            raise ExecutorIdentityInvalid("executor resource decision is incomplete")
+        return cls(identity, ExecutorResourceQuota.from_payload(value["quota"]), value["policy_id"])
+
+
+def default_executor_resource_decision(identity: ExecutorIdentity) -> ExecutorResourceDecision:
+    """Return the explicit baseline policy for one exact trusted executor."""
+    return ExecutorResourceDecision(
+        identity,
+        ExecutorResourceQuota(
+            workers=1,
+            cpu_millis=1000,
+            memory_bytes=256 << 20,
+            pids=64,
+            disk_bytes=64 << 20,
+            disk_inodes=4096,
+            file_descriptors=64,
+            duration_seconds=30,
+            concurrent_tools=1,
+            pty_sessions=1,
+            websocket_connections=1,
+            gateway_channels=1,
+            output_bytes=200_000,
+            network_bytes=1 << 20,
+            network_requests=64,
+        ),
+    )
+
+
+@dataclass(frozen=True)
 class ExecutorInvocation:
     """Explicit request metadata that must cross the executor process boundary."""
 
@@ -204,6 +318,7 @@ class ExecutorInvocation:
     api_request_id: str
     invocation_id: str
     egress_profile: EgressProfile | str = EgressProfile.TOOL_NONE
+    resource_decision: ExecutorResourceDecision | None = None
 
     def __post_init__(self) -> None:
         _required(self.tool_name, "tool_name")
@@ -214,6 +329,11 @@ class ExecutorInvocation:
         object.__setattr__(self, "egress_profile", parse_egress_profile(self.egress_profile, executor_admissible=True))
         if not isinstance(self.arguments, Mapping):
             raise ExecutorIdentityInvalid("arguments must be a mapping")
+        decision = self.resource_decision or default_executor_resource_decision(self.identity)
+        if not isinstance(decision, ExecutorResourceDecision):
+            raise ExecutorIdentityInvalid("executor resource decision is invalid")
+        decision.require_identity(self.identity)
+        object.__setattr__(self, "resource_decision", decision)
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -225,6 +345,7 @@ class ExecutorInvocation:
             "api_request_id": self.api_request_id,
             "invocation_id": self.invocation_id,
             "egress_profile": self.egress_profile.value,
+            "resource_decision": self.resource_decision.to_payload(),
         }
 
 

@@ -5412,6 +5412,150 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         if payload is not None:
             assert json.loads(captured["content"]) == payload
 
+    @pytest.mark.parametrize(
+        ("method", "path", "payload", "expected"),
+        [
+            ("GET", "/api/sessions?profile=local-profile", None, {"sessions": [], "total": 0, "limit": 20, "offset": 0}),
+            ("GET", "/api/sessions/local-session?profile=local-profile", None, {"session_id": "local-session", "profile": "local-profile"}),
+            ("DELETE", "/api/sessions/local-session?profile=local-profile", None, {"ok": True}),
+        ],
+    )
+    def test_local_legacy_session_routes_remain_independent_from_owner_worker(
+        self, monkeypatch, method, path, payload, expected
+    ):
+        """Local token mode retains its profile-backed SessionDB path only."""
+        import hermes_cli.owner_worker.client as owner_client
+        import hermes_cli.web_server as web_server
+        from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+        self.app.state.auth_required = False
+        self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+        opened_profiles = []
+
+        class _LocalSessionDB:
+            def list_sessions_rich(self, **kwargs):
+                return []
+
+            def session_count(self, **kwargs):
+                return 0
+
+            def resolve_session_id(self, session_id):
+                return session_id
+
+            def get_session(self, session_id):
+                return {"session_id": session_id}
+
+            def delete_session(self, session_id):
+                assert session_id == "local-session"
+
+            def close(self):
+                return None
+
+        def open_local_db(profile):
+            opened_profiles.append(profile)
+            return _LocalSessionDB()
+
+        def fail_owner_worker(*args, **kwargs):
+            raise AssertionError("local legacy request must not use an Owner Worker")
+
+        monkeypatch.setattr(web_server, "_open_session_db_for_profile", open_local_db)
+        monkeypatch.setattr(web_server, "_cron_profile_home", lambda profile: (profile, "/unused"))
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fail_owner_worker)
+        self.supervisor.get_or_start = fail_owner_worker
+
+        response = self.client.request(method, path, json=payload)
+
+        assert response.status_code == 200
+        assert response.json() == expected
+        assert opened_profiles == ["local-profile"]
+        assert not self.supervisor.owners
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/api/sessions?profile=default",
+            "/api/sessions/session-1?profile=default",
+            "/api/analytics/usage?profile=default",
+            "/api/model/info?profile=default",
+        ],
+    )
+    def test_authenticated_worker_failure_never_falls_back_to_local_or_global_state(self, monkeypatch, path):
+        import hermes_cli.owner_worker.client as owner_client
+        import hermes_cli.web_server as web_server
+
+        def fail_local_or_global(*args, **kwargs):
+            raise AssertionError("authenticated worker failure must not reach local or global state")
+
+        def fail_worker_request(*args, **kwargs):
+            raise RuntimeError("owner worker unavailable")
+
+        monkeypatch.setattr(web_server, "_open_session_db_for_profile", fail_local_or_global)
+        monkeypatch.setattr(web_server, "_cron_profile_home", fail_local_or_global)
+        monkeypatch.setattr(web_server, "_usage_analytics_from_db", fail_local_or_global)
+        monkeypatch.setattr(web_server, "_models_analytics_from_db", fail_local_or_global)
+        monkeypatch.setattr(web_server, "load_config", fail_local_or_global)
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fail_worker_request)
+
+        response = self.client.get(path)
+
+        assert response.status_code == 502
+        assert len(self.supervisor.owners) == 1
+
+    @pytest.mark.parametrize("selector", ["owner=other", "owner_home=/tmp/other", "owner_key=ok1_other"])
+    def test_authenticated_owner_selectors_are_rejected_before_any_fallback_or_proxy(self, monkeypatch, selector):
+        import hermes_cli.owner_worker.client as owner_client
+        import hermes_cli.web_server as web_server
+
+        def fail_reach(*args, **kwargs):
+            raise AssertionError("legacy selector must reject before any fallback or proxy")
+
+        monkeypatch.setattr(web_server, "_open_session_db_for_profile", fail_reach)
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fail_reach)
+
+        response = self.client.get(f"/api/analytics/usage?{selector}")
+
+        assert response.status_code == 400
+        assert not self.supervisor.owners
+
+    def test_authenticated_sessions_route_a_and_b_to_independent_trusted_owner_handles(self, monkeypatch):
+        import httpx
+        import hermes_cli.owner_worker.client as owner_client
+
+        captured = []
+
+        def fake_request(self, method, path, *, lease, headers=None, content=None):
+            del self, headers, content
+            captured.append((method, path, lease.owner_key))
+            return httpx.Response(200, json={"owner_key": lease.owner_key})
+
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fake_request)
+
+        response_a = self.client.get("/api/sessions?profile=default")
+        session_a = self.session
+        self.session = type(session_a)(
+            user_id="user-b",
+            email="b@example.test",
+            display_name="User B",
+            org_id="org-2",
+            provider="test",
+            expires_at=session_a.expires_at,
+            access_token="access-b",
+            refresh_token="refresh-b",
+        )
+        response_b = self.client.get("/api/sessions?profile=default")
+
+        assert response_a.status_code == 200
+        assert response_b.status_code == 200
+        assert len(captured) == 2
+        assert captured[0][:2] == ("GET", "/api/sessions")
+        assert captured[1][:2] == ("GET", "/api/sessions")
+        assert captured[0][2] != captured[1][2]
+        assert response_a.json()["owner_key"] == captured[0][2]
+        assert response_b.json()["owner_key"] == captured[1][2]
+        assert [owner.owner_key for owner in self.supervisor.owners] == [
+            captured[0][2], captured[1][2]
+        ]
+
     def test_authenticated_session_proxy_rejects_mismatched_owner_handle_before_request(self, monkeypatch):
         import hermes_cli.owner_worker.client as owner_client
 
@@ -5580,6 +5724,8 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
             "/api/logs",
             "/api/profiles",
             "/api/media?path=/tmp/example.png",
+            "/api/ops/checkpoints",
+            "/api/ops/checkpoints/prune",
         ],
     )
     def test_authenticated_unmigrated_apis_fail_closed(self, path):

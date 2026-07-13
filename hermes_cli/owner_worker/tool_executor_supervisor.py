@@ -15,12 +15,15 @@ from typing import Any, Callable, Mapping
 
 from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
 from hermes_cli.controlled_roots import ExpectedType, RootKind
+from hermes_cli.dashboard_auth.audit import AuthorityAuditEvent, AuthorityAuditReason
 from hermes_cli.owner_worker.credential_broker import CredentialBroker
 from hermes_cli.owner_worker.executor_identity import (
     EgressProfile,
     ExecutorIdentity,
     ExecutorIdentityInvalid,
     ExecutorInvocation,
+    ExecutorResourceDecision,
+    default_executor_resource_decision,
     parse_egress_profile,
 )
 from hermes_cli.owner_worker.tool_executor_sandbox import (
@@ -101,6 +104,8 @@ class ToolExecutorSupervisor:
         sandbox_verification_policy: SandboxVerificationPolicy | None = None,
         sandbox_syscall_filter_source: Callable[[SandboxLaunchBinding, SandboxSecurityPolicy], SandboxSyscallFilter | None] | None = None,
         egress_policy: ExecutorEgressPolicy | None = None,
+        resource_decision_source: Callable[[ExecutorIdentity], ExecutorResourceDecision] = default_executor_resource_decision,
+        audit_reporter: Callable[[AuthorityAuditEvent, AuthorityAuditReason, ExecutorIdentity], None] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.owner_home = Path(owner_home).resolve()
@@ -117,13 +122,28 @@ class ToolExecutorSupervisor:
         self.sandbox_verification_policy = sandbox_verification_policy
         self.sandbox_syscall_filter_source = sandbox_syscall_filter_source
         self.egress_policy = egress_policy or ExecutorEgressPolicy()
-        if not isinstance(self.egress_policy, ExecutorEgressPolicy):
+        self.resource_decision_source = resource_decision_source
+        self.audit_reporter = audit_reporter
+        if (
+            not isinstance(self.egress_policy, ExecutorEgressPolicy)
+            or not callable(self.resource_decision_source)
+            or (self.audit_reporter is not None and not callable(self.audit_reporter))
+        ):
             raise ExecutorIdentityInvalid("executor egress policy is invalid")
         self._clock = clock
         self._lock = threading.RLock()
         self._identities: dict[tuple[str, str], ExecutorIdentity] = {}
         self._live: dict[tuple[tuple, str], _LiveInvocation] = {}
         self._revoked: set[tuple] = set()
+
+    def _report(self, event: AuthorityAuditEvent, reason: AuthorityAuditReason, identity: ExecutorIdentity) -> None:
+        if self.audit_reporter is None:
+            return
+        try:
+            self.audit_reporter(event, reason, identity)
+        except Exception:
+            # Audit delivery cannot relax executor admission or revocation.
+            pass
 
     def identity_for(self, *, task_id: str, session_id: str) -> ExecutorIdentity:
         key = (str(task_id or ""), str(session_id or ""))
@@ -154,8 +174,25 @@ class ToolExecutorSupervisor:
         turn_id: str,
         api_request_id: str,
     ) -> str:
-        egress_profile = self.egress_policy.select(function_name)
         identity = self.identity_for(task_id=task_id, session_id=session_id)
+        try:
+            egress_profile = self.egress_policy.select(function_name)
+        except ExecutorIdentityInvalid:
+            self._report(AuthorityAuditEvent.EGRESS_REJECTED, AuthorityAuditReason.EGRESS_PROFILE_REJECTED, identity)
+            raise
+        try:
+            resource_decision = self._resource_decision_for(identity)
+        except ExecutorIdentityInvalid as exc:
+            self._report(
+                AuthorityAuditEvent.RESOURCE_REJECTED,
+                (
+                    AuthorityAuditReason.RESOURCE_DECISION_UNAVAILABLE
+                    if "unavailable" in str(exc)
+                    else AuthorityAuditReason.RESOURCE_DECISION_INVALID
+                ),
+                identity,
+            )
+            raise
         invocation = ExecutorInvocation(
             identity=identity,
             tool_name=function_name,
@@ -165,8 +202,36 @@ class ToolExecutorSupervisor:
             api_request_id=api_request_id or "request",
             invocation_id=os.urandom(16).hex(),
             egress_profile=egress_profile,
+            resource_decision=resource_decision,
         )
-        return self._dispatch_invocation(invocation)
+        try:
+            return self._dispatch_invocation(invocation)
+        except PermissionError:
+            self._report(AuthorityAuditEvent.EXECUTOR_REJECTED, AuthorityAuditReason.EXECUTOR_LEASE_REJECTED, identity)
+            raise
+        except SandboxVerificationInvalid as exc:
+            self._report(
+                AuthorityAuditEvent.EXECUTOR_REJECTED,
+                (
+                    AuthorityAuditReason.SYSCALL_FILTER_REJECTED
+                    if "syscall filter" in str(exc)
+                    else AuthorityAuditReason.SANDBOX_REJECTED
+                ),
+                identity,
+            )
+            raise
+
+    def _resource_decision_for(self, identity: ExecutorIdentity) -> ExecutorResourceDecision:
+        try:
+            decision = self.resource_decision_source(identity)
+        except ExecutorIdentityInvalid:
+            raise
+        except Exception as exc:
+            raise ExecutorIdentityInvalid("executor resource decision is unavailable") from exc
+        if not isinstance(decision, ExecutorResourceDecision):
+            raise ExecutorIdentityInvalid("executor resource decision is invalid")
+        decision.require_identity(identity)
+        return decision
 
     def _require_current_lease_identity(self, identity: ExecutorIdentity) -> None:
         expected = (

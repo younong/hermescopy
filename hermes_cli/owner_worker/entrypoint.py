@@ -279,15 +279,19 @@ def create_app(
     from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
 
     workspace_context = AuthenticatedWorkspaceContext(controlled_roots)
+    from hermes_cli.owner_worker.audit import report_executor_authority_decision
     from hermes_cli.owner_worker.credential_broker import CredentialBroker
     from hermes_cli.owner_worker.tool_executor_supervisor import ToolExecutorSupervisor
 
-    app.state.tool_executor_credential_broker = CredentialBroker()
+    app.state.tool_executor_credential_broker = CredentialBroker(
+        audit_reporter=report_executor_authority_decision,
+    )
     app.state.tool_executor_supervisor = ToolExecutorSupervisor(
         owner_home=owner_home,
         workspace_context=workspace_context,
         lease=lease,
         credential_broker=app.state.tool_executor_credential_broker,
+        audit_reporter=report_executor_authority_decision,
     )
     app.state.owner_worker_live_state.gateway_runtime = OwnerWorkerGatewayRuntime(
         owner_key=lease.owner_key,

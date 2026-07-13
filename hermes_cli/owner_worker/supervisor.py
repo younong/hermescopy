@@ -13,6 +13,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from hermes_constants import get_hermes_home
+from hermes_cli.dashboard_auth.audit import (
+    AuthorityAuditEvent,
+    AuthorityAuditReason,
+    audit_authority,
+    new_authority_correlation_id,
+)
 from hermes_cli.dashboard_auth.authority import (
     AuthorityStore,
     AuthorizationRejected,
@@ -129,6 +135,7 @@ class OwnerWorkerSupervisor:
         max_workers: int | None = None,
         startup_cooldown: float | None = None,
         idle_timeout: float | None = None,
+        max_owner_concurrency: int | None = None,
         control_ws_base: str | None = None,
         authority_store_factory: Callable[[Path], AuthorityStore] = AuthorityStore,
         generation_bridge_revoker: Callable[[OwnerWorkerAuthorityLease], None] | None = None,
@@ -148,12 +155,36 @@ class OwnerWorkerSupervisor:
             1.0,
             float(idle_timeout if idle_timeout is not None else os.environ.get("HERMES_OWNER_WORKER_IDLE_TIMEOUT", "1800") or 1800),
         )
+        try:
+            configured_concurrency = max_owner_concurrency if max_owner_concurrency is not None else os.environ.get(
+                "HERMES_OWNER_WORKER_MAX_CONCURRENCY", "32"
+            )
+            self.max_owner_concurrency = int(configured_concurrency)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("owner worker concurrency limit is invalid") from exc
+        if self.max_owner_concurrency < 1:
+            raise ValueError("owner worker concurrency limit is invalid")
         self.control_ws_base = (control_ws_base or os.environ.get("HERMES_OWNER_WORKER_CONTROL_WS_BASE", "")).strip()
         self.authority_store = authority_store_factory(self.control_home)
         self.generation_bridge_revoker = generation_bridge_revoker
         self._handles: dict[str, OwnerWorkerHandle] = {}
         self._last_start_attempt: dict[str, float] = {}
         self._lock = threading.RLock()
+
+    @staticmethod
+    def _audit_generation(reason: AuthorityAuditReason, lease: OwnerWorkerAuthorityLease) -> None:
+        try:
+            audit_authority(
+                AuthorityAuditEvent.WORKER_GENERATION,
+                correlation_id=new_authority_correlation_id(),
+                reason=reason,
+                audience_class="none",
+                worker_generation=lease.worker_generation,
+                recovery_generation=lease.recovery_generation,
+            )
+        except Exception:
+            # Observability cannot alter worker fencing or cleanup behavior.
+            pass
 
     def get_or_start(self, owner: Any) -> OwnerWorkerHandle:
         with self._lock:
@@ -195,15 +226,7 @@ class OwnerWorkerSupervisor:
                 else:
                     self._terminate_handle(owner_key, existing)
 
-            last_attempt = self._last_start_attempt.get(owner_key, 0.0)
-            if self.startup_cooldown and now - last_attempt < self.startup_cooldown:
-                raise RuntimeError("owner worker startup throttled")
-            if owner_key not in self._handles and len(self._handles) >= self.max_workers:
-                self._evict_oldest_idle(now=now)
-            if owner_key not in self._handles and len(self._handles) >= self.max_workers:
-                raise RuntimeError("owner worker limit reached")
-
-            self._last_start_attempt[owner_key] = now
+            self._admit_start(owner_key, owner_home, now=now)
             ensure_owner_runtime_dirs(owner_home)
             claim = self.authority_store.claim_worker_start(owner_key, worker_id=uuid.uuid4().hex)
             generation = claim.generation
@@ -262,6 +285,7 @@ class OwnerWorkerSupervisor:
                 finally:
                     os.close(inherited_cwd_fd)
             except Exception:
+                self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, claim.lease)
                 try:
                     self.authority_store.transition_worker_lease(
                         claim.lease,
@@ -297,6 +321,7 @@ class OwnerWorkerSupervisor:
                     generation_state=WorkerGenerationState.ACTIVE,
                 )
             except Exception:
+                self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, claim.lease)
                 try:
                     self.authority_store.transition_worker_lease(
                         claim.lease,
@@ -330,7 +355,24 @@ class OwnerWorkerSupervisor:
                 last_health=health,
             )
             self._handles[owner_key] = handle
+            self._audit_generation(AuthorityAuditReason.GENERATION_ACTIVE, active_lease)
             return handle
+
+    def _admit_start(self, owner_key: str, owner_home: Path, *, now: float) -> None:
+        """Apply per-owner cold-start throttle and idle-only capacity eviction."""
+        if owner_key in self._handles:
+            current = self._handles[owner_key]
+            if current.owner_home.resolve() != owner_home.resolve():
+                raise RuntimeError("owner worker exact owner_home mismatch for owner_key")
+            return
+        last_attempt = self._last_start_attempt.get(owner_key, 0.0)
+        if self.startup_cooldown and now - last_attempt < self.startup_cooldown:
+            raise RuntimeError("owner worker startup throttled")
+        if len(self._handles) >= self.max_workers:
+            self._evict_oldest_idle(now=now)
+        if len(self._handles) >= self.max_workers:
+            raise RuntimeError("owner worker limit reached")
+        self._last_start_attempt[owner_key] = now
 
     def acquire_use(self, handle: OwnerWorkerHandle) -> OwnerWorkerLease:
         """Mark a worker as actively serving an HTTP stream or WS bridge."""
@@ -341,6 +383,8 @@ class OwnerWorkerSupervisor:
             self.authority_store.assert_worker_lease(
                 self._lease_for_handle(handle), states=frozenset({WorkerLeaseState.ACTIVE})
             )
+            if handle.active_uses >= self.max_owner_concurrency:
+                raise RuntimeError("owner worker concurrency limit reached")
             handle.active_uses += 1
             handle.last_used_at = time.time()
         return OwnerWorkerLease(self, handle)
@@ -445,6 +489,8 @@ class OwnerWorkerSupervisor:
         # touching the process. A stale local cleanup can never transition a
         # replacement fence and therefore cannot revoke its authority.
         draining = self._drain_handle(handle)
+        if draining is not None:
+            self._audit_generation(AuthorityAuditReason.GENERATION_DRAINING, draining)
         if self._handles.get(owner_key) is handle:
             self._handles.pop(owner_key, None)
         if self.generation_bridge_revoker is not None:
@@ -465,13 +511,19 @@ class OwnerWorkerSupervisor:
         if process_exited:
             self._cleanup_generation_socket(handle)
         if draining is not None:
-            self._finalize_drained_handle(
-                draining,
-                generation_state=(
-                    WorkerGenerationState.TERMINATED
+            terminal_state = (
+                WorkerGenerationState.TERMINATED
+                if process_exited
+                else WorkerGenerationState.REVOKED
+            )
+            self._finalize_drained_handle(draining, generation_state=terminal_state)
+            self._audit_generation(
+                (
+                    AuthorityAuditReason.GENERATION_TERMINATED
                     if process_exited
-                    else WorkerGenerationState.REVOKED
+                    else AuthorityAuditReason.GENERATION_REVOKED
                 ),
+                draining,
             )
 
     def _reap_exited(self) -> None:
@@ -497,9 +549,9 @@ class OwnerWorkerSupervisor:
         ]
         if not live:
             return
+        del now
         owner_key, handle = min(live, key=lambda item: item[1].last_used_at)
-        if now - handle.last_used_at >= self.idle_timeout:
-            self._terminate_handle(owner_key, handle)
+        self._terminate_handle(owner_key, handle)
 
     def socket_path_for(self, owner: Any, worker_generation: int | None = None) -> Path:
         if worker_generation is None:

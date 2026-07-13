@@ -15,6 +15,7 @@ from hermes_cli.owner_worker.executor_identity import (
     ExecutorIdentity,
     ExecutorIdentityInvalid,
     ExecutorInvocation,
+    ExecutorResourceDecision,
     install_executor_identity,
     parse_egress_profile,
     reset_executor_identity,
@@ -85,6 +86,7 @@ def invocation_from_payload(payload: dict[str, Any]) -> ExecutorInvocation:
             api_request_id=payload["api_request_id"],
             invocation_id=payload["invocation_id"],
             egress_profile=payload["egress_profile"],
+            resource_decision=ExecutorResourceDecision.from_payload(identity, payload["resource_decision"]),
         )
     except (KeyError, ExecutorIdentityInvalid) as exc:
         raise ExecutorRuntimeInvalid("executor invocation is invalid") from exc

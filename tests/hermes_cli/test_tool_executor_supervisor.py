@@ -19,7 +19,8 @@ from hermes_cli.owner_worker.tool_executor_sandbox import (
     SandboxVerificationPolicy,
     SandboxVerificationRecord,
 )
-from hermes_cli.owner_worker.executor_identity import ExecutorInvocation
+from hermes_cli.dashboard_auth.audit import AuthorityAuditEvent, AuthorityAuditReason
+from hermes_cli.owner_worker.executor_identity import ExecutorInvocation, default_executor_resource_decision
 from hermes_cli.owner_worker.executor_tokens import AUD_PROCESS_REGISTRY, ExecutorCapabilityInvalid
 from hermes_cli.owner_worker.tool_executor_supervisor import ExecutorEgressPolicy, ToolExecutorSupervisor
 
@@ -93,7 +94,7 @@ def _record(binding, mount_policy, invocation, *, observed_at=90, expires_at=110
 
 def _supervisor(
     tmp_path, process_factory, *, sandbox_builder=_launch_spec, verification_source=_record,
-    egress_policy=None, clock=lambda: 100,
+    egress_policy=None, audit_reporter=None, clock=lambda: 100,
 ):
     roots, locations = _roots(tmp_path)
     lease = OwnerWorkerAuthorityLease("ok1_owner", 1, "worker-a", WorkerLeaseState.ACTIVE, 1, 0)
@@ -107,8 +108,68 @@ def _supervisor(
         sandbox_verification_policy=_POLICY,
         sandbox_syscall_filter_source=_syscall_filter,
         egress_policy=egress_policy,
+        audit_reporter=audit_reporter,
         clock=clock,
     )
+
+
+def test_executor_rejection_audit_is_pre_spawn_and_deidentified(tmp_path):
+    spawned = []
+    audit_events = []
+    roots, supervisor = _supervisor(
+        tmp_path,
+        lambda *args, **kwargs: spawned.append((args, kwargs)),
+        audit_reporter=lambda event, reason, identity: audit_events.append((event, reason)),
+    )
+    workspace_fd_calls = []
+    try:
+        supervisor._workspace_fd = lambda: workspace_fd_calls.append(True)  # type: ignore[method-assign]
+        supervisor.resource_decision_source = lambda identity: None
+        with pytest.raises(Exception, match="resource decision"):
+            supervisor.dispatch(
+                function_name="tool-argument-sentinel",
+                function_args={"path": "/owner/home/path-sentinel", "capability": "capability-sentinel"},
+                task_id="task-a", session_id="session-a", tool_call_id="call-a", turn_id="turn-a", api_request_id="request-a",
+            )
+    finally:
+        roots.close()
+    assert spawned == []
+    assert workspace_fd_calls == []
+    assert audit_events == [
+        (AuthorityAuditEvent.RESOURCE_REJECTED, AuthorityAuditReason.RESOURCE_DECISION_INVALID),
+    ]
+    serialized = repr(audit_events)
+    for forbidden in ("tool-argument-sentinel", "/owner/home/path-sentinel", "capability-sentinel", "ok1_owner"):
+        assert forbidden not in serialized
+
+
+def test_supervisor_rejects_missing_or_foreign_resource_decision_before_launch_preparation(tmp_path):
+    spawned = []
+    roots, supervisor = _supervisor(tmp_path, lambda *args, **kwargs: spawned.append((args, kwargs)))
+    workspace_fd_calls = []
+    try:
+        supervisor._workspace_fd = lambda: workspace_fd_calls.append(True)  # type: ignore[method-assign]
+        supervisor.resource_decision_source = lambda identity: None
+        with pytest.raises(Exception, match="resource decision"):
+            supervisor.dispatch(
+                function_name="read_file", function_args={}, task_id="task-a", session_id="session-a",
+                tool_call_id="call-a", turn_id="turn-a", api_request_id="request-a",
+            )
+
+        def foreign(identity):
+            other = supervisor.identity_for(task_id="task-b", session_id="session-b")
+            return default_executor_resource_decision(other)
+
+        supervisor.resource_decision_source = foreign
+        with pytest.raises(Exception, match="resource decision"):
+            supervisor.dispatch(
+                function_name="read_file", function_args={}, task_id="task-a", session_id="session-a",
+                tool_call_id="call-a", turn_id="turn-a", api_request_id="request-a",
+            )
+    finally:
+        roots.close()
+    assert spawned == []
+    assert workspace_fd_calls == []
 
 
 def test_supervisor_uses_sandbox_fd_bootstrap_and_no_preexec_cwd(tmp_path):

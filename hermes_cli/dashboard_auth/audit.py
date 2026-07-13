@@ -11,6 +11,7 @@ import enum
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 from pathlib import Path
@@ -53,13 +54,120 @@ class AuthorityAuditEvent(enum.Enum):
     REPLAY_CONTINUITY_INVALIDATED = "authority_replay_continuity_invalidated"
     REPLAY_RECOVERY_COMPLETED = "authority_replay_recovery_completed"
     EPOCH_BUMP = "authority_epoch_bump"
+    EPOCH_REVOKED = "authority_epoch_revoked"
     TICKET_MINTED = "authority_ticket_minted"
     TICKET_ADMITTED = "authority_ticket_admitted"
     TICKET_REJECTED = "authority_ticket_rejected"
+    CAPABILITY_ADMITTED = "authority_capability_admitted"
+    CAPABILITY_REJECTED = "authority_capability_rejected"
     SESSION_REVOKED = "authority_session_revoked"
+    WORKER_GENERATION = "authority_worker_generation"
+    BRIDGE_LIFECYCLE = "authority_bridge_lifecycle"
+    PTY_LIFECYCLE = "authority_pty_lifecycle"
+    FILESYSTEM_DENIED = "authority_filesystem_denied"
+    EXECUTOR_REJECTED = "authority_executor_rejected"
+    CREDENTIAL_LIFECYCLE = "authority_credential_lifecycle"
+    EGRESS_REJECTED = "authority_egress_rejected"
+    RESOURCE_REJECTED = "authority_resource_rejected"
     KEY_ROTATION_FAILURE = "authority_key_rotation_failure"
     BRIDGE_CLOSED = "authority_bridge_closed"
     PERSISTED_SCOPE_REJECTED = "persisted_scope_rejected"
+
+
+class AuthorityAuditReason(enum.Enum):
+    """Closed reason vocabulary for :func:`audit_authority`."""
+
+    ADMITTED = "admitted"
+    MINTED = "minted"
+    UNSUPPORTED_AUDIENCE = "unsupported_audience"
+    TICKET_MINT_UNAVAILABLE = "ticket_mint_unavailable"
+    TICKET_REJECTED = "ticket_rejected"
+    AUTHORITY_UNAVAILABLE = "authority_unavailable"
+    SESSION_AUTHORITY_UNAVAILABLE = "session_authority_unavailable"
+    INTERNAL_OWNER_INVALID = "internal_owner_invalid"
+    INTERNAL_OWNER_CONTEXT_REQUIRED = "internal_owner_context_required"
+    LOGOUT = "logout"
+    BOOTSTRAP_REJECTED = "bootstrap_rejected"
+    GENERATION_ACTIVE = "generation_active"
+    GENERATION_START_FAILED = "generation_start_failed"
+    GENERATION_DRAINING = "generation_draining"
+    GENERATION_TERMINATED = "generation_terminated"
+    GENERATION_REVOKED = "generation_revoked"
+    BRIDGE_CLOSED = "bridge_closed"
+    BRIDGE_UNAVAILABLE = "bridge_unavailable"
+    CONTROL_PLANE_FILESYSTEM_FORBIDDEN = "control_plane_filesystem_forbidden"
+    RESOURCE_DECISION_UNAVAILABLE = "resource_decision_unavailable"
+    RESOURCE_DECISION_INVALID = "resource_decision_invalid"
+    EGRESS_PROFILE_REJECTED = "egress_profile_rejected"
+    EXECUTOR_LEASE_REJECTED = "executor_lease_rejected"
+    SANDBOX_REJECTED = "sandbox_rejected"
+    SYSCALL_FILTER_REJECTED = "syscall_filter_rejected"
+    CREDENTIAL_REJECTED = "credential_rejected"
+    CREDENTIAL_REVOKED_EXECUTOR = "credential_revoked_executor"
+    CREDENTIAL_REVOKED_GENERATION = "credential_revoked_generation"
+    PERSISTED_SCOPE_ASSERTION_MISMATCH = "persisted_scope_assertion_mismatch"
+
+
+_AUTHORITY_EVENT_REASONS: dict[AuthorityAuditEvent, frozenset[AuthorityAuditReason]] = {
+    AuthorityAuditEvent.AVAILABILITY_FAILURE: frozenset({
+        AuthorityAuditReason.AUTHORITY_UNAVAILABLE,
+        AuthorityAuditReason.SESSION_AUTHORITY_UNAVAILABLE,
+        AuthorityAuditReason.TICKET_MINT_UNAVAILABLE,
+    }),
+    AuthorityAuditEvent.EPOCH_BUMP: frozenset({AuthorityAuditReason.ADMITTED}),
+    AuthorityAuditEvent.EPOCH_REVOKED: frozenset({AuthorityAuditReason.LOGOUT}),
+    AuthorityAuditEvent.TICKET_MINTED: frozenset({AuthorityAuditReason.MINTED}),
+    AuthorityAuditEvent.TICKET_ADMITTED: frozenset({AuthorityAuditReason.ADMITTED}),
+    AuthorityAuditEvent.TICKET_REJECTED: frozenset({
+        AuthorityAuditReason.UNSUPPORTED_AUDIENCE,
+        AuthorityAuditReason.TICKET_REJECTED,
+        AuthorityAuditReason.INTERNAL_OWNER_INVALID,
+        AuthorityAuditReason.INTERNAL_OWNER_CONTEXT_REQUIRED,
+    }),
+    AuthorityAuditEvent.CAPABILITY_ADMITTED: frozenset({AuthorityAuditReason.ADMITTED}),
+    AuthorityAuditEvent.CAPABILITY_REJECTED: frozenset({
+        AuthorityAuditReason.BOOTSTRAP_REJECTED,
+        AuthorityAuditReason.CREDENTIAL_REJECTED,
+    }),
+    AuthorityAuditEvent.SESSION_REVOKED: frozenset({AuthorityAuditReason.LOGOUT}),
+    AuthorityAuditEvent.WORKER_GENERATION: frozenset({
+        AuthorityAuditReason.GENERATION_ACTIVE,
+        AuthorityAuditReason.GENERATION_START_FAILED,
+        AuthorityAuditReason.GENERATION_DRAINING,
+        AuthorityAuditReason.GENERATION_TERMINATED,
+        AuthorityAuditReason.GENERATION_REVOKED,
+    }),
+    AuthorityAuditEvent.BRIDGE_LIFECYCLE: frozenset({
+        AuthorityAuditReason.ADMITTED,
+        AuthorityAuditReason.BRIDGE_CLOSED,
+        AuthorityAuditReason.BRIDGE_UNAVAILABLE,
+    }),
+    AuthorityAuditEvent.PTY_LIFECYCLE: frozenset({
+        AuthorityAuditReason.ADMITTED,
+        AuthorityAuditReason.BRIDGE_CLOSED,
+    }),
+    AuthorityAuditEvent.FILESYSTEM_DENIED: frozenset({AuthorityAuditReason.CONTROL_PLANE_FILESYSTEM_FORBIDDEN}),
+    AuthorityAuditEvent.EXECUTOR_REJECTED: frozenset({
+        AuthorityAuditReason.EXECUTOR_LEASE_REJECTED,
+        AuthorityAuditReason.SANDBOX_REJECTED,
+        AuthorityAuditReason.SYSCALL_FILTER_REJECTED,
+    }),
+    AuthorityAuditEvent.CREDENTIAL_LIFECYCLE: frozenset({
+        AuthorityAuditReason.CREDENTIAL_REJECTED,
+        AuthorityAuditReason.CREDENTIAL_REVOKED_EXECUTOR,
+        AuthorityAuditReason.CREDENTIAL_REVOKED_GENERATION,
+    }),
+    AuthorityAuditEvent.EGRESS_REJECTED: frozenset({AuthorityAuditReason.EGRESS_PROFILE_REJECTED}),
+    AuthorityAuditEvent.RESOURCE_REJECTED: frozenset({
+        AuthorityAuditReason.RESOURCE_DECISION_UNAVAILABLE,
+        AuthorityAuditReason.RESOURCE_DECISION_INVALID,
+    }),
+    AuthorityAuditEvent.BRIDGE_CLOSED: frozenset({AuthorityAuditReason.BRIDGE_CLOSED}),
+    AuthorityAuditEvent.PERSISTED_SCOPE_REJECTED: frozenset({AuthorityAuditReason.PERSISTED_SCOPE_ASSERTION_MISMATCH}),
+}
+
+_CORRELATION_ID_RE = re.compile(r"^[a-f0-9]{32,64}$")
+_DIGEST_RE = re.compile(r"^(?:sha256:)?[a-f0-9]{64}$")
 
 
 def _resolve_log_path() -> Path:
@@ -110,48 +218,64 @@ def audit_authority(
     event: AuthorityAuditEvent,
     *,
     correlation_id: str,
-    reason: str,
+    reason: AuthorityAuditReason,
     audience_class: str = "browser-ws",
     epoch: int | None = None,
     recovery_generation: int | None = None,
     worker_generation: int | None = None,
+    executor_generation: int | None = None,
     sequence: int | None = None,
     scope_digest: str | None = None,
     credential_digest: str | None = None,
     issuer_digest: str | None = None,
+    policy_digest: str | None = None,
 ) -> None:
     """Write one allowlisted, de-identified Control Plane authority record.
 
     The helper intentionally has no ``**fields`` escape hatch. Callers must
-    map exceptions to fixed reason codes rather than serialize user-controlled
-    values, URLs, identities, or browser credentials.
+    map failures to :class:`AuthorityAuditReason`; user-controlled values,
+    URLs, identities, credentials, and exception text cannot enter this sink.
     """
+    if not isinstance(event, AuthorityAuditEvent):
+        raise ValueError("authority audit event is invalid")
+    if not isinstance(reason, AuthorityAuditReason) or reason not in _AUTHORITY_EVENT_REASONS.get(event, frozenset()):
+        raise ValueError("authority audit reason is invalid")
     correlation_id = str(correlation_id or "").strip()
-    if not correlation_id:
-        raise ValueError("authority audit correlation_id is required")
-    reason = str(reason or "").strip()
-    if not reason:
-        raise ValueError("authority audit reason is required")
+    if not _CORRELATION_ID_RE.fullmatch(correlation_id):
+        raise ValueError("authority audit correlation_id is invalid")
     if audience_class not in {"browser-ws", "owner-persisted-scope", "none"}:
         raise ValueError("authority audit audience class is invalid")
+
     entry: dict[str, Any] = {
         "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
         "event": event.value,
         "correlation_id": correlation_id,
-        "reason": reason,
+        "reason": reason.value,
         "audience_class": audience_class,
     }
     for key, value in (
         ("epoch", epoch),
         ("recovery_generation", recovery_generation),
         ("worker_generation", worker_generation),
+        ("executor_generation", executor_generation),
         ("sequence", sequence),
+    ):
+        if value is not None:
+            normalized = int(value)
+            if normalized < 0:
+                raise ValueError(f"authority audit {key} is invalid")
+            entry[key] = normalized
+    for key, value in (
         ("scope_digest", scope_digest),
         ("credential_digest", credential_digest),
         ("issuer_digest", issuer_digest),
+        ("policy_digest", policy_digest),
     ):
         if value is not None:
-            entry[key] = int(value) if key in {"epoch", "recovery_generation", "worker_generation", "sequence"} else str(value)
+            normalized = str(value).strip()
+            if not _DIGEST_RE.fullmatch(normalized):
+                raise ValueError(f"authority audit {key} is invalid")
+            entry[key] = normalized
     try:
         path = _authority_log_path()
     except Exception as exc:
