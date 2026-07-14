@@ -6,6 +6,7 @@ import asyncio
 import pytest
 
 from hermes_cli import web_server
+from hermes_cli.dashboard_auth.audit import AuthorityAuditReason
 
 
 class _Lease:
@@ -55,3 +56,13 @@ def test_owner_worker_bridge_close_closes_both_halves_and_releases_once() -> Non
     assert browser.closed == [{"code": 4401, "reason": "auth: membership revoked"}]
     assert worker.closed == [{"code": 4401, "reason": "auth: membership revoked"}]
     assert lease.release_count == 1
+
+
+def test_owner_worker_bridge_lifecycle_audit_is_terminal_and_exactly_once(monkeypatch) -> None:
+    events = []
+    monkeypatch.setattr(web_server, "_report_bridge_lifecycle", lambda lease, reason: events.append((lease, reason)))
+
+    browser, worker, lease = asyncio.run(_bridge_close_is_idempotent())
+
+    assert browser.closed and worker.closed
+    assert events == [(lease, AuthorityAuditReason.BRIDGE_CLOSED)]

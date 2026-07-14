@@ -28,6 +28,7 @@ from hermes_cli.owner_worker.executor_identity import (
 )
 from hermes_cli.owner_worker.tool_executor_sandbox import (
     BubblewrapLaunchSpec,
+    SandboxDeploymentPolicy,
     SandboxLaunchBinding,
     SandboxMountPolicy,
     SandboxSecurityPolicy,
@@ -98,6 +99,8 @@ class ToolExecutorSupervisor:
         sandbox_builder: Callable[..., BubblewrapLaunchSpec] = build_bubblewrap_launch_spec,
         control_home: str | Path | None = None,
         readonly_global_mount_roots: tuple[str | Path, ...] | None = None,
+        owner_root: str | Path | None = None,
+        deployment_policy: SandboxDeploymentPolicy | None = None,
         root_tmpfs_bytes: int = 64 << 20,
         executor_tmpfs_bytes: int = 32 << 20,
         sandbox_verification_source: Callable[[SandboxLaunchBinding, SandboxMountPolicy, ExecutorInvocation], SandboxVerificationRecord | None] | None = None,
@@ -115,12 +118,34 @@ class ToolExecutorSupervisor:
         self.credential_broker = credential_broker or CredentialBroker()
         self.sandbox_builder = sandbox_builder
         self.control_home = Path(control_home).resolve() if control_home else None
-        self.readonly_global_mount_roots = readonly_global_mount_roots or default_readonly_global_mount_roots()
+        if deployment_policy is not None:
+            if not isinstance(deployment_policy, SandboxDeploymentPolicy):
+                raise SandboxVerificationInvalid("sandbox deployment policy is invalid")
+            if any(value is not None for value in (
+                readonly_global_mount_roots,
+                owner_root,
+                sandbox_verification_source,
+                sandbox_verification_policy,
+                sandbox_syscall_filter_source,
+            )):
+                raise SandboxVerificationInvalid("sandbox deployment policy cannot be mixed with individual sources")
+            self.deployment_policy = deployment_policy
+            self.readonly_global_mount_roots = deployment_policy.readonly_global_roots
+            self.owner_root = deployment_policy.owner_root
+            self.sandbox_verification_source = deployment_policy.verification_source
+            self.sandbox_verification_policy = deployment_policy.verification_policy
+            self.sandbox_syscall_filter_source = deployment_policy.syscall_filter_source
+        else:
+            # Retained for direct unit construction. Authenticated worker startup
+            # supplies a deployment policy and never accepts these defaults.
+            self.deployment_policy = None
+            self.readonly_global_mount_roots = readonly_global_mount_roots or default_readonly_global_mount_roots()
+            self.owner_root = Path(owner_root).resolve() if owner_root else None
+            self.sandbox_verification_source = sandbox_verification_source
+            self.sandbox_verification_policy = sandbox_verification_policy
+            self.sandbox_syscall_filter_source = sandbox_syscall_filter_source
         self.root_tmpfs_bytes = root_tmpfs_bytes
         self.executor_tmpfs_bytes = executor_tmpfs_bytes
-        self.sandbox_verification_source = sandbox_verification_source
-        self.sandbox_verification_policy = sandbox_verification_policy
-        self.sandbox_syscall_filter_source = sandbox_syscall_filter_source
         self.egress_policy = egress_policy or ExecutorEgressPolicy()
         self.resource_decision_source = resource_decision_source
         self.audit_reporter = audit_reporter
@@ -267,6 +292,7 @@ class ToolExecutorSupervisor:
             readonly_global_roots=tuple(self.readonly_global_mount_roots),
             workspace_root=self.workspace_context.roots.get(RootKind.WORKSPACE).canonical_path,
             control_home=self.control_home,
+            owner_root=self.owner_root,
             root_tmpfs_bytes=self.root_tmpfs_bytes,
             executor_tmpfs_bytes=self.executor_tmpfs_bytes,
         )

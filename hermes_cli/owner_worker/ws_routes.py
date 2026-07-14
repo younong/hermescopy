@@ -104,6 +104,20 @@ def _ws_close_reason(text: str) -> str:
     return encoded[:120].decode("utf-8", "ignore") + "..."
 
 
+def _report_pty_lifecycle(app: Any, reason: AuthorityAuditReason) -> None:
+    """Record only trusted worker generation at PTY lifecycle boundaries."""
+    try:
+        from hermes_cli.owner_worker.audit import report_worker_lifecycle
+
+        report_worker_lifecycle(
+            AuthorityAuditEvent.PTY_LIFECYCLE,
+            reason,
+            worker_generation=int(app.state.owner_worker_generation),
+        )
+    except Exception:
+        return
+
+
 class _Owp1Peer:
     """Expose framed UDS peer data as existing FastAPI WebSocket operations."""
 
@@ -660,6 +674,7 @@ async def pty_ws(ws: WebSocket) -> None:
             await ws.close(code=4409, reason=_ws_close_reason("chat connection replaced after spawn"))
             return
 
+    _report_pty_lifecycle(ws.app, AuthorityAuditReason.ADMITTED)
     loop = asyncio.get_running_loop()
 
     async def pump_pty_to_ws() -> None:
@@ -716,6 +731,7 @@ async def pty_ws(ws: WebSocket) -> None:
         await asyncio.to_thread(bridge.close)
         if browser_registered and browser_id:
             await _release_browser_pty_owner(ws.app, browser_id=browser_id, owner_id=browser_owner_id, metadata=metadata)
+        _report_pty_lifecycle(ws.app, AuthorityAuditReason.BRIDGE_CLOSED)
 
 
 async def gateway_ws(ws: WebSocket) -> None:

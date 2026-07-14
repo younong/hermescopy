@@ -532,6 +532,9 @@ class TestWsAuthOkGated:
         assert old.calls and old.calls[0][0] == 1011
         assert newer.calls == []
         assert different_lease.calls == []
+        assert web_server._worker_bridge_identity(old_change) in web_server.app.state.revoked_ws_bridge_worker_fences
+        assert web_server._worker_bridge_identity(newer_change) not in web_server.app.state.revoked_ws_bridge_worker_fences
+        assert web_server._worker_bridge_identity(wrong_lease_change) not in web_server.app.state.revoked_ws_bridge_worker_fences
 
     def test_worker_change_closes_both_relay_halves_and_releases_exact_lease(self, gated_app):
         import asyncio
@@ -856,7 +859,7 @@ class TestWsAuthOkGated:
                 self.release_count += 1
 
         browser, worker, lease = _Browser(), _Worker(), _Lease()
-        handle = SimpleNamespace(socket_path="/unused", owner_key="ok1_owner", worker_generation=1, worker_id="worker-a", lease_version=1, recovery_generation=0)
+        handle = SimpleNamespace(socket_path="/unused", owner_key="ok1_owner", worker_generation=1, worker_id="worker-bridge-close", lease_version=1, recovery_generation=0)
         browser.app.state.owner_worker_supervisor = SimpleNamespace(get_or_start=lambda _owner: handle, control_home=tmp_path / "control")
         monkeypatch.setattr(web_server, "_owner_context_from_ws_auth_result", lambda _result: SimpleNamespace(owner_key="ok1_owner"))
         monkeypatch.setattr(web_server, "_acquire_owner_worker_use", lambda *_args: lease)
@@ -871,6 +874,97 @@ class TestWsAuthOkGated:
         assert browser.closed and browser.closed[-1][0] == 4409
         assert worker.closed and worker.closed[-1]["code"] == 4409
         assert lease.release_count == 1
+
+    def test_worker_fence_tombstone_rejects_bridge_registered_after_change(self, gated_app, monkeypatch, tmp_path):
+        import asyncio
+        from hermes_cli.dashboard_auth.authority import WorkerGenerationState, WorkerLeaseChange, WorkerLeaseState
+
+        class _Browser:
+            def __init__(self):
+                self.app = web_server.app
+                self.query_params = SimpleNamespace(get=lambda *_args: "")
+                self.url = SimpleNamespace(query="")
+                self.accepted = False
+                self.closed = []
+
+            async def accept(self):
+                self.accepted = True
+
+            async def close(self, *, code=1000, reason=""):
+                self.closed.append((code, reason))
+
+        class _Worker:
+            def __init__(self):
+                self.closed = []
+
+            async def send(self, _value):
+                return None
+
+            async def recv(self):
+                return "ack"
+
+            async def close(self, **kwargs):
+                self.closed.append(kwargs)
+
+        class _Lease:
+            def __init__(self):
+                self.release_count = 0
+
+            def release(self):
+                self.release_count += 1
+
+        browser, worker, lease = _Browser(), _Worker(), _Lease()
+        handle = SimpleNamespace(
+            socket_path="/unused", owner_key="ok1_owner", worker_generation=1,
+            worker_id="worker-late-registration", lease_version=1, recovery_generation=0,
+        )
+        browser.app.state.owner_worker_supervisor = SimpleNamespace(
+            get_or_start=lambda _owner: handle, control_home=tmp_path / "control"
+        )
+        monkeypatch.setattr(web_server, "_owner_context_from_ws_auth_result", lambda _result: SimpleNamespace(owner_key="ok1_owner"))
+        monkeypatch.setattr(web_server, "_acquire_owner_worker_use", lambda *_args: lease)
+        monkeypatch.setattr(web_server, "_connect_owner_worker_ws", lambda *_args, **_kwargs: asyncio.sleep(0, result=worker))
+        monkeypatch.setattr("hermes_cli.dashboard_auth.owner_context.ensure_owner_home", lambda _owner: None)
+        monkeypatch.setattr("hermes_cli.owner_worker.tokens.validate_owp1_control", lambda *_args, **_kwargs: None)
+
+        async def observe_change_before_registration(app_obj):
+            change = WorkerLeaseChange(
+                sequence=1, owner_key=handle.owner_key, worker_generation=handle.worker_generation,
+                worker_id=handle.worker_id, lease_version=handle.lease_version,
+                recovery_generation=handle.recovery_generation, lease_state=WorkerLeaseState.DRAINING,
+                generation_state=WorkerGenerationState.DRAINING,
+            )
+            await web_server.close_authorized_bridges_by_worker_change(
+                app_obj, (change,), reason="worker_generation_revoked"
+            )
+
+        async def exercise():
+            bridges, lock = web_server._authorized_ws_bridge_state(browser.app)
+            async with lock:
+                bridges.clear()
+                browser.app.state.authorized_ws_bridges_by_worker.clear()
+                browser.app.state.revoked_ws_bridge_worker_fences.clear()
+            await web_server._bridge_websocket_to_owner_worker(
+                browser,
+                path="/api/pty",
+                auth_result=web_server._WsAuthResult(
+                    None, "ticket", {
+                        "provider": "stub", "tenant_id": "tenant-a", "user_id": "user-a",
+                        "session_id": "session-a", "membership_revision": "v1", "epoch": 0,
+                    },
+                ),
+            )
+
+        monkeypatch.setattr(web_server, "_ensure_authority_change_dispatcher", observe_change_before_registration)
+        asyncio.run(exercise())
+
+        identity = web_server._worker_bridge_identity(handle)
+        assert browser.accepted is True
+        assert browser.closed == [(1011, "auth: worker generation revoked")]
+        assert worker.closed == [{"code": 1011, "reason": "auth: worker generation revoked"}]
+        assert lease.release_count == 1
+        assert identity in browser.app.state.revoked_ws_bridge_worker_fences
+        assert identity not in browser.app.state.authorized_ws_bridges_by_worker
 
     def test_bridge_connect_failure_releases_lease_before_browser_accept(self, gated_app, monkeypatch, tmp_path):
         import asyncio

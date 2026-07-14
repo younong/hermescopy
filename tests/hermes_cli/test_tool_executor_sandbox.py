@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -10,6 +11,7 @@ from hermes_cli.dashboard_auth.authority import OwnerWorkerAuthorityLease, Worke
 from hermes_cli.owner_worker.executor_identity import EgressProfile, ExecutorIdentity
 from hermes_cli.owner_worker.tool_executor_sandbox import (
     ExecutorIsolationUnavailable,
+    SandboxDeploymentPolicy,
     SandboxLaunchBinding,
     SandboxMountPolicy,
     SandboxSecurityPolicy,
@@ -18,6 +20,7 @@ from hermes_cli.owner_worker.tool_executor_sandbox import (
     SandboxVerificationPolicy,
     SandboxVerificationRecord,
     build_bubblewrap_launch_spec,
+    load_sandbox_deployment_policy,
     validate_sandbox_verification_record,
 )
 
@@ -150,6 +153,48 @@ def test_mount_policy_rejects_owner_workspace_and_sensitive_global_roots(tmp_pat
             SandboxMountPolicy(binding, (unsafe,), workspace, None)
     with pytest.raises(ExecutorIsolationUnavailable):
         SandboxMountPolicy(binding, (sibling,), workspace, sibling)
+
+
+def test_deployment_policy_rejects_owner_root_and_sibling_mounts(tmp_path):
+    owner, runtime, workspace, dependency, _bwrap = _inputs(tmp_path)
+    owner_root = owner.parent
+    sibling = owner_root / "other-owner"
+    sibling.mkdir()
+
+    with pytest.raises(ExecutorIsolationUnavailable, match="overlaps owner root"):
+        SandboxDeploymentPolicy(
+            _verification_policy(), lambda *_args: None, lambda *_args: None,
+            (sibling,), owner_root,
+        )
+
+    global_dependency = tmp_path.parent / f"{tmp_path.name}-global-dependency"
+    global_dependency.mkdir()
+    policy = SandboxDeploymentPolicy(
+        _verification_policy(), lambda *_args: None, lambda *_args: None,
+        (global_dependency,), owner_root,
+    )
+    binding = SandboxLaunchBinding(_identity(), "sandbox-a", owner, runtime)
+    with pytest.raises(ExecutorIsolationUnavailable, match="overlaps protected owner data"):
+        SandboxMountPolicy(binding, (owner_root,), workspace, None, owner_root)
+    assert policy.owner_root == owner_root.resolve()
+
+
+def test_deployment_policy_loader_requires_explicit_valid_operator_factory(tmp_path, monkeypatch):
+    owner, _runtime, _workspace, _dependency, _bwrap = _inputs(tmp_path)
+    global_dependency = tmp_path.parent / f"{tmp_path.name}-operator-global"
+    global_dependency.mkdir()
+    policy = SandboxDeploymentPolicy(
+        _verification_policy(), lambda *_args: None, lambda *_args: None,
+        (global_dependency,), owner.parent,
+    )
+    module = ModuleType("test_sandbox_operator")
+    module.make_policy = lambda: policy
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+
+    assert load_sandbox_deployment_policy("test_sandbox_operator:make_policy") is policy
+    for spec in ("", "test_sandbox_operator:missing", "test_sandbox_operator:make_policy.extra"):
+        with pytest.raises(SandboxVerificationInvalid):
+            load_sandbox_deployment_policy(spec)
 
 
 def test_mount_policy_rejects_unbounded_tmpfs(tmp_path):

@@ -16,6 +16,7 @@ from hermes_cli.dashboard_auth.audit import (
     audit_authority,
     audit_log,
 )
+from hermes_cli.owner_worker.audit import report_worker_lifecycle
 
 
 @pytest.fixture
@@ -154,6 +155,37 @@ def test_persisted_scope_audit_is_allowlisted(tmp_path, monkeypatch):
         "audience_class": "owner-persisted-scope",
         "worker_generation": 7,
     }
+
+
+def test_worker_lifecycle_audit_is_deidentified_and_best_effort(tmp_path, monkeypatch):
+    control_home = tmp_path / "control-plane"
+    control_home.mkdir()
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_owner")
+
+    report_worker_lifecycle(
+        AuthorityAuditEvent.PTY_LIFECYCLE,
+        AuthorityAuditReason.ADMITTED,
+        worker_generation=7,
+    )
+
+    entry = json.loads((control_home / "logs" / "authority.log").read_text())
+    assert entry == {
+        "ts": entry["ts"],
+        "event": "authority_pty_lifecycle",
+        "correlation_id": entry["correlation_id"],
+        "reason": "admitted",
+        "audience_class": "browser-ws",
+        "worker_generation": 7,
+    }
+    assert "ok1_owner" not in (control_home / "logs" / "authority.log").read_text()
+
+    monkeypatch.setattr("hermes_cli.owner_worker.audit.audit_authority", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("unavailable")))
+    report_worker_lifecycle(
+        AuthorityAuditEvent.PTY_LIFECYCLE,
+        AuthorityAuditReason.BRIDGE_CLOSED,
+        worker_generation=7,
+    )
 
 
 def test_authority_audit_rejects_unknown_reason_and_sensitive_escape_hatch(profile_home):

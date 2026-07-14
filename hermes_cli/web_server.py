@@ -176,6 +176,7 @@ async def _lifespan(app: "FastAPI"):
     app.state.pty_browser_lock = asyncio.Lock()
     app.state.authorized_ws_bridges = {}  # scope digest -> {(websocket, epoch)}
     app.state.authorized_ws_bridges_by_worker = {}  # exact worker fence -> {websocket}
+    app.state.revoked_ws_bridge_worker_fences = set()  # exact durable fences
     app.state.authorized_ws_bridge_lock = asyncio.Lock()
     app.state.authority_change_sequence = 0
     app.state.worker_change_sequence = 0
@@ -12478,6 +12479,21 @@ _OWNER_WORKER_WS_RELAY_QUEUE_SIZE = 16
 _OWNER_WORKER_WS_RELAY_OPERATION_TIMEOUT = 10.0
 
 
+def _report_bridge_lifecycle(lease: Any, reason: "AuthorityAuditReason") -> None:
+    """Record trusted bridge lifecycle facts without stream or owner data."""
+    try:
+        from hermes_cli.dashboard_auth.audit import AuthorityAuditEvent
+        from hermes_cli.owner_worker.audit import report_worker_lifecycle
+
+        report_worker_lifecycle(
+            AuthorityAuditEvent.BRIDGE_LIFECYCLE,
+            reason,
+            worker_generation=int(lease.worker_generation),
+        )
+    except Exception:
+        return
+
+
 class _OwnerWorkerWsRelayClosed(Exception):
     """Stop a relay with a sanitized public close result."""
 
@@ -12528,6 +12544,10 @@ class _OwnerWorkerWsBridge:
             if not self._released and self.lease is not None:
                 self._released = True
                 self.lease.release()
+            if self.lease is not None:
+                from hermes_cli.dashboard_auth.audit import AuthorityAuditReason
+
+                _report_bridge_lifecycle(self.lease, AuthorityAuditReason.BRIDGE_CLOSED)
 
 
 async def _relay_queue_put(queue: asyncio.Queue[Any], value: Any) -> None:
@@ -12609,6 +12629,8 @@ def _authorized_ws_bridge_state(
         app_obj.state.authority_change_task = None
     if not hasattr(app_obj.state, "authorized_ws_bridges_by_worker"):
         app_obj.state.authorized_ws_bridges_by_worker = {}
+    if not hasattr(app_obj.state, "revoked_ws_bridge_worker_fences"):
+        app_obj.state.revoked_ws_bridge_worker_fences = set()
     if not hasattr(app_obj.state, "worker_change_sequence"):
         app_obj.state.worker_change_sequence = 0
     return bridges, lock
@@ -12708,6 +12730,7 @@ async def close_authorized_bridges_by_worker_change(
             if not close_active and str(change.lease_state) in {"starting", "active"}:
                 continue
             identity = _worker_bridge_identity(change)
+            app_obj.state.revoked_ws_bridge_worker_fences.add(identity)
             targets.update(worker_bridges.pop(identity, set()))
         if targets:
             for digest, registrations in tuple(bridges.items()):
@@ -12907,6 +12930,9 @@ async def _bridge_websocket_to_owner_worker(
     await _ensure_authority_change_dispatcher(ws.app)
     bridges, bridge_lock = _authorized_ws_bridge_state(ws.app)
     async with bridge_lock:
+        if bridge_worker_identity in ws.app.state.revoked_ws_bridge_worker_fences:
+            await bridge.close(code=1011, reason="auth: worker generation revoked")
+            return
         ws.app.state.authorized_ws_bridges_by_worker.setdefault(
             bridge_worker_identity, set()
         ).add(bridge)
@@ -12924,6 +12950,9 @@ async def _bridge_websocket_to_owner_worker(
             bridges.setdefault(bridge_scope_digest, set()).add(
                 (bridge, int(auth_result.payload["epoch"]))
             )
+    from hermes_cli.dashboard_auth.audit import AuthorityAuditReason
+
+    _report_bridge_lifecycle(_owner_worker_authority_lease(handle), AuthorityAuditReason.ADMITTED)
     _log.info("owner websocket bridged path=%s owner=%s", path, owner.owner_key)
 
     async def expire_browser_session() -> None:

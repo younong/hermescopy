@@ -39,6 +39,48 @@ class TestHandleFunctionCall:
         assert len(parsed["error"]) > 0
         assert "error" in parsed["error"].lower() or "failed" in parsed["error"].lower()
 
+    def test_authenticated_runtime_without_executor_never_uses_registry(self, monkeypatch):
+        from tui_gateway import server
+
+        runtime = server.OwnerWorkerGatewayRuntime("owner-a", 1, "worker-a", 1, 0)
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("raw registry must not run")),
+        )
+
+        with server.owner_worker_gateway_runtime(runtime):
+            result = json.loads(handle_function_call("web_search", {"q": "test"}))
+
+        assert result["error"] == "[TOOL_ERROR] Error executing web_search: authenticated tool executor is unavailable"
+
+    def test_authenticated_runtime_dispatches_through_executor(self):
+        from tui_gateway import server
+
+        calls = []
+
+        class _Supervisor:
+            def dispatch(self, **kwargs):
+                calls.append(kwargs)
+                return '{"owner_executor":true}'
+
+        runtime = server.OwnerWorkerGatewayRuntime(
+            "owner-a", 1, "worker-a", 1, 0, tool_executor_supervisor=_Supervisor()
+        )
+        with (
+            patch("model_tools.registry.dispatch", side_effect=AssertionError("raw registry must not run")),
+            server.owner_worker_gateway_runtime(runtime),
+        ):
+            result = handle_function_call(
+                "web_search", {"q": "test"}, task_id="task-1", session_id="session-1"
+            )
+
+        assert result == '{"owner_executor":true}'
+        assert calls == [{
+            "function_name": "web_search", "function_args": {"q": "test"},
+            "task_id": "task-1", "session_id": "session-1", "tool_call_id": "",
+            "turn_id": "", "api_request_id": "",
+        }]
+
     def test_tool_hooks_receive_session_and_tool_call_ids(self):
         with (
             patch("model_tools.registry.dispatch", return_value='{"ok":true}'),

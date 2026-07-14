@@ -1139,6 +1139,10 @@ def handle_function_call(
 
             _owner_runtime = current_owner_worker_gateway_runtime()
             _executor_supervisor = getattr(_owner_runtime, "tool_executor_supervisor", None)
+            if _owner_runtime is not None and _executor_supervisor is None:
+                # An authenticated Owner Worker must never downgrade to the
+                # process-global registry. Its executor boundary is mandatory.
+                raise RuntimeError("authenticated tool executor is unavailable")
             if _executor_supervisor is not None:
                 # All existing middleware and policy hooks run before this
                 # terminal boundary. The executor itself dispatches directly to

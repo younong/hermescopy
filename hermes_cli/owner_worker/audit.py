@@ -16,6 +16,25 @@ from .executor_identity import ExecutorIdentity
 ExecutorAuditReporter = Callable[[AuthorityAuditEvent, AuthorityAuditReason, ExecutorIdentity], None]
 
 
+def report_worker_lifecycle(
+    event: AuthorityAuditEvent,
+    reason: AuthorityAuditReason,
+    *,
+    worker_generation: int,
+) -> None:
+    """Best-effort de-identified lifecycle audit for trusted worker boundaries."""
+    try:
+        audit_authority(
+            event,
+            correlation_id=new_authority_correlation_id(),
+            reason=reason,
+            audience_class="browser-ws",
+            worker_generation=worker_generation,
+        )
+    except Exception:
+        return
+
+
 def report_executor_authority_decision(
     event: AuthorityAuditEvent,
     reason: AuthorityAuditReason,

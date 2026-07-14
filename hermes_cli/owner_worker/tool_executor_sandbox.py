@@ -7,6 +7,7 @@ other mounts are derived from fixed runtime inputs.
 """
 from __future__ import annotations
 
+import importlib
 import os
 import platform
 import hashlib
@@ -117,6 +118,67 @@ def validate_sandbox_syscall_filter(
 
 
 @dataclass(frozen=True)
+class SandboxDeploymentPolicy:
+    """Operator-owned inputs required to admit authenticated executors.
+
+    This object is constructed by the deployment integration, never from tool
+    input or permissive interpreter/source-root defaults. The callbacks remain
+    outside the child process and must provide evidence/filter FDs for each
+    exact binding.
+    """
+
+    verification_policy: SandboxVerificationPolicy
+    verification_source: Callable[["SandboxLaunchBinding", "SandboxMountPolicy", object], "SandboxVerificationRecord | None"]
+    syscall_filter_source: Callable[["SandboxLaunchBinding", SandboxSecurityPolicy], SandboxSyscallFilter | None]
+    readonly_global_roots: tuple[Path, ...]
+    owner_root: Path
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.verification_policy, SandboxVerificationPolicy):
+            raise SandboxVerificationInvalid("sandbox deployment verification policy is required")
+        if not callable(self.verification_source) or not callable(self.syscall_filter_source):
+            raise SandboxVerificationInvalid("sandbox deployment sources are required")
+        owner_root = _canonical(self.owner_root, field="deployment owner root")
+        if not owner_root.is_dir():
+            raise ExecutorIsolationUnavailable("deployment owner root must be a directory")
+        roots: list[Path] = []
+        for root in self.readonly_global_roots:
+            resolved = _canonical(root, field="deployment readonly global mount root")
+            if not resolved.is_dir() or _overlaps(resolved, owner_root):
+                raise ExecutorIsolationUnavailable("deployment readonly root overlaps owner root")
+            if resolved not in roots:
+                roots.append(resolved)
+        if not roots:
+            raise ExecutorIsolationUnavailable("deployment readonly global mount roots are required")
+        object.__setattr__(self, "owner_root", owner_root)
+        object.__setattr__(self, "readonly_global_roots", tuple(roots))
+
+
+def load_sandbox_deployment_policy(spec: str) -> SandboxDeploymentPolicy:
+    """Load the explicit operator factory named by ``module:attribute``.
+
+    The contract intentionally has no default: authenticated startup remains
+    unavailable until an operator wires a trusted provider.
+    """
+    module_name, separator, attribute = str(spec or "").strip().partition(":")
+    if not separator or not module_name or not attribute or "." in attribute:
+        raise SandboxVerificationInvalid("sandbox deployment policy factory is required")
+    try:
+        factory = getattr(importlib.import_module(module_name), attribute)
+    except (ImportError, AttributeError) as exc:
+        raise SandboxVerificationInvalid("sandbox deployment policy factory is unavailable") from exc
+    if not callable(factory):
+        raise SandboxVerificationInvalid("sandbox deployment policy factory is invalid")
+    try:
+        policy = factory()
+    except Exception as exc:
+        raise SandboxVerificationInvalid("sandbox deployment policy factory failed") from exc
+    if not isinstance(policy, SandboxDeploymentPolicy):
+        raise SandboxVerificationInvalid("sandbox deployment policy factory returned invalid policy")
+    return policy
+
+
+@dataclass(frozen=True)
 class SandboxLaunchBinding:
     """Immutable owner/generation fence for one sandbox process."""
 
@@ -171,6 +233,7 @@ class SandboxMountPolicy:
     readonly_global_roots: tuple[Path, ...]
     workspace_root: Path | None
     control_home: Path | None
+    owner_root: Path | None = None
     root_tmpfs_bytes: int = 64 << 20
     executor_tmpfs_bytes: int = 32 << 20
     mount_policy_id: str = field(init=False)
@@ -183,7 +246,12 @@ class SandboxMountPolicy:
                 raise ExecutorIsolationUnavailable(f"sandbox {field_name} size is invalid")
         workspace = _canonical(self.workspace_root, field="workspace root") if self.workspace_root else None
         control = _canonical(self.control_home, field="control home") if self.control_home else None
+        owner_root = _canonical(self.owner_root, field="deployment owner root") if self.owner_root else None
+        if owner_root is not None and self.binding.owner_home.parent != owner_root:
+            raise ExecutorIsolationUnavailable("sandbox owner home does not match deployment owner root")
         protected = [self.binding.owner_home, self.binding.runtime_home]
+        if owner_root:
+            protected.append(owner_root)
         if workspace:
             protected.append(workspace)
         if control:
@@ -211,6 +279,7 @@ class SandboxMountPolicy:
         object.__setattr__(self, "readonly_global_roots", tuple(roots))
         object.__setattr__(self, "workspace_root", workspace)
         object.__setattr__(self, "control_home", control)
+        object.__setattr__(self, "owner_root", owner_root)
         manifest = {
             "owner_runtime": str(self.binding.runtime_home),
             "globals": [str(root) for root in roots],

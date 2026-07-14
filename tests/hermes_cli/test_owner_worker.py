@@ -1013,6 +1013,121 @@ def test_worker_create_app_fails_closed_when_controlled_roots_are_unavailable(tm
         entrypoint.create_app("ok1_worker_roots", owner_home)
 
 
+def test_worker_entrypoint_wires_only_explicit_deployment_policy(tmp_path, monkeypatch):
+    import hermes_cli.owner_worker.entrypoint as entrypoint
+    import hermes_cli.owner_worker.tool_executor_sandbox as sandbox
+    import hermes_cli.owner_worker.tool_executor_supervisor as supervisor_module
+
+    owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_worker_policy")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(tmp_path / "control"))
+    policy = object()
+    constructed = []
+
+    class _Supervisor:
+        def __init__(self, **kwargs):
+            constructed.append(kwargs)
+
+        def stop_generation(self):
+            return None
+
+    monkeypatch.setattr(sandbox, "load_sandbox_deployment_policy", lambda spec: policy)
+    monkeypatch.setattr(supervisor_module, "ToolExecutorSupervisor", _Supervisor)
+    monkeypatch.setenv("HERMES_SANDBOX_DEPLOYMENT_POLICY", "operator_policy:build")
+
+    app = entrypoint.create_app("ok1_worker_policy", owner_home)
+
+    assert len(constructed) == 1
+    assert constructed[0]["deployment_policy"] is policy
+    assert constructed[0]["owner_home"] == owner_home
+    assert app.state.tool_executor_supervisor is not None
+    assert app.state.owner_worker_live_state.gateway_runtime.tool_executor_supervisor is app.state.tool_executor_supervisor
+
+
+def test_worker_entrypoint_missing_deployment_policy_disables_executor(tmp_path, monkeypatch):
+    import hermes_cli.owner_worker.entrypoint as entrypoint
+    import hermes_cli.owner_worker.tool_executor_sandbox as sandbox
+
+    owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_worker_policy")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(tmp_path / "control"))
+    monkeypatch.delenv("HERMES_SANDBOX_DEPLOYMENT_POLICY", raising=False)
+    monkeypatch.setattr(
+        sandbox,
+        "load_sandbox_deployment_policy",
+        lambda _spec: (_ for _ in ()).throw(RuntimeError("missing operator policy")),
+    )
+
+    app = entrypoint.create_app("ok1_worker_policy", owner_home)
+
+    assert app.state.tool_executor_supervisor is None
+    assert app.state.tool_executor_startup_error == "sandbox deployment policy unavailable"
+    assert app.state.owner_worker_live_state.gateway_runtime.tool_executor_supervisor is None
+
+
+def test_owner_worker_pty_lifecycle_audit_is_admitted_then_terminal_once(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    from hermes_cli.dashboard_auth.audit import AuthorityAuditReason
+    from hermes_cli.owner_worker import ws_routes
+
+    events = []
+
+    class _WebSocket:
+        def __init__(self):
+            self.app = SimpleNamespace(state=SimpleNamespace(owner_worker_generation=7))
+            self.query_params = SimpleNamespace(get=lambda _key, default="": default)
+            self.url = SimpleNamespace(path="/api/pty")
+            self.accepted = False
+            self.closed = []
+
+        async def accept(self):
+            self.accepted = True
+
+        async def close(self, **kwargs):
+            self.closed.append(kwargs)
+
+        async def receive(self):
+            return {"type": "websocket.disconnect"}
+
+        async def send_bytes(self, _data):
+            return None
+
+    class _Bridge:
+        def __init__(self):
+            self.closed = 0
+
+        def read(self, _timeout):
+            return None
+
+        def close(self):
+            self.closed += 1
+
+        def resize(self, **_kwargs):
+            return None
+
+        def write(self, _data):
+            return None
+
+    bridge = _Bridge()
+    websocket = _WebSocket()
+    monkeypatch.setattr(ws_routes, "_admit_bootstrap_or_close", lambda _ws: asyncio.sleep(0, result=websocket))
+    monkeypatch.setattr(ws_routes, "_trusted_live_metadata", lambda *_args: ("trusted",))
+    monkeypatch.setattr(ws_routes, "_PTY_BRIDGE_AVAILABLE", True)
+    monkeypatch.setattr(ws_routes, "_resolve_chat_argv_async", lambda **_kwargs: asyncio.sleep(0, result=(["test"], None, {})))
+    monkeypatch.setattr(ws_routes, "PtyBridge", SimpleNamespace(spawn=lambda *_args, **_kwargs: bridge))
+    monkeypatch.setattr(ws_routes, "_report_pty_lifecycle", lambda _app, reason: events.append(reason))
+
+    asyncio.run(ws_routes.pty_ws(websocket))
+
+    assert websocket.accepted is True
+    assert events == [AuthorityAuditReason.ADMITTED, AuthorityAuditReason.BRIDGE_CLOSED]
+    assert bridge.closed >= 1
+
+
 def test_worker_session_routes_require_owner_token(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 

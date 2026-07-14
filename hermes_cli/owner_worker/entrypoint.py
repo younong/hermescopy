@@ -281,18 +281,30 @@ def create_app(
     workspace_context = AuthenticatedWorkspaceContext(controlled_roots)
     from hermes_cli.owner_worker.audit import report_executor_authority_decision
     from hermes_cli.owner_worker.credential_broker import CredentialBroker
+    from hermes_cli.owner_worker.tool_executor_sandbox import load_sandbox_deployment_policy
     from hermes_cli.owner_worker.tool_executor_supervisor import ToolExecutorSupervisor
 
     app.state.tool_executor_credential_broker = CredentialBroker(
         audit_reporter=report_executor_authority_decision,
     )
-    app.state.tool_executor_supervisor = ToolExecutorSupervisor(
-        owner_home=owner_home,
-        workspace_context=workspace_context,
-        lease=lease,
-        credential_broker=app.state.tool_executor_credential_broker,
-        audit_reporter=report_executor_authority_decision,
-    )
+    policy_factory = os.environ.get("HERMES_SANDBOX_DEPLOYMENT_POLICY", "")
+    try:
+        deployment_policy = load_sandbox_deployment_policy(policy_factory)
+    except Exception:
+        # The Gateway stays available for non-tool work, while tool admission
+        # remains fail closed until a deployment operator supplies this policy.
+        app.state.tool_executor_supervisor = None
+        app.state.tool_executor_startup_error = "sandbox deployment policy unavailable"
+    else:
+        app.state.tool_executor_supervisor = ToolExecutorSupervisor(
+            owner_home=owner_home,
+            workspace_context=workspace_context,
+            lease=lease,
+            credential_broker=app.state.tool_executor_credential_broker,
+            deployment_policy=deployment_policy,
+            control_home=app.state.owner_worker_control_home,
+            audit_reporter=report_executor_authority_decision,
+        )
     app.state.owner_worker_live_state.gateway_runtime = OwnerWorkerGatewayRuntime(
         owner_key=lease.owner_key,
         worker_generation=lease.worker_generation,

@@ -106,6 +106,9 @@ if os.name == "nt":
 
 _OWNER_WORKER_ENV_EXPLICIT_KEEP: frozenset[str] = frozenset({
     "HERMES_DISABLE_LAZY_INSTALLS",
+    # Operator-owned factory specification, passed to the authenticated worker
+    # only so its startup can construct the mandatory deployment policy.
+    "HERMES_SANDBOX_DEPLOYMENT_POLICY",
 })
 
 
