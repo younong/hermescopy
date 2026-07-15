@@ -353,6 +353,7 @@ class ToolExecutorSupervisor:
         mount_policy = self._sandbox_mount_policy(binding)
         verification_record = self._require_verified_sandbox(binding, mount_policy, invocation)
         syscall_filter = self._require_syscall_filter(binding)
+        inherited_security_fd = -1
         try:
             inherited_security_fd = os.dup(syscall_filter.fd)
             os.set_inheritable(inherited_security_fd, True)
