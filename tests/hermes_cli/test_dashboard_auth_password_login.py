@@ -424,6 +424,26 @@ class TestRateLimit:
 
 
 # ---------------------------------------------------------------------------
+# Password-only unauthenticated navigation
+# ---------------------------------------------------------------------------
+
+
+class TestPasswordOnlyLoginNavigation:
+    def test_deep_html_path_redirects_to_password_login_page(self, gated_app):
+        response = gated_app.get("/sessions?page=2", follow_redirects=False)
+
+        assert response.status_code == 302
+        assert response.headers["location"] == "/login?next=%2Fsessions%3Fpage%3D2"
+        assert "/auth/login" not in response.headers["location"]
+
+        login_page = gated_app.get(response.headers["location"])
+        assert login_page.status_code == 200
+        assert '<form class="provider-form" data-provider="testpw"' in login_page.text
+        assert 'name="username"' in login_page.text
+        assert 'name="password"' in login_page.text
+
+
+# ---------------------------------------------------------------------------
 # Login page rendering
 # ---------------------------------------------------------------------------
 
@@ -439,7 +459,9 @@ class TestLoginPageRender:
             assert 'name="password"' in html
             assert 'value="/sessions"' in html
             assert "<script>" in html
-            assert "/auth/password-login" in html
+            assert "var loginPrefix = window.location.pathname.replace(/\\/login$/, '') || '';" in html
+            assert "fetch(loginPrefix + '/auth/password-login'" in html
+            assert "window.location.assign(loginPrefix + target);" in html
         finally:
             clear_providers()
 
