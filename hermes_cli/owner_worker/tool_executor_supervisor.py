@@ -8,7 +8,7 @@ import stat
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -66,7 +66,7 @@ class _LiveInvocation:
 class ExecutorEgressPolicy:
     """Owner-side tool-name selection with no child-controlled inputs."""
 
-    by_tool_name: Mapping[str, EgressProfile | str] = MappingProxyType({})
+    by_tool_name: Mapping[str, EgressProfile | str] = field(default_factory=dict)
     default: EgressProfile = EgressProfile.TOOL_NONE
 
     def __post_init__(self) -> None:
