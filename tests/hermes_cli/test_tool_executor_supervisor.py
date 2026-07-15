@@ -257,6 +257,14 @@ def test_supervisor_selects_only_trusted_tool_egress_profiles(tmp_path, profile)
     assert [value.value for value in selected] == [profile]
 
 
+def test_egress_policy_default_mapping_is_immutable():
+    policy = ExecutorEgressPolicy()
+
+    assert policy.select("read_file").value == "tool-none"
+    with pytest.raises(TypeError):
+        policy.by_tool_name["read_file"] = "tool-public"
+
+
 def test_egress_policy_copies_source_mapping_and_defaults_unmapped_tools():
     source = {"read_file": "tool-public"}
     policy = ExecutorEgressPolicy(source)
