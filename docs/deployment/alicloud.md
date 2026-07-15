@@ -1,6 +1,6 @@
 # 阿里云部署
 
-Hermes 的阿里云生产部署使用 `deploy/` 目录里的 Node.js 工具。发布规则是：先确定一个 Git tag，再在本机基于该 tag 构建 web/ui-tui 产物，最后把源码 + 构建产物上传到服务器。服务器只负责解包、按需初始化/更新共享 Python venv、切换 current symlink，并通过 systemd 直接运行 Hermes gateway 和 dashboard。
+Hermes 的阿里云生产部署使用 `deploy/` 目录里的 Node.js 工具。常规发布先确定一个 Git tag，再在本机基于该 tag 构建 web/ui-tui 产物，最后把源码 + 构建产物上传到服务器。无 tag 的受限例外是 `--ref <40-hex-commit-sha>`：它只接受已推送到 `origin` 的不可变完整 commit SHA，绝不会发布当前工作区或可移动分支。服务器只负责解包、按需初始化/更新共享 Python venv、切换 current symlink，并通过 systemd 直接运行 Hermes gateway 和 dashboard。
 
 服务器默认配置：
 
@@ -140,6 +140,17 @@ npm run deploy -- --tag v2026.7.3
 ```
 
 `--tag` 模式会从 Git tag 生成源码包，不会上传当前工作区文件。构建产物随 release 上传；Python venv 为共享环境，仅当 `uv.lock` 变化时更新。
+
+## 无 tag 部署已推送 commit
+
+仅在明确不创建 tag 时使用完整、已推送的 commit SHA：
+
+```bash
+npm run deploy -- --ref <40-hex-commit-sha> --dry-run
+npm run deploy -- --ref <40-hex-commit-sha>
+```
+
+`--ref` 拒绝 `HEAD`、分支名、短 SHA、脏工作区和 `--force`。工具从该 SHA 的 `git archive` 构建 artifact，写入来源 manifest，并部署至 `/opt/hermes/releases/commit-<sha>`；已有来源不匹配的 release 会 fail closed，不会被覆盖。回滚继续使用稳定 tag。
 
 ## Release 保留与清理
 

@@ -73,8 +73,12 @@ export type BuildWsUrl = (
   params?: Record<string, string>,
 ) => Promise<string>;
 
-/** Lower-level: just the ``[authParamName, authParamValue]`` pair. */
-export type BuildWsAuthParam = () => Promise<[string, string]>;
+/**
+ * Lower-level: resolve the ``[authParamName, authParamValue]`` pair for a
+ * dashboard-relative WebSocket endpoint path. In gated mode the path binds
+ * the single-use ticket audience.
+ */
+export type BuildWsAuthParam = (path: string) => Promise<[string, string]>;
 
 // ---------------------------------------------------------------------------
 // Registry surface (window.__HERMES_PLUGINS__)
