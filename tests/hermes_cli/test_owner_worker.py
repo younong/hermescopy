@@ -291,6 +291,79 @@ def test_worker_ws_bootstrap_resolves_active_durable_lease_from_starting_config(
     assert replacement.lease.state is WorkerLeaseState.STARTING
 
 
+def test_events_ws_uses_admitted_owp1_peer_without_second_accept(monkeypatch):
+    from hermes_cli.owner_worker import ws_routes
+
+    class _Peer:
+        def __init__(self):
+            self.received = 0
+            self.closed = []
+
+        async def receive_text(self):
+            self.received += 1
+            raise ws_routes.WebSocketDisconnect(code=1000)
+
+        async def close(self, **kwargs):
+            self.closed.append(kwargs)
+
+    peer = _Peer()
+    app = type("App", (), {"state": type("State", (), {})()})()
+    websocket = type(
+        "WebSocket",
+        (),
+        {
+            "app": app,
+            "query_params": {"channel": "events-test"},
+            "accept": lambda _self: (_ for _ in ()).throw(AssertionError("second websocket accept")),
+        },
+    )()
+
+    async def _admit(_ws):
+        return peer
+
+    monkeypatch.setattr(ws_routes, "_admit_bootstrap_or_close", _admit)
+    asyncio.run(ws_routes.events_ws(websocket))
+
+    assert peer.received == 1
+    assert app.state.owner_worker_live_state.event_channels == {}
+
+
+def test_pub_ws_uses_admitted_owp1_peer_without_second_accept(monkeypatch):
+    from hermes_cli.owner_worker import ws_routes
+
+    class _Peer:
+        def __init__(self):
+            self.received = 0
+            self.closed = []
+
+        async def receive_text(self):
+            self.received += 1
+            raise ws_routes.WebSocketDisconnect(code=1000)
+
+        async def close(self, **kwargs):
+            self.closed.append(kwargs)
+
+    peer = _Peer()
+    app = type("App", (), {"state": type("State", (), {})()})()
+    websocket = type(
+        "WebSocket",
+        (),
+        {
+            "app": app,
+            "query_params": {"channel": "pub-test"},
+            "accept": lambda _self: (_ for _ in ()).throw(AssertionError("second websocket accept")),
+        },
+    )()
+
+    async def _admit(_ws):
+        return peer
+
+    monkeypatch.setattr(ws_routes, "_admit_bootstrap_or_close", _admit)
+    asyncio.run(ws_routes.pub_ws(websocket))
+
+    assert peer.received == 1
+
+
 def test_owp1_data_requires_exact_peer_and_monotonic_sequence(tmp_path):
     _store, lease = _active_lease(tmp_path)
     verifier = owner_worker_capability_public_config(tmp_path / "control")

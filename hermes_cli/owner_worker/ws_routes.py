@@ -795,41 +795,41 @@ async def gateway_ws(ws: WebSocket) -> None:
 
 
 async def pub_ws(ws: WebSocket) -> None:
-    if not await _admit_bootstrap_or_close(ws):
+    peer = await _admit_bootstrap_or_close(ws)
+    if peer is None:
         return
     channel = _channel_or_none(ws)
     if not channel:
-        await ws.close(code=4400)
+        await peer.close(code=4400)
         return
-    await ws.accept()
     try:
         while True:
-            await _broadcast_event(ws.app, channel, await ws.receive_text())
+            await _broadcast_event(ws.app, channel, await peer.receive_text())
     except WebSocketDisconnect:
         pass
 
 
 async def events_ws(ws: WebSocket) -> None:
-    if not await _admit_bootstrap_or_close(ws):
+    peer = await _admit_bootstrap_or_close(ws)
+    if peer is None:
         return
     channel = _channel_or_none(ws)
     if not channel:
-        await ws.close(code=4400)
+        await peer.close(code=4400)
         return
-    await ws.accept()
     event_channels, event_lock = _get_event_state(ws.app)
     async with event_lock:
-        event_channels.setdefault(channel, set()).add(ws)
+        event_channels.setdefault(channel, set()).add(peer)
     try:
         while True:
-            await ws.receive_text()
+            await peer.receive_text()
     except WebSocketDisconnect:
         pass
     finally:
         async with event_lock:
             subs = event_channels.get(channel)
             if subs is not None:
-                subs.discard(ws)
+                subs.discard(peer)
                 if not subs:
                     event_channels.pop(channel, None)
 
