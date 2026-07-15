@@ -225,6 +225,12 @@ async def _lifespan(app: "FastAPI"):
                 await authority_change_task
             except asyncio.CancelledError:
                 pass
+        supervisor = getattr(app.state, "owner_worker_supervisor", None)
+        if supervisor is not None:
+            try:
+                await asyncio.to_thread(supervisor.shutdown)
+            except Exception:
+                _log.exception("owner worker shutdown cleanup failed")
         if cron_stop is not None:
             cron_stop.set()
 

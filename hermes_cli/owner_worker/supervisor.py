@@ -1,7 +1,9 @@
 """Supervisor for per-owner Hermes worker processes."""
 from __future__ import annotations
 
+import errno
 import os
+import socket
 import stat
 import subprocess
 import sys
@@ -231,7 +233,15 @@ class OwnerWorkerSupervisor:
 
             self._admit_start(owner_key, owner_home, now=now)
             ensure_owner_runtime_dirs(owner_home)
-            claim = self.authority_store.claim_worker_start(owner_key, worker_id=uuid.uuid4().hex)
+            try:
+                claim = self.authority_store.claim_worker_start(owner_key, worker_id=uuid.uuid4().hex)
+            except AuthorizationRejected as exc:
+                if (
+                    str(exc) != "worker_lease_already_owned"
+                    or not self._reconcile_missing_local_worker(owner_key, owner_home)
+                ):
+                    raise
+                claim = self.authority_store.claim_worker_start(owner_key, worker_id=uuid.uuid4().hex)
             generation = claim.generation
             socket_path = self.socket_path_for(owner, generation.worker_generation)
             env = self._env_for(owner, generation, claim.lease)
@@ -360,6 +370,96 @@ class OwnerWorkerSupervisor:
             self._handles[owner_key] = handle
             self._audit_generation(AuthorityAuditReason.GENERATION_ACTIVE, active_lease)
             return handle
+
+    @staticmethod
+    def _canonical_socket_is_absent(socket_path: Path) -> bool:
+        """Return true only for an unambiguous absent/refused local UDS peer."""
+        if not socket_path.exists():
+            return True
+        try:
+            if not stat.S_ISSOCK(socket_path.stat().st_mode):
+                return False
+        except OSError:
+            return False
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            client.settimeout(0.25)
+            client.connect(str(socket_path))
+        except FileNotFoundError:
+            return True
+        except ConnectionRefusedError:
+            return True
+        except OSError as exc:
+            # Do not reclaim when permission, timeout, or any unexpected local
+            # condition leaves peer liveness uncertain.
+            return exc.errno in {errno.ENOENT, errno.ECONNREFUSED}
+        else:
+            return False
+        finally:
+            client.close()
+
+    def _reconcile_missing_local_worker(self, owner_key: str, owner_home: Path) -> bool:
+        """Release one conclusively absent local Worker fence, if safe.
+
+        A fresh Dashboard process has no handle map for children left by an
+        unclean predecessor.  Local UDS absence is sufficient evidence only for
+        the canonical per-generation socket; any existing socket is treated as
+        a potentially live peer and is never reclaimed here.
+        """
+        lease = self.authority_store.read_owner_worker_lease(owner_key)
+        # A STARTING fence may belong to a concurrent supervisor between
+        # claim and socket bind. Without a durable process identity/liveness
+        # witness, leave it fail-closed rather than racing that startup.
+        if lease is None or lease.state not in {
+            WorkerLeaseState.ACTIVE,
+            WorkerLeaseState.DRAINING,
+        }:
+            return False
+        socket_path = owner_worker_socket_path(owner_home, lease.worker_generation)
+        if not self._canonical_socket_is_absent(socket_path):
+            return False
+        try:
+            # Re-read the exact fence after observing socket absence. This
+            # protects against an authority replacement racing this supervisor.
+            lease = self.authority_store.assert_worker_lease(lease)
+            if lease.state is WorkerLeaseState.STARTING:
+                self.authority_store.transition_worker_lease(
+                    lease,
+                    state=WorkerLeaseState.REVOKED,
+                    generation_state=WorkerGenerationState.FAILED,
+                )
+            elif lease.state is WorkerLeaseState.ACTIVE:
+                draining = self.authority_store.transition_worker_lease(
+                    lease,
+                    state=WorkerLeaseState.DRAINING,
+                    generation_state=WorkerGenerationState.DRAINING,
+                )
+                self.authority_store.transition_worker_lease(
+                    draining,
+                    state=WorkerLeaseState.REVOKED,
+                    generation_state=WorkerGenerationState.REVOKED,
+                )
+            elif lease.state is WorkerLeaseState.DRAINING:
+                self.authority_store.transition_worker_lease(
+                    lease,
+                    state=WorkerLeaseState.REVOKED,
+                    generation_state=WorkerGenerationState.REVOKED,
+                )
+            else:  # pragma: no cover - state filter above is exhaustive
+                return False
+        except AuthorizationRejected:
+            return False
+        return True
+
+    def shutdown(self) -> None:
+        """Drain every locally owned generation before the Dashboard exits."""
+        with self._lock:
+            handles = tuple(self._handles.items())
+        for owner_key, handle in handles:
+            with self._lock:
+                if self._handles.get(owner_key) is not handle:
+                    continue
+                self._terminate_handle(owner_key, handle)
 
     def _admit_start(self, owner_key: str, owner_home: Path, *, now: float) -> None:
         """Apply per-owner cold-start throttle and idle-only capacity eviction."""

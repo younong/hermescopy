@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import sys
@@ -11,7 +12,12 @@ from pathlib import Path
 import httpx
 import pytest
 
-from hermes_cli.dashboard_auth.authority import AuthorityStore, WorkerGenerationState, WorkerLeaseState
+from hermes_cli.dashboard_auth.authority import (
+    AuthorityStore,
+    AuthorizationRejected,
+    WorkerGenerationState,
+    WorkerLeaseState,
+)
 from hermes_cli.dashboard_auth.base import Session
 from hermes_cli.dashboard_auth.owner_context import owner_context_from_session
 from hermes_cli.controlled_roots import RootKind, controlled_roots_for
@@ -208,6 +214,83 @@ def test_bootstrap_is_exact_lease_bound_and_consumed_once(tmp_path):
         )
 
 
+def test_worker_ws_bootstrap_resolves_active_durable_lease_from_starting_config(tmp_path):
+    from types import SimpleNamespace
+
+    from hermes_cli.owner_worker import ws_routes
+
+    control_home = tmp_path / "control"
+    store = AuthorityStore(control_home)
+    claim = store.claim_worker_start("ok1_ws_worker", worker_id="worker-a")
+    active = store.transition_worker_lease(
+        claim.lease,
+        state=WorkerLeaseState.ACTIVE,
+        generation_state=WorkerGenerationState.ACTIVE,
+    )
+    verifier = owner_worker_capability_public_config(control_home)
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            owner_worker_control_home=control_home,
+            owner_worker_lease=claim.lease,
+            owner_worker_capability_verifier=verifier,
+        ),
+    )
+
+    resolved = ws_routes._active_bootstrap_lease(app, claim.lease)
+
+    assert resolved == active
+
+    class _WebSocket:
+        def __init__(self, token):
+            self.app = app
+            self.query_params = {"internal_owner_bootstrap": token}
+            self.url = type("Url", (), {"path": "/api/events"})()
+            self.accepted = False
+            self.closed = []
+            self.sent = []
+
+        async def accept(self):
+            self.accepted = True
+
+        async def receive_text(self):
+            return hello
+
+        async def send_text(self, value):
+            self.sent.append(value)
+
+        async def close(self, **kwargs):
+            self.closed.append(kwargs)
+
+    from hermes_cli.owner_worker.tokens import owp1_hello, parse_owner_worker_bootstrap
+
+    token = mint_owner_worker_bootstrap(
+        active,
+        path="/api/events",
+        connection_id="connection_identifier_1234",
+        nonce="control_nonce_identifier_1234",
+        control_home=control_home,
+    )
+    claims = parse_owner_worker_bootstrap(
+        token,
+        expected_lease=active,
+        path="/api/events",
+        public_key=verifier["HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY"],
+        issuer_key_version=verifier["HERMES_OWNER_WORKER_CAPABILITY_ISSUER"],
+    )
+    hello = owp1_hello(claims)
+    websocket = _WebSocket(token)
+    peer = asyncio.run(ws_routes._admit_bootstrap_or_close(websocket))
+
+    assert peer is not None
+    assert websocket.accepted is True
+    assert websocket.closed == []
+    store.invalidate_outstanding_credentials(reason="replacement")
+    replacement = store.claim_worker_start("ok1_ws_worker", worker_id="worker-b")
+    with pytest.raises(OwnerWorkerCapabilityInvalid, match="identity_mismatch"):
+        ws_routes._active_bootstrap_lease(app, claim.lease)
+    assert replacement.lease.state is WorkerLeaseState.STARTING
+
+
 def test_owp1_data_requires_exact_peer_and_monotonic_sequence(tmp_path):
     _store, lease = _active_lease(tmp_path)
     verifier = owner_worker_capability_public_config(tmp_path / "control")
@@ -338,6 +421,108 @@ def test_supervisor_spawns_the_canonical_session_owner_context(tmp_path, monkeyp
     ]
     assert argv[argv.index("--worker-generation") + 1] == "1"
     assert argv[argv.index("--worker-id") + 1] == child_env["HERMES_WORKER_ID"]
+
+
+def test_supervisor_reclaims_conclusively_absent_orphan_lease(tmp_path):
+    owner = _Owner("ok1_orphan", tmp_path / "owner")
+    spawned: list[dict] = []
+
+    def fake_process_factory(*args, **kwargs):
+        spawned.append({"args": args, "kwargs": kwargs})
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    first = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+    handle = first.get_or_start(owner)
+    handle.socket_path.unlink()
+    first.authority_store.transition_worker_lease(
+        first._lease_for_handle(handle),
+        state=WorkerLeaseState.DRAINING,
+        generation_state=WorkerGenerationState.DRAINING,
+    )
+    restarted = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+
+    replacement = restarted.get_or_start(owner)
+
+    assert replacement.worker_generation == 2
+    assert first.authority_store.read_worker_generation(owner.owner_key, 1).state is WorkerGenerationState.REVOKED
+    assert restarted.authority_store.read_worker_generation(owner.owner_key, 2).state is WorkerGenerationState.ACTIVE
+    assert len(spawned) == 2
+
+
+def test_supervisor_does_not_reclaim_healthy_or_ambiguous_orphan_lease(tmp_path):
+    owner = _Owner("ok1_orphan_live", tmp_path / "owner")
+
+    def fake_process_factory(*args, **kwargs):
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    first = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+    first.get_or_start(owner)
+    restarted = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+
+    with pytest.raises(AuthorizationRejected, match="already_owned"):
+        restarted.get_or_start(owner)
+
+    assert restarted.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.ACTIVE
+
+
+def test_supervisor_shutdown_drains_all_local_workers_in_order(tmp_path):
+    owner = _Owner("ok1_shutdown", tmp_path / "owner")
+    events = []
+
+    class _OrderedProcess(_FakeProcess):
+        def terminate(self):
+            events.append("terminate")
+            super().terminate()
+
+    def fake_process_factory(*args, **kwargs):
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _OrderedProcess()
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+        generation_bridge_revoker=lambda _lease: events.append("bridges"),
+    )
+    handle = supervisor.get_or_start(owner)
+
+    supervisor.shutdown()
+
+    assert events == ["bridges", "terminate"]
+    assert supervisor._handles == {}
+    assert not handle.socket_path.exists()
+    assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.REVOKED
 
 
 def test_supervisor_restart_uses_new_generation_and_socket_with_reused_pid(tmp_path):

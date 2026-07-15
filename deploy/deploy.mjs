@@ -694,6 +694,7 @@ WorkingDirectory=$current
 ExecStart=$runner dashboard --host 127.0.0.1 --port 9119 --no-open --skip-build --require-auth
 Restart=always
 RestartSec=5
+KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=60
 StandardOutput=journal

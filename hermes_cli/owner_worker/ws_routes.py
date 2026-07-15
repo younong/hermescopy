@@ -31,7 +31,12 @@ from hermes_cli.dashboard_auth.audit import (
     new_authority_correlation_id,
 )
 from hermes_cli.owner_runtime import resolve_workspace_cwd
-from hermes_cli.dashboard_auth.authority import AuthorityStore
+from hermes_cli.dashboard_auth.authority import (
+    AuthorityStore,
+    AuthorityUnavailable,
+    AuthorizationRejected,
+    WorkerLeaseState,
+)
 from hermes_cli.owner_worker.tokens import (
     OwnerWorkerCapabilityInvalid,
     admit_owner_worker_bootstrap,
@@ -201,16 +206,44 @@ def _audit_bootstrap(reason: AuthorityAuditReason, lease: Any | None) -> None:
         return
 
 
+def _active_bootstrap_lease(app: Any, configured_lease: Any) -> Any:
+    """Resolve the exact active durable fence for this Worker process.
+
+    A Worker is spawned with a ``STARTING`` lease in its environment, then the
+    Control Plane promotes that same fence after its health probe.  Lifecycle
+    state is therefore deliberately re-read here, while every identity field
+    remains anchored to the process-start configuration.
+    """
+    store = AuthorityStore(_control_home(app))
+    current = store.read_owner_worker_lease(configured_lease.owner_key)
+    if current is None or (
+        current.owner_key != configured_lease.owner_key
+        or current.worker_generation != configured_lease.worker_generation
+        or current.worker_id != configured_lease.worker_id
+        or current.lease_version != configured_lease.lease_version
+        or current.recovery_generation != configured_lease.recovery_generation
+    ):
+        raise OwnerWorkerCapabilityInvalid("bootstrap_worker_identity_mismatch")
+    # This checks both the exact durable record and the current recovery
+    # generation.  The consume transaction in admit_owner_worker_bootstrap()
+    # remains the final race-closing check.
+    return store.assert_worker_lease(
+        current, states=frozenset({WorkerLeaseState.ACTIVE})
+    )
+
+
 async def _admit_bootstrap_or_close(ws: WebSocket) -> _Owp1Peer | None:
     """Consume one bootstrap and complete `owp1` hello/ack before route work."""
     token = ws.query_params.get("internal_owner_bootstrap", "")
-    lease = getattr(ws.app.state, "owner_worker_lease", None)
+    configured_lease = getattr(ws.app.state, "owner_worker_lease", None)
     verifier = getattr(ws.app.state, "owner_worker_capability_verifier", {})
-    if not token or lease is None:
-        _audit_bootstrap(AuthorityAuditReason.BOOTSTRAP_REJECTED, lease)
+    if not token or configured_lease is None:
+        _audit_bootstrap(AuthorityAuditReason.BOOTSTRAP_REJECTED, configured_lease)
         await ws.close(code=4401, reason=_ws_close_reason("auth: internal_owner_invalid"))
-        return False
+        return None
+    lease = configured_lease
     try:
+        lease = _active_bootstrap_lease(ws.app, configured_lease)
         claims = admit_owner_worker_bootstrap(
             token,
             expected_lease=lease,
@@ -226,7 +259,13 @@ async def _admit_bootstrap_or_close(ws: WebSocket) -> _Owp1Peer | None:
         await ws.send_text(owp1_ack(claims))
         _audit_bootstrap(AuthorityAuditReason.ADMITTED, lease)
         return _Owp1Peer(ws, claims)
-    except (OwnerWorkerCapabilityInvalid, RuntimeError, TimeoutError):
+    except (
+        AuthorityUnavailable,
+        AuthorizationRejected,
+        OwnerWorkerCapabilityInvalid,
+        RuntimeError,
+        TimeoutError,
+    ):
         _audit_bootstrap(AuthorityAuditReason.BOOTSTRAP_REJECTED, lease)
         await ws.close(code=4401, reason=_ws_close_reason("auth: internal_owner_invalid"))
         return None
