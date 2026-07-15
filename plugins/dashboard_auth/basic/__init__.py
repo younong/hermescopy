@@ -232,7 +232,12 @@ class BasicAuthProvider(DashboardAuthProvider):
                 ))
             except InvalidCredentialsError:
                 raise
-            except (LocalUserStoreConflict, LocalUserStoreUnavailable) as exc:
+            except LocalUserStoreConflict as exc:
+                # A password/status/revision change can race successful
+                # verification before durable session issuance. Treat it as a
+                # generic rejected login rather than claiming the store failed.
+                raise InvalidCredentialsError("invalid username or password") from exc
+            except LocalUserStoreUnavailable as exc:
                 raise ProviderError("local account store is unavailable") from exc
 
         # Legacy configured-account behavior, retained for compatibility.
