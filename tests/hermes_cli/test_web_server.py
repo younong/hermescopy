@@ -5,6 +5,7 @@ import os
 import json
 import shutil
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
@@ -5826,6 +5827,88 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
 
         assert response.status_code == 400
         assert not self.supervisor.owners
+
+    def test_authenticated_worker_startup_timeout_returns_503_without_acquiring_lease(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        acquired = False
+        startup_entered = threading.Event()
+        release_startup = threading.Event()
+
+        class _Supervisor:
+            control_home = self.supervisor.control_home
+            startup_timeout = 0
+
+            def get_or_start(self, owner):
+                startup_entered.set()
+                assert release_startup.wait(timeout=2)
+                raise TimeoutError("worker socket did not become healthy")
+
+            def acquire_use(self, handle):
+                nonlocal acquired
+                acquired = True
+                raise AssertionError("a startup timeout must not acquire a use lease")
+
+        def fail_worker_request(*args, **kwargs):
+            raise AssertionError("a startup timeout must not proxy a request")
+
+        self.app.state.owner_worker_supervisor = _Supervisor()
+        monkeypatch.setattr(web_server, "_owner_worker_startup_request_timeout", lambda supervisor: 0.01)
+        monkeypatch.setattr("hermes_cli.owner_worker.client.OwnerWorkerClient.request", fail_worker_request)
+
+        response = self.client.get("/api/sessions")
+        release_startup.set()
+
+        assert startup_entered.is_set()
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Owner worker startup timed out"
+        assert acquired is False
+
+    def test_authenticated_worker_startup_error_returns_502_without_acquiring_lease(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        acquired = False
+
+        class _Supervisor:
+            control_home = self.supervisor.control_home
+
+            def get_or_start(self, owner):
+                raise RuntimeError("worker bootstrap failed")
+
+            def acquire_use(self, handle):
+                nonlocal acquired
+                acquired = True
+                raise AssertionError("a failed startup must not acquire a use lease")
+
+        def fail_worker_request(*args, **kwargs):
+            raise AssertionError("a failed startup must not proxy a request")
+
+        self.app.state.owner_worker_supervisor = _Supervisor()
+        monkeypatch.setattr("hermes_cli.owner_worker.client.OwnerWorkerClient.request", fail_worker_request)
+
+        response = self.client.get("/api/sessions")
+
+        assert response.status_code == 502
+        assert response.json()["detail"] == "Owner worker request failed"
+        assert acquired is False
+
+
+def test_dashboard_thread_traceback_dump_is_opt_in(monkeypatch):
+    import faulthandler
+    import signal
+    import hermes_cli.web_server as web_server
+
+    registered = []
+    monkeypatch.delenv("HERMES_DASHBOARD_DUMP_THREADS", raising=False)
+    monkeypatch.setattr(faulthandler, "register", lambda *args, **kwargs: registered.append((args, kwargs)))
+
+    assert web_server._maybe_enable_dashboard_thread_traceback_dump() is False
+    assert registered == []
+
+    monkeypatch.setenv("HERMES_DASHBOARD_DUMP_THREADS", "true")
+
+    assert web_server._maybe_enable_dashboard_thread_traceback_dump() is True
+    assert registered == [((signal.SIGUSR1,), {"file": sys.stderr, "all_threads": True, "chain": False})]
 
 
 class TestDeleteSessionEndpoint:

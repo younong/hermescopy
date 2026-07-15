@@ -20,6 +20,7 @@ import hmac
 import importlib.util
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -526,6 +527,23 @@ def _release_owner_worker_iter(iterator: Any, lease: Any):
         lease.release()
 
 
+def _owner_worker_startup_request_timeout(supervisor: Any) -> float:
+    """Return a bounded HTTP wait for an Owner Worker's synchronous startup.
+
+    The supervisor applies its own startup deadline.  This outer deadline also
+    bounds a stalled supervisor implementation while leaving a small allowance
+    for thread scheduling and final cleanup.  A completed startup that has not
+    acquired a use lease cannot leak one.
+    """
+    try:
+        startup_timeout = float(getattr(supervisor, "startup_timeout", 5.0))
+    except (TypeError, ValueError):
+        startup_timeout = 5.0
+    if not math.isfinite(startup_timeout) or startup_timeout < 0:
+        startup_timeout = 5.0
+    return startup_timeout + 1.0
+
+
 async def _proxy_authenticated_owner_http(request: Request) -> Response:
     """Forward an authenticated owner-scoped HTTP request to its Owner Worker."""
     if not _authenticated_owner_request(request):
@@ -543,7 +561,10 @@ async def _proxy_authenticated_owner_http(request: Request) -> Response:
 
     lease: Any | None = None
     try:
-        handle = await asyncio.to_thread(supervisor.get_or_start, owner)
+        handle = await asyncio.wait_for(
+            asyncio.to_thread(supervisor.get_or_start, owner),
+            timeout=_owner_worker_startup_request_timeout(supervisor),
+        )
         if str(handle.owner_key) != str(owner.owner_key):
             raise RuntimeError("owner worker returned a mismatched owner handle")
         lease = _acquire_owner_worker_use(supervisor, handle)
@@ -571,6 +592,11 @@ async def _proxy_authenticated_owner_http(request: Request) -> Response:
         if lease is not None:
             lease.release()
         raise
+    except TimeoutError as exc:
+        if lease is not None:
+            lease.release()
+        _log.warning("owner worker startup timed out: %s", exc)
+        raise HTTPException(status_code=503, detail="Owner worker startup timed out") from exc
     except OwnerWorkerHealthError as exc:
         if lease is not None:
             lease.release()
@@ -15066,6 +15092,28 @@ app.include_router(_dashboard_auth_router)
 mount_spa(app)
 
 
+def _maybe_enable_dashboard_thread_traceback_dump() -> bool:
+    """Opt in to SIGUSR1 all-thread tracebacks for a running dashboard.
+
+    Tracebacks can include request data, so this is deliberately disabled by
+    default.  On supported POSIX hosts, setting HERMES_DASHBOARD_DUMP_THREADS
+    lets an operator diagnose a stuck server with ``kill -USR1 <pid>``.
+    """
+    if not env_var_enabled("HERMES_DASHBOARD_DUMP_THREADS"):
+        return False
+    try:
+        import faulthandler
+        import signal
+
+        dump_signal = signal.SIGUSR1
+        faulthandler.register(dump_signal, file=sys.stderr, all_threads=True, chain=False)
+    except (AttributeError, OSError, RuntimeError, ValueError) as exc:
+        _log.warning("Dashboard thread traceback dump is unavailable: %s", exc)
+        return False
+    _log.info("Dashboard thread traceback dump enabled; send SIGUSR1 to dump all threads")
+    return True
+
+
 def _read_bound_port(server: "uvicorn.Server", fallback: int) -> int:
     """Read the OS-assigned port from a live uvicorn server socket.
 
@@ -15181,6 +15229,8 @@ def start_server(
     machine dashboard.
     """
     import uvicorn
+
+    _maybe_enable_dashboard_thread_traceback_dump()
 
     try:
         from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive

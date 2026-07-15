@@ -789,7 +789,9 @@ function main() {
     assertCleanWorktree({ allowDirty: false, dryRun: args.dryRun });
     createAnnotatedTag(args.createTag, { dryRun: args.dryRun });
     args.sourceTag = args.createTag;
-    args.sourceCommit = runText("git", ["rev-parse", "--verify", `${args.createTag}^{commit}`]);
+    args.sourceCommit = args.dryRun
+      ? runText("git", ["rev-parse", "--verify", "HEAD^{commit}"])
+      : runText("git", ["rev-parse", "--verify", `${args.createTag}^{commit}`]);
   } else if (args.ref) {
     if (args.force || args.allowDirty) {
       throw new Error("--ref does not allow --force or --allow-dirty.");

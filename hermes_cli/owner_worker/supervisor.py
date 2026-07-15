@@ -174,7 +174,10 @@ class OwnerWorkerSupervisor:
         self.generation_bridge_revoker = generation_bridge_revoker
         self._handles: dict[str, OwnerWorkerHandle] = {}
         self._last_start_attempt: dict[str, float] = {}
+        self._starting_owner_keys: set[str] = set()
+        self._in_flight_starts = 0
         self._lock = threading.RLock()
+        self._start_finished = threading.Condition(self._lock)
 
     @staticmethod
     def _audit_generation(reason: AuthorityAuditReason, lease: OwnerWorkerAuthorityLease) -> None:
@@ -192,184 +195,203 @@ class OwnerWorkerSupervisor:
             pass
 
     def get_or_start(self, owner: Any) -> OwnerWorkerHandle:
-        with self._lock:
-            owner_key = self._owner_key(owner)
-            owner_home = self._owner_home(owner)
-            now = time.time()
-            self._reap_exited()
-            self._stop_idle(now=now)
+        owner_key = self._owner_key(owner)
+        owner_home = self._owner_home(owner)
+        with self._start_finished:
+            while True:
+                now = time.time()
+                self._reap_exited()
+                self._stop_idle(now=now)
 
-            existing = self._handles.get(owner_key)
-            if existing is not None:
-                if existing.owner_home.resolve() != owner_home.resolve():
-                    raise RuntimeError("owner worker exact owner_home mismatch for owner_key")
-                existing.last_used_at = time.time()
-                if existing.process.poll() is None:
-                    try:
-                        self.authority_store.assert_worker_lease(
-                            self._lease_for_handle(existing), states=frozenset({WorkerLeaseState.ACTIVE})
-                        )
-                        health = self.client_cls(existing.socket_path, control_home=self.control_home).verify_health(
-                            owner_key=owner_key,
-                            owner_home=owner_home,
-                            worker_generation=existing.worker_generation,
-                            worker_id=existing.worker_id,
-                            lease_version=existing.lease_version,
-                            recovery_generation=existing.recovery_generation,
-                            lease=self._lease_for_handle(existing),
-                        )
-                        if int(health["pid"]) != existing.pid:
-                            raise RuntimeError("owner worker pid mismatch")
-                    except (AuthorizationRejected, OwnerWorkerHealthError, RuntimeError):
-                        # A local cache never grants authority. Revoke and close
-                        # the exact local generation; its CAS can never mutate a
-                        # newer fence owned by another supervisor.
-                        self._terminate_handle(owner_key, existing)
-                    else:
-                        existing.last_health = health
-                        return existing
-                else:
-                    self._terminate_handle(owner_key, existing)
-
-            self._admit_start(owner_key, owner_home, now=now)
-            ensure_owner_runtime_dirs(owner_home)
-            try:
-                claim = self.authority_store.claim_worker_start(owner_key, worker_id=uuid.uuid4().hex)
-            except AuthorizationRejected as exc:
-                if (
-                    str(exc) != "worker_lease_already_owned"
-                    or not self._reconcile_missing_local_worker(owner_key, owner_home)
-                ):
-                    raise
-                claim = self.authority_store.claim_worker_start(owner_key, worker_id=uuid.uuid4().hex)
-            generation = claim.generation
-            socket_path = self.socket_path_for(owner, generation.worker_generation)
-            env = self._env_for(owner, generation, claim.lease)
-            runtime_paths = owner_worker_runtime_paths(
-                owner_home=owner_home,
-                worker_generation=generation.worker_generation,
-            )
-            controlled_roots = self._controlled_roots_for(runtime_paths)
-            try:
-                controlled_roots.mkdirs(
-                    RootKind.OWNER_WRITABLE,
-                    f"runtime/workers/{generation.worker_generation}",
-                )
-            except BaseException:
-                controlled_roots.close()
-                raise
-            cwd_fd = None
-            stdout_handle = None
-            stderr_handle = None
-            try:
-                cwd_fd = controlled_roots.open_relative(
-                    RootKind.WORKSPACE,
-                    "default",
-                    expected_type=ExpectedType.DIRECTORY,
-                )
-                stdout_handle = controlled_roots.open_append_file(
-                    RootKind.OWNER_WRITABLE,
-                    "runtime/logs/owner-worker.stdout.log",
-                )
-                stderr_handle = controlled_roots.open_append_file(
-                    RootKind.OWNER_WRITABLE,
-                    "runtime/logs/owner-worker.stderr.log",
-                )
-                os.fchmod(stdout_handle, stat.S_IRUSR | stat.S_IWUSR)
-                os.fchmod(stderr_handle, stat.S_IRUSR | stat.S_IWUSR)
-                inherited_cwd_fd = os.dup(cwd_fd)
-                os.set_inheritable(inherited_cwd_fd, True)
-
-                def _set_descriptor_cwd() -> None:
-                    os.fchdir(inherited_cwd_fd)
-                    os.close(inherited_cwd_fd)
-
-                try:
-                    process = self.process_factory(
-                        self._argv_for(owner, socket_path, generation),
-                        env=env,
-                        stdin=subprocess.DEVNULL,
-                        stdout=stdout_handle,
-                        stderr=stderr_handle,
-                        close_fds=True,
-                        preexec_fn=_set_descriptor_cwd,
-                        pass_fds=(inherited_cwd_fd,),
-                    )
-                finally:
-                    os.close(inherited_cwd_fd)
-            except Exception:
-                self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, claim.lease)
-                try:
-                    self.authority_store.transition_worker_lease(
-                        claim.lease,
-                        state=WorkerLeaseState.REVOKED,
-                        generation_state=WorkerGenerationState.FAILED,
-                    )
-                except AuthorizationRejected:
-                    pass
-                raise
-            finally:
-                if cwd_fd is not None:
-                    os.close(cwd_fd)
-                if stdout_handle is not None:
-                    os.close(stdout_handle)
-                if stderr_handle is not None:
-                    os.close(stderr_handle)
-                controlled_roots.close()
-            try:
-                health = self._wait_until_healthy(
-                    process=process,
-                    socket_path=socket_path,
-                    owner_key=owner_key,
-                    owner_home=owner_home,
-                    worker_generation=generation.worker_generation,
-                    worker_id=generation.worker_id,
-                    lease=claim.lease,
-                )
-                self._chmod_private_file(socket_path)
-                self._verify_socket_path(socket_path, owner_home, generation.worker_generation)
-                active_lease = self.authority_store.transition_worker_lease(
-                    claim.lease,
-                    state=WorkerLeaseState.ACTIVE,
-                    generation_state=WorkerGenerationState.ACTIVE,
-                )
-            except Exception:
-                self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, claim.lease)
-                try:
-                    self.authority_store.transition_worker_lease(
-                        claim.lease,
-                        state=WorkerLeaseState.REVOKED,
-                        generation_state=WorkerGenerationState.FAILED,
-                    )
-                except AuthorizationRejected:
-                    pass
-                if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
+                existing = self._handles.get(owner_key)
+                if existing is not None:
+                    if existing.owner_home.resolve() != owner_home.resolve():
+                        raise RuntimeError("owner worker exact owner_home mismatch for owner_key")
+                    existing.last_used_at = time.time()
+                    if existing.process.poll() is None:
                         try:
-                            process.wait(timeout=2)
-                        except subprocess.TimeoutExpired:
-                            pass
-                raise
+                            self.authority_store.assert_worker_lease(
+                                self._lease_for_handle(existing), states=frozenset({WorkerLeaseState.ACTIVE})
+                            )
+                            health = self.client_cls(existing.socket_path, control_home=self.control_home).verify_health(
+                                owner_key=owner_key,
+                                owner_home=owner_home,
+                                worker_generation=existing.worker_generation,
+                                worker_id=existing.worker_id,
+                                lease_version=existing.lease_version,
+                                recovery_generation=existing.recovery_generation,
+                                lease=self._lease_for_handle(existing),
+                            )
+                            if int(health["pid"]) != existing.pid:
+                                raise RuntimeError("owner worker pid mismatch")
+                        except (AuthorizationRejected, OwnerWorkerHealthError, RuntimeError):
+                            # A local cache never grants authority. Revoke and close
+                            # the exact local generation; its CAS can never mutate a
+                            # newer fence owned by another supervisor.
+                            self._terminate_handle(owner_key, existing)
+                        else:
+                            existing.last_health = health
+                            return existing
+                    else:
+                        self._terminate_handle(owner_key, existing)
 
-            handle = OwnerWorkerHandle(
+                if owner_key not in self._starting_owner_keys:
+                    self._admit_start(owner_key, owner_home, now=now)
+                    self._starting_owner_keys.add(owner_key)
+                    self._in_flight_starts += 1
+                    break
+                self._start_finished.wait()
+
+        try:
+            return self._start_owner_worker(owner, owner_key, owner_home)
+        finally:
+            with self._start_finished:
+                self._starting_owner_keys.remove(owner_key)
+                self._in_flight_starts -= 1
+                self._start_finished.notify_all()
+
+    def _start_owner_worker(self, owner: Any, owner_key: str, owner_home: Path) -> OwnerWorkerHandle:
+        ensure_owner_runtime_dirs(owner_home)
+        try:
+            claim = self.authority_store.claim_worker_start(owner_key, worker_id=uuid.uuid4().hex)
+        except AuthorizationRejected as exc:
+            if (
+                str(exc) != "worker_lease_already_owned"
+                or not self._reconcile_missing_local_worker(owner_key, owner_home)
+            ):
+                raise
+            claim = self.authority_store.claim_worker_start(owner_key, worker_id=uuid.uuid4().hex)
+        generation = claim.generation
+        socket_path = self.socket_path_for(owner, generation.worker_generation)
+        env = self._env_for(owner, generation, claim.lease)
+        runtime_paths = owner_worker_runtime_paths(
+            owner_home=owner_home,
+            worker_generation=generation.worker_generation,
+        )
+        controlled_roots = self._controlled_roots_for(runtime_paths)
+        try:
+            controlled_roots.mkdirs(
+                RootKind.OWNER_WRITABLE,
+                f"runtime/workers/{generation.worker_generation}",
+            )
+        except BaseException:
+            controlled_roots.close()
+            raise
+        cwd_fd = None
+        stdout_handle = None
+        stderr_handle = None
+        try:
+            cwd_fd = controlled_roots.open_relative(
+                RootKind.WORKSPACE,
+                "default",
+                expected_type=ExpectedType.DIRECTORY,
+            )
+            stdout_handle = controlled_roots.open_append_file(
+                RootKind.OWNER_WRITABLE,
+                "runtime/logs/owner-worker.stdout.log",
+            )
+            stderr_handle = controlled_roots.open_append_file(
+                RootKind.OWNER_WRITABLE,
+                "runtime/logs/owner-worker.stderr.log",
+            )
+            os.fchmod(stdout_handle, stat.S_IRUSR | stat.S_IWUSR)
+            os.fchmod(stderr_handle, stat.S_IRUSR | stat.S_IWUSR)
+            inherited_cwd_fd = os.dup(cwd_fd)
+            os.set_inheritable(inherited_cwd_fd, True)
+
+            def _set_descriptor_cwd() -> None:
+                os.fchdir(inherited_cwd_fd)
+                os.close(inherited_cwd_fd)
+
+            try:
+                process = self.process_factory(
+                    self._argv_for(owner, socket_path, generation),
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout_handle,
+                    stderr=stderr_handle,
+                    close_fds=True,
+                    preexec_fn=_set_descriptor_cwd,
+                    pass_fds=(inherited_cwd_fd,),
+                )
+            finally:
+                os.close(inherited_cwd_fd)
+        except Exception:
+            self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, claim.lease)
+            try:
+                self.authority_store.transition_worker_lease(
+                    claim.lease,
+                    state=WorkerLeaseState.REVOKED,
+                    generation_state=WorkerGenerationState.FAILED,
+                )
+            except AuthorizationRejected:
+                pass
+            raise
+        finally:
+            if cwd_fd is not None:
+                os.close(cwd_fd)
+            if stdout_handle is not None:
+                os.close(stdout_handle)
+            if stderr_handle is not None:
+                os.close(stderr_handle)
+            controlled_roots.close()
+        try:
+            health = self._wait_until_healthy(
+                process=process,
+                socket_path=socket_path,
                 owner_key=owner_key,
                 owner_home=owner_home,
                 worker_generation=generation.worker_generation,
                 worker_id=generation.worker_id,
-                lease_version=active_lease.lease_version,
-                recovery_generation=active_lease.recovery_generation,
-                socket_path=socket_path,
-                process=process,
-                pid=int(health["pid"]),
-                last_health=health,
+                lease=claim.lease,
             )
+            self._chmod_private_file(socket_path)
+            self._verify_socket_path(socket_path, owner_home, generation.worker_generation)
+            active_lease = self.authority_store.transition_worker_lease(
+                claim.lease,
+                state=WorkerLeaseState.ACTIVE,
+                generation_state=WorkerGenerationState.ACTIVE,
+            )
+        except Exception:
+            self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, claim.lease)
+            try:
+                self.authority_store.transition_worker_lease(
+                    claim.lease,
+                    state=WorkerLeaseState.REVOKED,
+                    generation_state=WorkerGenerationState.FAILED,
+                )
+            except AuthorizationRejected:
+                pass
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        pass
+            else:
+                process.wait()
+            raise
+
+        handle = OwnerWorkerHandle(
+            owner_key=owner_key,
+            owner_home=owner_home,
+            worker_generation=generation.worker_generation,
+            worker_id=generation.worker_id,
+            lease_version=active_lease.lease_version,
+            recovery_generation=active_lease.recovery_generation,
+            socket_path=socket_path,
+            process=process,
+            pid=int(health["pid"]),
+            last_health=health,
+        )
+        with self._lock:
             self._handles[owner_key] = handle
-            self._audit_generation(AuthorityAuditReason.GENERATION_ACTIVE, active_lease)
-            return handle
+        self._audit_generation(AuthorityAuditReason.GENERATION_ACTIVE, active_lease)
+        return handle
 
     @staticmethod
     def _canonical_socket_is_absent(socket_path: Path) -> bool:
@@ -471,9 +493,9 @@ class OwnerWorkerSupervisor:
         last_attempt = self._last_start_attempt.get(owner_key, 0.0)
         if self.startup_cooldown and now - last_attempt < self.startup_cooldown:
             raise RuntimeError("owner worker startup throttled")
-        if len(self._handles) >= self.max_workers:
+        if len(self._handles) + self._in_flight_starts >= self.max_workers:
             self._evict_oldest_idle(now=now)
-        if len(self._handles) >= self.max_workers:
+        if len(self._handles) + self._in_flight_starts >= self.max_workers:
             raise RuntimeError("owner worker limit reached")
         self._last_start_attempt[owner_key] = now
 
@@ -600,7 +622,9 @@ class OwnerWorkerSupervisor:
             self.generation_bridge_revoker(draining or self._lease_for_handle(handle))
 
         process_exited = handle.process.poll() is not None
-        if not process_exited:
+        if process_exited:
+            handle.process.wait()
+        else:
             handle.process.terminate()
             try:
                 handle.process.wait(timeout=2)

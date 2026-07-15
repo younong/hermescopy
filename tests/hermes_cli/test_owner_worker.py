@@ -762,6 +762,48 @@ def test_supervisor_serializes_concurrent_start_for_same_owner(tmp_path):
     assert len({id(result) for result in results}) == 1
 
 
+def test_supervisor_starts_different_owners_in_parallel(tmp_path):
+    owners = [_Owner("ok1_parallel_a", tmp_path / "a"), _Owner("ok1_parallel_b", tmp_path / "b")]
+    spawned: list[str] = []
+    factory_barrier = threading.Barrier(2, timeout=2)
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def fake_process_factory(*args, **_kwargs):
+        argv = args[0]
+        owner_key = argv[argv.index("--owner-key") + 1]
+        spawned.append(owner_key)
+        Path(argv[argv.index("--socket") + 1]).touch()
+        factory_barrier.wait()
+        return _FakeProcess()
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+        max_workers=2,
+    )
+
+    def start(owner):
+        try:
+            results.append(supervisor.get_or_start(owner))
+        except BaseException as exc:  # pragma: no cover - makes thread errors visible
+            errors.append(exc)
+
+    threads = [threading.Thread(target=start, args=(owner,)) for owner in owners]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert errors == []
+    assert set(spawned) == {owner.owner_key for owner in owners}
+    assert {result.owner_key for result in results} == {owner.owner_key for owner in owners}
+
+
 def test_competing_supervisors_admit_one_fenced_worker(tmp_path):
     owner = _Owner("ok1_shared", tmp_path / "owner")
     spawned: list[dict] = []
@@ -883,6 +925,34 @@ def test_supervisor_fences_and_closes_bridges_before_terminating_exact_generatio
     assert not socket_path.parent.exists()
     assert supervisor.authority_store.read_worker_generation(owner.owner_key, 1).state is WorkerGenerationState.TERMINATED
     assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.REVOKED
+
+
+def test_supervisor_reaps_already_exited_process_with_wait(tmp_path):
+    owner = _Owner("ok1_reaped", tmp_path / "owner")
+
+    def fake_process_factory(*args, **kwargs):
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+    handle = supervisor.get_or_start(owner)
+    handle.process.returncode = 0
+
+    supervisor._reap_exited()
+
+    assert handle.process.wait_calls == 1
+    assert not handle.process.terminated
+    assert not handle.process.killed
+    assert supervisor._handles == {}
+    assert not handle.socket_path.exists()
+    assert supervisor.authority_store.read_worker_generation(owner.owner_key, 1).state is WorkerGenerationState.TERMINATED
 
 
 def test_supervisor_does_not_mark_unconfirmed_process_exit_terminated(tmp_path):
