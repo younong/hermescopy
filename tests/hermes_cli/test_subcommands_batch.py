@@ -98,6 +98,7 @@ def test_dashboard_builder_two_handlers():
     )
     # bare dashboard -> launch handler
     assert parser.parse_args(["dashboard"]).func is dash
+    assert parser.parse_args(["dashboard", "--require-auth"]).require_auth is True
     # dashboard register -> register handler
     assert parser.parse_args(["dashboard", "register"]).func is reg
     # dashboard user lifecycle operations route to the management handler.

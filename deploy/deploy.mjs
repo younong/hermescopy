@@ -691,7 +691,7 @@ Environment=HERMES_HOME=$hermes_home
 Environment=HERMES_ENV_FILE=$env_file
 Environment=VIRTUAL_ENV=$shared/venv
 WorkingDirectory=$current
-ExecStart=$runner dashboard --host 127.0.0.1 --port 9119 --no-open --skip-build
+ExecStart=$runner dashboard --host 127.0.0.1 --port 9119 --no-open --skip-build --require-auth
 Restart=always
 RestartSec=5
 KillSignal=SIGTERM

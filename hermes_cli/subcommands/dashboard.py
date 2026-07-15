@@ -39,6 +39,14 @@ def _add_server_runtime_args(parser) -> None:
         ),
     )
     parser.add_argument(
+        "--require-auth",
+        action="store_true",
+        help=(
+            "Require cookie-based dashboard authentication on a loopback bind. "
+            "Use for multi-user access through an SSH tunnel or trusted proxy."
+        ),
+    )
+    parser.add_argument(
         "--skip-build",
         action="store_true",
         help=(

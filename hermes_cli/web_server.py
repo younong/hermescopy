@@ -15160,9 +15160,14 @@ def start_server(
     port: int = 9119,
     open_browser: bool = True,
     allow_public: bool = False,
+    require_auth: bool = False,
     initial_profile: str = "",
 ):
     """Start the web UI server.
+
+    ``require_auth`` explicitly enables the cookie/session gate for a
+    loopback-bound dashboard shared through an SSH tunnel or trusted proxy.
+    It does not make the service publicly reachable.
 
     ``initial_profile`` (when set) is appended to the auto-opened browser
     URL as ``?profile=<name>`` so the SPA's profile switcher preselects it
@@ -15178,11 +15183,12 @@ def start_server(
     except Exception as exc:
         _log.debug("Nous auth keepalive did not start: %s", exc)
 
-    # Phase 0: stash the auth-gate flag on app.state so middleware / SPA-token
-    # injection / WS-auth paths can branch on it consistently.  Phase 3.5
-    # uses this to decide whether to refuse the bind, log the gate-on
-    # banner, and enable uvicorn proxy_headers.
-    app.state.auth_required = should_require_auth(host)
+    # Stash the auth-gate flag on app.state so middleware / SPA-token injection
+    # / WS-auth paths branch consistently. A public bind is always gated;
+    # --require-auth extends that same fail-closed mode to a loopback service
+    # deliberately shared through a tunnel without changing its network bind.
+    public_bind_requires_auth = should_require_auth(host)
+    app.state.auth_required = require_auth or public_bind_requires_auth
     app.state.owner_worker_supervisor = None
     if app.state.auth_required:
         from hermes_cli.owner_worker import OwnerWorkerSupervisor
@@ -15273,9 +15279,8 @@ def start_server(
                     + _fix_hint
                 )
             raise SystemExit(
-                f"Refusing to bind dashboard to {host} — the auth gate "
-                f"engages on non-loopback binds, but no auth providers are "
-                f"registered.\n\n" + _fix_hint
+                f"Refusing to start dashboard on {host} — authentication is "
+                f"required, but no auth providers are registered.\n\n" + _fix_hint
             )
         _log.info(
             "Dashboard binding to %s with auth gate enabled. Providers: %s",
@@ -15324,12 +15329,11 @@ def start_server(
         app, host=host, port=port, log_level="warning",
         # proxy_headers defaults to False so _ws_client_is_allowed sees
         # the real connection peer rather than X-Forwarded-For's rewritten
-        # value (which would defeat the loopback gate when behind a reverse
-        # proxy).  When the OAuth gate is active we are explicitly running
-        # behind a TLS terminator (Fly.io) and need X-Forwarded-Proto to
-        # decide cookie Secure flags, so we flip proxy_headers on for that
-        # mode.
-        proxy_headers=bool(app.state.auth_required),
+        # value. Public gated deployments sit behind a TLS terminator and need
+        # X-Forwarded-Proto for cookie Secure flags. A forced loopback gate is
+        # normally reached through an SSH tunnel, so it must not start trusting
+        # client-provided forwarded headers merely because cookie auth is on.
+        proxy_headers=public_bind_requires_auth,
         # Half-open detection for public binds only (see above). Loopback
         # disables the protocol ping (None) so an event-loop stall can never
         # trigger a false disconnect; a genuinely dead local client is still
