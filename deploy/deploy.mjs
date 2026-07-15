@@ -425,6 +425,7 @@ release_id="$2"
 source_commit="$3"
 source_kind="$4"
 source_tag="$5"
+[ "$source_tag" = "-" ] && source_tag=""
 archive="$6"
 keep_releases="$7"
 prune_releases="$8"
@@ -738,7 +739,7 @@ function deployArchive(args, archivePath) {
       args.releaseId,
       args.sourceCommit,
       args.sourceKind,
-      args.sourceTag ?? "",
+      args.sourceTag ?? "-",
       remoteArchive,
       String(args.keepReleases),
       args.pruneReleases ? "1" : "0",
