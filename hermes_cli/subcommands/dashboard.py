@@ -84,7 +84,11 @@ def _add_server_runtime_args(parser) -> None:
 
 
 def build_dashboard_parser(
-    subparsers, *, cmd_dashboard: Callable, cmd_dashboard_register: Callable
+    subparsers,
+    *,
+    cmd_dashboard: Callable,
+    cmd_dashboard_register: Callable,
+    cmd_dashboard_users: Callable,
 ) -> None:
     """Attach the ``dashboard`` and ``serve`` subcommands.
 
@@ -193,3 +197,59 @@ def build_dashboard_parser(
         ),
     )
     dashboard_register_parser.set_defaults(func=cmd_dashboard_register)
+
+    # ``hermes dashboard users`` manages the durable, local multi-user Basic
+    # auth authority. Passwords never travel in argv: reset reads stdin (or an
+    # interactive hidden prompt), and bootstrap generation is TTY reveal-once.
+    dashboard_users_parser = dashboard_subparsers.add_parser(
+        "users",
+        help="Manage durable local dashboard users",
+        description=(
+            "Manage the local Basic-auth account authority. Bootstrap creates "
+            "exactly five accounts; generated credentials are displayed once "
+            "only on an interactive terminal."
+        ),
+    )
+    dashboard_users_subparsers = dashboard_users_parser.add_subparsers(
+        dest="dashboard_users_action",
+        required=True,
+    )
+
+    dashboard_users_list_parser = dashboard_users_subparsers.add_parser(
+        "list", help="List safe local dashboard user metadata"
+    )
+    dashboard_users_list_parser.add_argument(
+        "--json", action="store_true", help="Print safe metadata as JSON"
+    )
+    dashboard_users_list_parser.set_defaults(func=cmd_dashboard_users)
+
+    dashboard_users_bootstrap_parser = dashboard_users_subparsers.add_parser(
+        "bootstrap", help="Create the initial exact set of five local users"
+    )
+    dashboard_users_bootstrap_parser.add_argument(
+        "--generate",
+        action="store_true",
+        required=True,
+        help="Generate passwords and reveal them once on an interactive terminal",
+    )
+    dashboard_users_bootstrap_parser.set_defaults(func=cmd_dashboard_users)
+
+    dashboard_users_reset_parser = dashboard_users_subparsers.add_parser(
+        "reset-password", help="Reset a user's password and revoke sessions"
+    )
+    dashboard_users_reset_parser.add_argument("username", metavar="USERNAME")
+    dashboard_users_reset_parser.add_argument(
+        "--require-reset",
+        action="store_true",
+        help="Leave the account pending reset rather than enabled",
+    )
+    dashboard_users_reset_parser.set_defaults(func=cmd_dashboard_users)
+
+    for action, help_text in (
+        ("disable", "Disable a user and revoke sessions"),
+        ("enable", "Enable a user and revoke sessions"),
+        ("revoke-sessions", "Revoke every session for a user"),
+    ):
+        action_parser = dashboard_users_subparsers.add_parser(action, help=help_text)
+        action_parser.add_argument("username", metavar="USERNAME")
+        action_parser.set_defaults(func=cmd_dashboard_users)

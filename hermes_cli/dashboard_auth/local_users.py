@@ -335,6 +335,16 @@ class LocalUserStore:
         except (sqlite3.Error, OSError) as exc:
             raise LocalUserStoreUnavailable("local user store is unavailable") from exc
 
+    def list_accounts(self) -> tuple[LocalAccount, ...]:
+        """Return all non-secret account metadata in canonical-name order."""
+        self._ensure_ready()
+        try:
+            with self._connect() as conn:
+                rows = conn.execute("SELECT * FROM accounts ORDER BY username").fetchall()
+                return tuple(self._account_from_row(row) for row in rows)
+        except (sqlite3.Error, OSError) as exc:
+            raise LocalUserStoreUnavailable("local user store is unavailable") from exc
+
     def verify_credentials(
         self, *, username: str, password: str
     ) -> LocalAccount | None:
