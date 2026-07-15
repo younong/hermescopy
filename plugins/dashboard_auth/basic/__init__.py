@@ -1,58 +1,16 @@
-"""BasicAuthProvider — username/password dashboard auth (no OAuth IDP).
+"""Username/password dashboard authentication provider.
 
-A self-hosted "just put a password on my dashboard" provider. It plugs
-into the same ``DashboardAuthProvider`` framework as the Nous OAuth
-provider, but authenticates with a username + password instead of an
-OAuth redirect: it sets ``supports_password = True`` and implements
-``complete_password_login``. The login page renders a credential form for
-it; everything downstream of login (session cookies, verify, refresh,
-ws-tickets, logout) is identical to the OAuth path because a password
-session is just a :class:`Session` with provider-minted opaque tokens.
+``dashboard.basic_auth.store: local`` enables the durable multi-user
+:class:`hermes_cli.dashboard_auth.local_users.LocalUserStore`: it stores only
+scrypt password hashes and keyed digests of opaque access/refresh tokens.
+Session validation checks the stored account authorization revision and real
+server-side revocation state.  The configured secret is required in this mode
+and is used only as the store digest key; it is never logged or returned.
 
-This provider has **no external IDP and no database**. Credentials are
-configured up front; sessions are stateless HMAC-signed tokens this
-provider mints and verifies itself. That keeps it zero-infrastructure —
-appropriate for a single-box self-hosted dashboard.
-
-Configuration surfaces (env wins over config.yaml when set non-empty),
-mirroring the Nous provider's precedence convention:
-
-  ``config.yaml`` — canonical surface::
-
-      dashboard:
-        basic_auth:
-          username: admin               # required
-          # Provide EITHER a precomputed scrypt hash (preferred — no
-          # plaintext at rest) ...
-          password_hash: "scrypt$..."   # see hash_password()
-          # ... OR a plaintext password (hashed in-memory at load).
-          password: "s3cret"
-          secret: "<32+ random bytes, base64 or hex>"  # optional; token-signing key
-          session_ttl_seconds: 43200    # optional; access-token lifetime (default 12h)
-
-  Environment overrides::
-
-      HERMES_DASHBOARD_BASIC_AUTH_USERNAME
-      HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH   # preferred
-      HERMES_DASHBOARD_BASIC_AUTH_PASSWORD        # plaintext fallback
-      HERMES_DASHBOARD_BASIC_AUTH_SECRET
-      HERMES_DASHBOARD_BASIC_AUTH_TTL_SECONDS
-
-If ``secret`` is not configured, a random per-process secret is generated
-at startup. That's fine for a single-process dashboard, but means all
-sessions are invalidated on restart and sessions don't survive across
-multiple worker processes — set an explicit ``secret`` for stable
-multi-worker / restart-surviving sessions.
-
-Password hashing uses stdlib :func:`hashlib.scrypt` (memory-hard, no
-third-party dependency). ``complete_password_login`` runs a constant-time
-comparison and always performs a hash even for an unknown username, so
-the endpoint is not a username-enumeration timing oracle.
-
-Skip reasons:
-  Like the Nous provider, this exposes a module-level ``LAST_SKIP_REASON``
-  the gate's fail-closed branch can surface when the plugin loads but
-  declines to register (no username/password configured).
+The legacy, single configured username/password mode remains available when
+``store`` is unset, retaining its stateless HMAC-signed token behavior for
+existing self-hosted deployments.  Environment values take precedence over
+``config.yaml`` in both modes.
 """
 
 from __future__ import annotations
@@ -71,8 +29,14 @@ from hermes_cli.dashboard_auth import (
     DashboardAuthProvider,
     InvalidCredentialsError,
     LoginStart,
+    ProviderError,
     RefreshExpiredError,
     Session,
+)
+from hermes_cli.dashboard_auth.local_users import (
+    LocalUserStore,
+    LocalUserStoreConflict,
+    LocalUserStoreUnavailable,
 )
 
 logger = logging.getLogger(__name__)
@@ -199,7 +163,12 @@ def _unsign(token: str, secret: bytes) -> Optional[dict]:
 
 
 class BasicAuthProvider(DashboardAuthProvider):
-    """Username/password provider with stateless HMAC-signed sessions."""
+    """Username/password provider using either legacy or durable storage.
+
+    Pass ``store`` to use the durable local multi-user authority.  Omitting it
+    preserves the former single configured-account interface for callers that
+    construct this provider directly.
+    """
 
     name = "basic"
     display_name = "Username & Password"
@@ -208,19 +177,24 @@ class BasicAuthProvider(DashboardAuthProvider):
     def __init__(
         self,
         *,
-        username: str,
-        password_hash: str,
         secret: bytes,
         ttl_seconds: int = _DEFAULT_TTL_SECONDS,
+        username: str | None = None,
+        password_hash: str | None = None,
+        store: LocalUserStore | None = None,
     ) -> None:
-        if not username:
-            raise ValueError("username must be non-empty")
-        if not password_hash:
-            raise ValueError("password_hash must be non-empty")
         if len(secret) < 16:
             raise ValueError("secret must be at least 16 bytes")
+        if store is None:
+            if not username:
+                raise ValueError("username must be non-empty")
+            if not password_hash:
+                raise ValueError("password_hash must be non-empty")
+        elif username is not None or password_hash is not None:
+            raise ValueError("store mode does not accept configured credentials")
         self._username = username
         self._password_hash = password_hash
+        self._store = store
         self._secret = secret
         self._ttl = max(60, int(ttl_seconds))
 
@@ -244,11 +218,25 @@ class BasicAuthProvider(DashboardAuthProvider):
     def complete_password_login(
         self, *, username: str, password: str
     ) -> Session:
-        # Constant-time-ish: always run a scrypt verify (against the real
-        # hash if the username matches, else a dummy hash) so an unknown
-        # username and a wrong password take comparable time. Compare the
-        # username with compare_digest too, to avoid a length/byte timing
-        # leak on the username itself.
+        if self._store is not None:
+            try:
+                account = self._store.verify_credentials(
+                    username=username, password=password
+                )
+                if account is None:
+                    raise InvalidCredentialsError("invalid username or password")
+                return self._session_from_local(self._store.create_session(
+                    account=account,
+                    access_ttl_seconds=self._ttl,
+                    refresh_ttl_seconds=_REFRESH_TTL_SECONDS,
+                ))
+            except InvalidCredentialsError:
+                raise
+            except (LocalUserStoreConflict, LocalUserStoreUnavailable) as exc:
+                raise ProviderError("local account store is unavailable") from exc
+
+        # Legacy configured-account behavior, retained for compatibility.
+        assert self._username is not None and self._password_hash is not None
         username_ok = hmac.compare_digest(
             username.encode("utf-8"), self._username.encode("utf-8")
         )
@@ -261,6 +249,24 @@ class BasicAuthProvider(DashboardAuthProvider):
     # ---- session lifecycle -------------------------------------------------
 
     def verify_session(self, *, access_token: str) -> Optional[Session]:
+        if self._store is not None:
+            try:
+                verified = self._store.verify_access_token(access_token)
+            except LocalUserStoreUnavailable as exc:
+                raise ProviderError("local account store is unavailable") from exc
+            if verified is None:
+                return None
+            return Session(
+                user_id=verified.account.account_id,
+                email="",
+                display_name=verified.account.display_name,
+                org_id="",
+                provider=self.name,
+                expires_at=verified.access_expires_at,
+                access_token=access_token,
+                refresh_token="",
+            )
+
         payload = _unsign(access_token, self._secret)
         if (
             payload is None
@@ -271,6 +277,19 @@ class BasicAuthProvider(DashboardAuthProvider):
         return self._session_from_payload(access_token, "", payload)
 
     def refresh_session(self, *, refresh_token: str) -> Session:
+        if self._store is not None:
+            try:
+                session = self._store.rotate_refresh_token(
+                    refresh_token,
+                    access_ttl_seconds=self._ttl,
+                    refresh_ttl_seconds=_REFRESH_TTL_SECONDS,
+                )
+            except LocalUserStoreUnavailable as exc:
+                raise ProviderError("local account store is unavailable") from exc
+            if session is None:
+                raise RefreshExpiredError("refresh token expired or invalid")
+            return self._session_from_local(session)
+
         if not refresh_token:
             raise RefreshExpiredError("no refresh token present in session")
         payload = _unsign(refresh_token, self._secret)
@@ -283,10 +302,12 @@ class BasicAuthProvider(DashboardAuthProvider):
         return self._mint_session(str(payload.get("sub", self._username)))
 
     def revoke_session(self, *, refresh_token: str) -> None:
-        # Stateless tokens — nothing to revoke server-side. The session
-        # expires within its TTL. Best-effort no-op, must not raise.
-        _ = refresh_token
-        return None
+        if self._store is not None:
+            try:
+                self._store.revoke_refresh_token(refresh_token)
+            except LocalUserStoreUnavailable:
+                logger.warning("dashboard-auth-basic: local session revocation failed")
+        # Legacy stateless sessions cannot be revoked server-side.
 
     # ---- internals ---------------------------------------------------------
 
@@ -309,6 +330,18 @@ class BasicAuthProvider(DashboardAuthProvider):
             expires_at=exp,
             access_token=access_token,
             refresh_token=refresh_token,
+        )
+
+    def _session_from_local(self, session) -> Session:
+        return Session(
+            user_id=session.account.account_id,
+            email="",
+            display_name=session.account.display_name,
+            org_id="",
+            provider=self.name,
+            expires_at=session.access_expires_at,
+            access_token=session.access_token,
+            refresh_token=session.refresh_token,
         )
 
     def _session_from_payload(
@@ -392,18 +425,21 @@ def _resolve_secret(cfg_section: dict) -> bytes:
 
 
 def register(ctx) -> None:
-    """Plugin entry — registers BasicAuthProvider when credentials exist.
+    """Register basic authentication from legacy or durable-store config.
 
-    Loopback / ``--insecure`` operators and anyone using the OAuth
-    provider leave ``dashboard.basic_auth`` unset, so this plugin is a
-    no-op for them. When username + (password or password_hash) are
-    configured, it registers a password provider that the login page
-    renders as a credential form.
+    ``store: local`` (or ``HERMES_DASHBOARD_BASIC_AUTH_STORE=local``) selects
+    the durable multi-user SQLite authority.  In that mode account lifecycle
+    is deliberately external to this plugin; an empty store registers safely
+    but rejects every login until accounts are provisioned.  With no store
+    configured, the established single configured-account behavior applies.
     """
     global LAST_SKIP_REASON
     LAST_SKIP_REASON = ""
 
     section = _load_config_basic_auth_section()
+    store_mode = _resolve(
+        "HERMES_DASHBOARD_BASIC_AUTH_STORE", section, "store"
+    ).lower()
     username = _resolve(
         "HERMES_DASHBOARD_BASIC_AUTH_USERNAME", section, "username"
     )
@@ -416,6 +452,44 @@ def register(ctx) -> None:
     ttl_raw = _resolve(
         "HERMES_DASHBOARD_BASIC_AUTH_TTL_SECONDS", section, "session_ttl_seconds"
     )
+
+    if store_mode not in ("", "local"):
+        LAST_SKIP_REASON = "dashboard.basic_auth.store must be 'local' when set"
+        logger.warning("dashboard-auth-basic: %s", LAST_SKIP_REASON)
+        return
+
+    secret_raw = _resolve("HERMES_DASHBOARD_BASIC_AUTH_SECRET", section, "secret")
+    if store_mode == "local" and not secret_raw:
+        LAST_SKIP_REASON = (
+            "dashboard.basic_auth.store=local requires dashboard.basic_auth.secret "
+            "(or HERMES_DASHBOARD_BASIC_AUTH_SECRET)"
+        )
+        logger.warning("dashboard-auth-basic: %s", LAST_SKIP_REASON)
+        return
+    secret = _resolve_secret(section)
+    if store_mode == "local" and len(secret) < 32:
+        LAST_SKIP_REASON = "dashboard.basic_auth.store=local requires a secret of at least 32 bytes"
+        logger.warning("dashboard-auth-basic: %s", LAST_SKIP_REASON)
+        return
+
+    try:
+        ttl = int(ttl_raw) if ttl_raw else _DEFAULT_TTL_SECONDS
+    except ValueError:
+        ttl = _DEFAULT_TTL_SECONDS
+
+    if store_mode == "local":
+        try:
+            provider = BasicAuthProvider(
+                store=LocalUserStore(secret=secret), secret=secret, ttl_seconds=ttl
+            )
+        except (LocalUserStoreUnavailable, ValueError) as exc:
+            LAST_SKIP_REASON = "BasicAuthProvider durable store construction failed"
+            logger.warning("dashboard-auth-basic: %s", LAST_SKIP_REASON)
+            logger.debug("dashboard-auth-basic: durable store setup error: %s", exc)
+            return
+        ctx.register_dashboard_auth_provider(provider)
+        logger.info("dashboard-auth-basic: registered durable local password provider")
+        return
 
     if not username:
         LAST_SKIP_REASON = (
@@ -438,39 +512,16 @@ def register(ctx) -> None:
         logger.warning("dashboard-auth-basic: %s", LAST_SKIP_REASON)
         return
 
-    # Precedence (env-wins convention): a password supplied via the
-    # HERMES_DASHBOARD_BASIC_AUTH_PASSWORD env var overrides a config.yaml
-    # password_hash, so an operator can rotate the password by setting an
-    # env var without editing config. A password_hash (precomputed) wins
-    # over a config-only plaintext password at the same tier — it's the
-    # preferred at-rest form. Concretely:
-    #   * env password set        → hash it (overrides any config hash)
-    #   * else config password_hash set → use it
-    #   * else config plaintext password → hash it in-memory
+    # An env plaintext password intentionally overrides a configured hash.
     plaintext_from_env = os.environ.get(
         "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD", ""
     ).strip()
     if plaintext_from_env:
         password_hash = hash_password(plaintext_from_env)
-        logger.info(
-            "dashboard-auth-basic: hashed env-supplied password in-memory "
-            "(overrides any config password_hash)."
-        )
+        logger.info("dashboard-auth-basic: hashed env-supplied password in-memory")
     elif not password_hash:
-        # config-only plaintext password.
         password_hash = hash_password(plaintext)
-        logger.info(
-            "dashboard-auth-basic: hashed plaintext password in-memory. "
-            "For production, precompute dashboard.basic_auth.password_hash "
-            "and remove the plaintext password from config."
-        )
-
-    secret = _resolve_secret(section)
-
-    try:
-        ttl = int(ttl_raw) if ttl_raw else _DEFAULT_TTL_SECONDS
-    except ValueError:
-        ttl = _DEFAULT_TTL_SECONDS
+        logger.info("dashboard-auth-basic: hashed configured plaintext password in-memory")
 
     try:
         provider = BasicAuthProvider(
@@ -485,7 +536,4 @@ def register(ctx) -> None:
         return
 
     ctx.register_dashboard_auth_provider(provider)
-    logger.info(
-        "dashboard-auth-basic: registered password provider (username=%s)",
-        username,
-    )
+    logger.info("dashboard-auth-basic: registered configured password provider")

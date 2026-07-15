@@ -11,6 +11,8 @@ from __future__ import annotations
 import secrets
 from unittest.mock import MagicMock
 
+from hermes_cli.dashboard_auth.local_users import LocalUserStore
+
 import pytest
 
 import plugins.dashboard_auth.basic as basic_plugin
@@ -29,6 +31,7 @@ def basic():
 @pytest.fixture(autouse=True)
 def _clear_basic_env(monkeypatch):
     for var in (
+        "HERMES_DASHBOARD_BASIC_AUTH_STORE",
         "HERMES_DASHBOARD_BASIC_AUTH_USERNAME",
         "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD",
         "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH",
@@ -133,6 +136,42 @@ class TestProvider:
         p = self._make(basic)
         p.revoke_session(refresh_token="anything")  # must not raise
 
+    def test_durable_store_sessions_are_opaque_and_revocable(self, basic, tmp_path):
+        store = LocalUserStore(
+            secret=b"s" * 32, control_home=tmp_path / "control", max_accounts=2
+        )
+        alice = store.create_account(username="alice", password="hunter2")
+        bob = store.create_account(username="bobby", password="password2")
+        p = basic.BasicAuthProvider(store=store, secret=b"s" * 32)
+
+        alice_session = p.complete_password_login(username="ALICE", password="hunter2")
+        bob_session = p.complete_password_login(username="bobby", password="password2")
+        assert alice_session.user_id == alice.account_id
+        assert bob_session.user_id == bob.account_id
+        assert alice_session.access_token.startswith("hlu1.at.")
+        assert alice_session.refresh_token.startswith("hlu1.rt.")
+        assert "alice" not in alice_session.access_token
+        assert p.verify_session(access_token=alice_session.access_token) is not None
+
+        p.revoke_session(refresh_token=alice_session.refresh_token)
+        assert p.verify_session(access_token=alice_session.access_token) is None
+        with pytest.raises(RefreshExpiredError):
+            p.refresh_session(refresh_token=alice_session.refresh_token)
+        assert p.verify_session(access_token=bob_session.access_token) is not None
+
+    def test_durable_store_rotates_refresh_and_honors_auth_revision(self, basic, tmp_path):
+        store = LocalUserStore(secret=b"s" * 32, control_home=tmp_path / "control")
+        account = store.create_account(username="admin", password="hunter2")
+        p = basic.BasicAuthProvider(store=store, secret=b"s" * 32)
+        session = p.complete_password_login(username="admin", password="hunter2")
+        refreshed = p.refresh_session(refresh_token=session.refresh_token)
+        assert refreshed.access_token != session.access_token
+        assert refreshed.refresh_token != session.refresh_token
+        with pytest.raises(RefreshExpiredError):
+            p.refresh_session(refresh_token=session.refresh_token)
+        assert p.verify_session(access_token=refreshed.access_token) is None
+        assert store.get_account("admin").auth_revision == account.auth_revision + 1
+
     def test_oauth_methods_raise_not_implemented(self, basic):
         p = self._make(basic)
         with pytest.raises(NotImplementedError):
@@ -164,6 +203,40 @@ class TestProvider:
 
 
 class TestRegister:
+    def test_registers_durable_store_mode_without_credentials(self, basic, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            basic,
+            "_load_config_basic_auth_section",
+            lambda: {"store": "local", "secret": ("ab" * 32)},
+        )
+        monkeypatch.setenv("HERMES_CONTROL_HOME", str(tmp_path / "control"))
+        ctx = MagicMock()
+        basic.register(ctx)
+        provider = ctx.register_dashboard_auth_provider.call_args.args[0]
+        assert isinstance(provider._store, LocalUserStore)
+        assert provider._username is None
+        assert basic.LAST_SKIP_REASON == ""
+
+    def test_durable_store_requires_stable_secret(self, basic, monkeypatch):
+        monkeypatch.setattr(
+            basic, "_load_config_basic_auth_section", lambda: {"store": "local"}
+        )
+        ctx = MagicMock()
+        basic.register(ctx)
+        ctx.register_dashboard_auth_provider.assert_not_called()
+        assert "requires" in basic.LAST_SKIP_REASON
+
+    def test_rejects_unknown_store_mode_without_echoing_credentials(self, basic, monkeypatch):
+        monkeypatch.setattr(
+            basic,
+            "_load_config_basic_auth_section",
+            lambda: {"store": "remote-token", "password": "not-for-logs"},
+        )
+        ctx = MagicMock()
+        basic.register(ctx)
+        ctx.register_dashboard_auth_provider.assert_not_called()
+        assert "not-for-logs" not in basic.LAST_SKIP_REASON
+
     def test_skips_when_no_username(self, basic, monkeypatch):
         monkeypatch.setattr(basic, "_load_config_basic_auth_section", lambda: {})
         ctx = MagicMock()
