@@ -20,7 +20,6 @@ import hmac
 import importlib.util
 import json
 import logging
-import math
 import mimetypes
 import os
 import re
@@ -527,23 +526,6 @@ def _release_owner_worker_iter(iterator: Any, lease: Any):
         lease.release()
 
 
-def _owner_worker_startup_request_timeout(supervisor: Any) -> float:
-    """Return a bounded HTTP wait for an Owner Worker's synchronous startup.
-
-    The supervisor applies its own startup deadline.  This outer deadline also
-    bounds a stalled supervisor implementation while leaving a small allowance
-    for thread scheduling and final cleanup.  A completed startup that has not
-    acquired a use lease cannot leak one.
-    """
-    try:
-        startup_timeout = float(getattr(supervisor, "startup_timeout", 5.0))
-    except (TypeError, ValueError):
-        startup_timeout = 5.0
-    if not math.isfinite(startup_timeout) or startup_timeout < 0:
-        startup_timeout = 5.0
-    return startup_timeout + 1.0
-
-
 async def _proxy_authenticated_owner_http(request: Request) -> Response:
     """Forward an authenticated owner-scoped HTTP request to its Owner Worker."""
     if not _authenticated_owner_request(request):
@@ -561,10 +543,7 @@ async def _proxy_authenticated_owner_http(request: Request) -> Response:
 
     lease: Any | None = None
     try:
-        handle = await asyncio.wait_for(
-            asyncio.to_thread(supervisor.get_or_start, owner),
-            timeout=_owner_worker_startup_request_timeout(supervisor),
-        )
+        handle = await asyncio.to_thread(supervisor.get_or_start, owner)
         if str(handle.owner_key) != str(owner.owner_key):
             raise RuntimeError("owner worker returned a mismatched owner handle")
         lease = _acquire_owner_worker_use(supervisor, handle)

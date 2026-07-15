@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import errno
+import math
 import os
 import socket
 import stat
@@ -194,7 +195,8 @@ class OwnerWorkerSupervisor:
             # Observability cannot alter worker fencing or cleanup behavior.
             pass
 
-    def get_or_start(self, owner: Any) -> OwnerWorkerHandle:
+    def get_or_start(self, owner: Any, *, timeout: float | None = None) -> OwnerWorkerHandle:
+        deadline = time.monotonic() + self._startup_deadline_timeout(timeout)
         owner_key = self._owner_key(owner)
         owner_home = self._owner_home(owner)
         with self._start_finished:
@@ -236,21 +238,42 @@ class OwnerWorkerSupervisor:
                         self._terminate_handle(owner_key, existing)
 
                 if owner_key not in self._starting_owner_keys:
+                    if deadline <= time.monotonic():
+                        raise TimeoutError("timed out waiting for owner worker startup")
                     self._admit_start(owner_key, owner_home, now=now)
                     self._starting_owner_keys.add(owner_key)
                     self._in_flight_starts += 1
                     break
-                self._start_finished.wait()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self._start_finished.wait(timeout=remaining):
+                    raise TimeoutError("timed out waiting for owner worker startup")
 
         try:
-            return self._start_owner_worker(owner, owner_key, owner_home)
+            return self._start_owner_worker(owner, owner_key, owner_home, deadline=deadline)
         finally:
             with self._start_finished:
                 self._starting_owner_keys.remove(owner_key)
                 self._in_flight_starts -= 1
                 self._start_finished.notify_all()
 
-    def _start_owner_worker(self, owner: Any, owner_key: str, owner_home: Path) -> OwnerWorkerHandle:
+    def _startup_deadline_timeout(self, timeout: float | None) -> float:
+        value = self.startup_timeout if timeout is None else timeout
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            value = 5.0
+        if not math.isfinite(value) or value < 0:
+            value = 5.0
+        return value
+
+    def _start_owner_worker(
+        self,
+        owner: Any,
+        owner_key: str,
+        owner_home: Path,
+        *,
+        deadline: float,
+    ) -> OwnerWorkerHandle:
         ensure_owner_runtime_dirs(owner_home)
         try:
             claim = self.authority_store.claim_worker_start(owner_key, worker_id=uuid.uuid4().hex)
@@ -344,6 +367,7 @@ class OwnerWorkerSupervisor:
                 worker_generation=generation.worker_generation,
                 worker_id=generation.worker_id,
                 lease=claim.lease,
+                deadline=deadline,
             )
             self._chmod_private_file(socket_path)
             self._verify_socket_path(socket_path, owner_home, generation.worker_generation)
@@ -695,8 +719,8 @@ class OwnerWorkerSupervisor:
         worker_generation: int,
         worker_id: str,
         lease: OwnerWorkerAuthorityLease,
+        deadline: float,
     ) -> dict[str, Any]:
-        deadline = time.monotonic() + self.startup_timeout
         last_error: Exception | None = None
         while time.monotonic() < deadline:
             if process.poll() is not None:
@@ -714,7 +738,7 @@ class OwnerWorkerSupervisor:
                     )
                 except OwnerWorkerHealthError as exc:
                     last_error = exc
-            time.sleep(self.poll_interval)
+            time.sleep(min(self.poll_interval, max(0.0, deadline - time.monotonic())))
         if last_error is not None:
             raise RuntimeError(f"owner worker failed health verification: {last_error}") from last_error
         raise TimeoutError("timed out waiting for owner worker socket")

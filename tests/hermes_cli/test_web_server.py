@@ -5833,7 +5833,6 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
 
         acquired = False
         startup_entered = threading.Event()
-        release_startup = threading.Event()
 
         class _Supervisor:
             control_home = self.supervisor.control_home
@@ -5841,7 +5840,6 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
 
             def get_or_start(self, owner):
                 startup_entered.set()
-                assert release_startup.wait(timeout=2)
                 raise TimeoutError("worker socket did not become healthy")
 
             def acquire_use(self, handle):
@@ -5853,11 +5851,9 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
             raise AssertionError("a startup timeout must not proxy a request")
 
         self.app.state.owner_worker_supervisor = _Supervisor()
-        monkeypatch.setattr(web_server, "_owner_worker_startup_request_timeout", lambda supervisor: 0.01)
         monkeypatch.setattr("hermes_cli.owner_worker.client.OwnerWorkerClient.request", fail_worker_request)
 
         response = self.client.get("/api/sessions")
-        release_startup.set()
 
         assert startup_entered.is_set()
         assert response.status_code == 503

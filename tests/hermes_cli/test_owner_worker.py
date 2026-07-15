@@ -762,6 +762,58 @@ def test_supervisor_serializes_concurrent_start_for_same_owner(tmp_path):
     assert len({id(result) for result in results}) == 1
 
 
+def test_supervisor_waiting_same_owner_start_times_out_without_releasing_leader(tmp_path):
+    owner = _Owner("ok1_stalled", tmp_path / "owner")
+    startup_entered = threading.Event()
+    release_startup = threading.Event()
+    spawned: list[dict] = []
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def fake_process_factory(*args, **kwargs):
+        spawned.append({"args": args, "kwargs": kwargs})
+        startup_entered.set()
+        assert release_startup.wait(timeout=2)
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=1,
+        startup_cooldown=0,
+    )
+
+    def start_leader():
+        try:
+            results.append(supervisor.get_or_start(owner))
+        except BaseException as exc:  # pragma: no cover - makes thread errors visible
+            errors.append(exc)
+
+    leader = threading.Thread(target=start_leader)
+    leader.start()
+    assert startup_entered.wait(timeout=2)
+
+    with pytest.raises(TimeoutError, match="timed out waiting for owner worker startup"):
+        supervisor.get_or_start(owner, timeout=0.01)
+
+    assert len(spawned) == 1
+    assert owner.owner_key in supervisor._starting_owner_keys
+    assert supervisor._in_flight_starts == 1
+
+    release_startup.set()
+    leader.join(timeout=2)
+    assert not leader.is_alive()
+    assert errors == []
+    assert len(results) == 1
+    assert supervisor.get_or_start(owner) is results[0]
+    assert supervisor._starting_owner_keys == set()
+    assert supervisor._in_flight_starts == 0
+    assert len(spawned) == 1
+
+
 def test_supervisor_starts_different_owners_in_parallel(tmp_path):
     owners = [_Owner("ok1_parallel_a", tmp_path / "a"), _Owner("ok1_parallel_b", tmp_path / "b")]
     spawned: list[str] = []
