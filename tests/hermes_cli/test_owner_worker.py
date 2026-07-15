@@ -291,6 +291,7 @@ def test_child_token_ttl_is_bounded(monkeypatch):
 def test_supervisor_spawns_the_canonical_session_owner_context(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "global"))
     monkeypatch.setenv("HERMES_OWNER_SECRET", "owner-secret")
+    monkeypatch.setenv("PYTHONPATH", "/operator/pythonpath")
     session = Session(
         user_id="user-a",
         email="a@example.test",
@@ -330,6 +331,11 @@ def test_supervisor_spawns_the_canonical_session_owner_context(tmp_path, monkeyp
     assert child_env["HERMES_HOME"] == str(owner.owner_home)
     assert child_env["HERMES_WORKER_GENERATION"] == "1"
     assert child_env["HERMES_WORKER_ID"]
+    package_import_root = str(Path(__file__).resolve().parents[2])
+    assert child_env["PYTHONPATH"].split(os.pathsep) == [
+        package_import_root,
+        "/operator/pythonpath",
+    ]
     assert argv[argv.index("--worker-generation") + 1] == "1"
     assert argv[argv.index("--worker-id") + 1] == child_env["HERMES_WORKER_ID"]
 
@@ -823,61 +829,39 @@ def test_supervisor_evicts_only_idle_workers(tmp_path):
     lease.release()
 
 
-def test_worker_health_over_unix_socket_reports_owner_env(tmp_path):
+def test_worker_health_over_unix_socket_reports_owner_env(tmp_path, monkeypatch):
     # macOS AF_UNIX paths are capped at 104 bytes. pytest's default temporary
     # root can exceed that before the owner runtime suffix is appended, so keep
     # this real-subprocess socket under a short, per-process temporary root.
     socket_root = Path("/tmp") / f"h{os.getpid():x}"
     socket_root.mkdir(mode=0o700, exist_ok=True)
-    owner_home = socket_root / "u"
+    owner_home = ensure_owner_runtime_dirs(socket_root / "u")
     control_home = socket_root / "c"
-    socket_path = owner_worker_socket_path(owner_home, 1)
-    owner_home.mkdir(parents=True)
     control_home.mkdir(parents=True)
-    store = AuthorityStore(control_home)
-    claim = store.claim_worker_start("ok1_worker", worker_id="subprocess-test-worker")
-    verifier = owner_worker_capability_public_config(control_home)
-    worker_env = {
-        **os.environ,
-        "HERMES_HOME": str(owner_home),
-        "HERMES_OWNER_KEY": "ok1_worker",
-        "HERMES_WORKSPACE_ROOT": str(owner_home / "workspaces"),
-        "HERMES_CONTROL_HOME": str(control_home),
-        "HERMES_WORKER_GENERATION": str(claim.lease.worker_generation),
-        "HERMES_WORKER_ID": claim.lease.worker_id,
-        "HERMES_WORKER_LEASE_VERSION": str(claim.lease.lease_version),
-        "HERMES_WORKER_RECOVERY_GENERATION": str(claim.lease.recovery_generation),
-        **verifier,
-    }
-
+    owner = _Owner("ok1_worker", owner_home)
+    supervisor = OwnerWorkerSupervisor(
+        control_home=control_home,
+        global_home=socket_root / "global",
+        startup_timeout=10,
+    )
+    claim = supervisor.authority_store.claim_worker_start(
+        owner.owner_key,
+        worker_id="subprocess-test-worker",
+    )
+    socket_path = supervisor.socket_path_for(owner, claim.generation.worker_generation)
+    # The real service starts the child from its owner's workspace. Remove the
+    # test runner's ambient import path and use the supervisor's env/argv so
+    # this regression fails if the launch context stops exporting the package
+    # root needed by ``python -m hermes_cli.owner_worker.entrypoint``.
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    worker_env = supervisor._env_for(owner, claim.generation, claim.lease)
     proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "hermes_cli.owner_worker.entrypoint",
-            "--owner-key",
-            "ok1_worker",
-            "--owner-home",
-            str(owner_home),
-            "--socket",
-            str(socket_path),
-            "--tenant-id",
-            "tenant-1",
-            "--owner-user-id",
-            "user-1",
-            "--auth-provider",
-            "test",
-            "--control-home",
-            str(control_home),
-            "--worker-generation",
-            "1",
-            "--worker-id",
-            "subprocess-test-worker",
-        ],
+        supervisor._argv_for(owner, socket_path, claim.generation),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        cwd=owner_home / "workspaces" / "default",
         env=worker_env,
     )
     try:

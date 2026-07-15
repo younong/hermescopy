@@ -652,6 +652,18 @@ class OwnerWorkerSupervisor:
                 ],
             )
         )
+        # The child deliberately starts in the owner's workspace, so Python
+        # cannot rely on the Dashboard runner's release-root cwd to resolve
+        # ``-m hermes_cli.owner_worker.entrypoint``. Derive the trusted import
+        # root from this installed/source package instead of hard-coding a
+        # deployment path, and preserve operator-provided entries after it.
+        package_import_root = str(Path(__file__).resolve().parents[2])
+        inherited_pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (
+            package_import_root
+            if not inherited_pythonpath
+            else f"{package_import_root}{os.pathsep}{inherited_pythonpath}"
+        )
         if self.control_ws_base:
             env["HERMES_OWNER_WORKER_CONTROL_WS_BASE"] = self.control_ws_base
         return env
