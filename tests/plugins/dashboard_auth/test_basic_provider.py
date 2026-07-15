@@ -37,6 +37,7 @@ def _clear_basic_env(monkeypatch):
         "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH",
         "HERMES_DASHBOARD_BASIC_AUTH_SECRET",
         "HERMES_DASHBOARD_BASIC_AUTH_TTL_SECONDS",
+        "HERMES_DASHBOARD_BASIC_AUTH_MAX_ACCOUNTS",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -151,7 +152,10 @@ class TestProvider:
         assert alice_session.access_token.startswith("hlu1.at.")
         assert alice_session.refresh_token.startswith("hlu1.rt.")
         assert "alice" not in alice_session.access_token
-        assert p.verify_session(access_token=alice_session.access_token) is not None
+        verified = p.verify_session(access_token=alice_session.access_token)
+        assert verified is not None
+        assert verified.authorization_session_id
+        assert verified.authorization_revision == str(alice.auth_revision)
 
         p.revoke_session(refresh_token=alice_session.refresh_token)
         assert p.verify_session(access_token=alice_session.access_token) is None
@@ -215,7 +219,34 @@ class TestRegister:
         provider = ctx.register_dashboard_auth_provider.call_args.args[0]
         assert isinstance(provider._store, LocalUserStore)
         assert provider._username is None
+        assert provider.local_user_store is not None
+        assert provider.local_user_store.max_accounts == 5
         assert basic.LAST_SKIP_REASON == ""
+
+    def test_durable_store_honors_configured_account_cap(self, basic, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            basic,
+            "_load_config_basic_auth_section",
+            lambda: {"store": "local", "secret": ("ab" * 32), "max_accounts": 7},
+        )
+        monkeypatch.setenv("HERMES_CONTROL_HOME", str(tmp_path / "control"))
+        ctx = MagicMock()
+        basic.register(ctx)
+        provider = ctx.register_dashboard_auth_provider.call_args.args[0]
+        assert provider.local_user_store is not None
+        assert provider.local_user_store.max_accounts == 7
+
+    @pytest.mark.parametrize("max_accounts", ["0", "not-an-integer"])
+    def test_durable_store_rejects_invalid_account_cap(self, basic, monkeypatch, max_accounts):
+        monkeypatch.setattr(
+            basic,
+            "_load_config_basic_auth_section",
+            lambda: {"store": "local", "secret": ("ab" * 32), "max_accounts": max_accounts},
+        )
+        ctx = MagicMock()
+        basic.register(ctx)
+        ctx.register_dashboard_auth_provider.assert_not_called()
+        assert "durable store construction failed" in basic.LAST_SKIP_REASON
 
     def test_durable_store_requires_stable_secret(self, basic, monkeypatch):
         monkeypatch.setattr(

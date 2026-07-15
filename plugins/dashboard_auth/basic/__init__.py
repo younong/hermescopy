@@ -52,6 +52,7 @@ logger = logging.getLogger(__name__)
 # logged in.
 _DEFAULT_TTL_SECONDS = 12 * 60 * 60  # 12h
 _REFRESH_TTL_SECONDS = 30 * 24 * 60 * 60  # 30d
+_DEFAULT_MAX_ACCOUNTS = 5
 
 # scrypt parameters (RFC 7914 / stdlib hashlib.scrypt). n must be a power
 # of two; these are the widely-recommended interactive-login parameters
@@ -251,6 +252,27 @@ class BasicAuthProvider(DashboardAuthProvider):
             raise InvalidCredentialsError("invalid username or password")
         return self._mint_session(self._username)
 
+    # ---- durable local account authority ----------------------------------
+
+    @property
+    def local_user_store(self) -> LocalUserStore | None:
+        """Return the durable local authority only in ``store: local`` mode.
+
+        Routes use this narrow capability seam rather than accepting a store
+        from request data or attempting to reconstruct credentials.  Legacy
+        configured Basic auth intentionally exposes no account-management API.
+        """
+        return self._store
+
+    def local_account_for_session(self, session: Session):
+        """Resolve a current durable-local account from a verified session."""
+        if self._store is None or session.provider != self.name:
+            return None
+        try:
+            return self._store.get_account_by_id(session.user_id)
+        except LocalUserStoreUnavailable as exc:
+            raise ProviderError("local account store is unavailable") from exc
+
     # ---- session lifecycle -------------------------------------------------
 
     def verify_session(self, *, access_token: str) -> Optional[Session]:
@@ -270,6 +292,8 @@ class BasicAuthProvider(DashboardAuthProvider):
                 expires_at=verified.access_expires_at,
                 access_token=access_token,
                 refresh_token="",
+                authorization_session_id=verified.session_id,
+                authorization_revision=str(verified.account.auth_revision),
             )
 
         payload = _unsign(access_token, self._secret)
@@ -347,6 +371,8 @@ class BasicAuthProvider(DashboardAuthProvider):
             expires_at=session.access_expires_at,
             access_token=session.access_token,
             refresh_token=session.refresh_token,
+            authorization_session_id=session.session_id,
+            authorization_revision=str(session.account.auth_revision),
         )
 
     def _session_from_payload(
@@ -397,6 +423,20 @@ def _resolve(env_name: str, cfg_section: dict, cfg_key: str) -> str:
     if env:
         return env
     return str(cfg_section.get(cfg_key, "") or "").strip()
+
+
+def _account_cap(cfg_section: dict) -> int:
+    """Resolve a positive durable-account cap from trusted server settings."""
+    raw = _resolve(
+        "HERMES_DASHBOARD_BASIC_AUTH_MAX_ACCOUNTS", cfg_section, "max_accounts"
+    )
+    try:
+        value = int(raw) if raw else _DEFAULT_MAX_ACCOUNTS
+    except ValueError as exc:
+        raise ValueError("dashboard.basic_auth.max_accounts must be a positive integer") from exc
+    if value < 1:
+        raise ValueError("dashboard.basic_auth.max_accounts must be a positive integer")
+    return value
 
 
 def _resolve_secret(cfg_section: dict) -> bytes:
@@ -485,7 +525,11 @@ def register(ctx) -> None:
     if store_mode == "local":
         try:
             provider = BasicAuthProvider(
-                store=LocalUserStore(secret=secret), secret=secret, ttl_seconds=ttl
+                store=LocalUserStore(
+                    secret=secret, max_accounts=_account_cap(section)
+                ),
+                secret=secret,
+                ttl_seconds=ttl,
             )
         except (LocalUserStoreUnavailable, ValueError) as exc:
             LAST_SKIP_REASON = "BasicAuthProvider durable store construction failed"

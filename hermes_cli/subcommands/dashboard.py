@@ -214,8 +214,8 @@ def build_dashboard_parser(
         help="Manage durable local dashboard users",
         description=(
             "Manage the local Basic-auth account authority. Bootstrap creates "
-            "exactly five accounts; generated credentials are displayed once "
-            "only on an interactive terminal."
+            "the configured account cap (five by default); generated credentials "
+            "are displayed once only on an interactive terminal."
         ),
     )
     dashboard_users_subparsers = dashboard_users_parser.add_subparsers(
@@ -232,7 +232,7 @@ def build_dashboard_parser(
     dashboard_users_list_parser.set_defaults(func=cmd_dashboard_users)
 
     dashboard_users_bootstrap_parser = dashboard_users_subparsers.add_parser(
-        "bootstrap", help="Create the initial exact set of five local users"
+        "bootstrap", help="Create the initial configured set of local users"
     )
     dashboard_users_bootstrap_parser.add_argument(
         "--generate",
@@ -254,6 +254,7 @@ def build_dashboard_parser(
     dashboard_users_reset_parser.set_defaults(func=cmd_dashboard_users)
 
     for action, help_text in (
+        ("make-admin", "Grant administrator role to a user"),
         ("disable", "Disable a user and revoke sessions"),
         ("enable", "Enable a user and revoke sessions"),
         ("revoke-sessions", "Revoke every session for a user"),

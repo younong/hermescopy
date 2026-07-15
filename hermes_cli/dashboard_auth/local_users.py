@@ -31,7 +31,7 @@ from typing import Iterable, Literal, Sequence
 from hermes_constants import get_hermes_home
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _DB_NAME = "local-users.sqlite3"
 _ACCESS_PREFIX = "hlu1.at."
 _REFRESH_PREFIX = "hlu1.rt."
@@ -44,7 +44,11 @@ _SCRYPT_SALT_BYTES = 16
 _MAX_PASSWORD_BYTES = 4096
 _USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,63}$")
 
+# ``pending_reset`` remains readable only for v1 migration. New writes use an
+# active account plus ``must_change_password`` so the temporary credential can
+# establish the narrowly scoped session required to complete the change.
 AccountStatus = Literal["active", "disabled", "pending_reset"]
+AccountRole = Literal["admin", "member"]
 
 
 class LocalUserStoreUnavailable(RuntimeError):
@@ -66,7 +70,9 @@ class LocalAccount:
     account_id: str
     username: str
     display_name: str
+    role: AccountRole
     status: AccountStatus
+    must_change_password: bool
     auth_revision: int
     created_at: int
     updated_at: int
@@ -257,12 +263,13 @@ class LocalUserStore:
                 for username, password_hash, display_name in prepared:
                     conn.execute(
                         "INSERT INTO accounts("
-                        "account_id, username, display_name, password_hash, status, "
-                        "auth_revision, created_at, updated_at, password_changed_at, disabled_at"
-                        ") VALUES (?, ?, ?, ?, 'active', 1, ?, ?, ?, NULL)",
+                        "account_id, username, display_name, password_hash, role, status, "
+                        "must_change_password, auth_revision, created_at, updated_at, "
+                        "password_changed_at, disabled_at"
+                        ") VALUES (?, ?, ?, ?, ?, 'active', 0, 1, ?, ?, ?, NULL)",
                         (
                             _new_id(), username, display_name, password_hash,
-                            timestamp, timestamp, timestamp,
+                            "member", timestamp, timestamp, timestamp,
                         ),
                     )
                 rows = conn.execute(
@@ -281,12 +288,20 @@ class LocalUserStore:
         username: str,
         password: str,
         display_name: str = "",
+        role: AccountRole = "member",
         status: AccountStatus = "active",
+        must_change_password: bool = False,
         now: int | None = None,
     ) -> LocalAccount:
         """Create one account while enforcing the configured hard account cap."""
-        if status not in ("active", "disabled", "pending_reset"):
+        if role not in ("admin", "member"):
+            raise ValueError("invalid account role")
+        if status not in ("active", "disabled"):
             raise ValueError("invalid account status")
+        if not isinstance(must_change_password, bool):
+            raise ValueError("must_change_password must be boolean")
+        if status == "disabled" and must_change_password:
+            raise ValueError("disabled account cannot require a password change")
         canonical = normalize_username(username)
         password_hash = hash_password(password)
         display = _display_name(display_name, canonical)
@@ -301,12 +316,13 @@ class LocalUserStore:
                 account_id = _new_id()
                 conn.execute(
                     "INSERT INTO accounts("
-                    "account_id, username, display_name, password_hash, status, auth_revision, "
-                    "created_at, updated_at, password_changed_at, disabled_at"
-                    ") VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
+                    "account_id, username, display_name, password_hash, role, status, "
+                    "must_change_password, auth_revision, created_at, updated_at, "
+                    "password_changed_at, disabled_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
                     (
-                        account_id, canonical, display, password_hash, status, timestamp,
-                        timestamp, timestamp,
+                        account_id, canonical, display, password_hash, role, status,
+                        int(must_change_password), timestamp, timestamp, timestamp,
                         timestamp if status == "disabled" else None,
                     ),
                 )
@@ -330,6 +346,20 @@ class LocalUserStore:
             with self._connect() as conn:
                 row = conn.execute(
                     "SELECT * FROM accounts WHERE username=?", (canonical,)
+                ).fetchone()
+                return self._account_from_row(row) if row is not None else None
+        except (sqlite3.Error, OSError) as exc:
+            raise LocalUserStoreUnavailable("local user store is unavailable") from exc
+
+    def get_account_by_id(self, account_id: str) -> LocalAccount | None:
+        """Look up non-secret account metadata for a provider-verified ID."""
+        if not isinstance(account_id, str) or not account_id:
+            return None
+        self._ensure_ready()
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM accounts WHERE account_id=?", (account_id,)
                 ).fetchone()
                 return self._account_from_row(row) if row is not None else None
         except (sqlite3.Error, OSError) as exc:
@@ -372,6 +402,9 @@ class LocalUserStore:
                 if row is None or not valid_password:
                     return None
                 account = self._account_from_row(row)
+                # A reset-required account remains active so it can establish
+                # the narrowly scoped session needed to replace its temporary
+                # password. The HTTP gate restricts all normal capabilities.
                 return account if account.status == "active" else None
         except (sqlite3.Error, OSError) as exc:
             raise LocalUserStoreUnavailable("local user store is unavailable") from exc
@@ -388,10 +421,47 @@ class LocalUserStore:
         canonical = normalize_username(username)
         password_hash = hash_password(password)
         timestamp = _now(now)
-        status: AccountStatus = "pending_reset" if require_reset else "active"
         return self._update_account_auth(
-            canonical, password_hash=password_hash, status=status, now=timestamp
+            canonical,
+            password_hash=password_hash,
+            must_change_password=require_reset,
+            now=timestamp,
         )
+
+    def set_account_display_name(
+        self,
+        *,
+        username: str,
+        display_name: str,
+        now: int | None = None,
+    ) -> LocalAccount:
+        """Update display metadata without changing credentials or sessions."""
+        canonical = normalize_username(username)
+        display = _display_name(display_name, canonical)
+        timestamp = _now(now)
+        self._ensure_ready()
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT * FROM accounts WHERE username=?", (canonical,)
+                ).fetchone()
+                if row is None:
+                    raise LocalUserStoreConflict("local account does not exist")
+                account = self._account_from_row(row)
+                conn.execute(
+                    "UPDATE accounts SET display_name=?, updated_at=? WHERE account_id=?",
+                    (display, timestamp, account.account_id),
+                )
+                updated = conn.execute(
+                    "SELECT * FROM accounts WHERE account_id=?", (account.account_id,)
+                ).fetchone()
+                conn.execute("COMMIT")
+                return self._account_from_row(updated)
+        except LocalUserStoreConflict:
+            raise
+        except (sqlite3.Error, OSError) as exc:
+            raise LocalUserStoreUnavailable("local user store is unavailable") from exc
 
     def set_account_status(
         self,
@@ -400,16 +470,64 @@ class LocalUserStore:
         status: AccountStatus,
         now: int | None = None,
     ) -> LocalAccount:
-        """Enable/disable/reset-gate an account and invalidate all its sessions."""
-        if status not in ("active", "disabled", "pending_reset"):
+        """Enable or disable an account and invalidate all of its sessions."""
+        if status not in ("active", "disabled"):
             raise ValueError("invalid account status")
         return self._update_account_auth(
-            normalize_username(username), status=status, now=_now(now)
+            normalize_username(username),
+            status=status,
+            must_change_password=False if status == "disabled" else None,
+            now=_now(now),
         )
 
     def revoke_all_sessions(self, *, username: str, now: int | None = None) -> LocalAccount:
         """Invalidate every session for an account by advancing its revision."""
         return self._update_account_auth(normalize_username(username), now=_now(now))
+
+    def set_account_role(
+        self, *, username: str, role: AccountRole, now: int | None = None
+    ) -> LocalAccount:
+        """Set an account role while preserving at least one active administrator."""
+        if role not in ("admin", "member"):
+            raise ValueError("invalid account role")
+        canonical = normalize_username(username)
+        timestamp = _now(now)
+        self._ensure_ready()
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT * FROM accounts WHERE username=?", (canonical,)
+                ).fetchone()
+                if row is None:
+                    raise LocalUserStoreConflict("local account does not exist")
+                old = self._account_from_row(row)
+                if old.role == role:
+                    conn.execute("COMMIT")
+                    return old
+                if old.role == "admin" and old.status == "active" and role != "admin":
+                    active_admins = int(conn.execute(
+                        "SELECT COUNT(*) FROM accounts WHERE role='admin' AND status='active'"
+                    ).fetchone()[0])
+                    if active_admins <= 1:
+                        raise LocalUserStoreConflict("cannot remove the last active admin")
+                conn.execute(
+                    "UPDATE accounts SET role=?, auth_revision=?, updated_at=? "
+                    "WHERE account_id=?",
+                    (role, old.auth_revision + 1, timestamp, old.account_id),
+                )
+                self._revoke_sessions_in_transaction(
+                    conn, old.account_id, timestamp, "account_role_changed"
+                )
+                updated = conn.execute(
+                    "SELECT * FROM accounts WHERE account_id=?", (old.account_id,)
+                ).fetchone()
+                conn.execute("COMMIT")
+                return self._account_from_row(updated)
+        except LocalUserStoreConflict:
+            raise
+        except (sqlite3.Error, OSError) as exc:
+            raise LocalUserStoreUnavailable("local user store is unavailable") from exc
 
     # -- session lifecycle -------------------------------------------------
 
@@ -477,7 +595,8 @@ class LocalUserStore:
                 conn.execute("BEGIN IMMEDIATE")
                 row = conn.execute(
                     "SELECT s.*, a.account_id AS a_account_id, a.username AS a_username, "
-                    "a.display_name AS a_display_name, a.status AS a_status, "
+                    "a.display_name AS a_display_name, a.role AS a_role, a.status AS a_status, "
+                    "a.must_change_password AS a_must_change_password, "
                     "a.auth_revision AS a_auth_revision, a.created_at AS a_created_at, "
                     "a.updated_at AS a_updated_at, a.password_changed_at AS a_password_changed_at, "
                     "a.disabled_at AS a_disabled_at "
@@ -533,7 +652,8 @@ class LocalUserStore:
                     return None
                 row = conn.execute(
                     "SELECT s.*, a.account_id AS a_account_id, a.username AS a_username, "
-                    "a.display_name AS a_display_name, a.status AS a_status, "
+                    "a.display_name AS a_display_name, a.role AS a_role, a.status AS a_status, "
+                    "a.must_change_password AS a_must_change_password, "
                     "a.auth_revision AS a_auth_revision, a.created_at AS a_created_at, "
                     "a.updated_at AS a_updated_at, a.password_changed_at AS a_password_changed_at, "
                     "a.disabled_at AS a_disabled_at "
@@ -615,15 +735,6 @@ class LocalUserStore:
                 self._validate_paths()
                 with self._connect() as conn:
                     conn.execute("PRAGMA foreign_keys=ON")
-                    conn.execute(
-                        "CREATE TABLE IF NOT EXISTS local_user_meta ("
-                        "key TEXT PRIMARY KEY, value INTEGER NOT NULL)"
-                    )
-                    conn.execute(
-                        "INSERT OR IGNORE INTO local_user_meta(key, value) "
-                        "VALUES ('schema_version', ?)",
-                        (_SCHEMA_VERSION,),
-                    )
                     self._migrate_schema(conn)
                     row = conn.execute(
                         "SELECT value FROM local_user_meta WHERE key='schema_version'"
@@ -644,41 +755,94 @@ class LocalUserStore:
 
     @staticmethod
     def _migrate_schema(conn: sqlite3.Connection) -> None:
-        row = conn.execute(
-            "SELECT value FROM local_user_meta WHERE key='schema_version'"
-        ).fetchone()
-        version = 1 if row is None else int(row[0])
-        if version != _SCHEMA_VERSION:
-            raise LocalUserStoreUnavailable("local user store has unsupported schema")
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS accounts ("
-            "account_id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, "
-            "display_name TEXT NOT NULL, password_hash TEXT NOT NULL, "
-            "status TEXT NOT NULL CHECK(status IN ('active','disabled','pending_reset')), "
-            "auth_revision INTEGER NOT NULL, created_at INTEGER NOT NULL, "
-            "updated_at INTEGER NOT NULL, password_changed_at INTEGER NOT NULL, "
-            "disabled_at INTEGER)"
-        )
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS sessions ("
-            "session_id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(account_id), "
-            "access_token_digest TEXT NOT NULL UNIQUE, refresh_token_digest TEXT NOT NULL UNIQUE, "
-            "access_expires_at INTEGER NOT NULL, refresh_expires_at INTEGER NOT NULL, "
-            "auth_revision_at_issue INTEGER NOT NULL, created_at INTEGER NOT NULL, "
-            "last_used_at INTEGER NOT NULL, revoked_at INTEGER, revoked_reason TEXT)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS sessions_account_idx ON sessions(account_id)"
-        )
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS refresh_token_history ("
-            "token_digest TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(account_id), "
-            "session_id TEXT NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER NOT NULL)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS refresh_history_expiry_idx "
-            "ON refresh_token_history(expires_at)"
-        )
+        """Create v1 or upgrade a v1 authority to v2 atomically."""
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS local_user_meta ("
+                "key TEXT PRIMARY KEY, value INTEGER NOT NULL)"
+            )
+            row = conn.execute(
+                "SELECT value FROM local_user_meta WHERE key='schema_version'"
+            ).fetchone()
+            if row is None:
+                version = 1
+                conn.execute(
+                    "INSERT INTO local_user_meta(key, value) VALUES ('schema_version', 1)"
+                )
+            else:
+                version = int(row[0])
+            if version == 1:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS accounts ("
+                    "account_id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, "
+                    "display_name TEXT NOT NULL, password_hash TEXT NOT NULL, "
+                    "status TEXT NOT NULL CHECK(status IN ('active','disabled','pending_reset')), "
+                    "auth_revision INTEGER NOT NULL, created_at INTEGER NOT NULL, "
+                    "updated_at INTEGER NOT NULL, password_changed_at INTEGER NOT NULL, "
+                    "disabled_at INTEGER)"
+                )
+                columns = {
+                    str(column[1]) for column in conn.execute("PRAGMA table_info(accounts)")
+                }
+                if "role" not in columns:
+                    conn.execute(
+                        "ALTER TABLE accounts ADD COLUMN role TEXT NOT NULL "
+                        "DEFAULT 'member' CHECK(role IN ('admin','member'))"
+                    )
+                if "must_change_password" not in columns:
+                    conn.execute(
+                        "ALTER TABLE accounts ADD COLUMN must_change_password "
+                        "INTEGER NOT NULL DEFAULT 0 CHECK(must_change_password IN (0,1))"
+                    )
+                # v1 accounts deliberately retain member authority. Operators
+                # must explicitly elevate an administrator after upgrading. A
+                # legacy pending-reset account cannot complete its reset while
+                # blocked at login, so migrate it to the active, forced-change
+                # representation without touching credentials or revisions.
+                conn.execute("UPDATE accounts SET role='member'")
+                conn.execute(
+                    "UPDATE accounts SET must_change_password=0 "
+                    "WHERE status IN ('active', 'disabled')"
+                )
+                conn.execute(
+                    "UPDATE accounts SET status='active', must_change_password=1 "
+                    "WHERE status='pending_reset'"
+                )
+                conn.execute(
+                    "UPDATE local_user_meta SET value=? WHERE key='schema_version'",
+                    (_SCHEMA_VERSION,),
+                )
+                version = _SCHEMA_VERSION
+            if version != _SCHEMA_VERSION:
+                raise LocalUserStoreUnavailable("local user store has unsupported schema")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS sessions ("
+                "session_id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(account_id), "
+                "access_token_digest TEXT NOT NULL UNIQUE, refresh_token_digest TEXT NOT NULL UNIQUE, "
+                "access_expires_at INTEGER NOT NULL, refresh_expires_at INTEGER NOT NULL, "
+                "auth_revision_at_issue INTEGER NOT NULL, created_at INTEGER NOT NULL, "
+                "last_used_at INTEGER NOT NULL, revoked_at INTEGER, revoked_reason TEXT)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS sessions_account_idx ON sessions(account_id)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS refresh_token_history ("
+                "token_digest TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(account_id), "
+                "session_id TEXT NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER NOT NULL)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS refresh_history_expiry_idx "
+                "ON refresh_token_history(expires_at)"
+            )
+            conn.execute("COMMIT")
+        except LocalUserStoreUnavailable:
+            conn.execute("ROLLBACK")
+            raise
+        except sqlite3.Error:
+            conn.execute("ROLLBACK")
+            raise
 
     def _validate_control_home(self) -> None:
         try:
@@ -744,6 +908,7 @@ class LocalUserStore:
         *,
         password_hash: str | None = None,
         status: AccountStatus | None = None,
+        must_change_password: bool | None = None,
         now: int,
     ) -> LocalAccount:
         self._ensure_ready()
@@ -758,12 +923,29 @@ class LocalUserStore:
                 old = self._account_from_row(row)
                 next_status = status if status is not None else old.status
                 next_hash = password_hash if password_hash is not None else str(row["password_hash"])
+                next_must_change_password = (
+                    must_change_password
+                    if must_change_password is not None
+                    else old.must_change_password
+                )
+                if next_status not in ("active", "disabled"):
+                    raise ValueError("invalid account status")
+                if next_status == "disabled" and next_must_change_password:
+                    raise ValueError("disabled account cannot require a password change")
+                if old.role == "admin" and old.status == "active" and next_status != "active":
+                    active_admins = int(conn.execute(
+                        "SELECT COUNT(*) FROM accounts WHERE role='admin' AND status='active'"
+                    ).fetchone()[0])
+                    if active_admins <= 1:
+                        raise LocalUserStoreConflict("cannot disable the last active admin")
                 disabled_at = now if next_status == "disabled" else None
                 conn.execute(
-                    "UPDATE accounts SET password_hash=?, status=?, auth_revision=?, "
-                    "updated_at=?, password_changed_at=?, disabled_at=? WHERE account_id=?",
+                    "UPDATE accounts SET password_hash=?, status=?, must_change_password=?, "
+                    "auth_revision=?, updated_at=?, password_changed_at=?, disabled_at=? "
+                    "WHERE account_id=?",
                     (
-                        next_hash, next_status, old.auth_revision + 1, now,
+                        next_hash, next_status, int(next_must_change_password),
+                        old.auth_revision + 1, now,
                         now if password_hash is not None else old.password_changed_at,
                         disabled_at, old.account_id,
                     ),
@@ -824,14 +1006,22 @@ class LocalUserStore:
     def _account_from_row(row: sqlite3.Row) -> LocalAccount:
         prefix = "a_" if "a_account_id" in row.keys() else ""
         try:
+            role = str(row[f"{prefix}role"])
             status = str(row[f"{prefix}status"])
+            must_change_password = int(row[f"{prefix}must_change_password"])
+            if role not in ("admin", "member"):
+                raise ValueError("invalid account role")
             if status not in ("active", "disabled", "pending_reset"):
                 raise ValueError("invalid account status")
+            if must_change_password not in (0, 1):
+                raise ValueError("invalid must_change_password")
             return LocalAccount(
                 account_id=str(row[f"{prefix}account_id"]),
                 username=str(row[f"{prefix}username"]),
                 display_name=str(row[f"{prefix}display_name"]),
+                role=role,  # type: ignore[arg-type]
                 status=status,  # type: ignore[arg-type]
+                must_change_password=bool(must_change_password),
                 auth_revision=int(row[f"{prefix}auth_revision"]),
                 created_at=int(row[f"{prefix}created_at"]),
                 updated_at=int(row[f"{prefix}updated_at"]),

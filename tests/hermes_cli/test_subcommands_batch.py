@@ -107,6 +107,9 @@ def test_dashboard_builder_two_handlers():
     assert parser.parse_args(
         ["dashboard", "users", "reset-password", "alice"]
     ).func is users
+    assert parser.parse_args(
+        ["dashboard", "users", "make-admin", "alice"]
+    ).func is users
 
 
 # ── deprecated `hermes login` fails gracefully, not with argparse error ────

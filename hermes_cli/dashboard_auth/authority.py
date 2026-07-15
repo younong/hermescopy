@@ -1008,6 +1008,59 @@ class AuthorityStore:
         except (sqlite3.Error, OSError) as exc:
             raise AuthorityUnavailable("authority transaction failed") from exc
 
+    def revoke_principal_and_bump(
+        self, *, provider: str, user_id: str, reason: str
+    ) -> AuthorizationState:
+        """Revoke every active scope for one verified dashboard principal.
+
+        Account administration can invalidate credentials without possessing a
+        target user's raw browser token or session id. The provider/user pair
+        is the same de-identified principal key used by :meth:`activate`, so
+        this transaction fences every active tenant/session scope for that
+        account and emits bridge-close changes for each one.
+        """
+        del reason  # reasons belong in the caller's sanitized audit event.
+        provider = str(provider or "").strip()
+        user_id = str(user_id or "").strip()
+        if not provider or not user_id:
+            raise ValueError("provider and user_id are required")
+        material = "\x1f".join((provider, user_id)).encode("utf-8")
+        principal_digest = hashlib.sha256(material).hexdigest()
+        self._ensure_ready()
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                scopes = tuple(
+                    (str(row[0]), int(row[1]))
+                    for row in conn.execute(
+                        "SELECT scope_digest, epoch FROM authorization_scopes "
+                        "WHERE principal_digest=? AND revoked=0",
+                        (principal_digest,),
+                    ).fetchall()
+                )
+                if scopes:
+                    conn.execute(
+                        "UPDATE authorization_scopes SET revoked=1, epoch=epoch+1 "
+                        "WHERE principal_digest=? AND revoked=0",
+                        (principal_digest,),
+                    )
+                changes = tuple(
+                    self._record_change(
+                        conn, scope_digest=digest, epoch=epoch + 1, revoked=True
+                    )
+                    for digest, epoch in scopes
+                )
+                recovery_generation = self._recovery_generation(conn)
+                conn.commit()
+                return AuthorizationState(
+                    epoch=max((epoch + 1 for _digest, epoch in scopes), default=0),
+                    recovery_generation=recovery_generation,
+                    revoked_scope_digests=tuple(digest for digest, _epoch in scopes),
+                    changes=changes,
+                )
+        except (sqlite3.Error, OSError) as exc:
+            raise AuthorityUnavailable("authority transaction failed") from exc
+
     def revoke_and_bump(self, scope: AuthorizationScope, *, reason: str) -> AuthorizationState:
         """Revoke this verified session scope and increment its epoch."""
         del reason  # reason is carried by the caller's sanitized audit event.

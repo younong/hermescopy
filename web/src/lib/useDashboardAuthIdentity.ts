@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { api, type AuthMeResponse } from "@/lib/api";
 import { getHermesBrowserId } from "@/lib/browserIdentity";
@@ -11,6 +11,7 @@ interface DashboardAuthIdentity {
   loading: boolean;
   ownerKey?: string;
   ready: boolean;
+  refresh: () => Promise<void>;
 }
 
 function isAuthRequired(): boolean {
@@ -22,37 +23,45 @@ export function useDashboardAuthIdentity(): DashboardAuthIdentity {
   const [authMe, setAuthMe] = useState<AuthMeResponse | null>(null);
   const [loading, setLoading] = useState(authRequired);
   const [error, setError] = useState<string | null>(null);
+  const mounted = useRef(true);
+
+  const refresh = useMemo(
+    () => async () => {
+      if (!authRequired) {
+        if (mounted.current) {
+          setAuthMe(null);
+          setLoading(false);
+          setError(null);
+        }
+        return;
+      }
+
+      if (mounted.current) {
+        setLoading(true);
+        setError(null);
+      }
+      try {
+        const identity = await api.getAuthMe();
+        if (mounted.current) setAuthMe(identity);
+      } catch (err) {
+        if (mounted.current) {
+          setAuthMe(null);
+          setError(err instanceof Error ? err.message : String(err));
+        }
+      } finally {
+        if (mounted.current) setLoading(false);
+      }
+    },
+    [authRequired],
+  );
 
   useEffect(() => {
-    if (!authRequired) {
-      setAuthMe(null);
-      setLoading(false);
-      setError(null);
-      return;
-    }
-
-    let cancelled = false;
-    setLoading(true);
-    setError(null);
-    api
-      .getAuthMe()
-      .then((data) => {
-        if (cancelled) return;
-        setAuthMe(data);
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        setAuthMe(null);
-        setError(err instanceof Error ? err.message : String(err));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-
+    mounted.current = true;
+    void refresh();
     return () => {
-      cancelled = true;
+      mounted.current = false;
     };
-  }, [authRequired]);
+  }, [refresh, mounted]);
 
   const ownerKey = authMe?.owner_key;
   const [transitionReady, setTransitionReady] = useState(!authRequired);
@@ -70,6 +79,7 @@ export function useDashboardAuthIdentity(): DashboardAuthIdentity {
     loading,
     ownerKey,
     ready: (!authRequired || !!ownerKey) && transitionReady,
+    refresh,
   };
 }
 

@@ -16,10 +16,11 @@ The routes:
 from __future__ import annotations
 
 import logging
+import secrets
 import threading
 import time
 from collections import defaultdict, deque
-from typing import Any, Deque, Dict, Tuple
+from typing import Any, Deque, Dict, Literal, Tuple
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -54,6 +55,13 @@ from hermes_cli.dashboard_auth.cookies import (
     set_session_cookies,
 )
 from hermes_cli.dashboard_auth.login_page import render_login_html
+from hermes_cli.dashboard_auth.local_users import (
+    LocalAccount,
+    LocalUserStore,
+    LocalUserStoreConflict,
+    LocalUserStoreUnavailable,
+    hash_password,
+)
 from hermes_cli.dashboard_auth.owner_context import (
     owner_context_from_session,
     owner_public_summary,
@@ -469,6 +477,121 @@ class _WsTicketBody(BaseModel):
     audience: str
 
 
+class _LocalUserCreateBody(BaseModel):
+    username: str
+    display_name: str = ""
+    role: Literal["admin", "member"] = "member"
+
+
+class _LocalUserUpdateBody(BaseModel):
+    display_name: str | None = None
+    role: Literal["admin", "member"] | None = None
+    status: Literal["active", "disabled"] | None = None
+
+
+class _LocalUserPasswordChangeBody(BaseModel):
+    current_password: str
+    new_password: str
+
+
+def _local_account_summary(account: LocalAccount) -> dict[str, object]:
+    """Serialize only durable account metadata; passwords never leave storage."""
+    return {
+        "account_id": account.account_id,
+        "username": account.username,
+        "display_name": account.display_name,
+        "role": account.role,
+        "status": account.status,
+        "must_change_password": account.must_change_password,
+        "created_at": account.created_at,
+        "updated_at": account.updated_at,
+        "password_changed_at": account.password_changed_at,
+        "disabled_at": account.disabled_at,
+    }
+
+
+def _durable_local_basic(request: Request) -> tuple[Any, LocalUserStore] | None:
+    """Return the current durable-local Basic provider/store, never a fallback.
+
+    Management routes are intentionally absent for legacy configured Basic and
+    all non-Basic providers. The provider owns the store reference, so callers
+    cannot choose an authority through request parameters.
+    """
+    session = getattr(request.state, "session", None)
+    if session is None or session.provider != "basic":
+        return None
+    provider = get_provider("basic")
+    store = getattr(provider, "local_user_store", None) if provider is not None else None
+    if store is None:
+        return None
+    return provider, store
+
+
+def _local_account_for_request(request: Request) -> tuple[Any, LocalUserStore, LocalAccount]:
+    durable = _durable_local_basic(request)
+    if durable is None:
+        raise HTTPException(status_code=403, detail="Local account management is unavailable")
+    provider, store = durable
+    session = getattr(request.state, "session", None)
+    if session is None:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        account = provider.local_account_for_session(session)
+    except ProviderError as exc:
+        raise HTTPException(status_code=503, detail="Local account authority is unavailable") from exc
+    if account is None:
+        # The provider verified the access token, but the associated account can
+        # no longer be resolved. Do not let a stale principal authorize a route.
+        raise HTTPException(status_code=403, detail="Local account management is unavailable")
+    return provider, store, account
+
+
+def _admin_local_account_for_request(request: Request) -> tuple[Any, LocalUserStore, LocalAccount]:
+    provider, store, account = _local_account_for_request(request)
+    if account.role != "admin":
+        raise HTTPException(status_code=403, detail="Administrator access required")
+    return provider, store, account
+
+
+def _new_temporary_password() -> str:
+    # 32 url-safe random bytes are enough entropy for a reveal-once bootstrap
+    # credential. It is returned only after the authority transaction commits.
+    return secrets.token_urlsafe(32)
+
+
+async def _revoke_local_account_authority(
+    request: Request, account: LocalAccount, *, reason: str
+) -> None:
+    """Fence a changed durable account's live scopes and browser bridges.
+
+    This invalidates any already-admitted owner-worker ticket scope. Callers
+    fence scope authority before every credential, role, or status mutation. A
+    failure is surfaced to the caller; security-sensitive route mutations must
+    not claim success while stale browser capabilities could remain live.
+    """
+    from hermes_cli.dashboard_auth.ws_tickets import authority_store
+    from hermes_cli.web_server import close_authorized_bridges_by_changes
+
+    state = authority_store().revoke_principal_and_bump(
+        provider="basic", user_id=account.account_id, reason=reason
+    )
+    await close_authorized_bridges_by_changes(
+        request.app, state.changes, reason=reason
+    )
+
+
+def _session_requires_password_change(session) -> bool:
+    """Resolve reset state from the Basic provider's durable authority."""
+    if session.provider != "basic":
+        return False
+    provider = get_provider("basic")
+    resolver = getattr(provider, "local_account_for_session", None)
+    if not callable(resolver):
+        return False
+    account = resolver(session)
+    return bool(account is not None and account.must_change_password)
+
+
 @router.post("/auth/password-login", name="auth_password_login")
 async def auth_password_login(request: Request, body: _PasswordLoginBody):
     """Authenticate a username/password against a password provider.
@@ -562,7 +685,7 @@ async def auth_password_login(request: Request, body: _PasswordLoginBody):
 
 @router.post("/auth/logout", name="auth_logout")
 async def auth_logout(request: Request):
-    _at, rt = read_session_cookies(request)
+    at, rt = read_session_cookies(request)
     sess = getattr(request.state, "session", None)
     try:
         from hermes_cli.dashboard_auth.middleware import (
@@ -607,9 +730,10 @@ async def auth_logout(request: Request):
             clear_pkce_cookie(resp, prefix=_prefix(request))
             return resp
 
-    if rt and sess is not None:
-        # Provider revocation follows the durable local authority revoke and is
-        # best effort: an IdP transport failure cannot resurrect capabilities.
+    if rt:
+        # A refresh credential is server-issued and is specific enough to revoke
+        # even when its paired access cookie expired. Keep this best effort: an
+        # IdP transport failure cannot resurrect already-fenced capabilities.
         for provider in list_providers():
             try:
                 provider.revoke_session(refresh_token=rt)
@@ -640,12 +764,12 @@ async def auth_logout(request: Request):
 
 @router.get("/api/auth/me", name="auth_me")
 async def api_auth_me(request: Request):
-    """Return the verified session as JSON. Auth-required (gate enforces)."""
+    """Return the verified session and server-derived local account metadata."""
     sess = getattr(request.state, "session", None)
     if sess is None:
         raise HTTPException(status_code=401, detail="Unauthorized")
     owner = owner_context_from_session(sess)
-    return {
+    response: dict[str, object] = {
         "user_id": sess.user_id,
         "email": sess.email,
         "display_name": sess.display_name,
@@ -657,6 +781,221 @@ async def api_auth_me(request: Request):
         "legacy_sessions_message": "Authenticated owner isolation uses a separate owner home; legacy local sessions are not imported automatically.",
         **owner_public_summary(owner),
     }
+    durable = _durable_local_basic(request)
+    if durable is not None:
+        provider, _store = durable
+        try:
+            account = provider.local_account_for_session(sess)
+        except ProviderError as exc:
+            raise HTTPException(status_code=503, detail="Local account authority is unavailable") from exc
+        if account is None:
+            raise HTTPException(status_code=403, detail="Local account authorization is unavailable")
+        response.update({
+            "role": account.role,
+            "must_change_password": account.must_change_password,
+            "local_user_management": {
+                "enabled": True,
+                "is_admin": account.role == "admin",
+            },
+            "capabilities": (
+                ["auth.me", "auth.password.change", "auth.logout"]
+                if account.must_change_password
+                else [
+                    "auth.me", "auth.password.change", "auth.logout", "auth.ws_ticket",
+                    *(["local_users.read", "local_users.create", "local_users.update", "local_users.reset_password"] if account.role == "admin" else []),
+                ]
+            ),
+        })
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Auth-required: durable local Basic account management
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/auth/users", name="auth_local_users")
+@router.get("/api/auth/local-users", name="auth_local_users_compat")
+async def api_auth_local_users(request: Request):
+    _provider, store, _admin = _admin_local_account_for_request(request)
+    try:
+        accounts = [_local_account_summary(account) for account in store.list_accounts()]
+        return {
+            "users": accounts,
+            "accounts": accounts,
+            "count": len(accounts),
+            "max_accounts": store.max_accounts,
+        }
+    except LocalUserStoreUnavailable as exc:
+        raise HTTPException(status_code=503, detail="Local account authority is unavailable") from exc
+
+
+@router.post("/api/auth/users", name="auth_local_user_create")
+@router.post("/api/auth/local-users", name="auth_local_user_create_compat")
+async def api_auth_local_user_create(request: Request, body: _LocalUserCreateBody):
+    _provider, store, _admin = _admin_local_account_for_request(request)
+    password = _new_temporary_password()
+    try:
+        account = store.create_account(
+            username=body.username,
+            password=password,
+            display_name=body.display_name,
+            role=body.role,
+            status="active",
+            must_change_password=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid local account request") from exc
+    except LocalUserStoreConflict as exc:
+        raise HTTPException(status_code=409, detail="Local account could not be created") from exc
+    except LocalUserStoreUnavailable as exc:
+        raise HTTPException(status_code=503, detail="Local account authority is unavailable") from exc
+    # Temporary credential is intentionally reveal-once, after successful commit.
+    summary = _local_account_summary(account)
+    return {"user": summary, "account": summary, "temporary_password": password}
+
+
+@router.patch("/api/auth/users/{username}", name="auth_local_user_update")
+@router.patch("/api/auth/local-users/{username}", name="auth_local_user_update_compat")
+async def api_auth_local_user_update(
+    request: Request, username: str, body: _LocalUserUpdateBody
+):
+    _provider, store, _admin = _admin_local_account_for_request(request)
+    if body.display_name is None and body.role is None and body.status is None:
+        raise HTTPException(status_code=400, detail="No local account changes supplied")
+    try:
+        account = store.get_account(username)
+        if account is None:
+            raise HTTPException(status_code=404, detail="Local account not found")
+        # The minimal durable store API deliberately separates each mutation so
+        # invariant checks (especially last-active-admin) remain server-side.
+        authorization_changed = (
+            (body.role is not None and body.role != account.role)
+            or (body.status is not None and body.status != account.status)
+        )
+        if authorization_changed:
+            try:
+                # Fence ticket scopes before changing durable account state. If
+                # this fails, leave the account untouched rather than claiming
+                # a completed role/status mutation with live worker access.
+                await _revoke_local_account_authority(
+                    request, account, reason="local_account_authorization_changed"
+                )
+            except Exception as exc:
+                _log.warning("dashboard-auth: local account authority revoke failed: %s", exc)
+                raise HTTPException(
+                    status_code=503, detail="Local account authorization is unavailable"
+                ) from exc
+        if body.role is not None:
+            account = store.set_account_role(username=username, role=body.role)
+        if body.status is not None:
+            account = store.set_account_status(username=username, status=body.status)
+        if body.display_name is not None:
+            # Display-name updates are metadata-only and need a single durable
+            # primitive; set_account_profile validates and preserves auth state.
+            account = store.set_account_display_name(
+                username=username, display_name=body.display_name
+            )
+        summary = _local_account_summary(account)
+        return {"user": summary, "account": summary, "ok": True}
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid local account request") from exc
+    except LocalUserStoreConflict as exc:
+        raise HTTPException(status_code=409, detail="Local account update was rejected") from exc
+    except LocalUserStoreUnavailable as exc:
+        raise HTTPException(status_code=503, detail="Local account authority is unavailable") from exc
+
+
+@router.post("/api/auth/users/{username}/reset-password", name="auth_local_user_reset_password")
+@router.post("/api/auth/local-users/{username}/reset-password", name="auth_local_user_reset_password_compat")
+async def api_auth_local_user_reset_password(request: Request, username: str):
+    _provider, store, _admin = _admin_local_account_for_request(request)
+    try:
+        target = store.get_account(username)
+        if target is None:
+            raise HTTPException(status_code=404, detail="Local account not found")
+        await _revoke_local_account_authority(
+            request, target, reason="local_account_password_reset"
+        )
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid local account request") from exc
+    except LocalUserStoreUnavailable as exc:
+        raise HTTPException(
+            status_code=503, detail="Local account authorization is unavailable"
+        ) from exc
+    except Exception as exc:
+        _log.warning("dashboard-auth: local password-reset authority revoke failed: %s", exc)
+        raise HTTPException(
+            status_code=503, detail="Local account authorization is unavailable"
+        ) from exc
+
+    password = _new_temporary_password()
+    try:
+        account = store.set_password(username=username, password=password, require_reset=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid local account request") from exc
+    except LocalUserStoreConflict as exc:
+        raise HTTPException(status_code=404, detail="Local account not found") from exc
+    except LocalUserStoreUnavailable as exc:
+        raise HTTPException(status_code=503, detail="Local account authority is unavailable") from exc
+    # Only a successful reset reaches this response with a plaintext credential.
+    summary = _local_account_summary(account)
+    return {"user": summary, "account": summary, "temporary_password": password}
+
+
+@router.post("/api/auth/password-change", name="auth_local_password_change")
+@router.post("/api/auth/password/change", name="auth_local_password_change_compat")
+async def api_auth_local_password_change(
+    request: Request, body: _LocalUserPasswordChangeBody
+):
+    _provider, store, account = _local_account_for_request(request)
+    try:
+        # Always verify through the same durable credential path. It returns no
+        # reason for failure, preventing current-password account-state oracles.
+        current = store.verify_credentials(
+            username=account.username, password=body.current_password
+        )
+        if current is None or current.account_id != account.account_id:
+            raise HTTPException(status_code=400, detail="Current password is incorrect")
+        # Reject an invalid replacement before revoking the current session.
+        # ``set_password`` hashes independently inside its transaction, so this
+        # preliminary validation never stores or exposes the new credential.
+        hash_password(body.new_password)
+        # Fence any ticket scopes before mutating the credential store. The
+        # stores cannot share a transaction; this ordering may require re-login
+        # if the password write subsequently fails, but never leaves a live
+        # owner-worker capability after reporting a successful password change.
+        await _revoke_local_account_authority(
+            request, account, reason="local_account_password_changed"
+        )
+        updated = store.set_password(
+            username=account.username, password=body.new_password, require_reset=False
+        )
+    except HTTPException:
+        raise
+    except (ValueError, LocalUserStoreConflict):
+        # Do not distinguish malformed/current/reused password cases.
+        raise HTTPException(status_code=400, detail="Current password is incorrect") from None
+    except LocalUserStoreUnavailable as exc:
+        raise HTTPException(status_code=503, detail="Local account authority is unavailable") from exc
+    except Exception as exc:  # fail closed; stale ticket scopes are unsafe
+        _log.warning("dashboard-auth: local password-change authority revoke failed: %s", exc)
+        response = JSONResponse(
+            {"detail": "Local account authorization is unavailable"}, status_code=503
+        )
+        clear_session_cookies(response, prefix=_prefix(request))
+        return response
+
+    # set_password advances the durable revision and revokes all tokens. Clear
+    # browser cookies even though the request used the old valid access token.
+    summary = _local_account_summary(updated)
+    response = JSONResponse({"ok": True, "user": summary, "account": summary})
+    clear_session_cookies(response, prefix=_prefix(request))
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -680,6 +1019,11 @@ async def api_auth_ws_ticket(request: Request, body: _WsTicketBody):
     if sess is None:
         # Middleware should already have rejected, but check defensively.
         raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        if _session_requires_password_change(sess):
+            raise HTTPException(status_code=403, detail="Password change required")
+    except ProviderError as exc:
+        raise HTTPException(status_code=503, detail="Local account authority is unavailable") from exc
 
     # Import here so the routes module stays usable in test contexts that
     # don't load the ticket store.

@@ -60,6 +60,15 @@ def test_reset_password_reads_stdin_and_never_echoes_password(
     assert configured_store.verify_access_token(session.access_token) is None
 
 
+def test_make_admin_is_explicit(configured_store, capsys):
+    configured_store.create_account(username="alice", password="password")
+
+    cmd_dashboard_users(_args("make-admin", username="alice"))
+
+    assert configured_store.get_account("alice").role == "admin"
+    assert "administrator" in capsys.readouterr().out
+
+
 def test_disable_enable_and_revoke_sessions(configured_store, capsys):
     account = configured_store.create_account(username="alice", password="password")
     first = configured_store.create_session(
@@ -102,7 +111,7 @@ def test_bootstrap_configures_durable_authority_then_creates_exactly_five(
     ]
     monkeypatch.setattr("hermes_cli.dashboard_users._bootstrap_store", lambda: (calls.append(True), store)[1])
     monkeypatch.setattr("hermes_cli.dashboard_users._require_tty_for_reveal_once", lambda: None)
-    monkeypatch.setattr("hermes_cli.dashboard_users._generated_accounts", lambda: accounts)
+    monkeypatch.setattr("hermes_cli.dashboard_users._generated_accounts", lambda count: accounts)
 
     cmd_dashboard_users(_args("bootstrap", generate=True))
 
@@ -125,6 +134,16 @@ def test_bootstrap_preflight_does_not_change_existing_local_authority(monkeypatc
 
     with pytest.raises(Exception, match="already initialized"):
         users._bootstrap_store()
+
+
+def test_store_reads_configurable_account_cap(monkeypatch):
+    import hermes_cli.dashboard_users as users
+
+    monkeypatch.setattr(
+        "plugins.dashboard_auth.basic._load_config_basic_auth_section",
+        lambda: {"store": "local", "secret": "stable-secret-with-at-least-32-bytes", "max_accounts": "7"},
+    )
+    assert users._store().max_accounts == 7
 
 
 def test_store_configuration_rejects_nonlocal_mode(monkeypatch):

@@ -55,6 +55,42 @@ _GATE_PUBLIC_PREFIXES: tuple[str, ...] = (
 )
 
 
+def _password_change_required_response(request: Request) -> Response:
+    """Fail closed while preserving the session needed to change its password."""
+    del request
+    return JSONResponse(
+        {
+            "error": "password_change_required",
+            "detail": "Password change required",
+            "password_change_url": "/api/auth/password-change",
+        },
+        status_code=403,
+    )
+
+
+def _session_requires_password_change(session) -> bool:
+    """Return server-derived reset state for durable local Basic sessions only."""
+    if session.provider != "basic":
+        return False
+    from hermes_cli.dashboard_auth import get_provider
+
+    provider = get_provider("basic")
+    resolver = getattr(provider, "local_account_for_session", None)
+    if not callable(resolver):
+        return False
+    account = resolver(session)
+    return bool(account is not None and account.must_change_password)
+
+
+def _path_is_allowed_during_password_change(path: str) -> bool:
+    """Only recovery endpoints may use a forced-change durable session."""
+    return path in {
+        "/api/auth/me",
+        "/api/auth/password-change",
+        "/api/auth/password/change",
+    }
+
+
 def _path_is_public(path: str) -> bool:
     """True if ``path`` bypasses the OAuth auth gate.
 
@@ -190,6 +226,11 @@ def verify_websocket_ticket_session(ws, payload: dict[str, object]):
         raise WebSocketSessionUnavailable("provider_unavailable") from exc
     if session is None:
         raise WebSocketSessionRejected("session_invalid")
+    try:
+        if _session_requires_password_change(session):
+            raise WebSocketSessionRejected("password_change_required")
+    except ProviderError as exc:
+        raise WebSocketSessionUnavailable("local_account_unavailable") from exc
     if session.provider != provider_name or session.user_id != str(payload.get("user_id") or ""):
         raise WebSocketSessionRejected("session_principal_mismatch")
     if session.org_id != str(payload.get("org_id") or ""):
@@ -510,6 +551,35 @@ async def gated_auth_middleware(
                 clear_session_cookies(response, prefix=prefix_from_request(request))
                 return response
             request.state.session = new_session
+            try:
+                requires_password_change = _session_requires_password_change(new_session)
+            except ProviderError as exc:
+                _log.warning("dashboard-auth: local account state unavailable: %s", exc)
+                response = JSONResponse(
+                    {"detail": "Local account authority is unavailable"}, status_code=503
+                )
+                from hermes_cli.dashboard_auth.cookies import clear_session_cookies
+                from hermes_cli.dashboard_auth.prefix import prefix_from_request
+
+                clear_session_cookies(response, prefix=prefix_from_request(request))
+                return response
+            if requires_password_change and not _path_is_allowed_during_password_change(path):
+                response = _password_change_required_response(request)
+                from hermes_cli.dashboard_auth.cookies import (
+                    detect_https,
+                    set_session_cookies,
+                )
+                from hermes_cli.dashboard_auth.prefix import prefix_from_request
+
+                set_session_cookies(
+                    response,
+                    access_token=new_session.access_token,
+                    refresh_token=new_session.refresh_token,
+                    access_token_expires_in=_expires_in_seconds(new_session),
+                    use_https=detect_https(request),
+                    prefix=prefix_from_request(request),
+                )
+                return response
             from hermes_cli.web_server import _authenticated_owner_control_plane_gate_response
 
             gated = _authenticated_owner_control_plane_gate_response(request)
@@ -570,6 +640,15 @@ async def gated_auth_middleware(
             status_code=503,
         )
     request.state.session = session
+    try:
+        requires_password_change = _session_requires_password_change(session)
+    except ProviderError as exc:
+        _log.warning("dashboard-auth: local account state unavailable: %s", exc)
+        return JSONResponse(
+            {"detail": "Local account authority is unavailable"}, status_code=503
+        )
+    if requires_password_change and not _path_is_allowed_during_password_change(path):
+        return _password_change_required_response(request)
     from hermes_cli.web_server import _authenticated_owner_control_plane_gate_response
 
     gated = _authenticated_owner_control_plane_gate_response(request)

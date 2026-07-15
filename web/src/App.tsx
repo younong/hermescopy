@@ -65,6 +65,7 @@ import { SidebarStatusStrip, gatewayLine } from "@/components/SidebarStatusStrip
 import { useBelowBreakpoint } from "@nous-research/ui/hooks/use-below-breakpoint";
 import { useSidebarStatus } from "@/hooks/useSidebarStatus";
 import { AuthWidget } from "@/components/AuthWidget";
+import { ForcedPasswordChangePage } from "@/components/ForcedPasswordChangePage";
 import { PageHeaderProvider } from "@/contexts/PageHeaderProvider";
 import { ProfileProvider } from "@/contexts/ProfileProvider";
 import { useProfileScope } from "@/contexts/useProfileScope";
@@ -102,6 +103,7 @@ import { useTheme } from "@/themes";
 import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
 import { api } from "@/lib/api";
 import type { StatusResponse, UpdateCheckResponse } from "@/lib/api";
+import { useDashboardAuthIdentity } from "@/lib/useDashboardAuthIdentity";
 
 function RootRedirect() {
   return <Navigate to="/sessions" replace />;
@@ -358,6 +360,7 @@ export default function App() {
   const { pathname } = useLocation();
   const { manifests, loading: pluginsLoading } = usePlugins();
   const { theme } = useTheme();
+  const authIdentity = useDashboardAuthIdentity();
   const [mobileOpen, setMobileOpen] = useState(false);
   const closeMobile = useCallback(() => setMobileOpen(false), []);
 
@@ -486,6 +489,31 @@ export default function App() {
     mql.addEventListener("change", onChange);
     return () => mql.removeEventListener("change", onChange);
   }, []);
+
+  if (authIdentity.authRequired && authIdentity.loading) {
+    return (
+      <div className="flex min-h-dvh items-center justify-center bg-background-base text-text-primary">
+        <Spinner className="text-2xl text-primary" />
+      </div>
+    );
+  }
+
+  if (authIdentity.authRequired && authIdentity.error) {
+    return (
+      <div className="flex min-h-dvh items-center justify-center bg-background-base px-4 text-text-primary">
+        <div className="max-w-md text-center">
+          <h1 className="text-lg font-semibold">Authentication unavailable</h1>
+          <p className="mt-2 text-sm text-muted-foreground">
+            The dashboard could not verify your session. Refresh the page or try again shortly.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (authIdentity.authRequired && authIdentity.authMe?.must_change_password) {
+    return <ForcedPasswordChangePage />;
+  }
 
   return (
     <ProfileProvider>

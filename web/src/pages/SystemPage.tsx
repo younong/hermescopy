@@ -25,6 +25,8 @@ import {
   Terminal,
   Trash2,
   Upload,
+  UserPlus,
+  Users,
   X,
 } from "lucide-react";
 import { Badge } from "@nous-research/ui/ui/components/badge";
@@ -43,7 +45,7 @@ import { ConfirmDialog } from "@nous-research/ui/ui/components/confirm-dialog";
 import { useModalBehavior } from "@/hooks/useModalBehavior";
 import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
 import { cn, themedBody } from "@/lib/utils";
-import { api } from "@/lib/api";
+import { api, HERMES_BASE_PATH } from "@/lib/api";
 import type {
   StatusResponse,
   MemoryStatus,
@@ -56,6 +58,9 @@ import type {
   CuratorStatus,
   PortalStatus,
   DebugShareResponse,
+  AuthMeResponse,
+  LocalAccount,
+  LocalAccountRole,
 } from "@/lib/api";
 
 function formatBytes(n: number): string {
@@ -183,7 +188,23 @@ export default function SystemPage() {
   const [hooks, setHooks] = useState<HooksResponse | null>(null);
   const [curator, setCurator] = useState<CuratorStatus | null>(null);
   const [portal, setPortal] = useState<PortalStatus | null>(null);
+  const [authMe, setAuthMe] = useState<AuthMeResponse | null>(null);
+  const [localAccounts, setLocalAccounts] = useState<LocalAccount[]>([]);
+  const [localAccountsCount, setLocalAccountsCount] = useState(0);
+  const [localAccountsMax, setLocalAccountsMax] = useState(0);
   const [loading, setLoading] = useState(true);
+
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [newPasswordConfirmation, setNewPasswordConfirmation] = useState("");
+  const [changingPassword, setChangingPassword] = useState(false);
+  const [newAccountUsername, setNewAccountUsername] = useState("");
+  const [newAccountDisplayName, setNewAccountDisplayName] = useState("");
+  const [newAccountRole, setNewAccountRole] = useState<LocalAccountRole>("member");
+  const [creatingAccount, setCreatingAccount] = useState(false);
+  const [resettingUsername, setResettingUsername] = useState<string | null>(null);
+  const [resetConfirmationUsername, setResetConfirmationUsername] = useState<string | null>(null);
+  const [temporaryPassword, setTemporaryPassword] = useState<{ username: string; password: string } | null>(null);
 
   const [activeAction, setActiveAction] = useState<string | null>(null);
 
@@ -242,11 +263,12 @@ export default function SystemPage() {
       api.getHooks(),
       api.getCurator(),
       api.getPortal(),
+      api.getAuthMe(),
       // Cached (non-forced) check so the version row shows update status on
       // load without a separate effect / a forced network round-trip.
       api.checkHermesUpdate(false),
     ])
-      .then(([s, st, m, p, c, h, cur, prt, upd]) => {
+      .then(([s, st, m, p, c, h, cur, prt, me, upd]) => {
         if (s.status === "fulfilled") setStatus(s.value);
         if (st.status === "fulfilled") setStats(st.value);
         if (m.status === "fulfilled") setMemory(m.value);
@@ -255,6 +277,16 @@ export default function SystemPage() {
         if (h.status === "fulfilled") setHooks(h.value);
         if (cur.status === "fulfilled") setCurator(cur.value);
         if (prt.status === "fulfilled") setPortal(prt.value);
+        if (me.status === "fulfilled") {
+          setAuthMe(me.value);
+          if (me.value.local_user_management?.enabled && me.value.local_user_management.is_admin) {
+            void api.getLocalUsers().then((users) => {
+              setLocalAccounts(users.accounts);
+              setLocalAccountsCount(users.count);
+              setLocalAccountsMax(users.max_accounts);
+            });
+          }
+        }
         if (upd.status === "fulfilled") setUpdateInfo(upd.value);
       })
       .finally(() => setLoading(false));
@@ -263,6 +295,96 @@ export default function SystemPage() {
   useEffect(() => {
     loadAll();
   }, [loadAll]);
+
+
+  const loadLocalUsers = useCallback(async () => {
+    const users = await api.getLocalUsers();
+    setLocalAccounts(users.accounts);
+    setLocalAccountsCount(users.count);
+    setLocalAccountsMax(users.max_accounts);
+  }, []);
+
+  const changeOwnPassword = async () => {
+    if (!currentPassword || !newPassword || !newPasswordConfirmation) {
+      showToast("Current password, new password, and confirmation are required", "error");
+      return;
+    }
+    if (newPassword !== newPasswordConfirmation) {
+      setNewPassword("");
+      setNewPasswordConfirmation("");
+      showToast("New passwords do not match", "error");
+      return;
+    }
+    setChangingPassword(true);
+    try {
+      await api.changePassword(currentPassword, newPassword);
+      setCurrentPassword("");
+      setNewPassword("");
+      setNewPasswordConfirmation("");
+      window.location.assign(`${HERMES_BASE_PATH}/login`);
+    } catch (error) {
+      setCurrentPassword("");
+      setNewPassword("");
+      setNewPasswordConfirmation("");
+      showToast(`Password change failed: ${error}`, "error");
+    } finally {
+      setChangingPassword(false);
+    }
+  };
+
+  const createLocalAccount = async () => {
+    if (!newAccountUsername.trim()) {
+      showToast("Username is required", "error");
+      return;
+    }
+    setCreatingAccount(true);
+    setTemporaryPassword(null);
+    try {
+      const result = await api.createLocalUser({
+        username: newAccountUsername.trim(),
+        display_name: newAccountDisplayName.trim() || undefined,
+        role: newAccountRole,
+      });
+      setNewAccountUsername("");
+      setNewAccountDisplayName("");
+      setNewAccountRole("member");
+      setTemporaryPassword({ username: result.account.username, password: result.temporary_password });
+      showToast("Account created", "success");
+      await loadLocalUsers();
+    } catch (error) {
+      showToast(`Account creation failed: ${error}`, "error");
+    } finally {
+      setCreatingAccount(false);
+    }
+  };
+
+  const resetLocalAccountPassword = async (username: string) => {
+    setResettingUsername(username);
+    setTemporaryPassword(null);
+    try {
+      const result = await api.resetLocalUserPassword(username);
+      setTemporaryPassword({ username: result.account.username, password: result.temporary_password });
+      showToast("Temporary password created", "success");
+      await loadLocalUsers();
+    } catch (error) {
+      showToast(`Password reset failed: ${error}`, "error");
+    } finally {
+      setResettingUsername(null);
+    }
+  };
+
+  const updateLocalAccount = async (
+    account: LocalAccount,
+    updates: { role?: LocalAccountRole; status?: LocalAccount["status"] },
+  ) => {
+    try {
+      await api.updateLocalUser(account.username, updates);
+      await loadLocalUsers();
+      showToast("Account updated", "success");
+    } catch (error) {
+      showToast(`Account update failed: ${error}`, "error");
+    }
+  };
 
   // ── Gateway lifecycle ──────────────────────────────────────────────
   const runGateway = async (verb: "start" | "stop" | "restart") => {
@@ -680,6 +802,19 @@ export default function SystemPage() {
         description="Remove this hook from config and revoke its consent? It stops firing on the next restart."
         loading={hookDelete.isDeleting}
       />
+      <ConfirmDialog
+        open={resetConfirmationUsername !== null}
+        onCancel={() => setResetConfirmationUsername(null)}
+        onConfirm={() => {
+          const username = resetConfirmationUsername;
+          setResetConfirmationUsername(null);
+          if (username) void resetLocalAccountPassword(username);
+        }}
+        title="Reset account password?"
+        description="This revokes the user's existing sessions and creates a new temporary password that is shown only once."
+        confirmLabel="Reset password"
+        destructive
+      />
 
       {/* Create-hook modal */}
       {hookModalOpen && (
@@ -927,6 +1062,107 @@ export default function SystemPage() {
           </CardContent>
         </Card>
       </section>
+
+      {/* ── Account security ───────────────────────────────────────── */}
+      {authMe?.local_user_management?.enabled && (
+        <section className="flex flex-col gap-3">
+          <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
+            <KeyRound className="h-4 w-4" /> Account security
+          </H2>
+          <Card>
+            <CardContent className="flex flex-col gap-4 py-4">
+              <div>
+                <p className="text-sm font-medium">Change password</p>
+                <p className="text-xs text-muted-foreground">Use your current password to choose a new one.</p>
+              </div>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-4 sm:items-end">
+                <div className="grid gap-2">
+                  <Label htmlFor="current-password">Current password</Label>
+                  <Input id="current-password" type="password" autoComplete="current-password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} />
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="new-password">New password</Label>
+                  <Input id="new-password" type="password" autoComplete="new-password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} />
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="new-password-confirmation">Confirm new password</Label>
+                  <Input id="new-password-confirmation" type="password" autoComplete="new-password" value={newPasswordConfirmation} onChange={(event) => setNewPasswordConfirmation(event.target.value)} />
+                </div>
+                <Button size="sm" className="uppercase" disabled={changingPassword} prefix={changingPassword ? <Spinner /> : undefined} onClick={() => void changeOwnPassword()}>
+                  Change password
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </section>
+      )}
+
+      {/* ── Local account management ───────────────────────────────── */}
+      {authMe?.local_user_management?.enabled && authMe.local_user_management.is_admin && (
+        <section className="flex flex-col gap-3">
+          <div className="flex items-center justify-between gap-3">
+            <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
+              <Users className="h-4 w-4" /> Local accounts
+            </H2>
+            <span className="text-xs text-muted-foreground">{localAccountsCount} / {localAccountsMax} accounts</span>
+          </div>
+          <Card>
+            <CardContent className="flex flex-col gap-4 py-4">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-4 sm:items-end">
+                <div className="grid gap-2">
+                  <Label htmlFor="new-account-username">Username</Label>
+                  <Input id="new-account-username" autoComplete="off" value={newAccountUsername} onChange={(event) => setNewAccountUsername(event.target.value)} placeholder="alex" />
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="new-account-display-name">Display name</Label>
+                  <Input id="new-account-display-name" value={newAccountDisplayName} onChange={(event) => setNewAccountDisplayName(event.target.value)} placeholder="Optional" />
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="new-account-role">Role</Label>
+                  <Select id="new-account-role" value={newAccountRole} onValueChange={(value) => setNewAccountRole(value as LocalAccountRole)}>
+                    <SelectOption value="member">Member</SelectOption>
+                    <SelectOption value="admin">Admin</SelectOption>
+                  </Select>
+                </div>
+                <Button size="sm" className="uppercase" disabled={creatingAccount || localAccountsCount >= localAccountsMax} prefix={creatingAccount ? <Spinner /> : <UserPlus className="h-3.5 w-3.5" />} onClick={() => void createLocalAccount()}>
+                  Create account
+                </Button>
+              </div>
+
+              {temporaryPassword && (
+                <div className="flex flex-wrap items-center gap-2 border border-warning/30 bg-warning/5 px-3 py-2 text-sm">
+                  <strong>Temporary password for {temporaryPassword.username}:</strong>
+                  <code className="select-all rounded bg-background px-2 py-1 font-mono text-xs">{temporaryPassword.password}</code>
+                  <Button size="sm" ghost className="ml-auto" onClick={() => setTemporaryPassword(null)}>Dismiss</Button>
+                </div>
+              )}
+
+              <div className="flex flex-col divide-y divide-border border-y border-border">
+                {localAccounts.map((account) => (
+                  <div key={account.account_id} className="grid gap-3 py-3 sm:grid-cols-[minmax(0,1fr)_8rem_8rem_auto] sm:items-center">
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-medium">{account.display_name || account.username}</div>
+                      <div className="truncate font-mono text-xs text-muted-foreground">{account.username}</div>
+                    </div>
+                    <Select value={account.role} onValueChange={(value) => void updateLocalAccount(account, { role: value as LocalAccountRole })}>
+                      <SelectOption value="member">Member</SelectOption>
+                      <SelectOption value="admin">Admin</SelectOption>
+                    </Select>
+                    <Select value={account.status} onValueChange={(value) => void updateLocalAccount(account, { status: value as LocalAccount["status"] })}>
+                      <SelectOption value="active">Active</SelectOption>
+                      <SelectOption value="disabled">Disabled</SelectOption>
+                    </Select>
+                    <Button size="sm" ghost disabled={resettingUsername === account.username} prefix={resettingUsername === account.username ? <Spinner /> : undefined} onClick={() => setResetConfirmationUsername(account.username)}>
+                      Reset password
+                    </Button>
+                  </div>
+                ))}
+                {localAccounts.length === 0 && <p className="py-3 text-sm text-muted-foreground">No local accounts found.</p>}
+              </div>
+            </CardContent>
+          </Card>
+        </section>
+      )}
 
       {/* ── Portal ────────────────────────────────────────────────── */}
       <section className="flex flex-col gap-3">

@@ -79,6 +79,39 @@ def test_revoke_marks_session_and_bumps_epoch(tmp_path):
         store.read_state(scope)
 
 
+def test_principal_revocation_fences_all_active_scopes_for_one_user(tmp_path):
+    store = AuthorityStore(tmp_path / "control-plane")
+    first = _scope(user_id="local-account", tenant_id="tenant-a", session_id="one")
+    second = _scope(user_id="local-account", tenant_id="tenant-b", session_id="two")
+    other = _scope(user_id="other-account", tenant_id="tenant-a", session_id="three")
+
+    # The normal activation path supersedes another active session for a
+    # principal, so seed distinct tenant/session variants directly to model
+    # scopes admitted by concurrently running dashboard workers.
+    store.activate(first)
+    with store._connect() as conn:  # noqa: SLF001 - setup for principal-wide test
+        conn.execute(
+            "INSERT INTO authorization_scopes(scope_digest, principal_digest, membership_revision, epoch, revoked) "
+            "VALUES (?, ?, ?, ?, 0)",
+            (second.digest, second.principal_digest, second.membership_revision, 3),
+        )
+    store.activate(other)
+
+    revoked = store.revoke_principal_and_bump(
+        provider="stub", user_id="local-account", reason="password_reset"
+    )
+
+    assert set(revoked.revoked_scope_digests) == {first.digest, second.digest}
+    assert {change.scope_digest for change in revoked.changes} == {first.digest, second.digest}
+    assert all(change.revoked for change in revoked.changes)
+    assert revoked.epoch == 4
+    with pytest.raises(AuthorizationRejected, match="session_revoked"):
+        store.read_state(first)
+    with pytest.raises(AuthorizationRejected, match="session_revoked"):
+        store.read_state(second)
+    assert store.read_state(other).epoch == 0
+
+
 def test_revoke_rejects_stale_membership_revision(tmp_path):
     store = AuthorityStore(tmp_path / "control-plane")
     original = _scope(membership_revision="member-v1")

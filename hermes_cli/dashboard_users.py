@@ -21,8 +21,24 @@ from hermes_cli.dashboard_auth.local_users import (
     LocalUserStoreUnavailable,
 )
 
-_BOOTSTRAP_ACCOUNT_COUNT = 5
+_DEFAULT_MAX_ACCOUNTS = 5
 _GENERATED_PASSWORD_BYTES = 24
+
+
+def _account_cap(section: dict) -> int:
+    """Resolve the durable authority cap without accepting invalid limits."""
+    try:
+        from plugins.dashboard_auth.basic import _resolve
+
+        raw = _resolve(
+            "HERMES_DASHBOARD_BASIC_AUTH_MAX_ACCOUNTS", section, "max_accounts"
+        )
+        value = int(raw) if raw else _DEFAULT_MAX_ACCOUNTS
+    except (TypeError, ValueError) as exc:
+        raise LocalUserStoreUnavailable("local account cap must be a positive integer") from exc
+    if value < 1:
+        raise LocalUserStoreUnavailable("local account cap must be a positive integer")
+    return value
 
 
 def _store() -> LocalUserStore:
@@ -42,7 +58,7 @@ def _store() -> LocalUserStore:
         raise LocalUserStoreUnavailable("local account authority is unavailable") from exc
     if len(secret) < 32:
         raise LocalUserStoreUnavailable("local account authority requires a stable secret")
-    return LocalUserStore(secret=secret, max_accounts=_BOOTSTRAP_ACCOUNT_COUNT)
+    return LocalUserStore(secret=secret, max_accounts=_account_cap(section))
 
 
 def _configure_durable_store() -> None:
@@ -96,7 +112,9 @@ def _account_metadata(account: LocalAccount) -> dict[str, object]:
         "account_id": account.account_id,
         "username": account.username,
         "display_name": account.display_name,
+        "role": account.role,
         "status": account.status,
+        "must_change_password": account.must_change_password,
         "auth_revision": account.auth_revision,
         "created_at": account.created_at,
         "updated_at": account.updated_at,
@@ -120,14 +138,14 @@ def _read_password(*, stdin: TextIO | None = None) -> str:
     return password.rstrip("\r\n")
 
 
-def _generated_accounts() -> list[tuple[str, str, str]]:
+def _generated_accounts(count: int) -> list[tuple[str, str, str]]:
     return [
         (
             f"user{number}",
             secrets.token_urlsafe(_GENERATED_PASSWORD_BYTES),
             f"User {number}",
         )
-        for number in range(1, _BOOTSTRAP_ACCOUNT_COUNT + 1)
+        for number in range(1, count + 1)
     ]
 
 
@@ -160,8 +178,8 @@ def cmd_dashboard_users(args) -> None:
         if action == "bootstrap":
             _require_tty_for_reveal_once()
             store = _bootstrap_store()
-            accounts = _generated_accounts()
-            store.bootstrap_accounts(accounts, expected_count=_BOOTSTRAP_ACCOUNT_COUNT)
+            accounts = _generated_accounts(store.max_accounts)
+            store.bootstrap_accounts(accounts, expected_count=store.max_accounts)
             print("Local dashboard users bootstrapped. Record these credentials now; they will not be shown again.")
             for username, password, _display_name in accounts:
                 print(f"{username}\t{password}")
@@ -176,6 +194,10 @@ def cmd_dashboard_users(args) -> None:
                 require_reset=bool(getattr(args, "require_reset", False)),
             )
             print(f"Password reset and sessions revoked for user {username}.")
+            return
+        if action == "make-admin":
+            store.set_account_role(username=username, role="admin")
+            print(f"Granted administrator role to user {username}.")
             return
         if action == "disable":
             store.set_account_status(username=username, status="disabled")

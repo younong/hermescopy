@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import stat
 
 import pytest
@@ -87,6 +88,83 @@ class TestAccountLifecycle:
         for invalid in ("ab", "a/b", "a b", "A!", "x" * 65):
             with pytest.raises(ValueError):
                 normalize_username(invalid)
+
+    def test_bootstrap_creates_members_without_implicit_administrator(self, tmp_path):
+        accounts = _bootstrap(_store(tmp_path))
+        assert all(account.role == "member" for account in accounts)
+        assert all(account.status == "active" for account in accounts)
+        assert all(not account.must_change_password for account in accounts)
+
+    def test_last_active_admin_cannot_be_disabled_or_demoted(self, tmp_path):
+        store = _store(tmp_path)
+        admin = store.create_account(
+            username="admin", password="password-long-enough", role="admin", now=100
+        )
+        with pytest.raises(LocalUserStoreConflict, match="last active admin"):
+            store.set_account_status(username=admin.username, status="disabled", now=101)
+        with pytest.raises(LocalUserStoreConflict, match="last active admin"):
+            store.set_account_role(username=admin.username, role="member", now=101)
+
+        store.create_account(
+            username="alice", password="password-long-enough", role="admin", now=100
+        )
+        assert store.set_account_status(
+            username=admin.username, status="disabled", now=101
+        ).status == "disabled"
+
+    def test_password_reset_records_must_change_password(self, tmp_path):
+        store = _store(tmp_path)
+        store.create_account(username="alice", password="password-long-enough", now=100)
+        pending = store.set_password(
+            username="alice", password="replacement-password", require_reset=True, now=101
+        )
+        assert pending.status == "active"
+        assert pending.must_change_password is True
+        assert store.verify_credentials(
+            username="alice", password="replacement-password"
+        ) == pending
+        active = store.set_password(
+            username="alice", password="another-password", now=102
+        )
+        assert active.status == "active"
+        assert active.must_change_password is False
+
+    def test_v1_accounts_migrate_to_members_transactionally(self, tmp_path):
+        control = tmp_path / "control"
+        control.mkdir(mode=0o700)
+        path = control / "local-users.sqlite3"
+        with sqlite3.connect(path) as conn:
+            conn.execute(
+                "CREATE TABLE local_user_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL)"
+            )
+            conn.execute("INSERT INTO local_user_meta VALUES ('schema_version', 1)")
+            conn.execute(
+                "CREATE TABLE accounts ("
+                "account_id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, "
+                "display_name TEXT NOT NULL, password_hash TEXT NOT NULL, "
+                "status TEXT NOT NULL, auth_revision INTEGER NOT NULL, "
+                "created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, "
+                "password_changed_at INTEGER NOT NULL, disabled_at INTEGER)"
+            )
+            conn.execute(
+                "INSERT INTO accounts VALUES (?, ?, ?, ?, 'active', 1, 100, 100, 100, NULL)",
+                ("v1-account", "alice", "alice", "hash"),
+            )
+            conn.execute(
+                "INSERT INTO accounts VALUES (?, ?, ?, ?, 'pending_reset', 1, 100, 100, 100, NULL)",
+                ("v1-reset", "bob", "bob", "hash"),
+            )
+        path.chmod(0o600)
+        migrated = _store(tmp_path).get_account("alice")
+        reset_required = _store(tmp_path).get_account("bob")
+        assert migrated is not None
+        assert migrated.role == "member"
+        assert migrated.status == "active"
+        assert migrated.must_change_password is False
+        assert reset_required is not None
+        assert reset_required.role == "member"
+        assert reset_required.status == "active"
+        assert reset_required.must_change_password is True
 
 
 class TestSessionLifecycle:
