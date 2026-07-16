@@ -584,7 +584,7 @@ if ! [[ "$keep_releases" =~ ^[0-9]+$ ]] || [ "$keep_releases" -lt 1 ]; then
   exit 1
 fi
 
-for required in tar systemctl sha256sum readlink stat sort mv getent useradd groupadd install cp find ldd sed; do
+for required in tar systemctl sha256sum readlink realpath stat sort mv getent useradd groupadd install cp find ldd sed; do
   if ! command -v "$required" >/dev/null 2>&1; then
     echo "Missing required command: $required" >&2
     exit 1
@@ -652,7 +652,7 @@ test -f "$release/ui-tui/dist/entry.js"
 lock_hash="$(sha256sum "$release/uv.lock" | cut -d ' ' -f1)"
 architecture="$(uname -m)"
 python_version="3.11"
-runtime_id="py311-${"${"}architecture}-${"${"}lock_hash}-sandbox2"
+runtime_id="py311-${"${"}architecture}-${"${"}lock_hash}-sandbox3"
 venv="$runtimes_dir/$runtime_id"
 
 if [ ! -x "$venv/bin/python3" ]; then
@@ -722,6 +722,13 @@ if [ ! -x "$venv/bin/python3" ]; then
   find "$runtime_tmp" -type f -exec chmod go-w {} +
   find "$runtime_tmp" -type f ! -perm -u+x -exec chmod 0644 {} +
   mv -- "$runtime_tmp" "$venv"
+  final_python="$(find "$venv/python-base" -type f -path '*/bin/python3*' -perm -u+x | sort | head -n 1)"
+  if [ -z "$final_python" ]; then
+    echo "Final sandbox Python executable was not installed" >&2
+    exit 1
+  fi
+  final_python_relative="$(realpath --relative-to="$venv/bin" "$final_python")"
+  ln -sfn "$final_python_relative" "$venv/bin/python"
 else
   echo "Reusing immutable Python runtime $venv"
 fi
