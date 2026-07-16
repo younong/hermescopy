@@ -692,7 +692,7 @@ if [ ! -x "$venv/bin/python3" ]; then
     *) echo "Sandbox Python resolves outside the runtime" >&2; exit 1 ;;
   esac
   for command in bash sh ls pwd printf cat grep find; do
-    command_path="$(command -v "$command" || true)"
+    command_path="$(type -P "$command" || true)"
     if [ -z "$command_path" ]; then
       echo "Missing local executor command: $command" >&2
       exit 1
