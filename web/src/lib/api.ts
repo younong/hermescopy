@@ -627,7 +627,7 @@ export const api = {
 
   // Profiles
   getProfiles: () =>
-    fetchJSON<{ profiles: ProfileInfo[] }>("/api/profiles"),
+    fetchJSON<ProfileListResponse>("/api/profiles"),
   getActiveProfile: () =>
     fetchJSON<ActiveProfileInfo>("/api/profiles/active"),
   setActiveProfile: (name: string) =>
@@ -1962,9 +1962,16 @@ export interface ProfileDescribeAutoResult {
   description_auto: boolean;
 }
 
+export type ProfileManagementMode = "legacy_multi_profile" | "owner_singleton";
+
+export interface ProfileListResponse {
+  profiles: ProfileInfo[];
+  management_mode?: ProfileManagementMode;
+}
+
 export interface ProfileInfo {
   name: string;
-  path: string;
+  path: string | null;
   is_default: boolean;
   model: string | null;
   provider: string | null;

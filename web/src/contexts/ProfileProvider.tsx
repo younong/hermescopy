@@ -6,7 +6,7 @@ import {
   type ReactNode,
 } from "react";
 import { useLocation, useSearchParams } from "react-router-dom";
-import { api, setManagementProfile } from "@/lib/api";
+import { api, setManagementProfile, type ProfileManagementMode } from "@/lib/api";
 import { ProfileContext } from "@/contexts/profile-context";
 
 /**
@@ -38,6 +38,9 @@ export function ProfileProvider({ children }: { children: ReactNode }) {
   const { pathname } = useLocation();
   const [profiles, setProfiles] = useState<string[]>([]);
   const [currentProfile, setCurrentProfile] = useState("default");
+  const [managementMode, setManagementMode] = useState<ProfileManagementMode>(
+    "legacy_multi_profile",
+  );
 
   // Initial value comes from the URL (deep link / refresh / unified-launch
   // preselect); afterwards state leads and the URL follows.
@@ -82,20 +85,34 @@ export function ProfileProvider({ children }: { children: ReactNode }) {
     let cancelled = false;
     const urlProfile = searchParams.get("profile");
 
-    Promise.all([api.getProfiles(), api.getActiveProfile()])
-      .then(([profilesRes, info]) => {
+    api
+      .getProfiles()
+      .then(async (profilesRes) => {
         if (cancelled) return;
-
+        const mode = profilesRes.management_mode ?? "legacy_multi_profile";
+        setManagementMode(mode);
         setProfiles(profilesRes.profiles.map((p) => p.name));
 
+        if (mode === "owner_singleton") {
+          setCurrentProfile("default");
+          setManagementProfile("");
+          setProfileState("");
+          setSearchParams(
+            (prev) => {
+              const next = new URLSearchParams(prev);
+              next.delete("profile");
+              return next;
+            },
+            { replace: true },
+          );
+          return;
+        }
+
+        const info = await api.getActiveProfile();
+        if (cancelled) return;
         const current = info.current || "default";
         const active = info.active || "default";
         setCurrentProfile(current);
-
-        // Deep links (?profile=) win. Otherwise align the switcher with the
-        // sticky active profile so Chat and management pages match what the
-        // Profiles page shows as "active" (machine dashboard runs as
-        // `current`, usually default).
         if (urlProfile === null && active !== current) {
           setManagementProfile(active);
           setProfileState(active);
@@ -111,6 +128,7 @@ export function ProfileProvider({ children }: { children: ReactNode }) {
 
   const setProfile = useCallback(
     (name: string) => {
+      if (managementMode === "owner_singleton") name = "";
       setManagementProfile(name);
       setProfileState(name);
       setSearchParams(
@@ -123,12 +141,12 @@ export function ProfileProvider({ children }: { children: ReactNode }) {
         { replace: true },
       );
     },
-    [setSearchParams],
+    [managementMode, setSearchParams],
   );
 
   const value = useMemo(
-    () => ({ profile, currentProfile, profiles, setProfile }),
-    [profile, currentProfile, profiles, setProfile],
+    () => ({ profile, currentProfile, profiles, managementMode, setProfile }),
+    [profile, currentProfile, profiles, managementMode, setProfile],
   );
 
   return (

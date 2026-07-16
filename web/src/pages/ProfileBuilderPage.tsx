@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { useProfileScope } from "@/contexts/useProfileScope";
 import { H2 } from "@nous-research/ui/ui/components/typography/h2";
 import { Card, CardContent } from "@nous-research/ui/ui/components/card";
 import { Badge } from "@nous-research/ui/ui/components/badge";
@@ -48,6 +49,7 @@ interface ModelChoice {
  */
 export default function ProfileBuilderPage() {
   const navigate = useNavigate();
+  const { managementMode } = useProfileScope();
   const { toast, showToast } = useToast();
 
   const [step, setStep] = useState<StepId>("identity");
@@ -245,6 +247,20 @@ export default function ProfileBuilderPage() {
 
   const stepIndex = STEPS.findIndex((s) => s.id === step);
   const canAdvance = step !== "identity" || nameValid;
+
+  if (managementMode === "owner_singleton") {
+    return (
+      <div className="mx-auto w-full max-w-3xl space-y-6 p-4">
+        <H2>Profile builder unavailable</H2>
+        <Card>
+          <CardContent className="space-y-4 py-6 text-sm text-muted-foreground">
+            <p>This authenticated account already has one isolated owner profile. Machine-wide profile creation is unavailable.</p>
+            <Button onClick={() => navigate("/profiles")}>Back to profiles</Button>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
 
   return (
     <div className="mx-auto w-full max-w-3xl space-y-6 p-4">

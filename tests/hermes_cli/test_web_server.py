@@ -5703,6 +5703,51 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         assert response.status_code == 400
         assert not self.supervisor.owners
 
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/api/profiles",
+            "/api/config",
+            "/api/dashboard/font",
+            "/api/dashboard/plugins",
+        ],
+    )
+    def test_authenticated_owner_startup_reads_are_proxied(self, monkeypatch, path):
+        import hermes_cli.owner_worker.client as owner_client
+
+        captured = {}
+
+        def fake_request(self, method, worker_path, *, lease, headers=None, content=None):
+            import httpx
+
+            captured.update({"method": method, "path": worker_path, "owner_key": lease.owner_key})
+            return httpx.Response(200, json={"ok": True})
+
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fake_request)
+
+        response = self.client.get(path)
+
+        assert response.status_code == 200
+        assert captured["method"] == "GET"
+        assert captured["path"] == path
+        assert captured["owner_key"]
+
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("post", "/api/profiles"),
+            ("get", "/api/profiles/active"),
+            ("put", "/api/config"),
+            ("put", "/api/dashboard/font"),
+            ("get", "/api/dashboard/plugins/rescan"),
+        ],
+    )
+    def test_authenticated_owner_startup_writes_and_management_remain_closed(self, method, path):
+        response = getattr(self.client, method)(path)
+
+        assert response.status_code == 403
+        assert not self.supervisor.owners
+
     def test_authenticated_profiles_sessions_fails_closed(self):
         response = self.client.get("/api/profiles/sessions")
 
@@ -5725,7 +5770,6 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
             "/api/memory",
             "/api/credentials/pool",
             "/api/logs",
-            "/api/profiles",
             "/api/media?path=/tmp/example.png",
             "/api/ops/checkpoints",
             "/api/ops/checkpoints/prune",

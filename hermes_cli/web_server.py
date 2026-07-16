@@ -793,14 +793,21 @@ async def host_header_middleware(request: Request, call_next):
 def _authenticated_owner_control_plane_gate_response(request: Request) -> Optional[JSONResponse]:
     """Return a fail-closed response for authenticated APIs not behind workers."""
     path = request.url.path
+    method = request.method
     if (
         getattr(request.app.state, "auth_required", False)
         and getattr(request.state, "session", None) is not None
         and path.startswith("/api/")
         and not getattr(request.state, "token_authenticated", False)
-        and not authenticated_control_plane_api_allowed(path)
-        and not authenticated_owner_worker_api_allowed(path)
+        and not authenticated_control_plane_api_allowed(path, method=method)
+        and not authenticated_owner_worker_api_allowed(path, method=method)
     ):
+        _log.warning(
+            "authenticated API denied method=%s path=%s request_id=%s",
+            method,
+            path,
+            request.headers.get("x-request-id", ""),
+        )
         return JSONResponse(
             status_code=403,
             content={"detail": "This API is not available until routed through the Owner Worker"},
@@ -4302,26 +4309,9 @@ async def search_sessions(request: Request, q: str = "", limit: int = 20, profil
 
 
 def _normalize_config_for_web(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize config for the web UI.
+    from hermes_cli.dashboard_owner_payloads import normalize_config_for_web
 
-    Hermes supports ``model`` as either a bare string (``"anthropic/claude-sonnet-4"``)
-    or a dict (``{default: ..., provider: ..., base_url: ...}``).  The schema is built
-    from DEFAULT_CONFIG where ``model`` is a string, but user configs often have the
-    dict form.  Normalize to the string form so the frontend schema matches.
-
-    Also surfaces ``model_context_length`` as a top-level field so the web UI can
-    display and edit it.  A value of 0 means "auto-detect".
-    """
-    config = dict(config)  # shallow copy
-    model_val = config.get("model")
-    if isinstance(model_val, dict):
-        # Extract context_length before flattening the dict
-        ctx_len = model_val.get("context_length", 0)
-        config["model"] = model_val.get("default", model_val.get("name", ""))
-        config["model_context_length"] = ctx_len if isinstance(ctx_len, int) else 0
-    else:
-        config["model_context_length"] = 0
-    return config
+    return normalize_config_for_web(config)
 
 
 def _memory_provider_config_path(provider: MemoryProvider) -> Path:
@@ -4479,11 +4469,12 @@ async def update_memory_provider_config(name: str, body: MemoryProviderConfigUpd
 
 
 @app.get("/api/config")
-async def get_config(profile: Optional[str] = None):
+async def get_config(request: Request, profile: Optional[str] = None):
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
     with _profile_scope(profile):
-        config = _normalize_config_for_web(load_config())
-    # Strip internal keys that the frontend shouldn't see or send back
-    return {k: v for k, v in config.items() if not k.startswith("_")}
+        return _normalize_config_for_web(load_config())
 
 
 @app.get("/api/config/defaults")
@@ -11073,15 +11064,23 @@ def _disable_unselected_skills(profile_dir: Path, keep: List[str]) -> int:
 
 
 @app.get("/api/profiles")
-async def list_profiles_endpoint():
+async def list_profiles_endpoint(request: Request):
+    if _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
     from hermes_cli import profiles as profiles_mod
     try:
         loop = asyncio.get_running_loop()
         profiles = await loop.run_in_executor(None, profiles_mod.list_profiles)
-        return {"profiles": [_profile_to_dict(p) for p in profiles]}
+        return {
+            "management_mode": "legacy_multi_profile",
+            "profiles": [_profile_to_dict(p) for p in profiles],
+        }
     except Exception:
         _log.exception("GET /api/profiles failed; falling back to profile directory scan")
-        return {"profiles": _fallback_profile_dicts(profiles_mod)}
+        return {
+            "management_mode": "legacy_multi_profile",
+            "profiles": _fallback_profile_dicts(profiles_mod),
+        }
 
 
 @app.post("/api/profiles")
@@ -14384,23 +14383,20 @@ async def set_dashboard_theme(body: ThemeSetBody):
 # the backend only needs the id allow-list so it can reject anything not
 # in the vetted catalog (the font's webfont URL is injected as a <link>,
 # so we never accept an arbitrary user-supplied id/URL here).
-_FONT_DEFAULT_ID = "theme"
-_FONT_CHOICES = frozenset({
-    "system-sans", "system-serif", "system-mono",
-    "inter", "ibm-plex-sans", "work-sans", "atkinson-hyperlegible", "dm-sans",
-    "spectral", "fraunces", "source-serif",
-    "jetbrains-mono", "ibm-plex-mono", "space-mono",
-})
+from hermes_cli.dashboard_owner_payloads import (
+    FONT_CHOICES as _FONT_CHOICES,
+    FONT_DEFAULT_ID as _FONT_DEFAULT_ID,
+)
 
 
 @app.get("/api/dashboard/font")
-async def get_dashboard_font():
+async def get_dashboard_font(request: Request):
     """Return the active font override (``"theme"`` = use the theme's font)."""
-    config = load_config()
-    font = cfg_get(config, "dashboard", "font", default=_FONT_DEFAULT_ID)
-    if font not in _FONT_CHOICES:
-        font = _FONT_DEFAULT_ID
-    return {"font": font}
+    if _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
+    from hermes_cli.dashboard_owner_payloads import dashboard_font_payload
+
+    return dashboard_font_payload()
 
 
 class FontSetBody(BaseModel):
@@ -14585,43 +14581,13 @@ def _get_dashboard_plugins(force_rescan: bool = False) -> list:
 
 
 @app.get("/api/dashboard/plugins")
-async def get_dashboard_plugins():
-    """Return discovered dashboard plugins (excludes user-hidden and non-enabled ones)."""
-    plugins = _get_dashboard_plugins()
-    # Read user's hidden plugins list from config.
-    config = load_config()
-    hidden: list = cfg_get(config, "dashboard", "hidden_plugins", default=[]) or []
-    # Gate: only serve user plugins that are in plugins.enabled and not
-    # in plugins.disabled.  This prevents the frontend from loading JS/CSS
-    # from plugins the user has not explicitly activated.  (#46435)
-    try:
-        from hermes_cli.plugins_cmd import _get_enabled_set, _get_disabled_set
-        enabled_set = _get_enabled_set()
-        disabled_set = _get_disabled_set()
-    except Exception:
-        enabled_set = set()
-        disabled_set = set()
+async def get_dashboard_plugins(request: Request):
+    """Return discovered dashboard plugins (excludes hidden and disabled ones)."""
+    if _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
+    from hermes_cli.dashboard_owner_payloads import active_dashboard_plugin_payload
 
-    def _is_active(p: dict) -> bool:
-        name = p.get("name", "")
-        if name in hidden:
-            return False
-        if p.get("source") == "user":
-            if name in disabled_set:
-                return False
-            if name not in enabled_set:
-                return False
-        elif p.get("source") == "bundled":
-            if name in disabled_set:
-                return False
-        return True
-
-    # Strip internal fields before sending to frontend.
-    return [
-        {k: v for k, v in p.items() if not k.startswith("_")}
-        for p in plugins
-        if _is_active(p)
-    ]
+    return active_dashboard_plugin_payload(_get_dashboard_plugins())
 
 
 @app.get("/api/dashboard/plugins/rescan")

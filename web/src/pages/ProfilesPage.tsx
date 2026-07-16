@@ -260,7 +260,8 @@ export default function ProfilesPage() {
   const { toast, showToast } = useToast();
   const { t } = useI18n();
   const { setEnd } = usePageHeader();
-  const { setProfile } = useProfileScope();
+  const { setProfile, managementMode } = useProfileScope();
+  const ownerSingleton = managementMode === "owner_singleton";
 
   // Locale strings with English fallbacks. The enriched keys are optional in
   // the i18n type so untranslated locales don't break the build — they render
@@ -393,10 +394,15 @@ export default function ProfilesPage() {
   }, [modelChoices]);
 
   const load = useCallback(() => {
-    Promise.all([api.getProfiles(), api.getActiveProfile().catch(() => null)])
-      .then(([res, active]) => {
+    api
+      .getProfiles()
+      .then(async (res) => {
         setProfiles(res.profiles);
-        setActiveInfo(active);
+        if ((res.management_mode ?? "legacy_multi_profile") === "owner_singleton") {
+          setActiveInfo(null);
+          return;
+        }
+        setActiveInfo(await api.getActiveProfile().catch(() => null));
       })
       .catch((e) => showToast(`${t.status.error}: ${e}`, "error"))
       .finally(() => setLoading(false));
@@ -747,6 +753,10 @@ export default function ProfilesPage() {
 
   // Put "Build" (full builder) + "Create" (quick modal) buttons in header
   useLayoutEffect(() => {
+    if (ownerSingleton) {
+      setEnd(null);
+      return () => setEnd(null);
+    }
     setEnd(
       <div className="flex items-center gap-2">
         <Button
@@ -769,7 +779,7 @@ export default function ProfilesPage() {
     return () => {
       setEnd(null);
     };
-  }, [setEnd, t.common.create, loading, navigate]);
+  }, [setEnd, t.common.create, loading, navigate, ownerSingleton]);
 
   const cloning = cloneFrom !== null;
 
@@ -791,6 +801,14 @@ export default function ProfilesPage() {
     <div className="flex flex-col gap-6">
       <Toast toast={toast} />
 
+      {ownerSingleton && (
+        <Card>
+          <CardContent className="py-4 text-sm text-muted-foreground">
+            This authenticated account uses one isolated owner profile. Machine-wide profile creation, switching, and editing are unavailable here.
+          </CardContent>
+        </Card>
+      )}
+
       <DeleteConfirmDialog
         open={profileDelete.isOpen}
         onCancel={profileDelete.cancel}
@@ -801,7 +819,7 @@ export default function ProfilesPage() {
       />
 
       {/* Create profile modal */}
-      {createModalOpen && (
+      {createModalOpen && !ownerSingleton && (
         <div
           ref={createModalRef}
           className="fixed inset-0 z-[100] flex items-center justify-center bg-background/85 p-4"
@@ -1124,7 +1142,7 @@ export default function ProfilesPage() {
                           )}
                         </div>
 
-                        <ProfileActionsMenu
+                        {!ownerSingleton && <ProfileActionsMenu
                           isActive={active}
                           isDefault={p.is_default}
                           isEditingDesc={isEditingDesc}
@@ -1159,7 +1177,7 @@ export default function ProfilesPage() {
                             setRenameTo(p.name);
                           }}
                           onSetActive={() => handleSetActive(p.name)}
-                        />
+                        />}
                       </div>
 
                       <div className="flex items-center gap-1.5 text-xs">
@@ -1216,7 +1234,9 @@ export default function ProfilesPage() {
                           {t.profiles.skills}: {p.skill_count}
                         </span>
 
-                        <span className="font-mono truncate">{p.path}</span>
+                        {p.path && (
+                          <span className="font-mono truncate">{p.path}</span>
+                        )}
                       </div>
                     </>
                   )}

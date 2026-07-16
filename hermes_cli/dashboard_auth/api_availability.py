@@ -27,24 +27,31 @@ CONTROL_PLANE_AUTH_PATHS: frozenset[str] = frozenset({
 CONTROL_PLANE_AUTH_PREFIXES: tuple[str, ...] = (
     "/api/auth/",
 )
-OWNER_WORKER_PATHS: frozenset[str] = frozenset({
-    "/api/model/info",
-    "/api/analytics/usage",
-    "/api/analytics/models",
-    "/api/sessions",
-    "/api/sessions/search",
-    "/api/sessions/bulk-delete",
-    "/api/sessions/empty/count",
-    "/api/sessions/empty",
-    "/api/sessions/stats",
-    "/api/sessions/prune",
-    "/api/files",
-    "/api/files/read",
-    "/api/files/download",
-    "/api/files/upload",
-    "/api/files/upload-stream",
-    "/api/files/mkdir",
+OWNER_WORKER_ROUTES: frozenset[tuple[str, str]] = frozenset({
+    ("GET", "/api/profiles"),
+    ("GET", "/api/config"),
+    ("GET", "/api/dashboard/font"),
+    ("GET", "/api/dashboard/plugins"),
+    ("GET", "/api/model/info"),
+    ("GET", "/api/analytics/usage"),
+    ("GET", "/api/analytics/models"),
+    ("GET", "/api/sessions"),
+    ("GET", "/api/sessions/search"),
+    ("POST", "/api/sessions/bulk-delete"),
+    ("GET", "/api/sessions/empty/count"),
+    ("DELETE", "/api/sessions/empty"),
+    ("GET", "/api/sessions/stats"),
+    ("POST", "/api/sessions/prune"),
+    ("GET", "/api/files"),
+    ("DELETE", "/api/files"),
+    ("GET", "/api/files/read"),
+    ("GET", "/api/files/download"),
+    ("POST", "/api/files/upload"),
+    ("POST", "/api/files/upload-stream"),
+    ("POST", "/api/files/mkdir"),
 })
+# Compatibility export for callers that only need the known path inventory.
+OWNER_WORKER_PATHS: frozenset[str] = frozenset(path for _method, path in OWNER_WORKER_ROUTES)
 _SESSION_ITEM_SUFFIXES: frozenset[str] = frozenset({
     "latest-descendant",
     "messages",
@@ -76,14 +83,20 @@ def _session_item_path(path: str) -> bool:
     )
 
 
-def classify_authenticated_api(path: str, *, token_authenticated: bool = False) -> AuthenticatedApiDecision:
-    """Classify an authenticated-mode dashboard API path.
+def classify_authenticated_api(
+    path: str,
+    *,
+    method: str = "GET",
+    token_authenticated: bool = False,
+) -> AuthenticatedApiDecision:
+    """Classify an authenticated-mode dashboard API method and path.
 
     Unknown ``/api/*`` routes are deliberately unavailable until they are proven
-    owner-insensitive or moved behind Owner Worker routing.  Owner-worker paths
-    are enumerated instead of prefix-allowed so adding a new Control Plane route
-    under ``/api/sessions`` does not silently bypass the fail-closed gate.
+    owner-insensitive or moved behind Owner Worker routing. Owner-worker routes
+    are enumerated by exact method and path so a new write handler cannot silently
+    inherit permission from an existing read route.
     """
+    method = str(method or "GET").upper()
     if not path.startswith("/api/"):
         return AuthenticatedApiDecision(
             AuthenticatedApiBucket.CONTROL_PLANE_AUTH,
@@ -95,7 +108,15 @@ def classify_authenticated_api(path: str, *, token_authenticated: bool = False) 
         return AuthenticatedApiDecision(bucket, True, bucket.value)
     if path in CONTROL_PLANE_AUTH_PATHS or any(path.startswith(prefix) for prefix in CONTROL_PLANE_AUTH_PREFIXES):
         return AuthenticatedApiDecision(AuthenticatedApiBucket.CONTROL_PLANE_AUTH, True, "control-plane auth")
-    if path in OWNER_WORKER_PATHS or _session_item_path(path):
+    if (method, path) in OWNER_WORKER_ROUTES or (
+        _session_item_path(path)
+        and method in {"GET", "PATCH", "DELETE"}
+        and not (path.endswith("/messages") or path.endswith("/export") or path.endswith("/latest-descendant"))
+    ) or (
+        _session_item_path(path)
+        and method == "GET"
+        and path.rsplit("/", 1)[-1] in _SESSION_ITEM_SUFFIXES
+    ):
         return AuthenticatedApiDecision(AuthenticatedApiBucket.OWNER_WORKER, True, "owner-worker routed")
     if token_authenticated:
         return AuthenticatedApiDecision(AuthenticatedApiBucket.TOKEN_AUTH_ONLY, True, "token authenticated")
@@ -106,8 +127,8 @@ def classify_authenticated_api(path: str, *, token_authenticated: bool = False) 
     )
 
 
-def authenticated_control_plane_api_allowed(path: str) -> bool:
-    decision = classify_authenticated_api(path)
+def authenticated_control_plane_api_allowed(path: str, *, method: str = "GET") -> bool:
+    decision = classify_authenticated_api(path, method=method)
     return decision.allowed and decision.bucket in {
         AuthenticatedApiBucket.PUBLIC_BOOTSTRAP,
         AuthenticatedApiBucket.CONTROL_PLANE_AUTH,
@@ -115,6 +136,6 @@ def authenticated_control_plane_api_allowed(path: str) -> bool:
     }
 
 
-def authenticated_owner_worker_api_allowed(path: str) -> bool:
-    decision = classify_authenticated_api(path)
+def authenticated_owner_worker_api_allowed(path: str, *, method: str = "GET") -> bool:
+    decision = classify_authenticated_api(path, method=method)
     return decision.allowed and decision.bucket == AuthenticatedApiBucket.OWNER_WORKER
