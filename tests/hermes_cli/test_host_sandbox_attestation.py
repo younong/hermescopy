@@ -43,8 +43,9 @@ def _inputs(tmp_path: Path):
     return mount_policy, security
 
 
-def _status(*, uid=65532, gid=65532, nnp=1, seccomp=2, cap_eff="0"):
+def _status(*, uid=65532, gid=65532, nnp=1, seccomp=2, cap_eff="0", name="python3"):
     return "\n".join((
+        f"Name:\t{name}",
         f"Uid:\t{uid}\t{uid}\t{uid}\t{uid}",
         f"Gid:\t{gid}\t{gid}\t{gid}\t{gid}",
         f"NoNewPrivs:\t{nnp}", f"Seccomp:\t{seccomp}",
@@ -97,6 +98,45 @@ def test_host_attestation_accepts_exact_post_spawn_kernel_state(tmp_path):
         proc_root=tmp_path / "proc", read_text=_reader(_status(), _mountinfo()),
         read_link=_links, stat_path=_stats,
     )
+
+
+def test_host_attestation_waits_for_bubblewrap_final_security_state(tmp_path):
+    mount_policy, security = _inputs(tmp_path)
+    statuses = iter((
+        _status(nnp=1, seccomp=0, cap_eff="1", name="bwrap"),
+        _status(nnp=1, seccomp=0, cap_eff="1", name="bwrap"),
+        _status(),
+    ))
+    sleeps = []
+
+    def read(path: Path) -> str:
+        return _mountinfo() if path.name == "mountinfo" else next(statuses)
+
+    attest_host_bubblewrap_process(
+        4243, mount_policy=mount_policy, security_policy=security,
+        proc_root=tmp_path / "proc", read_text=read,
+        read_link=_links, stat_path=_stats,
+        clock=lambda: 0.0, sleep=sleeps.append,
+    )
+
+    assert sleeps == [0.001, 0.001]
+
+
+def test_host_attestation_rejects_bubblewrap_that_never_applies_security(tmp_path):
+    mount_policy, security = _inputs(tmp_path)
+    now = iter((0.0, 0.0, 5.0))
+
+    with pytest.raises(SandboxVerificationInvalid, match="seccomp"):
+        attest_host_bubblewrap_process(
+            4243, mount_policy=mount_policy, security_policy=security,
+            proc_root=tmp_path / "proc",
+            read_text=_reader(
+                _status(nnp=1, seccomp=0, cap_eff="1", name="bwrap"),
+                _mountinfo(),
+            ),
+            read_link=_links, stat_path=_stats,
+            clock=lambda: next(now), sleep=lambda _seconds: None,
+        )
 
 
 @pytest.mark.parametrize("status", [

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from pathlib import Path, PurePosixPath
 from typing import Callable, Mapping
 
@@ -14,6 +15,8 @@ from hermes_cli.owner_worker.tool_executor_sandbox import (
 
 _REQUIRED_NAMESPACES = ("user", "pid", "ipc", "mnt", "net")
 _ZERO_CAPABILITIES = ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")
+_ATTESTATION_TIMEOUT_SECONDS = 5.0
+_ATTESTATION_RETRY_SECONDS = 0.001
 
 
 def attest_host_bubblewrap_process(
@@ -25,6 +28,8 @@ def attest_host_bubblewrap_process(
     read_text: Callable[[Path], str] | None = None,
     read_link: Callable[[Path], str] = os.readlink,
     stat_path: Callable[[Path], os.stat_result] | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> None:
     """Require exact kernel state before an executor start gate is released."""
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
@@ -32,8 +37,14 @@ def attest_host_bubblewrap_process(
     root = Path(proc_root) / str(pid)
     reader = read_text or (lambda path: path.read_text(encoding="utf-8"))
     stat_reader = stat_path or (lambda path: path.stat())
+    status = _await_final_security_status(
+        root / "status",
+        security_policy,
+        reader=reader,
+        clock=clock,
+        sleep=sleep,
+    )
     try:
-        status = _status_fields(reader(root / "status"))
         mountinfo = reader(root / "mountinfo")
         namespaces = {name: read_link(root / "ns" / name) for name in _REQUIRED_NAMESPACES}
         root_link = read_link(root / "root")
@@ -57,6 +68,33 @@ def attest_host_bubblewrap_process(
         process_root=root / "root",
         stat_path=stat_reader,
     )
+
+
+def _await_final_security_status(
+    path: Path,
+    policy: SandboxSecurityPolicy,
+    *,
+    reader: Callable[[Path], str],
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> dict[str, str]:
+    """Wait for Bubblewrap to finish applying its final child security state."""
+    deadline = clock() + _ATTESTATION_TIMEOUT_SECONDS
+    last_error: SandboxVerificationInvalid | None = None
+    while True:
+        try:
+            status = _status_fields(reader(path))
+            _attest_status(status, policy)
+            return status
+        except (OSError, UnicodeError) as exc:
+            raise SandboxVerificationInvalid("sandbox process evidence is unavailable") from exc
+        except SandboxVerificationInvalid as exc:
+            last_error = exc
+            if status.get("Name") != "bwrap":
+                raise
+        if clock() >= deadline:
+            raise last_error
+        sleep(_ATTESTATION_RETRY_SECONDS)
 
 
 def _status_fields(raw: str) -> dict[str, str]:
