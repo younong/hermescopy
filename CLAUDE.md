@@ -14,9 +14,12 @@ follow the implementation and its closest focused tests.
 3. Expand into one adjacent subsystem only when the focused path is insufficient.
 4. Use a repository-wide search only to locate an unknown entry point—not as the
    default starting point.
-5. Use `rg --no-ignore` only when generated or ignored output is explicitly in
+5. Do not use the `Explore` agent for routine repository navigation. Prefer
+   focused `rg` and direct file reads; reserve `Explore` for genuinely broad,
+   uncertain discovery after targeted searching is insufficient.
+6. Use `rg --no-ignore` only when generated or ignored output is explicitly in
    scope.
-6. For intent-sensitive behavior, follow the existing convention:
+7. For intent-sensitive behavior, follow the existing convention:
    `git log -p -S <symbol>`.
 
 Examples:
