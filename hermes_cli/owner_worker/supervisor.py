@@ -60,6 +60,14 @@ class OwnerWorkerHandle:
     active_uses: int = 0
 
 
+class OwnerWorkerUnavailableError(RuntimeError):
+    """Raised when an Owner Worker cannot be admitted or started yet."""
+
+
+class OwnerWorkerStartupError(OwnerWorkerUnavailableError):
+    """Raised when an Owner Worker exits or fails health checks during startup."""
+
+
 class OwnerWorkerLease:
     """Reference-counted active-use lease for an owner worker handle."""
 
@@ -282,7 +290,7 @@ class OwnerWorkerSupervisor:
                 str(exc) != "worker_lease_already_owned"
                 or not self._reconcile_missing_local_worker(owner_key, owner_home)
             ):
-                raise
+                raise OwnerWorkerUnavailableError(f"owner worker is already owned: {exc}") from exc
             claim = self.authority_store.claim_worker_start(owner_key, worker_id=uuid.uuid4().hex)
         generation = claim.generation
         socket_path = self.socket_path_for(owner, generation.worker_generation)
@@ -339,7 +347,7 @@ class OwnerWorkerSupervisor:
                 )
             finally:
                 os.close(inherited_cwd_fd)
-        except Exception:
+        except Exception as exc:
             self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, claim.lease)
             try:
                 self.authority_store.transition_worker_lease(
@@ -349,7 +357,7 @@ class OwnerWorkerSupervisor:
                 )
             except AuthorizationRejected:
                 pass
-            raise
+            raise OwnerWorkerStartupError(f"owner worker process launch failed: {exc}") from exc
         finally:
             if cwd_fd is not None:
                 os.close(cwd_fd)
@@ -376,7 +384,7 @@ class OwnerWorkerSupervisor:
                 state=WorkerLeaseState.ACTIVE,
                 generation_state=WorkerGenerationState.ACTIVE,
             )
-        except Exception:
+        except Exception as exc:
             self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, claim.lease)
             try:
                 self.authority_store.transition_worker_lease(
@@ -398,7 +406,9 @@ class OwnerWorkerSupervisor:
                         pass
             else:
                 process.wait()
-            raise
+            if isinstance(exc, (OwnerWorkerUnavailableError, TimeoutError)):
+                raise
+            raise OwnerWorkerStartupError("owner worker startup failed") from exc
 
         handle = OwnerWorkerHandle(
             owner_key=owner_key,
@@ -516,11 +526,11 @@ class OwnerWorkerSupervisor:
             return
         last_attempt = self._last_start_attempt.get(owner_key, 0.0)
         if self.startup_cooldown and now - last_attempt < self.startup_cooldown:
-            raise RuntimeError("owner worker startup throttled")
+            raise OwnerWorkerUnavailableError("owner worker startup throttled")
         if len(self._handles) + self._in_flight_starts >= self.max_workers:
             self._evict_oldest_idle(now=now)
         if len(self._handles) + self._in_flight_starts >= self.max_workers:
-            raise RuntimeError("owner worker limit reached")
+            raise OwnerWorkerUnavailableError("owner worker limit reached")
         self._last_start_attempt[owner_key] = now
 
     def acquire_use(self, handle: OwnerWorkerHandle) -> OwnerWorkerLease:
@@ -533,7 +543,7 @@ class OwnerWorkerSupervisor:
                 self._lease_for_handle(handle), states=frozenset({WorkerLeaseState.ACTIVE})
             )
             if handle.active_uses >= self.max_owner_concurrency:
-                raise RuntimeError("owner worker concurrency limit reached")
+                raise OwnerWorkerUnavailableError("owner worker concurrency limit reached")
             handle.active_uses += 1
             handle.last_used_at = time.time()
         return OwnerWorkerLease(self, handle)
@@ -724,7 +734,9 @@ class OwnerWorkerSupervisor:
         last_error: Exception | None = None
         while time.monotonic() < deadline:
             if process.poll() is not None:
-                raise RuntimeError(f"owner worker exited during startup with code {process.returncode}")
+                raise OwnerWorkerStartupError(
+                    f"owner worker exited during startup with code {process.returncode}"
+                )
             if socket_path.exists():
                 try:
                     return self.client_cls(socket_path, control_home=self.control_home).verify_health(
@@ -740,7 +752,9 @@ class OwnerWorkerSupervisor:
                     last_error = exc
             time.sleep(min(self.poll_interval, max(0.0, deadline - time.monotonic())))
         if last_error is not None:
-            raise RuntimeError(f"owner worker failed health verification: {last_error}") from last_error
+            raise OwnerWorkerStartupError(
+                f"owner worker failed health verification: {last_error}"
+            ) from last_error
         raise TimeoutError("timed out waiting for owner worker socket")
 
     def _argv_for(self, owner: Any, socket_path: Path, generation: WorkerGeneration) -> list[str]:

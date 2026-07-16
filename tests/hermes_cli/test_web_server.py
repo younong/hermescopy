@@ -5487,8 +5487,10 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         def fail_local_or_global(*args, **kwargs):
             raise AssertionError("authenticated worker failure must not reach local or global state")
 
+        from hermes_cli.owner_worker import OwnerWorkerHealthError
+
         def fail_worker_request(*args, **kwargs):
-            raise RuntimeError("owner worker unavailable")
+            raise OwnerWorkerHealthError("owner worker unavailable")
 
         monkeypatch.setattr(web_server, "_open_session_db_for_profile", fail_local_or_global)
         monkeypatch.setattr(web_server, "_cron_profile_home", fail_local_or_global)
@@ -5860,8 +5862,8 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         assert response.json()["detail"] == "Owner worker startup timed out"
         assert acquired is False
 
-    def test_authenticated_worker_startup_error_returns_502_without_acquiring_lease(self, monkeypatch):
-        import hermes_cli.web_server as web_server
+    def test_authenticated_worker_unavailable_returns_503_without_acquiring_lease(self, monkeypatch):
+        from hermes_cli.owner_worker import OwnerWorkerUnavailableError
 
         acquired = False
 
@@ -5869,7 +5871,7 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
             control_home = self.supervisor.control_home
 
             def get_or_start(self, owner):
-                raise RuntimeError("worker bootstrap failed")
+                raise OwnerWorkerUnavailableError("worker bootstrap failed")
 
             def acquire_use(self, handle):
                 nonlocal acquired
@@ -5884,9 +5886,72 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
 
         response = self.client.get("/api/sessions")
 
-        assert response.status_code == 502
-        assert response.json()["detail"] == "Owner worker request failed"
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Owner worker is unavailable"
         assert acquired is False
+
+    def test_authenticated_worker_response_status_is_preserved_and_releases_lease(self, monkeypatch):
+        import httpx
+        import hermes_cli.owner_worker.client as owner_client
+        from hermes_cli.dashboard_auth.owner_context import owner_context_from_session
+
+        owner = owner_context_from_session(self.session)
+        released = False
+        handle = type(
+            "_Handle",
+            (),
+            {
+                "owner_key": owner.owner_key,
+                "socket_path": "unused.sock",
+                "worker_generation": 9,
+                "worker_id": "worker-generation-9",
+                "lease_version": 7,
+                "recovery_generation": 3,
+            },
+        )()
+
+        class _Lease:
+            def release(self):
+                nonlocal released
+                released = True
+
+        class _Supervisor:
+            control_home = self.supervisor.control_home
+
+            def get_or_start(self, requested_owner):
+                assert requested_owner.owner_key == owner.owner_key
+                return handle
+
+            def acquire_use(self, requested_handle):
+                assert requested_handle is handle
+                return _Lease()
+
+        def worker_error(self, method, path, *, lease, headers=None, content=None):
+            assert method == "GET"
+            assert path == "/api/sessions?limit=30&offset=0&order=recent"
+            return httpx.Response(500, json={"detail": "owner database failure"})
+
+        self.app.state.owner_worker_supervisor = _Supervisor()
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", worker_error)
+
+        response = self.client.get("/api/sessions?limit=30&offset=0&order=recent")
+
+        assert response.status_code == 500
+        assert response.json() == {"detail": "owner database failure"}
+        assert released is True
+
+    def test_authenticated_proxy_internal_error_is_500(self, monkeypatch):
+        import hermes_cli.owner_worker.client as owner_client
+
+        def unexpected_failure(*args, **kwargs):
+            raise RuntimeError("control-plane defect")
+
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", unexpected_failure)
+
+        response = self.client.get("/api/sessions")
+
+        assert response.status_code == 500
+        assert response.json()["detail"] == "Internal server error"
 
 
 def test_dashboard_thread_traceback_dump_is_opt_in(monkeypatch):

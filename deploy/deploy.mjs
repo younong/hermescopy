@@ -694,7 +694,9 @@ WorkingDirectory=$current
 ExecStart=$runner dashboard --host 127.0.0.1 --port 9119 --no-open --skip-build --require-auth
 Restart=always
 RestartSec=5
-KillMode=mixed
+# Keep owner workers in the dashboard service cgroup so shutdown cleanup can
+# revoke their authority fence before systemd reaps any remaining children.
+KillMode=control-group
 KillSignal=SIGTERM
 TimeoutStopSec=60
 StandardOutput=journal
@@ -706,7 +708,28 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable hermes-gateway.service hermes-dashboard.service
-systemctl restart hermes-gateway.service hermes-dashboard.service
+# Stop the control plane before rotating a release, then terminate any worker
+# that survived an older dashboard unit. Older KillMode=mixed releases could
+# leave those children orphaned with an ACTIVE durable lease, blocking every
+# cold start after the new dashboard comes up.
+systemctl stop hermes-dashboard.service
+owner_worker_pids="$(pgrep -f '[h]ermes_cli.owner_worker.entrypoint' || true)"
+if [ -n "$owner_worker_pids" ]; then
+  kill -TERM $owner_worker_pids || true
+  for _ in $(seq 1 50); do
+    live_owner_workers=""
+    for pid in $owner_worker_pids; do
+      if kill -0 "$pid" 2>/dev/null; then
+        live_owner_workers="$live_owner_workers $pid"
+      fi
+    done
+    [ -z "$live_owner_workers" ] && break
+    sleep 0.1
+  done
+  [ -z "${"${"}live_owner_workers:-}" ] || kill -KILL $live_owner_workers || true
+fi
+systemctl restart hermes-gateway.service
+systemctl start hermes-dashboard.service
 systemctl is-active --quiet hermes-gateway.service
 systemctl is-active --quiet hermes-dashboard.service
 systemctl --no-pager --full status hermes-gateway.service hermes-dashboard.service || true

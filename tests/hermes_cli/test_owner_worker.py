@@ -22,7 +22,12 @@ from hermes_cli.dashboard_auth.base import Session
 from hermes_cli.dashboard_auth.owner_context import owner_context_from_session
 from hermes_cli.controlled_roots import RootKind, controlled_roots_for
 from hermes_cli.owner_runtime import REQUIRED_OWNER_DIRS, ensure_owner_runtime_dirs, owner_worker_socket_path
-from hermes_cli.owner_worker import OwnerWorkerClient, OwnerWorkerSupervisor
+from hermes_cli.owner_worker import (
+    OwnerWorkerClient,
+    OwnerWorkerStartupError,
+    OwnerWorkerSupervisor,
+    OwnerWorkerUnavailableError,
+)
 from hermes_cli.owner_worker.tokens import (
     AUD_OWNER_WORKER_HTTP,
     AUD_OWNER_WORKER_WS,
@@ -560,7 +565,7 @@ def test_supervisor_does_not_reclaim_healthy_or_ambiguous_orphan_lease(tmp_path)
         startup_cooldown=0,
     )
 
-    with pytest.raises(AuthorizationRejected, match="already_owned"):
+    with pytest.raises(OwnerWorkerUnavailableError, match="already_owned"):
         restarted.get_or_start(owner)
 
     assert restarted.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.ACTIVE
@@ -1091,12 +1096,41 @@ def test_supervisor_startup_throttle_is_per_owner(tmp_path):
     )
     first = supervisor.get_or_start(owners[0])
     supervisor._terminate_handle(owners[0].owner_key, first)
-    with pytest.raises(RuntimeError, match="startup throttled"):
+    with pytest.raises(OwnerWorkerUnavailableError, match="startup throttled"):
         supervisor.get_or_start(owners[0])
     second = supervisor.get_or_start(owners[1])
 
     assert second.owner_key == owners[1].owner_key
     assert len(spawned) == 2
+
+
+def test_supervisor_startup_exit_is_typed_and_releases_the_fence(tmp_path):
+    owner = _Owner("ok1_startup_exit", tmp_path / "owner")
+
+    def fake_process_factory(*args, **kwargs):
+        del kwargs
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        process = _FakeProcess()
+        process.returncode = 1
+        return process
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+
+    with pytest.raises(OwnerWorkerStartupError, match="exited during startup"):
+        supervisor.get_or_start(owner)
+
+    assert supervisor._handles == {}
+    assert supervisor._starting_owner_keys == set()
+    assert supervisor._in_flight_starts == 0
+    assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.REVOKED
+    assert supervisor.authority_store.read_worker_generation(owner.owner_key, 1).state is WorkerGenerationState.FAILED
 
 
 def test_supervisor_owner_concurrency_cap_is_exact_handle_scoped(tmp_path):

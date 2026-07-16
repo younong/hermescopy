@@ -532,7 +532,11 @@ async def _proxy_authenticated_owner_http(request: Request) -> Response:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     from hermes_cli.dashboard_auth.owner_context import ensure_owner_home, owner_context_from_session
-    from hermes_cli.owner_worker import OwnerWorkerClient, OwnerWorkerHealthError
+    from hermes_cli.owner_worker import (
+        OwnerWorkerClient,
+        OwnerWorkerHealthError,
+        OwnerWorkerUnavailableError,
+    )
 
     _reject_authenticated_profile_query_params(request)
     owner = owner_context_from_session(request.state.session)
@@ -545,7 +549,13 @@ async def _proxy_authenticated_owner_http(request: Request) -> Response:
     try:
         handle = await asyncio.to_thread(supervisor.get_or_start, owner)
         if str(handle.owner_key) != str(owner.owner_key):
-            raise RuntimeError("owner worker returned a mismatched owner handle")
+            _log.error(
+                "owner worker returned a mismatched handle method=%s path=%s request_id=%s",
+                request.method,
+                request.url.path,
+                request.headers.get("x-request-id", ""),
+            )
+            raise HTTPException(status_code=502, detail="Owner worker request failed")
         lease = _acquire_owner_worker_use(supervisor, handle)
         content = await request.body()
         worker_path = request.url.path
@@ -576,16 +586,38 @@ async def _proxy_authenticated_owner_http(request: Request) -> Response:
             lease.release()
         _log.warning("owner worker startup timed out: %s", exc)
         raise HTTPException(status_code=503, detail="Owner worker startup timed out") from exc
+    except OwnerWorkerUnavailableError as exc:
+        if lease is not None:
+            lease.release()
+        _log.warning(
+            "owner worker unavailable method=%s path=%s request_id=%s: %s",
+            request.method,
+            request.url.path,
+            request.headers.get("x-request-id", ""),
+            exc,
+        )
+        raise HTTPException(status_code=503, detail="Owner worker is unavailable") from exc
     except OwnerWorkerHealthError as exc:
         if lease is not None:
             lease.release()
-        _log.warning("owner worker proxy failed: %s", exc)
+        _log.warning(
+            "owner worker proxy transport failed method=%s path=%s request_id=%s: %s",
+            request.method,
+            request.url.path,
+            request.headers.get("x-request-id", ""),
+            exc,
+        )
         raise HTTPException(status_code=502, detail="Owner worker request failed") from exc
     except Exception as exc:
         if lease is not None:
             lease.release()
-        _log.exception("owner worker proxy failed")
-        raise HTTPException(status_code=502, detail="Owner worker request failed") from exc
+        _log.exception(
+            "owner worker proxy internal failure method=%s path=%s request_id=%s",
+            request.method,
+            request.url.path,
+            request.headers.get("x-request-id", ""),
+        )
+        raise HTTPException(status_code=500, detail="Internal server error") from exc
 
     response_headers = {
         name: value
