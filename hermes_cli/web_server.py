@@ -11656,39 +11656,15 @@ async def update_skill_content(request: Request, body: SkillContentUpdate):
 
 
 @app.get("/api/tools/toolsets")
-async def get_toolsets(profile: Optional[str] = None):
-    from hermes_cli.tools_config import (
-        _get_effective_configurable_toolsets,
-        _get_platform_tools,
-        _toolset_has_keys,
-        gui_toolset_label,
-    )
-    from toolsets import resolve_toolset
+async def get_toolsets(request: Request, profile: Optional[str] = None):
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
+
+    from hermes_cli.dashboard_owner_payloads import toolsets_payload
 
     with _profile_scope(profile):
-        config = load_config()
-        enabled_toolsets = _get_platform_tools(
-            config,
-            "cli",
-            include_default_mcp_servers=False,
-        )
-    result = []
-    for name, label, desc in _get_effective_configurable_toolsets():
-        try:
-            tools = sorted(set(resolve_toolset(name)))
-        except Exception:
-            tools = []
-        is_enabled = name in enabled_toolsets
-        result.append({
-            "name": name,
-            "label": gui_toolset_label(label),
-            "description": desc,
-            "enabled": is_enabled,
-            "available": is_enabled,
-            "configured": _toolset_has_keys(name, config),
-            "tools": tools,
-        })
-    return result
+        return toolsets_payload(load_config())
 
 
 class ToolsetToggle(BaseModel):

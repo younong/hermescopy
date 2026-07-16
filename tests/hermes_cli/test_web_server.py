@@ -5592,6 +5592,7 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
             "/api/sessions/session-1?profile=default",
             "/api/analytics/usage?profile=default",
             "/api/model/info?profile=default",
+            "/api/tools/toolsets?profile=default",
         ],
     )
     def test_authenticated_worker_failure_never_falls_back_to_local_or_global_state(self, monkeypatch, path):
@@ -5783,7 +5784,14 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         assert response.status_code == 400
         assert not self.supervisor.owners
 
-    def test_authenticated_profile_selection_rejects_legacy_profiles_before_proxy(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/api/sessions?profile=other",
+            "/api/tools/toolsets?profile=other",
+        ],
+    )
+    def test_authenticated_profile_selection_rejects_legacy_profiles_before_proxy(self, monkeypatch, path):
         import hermes_cli.owner_worker.client as owner_client
 
         def fail_request(*args, **kwargs):
@@ -5791,7 +5799,7 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
 
         monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fail_request)
 
-        response = self.client.get("/api/sessions?profile=other")
+        response = self.client.get(path)
 
         assert response.status_code == 400
         assert not self.supervisor.owners
@@ -5824,6 +5832,7 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
             "/api/config",
             "/api/dashboard/font",
             "/api/dashboard/plugins",
+            "/api/tools/toolsets",
         ],
     )
     def test_authenticated_owner_startup_reads_are_proxied(self, monkeypatch, path):
@@ -5854,6 +5863,8 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
             ("put", "/api/config"),
             ("put", "/api/dashboard/font"),
             ("get", "/api/dashboard/plugins/rescan"),
+            ("put", "/api/tools/toolsets"),
+            ("get", "/api/tools/toolsets/example/config"),
         ],
     )
     def test_authenticated_owner_startup_writes_and_management_remain_closed(self, method, path):

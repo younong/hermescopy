@@ -39,6 +39,41 @@ def dashboard_font_payload(config: dict[str, Any] | None = None) -> dict[str, st
     return {"font": font}
 
 
+def toolsets_payload(config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Describe configurable CLI toolsets using owner-local config and keys."""
+    from hermes_cli.tools_config import (
+        _get_effective_configurable_toolsets,
+        _get_platform_tools,
+        _toolset_has_keys,
+        gui_toolset_label,
+    )
+    from toolsets import resolve_toolset
+
+    owner_config = config if config is not None else load_config()
+    enabled_toolsets = _get_platform_tools(
+        owner_config,
+        "cli",
+        include_default_mcp_servers=False,
+    )
+    result = []
+    for name, label, desc in _get_effective_configurable_toolsets():
+        try:
+            tools = sorted(set(resolve_toolset(name)))
+        except Exception:
+            tools = []
+        is_enabled = name in enabled_toolsets
+        result.append({
+            "name": name,
+            "label": gui_toolset_label(label),
+            "description": desc,
+            "enabled": is_enabled,
+            "available": is_enabled,
+            "configured": _toolset_has_keys(name, owner_config),
+            "tools": tools,
+        })
+    return result
+
+
 def owner_singleton_profile_payload(owner_home: Path) -> dict[str, Any]:
     """Describe only the immutable owner home, never host-level sibling profiles."""
     from hermes_cli import profiles as profiles_mod

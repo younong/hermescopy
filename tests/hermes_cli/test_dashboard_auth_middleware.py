@@ -276,6 +276,7 @@ def test_gated_require_token_routes_reject_cookie_session_in_owner_mode(
         ("/api/skills", True),
         ("/api/skills/content", True),
         ("/api/skills/hub/search", False),
+        ("/api/tools/toolsets", True),
         ("/api/sessions", True),
         ("/api/sessions/abc123/messages", True),
         ("/api/sessions/abc123/export", True),
@@ -310,6 +311,8 @@ def test_authenticated_api_availability_requires_explicit_owner_worker_routes(pa
         ("POST", "/api/skills/content"),
         ("GET", "/api/skills/export"),
         ("GET", "/api/skills/hub/search"),
+        ("PUT", "/api/tools/toolsets"),
+        ("GET", "/api/tools/toolsets/example/config"),
     ],
 )
 def test_authenticated_owner_worker_routes_are_method_and_path_exact(method, path):

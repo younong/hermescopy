@@ -862,6 +862,16 @@ def create_app(
         _clear_skills_prompt_cache()
         return result
 
+    @app.get("/api/tools/toolsets")
+    def get_toolsets(
+        profile: str | None = None,
+        _: None = Depends(_require_owner_token),
+    ) -> list[dict[str, Any]]:
+        _reject_profile(profile)
+        from hermes_cli.dashboard_owner_payloads import toolsets_payload
+
+        return toolsets_payload()
+
     @app.get("/api/model/info")
     def get_model_info(profile: str | None = None, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(profile)

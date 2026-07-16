@@ -1417,6 +1417,10 @@ def test_worker_health_over_unix_socket_reports_owner_env(tmp_path, monkeypatch)
     owner_home = ensure_owner_runtime_dirs(socket_root / "u")
     control_home = socket_root / "c"
     control_home.mkdir(parents=True)
+    (owner_home / "config.yaml").write_text(
+        "platform_toolsets:\n  cli:\n    - x_search\n",
+        encoding="utf-8",
+    )
     owner = _Owner("ok1_worker", owner_home)
     supervisor = OwnerWorkerSupervisor(
         control_home=control_home,
@@ -1481,6 +1485,16 @@ def test_worker_health_over_unix_socket_reports_owner_env(tmp_path, monkeypatch)
         assert health["pid"] == proc.pid
         assert health["workspace_root"] == str((owner_home / "workspaces").resolve())
         assert health["forbidden_env_present"] == []
+
+        response = OwnerWorkerClient(socket_path, control_home=control_home).request(
+            "GET",
+            "/api/tools/toolsets",
+            lease=lease,
+        )
+        assert response.status_code == 200
+        toolsets_by_name = {item["name"]: item for item in response.json()}
+        assert toolsets_by_name["x_search"]["enabled"] is True
+        assert toolsets_by_name["x_search"]["available"] is True
 
         transport = httpx.HTTPTransport(uds=str(socket_path))
         with httpx.Client(transport=transport, base_url="http://owner-worker") as client:
@@ -2219,6 +2233,7 @@ def test_worker_analytics_and_model_info_routes_require_owner_token(tmp_path, mo
     assert client.get("/api/config").status_code == 401
     assert client.get("/api/dashboard/font").status_code == 401
     assert client.get("/api/dashboard/plugins").status_code == 401
+    assert client.get("/api/tools/toolsets").status_code == 401
 
 
 def test_worker_owner_startup_routes_return_owner_local_payloads(tmp_path, monkeypatch):
@@ -2235,6 +2250,7 @@ def test_worker_owner_startup_routes_return_owner_local_payloads(tmp_path, monke
     save_config({
         "model": {"default": "owner-model", "provider": "owner-provider"},
         "dashboard": {"font": "fraunces"},
+        "platform_toolsets": {"cli": ["x_search"]},
     })
     (owner_home / "skills" / "owner-skill").mkdir(parents=True)
     (owner_home / "skills" / "owner-skill" / "SKILL.md").write_text("# owner", encoding="utf-8")
@@ -2249,6 +2265,7 @@ def test_worker_owner_startup_routes_return_owner_local_payloads(tmp_path, monke
     config = get("/api/config")
     font = get("/api/dashboard/font")
     plugins = get("/api/dashboard/plugins")
+    toolsets = get("/api/tools/toolsets")
 
     assert profiles.status_code == 200
     assert profiles.json()["management_mode"] == "owner_singleton"
@@ -2265,6 +2282,10 @@ def test_worker_owner_startup_routes_return_owner_local_payloads(tmp_path, monke
     assert font.json() == {"font": "fraunces"}
     assert plugins.status_code == 200
     assert isinstance(plugins.json(), list)
+    assert toolsets.status_code == 200
+    toolsets_by_name = {item["name"]: item for item in toolsets.json()}
+    assert toolsets_by_name["x_search"]["enabled"] is True
+    assert toolsets_by_name["x_search"]["available"] is True
 
 
 def test_worker_analytics_routes_return_owner_local_data(tmp_path, monkeypatch):
