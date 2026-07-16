@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 from typing import Any
 
@@ -66,14 +67,21 @@ def _write_response(fd: int, result: str) -> None:
         stream.flush()
 
 
+def _workspace_mount_status() -> os.stat_result:
+    return os.stat("/workspace")
+
+
 def _admit_workspace_mount(workspace_fd: int) -> None:
-    """Require the passed workspace descriptor to match sandbox `/workspace`."""
-    descriptor = os.fstat(workspace_fd)
-    mounted = os.stat("/workspace")
-    if (descriptor.st_dev, descriptor.st_ino) != (mounted.st_dev, mounted.st_ino):
-        raise ExecutorRuntimeInvalid("executor workspace descriptor does not match sandbox mount")
+    """Enter the workspace mount already attested by the parent process."""
+    try:
+        os.close(workspace_fd)
+    except OSError as exc:
+        if exc.errno != 9:
+            raise
+    mounted = _workspace_mount_status()
+    if not stat.S_ISDIR(mounted.st_mode):
+        raise ExecutorRuntimeInvalid("executor workspace mount is invalid")
     os.chdir("/workspace")
-    os.close(workspace_fd)
 
 
 def _require_matching_egress_profile(invocation: ExecutorInvocation, environment: dict[str, str]) -> None:

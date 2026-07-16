@@ -212,19 +212,19 @@ def test_resource_decision_rejects_foreign_identity_and_invalid_quota():
         ExecutorResourceQuota(**dict(quota.to_payload(), output_bytes=0))
 
 
-def test_workspace_descriptor_must_match_the_fixed_sandbox_mount(tmp_path, monkeypatch):
+def test_workspace_admission_rejects_non_directory_mount(tmp_path, monkeypatch):
     workspace = tmp_path / "workspace"
-    other = tmp_path / "other"
     workspace.mkdir()
-    other.mkdir()
     descriptor = os.open(workspace, os.O_RDONLY)
-    other_stat = os.stat(other)
-    try:
-        monkeypatch.setattr("hermes_cli.tool_executor_runtime.entrypoint.os.stat", lambda _: other_stat)
-        with pytest.raises(ExecutorRuntimeInvalid, match="does not match"):
-            _admit_workspace_mount(descriptor)
-    finally:
-        os.close(descriptor)
+    file_status = (tmp_path / "file")
+    file_status.write_text("not a directory")
+    monkeypatch.setattr(
+        "hermes_cli.tool_executor_runtime.entrypoint._workspace_mount_status",
+        lambda: file_status.stat(),
+    )
+
+    with pytest.raises(ExecutorRuntimeInvalid, match="mount"):
+        _admit_workspace_mount(descriptor)
 
 
 def test_workspace_descriptor_admission_changes_to_verified_workspace_and_closes_fd(tmp_path, monkeypatch):
@@ -233,7 +233,7 @@ def test_workspace_descriptor_admission_changes_to_verified_workspace_and_closes
     descriptor = os.open(workspace, os.O_RDONLY)
     descriptor_stat = os.fstat(descriptor)
     seen = []
-    monkeypatch.setattr("hermes_cli.tool_executor_runtime.entrypoint.os.stat", lambda _: descriptor_stat)
+    monkeypatch.setattr("hermes_cli.tool_executor_runtime.entrypoint._workspace_mount_status", lambda: descriptor_stat)
     monkeypatch.setattr("hermes_cli.tool_executor_runtime.entrypoint.os.chdir", seen.append)
 
     _admit_workspace_mount(descriptor)
@@ -241,6 +241,23 @@ def test_workspace_descriptor_admission_changes_to_verified_workspace_and_closes
     assert seen == ["/workspace"]
     with pytest.raises(OSError):
         os.fstat(descriptor)
+
+
+def test_workspace_admission_accepts_descriptor_consumed_by_bubblewrap(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    descriptor = os.open(workspace, os.O_RDONLY)
+    os.close(descriptor)
+    seen = []
+    monkeypatch.setattr(
+        "hermes_cli.tool_executor_runtime.entrypoint._workspace_mount_status",
+        lambda: workspace.stat(),
+    )
+    monkeypatch.setattr("hermes_cli.tool_executor_runtime.entrypoint.os.chdir", seen.append)
+
+    _admit_workspace_mount(descriptor)
+
+    assert seen == ["/workspace"]
 
 
 def test_executor_environment_keeps_tmp_internal_without_host_tmp_input(tmp_path):
