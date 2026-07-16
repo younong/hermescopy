@@ -279,6 +279,62 @@ def test_owner_resume_rejects_foreign_scope_before_recovery_reads(monkeypatch, t
     assert calls == ["scope"]
 
 
+def test_owner_resume_accepts_prior_worker_generation_history(monkeypatch, tmp_path):
+    _owner, root, default = _owner_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_WORKER_GENERATION", "8")
+    calls: list[tuple[str, dict]] = []
+
+    class _HistoricalDb:
+        def find_resume_recovery_scope(self, selector):
+            assert selector == "owned-session"
+            return {
+                "id": "owned-session",
+                "owner_key": "ok1_owner",
+                "workspace_root": str(root.resolve()),
+                "worker_generation": 7,
+            }
+
+        def get_session_for_recovery(self, session_id, *, recovery_scope):
+            calls.append(("full", recovery_scope))
+            assert session_id == "owned-session"
+            return {
+                "id": session_id,
+                "owner_key": "ok1_owner",
+                "workspace_root": str(root.resolve()),
+                "worker_generation": 7,
+            }
+
+        def resolve_resume_session_id(self, session_id, *, recovery_scope):
+            calls.append(("lineage", recovery_scope))
+            return session_id
+
+        def reopen_session(self, session_id, *, recovery_scope):
+            calls.append(("reopen", recovery_scope))
+            assert session_id == "owned-session"
+
+        def get_messages_as_conversation(self, session_id, **kwargs):
+            calls.append(("history", kwargs["recovery_scope"]))
+            assert session_id == "owned-session"
+            return []
+
+    monkeypatch.setattr(server, "_get_db", lambda: _HistoricalDb())
+    monkeypatch.setattr(server, "_sessions", {})
+    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *args, **kwargs: (None, None))
+    monkeypatch.setattr(server, "_claim_or_reuse_live", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_profile_configured_cwd", lambda _: None)
+
+    response = server._methods["session.resume"]("1", {"session_id": "owned-session"})
+
+    assert response["result"]["resumed"] == "owned-session"
+    assert response["result"]["info"]["cwd"] == str(default.resolve())
+    assert {name for name, _scope in calls} == {"full", "lineage", "reopen", "history"}
+    assert all(scope["historical_resume"] is True for _name, scope in calls)
+    assert all(scope["worker_generation"] == 8 for _name, scope in calls)
+
+
 def test_owner_resume_accepts_matching_scope(monkeypatch, tmp_path):
     _owner, root, default = _owner_env(monkeypatch, tmp_path)
     monkeypatch.setenv("HERMES_WORKER_GENERATION", "7")
@@ -295,6 +351,7 @@ def test_owner_resume_accepts_matching_scope(monkeypatch, tmp_path):
         def get_session_for_recovery(self, session_id, *, recovery_scope):
             assert session_id == "owned-session"
             assert recovery_scope["worker_generation"] == 7
+            assert recovery_scope["historical_resume"] is True
             return {
                 "id": session_id,
                 "owner_key": "ok1_owner",

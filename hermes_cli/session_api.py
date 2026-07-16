@@ -15,18 +15,6 @@ from typing import Any
 from fastapi import HTTPException
 
 
-def _row_get(row: Any, key: str, index: int) -> Any:
-    if isinstance(row, dict):
-        return row.get(key)
-    try:
-        return row[key]
-    except Exception:
-        try:
-            return row[index]
-        except Exception:
-            return None
-
-
 def list_sessions_payload(
     db: Any,
     *,
@@ -195,58 +183,43 @@ def search_sessions_payload(db: Any, *, q: str = "", limit: int = 20) -> dict[st
     return {"results": list(seen.values())}
 
 
-def session_latest_descendant(db: Any, session_id: str) -> tuple[str | None, list[str]]:
+def session_latest_descendant(
+    db: Any,
+    session_id: str,
+    *,
+    recovery_scope: dict[str, Any] | None = None,
+) -> tuple[str | None, list[str]]:
+    """Return the canonical compression continuation for a resumable session."""
     sid = db.resolve_session_id(session_id)
-    if not sid or not db.get_session(sid):
+    if not sid:
         return None, []
-    conn = (
-        getattr(db, "conn", None)
-        or getattr(db, "_conn", None)
-        or getattr(db, "connection", None)
-        or getattr(db, "_connection", None)
-    )
-    rows: list[dict[str, Any]] = []
-    if conn is not None:
-        raw_rows = conn.execute("SELECT id, parent_session_id, started_at FROM sessions").fetchall()
-        rows = [
-            {
-                "id": _row_get(row, "id", 0),
-                "parent_session_id": _row_get(row, "parent_session_id", 1),
-                "started_at": _row_get(row, "started_at", 2),
-            }
-            for row in raw_rows
-        ]
+    if recovery_scope is None:
+        row = db.get_session(sid)
     else:
-        rows = db.list_sessions_rich(limit=10000, offset=0)
-    children: dict[str, list[dict[str, Any]]] = {}
-    for row in rows:
-        rid = row.get("id")
-        parent = row.get("parent_session_id")
-        if rid and parent:
-            children.setdefault(parent, []).append(row)
-
-    def started(row: dict[str, Any]) -> float:
-        try:
-            return float(row.get("started_at") or 0)
-        except Exception:
-            return 0.0
-
-    current = sid
-    path = [sid]
-    seen = {sid}
-    while children.get(current):
-        candidates = [row for row in children[current] if row.get("id") not in seen]
-        if not candidates:
-            break
-        candidates.sort(key=started, reverse=True)
-        current = candidates[0]["id"]
-        path.append(current)
-        seen.add(current)
-    return current, path
+        row = db.get_session_for_recovery(sid, recovery_scope=recovery_scope)
+    if not row:
+        return None, []
+    try:
+        if recovery_scope is None:
+            latest = db.resolve_resume_session_id(sid)
+        else:
+            latest = db.resolve_resume_session_id(sid, recovery_scope=recovery_scope)
+    except TypeError:
+        if recovery_scope is not None:
+            return None, []
+        return None, []
+    if not latest:
+        return None, []
+    return latest, [sid] if latest == sid else [sid, latest]
 
 
-def latest_descendant_payload(db: Any, session_id: str) -> dict[str, Any]:
-    latest, path = session_latest_descendant(db, session_id)
+def latest_descendant_payload(
+    db: Any,
+    session_id: str,
+    *,
+    recovery_scope: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    latest, path = session_latest_descendant(db, session_id, recovery_scope=recovery_scope)
     if not latest:
         raise HTTPException(status_code=404, detail="Session not found")
     return {

@@ -482,19 +482,29 @@ async def _close_replaced_browser_pty(owner: dict[str, Any]) -> None:
 
 
 def _latest_descendant(session_id: str) -> str | None:
-    """Return the owner-local latest descendant for a resume id when available."""
+    """Return the owner-local compression continuation for a resume id."""
     try:
+        from gateway.session import current_historical_resume_scope
         from hermes_state import SessionDB
 
+        scope = current_historical_resume_scope()
         db = SessionDB()
         try:
             sid = db.resolve_session_id(session_id)
-            if not sid or not db.get_session(sid):
+            if not sid:
+                return None
+            if scope is None:
+                row = db.get_session(sid)
+            else:
+                row = db.get_session_for_recovery(sid, recovery_scope=scope)
+            if not row:
                 return None
             try:
-                return db.resolve_resume_session_id(sid) or sid
+                if scope is None:
+                    return db.resolve_resume_session_id(sid) or sid
+                return db.resolve_resume_session_id(sid, recovery_scope=scope) or sid
             except Exception:
-                return sid
+                return None
         finally:
             db.close()
     except Exception:

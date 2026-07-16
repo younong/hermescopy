@@ -734,9 +734,22 @@ def create_app(
 
     @app.get("/api/sessions/{session_id}/latest-descendant")
     def get_session_latest_descendant(session_id: str, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
+        from gateway.session import current_historical_resume_scope
+
         db = _open_db()
         try:
-            return session_api.latest_descendant_payload(db, session_id)
+            scope = current_historical_resume_scope()
+            # Direct in-process app construction is test-only and may create
+            # legacy owner-local rows before the gateway writes complete durable
+            # metadata. Production app construction receives a UDS socket from
+            # the supervisor and always enforces the historical scope.
+            if socket_path is None or scope is None:
+                return session_api.latest_descendant_payload(db, session_id)
+            return session_api.latest_descendant_payload(
+                db,
+                session_id,
+                recovery_scope=scope,
+            )
         finally:
             db.close()
 

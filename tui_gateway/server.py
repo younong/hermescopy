@@ -27,7 +27,11 @@ from hermes_constants import (
 )
 from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_cli.owner_runtime import is_owner_worker_env, resolve_workspace_cwd
-from gateway.session import current_recovery_scope, owner_metadata_matches_current
+from gateway.session import (
+    current_historical_resume_scope,
+    current_recovery_scope,
+    owner_metadata_matches_historical_resume_scope,
+)
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
@@ -1024,7 +1028,7 @@ def _owner_scoped_resume_row(db, target: str) -> tuple[dict | None, dict | None]
     prompt history, or a reopen can observe it. Local and owner-only legacy
     compatibility environments retain their existing resume contract.
     """
-    scope = current_recovery_scope()
+    scope = current_historical_resume_scope()
     if scope is None:
         return None, None
     scope_lookup = getattr(db, "find_resume_recovery_scope", None)
@@ -1032,10 +1036,10 @@ def _owner_scoped_resume_row(db, target: str) -> tuple[dict | None, dict | None]
     if not callable(scope_lookup) or not callable(scoped_get):
         return None, scope
     record = scope_lookup(target)
-    if not record or not owner_metadata_matches_current(record):
+    if not record or not owner_metadata_matches_historical_resume_scope(record):
         return None, scope
     row = scoped_get(str(record.get("id") or ""), recovery_scope=scope)
-    if not row or not owner_metadata_matches_current(row):
+    if not row or not owner_metadata_matches_historical_resume_scope(row):
         return None, scope
     return row, scope
 
@@ -5646,7 +5650,7 @@ def _(rid, params: dict) -> dict:
     if db is None:
         return _db_unavailable_error(rid, code=5000)
 
-    recovery_scope = current_recovery_scope()
+    recovery_scope = current_historical_resume_scope()
     if recovery_scope is not None:
         # Authenticated recovery starts with the scope-only row. Do not resolve
         # a title to a full row, inspect live child state, or follow lineage until
@@ -5704,7 +5708,7 @@ def _(rid, params: dict) -> dict:
             target = tip
             if recovery_scope is not None:
                 found = db.get_session_for_recovery(target, recovery_scope=recovery_scope)
-                if not found or not owner_metadata_matches_current(found):
+                if not found or not owner_metadata_matches_historical_resume_scope(found):
                     return _err(rid, 4007, "session not found")
             else:
                 found = db.get_session(target) or found

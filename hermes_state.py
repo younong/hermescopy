@@ -1704,12 +1704,25 @@ class SessionDB:
     def _recovery_scope_clause(
         recovery_scope: Optional[Dict[str, Any]], *, alias: str = "sessions"
     ) -> Tuple[str, List[Any]]:
-        """Return an exact durable owner-scope predicate for recovery reads."""
+        """Return the durable scope predicate for runtime or historical recovery."""
         if not recovery_scope:
             return "", []
         required = ("owner_key", "workspace_root", "worker_generation")
         if any(recovery_scope.get(key) in (None, "") for key in required):
             return " AND 1 = 0", []
+        if recovery_scope.get("historical_resume") is True:
+            # A worker-generation is a live-runtime fence, not a permanent
+            # conversation owner. Historical recovery still requires valid
+            # persisted generation metadata on every row it observes.
+            return (
+                f" AND {alias}.owner_key = ? AND {alias}.workspace_root = ? "
+                f"AND typeof({alias}.worker_generation) = 'integer' "
+                f"AND {alias}.worker_generation > 0",
+                [
+                    str(recovery_scope["owner_key"]),
+                    str(recovery_scope["workspace_root"]),
+                ],
+            )
         return (
             f" AND {alias}.owner_key = ? AND {alias}.workspace_root = ? "
             f"AND {alias}.worker_generation = ?",
@@ -2731,7 +2744,12 @@ class SessionDB:
         lineage_scope_clause = (
             " AND child.owner_key = parent.owner_key "
             "AND child.workspace_root = parent.workspace_root "
-            "AND child.worker_generation = parent.worker_generation"
+            + (
+                "AND typeof(child.worker_generation) = 'integer' "
+                "AND child.worker_generation > 0"
+                if recovery_scope.get("historical_resume")
+                else "AND child.worker_generation = parent.worker_generation"
+            )
             if recovery_scope
             else ""
         )
@@ -3860,7 +3878,12 @@ class SessionDB:
         lineage_scope_clause = (
             "  AND parent.owner_key = child.owner_key "
             "AND parent.workspace_root = child.workspace_root "
-            "AND parent.worker_generation = child.worker_generation "
+            + (
+                "AND typeof(child.worker_generation) = 'integer' "
+                "AND child.worker_generation > 0 "
+                if recovery_scope.get("historical_resume")
+                else "AND parent.worker_generation = child.worker_generation "
+            )
             if recovery_scope
             else ""
         )

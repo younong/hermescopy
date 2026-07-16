@@ -810,6 +810,253 @@ class TestWsAuthOkGated:
         assert worker.closed
         assert lease.released is True
 
+    def test_bridge_close_cancels_expiry_task_without_leaking_cancellation(self, gated_app, monkeypatch, tmp_path):
+        import asyncio
+        import time
+
+        class _Browser:
+            def __init__(self):
+                self.app = web_server.app
+                self.query_params = SimpleNamespace(get=lambda *_args: "")
+                self.url = SimpleNamespace(query="")
+                self.accepted = False
+                self.closed = []
+                self._closed = asyncio.Event()
+
+            async def accept(self):
+                self.accepted = True
+
+            async def close(self, *, code=1000, reason=""):
+                self.closed.append((code, reason))
+                self._closed.set()
+
+            async def receive(self):
+                await self._closed.wait()
+                return {"type": "websocket.disconnect", "code": 1000}
+
+        class _Worker:
+            def __init__(self):
+                self.closed = []
+                self.sent = []
+
+            async def send(self, value):
+                self.sent.append(value)
+
+            async def recv(self):
+                return "ack"
+
+            async def close(self, **kwargs):
+                self.closed.append(kwargs)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.Future()
+
+        class _Lease:
+            def __init__(self):
+                self.release_count = 0
+
+            def release(self):
+                self.release_count += 1
+
+        registered = asyncio.Event()
+        captured = []
+
+        class _CapturingBridge(web_server._OwnerWorkerWsBridge):
+            def set_tasks(self, tasks):
+                super().set_tasks(tasks)
+                captured.append(self)
+                registered.set()
+
+        browser, worker, lease = _Browser(), _Worker(), _Lease()
+        handle = SimpleNamespace(
+            socket_path="/unused",
+            owner_key="ok1_owner",
+            worker_generation=1,
+            worker_id="worker-expiry-cancel",
+            lease_version=1,
+            recovery_generation=0,
+        )
+        browser.app.state.owner_worker_supervisor = SimpleNamespace(
+            get_or_start=lambda _owner: handle,
+            control_home=tmp_path / "control",
+        )
+        monkeypatch.setattr(
+            web_server,
+            "_owner_context_from_ws_auth_result",
+            lambda _result: SimpleNamespace(owner_key="ok1_owner"),
+        )
+        monkeypatch.setattr(web_server, "_acquire_owner_worker_use", lambda *_args: lease)
+        monkeypatch.setattr(
+            web_server,
+            "_connect_owner_worker_ws",
+            lambda *_args, **_kwargs: asyncio.sleep(0, result=worker),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.dashboard_auth.owner_context.ensure_owner_home",
+            lambda _owner: None,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.owner_worker.tokens.validate_owp1_control",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(web_server, "_OwnerWorkerWsBridge", _CapturingBridge)
+        auth_result = web_server._WsAuthResult(
+            None,
+            "ticket",
+            {
+                "provider": "stub",
+                "tenant_id": "tenant-a",
+                "user_id": "user-a",
+                "session_id": "session-a",
+                "membership_revision": "v1",
+                "epoch": 0,
+            },
+            session_expires_at=int(time.time()) + 60,
+        )
+
+        async def exercise():
+            bridge_task = asyncio.create_task(
+                web_server._bridge_websocket_to_owner_worker(
+                    browser, path="/api/pty", auth_result=auth_result
+                )
+            )
+            await asyncio.wait_for(registered.wait(), timeout=1)
+            await captured[0].close(code=1011, reason="worker generation revoked")
+            await asyncio.wait_for(bridge_task, timeout=1)
+
+        asyncio.run(exercise())
+
+        assert browser.accepted is True
+        assert browser.closed and browser.closed[-1][0] == 1011
+        assert worker.closed and worker.closed[-1]["code"] == 1011
+        assert lease.release_count == 1
+
+    def test_unowned_expiry_task_cancellation_still_propagates(self, gated_app, monkeypatch, tmp_path):
+        import asyncio
+        import time
+
+        class _Browser:
+            def __init__(self):
+                self.app = web_server.app
+                self.query_params = SimpleNamespace(get=lambda *_args: "")
+                self.url = SimpleNamespace(query="")
+                self.closed = []
+                self._closed = asyncio.Event()
+
+            async def accept(self):
+                return None
+
+            async def close(self, *, code=1000, reason=""):
+                self.closed.append((code, reason))
+                self._closed.set()
+
+            async def receive(self):
+                await self._closed.wait()
+                return {"type": "websocket.disconnect", "code": 1000}
+
+        class _Worker:
+            def __init__(self):
+                self.closed = []
+
+            async def send(self, _value):
+                return None
+
+            async def recv(self):
+                return "ack"
+
+            async def close(self, **kwargs):
+                self.closed.append(kwargs)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.Future()
+
+        class _Lease:
+            def __init__(self):
+                self.release_count = 0
+
+            def release(self):
+                self.release_count += 1
+
+        registered = asyncio.Event()
+        captured = []
+
+        class _CapturingBridge(web_server._OwnerWorkerWsBridge):
+            def set_tasks(self, tasks):
+                super().set_tasks(tasks)
+                captured.append(self)
+                registered.set()
+
+        browser, worker, lease = _Browser(), _Worker(), _Lease()
+        handle = SimpleNamespace(
+            socket_path="/unused",
+            owner_key="ok1_owner",
+            worker_generation=1,
+            worker_id="worker-unowned-expiry-cancel",
+            lease_version=1,
+            recovery_generation=0,
+        )
+        browser.app.state.owner_worker_supervisor = SimpleNamespace(
+            get_or_start=lambda _owner: handle,
+            control_home=tmp_path / "control",
+        )
+        monkeypatch.setattr(
+            web_server,
+            "_owner_context_from_ws_auth_result",
+            lambda _result: SimpleNamespace(owner_key="ok1_owner"),
+        )
+        monkeypatch.setattr(web_server, "_acquire_owner_worker_use", lambda *_args: lease)
+        monkeypatch.setattr(
+            web_server,
+            "_connect_owner_worker_ws",
+            lambda *_args, **_kwargs: asyncio.sleep(0, result=worker),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.dashboard_auth.owner_context.ensure_owner_home",
+            lambda _owner: None,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.owner_worker.tokens.validate_owp1_control",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(web_server, "_OwnerWorkerWsBridge", _CapturingBridge)
+        auth_result = web_server._WsAuthResult(
+            None,
+            "ticket",
+            {
+                "provider": "stub",
+                "tenant_id": "tenant-a",
+                "user_id": "user-a",
+                "session_id": "session-a",
+                "membership_revision": "v1",
+                "epoch": 0,
+            },
+            session_expires_at=int(time.time()) + 60,
+        )
+
+        async def exercise():
+            bridge_task = asyncio.create_task(
+                web_server._bridge_websocket_to_owner_worker(
+                    browser, path="/api/pty", auth_result=auth_result
+                )
+            )
+            await asyncio.wait_for(registered.wait(), timeout=1)
+            expiry_task = captured[0]._tasks[-1]
+            expiry_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(bridge_task, timeout=1)
+
+        asyncio.run(exercise())
+
+        assert browser.closed
+        assert worker.closed
+        assert lease.release_count == 1
+
     def test_bridge_close_propagates_to_worker_and_releases_exact_lease(self, gated_app, monkeypatch, tmp_path):
         import asyncio
 

@@ -640,6 +640,20 @@ def current_recovery_scope() -> Dict[str, Any] | None:
     return metadata if all(metadata.get(key) not in (None, "") for key in required) else None
 
 
+def current_historical_resume_scope() -> Dict[str, Any] | None:
+    """Return the trusted owner/workspace scope for durable history resumes.
+
+    Worker generations fence live runtime records and capabilities, but a
+    persisted conversation remains owned by its owner and workspace after that
+    worker restarts. The marker is consumed only by SessionDB recovery queries;
+    callers still derive every expected field from the Owner Worker environment.
+    """
+    scope = current_recovery_scope()
+    if scope is None:
+        return None
+    return {**scope, "historical_resume": True}
+
+
 def _persisted_scope_value(data: Dict[str, Any], key: str) -> Any:
     value = data.get(key)
     if value is None and isinstance(data.get("origin"), dict):
@@ -666,6 +680,32 @@ def _audit_persisted_scope_rejection(reason: str) -> None:
         )
     except Exception:
         logger.debug("persisted scope audit unavailable", exc_info=True)
+
+
+def owner_metadata_matches_historical_resume_scope(data: Dict[str, Any]) -> bool:
+    """Validate durable history ownership without treating generation as identity."""
+    expected = current_recovery_scope()
+    if expected is None:
+        return False
+    required = ("owner_key", "workspace_root", "worker_generation")
+    actual = {key: _persisted_scope_value(data, key) for key in required}
+    if any(value in (None, "") for value in actual.values()):
+        _audit_persisted_scope_rejection("historical_resume_scope_assertion_missing")
+        return False
+    try:
+        actual_workspace = str(Path(str(actual["workspace_root"])).expanduser().resolve())
+        actual_generation = int(actual["worker_generation"])
+    except (TypeError, ValueError):
+        _audit_persisted_scope_rejection("historical_resume_scope_assertion_invalid")
+        return False
+    if (
+        actual_generation <= 0
+        or str(actual["owner_key"]) != str(expected["owner_key"])
+        or actual_workspace != str(expected["workspace_root"])
+    ):
+        _audit_persisted_scope_rejection("historical_resume_scope_assertion_mismatch")
+        return False
+    return True
 
 
 def owner_metadata_matches_current(data: Dict[str, Any]) -> bool:

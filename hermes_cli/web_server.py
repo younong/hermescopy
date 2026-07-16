@@ -13098,7 +13098,15 @@ async def _bridge_websocket_to_owner_worker(
         wait_targets = (*relay_tasks, *((expiry_task,) if expiry_task is not None else ()))
         done, _pending = await asyncio.wait(wait_targets, return_when=asyncio.FIRST_COMPLETED)
         if expiry_task is not None and expiry_task in done:
-            await expiry_task
+            try:
+                await expiry_task
+            except asyncio.CancelledError:
+                # ``bridge.close()`` owns and cancels its registered expiry task
+                # during normal relay teardown. Do not turn that expected child
+                # cancellation into an ASGI application error, but retain an
+                # unexpected timer cancellation for diagnosis.
+                if not bridge.closing:
+                    raise
             return
         # Let all immediately-completing pumps report their close result before
         # selecting the terminal state. This prevents a cancelled sibling from
