@@ -30,7 +30,7 @@ SANDBOX_RUNTIME_BIN = "/opt/hermes/python/bin"
 SANDBOX_SYSTEM_PATH = f"{SANDBOX_RUNTIME_BIN}:/usr/bin:/bin"
 
 _ALLOWED_ENV_KEYS = frozenset({
-    "HOME", "TMPDIR", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "__CF_USER_TEXT_ENCODING",
+    "HOME", "TMPDIR", "PATH", "PWD", "LANG", "LC_ALL", "LC_CTYPE", "__CF_USER_TEXT_ENCODING",
     "PYTHONUNBUFFERED", "PYTHONNOUSERSITE",
     EXECUTOR_RUNTIME_FLAG, EXECUTOR_HOME, EXECUTOR_TMP, EXECUTOR_WORKSPACE_FD,
     EXECUTOR_BOOTSTRAP_FD, EXECUTOR_RESPONSE_FD, EXECUTOR_START_GATE_FD,
@@ -104,6 +104,7 @@ def validate_executor_environment(environment: Mapping[str, str]) -> None:
         EXECUTOR_EGRESS_PROFILE: None,
         "HOME": SANDBOX_EXECUTOR_HOME,
         "TMPDIR": SANDBOX_EXECUTOR_TMP,
+        "PWD": "/workspace",
     }
     for key, expected in required.items():
         value = str(environment.get(key, "") or "").strip()
@@ -137,6 +138,7 @@ def build_executor_environment(
     result = {
         "HOME": SANDBOX_EXECUTOR_HOME,
         "TMPDIR": SANDBOX_EXECUTOR_TMP,
+        "PWD": "/workspace",
         "PATH": str(path),
         "LANG": str(locale),
         "PYTHONUNBUFFERED": "1",
