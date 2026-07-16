@@ -20,9 +20,32 @@ from hermes_cli.owner_worker.tool_executor_sandbox import (
     SandboxVerificationRecord,
 )
 from hermes_cli.dashboard_auth.audit import AuthorityAuditEvent, AuthorityAuditReason
-from hermes_cli.owner_worker.executor_identity import ExecutorInvocation, default_executor_resource_decision
+from hermes_cli.owner_worker.executor_identity import EgressProfile, ExecutorInvocation, default_executor_resource_decision
 from hermes_cli.owner_worker.executor_tokens import AUD_PROCESS_REGISTRY, ExecutorCapabilityInvalid
 from hermes_cli.owner_worker.tool_executor_supervisor import ExecutorEgressPolicy, ToolExecutorSupervisor
+
+
+def _publish_fake_sandbox_info(argv, *, pid=4243):
+    info_fd = os.dup(int(argv[argv.index("--info-fd") + 1]))
+    os.write(info_fd, json.dumps({"child-pid": pid}).encode("utf-8"))
+    os.close(info_fd)
+
+
+def test_bubblewrap_child_pid_accepts_partial_info_writes():
+    read_fd, write_fd = os.pipe()
+
+    def publish():
+        os.write(write_fd, b'{"child-')
+        os.write(write_fd, b'pid":4243}')
+        os.close(write_fd)
+
+    thread = threading.Thread(target=publish)
+    thread.start()
+    try:
+        assert ToolExecutorSupervisor._bubblewrap_child_pid(read_fd) == 4243
+    finally:
+        os.close(read_fd)
+        thread.join()
 
 
 class _FakeProcess:
@@ -52,7 +75,10 @@ def _roots(tmp_path):
 def _launch_spec(**kwargs):
     environment = kwargs["environment"]
     return BubblewrapLaunchSpec(
-        ("/trusted/bwrap", "--unshare-pid", "--bind-fd", str(kwargs["workspace_fd"]), "/workspace", "--", "python"),
+        (
+            "/trusted/bwrap", "--unshare-pid", "--info-fd", str(kwargs["info_fd"]),
+            "--bind-fd", str(kwargs["workspace_fd"]), "/workspace", "--", "python",
+        ),
         "/trusted/bwrap",
         Path(environment["HERMES_EXECUTOR_HOME"]),
     )
@@ -178,10 +204,14 @@ def test_supervisor_uses_sandbox_fd_bootstrap_and_no_preexec_cwd(tmp_path):
 
     def fake_process_factory(*args, **kwargs):
         spawned.append((args, kwargs))
+        _publish_fake_sandbox_info(args[0])
+        gate_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_START_GATE_FD"]))
         request_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_BOOTSTRAP_FD"]))
         response_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_RESPONSE_FD"]))
 
         def respond():
+            assert os.read(gate_fd, 1) == b"1"
+            os.close(gate_fd)
             raw = os.read(request_fd, 1 << 20)
             payload = json.loads(raw.decode("utf-8"))
             received.append(payload)
@@ -208,8 +238,11 @@ def test_supervisor_uses_sandbox_fd_bootstrap_and_no_preexec_cwd(tmp_path):
     assert kwargs["stdin"] is not None
     assert kwargs["stdout"] is not None
     assert kwargs["stderr"] is not None
-    assert len(kwargs["pass_fds"]) == 4
-    assert len(set(kwargs["pass_fds"])) == 4
+    assert len(kwargs["pass_fds"]) == 6
+    assert len(set(kwargs["pass_fds"])) == 6
+    assert kwargs["env"]["HERMES_EXECUTOR_START_GATE_FD"] in {
+        str(fd) for fd in kwargs["pass_fds"]
+    }
     assert "cwd" not in kwargs
     assert "preexec_fn" not in kwargs
     assert kwargs["env"]["HERMES_EXECUTOR_RUNTIME"] == "1"
@@ -233,9 +266,13 @@ def test_supervisor_selects_only_trusted_tool_egress_profiles(tmp_path, profile)
         return _record(binding, mount_policy, invocation)
 
     def fake_process_factory(*args, **kwargs):
+        _publish_fake_sandbox_info(args[0])
+        gate_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_START_GATE_FD"]))
         request_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_BOOTSTRAP_FD"]))
         response_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_RESPONSE_FD"]))
         def respond():
+            assert os.read(gate_fd, 1) == b"1"
+            os.close(gate_fd)
             os.read(request_fd, 1 << 20)
             os.write(response_fd, b'{"result":"ok"}')
             os.close(request_fd)
@@ -257,10 +294,29 @@ def test_supervisor_selects_only_trusted_tool_egress_profiles(tmp_path, profile)
     assert [value.value for value in selected] == [profile]
 
 
+def test_deployment_policy_rejects_network_egress_before_launch_preparation(tmp_path):
+    spawned = []
+    roots, supervisor = _supervisor(
+        tmp_path, lambda *args, **kwargs: spawned.append((args, kwargs)),
+    )
+    supervisor.allowed_egress_profiles = (EgressProfile.TOOL_NONE,)
+    try:
+        with pytest.raises(Exception, match="network egress is not configured"):
+            supervisor.dispatch(
+                function_name="web_search", function_args={}, task_id="task-a", session_id="session-a",
+                tool_call_id="call-a", turn_id="turn-a", api_request_id="request-a",
+            )
+    finally:
+        roots.close()
+    assert spawned == []
+
+
 def test_egress_policy_default_mapping_is_immutable():
     policy = ExecutorEgressPolicy()
 
     assert policy.select("read_file").value == "tool-none"
+    assert policy.select("web_search").value == "tool-public"
+    assert policy.select("browser_navigate").value == "tool-public"
     with pytest.raises(TypeError):
         policy.by_tool_name["read_file"] = "tool-public"
 
@@ -406,10 +462,14 @@ def test_supervisor_uses_distinct_sandbox_bindings_for_cached_executor_identity(
         return _launch_spec(**kwargs)
 
     def fake_process_factory(*args, **kwargs):
+        _publish_fake_sandbox_info(args[0])
+        gate_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_START_GATE_FD"]))
         request_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_BOOTSTRAP_FD"]))
         response_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_RESPONSE_FD"]))
 
         def respond():
+            assert os.read(gate_fd, 1) == b"1"
+            os.close(gate_fd)
             os.read(request_fd, 1 << 20)
             os.write(response_fd, b'{"result":"ok"}')
             os.close(request_fd)
@@ -461,10 +521,14 @@ def test_supervisor_rejects_identity_that_does_not_match_active_lease_before_spa
 
 def test_invalid_executor_response_terminates_and_removes_live_process(tmp_path):
     def fake_process_factory(*args, **kwargs):
+        _publish_fake_sandbox_info(args[0])
+        gate_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_START_GATE_FD"]))
         request_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_BOOTSTRAP_FD"]))
         response_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_RESPONSE_FD"]))
 
         def respond():
+            assert os.read(gate_fd, 1) == b"1"
+            os.close(gate_fd)
             os.read(request_fd, 1 << 20)
             os.write(response_fd, b"not-json")
             os.close(request_fd)

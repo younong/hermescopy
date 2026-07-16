@@ -20,17 +20,22 @@ EXECUTOR_TMP = "HERMES_EXECUTOR_TMP"
 EXECUTOR_WORKSPACE_FD = "HERMES_EXECUTOR_WORKSPACE_FD"
 EXECUTOR_BOOTSTRAP_FD = "HERMES_EXECUTOR_BOOTSTRAP_FD"
 EXECUTOR_RESPONSE_FD = "HERMES_EXECUTOR_RESPONSE_FD"
+EXECUTOR_START_GATE_FD = "HERMES_EXECUTOR_START_GATE_FD"
 EXECUTOR_GENERATION = "HERMES_EXECUTOR_GENERATION"
 EXECUTOR_EGRESS_PROFILE = "HERMES_EXECUTOR_EGRESS_PROFILE"
 
 SANDBOX_EXECUTOR_HOME = "/executor"
 SANDBOX_EXECUTOR_TMP = "/executor/tmp"
+SANDBOX_RUNTIME_BIN = "/opt/hermes/python/bin"
+SANDBOX_RELEASE_ROOT = "/opt/hermes/release"
+SANDBOX_SYSTEM_PATH = f"{SANDBOX_RUNTIME_BIN}:/usr/bin:/bin"
 
 _ALLOWED_ENV_KEYS = frozenset({
-    "HOME", "TMPDIR", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "__CF_USER_TEXT_ENCODING",
-    "PYTHONUNBUFFERED", "PYTHONNOUSERSITE",
+    "HOME", "TMPDIR", "PATH", "PWD", "LANG", "LC_ALL", "LC_CTYPE", "__CF_USER_TEXT_ENCODING",
+    "PYTHONPATH", "PYTHONUNBUFFERED", "PYTHONNOUSERSITE",
     EXECUTOR_RUNTIME_FLAG, EXECUTOR_HOME, EXECUTOR_TMP, EXECUTOR_WORKSPACE_FD,
-    EXECUTOR_BOOTSTRAP_FD, EXECUTOR_RESPONSE_FD, EXECUTOR_GENERATION, EXECUTOR_EGRESS_PROFILE,
+    EXECUTOR_BOOTSTRAP_FD, EXECUTOR_RESPONSE_FD, EXECUTOR_START_GATE_FD,
+    EXECUTOR_GENERATION, EXECUTOR_EGRESS_PROFILE,
 })
 
 # These names identify parent/control-plane authority. Their presence is a
@@ -62,7 +67,10 @@ def _absolute_under(value: str | Path, parent: str | Path, *, field: str) -> Pat
 def _validate_descriptor_numbers(environment: Mapping[str, str]) -> None:
     values: list[int] = []
     try:
-        for key in (EXECUTOR_WORKSPACE_FD, EXECUTOR_BOOTSTRAP_FD, EXECUTOR_RESPONSE_FD):
+        for key in (
+            EXECUTOR_WORKSPACE_FD, EXECUTOR_BOOTSTRAP_FD,
+            EXECUTOR_RESPONSE_FD, EXECUTOR_START_GATE_FD,
+        ):
             value = int(str(environment[key]))
             if value in {0, 1, 2} or value < 0:
                 raise ValueError
@@ -92,10 +100,13 @@ def validate_executor_environment(environment: Mapping[str, str]) -> None:
         EXECUTOR_WORKSPACE_FD: None,
         EXECUTOR_BOOTSTRAP_FD: None,
         EXECUTOR_RESPONSE_FD: None,
+        EXECUTOR_START_GATE_FD: None,
         EXECUTOR_GENERATION: None,
         EXECUTOR_EGRESS_PROFILE: None,
         "HOME": SANDBOX_EXECUTOR_HOME,
         "TMPDIR": SANDBOX_EXECUTOR_TMP,
+        "PWD": "/workspace",
+        "PYTHONPATH": SANDBOX_RELEASE_ROOT,
     }
     for key, expected in required.items():
         value = str(environment.get(key, "") or "").strip()
@@ -115,8 +126,9 @@ def build_executor_environment(
     workspace_fd: int,
     bootstrap_fd: int,
     response_fd: int,
+    start_gate_fd: int,
     egress_profile: str,
-    path: str = "/usr/bin:/bin",
+    path: str = SANDBOX_SYSTEM_PATH,
     locale: str = "C.UTF-8",
 ) -> dict[str, str]:
     """Create the complete allowlisted environment for one executor child."""
@@ -128,7 +140,9 @@ def build_executor_environment(
     result = {
         "HOME": SANDBOX_EXECUTOR_HOME,
         "TMPDIR": SANDBOX_EXECUTOR_TMP,
+        "PWD": "/workspace",
         "PATH": str(path),
+        "PYTHONPATH": SANDBOX_RELEASE_ROOT,
         "LANG": str(locale),
         "PYTHONUNBUFFERED": "1",
         "PYTHONNOUSERSITE": "1",
@@ -138,6 +152,7 @@ def build_executor_environment(
         EXECUTOR_WORKSPACE_FD: str(int(workspace_fd)),
         EXECUTOR_BOOTSTRAP_FD: str(int(bootstrap_fd)),
         EXECUTOR_RESPONSE_FD: str(int(response_fd)),
+        EXECUTOR_START_GATE_FD: str(int(start_gate_fd)),
         EXECUTOR_GENERATION: str(identity.executor_generation),
         EXECUTOR_EGRESS_PROFILE: str(egress_profile),
     }
@@ -171,7 +186,7 @@ def build_authenticated_child_environment(environment: Mapping[str, str] | None 
     result = {
         "HOME": SANDBOX_EXECUTOR_HOME,
         "TMPDIR": SANDBOX_EXECUTOR_TMP,
-        "PATH": "/usr/bin:/bin",
+        "PATH": SANDBOX_SYSTEM_PATH,
         "LANG": "C.UTF-8",
         "PYTHONUNBUFFERED": "1",
         "PYTHONNOUSERSITE": "1",

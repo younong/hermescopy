@@ -15094,7 +15094,9 @@ def _maybe_enable_dashboard_thread_traceback_dump() -> bool:
         import faulthandler
         import signal
 
-        dump_signal = signal.SIGUSR1
+        dump_signal = getattr(signal, "SIGUSR1", None)
+        if dump_signal is None:
+            return False
         faulthandler.register(dump_signal, file=sys.stderr, all_threads=True, chain=False)
     except (AttributeError, OSError, RuntimeError, ValueError) as exc:
         _log.warning("Dashboard thread traceback dump is unavailable: %s", exc)

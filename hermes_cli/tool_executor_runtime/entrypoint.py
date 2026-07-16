@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 from typing import Any
 
@@ -24,6 +25,7 @@ from hermes_cli.tool_executor_runtime.env import (
     EXECUTOR_BOOTSTRAP_FD,
     EXECUTOR_EGRESS_PROFILE,
     EXECUTOR_RESPONSE_FD,
+    EXECUTOR_START_GATE_FD,
     EXECUTOR_WORKSPACE_FD,
     ExecutorEnvironmentInvalid,
     validate_executor_environment,
@@ -32,6 +34,18 @@ from hermes_cli.tool_executor_runtime.env import (
 
 class ExecutorRuntimeInvalid(RuntimeError):
     """The isolated executor bootstrap did not meet its admission contract."""
+
+
+def _await_start_gate(fd: int) -> None:
+    """Block until the parent attests this exact sandbox and releases it."""
+    try:
+        with os.fdopen(fd, "rb", closefd=True) as stream:
+            value = stream.read(1)
+            trailing = stream.read(1)
+    except OSError as exc:
+        raise ExecutorRuntimeInvalid("executor start gate is unavailable") from exc
+    if value != b"1" or trailing:
+        raise ExecutorRuntimeInvalid("executor start gate was not released")
 
 
 def _read_bootstrap(fd: int) -> dict[str, Any]:
@@ -53,14 +67,21 @@ def _write_response(fd: int, result: str) -> None:
         stream.flush()
 
 
+def _workspace_mount_status() -> os.stat_result:
+    return os.stat("/workspace")
+
+
 def _admit_workspace_mount(workspace_fd: int) -> None:
-    """Require the passed workspace descriptor to match sandbox `/workspace`."""
-    descriptor = os.fstat(workspace_fd)
-    mounted = os.stat("/workspace")
-    if (descriptor.st_dev, descriptor.st_ino) != (mounted.st_dev, mounted.st_ino):
-        raise ExecutorRuntimeInvalid("executor workspace descriptor does not match sandbox mount")
+    """Enter the workspace mount already attested by the parent process."""
+    try:
+        os.close(workspace_fd)
+    except OSError as exc:
+        if exc.errno != 9:
+            raise
+    mounted = _workspace_mount_status()
+    if not stat.S_ISDIR(mounted.st_mode):
+        raise ExecutorRuntimeInvalid("executor workspace mount is invalid")
     os.chdir("/workspace")
-    os.close(workspace_fd)
 
 
 def _require_matching_egress_profile(invocation: ExecutorInvocation, environment: dict[str, str]) -> None:
@@ -100,6 +121,10 @@ def run_once(environment: dict[str, str] | None = None) -> int:
         workspace_fd = int(env[EXECUTOR_WORKSPACE_FD])
         bootstrap_fd = int(env[EXECUTOR_BOOTSTRAP_FD])
         response_fd = int(env[EXECUTOR_RESPONSE_FD])
+        start_gate_fd = int(env[EXECUTOR_START_GATE_FD])
+        # Do not read tool-controlled bootstrap data or import tools until the
+        # parent has attested the exact post-spawn sandbox process.
+        _await_start_gate(start_gate_fd)
         # Bubblewrap mounted this already-authorized descriptor at a fixed
         # internal path. Verify that binding before importing tool modules.
         _admit_workspace_mount(workspace_fd)
@@ -107,8 +132,9 @@ def run_once(environment: dict[str, str] | None = None) -> int:
         _require_matching_egress_profile(invocation, env)
         token = install_executor_identity(invocation.identity)
         try:
-            from tools.registry import registry
+            from tools.registry import discover_builtin_tools, registry
 
+            discover_builtin_tools()
             result = registry.dispatch(
                 invocation.tool_name,
                 dict(invocation.arguments),
