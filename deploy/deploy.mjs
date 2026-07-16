@@ -652,7 +652,7 @@ test -f "$release/ui-tui/dist/entry.js"
 lock_hash="$(sha256sum "$release/uv.lock" | cut -d ' ' -f1)"
 architecture="$(uname -m)"
 python_version="3.11"
-runtime_id="py311-${"${"}architecture}-${"${"}lock_hash}-sandbox3"
+runtime_id="py311-${"${"}architecture}-${"${"}lock_hash}-sandbox4"
 venv="$runtimes_dir/$runtime_id"
 
 if [ ! -x "$venv/bin/python3" ]; then
@@ -701,6 +701,14 @@ if [ ! -x "$venv/bin/python3" ]; then
     mkdir -p "$(dirname "$library_target")"
     cp -aL -- "$library" "$library_target"
   done < <(ldd "$resolved_python" | sed -nE 's#.*=> (/[^ ]+).*#\1#p; s#^[[:space:]]*(/[^ ]+).*#\1#p')
+  while IFS= read -r -d '' extension; do
+    while read -r library; do
+      [ -n "$library" ] || continue
+      library_target="$runtime_tmp/toolchain$library"
+      mkdir -p "$(dirname "$library_target")"
+      cp -aL -- "$library" "$library_target"
+    done < <(ldd "$extension" | sed -nE 's#.*=> (/[^ ]+).*#\1#p; s#^[[:space:]]*(/[^ ]+).*#\1#p')
+  done < <(find "$runtime_tmp/lib/python3.11/site-packages" -type f -name '*.so' -print0)
   for command in bash sh ls pwd printf cat grep find; do
     command_path="$(type -P "$command" || true)"
     if [ -z "$command_path" ]; then
