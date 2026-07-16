@@ -22,6 +22,19 @@ follow the implementation and its closest focused tests.
 7. For intent-sensitive behavior, follow the existing convention:
    `git log -p -S <symbol>`.
 
+## Bounded Code Reviews
+
+- Code reviews in this repository have a global Claude Code `Agent` budget of
+  **0**. Review and verify findings serially in the main conversation.
+- Do not call `Agent` or `Workflow`, delegate review work, or spawn finder,
+  verifier, Explore, general-purpose, or candidate-specific subagents.
+- Never invoke `code-review` or another review skill from inside a subagent, and
+  never ask a delegated agent to invoke a review skill or create more agents.
+- Prefer the project `/bounded-code-review` skill for explicit reviews. Use
+  focused searches, direct reads, relevant history, and applicable tests.
+- If the scope is too large for the main conversation, identify what remains
+  unreviewed instead of fanning out or implying complete coverage.
+
 Examples:
 
 ```bash
