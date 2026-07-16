@@ -55,6 +55,7 @@ def test_executor_environment_is_fresh_allowlist_and_binds_runtime_dirs(tmp_path
     assert environment["TMPDIR"] == "/executor/tmp"
     assert environment[EXECUTOR_HOME] == "/executor"
     assert environment["PWD"] == "/workspace"
+    assert environment["PYTHONPATH"] == "/opt/hermes/release"
     assert str(home.resolve()) not in environment.values()
     assert str(tmp.resolve()) not in environment.values()
     assert environment[EXECUTOR_BOOTSTRAP_FD] == "12"
@@ -63,7 +64,7 @@ def test_executor_environment_is_fresh_allowlist_and_binds_runtime_dirs(tmp_path
     assert "HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY" not in environment
     assert "ANTHROPIC_API_KEY" not in environment
     assert set(environment) <= {
-        "HOME", "TMPDIR", "PATH", "PWD", "LANG", "LC_ALL", "LC_CTYPE", "__CF_USER_TEXT_ENCODING", "PYTHONUNBUFFERED", "PYTHONNOUSERSITE",
+        "HOME", "TMPDIR", "PATH", "PWD", "LANG", "LC_ALL", "LC_CTYPE", "__CF_USER_TEXT_ENCODING", "PYTHONPATH", "PYTHONUNBUFFERED", "PYTHONNOUSERSITE",
         "HERMES_EXECUTOR_RUNTIME", "HERMES_EXECUTOR_HOME", "HERMES_EXECUTOR_TMP", "HERMES_EXECUTOR_WORKSPACE_FD",
         "HERMES_EXECUTOR_BOOTSTRAP_FD", "HERMES_EXECUTOR_RESPONSE_FD", "HERMES_EXECUTOR_START_GATE_FD",
         "HERMES_EXECUTOR_GENERATION", "HERMES_EXECUTOR_EGRESS_PROFILE",
@@ -86,6 +87,8 @@ def test_executor_environment_rejects_parent_authority_and_unknown_keys(tmp_path
         validate_executor_environment(poisoned)
     with pytest.raises(ExecutorEnvironmentInvalid, match="PWD"):
         validate_executor_environment(dict(environment, PWD="/tmp"))
+    with pytest.raises(ExecutorEnvironmentInvalid, match="PYTHONPATH"):
+        validate_executor_environment(dict(environment, PYTHONPATH="/tmp"))
 
 
 def test_executor_start_gate_requires_one_explicit_release_byte():
