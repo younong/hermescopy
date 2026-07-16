@@ -12972,27 +12972,31 @@ async def _bridge_websocket_to_owner_worker(
     bridge_worker_identity = _worker_bridge_identity(_owner_worker_authority_lease(handle))
     await _ensure_authority_change_dispatcher(ws.app)
     bridges, bridge_lock = _authorized_ws_bridge_state(ws.app)
+    revoked_before_registration = False
     async with bridge_lock:
         if bridge_worker_identity in ws.app.state.revoked_ws_bridge_worker_fences:
-            await bridge.close(code=1011, reason="auth: worker generation revoked")
-            return
-        ws.app.state.authorized_ws_bridges_by_worker.setdefault(
-            bridge_worker_identity, set()
-        ).add(bridge)
-        if auth_result.credential == "ticket":
-            from hermes_cli.dashboard_auth.authority import AuthorizationScope
+            revoked_before_registration = True
+        else:
+            ws.app.state.authorized_ws_bridges_by_worker.setdefault(
+                bridge_worker_identity, set()
+            ).add(bridge)
+            if auth_result.credential == "ticket":
+                from hermes_cli.dashboard_auth.authority import AuthorizationScope
 
-            bridge_scope = AuthorizationScope(
-                provider=str(auth_result.payload["provider"]),
-                tenant_id=str(auth_result.payload["tenant_id"]),
-                user_id=str(auth_result.payload["user_id"]),
-                session_id=str(auth_result.payload["session_id"]),
-                membership_revision=str(auth_result.payload["membership_revision"]),
-            )
-            bridge_scope_digest = bridge_scope.digest
-            bridges.setdefault(bridge_scope_digest, set()).add(
-                (bridge, int(auth_result.payload["epoch"]))
-            )
+                bridge_scope = AuthorizationScope(
+                    provider=str(auth_result.payload["provider"]),
+                    tenant_id=str(auth_result.payload["tenant_id"]),
+                    user_id=str(auth_result.payload["user_id"]),
+                    session_id=str(auth_result.payload["session_id"]),
+                    membership_revision=str(auth_result.payload["membership_revision"]),
+                )
+                bridge_scope_digest = bridge_scope.digest
+                bridges.setdefault(bridge_scope_digest, set()).add(
+                    (bridge, int(auth_result.payload["epoch"]))
+                )
+    if revoked_before_registration:
+        await bridge.close(code=1011, reason="auth: worker generation revoked")
+        return
     from hermes_cli.dashboard_auth.audit import AuthorityAuditReason
 
     _report_bridge_lifecycle(_owner_worker_authority_lease(handle), AuthorityAuditReason.ADMITTED)

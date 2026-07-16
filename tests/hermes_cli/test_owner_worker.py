@@ -24,6 +24,7 @@ from hermes_cli.controlled_roots import RootKind, controlled_roots_for
 from hermes_cli.owner_runtime import REQUIRED_OWNER_DIRS, ensure_owner_runtime_dirs, owner_worker_socket_path
 from hermes_cli.owner_worker import (
     OwnerWorkerClient,
+    OwnerWorkerHealthError,
     OwnerWorkerStartupError,
     OwnerWorkerSupervisor,
     OwnerWorkerUnavailableError,
@@ -601,6 +602,128 @@ def test_supervisor_shutdown_drains_all_local_workers_in_order(tmp_path):
     assert supervisor._handles == {}
     assert not handle.socket_path.exists()
     assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.REVOKED
+
+
+def test_supervisor_shutdown_revoker_can_release_active_use_from_event_loop(tmp_path):
+    """Synchronous bridge revocation must not retain the supervisor lock."""
+    owner = _Owner("ok1_shutdown_release", tmp_path / "owner")
+    events = []
+    loop = asyncio.new_event_loop()
+    loop_ready = threading.Event()
+
+    def run_loop():
+        asyncio.set_event_loop(loop)
+        loop_ready.set()
+        loop.run_forever()
+
+    loop_thread = threading.Thread(target=run_loop)
+    loop_thread.start()
+    assert loop_ready.wait(timeout=1)
+
+    def fake_process_factory(*args, **kwargs):
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+    handle = supervisor.get_or_start(owner)
+    use_lease = supervisor.acquire_use(handle)
+
+    async def close_bridge():
+        use_lease.release()
+        events.append("lease_released")
+
+    def revoke_bridges(lease):
+        assert lease.state is WorkerLeaseState.DRAINING
+        future = asyncio.run_coroutine_threadsafe(close_bridge(), loop)
+        future.result(timeout=1)
+        events.append("bridges_closed")
+
+    supervisor.generation_bridge_revoker = revoke_bridges
+    try:
+        supervisor.shutdown()
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(timeout=1)
+        loop.close()
+
+    assert events == ["lease_released", "bridges_closed"]
+    assert handle.active_uses == 0
+    assert handle.process.terminated
+    assert supervisor._handles == {}
+    assert supervisor._terminating_handles == {}
+
+
+def test_supervisor_get_or_start_health_retirement_releases_bridge_lease(tmp_path):
+    """A failed health check can synchronously revoke a bridged generation."""
+    owner = _Owner("ok1_health_release", tmp_path / "owner")
+    events = []
+    loop = asyncio.new_event_loop()
+    loop_ready = threading.Event()
+
+    def run_loop():
+        asyncio.set_event_loop(loop)
+        loop_ready.set()
+        loop.run_forever()
+
+    loop_thread = threading.Thread(target=run_loop)
+    loop_thread.start()
+    assert loop_ready.wait(timeout=1)
+
+    class _FailsAfterStartupClient(_FakeClient):
+        health_calls = 0
+
+        def verify_health(self, **kwargs):
+            type(self).health_calls += 1
+            if type(self).health_calls == 2:
+                raise OwnerWorkerHealthError("worker unavailable")
+            return super().verify_health(**kwargs)
+
+    def fake_process_factory(*args, **kwargs):
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess(pid=4300 + _FailsAfterStartupClient.health_calls)
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FailsAfterStartupClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+    first = supervisor.get_or_start(owner)
+    use_lease = supervisor.acquire_use(first)
+
+    async def close_bridge():
+        use_lease.release()
+        events.append("lease_released")
+
+    def revoke_bridges(lease):
+        assert lease.state is WorkerLeaseState.DRAINING
+        future = asyncio.run_coroutine_threadsafe(close_bridge(), loop)
+        future.result(timeout=1)
+        events.append("bridges_closed")
+
+    supervisor.generation_bridge_revoker = revoke_bridges
+    try:
+        replacement = supervisor.get_or_start(owner)
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(timeout=1)
+        loop.close()
+
+    assert replacement is not first
+    assert first.process.terminated
+    assert first.active_uses == 0
+    assert events == ["lease_released", "bridges_closed"]
+    assert supervisor._handles[owner.owner_key] is replacement
+    assert supervisor._terminating_handles == {}
 
 
 def test_supervisor_restart_uses_new_generation_and_socket_with_reused_pid(tmp_path):

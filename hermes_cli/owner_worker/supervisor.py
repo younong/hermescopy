@@ -182,6 +182,10 @@ class OwnerWorkerSupervisor:
         self.authority_store = authority_store_factory(self.control_home)
         self.generation_bridge_revoker = generation_bridge_revoker
         self._handles: dict[str, OwnerWorkerHandle] = {}
+        # A detached handle remains counted until its synchronous bridge revocation
+        # and process teardown complete. This prevents duplicate retirement, new
+        # use leases, and replacement admission while the old process is live.
+        self._terminating_handles: dict[str, OwnerWorkerHandle] = {}
         self._last_start_attempt: dict[str, float] = {}
         self._starting_owner_keys: set[str] = set()
         self._in_flight_starts = 0
@@ -204,60 +208,73 @@ class OwnerWorkerSupervisor:
             pass
 
     def get_or_start(self, owner: Any, *, timeout: float | None = None) -> OwnerWorkerHandle:
-        deadline = time.monotonic() + self._startup_deadline_timeout(timeout)
+        startup_timeout = self._startup_deadline_timeout(timeout)
+        deadline: float | None = None
         owner_key = self._owner_key(owner)
         owner_home = self._owner_home(owner)
-        with self._start_finished:
-            while True:
-                now = time.time()
-                self._reap_exited()
-                self._stop_idle(now=now)
+        while True:
+            # These methods only select handles while locked; their synchronous
+            # revoker/process work runs after releasing the supervisor lock.
+            self._reap_exited()
+            self._stop_idle(now=time.time())
 
+            with self._start_finished:
                 existing = self._handles.get(owner_key)
                 if existing is not None:
                     if existing.owner_home.resolve() != owner_home.resolve():
                         raise RuntimeError("owner worker exact owner_home mismatch for owner_key")
                     existing.last_used_at = time.time()
-                    if existing.process.poll() is None:
-                        try:
-                            self.authority_store.assert_worker_lease(
-                                self._lease_for_handle(existing), states=frozenset({WorkerLeaseState.ACTIVE})
-                            )
-                            health = self.client_cls(existing.socket_path, control_home=self.control_home).verify_health(
-                                owner_key=owner_key,
-                                owner_home=owner_home,
-                                worker_generation=existing.worker_generation,
-                                worker_id=existing.worker_id,
-                                lease_version=existing.lease_version,
-                                recovery_generation=existing.recovery_generation,
-                                lease=self._lease_for_handle(existing),
-                            )
-                            if int(health["pid"]) != existing.pid:
-                                raise RuntimeError("owner worker pid mismatch")
-                        except (AuthorizationRejected, OwnerWorkerHealthError, RuntimeError):
-                            # A local cache never grants authority. Revoke and close
-                            # the exact local generation; its CAS can never mutate a
-                            # newer fence owned by another supervisor.
-                            self._terminate_handle(owner_key, existing)
-                        else:
-                            existing.last_health = health
-                            return existing
-                    else:
-                        self._terminate_handle(owner_key, existing)
-
-                if owner_key not in self._starting_owner_keys:
-                    if deadline <= time.monotonic():
+                elif owner_key in self._starting_owner_keys or owner_key in self._terminating_handles:
+                    if deadline is None:
+                        deadline = time.monotonic() + startup_timeout
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not self._start_finished.wait(timeout=remaining):
                         raise TimeoutError("timed out waiting for owner worker startup")
-                    self._admit_start(owner_key, owner_home, now=now)
-                    self._starting_owner_keys.add(owner_key)
-                    self._in_flight_starts += 1
-                    break
-                remaining = deadline - time.monotonic()
-                if remaining <= 0 or not self._start_finished.wait(timeout=remaining):
-                    raise TimeoutError("timed out waiting for owner worker startup")
+                    continue
+                else:
+                    eviction = self._admit_start(owner_key, owner_home, now=time.time())
+                    if eviction is None:
+                        self._starting_owner_keys.add(owner_key)
+                        self._in_flight_starts += 1
+                        deadline = time.monotonic() + startup_timeout
+                        break
+
+            if existing is not None:
+                if existing.process.poll() is not None:
+                    self._terminate_handle(owner_key, existing)
+                    continue
+                try:
+                    self.authority_store.assert_worker_lease(
+                        self._lease_for_handle(existing), states=frozenset({WorkerLeaseState.ACTIVE})
+                    )
+                    health = self.client_cls(existing.socket_path, control_home=self.control_home).verify_health(
+                        owner_key=owner_key,
+                        owner_home=owner_home,
+                        worker_generation=existing.worker_generation,
+                        worker_id=existing.worker_id,
+                        lease_version=existing.lease_version,
+                        recovery_generation=existing.recovery_generation,
+                        lease=self._lease_for_handle(existing),
+                    )
+                    if int(health["pid"]) != existing.pid:
+                        raise RuntimeError("owner worker pid mismatch")
+                except (AuthorizationRejected, OwnerWorkerHealthError, RuntimeError):
+                    # A local cache never grants authority. Revoke and close the
+                    # exact local generation; a stale CAS cannot affect a replacement.
+                    self._terminate_handle(owner_key, existing)
+                    continue
+                with self._lock:
+                    if self._handles.get(owner_key) is existing:
+                        existing.last_health = health
+                        return existing
+                continue
+
+            # Capacity eviction was reserved while locked. Complete its strict
+            # bridge-revoke/process teardown outside the lock, then retry admission.
+            self._teardown_terminated_handle(eviction[0], eviction[1])
 
         try:
-            return self._start_owner_worker(owner, owner_key, owner_home, deadline=deadline)
+            return self._start_owner_worker(owner, owner_key, owner_home, deadline=deadline or time.monotonic())
         finally:
             with self._start_finished:
                 self._starting_owner_keys.remove(owner_key)
@@ -511,27 +528,37 @@ class OwnerWorkerSupervisor:
         """Drain every locally owned generation before the Dashboard exits."""
         with self._lock:
             handles = tuple(self._handles.items())
-        for owner_key, handle in handles:
-            with self._lock:
-                if self._handles.get(owner_key) is not handle:
-                    continue
-                self._terminate_handle(owner_key, handle)
+            reserved = [
+                (owner_key, handle)
+                for owner_key, handle in handles
+                if self._reserve_termination_locked(owner_key, handle)
+            ]
+        for owner_key, handle in reserved:
+            self._teardown_terminated_handle(owner_key, handle)
 
-    def _admit_start(self, owner_key: str, owner_home: Path, *, now: float) -> None:
-        """Apply per-owner cold-start throttle and idle-only capacity eviction."""
+    def _admit_start(
+        self, owner_key: str, owner_home: Path, *, now: float
+    ) -> tuple[str, OwnerWorkerHandle] | None:
+        """Apply cold-start checks and reserve an idle eviction if needed.
+
+        Callers hold ``_lock``. Returned eviction work must be completed after
+        releasing it so synchronous bridge revocation cannot invert locks.
+        """
         if owner_key in self._handles:
             current = self._handles[owner_key]
             if current.owner_home.resolve() != owner_home.resolve():
                 raise RuntimeError("owner worker exact owner_home mismatch for owner_key")
-            return
+            return None
         last_attempt = self._last_start_attempt.get(owner_key, 0.0)
         if self.startup_cooldown and now - last_attempt < self.startup_cooldown:
             raise OwnerWorkerUnavailableError("owner worker startup throttled")
-        if len(self._handles) + self._in_flight_starts >= self.max_workers:
-            self._evict_oldest_idle(now=now)
-        if len(self._handles) + self._in_flight_starts >= self.max_workers:
-            raise OwnerWorkerUnavailableError("owner worker limit reached")
+        if len(self._handles) + len(self._terminating_handles) + self._in_flight_starts >= self.max_workers:
+            eviction = self._reserve_oldest_idle_locked()
+            if eviction is None:
+                raise OwnerWorkerUnavailableError("owner worker limit reached")
+            return eviction
         self._last_start_attempt[owner_key] = now
+        return None
 
     def acquire_use(self, handle: OwnerWorkerHandle) -> OwnerWorkerLease:
         """Mark a worker as actively serving an HTTP stream or WS bridge."""
@@ -643,76 +670,125 @@ class OwnerWorkerSupervisor:
         except OSError:
             pass
 
-    def _terminate_handle(self, owner_key: str, handle: OwnerWorkerHandle) -> None:
-        # Fence exact capability/bootstrap admission before closing bridge or
-        # touching the process. A stale local cleanup can never transition a
-        # replacement fence and therefore cannot revoke its authority.
-        draining = self._drain_handle(handle)
-        if draining is not None:
-            self._audit_generation(AuthorityAuditReason.GENERATION_DRAINING, draining)
-        if self._handles.get(owner_key) is handle:
-            self._handles.pop(owner_key, None)
-        if self.generation_bridge_revoker is not None:
-            self.generation_bridge_revoker(draining or self._lease_for_handle(handle))
+    def _reserve_termination_locked(self, owner_key: str, handle: OwnerWorkerHandle) -> bool:
+        """Detach an exact handle before running any external teardown work.
 
-        process_exited = handle.process.poll() is not None
-        if process_exited:
-            handle.process.wait()
-        else:
-            handle.process.terminate()
-            try:
-                handle.process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                handle.process.kill()
+        The caller must hold ``_lock``. Detachment blocks new use leases; the
+        separate reservation continues to consume worker capacity until teardown
+        has synchronously closed bridges and reaped the process.
+        """
+        if self._handles.get(owner_key) is not handle:
+            return False
+        if self._terminating_handles.get(owner_key) is not None:
+            return False
+        self._handles.pop(owner_key, None)
+        self._terminating_handles[owner_key] = handle
+        return True
+
+    def _terminate_handle(self, owner_key: str, handle: OwnerWorkerHandle) -> None:
+        """Retire one exact local handle without holding the supervisor lock."""
+        with self._lock:
+            if not self._reserve_termination_locked(owner_key, handle):
+                return
+        self._teardown_terminated_handle(owner_key, handle)
+
+    def _teardown_terminated_handle(self, owner_key: str, handle: OwnerWorkerHandle) -> None:
+        """Run ordered external teardown for a previously reserved handle.
+
+        This method deliberately never holds ``_lock`` while calling the bridge
+        revoker. The revoker synchronously waits for bridge close, which releases
+        an owner-use lease back through ``release_use()`` and must acquire it.
+        """
+        try:
+            # Fence exact capability/bootstrap admission before closing bridge or
+            # touching the process. A stale local cleanup can never transition a
+            # replacement fence and therefore cannot revoke its authority.
+            draining = self._drain_handle(handle)
+            if draining is not None:
+                self._audit_generation(AuthorityAuditReason.GENERATION_DRAINING, draining)
+            if self.generation_bridge_revoker is not None:
+                self.generation_bridge_revoker(draining or self._lease_for_handle(handle))
+
+            process_exited = handle.process.poll() is not None
+            if process_exited:
+                handle.process.wait()
+            else:
+                handle.process.terminate()
                 try:
                     handle.process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
-                    pass
-            process_exited = handle.process.poll() is not None
-        if process_exited:
-            self._cleanup_generation_socket(handle)
-        if draining is not None:
-            terminal_state = (
-                WorkerGenerationState.TERMINATED
-                if process_exited
-                else WorkerGenerationState.REVOKED
-            )
-            self._finalize_drained_handle(draining, generation_state=terminal_state)
-            self._audit_generation(
-                (
-                    AuthorityAuditReason.GENERATION_TERMINATED
+                    handle.process.kill()
+                    try:
+                        handle.process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        pass
+                process_exited = handle.process.poll() is not None
+            if process_exited:
+                self._cleanup_generation_socket(handle)
+            if draining is not None:
+                terminal_state = (
+                    WorkerGenerationState.TERMINATED
                     if process_exited
-                    else AuthorityAuditReason.GENERATION_REVOKED
-                ),
-                draining,
-            )
+                    else WorkerGenerationState.REVOKED
+                )
+                self._finalize_drained_handle(draining, generation_state=terminal_state)
+                self._audit_generation(
+                    (
+                        AuthorityAuditReason.GENERATION_TERMINATED
+                        if process_exited
+                        else AuthorityAuditReason.GENERATION_REVOKED
+                    ),
+                    draining,
+                )
+        finally:
+            with self._start_finished:
+                if self._terminating_handles.get(owner_key) is handle:
+                    self._terminating_handles.pop(owner_key, None)
+                self._start_finished.notify_all()
 
     def _reap_exited(self) -> None:
-        for owner_key, handle in list(self._handles.items()):
-            if handle.process.poll() is not None:
-                self._terminate_handle(owner_key, handle)
+        with self._lock:
+            reserved = [
+                (owner_key, handle)
+                for owner_key, handle in tuple(self._handles.items())
+                if handle.process.poll() is not None and self._reserve_termination_locked(owner_key, handle)
+            ]
+        for owner_key, handle in reserved:
+            self._teardown_terminated_handle(owner_key, handle)
 
     def _stop_idle(self, *, now: float) -> None:
-        for owner_key, handle in list(self._handles.items()):
-            if handle.process.poll() is not None:
-                self._terminate_handle(owner_key, handle)
-                continue
-            if handle.active_uses > 0:
-                continue
-            if now - handle.last_used_at >= self.idle_timeout:
-                self._terminate_handle(owner_key, handle)
+        with self._lock:
+            reserved = []
+            for owner_key, handle in tuple(self._handles.items()):
+                if handle.process.poll() is not None:
+                    if self._reserve_termination_locked(owner_key, handle):
+                        reserved.append((owner_key, handle))
+                    continue
+                if handle.active_uses <= 0 and now - handle.last_used_at >= self.idle_timeout:
+                    if self._reserve_termination_locked(owner_key, handle):
+                        reserved.append((owner_key, handle))
+        for owner_key, handle in reserved:
+            self._teardown_terminated_handle(owner_key, handle)
 
-    def _evict_oldest_idle(self, *, now: float) -> None:
+    def _reserve_oldest_idle_locked(self) -> tuple[str, OwnerWorkerHandle] | None:
         live = [
             (owner_key, handle)
             for owner_key, handle in self._handles.items()
             if handle.process.poll() is None and handle.active_uses <= 0
         ]
         if not live:
-            return
-        del now
+            return None
         owner_key, handle = min(live, key=lambda item: item[1].last_used_at)
-        self._terminate_handle(owner_key, handle)
+        if self._reserve_termination_locked(owner_key, handle):
+            return owner_key, handle
+        return None
+
+    def _evict_oldest_idle(self, *, now: float) -> None:
+        del now
+        with self._lock:
+            reserved = self._reserve_oldest_idle_locked()
+        if reserved is not None:
+            self._teardown_terminated_handle(*reserved)
 
     def socket_path_for(self, owner: Any, worker_generation: int | None = None) -> Path:
         if worker_generation is None:
