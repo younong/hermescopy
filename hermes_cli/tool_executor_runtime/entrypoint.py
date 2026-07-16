@@ -132,8 +132,9 @@ def run_once(environment: dict[str, str] | None = None) -> int:
         _require_matching_egress_profile(invocation, env)
         token = install_executor_identity(invocation.identity)
         try:
-            from tools.registry import registry
+            from tools.registry import discover_builtin_tools, registry
 
+            discover_builtin_tools()
             result = registry.dispatch(
                 invocation.tool_name,
                 dict(invocation.arguments),
