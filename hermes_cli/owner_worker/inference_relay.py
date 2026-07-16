@@ -247,7 +247,10 @@ class DeploymentInferenceBroker:
         else:
             headers["Authorization"] = f"Bearer {runtime['api_key']}"
         headers.setdefault("Content-Type", "application/json")
-        return str(runtime["base_url"]).rstrip("/") + path, body, headers
+        upstream_base_url = str(runtime["base_url"]).rstrip("/")
+        if upstream_base_url.endswith("/v1"):
+            upstream_base_url = upstream_base_url[:-3]
+        return upstream_base_url + path, body, headers
 
     def _handle_request(
         self,

@@ -156,7 +156,8 @@ def _activate_relay(store: AuthorityStore, policy: DeploymentInferencePolicy):
     return broker, active, relay
 
 
-def test_owner_relay_streams_sse_and_injects_control_plane_credential(tmp_path):
+@pytest.mark.parametrize("base_path", ["", "/v1"])
+def test_owner_relay_streams_sse_and_injects_control_plane_credential(tmp_path, base_path):
     with _upstream_server() as (server, received):
         policy = DeploymentInferencePolicy(
             provider="custom:deployment",
@@ -165,7 +166,7 @@ def test_owner_relay_streams_sse_and_injects_control_plane_credential(tmp_path):
             runtime_resolver=lambda: {
                 "provider": "custom:deployment",
                 "api_mode": "chat_completions",
-                "base_url": f"http://127.0.0.1:{server.server_port}",
+                "base_url": f"http://127.0.0.1:{server.server_port}{base_path}",
                 "api_key": "control-plane-secret",
             },
         )
@@ -186,6 +187,50 @@ def test_owner_relay_streams_sse_and_injects_control_plane_credential(tmp_path):
             assert upstream["path"] == "/v1/chat/completions"
             assert upstream["headers"]["Authorization"] == "Bearer control-plane-secret"
             assert "worker-marker" not in str(upstream["headers"])
+        finally:
+            broker.revoke(active)
+            relay.close()
+
+
+def test_owner_relay_preserves_upstream_prefix_for_anthropic_messages(tmp_path):
+    with _upstream_server() as (server, received):
+        policy = DeploymentInferencePolicy(
+            provider="custom:deployment",
+            model="claude-safe",
+            api_mode="anthropic_messages",
+            runtime_resolver=lambda: {
+                "provider": "custom:deployment",
+                "api_mode": "anthropic_messages",
+                "base_url": f"http://127.0.0.1:{server.server_port}/prefix/v1",
+                "api_key": "control-plane-secret",
+            },
+        )
+        broker, active, relay = _activate_relay(AuthorityStore(tmp_path / "control"), policy)
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                with client.stream(
+                    "POST",
+                    f"{relay.base_url}/messages",
+                    headers={
+                        "Authorization": "Bearer worker-marker",
+                        "x-api-key": "worker-marker",
+                    },
+                    json={
+                        "model": "claude-safe",
+                        "stream": True,
+                        "messages": [],
+                        "max_tokens": 1,
+                    },
+                ) as response:
+                    assert response.status_code == 200
+                    assert response.headers["content-type"] == "text/event-stream"
+                    assert b"".join(response.iter_raw()) == b"data: first\n\ndata: second\n\n"
+
+            upstream = received[0]
+            upstream_headers = {name.lower(): value for name, value in upstream["headers"].items()}
+            assert upstream["path"] == "/prefix/v1/messages"
+            assert upstream_headers["x-api-key"] == "control-plane-secret"
+            assert "worker-marker" not in str(upstream_headers)
         finally:
             broker.revoke(active)
             relay.close()
