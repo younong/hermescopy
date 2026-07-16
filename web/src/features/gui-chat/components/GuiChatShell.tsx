@@ -8,7 +8,8 @@ import { ChatSessionList } from "@/components/ChatSessionList";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useProfileScope } from "@/contexts/useProfileScope";
 import { useI18n } from "@/i18n";
-import type { GatewayEvent } from "@/lib/gatewayClient";
+import { JsonRpcGatewayError, type GatewayEvent } from "@/lib/gatewayClient";
+import { api, FetchJSONError } from "@/lib/api";
 import { dashboardAuthTransition } from "@/lib/dashboardAuthTransition";
 import { useDashboardAuthIdentity } from "@/lib/useDashboardAuthIdentity";
 import { cn } from "@/lib/utils";
@@ -36,6 +37,13 @@ export function GuiChatShell() {
   const pendingStreamEventsRef = useRef<GatewayEvent[]>([]);
   const streamFlushFrameRef = useRef<number | undefined>(undefined);
   const [newChatNonce, setNewChatNonce] = useState(0);
+  const [resumeResolutionNonce, setResumeResolutionNonce] = useState(0);
+  const [resumeTarget, setResumeTarget] = useState<ResumeTargetState>({
+    error: null,
+    requested: null,
+    sessionId: null,
+  });
+  const [resumeNotice, setResumeNotice] = useState<string | null>(null);
   const [sendScrollNonce, setSendScrollNonce] = useState(0);
   const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false);
   const { ownerKey, ready: authIdentityReady } = useDashboardAuthIdentity();
@@ -48,8 +56,13 @@ export function GuiChatShell() {
       : false,
   );
   const mobilePanelOpen = mobilePanelOpenRaw;
-  const activeSessionId = state.storedSessionId ?? resumeSessionId;
-  const terminalResumeId = state.storedSessionId ?? resumeSessionId;
+  const canonicalResumeSessionId =
+    resumeTarget.requested === resumeSessionId ? resumeTarget.sessionId : null;
+  const resumeResolutionError =
+    resumeTarget.requested === resumeSessionId ? resumeTarget.error : null;
+  const resumeResolutionPending = Boolean(resumeSessionId) && !canonicalResumeSessionId && !resumeResolutionError;
+  const activeSessionId = state.storedSessionId ?? canonicalResumeSessionId ?? resumeSessionId;
+  const terminalResumeId = state.storedSessionId ?? canonicalResumeSessionId ?? resumeSessionId;
   const forceBottomKey = `${activeSessionId ?? `new-${newChatNonce}`}:${sendScrollNonce}`;
   const closeMobilePanel = useCallback(() => setMobilePanelOpenRaw(false), []);
 
@@ -94,6 +107,8 @@ export function GuiChatShell() {
   );
 
   const startNewGuiChat = useCallback(() => {
+    setResumeNotice(null);
+    setResumeTarget({ error: null, requested: null, sessionId: null });
     setSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev);
@@ -105,7 +120,72 @@ export function GuiChatShell() {
     setNewChatNonce((n) => n + 1);
   }, [setSearchParams]);
 
+  useEffect(() => {
+    let cancelled = false;
+    if (!resumeSessionId) {
+      setResumeTarget((current) =>
+        current.requested === null && current.sessionId === null && current.error === null
+          ? current
+          : { error: null, requested: null, sessionId: null },
+      );
+      return;
+    }
+    if (mockMode) {
+      setResumeTarget((current) =>
+        current.requested === resumeSessionId && current.sessionId === resumeSessionId && current.error === null
+          ? current
+          : { error: null, requested: resumeSessionId, sessionId: resumeSessionId },
+      );
+      return;
+    }
+
+    setResumeNotice(null);
+    setResumeTarget({ error: null, requested: resumeSessionId, sessionId: null });
+    void api
+      .getSessionLatestDescendant(resumeSessionId)
+      .then(({ session_id }) => {
+        if (cancelled) return;
+        if (session_id !== resumeSessionId) {
+          setSearchParams(
+            (prev) => {
+              if (prev.get("resume") !== resumeSessionId) return prev;
+              const next = new URLSearchParams(prev);
+              next.set("resume", session_id);
+              return next;
+            },
+            { replace: true },
+          );
+        }
+        setResumeTarget({ error: null, requested: resumeSessionId, sessionId: session_id });
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        if (error instanceof FetchJSONError && error.status === 404) {
+          setResumeNotice("This session is no longer available. Started a new chat instead.");
+          setSearchParams(
+            (prev) => {
+              if (prev.get("resume") !== resumeSessionId) return prev;
+              const next = new URLSearchParams(prev);
+              next.delete("resume");
+              return next;
+            },
+            { replace: true },
+          );
+          return;
+        }
+        setResumeTarget({
+          error: error instanceof Error ? error.message : String(error),
+          requested: resumeSessionId,
+          sessionId: null,
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mockMode, resumeResolutionNonce, resumeSessionId, setSearchParams]);
+
   const connect = useCallback(() => {
+    let disposed = false;
     connectionRef.current?.close();
     if (streamFlushFrameRef.current !== undefined) {
       cancelAnimationFrame(streamFlushFrameRef.current);
@@ -115,7 +195,7 @@ export function GuiChatShell() {
     dispatch({ type: "reset" });
     const connection = mockMode
       ? connectMockGuiChat()
-      : connectGuiChat({ ownerKey, profile, resumeSessionId });
+      : connectGuiChat({ ownerKey, profile, resumeSessionId: canonicalResumeSessionId });
     connectionRef.current = connection;
     const offState = connection.client.onState((next) => {
       dispatch({ type: "connection", state: next });
@@ -123,9 +203,23 @@ export function GuiChatShell() {
     const offEvents = connection.client.onEvent(dispatchGatewayEvent);
     void connection
       .createOrResume()
-      .then((response) => dispatch({ type: "session.created", response }))
-      .catch((error: Error) => dispatch({ type: "error", message: error.message }));
+      .then((response) => {
+        if (!disposed) dispatch({ type: "session.created", response });
+      })
+      .catch((error: unknown) => {
+        if (disposed) return;
+        if (error instanceof JsonRpcGatewayError && error.code === 4007) {
+          startNewGuiChat();
+          setResumeNotice("This session is no longer available. Started a new chat instead.");
+          return;
+        }
+        dispatch({
+          type: "error",
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
     return () => {
+      disposed = true;
       offState();
       offEvents();
       if (streamFlushFrameRef.current !== undefined) {
@@ -138,12 +232,25 @@ export function GuiChatShell() {
         connectionRef.current = null;
       }
     };
-  }, [dispatchGatewayEvent, mockMode, ownerKey, profile, resumeSessionId]);
+  }, [
+    canonicalResumeSessionId,
+    dispatchGatewayEvent,
+    mockMode,
+    ownerKey,
+    profile,
+    startNewGuiChat,
+  ]);
 
   useEffect(() => {
-    if (!authIdentityReady) return;
+    if (!authIdentityReady || resumeResolutionPending || resumeResolutionError) return;
     return connect();
-  }, [authIdentityReady, connect, newChatNonce]);
+  }, [
+    authIdentityReady,
+    connect,
+    newChatNonce,
+    resumeResolutionError,
+    resumeResolutionPending,
+  ]);
 
   useEffect(() => {
     const mql = window.matchMedia("(max-width: 1023px)");
@@ -415,12 +522,35 @@ export function GuiChatShell() {
             <span className="ml-auto text-text-tertiary">
               {mockMode ? "mock structured events" : "/api/ws structured beta"}
             </span>
-            <Button ghost size="sm" className="h-7 px-2 text-xs" onClick={connect}>
+            <Button
+              ghost
+              size="sm"
+              className="h-7 px-2 text-xs"
+              onClick={() => {
+                if (resumeSessionId) {
+                  setResumeResolutionNonce((n) => n + 1);
+                  return;
+                }
+                void connect();
+              }}
+            >
               <RefreshCw className="h-3.5 w-3.5" />
               {mockMode ? "Replay" : t.common.retry}
             </Button>
           </div>
 
+          {resumeNotice ? (
+            <div className="flex shrink-0 items-start gap-2 border-b border-current/20 bg-background-alt px-3 py-2 text-sm text-text-secondary sm:px-5">
+              <AlertCircle className="mt-0.5 h-4 w-4" />
+              <span className="min-w-0 flex-1 whitespace-pre-wrap">{resumeNotice}</span>
+            </div>
+          ) : null}
+          {resumeResolutionError ? (
+            <div className="flex shrink-0 items-start gap-2 border-b border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive sm:px-5">
+              <AlertCircle className="mt-0.5 h-4 w-4" />
+              <span className="min-w-0 flex-1 whitespace-pre-wrap">{resumeResolutionError}</span>
+            </div>
+          ) : null}
           {state.error ? (
             <div className="flex shrink-0 items-start gap-2 border-b border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive sm:px-5">
               <AlertCircle className="mt-0.5 h-4 w-4" />
@@ -455,6 +585,12 @@ export function GuiChatShell() {
       </div>
     </div>
   );
+}
+
+interface ResumeTargetState {
+  error: string | null;
+  requested: string | null;
+  sessionId: string | null;
 }
 
 class AttachmentError extends Error {

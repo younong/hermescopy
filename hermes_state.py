@@ -2918,6 +2918,7 @@ class SessionDB:
         include_archived: bool = False,
         archived_only: bool = False,
         id_query: str = None,
+        recovery_scope: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -2948,6 +2949,13 @@ class SessionDB:
         """
         where_clauses = []
         params = []
+
+        scope_clause, scope_params = self._recovery_scope_clause(
+            recovery_scope, alias="s"
+        )
+        if scope_clause:
+            where_clauses.append(scope_clause.removeprefix(" AND "))
+            params.extend(scope_params)
 
         if not include_children:
             # Show root sessions and branch sessions, while still hiding
@@ -3012,6 +3020,7 @@ class SessionDB:
             # ended_at is written, while stale websocket siblings may satisfy
             # the timestamp test and hijack resume/list projection.
             outer_where = where_sql
+            chain_child_scope_clause = scope_clause.replace("s.", "child.")
             id_params: List[Any] = []
             if id_needle:
                 # Admit a surfaced row if its own id or any id in its forward
@@ -3045,6 +3054,7 @@ class SessionDB:
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
                       AND COALESCE(child.source, '') != 'tool'
+                      {chain_child_scope_clause}
                 ),
                 chain_max AS (
                     SELECT
@@ -3075,9 +3085,10 @@ class SessionDB:
                 ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
                 LIMIT ? OFFSET ?
             """
-            # WHERE params apply twice (CTE seed + outer select); the id filter
-            # only applies to the outer select.
-            params = params + params + id_params + [limit, offset]
+            # Root WHERE params apply to the CTE seed and outer select. The
+            # chain child predicate has its own historical/runtime scope params;
+            # the id filter applies only to the outer select.
+            params = params + scope_params + params + id_params + [limit, offset]
         else:
             query = f"""
                 SELECT s.*,
@@ -3123,11 +3134,15 @@ class SessionDB:
                 if s.get("end_reason") != "compression":
                     projected.append(s)
                     continue
-                tip_id = self.get_compression_tip(s["id"])
+                tip_id = self.get_compression_tip(
+                    s["id"], recovery_scope=recovery_scope
+                )
                 if tip_id == s["id"]:
                     projected.append(s)
                     continue
-                tip_row = self._get_session_rich_row(tip_id)
+                tip_row = self._get_session_rich_row(
+                    tip_id, recovery_scope=recovery_scope
+                )
                 if not tip_row:
                     projected.append(s)
                     continue
@@ -3210,12 +3225,17 @@ class SessionDB:
             runs.append(s)
         return runs
 
-    def _get_session_rich_row(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Fetch a single session with the same enriched columns as
-        ``list_sessions_rich`` (preview + last_active). Returns None if the
-        session doesn't exist.
-        """
-        query = """
+    def _get_session_rich_row(
+        self,
+        session_id: str,
+        *,
+        recovery_scope: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch a scoped enriched session row used for list projection."""
+        scope_clause, scope_params = self._recovery_scope_clause(
+            recovery_scope, alias="s"
+        )
+        query = f"""
             SELECT s.*,
                 COALESCE(
                     (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
@@ -3229,10 +3249,10 @@ class SessionDB:
                     s.started_at
                 ) AS last_active
             FROM sessions s
-            WHERE s.id = ?
+            WHERE s.id = ?{scope_clause}
         """
         with self._lock:
-            cursor = self._conn.execute(query, (session_id,))
+            cursor = self._conn.execute(query, (session_id, *scope_params))
             row = cursor.fetchone()
         if not row:
             return None
@@ -4768,6 +4788,7 @@ class SessionDB:
         archived_only: bool = False,
         exclude_children: bool = False,
         exclude_sources: List[str] = None,
+        recovery_scope: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Count sessions, optionally filtered by source.
 
@@ -4785,6 +4806,13 @@ class SessionDB:
         """
         where_clauses = []
         params = []
+
+        scope_clause, scope_params = self._recovery_scope_clause(
+            recovery_scope, alias="s"
+        )
+        if scope_clause:
+            where_clauses.append(scope_clause.removeprefix(" AND "))
+            params.extend(scope_params)
 
         if exclude_children:
             # Mirror list_sessions_rich's child-exclusion clause exactly so the

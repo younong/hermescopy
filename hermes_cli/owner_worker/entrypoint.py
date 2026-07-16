@@ -627,8 +627,11 @@ def create_app(
         _: None = Depends(_require_owner_token),
     ) -> dict[str, Any]:
         _reject_profile(profile)
+        from gateway.session import current_historical_resume_scope
+
         db = _open_db()
         try:
+            scope = current_historical_resume_scope()
             return session_api.list_sessions_payload(
                 db,
                 limit=limit,
@@ -639,6 +642,7 @@ def create_app(
                 source=source,
                 exclude_sources=exclude_sources,
                 cwd_prefix=cwd_prefix,
+                recovery_scope=(scope if socket_path is not None and scope is not None else None),
             )
         finally:
             db.close()

@@ -15,6 +15,7 @@
 
 import {
   JsonRpcGatewayClient,
+  JsonRpcGatewayError,
   buildHermesWebSocketUrl,
   type ConnectionState,
   type GatewayEvent,
@@ -23,6 +24,7 @@ import {
 
 import { HERMES_BASE_PATH, buildWsAuthParam } from "@/lib/api";
 
+export { JsonRpcGatewayError };
 export type { ConnectionState, GatewayEvent, GatewayEventName };
 
 export class GatewayClient extends JsonRpcGatewayClient {

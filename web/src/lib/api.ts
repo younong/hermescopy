@@ -101,6 +101,16 @@ export function withHermesAssetAuth(url: string): string {
   return `${absolute}${sep}token=${encodeURIComponent(token)}`;
 }
 
+export class FetchJSONError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "FetchJSONError";
+    this.status = status;
+  }
+}
+
 export async function fetchJSON<T>(
   url: string,
   init?: RequestInit,
@@ -196,7 +206,7 @@ export async function fetchJSON<T>(
   }
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
-    throw new Error(`${res.status}: ${text}`);
+    throw new FetchJSONError(res.status, `${res.status}: ${text}`);
   }
   return res.json();
 }

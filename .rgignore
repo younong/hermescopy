@@ -1,0 +1,48 @@
+# Dependencies and virtual environments
+.venv/
+venv/
+node_modules/
+
+# Caches
+__pycache__/
+.pytest_cache/
+.pytest-cache/
+.ruff_cache/
+
+# Local runtime and scratch output
+.hermes/
+.hermes-docker/
+.tmp/
+tmp/
+logs/
+data/
+testlogs/
+wandb/
+scripts/out/
+
+# Local Claude Code state; retain the checked-in release skill.
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/hermes-release/
+!.claude/skills/hermes-release/SKILL.md
+
+# Local package and browser-tooling artifacts.
+hermes_agent.egg-info/
+web/.playwright-cli/
+
+# Generated application assets and build output
+hermes_cli/web_dist/
+hermes_cli/tui_dist/
+ui-tui/dist/
+apps/desktop/build/
+apps/desktop/dist/
+apps/desktop/release/
+web/public/fonts/
+web/public/ds-assets/
+
+# Generated documentation indexes
+website/static/api/skills-index.json
+website/static/api/skills.json
+website/static/api/skills-meta.json
+website/static/api/automation-blueprints-index.json

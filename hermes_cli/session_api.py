@@ -27,6 +27,7 @@ def list_sessions_payload(
     exclude_sources: str | None = None,
     cwd_prefix: str | None = None,
     profile_name: str | None = None,
+    recovery_scope: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if archived not in ("exclude", "only", "include"):
         raise HTTPException(status_code=400, detail="archived must be one of: exclude, only, include")
@@ -46,6 +47,7 @@ def list_sessions_payload(
         include_archived=include_archived,
         archived_only=archived_only,
         order_by_last_active=order == "recent",
+        recovery_scope=recovery_scope,
     )
     total = db.session_count(
         source=source or None,
@@ -55,6 +57,7 @@ def list_sessions_payload(
         include_archived=include_archived,
         archived_only=archived_only,
         exclude_children=True,
+        recovery_scope=recovery_scope,
     )
     now = time.time()
     for session in sessions:
