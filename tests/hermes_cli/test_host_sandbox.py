@@ -105,6 +105,24 @@ def _binding(config):
     return binding, policy
 
 
+def test_host_policy_accepts_packaged_usr_lib64_mount(tmp_path):
+    _loaded_config, document, policy_path = _config(tmp_path)
+    runtime = Path(document["runtime_root"])
+    usr_lib64 = runtime / "toolchain" / "usr" / "lib64"
+    usr_lib64.mkdir(parents=True)
+    document["readonly_mounts"].append({
+        "source": str(usr_lib64),
+        "destination": "/usr/lib64",
+    })
+    _write_policy(document, policy_path)
+
+    config = load_host_sandbox_config(
+        policy_path, require_root_owner=False, platform_name="Linux", machine="x86_64"
+    )
+
+    assert config.readonly_mounts[-1].destination == PurePosixPath("/usr/lib64")
+
+
 def test_load_host_policy_validates_architecture_artifacts_mounts_and_modes(tmp_path):
     config, document, _policy_path = _config(tmp_path)
 

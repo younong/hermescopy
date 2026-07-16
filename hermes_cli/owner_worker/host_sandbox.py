@@ -159,6 +159,7 @@ def parse_host_sandbox_config(
         PurePosixPath("/lib"),
         PurePosixPath("/lib64"),
         PurePosixPath("/usr/lib"),
+        PurePosixPath("/usr/lib64"),
     }
     for item in mounts_raw:
         if not isinstance(item, Mapping) or set(item) != {"source", "destination"}:

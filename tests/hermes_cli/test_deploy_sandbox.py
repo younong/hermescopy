@@ -17,7 +17,7 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     source = DEPLOY.read_text(encoding="utf-8")
 
     assert 'runtimes_dir="$remote_root/runtimes/python"' in source
-    assert 'runtime_id="py311-${"${"}architecture}-${"${"}lock_hash}"' in source
+    assert 'runtime_id="py311-${"${"}architecture}-${"${"}lock_hash}-sandbox2"' in source
     assert 'venv="$shared/venv"' not in source
     assert "User=$service_user" in source
     assert "Group=$service_group" in source
@@ -30,6 +30,8 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert "uv python install \"$python_version\" --install-dir \"$runtime_tmp/python-base\" --no-bin" in source
     assert "uv sync --extra all --locked --no-editable --link-mode copy" in source
     assert 'resolved_python="$(readlink -f "$runtime_tmp/bin/python3")"' in source
+    assert 'ldd "$resolved_python"' in source
+    assert 'for destination in /bin /usr/bin /lib /lib64 /usr/lib /usr/lib64; do' in source
     assert 'runtime_tmp/toolchain' in source
     assert 'command_path="$(type -P "$command" || true)"' in source
     assert 'command_path="$(command -v "$command" || true)"' not in source

@@ -652,7 +652,7 @@ test -f "$release/ui-tui/dist/entry.js"
 lock_hash="$(sha256sum "$release/uv.lock" | cut -d ' ' -f1)"
 architecture="$(uname -m)"
 python_version="3.11"
-runtime_id="py311-${"${"}architecture}-${"${"}lock_hash}"
+runtime_id="py311-${"${"}architecture}-${"${"}lock_hash}-sandbox2"
 venv="$runtimes_dir/$runtime_id"
 
 if [ ! -x "$venv/bin/python3" ]; then
@@ -694,6 +694,13 @@ if [ ! -x "$venv/bin/python3" ]; then
     "$runtime_tmp"/*) ;;
     *) echo "Sandbox Python resolves outside the runtime" >&2; exit 1 ;;
   esac
+  resolved_python="$(readlink -f "$runtime_tmp/bin/python3")"
+  while read -r library; do
+    [ -n "$library" ] || continue
+    library_target="$runtime_tmp/toolchain$library"
+    mkdir -p "$(dirname "$library_target")"
+    cp -aL -- "$library" "$library_target"
+  done < <(ldd "$resolved_python" | sed -nE 's#.*=> (/[^ ]+).*#\1#p; s#^[[:space:]]*(/[^ ]+).*#\1#p')
   for command in bash sh ls pwd printf cat grep find; do
     command_path="$(type -P "$command" || true)"
     if [ -z "$command_path" ]; then
@@ -736,7 +743,7 @@ seccomp_digest="$(sha256sum "$release/deploy/sandbox/executor-x86_64.bpf" | cut 
 install -o root -g root -m 0444 "$release/deploy/sandbox/executor-x86_64.bpf" "$sandbox_seccomp"
 image_digest="$(printf '%s:%s' "$source_commit" "$runtime_id" | sha256sum | cut -d ' ' -f1)"
 readonly_mounts=''
-for destination in /bin /usr/bin /lib /lib64 /usr/lib; do
+for destination in /bin /usr/bin /lib /lib64 /usr/lib /usr/lib64; do
   source="$venv/toolchain$destination"
   [ -d "$source" ] || continue
   readonly_mounts="$readonly_mounts,{\"source\":\"$source\",\"destination\":\"$destination\"}"
