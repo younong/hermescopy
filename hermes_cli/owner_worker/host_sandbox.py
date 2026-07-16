@@ -199,7 +199,10 @@ def parse_host_sandbox_config(
         raise HostSandboxInvalid("sandbox Python executable is outside readonly mounts")
     relative_python = python_executable.relative_to(python_mount.destination)
     python_path = python_mount.source / Path(relative_python.as_posix())
-    resolved_python = _canonical(python_path, "host sandbox Python executable")
+    try:
+        resolved_python = python_path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise HostSandboxInvalid("host sandbox Python executable is unavailable") from exc
     if runtime not in resolved_python.parents:
         raise HostSandboxInvalid("host sandbox Python executable resolves outside runtime")
     python_status = resolved_python.stat()

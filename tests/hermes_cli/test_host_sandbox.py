@@ -117,6 +117,22 @@ def test_load_host_policy_validates_architecture_artifacts_mounts_and_modes(tmp_
     ]
 
 
+def test_host_policy_accepts_runtime_internal_python_symlink(tmp_path):
+    _loaded_config, document, policy_path = _config(tmp_path)
+    runtime = Path(document["runtime_root"])
+    target = runtime / "bin/python3.11"
+    (runtime / "bin/python3").unlink()
+    target.write_text("python")
+    target.chmod(0o755)
+    (runtime / "bin/python3").symlink_to("python3.11")
+
+    config = load_host_sandbox_config(
+        policy_path, require_root_owner=False, platform_name="Linux", machine="x86_64"
+    )
+
+    assert config.python_executable == PurePosixPath("/opt/hermes/python/bin/python3")
+
+
 def test_host_policy_rejects_unknown_schema_wrong_arch_root_ids_and_egress(tmp_path):
     config, document, policy_path = _config(tmp_path)
     del config
