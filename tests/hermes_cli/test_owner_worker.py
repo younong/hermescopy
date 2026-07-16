@@ -1722,6 +1722,145 @@ def test_worker_session_routes_require_owner_token(tmp_path, monkeypatch):
     assert client.get("/api/sessions", headers={"Authorization": f"Bearer {wrong}"}).status_code == 401
 
 
+def test_worker_skill_routes_are_capability_bound_and_owner_local(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
+    control_home = tmp_path / "control"
+    other_home = tmp_path / "other"
+    other_skill = other_home / "skills" / "other-only"
+    other_skill.mkdir(parents=True)
+    (other_skill / "SKILL.md").write_text(
+        "---\nname: other-only\ndescription: must not leak\n---\n",
+        encoding="utf-8",
+    )
+    owner_skill = owner_home / "skills" / "owner-skill"
+    owner_skill.mkdir(parents=True)
+    owner_content = "---\nname: owner-skill\ndescription: owner only\n---\n\n# Owner\n"
+    owner_skill.joinpath("SKILL.md").write_text(owner_content, encoding="utf-8")
+    owner_home.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_worker_skills")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+    from hermes_cli.owner_worker.entrypoint import create_app
+
+    app = create_app("ok1_worker_skills", owner_home)
+    client = TestClient(app)
+
+    def headers(path: str) -> dict[str, str]:
+        token = _capability_for(app, path=path, control_home=control_home)
+        return {"Authorization": f"Bearer {token}"}
+
+    assert client.get("/api/skills").status_code == 401
+    wrong_token = _capability_for(app, path="/api/sessions", control_home=control_home)
+    assert client.get(
+        "/api/skills",
+        headers={"Authorization": f"Bearer {wrong_token}"},
+    ).status_code == 401
+
+    listed = client.get("/api/skills", headers=headers("/api/skills"))
+    assert listed.status_code == 200
+    names = {skill["name"] for skill in listed.json()}
+    assert "owner-skill" in names
+    assert "other-only" not in names
+
+    content = client.get(
+        "/api/skills/content?name=owner-skill",
+        headers=headers("/api/skills/content"),
+    )
+    assert content.status_code == 200
+    assert content.json()["content"] == owner_content
+    assert str(other_home) not in content.text
+
+    rejected = client.get(
+        "/api/skills?profile=other",
+        headers=headers("/api/skills"),
+    )
+    assert rejected.status_code == 400
+
+
+def test_worker_skill_writes_mutate_only_owner_home(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    import yaml
+
+    owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
+    control_home = tmp_path / "control"
+    other_home = tmp_path / "other"
+    other_home.mkdir()
+    other_home.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    owner_home.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    existing = owner_home / "skills" / "owner-skill"
+    existing.mkdir(parents=True)
+    existing.joinpath("SKILL.md").write_text(
+        "---\nname: owner-skill\ndescription: before\n---\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_worker_skills")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+    from hermes_cli.owner_worker.entrypoint import create_app
+
+    app = create_app("ok1_worker_skills", owner_home)
+    client = TestClient(app)
+    # Direct app construction reuses this test process; production workers set
+    # HERMES_HOME before these owner-sensitive modules are ever imported.
+    import tools.skill_manager_tool as skill_manager_tool
+    import tools.skills_tool as skills_tool
+
+    monkeypatch.setattr(skills_tool, "HERMES_HOME", owner_home)
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", owner_home / "skills")
+    monkeypatch.setattr(skill_manager_tool, "HERMES_HOME", owner_home)
+    monkeypatch.setattr(skill_manager_tool, "SKILLS_DIR", owner_home / "skills")
+
+    def request(method: str, path: str, payload: dict):
+        token = _capability_for(app, path=path, control_home=control_home)
+        return client.request(
+            method,
+            path,
+            json=payload,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        )
+
+    toggled = request(
+        "PUT",
+        "/api/skills/toggle",
+        {"name": "owner-skill", "enabled": False},
+    )
+    assert toggled.status_code == 200
+    owner_config = yaml.safe_load(owner_home.joinpath("config.yaml").read_text()) or {}
+    assert "owner-skill" in owner_config.get("skills", {}).get("disabled", [])
+    assert yaml.safe_load(other_home.joinpath("config.yaml").read_text()) == {}
+
+    new_content = "---\nname: new-skill\ndescription: created\n---\n\n# New\n"
+    created = request(
+        "POST",
+        "/api/skills",
+        {"name": "new-skill", "content": new_content},
+    )
+    assert created.status_code == 200, created.text
+    assert owner_home.joinpath("skills/new-skill/SKILL.md").read_text() == new_content
+    assert not other_home.joinpath("skills/new-skill").exists()
+
+    updated_content = "---\nname: owner-skill\ndescription: after\n---\n\n# Updated\n"
+    updated = request(
+        "PUT",
+        "/api/skills/content",
+        {"name": "owner-skill", "content": updated_content},
+    )
+    assert updated.status_code == 200, updated.text
+    assert existing.joinpath("SKILL.md").read_text() == updated_content
+
+    rejected = request(
+        "POST",
+        "/api/skills",
+        {"name": "blocked", "content": new_content, "profile": "other"},
+    )
+    assert rejected.status_code == 400
+    assert not owner_home.joinpath("skills/blocked").exists()
+
+
 def test_worker_managed_files_are_descriptor_scoped_to_its_owner(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
     from hermes_cli.owner_worker.entrypoint import create_app

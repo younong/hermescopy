@@ -273,6 +273,9 @@ def test_gated_require_token_routes_reject_cookie_session_in_owner_mode(
         ("/api/config", True),
         ("/api/dashboard/font", True),
         ("/api/dashboard/plugins", True),
+        ("/api/skills", True),
+        ("/api/skills/content", True),
+        ("/api/skills/hub/search", False),
         ("/api/sessions", True),
         ("/api/sessions/abc123/messages", True),
         ("/api/sessions/abc123/export", True),
@@ -302,12 +305,33 @@ def test_authenticated_api_availability_requires_explicit_owner_worker_routes(pa
         ("PUT", "/api/dashboard/font"),
         ("GET", "/api/dashboard/plugins/rescan"),
         ("POST", "/api/dashboard/plugins/example/visibility"),
+        ("DELETE", "/api/skills"),
+        ("GET", "/api/skills/toggle"),
+        ("POST", "/api/skills/content"),
+        ("GET", "/api/skills/export"),
+        ("GET", "/api/skills/hub/search"),
     ],
 )
 def test_authenticated_owner_worker_routes_are_method_and_path_exact(method, path):
     from hermes_cli.dashboard_auth.api_availability import authenticated_owner_worker_api_allowed
 
     assert authenticated_owner_worker_api_allowed(path, method=method) is False
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/api/skills"),
+        ("POST", "/api/skills"),
+        ("GET", "/api/skills/content"),
+        ("PUT", "/api/skills/content"),
+        ("PUT", "/api/skills/toggle"),
+    ],
+)
+def test_authenticated_skill_routes_are_explicit_owner_worker_routes(method, path):
+    from hermes_cli.dashboard_auth.api_availability import authenticated_owner_worker_api_allowed
+
+    assert authenticated_owner_worker_api_allowed(path, method=method) is True
 
 
 def test_login_unknown_provider_returns_404(gated_app):

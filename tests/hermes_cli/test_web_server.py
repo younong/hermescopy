@@ -5414,6 +5414,120 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
             assert json.loads(captured["content"]) == payload
 
     @pytest.mark.parametrize(
+        ("request_path", "worker_path"),
+        [
+            ("/api/skills?profile=default", "/api/skills"),
+            (
+                "/api/skills/content?name=owner-skill&profile=default",
+                "/api/skills/content?name=owner-skill",
+            ),
+        ],
+    )
+    def test_authenticated_skill_reads_proxy_without_control_plane_skill_access(
+        self, monkeypatch, request_path, worker_path
+    ):
+        import contextlib
+        import httpx
+        import hermes_cli.owner_worker.client as owner_client
+        import hermes_cli.web_server as web_server
+
+        captured = {}
+
+        @contextlib.contextmanager
+        def fail_profile_scope(*args, **kwargs):
+            raise AssertionError("authenticated skill reads must not access Control Plane profiles")
+            yield
+
+        def fake_request(self, method, path, *, lease, headers=None, content=None):
+            captured.update({"method": method, "path": path, "owner_key": lease.owner_key})
+            return httpx.Response(200, json=[])
+
+        monkeypatch.setattr(web_server, "_profile_scope", fail_profile_scope)
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fake_request)
+
+        response = self.client.get(request_path, headers={"X-Forwarded-Prefix": "/hermes"})
+
+        assert response.status_code == 200
+        assert captured == {
+            "method": "GET",
+            "path": worker_path,
+            "owner_key": self.supervisor.owners[0].owner_key,
+        }
+
+    @pytest.mark.parametrize(
+        ("method", "path", "payload"),
+        [
+            ("PUT", "/api/skills/toggle", {"name": "owner-skill", "enabled": False, "profile": "default"}),
+            (
+                "POST",
+                "/api/skills",
+                {"name": "new-skill", "content": "---\\nname: new-skill\\ndescription: test\\n---\\n", "profile": "default"},
+            ),
+            (
+                "PUT",
+                "/api/skills/content",
+                {"name": "owner-skill", "content": "---\\nname: owner-skill\\ndescription: updated\\n---\\n", "profile": "default"},
+            ),
+        ],
+    )
+    def test_authenticated_skill_writes_proxy_with_body_unchanged(
+        self, monkeypatch, method, path, payload
+    ):
+        import contextlib
+        import httpx
+        import hermes_cli.owner_worker.client as owner_client
+        import hermes_cli.web_server as web_server
+
+        captured = {}
+
+        @contextlib.contextmanager
+        def fail_profile_scope(*args, **kwargs):
+            raise AssertionError("authenticated skill writes must not access Control Plane profiles")
+            yield
+
+        def fake_request(self, request_method, worker_path, *, lease, headers=None, content=None):
+            captured.update({
+                "method": request_method,
+                "path": worker_path,
+                "owner_key": lease.owner_key,
+                "content": json.loads(content),
+            })
+            return httpx.Response(200, json={"success": True})
+
+        monkeypatch.setattr(web_server, "_profile_scope", fail_profile_scope)
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fake_request)
+
+        response = self.client.request(method, path, json=payload)
+
+        assert response.status_code == 200
+        assert captured == {
+            "method": method,
+            "path": path,
+            "owner_key": self.supervisor.owners[0].owner_key,
+            "content": payload,
+        }
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/api/skills?profile=other",
+            "/api/skills/content?name=owner-skill&profile=other",
+        ],
+    )
+    def test_authenticated_skill_reads_reject_legacy_profiles_before_proxy(self, monkeypatch, path):
+        import hermes_cli.owner_worker.client as owner_client
+
+        def fail_request(*args, **kwargs):
+            raise AssertionError("must not proxy arbitrary profile selection")
+
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fail_request)
+
+        response = self.client.get(path)
+
+        assert response.status_code == 400
+        assert not self.supervisor.owners
+
+    @pytest.mark.parametrize(
         ("method", "path", "payload", "expected"),
         [
             ("GET", "/api/sessions?profile=local-profile", None, {"sessions": [], "total": 0, "limit": 20, "offset": 0}),
