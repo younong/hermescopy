@@ -547,6 +547,19 @@ def _resolve_chat_argv(
             os.environ["HERMES_TUI_DIR"] = old_tui_dir
 
     env = os.environ.copy()
+    # The terminal child talks only through the authenticated Gateway bridge.
+    # It must not inherit deployment-default metadata intended for the owner
+    # worker's local inference resolver, even though those fields are non-secret.
+    for key in (
+        "HERMES_DEPLOYMENT_INFERENCE_PROVIDER",
+        "HERMES_DEPLOYMENT_INFERENCE_MODEL",
+        "HERMES_DEPLOYMENT_INFERENCE_API_MODE",
+        "HERMES_DEPLOYMENT_INFERENCE_POLICY_ID",
+        "HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS",
+        "HERMES_DEPLOYMENT_INFERENCE_RELAY_FD",
+        "HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL",
+    ):
+        env.pop(key, None)
     try:
         from hermes_cli.config import apply_terminal_config_to_env
 

@@ -30,6 +30,19 @@ rg -n "session_detail_payload|resolve_resume_session_id" \
   hermes_cli/session_api.py tests/hermes_state/test_resolve_resume_session_id.py
 ```
 
+## Choose a Work Path
+
+- **Fast:** the target file and closest focused test are known, the change is
+  local, and no Strict trigger in `AGENTS.md` applies.
+- **Standard:** the default; use the ownership map and focused-search workflow
+  above, expanding into one adjacent subsystem only when necessary.
+- **Strict:** follow the matching ownership row, read the relevant reference
+  heading, and use the real-path validation policy in `AGENTS.md`.
+
+Escalate to Strict before editing when work reaches owner-worker, session/resume,
+gateway/approval/security, profiles or config propagation, remote I/O, or another
+client surface.
+
 ## High-Frequency Ownership Map
 
 | Change area | Start with | Focused validation |
@@ -58,8 +71,9 @@ Use the canonical test runner rather than direct `pytest`:
 scripts/run_tests.sh tests/path/to/affected_test.py
 ```
 
-Start with the narrowest affected test file. Expand according to the existing
-integration guidance in `AGENTS.md` for configuration propagation, security
-boundaries, session state, file/network I/O, and gateway transport. For frontend
-changes, run the applicable workspace typecheck and build described in
+Fast work normally stops at the narrowest affected test file. Standard work
+expands only across the directly affected boundary. Strict work follows the
+real-path integration guidance in `AGENTS.md` for configuration propagation,
+security boundaries, session state, file/network I/O, and gateway transport. For
+frontend changes, run the applicable workspace typecheck and build described in
 `AGENTS.md`.

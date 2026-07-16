@@ -45,6 +45,13 @@ OWNER_ENV_KEYS: tuple[str, ...] = (
     "HERMES_OWNER_WORKER_CONTROL_WS_BASE",
     "HERMES_SANDBOX_DEPLOYMENT_POLICY",
     "HERMES_DISABLE_LAZY_INSTALLS",
+    "HERMES_DEPLOYMENT_INFERENCE_PROVIDER",
+    "HERMES_DEPLOYMENT_INFERENCE_MODEL",
+    "HERMES_DEPLOYMENT_INFERENCE_API_MODE",
+    "HERMES_DEPLOYMENT_INFERENCE_POLICY_ID",
+    "HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS",
+    "HERMES_DEPLOYMENT_INFERENCE_RELAY_FD",
+    "HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL",
 )
 
 FORBIDDEN_OWNER_WORKER_ENV_KEYS: tuple[str, ...] = (
@@ -147,6 +154,7 @@ def owner_worker_env_for(
     capability_issuer: str = "",
     capability_public_key: str = "",
     capability_retained_public_keys: str = "",
+    deployment_inference_descriptor: object | None = None,
 ) -> dict[str, str]:
     """Return the canonical owner-worker environment values."""
     home = Path(owner_home).expanduser().resolve()
@@ -188,6 +196,18 @@ def owner_worker_env_for(
         env["HERMES_OWNER_WORKER_CAPABILITY_ISSUER"] = str(capability_issuer)
         env["HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY"] = str(capability_public_key)
         env["HERMES_OWNER_WORKER_CAPABILITY_RETAINED_PUBLIC_KEYS"] = str(capability_retained_public_keys or "{}")
+    if deployment_inference_descriptor is not None:
+        from hermes_cli.deployment_inference import DeploymentInferenceDescriptor
+
+        if not isinstance(deployment_inference_descriptor, DeploymentInferenceDescriptor):
+            raise ValueError("deployment inference descriptor is invalid")
+        env.update({
+            "HERMES_DEPLOYMENT_INFERENCE_PROVIDER": deployment_inference_descriptor.provider,
+            "HERMES_DEPLOYMENT_INFERENCE_MODEL": deployment_inference_descriptor.model,
+            "HERMES_DEPLOYMENT_INFERENCE_API_MODE": deployment_inference_descriptor.api_mode,
+            "HERMES_DEPLOYMENT_INFERENCE_POLICY_ID": deployment_inference_descriptor.policy_id,
+            "HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS": ",".join(deployment_inference_descriptor.allowed_models),
+        })
     return env
 
 

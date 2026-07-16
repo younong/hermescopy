@@ -35,6 +35,7 @@ from hermes_cli.config import (
     get_compatible_custom_providers,
     load_config,
     normalize_extra_headers,
+    read_raw_config,
 )
 from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, env_int
@@ -1503,6 +1504,81 @@ def _resolve_explicit_runtime(
     return None
 
 
+def _explicit_owner_model_selection() -> dict[str, Any]:
+    """Return only ``config.yaml`` model fields actually chosen by this owner.
+
+    ``load_config`` merges defaults, which must never make an unconfigured
+    Dashboard owner look as though they chose a provider or model.
+    """
+    try:
+        raw_config = read_raw_config()
+    except Exception:
+        return {}
+    model_cfg = raw_config.get("model") if isinstance(raw_config, dict) else None
+    if isinstance(model_cfg, dict):
+        return {
+            key: model_cfg[key]
+            for key in ("provider", "default", "model", "base_url", "api_mode")
+            if str(model_cfg.get(key) or "").strip()
+        }
+    if isinstance(model_cfg, str) and model_cfg.strip():
+        return {"default": model_cfg.strip()}
+    return {}
+
+
+def resolve_deployment_inference_runtime(
+    *,
+    requested: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+    target_model: Optional[str] = None,
+) -> Dict[str, Any] | None:
+    """Return the safe relay runtime when selection matches deployment policy.
+
+    This helper runs only in an authenticated owner worker.  It intentionally
+    never calls the Control Plane resolver and never exposes an upstream URL or
+    credential.  A request or raw owner config that selects any incompatible
+    provider, endpoint, API mode, or model is left to normal resolution.
+    """
+    from hermes_cli.deployment_inference import deployment_descriptor_from_environment
+    from hermes_cli.owner_runtime import is_owner_worker_env
+
+    if not is_owner_worker_env():
+        return None
+    descriptor = deployment_descriptor_from_environment()
+    if descriptor is None:
+        return None
+    raw_owner = _explicit_owner_model_selection()
+    # A deliberate owner config has always owned its credentials and transport.
+    # Do not override it merely because its provider/model happens to match the
+    # deployment policy; relay fallback is for otherwise blank owner homes.
+    if raw_owner:
+        return None
+    requested_provider = str(requested or "").strip().lower()
+    configured_provider = str(raw_owner.get("provider") or "").strip().lower()
+    selected_provider = requested_provider or configured_provider or descriptor.provider
+    selected_model = str(
+        target_model or raw_owner.get("default") or raw_owner.get("model") or descriptor.model
+    ).strip()
+    selected_base_url = str(explicit_base_url or raw_owner.get("base_url") or "").strip()
+    selected_api_mode = str(raw_owner.get("api_mode") or "").strip()
+    if selected_provider != descriptor.provider.lower():
+        return None
+    if selected_base_url or (selected_api_mode and selected_api_mode != descriptor.api_mode):
+        return None
+    if not descriptor.allows_model(selected_model):
+        return None
+    relay_base_url = os.environ.get("HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL", "").strip()
+    if not relay_base_url:
+        return None
+    parsed_relay = urlparse(relay_base_url)
+    if parsed_relay.scheme != "http" or parsed_relay.hostname not in {"127.0.0.1", "::1", "localhost"}:
+        return None
+    runtime = descriptor.relay_runtime(model=selected_model)
+    runtime["base_url"] = relay_base_url.rstrip("/")
+    runtime["requested_provider"] = requested_provider or descriptor.provider
+    return runtime
+
+
 def resolve_runtime_provider(
     *,
     requested: Optional[str] = None,
@@ -1520,6 +1596,16 @@ def resolve_runtime_provider(
     persisted default. Other callers can leave it None to preserve existing
     behavior (api_mode derived from config).
     """
+    deployment_runtime = None
+    if not explicit_api_key:
+        deployment_runtime = resolve_deployment_inference_runtime(
+            requested=requested,
+            explicit_base_url=explicit_base_url,
+            target_model=target_model,
+        )
+    if deployment_runtime is not None:
+        return deployment_runtime
+
     requested_provider = resolve_requested_provider(requested)
 
     if requested_provider == "moa":

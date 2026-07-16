@@ -28,6 +28,18 @@ reviewing any change:
   high. Most new capability should arrive as a CLI command + skill, a
   service-gated tool, or a plugin — not as core surface.
 
+## How to Use This Reference
+
+This is on-demand detailed guidance, not a startup document. Enter through a
+focused search for the relevant heading, then read that section and its immediate
+dependencies. Read the full reference only for genuinely cross-cutting
+architecture or migration work. For Strict work, follow the relevant section
+identified by `AGENTS.md` and `CLAUDE.md` before editing.
+
+This developer-navigation rule does not permit pagination or partial loading of
+instructional content exposed to the product agent; those materials must remain
+fully readable.
+
 ## Contribution Rubric — What We Want / What We Don't
 
 This is the project's intent layer. Use it two ways:

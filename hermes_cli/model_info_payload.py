@@ -13,7 +13,11 @@ EMPTY_MODEL_INFO: dict[str, Any] = {
 }
 
 
-def model_info_payload_from_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
+def model_info_payload_from_config(
+    cfg: Mapping[str, Any],
+    *,
+    deployment_descriptor: Any | None = None,
+) -> dict[str, Any]:
     """Return the /api/model/info response shape for a loaded config mapping."""
     model_cfg = cfg.get("model", "")
 
@@ -28,6 +32,11 @@ def model_info_payload_from_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
         base_url = ""
         config_ctx = None
 
+    selection_source = ""
+    if not model_name and deployment_descriptor is not None:
+        model_name = str(getattr(deployment_descriptor, "model", "") or "")
+        provider = str(getattr(deployment_descriptor, "provider", "") or "")
+        selection_source = "deployment"
     if not model_name:
         return dict(EMPTY_MODEL_INFO, provider=provider)
 
@@ -66,7 +75,7 @@ def model_info_payload_from_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
     except Exception:
         pass
 
-    return {
+    payload = {
         "model": model_name,
         "provider": provider,
         "auto_context_length": auto_ctx,
@@ -74,3 +83,6 @@ def model_info_payload_from_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
         "effective_context_length": effective_ctx,
         "capabilities": caps,
     }
+    if selection_source:
+        payload["selection_source"] = selection_source
+    return payload

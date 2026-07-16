@@ -31,6 +31,8 @@ from hermes_cli.dashboard_auth.authority import (
     WorkerLeaseState,
 )
 from hermes_cli.controlled_roots import ControlledRoots, ExpectedType, RootKind, controlled_roots_for
+from hermes_cli.deployment_inference import DeploymentInferencePolicy
+from hermes_cli.owner_worker.inference_relay import DeploymentInferenceBroker
 from hermes_cli.owner_runtime import (
     OwnerWorkerRuntimePaths,
     ensure_owner_runtime_dirs,
@@ -153,6 +155,7 @@ class OwnerWorkerSupervisor:
         control_ws_base: str | None = None,
         authority_store_factory: Callable[[Path], AuthorityStore] = AuthorityStore,
         generation_bridge_revoker: Callable[[OwnerWorkerAuthorityLease], None] | None = None,
+        deployment_inference_policy: DeploymentInferencePolicy | None = None,
     ) -> None:
         self.global_home = Path(global_home).resolve() if global_home else get_hermes_home().resolve()
         self.control_home = Path(control_home).resolve() if control_home else self.global_home / "control-plane"
@@ -181,6 +184,15 @@ class OwnerWorkerSupervisor:
         self.control_ws_base = (control_ws_base or os.environ.get("HERMES_OWNER_WORKER_CONTROL_WS_BASE", "")).strip()
         self.authority_store = authority_store_factory(self.control_home)
         self.generation_bridge_revoker = generation_bridge_revoker
+        self.deployment_inference_policy = deployment_inference_policy
+        self.deployment_inference_broker = (
+            DeploymentInferenceBroker(
+                policy=deployment_inference_policy,
+                authority_store=self.authority_store,
+            )
+            if deployment_inference_policy is not None
+            else None
+        )
         self._handles: dict[str, OwnerWorkerHandle] = {}
         # A detached handle remains counted until its synchronous bridge revocation
         # and process teardown complete. This prevents duplicate retirement, new
@@ -312,6 +324,10 @@ class OwnerWorkerSupervisor:
         generation = claim.generation
         socket_path = self.socket_path_for(owner, generation.worker_generation)
         env = self._env_for(owner, generation, claim.lease)
+        relay_fd = None
+        if self.deployment_inference_broker is not None:
+            relay_fd = self.deployment_inference_broker.register(claim.lease)
+            env["HERMES_DEPLOYMENT_INFERENCE_RELAY_FD"] = str(relay_fd)
         runtime_paths = owner_worker_runtime_paths(
             owner_home=owner_home,
             worker_generation=generation.worker_generation,
@@ -360,11 +376,18 @@ class OwnerWorkerSupervisor:
                     stderr=stderr_handle,
                     close_fds=True,
                     preexec_fn=_set_descriptor_cwd,
-                    pass_fds=(inherited_cwd_fd,),
+                    pass_fds=tuple(
+                        fd for fd in (inherited_cwd_fd, relay_fd) if fd is not None
+                    ),
                 )
             finally:
                 os.close(inherited_cwd_fd)
+                if relay_fd is not None:
+                    os.close(relay_fd)
+                    relay_fd = None
         except Exception as exc:
+            if self.deployment_inference_broker is not None:
+                self.deployment_inference_broker.revoke(claim.lease)
             self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, claim.lease)
             try:
                 self.authority_store.transition_worker_lease(
@@ -402,6 +425,8 @@ class OwnerWorkerSupervisor:
                 generation_state=WorkerGenerationState.ACTIVE,
             )
         except Exception as exc:
+            if self.deployment_inference_broker is not None:
+                self.deployment_inference_broker.revoke(claim.lease)
             self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, claim.lease)
             try:
                 self.authority_store.transition_worker_lease(
@@ -439,6 +464,12 @@ class OwnerWorkerSupervisor:
             pid=int(health["pid"]),
             last_health=health,
         )
+        if self.deployment_inference_broker is not None:
+            try:
+                self.deployment_inference_broker.activate(active_lease)
+            except Exception:
+                self.deployment_inference_broker.revoke(active_lease)
+                raise
         with self._lock:
             self._handles[owner_key] = handle
         self._audit_generation(AuthorityAuditReason.GENERATION_ACTIVE, active_lease)
@@ -535,6 +566,8 @@ class OwnerWorkerSupervisor:
             ]
         for owner_key, handle in reserved:
             self._teardown_terminated_handle(owner_key, handle)
+        if self.deployment_inference_broker is not None:
+            self.deployment_inference_broker.close()
 
     def _admit_start(
         self, owner_key: str, owner_home: Path, *, now: float
@@ -706,8 +739,11 @@ class OwnerWorkerSupervisor:
             draining = self._drain_handle(handle)
             if draining is not None:
                 self._audit_generation(AuthorityAuditReason.GENERATION_DRAINING, draining)
+            retired_lease = draining or self._lease_for_handle(handle)
+            if self.deployment_inference_broker is not None:
+                self.deployment_inference_broker.revoke(retired_lease)
             if self.generation_bridge_revoker is not None:
-                self.generation_bridge_revoker(draining or self._lease_for_handle(handle))
+                self.generation_bridge_revoker(retired_lease)
 
             process_exited = handle.process.poll() is not None
             if process_exited:
@@ -888,6 +924,11 @@ class OwnerWorkerSupervisor:
                 capability_retained_public_keys=verifier[
                     "HERMES_OWNER_WORKER_CAPABILITY_RETAINED_PUBLIC_KEYS"
                 ],
+                deployment_inference_descriptor=(
+                    self.deployment_inference_policy.descriptor()
+                    if self.deployment_inference_policy is not None
+                    else None
+                ),
             )
         )
         # The child deliberately starts in the owner's workspace, so Python

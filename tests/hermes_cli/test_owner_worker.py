@@ -502,6 +502,48 @@ def test_supervisor_spawns_the_canonical_session_owner_context(tmp_path, monkeyp
     assert argv[argv.index("--worker-id") + 1] == child_env["HERMES_WORKER_ID"]
 
 
+def test_supervisor_passes_only_safe_deployment_descriptor(tmp_path):
+    from hermes_cli.deployment_inference import DeploymentInferencePolicy
+
+    owner = _Owner("ok1_deployment", tmp_path / "owner")
+    spawned: list[dict] = []
+
+    def fake_process_factory(*args, **kwargs):
+        spawned.append({"args": args, "kwargs": kwargs})
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    policy = DeploymentInferencePolicy(
+        provider="custom:deployment",
+        model="gpt-safe",
+        api_mode="chat_completions",
+        runtime_resolver=lambda: {
+            "provider": "custom:deployment",
+            "api_mode": "chat_completions",
+            "base_url": "https://provider.example.test/v1",
+            "api_key": "control-plane-secret",
+        },
+    )
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        deployment_inference_policy=policy,
+    )
+
+    supervisor.get_or_start(owner)
+
+    child_env = spawned[0]["kwargs"]["env"]
+    assert child_env["HERMES_DEPLOYMENT_INFERENCE_PROVIDER"] == "custom:deployment"
+    assert child_env["HERMES_DEPLOYMENT_INFERENCE_MODEL"] == "gpt-safe"
+    assert "control-plane-secret" not in child_env.values()
+    assert "https://provider.example.test/v1" not in child_env.values()
+    assert "HERMES_DEPLOYMENT_INFERENCE_RELAY_FD" in child_env
+    supervisor.shutdown()
+
+
 def test_supervisor_reclaims_conclusively_absent_orphan_lease(tmp_path):
     owner = _Owner("ok1_orphan", tmp_path / "owner")
     spawned: list[dict] = []

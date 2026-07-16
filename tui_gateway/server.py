@@ -2271,6 +2271,14 @@ def _resolve_model() -> str:
         return str(m.get("default", "") or "").strip()
     if isinstance(m, str) and m:
         return m.strip()
+    try:
+        from hermes_cli.deployment_inference import deployment_descriptor_from_environment
+
+        descriptor = deployment_descriptor_from_environment()
+        if descriptor is not None:
+            return descriptor.model
+    except Exception:
+        pass
     return "anthropic/claude-sonnet-4"
 
 

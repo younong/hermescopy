@@ -15270,7 +15270,17 @@ def start_server(
     app.state.auth_required = require_auth or public_bind_requires_auth
     app.state.owner_worker_supervisor = None
     if app.state.auth_required:
+        from hermes_cli.deployment_inference import (
+            DeploymentInferencePolicyInvalid,
+            load_deployment_inference_policy,
+        )
         from hermes_cli.owner_worker import OwnerWorkerSupervisor
+
+        policy_spec = os.environ.get("HERMES_DEPLOYMENT_INFERENCE_POLICY", "")
+        try:
+            deployment_inference_policy = load_deployment_inference_policy(policy_spec)
+        except DeploymentInferencePolicyInvalid as exc:
+            raise RuntimeError("deployment inference policy is invalid") from exc
 
         worker_scheme = "wss" if os.environ.get("HERMES_DASHBOARD_EXTERNAL_SCHEME", "").lower() == "https" else "ws"
         worker_host = os.environ.get("HERMES_DASHBOARD_EXTERNAL_HOST", "").strip() or host
@@ -15297,6 +15307,7 @@ def start_server(
             control_home=global_home / "control-plane",
             control_ws_base=f"{worker_scheme}://{worker_netloc}",
             generation_bridge_revoker=revoke_generation_bridges,
+            deployment_inference_policy=deployment_inference_policy,
         )
 
     # ``--insecure`` no longer disables the auth gate (June 2026 hardening:

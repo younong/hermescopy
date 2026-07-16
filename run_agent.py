@@ -1133,11 +1133,16 @@ class AIAgent:
 
     def _current_main_runtime(self) -> Dict[str, str]:
         """Return the live main runtime for session-scoped auxiliary routing."""
+        api_key = getattr(self, "api_key", "") or ""
+        if api_key == "deployment-inference-relay":
+            # This marker only authorizes the owner-local relay and is not a
+            # credential.  Do not serialize it into session or auxiliary state.
+            api_key = ""
         return {
             "model": getattr(self, "model", "") or "",
             "provider": getattr(self, "provider", "") or "",
             "base_url": getattr(self, "base_url", "") or "",
-            "api_key": getattr(self, "api_key", "") or "",
+            "api_key": api_key,
             "api_mode": getattr(self, "api_mode", "") or "",
         }
 

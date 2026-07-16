@@ -231,9 +231,23 @@ def create_app(
 
     @asynccontextmanager
     async def _lifespan(_: FastAPI):
+        relay = None
+        relay_fd = os.environ.pop("HERMES_DEPLOYMENT_INFERENCE_RELAY_FD", "").strip()
+        if relay_fd:
+            try:
+                from hermes_cli.owner_worker.inference_relay import OwnerInferenceRelay
+
+                relay = OwnerInferenceRelay(int(relay_fd))
+                relay.start()
+                os.environ["HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL"] = relay.base_url
+            except Exception as exc:
+                raise RuntimeError("deployment inference relay startup failed") from exc
         try:
             yield
         finally:
+            os.environ.pop("HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL", None)
+            if relay is not None:
+                relay.close()
             supervisor = getattr(app.state, "tool_executor_supervisor", None)
             if supervisor is not None:
                 supervisor.stop_generation()
@@ -718,9 +732,13 @@ def create_app(
     def get_model_info(profile: str | None = None, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(profile)
         from hermes_cli.config import load_config
+        from hermes_cli.deployment_inference import deployment_descriptor_from_environment
         from hermes_cli.model_info_payload import model_info_payload_from_config
 
-        return model_info_payload_from_config(load_config())
+        return model_info_payload_from_config(
+            load_config(),
+            deployment_descriptor=deployment_descriptor_from_environment(),
+        )
 
     @app.post("/api/sessions/prune")
     def prune_sessions(body: SessionPrune, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
