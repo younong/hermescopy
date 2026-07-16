@@ -24,6 +24,7 @@ from hermes_cli.tool_executor_runtime.env import (
     EXECUTOR_BOOTSTRAP_FD,
     EXECUTOR_EGRESS_PROFILE,
     EXECUTOR_RESPONSE_FD,
+    EXECUTOR_START_GATE_FD,
     EXECUTOR_WORKSPACE_FD,
     ExecutorEnvironmentInvalid,
     validate_executor_environment,
@@ -32,6 +33,18 @@ from hermes_cli.tool_executor_runtime.env import (
 
 class ExecutorRuntimeInvalid(RuntimeError):
     """The isolated executor bootstrap did not meet its admission contract."""
+
+
+def _await_start_gate(fd: int) -> None:
+    """Block until the parent attests this exact sandbox and releases it."""
+    try:
+        with os.fdopen(fd, "rb", closefd=True) as stream:
+            value = stream.read(1)
+            trailing = stream.read(1)
+    except OSError as exc:
+        raise ExecutorRuntimeInvalid("executor start gate is unavailable") from exc
+    if value != b"1" or trailing:
+        raise ExecutorRuntimeInvalid("executor start gate was not released")
 
 
 def _read_bootstrap(fd: int) -> dict[str, Any]:
@@ -100,6 +113,10 @@ def run_once(environment: dict[str, str] | None = None) -> int:
         workspace_fd = int(env[EXECUTOR_WORKSPACE_FD])
         bootstrap_fd = int(env[EXECUTOR_BOOTSTRAP_FD])
         response_fd = int(env[EXECUTOR_RESPONSE_FD])
+        start_gate_fd = int(env[EXECUTOR_START_GATE_FD])
+        # Do not read tool-controlled bootstrap data or import tools until the
+        # parent has attested the exact post-spawn sandbox process.
+        _await_start_gate(start_gate_fd)
         # Bubblewrap mounted this already-authorized descriptor at a fixed
         # internal path. Verify that binding before importing tool modules.
         _admit_workspace_mount(workspace_fd)

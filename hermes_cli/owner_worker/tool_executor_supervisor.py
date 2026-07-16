@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import select
 import stat
 import subprocess
 import threading
@@ -62,11 +63,23 @@ class _LiveInvocation:
     verification_record: SandboxVerificationRecord | None = None
 
 
+_NETWORK_TOOL_NAMES = frozenset({
+    "web_search", "web_extract", "browser_navigate", "browser_snapshot",
+    "browser_click", "browser_type", "browser_scroll", "browser_back",
+    "browser_press", "browser_get_images", "browser_vision", "browser_console",
+    "image_generation", "text_to_speech", "speech_to_text",
+})
+
+
 @dataclass(frozen=True)
 class ExecutorEgressPolicy:
     """Owner-side tool-name selection with no child-controlled inputs."""
 
-    by_tool_name: Mapping[str, EgressProfile | str] = field(default_factory=dict)
+    by_tool_name: Mapping[str, EgressProfile | str] = field(
+        default_factory=lambda: {
+            name: EgressProfile.TOOL_PUBLIC for name in _NETWORK_TOOL_NAMES
+        }
+    )
     default: EgressProfile = EgressProfile.TOOL_NONE
 
     def __post_init__(self) -> None:
@@ -131,17 +144,31 @@ class ToolExecutorSupervisor:
                 raise SandboxVerificationInvalid("sandbox deployment policy cannot be mixed with individual sources")
             self.deployment_policy = deployment_policy
             self.readonly_global_mount_roots = deployment_policy.readonly_global_roots
+            self.readonly_mounts = deployment_policy.readonly_mounts
+            self.python_executable = deployment_policy.python_executable
+            self.bubblewrap_binary = deployment_policy.bubblewrap_binary
             self.owner_root = deployment_policy.owner_root
+            self.allowed_egress_profiles = deployment_policy.allowed_egress_profiles
             self.sandbox_verification_source = deployment_policy.verification_source
+            self.sandbox_post_spawn_verification_source = deployment_policy.post_spawn_verification_source
             self.sandbox_verification_policy = deployment_policy.verification_policy
             self.sandbox_syscall_filter_source = deployment_policy.syscall_filter_source
+            root_tmpfs_bytes = deployment_policy.root_tmpfs_bytes
+            executor_tmpfs_bytes = deployment_policy.executor_tmpfs_bytes
         else:
             # Retained for direct unit construction. Authenticated worker startup
             # supplies a deployment policy and never accepts these defaults.
             self.deployment_policy = None
             self.readonly_global_mount_roots = readonly_global_mount_roots or default_readonly_global_mount_roots()
+            self.readonly_mounts = ()
+            self.python_executable = None
+            self.bubblewrap_binary = None
             self.owner_root = Path(owner_root).resolve() if owner_root else None
+            self.allowed_egress_profiles = (
+                EgressProfile.TOOL_NONE, EgressProfile.TOOL_PUBLIC, EgressProfile.PROTECTED_TARGET,
+            )
             self.sandbox_verification_source = sandbox_verification_source
+            self.sandbox_post_spawn_verification_source = None
             self.sandbox_verification_policy = sandbox_verification_policy
             self.sandbox_syscall_filter_source = sandbox_syscall_filter_source
         self.root_tmpfs_bytes = root_tmpfs_bytes
@@ -202,6 +229,8 @@ class ToolExecutorSupervisor:
         identity = self.identity_for(task_id=task_id, session_id=session_id)
         try:
             egress_profile = self.egress_policy.select(function_name)
+            if egress_profile not in self.allowed_egress_profiles:
+                raise ExecutorIdentityInvalid("authenticated network egress is not configured")
         except ExecutorIdentityInvalid:
             self._report(AuthorityAuditEvent.EGRESS_REJECTED, AuthorityAuditReason.EGRESS_PROFILE_REJECTED, identity)
             raise
@@ -289,10 +318,14 @@ class ToolExecutorSupervisor:
     def _sandbox_mount_policy(self, binding: SandboxLaunchBinding) -> SandboxMountPolicy:
         return SandboxMountPolicy(
             binding=binding,
-            readonly_global_roots=tuple(self.readonly_global_mount_roots),
+            readonly_global_roots=(
+                () if self.readonly_mounts else tuple(self.readonly_global_mount_roots)
+            ),
             workspace_root=self.workspace_context.roots.get(RootKind.WORKSPACE).canonical_path,
             control_home=self.control_home,
             owner_root=self.owner_root,
+            readonly_mounts=tuple(self.readonly_mounts),
+            python_executable=self.python_executable,
             root_tmpfs_bytes=self.root_tmpfs_bytes,
             executor_tmpfs_bytes=self.executor_tmpfs_bytes,
         )
@@ -333,6 +366,69 @@ class ToolExecutorSupervisor:
         except Exception as exc:
             raise SandboxVerificationInvalid("trusted sandbox syscall filter is unavailable") from exc
 
+    @staticmethod
+    def _bubblewrap_child_pid(info_fd: int, *, timeout: float = 5.0) -> int:
+        """Read Bubblewrap's exact host-visible sandbox PID from ``--info-fd``."""
+        deadline = time.monotonic() + timeout
+        raw = bytearray()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SandboxVerificationInvalid("Bubblewrap sandbox identity timed out")
+            ready, _, _ = select.select([info_fd], [], [], remaining)
+            if not ready:
+                raise SandboxVerificationInvalid("Bubblewrap sandbox identity timed out")
+            chunk = os.read(info_fd, 4096)
+            if not chunk:
+                break
+            raw.extend(chunk)
+            if len(raw) > 65536:
+                raise SandboxVerificationInvalid("Bubblewrap sandbox identity is invalid")
+            try:
+                text = raw.decode("utf-8")
+                value, offset = json.JSONDecoder().raw_decode(text)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if text[offset:].strip():
+                raise SandboxVerificationInvalid("Bubblewrap sandbox identity is invalid")
+            break
+        try:
+            text = raw.decode("utf-8")
+            value, offset = json.JSONDecoder().raw_decode(text)
+            if text[offset:].strip():
+                raise ValueError
+            pid = value["child-pid"]
+        except (UnicodeDecodeError, TypeError, KeyError, ValueError, json.JSONDecodeError) as exc:
+            raise SandboxVerificationInvalid("Bubblewrap sandbox identity is invalid") from exc
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise SandboxVerificationInvalid("Bubblewrap sandbox identity is invalid")
+        return pid
+
+    def _post_spawn_verification(
+        self,
+        binding: SandboxLaunchBinding,
+        mount_policy: SandboxMountPolicy,
+        invocation: ExecutorInvocation,
+        sandbox_pid: int,
+    ) -> SandboxVerificationRecord:
+        source = self.sandbox_post_spawn_verification_source
+        if source is None:
+            raise SandboxVerificationInvalid("trusted post-spawn sandbox verification is required")
+        try:
+            record = source(binding, mount_policy, invocation, sandbox_pid)
+        except SandboxVerificationInvalid:
+            raise
+        except Exception as exc:
+            raise SandboxVerificationInvalid("trusted post-spawn sandbox verification is unavailable") from exc
+        return validate_sandbox_verification_record(
+            record,
+            binding=binding,
+            mount_policy=mount_policy,
+            egress_profile=invocation.egress_profile,
+            policy=self.sandbox_verification_policy,
+            now=int(self._clock()),
+        )
+
     def _workspace_fd(self) -> int:
         try:
             return self.workspace_context.roots.open_relative(
@@ -351,7 +447,11 @@ class ToolExecutorSupervisor:
         identity = invocation.identity
         binding = self._sandbox_binding(identity)
         mount_policy = self._sandbox_mount_policy(binding)
-        verification_record = self._require_verified_sandbox(binding, mount_policy, invocation)
+        verification_record = (
+            None
+            if self.sandbox_post_spawn_verification_source is not None
+            else self._require_verified_sandbox(binding, mount_policy, invocation)
+        )
         syscall_filter = self._require_syscall_filter(binding)
         inherited_security_fd = -1
         try:
@@ -374,7 +474,9 @@ class ToolExecutorSupervisor:
             runtime_home.chmod(stat.S_IRWXU)
 
         workspace_fd = inherited_workspace_fd = request_read = request_write = response_read = response_write = -1
+        gate_read = gate_write = info_read = info_write = -1
         process: Any | None = None
+        spec: BubblewrapLaunchSpec | None = None
         completed = False
         live_key = (identity.stable_key, invocation.invocation_id)
         try:
@@ -382,7 +484,9 @@ class ToolExecutorSupervisor:
             inherited_workspace_fd = os.dup(workspace_fd)
             request_read, request_write = os.pipe()
             response_read, response_write = os.pipe()
-            for fd in (inherited_workspace_fd, request_read, response_write):
+            gate_read, gate_write = os.pipe()
+            info_read, info_write = os.pipe()
+            for fd in (inherited_workspace_fd, request_read, response_write, gate_read, info_write):
                 os.set_inheritable(fd, True)
             environment = build_executor_environment(
                 identity,
@@ -390,6 +494,7 @@ class ToolExecutorSupervisor:
                 workspace_fd=inherited_workspace_fd,
                 bootstrap_fd=request_read,
                 response_fd=response_write,
+                start_gate_fd=gate_read,
                 egress_profile=invocation.egress_profile,
             )
             spec = self.sandbox_builder(
@@ -403,6 +508,8 @@ class ToolExecutorSupervisor:
                     syscall_filter.syscall_policy_id,
                     syscall_filter.syscall_policy_digest,
                 ),
+                bubblewrap_binary=(str(self.bubblewrap_binary) if self.bubblewrap_binary else None),
+                info_fd=info_write,
             )
             with self._lock:
                 if identity.stable_key in self._revoked:
@@ -415,16 +522,42 @@ class ToolExecutorSupervisor:
                     stderr=subprocess.DEVNULL,
                     close_fds=True,
                     pass_fds=tuple(dict.fromkeys((
-                        inherited_workspace_fd, request_read, response_write, inherited_security_fd, *spec.inherited_security_fds,
+                        inherited_workspace_fd, request_read, response_write, gate_read,
+                        info_write, inherited_security_fd, *spec.inherited_security_fds,
                     ))),
                     start_new_session=True,
                 )
                 self._live[live_key] = _LiveInvocation(
                     identity, invocation.invocation_id, process, binding, verification_record
                 )
-            os.close(request_read)
-            os.close(response_write)
-            request_read = response_write = -1
+            for fd in (request_read, response_write, gate_read, info_write):
+                os.close(fd)
+            request_read = response_write = gate_read = info_write = -1
+            for fd in spec.inherited_security_fds:
+                if fd != inherited_security_fd:
+                    os.close(fd)
+            spec = BubblewrapLaunchSpec(
+                spec.argv, spec.bubblewrap_path, spec.runtime_home,
+                spec.binding, (inherited_security_fd,),
+            )
+            sandbox_pid = self._bubblewrap_child_pid(info_read)
+            os.close(info_read)
+            info_read = -1
+            if self.sandbox_post_spawn_verification_source is not None:
+                verification_record = self._post_spawn_verification(
+                    binding, mount_policy, invocation, sandbox_pid
+                )
+            with self._lock:
+                if identity.stable_key in self._revoked:
+                    raise PermissionError("executor generation is revoked")
+                live = self._live.get(live_key)
+                if live is None or live.process is not process:
+                    raise PermissionError("executor generation is revoked")
+                live.verification_record = verification_record
+            with os.fdopen(gate_write, "wb", closefd=True) as stream:
+                stream.write(b"1")
+                stream.flush()
+            gate_write = -1
             with os.fdopen(request_write, "wb", closefd=True) as stream:
                 stream.write(json.dumps(invocation.to_payload(), ensure_ascii=False).encode("utf-8"))
                 stream.flush()
@@ -447,7 +580,17 @@ class ToolExecutorSupervisor:
                     self._terminate(process)
                 with self._lock:
                     self._live.pop(live_key, None)
-            for fd in (workspace_fd, inherited_workspace_fd, request_read, request_write, response_read, response_write, inherited_security_fd):
+            extra_spec_fds = (
+                () if spec is None else tuple(
+                    fd for fd in spec.inherited_security_fds
+                    if fd != inherited_security_fd
+                )
+            )
+            for fd in (
+                workspace_fd, inherited_workspace_fd, request_read, request_write,
+                response_read, response_write, gate_read, gate_write,
+                info_read, info_write, inherited_security_fd, *extra_spec_fds,
+            ):
                 if isinstance(fd, int) and fd >= 0:
                     try:
                         os.close(fd)

@@ -16,9 +16,8 @@ import re
 import shutil
 import stat
 import subprocess
-import sys
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Mapping, Sequence
 
 from hermes_cli.owner_worker.executor_identity import EgressProfile, ExecutorIdentity, ExecutorIdentityInvalid, parse_egress_profile
@@ -118,6 +117,24 @@ def validate_sandbox_syscall_filter(
 
 
 @dataclass(frozen=True)
+class SandboxReadonlyMount:
+    """One exact host source exposed at one read-only sandbox destination."""
+
+    source: Path
+    destination: PurePosixPath
+
+    def __post_init__(self) -> None:
+        source = _canonical(self.source, field="sandbox readonly mount source")
+        destination = PurePosixPath(str(self.destination))
+        if not destination.is_absolute() or destination == PurePosixPath("/") or ".." in destination.parts:
+            raise ExecutorIsolationUnavailable("sandbox readonly mount destination is invalid")
+        if any("\x00" in part for part in destination.parts):
+            raise ExecutorIsolationUnavailable("sandbox readonly mount destination is invalid")
+        object.__setattr__(self, "source", source)
+        object.__setattr__(self, "destination", destination)
+
+
+@dataclass(frozen=True)
 class SandboxDeploymentPolicy:
     """Operator-owned inputs required to admit authenticated executors.
 
@@ -132,26 +149,66 @@ class SandboxDeploymentPolicy:
     syscall_filter_source: Callable[["SandboxLaunchBinding", SandboxSecurityPolicy], SandboxSyscallFilter | None]
     readonly_global_roots: tuple[Path, ...]
     owner_root: Path
+    readonly_mounts: tuple[SandboxReadonlyMount, ...] = ()
+    python_executable: PurePosixPath | str | None = None
+    bubblewrap_binary: Path | None = None
+    post_spawn_verification_source: Callable[["SandboxLaunchBinding", "SandboxMountPolicy", object, int], "SandboxVerificationRecord | None"] | None = None
+    allowed_egress_profiles: tuple[EgressProfile | str, ...] = (
+        EgressProfile.TOOL_NONE, EgressProfile.TOOL_PUBLIC, EgressProfile.PROTECTED_TARGET,
+    )
+    root_tmpfs_bytes: int = 64 << 20
+    executor_tmpfs_bytes: int = 32 << 20
 
     def __post_init__(self) -> None:
         if not isinstance(self.verification_policy, SandboxVerificationPolicy):
             raise SandboxVerificationInvalid("sandbox deployment verification policy is required")
         if not callable(self.verification_source) or not callable(self.syscall_filter_source):
             raise SandboxVerificationInvalid("sandbox deployment sources are required")
+        if self.post_spawn_verification_source is not None and not callable(self.post_spawn_verification_source):
+            raise SandboxVerificationInvalid("sandbox post-spawn verification source is invalid")
+        try:
+            allowed_egress_profiles = tuple(
+                parse_egress_profile(value, executor_admissible=True)
+                for value in self.allowed_egress_profiles
+            )
+        except ExecutorIdentityInvalid as exc:
+            raise SandboxVerificationInvalid("sandbox allowed egress profiles are invalid") from exc
+        if not allowed_egress_profiles or len(set(allowed_egress_profiles)) != len(allowed_egress_profiles):
+            raise SandboxVerificationInvalid("sandbox allowed egress profiles are invalid")
+        for value, field_name in (
+            (self.root_tmpfs_bytes, "root tmpfs"),
+            (self.executor_tmpfs_bytes, "executor tmpfs"),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or not 0 < value <= _MAX_TMPFS_BYTES:
+                raise SandboxVerificationInvalid(f"sandbox deployment {field_name} size is invalid")
         owner_root = _canonical(self.owner_root, field="deployment owner root")
         if not owner_root.is_dir():
             raise ExecutorIsolationUnavailable("deployment owner root must be a directory")
-        roots: list[Path] = []
-        for root in self.readonly_global_roots:
-            resolved = _canonical(root, field="deployment readonly global mount root")
-            if not resolved.is_dir() or _overlaps(resolved, owner_root):
+        mounts = _normalized_readonly_mounts(self.readonly_mounts, self.readonly_global_roots)
+        for mount in mounts:
+            if not mount.source.is_dir() or _overlaps(mount.source, owner_root):
                 raise ExecutorIsolationUnavailable("deployment readonly root overlaps owner root")
-            if resolved not in roots:
-                roots.append(resolved)
-        if not roots:
-            raise ExecutorIsolationUnavailable("deployment readonly global mount roots are required")
+        python_executable = (
+            PurePosixPath(str(self.python_executable))
+            if self.python_executable is not None
+            else _compatible_python_destination(mounts)
+        )
+        if not python_executable.is_absolute() or ".." in python_executable.parts or "\x00" in str(python_executable):
+            raise SandboxVerificationInvalid("sandbox Python executable is invalid")
+        if self.readonly_mounts and not any(
+            _posix_contains(mount.destination, python_executable) for mount in mounts
+        ):
+            raise SandboxVerificationInvalid("sandbox Python executable is outside readonly mounts")
+        bubblewrap_binary = (
+            _canonical(self.bubblewrap_binary, field="deployment Bubblewrap executable")
+            if self.bubblewrap_binary is not None else None
+        )
         object.__setattr__(self, "owner_root", owner_root)
-        object.__setattr__(self, "readonly_global_roots", tuple(roots))
+        object.__setattr__(self, "readonly_mounts", mounts)
+        object.__setattr__(self, "readonly_global_roots", tuple(mount.source for mount in mounts))
+        object.__setattr__(self, "python_executable", python_executable)
+        object.__setattr__(self, "bubblewrap_binary", bubblewrap_binary)
+        object.__setattr__(self, "allowed_egress_profiles", allowed_egress_profiles)
 
 
 def load_sandbox_deployment_policy(spec: str) -> SandboxDeploymentPolicy:
@@ -234,6 +291,8 @@ class SandboxMountPolicy:
     workspace_root: Path | None
     control_home: Path | None
     owner_root: Path | None = None
+    readonly_mounts: tuple[SandboxReadonlyMount, ...] = ()
+    python_executable: PurePosixPath | str | None = None
     root_tmpfs_bytes: int = 64 << 20
     executor_tmpfs_bytes: int = 32 << 20
     mount_policy_id: str = field(init=False)
@@ -256,33 +315,55 @@ class SandboxMountPolicy:
             protected.append(workspace)
         if control:
             protected.append(control)
+        mounts = _normalized_readonly_mounts(self.readonly_mounts, self.readonly_global_roots)
         forbidden = tuple(Path(value) for value in ("/", "/proc", "/sys", "/dev", "/run", "/var/run"))
-        roots: list[Path] = []
-        for root in self.readonly_global_roots:
-            requested = Path(root)
+        destinations: list[PurePosixPath] = []
+        for mount in mounts:
+            requested = mount.source
+            original_requests = tuple(Path(root) for root in self.readonly_global_roots)
+            if any(root in forbidden for root in original_requests):
+                raise ExecutorIsolationUnavailable("readonly global mount root is too broad")
             if requested == Path("/") or any(
                 requested == item or item in requested.parents or requested in item.parents
                 for item in forbidden
                 if item != Path("/")
             ):
                 raise ExecutorIsolationUnavailable("readonly global mount root is too broad")
-            resolved = _canonical(root, field="readonly global mount root")
             if (
-                not resolved.is_dir()
-                or any(_overlaps(resolved, item) for item in protected)
+                not mount.source.is_dir()
+                or any(_overlaps(mount.source, item) for item in protected)
             ):
                 raise ExecutorIsolationUnavailable("readonly global mount root overlaps protected owner data")
-            if resolved not in roots:
-                roots.append(resolved)
-        if not roots:
-            raise ExecutorIsolationUnavailable("readonly global mount roots are required")
-        object.__setattr__(self, "readonly_global_roots", tuple(roots))
+            if any(_posix_overlaps(mount.destination, item) for item in destinations):
+                raise ExecutorIsolationUnavailable("sandbox readonly mount destinations overlap")
+            if _reserved_destination(mount.destination):
+                raise ExecutorIsolationUnavailable("sandbox readonly mount destination is reserved")
+            destinations.append(mount.destination)
+        python_executable = (
+            PurePosixPath(str(self.python_executable))
+            if self.python_executable is not None
+            else _compatible_python_destination(mounts)
+        )
+        if not python_executable.is_absolute() or ".." in python_executable.parts or "\x00" in str(python_executable):
+            raise ExecutorIsolationUnavailable("sandbox Python executable is invalid")
+        explicit_mounts = bool(self.readonly_mounts)
+        if explicit_mounts and not any(
+            _posix_contains(mount.destination, python_executable) for mount in mounts
+        ):
+            raise ExecutorIsolationUnavailable("sandbox Python executable is outside readonly mounts")
+        object.__setattr__(self, "readonly_mounts", mounts)
+        object.__setattr__(self, "readonly_global_roots", tuple(mount.source for mount in mounts))
+        object.__setattr__(self, "python_executable", python_executable)
         object.__setattr__(self, "workspace_root", workspace)
         object.__setattr__(self, "control_home", control)
         object.__setattr__(self, "owner_root", owner_root)
         manifest = {
             "owner_runtime": str(self.binding.runtime_home),
-            "globals": [str(root) for root in roots],
+            "globals": [
+                {"source": str(mount.source), "destination": str(mount.destination)}
+                for mount in mounts
+            ],
+            "python_executable": str(python_executable),
             "workspace": self.binding.workspace_mount,
             "runtime": self.binding.runtime_mount,
             "tmp": self.binding.tmp_mount,
@@ -436,13 +517,51 @@ def _overlaps(first: Path, second: Path) -> bool:
     return first == second or first in second.parents or second in first.parents
 
 
+def _posix_contains(root: PurePosixPath, path: PurePosixPath) -> bool:
+    return root == path or root in path.parents
+
+
+def _posix_overlaps(first: PurePosixPath, second: PurePosixPath) -> bool:
+    return _posix_contains(first, second) or _posix_contains(second, first)
+
+
+def _reserved_destination(destination: PurePosixPath) -> bool:
+    reserved = tuple(PurePosixPath(value) for value in ("/proc", "/dev", "/workspace", "/executor"))
+    return any(_posix_overlaps(destination, item) for item in reserved)
+
+
+def _normalized_readonly_mounts(
+    mounts: Sequence[SandboxReadonlyMount], roots: Sequence[str | Path]
+) -> tuple[SandboxReadonlyMount, ...]:
+    if mounts and roots:
+        raise ExecutorIsolationUnavailable("sandbox readonly mounts cannot be mixed with legacy roots")
+    normalized = tuple(mounts) if mounts else tuple(
+        SandboxReadonlyMount(Path(root), PurePosixPath(str(_canonical(root, field="readonly global mount root"))))
+        for root in roots
+    )
+    if not normalized or any(not isinstance(mount, SandboxReadonlyMount) for mount in normalized):
+        raise ExecutorIsolationUnavailable("sandbox readonly mounts are required")
+    if len({(mount.source, mount.destination) for mount in normalized}) != len(normalized):
+        raise ExecutorIsolationUnavailable("sandbox readonly mounts must be unique")
+    return normalized
+
+
+def _compatible_python_destination(mounts: Sequence[SandboxReadonlyMount]) -> PurePosixPath:
+    """Compatibility inference for legacy callers; production policy is explicit."""
+    executable = Path(os.path.realpath(os.environ.get("PYTHON", os.sys.executable)))
+    for mount in mounts:
+        try:
+            relative = executable.relative_to(mount.source)
+        except ValueError:
+            continue
+        return mount.destination / PurePosixPath(relative.as_posix())
+    return PurePosixPath(str(executable))
+
+
 def default_readonly_global_mount_roots() -> tuple[Path, ...]:
-    """Return deployment-local interpreter/application roots, never host root."""
-    # Production installs are normally importable from the interpreter prefix;
-    # source/editable installs additionally need the trusted application root.
-    # It is subsequently rejected if it overlaps any owner/control/workspace root.
+    """Return deployment-local interpreter/application roots for test compatibility."""
     application_root = Path(__file__).resolve().parents[2]
-    candidates = (Path(sys.prefix), Path(sys.base_prefix), application_root)
+    candidates = (Path(os.sys.prefix), Path(os.sys.base_prefix), application_root)
     result: list[Path] = []
     for candidate in candidates:
         resolved = _canonical(candidate, field="executor runtime dependency root")
@@ -483,10 +602,13 @@ def _require_bubblewrap_support(binary: str, *, runner: Callable[..., object]) -
     # exact --cap-drop ALL contract prohibit the latter; host evidence separately
     # attests the resulting no-new-privileges state. Do not mistake --new-session
     # (a session-management flag) for an NNP control.
-    required = ("--bind-fd", "--size", "--uid", "--gid", "--cap-drop", "--seccomp")
+    required = (
+        "--bind-fd", "--ro-bind-fd", "--size", "--uid", "--gid", "--cap-drop",
+        "--seccomp", "--remount-ro", "--info-fd",
+    )
     if getattr(result, "returncode", 1) != 0 or any(option not in output for option in required):
         raise ExecutorIsolationUnavailable(
-            "Bubblewrap does not support required --bind-fd/--size/--uid/--gid/--cap-drop/--seccomp isolation"
+            "Bubblewrap does not support required --bind-fd/--ro-bind-fd/--size/--uid/--gid/--cap-drop/--seccomp isolation"
         )
 
 
@@ -556,12 +678,15 @@ def build_bubblewrap_launch_spec(
     which: Callable[[str], str | None] = shutil.which,
     runner: Callable[..., object] = subprocess.run,
     python_executable: str | Path | None = None,
+    info_fd: int | None = None,
 ) -> BubblewrapLaunchSpec:
     """Build a private namespace launch command or fail before child startup."""
     if (platform_name or platform.system()).lower() != "linux":
         raise ExecutorIsolationUnavailable("authenticated executor isolation requires Linux Bubblewrap")
     if not isinstance(workspace_fd, int) or workspace_fd < 0:
         raise ExecutorIsolationUnavailable("workspace descriptor is invalid")
+    if info_fd is not None and (not isinstance(info_fd, int) or info_fd < 0):
+        raise ExecutorIsolationUnavailable("Bubblewrap info descriptor is invalid")
 
     if not isinstance(mount_policy, SandboxMountPolicy) or mount_policy.binding != binding:
         raise ExecutorIsolationUnavailable("sandbox mount policy does not match launch binding")
@@ -581,7 +706,9 @@ def build_bubblewrap_launch_spec(
     bubblewrap = _resolve_bubblewrap(bubblewrap_binary, which=which)
     _require_bubblewrap_support(bubblewrap, runner=runner)
     runtime = binding.runtime_home
-    dependency_roots = mount_policy.readonly_global_roots
+    readonly_mounts = mount_policy.readonly_mounts
+    if python_executable is not None and PurePosixPath(str(python_executable)) != mount_policy.python_executable:
+        raise ExecutorIsolationUnavailable("sandbox Python executable does not match mount policy")
 
     argv: list[str] = [
         bubblewrap,
@@ -594,6 +721,7 @@ def build_bubblewrap_launch_spec(
         "--gid", str(security_policy.gid),
         "--cap-drop", "ALL",
         "--seccomp", str(syscall_filter.fd),
+        *(("--info-fd", str(info_fd)) if info_fd is not None else ()),
         "--size", str(mount_policy.root_tmpfs_bytes),
         "--tmpfs", "/",
         "--dev", "/dev",
@@ -603,20 +731,37 @@ def build_bubblewrap_launch_spec(
     for key, value in sorted((str(key), str(value)) for key, value in environment.items()):
         argv.extend(("--setenv", key, value))
     sandbox_runtime = Path("/executor")
-    for directory in _sandbox_destination_dirs((*dependency_roots, sandbox_runtime)):
+    destinations = tuple(Path(str(mount.destination)) for mount in readonly_mounts)
+    for directory in _sandbox_destination_dirs((*destinations, sandbox_runtime)):
         argv.extend(("--dir", str(directory)))
-    for root in dependency_roots:
-        argv.extend(("--ro-bind", str(root), str(root)))
+    mount_fds: list[int] = []
+    try:
+        for mount in readonly_mounts:
+            mount_fd = os.open(
+                mount.source,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+            )
+            os.set_inheritable(mount_fd, True)
+            mount_fds.append(mount_fd)
+            argv.extend(("--ro-bind-fd", str(mount_fd), str(mount.destination)))
+    except Exception:
+        for mount_fd in mount_fds:
+            os.close(mount_fd)
+        raise
     # `--bind-fd` consumes only the descriptor passed through Popen.pass_fds;
     # the workspace host path is never an argv or environment authority input.
     argv.extend((
+        "--remount-ro", "/",
         "--bind-fd", str(workspace_fd), "/workspace",
         "--bind", str(runtime), "/executor",
         "--size", str(mount_policy.executor_tmpfs_bytes),
         "--tmpfs", "/executor/tmp",
         "--chdir", "/workspace",
         "--",
-        str(Path(python_executable or sys.executable).resolve()),
+        str(mount_policy.python_executable),
         "-m", "hermes_cli.tool_executor_runtime.entrypoint",
     ))
-    return BubblewrapLaunchSpec(tuple(argv), bubblewrap, runtime, binding, (syscall_filter.fd,))
+    return BubblewrapLaunchSpec(
+        tuple(argv), bubblewrap, runtime, binding,
+        (syscall_filter.fd, *mount_fds),
+    )

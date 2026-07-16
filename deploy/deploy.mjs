@@ -439,17 +439,64 @@ shared="$remote_root/shared"
 env_file="$shared/.env"
 hermes_home="$shared/.hermes"
 runner="$shared/hermes-service-runner.sh"
+runtimes_dir="$remote_root/runtimes/python"
+sandbox_dir="/etc/hermes"
+sandbox_policy="$sandbox_dir/executor-sandbox.json"
+sandbox_seccomp="$sandbox_dir/executor-x86_64.bpf"
+owner_root="$hermes_home/users"
+service_user="hermes"
+service_group="hermes"
 old_current_target=""
 new_current_target=""
 release_target=""
+rollback_dir=""
+deployment_committed="0"
+services_touched="0"
 
 gateway_unit="/etc/systemd/system/hermes-gateway.service"
 dashboard_unit="/etc/systemd/system/hermes-dashboard.service"
 
+backup_deployment_state() {
+  rollback_dir="$(mktemp -d "$tmp_dir/hermes-rollback.XXXXXX")"
+  for path in "$gateway_unit" "$dashboard_unit" "$runner" "$sandbox_policy" "$sandbox_seccomp"; do
+    if [ -e "$path" ]; then
+      cp -a -- "$path" "$rollback_dir/$(printf '%s' "$path" | sed 's#/#_#g')"
+    fi
+  done
+}
+
+restore_deployment_state() {
+  local path backup
+  for path in "$gateway_unit" "$dashboard_unit" "$runner" "$sandbox_policy" "$sandbox_seccomp"; do
+    backup="$rollback_dir/$(printf '%s' "$path" | sed 's#/#_#g')"
+    if [ -e "$backup" ]; then
+      cp -a -- "$backup" "$path"
+    else
+      rm -f -- "$path"
+    fi
+  done
+  if [ -n "$old_current_target" ]; then
+    ln -sfnT "$old_current_target" "$current"
+  else
+    rm -f -- "$current"
+  fi
+}
+
 cleanup_release_tmp() {
+  local exit_status="$?"
+  if [ "$deployment_committed" != "1" ] && [ -n "$rollback_dir" ]; then
+    restore_deployment_state || true
+    systemctl daemon-reload || true
+    if [ "$services_touched" = "1" ] && [ -n "$old_current_target" ]; then
+      systemctl restart hermes-gateway.service || true
+      systemctl restart hermes-dashboard.service || true
+    fi
+  fi
   rm -rf -- "$release_tmp"
+  [ -z "$rollback_dir" ] || rm -rf -- "$rollback_dir"
   rm -f -- "$archive"
   rmdir -- "$release_lock" 2>/dev/null || true
+  return "$exit_status"
 }
 trap cleanup_release_tmp EXIT
 
@@ -537,20 +584,29 @@ if ! [[ "$keep_releases" =~ ^[0-9]+$ ]] || [ "$keep_releases" -lt 1 ]; then
   exit 1
 fi
 
-for required in tar systemctl sha256sum readlink stat sort mv; do
+for required in tar systemctl sha256sum readlink stat sort mv getent useradd groupadd install cp find ldd sed; do
   if ! command -v "$required" >/dev/null 2>&1; then
     echo "Missing required command: $required" >&2
     exit 1
   fi
 done
 
-mkdir -p "$releases_dir" "$tmp_dir" "$hermes_home"
+if ! getent group "$service_group" >/dev/null; then
+  groupadd --system "$service_group"
+fi
+if ! getent passwd "$service_user" >/dev/null; then
+  useradd --system --gid "$service_group" --home-dir "$shared" --shell /usr/sbin/nologin "$service_user"
+fi
+mkdir -p "$releases_dir" "$tmp_dir" "$hermes_home" "$owner_root" "$runtimes_dir" "$sandbox_dir"
+chown -R "$service_user:$service_group" "$hermes_home"
+chmod 0750 "$owner_root"
 if [ ! -f "$env_file" ]; then
   umask 077
   : > "$env_file"
 fi
-chmod 600 "$env_file" 2>/dev/null || true
-chmod 700 "$hermes_home" 2>/dev/null || true
+chown root:"$service_group" "$env_file"
+chmod 0640 "$env_file"
+chmod 0750 "$hermes_home" 2>/dev/null || true
 
 if ! mkdir -- "$release_lock"; then
   echo "Release is already being deployed or requires investigation: $release_id" >&2
@@ -559,6 +615,7 @@ fi
 if [ -L "$current" ]; then
   old_current_target="$(resolved_path "$current")"
 fi
+backup_deployment_state
 
 expected_manifest="{\"schemaVersion\":1,\"releaseId\":\"$release_id\",\"source\":{\"kind\":\"$source_kind\",\"commit\":\"$source_commit\",\"tag\":$(if [ -n "$source_tag" ]; then printf '\"%s\"' "$source_tag"; else printf 'null'; fi)}}"
 if [ -e "$release" ]; then
@@ -589,16 +646,14 @@ export HERMES_HOME="$hermes_home"
 test -f "$release/hermes_cli/web_dist/index.html"
 test -f "$release/ui-tui/dist/entry.js"
 
-venv="$shared/venv"
 lock_hash="$(sha256sum "$release/uv.lock" | cut -d ' ' -f1)"
-lock_stamp="$venv/.hermes-uv-lock.sha256"
-installed_hash=""
-if [ -f "$lock_stamp" ]; then
-  installed_hash="$(cat "$lock_stamp")"
-fi
+architecture="$(uname -m)"
+python_version="3.11"
+runtime_id="py311-${"${"}architecture}-${"${"}lock_hash}"
+venv="$runtimes_dir/$runtime_id"
 
-if [ ! -x "$venv/bin/python" ] || [ "$installed_hash" != "$lock_hash" ]; then
-  echo "Python dependencies need bootstrap/update for uv.lock $lock_hash"
+if [ ! -x "$venv/bin/python3" ]; then
+  echo "Bootstrapping immutable Python runtime $runtime_id"
   if ! command -v uv >/dev/null 2>&1; then
     if ! command -v curl >/dev/null 2>&1; then
       echo "Missing required command: curl (needed to install uv)" >&2
@@ -611,13 +666,91 @@ if [ ! -x "$venv/bin/python" ] || [ "$installed_hash" != "$lock_hash" ]; then
     rm -f "$uv_installer"
     export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
   fi
-  uv python find 3.11 >/dev/null 2>&1 || uv python install 3.11
+  runtime_tmp="$runtimes_dir/.${"${"}runtime_id}.tmp.$$"
+  rm -rf -- "$runtime_tmp"
+  mkdir -p "$runtime_tmp/python-base" "$runtime_tmp/venv" "$runtime_tmp/toolchain"
+  uv python install "$python_version" --install-dir "$runtime_tmp/python-base" --no-bin
+  base_python="$(find "$runtime_tmp/python-base" -type f -path '*/bin/python3*' -perm -u+x | sort | head -n 1)"
+  if [ -z "$base_python" ]; then
+    echo "uv-managed Python executable was not installed" >&2
+    exit 1
+  fi
+  UV_PYTHON_DOWNLOADS=never uv venv --relocatable --python "$base_python" "$runtime_tmp/venv"
   cd "$release"
-  UV_PROJECT_ENVIRONMENT="$venv" uv sync --extra all --locked
-  printf '%s\n' "$lock_hash" > "$lock_stamp"
+  UV_PROJECT_ENVIRONMENT="$runtime_tmp/venv" uv sync --extra all --locked --no-editable --link-mode copy
+  cp -a "$runtime_tmp/venv/." "$runtime_tmp/"
+  rm -rf -- "$runtime_tmp/venv"
+  python_target="$(readlink "$runtime_tmp/bin/python3" || true)"
+  if [ -n "$python_target" ]; then
+    case "$python_target" in
+      /*) echo "Sandbox Python points outside the runtime" >&2; exit 1 ;;
+    esac
+  fi
+  resolved_python="$(readlink -f "$runtime_tmp/bin/python3")"
+  case "$resolved_python" in
+    "$runtime_tmp"/*) ;;
+    *) echo "Sandbox Python resolves outside the runtime" >&2; exit 1 ;;
+  esac
+  for command in bash sh ls pwd printf cat grep find; do
+    command_path="$(command -v "$command" || true)"
+    if [ -z "$command_path" ]; then
+      echo "Missing local executor command: $command" >&2
+      exit 1
+    fi
+    command_target="$runtime_tmp/toolchain$command_path"
+    mkdir -p "$(dirname "$command_target")"
+    cp -aL -- "$command_path" "$command_target"
+    while read -r library; do
+      [ -n "$library" ] || continue
+      library_target="$runtime_tmp/toolchain$library"
+      mkdir -p "$(dirname "$library_target")"
+      cp -aL -- "$library" "$library_target"
+    done < <(ldd "$command_path" | sed -nE 's#.*=> (/[^ ]+).*#\1#p; s#^[[:space:]]*(/[^ ]+).*#\1#p')
+  done
+  chown -R root:root "$runtime_tmp"
+  find "$runtime_tmp" -type d -exec chmod 0755 {} +
+  find "$runtime_tmp" -type f -exec chmod go-w {} +
+  find "$runtime_tmp" -type f ! -perm -u+x -exec chmod 0644 {} +
+  mv -- "$runtime_tmp" "$venv"
 else
-  echo "Python dependencies unchanged; reusing $venv"
+  echo "Reusing immutable Python runtime $venv"
 fi
+
+if [ ! -x /usr/bin/bwrap ]; then
+  echo "Bubblewrap must be installed at /usr/bin/bwrap" >&2
+  exit 1
+fi
+bwrap_help="$(/usr/bin/bwrap --help 2>&1)"
+for option in --bind-fd --ro-bind-fd --size --uid --gid --cap-drop --seccomp --remount-ro --info-fd; do
+  if ! grep -F -- "$option" <<<"$bwrap_help" >/dev/null; then
+    echo "Bubblewrap lacks required option: $option" >&2
+    exit 1
+  fi
+done
+
+test -f "$release/deploy/sandbox/executor-x86_64.bpf"
+seccomp_digest="$(sha256sum "$release/deploy/sandbox/executor-x86_64.bpf" | cut -d ' ' -f1)"
+install -o root -g root -m 0444 "$release/deploy/sandbox/executor-x86_64.bpf" "$sandbox_seccomp"
+image_digest="$(printf '%s:%s' "$source_commit" "$runtime_id" | sha256sum | cut -d ' ' -f1)"
+readonly_mounts=''
+for destination in /bin /usr/bin /lib /lib64 /usr/lib; do
+  source="$venv/toolchain$destination"
+  [ -d "$source" ] || continue
+  readonly_mounts="$readonly_mounts,{\"source\":\"$source\",\"destination\":\"$destination\"}"
+done
+policy_tmp="$sandbox_policy.tmp.$$"
+cat > "$policy_tmp" <<POLICY
+{"schema_version":1,"architecture":"$architecture","owner_root":"$owner_root","uid":$(id -u "$service_user"),"gid":$(getent group "$service_group" | cut -d: -f3),"bwrap_binary":"/usr/bin/bwrap","release_root":"$release","runtime_root":"$venv","python_executable":"/opt/hermes/python/bin/python3","readonly_mounts":[{"source":"$release","destination":"/opt/hermes/release"},{"source":"$venv","destination":"/opt/hermes/python"}$readonly_mounts],"syscall_policy_id":"executor-local-v1","syscall_policy_digest":"sha256:$seccomp_digest","seccomp_artifact":"$sandbox_seccomp","image_digest":"sha256:$image_digest","profile":"executor-bwrap-v1","security_backend":"host-bwrap-seccomp-v1","network_mode":"isolated-tool-network","verifier":"host-sandbox-policy-v1","record_ttl_seconds":30,"root_tmpfs_bytes":67108864,"executor_tmpfs_bytes":33554432,"allowed_egress_profiles":["tool-none"]}
+POLICY
+chown root:root "$policy_tmp"
+chmod 0644 "$policy_tmp"
+mv -- "$policy_tmp" "$sandbox_policy"
+
+PYTHONPATH="$release" "$venv/bin/python" -c 'from hermes_cli.owner_worker.host_sandbox import host_sandbox_deployment_policy; host_sandbox_deployment_policy()'
+for command in bash sh ls pwd printf cat grep find; do
+  PATH="$venv/toolchain/usr/bin:$venv/toolchain/bin" command -v "$command" >/dev/null
+done
+PYTHONPATH="$release" "$venv/bin/python" -c 'import hermes_cli.tool_executor_runtime.entrypoint, tools.registry'
 
 ln -sfnT "$release" "$current"
 release_target="$(resolved_path "$release")"
@@ -631,7 +764,7 @@ current="$remote_root/current"
 shared="$remote_root/shared"
 env_file="${"${"}HERMES_ENV_FILE:-$shared/.env}"
 hermes_home="${"${"}HERMES_HOME:-$shared/.hermes}"
-venv="${"${"}VIRTUAL_ENV:-$shared/venv}"
+venv="${"${"}VIRTUAL_ENV:?VIRTUAL_ENV is required}"
 
 export HERMES_HOME="$hermes_home"
 export VIRTUAL_ENV="$venv"
@@ -658,11 +791,16 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+User=$service_user
+Group=$service_group
 Environment=HERMES_REMOTE_ROOT=$remote_root
 Environment=HERMES_HOME=$hermes_home
 Environment=HERMES_ENV_FILE=$env_file
-Environment=VIRTUAL_ENV=$shared/venv
+Environment=VIRTUAL_ENV=$venv
+Environment=HERMES_SANDBOX_DEPLOYMENT_POLICY=hermes_cli.owner_worker.host_sandbox:host_sandbox_deployment_policy
+Environment=HERMES_DISABLE_LAZY_INSTALLS=1
 WorkingDirectory=$current
+ExecStartPre=$venv/bin/python -c 'from hermes_cli.owner_worker.host_sandbox import host_sandbox_deployment_policy; host_sandbox_deployment_policy()'
 ExecStart=$runner gateway run --replace
 ExecReload=/bin/kill -USR1 \$MAINPID
 Restart=always
@@ -686,11 +824,16 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+User=$service_user
+Group=$service_group
 Environment=HERMES_REMOTE_ROOT=$remote_root
 Environment=HERMES_HOME=$hermes_home
 Environment=HERMES_ENV_FILE=$env_file
-Environment=VIRTUAL_ENV=$shared/venv
+Environment=VIRTUAL_ENV=$venv
+Environment=HERMES_SANDBOX_DEPLOYMENT_POLICY=hermes_cli.owner_worker.host_sandbox:host_sandbox_deployment_policy
+Environment=HERMES_DISABLE_LAZY_INSTALLS=1
 WorkingDirectory=$current
+ExecStartPre=$venv/bin/python -c 'from hermes_cli.owner_worker.host_sandbox import host_sandbox_deployment_policy; host_sandbox_deployment_policy()'
 ExecStart=$runner dashboard --host 127.0.0.1 --port 9119 --no-open --skip-build --require-auth
 Restart=always
 RestartSec=5
@@ -708,6 +851,7 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable hermes-gateway.service hermes-dashboard.service
+services_touched="1"
 # Stop the control plane before rotating a release, then terminate any worker
 # that survived an older dashboard unit. Older KillMode=mixed releases could
 # leave those children orphaned with an ACTIVE durable lease, blocking every
@@ -728,11 +872,21 @@ if [ -n "$owner_worker_pids" ]; then
   done
   [ -z "${"${"}live_owner_workers:-}" ] || kill -KILL $live_owner_workers || true
 fi
-systemctl restart hermes-gateway.service
-systemctl start hermes-dashboard.service
-systemctl is-active --quiet hermes-gateway.service
-systemctl is-active --quiet hermes-dashboard.service
+if ! systemctl restart hermes-gateway.service || ! systemctl start hermes-dashboard.service || \
+   ! systemctl is-active --quiet hermes-gateway.service || \
+   ! systemctl is-active --quiet hermes-dashboard.service; then
+  echo "New services failed; restoring previous deployment state" >&2
+  restore_deployment_state
+  deployment_committed="1"
+  systemctl daemon-reload
+  if [ -n "$old_current_target" ]; then
+    systemctl restart hermes-gateway.service || true
+    systemctl restart hermes-dashboard.service || true
+  fi
+  exit 1
+fi
 systemctl --no-pager --full status hermes-gateway.service hermes-dashboard.service || true
+deployment_committed="1"
 
 prune_old_releases
 
