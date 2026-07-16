@@ -33,6 +33,8 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert 'runtime_tmp/toolchain' in source
     assert 'command_path="$(type -P "$command" || true)"' in source
     assert 'command_path="$(command -v "$command" || true)"' not in source
+    assert 'chown -R root:root "$release_tmp"' in source
+    assert 'find "$release_tmp" -type d -exec chmod go-w {} +' in source
     assert source.index("host_sandbox_deployment_policy()") < source.index('ln -sfnT "$release" "$current"')
     assert "restoring previous deployment state" in source
     assert "restore_deployment_state" in source

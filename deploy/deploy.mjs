@@ -635,6 +635,9 @@ else
   fi
   test -f "$release_tmp/hermes_cli/web_dist/index.html"
   test -f "$release_tmp/ui-tui/dist/entry.js"
+  chown -R root:root "$release_tmp"
+  find "$release_tmp" -type d -exec chmod go-w {} +
+  find "$release_tmp" -type f -exec chmod go-w {} +
   mv -- "$release_tmp" "$release"
 fi
 rm -f -- "$archive"
