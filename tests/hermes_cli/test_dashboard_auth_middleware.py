@@ -269,6 +269,10 @@ def test_gated_require_token_routes_reject_cookie_session_in_owner_mode(
 @pytest.mark.parametrize(
     ("path", "allowed"),
     [
+        ("/api/profiles", True),
+        ("/api/config", True),
+        ("/api/dashboard/font", True),
+        ("/api/dashboard/plugins", True),
         ("/api/sessions", True),
         ("/api/sessions/abc123/messages", True),
         ("/api/sessions/abc123/export", True),
@@ -287,6 +291,23 @@ def test_authenticated_api_availability_requires_explicit_owner_worker_routes(pa
     from hermes_cli.dashboard_auth.api_availability import authenticated_owner_worker_api_allowed
 
     assert authenticated_owner_worker_api_allowed(path) is allowed
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("POST", "/api/profiles"),
+        ("GET", "/api/profiles/active"),
+        ("PUT", "/api/config"),
+        ("PUT", "/api/dashboard/font"),
+        ("GET", "/api/dashboard/plugins/rescan"),
+        ("POST", "/api/dashboard/plugins/example/visibility"),
+    ],
+)
+def test_authenticated_owner_worker_routes_are_method_and_path_exact(method, path):
+    from hermes_cli.dashboard_auth.api_availability import authenticated_owner_worker_api_allowed
+
+    assert authenticated_owner_worker_api_allowed(path, method=method) is False
 
 
 def test_login_unknown_provider_returns_404(gated_app):

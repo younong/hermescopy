@@ -728,6 +728,32 @@ def create_app(
         finally:
             db.close()
 
+    @app.get("/api/profiles")
+    def get_profiles(_: None = Depends(_require_owner_token)) -> dict[str, Any]:
+        from hermes_cli.dashboard_owner_payloads import owner_singleton_profile_payload
+
+        return owner_singleton_profile_payload(owner_home)
+
+    @app.get("/api/config")
+    def get_config(profile: str | None = None, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
+        _reject_profile(profile)
+        from hermes_cli.config import load_config
+        from hermes_cli.dashboard_owner_payloads import normalize_config_for_web
+
+        return normalize_config_for_web(load_config())
+
+    @app.get("/api/dashboard/font")
+    def get_dashboard_font(_: None = Depends(_require_owner_token)) -> dict[str, str]:
+        from hermes_cli.dashboard_owner_payloads import dashboard_font_payload
+
+        return dashboard_font_payload()
+
+    @app.get("/api/dashboard/plugins")
+    def get_dashboard_plugins(_: None = Depends(_require_owner_token)) -> list[dict[str, Any]]:
+        from hermes_cli.dashboard_owner_payloads import active_dashboard_plugin_payload
+
+        return active_dashboard_plugin_payload()
+
     @app.get("/api/model/info")
     def get_model_info(profile: str | None = None, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(profile)

@@ -2076,6 +2076,56 @@ def test_worker_analytics_and_model_info_routes_require_owner_token(tmp_path, mo
     assert client.get("/api/analytics/usage").status_code == 401
     assert client.get("/api/analytics/models").status_code == 401
     assert client.get("/api/model/info").status_code == 401
+    assert client.get("/api/profiles").status_code == 401
+    assert client.get("/api/config").status_code == 401
+    assert client.get("/api/dashboard/font").status_code == 401
+    assert client.get("/api/dashboard/plugins").status_code == 401
+
+
+def test_worker_owner_startup_routes_return_owner_local_payloads(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    owner_home = tmp_path / "owner"
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_worker_routes")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(tmp_path / "control"))
+    from hermes_cli.config import save_config
+    from hermes_cli.owner_worker.entrypoint import create_app
+
+    ensure_owner_runtime_dirs(owner_home)
+    save_config({
+        "model": {"default": "owner-model", "provider": "owner-provider"},
+        "dashboard": {"font": "fraunces"},
+    })
+    (owner_home / "skills" / "owner-skill").mkdir(parents=True)
+    (owner_home / "skills" / "owner-skill" / "SKILL.md").write_text("# owner", encoding="utf-8")
+    app = create_app("ok1_worker_routes", owner_home)
+    client = TestClient(app)
+
+    def get(path):
+        token = _capability_for(app, path=path, control_home=tmp_path / "control")
+        return client.get(path, headers={"Authorization": f"Bearer {token}"})
+
+    profiles = get("/api/profiles")
+    config = get("/api/config")
+    font = get("/api/dashboard/font")
+    plugins = get("/api/dashboard/plugins")
+
+    assert profiles.status_code == 200
+    assert profiles.json()["management_mode"] == "owner_singleton"
+    assert len(profiles.json()["profiles"]) == 1
+    profile = profiles.json()["profiles"][0]
+    assert profile["name"] == "default"
+    assert profile["path"] is None
+    assert profile["model"] == "owner-model"
+    assert profile["skill_count"] == 1
+    assert str(owner_home) not in profiles.text
+    assert config.status_code == 200
+    assert config.json()["model"] == "owner-model"
+    assert "_config_version" not in config.json()
+    assert font.json() == {"font": "fraunces"}
+    assert plugins.status_code == 200
+    assert isinstance(plugins.json(), list)
 
 
 def test_worker_analytics_routes_return_owner_local_data(tmp_path, monkeypatch):
