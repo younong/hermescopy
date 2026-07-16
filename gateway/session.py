@@ -634,10 +634,18 @@ def current_owner_metadata() -> Dict[str, Any]:
 
 
 def current_recovery_scope() -> Dict[str, Any] | None:
-    """Return the complete trusted durable scope for owner-worker recovery."""
+    """Return the persisted ownership assertions for owner-worker recovery.
+
+    ``current_owner_metadata()`` also carries descriptive tenant/auth fields for
+    in-memory session records. Durable SessionDB scope APIs deliberately accept
+    only this three-field ownership contract, so never forward the extra fields
+    through ``**current_recovery_scope()``.
+    """
     metadata = current_owner_metadata()
     required = ("owner_key", "workspace_root", "worker_generation")
-    return metadata if all(metadata.get(key) not in (None, "") for key in required) else None
+    if any(metadata.get(key) in (None, "") for key in required):
+        return None
+    return {key: metadata[key] for key in required}
 
 
 def current_historical_resume_scope() -> Dict[str, Any] | None:

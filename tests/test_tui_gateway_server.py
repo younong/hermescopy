@@ -2302,6 +2302,41 @@ def test_session_create_does_not_persist_empty_row(monkeypatch):
         server._sessions.pop(sid, None)
 
 
+def test_ensure_session_db_row_persists_trusted_owner_scope(monkeypatch, tmp_path):
+    """Owner-worker durable rows receive only the SessionDB ownership contract."""
+    created = []
+
+    class _FakeDB:
+        def create_session(self, key, **kwargs):
+            created.append((key, kwargs))
+
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_owner")
+    monkeypatch.setenv("HERMES_TENANT_ID", "tenant-a")
+    monkeypatch.setenv("HERMES_AUTH_PROVIDER", "basic")
+    monkeypatch.setenv("HERMES_WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_WORKER_GENERATION", "7")
+
+    server._ensure_session_db_row({"session_key": "k1"})
+
+    assert created == [
+        (
+            "k1",
+            {
+                "source": "tui",
+                "model": "test-model",
+                "model_config": None,
+                "parent_session_id": None,
+                "cwd": None,
+                "owner_key": "ok1_owner",
+                "workspace_root": str(tmp_path.resolve()),
+                "worker_generation": 7,
+            },
+        )
+    ]
+
+
 def test_ensure_session_db_row_persists_explicit_cwd(monkeypatch, tmp_path):
     """An explicitly chosen workspace is persisted as the session cwd."""
     created = []
