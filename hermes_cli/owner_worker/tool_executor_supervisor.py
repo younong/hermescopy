@@ -603,14 +603,14 @@ class ToolExecutorSupervisor:
         if not isinstance(pid, int) or pid <= 0:
             return
         try:
-            os.killpg(pid, signal.SIGTERM)
+            os.killpg(pid, signal.SIGTERM)  # windows-footgun: ok
         except (OSError, ProcessLookupError):
             return
         try:
             process.wait(timeout=2)
         except (subprocess.TimeoutExpired, TimeoutError):
             try:
-                os.killpg(pid, signal.SIGKILL)
+                os.killpg(pid, signal.SIGKILL)  # windows-footgun: ok
             except (OSError, ProcessLookupError):
                 pass
             try:
