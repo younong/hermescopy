@@ -112,11 +112,17 @@ class DeploymentInferencePolicy:
         except Exception as exc:  # pragma: no cover - operator callback details are private
             raise DeploymentInferencePolicyInvalid("deployment inference runtime is unavailable") from exc
         provider = str(runtime.get("provider") or "").strip()
+        requested_provider = str(runtime.get("requested_provider") or "").strip().lower()
         api_key = runtime.get("api_key")
         base_url = str(runtime.get("base_url") or "").strip().rstrip("/")
         api_mode = str(runtime.get("api_mode") or "").strip()
         parsed = urlparse(base_url)
-        if provider != self.provider or api_mode != self.api_mode or not base_url:
+        # Named custom providers resolve to the shared transport class ``custom``
+        # while preserving their routable identity in ``requested_provider``.
+        # The descriptor needs that named identity so an owner worker cannot
+        # select a different configured custom endpoint through the relay.
+        matches_provider = provider == self.provider or requested_provider == self.provider
+        if not matches_provider or api_mode != self.api_mode or not base_url:
             raise DeploymentInferencePolicyInvalid("deployment inference runtime does not match policy")
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise DeploymentInferencePolicyInvalid("deployment inference endpoint is invalid")

@@ -224,6 +224,23 @@ def test_owner_relay_rejects_revoked_worker_before_upstream_call(tmp_path):
             relay.close()
 
 
+def test_policy_runtime_accepts_named_custom_provider_resolved_to_custom():
+    policy = DeploymentInferencePolicy(
+        provider="custom:deployment",
+        model="gpt-safe",
+        api_mode="chat_completions",
+        runtime_resolver=lambda: {
+            "provider": "custom",
+            "requested_provider": "custom:deployment",
+            "api_mode": "chat_completions",
+            "base_url": "https://provider.example.test/v1",
+            "api_key": "control-plane-secret",
+        },
+    )
+
+    assert policy.resolve_runtime()["provider"] == "custom"
+
+
 def test_policy_runtime_refuses_wrong_upstream_identity_or_credential():
     policy = DeploymentInferencePolicy(
         provider="custom:deployment",
