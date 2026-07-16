@@ -818,6 +818,14 @@ class TestSilentFileMisplacementE2E:
         project.mkdir()
         config_default.mkdir()
         monkeypatch.delenv("TERMINAL_CWD", raising=False)
+        # macOS pytest temp directories live under /private/var. Keep the
+        # production system-path guard intact while allowing this test to
+        # exercise its live-CWD and durable-CWD behavior.
+        monkeypatch.setattr(
+            ft,
+            "_SENSITIVE_PATH_PREFIXES",
+            tuple(prefix for prefix in ft._SENSITIVE_PATH_PREFIXES if prefix != "/private/var/"),
+        )
 
         _orig = tt._get_env_config
         monkeypatch.setattr(

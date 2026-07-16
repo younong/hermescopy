@@ -108,10 +108,14 @@ def _merge_streaming_lines(lines: list[str]) -> list[str]:
             pending_key = key
             continue
 
-        for field in ("text", "rendered"):
-            value = payload.get(field)
-            if isinstance(value, str):
-                pending_payload[field] = f"{pending_payload.get(field, '')}{value}"
+        value = payload.get("text")
+        if isinstance(value, str):
+            pending_payload["text"] = f"{pending_payload.get('text', '')}{value}"
+        rendered = payload.get("rendered")
+        if isinstance(rendered, str):
+            # `rendered` is a renderer snapshot, not guaranteed to be an append-only
+            # delta. Keep the newest snapshot while text remains coalesced.
+            pending_payload["rendered"] = rendered
         for field, value in payload.items():
             if field not in {"text", "rendered"}:
                 pending_payload[field] = value
@@ -341,8 +345,21 @@ def _disable_nagle(ws: Any) -> None:
         _log.debug("ws TCP_NODELAY skip: %s", exc)
 
 
-async def handle_ws(ws: Any) -> None:
-    """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``."""
+async def handle_ws(
+    ws: Any,
+    *,
+    runtime: server.OwnerWorkerGatewayRuntime | None = None,
+    require_owner_runtime: bool = False,
+) -> None:
+    """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``.
+
+    Owner-worker routes must supply their app-local immutable runtime fence.  A
+    missing fence is rejected at the route boundary rather than falling back to
+    the standalone module-global dispatch path.
+    """
+    if require_owner_runtime and runtime is None:
+        await ws.close(code=1011, reason="owner gateway runtime unavailable")
+        return
     peer = _ws_peer_label(ws)
     transport: WSTransport | None = None
     messages = 0
@@ -446,7 +463,7 @@ async def handle_ws(ws: Any) -> None:
             req_id = req.get("id") if isinstance(req, dict) else None
             req_method = req.get("method") if isinstance(req, dict) else None
             try:
-                resp = await asyncio.to_thread(server.dispatch, req, transport)
+                resp = await asyncio.to_thread(server.dispatch, req, transport, runtime)
             except Exception:
                 dispatch_crashes += 1
                 _log.exception(

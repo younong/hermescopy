@@ -16,10 +16,11 @@
 
 ## 核心发布规则
 
-每次发布必须先确定 Git tag，然后只发布该 tag 中的代码。
+常规发布先确定 Git tag，然后只发布该 tag 中的代码。
 
 - 新发布：`--create-tag <tag>`
 - 重试/回滚：`--tag <existing-tag>`
+- 无 tag 的受限例外：`--ref <40-hex-commit-sha>`，仅发布已推送到 `origin` 的不可变完整 commit SHA；不会打 tag，也绝不会上传当前工作区或接受分支名、`HEAD`、短 SHA。
 
 工具使用 `git archive <tag>` 生成干净源码，在本机临时源码目录中安装 Node 依赖并构建 web/ui-tui 产物，然后把源码 + 构建产物打包上传到服务器。服务器只解包到 `/opt/hermes/releases/<tag>`、按需初始化/更新共享 Python venv、切换 `/opt/hermes/current`，最后重启 systemd 服务。发布成功后会清理本次上传的远端 tarball，并按保留策略回收旧 release。
 
@@ -89,6 +90,15 @@ npm run deploy -- --create-tag v2026.7.4
 ```bash
 npm run deploy -- --tag v2026.7.4
 ```
+
+不创建 tag 时，部署已推送的完整 commit SHA：
+
+```bash
+npm run deploy -- --ref <40-hex-commit-sha> --dry-run
+npm run deploy -- --ref <40-hex-commit-sha>
+```
+
+`--ref` 仍要求干净工作树，并将 release 目录固定命名为 `commit-<sha>`；artifact 中的 `.hermes-release.json` 必须与该 SHA 一致，已有不同来源的 release 不会被覆盖。
 
 回滚到旧 tag：
 

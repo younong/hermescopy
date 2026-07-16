@@ -11491,7 +11491,7 @@ def _dashboard_listening(host: str, port: int) -> bool:
 
 
 def _maybe_setup_dashboard_auth_interactively(args) -> None:
-    """Offer to configure dashboard auth when a non-loopback bind has none.
+    """Offer to configure dashboard auth when the selected mode has none.
 
     Called from ``cmd_dashboard`` just before ``start_server``. The auth
     gate engages on every non-loopback bind (``--insecure`` is a no-op since
@@ -11503,7 +11503,7 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
 
     No-ops (so the existing fail-closed ``SystemExit`` remains the backstop)
     when:
-      * the bind is loopback (gate never engages), or
+      * the bind is loopback and --require-auth was not selected, or
       * a provider is already registered, or
       * stdin/stdout isn't a TTY (Docker/s6, CI, piped ``--no-open`` runs).
     """
@@ -11511,8 +11511,8 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
 
     try:
         from hermes_cli.web_server import should_require_auth
-        if not should_require_auth(host):
-            return  # loopback bind — gate never engages
+        if not (should_require_auth(host) or getattr(args, "require_auth", False)):
+            return  # ordinary loopback bind — gate does not engage
     except Exception:
         return  # if we can't tell, defer to start_server's own gate
 
@@ -11530,7 +11530,7 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
 
     print()
     print(
-        f"⚠ The dashboard is binding to a non-loopback address ({host}) and "
+        f"⚠ The dashboard authentication gate is enabled for {host} and "
         f"needs an auth provider."
     )
     print(
@@ -11705,6 +11705,8 @@ def cmd_dashboard(args):
             reexec_argv.append("--no-open")
         if getattr(args, "insecure", False):
             reexec_argv.append("--insecure")
+        if getattr(args, "require_auth", False):
+            reexec_argv.append("--require-auth")
         if getattr(args, "skip_build", False):
             reexec_argv.append("--skip-build")
         env = os.environ.copy()
@@ -11837,6 +11839,7 @@ def cmd_dashboard(args):
         port=args.port,
         open_browser=not args.no_open,
         allow_public=getattr(args, "insecure", False),
+        require_auth=getattr(args, "require_auth", False),
         initial_profile=getattr(args, "open_profile", "") or "",
     )
 
@@ -11844,6 +11847,13 @@ def cmd_dashboard(args):
 def cmd_dashboard_register(args):
     """Register a self-hosted dashboard OAuth client with Nous Portal."""
     from hermes_cli.dashboard_register import cmd_dashboard_register as _impl
+
+    _impl(args)
+
+
+def cmd_dashboard_users(args):
+    """Manage durable local dashboard Basic-auth accounts."""
+    from hermes_cli.dashboard_users import cmd_dashboard_users as _impl
 
     _impl(args)
 
@@ -13498,6 +13508,7 @@ def main():
         subparsers,
         cmd_dashboard=cmd_dashboard,
         cmd_dashboard_register=cmd_dashboard_register,
+        cmd_dashboard_users=cmd_dashboard_users,
     )
 
 

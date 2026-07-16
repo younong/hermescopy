@@ -47,7 +47,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from hermes_cli import __version__, __release_date__
+from hermes_cli import __version__, __release_date__, session_api
 from hermes_cli.config import (
     cfg_get,
     DEFAULT_CONFIG,
@@ -91,7 +91,7 @@ try:
         WebSocket, WebSocketDisconnect,
     )
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel
 except ImportError:
@@ -106,7 +106,7 @@ except ImportError:
             WebSocket, WebSocketDisconnect,
         )
         from fastapi.middleware.cors import CORSMiddleware
-        from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+        from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
         from fastapi.staticfiles import StaticFiles
         from pydantic import BaseModel
     except Exception:
@@ -174,6 +174,15 @@ async def _lifespan(app: "FastAPI"):
     app.state.pty_active_session_files = {}  # dict[str, Path]
     app.state.pty_browser_sessions = {}  # browser_id -> active /api/pty owner
     app.state.pty_browser_lock = asyncio.Lock()
+    app.state.authorized_ws_bridges = {}  # scope digest -> {(websocket, epoch)}
+    app.state.authorized_ws_bridges_by_worker = {}  # exact worker fence -> {websocket}
+    app.state.revoked_ws_bridge_worker_fences = set()  # exact durable fences
+    app.state.authorized_ws_bridge_lock = asyncio.Lock()
+    app.state.authority_change_sequence = 0
+    app.state.worker_change_sequence = 0
+    app.state.server_event_loop = asyncio.get_running_loop()
+    app.state.authority_change_stop = asyncio.Event()
+    app.state.authority_change_task = None
     # Serializes chat-argv resolution so concurrent /api/pty connections
     # don't trigger overlapping ``npm install`` / ``npm run build`` work.
     # On app.state (not a module global) so the Lock binds to the running
@@ -206,6 +215,22 @@ async def _lifespan(app: "FastAPI"):
     try:
         yield
     finally:
+        authority_change_stop = getattr(app.state, "authority_change_stop", None)
+        authority_change_task = getattr(app.state, "authority_change_task", None)
+        if authority_change_stop is not None:
+            authority_change_stop.set()
+        if authority_change_task is not None:
+            authority_change_task.cancel()
+            try:
+                await authority_change_task
+            except asyncio.CancelledError:
+                pass
+        supervisor = getattr(app.state, "owner_worker_supervisor", None)
+        if supervisor is not None:
+            try:
+                await asyncio.to_thread(supervisor.shutdown)
+            except Exception:
+                _log.exception("owner worker shutdown cleanup failed")
         if cron_stop is not None:
             cron_stop.set()
 
@@ -318,6 +343,10 @@ app.add_middleware(
 # Keep the upstream list minimal — only truly non-sensitive, read-only
 # endpoints belong there.
 # ---------------------------------------------------------------------------
+from hermes_cli.dashboard_auth.api_availability import (
+    authenticated_control_plane_api_allowed,
+    authenticated_owner_worker_api_allowed,
+)
 from hermes_cli.dashboard_auth.public_paths import (
     PUBLIC_API_PATHS as _PUBLIC_API_PATHS,
 )
@@ -359,6 +388,265 @@ def _has_valid_query_token(request: Request, path: str) -> bool:
     return bool(token) and hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode())
 
 
+def _authenticated_owner_request(request: Request) -> bool:
+    """Return True for dashboard-auth requests that must be owner-worker routed."""
+    app_obj = getattr(request, "app", None)
+    state = getattr(request, "state", None)
+    return bool(
+        getattr(getattr(app_obj, "state", None), "auth_required", False)
+        and getattr(state, "session", None) is not None
+    )
+
+
+_AUTHENTICATED_ALLOWED_PROFILE_VALUES: frozenset[str] = frozenset({"", "current", "default"})
+
+
+def _authenticated_profile_value_allowed(profile: Optional[str]) -> bool:
+    return str(profile or "").strip().lower() in _AUTHENTICATED_ALLOWED_PROFILE_VALUES
+
+
+def _reject_authenticated_profile_param(profile: Optional[str]) -> None:
+    """Authenticated mode must not let frontend profile select legacy homes."""
+    if not _authenticated_profile_value_allowed(profile):
+        raise HTTPException(
+            status_code=400,
+            detail="profile selection is not available in authenticated mode",
+        )
+
+
+def _reject_authenticated_profile_query_params(request: Request) -> None:
+    """Reject legacy profile and external owner selectors before proxying."""
+    getlist = getattr(request.query_params, "getlist", None)
+    values = getlist("profile") if callable(getlist) else [request.query_params.get("profile")]
+    for value in values:
+        if not _authenticated_profile_value_allowed(value):
+            raise HTTPException(
+                status_code=400,
+                detail="profile selection is not available in authenticated mode",
+            )
+    for key in ("owner", "owner_home", "owner_key"):
+        values = getlist(key) if callable(getlist) else [request.query_params.get(key)]
+        if any(str(value or "").strip() for value in values):
+            raise HTTPException(
+                status_code=400,
+                detail="owner selection is not available in authenticated mode",
+            )
+
+
+def _owner_worker_query_string(raw_query: str) -> str:
+    """Forward query params to the worker after stripping legacy profile hints."""
+    pairs = [
+        (key, value)
+        for key, value in urllib.parse.parse_qsl(str(raw_query or ""), keep_blank_values=True)
+        if key not in {"profile", "owner", "owner_home", "owner_key"}
+    ]
+    return urllib.parse.urlencode(pairs, doseq=True)
+
+
+def _reject_authenticated_filesystem_api(request: Request) -> None:
+    """Authenticated Control Plane must not serve host filesystem APIs."""
+    if _authenticated_owner_request(request):
+        from hermes_cli.dashboard_auth.audit import (
+            AuthorityAuditEvent,
+            AuthorityAuditReason,
+            audit_authority,
+            new_authority_correlation_id,
+        )
+
+        audit_authority(
+            AuthorityAuditEvent.FILESYSTEM_DENIED,
+            correlation_id=new_authority_correlation_id(),
+            reason=AuthorityAuditReason.CONTROL_PLANE_FILESYSTEM_FORBIDDEN,
+            audience_class="none",
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="Filesystem APIs are not available in authenticated mode",
+        )
+
+
+def _reject_authenticated_control_plane_owner_surface(surface: str = "This API") -> None:
+    """Fail closed for owner-sensitive Control Plane handlers in auth mode.
+
+    These handlers operate on host paths, legacy profiles, config/env/skills, or
+    other process-global state.  In authenticated deployments those surfaces must
+    be explicitly routed to an Owner Worker before they are reachable; relying on
+    the outer route classifier alone is too fragile because future allowlist/token
+    changes could accidentally expose the legacy handler.
+    """
+    if getattr(app.state, "auth_required", False):
+        raise HTTPException(
+            status_code=403,
+            detail=f"{surface} is not available in authenticated owner mode until routed through the Owner Worker",
+        )
+
+
+_HOP_BY_HOP_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+}
+
+
+class _NoopOwnerWorkerLease:
+    def release(self) -> None:
+        return None
+
+
+def _acquire_owner_worker_use(supervisor: Any, handle: Any) -> Any:
+    acquire = getattr(supervisor, "acquire_use", None)
+    if callable(acquire):
+        return acquire(handle)
+    return _NoopOwnerWorkerLease()
+
+
+def _owner_worker_authority_lease(handle: Any):
+    """Construct the exact durable fence without trusting a supervisor helper."""
+    from hermes_cli.dashboard_auth.authority import OwnerWorkerAuthorityLease, WorkerLeaseState
+
+    return OwnerWorkerAuthorityLease(
+        owner_key=str(handle.owner_key),
+        worker_generation=int(handle.worker_generation),
+        worker_id=str(handle.worker_id),
+        state=WorkerLeaseState.ACTIVE,
+        lease_version=int(handle.lease_version),
+        recovery_generation=int(handle.recovery_generation),
+    )
+
+
+def _release_owner_worker_iter(iterator: Any, lease: Any):
+    try:
+        yield from iterator
+    finally:
+        lease.release()
+
+
+async def _proxy_authenticated_owner_http(request: Request) -> Response:
+    """Forward an authenticated owner-scoped HTTP request to its Owner Worker."""
+    if not _authenticated_owner_request(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    from hermes_cli.dashboard_auth.owner_context import ensure_owner_home, owner_context_from_session
+    from hermes_cli.owner_worker import (
+        OwnerWorkerClient,
+        OwnerWorkerHealthError,
+        OwnerWorkerUnavailableError,
+    )
+
+    _reject_authenticated_profile_query_params(request)
+    owner = owner_context_from_session(request.state.session)
+    ensure_owner_home(owner)
+    supervisor = getattr(request.app.state, "owner_worker_supervisor", None)
+    if supervisor is None:
+        raise HTTPException(status_code=503, detail="Owner worker supervisor is unavailable")
+
+    lease: Any | None = None
+    try:
+        handle = await asyncio.to_thread(supervisor.get_or_start, owner)
+        if str(handle.owner_key) != str(owner.owner_key):
+            _log.error(
+                "owner worker returned a mismatched handle method=%s path=%s request_id=%s",
+                request.method,
+                request.url.path,
+                request.headers.get("x-request-id", ""),
+            )
+            raise HTTPException(status_code=502, detail="Owner worker request failed")
+        lease = _acquire_owner_worker_use(supervisor, handle)
+        content = await request.body()
+        worker_path = request.url.path
+        query = _owner_worker_query_string(request.url.query)
+        if query:
+            worker_path = f"{worker_path}?{query}"
+        forwarded_headers: dict[str, str] = {}
+        for name, value in request.headers.items():
+            lname = name.lower()
+            if lname in _HOP_BY_HOP_HEADERS or lname in {"host", "authorization", "cookie"}:
+                continue
+            if lname in {"accept", "accept-encoding", "content-type", "user-agent", "x-request-id"}:
+                forwarded_headers[name] = value
+        response = await asyncio.to_thread(
+            OwnerWorkerClient(handle.socket_path, control_home=getattr(supervisor, "control_home", None)).request,
+            request.method,
+            worker_path,
+            lease=_owner_worker_authority_lease(handle),
+            headers=forwarded_headers,
+            content=content,
+        )
+    except HTTPException:
+        if lease is not None:
+            lease.release()
+        raise
+    except TimeoutError as exc:
+        if lease is not None:
+            lease.release()
+        _log.warning("owner worker startup timed out: %s", exc)
+        raise HTTPException(status_code=503, detail="Owner worker startup timed out") from exc
+    except OwnerWorkerUnavailableError as exc:
+        if lease is not None:
+            lease.release()
+        _log.warning(
+            "owner worker unavailable method=%s path=%s request_id=%s: %s",
+            request.method,
+            request.url.path,
+            request.headers.get("x-request-id", ""),
+            exc,
+        )
+        raise HTTPException(status_code=503, detail="Owner worker is unavailable") from exc
+    except OwnerWorkerHealthError as exc:
+        if lease is not None:
+            lease.release()
+        _log.warning(
+            "owner worker proxy transport failed method=%s path=%s request_id=%s: %s",
+            request.method,
+            request.url.path,
+            request.headers.get("x-request-id", ""),
+            exc,
+        )
+        raise HTTPException(status_code=502, detail="Owner worker request failed") from exc
+    except Exception as exc:
+        if lease is not None:
+            lease.release()
+        _log.exception(
+            "owner worker proxy internal failure method=%s path=%s request_id=%s",
+            request.method,
+            request.url.path,
+            request.headers.get("x-request-id", ""),
+        )
+        raise HTTPException(status_code=500, detail="Internal server error") from exc
+
+    response_headers = {
+        name: value
+        for name, value in response.headers.items()
+        if name.lower() not in _HOP_BY_HOP_HEADERS and name.lower() not in {"content-length"}
+    }
+    if response.is_stream_consumed:
+        try:
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                headers=response_headers,
+                media_type=response.headers.get("content-type"),
+            )
+        finally:
+            if lease is not None:
+                lease.release()
+    if lease is None:
+        iterator = response.iter_bytes()
+    else:
+        iterator = _release_owner_worker_iter(response.iter_bytes(), lease)
+    return StreamingResponse(
+        iterator,
+        status_code=response.status_code,
+        headers=response_headers,
+        media_type=response.headers.get("content-type"),
+    )
+
+
 def _require_token(request: Request) -> None:
     """Authorize a sensitive endpoint, raising 401 if the caller isn't allowed.
 
@@ -378,12 +666,18 @@ def _require_token(request: Request) -> None:
       making plugin install/enable/disable and the other ``_require_token``
       endpoints permanently unreachable behind the gate. Defer to the gate.
     """
+    if getattr(request.state, "token_authenticated", False):
+        return
     if getattr(request.app.state, "auth_required", False):
-        # Gate is authoritative. It attaches ``request.state.session`` on
-        # success and 401s otherwise, so a request that reached us is already
-        # authenticated. Belt-and-braces: confirm the session is present.
-        if getattr(request.state, "session", None) is not None:
-            return
+        # In owner-authenticated mode these legacy management endpoints would
+        # otherwise run in the Control Plane and read/write the global home.
+        # Keep them fail-closed until each surface is explicitly routed to an
+        # Owner Worker.
+        if _authenticated_owner_request(request):
+            raise HTTPException(
+                status_code=403,
+                detail="This management API is not available in authenticated owner mode until routed through the Owner Worker",
+            )
         raise HTTPException(status_code=401, detail="Unauthorized")
     if not _has_valid_session_token(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -493,6 +787,33 @@ async def host_header_middleware(request: Request, call_next):
                     ),
                 },
             )
+    return await call_next(request)
+
+
+def _authenticated_owner_control_plane_gate_response(request: Request) -> Optional[JSONResponse]:
+    """Return a fail-closed response for authenticated APIs not behind workers."""
+    path = request.url.path
+    if (
+        getattr(request.app.state, "auth_required", False)
+        and getattr(request.state, "session", None) is not None
+        and path.startswith("/api/")
+        and not getattr(request.state, "token_authenticated", False)
+        and not authenticated_control_plane_api_allowed(path)
+        and not authenticated_owner_worker_api_allowed(path)
+    ):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "This API is not available until routed through the Owner Worker"},
+        )
+    return None
+
+
+@app.middleware("http")
+async def _authenticated_owner_control_plane_gate(request: Request, call_next):
+    """Fail closed for authenticated APIs that have not moved behind owner workers."""
+    response = _authenticated_owner_control_plane_gate_response(request)
+    if response is not None:
+        return response
     return await call_next(request)
 
 
@@ -1396,7 +1717,7 @@ def _media_serve_roots() -> list[Path]:
 
 
 @app.get("/api/media")
-async def get_media(path: str):
+async def get_media(request: Request, path: str):
     """Return a gateway-local image file as a base64 data URL.
 
     Lets remote clients (the desktop app over the network, or the web dashboard
@@ -1407,6 +1728,7 @@ async def get_media(path: str):
     an image-extension allowlist, a size cap, AND the gateway's own media roots
     (resolved, symlink-safe) so it can't be used to read arbitrary files.
     """
+    _reject_authenticated_filesystem_api(request)
     try:
         target = Path(path).expanduser().resolve()
     except (OSError, RuntimeError):
@@ -1632,6 +1954,9 @@ def _decode_data_url(data_url: str) -> tuple[bytes, str]:
 
 @app.get("/api/files")
 async def list_managed_files(request: Request, path: Optional[str] = None):
+    if _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
+    _reject_authenticated_filesystem_api(request)
     policy, target, display_path = _resolve_managed_path(path, request)
     if not target.exists():
         raise HTTPException(status_code=404, detail="Path not found")
@@ -1660,6 +1985,9 @@ async def list_managed_files(request: Request, path: Optional[str] = None):
 
 @app.get("/api/files/read")
 async def read_managed_file(request: Request, path: str):
+    if _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
+    _reject_authenticated_filesystem_api(request)
     policy, target, display_path = _resolve_managed_path(path, request)
     if not target.exists():
         raise HTTPException(status_code=404, detail="File not found")
@@ -1702,6 +2030,9 @@ async def download_managed_file(request: Request, path: str):
     (which can't set the session header) still authenticates. See ``/api/pty``
     for the same query-token precedent.
     """
+    if _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
+    _reject_authenticated_filesystem_api(request)
     policy, target, _display_path = _resolve_managed_path(path, request)
     if not target.exists():
         raise HTTPException(status_code=404, detail="File not found")
@@ -1727,6 +2058,9 @@ async def download_managed_file(request: Request, path: str):
 
 @app.post("/api/files/upload")
 async def upload_managed_file(payload: ManagedFileUpload, request: Request):
+    if _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
+    _reject_authenticated_filesystem_api(request)
     policy, target, display_path = _resolve_managed_path(payload.path, request, for_write=True)
     if target.exists() and target.is_dir():
         raise HTTPException(status_code=409, detail="A directory already exists at that path")
@@ -1767,6 +2101,9 @@ async def upload_managed_file_stream(
     path: str = Form(...),
     overwrite: bool = Form(True),
 ):
+    if hasattr(request, "app") and _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
+    _reject_authenticated_filesystem_api(request)
     policy, target, display_path = _resolve_managed_path(path, request, for_write=True)
     if target.exists() and target.is_dir():
         raise HTTPException(status_code=409, detail="A directory already exists at that path")
@@ -1826,6 +2163,9 @@ async def upload_managed_file_stream(
 
 @app.post("/api/files/mkdir")
 async def create_managed_directory(payload: ManagedDirectoryCreate, request: Request):
+    if _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
+    _reject_authenticated_filesystem_api(request)
     policy, target, display_path = _resolve_managed_path(payload.path, request, for_write=True)
     if target.exists() and not target.is_dir():
         raise HTTPException(status_code=409, detail="A file already exists at that path")
@@ -1847,6 +2187,9 @@ async def create_managed_directory(payload: ManagedDirectoryCreate, request: Req
 
 @app.delete("/api/files")
 async def delete_managed_file(payload: ManagedFileDelete, request: Request):
+    if _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
+    _reject_authenticated_filesystem_api(request)
     policy, target, display_path = _resolve_managed_path(payload.path, request)
     if policy.locked_root is not None and target == policy.locked_root:
         raise HTTPException(status_code=400, detail="Cannot delete the managed files root")
@@ -1871,7 +2214,8 @@ async def delete_managed_file(payload: ManagedFileDelete, request: Request):
 
 
 @app.get("/api/fs/list")
-async def fs_list(path: str):
+async def fs_list(request: Request, path: str):
+    _reject_authenticated_filesystem_api(request)
     target = _fs_path(path)
     try:
         entries = []
@@ -1897,7 +2241,8 @@ async def fs_list(path: str):
 
 
 @app.get("/api/fs/read-text")
-async def fs_read_text(path: str):
+async def fs_read_text(request: Request, path: str):
+    _reject_authenticated_filesystem_api(request)
     target, st = _fs_regular_file(_fs_path(path))
     if st.st_size > _FS_TEXT_SOURCE_MAX_BYTES:
         raise HTTPException(status_code=413, detail="File too large")
@@ -1926,7 +2271,7 @@ class FsWriteText(BaseModel):
 
 
 @app.post("/api/fs/write-text")
-async def fs_write_text(payload: FsWriteText):
+async def fs_write_text(request: Request, payload: FsWriteText):
     """Overwrite (or create) a UTF-8 text file for the in-app spot editor.
 
     Mirrors the local Electron ``hermes:fs:writeText`` hardening: the path is
@@ -1937,6 +2282,7 @@ async def fs_write_text(payload: FsWriteText):
     original. Stale-on-disk detection is the client's job (re-read before save),
     so both transports behave identically.
     """
+    _reject_authenticated_filesystem_api(request)
     target = _fs_path(payload.path)
     text = payload.content or ""
     if len(text.encode("utf-8")) > _FS_TEXT_WRITE_MAX_BYTES:
@@ -1973,7 +2319,8 @@ async def fs_write_text(payload: FsWriteText):
 
 
 @app.get("/api/fs/read-data-url")
-async def fs_read_data_url(path: str, cwd: str | None = None):
+async def fs_read_data_url(request: Request, path: str, cwd: str | None = None):
+    _reject_authenticated_filesystem_api(request)
     target, st = _fs_regular_file(_fs_path(path, cwd=cwd))
     if st.st_size > _FS_DATA_URL_MAX_BYTES:
         raise HTTPException(status_code=413, detail="File too large")
@@ -1987,7 +2334,8 @@ async def fs_read_data_url(path: str, cwd: str | None = None):
 
 
 @app.get("/api/generated-images/{filename}")
-async def generated_image_file(filename: str):
+async def generated_image_file(request: Request, filename: str):
+    _reject_authenticated_filesystem_api(request)
     if not filename or filename in {".", ".."} or "/" in filename or "\\" in filename or "\0" in filename:
         raise HTTPException(status_code=400, detail="Invalid image filename")
     from hermes_constants import get_hermes_home
@@ -2028,7 +2376,8 @@ async def generated_image_file(filename: str):
 
 
 @app.get("/api/fs/git-root")
-async def fs_git_root(path: str):
+async def fs_git_root(request: Request, path: str):
+    _reject_authenticated_filesystem_api(request)
     target = _fs_path(path)
     try:
         st = target.stat()
@@ -2039,7 +2388,8 @@ async def fs_git_root(path: str):
 
 
 @app.get("/api/fs/default-cwd")
-async def fs_default_cwd():
+async def fs_default_cwd(request: Request):
+    _reject_authenticated_filesystem_api(request)
     cwd = _fs_default_cwd()
     return {"cwd": cwd, "branch": _fs_git_branch(cwd)}
 
@@ -2104,84 +2454,100 @@ class GitBranchSwitchBody(BaseModel):
 
 
 @app.get("/api/git/status")
-async def git_status_route(path: str):
+async def git_status_route(request: Request, path: str):
+    _reject_authenticated_control_plane_owner_surface("Git APIs")
     return await _git_op(_web_git.repo_status, _git_path(path))
 
 
 @app.get("/api/git/worktrees")
-async def git_worktrees_route(path: str):
+async def git_worktrees_route(request: Request, path: str):
+    _reject_authenticated_control_plane_owner_surface("Git APIs")
     return {"worktrees": await _git_op(_web_git.worktree_list, _git_path(path))}
 
 
 @app.get("/api/git/branches")
-async def git_branches_route(path: str):
+async def git_branches_route(request: Request, path: str):
+    _reject_authenticated_control_plane_owner_surface("Git APIs")
     return {"branches": await _git_op(_web_git.branch_list, _git_path(path))}
 
 
 @app.get("/api/git/review/list")
-async def git_review_list_route(path: str, scope: str = "uncommitted", base: Optional[str] = None):
+async def git_review_list_route(request: Request, path: str, scope: str = "uncommitted", base: Optional[str] = None):
+    _reject_authenticated_control_plane_owner_surface("Git APIs")
     return await _git_op(_web_git.review_list, _git_path(path), scope, base)
 
 
 @app.get("/api/git/review/diff")
 async def git_review_diff_route(
-    path: str, file: str, scope: str = "uncommitted", base: Optional[str] = None, staged: bool = False
+    request: Request, path: str, file: str, scope: str = "uncommitted", base: Optional[str] = None, staged: bool = False
 ):
+    _reject_authenticated_control_plane_owner_surface("Git APIs")
     return {"diff": await _git_op(_web_git.review_diff, _git_path(path), file, scope, base, staged)}
 
 
 @app.get("/api/git/file-diff")
-async def git_file_diff_route(path: str, file: str):
+async def git_file_diff_route(request: Request, path: str, file: str):
+    _reject_authenticated_control_plane_owner_surface("Git APIs")
     return {"diff": await _git_op(_web_git.file_diff_vs_head, _git_path(path), file)}
 
 
 @app.get("/api/git/review/commit-context")
-async def git_commit_context_route(path: str):
+async def git_commit_context_route(request: Request, path: str):
+    _reject_authenticated_control_plane_owner_surface("Git APIs")
     return await _git_op(_web_git.review_commit_context, _git_path(path))
 
 
 @app.get("/api/git/review/rev-parse")
-async def git_rev_parse_route(path: str, ref: Optional[str] = None):
+async def git_rev_parse_route(request: Request, path: str, ref: Optional[str] = None):
+    _reject_authenticated_control_plane_owner_surface("Git APIs")
     return {"sha": await _git_op(_web_git.review_rev_parse, _git_path(path), ref)}
 
 
 @app.get("/api/git/review/ship-info")
-async def git_ship_info_route(path: str):
+async def git_ship_info_route(request: Request, path: str):
+    _reject_authenticated_control_plane_owner_surface("Git APIs")
     return await _git_op(_web_git.review_ship_info, _git_path(path))
 
 
 @app.post("/api/git/review/stage")
-async def git_stage_route(body: GitFileBody):
+async def git_stage_route(request: Request, body: GitFileBody):
+    _reject_authenticated_control_plane_owner_surface("Git APIs")
     return await _git_op(_web_git.review_stage, _git_path(body.path), body.file)
 
 
 @app.post("/api/git/review/unstage")
-async def git_unstage_route(body: GitFileBody):
+async def git_unstage_route(request: Request, body: GitFileBody):
+    _reject_authenticated_control_plane_owner_surface("Git APIs")
     return await _git_op(_web_git.review_unstage, _git_path(body.path), body.file)
 
 
 @app.post("/api/git/review/revert")
-async def git_revert_route(body: GitFileBody):
+async def git_revert_route(request: Request, body: GitFileBody):
+    _reject_authenticated_control_plane_owner_surface("Git APIs")
     return await _git_op(_web_git.review_revert, _git_path(body.path), body.file)
 
 
 @app.post("/api/git/review/commit")
-async def git_commit_route(body: GitCommitBody):
+async def git_commit_route(request: Request, body: GitCommitBody):
+    _reject_authenticated_control_plane_owner_surface("Git APIs")
     return await _git_op(_web_git.review_commit, _git_path(body.path), body.message, body.push)
 
 
 @app.post("/api/git/review/push")
-async def git_push_route(body: GitPathBody):
+async def git_push_route(request: Request, body: GitPathBody):
+    _reject_authenticated_control_plane_owner_surface("Git APIs")
     return await _git_op(_web_git.review_push, _git_path(body.path))
 
 
 @app.post("/api/git/review/create-pr")
-async def git_create_pr_route(body: GitPathBody):
+async def git_create_pr_route(request: Request, body: GitPathBody):
+    _reject_authenticated_control_plane_owner_surface("Git APIs")
     return await _git_op(_web_git.review_create_pr, _git_path(body.path))
 
 
 @app.post("/api/git/worktree/add")
-async def git_worktree_add_route(body: GitWorktreeAddBody):
+async def git_worktree_add_route(request: Request, body: GitWorktreeAddBody):
+    _reject_authenticated_control_plane_owner_surface("Git APIs")
     options = {
         key: value
         for key, value in {
@@ -2196,14 +2562,16 @@ async def git_worktree_add_route(body: GitWorktreeAddBody):
 
 
 @app.post("/api/git/worktree/remove")
-async def git_worktree_remove_route(body: GitWorktreeRemoveBody):
+async def git_worktree_remove_route(request: Request, body: GitWorktreeRemoveBody):
+    _reject_authenticated_control_plane_owner_surface("Git APIs")
     return await _git_op(
         _web_git.worktree_remove, _git_path(body.path), _git_path(body.worktreePath), body.force
     )
 
 
 @app.post("/api/git/branch/switch")
-async def git_branch_switch_route(body: GitBranchSwitchBody):
+async def git_branch_switch_route(request: Request, body: GitBranchSwitchBody):
+    _reject_authenticated_control_plane_owner_surface("Git APIs")
     return await _git_op(_web_git.branch_switch, _git_path(body.path), body.branch)
 
 
@@ -2212,8 +2580,11 @@ async def get_status(profile: Optional[str] = None):
     status_scope = None
     requested_profile = (profile or "").strip()
     # Plain /api/status stays the machine-level public liveness probe. The
-    # dashboard adds ?profile= when its management switcher targets another
-    # profile, so its gateway badge reflects the selected profile.
+    # dashboard adds ?profile= in local/profile-manager mode when its management
+    # switcher targets another profile, so its gateway badge reflects the selected
+    # profile.  In authenticated owner mode this public endpoint must not let an
+    # unauthenticated caller select a legacy profile/home; owner-sensitive status
+    # must be routed through an authenticated Owner Worker surface instead.
     #
     # Use the config-only (contextvar) scope, NOT _profile_scope: this handler
     # awaits the remote-health probe, and _profile_scope swaps process-global
@@ -2221,6 +2592,8 @@ async def get_status(profile: Optional[str] = None):
     # across that await. Status only resolves get_hermes_home() at call time
     # (config/env/gateway state), which the task-local contextvar covers.
     if requested_profile and requested_profile.lower() != "current":
+        if getattr(app.state, "auth_required", False):
+            raise HTTPException(status_code=403, detail="profile status is not available in authenticated mode")
         status_scope = _config_profile_scope(requested_profile)
         status_scope.__enter__()
 
@@ -2304,21 +2677,22 @@ async def get_status(profile: Optional[str] = None):
             gateway_state = "running"
 
         active_sessions = 0
-        try:
-            from hermes_state import SessionDB
-            db = SessionDB()
+        if not getattr(app.state, "auth_required", False):
             try:
-                sessions = db.list_sessions_rich(limit=50)
-                now = time.time()
-                active_sessions = sum(
-                    1 for s in sessions
-                    if s.get("ended_at") is None
-                    and (now - s.get("last_active", s.get("started_at", 0))) < 300
-                )
-            finally:
-                db.close()
-        except Exception:
-            pass
+                from hermes_state import SessionDB
+                db = SessionDB()
+                try:
+                    sessions = db.list_sessions_rich(limit=50)
+                    now = time.time()
+                    active_sessions = sum(
+                        1 for s in sessions
+                        if s.get("ended_at") is None
+                        and (now - s.get("last_active", s.get("started_at", 0))) < 300
+                    )
+                finally:
+                    db.close()
+            except Exception:
+                pass
 
         # Busy/drainable readout (NAS lifecycle-safety gate).  active_agents is
         # the in-flight gateway-turn count the gateway now persists at every
@@ -3547,6 +3921,7 @@ async def get_action_status(name: str, lines: int = 200):
 
 @app.get("/api/sessions")
 async def get_sessions(
+    request: Request,
     limit: int = 20,
     offset: int = 0,
     min_messages: int = 0,
@@ -3579,6 +3954,9 @@ async def get_sessions(
             status_code=400,
             detail="order must be one of: created, recent",
         )
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
     profile_name: Optional[str] = None
     if profile:
         profile_name, _ = _cron_profile_home(profile)
@@ -3636,6 +4014,7 @@ async def get_sessions(
 
 @app.get("/api/profiles/sessions")
 def get_profiles_sessions(
+    request: Request,
     limit: int = 20,
     offset: int = 0,
     min_messages: int = 0,
@@ -3658,6 +4037,8 @@ def get_profiles_sessions(
         raise HTTPException(status_code=400, detail="archived must be one of: exclude, only, include")
     if order not in ("created", "recent"):
         raise HTTPException(status_code=400, detail="order must be one of: created, recent")
+    if _authenticated_owner_request(request):
+        raise HTTPException(status_code=403, detail="profile session aggregation is not available in authenticated mode")
 
     from hermes_state import SessionDB
     from hermes_cli import profiles as profiles_mod
@@ -3754,7 +4135,7 @@ def get_profiles_sessions(
 
 
 @app.get("/api/sessions/search")
-async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] = None):
+async def search_sessions(request: Request, q: str = "", limit: int = 20, profile: Optional[str] = None):
     """Search sessions by ID plus full-text message content using FTS5.
 
     Direct session-id matches are surfaced first, then FTS message-content
@@ -3765,6 +4146,9 @@ async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] =
     Branches also use ``parent_session_id``, but they are real alternate
     conversations; don't collapse branch-specific hits back into the parent.
     """
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
     if not q or not q.strip():
         return {"results": []}
     try:
@@ -4112,96 +4496,29 @@ async def get_schema():
     return {"fields": CONFIG_SCHEMA, "category_order": _CATEGORY_ORDER}
 
 
-_EMPTY_MODEL_INFO: dict = {
-    "model": "",
-    "provider": "",
-    "auto_context_length": 0,
-    "config_context_length": 0,
-    "effective_context_length": 0,
-    "capabilities": {},
-}
-
-
 @app.get("/api/model/info")
-def get_model_info(profile: Optional[str] = None):
+async def get_model_info(request: Request, profile: Optional[str] = None):
     """Return resolved model metadata for the currently configured model.
 
-    Calls the same context-length resolution chain the agent uses, so the
-    frontend can display "Auto-detected: 200K" alongside the override field.
-    Also returns model capabilities (vision, reasoning, tools) when available.
+    Authenticated owner mode proxies this owner-sensitive config read to the
+    Owner Worker.  Local/loopback mode keeps the legacy Control Plane read.
     """
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
     try:
+        from hermes_cli.model_info_payload import EMPTY_MODEL_INFO, model_info_payload_from_config
+
         with _profile_scope(profile):
             cfg = load_config()
-        model_cfg = cfg.get("model", "")
-
-        # Extract model name and provider from the config
-        if isinstance(model_cfg, dict):
-            model_name = model_cfg.get("default", model_cfg.get("name", ""))
-            provider = model_cfg.get("provider", "")
-            base_url = model_cfg.get("base_url", "")
-            config_ctx = model_cfg.get("context_length")
-        else:
-            model_name = str(model_cfg) if model_cfg else ""
-            provider = ""
-            base_url = ""
-            config_ctx = None
-
-        if not model_name:
-            return dict(_EMPTY_MODEL_INFO, provider=provider)
-
-        # Resolve auto-detected context length (pass config_ctx=None to get
-        # purely auto-detected value, then separately report the override)
-        try:
-            from agent.model_metadata import get_model_context_length
-            auto_ctx = get_model_context_length(
-                model=model_name,
-                base_url=base_url,
-                provider=provider,
-                config_context_length=None,  # ignore override — we want auto value
-            )
-        except Exception:
-            auto_ctx = 0
-
-        config_ctx_int = 0
-        if isinstance(config_ctx, int) and config_ctx > 0:
-            config_ctx_int = config_ctx
-
-        # Effective is what the agent actually uses
-        effective_ctx = config_ctx_int if config_ctx_int > 0 else auto_ctx
-
-        # Try to get model capabilities from models.dev
-        caps = {}
-        try:
-            from agent.models_dev import get_model_capabilities
-            mc = get_model_capabilities(provider=provider, model=model_name)
-            if mc is not None:
-                caps = {
-                    "supports_tools": mc.supports_tools,
-                    "supports_vision": mc.supports_vision,
-                    "supports_reasoning": mc.supports_reasoning,
-                    "context_window": mc.context_window,
-                    "max_output_tokens": mc.max_output_tokens,
-                    "model_family": mc.model_family,
-                }
-        except Exception:
-            pass
-
-        return {
-            "model": model_name,
-            "provider": provider,
-            "auto_context_length": auto_ctx,
-            "config_context_length": config_ctx_int,
-            "effective_context_length": effective_ctx,
-            "capabilities": caps,
-        }
+        return model_info_payload_from_config(cfg)
     except HTTPException:
         # Unknown/invalid profile must surface as 404, not degrade into a
         # 200 with empty model info (which would render as "no model set").
         raise
     except Exception:
         _log.exception("GET /api/model/info failed")
-        return dict(_EMPTY_MODEL_INFO)
+        return dict(EMPTY_MODEL_INFO)
 
 
 # ---------------------------------------------------------------------------
@@ -7802,78 +8119,12 @@ async def cancel_oauth_session(
 
 
 def _session_latest_descendant(session_id: str):
-    """Resolve a session id to the newest child leaf session.
-
-    /model may create child sessions. Dashboard refresh should continue the
-    newest child instead of reopening the old parent.
-    """
+    """Resolve a session id to the newest child leaf session."""
     from hermes_state import SessionDB
-
-    def row_get(row, key, index):
-        if isinstance(row, dict):
-            return row.get(key)
-        try:
-            return row[key]
-        except Exception:
-            try:
-                return row[index]
-            except Exception:
-                return None
 
     db = SessionDB()
     try:
-        sid = db.resolve_session_id(session_id)
-        if not sid or not db.get_session(sid):
-            return None, []
-
-        conn = (
-            getattr(db, "conn", None)
-            or getattr(db, "_conn", None)
-            or getattr(db, "connection", None)
-            or getattr(db, "_connection", None)
-        )
-
-        rows = []
-        if conn is not None:
-            raw_rows = conn.execute(
-                "SELECT id, parent_session_id, started_at FROM sessions"
-            ).fetchall()
-            for row in raw_rows:
-                rows.append({
-                    "id": row_get(row, "id", 0),
-                    "parent_session_id": row_get(row, "parent_session_id", 1),
-                    "started_at": row_get(row, "started_at", 2),
-                })
-        else:
-            rows = db.list_sessions_rich(limit=10000, offset=0)
-
-        children = {}
-        for row in rows:
-            rid = row.get("id")
-            parent = row.get("parent_session_id")
-            if rid and parent:
-                children.setdefault(parent, []).append(row)
-
-        def started(row):
-            try:
-                return float(row.get("started_at") or 0)
-            except Exception:
-                return 0.0
-
-        current = sid
-        path = [sid]
-        seen = {sid}
-
-        while children.get(current):
-            candidates = [r for r in children[current] if r.get("id") not in seen]
-            if not candidates:
-                break
-            candidates.sort(key=started, reverse=True)
-            current = candidates[0]["id"]
-            path.append(current)
-            seen.add(current)
-
-        return current, path
+        return session_api.session_latest_descendant(db, session_id)
     finally:
         db.close()
 
@@ -7894,7 +8145,7 @@ class BulkDeleteSessions(BaseModel):
 
 
 @app.post("/api/sessions/bulk-delete")
-async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
+async def bulk_delete_sessions_endpoint(request: Request, body: BulkDeleteSessions):
     """Delete every session in ``body.ids`` in a single DB transaction.
 
     Backs the dashboard's bulk-select-and-delete flow on the sessions
@@ -7935,6 +8186,9 @@ async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
             status_code=400,
             detail="ids must contain at most 500 entries",
         )
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(body.profile)
+        return await _proxy_authenticated_owner_http(request)
     db = _open_session_db_for_profile(body.profile)
     try:
         deleted = db.delete_sessions(body.ids)
@@ -7944,13 +8198,16 @@ async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
 
 
 @app.get("/api/sessions/empty/count")
-async def count_empty_sessions_endpoint(profile: Optional[str] = None):
+async def count_empty_sessions_endpoint(request: Request, profile: Optional[str] = None):
     """Return the number of empty, ended, non-archived sessions.
 
     Drives the dashboard's "Delete empty (N)" button — when N is 0 the
     UI hides the affordance so users aren't presented with a button
     that does nothing. Cheap, single-COUNT query.
     """
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
     db = _open_session_db_for_profile(profile)
     try:
         return {"count": db.count_empty_sessions()}
@@ -7959,7 +8216,7 @@ async def count_empty_sessions_endpoint(profile: Optional[str] = None):
 
 
 @app.delete("/api/sessions/empty")
-async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
+async def delete_empty_sessions_endpoint(request: Request, profile: Optional[str] = None):
     """Delete every empty (``message_count == 0``), ended,
     non-archived session in a single transaction.
 
@@ -7978,6 +8235,9 @@ async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
     prune-on-startup pass. Matching that pre-existing trade-off keeps
     the two delete endpoints' DB-vs-disk behaviour consistent.
     """
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
     db = _open_session_db_for_profile(profile)
     try:
         deleted = db.delete_empty_sessions()
@@ -7987,12 +8247,15 @@ async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
 
 
 @app.get("/api/sessions/stats")
-async def get_session_stats(profile: Optional[str] = None):
+async def get_session_stats(request: Request, profile: Optional[str] = None):
     """Session-store statistics for the Sessions page (mirrors `hermes sessions stats`).
 
     Registered before ``/api/sessions/{session_id}`` so the literal ``stats``
     path isn't captured as a session id by the parameterized route.
     """
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
     db = _open_session_db_for_profile(profile)
     try:
         total = db.session_count(include_archived=True)
@@ -8017,14 +8280,24 @@ async def get_session_stats(profile: Optional[str] = None):
         db.close()
 
 
-def _open_session_db_for_profile(profile: Optional[str]):
-    """Open a SessionDB for read paths, optionally for another profile.
+def _open_session_db_for_profile(profile: Optional[str], *, request: Request | None = None):
+    """Open a legacy-local SessionDB, never an authenticated owner's store.
+
+    Every authenticated session route must proxy before reaching this helper.
+    Passing its request makes a future route regression fail closed instead of
+    silently selecting the Control Plane/global default database.
 
     ``profile`` None/empty → this process's own ``state.db`` (the common,
     single-profile case). A named profile opens that profile's on-disk
     ``state.db`` directly so the primary backend can serve cross-profile reads
     (transcripts, detail) without spawning that profile's backend.
     """
+    if getattr(app.state, "auth_required", False):
+        _log.error("authenticated Control Plane attempted to open SessionDB directly")
+        raise HTTPException(
+            status_code=500,
+            detail="Owner-scoped sessions must be served by the Owner Worker",
+        )
     from hermes_state import SessionDB
     if not profile:
         return SessionDB()
@@ -8033,7 +8306,10 @@ def _open_session_db_for_profile(profile: Optional[str]):
 
 
 @app.get("/api/sessions/{session_id}")
-async def get_session_detail(session_id: str, profile: Optional[str] = None):
+async def get_session_detail(request: Request, session_id: str, profile: Optional[str] = None):
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
     db = _open_session_db_for_profile(profile)
     try:
         sid = db.resolve_session_id(session_id)
@@ -8049,7 +8325,9 @@ async def get_session_detail(session_id: str, profile: Optional[str] = None):
 
 
 @app.get("/api/sessions/{session_id}/latest-descendant")
-async def get_session_latest_descendant(session_id: str):
+async def get_session_latest_descendant(request: Request, session_id: str):
+    if _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
     latest, path = _session_latest_descendant(session_id)
     if not latest:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -8061,7 +8339,10 @@ async def get_session_latest_descendant(session_id: str):
     }
 
 @app.get("/api/sessions/{session_id}/messages")
-async def get_session_messages(session_id: str, profile: Optional[str] = None):
+async def get_session_messages(request: Request, session_id: str, profile: Optional[str] = None):
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
     db = _open_session_db_for_profile(profile)
     try:
         sid = db.resolve_session_id(session_id)
@@ -8075,10 +8356,13 @@ async def get_session_messages(session_id: str, profile: Optional[str] = None):
 
 
 @app.delete("/api/sessions/{session_id}")
-async def delete_session_endpoint(session_id: str, profile: Optional[str] = None):
+async def delete_session_endpoint(request: Request, session_id: str, profile: Optional[str] = None):
     # ``profile`` deletes a session belonging to another (local) profile by
     # opening its state.db directly. Remote profiles never reach here — the
     # desktop routes their DELETE to the remote backend. Omit for current/default.
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
     db = _open_session_db_for_profile(profile)
     try:
         # Resolve exact ids / unique prefixes like every other session endpoint
@@ -8108,13 +8392,16 @@ class SessionRename(BaseModel):
 
 
 @app.patch("/api/sessions/{session_id}")
-async def rename_session_endpoint(session_id: str, body: SessionRename):
+async def rename_session_endpoint(request: Request, session_id: str, body: SessionRename):
     """Update a session: rename (or clear its title) and/or archive it.
 
     ``title`` renames (empty/null clears the title); ``archived`` soft-hides or
     restores the session. Either field may be omitted. ``profile`` targets
     another profile's session.
     """
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(body.profile)
+        return await _proxy_authenticated_owner_http(request)
     db = _open_session_db_for_profile(body.profile)
     try:
         sid = db.resolve_session_id(session_id)
@@ -8142,8 +8429,11 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
 
 
 @app.get("/api/sessions/{session_id}/export")
-async def export_session_endpoint(session_id: str, profile: Optional[str] = None):
+async def export_session_endpoint(request: Request, session_id: str, profile: Optional[str] = None):
     """Export a single session (metadata + messages) as JSON."""
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
     db = _open_session_db_for_profile(profile)
     try:
         sid = db.resolve_session_id(session_id)
@@ -8164,10 +8454,13 @@ class SessionPrune(BaseModel):
 
 
 @app.post("/api/sessions/prune")
-async def prune_sessions_endpoint(body: SessionPrune):
+async def prune_sessions_endpoint(request: Request, body: SessionPrune):
     """Delete ended sessions older than N days (mirrors `hermes sessions prune`)."""
     if body.older_than_days < 1:
         raise HTTPException(status_code=400, detail="older_than_days must be >= 1")
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(body.profile)
+        return await _proxy_authenticated_owner_http(request)
     profile_home = _cron_profile_home(body.profile)[1] if body.profile else get_hermes_home()
     db = _open_session_db_for_profile(body.profile)
     try:
@@ -11168,6 +11461,7 @@ def _profile_scope(profile: Optional[str]):
     imported the modules before a HERMES_HOME override, or under test
     isolation).
     """
+    _reject_authenticated_control_plane_owner_surface("Profile-scoped management APIs")
     requested = (profile or "").strip()
 
     from hermes_constants import (
@@ -11221,6 +11515,7 @@ def _config_profile_scope(profile: Optional[str]):
 
     None/""/"current" means the dashboard's own profile — no override.
     """
+    _reject_authenticated_control_plane_owner_surface("Profile-scoped management APIs")
     requested = (profile or "").strip()
     if not requested or requested.lower() == "current":
         yield None
@@ -11739,225 +12034,45 @@ async def update_config_raw(body: RawConfigUpdate, profile: Optional[str] = None
 # ---------------------------------------------------------------------------
 
 
+def _usage_analytics_from_db(db: Any, days: int = 30) -> dict[str, Any]:
+    from hermes_cli.session_analytics import usage_analytics_from_db
+
+    return usage_analytics_from_db(db, days=days)
+
+
 @app.get("/api/analytics/usage")
-async def get_usage_analytics(days: int = 30, profile: Optional[str] = None):
-    from agent.insights import InsightsEngine
+async def get_usage_analytics(request: Request, days: int = 30, profile: Optional[str] = None):
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
 
     db = _open_session_db_for_profile(profile)
     try:
-        cutoff = time.time() - (days * 86400)
-        cur = db._conn.execute("""
-            SELECT date(started_at, 'unixepoch') as day,
-                   SUM(input_tokens) as input_tokens,
-                   SUM(output_tokens) as output_tokens,
-                   SUM(cache_read_tokens) as cache_read_tokens,
-                   SUM(reasoning_tokens) as reasoning_tokens,
-                   COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
-                   COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
-                   COUNT(*) as sessions,
-                   SUM(COALESCE(api_call_count, 0)) as api_calls
-            FROM sessions WHERE started_at > ?
-            GROUP BY day ORDER BY day
-        """, (cutoff,))
-        daily = [dict(r) for r in cur.fetchall()]
-
-        cur2 = db._conn.execute("""
-            SELECT model,
-                   SUM(input_tokens) as input_tokens,
-                   SUM(output_tokens) as output_tokens,
-                   COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
-                   COUNT(*) as sessions,
-                   SUM(COALESCE(api_call_count, 0)) as api_calls
-            FROM sessions WHERE started_at > ? AND model IS NOT NULL
-            GROUP BY model ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC
-        """, (cutoff,))
-        by_model = [dict(r) for r in cur2.fetchall()]
-
-        cur3 = db._conn.execute("""
-            SELECT SUM(input_tokens) as total_input,
-                   SUM(output_tokens) as total_output,
-                   SUM(cache_read_tokens) as total_cache_read,
-                   SUM(reasoning_tokens) as total_reasoning,
-                   COALESCE(SUM(estimated_cost_usd), 0) as total_estimated_cost,
-                   COALESCE(SUM(actual_cost_usd), 0) as total_actual_cost,
-                   COUNT(*) as total_sessions,
-                   SUM(COALESCE(api_call_count, 0)) as total_api_calls
-            FROM sessions WHERE started_at > ?
-        """, (cutoff,))
-        totals = dict(cur3.fetchone())
-        insights_report = InsightsEngine(db).generate(days=days)
-        skills = insights_report.get("skills", {
-            "summary": {
-                "total_skill_loads": 0,
-                "total_skill_edits": 0,
-                "total_skill_actions": 0,
-                "distinct_skills_used": 0,
-            },
-            "top_skills": [],
-        })
-
-        return {
-            "daily": daily,
-            "by_model": by_model,
-            "totals": totals,
-            "period_days": days,
-            "skills": skills,
-        }
+        return _usage_analytics_from_db(db, days=days)
     finally:
         db.close()
 
 
+def _models_analytics_from_db(db: Any, days: int = 30) -> dict[str, Any]:
+    from hermes_cli.session_analytics import models_analytics_from_db
+
+    return models_analytics_from_db(db, days=days)
+
+
 @app.get("/api/analytics/models")
-async def get_models_analytics(days: int = 30, profile: Optional[str] = None):
+async def get_models_analytics(request: Request, days: int = 30, profile: Optional[str] = None):
     """Rich per-model analytics for the Models dashboard page.
 
     Returns token/cost/session breakdown per model plus capability metadata
     from models.dev (context window, vision, tools, reasoning, etc.).
     """
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
+
     db = _open_session_db_for_profile(profile)
     try:
-        cutoff = time.time() - (days * 86400)
-
-        cur = db._conn.execute("""
-            SELECT model,
-                   billing_provider,
-                   SUM(input_tokens) as input_tokens,
-                   SUM(output_tokens) as output_tokens,
-                   SUM(cache_read_tokens) as cache_read_tokens,
-                   SUM(reasoning_tokens) as reasoning_tokens,
-                   COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
-                   COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
-                   COUNT(*) as sessions,
-                   SUM(COALESCE(api_call_count, 0)) as api_calls,
-                   SUM(tool_call_count) as tool_calls,
-                   MAX(started_at) as last_used_at,
-                   AVG(input_tokens + output_tokens) as avg_tokens_per_session
-            FROM sessions WHERE started_at > ? AND model IS NOT NULL AND model != ''
-            GROUP BY model, billing_provider
-            ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC
-        """, (cutoff,))
-        raw_rows = [dict(r) for r in cur.fetchall()]
-
-        # Session rows can be created before the first billable provider call
-        # finishes. If that early row records only the model name, and a later
-        # row for the same model has real accounting + billing_provider, the
-        # Models page used to show a duplicate "0 tokens / — API calls" card
-        # next to the real provider card. Fold those session-only rows into
-        # the single accounted provider row when the ownership is unambiguous.
-        rows_by_model: Dict[str, List[Dict[str, Any]]] = {}
-        for row in raw_rows:
-            rows_by_model.setdefault(row.get("model") or "", []).append(row)
-
-        rows: List[Dict[str, Any]] = []
-        for model_rows in rows_by_model.values():
-            provider_rows = [r for r in model_rows if r.get("billing_provider")]
-            if len(provider_rows) == 1:
-                target = provider_rows[0]
-                for row in model_rows:
-                    if row is target or row.get("billing_provider"):
-                        continue
-                    has_usage = any(
-                        (row.get(key) or 0) != 0
-                        for key in (
-                            "input_tokens",
-                            "output_tokens",
-                            "cache_read_tokens",
-                            "reasoning_tokens",
-                            "estimated_cost",
-                            "actual_cost",
-                            "api_calls",
-                            "tool_calls",
-                        )
-                    )
-                    if has_usage:
-                        continue
-                    target["sessions"] = (target.get("sessions") or 0) + (row.get("sessions") or 0)
-                    target["last_used_at"] = max(target.get("last_used_at") or 0, row.get("last_used_at") or 0)
-                    total_tokens = (target.get("input_tokens") or 0) + (target.get("output_tokens") or 0)
-                    sessions = target.get("sessions") or 0
-                    target["avg_tokens_per_session"] = total_tokens / sessions if sessions else 0
-                rows.append(target)
-                rows.extend(
-                    r for r in model_rows
-                    if r is not target
-                    and (r.get("billing_provider") or any(
-                        (r.get(key) or 0) != 0
-                        for key in (
-                            "input_tokens",
-                            "output_tokens",
-                            "cache_read_tokens",
-                            "reasoning_tokens",
-                            "estimated_cost",
-                            "actual_cost",
-                            "api_calls",
-                            "tool_calls",
-                        )
-                    ))
-                )
-            else:
-                rows.extend(model_rows)
-
-        rows.sort(
-            key=lambda r: (r.get("input_tokens") or 0) + (r.get("output_tokens") or 0),
-            reverse=True,
-        )
-
-        models = []
-        for row in rows:
-            provider = row.get("billing_provider") or ""
-            model_name = row["model"]
-            caps = {}
-            try:
-                from agent.models_dev import get_model_capabilities
-                mc = get_model_capabilities(provider=provider, model=model_name)
-                if mc is not None:
-                    caps = {
-                        "supports_tools": mc.supports_tools,
-                        "supports_vision": mc.supports_vision,
-                        "supports_reasoning": mc.supports_reasoning,
-                        "context_window": mc.context_window,
-                        "max_output_tokens": mc.max_output_tokens,
-                        "model_family": mc.model_family,
-                    }
-            except Exception:
-                pass
-
-            models.append({
-                "model": model_name,
-                "provider": provider,
-                "input_tokens": row["input_tokens"],
-                "output_tokens": row["output_tokens"],
-                "cache_read_tokens": row["cache_read_tokens"],
-                "reasoning_tokens": row["reasoning_tokens"],
-                "estimated_cost": row["estimated_cost"],
-                "actual_cost": row["actual_cost"],
-                "sessions": row["sessions"],
-                "api_calls": row["api_calls"],
-                "tool_calls": row["tool_calls"],
-                "last_used_at": row["last_used_at"],
-                "avg_tokens_per_session": row["avg_tokens_per_session"],
-                "capabilities": caps,
-            })
-
-        totals_cur = db._conn.execute("""
-            SELECT COUNT(DISTINCT model) as distinct_models,
-                   SUM(input_tokens) as total_input,
-                   SUM(output_tokens) as total_output,
-                   SUM(cache_read_tokens) as total_cache_read,
-                   SUM(reasoning_tokens) as total_reasoning,
-                   COALESCE(SUM(estimated_cost_usd), 0) as total_estimated_cost,
-                   COALESCE(SUM(actual_cost_usd), 0) as total_actual_cost,
-                   COUNT(*) as total_sessions,
-                   SUM(COALESCE(api_call_count, 0)) as total_api_calls
-            FROM sessions WHERE started_at > ? AND model IS NOT NULL AND model != ''
-        """, (cutoff,))
-        totals = dict(totals_cur.fetchone())
-
-        return {
-            "models": models,
-            "totals": totals,
-            "period_days": days,
-        }
+        return _models_analytics_from_db(db, days=days)
     finally:
         db.close()
 
@@ -12021,9 +12136,10 @@ def _ws_client_reason(ws: "WebSocket") -> Optional[str]:
 
     See :func:`_ws_client_is_allowed` for the full policy rationale.
     """
-    if getattr(app.state, "auth_required", False):
+    state = _ws_app_state(ws)
+    if getattr(state, "auth_required", False) or getattr(state, "owner_worker_mode", False):
         return None
-    bound_host = (getattr(app.state, "bound_host", "") or "").strip().lower()
+    bound_host = (getattr(state, "bound_host", "") or "").strip().lower()
     if bound_host and bound_host not in _LOOPBACK_HOSTS:
         return None
     client_host = ws.client.host if ws.client else ""
@@ -12063,14 +12179,15 @@ def _ws_client_is_allowed(ws: "WebSocket") -> bool:
     Host/Origin guard in :func:`_ws_host_origin_is_allowed` is what
     blocks DNS-rebinding here, not the peer IP.
     """
-    if getattr(app.state, "auth_required", False):
+    state = _ws_app_state(ws)
+    if getattr(state, "auth_required", False) or getattr(state, "owner_worker_mode", False):
         return True
     # Any explicit non-loopback bind (0.0.0.0, ::, or a specific LAN /
     # Tailscale address) means the operator opted into non-loopback
     # access via --insecure.  The loopback-only peer gate only applies to
     # an actual loopback bind; otherwise the WS handshake is rejected even
     # though same-bind HTTP requests pass _is_accepted_host.
-    bound_host = (getattr(app.state, "bound_host", "") or "").strip().lower()
+    bound_host = (getattr(state, "bound_host", "") or "").strip().lower()
     if bound_host and bound_host not in _LOOPBACK_HOSTS:
         return True
     client_host = ws.client.host if ws.client else ""
@@ -12089,7 +12206,8 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     machine-parseable token (``host_mismatch …`` / ``origin_mismatch …``)
     on rejection so the close path can log *why* the upgrade was refused.
     """
-    bound_host = getattr(app.state, "bound_host", None)
+    state = _ws_app_state(ws)
+    bound_host = getattr(state, "bound_host", None)
     if not bound_host:
         return None
 
@@ -12138,103 +12256,905 @@ def _ws_request_is_allowed(ws: "WebSocket") -> bool:
     return _ws_host_origin_is_allowed(ws) and _ws_client_is_allowed(ws)
 
 
-def _ws_auth_mode() -> str:
+@dataclass(frozen=True)
+class _WsAuthResult:
+    reason: Optional[str]
+    credential: str
+    payload: Optional[dict[str, Any]] = None
+    # Ephemeral verified-session expiry. It is never signed ticket material and
+    # never forwarded to an Owner Worker; bridge admission uses it to terminate
+    # a browser connection when its current access session expires.
+    session_expires_at: Optional[int] = None
+
+
+def _ws_app_state(ws: "WebSocket") -> Any:
+    return getattr(getattr(ws, "app", None), "state", app.state)
+
+
+def _ws_auth_mode(ws: "WebSocket | None" = None) -> str:
     """Short label for the active WS auth mode — logged on every connection."""
-    if getattr(app.state, "auth_required", False):
+    state = _ws_app_state(ws) if ws is not None else app.state
+    if getattr(state, "owner_worker_mode", False):
+        return "owner-worker"
+    if getattr(state, "auth_required", False):
         return "gated"
-    bound_host = (getattr(app.state, "bound_host", "") or "").strip().lower()
+    bound_host = (getattr(state, "bound_host", "") or "").strip().lower()
     if bound_host and bound_host not in _LOOPBACK_HOSTS:
         return "insecure"
     return "loopback"
 
 
-def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
-    """Validate WS-upgrade auth; return ``(reason, credential)``.
+def _ws_auth_result(ws: "WebSocket") -> _WsAuthResult:
+    """Validate WS-upgrade auth and retain the consumed credential payload.
 
     ``reason`` is None when the credential is accepted, else a short
     machine-parseable token explaining the rejection (``no_credential``,
     ``token_mismatch``, ``ticket_invalid``, ``internal_invalid``).
     ``credential`` names which credential type was presented (``ticket``,
-    ``internal``, ``token``, or ``none``) so the accepted path can log *how*
-    a peer authed, not just that it did.
+    ``internal``, ``internal_owner_token``, ``token``, or ``none``).
 
-    Loopback / ``--insecure``: legacy ``?token=<_SESSION_TOKEN>`` query
-    parameter, constant-time compared.
-
-    Gated (public bind, no ``--insecure``): one of two credentials —
-
-    * ``?ticket=<single-use>`` — a browser-minted, single-use, 30s-TTL ticket
-      consumed against the dashboard-auth ticket store. This is what the SPA
-      (and native clients) use.
-    * ``?internal=<process-credential>`` — the process-lifetime internal
-      credential, used only by WS clients the server spawns itself (the
-      embedded-TUI PTY child attaching to ``/api/ws`` and ``/api/pub``). It
-      is multi-use and never expires so the child can reconnect, and is never
-      injected into the SPA — see ``dashboard_auth.ws_tickets`` for the
-      threat model.
-
-    The legacy ``?token=`` path is unconditionally rejected in gated mode
-    (the SPA bundle isn't carrying the token any longer, and a leaked
-    ``_SESSION_TOKEN`` must not grant WS access once the gate is engaged).
-
-    Audit-logs the rejection so operators can debug "WS keeps closing"
-    issues from the log.
+    The public ``_ws_auth_reason`` / ``_ws_auth_ok`` wrappers preserve the old
+    tuple / boolean API for existing callers and tests. Authenticated owner
+    bridges use this richer result so the Control Plane can derive owner
+    context from the server-minted, single-use browser ticket payload without
+    consuming the ticket twice.
     """
-    auth_required = bool(getattr(app.state, "auth_required", False))
+    state = _ws_app_state(ws)
+
+    if getattr(state, "owner_worker_mode", False):
+        # Owner Worker UDS routes must be authorized by a short-lived token
+        # bound to this exact owner. The Control Plane's process-lifetime
+        # dashboard internal WS credential is intentionally insufficient here.
+        owner_key = str(getattr(state, "owner_worker_owner_key", "") or "").strip()
+        token = ws.query_params.get("internal_owner_token", "")
+        if not token:
+            return _WsAuthResult("no_credential", "none")
+        try:
+            from hermes_cli.dashboard_auth.authority import AuthorityStore
+            from hermes_cli.owner_worker.tokens import (
+                AUD_OWNER_WORKER_WS,
+                SCOPE_OWNER_WORKER_WS,
+                OwnerWorkerCapabilityInvalid,
+                verify_owner_worker_capability,
+            )
+            lease = getattr(state, "owner_worker_lease", None)
+            verifier = getattr(state, "owner_worker_capability_verifier", {})
+            if lease is None:
+                raise OwnerWorkerCapabilityInvalid("capability_lease_invalid")
+            verify_owner_worker_capability(
+                token,
+                expected_lease=lease,
+                audience=AUD_OWNER_WORKER_WS,
+                scope=SCOPE_OWNER_WORKER_WS,
+                path=ws.url.path,
+                authority_store=AuthorityStore(getattr(state, "owner_worker_control_home", None)),
+                public_key=verifier.get("HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY"),
+                issuer_key_version=verifier.get("HERMES_OWNER_WORKER_CAPABILITY_ISSUER"),
+                retained_public_keys=verifier.get(
+                    "HERMES_OWNER_WORKER_CAPABILITY_RETAINED_PUBLIC_KEYS"
+                ),
+            )
+        except Exception:
+            return _WsAuthResult("internal_owner_invalid", "internal_owner_token")
+        return _WsAuthResult(None, "internal_owner_token", {"owner_key": owner_key})
+
+    auth_required = bool(getattr(state, "auth_required", False))
     if auth_required:
         # Lazy import — keeps this function importable in test harnesses
         # that don't bring in the dashboard_auth layer.
-        from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
+        from hermes_cli.dashboard_auth.audit import (
+            AuthorityAuditEvent,
+            AuthorityAuditReason,
+            audit_authority,
+            new_authority_correlation_id,
+        )
+        from hermes_cli.dashboard_auth.middleware import (
+            WebSocketSessionRejected,
+            WebSocketSessionUnavailable,
+            verify_websocket_ticket_session,
+        )
         from hermes_cli.dashboard_auth.ws_tickets import (
             TicketInvalid,
-            consume_internal_credential,
+            authority_store,
+            browser_ws_audience,
             consume_ticket,
+            verify_ticket,
         )
 
-        # Server-spawned children (PTY child → /api/ws, /api/pub) present the
-        # multi-use internal credential rather than a single-use ticket, so
-        # they survive reconnects and slow cold boots.
+        # Owner-worker-spawned children use a short-lived owner-bound token;
+        # route those back through the Control Plane bridge to the matching worker.
+        # The old process-lifetime internal credential is intentionally rejected
+        # here because it carries no owner context.
+        internal_owner_token = ws.query_params.get("internal_owner_token", "")
+        if internal_owner_token:
+            try:
+                from hermes_cli.owner_worker.tokens import AUD_CONTROL_PLANE_WS, validate_internal_token_payload
+
+                supervisor = getattr(state, "owner_worker_supervisor", None)
+                payload = validate_internal_token_payload(
+                    internal_owner_token,
+                    audience=AUD_CONTROL_PLANE_WS,
+                    path=ws.url.path,
+                    control_home=getattr(supervisor, "control_home", None),
+                )
+            except Exception:
+                payload = None
+            if payload:
+                return _WsAuthResult(None, "internal_owner_token", payload)
+            audit_authority(
+                AuthorityAuditEvent.TICKET_REJECTED,
+                correlation_id=new_authority_correlation_id(),
+                reason=AuthorityAuditReason.INTERNAL_OWNER_INVALID,
+            )
+            return _WsAuthResult("internal_owner_invalid", "internal_owner_token")
+
         internal = ws.query_params.get("internal", "")
         if internal:
-            try:
-                consume_internal_credential(internal)
-                return None, "internal"
-            except TicketInvalid as exc:
-                audit_log(
-                    AuditEvent.WS_TICKET_REJECTED,
-                    reason=f"internal: {exc}",
-                    ip=(ws.client.host if ws.client else ""),
-                    path=ws.url.path,
-                )
-                return "internal_invalid", "internal"
+            audit_authority(
+                AuthorityAuditEvent.TICKET_REJECTED,
+                correlation_id=new_authority_correlation_id(),
+                reason=AuthorityAuditReason.INTERNAL_OWNER_CONTEXT_REQUIRED,
+            )
+            return _WsAuthResult("internal_owner_context_required", "internal")
 
         ticket = ws.query_params.get("ticket", "")
         if not ticket:
-            return "no_credential", "none"
+            return _WsAuthResult("no_credential", "none")
+        authority_correlation_id = new_authority_correlation_id()
 
         try:
-            consume_ticket(ticket)
-            return None, "ticket"
-        except TicketInvalid as exc:
-            audit_log(
-                AuditEvent.WS_TICKET_REJECTED,
-                reason=str(exc),
-                ip=(ws.client.host if ws.client else ""),
-                path=ws.url.path,
+            audience = browser_ws_audience(ws.url.path)
+            # Validate the ticket first without consuming it, then revalidate
+            # its cookie-bound provider session and membership state.  The
+            # authority transaction remains last so rejected upgrades cannot
+            # burn a valid browser capability.
+            ticket_store = authority_store()
+            payload = verify_ticket(ticket, audience=audience, store=ticket_store)
+            # Reconstruct before worker start/accept so signed-but-inconsistent
+            # principal material cannot become an owner routing input.
+            from hermes_cli.dashboard_auth.owner_context import owner_context_from_ticket_payload
+            owner_context_from_ticket_payload(payload)
+            session = verify_websocket_ticket_session(ws, payload)
+            payload = consume_ticket(ticket, audience=audience, store=ticket_store)
+            audit_authority(
+                AuthorityAuditEvent.TICKET_ADMITTED,
+                correlation_id=authority_correlation_id,
+                reason=AuthorityAuditReason.ADMITTED,
+                epoch=int(payload["epoch"]),
             )
-            return "ticket_invalid", "ticket"
+            return _WsAuthResult(
+                None,
+                "ticket",
+                payload,
+                session_expires_at=int(session.expires_at),
+            )
+        except WebSocketSessionUnavailable:
+            audit_authority(
+                AuthorityAuditEvent.AVAILABILITY_FAILURE,
+                correlation_id=authority_correlation_id,
+                reason=AuthorityAuditReason.SESSION_AUTHORITY_UNAVAILABLE,
+            )
+            return _WsAuthResult("authority_unavailable", "ticket")
+        except TicketInvalid as exc:
+            reason = str(exc)
+            audit_authority(
+                AuthorityAuditEvent.AVAILABILITY_FAILURE
+                if reason in {"authority_unavailable", "replay_continuity_unavailable"}
+                else AuthorityAuditEvent.TICKET_REJECTED,
+                correlation_id=authority_correlation_id,
+                reason=(
+                    AuthorityAuditReason.AUTHORITY_UNAVAILABLE
+                    if reason in {"authority_unavailable", "replay_continuity_unavailable"}
+                    else AuthorityAuditReason.TICKET_REJECTED
+                ),
+            )
+            return _WsAuthResult(
+                "authority_unavailable" if reason in {"authority_unavailable", "replay_continuity_unavailable"} else "ticket_invalid",
+                "ticket",
+            )
+        except (ValueError, WebSocketSessionRejected):
+            audit_authority(
+                AuthorityAuditEvent.TICKET_REJECTED,
+                correlation_id=authority_correlation_id,
+                reason=AuthorityAuditReason.TICKET_REJECTED,
+            )
+            return _WsAuthResult("ticket_invalid", "ticket")
 
     token = ws.query_params.get("token", "")
     if not token:
-        return "no_credential", "none"
+        return _WsAuthResult("no_credential", "none")
     if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
-        return None, "token"
-    return "token_mismatch", "token"
+        return _WsAuthResult(None, "token")
+    return _WsAuthResult("token_mismatch", "token")
+
+
+def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
+    """Validate WS-upgrade auth; return ``(reason, credential)``."""
+    result = _ws_auth_result(ws)
+    return result.reason, result.credential
 
 
 def _ws_auth_ok(ws: "WebSocket") -> bool:
     """True when the WS-upgrade credential is accepted. See _ws_auth_reason."""
-    return _ws_auth_reason(ws)[0] is None
+    return _ws_auth_result(ws).reason is None
+
+
+def _should_bridge_ws_to_owner_worker(ws: "WebSocket", auth_result: _WsAuthResult) -> bool:
+    """Return True when a Control Plane WS carries owner identity to bridge."""
+    state = _ws_app_state(ws)
+    return bool(
+        getattr(state, "auth_required", False)
+        and not getattr(state, "owner_worker_mode", False)
+        and auth_result.credential in {"ticket", "internal_owner_token"}
+    )
+
+
+def _ws_query_for_owner_worker(ws: "WebSocket", *, internal_owner_bootstrap: str) -> str:
+    """Forward browser query params to the worker with external auth stripped."""
+    # ``profile=default`` is a harmless management-profile hint in the Control
+    # Plane, but inside an owner worker the legacy profile resolver would map it
+    # back to the global default profile and overwrite HERMES_HOME. Strip all
+    # auth/profile selectors before forwarding; owner identity is already fixed
+    # by the worker env and the one-use internal_owner_bootstrap.
+    stripped_keys = {"ticket", "token", "internal", "internal_owner_token", "internal_owner_bootstrap", "profile"}
+    pairs = [
+        (key, value)
+        for key, value in urllib.parse.parse_qsl(str(ws.url.query or ""), keep_blank_values=True)
+        if key not in stripped_keys
+    ]
+    pairs.append(("internal_owner_bootstrap", internal_owner_bootstrap))
+    return urllib.parse.urlencode(pairs, doseq=True)
+
+
+def _ws_bridge_close_code(value: Any, default: int = 1011) -> int:
+    try:
+        code = int(value)
+    except (TypeError, ValueError):
+        return default
+    if 1000 <= code <= 1014 or 3000 <= code <= 4999:
+        return code
+    return default
+
+
+_OWNER_WORKER_WS_CONNECT_TIMEOUT = 10.0
+_OWNER_WORKER_WS_HANDSHAKE_TIMEOUT = 5.0
+_OWNER_WORKER_WS_RELAY_QUEUE_SIZE = 16
+_OWNER_WORKER_WS_RELAY_OPERATION_TIMEOUT = 10.0
+
+
+def _report_bridge_lifecycle(lease: Any, reason: "AuthorityAuditReason") -> None:
+    """Record trusted bridge lifecycle facts without stream or owner data."""
+    try:
+        from hermes_cli.dashboard_auth.audit import AuthorityAuditEvent
+        from hermes_cli.owner_worker.audit import report_worker_lifecycle
+
+        report_worker_lifecycle(
+            AuthorityAuditEvent.BRIDGE_LIFECYCLE,
+            reason,
+            worker_generation=int(lease.worker_generation),
+        )
+    except Exception:
+        return
+
+
+class _OwnerWorkerWsRelayClosed(Exception):
+    """Stop a relay with a sanitized public close result."""
+
+    def __init__(self, code: int, reason: str = "") -> None:
+        self.code = _ws_bridge_close_code(code)
+        self.reason = _ws_close_reason(reason) if reason else ""
+        super().__init__(self.reason or f"websocket relay closed ({self.code})")
+
+
+class _OwnerWorkerWsBridge:
+    """Own the two relay halves and release the exact use lease once."""
+
+    def __init__(self, browser_ws: Any, worker_ws: Any, lease: Any) -> None:
+        self.browser_ws = browser_ws
+        self.worker_ws = worker_ws
+        self.lease = lease
+        self._tasks: tuple[asyncio.Task[Any], ...] = ()
+        self._closing = False
+        self._released = False
+        self._lock = asyncio.Lock()
+
+    def set_tasks(self, tasks: tuple[asyncio.Task[Any], ...]) -> None:
+        self._tasks = tasks
+
+    @property
+    def closing(self) -> bool:
+        return self._closing
+
+    async def close(self, *, code: int = 1011, reason: str = "") -> None:
+        """Cancel relay work, close both halves, and release the use lease."""
+        async with self._lock:
+            if self._closing:
+                return
+            self._closing = True
+            current = asyncio.current_task()
+            tasks = tuple(task for task in self._tasks if task is not current and not task.done())
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            close_code = _ws_bridge_close_code(code)
+            close_reason = _ws_close_reason(reason) if reason else ""
+            for peer in (self.browser_ws, self.worker_ws):
+                try:
+                    await peer.close(code=close_code, reason=close_reason)
+                except Exception:
+                    pass
+            if not self._released and self.lease is not None:
+                self._released = True
+                self.lease.release()
+            if self.lease is not None:
+                from hermes_cli.dashboard_auth.audit import AuthorityAuditReason
+
+                _report_bridge_lifecycle(self.lease, AuthorityAuditReason.BRIDGE_CLOSED)
+
+
+async def _relay_queue_put(queue: asyncio.Queue[Any], value: Any) -> None:
+    try:
+        await asyncio.wait_for(
+            queue.put(value), timeout=_OWNER_WORKER_WS_RELAY_OPERATION_TIMEOUT
+        )
+    except TimeoutError as exc:
+        raise _OwnerWorkerWsRelayClosed(1013, "relay backpressure") from exc
+
+
+async def _relay_operation(
+    operation: Any, *, timeout: float = _OWNER_WORKER_WS_RELAY_OPERATION_TIMEOUT
+) -> None:
+    try:
+        await asyncio.wait_for(operation, timeout=timeout)
+    except TimeoutError as exc:
+        raise _OwnerWorkerWsRelayClosed(1013, "relay backpressure") from exc
+
+
+async def _relay_send(peer: Any, value: Any) -> None:
+    await _relay_operation(peer.send(value))
+
+
+async def _connect_owner_worker_ws(socket_path: Path, uri: str, *, open_timeout: float = _OWNER_WORKER_WS_CONNECT_TIMEOUT) -> Any:
+    """Open a websocket client over a Unix-domain socket.
+
+    ``websockets`` is a project dependency but isn't present in some system
+    interpreters used only for lint/compile checks, so import lazily. The
+    top-level ``unix_connect`` call signature differs between websockets
+    legacy/new asyncio APIs; try both supported shapes.
+    """
+    try:
+        import websockets
+    except Exception as exc:  # pragma: no cover - depends on runtime extras
+        raise RuntimeError("websockets package is required for owner worker WS bridge") from exc
+
+    unix_connect = getattr(websockets, "unix_connect", None)
+    if unix_connect is None:  # pragma: no cover - old/stripped installations
+        raise RuntimeError("websockets.unix_connect is unavailable")
+
+    kwargs = {"open_timeout": open_timeout, "max_queue": _OWNER_WORKER_WS_RELAY_QUEUE_SIZE}
+    try:
+        return await unix_connect(uri=uri, path=str(socket_path), **kwargs)
+    except TypeError:
+        return await unix_connect(str(socket_path), uri=uri, **kwargs)
+
+
+def _worker_bridge_identity(lease: Any) -> tuple[str, int, str, int, int]:
+    """Return the exact durable Worker fence used for bridge cleanup."""
+    return (
+        str(lease.owner_key),
+        int(lease.worker_generation),
+        str(lease.worker_id),
+        int(lease.lease_version),
+        int(lease.recovery_generation),
+    )
+
+
+def _authorized_ws_bridge_state(
+    app_obj: Any,
+) -> tuple[dict[str, set[tuple[Any, int]]], asyncio.Lock]:
+    """Return Control-Plane browser bridge state for ``app_obj``.
+
+    Each registration retains the admission epoch.  A later membership change
+    may keep the same scope digest, so closing by scope alone would incorrectly
+    terminate a newly admitted bridge carrying the new epoch.
+    """
+    try:
+        bridges = app_obj.state.authorized_ws_bridges
+        lock = app_obj.state.authorized_ws_bridge_lock
+    except AttributeError:
+        bridges = {}
+        lock = asyncio.Lock()
+        app_obj.state.authorized_ws_bridges = bridges
+        app_obj.state.authorized_ws_bridge_lock = lock
+        app_obj.state.authority_change_sequence = 0
+        app_obj.state.authority_change_stop = asyncio.Event()
+        app_obj.state.authority_change_task = None
+    if not hasattr(app_obj.state, "authorized_ws_bridges_by_worker"):
+        app_obj.state.authorized_ws_bridges_by_worker = {}
+    if not hasattr(app_obj.state, "revoked_ws_bridge_worker_fences"):
+        app_obj.state.revoked_ws_bridge_worker_fences = set()
+    if not hasattr(app_obj.state, "worker_change_sequence"):
+        app_obj.state.worker_change_sequence = 0
+    return bridges, lock
+
+
+async def _close_authorized_bridge_targets(
+    app_obj: Any,
+    targets: tuple[Any, ...],
+    *,
+    reason: str,
+    code: int = 4401,
+) -> None:
+    for ws in targets:
+        try:
+            await ws.close(code=code, reason=_ws_close_reason(f"auth: {reason}"))
+        except Exception:
+            _log.debug("failed to close revoked browser websocket", exc_info=True)
+
+
+async def close_authorized_bridges_by_digest(
+    app_obj: Any,
+    scope_digests: tuple[str, ...],
+    *,
+    reason: str,
+) -> None:
+    """Close every local browser bridge for explicitly revoked scopes."""
+    bridges, lock = _authorized_ws_bridge_state(app_obj)
+    async with lock:
+        targets = tuple(
+            ws
+            for digest in scope_digests
+            for ws, _epoch in bridges.pop(str(digest), set())
+        )
+        if targets:
+            worker_bridges = app_obj.state.authorized_ws_bridges_by_worker
+            for identity, registered in tuple(worker_bridges.items()):
+                kept = registered.difference(targets)
+                if kept:
+                    worker_bridges[identity] = kept
+                else:
+                    worker_bridges.pop(identity, None)
+    await _close_authorized_bridge_targets(app_obj, targets, reason=reason)
+
+
+async def close_authorized_bridges_by_changes(
+    app_obj: Any,
+    changes: tuple[Any, ...],
+    *,
+    reason: str,
+) -> None:
+    """Apply shared authority transitions to locally registered bridges."""
+    if not changes:
+        return
+    bridges, lock = _authorized_ws_bridge_state(app_obj)
+    async with lock:
+        targets: list[Any] = []
+        for change in changes:
+            digest = str(change.scope_digest)
+            registrations = bridges.get(digest, set())
+            kept: set[tuple[Any, int]] = set()
+            for ws, admitted_epoch in registrations:
+                if bool(change.revoked) or admitted_epoch < int(change.epoch):
+                    targets.append(ws)
+                else:
+                    kept.add((ws, admitted_epoch))
+            if kept:
+                bridges[digest] = kept
+            else:
+                bridges.pop(digest, None)
+        if targets:
+            worker_bridges = app_obj.state.authorized_ws_bridges_by_worker
+            for identity, registered in tuple(worker_bridges.items()):
+                kept = registered.difference(targets)
+                if kept:
+                    worker_bridges[identity] = kept
+                else:
+                    worker_bridges.pop(identity, None)
+    await _close_authorized_bridge_targets(app_obj, tuple(targets), reason=reason)
+
+
+async def close_authorized_bridges_by_worker_change(
+    app_obj: Any,
+    changes: tuple[Any, ...],
+    *,
+    reason: str,
+    close_active: bool = False,
+) -> None:
+    """Close only bridges bound to a non-admissible exact Worker fence."""
+    if not changes:
+        return
+    _authorized_ws_bridge_state(app_obj)
+    worker_bridges = app_obj.state.authorized_ws_bridges_by_worker
+    bridges, lock = _authorized_ws_bridge_state(app_obj)
+    targets: set[Any] = set()
+    async with lock:
+        for change in changes:
+            if not close_active and str(change.lease_state) in {"starting", "active"}:
+                continue
+            identity = _worker_bridge_identity(change)
+            app_obj.state.revoked_ws_bridge_worker_fences.add(identity)
+            targets.update(worker_bridges.pop(identity, set()))
+        if targets:
+            for digest, registrations in tuple(bridges.items()):
+                kept = {(ws, epoch) for ws, epoch in registrations if ws not in targets}
+                if kept:
+                    bridges[digest] = kept
+                else:
+                    bridges.pop(digest, None)
+    await _close_authorized_bridge_targets(
+        app_obj, tuple(targets), reason=reason, code=1011
+    )
+
+
+async def close_authorized_bridges(app_obj: Any, scope: Any, *, reason: str) -> None:
+    """Close local browser bridges for a revoked authority scope."""
+    await close_authorized_bridges_by_digest(
+        app_obj, (str(scope.digest),), reason=reason
+    )
+
+
+async def _watch_authority_changes(app_obj: Any) -> None:
+    """Dispatch shared authority transitions to this replica's bridge registry."""
+    from hermes_cli.dashboard_auth.ws_tickets import authority_store
+
+    state = app_obj.state
+    while not state.authority_change_stop.is_set():
+        try:
+            store = authority_store()
+            changes, worker_changes = await asyncio.gather(
+                asyncio.to_thread(store.changes_since, int(state.authority_change_sequence)),
+                asyncio.to_thread(store.worker_changes_since, int(state.worker_change_sequence)),
+            )
+        except Exception:
+            # A replica that cannot read the shared authority cannot safely keep
+            # authenticated long-lived connections alive. Admission is already
+            # fail-closed; end the local bridges too rather than retrying while
+            # they continue with stale authority.
+            _log.warning("authority change dispatch unavailable; closing local browser bridges")
+            bridges, lock = _authorized_ws_bridge_state(app_obj)
+            async with lock:
+                targets = tuple(
+                    ws for registrations in bridges.values() for ws, _epoch in registrations
+                )
+                bridges.clear()
+                app_obj.state.authorized_ws_bridges_by_worker.clear()
+            await _close_authorized_bridge_targets(
+                app_obj, targets, reason="authority_unavailable"
+            )
+            return
+        if changes:
+            await close_authorized_bridges_by_changes(
+                app_obj, changes, reason="authority_transition"
+            )
+            state.authority_change_sequence = changes[-1].sequence
+        if worker_changes:
+            await close_authorized_bridges_by_worker_change(
+                app_obj, worker_changes, reason="worker_generation_revoked"
+            )
+            state.worker_change_sequence = worker_changes[-1].sequence
+        try:
+            await asyncio.wait_for(state.authority_change_stop.wait(), timeout=0.25)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def _ensure_authority_change_dispatcher(app_obj: Any) -> None:
+    """Start one shared-authority watcher for the local Control Plane."""
+    _authorized_ws_bridge_state(app_obj)
+    state = app_obj.state
+    task = getattr(state, "authority_change_task", None)
+    if task is None or task.done():
+        state.authority_change_stop = asyncio.Event()
+        state.authority_change_task = asyncio.create_task(_watch_authority_changes(app_obj))
+
+
+def _owner_context_from_ws_auth_result(auth_result: _WsAuthResult) -> Any:
+    """Resolve owner routing context from a trusted WS credential payload."""
+    from hermes_cli.dashboard_auth.owner_context import (
+        owner_context_from_owner_key,
+        owner_context_from_ticket_payload,
+    )
+
+    if not auth_result.payload:
+        raise ValueError("missing owner payload")
+    if auth_result.credential == "internal_owner_token":
+        supervisor = getattr(app.state, "owner_worker_supervisor", None)
+        global_home = getattr(supervisor, "global_home", None)
+        return owner_context_from_owner_key(str(auth_result.payload.get("owner_key") or ""), global_home=global_home)
+    if auth_result.credential == "ticket":
+        return owner_context_from_ticket_payload(auth_result.payload)
+    raise ValueError("unsupported owner credential")
+
+
+async def _bridge_websocket_to_owner_worker(
+    ws: "WebSocket",
+    *,
+    path: str,
+    auth_result: _WsAuthResult,
+) -> None:
+    """Bridge an authenticated browser/internal WS to the owner's worker UDS route."""
+    if auth_result.credential not in {"ticket", "internal_owner_token"} or not auth_result.payload:
+        await ws.close(code=4401, reason=_ws_close_reason("auth: owner credential required"))
+        return
+
+    profile = ws.query_params.get("profile", "")
+    if profile and profile.strip().lower() not in {"default"}:
+        await ws.close(code=4400, reason=_ws_close_reason("profile selection is not available in authenticated mode"))
+        return
+
+    from hermes_cli.dashboard_auth.owner_context import ensure_owner_home
+    from hermes_cli.owner_worker.tokens import (
+        mint_owner_worker_bootstrap,
+        owner_worker_capability_public_config,
+        owp1_data,
+        parse_owner_worker_bootstrap,
+        owp1_hello,
+        parse_owp1_data,
+        validate_owp1_control,
+    )
+    try:
+        owner = _owner_context_from_ws_auth_result(auth_result)
+        ensure_owner_home(owner)
+    except Exception as exc:
+        _log.warning("owner websocket payload rejected path=%s cred=%s: %s", path, auth_result.credential, _redact_auth_secrets(exc))
+        await ws.close(code=4401, reason=_ws_close_reason("auth: owner payload invalid"))
+        return
+
+    supervisor = getattr(ws.app.state, "owner_worker_supervisor", None)
+    if supervisor is None:
+        await ws.close(code=1013, reason=_ws_close_reason("owner worker supervisor unavailable"))
+        return
+
+    lease: Any | None = None
+    try:
+        handle = await asyncio.to_thread(supervisor.get_or_start, owner)
+        lease = _acquire_owner_worker_use(supervisor, handle)
+    except Exception as exc:
+        if lease is not None:
+            lease.release()
+        _log.warning("owner worker start failed for websocket path=%s: %s", path, _redact_auth_secrets(exc))
+        await ws.close(code=1013, reason=_ws_close_reason("owner worker unavailable"))
+        return
+
+    connection_id = secrets.token_urlsafe(18)
+    nonce = secrets.token_urlsafe(18)
+    bootstrap_claims = mint_owner_worker_bootstrap(
+        _owner_worker_authority_lease(handle),
+        path=path,
+        connection_id=connection_id,
+        nonce=nonce,
+        control_home=getattr(supervisor, "control_home", None),
+    )
+    verifier = owner_worker_capability_public_config(getattr(supervisor, "control_home", None))
+    bootstrap = parse_owner_worker_bootstrap(
+        bootstrap_claims,
+        expected_lease=_owner_worker_authority_lease(handle),
+        path=path,
+        public_key=verifier["HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY"],
+        issuer_key_version=verifier["HERMES_OWNER_WORKER_CAPABILITY_ISSUER"],
+        retained_public_keys=verifier["HERMES_OWNER_WORKER_CAPABILITY_RETAINED_PUBLIC_KEYS"],
+    )
+    query = _ws_query_for_owner_worker(ws, internal_owner_bootstrap=bootstrap_claims)
+    worker_uri = f"ws://owner-worker{path}"
+    if query:
+        worker_uri = f"{worker_uri}?{query}"
+
+    worker_ws = None
+    try:
+        worker_ws = await _connect_owner_worker_ws(handle.socket_path, worker_uri)
+        await _relay_send(worker_ws, owp1_hello(bootstrap))
+        ack = await asyncio.wait_for(
+            worker_ws.recv(), timeout=_OWNER_WORKER_WS_HANDSHAKE_TIMEOUT
+        )
+        validate_owp1_control(ack, bootstrap, message_type="ack")
+    except Exception as exc:
+        if worker_ws is not None:
+            try:
+                await worker_ws.close(code=1011)
+            except Exception:
+                pass
+        if lease is not None:
+            lease.release()
+        _log.warning("owner worker websocket connect failed path=%s owner=%s: %s", path, owner.owner_key, _redact_auth_secrets(exc))
+        await ws.close(code=1013, reason=_ws_close_reason("owner worker websocket unavailable"))
+        return
+
+    await ws.accept()
+    bridge = _OwnerWorkerWsBridge(ws, worker_ws, lease)
+    if (
+        auth_result.session_expires_at is not None
+        and auth_result.session_expires_at <= int(time.time())
+    ):
+        await bridge.close(code=4401, reason="auth: session_expired")
+        return
+    bridge_scope_digest: str | None = None
+    bridge_worker_identity = _worker_bridge_identity(_owner_worker_authority_lease(handle))
+    await _ensure_authority_change_dispatcher(ws.app)
+    bridges, bridge_lock = _authorized_ws_bridge_state(ws.app)
+    revoked_before_registration = False
+    async with bridge_lock:
+        if bridge_worker_identity in ws.app.state.revoked_ws_bridge_worker_fences:
+            revoked_before_registration = True
+        else:
+            ws.app.state.authorized_ws_bridges_by_worker.setdefault(
+                bridge_worker_identity, set()
+            ).add(bridge)
+            if auth_result.credential == "ticket":
+                from hermes_cli.dashboard_auth.authority import AuthorizationScope
+
+                bridge_scope = AuthorizationScope(
+                    provider=str(auth_result.payload["provider"]),
+                    tenant_id=str(auth_result.payload["tenant_id"]),
+                    user_id=str(auth_result.payload["user_id"]),
+                    session_id=str(auth_result.payload["session_id"]),
+                    membership_revision=str(auth_result.payload["membership_revision"]),
+                )
+                bridge_scope_digest = bridge_scope.digest
+                bridges.setdefault(bridge_scope_digest, set()).add(
+                    (bridge, int(auth_result.payload["epoch"]))
+                )
+    if revoked_before_registration:
+        await bridge.close(code=1011, reason="auth: worker generation revoked")
+        return
+    from hermes_cli.dashboard_auth.audit import AuthorityAuditReason
+
+    _report_bridge_lifecycle(_owner_worker_authority_lease(handle), AuthorityAuditReason.ADMITTED)
+    _log.info("owner websocket bridged path=%s owner=%s", path, owner.owner_key)
+
+    async def expire_browser_session() -> None:
+        expires_at = auth_result.session_expires_at
+        if expires_at is None:
+            return
+        delay = max(0, expires_at - int(time.time()))
+        await asyncio.sleep(delay)
+        await bridge.close(code=4401, reason="auth: session_expired")
+
+    browser_to_worker: asyncio.Queue[Any] = asyncio.Queue(
+        maxsize=_OWNER_WORKER_WS_RELAY_QUEUE_SIZE
+    )
+    worker_to_browser: asyncio.Queue[tuple[str, Any]] = asyncio.Queue(
+        maxsize=_OWNER_WORKER_WS_RELAY_QUEUE_SIZE
+    )
+
+    async def receive_browser() -> None:
+        sequence = 1
+        while True:
+            msg = await ws.receive()
+            if msg.get("type") == "websocket.disconnect":
+                raise _OwnerWorkerWsRelayClosed(
+                    _ws_bridge_close_code(msg.get("code"), default=1000),
+                    str(msg.get("reason") or ""),
+                )
+            if msg.get("bytes") is not None:
+                envelope = owp1_data(
+                    bootstrap,
+                    direction="control-to-worker",
+                    sequence=sequence,
+                    data=msg["bytes"],
+                )
+            elif msg.get("text") is not None:
+                envelope = owp1_data(
+                    bootstrap,
+                    direction="control-to-worker",
+                    sequence=sequence,
+                    text=msg["text"],
+                )
+            else:
+                continue
+            await _relay_queue_put(browser_to_worker, envelope)
+            sequence += 1
+
+    async def send_worker() -> None:
+        while True:
+            await _relay_send(worker_ws, await browser_to_worker.get())
+
+    async def receive_worker() -> None:
+        sequence = 1
+        try:
+            async for message in worker_ws:
+                kind, payload = parse_owp1_data(
+                    message,
+                    bootstrap,
+                    direction="worker-to-control",
+                    expected_sequence=sequence,
+                )
+                sequence += 1
+                await _relay_queue_put(worker_to_browser, (kind, payload))
+        except _OwnerWorkerWsRelayClosed:
+            raise
+        except Exception as exc:
+            raise _OwnerWorkerWsRelayClosed(
+                _ws_bridge_close_code(getattr(exc, "code", None), default=1011),
+                str(getattr(exc, "reason", "") or ""),
+            ) from exc
+        raise _OwnerWorkerWsRelayClosed(1000)
+
+    async def send_browser() -> None:
+        while True:
+            kind, payload = await worker_to_browser.get()
+            if kind == "bytes":
+                await _relay_operation(ws.send_bytes(bytes(payload)))
+            else:
+                await _relay_operation(ws.send_text(str(payload)))
+
+    expiry_task = (
+        asyncio.create_task(expire_browser_session())
+        if auth_result.session_expires_at is not None
+        else None
+    )
+    relay_tasks = (
+        asyncio.create_task(receive_browser()),
+        asyncio.create_task(send_worker()),
+        asyncio.create_task(receive_worker()),
+        asyncio.create_task(send_browser()),
+    )
+    bridge.set_tasks((*relay_tasks, *((expiry_task,) if expiry_task is not None else ())))
+    # Let an already-expired browser session close the bridge before a relay
+    # task can race into its normal disconnect path.
+    await asyncio.sleep(0)
+    close_code, close_reason = 1011, "owner worker relay ended"
+    try:
+        wait_targets = (*relay_tasks, *((expiry_task,) if expiry_task is not None else ()))
+        done, _pending = await asyncio.wait(wait_targets, return_when=asyncio.FIRST_COMPLETED)
+        if expiry_task is not None and expiry_task in done:
+            try:
+                await expiry_task
+            except asyncio.CancelledError:
+                # ``bridge.close()`` owns and cancels its registered expiry task
+                # during normal relay teardown. Do not turn that expected child
+                # cancellation into an ASGI application error, but retain an
+                # unexpected timer cancellation for diagnosis.
+                if not bridge.closing:
+                    raise
+            return
+        # Let all immediately-completing pumps report their close result before
+        # selecting the terminal state. This prevents a cancelled sibling from
+        # masking the browser's explicit close frame.
+        await asyncio.sleep(0)
+        done = {task for task in relay_tasks if task.done()}
+        for task in done:
+            if task.cancelled():
+                continue
+            try:
+                task.result()
+            except _OwnerWorkerWsRelayClosed as exc:
+                close_code, close_reason = exc.code, exc.reason
+                break
+            except Exception:
+                _log.debug("owner websocket relay ended", exc_info=True)
+                break
+    finally:
+        if expiry_task is not None:
+            expiry_task.cancel()
+            await asyncio.gather(expiry_task, return_exceptions=True)
+        if bridge_scope_digest is not None or bridge_worker_identity is not None:
+            bridges, bridge_lock = _authorized_ws_bridge_state(ws.app)
+            async with bridge_lock:
+                if bridge_scope_digest is not None:
+                    registered = bridges.get(bridge_scope_digest)
+                    if registered is not None:
+                        registered = {
+                            (registered_bridge, admitted_epoch)
+                            for registered_bridge, admitted_epoch in registered
+                            if registered_bridge is not bridge
+                        }
+                        if registered:
+                            bridges[bridge_scope_digest] = registered
+                        else:
+                            bridges.pop(bridge_scope_digest, None)
+                worker_registered = ws.app.state.authorized_ws_bridges_by_worker.get(
+                    bridge_worker_identity
+                )
+                if worker_registered is not None:
+                    worker_registered.discard(bridge)
+                    if not worker_registered:
+                        ws.app.state.authorized_ws_bridges_by_worker.pop(
+                            bridge_worker_identity, None
+                        )
+        if not bridge.closing:
+            await bridge.close(code=close_code, reason=close_reason)
+
 
 # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
 # and /api/events (dashboard → browser sidebar).  Keyed by an opaque channel id
@@ -12250,6 +13170,7 @@ def _resolve_chat_argv(
     profile: Optional[str] = None,
     active_session_file: Optional[str] = None,
     browser_id: Optional[str] = None,
+    app_obj: Any | None = None,
 ) -> tuple[list[str], Optional[str], Optional[dict]]:
     """Resolve the argv + cwd + env for the chat PTY.
 
@@ -12288,10 +13209,16 @@ def _resolve_chat_argv(
     """
     from hermes_cli.main import PROJECT_ROOT, _make_tui_argv
 
+    owner_worker_mode = bool(getattr(getattr(app_obj, "state", app.state), "owner_worker_mode", False))
     profile_dir: Optional[Path] = None
     requested = (profile or "").strip()
     if requested and requested.lower() != "current":
-        profile_dir = _resolve_profile_dir(requested)
+        if owner_worker_mode and requested.lower() == "default":
+            requested = ""
+        elif owner_worker_mode:
+            raise HTTPException(status_code=400, detail="profile selection is not available in authenticated mode")
+        else:
+            profile_dir = _resolve_profile_dir(requested)
 
     tui_dir = PROJECT_ROOT / "ui-tui"
     prebuilt_tui_dir = tui_dir if (tui_dir / "dist" / "entry.js").is_file() else None
@@ -12331,6 +13258,16 @@ def _resolve_chat_argv(
             resume = latest_resume
         env["HERMES_TUI_RESUME"] = resume
 
+    if owner_worker_mode:
+        try:
+            from hermes_cli.owner_runtime import resolve_workspace_cwd
+
+            cwd = resolve_workspace_cwd(None, create_default=True)
+            env["HERMES_CWD"] = str(cwd)
+            env["TERMINAL_CWD"] = str(cwd)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     if sidecar_url:
         env["HERMES_TUI_SIDECAR_URL"] = sidecar_url
 
@@ -12345,25 +13282,29 @@ def _resolve_chat_argv(
     # attach URL, gatewayClient spawns its own `tui_gateway.entry`, which
     # inherits the profile HERMES_HOME set above.
     if profile_dir is None:
-        if gateway_ws_url := _build_gateway_ws_url():
+        if gateway_ws_url := _build_gateway_ws_url(app_obj=app_obj):
             env["HERMES_TUI_GATEWAY_URL"] = gateway_ws_url
 
     return list(argv), str(cwd) if cwd else None, env
 
 
-def _build_gateway_ws_url() -> Optional[str]:
+def _build_gateway_ws_url(app_obj: Any | None = None) -> Optional[str]:
     """ws:// URL the PTY child should attach to for JSON-RPC gateway traffic.
 
     Loopback / ``--insecure``: ``?token=<_SESSION_TOKEN>``.
 
-    Gated mode: the legacy token path is rejected by ``_ws_auth_ok``, so the
-    server-spawned PTY child authenticates with the process-lifetime internal
-    credential (``?internal=``). It must NOT use a single-use browser ticket:
-    the child reads this URL once at startup and reuses it on every reconnect,
-    and a 30s-TTL ticket can expire before a slow cold boot even dials.
+    Authenticated Control Plane mode returns ``None``: live PTY children must be
+    spawned inside an Owner Worker, where the worker builds an owner-bound
+    ``internal_owner_token`` URL back to this Control Plane.
     """
-    host = getattr(app.state, "bound_host", None)
-    port = getattr(app.state, "bound_port", None)
+    state = getattr(app_obj, "state", app.state) if app_obj is not None else app.state
+    if getattr(state, "owner_worker_mode", False):
+        # Workers only carry public verification material. Child bootstrap is
+        # intentionally deferred until the single-use handshake capability.
+        return None
+
+    host = getattr(state, "bound_host", None)
+    port = getattr(state, "bound_port", None)
 
     if not host or not port:
         return None
@@ -12374,12 +13315,9 @@ def _build_gateway_ws_url() -> Optional[str]:
         else f"{host}:{port}"
     )
 
-    if getattr(app.state, "auth_required", False):
-        from hermes_cli.dashboard_auth.ws_tickets import internal_ws_credential
-
-        qs = urllib.parse.urlencode({"internal": internal_ws_credential()})
-    else:
-        qs = urllib.parse.urlencode({"token": _SESSION_TOKEN})
+    if getattr(state, "auth_required", False):
+        return None
+    qs = urllib.parse.urlencode({"token": _SESSION_TOKEN})
 
     return f"ws://{netloc}/api/ws?{qs}"
 
@@ -12390,6 +13328,7 @@ async def _resolve_chat_argv_async(
     profile: Optional[str] = None,
     active_session_file: Optional[str] = None,
     browser_id: Optional[str] = None,
+    app_obj: Any | None = None,
 ) -> tuple[list[str], Optional[str], Optional[dict]]:
     """Resolve chat argv without blocking the dashboard event loop.
 
@@ -12406,51 +13345,43 @@ async def _resolve_chat_argv_async(
         "sidecar_url": sidecar_url,
         "profile": profile,
         "browser_id": browser_id,
+        "app_obj": app_obj,
     }
     if active_session_file is not None:
         kwargs["active_session_file"] = active_session_file
     if browser_id is not None:
         kwargs["browser_id"] = browser_id
 
-    async with _get_chat_argv_lock(app):
-        return await asyncio.to_thread(
-            _resolve_chat_argv,
-            **kwargs,
-        )
+    lock_app = app_obj or app
+    async with _get_chat_argv_lock(lock_app):
+        return await asyncio.to_thread(_resolve_chat_argv, **kwargs)
 
 
-def _build_sidecar_url(channel: str) -> Optional[str]:
+def _build_sidecar_url(channel: str, app_obj: Any | None = None) -> Optional[str]:
     """ws:// URL the PTY child should publish events to, or None when unbound.
 
     Loopback / ``--insecure``: uses ``?token=<_SESSION_TOKEN>``.
 
-    Gated mode: authenticates with the process-lifetime internal credential
-    (``?internal=``), the same one ``_build_gateway_ws_url`` uses. The PTY
-    child is a server-spawned process we trust; the credential is multi-use
-    and never expires, so the child can reconnect ``/api/pub`` without a new
-    URL. (This previously minted a single-use 30s ticket, which meant the
-    child could not reconnect and could miss the window on a slow cold boot.)
-    Connections authenticated this way are recorded under the
-    ``server-internal`` identity in the audit log.
+    Authenticated Control Plane mode returns ``None``: live PTY children must be
+    spawned inside an Owner Worker, where the worker builds an owner-bound
+    ``internal_owner_token`` URL back to this Control Plane.
     """
-    host = getattr(app.state, "bound_host", None)
-    port = getattr(app.state, "bound_port", None)
+    state = getattr(app_obj, "state", app.state) if app_obj is not None else app.state
+    if getattr(state, "owner_worker_mode", False):
+        del channel
+        return None
+
+    host = getattr(state, "bound_host", None)
+    port = getattr(state, "bound_port", None)
 
     if not host or not port:
         return None
 
     netloc = f"[{host}]:{port}" if ":" in host and not host.startswith("[") else f"{host}:{port}"
 
-    if getattr(app.state, "auth_required", False):
-        # Gated mode — use the internal credential so the WS upgrade survives
-        # _ws_auth_ok and the child can reconnect.
-        from hermes_cli.dashboard_auth.ws_tickets import internal_ws_credential
-
-        qs = urllib.parse.urlencode(
-            {"internal": internal_ws_credential(), "channel": channel}
-        )
-    else:
-        qs = urllib.parse.urlencode({"token": _SESSION_TOKEN, "channel": channel})
+    if getattr(state, "auth_required", False):
+        return None
+    qs = urllib.parse.urlencode({"token": _SESSION_TOKEN, "channel": channel})
 
     return f"ws://{netloc}/api/pub?{qs}"
 
@@ -12515,6 +13446,13 @@ def _forget_active_session_file(path: Path) -> None:
         pass
 
 
+_AUTH_SECRET_PARAM_RE = re.compile(r"(?i)(ticket|token|internal|internal_owner_token|authorization)=([^&\s]+)")
+
+
+def _redact_auth_secrets(text: Any) -> str:
+    return _AUTH_SECRET_PARAM_RE.sub(lambda m: f"{m.group(1)}=<redacted>", str(text))
+
+
 def _ws_close_reason(text: str) -> str:
     """Clamp a WS close reason to the protocol's 123-byte UTF-8 limit.
 
@@ -12522,6 +13460,7 @@ def _ws_close_reason(text: str) -> str:
     longer string is passed. Our reasons embed an attacker-controlled origin,
     so truncate defensively rather than crash the close handler.
     """
+    text = _redact_auth_secrets(text)
     encoded = text.encode("utf-8", "replace")
     if len(encoded) <= 123:
         return text
@@ -12618,8 +13557,9 @@ async def pty_ws(ws: WebSocket) -> None:
     #     browser banner agree on the cause:
     #       4401 bad credential   4403 host/origin mismatch
     #       4408 peer not allowed  4404 chat disabled
-    auth_reason, cred = _ws_auth_reason(ws)
-    mode = _ws_auth_mode()
+    auth_result = _ws_auth_result(ws)
+    auth_reason, cred = auth_result.reason, auth_result.credential
+    mode = _ws_auth_mode(ws)
     if auth_reason is not None:
         _log.warning(
             "pty auth rejected reason=%s mode=%s cred=%s peer=%s",
@@ -12638,6 +13578,13 @@ async def pty_ws(ws: WebSocket) -> None:
     if client_reason is not None:
         _log.warning("pty refused: %s", client_reason)
         await ws.close(code=4408, reason=_ws_close_reason(client_reason))
+        return
+
+    if _should_bridge_ws_to_owner_worker(ws, auth_result):
+        # Authenticated browser live-state endpoints must not fall through to this
+        # Control Plane process's shared PTY/browser maps. Server-spawned internal
+        # sidecars do not carry owner identity here and remain on the local app.
+        await _bridge_websocket_to_owner_worker(ws, path="/api/pty", auth_result=auth_result)
         return
 
     await ws.accept()
@@ -12662,7 +13609,7 @@ async def pty_ws(ws: WebSocket) -> None:
     browser_registered = False
     browser_owner_id = uuid.uuid4().hex if browser_id else ""
     channel = _channel_or_close_code(ws)
-    sidecar_url = _build_sidecar_url(channel) if channel else None
+    sidecar_url = _build_sidecar_url(channel, app_obj=ws.app) if channel else None
     force_fresh = (ws.query_params.get("fresh") or "").strip().lower() in {
         "1",
         "true",
@@ -12708,7 +13655,7 @@ async def pty_ws(ws: WebSocket) -> None:
         resolve_kwargs["active_session_file"] = str(active_session_file)
 
     try:
-        argv, cwd, env = await _resolve_chat_argv_async(**resolve_kwargs)
+        argv, cwd, env = await _resolve_chat_argv_async(**resolve_kwargs, app_obj=ws.app)
     except HTTPException as exc:
         # Unknown/invalid profile from _resolve_profile_dir.
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc.detail}\x1b[0m\r\n")
@@ -12885,12 +13832,17 @@ async def gateway_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    if not _ws_auth_ok(ws):
-        await ws.close(code=4401)
+    auth_result = _ws_auth_result(ws)
+    if auth_result.reason is not None:
+        await ws.close(code=4401, reason=_ws_close_reason(f"auth: {auth_result.reason}"))
         return
 
     if not _ws_request_is_allowed(ws):
         await ws.close(code=4403)
+        return
+
+    if _should_bridge_ws_to_owner_worker(ws, auth_result):
+        await _bridge_websocket_to_owner_worker(ws, path="/api/ws", auth_result=auth_result)
         return
 
     from tui_gateway.ws import handle_ws
@@ -12916,12 +13868,17 @@ async def pub_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    if not _ws_auth_ok(ws):
-        await ws.close(code=4401)
+    auth_result = _ws_auth_result(ws)
+    if auth_result.reason is not None:
+        await ws.close(code=4401, reason=_ws_close_reason(f"auth: {auth_result.reason}"))
         return
 
     if not _ws_request_is_allowed(ws):
         await ws.close(code=4403)
+        return
+
+    if _should_bridge_ws_to_owner_worker(ws, auth_result):
+        await _bridge_websocket_to_owner_worker(ws, path="/api/pub", auth_result=auth_result)
         return
 
     channel = _channel_or_close_code(ws)
@@ -12944,12 +13901,17 @@ async def events_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    if not _ws_auth_ok(ws):
-        await ws.close(code=4401)
+    auth_result = _ws_auth_result(ws)
+    if auth_result.reason is not None:
+        await ws.close(code=4401, reason=_ws_close_reason(f"auth: {auth_result.reason}"))
         return
 
     if not _ws_request_is_allowed(ws):
         await ws.close(code=4403)
+        return
+
+    if _should_bridge_ws_to_owner_worker(ws, auth_result):
+        await _bridge_websocket_to_owner_worker(ws, path="/api/events", auth_result=auth_result)
         return
 
     channel = _channel_or_close_code(ws)
@@ -14153,6 +15115,28 @@ app.include_router(_dashboard_auth_router)
 mount_spa(app)
 
 
+def _maybe_enable_dashboard_thread_traceback_dump() -> bool:
+    """Opt in to SIGUSR1 all-thread tracebacks for a running dashboard.
+
+    Tracebacks can include request data, so this is deliberately disabled by
+    default.  On supported POSIX hosts, setting HERMES_DASHBOARD_DUMP_THREADS
+    lets an operator diagnose a stuck server with ``kill -USR1 <pid>``.
+    """
+    if not env_var_enabled("HERMES_DASHBOARD_DUMP_THREADS"):
+        return False
+    try:
+        import faulthandler
+        import signal
+
+        dump_signal = signal.SIGUSR1
+        faulthandler.register(dump_signal, file=sys.stderr, all_threads=True, chain=False)
+    except (AttributeError, OSError, RuntimeError, ValueError) as exc:
+        _log.warning("Dashboard thread traceback dump is unavailable: %s", exc)
+        return False
+    _log.info("Dashboard thread traceback dump enabled; send SIGUSR1 to dump all threads")
+    return True
+
+
 def _read_bound_port(server: "uvicorn.Server", fallback: int) -> int:
     """Read the OS-assigned port from a live uvicorn server socket.
 
@@ -14253,9 +15237,14 @@ def start_server(
     port: int = 9119,
     open_browser: bool = True,
     allow_public: bool = False,
+    require_auth: bool = False,
     initial_profile: str = "",
 ):
     """Start the web UI server.
+
+    ``require_auth`` explicitly enables the cookie/session gate for a
+    loopback-bound dashboard shared through an SSH tunnel or trusted proxy.
+    It does not make the service publicly reachable.
 
     ``initial_profile`` (when set) is appended to the auto-opened browser
     URL as ``?profile=<name>`` so the SPA's profile switcher preselects it
@@ -14264,6 +15253,8 @@ def start_server(
     """
     import uvicorn
 
+    _maybe_enable_dashboard_thread_traceback_dump()
+
     try:
         from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
 
@@ -14271,11 +15262,53 @@ def start_server(
     except Exception as exc:
         _log.debug("Nous auth keepalive did not start: %s", exc)
 
-    # Phase 0: stash the auth-gate flag on app.state so middleware / SPA-token
-    # injection / WS-auth paths can branch on it consistently.  Phase 3.5
-    # uses this to decide whether to refuse the bind, log the gate-on
-    # banner, and enable uvicorn proxy_headers.
-    app.state.auth_required = should_require_auth(host)
+    # Stash the auth-gate flag on app.state so middleware / SPA-token injection
+    # / WS-auth paths branch consistently. A public bind is always gated;
+    # --require-auth extends that same fail-closed mode to a loopback service
+    # deliberately shared through a tunnel without changing its network bind.
+    public_bind_requires_auth = should_require_auth(host)
+    app.state.auth_required = require_auth or public_bind_requires_auth
+    app.state.owner_worker_supervisor = None
+    if app.state.auth_required:
+        from hermes_cli.deployment_inference import (
+            DeploymentInferencePolicyInvalid,
+            load_deployment_inference_policy,
+        )
+        from hermes_cli.owner_worker import OwnerWorkerSupervisor
+
+        policy_spec = os.environ.get("HERMES_DEPLOYMENT_INFERENCE_POLICY", "")
+        try:
+            deployment_inference_policy = load_deployment_inference_policy(policy_spec)
+        except DeploymentInferencePolicyInvalid as exc:
+            raise RuntimeError("deployment inference policy is invalid") from exc
+
+        worker_scheme = "wss" if os.environ.get("HERMES_DASHBOARD_EXTERNAL_SCHEME", "").lower() == "https" else "ws"
+        worker_host = os.environ.get("HERMES_DASHBOARD_EXTERNAL_HOST", "").strip() or host
+        worker_netloc = f"[{worker_host}]:{port}" if ":" in worker_host and not worker_host.startswith("[") else f"{worker_host}:{port}"
+        global_home = get_hermes_home()
+
+        def revoke_generation_bridges(lease: Any) -> None:
+            loop = getattr(app.state, "server_event_loop", None)
+            if loop is None or loop.is_closed():
+                return
+            future = asyncio.run_coroutine_threadsafe(
+                close_authorized_bridges_by_worker_change(
+                    app,
+                    (lease,),
+                    reason="worker_generation_revoked",
+                    close_active=True,
+                ),
+                loop,
+            )
+            future.result()
+
+        app.state.owner_worker_supervisor = OwnerWorkerSupervisor(
+            global_home=global_home,
+            control_home=global_home / "control-plane",
+            control_ws_base=f"{worker_scheme}://{worker_netloc}",
+            generation_bridge_revoker=revoke_generation_bridges,
+            deployment_inference_policy=deployment_inference_policy,
+        )
 
     # ``--insecure`` no longer disables the auth gate (June 2026 hardening:
     # the hermes-0day MCP-persistence campaign abused unauthenticated public
@@ -14336,9 +15369,8 @@ def start_server(
                     + _fix_hint
                 )
             raise SystemExit(
-                f"Refusing to bind dashboard to {host} — the auth gate "
-                f"engages on non-loopback binds, but no auth providers are "
-                f"registered.\n\n" + _fix_hint
+                f"Refusing to start dashboard on {host} — authentication is "
+                f"required, but no auth providers are registered.\n\n" + _fix_hint
             )
         _log.info(
             "Dashboard binding to %s with auth gate enabled. Providers: %s",
@@ -14387,12 +15419,11 @@ def start_server(
         app, host=host, port=port, log_level="warning",
         # proxy_headers defaults to False so _ws_client_is_allowed sees
         # the real connection peer rather than X-Forwarded-For's rewritten
-        # value (which would defeat the loopback gate when behind a reverse
-        # proxy).  When the OAuth gate is active we are explicitly running
-        # behind a TLS terminator (Fly.io) and need X-Forwarded-Proto to
-        # decide cookie Secure flags, so we flip proxy_headers on for that
-        # mode.
-        proxy_headers=bool(app.state.auth_required),
+        # value. Public gated deployments sit behind a TLS terminator and need
+        # X-Forwarded-Proto for cookie Secure flags. A forced loopback gate is
+        # normally reached through an SSH tunnel, so it must not start trusting
+        # client-provided forwarded headers merely because cookie auth is on.
+        proxy_headers=public_bind_requires_auth,
         # Half-open detection for public binds only (see above). Loopback
         # disables the protocol ping (None) so an event-loop stall can never
         # trigger a false disconnect; a genuinely dead local client is still
@@ -14415,6 +15446,12 @@ def start_server(
 
             actual_port = _read_bound_port(server, fallback=port)
             app.state.bound_port = actual_port
+            supervisor = getattr(app.state, "owner_worker_supervisor", None)
+            if supervisor is not None:
+                worker_scheme = "wss" if os.environ.get("HERMES_DASHBOARD_EXTERNAL_SCHEME", "").lower() == "https" else "ws"
+                worker_host = os.environ.get("HERMES_DASHBOARD_EXTERNAL_HOST", "").strip() or host
+                worker_netloc = f"[{worker_host}]:{actual_port}" if ":" in worker_host and not worker_host.startswith("[") else f"{worker_host}:{actual_port}"
+                supervisor.control_ws_base = f"{worker_scheme}://{worker_netloc}"
 
             _write_dashboard_ready_file(actual_port)
             print(f"HERMES_DASHBOARD_READY port={actual_port}", flush=True)

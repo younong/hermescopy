@@ -15,6 +15,7 @@
 
 import {
   JsonRpcGatewayClient,
+  JsonRpcGatewayError,
   buildHermesWebSocketUrl,
   type ConnectionState,
   type GatewayEvent,
@@ -23,6 +24,7 @@ import {
 
 import { HERMES_BASE_PATH, buildWsAuthParam } from "@/lib/api";
 
+export { JsonRpcGatewayError };
 export type { ConnectionState, GatewayEvent, GatewayEventName };
 
 export class GatewayClient extends JsonRpcGatewayClient {
@@ -43,7 +45,7 @@ export class GatewayClient extends JsonRpcGatewayClient {
     // Gated mode: legacy ``?token=`` is rejected by ``_ws_auth_ok``; the SPA
     // must fetch a single-use ticket. Explicit ``token`` keeps the test-only
     // override path.
-    const authParam = token ? (["token", token] as const) : await buildWsAuthParam();
+    const authParam = token ? (["token", token] as const) : await buildWsAuthParam("/api/ws");
     if (!authParam[1]) {
       throw new Error(
         "Session token not available — page must be served by the Hermes dashboard server",

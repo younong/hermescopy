@@ -19,7 +19,7 @@ def main_mod():
 def _args(**kw):
     defaults = dict(
         status=False, stop=False, host="127.0.0.1", port=9119,
-        no_open=True, insecure=False, skip_build=False,
+        no_open=True, insecure=False, require_auth=False, skip_build=False,
         isolated=False, open_profile="",
     )
     defaults.update(kw)
@@ -80,12 +80,30 @@ class TestUnifiedDashboardRouting:
         assert "-p" in argv and argv[argv.index("-p") + 1] == "default"
         assert "--open-profile" in argv
         assert argv[argv.index("--open-profile") + 1] == "worker_x"
+        assert "--require-auth" not in argv
         # The child is pinned to the machine ROOT, not the launching profile's
         # HERMES_HOME.  For a standard install (HERMES_HOME unset) that root is
         # the platform-native default (~/.hermes), NOT dropped — see the Docker
         # test below for why we resolve explicitly instead of popping.
         from hermes_constants import get_default_hermes_root
         assert env.get("HERMES_HOME") == str(get_default_hermes_root())
+
+    def test_profile_launch_preserves_require_auth(self, main_mod, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "worker_x"
+        )
+        monkeypatch.setattr(main_mod, "_dashboard_listening", lambda host, port: False)
+        execs = []
+
+        def fake_exec(exe, argv, env):
+            execs.append((exe, argv, env))
+            raise SystemExit(0)
+
+        monkeypatch.setattr(main_mod.os, "execvpe", fake_exec)
+        with pytest.raises(SystemExit):
+            main_mod.cmd_dashboard(_args(require_auth=True))
+
+        assert "--require-auth" in execs[0][1]
 
     def test_reexec_pins_docker_machine_root(self, main_mod, monkeypatch):
         """In the Docker layout (HERMES_HOME=/opt/data, profiles under

@@ -1,5 +1,10 @@
 const BROWSER_ID_KEY = "hermes.dashboard.browser_id";
 
+function storageKey(ownerKey?: string | null): string {
+  const owner = ownerKey?.trim();
+  return owner ? `${BROWSER_ID_KEY}:${owner}` : BROWSER_ID_KEY;
+}
+
 function randomBrowserId(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
     return `browser-${crypto.randomUUID()}`;
@@ -8,20 +13,21 @@ function randomBrowserId(): string {
   return `browser-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
 }
 
-export function getHermesBrowserId(): string {
+export function getHermesBrowserId(ownerKey?: string | null): string {
   if (typeof window === "undefined") {
     return randomBrowserId();
   }
 
   try {
-    const existing = window.localStorage.getItem(BROWSER_ID_KEY);
+    const key = storageKey(ownerKey);
+    const existing = window.localStorage.getItem(key);
 
     if (existing) {
       return existing;
     }
 
     const next = randomBrowserId();
-    window.localStorage.setItem(BROWSER_ID_KEY, next);
+    window.localStorage.setItem(key, next);
 
     return next;
   } catch {

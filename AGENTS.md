@@ -18,10 +18,27 @@ Two design constraints matter for almost every change:
 ## Default Workflow
 
 - Prefer `.venv` (`source .venv/bin/activate`), with `venv` as fallback.
-- Verify the real path, not only mocked units, for changes touching config propagation, security boundaries, remote backends, file/network I/O, gateway transport, or session state.
 - Match surrounding code style and comments.
-- Keep Terminal/TUI/dashboard/desktop compatibility in mind when changing shared gateway or agent code.
 - Before restricting behavior, read the original intent (`git log -p -S <symbol>`) and preserve the feature purpose.
+
+### Engineering Paths
+
+Choose the least costly path that preserves the existing safeguards. Default to
+**Standard** when scope or impact is uncertain, and escalate immediately if
+investigation reaches a Strict trigger.
+
+| Path | Use when | Required discovery and validation |
+| --- | --- | --- |
+| **Fast** | A small, reversible change in one owned concern with no Strict trigger. | Read the target region and closest focused test; run the narrowest relevant check. |
+| **Standard** | Normal work, unclear ownership, or nearby multi-file changes in one subsystem. | Use the `CLAUDE.md` ownership map and focused search; expand into one adjacent subsystem only when needed; validate the directly affected boundary. |
+| **Strict** | Owner-worker; session/resume; gateway, approval, authentication, or security behavior; remote backends; file/network I/O; config/profile propagation; or shared agent/gateway code that can affect Terminal, TUI, dashboard, or desktop. | Read the relevant section—not all—of `docs/agents-reference.md`; inspect original intent before restrictions; exercise the real path and applicable integration/E2E checks. |
+
+Fast never relaxes prompt-cache, message-role, profile-isolation, safety, or
+focused-test invariants. Strict is a discovery and validation escalation, not
+permission to broaden the change or add abstractions.
+
+- Verify the real path, not only mocked units, for Strict changes touching config propagation, security boundaries, remote backends, file/network I/O, gateway transport, or session state.
+- Keep Terminal/TUI/dashboard/desktop compatibility in mind when changing shared gateway or agent code.
 
 ## Contribution Rubric
 
@@ -71,7 +88,9 @@ If several contributions target the same category, design one shared interface/o
 - `hermes_state.py` — SQLite session store.
 - `hermes_constants.py`, `hermes_logging.py` — profile-aware paths/logging.
 
-Read `docs/agents-reference.md` before making larger changes in any of these subsystems.
+For Strict changes in these subsystems, read only the relevant section(s) of
+`docs/agents-reference.md`; for Standard changes, consult it when focused code
+and tests do not provide the needed implementation detail or rationale.
 
 ## Gateway / TUI / Dashboard Rules
 

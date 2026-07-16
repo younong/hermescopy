@@ -15,11 +15,28 @@ from datetime import datetime
 from typing import Optional
 
 from hermes_cli.config import get_hermes_home
+from gateway.session import owner_metadata_matches_current
 
 logger = logging.getLogger(__name__)
 
-_SESSIONS_DIR = get_hermes_home() / "sessions"
-_SESSIONS_INDEX = _SESSIONS_DIR / "sessions.json"
+def get_sessions_dir():
+    return get_hermes_home() / "sessions"
+
+
+def get_sessions_index_path():
+    return get_sessions_dir() / "sessions.json"
+
+
+# Backward-compatible patch targets. If tests/downstream code monkeypatch these
+# away from the import-time default, use the patched values; otherwise resolve
+# dynamically for the current owner worker HERMES_HOME.
+_SESSIONS_DIR = get_sessions_dir()
+_SESSIONS_INDEX = get_sessions_index_path()
+_DEFAULT_SESSIONS_INDEX = _SESSIONS_INDEX
+
+
+def _effective_sessions_index_path():
+    return _SESSIONS_INDEX if _SESSIONS_INDEX != _DEFAULT_SESSIONS_INDEX else get_sessions_index_path()
 
 
 def mirror_to_session(
@@ -110,11 +127,12 @@ def _find_session_id(
     same-chat candidates exist and none matches the user, return None instead
     of guessing and contaminating another participant's session.
     """
-    if not _SESSIONS_INDEX.exists():
+    sessions_index = _effective_sessions_index_path()
+    if not sessions_index.exists():
         return None
 
     try:
-        with open(_SESSIONS_INDEX, encoding="utf-8") as f:
+        with open(sessions_index, encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
         return None
@@ -126,6 +144,8 @@ def _find_session_id(
         # Skip documentation/metadata sentinels (keys starting with "_", e.g.
         # the gateway's "_README" note) — they are not session entries.
         if str(_key).startswith("_") or not isinstance(entry, dict):
+            continue
+        if not owner_metadata_matches_current(entry):
             continue
         origin = entry.get("origin") or {}
         entry_platform = (origin.get("platform") or entry.get("platform", "")).lower()

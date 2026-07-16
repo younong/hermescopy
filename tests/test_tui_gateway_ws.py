@@ -8,6 +8,28 @@ from tui_gateway import server
 from tui_gateway import ws as ws_mod
 
 
+def test_owner_worker_ws_rejects_missing_runtime_before_gateway_dispatch(monkeypatch):
+    class FakeWS:
+        def __init__(self):
+            self.closed = []
+
+        async def close(self, *, code=1000, reason=""):
+            self.closed.append((code, reason))
+
+    ws = FakeWS()
+    discovery_calls = []
+    monkeypatch.setattr(
+        mcp_startup,
+        "start_background_mcp_discovery",
+        lambda **kwargs: discovery_calls.append(kwargs),
+    )
+
+    asyncio.run(ws_mod.handle_ws(ws, require_owner_runtime=True))
+
+    assert ws.closed == [(1011, "owner gateway runtime unavailable")]
+    assert discovery_calls == []
+
+
 def test_ws_startup_starts_background_mcp_discovery(monkeypatch):
     """The desktop app and dashboard chat reach the agent through this WS
     sidecar, not through tui_gateway.entry.main() (which spawns the discovery

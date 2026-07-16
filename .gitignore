@@ -23,6 +23,7 @@ deploy/*.local.env
 .notebooklm-playwright/
 .pip-cache/
 .uv-cache/
+.tmp/
 
 # Keep local Claude settings/transcripts out of git, but allow the project release skill.
 .claude/*

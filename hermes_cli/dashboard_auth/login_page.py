@@ -412,6 +412,12 @@ auth gate (not recommended on untrusted networks).</p>
 _PASSWORD_FORM_SCRIPT = """\
 <script>
 (function () {
+  // The dashboard may be reverse-proxied under a path prefix such as
+  // /hermes. Build form and landing paths from the rendered login URL so
+  // password authentication never escapes that prefix to the proxy's default
+  // upstream.
+  var loginPrefix = window.location.pathname.replace(/\\/login$/, '') || '';
+
   function handle(form) {
     form.addEventListener('submit', function (ev) {
       ev.preventDefault();
@@ -425,7 +431,7 @@ _PASSWORD_FORM_SCRIPT = """\
         password: (form.querySelector('input[name=password]') || {}).value || '',
         next: (form.querySelector('input[name=next]') || {}).value || ''
       };
-      fetch('/auth/password-login', {
+      fetch(loginPrefix + '/auth/password-login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -433,7 +439,8 @@ _PASSWORD_FORM_SCRIPT = """\
       }).then(function (resp) {
         if (resp.ok) {
           return resp.json().then(function (data) {
-            window.location.assign((data && data.next) || '/');
+            var target = (data && data.next) || '/';
+            window.location.assign(loginPrefix + target);
           });
         }
         var msg = resp.status === 429

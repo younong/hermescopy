@@ -9,7 +9,14 @@ from __future__ import annotations
 import json
 import pytest
 
-from hermes_cli.dashboard_auth.audit import audit_log, AuditEvent
+from hermes_cli.dashboard_auth.audit import (
+    AuditEvent,
+    AuthorityAuditEvent,
+    AuthorityAuditReason,
+    audit_authority,
+    audit_log,
+)
+from hermes_cli.owner_worker.audit import report_worker_lifecycle
 
 
 @pytest.fixture
@@ -79,3 +86,127 @@ def test_audit_creates_logs_dir_if_missing(tmp_path, monkeypatch):
     audit_log(AuditEvent.LOGIN_START, provider="nous")
     assert (home / "logs").is_dir()
     assert (home / "logs" / "dashboard-auth.log").exists()
+
+
+def test_authority_audit_requires_correlation_id(profile_home):
+    with pytest.raises(ValueError, match="correlation_id"):
+        audit_authority(
+            AuthorityAuditEvent.TICKET_REJECTED,
+            correlation_id="",
+            reason=AuthorityAuditReason.TICKET_REJECTED,
+        )
+
+
+def test_authority_audit_is_allowlisted_and_control_plane_only(tmp_path, monkeypatch):
+    owner_home = tmp_path / "users" / "ok1_owner"
+    owner_home.mkdir(parents=True)
+    control_home = tmp_path / "control-plane"
+    control_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_owner")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+
+    audit_authority(
+        AuthorityAuditEvent.TICKET_REJECTED,
+        correlation_id="f" * 32,
+        reason=AuthorityAuditReason.TICKET_REJECTED,
+        epoch=4,
+        recovery_generation=2,
+        worker_generation=7,
+        scope_digest="a" * 64,
+        credential_digest="b" * 64,
+        issuer_digest="c" * 64,
+    )
+
+    path = control_home / "logs" / "authority.log"
+    assert path.exists()
+    assert not (owner_home / "logs" / "authority.log").exists()
+    entry = json.loads(path.read_text())
+    assert set(entry) == {
+        "ts", "event", "correlation_id", "reason", "audience_class",
+        "epoch", "recovery_generation", "worker_generation", "scope_digest", "credential_digest",
+        "issuer_digest",
+    }
+    raw = path.read_text()
+    for forbidden in (str(owner_home), "ok1_owner", "HERMES_HOME"):
+        assert forbidden not in raw
+
+
+def test_persisted_scope_audit_is_allowlisted(tmp_path, monkeypatch):
+    control_home = tmp_path / "control-plane"
+    control_home.mkdir()
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_owner")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+
+    audit_authority(
+        AuthorityAuditEvent.PERSISTED_SCOPE_REJECTED,
+        correlation_id="b" * 32,
+        reason=AuthorityAuditReason.PERSISTED_SCOPE_ASSERTION_MISMATCH,
+        audience_class="owner-persisted-scope",
+        worker_generation=7,
+    )
+
+    entry = json.loads((control_home / "logs" / "authority.log").read_text())
+    assert entry == {
+        "ts": entry["ts"],
+        "event": "persisted_scope_rejected",
+        "correlation_id": "b" * 32,
+        "reason": "persisted_scope_assertion_mismatch",
+        "audience_class": "owner-persisted-scope",
+        "worker_generation": 7,
+    }
+
+
+def test_worker_lifecycle_audit_is_deidentified_and_best_effort(tmp_path, monkeypatch):
+    control_home = tmp_path / "control-plane"
+    control_home.mkdir()
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_owner")
+
+    report_worker_lifecycle(
+        AuthorityAuditEvent.PTY_LIFECYCLE,
+        AuthorityAuditReason.ADMITTED,
+        worker_generation=7,
+    )
+
+    entry = json.loads((control_home / "logs" / "authority.log").read_text())
+    assert entry == {
+        "ts": entry["ts"],
+        "event": "authority_pty_lifecycle",
+        "correlation_id": entry["correlation_id"],
+        "reason": "admitted",
+        "audience_class": "browser-ws",
+        "worker_generation": 7,
+    }
+    assert "ok1_owner" not in (control_home / "logs" / "authority.log").read_text()
+
+    monkeypatch.setattr("hermes_cli.owner_worker.audit.audit_authority", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("unavailable")))
+    report_worker_lifecycle(
+        AuthorityAuditEvent.PTY_LIFECYCLE,
+        AuthorityAuditReason.BRIDGE_CLOSED,
+        worker_generation=7,
+    )
+
+
+def test_authority_audit_rejects_unknown_reason_and_sensitive_escape_hatch(profile_home):
+    with pytest.raises(ValueError, match="reason"):
+        audit_authority(
+            AuthorityAuditEvent.TICKET_REJECTED,
+            correlation_id="d" * 32,
+            reason="ticket=secret",  # type: ignore[arg-type]
+        )
+
+    audit_authority(
+        AuthorityAuditEvent.TICKET_REJECTED,
+        correlation_id="a" * 32,
+        reason=AuthorityAuditReason.TICKET_REJECTED,
+        audience_class="browser-ws",
+    )
+    raw = (profile_home / "control-plane" / "logs" / "authority.log").read_text()
+    assert "ticket_rejected" in raw
+    for forbidden in (
+        "ticket=secret", "jti-value", "user@example.test", "/api/ws",
+        "ok1_owner", "/owner/home", "token=secret", "capability-value",
+        "prompt-body", "tool-arguments", "pty-bytes", "exception-detail",
+    ):
+        assert forbidden not in raw

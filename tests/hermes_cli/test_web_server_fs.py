@@ -1,9 +1,12 @@
 import base64
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pytest
 
 from hermes_cli import web_server
+from hermes_cli.dashboard_auth import clear_providers, register_provider
+from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
 
 pytest.importorskip("starlette.testclient")
 from starlette.testclient import TestClient
@@ -25,6 +28,65 @@ def client(monkeypatch):
                 pass
         else:
             web_server.app.state.auth_required = previous_auth_required
+
+
+@pytest.fixture
+def authenticated_client(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(home / ".hermes"))
+    clear_providers()
+    register_provider(StubAuthProvider())
+    previous_auth_required = getattr(web_server.app.state, "auth_required", None)
+    previous_bound_host = getattr(web_server.app.state, "bound_host", None)
+    previous_bound_port = getattr(web_server.app.state, "bound_port", None)
+    web_server.app.state.auth_required = True
+    web_server.app.state.bound_host = "example.test"
+    web_server.app.state.bound_port = 443
+    test_client = TestClient(web_server.app, base_url="https://example.test")
+    try:
+        login = test_client.get("/auth/login?provider=stub", follow_redirects=False)
+        assert login.status_code == 302
+        state = urlparse(login.headers["location"]).query.split("state=", 1)[1]
+        callback = test_client.get(f"/auth/callback?code=stub_code&state={state}", follow_redirects=False)
+        assert callback.status_code == 302
+        yield test_client, home
+    finally:
+        test_client.close()
+        clear_providers()
+        if previous_auth_required is None:
+            try:
+                delattr(web_server.app.state, "auth_required")
+            except AttributeError:
+                pass
+        else:
+            web_server.app.state.auth_required = previous_auth_required
+        web_server.app.state.bound_host = previous_bound_host
+        web_server.app.state.bound_port = previous_bound_port
+
+
+def test_authenticated_mode_rejects_control_plane_fs_apis(authenticated_client, tmp_path, monkeypatch):
+    client, home = authenticated_client
+    target = home / "secret.txt"
+    target.write_text("keep")
+    images = home / ".hermes" / "images"
+    images.mkdir(parents=True)
+    (images / "generated.png").write_bytes(b"pngbytes")
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: home / ".hermes")
+
+    assert client.get("/api/fs/list", params={"path": str(home)}).status_code == 403
+    assert client.get("/api/fs/read-text", params={"path": str(target)}).status_code == 403
+    assert client.post(
+        "/api/fs/write-text",
+        json={"path": str(target), "content": "changed"},
+    ).status_code == 403
+    assert client.get("/api/fs/read-data-url", params={"path": str(target)}).status_code == 403
+    assert client.get("/api/fs/git-root", params={"path": str(target)}).status_code == 403
+    assert client.get("/api/fs/default-cwd").status_code == 403
+    assert client.get("/api/generated-images/generated.png").status_code == 403
+    assert client.get("/api/media", params={"path": str(images / "generated.png")}).status_code == 403
+    assert target.read_text() == "keep"
 
 
 def test_fs_list_sorts_and_hides_noise(client, tmp_path):

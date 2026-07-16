@@ -28,32 +28,30 @@ Usage:
 import os
 import re
 import difflib
+import fnmatch
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, ClassVar
 from pathlib import Path
 from tools.binary_extensions import BINARY_EXTENSIONS
+from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
+from hermes_cli.controlled_roots import ExpectedType, RootKind
 
-from agent.file_safety import (
-    build_write_denied_paths,
-    build_write_denied_prefixes,
-    is_write_denied as _shared_is_write_denied,
-)
+from agent.file_safety import is_write_denied as _shared_is_write_denied
 
 
 # ---------------------------------------------------------------------------
 # Write-path deny list — blocks writes to sensitive system/credential files
 # ---------------------------------------------------------------------------
 
-_HOME = str(Path.home())
-
-WRITE_DENIED_PATHS = build_write_denied_paths(_HOME)
-
-WRITE_DENIED_PREFIXES = build_write_denied_prefixes(_HOME)
-
 
 _OSC_SEQUENCE_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _FENCE_MARKER_RE = re.compile(r"'?\x07?__HERMES_FENCE_[A-Za-z0-9]+__\x07?'?")
+
+# Descriptor-backed reads cannot delegate pagination or size limiting to a shell
+# command. Keep the in-process read budget finite so authenticated file tools
+# cannot accumulate an unbounded file in the owner-worker process.
+_CONTROLLED_MAX_READ_BYTES = 10 * 1024 * 1024
 
 
 def _strip_terminal_fence_leaks(text: str) -> str:
@@ -490,6 +488,282 @@ class FileOperations(ABC):
                output_mode: str = "content", context: int = 0) -> SearchResult:
         """Search for content or files."""
         ...
+
+
+# =============================================================================
+# Authenticated descriptor-backed implementation
+# =============================================================================
+
+
+class ControlledWorkspaceFileOperations(FileOperations):
+    """File operations rooted at one authenticated worker's workspace FD.
+
+    This deliberately implements only operations that can remain entirely
+    descriptor-relative.  It never accepts absolute paths, expands ``~``, or
+    delegates to a terminal backend.  Unsupported operations fail closed rather
+    than recovering through ambient cwd or a shell command.
+    """
+
+    def __init__(self, context: AuthenticatedWorkspaceContext) -> None:
+        self._context = context
+
+    def _relative_path(self, path: str) -> str:
+        if not isinstance(path, str) or not path:
+            raise ValueError("path must be a non-empty workspace-relative path")
+        if path.startswith(("/", "~")) or "\x00" in path:
+            raise ValueError("path must be a workspace-relative path")
+        components = tuple(path.split("/"))
+        if any(component in {"", ".", ".."} for component in components):
+            raise ValueError("path must not contain empty, dot, or parent components")
+        return f"{self._context.workspace_prefix}/{path}"
+
+    def diagnostic_path(self, path: str) -> str:
+        """Return a display-only path after validating the relative input."""
+        relative_path = self._relative_path(path)
+        return str(self._context.roots.get(RootKind.WORKSPACE).canonical_path / relative_path)
+
+    @staticmethod
+    def _read_all(fd: int, *, maximum: int | None = None) -> bytes:
+        maximum = _CONTROLLED_MAX_READ_BYTES if maximum is None else maximum
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            # Read one byte past the configured limit so a file exactly at the
+            # limit succeeds while a growing file is still bounded and rejected.
+            chunk = os.read(fd, min(1024 * 1024, maximum - total + 1))
+            if not chunk:
+                return b"".join(chunks)
+            total += len(chunk)
+            if total > maximum:
+                raise ValueError(
+                    f"File exceeds the authenticated read limit of {maximum} bytes"
+                )
+            chunks.append(chunk)
+
+    @staticmethod
+    def _number_lines(content: str, offset: int) -> str:
+        from tools.tool_output_limits import get_max_line_length
+
+        maximum = get_max_line_length()
+        return "\n".join(
+            f"{line_number}|{line[:maximum]}{'... [truncated]' if len(line) > maximum else ''}"
+            for line_number, line in enumerate(content.split("\n"), start=offset)
+        )
+
+    def _read_text(self, path: str) -> tuple[str, os.stat_result]:
+        fd = self._context.roots.open_relative(
+            RootKind.WORKSPACE,
+            self._relative_path(path),
+            expected_type=ExpectedType.REGULAR_FILE,
+        )
+        try:
+            metadata = os.fstat(fd)
+            raw = self._read_all(fd)
+        finally:
+            os.close(fd)
+        if b"\x00" in raw:
+            raise ValueError("Binary file - cannot display as text.")
+        try:
+            return raw.decode("utf-8"), metadata
+        except UnicodeDecodeError as exc:
+            raise ValueError("Binary file - cannot display as text.") from exc
+
+    def read_file(self, path: str, offset: int = 1, limit: int = 500) -> ReadResult:
+        try:
+            content, metadata = self._read_text(path)
+        except FileNotFoundError:
+            return ReadResult(error=f"File not found: {path}")
+        except (OSError, RuntimeError, ValueError) as exc:
+            return ReadResult(error=str(exc))
+        offset, limit = normalize_read_pagination(offset, limit)
+        lines = content.split("\n")
+        page = "\n".join(lines[offset - 1:offset - 1 + limit])
+        end_line = offset + limit - 1
+        total_lines = len(lines)
+        return ReadResult(
+            content=self._number_lines(page, offset),
+            total_lines=total_lines,
+            file_size=metadata.st_size,
+            truncated=total_lines > end_line,
+            hint=(
+                f"Use offset={end_line + 1} to continue reading "
+                f"(showing {offset}-{end_line} of {total_lines} lines)"
+                if total_lines > end_line else None
+            ),
+        )
+
+    def read_file_raw(self, path: str) -> ReadResult:
+        try:
+            content, metadata = self._read_text(path)
+            content, _ = _strip_bom(content)
+            return ReadResult(content=content, file_size=metadata.st_size)
+        except FileNotFoundError:
+            return ReadResult(error=f"File not found: {path}")
+        except (OSError, RuntimeError, ValueError) as exc:
+            return ReadResult(error=str(exc))
+
+    def write_file(self, path: str, content: str) -> WriteResult:
+        try:
+            entry = self._context.roots.replace_bytes(
+                RootKind.WORKSPACE,
+                self._relative_path(path),
+                content.encode("utf-8"),
+            )
+            return WriteResult(bytes_written=entry.size or 0, dirs_created="/" in path)
+        except (OSError, RuntimeError, ValueError, UnicodeEncodeError) as exc:
+            return WriteResult(error=str(exc))
+
+    def patch_replace(
+        self, path: str, old_string: str, new_string: str, replace_all: bool = False
+    ) -> PatchResult:
+        result = self.read_file_raw(path)
+        if result.error:
+            return PatchResult(error=result.error)
+        from tools.fuzzy_match import fuzzy_find_and_replace
+
+        new_content, match_count, _strategy, error = fuzzy_find_and_replace(
+            result.content, old_string, new_string, replace_all
+        )
+        if error or match_count == 0:
+            return PatchResult(error=error or f"Could not find match for old_string in {path}")
+        written = self.write_file(path, new_content)
+        if written.error:
+            return PatchResult(error=f"Failed to write changes: {written.error}")
+        return PatchResult(
+            success=True,
+            diff="".join(difflib.unified_diff(
+                result.content.splitlines(keepends=True),
+                new_content.splitlines(keepends=True),
+                fromfile=f"a/{path}", tofile=f"b/{path}",
+            )),
+            files_modified=[path],
+        )
+
+    def patch_v4a(self, patch_content: str) -> PatchResult:
+        from tools.patch_parser import apply_v4a_operations, parse_v4a_patch
+
+        operations, parse_error = parse_v4a_patch(patch_content)
+        if parse_error:
+            return PatchResult(error=f"Failed to parse patch: {parse_error}")
+        try:
+            for operation in operations:
+                self._relative_path(operation.file_path)
+                if operation.new_path is not None:
+                    self._relative_path(operation.new_path)
+        except (TypeError, ValueError) as exc:
+            return PatchResult(error=str(exc))
+        return apply_v4a_operations(operations, self)
+
+    def _check_lint(self, path: str, content: Optional[str] = None) -> LintResult:
+        """Run only in-process syntax checks for descriptor-backed writes."""
+        extension = os.path.splitext(path)[1].lower()
+        checker = LINTERS_INPROC.get(extension)
+        if checker is None:
+            return LintResult(skipped=True, message=f"No in-process linter for {extension} files")
+        if content is None:
+            result = self.read_file_raw(path)
+            if result.error:
+                return LintResult(skipped=True, message=f"Failed to read {path} for lint")
+            content = result.content
+        ok, error = checker(content)
+        if error == "__SKIP__":
+            return LintResult(skipped=True, message=f"No linter available for {extension}")
+        return LintResult(success=ok, output="" if ok else error)
+
+    def delete_file(self, path: str) -> WriteResult:
+        try:
+            self._context.roots.remove(RootKind.WORKSPACE, self._relative_path(path))
+            return WriteResult()
+        except (OSError, RuntimeError, ValueError) as exc:
+            return WriteResult(error=str(exc))
+
+    def move_file(self, src: str, dst: str) -> WriteResult:
+        try:
+            self._context.roots.rename(
+                RootKind.WORKSPACE, self._relative_path(src), self._relative_path(dst)
+            )
+            return WriteResult()
+        except (OSError, RuntimeError, ValueError) as exc:
+            return WriteResult(error=str(exc))
+
+    def _search_root(self, path: str) -> str:
+        if path == ".":
+            return self._context.workspace_prefix
+        return self._relative_path(path)
+
+    def _walk_regular_files(self, relative_directory: str) -> list[str]:
+        files: list[str] = []
+        pending = [relative_directory]
+        while pending:
+            directory = pending.pop()
+            for entry in self._context.roots.list_directory(RootKind.WORKSPACE, directory):
+                if entry.name.startswith("."):
+                    continue
+                if entry.is_directory:
+                    pending.append(entry.relative_path)
+                else:
+                    files.append(entry.relative_path)
+        return sorted(files)
+
+    def _display_path(self, workspace_relative_path: str) -> str:
+        prefix = f"{self._context.workspace_prefix}/"
+        return workspace_relative_path.removeprefix(prefix)
+
+    def search(
+        self, pattern: str, path: str = ".", target: str = "content",
+        file_glob: Optional[str] = None, limit: int = 50, offset: int = 0,
+        output_mode: str = "content", context: int = 0,
+    ) -> SearchResult:
+        if target not in {"content", "files"}:
+            return SearchResult(error=f"Unknown search target: {target}")
+        if output_mode not in {"content", "files_only", "count"}:
+            return SearchResult(error=f"Unknown search output mode: {output_mode}")
+        try:
+            files = self._walk_regular_files(self._search_root(path))
+        except (OSError, RuntimeError, ValueError) as exc:
+            return SearchResult(error=str(exc))
+        if target == "files":
+            matched = [
+                self._display_path(item)
+                for item in files
+                if fnmatch.fnmatch(self._display_path(item), pattern)
+            ]
+            return SearchResult(
+                files=matched[offset:offset + limit],
+                total_count=len(matched),
+                truncated=len(matched) > offset + limit,
+            )
+        try:
+            regex = re.compile(pattern)
+        except re.error as exc:
+            return SearchResult(error=f"Search failed: {exc}")
+        matches: list[SearchMatch] = []
+        counts: Dict[str, int] = {}
+        for workspace_path in files:
+            display_path = self._display_path(workspace_path)
+            if file_glob and not fnmatch.fnmatch(display_path, file_glob):
+                continue
+            result = self.read_file_raw(display_path)
+            if result.error:
+                continue
+            file_matches = [
+                SearchMatch(path=display_path, line_number=line_number, content=line[:500])
+                for line_number, line in enumerate(result.content.splitlines(), start=1)
+                if regex.search(line)
+            ]
+            if file_matches:
+                counts[display_path] = len(file_matches)
+                matches.extend(file_matches)
+        if output_mode == "files_only":
+            paths = list(counts)
+            return SearchResult(files=paths[offset:offset + limit], total_count=len(paths), truncated=len(paths) > offset + limit)
+        if output_mode == "count":
+            return SearchResult(counts=counts, total_count=sum(counts.values()))
+        return SearchResult(
+            matches=matches[offset:offset + limit],
+            total_count=len(matches),
+            truncated=len(matches) > offset + limit,
+        )
 
 
 # =============================================================================

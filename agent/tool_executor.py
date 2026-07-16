@@ -463,25 +463,29 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
         # ── Checkpoint preflight (only for tools that will execute) ──
         if block_result is None:
-            # Checkpoint for file-mutating tools
-            if function_name in {"write_file", "patch"} and agent._checkpoint_mgr.enabled:
+            checkpoint_mgr = agent._checkpoint_mgr
+            authenticated_checkpoint_mode = getattr(checkpoint_mgr, "_authenticated_mode", False)
+            if function_name in {"write_file", "patch"} and checkpoint_mgr.enabled:
                 try:
-                    file_path = function_args.get("path", "")
-                    if file_path:
-                        work_dir = agent._checkpoint_mgr.get_working_dir_for_path(file_path)
-                        agent._checkpoint_mgr.ensure_checkpoint(work_dir, f"before {function_name}")
+                    if authenticated_checkpoint_mode:
+                        checkpoint_mgr.ensure_authenticated_checkpoint(f"before {function_name}")
+                    else:
+                        file_path = function_args.get("path", "")
+                        if file_path:
+                            work_dir = checkpoint_mgr.get_working_dir_for_path(file_path)
+                            checkpoint_mgr.ensure_checkpoint(work_dir, f"before {function_name}")
                 except Exception:
                     pass
 
-            # Checkpoint before destructive terminal commands
-            if function_name == "terminal" and agent._checkpoint_mgr.enabled:
+            # Authenticated terminal execution does not yet carry an explicit
+            # execution-directory capability. Fail closed rather than infer one
+            # from an argument, environment variable, or process CWD.
+            if function_name == "terminal" and checkpoint_mgr.enabled and not authenticated_checkpoint_mode:
                 try:
                     cmd = function_args.get("command", "")
                     if _is_destructive_command(cmd):
                         cwd = function_args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
-                        agent._checkpoint_mgr.ensure_checkpoint(
-                            cwd, f"before terminal: {cmd[:60]}"
-                        )
+                        checkpoint_mgr.ensure_checkpoint(cwd, f"before terminal: {cmd[:60]}")
                 except Exception:
                     pass
 
@@ -1105,27 +1109,31 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool start callback error: {cb_err}")
 
-        # Checkpoint: snapshot working dir before file-mutating tools
-        if not _execution_blocked and function_name in {"write_file", "patch"} and agent._checkpoint_mgr.enabled:
+        # Checkpoint: snapshot before file-mutating tools. The authenticated
+        # path is fixed by the worker capability and must never inspect a tool
+        # argument or ambient CWD to choose its checkpoint root.
+        checkpoint_mgr = agent._checkpoint_mgr
+        authenticated_checkpoint_mode = getattr(checkpoint_mgr, "_authenticated_mode", False)
+        if not _execution_blocked and function_name in {"write_file", "patch"} and checkpoint_mgr.enabled:
             try:
-                file_path = function_args.get("path", "")
-                if file_path:
-                    work_dir = agent._checkpoint_mgr.get_working_dir_for_path(file_path)
-                    agent._checkpoint_mgr.ensure_checkpoint(
-                        work_dir, f"before {function_name}"
-                    )
+                if authenticated_checkpoint_mode:
+                    checkpoint_mgr.ensure_authenticated_checkpoint(f"before {function_name}")
+                else:
+                    file_path = function_args.get("path", "")
+                    if file_path:
+                        work_dir = checkpoint_mgr.get_working_dir_for_path(file_path)
+                        checkpoint_mgr.ensure_checkpoint(work_dir, f"before {function_name}")
             except Exception:
                 pass  # never block tool execution
 
-        # Checkpoint before destructive terminal commands
-        if not _execution_blocked and function_name == "terminal" and agent._checkpoint_mgr.enabled:
+        # Authenticated terminal execution has no explicit execution-directory
+        # capability yet, so intentionally skip its formerly ambient checkpoint.
+        if not _execution_blocked and function_name == "terminal" and checkpoint_mgr.enabled and not authenticated_checkpoint_mode:
             try:
                 cmd = function_args.get("command", "")
                 if _is_destructive_command(cmd):
                     cwd = function_args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
-                    agent._checkpoint_mgr.ensure_checkpoint(
-                        cwd, f"before terminal: {cmd[:60]}"
-                    )
+                    checkpoint_mgr.ensure_checkpoint(cwd, f"before terminal: {cmd[:60]}")
             except Exception:
                 pass  # never block tool execution
 

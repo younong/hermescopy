@@ -268,3 +268,93 @@ class TestAppendToSqlite:
             _append_to_sqlite("sess_1", {"role": "assistant", "content": "hello"})
 
         mock_db.close.assert_called_once()
+
+
+
+def test_find_session_id_uses_dynamic_hermes_home(tmp_path, monkeypatch):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    _setup_sessions(first, {
+        "s1": {"session_id": "sess_first", "origin": {"platform": "telegram", "chat_id": "1"}}
+    })
+    _setup_sessions(second, {
+        "s2": {"session_id": "sess_second", "origin": {"platform": "telegram", "chat_id": "2"}}
+    })
+
+    monkeypatch.setenv("HERMES_HOME", str(first))
+    assert _find_session_id("telegram", "1") == "sess_first"
+    monkeypatch.setenv("HERMES_HOME", str(second))
+    assert _find_session_id("telegram", "2") == "sess_second"
+
+
+def test_find_session_id_ignores_owner_mismatch_in_worker(tmp_path, monkeypatch):
+    _setup_sessions(tmp_path, {
+        "mine": {
+            "session_id": "sess_mine",
+            "owner_key": "ok_mine",
+            "origin": {"platform": "telegram", "chat_id": "1"},
+        },
+        "other": {
+            "session_id": "sess_other",
+            "owner_key": "ok_other",
+            "origin": {"platform": "telegram", "chat_id": "1"},
+        },
+        "legacy": {
+            "session_id": "sess_legacy",
+            "origin": {"platform": "telegram", "chat_id": "1"},
+        },
+    })
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok_mine")
+    monkeypatch.delenv("HERMES_WORKSPACE_ROOT", raising=False)
+    monkeypatch.delenv("HERMES_WORKER_GENERATION", raising=False)
+
+    assert _find_session_id("telegram", "1") == "sess_mine"
+
+
+def test_find_session_id_treats_workspace_generation_mismatch_as_absent(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspaces"
+    workspace.mkdir()
+    _setup_sessions(tmp_path, {
+        "stale": {
+            "session_id": "sess_stale",
+            "owner_key": "ok_mine",
+            "workspace_root": str(workspace),
+            "worker_generation": 4,
+            "origin": {"platform": "telegram", "chat_id": "1"},
+        },
+    })
+    events = []
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok_mine")
+    monkeypatch.setenv("HERMES_WORKSPACE_ROOT", str(workspace))
+    monkeypatch.setenv("HERMES_WORKER_GENERATION", "5")
+    monkeypatch.setattr(
+        "hermes_cli.dashboard_auth.audit.audit_authority",
+        lambda event, **fields: events.append((event, fields)),
+    )
+
+    assert _find_session_id("telegram", "1") is None
+    assert events[0][0].value == "persisted_scope_rejected"
+    assert events[0][1]["reason"] == "persisted_scope_assertion_mismatch"
+    assert "sess_stale" not in repr(events[0][1])
+
+
+def test_find_session_id_keeps_legacy_records_outside_owner_worker(tmp_path, monkeypatch):
+    _setup_sessions(tmp_path, {
+        "mine": {
+            "session_id": "sess_mine",
+            "owner_key": "ok_mine",
+            "origin": {"platform": "telegram", "chat_id": "1"},
+            "updated_at": "2026-01-01T00:00:00",
+        },
+        "legacy": {
+            "session_id": "sess_legacy",
+            "origin": {"platform": "telegram", "chat_id": "1"},
+            "updated_at": "2026-02-01T00:00:00",
+        },
+    })
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_OWNER_KEY", raising=False)
+
+    assert _find_session_id("telegram", "1") == "sess_legacy"

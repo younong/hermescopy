@@ -169,6 +169,94 @@ def test_redirects_from_message_bearing_parent_to_child(db):
     assert db.resolve_resume_session_id("original") == "continued"
 
 
+def test_scoped_resume_does_not_follow_foreign_compression_child(db):
+    scope = {
+        "owner_key": "ok1_owner",
+        "workspace_root": "/workspace/owner",
+        "worker_generation": 7,
+    }
+    db.create_session("root", source="tui", **scope)
+    db.append_message("root", role="user", content="owner root")
+    db.end_session("root", "compression")
+    db.create_session(
+        "foreign-child",
+        source="tui",
+        parent_session_id="root",
+        owner_key="ok1_other",
+        workspace_root="/workspace/other",
+        worker_generation=7,
+    )
+    db.append_message("foreign-child", role="assistant", content="must stay private")
+
+    assert db.get_compression_tip("root", recovery_scope=scope) == "root"
+    assert db.resolve_resume_session_id("root", recovery_scope=scope) == "root"
+
+
+def test_historical_scope_follows_same_owner_cross_generation_compression_chain(db):
+    historical_scope = {
+        "owner_key": "ok1_owner",
+        "workspace_root": "/workspace/owner",
+        "worker_generation": 2,
+        "historical_resume": True,
+    }
+    db.create_session(
+        "root",
+        source="tui",
+        owner_key="ok1_owner",
+        workspace_root="/workspace/owner",
+        worker_generation=1,
+    )
+    db.append_message("root", role="user", content="before restart")
+    db.end_session("root", "compression")
+    db.create_session(
+        "tip",
+        source="tui",
+        parent_session_id="root",
+        owner_key="ok1_owner",
+        workspace_root="/workspace/owner",
+        worker_generation=2,
+    )
+    db.append_message("tip", role="assistant", content="after restart")
+
+    assert db.get_compression_tip("root", recovery_scope=historical_scope) == "tip"
+    assert db.resolve_resume_session_id("root", recovery_scope=historical_scope) == "tip"
+    assert db.get_session_for_recovery("root", recovery_scope=historical_scope)["id"] == "root"
+    assert [
+        message["content"]
+        for message in db.get_messages_as_conversation(
+            "tip", include_ancestors=True, recovery_scope=historical_scope
+        )
+    ] == ["before restart", "after restart"]
+
+
+def test_latest_descendant_uses_compression_chain_not_branch_or_delegate(db):
+    from hermes_cli.session_api import latest_descendant_payload
+
+    db.create_session("root", source="tui")
+    db.end_session("root", "compression")
+    db.create_session("continuation", source="tui", parent_session_id="root")
+    db.create_session(
+        "branch",
+        source="tui",
+        parent_session_id="root",
+        model_config={"_branched_from": "root"},
+    )
+    db.create_session(
+        "delegate",
+        source="tui",
+        parent_session_id="root",
+        model_config={"_delegate_from": "root"},
+    )
+    db.append_message("continuation", role="assistant", content="resume here")
+    db.append_message("branch", role="assistant", content="never resume branch")
+    db.append_message("delegate", role="assistant", content="never resume delegate")
+
+    payload = latest_descendant_payload(db, "root")
+
+    assert payload["session_id"] == "continuation"
+    assert payload["path"] == ["root", "continuation"]
+
+
 def test_compression_tip_handles_pre_ended_real_child_and_ws_orphan_sibling(db):
     # Real desktop repro shape from a long GUI session:
     #

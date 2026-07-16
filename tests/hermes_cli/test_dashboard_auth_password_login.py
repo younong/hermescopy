@@ -254,6 +254,35 @@ class TestPasswordLoginRoute:
         assert me.json()["user_id"] == "admin"
         assert me.json()["provider"] == "testpw"
 
+    def test_forced_loopback_cookie_session_grants_authenticated_access(self, pw_provider):
+        """A tunnel-only forced gate validates the same cookie flow as public auth."""
+        clear_providers()
+        register_provider(pw_provider)
+        _reset_password_rate_limit()
+        prev_host = getattr(web_server.app.state, "bound_host", None)
+        prev_port = getattr(web_server.app.state, "bound_port", None)
+        prev_required = getattr(web_server.app.state, "auth_required", None)
+        web_server.app.state.bound_host = "127.0.0.1"
+        web_server.app.state.bound_port = 9119
+        web_server.app.state.auth_required = True
+        try:
+            client = TestClient(web_server.app, base_url="http://127.0.0.1:9119")
+            login = client.post(
+                "/auth/password-login",
+                json={"provider": "testpw", "username": "admin", "password": "hunter2"},
+            )
+            assert login.status_code == 200
+            me = client.get("/api/auth/me")
+            assert me.status_code == 200
+            assert me.json()["user_id"] == "admin"
+            assert me.json()["provider"] == "testpw"
+        finally:
+            clear_providers()
+            _reset_password_rate_limit()
+            web_server.app.state.bound_host = prev_host
+            web_server.app.state.bound_port = prev_port
+            web_server.app.state.auth_required = prev_required
+
     def test_wrong_password_returns_generic_401(self, gated_app):
         resp = gated_app.post(
             "/auth/password-login",
@@ -395,6 +424,26 @@ class TestRateLimit:
 
 
 # ---------------------------------------------------------------------------
+# Password-only unauthenticated navigation
+# ---------------------------------------------------------------------------
+
+
+class TestPasswordOnlyLoginNavigation:
+    def test_deep_html_path_redirects_to_password_login_page(self, gated_app):
+        response = gated_app.get("/sessions?page=2", follow_redirects=False)
+
+        assert response.status_code == 302
+        assert response.headers["location"] == "/login?next=%2Fsessions%3Fpage%3D2"
+        assert "/auth/login" not in response.headers["location"]
+
+        login_page = gated_app.get(response.headers["location"])
+        assert login_page.status_code == 200
+        assert '<form class="provider-form" data-provider="testpw"' in login_page.text
+        assert 'name="username"' in login_page.text
+        assert 'name="password"' in login_page.text
+
+
+# ---------------------------------------------------------------------------
 # Login page rendering
 # ---------------------------------------------------------------------------
 
@@ -410,7 +459,9 @@ class TestLoginPageRender:
             assert 'name="password"' in html
             assert 'value="/sessions"' in html
             assert "<script>" in html
-            assert "/auth/password-login" in html
+            assert "var loginPrefix = window.location.pathname.replace(/\\/login$/, '') || '';" in html
+            assert "fetch(loginPrefix + '/auth/password-login'" in html
+            assert "window.location.assign(loginPrefix + target);" in html
         finally:
             clear_providers()
 

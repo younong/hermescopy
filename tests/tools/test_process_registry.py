@@ -182,17 +182,20 @@ def test_close_terminal_tool_routes_to_registry(monkeypatch):
 
     seen = {}
 
-    def _fake_close(sid):
+    def _fake_close(sid, *, executor_identity=None):
         seen["sid"] = sid
+        seen["executor_identity"] = executor_identity
 
         return {"status": "ok", "closed": sid}
 
     monkeypatch.setattr(ct.process_registry, "request_close_terminal", _fake_close)
 
-    out = ct.close_terminal_tool("proc_abc")
+    identity = object()
+    out = ct.close_terminal_tool("proc_abc", executor_identity=identity)
 
     assert json.loads(out)["closed"] == "proc_abc"
     assert seen["sid"] == "proc_abc"
+    assert seen["executor_identity"] is identity
 
 
 def test_close_terminal_tool_gated_on_desktop(monkeypatch):
@@ -1180,6 +1183,31 @@ class TestProcessToolHandler:
         from tools.process_registry import _handle_process
         result = json.loads(_handle_process({"action": "unknown_action"}))
         assert "error" in result
+
+    @pytest.mark.parametrize("action", ["poll", "log", "wait", "kill", "write", "submit", "close"])
+    def test_direct_actions_forward_executor_identity(self, monkeypatch, action):
+        import tools.process_registry as pr_mod
+
+        seen = {}
+
+        def capture(*args, **kwargs):
+            seen["args"] = args
+            seen["kwargs"] = kwargs
+            return {"status": "ok"}
+
+        method = {
+            "poll": "poll", "log": "read_log", "wait": "wait", "kill": "kill_process",
+            "write": "write_stdin", "submit": "submit_stdin", "close": "close_stdin",
+        }[action]
+        monkeypatch.setattr(pr_mod.process_registry, method, capture)
+        identity = object()
+        result = json.loads(pr_mod._handle_process(
+            {"action": action, "session_id": "proc-auth", "data": "input"},
+            executor_identity=identity,
+        ))
+
+        assert result["status"] == "ok"
+        assert seen["kwargs"]["executor_identity"] is identity
 
 
 # =========================================================================

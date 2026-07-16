@@ -15,6 +15,19 @@ from fastapi.testclient import TestClient
 from hermes_cli import web_server
 
 
+@pytest.fixture(autouse=True)
+def restore_dashboard_app_state():
+    """Keep startup-mode tests from leaking mutable global app state."""
+    state = web_server.app.state
+    saved = {
+        name: getattr(state, name, None)
+        for name in ("auth_required", "bound_host", "bound_port", "owner_worker_supervisor")
+    }
+    yield
+    for name, value in saved.items():
+        setattr(state, name, value)
+
+
 @pytest.fixture
 def client_loopback():
     # Pin the bound-host state for host_header_middleware so requests with
@@ -174,6 +187,22 @@ def test_start_server_loopback_sets_auth_required_false(monkeypatch):
         open_browser=False, allow_public=False,
     )
     assert web_server.app.state.auth_required is False
+    assert web_server.app.state.owner_worker_supervisor is None
+
+
+def test_start_server_forced_loopback_gate_requires_provider(monkeypatch):
+    """--require-auth turns a tunnel-only loopback dashboard fail-closed."""
+    from hermes_cli.dashboard_auth import clear_providers
+
+    clear_providers()
+    _stub_uvicorn_run(monkeypatch)
+    web_server.app.state.auth_required = None
+    with pytest.raises(SystemExit, match=r"authentication is required"):
+        web_server.start_server(
+            host="127.0.0.1", port=9119,
+            open_browser=False, allow_public=False, require_auth=True,
+        )
+    assert web_server.app.state.auth_required is True
 
 
 def test_start_server_insecure_public_no_longer_bypasses_gate(monkeypatch):
@@ -218,6 +247,28 @@ def test_start_server_public_without_insecure_records_auth_required(monkeypatch)
 # ---------------------------------------------------------------------------
 
 
+def test_start_server_forced_loopback_gate_keeps_proxy_headers_off(monkeypatch):
+    """Tunnel-only cookie auth must not trust forwarded client headers."""
+    from hermes_cli.dashboard_auth import clear_providers, register_provider
+    from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
+
+    clear_providers()
+    register_provider(StubAuthProvider())
+    captured = _stub_uvicorn_run(monkeypatch)
+    try:
+        web_server.start_server(
+            host="127.0.0.1", port=9119,
+            open_browser=False, allow_public=False, require_auth=True,
+        )
+        assert web_server.app.state.auth_required is True
+        assert web_server.app.state.owner_worker_supervisor is not None
+        assert captured["kwargs"].get("proxy_headers") is False
+    finally:
+        clear_providers()
+        web_server.app.state.auth_required = None
+        web_server.app.state.owner_worker_supervisor = None
+
+
 def test_start_server_gate_with_provider_proceeds_and_sets_proxy_headers(monkeypatch):
     """With at least one provider, public bind + no --insecure starts the server.
 
@@ -239,10 +290,13 @@ def test_start_server_gate_with_provider_proceeds_and_sets_proxy_headers(monkeyp
             open_browser=False, allow_public=False,
         )
         assert web_server.app.state.auth_required is True
+        assert web_server.app.state.owner_worker_supervisor is not None
         assert captured["kwargs"].get("host") == "0.0.0.0"
         assert captured["kwargs"].get("proxy_headers") is True
     finally:
         clear_providers()
+        web_server.app.state.auth_required = None
+        web_server.app.state.owner_worker_supervisor = None
 
 
 def test_start_server_gate_without_provider_fails_closed(monkeypatch):

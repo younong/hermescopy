@@ -56,9 +56,12 @@ import re
 import shutil
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
+from hermes_cli.controlled_roots import ExpectedType, RootKind
 from typing import Dict, List, Optional, Set, Tuple
 
 from utils import env_int
@@ -69,7 +72,17 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-CHECKPOINT_BASE = get_hermes_home() / "checkpoints"
+def get_checkpoint_base() -> Path:
+    return get_hermes_home() / "checkpoints"
+
+
+# Explicit test override only. Production callers resolve the active runtime
+# home at use time so a prior import cannot pin another owner's checkpoint base.
+CHECKPOINT_BASE: Path | None = None
+
+
+def _effective_checkpoint_base() -> Path:
+    return CHECKPOINT_BASE if CHECKPOINT_BASE is not None else get_checkpoint_base()
 
 # Single shared store directory under CHECKPOINT_BASE.
 _STORE_DIRNAME = "store"
@@ -193,6 +206,45 @@ def _validate_file_path(file_path: str, working_dir: str) -> Optional[str]:
 # Path / hash helpers
 # ---------------------------------------------------------------------------
 
+
+@dataclass(frozen=True)
+class AuthenticatedCheckpointTarget:
+    """One immutable, descriptor-authorized authenticated workspace.
+
+    ``workspace_fd`` is opened only from the worker's trusted root capability.
+    The descriptor-derived identity scopes the shared checkpoint store without
+    using a diagnostic canonical path as authorization input.
+    """
+
+    context: AuthenticatedWorkspaceContext
+    identity: str
+
+    @classmethod
+    def from_context(cls, context: AuthenticatedWorkspaceContext) -> "AuthenticatedCheckpointTarget":
+        if not isinstance(context, AuthenticatedWorkspaceContext):
+            raise TypeError("authenticated checkpoint context is invalid")
+        fd = context.roots.open_relative(
+            RootKind.WORKSPACE,
+            context.workspace_prefix,
+            expected_type=ExpectedType.DIRECTORY,
+        )
+        try:
+            metadata = os.fstat(fd)
+        finally:
+            os.close(fd)
+        identity = hashlib.sha256(
+            f"workspace:{metadata.st_dev}:{metadata.st_ino}".encode()
+        ).hexdigest()[:16]
+        return cls(context=context, identity=identity)
+
+    def open_workspace_fd(self) -> int:
+        return self.context.roots.open_relative(
+            RootKind.WORKSPACE,
+            self.context.workspace_prefix,
+            expected_type=ExpectedType.DIRECTORY,
+        )
+
+
 def _normalize_path(path_value: str) -> Path:
     """Return a canonical absolute path for checkpoint operations."""
     return Path(path_value).expanduser().resolve()
@@ -206,7 +258,7 @@ def _project_hash(working_dir: str) -> str:
 
 def _store_path(base: Optional[Path] = None) -> Path:
     """Return the single shared shadow store path."""
-    return (base or CHECKPOINT_BASE) / _STORE_DIRNAME
+    return (base or _effective_checkpoint_base()) / _STORE_DIRNAME
 
 
 def _shadow_repo_path(working_dir: str) -> Path:  # pragma: no cover — kept for BC
@@ -361,6 +413,65 @@ def _run_git(
     except Exception as exc:
         logger.error("Unexpected git error running %s: %s", " ".join(cmd), exc, exc_info=True)
         return False, "", str(exc)
+
+
+def _run_authenticated_git(
+    args: List[str],
+    store: Path,
+    target: AuthenticatedCheckpointTarget,
+    timeout: int = _GIT_TIMEOUT,
+    allowed_returncodes: Optional[Set[int]] = None,
+    index_file: Optional[Path] = None,
+) -> Tuple[bool, str, str]:
+    """Run Git against a workspace inherited only through its directory FD."""
+    workspace_fd = target.open_workspace_fd()
+    try:
+        env = os.environ.copy()
+        env["GIT_DIR"] = str(store)
+        # The child switches to the inherited descriptor before exec. ``.`` is
+        # therefore Git's work tree without exposing a host pathname as a
+        # workspace authorization input (and unlike /proc/self/fd, it also
+        # works in Linux-compatible test environments without procfs).
+        env["GIT_WORK_TREE"] = "."
+        env.pop("GIT_NAMESPACE", None)
+        env.pop("GIT_ALTERNATE_OBJECT_DIRECTORIES", None)
+        if index_file is not None:
+            env["GIT_INDEX_FILE"] = str(index_file)
+        else:
+            env.pop("GIT_INDEX_FILE", None)
+        env["GIT_CONFIG_GLOBAL"] = os.devnull
+        env["GIT_CONFIG_SYSTEM"] = os.devnull
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        cmd = ["git"] + list(args)
+        allowed_returncodes = allowed_returncodes or set()
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+                cwd="/",
+                pass_fds=(workspace_fd,),
+                preexec_fn=lambda: os.fchdir(workspace_fd),
+                stdin=subprocess.DEVNULL,
+                creationflags=windows_hide_flags(),
+            )
+        except subprocess.TimeoutExpired:
+            return False, "", f"git timed out after {timeout}s: {' '.join(cmd)}"
+        except FileNotFoundError as exc:
+            return False, "", "git not found" if getattr(exc, "filename", None) == "git" else str(exc)
+        stdout = result.stdout.strip()
+        stderr = result.stderr.strip()
+        ok = result.returncode == 0
+        if not ok and result.returncode not in allowed_returncodes:
+            logger.error("Authenticated git command failed: %s (rc=%d) stderr=%s", " ".join(cmd), result.returncode, stderr)
+        return ok, stdout, stderr
+    except Exception as exc:
+        logger.error("Authenticated git command failed before execution: %s", exc, exc_info=True)
+        return False, "", str(exc)
+    finally:
+        os.close(workspace_fd)
 
 
 # ---------------------------------------------------------------------------
@@ -633,11 +744,22 @@ class CheckpointManager:
         max_snapshots: int = 20,
         max_total_size_mb: int = 500,
         max_file_size_mb: int = 10,
+        authenticated_context: AuthenticatedWorkspaceContext | None = None,
+        authenticated_mode: bool = False,
+        executor_identity: object | None = None,
     ):
         self.enabled = enabled
         self.max_snapshots = max(1, int(max_snapshots))
         self.max_total_size_mb = max(0, int(max_total_size_mb))
         self.max_file_size_mb = max(0, int(max_file_size_mb))
+        self._authenticated_mode = authenticated_mode
+        self._executor_identity = executor_identity
+        if authenticated_mode and authenticated_context is None:
+            raise RuntimeError("authenticated checkpoint manager lacks filesystem capability")
+        self._authenticated_target = (
+            AuthenticatedCheckpointTarget.from_context(authenticated_context)
+            if authenticated_context is not None else None
+        )
         self._checkpointed_dirs: Set[str] = set()
         self._git_available: Optional[bool] = None  # lazy probe
 
@@ -687,10 +809,69 @@ class CheckpointManager:
             logger.debug("Checkpoint failed (non-fatal): %s", e)
             return False
 
+    def _require_executor_identity(self, executor_identity: object | None) -> bool:
+        """Require an exact executor fence when this manager is executor-bound."""
+        return self._executor_identity is None or executor_identity == self._executor_identity
+
+    def ensure_authenticated_checkpoint(self, reason: str = "auto", *, executor_identity: object | None = None) -> bool:
+        """Snapshot the fixed authenticated workspace without path authority."""
+        if not self._require_executor_identity(executor_identity):
+            return False
+        if not self.enabled or self._authenticated_target is None:
+            return False
+        if self._git_available is None:
+            self._git_available = shutil.which("git") is not None
+        if not self._git_available or self._authenticated_target.identity in self._checkpointed_dirs:
+            return False
+        self._checkpointed_dirs.add(self._authenticated_target.identity)
+        try:
+            return self._take_authenticated(self._authenticated_target, reason)
+        except Exception as exc:
+            logger.debug("Authenticated checkpoint failed (non-fatal): %s", exc)
+            return False
+
+    def list_authenticated_checkpoints(self, *, executor_identity: object | None = None) -> List[Dict]:
+        """List checkpoints for the fixed authenticated workspace only."""
+        if not self._require_executor_identity(executor_identity):
+            return []
+        if self._authenticated_target is None:
+            return []
+        store = _store_path(_effective_checkpoint_base())
+        if not (store / "HEAD").exists():
+            return []
+        ref = _ref_name(self._authenticated_target.identity)
+        ok, stdout, _ = _run_authenticated_git(
+            ["log", ref, f"--format=%H|%h|%aI|%s", "-n", str(self.max_snapshots)],
+            store,
+            self._authenticated_target,
+            allowed_returncodes={128, 129},
+        )
+        if not ok or not stdout:
+            return []
+        results: List[Dict] = []
+        for line in stdout.splitlines():
+            parts = line.split("|", 3)
+            if len(parts) != 4:
+                continue
+            entry = {
+                "hash": parts[0], "short_hash": parts[1], "timestamp": parts[2],
+                "reason": parts[3], "files_changed": 0, "insertions": 0, "deletions": 0,
+            }
+            stat_ok, stat_out, _ = _run_authenticated_git(
+                ["diff", "--shortstat", f"{parts[0]}~1", parts[0]],
+                store,
+                self._authenticated_target,
+                allowed_returncodes={128, 129},
+            )
+            if stat_ok and stat_out:
+                self._parse_shortstat(stat_out, entry)
+            results.append(entry)
+        return results
+
     def list_checkpoints(self, working_dir: str) -> List[Dict]:
         """List available checkpoints for a directory (most recent first)."""
         abs_dir = str(_normalize_path(working_dir))
-        store = _store_path(CHECKPOINT_BASE)
+        store = _store_path(_effective_checkpoint_base())
 
         if not (store / "HEAD").exists():
             return []
@@ -741,6 +922,85 @@ class CheckpointManager:
         if m:
             entry["deletions"] = int(m.group(1))
 
+    @staticmethod
+    def _checkpoint_in_legacy_ref(store: Path, working_dir: str, ref: str, commit_hash: str) -> bool:
+        ok, _, _ = _run_git(
+            ["merge-base", "--is-ancestor", commit_hash, ref], store, working_dir,
+            allowed_returncodes={1, 128},
+        )
+        return ok
+
+    @staticmethod
+    def _checkpoint_in_authenticated_ref(
+        store: Path, target: AuthenticatedCheckpointTarget, ref: str, commit_hash: str,
+    ) -> bool:
+        ok, _, _ = _run_authenticated_git(
+            ["merge-base", "--is-ancestor", commit_hash, ref], store, target,
+            allowed_returncodes={1, 128},
+        )
+        return ok
+
+    def diff_authenticated_checkpoint(self, commit_hash: str, *, executor_identity: object | None = None) -> Dict:
+        """Diff one authorized checkpoint against the fixed workspace."""
+        if not self._require_executor_identity(executor_identity):
+            return {"success": False, "error": "executor checkpoint identity mismatch"}
+        hash_err = _validate_commit_hash(commit_hash)
+        if hash_err:
+            return {"success": False, "error": hash_err}
+        target = self._authenticated_target
+        if target is None:
+            return {"success": False, "error": "authenticated checkpoint capability unavailable"}
+        store = _store_path(_effective_checkpoint_base())
+        ref = _ref_name(target.identity)
+        if not (store / "HEAD").exists():
+            return {"success": False, "error": "No checkpoints exist for this workspace"}
+        if not self._checkpoint_in_authenticated_ref(store, target, ref, commit_hash):
+            return {"success": False, "error": f"Checkpoint '{commit_hash}' is not in this workspace"}
+        index_file = _index_path(store, target.identity)
+        _run_authenticated_git(["add", "-A"], store, target, timeout=_GIT_TIMEOUT * 2, index_file=index_file)
+        ok_stat, stat_out, _ = _run_authenticated_git(
+            ["diff", "--stat", commit_hash, "--cached"], store, target, index_file=index_file,
+        )
+        ok_diff, diff_out, _ = _run_authenticated_git(
+            ["diff", commit_hash, "--cached", "--no-color"], store, target, index_file=index_file,
+        )
+        _run_authenticated_git(["read-tree", ref], store, target, index_file=index_file, allowed_returncodes={128})
+        if not ok_stat and not ok_diff:
+            return {"success": False, "error": "Could not generate diff"}
+        return {"success": True, "stat": stat_out if ok_stat else "", "diff": diff_out if ok_diff else ""}
+
+    def restore_authenticated_checkpoint(self, commit_hash: str, *, executor_identity: object | None = None) -> Dict:
+        """Restore the fixed authenticated workspace from an authorized checkpoint."""
+        if not self._require_executor_identity(executor_identity):
+            return {"success": False, "error": "executor checkpoint identity mismatch"}
+        hash_err = _validate_commit_hash(commit_hash)
+        if hash_err:
+            return {"success": False, "error": hash_err}
+        target = self._authenticated_target
+        if target is None:
+            return {"success": False, "error": "authenticated checkpoint capability unavailable"}
+        store = _store_path(_effective_checkpoint_base())
+        ref = _ref_name(target.identity)
+        if not (store / "HEAD").exists():
+            return {"success": False, "error": "No checkpoints exist for this workspace"}
+        if not self._checkpoint_in_authenticated_ref(store, target, ref, commit_hash):
+            return {"success": False, "error": f"Checkpoint '{commit_hash}' is not in this workspace"}
+        self._take_authenticated(target, f"pre-rollback snapshot (restoring to {commit_hash[:8]})")
+        index_file = _index_path(store, target.identity)
+        ok, _, err = _run_authenticated_git(
+            ["checkout", commit_hash, "--", "."], store, target,
+            timeout=_GIT_TIMEOUT * 2, index_file=index_file,
+        )
+        if not ok:
+            return {"success": False, "error": f"Restore failed: {err}", "debug": err or None}
+        ok_reason, reason, _ = _run_authenticated_git(["log", "--format=%s", "-1", commit_hash], store, target)
+        return {
+            "success": True,
+            "restored_to": commit_hash[:8],
+            "reason": reason if ok_reason else "unknown",
+            "directory": "authenticated workspace",
+        }
+
     def diff(self, working_dir: str, commit_hash: str) -> Dict:
         """Show diff between a checkpoint and the current working tree."""
         hash_err = _validate_commit_hash(commit_hash)
@@ -748,7 +1008,7 @@ class CheckpointManager:
             return {"success": False, "error": hash_err}
 
         abs_dir = str(_normalize_path(working_dir))
-        store = _store_path(CHECKPOINT_BASE)
+        store = _store_path(_effective_checkpoint_base())
 
         if not (store / "HEAD").exists():
             return {"success": False, "error": "No checkpoints exist for this directory"}
@@ -760,6 +1020,9 @@ class CheckpointManager:
             return {"success": False, "error": f"Checkpoint '{commit_hash}' not found"}
 
         dir_hash = _project_hash(abs_dir)
+        ref = _ref_name(dir_hash)
+        if not self._checkpoint_in_legacy_ref(store, abs_dir, ref, commit_hash):
+            return {"success": False, "error": f"Checkpoint '{commit_hash}' is not in this directory"}
         index_file = _index_path(store, dir_hash)
 
         # Stage current state into the per-project index to compare.
@@ -804,7 +1067,7 @@ class CheckpointManager:
             if path_err:
                 return {"success": False, "error": path_err}
 
-        store = _store_path(CHECKPOINT_BASE)
+        store = _store_path(_effective_checkpoint_base())
 
         if not (store / "HEAD").exists():
             return {"success": False, "error": "No checkpoints exist for this directory"}
@@ -816,10 +1079,14 @@ class CheckpointManager:
             return {"success": False, "error": f"Checkpoint '{commit_hash}' not found",
                     "debug": err or None}
 
+        dir_hash = _project_hash(abs_dir)
+        ref = _ref_name(dir_hash)
+        if not self._checkpoint_in_legacy_ref(store, abs_dir, ref, commit_hash):
+            return {"success": False, "error": f"Checkpoint '{commit_hash}' is not in this directory"}
+
         # Take a pre-rollback snapshot so you can undo the undo.
         self._take(abs_dir, f"pre-rollback snapshot (restoring to {commit_hash[:8]})")
 
-        dir_hash = _project_hash(abs_dir)
         index_file = _index_path(store, dir_hash)
 
         restore_target = file_path if file_path else "."
@@ -870,9 +1137,152 @@ class CheckpointManager:
     # Internal
     # ------------------------------------------------------------------
 
+    def _take_authenticated(self, target: AuthenticatedCheckpointTarget, reason: str) -> bool:
+        """Take a snapshot of a descriptor-authorized workspace.
+
+        The workspace is never converted into a host path. Git receives only an
+        inherited directory descriptor, while the owner-local store remains the
+        trusted storage location established at worker startup.
+        """
+        store = _store_path(_effective_checkpoint_base())
+        err = _init_store(store, str(store.parent))
+        if err:
+            logger.debug("Authenticated checkpoint store init failed: %s", err)
+            return False
+        self._touch_authenticated_project(store, target)
+        if self._authenticated_file_count(target) > _MAX_FILES:
+            logger.debug("Authenticated checkpoint skipped: >%d files", _MAX_FILES)
+            return False
+
+        dir_hash = target.identity
+        index_file = _index_path(store, dir_hash)
+        ref = _ref_name(dir_hash)
+        if index_file.exists():
+            ok_ref, ref_commit, _ = _run_authenticated_git(
+                ["rev-parse", "--verify", ref + "^{commit}"], store, target,
+                allowed_returncodes={128},
+            )
+            if ok_ref and ref_commit:
+                _run_authenticated_git(["read-tree", ref_commit], store, target, index_file=index_file)
+            else:
+                try:
+                    index_file.unlink()
+                except OSError:
+                    pass
+        else:
+            index_file.parent.mkdir(parents=True, exist_ok=True)
+
+        ok, _, err = _run_authenticated_git(
+            ["add", "-A"], store, target, timeout=_GIT_TIMEOUT * 2, index_file=index_file,
+        )
+        if not ok:
+            logger.debug("Authenticated checkpoint git-add failed: %s", err)
+            return False
+        if self.max_file_size_mb > 0:
+            self._drop_authenticated_oversize_from_index(store, target, index_file)
+
+        ok_ref, ref_commit, _ = _run_authenticated_git(
+            ["rev-parse", "--verify", ref + "^{commit}"], store, target,
+            allowed_returncodes={128},
+        )
+        has_ref = ok_ref and bool(ref_commit)
+        if has_ref:
+            unchanged, _, _ = _run_authenticated_git(
+                ["diff-index", "--cached", "--quiet", ref_commit], store, target,
+                allowed_returncodes={1}, index_file=index_file,
+            )
+            if unchanged:
+                return False
+        else:
+            ok_ls, ls_out, _ = _run_authenticated_git(
+                ["ls-files", "--cached"], store, target, index_file=index_file,
+            )
+            if ok_ls and not ls_out.strip():
+                return False
+
+        ok_tree, tree_sha, err = _run_authenticated_git(["write-tree"], store, target, index_file=index_file)
+        if not ok_tree or not tree_sha:
+            logger.debug("Authenticated checkpoint write-tree failed: %s", err)
+            return False
+        commit_args = ["commit-tree", tree_sha, "-m", reason, "--no-gpg-sign"]
+        if has_ref:
+            commit_args = ["commit-tree", tree_sha, "-p", ref_commit, "-m", reason, "--no-gpg-sign"]
+        ok_commit, new_sha, err = _run_authenticated_git(commit_args, store, target, index_file=index_file)
+        if not ok_commit or not new_sha:
+            logger.debug("Authenticated checkpoint commit-tree failed: %s", err)
+            return False
+        update_args = ["update-ref", ref, new_sha]
+        if has_ref:
+            update_args.append(ref_commit)
+        ok_update, _, err = _run_authenticated_git(update_args, store, target)
+        if not ok_update:
+            logger.debug("Authenticated checkpoint update-ref failed: %s", err)
+            return False
+        return True
+
+    @staticmethod
+    def _authenticated_file_count(target: AuthenticatedCheckpointTarget) -> int:
+        count = 0
+        pending = [target.context.workspace_prefix]
+        while pending:
+            directory = pending.pop()
+            for entry in target.context.roots.list_directory(RootKind.WORKSPACE, directory):
+                count += 1
+                if count > _MAX_FILES:
+                    return count
+                if entry.is_directory:
+                    pending.append(entry.relative_path)
+        return count
+
+    @staticmethod
+    def _touch_authenticated_project(store: Path, target: AuthenticatedCheckpointTarget) -> None:
+        meta_path = _project_meta_path(store, target.identity)
+        now = time.time()
+        meta: Dict = {"workspace": "authenticated", "created_at": now, "last_touch": now}
+        try:
+            if meta_path.exists():
+                existing = json.loads(meta_path.read_text(encoding="utf-8"))
+                if isinstance(existing, dict):
+                    meta["created_at"] = existing.get("created_at", now)
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            meta_path.write_text(json.dumps(meta), encoding="utf-8")
+        except OSError as exc:
+            logger.debug("Could not update authenticated checkpoint metadata: %s", exc)
+
+    def _drop_authenticated_oversize_from_index(
+        self, store: Path, target: AuthenticatedCheckpointTarget, index_file: Path,
+    ) -> None:
+        cap = self.max_file_size_mb * 1024 * 1024
+        ok, stdout, _ = _run_authenticated_git(
+            ["ls-files", "--cached", "-z"], store, target, index_file=index_file,
+        )
+        if cap <= 0 or not ok or not stdout:
+            return
+        oversize: List[str] = []
+        for relative_path in (item for item in stdout.split("\x00") if item):
+            try:
+                fd = target.context.roots.open_relative(
+                    RootKind.WORKSPACE,
+                    f"{target.context.workspace_prefix}/{relative_path}",
+                    expected_type=ExpectedType.REGULAR_FILE,
+                )
+                try:
+                    size = os.fstat(fd).st_size
+                finally:
+                    os.close(fd)
+            except OSError:
+                continue
+            if size > cap:
+                oversize.append(relative_path)
+        for start in range(0, len(oversize), 200):
+            _run_authenticated_git(
+                ["rm", "--cached", "--quiet", "--"] + oversize[start:start + 200],
+                store, target, index_file=index_file, allowed_returncodes={128},
+            )
+
     def _take(self, working_dir: str, reason: str) -> bool:
         """Take a snapshot.  Returns True on success."""
-        store = _store_path(CHECKPOINT_BASE)
+        store = _store_path(_effective_checkpoint_base())
 
         err = _init_store(store, working_dir)
         if err:
@@ -1281,7 +1691,7 @@ def prune_checkpoints(
 
     Never raises — maintenance must never block interactive startup.
     """
-    base = checkpoint_base or CHECKPOINT_BASE
+    base = checkpoint_base or _effective_checkpoint_base()
     result = {
         "scanned": 0,
         "deleted_orphan": 0,
@@ -1511,7 +1921,7 @@ def maybe_auto_prune_checkpoints(
     Returns ``{"skipped": bool, "result": prune_checkpoints-dict,
     "error": optional str}``.
     """
-    base = checkpoint_base or CHECKPOINT_BASE
+    base = checkpoint_base or _effective_checkpoint_base()
     out: Dict[str, object] = {"skipped": False}
 
     try:
@@ -1574,7 +1984,7 @@ def store_status(checkpoint_base: Optional[Path] = None) -> Dict:
        "total_size_bytes": N, "project_count": N, "projects": [...],
        "legacy_archives": [...]}``
     """
-    base = checkpoint_base or CHECKPOINT_BASE
+    base = checkpoint_base or _effective_checkpoint_base()
     out: Dict = {
         "base": str(base),
         "store_size_bytes": 0,
@@ -1639,7 +2049,7 @@ def clear_all(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
 
     Returns ``{"bytes_freed": N, "deleted": bool}``.
     """
-    base = checkpoint_base or CHECKPOINT_BASE
+    base = checkpoint_base or _effective_checkpoint_base()
     out = {"bytes_freed": 0, "deleted": False}
     if not base.exists():
         return out
@@ -1658,7 +2068,7 @@ def clear_legacy(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
 
     Returns ``{"bytes_freed": N, "deleted": count}``.
     """
-    base = checkpoint_base or CHECKPOINT_BASE
+    base = checkpoint_base or _effective_checkpoint_base()
     out = {"bytes_freed": 0, "deleted": 0}
     if not base.exists():
         return out

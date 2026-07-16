@@ -1,8 +1,12 @@
 """Tests for hermes_cli.logs — log viewing and filtering."""
 
+import os
 from datetime import datetime, timedelta
 
+import pytest
 
+from hermes_cli.controlled_roots import RootKind, controlled_roots_for
+from hermes_cli.owner_runtime import ensure_owner_runtime_dirs, owner_worker_runtime_paths
 from hermes_cli.logs import (
     LOG_FILES,
     _extract_level,
@@ -214,6 +218,28 @@ class TestMatchesFilters:
 # ---------------------------------------------------------------------------
 # File reading
 # ---------------------------------------------------------------------------
+
+def test_owner_log_reader_uses_allowlisted_descriptor_relative_file(tmp_path, monkeypatch):
+    import hermes_cli.controlled_roots as controlled_roots
+    from hermes_cli.logs import _read_owner_log_tail
+
+    monkeypatch.setattr(controlled_roots.sys, "platform", "linux")
+    monkeypatch.setattr(controlled_roots, "_openat2", lambda *_args: None)
+    owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
+    (owner_home / "logs" / "agent.log").write_text("one\ntwo\n")
+    roots = controlled_roots_for(owner_worker_runtime_paths(owner_home=owner_home, worker_generation=1))
+
+    try:
+        assert _read_owner_log_tail(roots, "agent.log", 1) == ["two\n"]
+        with pytest.raises(ValueError, match="unknown owner log"):
+            _read_owner_log_tail(roots, "../secret.log", 10)
+        (owner_home / "logs" / "agent.log").unlink()
+        os.symlink(tmp_path / "outside.log", owner_home / "logs" / "agent.log")
+        with pytest.raises(OSError):
+            _read_owner_log_tail(roots, "agent.log", 10)
+    finally:
+        roots.close()
+
 
 class TestReadTail:
     def test_read_small_file(self, tmp_path):

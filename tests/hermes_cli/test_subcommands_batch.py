@@ -89,12 +89,27 @@ def test_single_handler_builders(name, builder, kw, argv):
 def test_dashboard_builder_two_handlers():
     parser = argparse.ArgumentParser(prog="hermes")
     sub = parser.add_subparsers(dest="command")
-    dash, reg = _h("dashboard"), _h("dashboard_register")
-    build_dashboard_parser(sub, cmd_dashboard=dash, cmd_dashboard_register=reg)
+    dash, reg, users = _h("dashboard"), _h("dashboard_register"), _h("dashboard_users")
+    build_dashboard_parser(
+        sub,
+        cmd_dashboard=dash,
+        cmd_dashboard_register=reg,
+        cmd_dashboard_users=users,
+    )
     # bare dashboard -> launch handler
     assert parser.parse_args(["dashboard"]).func is dash
+    assert parser.parse_args(["dashboard", "--require-auth"]).require_auth is True
     # dashboard register -> register handler
     assert parser.parse_args(["dashboard", "register"]).func is reg
+    # dashboard user lifecycle operations route to the management handler.
+    assert parser.parse_args(["dashboard", "users", "list"]).func is users
+    assert parser.parse_args(["dashboard", "users", "bootstrap", "--generate"]).func is users
+    assert parser.parse_args(
+        ["dashboard", "users", "reset-password", "alice"]
+    ).func is users
+    assert parser.parse_args(
+        ["dashboard", "users", "make-admin", "alice"]
+    ).func is users
 
 
 # ── deprecated `hermes login` fails gracefully, not with argparse error ────

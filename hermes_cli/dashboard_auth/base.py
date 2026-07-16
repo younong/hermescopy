@@ -23,6 +23,13 @@ class Session:
     expires_at: int  # unix seconds; the access_token's exp claim
     access_token: str
     refresh_token: str
+    # Provider-issued authorization session and membership/role revision. Empty
+    # values preserve compatibility with providers predating authority epochs;
+    # the Control Plane derives a non-secret session fingerprint only at the
+    # authority boundary and rejects providers that cannot supply a trusted
+    # authorization state once their integration is enabled.
+    authorization_session_id: str = ""
+    authorization_revision: str = "v1"
 
 
 @dataclass(frozen=True)
@@ -199,6 +206,30 @@ class DashboardAuthProvider(ABC):
 
     @abstractmethod
     def revoke_session(self, *, refresh_token: str) -> None: ...
+
+    def authorization_state(self, session: Session) -> tuple[str, str]:
+        """Return trusted ``(session_id, membership_revision)`` for authority.
+
+        Providers with a durable provider-issued session/membership revision
+        should override this method. The compatibility default derives only a
+        non-secret stable session handle from the already verified session,
+        while the revision comes from the verified Session object.
+        """
+        import hashlib
+
+        session_id = str(session.authorization_session_id or "").strip()
+        if not session_id:
+            material = "\x1f".join((
+                session.provider,
+                session.user_id,
+                session.org_id,
+                session.access_token,
+            )).encode("utf-8")
+            session_id = hashlib.sha256(material).hexdigest()
+        revision = str(session.authorization_revision or "").strip()
+        if not revision:
+            raise ProviderError("provider did not supply an authorization revision")
+        return session_id, revision
 
     def complete_password_login(
         self, *, username: str, password: str

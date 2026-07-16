@@ -9,7 +9,11 @@ import pytest
 from pathlib import Path
 from unittest.mock import patch
 
+from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
+from hermes_cli.controlled_roots import ExpectedType, RootKind, controlled_roots_for
+from hermes_cli.owner_runtime import ensure_owner_runtime_dirs, owner_worker_runtime_paths
 from tools.checkpoint_manager import (
+    AuthenticatedCheckpointTarget,
     CheckpointManager,
     _shadow_repo_path,
     _init_shadow_repo,
@@ -72,6 +76,20 @@ def mgr(work_dir, checkpoint_base, monkeypatch):
 def disabled_mgr(checkpoint_base, monkeypatch):
     monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
     return CheckpointManager(enabled=False)
+
+
+@pytest.fixture(autouse=True)
+def _simulate_linux_controlled_roots(monkeypatch):
+    import hermes_cli.controlled_roots as controlled_roots
+
+    monkeypatch.setattr(controlled_roots.sys, "platform", "linux")
+    monkeypatch.setattr(controlled_roots, "_openat2", lambda *_args: None)
+
+
+def _authenticated_context(tmp_path, owner_name):
+    owner_home = ensure_owner_runtime_dirs(tmp_path / owner_name)
+    roots = controlled_roots_for(owner_worker_runtime_paths(owner_home=owner_home, worker_generation=1))
+    return AuthenticatedWorkspaceContext(roots)
 
 
 # =========================================================================
@@ -173,6 +191,105 @@ class TestDisabledManager:
 
     def test_new_turn_works(self, disabled_mgr):
         disabled_mgr.new_turn()
+
+
+# =========================================================================
+# Authenticated capability checkpoints
+# =========================================================================
+
+
+class TestAuthenticatedCheckpoints:
+    def test_requires_capability_in_authenticated_mode(self):
+        with pytest.raises(RuntimeError, match="lacks filesystem capability"):
+            CheckpointManager(enabled=True, authenticated_mode=True)
+
+    def test_owner_workspaces_are_isolated_and_ignore_ambient_cwd(self, tmp_path, checkpoint_base, monkeypatch):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        context_a = _authenticated_context(tmp_path, "owner-a")
+        context_b = _authenticated_context(tmp_path, "owner-b")
+        try:
+            context_a.roots.replace_bytes(RootKind.WORKSPACE, "default/a.txt", b"owner-a\n")
+            context_b.roots.replace_bytes(RootKind.WORKSPACE, "default/b.txt", b"owner-b\n")
+            manager_a = CheckpointManager(enabled=True, authenticated_context=context_a, authenticated_mode=True)
+            manager_b = CheckpointManager(enabled=True, authenticated_context=context_b, authenticated_mode=True)
+            unrelated = tmp_path / "unrelated"
+            unrelated.mkdir()
+            monkeypatch.chdir(unrelated)
+
+            assert manager_a.ensure_authenticated_checkpoint("owner-a") is True
+            assert manager_b.ensure_authenticated_checkpoint("owner-b") is True
+
+            target_a = AuthenticatedCheckpointTarget.from_context(context_a)
+            target_b = AuthenticatedCheckpointTarget.from_context(context_b)
+            assert target_a.identity != target_b.identity
+            store = _store_path(checkpoint_base)
+            ok_a, tree_a, _ = _run_git(
+                ["ls-tree", "-r", "--name-only", _ref_name(target_a.identity)],
+                store,
+                str(checkpoint_base),
+            )
+            ok_b, tree_b, _ = _run_git(
+                ["ls-tree", "-r", "--name-only", _ref_name(target_b.identity)],
+                store,
+                str(checkpoint_base),
+            )
+            assert ok_a and tree_a == "a.txt"
+            assert ok_b and tree_b == "b.txt"
+        finally:
+            context_a.roots.close()
+            context_b.roots.close()
+
+    def test_authenticated_diff_and_restore_reject_other_owner_checkpoint(self, tmp_path, checkpoint_base, monkeypatch):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        context_a = _authenticated_context(tmp_path, "owner-a")
+        context_b = _authenticated_context(tmp_path, "owner-b")
+        try:
+            context_a.roots.replace_bytes(RootKind.WORKSPACE, "default/note.txt", b"a-one\n")
+            context_b.roots.replace_bytes(RootKind.WORKSPACE, "default/note.txt", b"b-one\n")
+            manager_a = CheckpointManager(enabled=True, authenticated_context=context_a, authenticated_mode=True)
+            manager_b = CheckpointManager(enabled=True, authenticated_context=context_b, authenticated_mode=True)
+            assert manager_a.ensure_authenticated_checkpoint("a") is True
+            assert manager_b.ensure_authenticated_checkpoint("b") is True
+            b_hash = manager_b.list_authenticated_checkpoints()[0]["hash"]
+
+            assert manager_a.diff_authenticated_checkpoint(b_hash)["success"] is False
+            restore = manager_a.restore_authenticated_checkpoint(b_hash)
+            assert restore["success"] is False
+            assert "not in this workspace" in restore["error"]
+            fd = context_a.roots.open_relative(
+                RootKind.WORKSPACE, "default/note.txt", expected_type=ExpectedType.REGULAR_FILE,
+            )
+            try:
+                assert os.read(fd, 64) == b"a-one\n"
+            finally:
+                os.close(fd)
+        finally:
+            context_a.roots.close()
+            context_b.roots.close()
+
+    def test_authenticated_snapshot_passes_workspace_fd_to_git(self, tmp_path, checkpoint_base, monkeypatch):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        context = _authenticated_context(tmp_path, "owner")
+        try:
+            context.roots.replace_bytes(RootKind.WORKSPACE, "default/note.txt", b"note\n")
+            calls = []
+            original_run = subprocess.run
+
+            def record_run(*args, **kwargs):
+                calls.append(kwargs)
+                return original_run(*args, **kwargs)
+
+            monkeypatch.setattr("tools.checkpoint_manager.subprocess.run", record_run)
+            manager = CheckpointManager(enabled=True, authenticated_context=context, authenticated_mode=True)
+            assert manager.ensure_authenticated_checkpoint("initial") is True
+            git_calls = [kwargs for kwargs in calls if kwargs.get("pass_fds")]
+            assert git_calls
+            assert all(kwargs["cwd"] == "/" for kwargs in git_calls)
+            assert all(kwargs["pass_fds"] for kwargs in git_calls)
+            assert all(kwargs["env"]["GIT_WORK_TREE"] == "." for kwargs in git_calls)
+            assert all(kwargs["preexec_fn"] is not None for kwargs in git_calls)
+        finally:
+            context.roots.close()
 
 
 # =========================================================================

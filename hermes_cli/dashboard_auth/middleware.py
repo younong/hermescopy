@@ -55,6 +55,42 @@ _GATE_PUBLIC_PREFIXES: tuple[str, ...] = (
 )
 
 
+def _password_change_required_response(request: Request) -> Response:
+    """Fail closed while preserving the session needed to change its password."""
+    del request
+    return JSONResponse(
+        {
+            "error": "password_change_required",
+            "detail": "Password change required",
+            "password_change_url": "/api/auth/password-change",
+        },
+        status_code=403,
+    )
+
+
+def _session_requires_password_change(session) -> bool:
+    """Return server-derived reset state for durable local Basic sessions only."""
+    if session.provider != "basic":
+        return False
+    from hermes_cli.dashboard_auth import get_provider
+
+    provider = get_provider("basic")
+    resolver = getattr(provider, "local_account_for_session", None)
+    if not callable(resolver):
+        return False
+    account = resolver(session)
+    return bool(account is not None and account.must_change_password)
+
+
+def _path_is_allowed_during_password_change(path: str) -> bool:
+    """Only recovery endpoints may use a forced-change durable session."""
+    return path in {
+        "/api/auth/me",
+        "/api/auth/password-change",
+        "/api/auth/password/change",
+    }
+
+
 def _path_is_public(path: str) -> bool:
     """True if ``path`` bypasses the OAuth auth gate.
 
@@ -81,6 +117,145 @@ def _client_ip(request: Request) -> str:
     if fwd:
         return fwd.split(",")[0].strip()
     return request.client.host if request.client else ""
+
+
+class WebSocketSessionRejected(RuntimeError):
+    """A browser WS upgrade has no current, matching verified session."""
+
+
+class WebSocketSessionUnavailable(RuntimeError):
+    """The provider needed to revalidate a browser WS session is unavailable."""
+
+
+def verified_access_session(request):
+    """Return a freshly verified cookie session, or ``None`` if untrusted.
+
+    Public auth routes such as logout cannot rely on HTTP middleware state, but
+    they may only revoke authority after this same provider verification step.
+    A provider outage remains distinguishable from an unknown/expired cookie so
+    callers can fail closed without ever creating a wildcard revocation.
+    """
+    access_token, _refresh_token = read_session_cookies(request)
+    if not access_token:
+        return None
+    unreachable = False
+    for provider in list_session_providers():
+        try:
+            session = provider.verify_session(access_token=access_token)
+        except ProviderError:
+            unreachable = True
+            continue
+        if session is not None:
+            return session
+    if unreachable:
+        raise ProviderError("session provider is unavailable")
+    return None
+
+
+def authorization_scope_for_session(session):
+    """Build the authority scope from a current verified provider session."""
+    from hermes_cli.dashboard_auth import get_provider
+    from hermes_cli.dashboard_auth.authority import AuthorizationScope
+    from hermes_cli.dashboard_auth.owner_context import owner_context_from_session
+
+    provider = get_provider(session.provider)
+    if provider is None or not getattr(provider, "supports_session", True):
+        raise ProviderError("session provider is unavailable")
+    session_id, membership_revision = provider.authorization_state(session)
+    owner = owner_context_from_session(session)
+    return AuthorizationScope(
+        provider=session.provider,
+        tenant_id=owner.tenant_id,
+        user_id=session.user_id,
+        session_id=session_id,
+        membership_revision=membership_revision,
+    )
+
+
+def revoke_session_authority(
+    session, *, reason: str
+) -> tuple["AuthorizationScope", "AuthorizationState"]:
+    """Fail-close revoke all browser credentials bound to a verified session."""
+    from hermes_cli.dashboard_auth.authority import AuthorizationScope, AuthorizationState
+    from hermes_cli.dashboard_auth.ws_tickets import authority_store
+
+    scope = authorization_scope_for_session(session)
+    return scope, authority_store().revoke_and_bump(scope, reason=reason)
+
+
+async def activate_verified_session_authority(request: Request, session) -> None:
+    """Activate current provider authority and close locally superseded bridges."""
+    from hermes_cli.dashboard_auth.ws_tickets import authority_store
+
+    state = authority_store().activate(authorization_scope_for_session(session))
+    if state.changes:
+        from hermes_cli.web_server import close_authorized_bridges_by_changes
+
+        await close_authorized_bridges_by_changes(
+            request.app,
+            state.changes,
+            reason="session_transition",
+        )
+
+
+def verify_websocket_ticket_session(ws, payload: dict[str, object]):
+    """Revalidate the cookie session bound to a signed browser WS ticket.
+
+    WebSocket upgrades bypass FastAPI's HTTP middleware, so this deliberately
+    repeats the provider verification that the HTTP gate performs.  It never
+    refreshes a session during an upgrade: a missing or expired access-token
+    cookie requires the browser to re-establish its HTTP session and mint a
+    fresh ticket.  The returned session has been matched against every trusted
+    principal and authorization-state claim before the caller consumes the
+    ticket in the authority store.
+    """
+    from hermes_cli.dashboard_auth import get_provider
+    from hermes_cli.dashboard_auth.owner_context import owner_context_from_session
+
+    provider_name = str(payload.get("provider") or "").strip()
+    access_token, _refresh_token = read_session_cookies(ws)
+    if not provider_name or not access_token:
+        raise WebSocketSessionRejected("session_missing")
+
+    provider = get_provider(provider_name)
+    if provider is None or not getattr(provider, "supports_session", True):
+        raise WebSocketSessionRejected("provider_unavailable")
+    try:
+        session = provider.verify_session(access_token=access_token)
+    except ProviderError as exc:
+        raise WebSocketSessionUnavailable("provider_unavailable") from exc
+    if session is None:
+        raise WebSocketSessionRejected("session_invalid")
+    try:
+        if _session_requires_password_change(session):
+            raise WebSocketSessionRejected("password_change_required")
+    except ProviderError as exc:
+        raise WebSocketSessionUnavailable("local_account_unavailable") from exc
+    if session.provider != provider_name or session.user_id != str(payload.get("user_id") or ""):
+        raise WebSocketSessionRejected("session_principal_mismatch")
+    if session.org_id != str(payload.get("org_id") or ""):
+        raise WebSocketSessionRejected("session_tenant_mismatch")
+
+    try:
+        owner = owner_context_from_session(session)
+    except Exception as exc:
+        raise WebSocketSessionUnavailable("owner_context_unavailable") from exc
+    if (
+        owner.tenant_id != str(payload.get("tenant_id") or "")
+        or owner.owner_key != str(payload.get("owner_key") or "")
+    ):
+        raise WebSocketSessionRejected("session_owner_mismatch")
+
+    try:
+        session_id, membership_revision = provider.authorization_state(session)
+    except ProviderError as exc:
+        raise WebSocketSessionUnavailable("authorization_state_unavailable") from exc
+    if (
+        session_id != str(payload.get("session_id") or "")
+        or membership_revision != str(payload.get("membership_revision") or "")
+    ):
+        raise WebSocketSessionRejected("membership_revision_mismatch")
+    return session
 
 
 def _unauth_response(request: Request, *, reason: str) -> Response:
@@ -147,9 +322,10 @@ def _auto_sso_response(request: Request) -> Response | None:
       * the request is an HTML document navigation, not an ``/api/*`` fetch
         (a fetch() would follow the 302 into the cross-origin OAuth dance
         opaquely — same reason ``_unauth_response`` never redirects APIs);
-      * exactly ONE interactive provider is registered — with two or more we
-        can't pick for the user, so the ``/login`` chooser must render; with
-        zero there's nothing to redirect to;
+      * exactly ONE interactive provider is registered and it is redirect
+        based — a password provider must render its credential form on
+        ``/login`` instead; if password and OAuth providers coexist, the
+        interstitial preserves the user's choice;
       * the one-shot loop-guard marker is ABSENT. Its presence means we
         already bounced to the portal once and came back still
         unauthenticated (no portal session) — auto-redirecting again would
@@ -177,9 +353,13 @@ def _auto_sso_response(request: Request) -> Response | None:
 
     # list_session_providers() already filters on supports_session=True, so
     # token-only credentials (drain/service providers) are never candidates.
+    # Password-capable providers authenticate through the /login form rather
+    # than the OAuth-start route. Their presence also means the user must see
+    # the login page to choose between password and any redirect providers.
     providers = list_session_providers()
-    if len(providers) != 1:
-        # Zero → nothing to redirect to. Two+ → user must choose at /login.
+    if len(providers) != 1 or getattr(providers[0], "supports_password", False):
+        # Zero → nothing to redirect to. Multiple providers or a password
+        # provider → render /login so the user can select an available flow.
         return None
 
     from hermes_cli.dashboard_auth.prefix import prefix_from_request
@@ -353,8 +533,60 @@ async def gated_auth_middleware(
         refreshed = _attempt_refresh(request, refresh_token=_rt)
         if refreshed is not None:
             new_session, refreshing_provider = refreshed
+            try:
+                # A rotating refresh can carry a new session, tenant, or
+                # membership revision. Activate the new scope before serving
+                # any request; AuthorityStore atomically invalidates the old
+                # active scope for the same principal when necessary.
+                await activate_verified_session_authority(request, new_session)
+            except Exception as exc:
+                _log.warning("dashboard-auth: refresh authority activation failed: %s", exc)
+                response = JSONResponse(
+                    {"detail": "Authorization state is unavailable"},
+                    status_code=503,
+                )
+                from hermes_cli.dashboard_auth.cookies import clear_session_cookies
+                from hermes_cli.dashboard_auth.prefix import prefix_from_request
+
+                clear_session_cookies(response, prefix=prefix_from_request(request))
+                return response
             request.state.session = new_session
-            response = await call_next(request)
+            try:
+                requires_password_change = _session_requires_password_change(new_session)
+            except ProviderError as exc:
+                _log.warning("dashboard-auth: local account state unavailable: %s", exc)
+                response = JSONResponse(
+                    {"detail": "Local account authority is unavailable"}, status_code=503
+                )
+                from hermes_cli.dashboard_auth.cookies import clear_session_cookies
+                from hermes_cli.dashboard_auth.prefix import prefix_from_request
+
+                clear_session_cookies(response, prefix=prefix_from_request(request))
+                return response
+            if requires_password_change and not _path_is_allowed_during_password_change(path):
+                response = _password_change_required_response(request)
+                from hermes_cli.dashboard_auth.cookies import (
+                    detect_https,
+                    set_session_cookies,
+                )
+                from hermes_cli.dashboard_auth.prefix import prefix_from_request
+
+                set_session_cookies(
+                    response,
+                    access_token=new_session.access_token,
+                    refresh_token=new_session.refresh_token,
+                    access_token_expires_in=_expires_in_seconds(new_session),
+                    use_https=detect_https(request),
+                    prefix=prefix_from_request(request),
+                )
+                return response
+            from hermes_cli.web_server import _authenticated_owner_control_plane_gate_response
+
+            gated = _authenticated_owner_control_plane_gate_response(request)
+            if gated is not None:
+                response = gated
+            else:
+                response = await call_next(request)
             # Persist the ROTATED tokens. Portal rotates the refresh token on
             # every refresh and runs reuse-detection, so writing the new RT
             # back is mandatory: a stale RT cookie would replay a rotated
@@ -399,7 +631,29 @@ async def gated_auth_middleware(
         clear_session_cookies(response, prefix=prefix_from_request(request))
         return response
 
+    try:
+        await activate_verified_session_authority(request, session)
+    except Exception as exc:
+        _log.warning("dashboard-auth: session authority activation failed: %s", exc)
+        return JSONResponse(
+            {"detail": "Authorization state is unavailable"},
+            status_code=503,
+        )
     request.state.session = session
+    try:
+        requires_password_change = _session_requires_password_change(session)
+    except ProviderError as exc:
+        _log.warning("dashboard-auth: local account state unavailable: %s", exc)
+        return JSONResponse(
+            {"detail": "Local account authority is unavailable"}, status_code=503
+        )
+    if requires_password_change and not _path_is_allowed_during_password_change(path):
+        return _password_change_required_response(request)
+    from hermes_cli.web_server import _authenticated_owner_control_plane_gate_response
+
+    gated = _authenticated_owner_control_plane_gate_response(request)
+    if gated is not None:
+        return gated
     return await call_next(request)
 
 

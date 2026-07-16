@@ -65,13 +65,14 @@ class CLICommandsMixin:
             print("  Or in config.yaml: checkpoints: { enabled: true }")
             return
 
-        cwd = os.getenv("TERMINAL_CWD", os.getcwd())
+        authenticated_checkpoint_mode = getattr(mgr, "_authenticated_mode", False)
+        cwd = "authenticated workspace" if authenticated_checkpoint_mode else os.getenv("TERMINAL_CWD", os.getcwd())
         parts = command.split()
         args = parts[1:] if len(parts) > 1 else []
 
         if not args:
             # List checkpoints
-            checkpoints = mgr.list_checkpoints(cwd)
+            checkpoints = mgr.list_authenticated_checkpoints() if authenticated_checkpoint_mode else mgr.list_checkpoints(cwd)
             print(format_checkpoint_list(checkpoints, cwd))
             return
 
@@ -80,14 +81,17 @@ class CLICommandsMixin:
             if len(args) < 2:
                 print("  Usage: /rollback diff <N>")
                 return
-            checkpoints = mgr.list_checkpoints(cwd)
+            checkpoints = mgr.list_authenticated_checkpoints() if authenticated_checkpoint_mode else mgr.list_checkpoints(cwd)
             if not checkpoints:
                 print(f"  No checkpoints found for {cwd}")
                 return
             target_hash = self._resolve_checkpoint_ref(args[1], checkpoints)
             if not target_hash:
                 return
-            result = mgr.diff(cwd, target_hash)
+            result = (
+                mgr.diff_authenticated_checkpoint(target_hash)
+                if authenticated_checkpoint_mode else mgr.diff(cwd, target_hash)
+            )
             if result["success"]:
                 stat = result.get("stat", "")
                 diff = result.get("diff", "")
@@ -109,7 +113,7 @@ class CLICommandsMixin:
             return
 
         # Resolve checkpoint reference (number or hash)
-        checkpoints = mgr.list_checkpoints(cwd)
+        checkpoints = mgr.list_authenticated_checkpoints() if authenticated_checkpoint_mode else mgr.list_checkpoints(cwd)
         if not checkpoints:
             print(f"  No checkpoints found for {cwd}")
             return
@@ -118,10 +122,17 @@ class CLICommandsMixin:
         if not target_hash:
             return
 
-        # Check for file-level restore: /rollback <N> <file>
+        # Authenticated restores currently operate on the fixed workspace as a
+        # whole; file-scoped restore would need a separate descriptor-relative
+        # path contract.
         file_path = args[1] if len(args) > 1 else None
-
-        result = mgr.restore(cwd, target_hash, file_path=file_path)
+        if authenticated_checkpoint_mode and file_path:
+            print("  File-scoped rollback is unavailable in an authenticated worker.")
+            return
+        result = (
+            mgr.restore_authenticated_checkpoint(target_hash)
+            if authenticated_checkpoint_mode else mgr.restore(cwd, target_hash, file_path=file_path)
+        )
         if result["success"]:
             if file_path:
                 print(f"  ✅ Restored {file_path} from checkpoint {result['restored_to']}: {result['reason']}")

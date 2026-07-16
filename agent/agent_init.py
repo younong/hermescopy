@@ -1175,13 +1175,29 @@ def init_agent(
     # Cached system prompt -- built once per session, only rebuilt on compression
     agent._cached_system_prompt: Optional[str] = None
     
-    # Filesystem checkpoint manager (transparent — not a tool)
+    # Filesystem checkpoint manager (transparent — not a tool). Authenticated
+    # workers inherit their fixed descriptor capability from the dispatch-bound
+    # runtime; a missing capability is an authority failure, not a fallback to
+    # terminal or process CWD resolution.
     from tools.checkpoint_manager import CheckpointManager
+    checkpoint_context = None
+    authenticated_checkpoint_mode = False
+    try:
+        from tui_gateway.server import current_owner_worker_gateway_runtime
+
+        runtime = current_owner_worker_gateway_runtime()
+        if runtime is not None:
+            authenticated_checkpoint_mode = True
+            checkpoint_context = runtime.filesystem_context
+    except Exception:
+        pass
     agent._checkpoint_mgr = CheckpointManager(
         enabled=checkpoints_enabled,
         max_snapshots=checkpoint_max_snapshots,
         max_total_size_mb=checkpoint_max_total_size_mb,
         max_file_size_mb=checkpoint_max_file_size_mb,
+        authenticated_context=checkpoint_context,
+        authenticated_mode=authenticated_checkpoint_mode,
     )
     
     # SQLite session store (optional -- provided by CLI or gateway)

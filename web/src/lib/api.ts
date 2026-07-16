@@ -101,6 +101,16 @@ export function withHermesAssetAuth(url: string): string {
   return `${absolute}${sep}token=${encodeURIComponent(token)}`;
 }
 
+export class FetchJSONError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "FetchJSONError";
+    this.status = status;
+  }
+}
+
 export async function fetchJSON<T>(
   url: string,
   init?: RequestInit,
@@ -196,7 +206,7 @@ export async function fetchJSON<T>(
   }
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
-    throw new Error(`${res.status}: ${text}`);
+    throw new FetchJSONError(res.status, `${res.status}: ${text}`);
   }
   return res.json();
 }
@@ -228,10 +238,12 @@ async function getSessionToken(): Promise<string> {
  * Tickets are single-use and TTL=30s — every WS connect attempt must
  * fetch a fresh ticket.
  */
-export async function getWsTicket(): Promise<{ ticket: string; ttl_seconds: number }> {
+export async function getWsTicket(path: string): Promise<{ ticket: string; ttl_seconds: number }> {
   const res = await fetch(`${BASE}/api/auth/ws-ticket`, {
     method: "POST",
     credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ audience: `browser-ws:${path}` }),
   });
   if (!res.ok) {
     throw new Error(`/api/auth/ws-ticket: HTTP ${res.status}`);
@@ -244,9 +256,9 @@ export async function getWsTicket(): Promise<{ ticket: string; ttl_seconds: numb
  * connect. In gated mode mints a fresh single-use ticket; in loopback
  * mode returns the injected session token.
  */
-export async function buildWsAuthParam(): Promise<[string, string]> {
+export async function buildWsAuthParam(path: string): Promise<[string, string]> {
   if (window.__HERMES_AUTH_REQUIRED__) {
-    const { ticket } = await getWsTicket();
+    const { ticket } = await getWsTicket(path);
     return ["ticket", ticket];
   }
   const token = window.__HERMES_SESSION_TOKEN__ ?? "";
@@ -304,7 +316,7 @@ export async function buildWsUrl(
   params?: Record<string, string>,
 ): Promise<string> {
   return buildHermesWebSocketUrl({
-    authParam: await buildWsAuthParam(),
+    authParam: await buildWsAuthParam(path),
     basePath: BASE,
     params,
     path,
@@ -348,6 +360,34 @@ export const api = {
     fetchJSON<AuthMeResponse>("/api/auth/me", undefined, {
       allowUnauthorized: true,
     }),
+  changePassword: (current_password: string, new_password: string) =>
+    fetchJSON<{ ok: boolean; account: LocalAccount }>("/api/auth/password-change", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ current_password, new_password }),
+    }),
+  getLocalUsers: () =>
+    fetchJSON<LocalUsersResponse>("/api/auth/users"),
+  createLocalUser: (body: CreateLocalUserRequest) =>
+    fetchJSON<TemporaryPasswordResponse>("/api/auth/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  resetLocalUserPassword: (username: string) =>
+    fetchJSON<TemporaryPasswordResponse>(
+      `/api/auth/users/${encodeURIComponent(username)}/reset-password`,
+      { method: "POST" },
+    ),
+  updateLocalUser: (username: string, body: UpdateLocalUserRequest) =>
+    fetchJSON<{ ok: boolean; account: LocalAccount }>(
+      `/api/auth/users/${encodeURIComponent(username)}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
   logout: () =>
     fetch(`${BASE}/auth/logout`, {
       method: "POST",
@@ -356,7 +396,7 @@ export const api = {
       // /auth/logout returns 302 → /login. Follow that with a full-page
       // navigation rather than letting fetch() opaquely consume the
       // redirect — the SPA needs to leave the protected area.
-      window.location.assign("/login");
+      window.location.assign(`${HERMES_BASE_PATH}/login`);
       return r;
     }),
   getSessions: (
@@ -1216,8 +1256,60 @@ export interface AuthMeResponse {
   email: string;
   display_name: string;
   org_id: string;
+  tenant_id: string;
+  owner_key: string;
   provider: string;
   expires_at: number;
+  role?: LocalAccountRole;
+  must_change_password?: boolean;
+  local_user_management?: LocalUserManagement;
+  isolation_mode?: string;
+  legacy_sessions_imported?: boolean;
+  legacy_sessions_message?: string;
+}
+
+export type LocalAccountRole = "admin" | "member";
+export type LocalAccountStatus = "active" | "disabled";
+
+export interface LocalAccount {
+  account_id: string;
+  username: string;
+  display_name: string;
+  role: LocalAccountRole;
+  status: LocalAccountStatus;
+  must_change_password: boolean;
+  created_at: number;
+  updated_at: number;
+  password_changed_at: number;
+  disabled_at: number | null;
+}
+
+export interface LocalUserManagement {
+  enabled: boolean;
+  is_admin: boolean;
+}
+
+export interface LocalUsersResponse {
+  accounts: LocalAccount[];
+  count: number;
+  max_accounts: number;
+}
+
+export interface CreateLocalUserRequest {
+  username: string;
+  display_name?: string;
+  role: LocalAccountRole;
+}
+
+export interface UpdateLocalUserRequest {
+  display_name?: string;
+  role?: LocalAccountRole;
+  status?: LocalAccountStatus;
+}
+
+export interface TemporaryPasswordResponse {
+  temporary_password: string;
+  account: LocalAccount;
 }
 
 export interface ActionResponse {

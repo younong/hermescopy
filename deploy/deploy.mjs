@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,6 +21,7 @@ const SSH_CONNECTION_ARGS = [
   "ServerAliveCountMax=3",
 ];
 const TAG_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const COMMIT_SHA_RE = /^[0-9a-f]{40}$/;
 const DEFAULT_KEEP_RELEASES = 5;
 const DEPLOY_NPM_WORKSPACES = ["web", "ui-tui"];
 
@@ -32,11 +34,13 @@ function usage() {
 Usage:
   npm run deploy -- --create-tag v2026.7.3
   npm run deploy -- --tag v2026.7.3
+  npm run deploy -- --ref <40-hex-commit-sha>
   npm run deploy -- --tag v2026.7.3 --dry-run
 
 Options:
   --tag <tag>              Deploy an existing local git tag.
   --create-tag <tag>       Create an annotated tag at HEAD, push it, then deploy it.
+  --ref <commit-sha>       Deploy an already-pushed immutable 40-hex commit SHA without creating a tag.
   --host <host>            SSH host. Default: ${DEFAULT_HOST}
   --user <user>            SSH user. Default: ${DEFAULT_USER}
   --port <port>            SSH port. Default: 22
@@ -44,7 +48,7 @@ Options:
   --remote-root <path>     Remote release root. Default: ${DEFAULT_REMOTE_ROOT}
   --allow-non-main         Allow creating a tag away from main.
   --allow-dirty            Allow deploying an existing tag with a dirty worktree.
-  --force                  Replace an existing remote release directory for the tag.
+  --force                  Deprecated and rejected; immutable releases are never replaced.
   --keep-releases <n>      Keep the newest n remote releases after deploy. Default: ${DEFAULT_KEEP_RELEASES}
   --no-prune-releases      Do not delete old remote release directories.
   --dry-run                Print commands without changing local or remote state.
@@ -94,6 +98,9 @@ function parseArgs(argv) {
       case "--create-tag":
         args.createTag = next();
         break;
+      case "--ref":
+        args.ref = next();
+        break;
       case "--host":
         args.host = next();
         break;
@@ -136,11 +143,13 @@ function parseArgs(argv) {
     }
   }
 
-  if (!args.help && Boolean(args.tag) === Boolean(args.createTag)) {
-    throw new Error("Pass exactly one of --tag or --create-tag.");
+  const sourceCount = [args.tag, args.createTag, args.ref].filter(Boolean).length;
+  if (!args.help && sourceCount !== 1) {
+    throw new Error("Pass exactly one of --tag, --create-tag, or --ref.");
   }
 
-  args.deployTag = args.createTag || args.tag;
+  args.sourceKind = args.ref ? "commit" : "tag";
+  args.sourceRef = args.ref || args.createTag || args.tag;
   return args;
 }
 
@@ -217,6 +226,26 @@ function validateTag(tag) {
   }
 }
 
+function validateImmutableCommitRef(ref) {
+  if (!COMMIT_SHA_RE.test(ref)) {
+    throw new Error("--ref requires a full lowercase 40-hex commit SHA.");
+  }
+}
+
+function resolveImmutableCommit(ref) {
+  validateImmutableCommitRef(ref);
+  const resolved = runText("git", ["rev-parse", "--verify", `${ref}^{commit}`]);
+  if (resolved !== ref) {
+    throw new Error("--ref must resolve exactly to the supplied commit SHA.");
+  }
+  run("git", ["fetch", "--dry-run", "--no-tags", "origin", ref], { quiet: true });
+  return resolved;
+}
+
+function releaseIdFor(args) {
+  return args.sourceKind === "commit" ? `commit-${args.sourceCommit}` : args.sourceTag;
+}
+
 function assertCleanWorktree({ allowDirty, dryRun = false }) {
   const status = runText("git", ["status", "--porcelain"]);
   if (status && dryRun) {
@@ -254,18 +283,26 @@ function createAnnotatedTag(tag, { dryRun }) {
   run("git", ["push", "origin", "HEAD", "--tags"], { dryRun });
 }
 
-function createArchive(tag, { dryRun }) {
+function createArchive(args, { dryRun }) {
+  const { releaseId, sourceCommit, sourceKind, sourceTag } = args;
   const tmp = dryRun ? null : mkdtempSync(path.join(tmpdir(), "hermes-deploy-"));
-  const buildDir = dryRun ? path.join(tmpdir(), `hermes-${tag}-artifact`) : path.join(tmp, "artifact");
-  const archivePath = dryRun ? path.join(tmpdir(), `hermes-${tag}.tar.gz`) : path.join(tmp, `hermes-${tag}.tar.gz`);
-  const sourceArchive = dryRun ? path.join(tmpdir(), `hermes-${tag}.tar`) : path.join(tmp, `hermes-${tag}.tar`);
+  const buildDir = dryRun ? path.join(tmpdir(), `hermes-${releaseId}-artifact`) : path.join(tmp, "artifact");
+  const archivePath = dryRun ? path.join(tmpdir(), `hermes-${releaseId}.tar.gz`) : path.join(tmp, `hermes-${releaseId}.tar.gz`);
+  const sourceArchive = dryRun ? path.join(tmpdir(), `hermes-${releaseId}.tar`) : path.join(tmp, `hermes-${releaseId}.tar`);
 
   if (!dryRun) {
     mkdirSync(buildDir, { recursive: true });
   }
   const archiveEnv = { COPYFILE_DISABLE: "1" };
-  run("git", ["archive", "--format=tar", "--output", sourceArchive, tag], { dryRun, env: archiveEnv });
+  run("git", ["archive", "--format=tar", "--output", sourceArchive, sourceCommit], { dryRun, env: archiveEnv });
   run("tar", ["-xf", sourceArchive, "-C", buildDir], { dryRun, env: archiveEnv });
+  if (!dryRun) {
+    writeFileSync(
+      path.join(buildDir, ".hermes-release.json"),
+      `${JSON.stringify({ schemaVersion: 1, releaseId, source: { kind: sourceKind, commit: sourceCommit, tag: sourceTag ?? null } }, null, 2)}\n`,
+      "utf8",
+    );
+  }
 
   buildArtifact(buildDir, { dryRun });
   run(
@@ -384,15 +421,19 @@ function runScp(args, localPath, remotePath) {
 function remoteDeployScript() {
   return String.raw`set -euo pipefail
 remote_root="$1"
-tag="$2"
-force="$3"
-keep_releases="$4"
-prune_releases="$5"
+release_id="$2"
+source_commit="$3"
+source_kind="$4"
+source_tag="$5"
+[ "$source_tag" = "-" ] && source_tag=""
+archive="$6"
+keep_releases="$7"
+prune_releases="$8"
 tmp_dir="$remote_root/tmp"
 releases_dir="$remote_root/releases"
-archive="$tmp_dir/hermes-$tag.tar.gz"
-release="$releases_dir/$tag"
-release_tmp="$releases_dir/.$tag.tmp.$$"
+release="$releases_dir/$release_id"
+release_tmp="$releases_dir/.$release_id.tmp.$$"
+release_lock="$releases_dir/.$release_id.lock"
 current="$remote_root/current"
 shared="$remote_root/shared"
 env_file="$shared/.env"
@@ -406,9 +447,9 @@ gateway_unit="/etc/systemd/system/hermes-gateway.service"
 dashboard_unit="/etc/systemd/system/hermes-dashboard.service"
 
 cleanup_release_tmp() {
-  if [ -n "${"${"}release_tmp:-}" ] && [ -d "$release_tmp" ]; then
-    rm -rf -- "$release_tmp"
-  fi
+  rm -rf -- "$release_tmp"
+  rm -f -- "$archive"
+  rmdir -- "$release_lock" 2>/dev/null || true
 }
 trap cleanup_release_tmp EXIT
 
@@ -475,8 +516,20 @@ prune_old_releases() {
   done < <(printf '%s\n' "${"${"}ordered[@]}" | sort -rn)
 }
 
-if ! is_release_name "$tag"; then
-  echo "Invalid release tag on remote: $tag" >&2
+if ! is_release_name "$release_id"; then
+  echo "Invalid release ID on remote: $release_id" >&2
+  exit 1
+fi
+if ! [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]] || [[ "$source_kind" != "tag" && "$source_kind" != "commit" ]]; then
+  echo "Invalid immutable release source" >&2
+  exit 1
+fi
+if [ "$source_kind" = "tag" ] && ! is_release_name "$source_tag"; then
+  echo "Invalid release tag source" >&2
+  exit 1
+fi
+if [ "$source_kind" = "commit" ] && [ -n "$source_tag" ]; then
+  echo "Commit release must not include a tag" >&2
   exit 1
 fi
 if ! [[ "$keep_releases" =~ ^[0-9]+$ ]] || [ "$keep_releases" -lt 1 ]; then
@@ -499,19 +552,32 @@ fi
 chmod 600 "$env_file" 2>/dev/null || true
 chmod 700 "$hermes_home" 2>/dev/null || true
 
+if ! mkdir -- "$release_lock"; then
+  echo "Release is already being deployed or requires investigation: $release_id" >&2
+  exit 1
+fi
 if [ -L "$current" ]; then
   old_current_target="$(resolved_path "$current")"
 fi
 
-if [ -e "$release" ] && [ "$force" != "1" ]; then
-  echo "Remote release already exists, reusing: $release"
+expected_manifest="{\"schemaVersion\":1,\"releaseId\":\"$release_id\",\"source\":{\"kind\":\"$source_kind\",\"commit\":\"$source_commit\",\"tag\":$(if [ -n "$source_tag" ]; then printf '\"%s\"' "$source_tag"; else printf 'null'; fi)}}"
+if [ -e "$release" ]; then
+  actual_manifest="$(tr -d '\n[:space:]' < "$release/.hermes-release.json" 2>/dev/null || true)"
+  if [ "$actual_manifest" != "$expected_manifest" ]; then
+    echo "Existing release does not match immutable source: $release" >&2
+    exit 1
+  fi
+  echo "Remote release already exists with matching source, reusing: $release"
 else
-  rm -rf -- "$release_tmp"
   mkdir -p "$release_tmp"
   tar -xzf "$archive" -C "$release_tmp"
-  if [ -e "$release" ]; then
-    rm -rf -- "$release"
+  actual_manifest="$(tr -d '\n[:space:]' < "$release_tmp/.hermes-release.json" 2>/dev/null || true)"
+  if [ "$actual_manifest" != "$expected_manifest" ]; then
+    echo "Release manifest does not match immutable source" >&2
+    exit 1
   fi
+  test -f "$release_tmp/hermes_cli/web_dist/index.html"
+  test -f "$release_tmp/ui-tui/dist/entry.js"
   mv -- "$release_tmp" "$release"
 fi
 rm -f -- "$archive"
@@ -625,9 +691,12 @@ Environment=HERMES_HOME=$hermes_home
 Environment=HERMES_ENV_FILE=$env_file
 Environment=VIRTUAL_ENV=$shared/venv
 WorkingDirectory=$current
-ExecStart=$runner dashboard --host 127.0.0.1 --port 9119 --no-open --skip-build
+ExecStart=$runner dashboard --host 127.0.0.1 --port 9119 --no-open --skip-build --require-auth
 Restart=always
 RestartSec=5
+# Keep owner workers in the dashboard service cgroup so shutdown cleanup can
+# revoke their authority fence before systemd reaps any remaining children.
+KillMode=control-group
 KillSignal=SIGTERM
 TimeoutStopSec=60
 StandardOutput=journal
@@ -639,14 +708,35 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable hermes-gateway.service hermes-dashboard.service
-systemctl restart hermes-gateway.service hermes-dashboard.service
+# Stop the control plane before rotating a release, then terminate any worker
+# that survived an older dashboard unit. Older KillMode=mixed releases could
+# leave those children orphaned with an ACTIVE durable lease, blocking every
+# cold start after the new dashboard comes up.
+systemctl stop hermes-dashboard.service
+owner_worker_pids="$(pgrep -f '[h]ermes_cli.owner_worker.entrypoint' || true)"
+if [ -n "$owner_worker_pids" ]; then
+  kill -TERM $owner_worker_pids || true
+  for _ in $(seq 1 50); do
+    live_owner_workers=""
+    for pid in $owner_worker_pids; do
+      if kill -0 "$pid" 2>/dev/null; then
+        live_owner_workers="$live_owner_workers $pid"
+      fi
+    done
+    [ -z "$live_owner_workers" ] && break
+    sleep 0.1
+  done
+  [ -z "${"${"}live_owner_workers:-}" ] || kill -KILL $live_owner_workers || true
+fi
+systemctl restart hermes-gateway.service
+systemctl start hermes-dashboard.service
 systemctl is-active --quiet hermes-gateway.service
 systemctl is-active --quiet hermes-dashboard.service
 systemctl --no-pager --full status hermes-gateway.service hermes-dashboard.service || true
 
 prune_old_releases
 
-echo "Hermes deployed from tag $tag at $release"
+echo "Hermes deployed from $source_kind source $source_commit at $release"
 echo "Remote archive cleaned: $archive"
 if [ "$prune_releases" = "1" ]; then
   echo "Release retention: kept newest $keep_releases releases plus protected current/deployed releases"
@@ -658,7 +748,8 @@ fi
 
 function deployArchive(args, archivePath) {
   const remoteRoot = args.remoteRoot.replace(/\/+$/, "");
-  const remoteArchive = `${remoteRoot}/tmp/hermes-${args.deployTag}.tar.gz`;
+  const stagingId = args.dryRun ? "dry-run" : randomUUID();
+  const remoteArchive = `${remoteRoot}/tmp/hermes-${args.releaseId}-${stagingId}.tar.gz`;
 
   runSsh(args, ["mkdir", "-p", `${remoteRoot}/tmp`, `${remoteRoot}/releases`, `${remoteRoot}/shared/.hermes`]);
   runScp(args, archivePath, remoteArchive);
@@ -669,8 +760,11 @@ function deployArchive(args, archivePath) {
       "-s",
       "--",
       remoteRoot,
-      args.deployTag,
-      args.force ? "1" : "0",
+      args.releaseId,
+      args.sourceCommit,
+      args.sourceKind,
+      args.sourceTag ?? "-",
+      remoteArchive,
       String(args.keepReleases),
       args.pruneReleases ? "1" : "0",
     ],
@@ -682,19 +776,19 @@ function printSummary(args) {
   const remoteRoot = args.remoteRoot.replace(/\/+$/, "");
   const target = `${args.user}@${args.host}`;
   console.log(`\nDeploy target: ${target}:${remoteRoot}`);
-  console.log(`Tag: ${args.deployTag}`);
-  console.log(`Current symlink: ${remoteRoot}/current -> ${remoteRoot}/releases/${args.deployTag}`);
+  console.log(`${args.sourceKind === "commit" ? "Commit SHA" : "Tag"}: ${args.sourceKind === "commit" ? args.sourceCommit : args.sourceTag}`);
+  console.log(`Current symlink: ${remoteRoot}/current -> ${remoteRoot}/releases/${args.releaseId}`);
   console.log(`State dir: ${remoteRoot}/shared/.hermes`);
   console.log(`Env file: ${remoteRoot}/shared/.env`);
   console.log(`Services: hermes-gateway.service, hermes-dashboard.service`);
-  console.log(`Remote archive cleanup: ${remoteRoot}/tmp/hermes-${args.deployTag}.tar.gz is removed after extraction`);
+  console.log("Remote staging archive is uniquely named and removed after extraction.");
   console.log(
     args.pruneReleases
       ? `Release retention: keep newest ${args.keepReleases} releases plus protected current/deployed releases`
       : `Release retention: disabled (--no-prune-releases)`,
   );
   console.log(`Status: ssh ${target} 'systemctl status --no-pager hermes-gateway hermes-dashboard'`);
-  console.log(`Rollback example: npm run deploy -- --tag <previous-tag>`);
+  console.log("Rollback example: npm run deploy -- --tag <previous-tag>");
 }
 
 function main() {
@@ -704,23 +798,42 @@ function main() {
     return;
   }
 
-  validateTag(args.deployTag);
   requireBinary("git");
   requireBinary("ssh");
   requireBinary("scp");
 
+  if (args.force) {
+    throw new Error("--force is no longer supported for immutable releases.");
+  }
+
   if (args.createTag) {
+    validateTag(args.createTag);
     assertMainBranch({ allowNonMain: args.allowNonMain });
     assertCleanWorktree({ allowDirty: false, dryRun: args.dryRun });
     createAnnotatedTag(args.createTag, { dryRun: args.dryRun });
+    args.sourceTag = args.createTag;
+    args.sourceCommit = args.dryRun
+      ? runText("git", ["rev-parse", "--verify", "HEAD^{commit}"])
+      : runText("git", ["rev-parse", "--verify", `${args.createTag}^{commit}`]);
+  } else if (args.ref) {
+    if (args.force || args.allowDirty) {
+      throw new Error("--ref does not allow --force or --allow-dirty.");
+    }
+    assertCleanWorktree({ allowDirty: false, dryRun: args.dryRun });
+    validateImmutableCommitRef(args.ref);
+    args.sourceCommit = args.dryRun ? args.ref : resolveImmutableCommit(args.ref);
   } else {
+    validateTag(args.tag);
     assertCleanWorktree({ allowDirty: args.allowDirty, dryRun: args.dryRun });
     if (!tagExists(args.tag)) {
       throw new Error(`Tag does not exist locally: ${args.tag}. Run 'git fetch --tags' first if needed.`);
     }
+    args.sourceTag = args.tag;
+    args.sourceCommit = runText("git", ["rev-parse", "--verify", `${args.tag}^{commit}`]);
   }
 
-  const { tmp, archivePath } = createArchive(args.deployTag, { dryRun: args.dryRun });
+  args.releaseId = releaseIdFor(args);
+  const { tmp, archivePath } = createArchive(args, { dryRun: args.dryRun });
   try {
     deployArchive(args, archivePath);
     printSummary(args);

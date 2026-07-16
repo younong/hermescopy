@@ -21,13 +21,16 @@ from tools.process_registry import process_registry
 from tools.registry import registry, tool_error
 
 
-def close_terminal_tool(process_id: str) -> str:
+def close_terminal_tool(process_id: str, *, executor_identity=None) -> str:
     """Ask the desktop GUI to close a background process's read-only tab."""
     pid = (process_id or "").strip()
     if not pid:
         return tool_error("process_id is required (the background process whose tab to close).")
 
-    return json.dumps(process_registry.request_close_terminal(pid), ensure_ascii=False)
+    return json.dumps(
+        process_registry.request_close_terminal(pid, executor_identity=executor_identity),
+        ensure_ascii=False,
+    )
 
 
 def check_close_terminal_requirements() -> bool:
@@ -65,7 +68,9 @@ registry.register(
     name="close_terminal",
     toolset="terminal",
     schema=CLOSE_TERMINAL_SCHEMA,
-    handler=lambda args, **kw: close_terminal_tool(process_id=args.get("process_id", "")),
+    handler=lambda args, **kw: close_terminal_tool(
+        process_id=args.get("process_id", ""), executor_identity=kw.get("executor_identity")
+    ),
     check_fn=check_close_terminal_requirements,
     emoji="🖥️",
 )

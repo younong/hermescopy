@@ -139,3 +139,58 @@ async def test_new_command_only_clears_own_session():
     assert other_key in runner._session_reasoning_overrides
     assert session_key not in runner._pending_model_notes
     assert other_key in runner._pending_model_notes
+
+
+
+def test_session_source_and_entry_persist_owner_metadata(monkeypatch):
+    from datetime import datetime
+    from gateway.config import Platform
+    from gateway.session import SessionEntry, SessionSource
+
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok_owner")
+    monkeypatch.setenv("HERMES_TENANT_ID", "tenant")
+    monkeypatch.setenv("HERMES_AUTH_PROVIDER", "provider")
+
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat")
+    source_data = source.to_dict()
+    assert source_data["owner_key"] == "ok_owner"
+    assert source_data["tenant_id"] == "tenant"
+    assert source_data["auth_provider"] == "provider"
+    assert SessionSource.from_dict(source_data).owner_key == "ok_owner"
+
+    entry = SessionEntry(
+        session_key="agent:main:telegram:dm:chat",
+        session_id="sess",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        owner_key="ok_owner",
+        tenant_id="tenant",
+        auth_provider="provider",
+    )
+    data = entry.to_dict()
+    assert data["owner_key"] == "ok_owner"
+    assert data["origin"]["owner_key"] == "ok_owner"
+    assert SessionEntry.from_dict(data).owner_key == "ok_owner"
+
+
+def test_legacy_session_source_and_entry_without_owner_metadata_deserialize():
+    from gateway.config import Platform
+    from gateway.session import SessionEntry, SessionSource
+
+    source = SessionSource.from_dict({"platform": "telegram", "chat_id": "chat"})
+    assert source.platform == Platform.TELEGRAM
+    assert source.owner_key is None
+    assert source.tenant_id is None
+    assert source.auth_provider is None
+
+    entry = SessionEntry.from_dict({
+        "session_key": "agent:main:telegram:dm:chat",
+        "session_id": "sess",
+        "created_at": "2026-01-01T00:00:00",
+        "updated_at": "2026-01-01T00:00:00",
+        "origin": {"platform": "telegram", "chat_id": "chat"},
+    })
+    assert entry.owner_key is None
+    assert entry.origin is not None
+    assert entry.origin.owner_key is None

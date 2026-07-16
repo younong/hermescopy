@@ -23,8 +23,9 @@
  *     so the user knows the widget tried.
  */
 
-import { useEffect, useState } from "react";
-import { api, type AuthMeResponse } from "@/lib/api";
+import { api } from "@/lib/api";
+import { dashboardAuthTransition } from "@/lib/dashboardAuthTransition";
+import { useDashboardAuthIdentity } from "@/lib/useDashboardAuthIdentity";
 import { cn } from "@/lib/utils";
 import { LogOut } from "lucide-react";
 
@@ -41,38 +42,11 @@ function truncateUserId(id: string): string {
 }
 
 export function AuthWidget({ className }: AuthWidgetProps) {
-  const [me, setMe] = useState<AuthMeResponse | null>(null);
-  const [hidden, setHidden] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const { authMe: me, authRequired, error, loading } = useDashboardAuthIdentity();
 
-  useEffect(() => {
-    let cancelled = false;
-    api
-      .getAuthMe()
-      .then((data) => {
-        if (cancelled) return;
-        setMe(data);
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        // 401 from /api/auth/me means the gate isn't engaged in this
-        // process (loopback mode) — render nothing. fetchJSON throws an
-        // Error with the status code as a prefix; the global 401
-        // handler only redirects on the structured envelope, so a plain
-        // 401 from /api/auth/me with no envelope bubbles up here.
-        const msg = err instanceof Error ? err.message : String(err);
-        if (msg.startsWith("401:") || msg.startsWith("403:")) {
-          setHidden(true);
-          return;
-        }
-        setError("auth status unavailable");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  if (hidden) return null;
+  if (!authRequired || error?.startsWith("401:") || error?.startsWith("403:")) {
+    return null;
+  }
 
   if (error) {
     return (
@@ -82,12 +56,12 @@ export function AuthWidget({ className }: AuthWidgetProps) {
           className,
         )}
       >
-        {error}
+        auth status unavailable
       </div>
     );
   }
 
-  if (!me) {
+  if (loading || !me) {
     // Loading. Reserve the row height so the sidebar doesn't flicker
     // when the data arrives.
     return (
@@ -104,6 +78,7 @@ export function AuthWidget({ className }: AuthWidgetProps) {
   }
 
   const handleLogout = () => {
+    dashboardAuthTransition.reset();
     void api.logout();
   };
 
@@ -129,8 +104,11 @@ export function AuthWidget({ className }: AuthWidgetProps) {
           {label}
         </span>
         <span className="truncate text-muted-foreground/70">
-          via {me.provider}
+          via {me.provider}{me.isolation_mode === "owner_worker" ? " · isolated" : ""}
         </span>
+        {me.legacy_sessions_message ? (
+          <span className="sr-only">{me.legacy_sessions_message}</span>
+        ) : null}
       </div>
       <button
         type="button"

@@ -75,6 +75,20 @@ class TestWriteDenyExactPaths:
             assert _is_write_denied(os.path.join(home, name)) is True, f"{name} should be denied"
 
 
+class TestWriteDenyRuntimeResolution:
+    def test_active_hermes_home_changes_after_file_operations_import(self, tmp_path, monkeypatch):
+        home_a = tmp_path / "owner-a"
+        home_b = tmp_path / "owner-b"
+        home_a.mkdir()
+        home_b.mkdir()
+
+        monkeypatch.setenv("HERMES_HOME", str(home_a))
+        assert _is_write_denied(str(home_a / ".anthropic_oauth.json")) is True
+
+        monkeypatch.setenv("HERMES_HOME", str(home_b))
+        assert _is_write_denied(str(home_b / ".anthropic_oauth.json")) is True
+
+
 class TestWriteDenyPrefixes:
     def test_ssh_prefix(self):
         path = os.path.join(str(Path.home()), ".ssh", "some_key")

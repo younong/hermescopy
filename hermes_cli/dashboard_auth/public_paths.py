@@ -40,12 +40,10 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     # Read-only config-defaults / schema feeds for the SPA's Config page.
     "/api/config/defaults",
     "/api/config/schema",
-    # Read-only model metadata (context windows, etc.) — same shape as
-    # provider catalogs already exposed on the public internet.
-    "/api/model/info",
-    # Read-only theme + plugin manifests for the dashboard skin engine.
+    # Read-only theme manifests for the dashboard skin engine. Owner-sensitive
+    # model/plugin state is deliberately not public; authenticated callers must
+    # go through the Owner Worker or fail closed.
     "/api/dashboard/themes",
-    "/api/dashboard/plugins",
     # Chronos managed-cron fire webhook (NAS -> agent). NOT cookie-gated: it
     # carries its own short-lived NAS-minted JWT (purpose=cron_fire), which the
     # handler verifies as the real auth. Must bypass the dashboard auth gate so

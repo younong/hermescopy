@@ -406,6 +406,21 @@ class TestAutoSsoRedirect:
         assert r.headers["location"].startswith("/login")
         assert "/auth/login" not in r.headers["location"]
 
+    def test_password_and_oauth_providers_render_chooser_not_auto_sso(self, gated_app):
+        """A password provider must remain available beside an OAuth option."""
+        from hermes_cli.dashboard_auth import register_provider
+        from tests.hermes_cli.test_dashboard_auth_password_login import PasswordProvider
+
+        register_provider(PasswordProvider())
+        r = gated_app.get("/sessions", follow_redirects=False)
+        assert r.status_code == 302
+        assert r.headers["location"].startswith("/login")
+        assert "/auth/login" not in r.headers["location"]
+
+        login_page = gated_app.get(r.headers["location"])
+        assert 'href="/auth/login?provider=stub' in login_page.text
+        assert 'data-provider="testpw"' in login_page.text
+
 
 # ---------------------------------------------------------------------------
 # Gate middleware: same-origin next= validation

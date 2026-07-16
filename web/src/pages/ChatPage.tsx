@@ -34,7 +34,8 @@ import { ChatSessionList } from "@/components/ChatSessionList";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
-import { getHermesBrowserId } from "@/lib/browserIdentity";
+import { dashboardAuthTransition } from "@/lib/dashboardAuthTransition";
+import { useDashboardBrowserIdentity } from "@/lib/useDashboardAuthIdentity";
 import { normalizeSessionTitle } from "@/lib/chat-title";
 import {
   createTerminalInputMouseReportScrubber,
@@ -280,7 +281,17 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // management profile. Changing it remounts the terminal (key below /
   // effect dep) so the user explicitly starts a fresh scoped session.
   const { profile: scopedProfile } = useProfileScope();
-  const browserId = useMemo(() => getHermesBrowserId(), []);
+  const { browserId, ownerKey, ready: authIdentityReady } = useDashboardBrowserIdentity();
+
+  useEffect(() => dashboardAuthTransition.register(() => {
+    clearReconnectTimer();
+    reconnectAttemptRef.current = 0;
+    forceFreshPtyRef.current = true;
+    wsRef.current?.close(4401, "owner changed");
+    wsRef.current = null;
+    setBanner(null);
+    setSessionEnded(false);
+  }), [clearReconnectTimer]);
 
   const channel = useMemo(
     () => generateChannelId(`${resumeParam ?? ""}\0${scopedProfile}`),
@@ -541,6 +552,9 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // In gated mode the token is absent by design — api.buildWsUrl() mints
     // a WS ticket instead, so don't bail; let the effect reach that path.
     if (!token && !gated) {
+      return;
+    }
+    if (!authIdentityReady) {
       return;
     }
 
@@ -1050,7 +1064,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         copyResetRef.current = null;
       }
     };
-  }, [browserId, channel, clearReconnectTimer, resumeParam, scopedProfile, reconnectNonce]);
+  }, [authIdentityReady, browserId, channel, clearReconnectTimer, resumeParam, scopedProfile, reconnectNonce]);
 
   // When the user returns to the chat tab (isActive: false → true), the
   // terminal host just transitioned from display:none to display:flex.
@@ -1190,6 +1204,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               <ChatSidebar
                 channel={channel}
                 profile={scopedProfile}
+                ownerKey={authIdentityReady ? ownerKey : undefined}
+                disabled={!authIdentityReady}
                 onDashboardNewSessionRequest={guardedStartFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
               />
@@ -1289,6 +1305,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               <ChatSidebar
                 channel={channel}
                 profile={scopedProfile}
+                ownerKey={authIdentityReady ? ownerKey : undefined}
+                disabled={!authIdentityReady}
                 onDashboardNewSessionRequest={guardedStartFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
               />

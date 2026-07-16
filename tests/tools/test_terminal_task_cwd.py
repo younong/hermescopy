@@ -162,6 +162,50 @@ def test_background_command_prefers_live_env_cwd_over_init_time_cwd(monkeypatch)
     }]
 
 
+def test_authenticated_background_spawn_never_forwards_environment_snapshot(monkeypatch):
+    from hermes_cli.dashboard_auth.authority import OwnerWorkerAuthorityLease, WorkerLeaseState
+    from hermes_cli.owner_worker.executor_identity import install_executor_identity, reset_executor_identity, ExecutorIdentity
+    import tools.process_registry as process_registry_mod
+
+    class FakeEnv:
+        env = {"HERMES_CONTROL_HOME": "/control", "ARBITRARY_INHERITED_VALUE": "no"}
+        cwd = "/workspace/live"
+
+    class FakeRegistry:
+        pending_watchers = []
+
+        def __init__(self):
+            self.calls = []
+
+        def spawn_authenticated(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(id="proc_auth", pid=1234)
+
+    lease = OwnerWorkerAuthorityLease("ok1_owner", 1, "worker-a", WorkerLeaseState.ACTIVE, 1, 0)
+    identity = ExecutorIdentity.for_task(
+        lease, workspace_prefix="default", task_id="auth-task", session_id="auth-task", executor_id="executor-a"
+    )
+    registry = FakeRegistry()
+    monkeypatch.setattr(terminal_tool, "_active_environments", {"auth-task": FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config(cwd="/workspace/live"))
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: value or "default")
+    monkeypatch.setattr(terminal_tool, "_check_all_guards", lambda *args, **kwargs: {"approved": True})
+    monkeypatch.setattr(process_registry_mod, "process_registry", registry)
+    monkeypatch.setattr(terminal_tool.os, "getcwd", lambda: "/workspace")
+    token = install_executor_identity(identity)
+    try:
+        result = json.loads(terminal_tool.terminal_tool(command="sleep 1", task_id="auth-task", background=True))
+    finally:
+        reset_executor_identity(token)
+
+    assert result["exit_code"] == 0
+    assert registry.calls[0]["env_vars"] == {}
+    assert registry.calls[0]["cwd"] == "/workspace"
+
+
 def test_registering_cwd_override_updates_live_env_cwd(monkeypatch):
     """An ACP ``update_cwd`` (re-)registered mid-session must win over a
     previously ``cd``-ed live ``env.cwd``.

@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 from hermes_cli import web_server
 from hermes_cli.dashboard_auth import clear_providers, register_provider
 from hermes_cli.dashboard_auth.cookies import SESSION_AT_COOKIE
+from hermes_cli.dashboard_auth.ws_tickets import TicketInvalid, consume_ticket
 from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
 
 
@@ -80,9 +81,7 @@ def test_gated_status_is_public(gated_app):
 @pytest.mark.parametrize("path", [
     "/api/config/defaults",
     "/api/config/schema",
-    "/api/model/info",
     "/api/dashboard/themes",
-    "/api/dashboard/plugins",
 ])
 def test_other_public_api_paths_are_public_under_gate(gated_app, path):
     """The remaining ``PUBLIC_API_PATHS`` entries must also bypass the
@@ -176,14 +175,12 @@ def test_full_login_round_trip_unlocks_gated_api(gated_app):
     assert any("hermes_session_at" in c for c in set_cookies)
     assert any("hermes_session_rt" in c for c in set_cookies)
 
-    # 3) A gated API route (``/api/sessions``) now succeeds because we
-    #    have a valid session cookie. (We deliberately don't probe
-    #    ``/api/status`` here — it's in the shared PUBLIC_API_PATHS
-    #    allowlist and would 200 even without a login, so it can't
-    #    distinguish "logged in" from "gate accidentally disabled".)
-    r3 = gated_app.get("/api/sessions")
+    # 3) A gated control-plane auth route now succeeds because we have a valid
+    #    session cookie. Avoid owner-worker-routed routes here; this fixture does
+    #    not start a real owner worker supervisor.
+    r3 = gated_app.get("/api/auth/me")
     assert r3.status_code == 200, (
-        f"Expected 200 for /api/sessions post-login, got {r3.status_code}: "
+        f"Expected 200 for /api/auth/me post-login, got {r3.status_code}: "
         f"{r3.text}"
     )
 
@@ -205,23 +202,12 @@ def _complete_stub_login(client) -> None:
     assert r2.status_code == 302
 
 
-def test_gated_require_token_endpoint_accepts_cookie_session(gated_app):
-    """Regression: ``_require_token`` endpoints must work under the OAuth gate.
+def test_gated_require_token_endpoint_rejects_cookie_session_in_owner_mode(gated_app):
+    """Owner-authenticated management APIs must not run in Control Plane.
 
-    In gated mode the legacy ``_SESSION_TOKEN`` is NOT injected into the SPA
-    (it authenticates with the session cookie). Endpoints that call
-    ``_require_token`` directly — plugin install/enable/disable,
-    ``/api/dashboard/plugins/hub``, and others — used to re-check the absent
-    token and 401 every cookie-authenticated request, making them permanently
-    unreachable behind the gate (the dashboard surfaced a
-    ``401: {"detail":"Unauthorized"}`` popup on plugin install). The fix makes
-    ``_require_token`` defer to the gate, which has already verified the cookie
-    and attached ``request.state.session`` before the handler runs.
-
-    We POST a deliberately invalid plugin identifier: a passing auth layer
-    lets the request reach the handler, which rejects the identifier with a
-    400. The assertion is simply "not 401" — proving auth succeeded without
-    coupling to the validation message.
+    These legacy ``_require_token`` endpoints read/write global dashboard state.
+    In authenticated owner mode they now fail closed until each surface is
+    explicitly routed through an Owner Worker.
     """
     _complete_stub_login(gated_app)
     r = gated_app.post(
@@ -229,15 +215,8 @@ def test_gated_require_token_endpoint_accepts_cookie_session(gated_app):
         json={"identifier": "definitely not a valid identifier",
               "force": False, "enable": False},
     )
-    assert r.status_code != 401, (
-        "A _require_token endpoint 401'd a cookie-authenticated request under "
-        f"the OAuth gate (the install-popup bug). Body: {r.text}"
-    )
-    # And specifically: it reached the handler's own validation.
-    assert r.status_code == 400, (
-        f"Expected the install handler's 400 (bad identifier), got "
-        f"{r.status_code}: {r.text}"
-    )
+    assert r.status_code == 403
+    assert "Owner Worker" in r.text
 
 
 def test_gated_require_token_endpoint_still_rejects_no_cookie(gated_app):
@@ -274,23 +253,40 @@ _GATED_REQUIRE_TOKEN_ROUTES = [
 
 
 @pytest.mark.parametrize("method,path,body", _GATED_REQUIRE_TOKEN_ROUTES)
-def test_gated_require_token_routes_accept_cookie_session(
+def test_gated_require_token_routes_reject_cookie_session_in_owner_mode(
     gated_app, method, path, body
 ):
-    """Every ``_require_token`` route must clear auth for a logged-in caller.
-
-    Same root cause and fix as
-    ``test_gated_require_token_endpoint_accepts_cookie_session`` — this just
-    proves the fix covers the whole class, not only ``agent-plugins/install``.
-    """
+    """Representative ``_require_token`` routes fail closed in owner mode."""
     _complete_stub_login(gated_app)
     kwargs = {"json": body} if body is not None else {}
     r = gated_app.request(method.upper(), path, **kwargs)
-    assert r.status_code != 401, (
-        f"{method.upper()} {path} 401'd a cookie-authenticated request under "
-        f"the OAuth gate — _require_token still rejecting a valid session. "
+    assert r.status_code == 403, (
+        f"{method.upper()} {path} should fail closed in authenticated owner mode. "
         f"Body: {r.text}"
     )
+
+
+@pytest.mark.parametrize(
+    ("path", "allowed"),
+    [
+        ("/api/sessions", True),
+        ("/api/sessions/abc123/messages", True),
+        ("/api/sessions/abc123/export", True),
+        ("/api/analytics/usage", True),
+        ("/api/model/info", True),
+        ("/api/sessions/abc123/unmigrated", False),
+        ("/api/sessions-extra", False),
+        ("/api/analytics/admin", False),
+        ("/api/model/set", False),
+        ("/api/profiles/sessions", False),
+        ("/api/ops/checkpoints", False),
+        ("/api/dashboard/agent-plugins/install", False),
+    ],
+)
+def test_authenticated_api_availability_requires_explicit_owner_worker_routes(path, allowed):
+    from hermes_cli.dashboard_auth.api_availability import authenticated_owner_worker_api_allowed
+
+    assert authenticated_owner_worker_api_allowed(path) is allowed
 
 
 def test_login_unknown_provider_returns_404(gated_app):
@@ -374,6 +370,85 @@ def test_invalid_cookie_redirects_on_html(gated_app):
     assert r.headers["location"] in ("/login", "/login?next=%2F")
 
 
+def test_logout_revokes_only_verified_sessions_ticket(gated_app):
+    _complete_stub_login(gated_app)
+    minted = gated_app.post(
+        "/api/auth/ws-ticket", json={"audience": "browser-ws:/api/pty"}
+    )
+    assert minted.status_code == 200
+
+    logged_out = gated_app.post("/auth/logout", follow_redirects=False)
+
+    assert logged_out.status_code == 302
+    with pytest.raises(TicketInvalid, match="session_revoked"):
+        consume_ticket(minted.json()["ticket"])
+
+
+def test_logout_without_a_trusted_session_is_idempotent(gated_app):
+    first = gated_app.post("/auth/logout", follow_redirects=False)
+    second = gated_app.post("/auth/logout", follow_redirects=False)
+
+    assert first.status_code == 302
+    assert second.status_code == 302
+
+
+def test_provider_outage_logout_does_not_revoke_unverified_cookie_ticket(gated_app, monkeypatch):
+    _complete_stub_login(gated_app)
+    minted = gated_app.post(
+        "/api/auth/ws-ticket", json={"audience": "browser-ws:/api/pty"}
+    )
+    assert minted.status_code == 200
+
+    from hermes_cli.dashboard_auth import get_provider
+    from hermes_cli.dashboard_auth.base import ProviderError
+
+    provider = get_provider("stub")
+    assert provider is not None
+    monkeypatch.setattr(
+        provider,
+        "verify_session",
+        lambda *, access_token: (_ for _ in ()).throw(ProviderError("unavailable")),
+    )
+
+    response = gated_app.post("/auth/logout", follow_redirects=False)
+
+    assert response.status_code == 302
+    assert consume_ticket(minted.json()["ticket"])["user_id"] == "stub-user-1"
+
+
+def test_membership_transition_revokes_old_ticket_and_accepts_new_ticket(gated_app, monkeypatch):
+    _complete_stub_login(gated_app)
+    old_ticket = gated_app.post(
+        "/api/auth/ws-ticket", json={"audience": "browser-ws:/api/pty"}
+    ).json()["ticket"]
+
+    from hermes_cli.dashboard_auth import get_provider
+
+    provider = get_provider("stub")
+    assert provider is not None
+    original = provider.authorization_state
+    access_token = next(
+        value.strip('"')
+        for name, value in dict(gated_app.cookies).items()
+        if name.endswith("hermes_session_at")
+    )
+    session_id, _revision = original(
+        provider.verify_session(access_token=access_token)
+    )
+    monkeypatch.setattr(
+        provider, "authorization_state", lambda _session: (session_id, "membership-v2")
+    )
+
+    assert gated_app.get("/api/auth/me").status_code == 200
+    with pytest.raises(TicketInvalid, match="membership_revision_mismatch"):
+        consume_ticket(old_ticket)
+
+    new_ticket = gated_app.post(
+        "/api/auth/ws-ticket", json={"audience": "browser-ws:/api/pty"}
+    ).json()["ticket"]
+    assert consume_ticket(new_ticket)["membership_revision"] == "membership-v2"
+
+
 def test_logout_clears_cookies_and_redirects_to_login(gated_app):
     # First log in.
     r1 = gated_app.get("/auth/login?provider=stub", follow_redirects=False)
@@ -417,6 +492,12 @@ def test_api_auth_me_returns_session_after_login(gated_app):
     assert body["display_name"] == "Stub User"
     assert body["provider"] == "stub"
     assert body["org_id"] == "stub-org-1"
+    assert body["tenant_id"] == "stub-org-1"
+    assert body["owner_key"].startswith("ok1_")
+    assert body["isolation_mode"] == "owner_worker"
+    assert body["legacy_sessions_imported"] is False
+    assert "legacy local sessions" in body["legacy_sessions_message"]
+    assert "owner_home" not in body
     assert "expires_at" in body
 
 
@@ -429,6 +510,16 @@ def test_api_auth_me_requires_auth(gated_app):
 # ---------------------------------------------------------------------------
 # Zero-providers fail-closed
 # ---------------------------------------------------------------------------
+
+
+def test_gated_model_info_is_not_public(gated_app):
+    r = gated_app.get("/api/model/info", follow_redirects=False)
+    assert r.status_code in (302, 401)
+
+
+def test_gated_dashboard_plugins_manifest_is_not_public(gated_app):
+    r = gated_app.get("/api/dashboard/plugins", follow_redirects=False)
+    assert r.status_code in (302, 401)
 
 
 def test_gated_zero_providers_fails_closed_on_api_auth_providers():

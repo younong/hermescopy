@@ -98,7 +98,7 @@ def test_channel_reconnect_resumes_active_session_file(pty_client, monkeypatch):
     ws, client, token = pty_client
     captured = []
 
-    def fake_resolve(resume=None, sidecar_url=None, profile=None, active_session_file=None):
+    def fake_resolve(resume=None, sidecar_url=None, profile=None, active_session_file=None, **_kwargs):
         captured.append(
             {
                 "active_session_file": active_session_file,
@@ -135,7 +135,7 @@ def test_fresh_param_ignores_channel_active_session_file(pty_client, monkeypatch
     active_file.write_text(json.dumps({"session_id": "sess-old"}), encoding="utf-8")
     captured = {}
 
-    def fake_resolve(resume=None, sidecar_url=None, profile=None, active_session_file=None):
+    def fake_resolve(resume=None, sidecar_url=None, profile=None, active_session_file=None, **_kwargs):
         captured["active_session_file"] = active_session_file
         captured["resume"] = resume
         return (["fake-hermes-tui"], None, None)

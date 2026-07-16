@@ -1,0 +1,94 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+
+import { api, type AuthMeResponse } from "@/lib/api";
+import { getHermesBrowserId } from "@/lib/browserIdentity";
+import { dashboardAuthTransition } from "@/lib/dashboardAuthTransition";
+
+interface DashboardAuthIdentity {
+  authMe: AuthMeResponse | null;
+  authRequired: boolean;
+  error: string | null;
+  loading: boolean;
+  ownerKey?: string;
+  ready: boolean;
+  refresh: () => Promise<void>;
+}
+
+function isAuthRequired(): boolean {
+  return typeof window !== "undefined" && !!window.__HERMES_AUTH_REQUIRED__;
+}
+
+export function useDashboardAuthIdentity(): DashboardAuthIdentity {
+  const [authRequired] = useState(isAuthRequired);
+  const [authMe, setAuthMe] = useState<AuthMeResponse | null>(null);
+  const [loading, setLoading] = useState(authRequired);
+  const [error, setError] = useState<string | null>(null);
+  const mounted = useRef(true);
+
+  const refresh = useMemo(
+    () => async () => {
+      if (!authRequired) {
+        if (mounted.current) {
+          setAuthMe(null);
+          setLoading(false);
+          setError(null);
+        }
+        return;
+      }
+
+      if (mounted.current) {
+        setLoading(true);
+        setError(null);
+      }
+      try {
+        const identity = await api.getAuthMe();
+        if (mounted.current) setAuthMe(identity);
+      } catch (err) {
+        if (mounted.current) {
+          setAuthMe(null);
+          setError(err instanceof Error ? err.message : String(err));
+        }
+      } finally {
+        if (mounted.current) setLoading(false);
+      }
+    },
+    [authRequired],
+  );
+
+  useEffect(() => {
+    mounted.current = true;
+    void refresh();
+    return () => {
+      mounted.current = false;
+    };
+  }, [refresh, mounted]);
+
+  const ownerKey = authMe?.owner_key;
+  const [transitionReady, setTransitionReady] = useState(!authRequired);
+
+  useEffect(() => {
+    const nextOwnerKey = authRequired ? ownerKey : undefined;
+    dashboardAuthTransition.transition(nextOwnerKey);
+    setTransitionReady(!authRequired || !!nextOwnerKey);
+  }, [authRequired, ownerKey]);
+
+  return {
+    authMe,
+    authRequired,
+    error,
+    loading,
+    ownerKey,
+    ready: (!authRequired || !!ownerKey) && transitionReady,
+    refresh,
+  };
+}
+
+export function useDashboardBrowserIdentity(): DashboardAuthIdentity & { browserId: string } {
+  const identity = useDashboardAuthIdentity();
+  const browserId = useMemo(
+    () => (identity.ready ? getHermesBrowserId(identity.ownerKey) : ""),
+    [identity.ownerKey, identity.ready],
+  );
+
+  return { ...identity, browserId };
+}
