@@ -67,8 +67,21 @@ def test_executor_environment_is_fresh_allowlist_and_binds_runtime_dirs(tmp_path
         "HOME", "TMPDIR", "PATH", "PWD", "LANG", "LC_ALL", "LC_CTYPE", "__CF_USER_TEXT_ENCODING", "PYTHONPATH", "PYTHONUNBUFFERED", "PYTHONNOUSERSITE",
         "HERMES_EXECUTOR_RUNTIME", "HERMES_EXECUTOR_HOME", "HERMES_EXECUTOR_TMP", "HERMES_EXECUTOR_WORKSPACE_FD",
         "HERMES_EXECUTOR_BOOTSTRAP_FD", "HERMES_EXECUTOR_RESPONSE_FD", "HERMES_EXECUTOR_START_GATE_FD",
-        "HERMES_EXECUTOR_GENERATION", "HERMES_EXECUTOR_EGRESS_PROFILE",
+        "HERMES_EXECUTOR_WEB_RELAY_FD", "HERMES_EXECUTOR_GENERATION", "HERMES_EXECUTOR_EGRESS_PROFILE",
     }
+
+
+def test_executor_environment_allows_only_unique_optional_web_relay_descriptor(tmp_path):
+    environment = build_executor_environment(
+        _identity(), runtime_home=tmp_path, workspace_fd=11, bootstrap_fd=12,
+        response_fd=13, start_gate_fd=14, web_relay_fd=15,
+        egress_profile="tool-none",
+    )
+    assert environment["HERMES_EXECUTOR_WEB_RELAY_FD"] == "15"
+    with pytest.raises(ExecutorEnvironmentInvalid, match="descriptor"):
+        validate_executor_environment(dict(environment, HERMES_EXECUTOR_WEB_RELAY_FD="12"))
+    with pytest.raises(ExecutorEnvironmentInvalid, match="descriptor"):
+        validate_executor_environment(dict(environment, HERMES_EXECUTOR_WEB_RELAY_FD="1"))
 
 
 def test_executor_environment_rejects_parent_authority_and_unknown_keys(tmp_path):

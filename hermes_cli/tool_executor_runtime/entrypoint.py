@@ -1,8 +1,9 @@
 """One-shot isolated Tool Executor process entrypoint.
 
-The parent provides exactly three inherited descriptors: workspace cwd, a
-bootstrap request reader, and a response writer.  No control-plane socket or
-long-lived owner-worker credential enters this process.
+The parent provides workspace, bootstrap, response, and start-gate descriptors.
+An exact web invocation may additionally receive a one-shot owner-worker relay
+descriptor. No control-plane socket or long-lived owner credential enters this
+process.
 """
 from __future__ import annotations
 
@@ -26,6 +27,7 @@ from hermes_cli.tool_executor_runtime.env import (
     EXECUTOR_EGRESS_PROFILE,
     EXECUTOR_RESPONSE_FD,
     EXECUTOR_START_GATE_FD,
+    EXECUTOR_WEB_RELAY_FD,
     EXECUTOR_WORKSPACE_FD,
     ExecutorEnvironmentInvalid,
     validate_executor_environment,
@@ -130,21 +132,37 @@ def run_once(environment: dict[str, str] | None = None) -> int:
         _admit_workspace_mount(workspace_fd)
         invocation = invocation_from_payload(_read_bootstrap(bootstrap_fd))
         _require_matching_egress_profile(invocation, env)
-        token = install_executor_identity(invocation.identity)
-        try:
-            from tools.registry import discover_builtin_tools, registry
-
-            discover_builtin_tools()
-            result = registry.dispatch(
-                invocation.tool_name,
-                dict(invocation.arguments),
-                task_id=invocation.identity.task_id,
-                session_id=invocation.identity.session_id,
-                executor_identity=invocation.identity,
-                executor_invocation=invocation,
+        relay_fd_text = str(env.get(EXECUTOR_WEB_RELAY_FD, "") or "").strip()
+        if invocation.tool_name in {"web_search", "web_extract"}:
+            if not relay_fd_text:
+                raise ExecutorRuntimeInvalid("authenticated web tool relay is unavailable")
+            from hermes_cli.owner_worker.web_tool_relay import (
+                WebToolRelayError,
+                dispatch_web_tool_over_relay,
             )
-        finally:
-            reset_executor_identity(token)
+
+            try:
+                result = dispatch_web_tool_over_relay(int(relay_fd_text), invocation)
+            except WebToolRelayError as exc:
+                raise ExecutorRuntimeInvalid("authenticated web tool relay failed") from exc
+        else:
+            if relay_fd_text:
+                raise ExecutorRuntimeInvalid("unexpected authenticated web tool relay")
+            token = install_executor_identity(invocation.identity)
+            try:
+                from tools.registry import discover_builtin_tools, registry
+
+                discover_builtin_tools()
+                result = registry.dispatch(
+                    invocation.tool_name,
+                    dict(invocation.arguments),
+                    task_id=invocation.identity.task_id,
+                    session_id=invocation.identity.session_id,
+                    executor_identity=invocation.identity,
+                    executor_invocation=invocation,
+                )
+            finally:
+                reset_executor_identity(token)
         _write_response(response_fd, str(result))
         return 0
     except (ExecutorEnvironmentInvalid, ExecutorRuntimeInvalid, OSError, ValueError) as exc:
