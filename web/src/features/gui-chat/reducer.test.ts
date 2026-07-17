@@ -226,6 +226,135 @@ describe("guiChatReducer history image restoration", () => {
     });
   });
 
+  it("restores image, PDF, and file attachment cards from transcript metadata", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        info: { cwd: "/workspace" },
+        messages: [
+          {
+            attachments: [
+              {
+                kind: "image",
+                mime_type: "image/png",
+                name: "shot.png",
+                path: "/tmp/shot.png",
+                size_bytes: 123,
+                source_paths: ["/tmp/shot.png"],
+              },
+              {
+                kind: "pdf",
+                mime_type: "application/pdf",
+                name: "report.pdf",
+                pages_attached: 2,
+                size_bytes: 456,
+                source_paths: ["/tmp/pdf-1.png", "/tmp/pdf-2.png"],
+              },
+              {
+                kind: "file",
+                mime_type: "text/plain",
+                name: "notes.txt",
+                path: "/workspace/notes.txt",
+                ref_text: "@file:notes.txt",
+                size_bytes: 789,
+              },
+            ],
+            role: "user",
+            text: "please inspect",
+          },
+        ],
+        session_id: "sid",
+      },
+    });
+
+    expect(state.messages[0].attachments).toEqual([
+      {
+        id: "history-0-attachment-0",
+        kind: "image",
+        mimeType: "image/png",
+        name: "shot.png",
+        pagesAttached: undefined,
+        previewUrl: "/api/fs/read-data-url?path=%2Ftmp%2Fshot.png",
+        refText: undefined,
+        sizeBytes: 123,
+      },
+      {
+        id: "history-0-attachment-1",
+        kind: "pdf",
+        mimeType: "application/pdf",
+        name: "report.pdf",
+        pagesAttached: 2,
+        previewUrl: undefined,
+        refText: undefined,
+        sizeBytes: 456,
+      },
+      {
+        id: "history-0-attachment-2",
+        kind: "file",
+        mimeType: "text/plain",
+        name: "notes.txt",
+        pagesAttached: undefined,
+        previewUrl: undefined,
+        refText: "@file:notes.txt",
+        sizeBytes: 789,
+      },
+    ]);
+  });
+
+  it("keeps an attachment-only historical user message", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        messages: [
+          {
+            attachments: [{ kind: "file", name: "notes.txt", size_bytes: 12 }],
+            role: "user",
+            text: "",
+          },
+        ],
+        session_id: "sid",
+      },
+    });
+
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0].text).toBe("");
+    expect(state.messages[0].attachments).toHaveLength(1);
+  });
+
+  it("removes attachment prompt hints and avoids duplicate image artifacts", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        messages: [
+          {
+            attachments: [
+              {
+                kind: "image",
+                name: "shot.png",
+                path: "/tmp/shot.png",
+                size_bytes: 123,
+                source_paths: ["/tmp/shot.png"],
+              },
+              {
+                kind: "file",
+                name: "notes.txt",
+                ref_text: "@file:notes.txt",
+                size_bytes: 12,
+              },
+            ],
+            role: "user",
+            text: "inspect these\n[Image attached at: /tmp/shot.png]\n\n附件：\n@file:notes.txt\n/tmp/shot.png",
+          },
+        ],
+        session_id: "sid",
+      },
+    });
+
+    expect(state.messages[0].text).toBe("inspect these");
+    expect(state.messages[0].artifactIds).toEqual([]);
+    expect(state.artifacts).toEqual({});
+  });
+
   it("does not duplicate native image attachments restored from content plus path hint", () => {
     const state = guiChatReducer(initialGuiChatState, {
       type: "session.created",

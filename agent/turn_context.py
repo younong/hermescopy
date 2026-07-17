@@ -125,6 +125,7 @@ def build_turn_context(
     stream_callback,
     persist_user_message: Optional[str],
     persist_user_timestamp: Optional[float] = None,
+    persist_user_attachments: Optional[List[Dict[str, Any]]] = None,
     *,
     restore_or_build_system_prompt,
     install_safe_stdio,
@@ -300,8 +301,11 @@ def build_turn_context(
             should_review_memory = True
             agent._turns_since_memory = 0
 
-    # Add user message.
+    # Add user message. Attachment metadata is internal transcript state; the
+    # provider-facing copy strips it before every API request.
     user_msg = {"role": "user", "content": user_message}
+    if persist_user_attachments:
+        user_msg["attachments"] = list(persist_user_attachments)
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx

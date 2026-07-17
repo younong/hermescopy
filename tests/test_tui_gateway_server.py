@@ -1074,6 +1074,38 @@ def test_history_to_messages_preserves_tool_calls_for_resume_display():
     ]
 
 
+def test_history_to_messages_preserves_attachment_metadata_and_attachment_only_turns():
+    attachments = [
+        {
+            "kind": "pdf",
+            "name": "report.pdf",
+            "mime_type": "application/pdf",
+            "size_bytes": 456,
+            "pages_attached": 2,
+            "source_paths": ["/tmp/page-1.png", "/tmp/page-2.png"],
+        }
+    ]
+
+    assert server._history_to_messages(
+        [{"role": "user", "content": "", "attachments": attachments}]
+    ) == [{"role": "user", "text": "", "attachments": attachments}]
+
+
+def test_history_to_messages_rejects_invalid_attachment_metadata():
+    history = [
+        {
+            "role": "user",
+            "content": "hello",
+            "attachments": [
+                {"kind": "video", "name": "bad.mp4"},
+                {"kind": "image", "name": ""},
+            ],
+        }
+    ]
+
+    assert server._history_to_messages(history) == [{"role": "user", "text": "hello"}]
+
+
 def test_history_to_messages_keeps_reasoning_only_assistant_turn():
     # A thinking-only assistant turn (reasoning present, no visible text) is
     # persisted and recallable, but was dropped from the resumed session view
@@ -4315,6 +4347,71 @@ def test_prompt_submit_uses_matching_deployment_vision_capability(monkeypatch, t
     )
     assert image_part["image_url"]["url"].startswith("data:image/jpeg;base64,")
     assert "/opt/hermes/shared" not in str(captured["prompt"])
+
+
+def test_prompt_submit_consumes_attachment_metadata_once(monkeypatch, tmp_path):
+    captured = []
+    image_path = tmp_path / "shot.png"
+    image_path.write_bytes(b"png")
+
+    class _Agent:
+        model = "test/model"
+        provider = "test"
+        base_url = ""
+        api_key = ""
+        api_mode = ""
+
+        def run_conversation(
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            persist_user_message=None,
+            persist_user_attachments=None,
+        ):
+            captured.append(
+                {
+                    "persist_user_message": persist_user_message,
+                    "attachments": persist_user_attachments,
+                }
+            )
+            return {
+                "final_response": "ok",
+                "messages": [{"role": "assistant", "content": "ok"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_enrich_with_attached_images", lambda text, images: text)
+    attachments = [server._image_attachment_metadata(image_path)]
+    session = _session(agent=_Agent(), pending_attachments=attachments)
+    server._sessions["sid"] = session
+
+    try:
+        server._run_prompt_submit("1", "sid", session, "first")
+        server._run_prompt_submit("2", "sid", session, "second")
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert captured[0] == {
+        "persist_user_message": "first",
+        "attachments": attachments,
+    }
+    assert captured[1] == {
+        "persist_user_message": "second",
+        "attachments": None,
+    }
+    assert session["pending_attachments"] == []
 
 
 def test_file_attach_reference_reaches_model_input(monkeypatch, tmp_path):
@@ -8258,6 +8355,16 @@ def test_image_attach_bytes_writes_to_gateway_dir(monkeypatch, tmp_path):
     assert written.parent == tmp_path / "images"
     assert written.read_bytes().startswith(b"\x89PNG")
     assert len(server._sessions["abx"]["attached_images"]) == 1
+    assert server._sessions["abx"]["pending_attachments"] == [
+        {
+            "kind": "image",
+            "mime_type": "image/png",
+            "name": "shot.png",
+            "path": str(written),
+            "size_bytes": written.stat().st_size,
+            "source_paths": [str(written)],
+        }
+    ]
     assert res["bytes"] > 0
 
 

@@ -7,10 +7,22 @@ export interface SessionInfoPayload {
   title?: string;
 }
 
+export interface GatewayTranscriptAttachment {
+  kind?: unknown;
+  mime_type?: unknown;
+  name?: unknown;
+  pages_attached?: unknown;
+  path?: unknown;
+  ref_text?: unknown;
+  size_bytes?: unknown;
+  source_paths?: unknown;
+}
+
 export interface GatewayTranscriptMessage {
   role: "assistant" | "system" | "tool" | "user";
   text?: string;
   content?: unknown;
+  attachments?: GatewayTranscriptAttachment[];
   name?: string;
   context?: string;
 }

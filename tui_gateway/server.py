@@ -1237,6 +1237,59 @@ def _image_meta(path: Path) -> dict:
     return meta
 
 
+def _queue_attachment_metadata(session: dict, attachment: dict) -> None:
+    """Queue JSON-safe UI metadata for the next submitted user turn."""
+    allowed = {
+        "kind",
+        "name",
+        "mime_type",
+        "size_bytes",
+        "path",
+        "ref_text",
+        "pages_attached",
+        "source_paths",
+    }
+    metadata = {key: attachment[key] for key in allowed if attachment.get(key) is not None}
+    if metadata.get("kind") not in {"image", "pdf", "file"}:
+        return
+    if not isinstance(metadata.get("name"), str) or not metadata["name"]:
+        return
+    session.setdefault("pending_attachments", []).append(metadata)
+
+
+def _image_attachment_metadata(path: Path, *, name: str | None = None) -> dict:
+    import mimetypes
+
+    try:
+        size_bytes = path.stat().st_size
+    except OSError:
+        size_bytes = 0
+    return {
+        "kind": "image",
+        "name": name or path.name,
+        "mime_type": mimetypes.guess_type(name or path.name)[0] or "image/png",
+        "size_bytes": size_bytes,
+        "path": str(path),
+        "source_paths": [str(path)],
+    }
+
+
+def _valid_history_attachments(value: Any) -> list[dict]:
+    """Return the persisted attachment subset safe to expose to clients."""
+    if not isinstance(value, list):
+        return []
+    valid = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("kind")
+        name = item.get("name")
+        if kind not in {"image", "pdf", "file"} or not isinstance(name, str) or not name:
+            continue
+        valid.append(dict(item))
+    return valid
+
+
 def _ok(rid, result: dict) -> dict:
     return {"jsonrpc": "2.0", "id": rid, "result": result}
 
@@ -4752,6 +4805,7 @@ def _init_session(
             "last_active": now,
             "running": False,
             "attached_images": [],
+            "pending_attachments": [],
             "image_counter": 0,
             "cwd": cwd or _completion_cwd(),
             "cols": cols,
@@ -5047,9 +5101,12 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         has_reasoning = role == "assistant" and any(
             m.get(key) for key in reasoning_keys
         )
-        if not content_text.strip() and not has_reasoning:
+        attachments = _valid_history_attachments(m.get("attachments"))
+        if not content_text.strip() and not has_reasoning and not attachments:
             continue
         msg = {"role": role, "text": content_text}
+        if attachments:
+            msg["attachments"] = attachments
         if role == "assistant":
             for key in reasoning_keys:
                 if key in m and m.get(key) is not None:
@@ -5312,6 +5369,7 @@ def _(rid, params: dict) -> dict:
             "agent_error": None,
             "agent_ready": ready,
             "attached_images": [],
+            "pending_attachments": [],
             "close_on_disconnect": is_truthy_value(params.get("close_on_disconnect", False)),
             "browser_id": str(params.get("browser_id") or "").strip() or None,
             "skip_slash_worker": is_truthy_value(params.get("skip_slash_worker", False)),
@@ -5565,6 +5623,7 @@ def _deferred_session_record(
         "agent_error": None,
         "agent_ready": threading.Event(),
         "attached_images": [],
+        "pending_attachments": [],
         "close_on_disconnect": close_on_disconnect,
         "active_session_lease": lease,
         "cols": cols,
@@ -8950,7 +9009,9 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
         images = list(session.get("attached_images", []))
+        attachments = list(session.get("pending_attachments", []))
         session["attached_images"] = []
+        session["pending_attachments"] = []
         if not isinstance(session.get("inflight_turn"), dict):
             _start_inflight_turn(session, text)
     agent = session["agent"]
@@ -9112,8 +9173,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 "stream_callback": _stream,
             }
             try:
-                if "task_id" in inspect.signature(agent.run_conversation).parameters:
+                run_parameters = inspect.signature(agent.run_conversation).parameters
+                if "task_id" in run_parameters:
                     run_kwargs["task_id"] = session["session_key"]
+                if "persist_user_message" in run_parameters and isinstance(text, str):
+                    run_kwargs["persist_user_message"] = text
+                if "persist_user_attachments" in run_parameters and attachments:
+                    run_kwargs["persist_user_attachments"] = attachments
             except (TypeError, ValueError):
                 pass
             result = agent.run_conversation(run_message, **run_kwargs)
@@ -9482,6 +9548,7 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"attached": False, "message": msg})
 
     session.setdefault("attached_images", []).append(str(img_path))
+    _queue_attachment_metadata(session, _image_attachment_metadata(img_path))
     return _ok(
         rid,
         {
@@ -9521,6 +9588,7 @@ def _(rid, params: dict) -> dict:
         if image_path.suffix.lower() not in _IMAGE_EXTENSIONS:
             return _err(rid, 4016, f"unsupported image: {image_path.name}")
         session.setdefault("attached_images", []).append(str(image_path))
+        _queue_attachment_metadata(session, _image_attachment_metadata(image_path))
         return _ok(
             rid,
             {
@@ -9671,6 +9739,10 @@ def _(rid, params: dict) -> dict:
         img_path = _queue_attached_image(session, img_bytes, ext, prefix="upload")
     except Exception as e:
         return _err(rid, 5027, f"write failed: {e}")
+    _queue_attachment_metadata(
+        session,
+        _image_attachment_metadata(img_path, name=filename or img_path.name),
+    )
 
     return _ok(
         rid,
@@ -9747,6 +9819,7 @@ def _(rid, params: dict) -> dict:
             pdf_path = Path(resolved)
             display_name = pdf_path.name
 
+        pdf_size_bytes = len(pdf_bytes) if raw_b64 else pdf_path.stat().st_size
         try:
             first_page = int(params.get("first_page") or 1)
             last_page_param = params.get("last_page")
@@ -9796,6 +9869,17 @@ def _(rid, params: dict) -> dict:
             dst = _queue_attached_image(session, src.read_bytes(), ".png", prefix=f"pdf_p{page_num}")
             attached_pages.append({"path": str(dst), "page": page_int, **_image_meta(dst)})
 
+        _queue_attachment_metadata(
+            session,
+            {
+                "kind": "pdf",
+                "name": display_name,
+                "mime_type": "application/pdf",
+                "size_bytes": pdf_size_bytes,
+                "pages_attached": len(attached_pages),
+                "source_paths": [page["path"] for page in attached_pages],
+            },
+        )
         return _ok(
             rid,
             {
@@ -9985,6 +10069,20 @@ def _(rid, params: dict) -> dict:
             session, raw_path=raw, data_url=data_url, name=name
         )
         ref_path = _attachment_ref_path(session, stored_path)
+        ref_text = f"@file:{_format_ref_value(ref_path)}"
+        import mimetypes
+
+        _queue_attachment_metadata(
+            session,
+            {
+                "kind": "file",
+                "name": stored_path.name,
+                "mime_type": mimetypes.guess_type(stored_path.name)[0],
+                "size_bytes": stored_path.stat().st_size,
+                "path": str(stored_path),
+                "ref_text": ref_text,
+            },
+        )
         return _ok(
             rid,
             {
@@ -9992,7 +10090,7 @@ def _(rid, params: dict) -> dict:
                 "name": stored_path.name,
                 "path": str(stored_path),
                 "ref_path": ref_path,
-                "ref_text": f"@file:{_format_ref_value(ref_path)}",
+                "ref_text": ref_text,
                 "uploaded": uploaded,
             },
         )
@@ -10011,6 +10109,13 @@ def _(rid, params: dict) -> dict:
     images = session.setdefault("attached_images", [])
     before = len(images)
     session["attached_images"] = [path for path in images if path != raw]
+    pending = session.setdefault("pending_attachments", [])
+    session["pending_attachments"] = [
+        attachment
+        for attachment in pending
+        if attachment.get("path") != raw
+        and raw not in attachment.get("source_paths", [])
+    ]
     return _ok(
         rid,
         {
@@ -10037,6 +10142,7 @@ def _(rid, params: dict) -> dict:
         remainder = dropped["remainder"]
         if dropped["is_image"]:
             session.setdefault("attached_images", []).append(str(drop_path))
+            _queue_attachment_metadata(session, _image_attachment_metadata(drop_path))
             text = remainder or f"[User attached image: {drop_path.name}]"
             return _ok(
                 rid,

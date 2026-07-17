@@ -524,6 +524,7 @@ def run_conversation(
     stream_callback: Optional[callable] = None,
     persist_user_message: Optional[str] = None,
     persist_user_timestamp: Optional[float] = None,
+    persist_user_attachments: Optional[List[Dict[str, Any]]] = None,
     moa_config: Optional[dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
@@ -542,7 +543,8 @@ def run_conversation(
             synthetic prefixes.
         persist_user_timestamp: Optional platform event timestamp to store
             as metadata on that persisted user message.
-                or queuing follow-up prefetch work.
+        persist_user_attachments: Optional internal attachment metadata to store
+            on the persisted user message without sending it to the provider.
 
     Returns:
         Dict: Complete conversation result with final response and message history
@@ -577,6 +579,7 @@ def run_conversation(
         stream_callback,
         persist_user_message,
         persist_user_timestamp,
+        persist_user_attachments,
         restore_or_build_system_prompt=_restore_or_build_system_prompt,
         install_safe_stdio=_install_safe_stdio,
         sanitize_surrogates=_sanitize_surrogates,
@@ -812,8 +815,9 @@ def run_conversation(
             # Remove finish_reason - not accepted by strict APIs (e.g. Mistral)
             if "finish_reason" in api_msg:
                 api_msg.pop("finish_reason")
-            # Strip internal thinking-prefill marker
+            # Strip internal transcript fields that providers do not accept.
             api_msg.pop("_thinking_prefill", None)
+            api_msg.pop("attachments", None)
             # Strip Codex Responses API fields (call_id, response_item_id) for
             # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
             # Uses new dicts so the internal messages list retains the fields
