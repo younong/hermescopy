@@ -14,6 +14,7 @@ from hermes_cli.owner_worker.tool_executor_sandbox import (
     SandboxDeploymentPolicy,
     SandboxLaunchBinding,
     SandboxMountPolicy,
+    SandboxReadonlyMount,
     SandboxSecurityPolicy,
     SandboxSyscallFilter,
     SandboxVerificationInvalid,
@@ -51,8 +52,8 @@ def _probe(*args, **kwargs):
     del args, kwargs
     return SimpleNamespace(
         returncode=0,
-        stdout="  --bind-fd FD DEST\n  --size BYTES\n  --uid UID\n  --gid GID\n"
-        "  --cap-drop CAP\n  --seccomp FD\n",
+        stdout="  --bind-fd FD DEST\n  --ro-bind-fd FD DEST\n  --size BYTES\n  --uid UID\n  --gid GID\n"
+        "  --cap-drop CAP\n  --seccomp FD\n  --remount-ro DEST\n  --info-fd FD\n",
         stderr="",
     )
 
@@ -128,10 +129,70 @@ def test_linux_spec_uses_private_namespaces_minimal_mounts_and_exact_environment
     assert "/workspace" in argv
     assert str(tmp_path / "workspace") not in argv
     assert ["--bind", str(tmp_path / "owner" / "runtime" / "executors" / "executor-a" / "gen-1"), "/executor"] == argv[argv.index("--bind"):argv.index("--bind") + 3]
+    assert ["--remount-ro", "/"] == argv[argv.index("--remount-ro"):argv.index("--remount-ro") + 2]
+    assert argv.index("--remount-ro") < argv.index("--bind-fd") < argv.index("--bind")
     assert ["--chdir", "/workspace"] == argv[argv.index("--chdir"):argv.index("--chdir") + 2]
     triples = list(zip(argv, argv[1:], argv[2:]))
     for key, value in _environment().items():
         assert ("--setenv", key, value) in triples
+
+
+def test_linux_spec_wires_bubblewrap_info_descriptor(tmp_path):
+    spec = _spec(tmp_path, info_fd=17)
+    argv = list(spec.argv)
+
+    assert ["--info-fd", "17"] == argv[argv.index("--info-fd"):argv.index("--info-fd") + 2]
+
+
+def test_explicit_readonly_mounts_use_exact_destinations_and_policy_python(tmp_path):
+    owner, runtime, workspace, dependency, bwrap = _inputs(tmp_path)
+    destination = Path("/opt/hermes/runtime")
+    python = destination / "bin/python3"
+    binding = SandboxLaunchBinding(_identity(), "sandbox-a", owner, runtime)
+    mount_policy = SandboxMountPolicy(
+        binding, (), workspace, None,
+        readonly_mounts=(SandboxReadonlyMount(dependency, destination),),
+        python_executable=python,
+    )
+    spec = build_bubblewrap_launch_spec(
+        environment=_environment(), workspace_fd=10, binding=binding,
+        mount_policy=mount_policy, security_policy=_security_policy(),
+        syscall_filter=_syscall_filter(), bubblewrap_binary=bwrap,
+        platform_name="Linux", runner=_probe,
+    )
+    argv = list(spec.argv)
+
+    mount_index = argv.index("--ro-bind-fd")
+    mount_fd = int(argv[mount_index + 1])
+    try:
+        assert argv[mount_index + 2] == str(destination)
+        assert mount_fd in spec.inherited_security_fds
+        descriptor = os.fstat(mount_fd)
+        source = dependency.stat()
+        assert (descriptor.st_dev, descriptor.st_ino) == (source.st_dev, source.st_ino)
+        assert argv[argv.index("--") + 1] == str(python)
+        assert str(dependency) not in argv
+        assert str(dependency / "bin/python3") not in argv
+    finally:
+        for fd in spec.inherited_security_fds:
+            os.close(fd)
+
+
+def test_readonly_mount_destinations_must_be_unique_reserved_and_non_overlapping(tmp_path):
+    owner, runtime, workspace, dependency, _bwrap = _inputs(tmp_path)
+    other = tmp_path / "other-runtime"
+    other.mkdir()
+    binding = SandboxLaunchBinding(_identity(), "sandbox-a", owner, runtime)
+
+    for mounts in (
+        (SandboxReadonlyMount(dependency, "/opt/runtime"), SandboxReadonlyMount(other, "/opt/runtime/lib")),
+        (SandboxReadonlyMount(dependency, "/workspace/runtime"),),
+    ):
+        with pytest.raises(ExecutorIsolationUnavailable):
+            SandboxMountPolicy(
+                binding, (), workspace, None, readonly_mounts=mounts,
+                python_executable=Path(str(mounts[0].destination)) / "bin/python3",
+            )
 
 
 def test_non_linux_or_missing_or_unsupported_bubblewrap_fails_before_launch_spec(tmp_path):

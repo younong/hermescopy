@@ -14,7 +14,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from hermes_cli.dashboard_auth import ws_tickets
+from hermes_cli.dashboard_auth import owner_context, ws_tickets
 from hermes_cli.dashboard_auth.base import Session
 from hermes_cli.dashboard_auth.owner_context import (
     begin_owner_key_rotation,
@@ -293,6 +293,20 @@ class TestOwnerContext:
         owner.host_owner_home.chmod(0o755)
 
         with pytest.raises(RuntimeError, match="unsafe permissions"):
+            ensure_owner_home(owner)
+
+    def test_ensure_owner_home_rejects_unexpected_owner_uid(self, monkeypatch, tmp_path):
+        if os.name == "nt" or not hasattr(os, "getuid"):
+            pytest.skip("POSIX ownership unavailable")
+        monkeypatch.setenv("HERMES_OWNER_SECRET", "test-owner-secret")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "global"))
+        owner = owner_context_from_session(_session())
+        owner.host_owner_home.mkdir(parents=True)
+        owner.host_owner_home.chmod(0o700)
+        process_uid = os.getuid()
+        monkeypatch.setattr(owner_context.os, "getuid", lambda: process_uid + 1)
+
+        with pytest.raises(RuntimeError, match="unexpected ownership"):
             ensure_owner_home(owner)
 
     def test_ensure_owner_home_and_worker_env(self, monkeypatch, tmp_path):

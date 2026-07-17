@@ -19,6 +19,7 @@ from hermes_cli.owner_worker.executor_identity import (
 from hermes_cli.tool_executor_runtime.entrypoint import (
     ExecutorRuntimeInvalid,
     _admit_workspace_mount,
+    _await_start_gate,
     _require_matching_egress_profile,
     invocation_from_payload,
 )
@@ -47,12 +48,14 @@ def test_executor_environment_is_fresh_allowlist_and_binds_runtime_dirs(tmp_path
     tmp.mkdir(parents=True)
 
     environment = build_executor_environment(
-        _identity(), runtime_home=home, workspace_fd=11, bootstrap_fd=12, response_fd=13, egress_profile="tool-none"
+        _identity(), runtime_home=home, workspace_fd=11, bootstrap_fd=12, response_fd=13, start_gate_fd=14, egress_profile="tool-none"
     )
 
     assert environment["HOME"] == "/executor"
     assert environment["TMPDIR"] == "/executor/tmp"
     assert environment[EXECUTOR_HOME] == "/executor"
+    assert environment["PWD"] == "/workspace"
+    assert environment["PYTHONPATH"] == "/opt/hermes/release"
     assert str(home.resolve()) not in environment.values()
     assert str(tmp.resolve()) not in environment.values()
     assert environment[EXECUTOR_BOOTSTRAP_FD] == "12"
@@ -61,9 +64,10 @@ def test_executor_environment_is_fresh_allowlist_and_binds_runtime_dirs(tmp_path
     assert "HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY" not in environment
     assert "ANTHROPIC_API_KEY" not in environment
     assert set(environment) <= {
-        "HOME", "TMPDIR", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "__CF_USER_TEXT_ENCODING", "PYTHONUNBUFFERED", "PYTHONNOUSERSITE",
+        "HOME", "TMPDIR", "PATH", "PWD", "LANG", "LC_ALL", "LC_CTYPE", "__CF_USER_TEXT_ENCODING", "PYTHONPATH", "PYTHONUNBUFFERED", "PYTHONNOUSERSITE",
         "HERMES_EXECUTOR_RUNTIME", "HERMES_EXECUTOR_HOME", "HERMES_EXECUTOR_TMP", "HERMES_EXECUTOR_WORKSPACE_FD",
-        "HERMES_EXECUTOR_BOOTSTRAP_FD", "HERMES_EXECUTOR_RESPONSE_FD", "HERMES_EXECUTOR_GENERATION", "HERMES_EXECUTOR_EGRESS_PROFILE",
+        "HERMES_EXECUTOR_BOOTSTRAP_FD", "HERMES_EXECUTOR_RESPONSE_FD", "HERMES_EXECUTOR_START_GATE_FD",
+        "HERMES_EXECUTOR_GENERATION", "HERMES_EXECUTOR_EGRESS_PROFILE",
     }
 
 
@@ -72,7 +76,7 @@ def test_executor_environment_rejects_parent_authority_and_unknown_keys(tmp_path
     tmp = home / "tmp"
     tmp.mkdir(parents=True)
     environment = build_executor_environment(
-        _identity(), runtime_home=home, workspace_fd=11, bootstrap_fd=12, response_fd=13, egress_profile="tool-none"
+        _identity(), runtime_home=home, workspace_fd=11, bootstrap_fd=12, response_fd=13, start_gate_fd=14, egress_profile="tool-none"
     )
 
     poisoned = dict(environment, HERMES_CONTROL_HOME="/control")
@@ -81,6 +85,25 @@ def test_executor_environment_rejects_parent_authority_and_unknown_keys(tmp_path
     poisoned = dict(environment, ANTHROPIC_API_KEY="secret")
     with pytest.raises(ExecutorEnvironmentInvalid, match="unallowed|forbidden"):
         validate_executor_environment(poisoned)
+    with pytest.raises(ExecutorEnvironmentInvalid, match="PWD"):
+        validate_executor_environment(dict(environment, PWD="/tmp"))
+    with pytest.raises(ExecutorEnvironmentInvalid, match="PYTHONPATH"):
+        validate_executor_environment(dict(environment, PYTHONPATH="/tmp"))
+
+
+def test_executor_start_gate_requires_one_explicit_release_byte():
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, b"1")
+    os.close(write_fd)
+    _await_start_gate(read_fd)
+
+    for value in (b"", b"0", b"11"):
+        read_fd, write_fd = os.pipe()
+        if value:
+            os.write(write_fd, value)
+        os.close(write_fd)
+        with pytest.raises(ExecutorRuntimeInvalid, match="start gate"):
+            _await_start_gate(read_fd)
 
 
 def test_executor_environment_rejects_duplicate_stdio_descriptors_and_missing_egress(tmp_path):
@@ -88,7 +111,7 @@ def test_executor_environment_rejects_duplicate_stdio_descriptors_and_missing_eg
     tmp = home / "tmp"
     tmp.mkdir(parents=True)
     environment = build_executor_environment(
-        _identity(), runtime_home=home, workspace_fd=11, bootstrap_fd=12, response_fd=13, egress_profile="tool-none"
+        _identity(), runtime_home=home, workspace_fd=11, bootstrap_fd=12, response_fd=13, start_gate_fd=14, egress_profile="tool-none"
     )
     for key, value in (
         ("HERMES_EXECUTOR_BOOTSTRAP_FD", "11"),
@@ -122,7 +145,7 @@ def test_egress_profile_rejects_noncanonical_values(value):
 @pytest.mark.parametrize("profile", ["tool-none", "tool-public", "protected-target"])
 def test_executor_environment_accepts_only_executor_profiles(tmp_path, profile):
     environment = build_executor_environment(
-        _identity(), runtime_home=tmp_path, workspace_fd=11, bootstrap_fd=12, response_fd=13, egress_profile=profile
+        _identity(), runtime_home=tmp_path, workspace_fd=11, bootstrap_fd=12, response_fd=13, start_gate_fd=14, egress_profile=profile
     )
     assert environment["HERMES_EXECUTOR_EGRESS_PROFILE"] == profile
 
@@ -131,7 +154,7 @@ def test_executor_environment_accepts_only_executor_profiles(tmp_path, profile):
 def test_executor_environment_rejects_non_tool_egress_profiles(tmp_path, profile):
     with pytest.raises(ExecutorEnvironmentInvalid, match="egress profile"):
         build_executor_environment(
-            _identity(), runtime_home=tmp_path, workspace_fd=11, bootstrap_fd=12, response_fd=13, egress_profile=profile
+            _identity(), runtime_home=tmp_path, workspace_fd=11, bootstrap_fd=12, response_fd=13, start_gate_fd=14, egress_profile=profile
         )
 
 
@@ -189,19 +212,19 @@ def test_resource_decision_rejects_foreign_identity_and_invalid_quota():
         ExecutorResourceQuota(**dict(quota.to_payload(), output_bytes=0))
 
 
-def test_workspace_descriptor_must_match_the_fixed_sandbox_mount(tmp_path, monkeypatch):
+def test_workspace_admission_rejects_non_directory_mount(tmp_path, monkeypatch):
     workspace = tmp_path / "workspace"
-    other = tmp_path / "other"
     workspace.mkdir()
-    other.mkdir()
     descriptor = os.open(workspace, os.O_RDONLY)
-    other_stat = os.stat(other)
-    try:
-        monkeypatch.setattr("hermes_cli.tool_executor_runtime.entrypoint.os.stat", lambda _: other_stat)
-        with pytest.raises(ExecutorRuntimeInvalid, match="does not match"):
-            _admit_workspace_mount(descriptor)
-    finally:
-        os.close(descriptor)
+    file_status = (tmp_path / "file")
+    file_status.write_text("not a directory")
+    monkeypatch.setattr(
+        "hermes_cli.tool_executor_runtime.entrypoint._workspace_mount_status",
+        lambda: file_status.stat(),
+    )
+
+    with pytest.raises(ExecutorRuntimeInvalid, match="mount"):
+        _admit_workspace_mount(descriptor)
 
 
 def test_workspace_descriptor_admission_changes_to_verified_workspace_and_closes_fd(tmp_path, monkeypatch):
@@ -210,7 +233,7 @@ def test_workspace_descriptor_admission_changes_to_verified_workspace_and_closes
     descriptor = os.open(workspace, os.O_RDONLY)
     descriptor_stat = os.fstat(descriptor)
     seen = []
-    monkeypatch.setattr("hermes_cli.tool_executor_runtime.entrypoint.os.stat", lambda _: descriptor_stat)
+    monkeypatch.setattr("hermes_cli.tool_executor_runtime.entrypoint._workspace_mount_status", lambda: descriptor_stat)
     monkeypatch.setattr("hermes_cli.tool_executor_runtime.entrypoint.os.chdir", seen.append)
 
     _admit_workspace_mount(descriptor)
@@ -220,11 +243,28 @@ def test_workspace_descriptor_admission_changes_to_verified_workspace_and_closes
         os.fstat(descriptor)
 
 
+def test_workspace_admission_accepts_descriptor_consumed_by_bubblewrap(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    descriptor = os.open(workspace, os.O_RDONLY)
+    os.close(descriptor)
+    seen = []
+    monkeypatch.setattr(
+        "hermes_cli.tool_executor_runtime.entrypoint._workspace_mount_status",
+        lambda: workspace.stat(),
+    )
+    monkeypatch.setattr("hermes_cli.tool_executor_runtime.entrypoint.os.chdir", seen.append)
+
+    _admit_workspace_mount(descriptor)
+
+    assert seen == ["/workspace"]
+
+
 def test_executor_environment_keeps_tmp_internal_without_host_tmp_input(tmp_path):
     home = tmp_path / "runtime"
     home.mkdir()
     environment = build_executor_environment(
-        _identity(), runtime_home=home, workspace_fd=11, bootstrap_fd=12, response_fd=13, egress_profile="tool-none",
+        _identity(), runtime_home=home, workspace_fd=11, bootstrap_fd=12, response_fd=13, start_gate_fd=14, egress_profile="tool-none",
     )
     assert environment["TMPDIR"] == "/executor/tmp"
     assert str(home) not in environment.values()

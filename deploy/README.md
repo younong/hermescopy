@@ -22,7 +22,7 @@
 - 重试/回滚：`--tag <existing-tag>`
 - 无 tag 的受限例外：`--ref <40-hex-commit-sha>`，仅发布已推送到 `origin` 的不可变完整 commit SHA；不会打 tag，也绝不会上传当前工作区或接受分支名、`HEAD`、短 SHA。
 
-工具使用 `git archive <tag>` 生成干净源码，在本机临时源码目录中安装 Node 依赖并构建 web/ui-tui 产物，然后把源码 + 构建产物打包上传到服务器。服务器只解包到 `/opt/hermes/releases/<tag>`、按需初始化/更新共享 Python venv、切换 `/opt/hermes/current`，最后重启 systemd 服务。发布成功后会清理本次上传的远端 tarball，并按保留策略回收旧 release。
+工具使用 `git archive <tag>` 生成干净源码，在本机临时源码目录中安装 Node 依赖并构建 web/ui-tui 产物，然后把源码 + 构建产物打包上传到服务器。服务器只解包到 `/opt/hermes/releases/<tag>`、按 `uv.lock + 架构` 创建或复用 root-owned immutable Python runtime、验证 host sandbox policy、切换 `/opt/hermes/current`，最后以稳定的非 root `hermes` user/group 重启 systemd 服务。发布成功后会清理本次上传的远端 tarball，并按保留策略回收旧 release。
 
 ## 服务器运行方式
 
@@ -40,8 +40,10 @@
 /opt/hermes/current              # 当前线上版本 symlink
 /opt/hermes/shared/.hermes       # 持久化数据 / HERMES_HOME
 /opt/hermes/shared/.env          # 服务器本地环境变量，永不提交
-/opt/hermes/shared/venv          # 共享 Python venv，仅 uv.lock 变化时更新
+/opt/hermes/runtimes/python/<runtime-id> # root-owned immutable Python runtime
 /opt/hermes/shared/hermes-service-runner.sh
+/etc/hermes/executor-sandbox.json      # root-owned host sandbox policy
+/etc/hermes/executor-x86_64.bpf        # root-owned seccomp artifact
 ```
 
 Dashboard 只绑定 `127.0.0.1:9119`，生产入口为：
@@ -67,7 +69,9 @@ ssh -L 9119:localhost:9119 root@106.15.186.104
 - systemd
 - tar / gzip
 - `sha256sum`
-- Python 由共享 venv 提供；首次部署或 `uv.lock` 变化时，部署脚本会用 `uv sync` 初始化/更新 `/opt/hermes/shared/venv`
+- Python 由 root-owned、只读的版本化 runtime 提供；部署脚本会打包 uv-managed Python、locked dependencies 和最小本地命令集
+- Bubblewrap 必须安装为 `/usr/bin/bwrap` 并支持发布脚本检查的 namespace、bind-fd、seccomp 与 attestation 参数
+- 内核必须允许非 root user namespace 和 seccomp filter
 - 如果服务器没有 `uv`，部署脚本会用 `curl` 安装一次
 - 常见编译/运行依赖按服务器实际错误补充，例如 `gcc`、`g++`、`make`、`cmake`、`python3-dev`、`python3-venv`、`ffmpeg`、`ripgrep`
 
@@ -176,7 +180,7 @@ ssh root@106.15.186.104 \
   'python3 /opt/hermes/current/deploy/nginx/manage_hermes_proxy.py status --vhost /etc/nginx/conf.d/abinllm.conf'
 ```
 
-迁移前建议保存 `nginx -T` 和 vhost checksum。失败时优先恢复工具报告的 `abinllm.conf.hermes-backup-<timestamp>`，再执行 `nginx -t && systemctl reload nginx`。不要通过删除 `--require-auth`、清空 local-user SQLite、轮换 durable-store secret 或重跑 bootstrap 来回滚。旧 `.htpasswd-hermes` 只可在 `nginx -T` 确认不再引用后人工清理。
+迁移前建议保存 `nginx -T` 和 vhost checksum。失败时优先恢复工具报告的 `abinllm.conf.hermes-backup-<timestamp>`，再执行 `nginx -t && systemctl reload nginx`。不要通过删除 `--require-auth`、清空 local-user SQLite、轮换 durable-store secret、重跑 bootstrap、恢复 root 服务身份或放宽 owner-home ownership 检查来回滚。旧 `.htpasswd-hermes` 只可在 `nginx -T` 确认不再引用后人工清理。
 
 ## 发布后检查
 
@@ -188,6 +192,6 @@ ssh root@106.15.186.104 'nginx -t && nginx -T 2>/dev/null | grep -n -A25 -B5 her
 ssh root@106.15.186.104 'journalctl -u hermes-gateway -u hermes-dashboard --since "10 min ago" --no-pager -n 200'
 ```
 
-使用隐私窗口访问 `https://abinllm.xyz/hermes/`，应直接看到 Hermes 登录页而不是浏览器原生 Basic Auth challenge。用 active member 验证普通功能和 WebSocket/PTY；member 的账号管理 API 仍应为 403，admin 管理读取仍应成功。现有 local-user DB、stable secret 和角色都保持不变。
+使用隐私窗口访问 `https://abinllm.xyz/hermes/`，应直接看到 Hermes 登录页而不是浏览器原生 Basic Auth challenge。用 active member 验证 sessions API、普通功能和 WebSocket/PTY；member 的账号管理 API 仍应为 403，admin 管理读取仍应成功。gateway、dashboard、Owner Worker 和 `/opt/hermes/shared/.hermes/users/<owner-key>` 应使用同一个稳定 `hermes` UID/GID。现有 local-user DB、stable secret 和角色都保持不变。
 
-APIYI smoke test 不是发布脚本的必跑步骤；需要真实调用模型时再单独执行。
+发布脚本会执行 host sandbox preflight、systemd health、Hermes auth readiness 和 Nginx validation。APIYI smoke test 不是必跑步骤；需要真实调用模型时再单独执行。
