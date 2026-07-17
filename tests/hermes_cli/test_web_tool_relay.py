@@ -39,6 +39,29 @@ def _invocation(tool_name="web_search", arguments=None, *, identity=None, invoca
     )
 
 
+def test_web_relay_logs_only_safe_correlation_fields(caplog):
+    secret_query = "private-query-sentinel"
+    invocation = _invocation(arguments={"query": secret_query, "limit": 5})
+    broker = WebToolRelayBroker(
+        identity_validator=lambda _identity: None,
+        dispatcher=lambda _name, _args: '{"success":true}',
+    )
+    with caplog.at_level("INFO", logger="hermes_cli.owner_worker.web_tool_relay"):
+        relay_fd = broker.register(invocation)
+        assert dispatch_web_tool_over_relay(relay_fd, invocation) == '{"success":true}'
+    broker.close()
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "dispatch started" in messages
+    assert "dispatch completed" in messages
+    assert secret_query not in messages
+    for record in caplog.records:
+        assert record.tool_name == "web_search"
+        assert record.invocation_id == invocation.invocation_id
+        assert record.tool_call_id == invocation.tool_call_id
+        assert record.api_request_id == invocation.api_request_id
+
+
 def test_web_relay_dispatches_exact_search_and_extract_invocations():
     seen = []
     broker = WebToolRelayBroker(

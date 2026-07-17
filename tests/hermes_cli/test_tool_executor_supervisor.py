@@ -20,7 +20,12 @@ from hermes_cli.owner_worker.tool_executor_sandbox import (
     SandboxVerificationRecord,
 )
 from hermes_cli.dashboard_auth.audit import AuthorityAuditEvent, AuthorityAuditReason
-from hermes_cli.owner_worker.executor_identity import EgressProfile, ExecutorInvocation, default_executor_resource_decision
+from hermes_cli.owner_worker.executor_identity import (
+    EgressProfile,
+    ExecutorIdentityInvalid,
+    ExecutorInvocation,
+    default_executor_resource_decision,
+)
 from hermes_cli.owner_worker.executor_tokens import AUD_PROCESS_REGISTRY, ExecutorCapabilityInvalid
 from hermes_cli.owner_worker.tool_executor_supervisor import ExecutorEgressPolicy, ToolExecutorSupervisor
 
@@ -204,6 +209,22 @@ def test_default_web_tools_use_tool_none_broker_while_other_network_tools_stay_p
     assert policy.select("web_search") is EgressProfile.TOOL_NONE
     assert policy.select("web_extract") is EgressProfile.TOOL_NONE
     assert policy.select("browser_navigate") is EgressProfile.TOOL_PUBLIC
+
+
+def test_supervisor_exposes_deterministic_egress_admission_policy(tmp_path):
+    roots, supervisor = _supervisor(
+        tmp_path, lambda *_args, **_kwargs: _FakeProcess()
+    )
+    supervisor.allowed_egress_profiles = (EgressProfile.TOOL_NONE,)
+    try:
+        assert supervisor.admitted_egress_profile_for("web_search") is EgressProfile.TOOL_NONE
+        with pytest.raises(ExecutorIdentityInvalid, match="network egress is not configured"):
+            supervisor.admitted_egress_profile_for("browser_navigate")
+        assert supervisor.egress_policy_fingerprint == supervisor.egress_policy_fingerprint
+        assert supervisor.egress_policy_fingerprint[0] == ("tool-none",)
+    finally:
+        roots.close()
+        supervisor.web_tool_relay.close()
 
 
 def test_supervisor_uses_sandbox_fd_bootstrap_and_no_preexec_cwd(tmp_path):

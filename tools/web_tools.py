@@ -859,16 +859,42 @@ async def web_extract_tool(
         return tool_error(error_msg)
 
 
-# Convenience function to check Firecrawl credentials
+def _active_provider_available(capability: str) -> bool:
+    """Return whether the active provider can serve one web capability."""
+    _ensure_web_plugins_loaded()
+    try:
+        from agent.web_search_registry import (
+            get_active_extract_provider,
+            get_active_search_provider,
+        )
+
+        if capability == "search":
+            provider = get_active_search_provider()
+            supports = provider.supports_search if provider is not None else None
+        elif capability == "extract":
+            provider = get_active_extract_provider()
+            supports = provider.supports_extract if provider is not None else None
+        else:
+            return False
+        return bool(provider is not None and supports() and provider.is_available())
+    except Exception as exc:
+        logger.debug("Web %s availability check failed: %s", capability, exc)
+        return False
+
+
+def check_web_search_available() -> bool:
+    """Return whether a configured or auto-detected search provider is usable."""
+    return _active_provider_available("search")
+
+
+def check_web_extract_available() -> bool:
+    """Return whether a configured or auto-detected extract provider is usable."""
+    return _active_provider_available("extract")
+
+
 def check_web_api_key() -> bool:
-    """Check whether the configured web backend is available."""
-    configured = _load_web_config().get("backend", "").lower().strip()
-    if configured in {"exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs", "xai"}:
-        return _is_backend_available(configured)
-    return any(
-        _is_backend_available(backend)
-        for backend in ("exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs", "xai")
-    )
+    """Backward-compatible aggregate web-provider availability check."""
+    return check_web_search_available() or check_web_extract_available()
 
 
 if __name__ == "__main__":
@@ -1001,7 +1027,7 @@ registry.register(
     toolset="web",
     schema=WEB_SEARCH_SCHEMA,
     handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=args.get("limit", 5)),
-    check_fn=check_web_api_key,
+    check_fn=check_web_search_available,
     requires_env=_web_requires_env(),
     emoji="🔍",
     max_result_size_chars=100_000,
@@ -1015,7 +1041,7 @@ registry.register(
         "markdown",
         char_limit=args.get("char_limit"),
     ),
-    check_fn=check_web_api_key,
+    check_fn=check_web_extract_available,
     requires_env=_web_requires_env(),
     is_async=True,
     emoji="📄",

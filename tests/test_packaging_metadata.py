@@ -355,6 +355,12 @@ def test_pyproject_pins_are_internally_consistent():
     )
 
 
+def test_ddgs_extra_is_exact_pinned_and_matches_lazy_feature():
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert data["project"]["optional-dependencies"]["ddgs"] == ["ddgs==9.14.4"]
+    assert _lazy_deps_by_feature()["search.ddgs"] == ["ddgs==9.14.4"]
+
+
 def test_pyproject_and_lazy_deps_pins_agree():
     """Every package pinned in BOTH places must use the same version.
 

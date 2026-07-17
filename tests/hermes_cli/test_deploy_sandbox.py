@@ -34,7 +34,7 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     ) in source
     assert "ExecStartPre=$venv/bin/python" in source
     assert "uv python install \"$python_version\" --install-dir \"$runtime_tmp/python-base\" --no-bin" in source
-    assert "uv sync --extra all --locked --no-editable --link-mode copy" in source
+    assert "uv sync --extra all --extra ddgs --locked --no-editable --link-mode copy" in source
     assert 'resolved_python="$(readlink -f "$runtime_tmp/bin/python3")"' in source
     assert 'final_python_relative="$(realpath --relative-to="$venv/bin" "$final_python")"' in source
     assert 'ln -sfn "$final_python_relative" "$venv/bin/python"' in source

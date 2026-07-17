@@ -259,10 +259,24 @@ class TestDDGSBackendWiring:
         monkeypatch.setattr(web_tools, "_ddgs_package_importable", lambda: True)
         assert web_tools._get_backend() == "ddgs"
 
-    def test_check_web_api_key_true_when_ddgs_configured(self, monkeypatch):
+    def test_ddgs_exposes_search_but_not_extract(self, monkeypatch):
         from tools import web_tools
-        monkeypatch.setattr(web_tools, "_load_web_config", lambda: {"backend": "ddgs"})
-        monkeypatch.setattr(web_tools, "_ddgs_package_importable", lambda: True)
+        from plugins.web.ddgs.provider import DDGSWebSearchProvider
+
+        provider = DDGSWebSearchProvider()
+        monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
+        monkeypatch.setattr(
+            "agent.web_search_registry.get_active_search_provider",
+            lambda: provider,
+        )
+        monkeypatch.setattr(
+            "agent.web_search_registry.get_active_extract_provider",
+            lambda: None,
+        )
+        monkeypatch.setattr(provider, "is_available", lambda: True)
+
+        assert web_tools.check_web_search_available() is True
+        assert web_tools.check_web_extract_available() is False
         assert web_tools.check_web_api_key() is True
 
 

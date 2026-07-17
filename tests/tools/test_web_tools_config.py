@@ -585,7 +585,10 @@ class TestCheckWebApiKey:
 
     def test_no_keys_returns_false(self):
         from tools.web_tools import check_web_api_key
-        with patch("tools.web_tools._ddgs_package_importable", return_value=False):
+        with (
+            patch("tools.web_tools.check_web_search_available", return_value=False),
+            patch("tools.web_tools.check_web_extract_available", return_value=False),
+        ):
             assert check_web_api_key() is False
 
     def test_both_keys_returns_true(self):

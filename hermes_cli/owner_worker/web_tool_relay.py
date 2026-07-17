@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import socket
 import struct
@@ -22,6 +23,8 @@ from hermes_cli.owner_worker.executor_identity import (
     ExecutorIdentity,
     ExecutorInvocation,
 )
+
+logger = logging.getLogger(__name__)
 
 WEB_RELAY_TOOL_NAMES = frozenset({"web_search", "web_extract"})
 _MAX_REQUEST_BYTES = 256 * 1024
@@ -231,9 +234,21 @@ class WebToolRelayBroker:
         arguments = _validated_arguments(expected.tool_name, request["arguments"])
         if arguments != _validated_arguments(expected.tool_name, expected.arguments):
             raise WebToolRelayError("web tool relay arguments do not match")
-        result = self._dispatcher(expected.tool_name, arguments)
-        if not isinstance(result, str):
-            raise WebToolRelayError("web tool relay result is invalid")
+        correlation = {
+            "tool_name": expected.tool_name,
+            "invocation_id": expected.invocation_id,
+            "tool_call_id": expected.tool_call_id,
+            "api_request_id": expected.api_request_id,
+        }
+        logger.info("Authenticated web relay dispatch started", extra=correlation)
+        try:
+            result = self._dispatcher(expected.tool_name, arguments)
+            if not isinstance(result, str):
+                raise WebToolRelayError("web tool relay result is invalid")
+        except Exception:
+            logger.warning("Authenticated web relay dispatch failed", extra=correlation)
+            raise
+        logger.info("Authenticated web relay dispatch completed", extra=correlation)
         return result
 
     def revoke_invocation(self, invocation: ExecutorInvocation) -> int:

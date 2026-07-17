@@ -53,6 +53,65 @@ class TestHandleFunctionCall:
 
         assert result["error"] == "[TOOL_ERROR] Error executing web_search: authenticated tool executor is unavailable"
 
+    def test_authenticated_tool_definitions_hide_denied_egress(self, monkeypatch):
+        from tui_gateway import server
+        from hermes_cli.owner_worker.executor_identity import ExecutorIdentityInvalid
+        from model_tools import get_tool_definitions, _clear_tool_defs_cache
+
+        class _Supervisor:
+            egress_policy_fingerprint = (("tool-none",), "tool-none", ())
+
+            def admitted_egress_profile_for(self, name):
+                if name.startswith("browser_"):
+                    raise ExecutorIdentityInvalid(
+                        "authenticated network egress is not configured"
+                    )
+                return "tool-none"
+
+        fake_defs = [
+            {"type": "function", "function": {"name": "web_search", "description": "search"}},
+            {"type": "function", "function": {"name": "browser_navigate", "description": "browse"}},
+        ]
+        monkeypatch.setattr("model_tools.registry.get_definitions", lambda *_args, **_kwargs: list(fake_defs))
+        monkeypatch.setattr("model_tools.resolve_toolset", lambda _name: {"web_search", "browser_navigate"})
+        monkeypatch.setattr("model_tools.validate_toolset", lambda _name: True)
+        runtime = server.OwnerWorkerGatewayRuntime(
+            "owner-a", 1, "worker-a", 1, 0,
+            tool_executor_supervisor=_Supervisor(),
+        )
+        _clear_tool_defs_cache()
+        with server.owner_worker_gateway_runtime(runtime):
+            names = {
+                tool["function"]["name"]
+                for tool in get_tool_definitions(
+                    enabled_toolsets=["test"], quiet_mode=True,
+                )
+            }
+        _clear_tool_defs_cache()
+
+        assert names == {"web_search"}
+
+    def test_authenticated_tool_definitions_fail_closed_without_executor(self, monkeypatch):
+        from tui_gateway import server
+        from model_tools import get_tool_definitions, _clear_tool_defs_cache
+
+        monkeypatch.setattr(
+            "model_tools.registry.get_definitions",
+            lambda *_args, **_kwargs: [{
+                "type": "function",
+                "function": {"name": "read_file", "description": "read"},
+            }],
+        )
+        monkeypatch.setattr("model_tools.resolve_toolset", lambda _name: {"read_file"})
+        monkeypatch.setattr("model_tools.validate_toolset", lambda _name: True)
+        runtime = server.OwnerWorkerGatewayRuntime("owner-a", 1, "worker-a", 1, 0)
+        _clear_tool_defs_cache()
+        with server.owner_worker_gateway_runtime(runtime):
+            tools = get_tool_definitions(enabled_toolsets=["test"], quiet_mode=True)
+        _clear_tool_defs_cache()
+
+        assert tools == []
+
     def test_authenticated_runtime_dispatches_through_executor(self):
         from tui_gateway import server
 

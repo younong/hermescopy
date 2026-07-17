@@ -205,6 +205,25 @@ class ToolExecutorSupervisor:
             # Audit delivery cannot relax executor admission or revocation.
             pass
 
+    @property
+    def egress_policy_fingerprint(self) -> tuple[Any, ...]:
+        """Return a deterministic fingerprint for model-visible policy caches."""
+        return (
+            tuple(sorted(profile.value for profile in self.allowed_egress_profiles)),
+            self.egress_policy.default.value,
+            tuple(sorted(
+                (name, profile.value)
+                for name, profile in self.egress_policy.by_tool_name.items()
+            )),
+        )
+
+    def admitted_egress_profile_for(self, function_name: str) -> EgressProfile:
+        """Select the trusted tool profile and fail if this host denies it."""
+        egress_profile = self.egress_policy.select(function_name)
+        if egress_profile not in self.allowed_egress_profiles:
+            raise ExecutorIdentityInvalid("authenticated network egress is not configured")
+        return egress_profile
+
     def identity_for(self, *, task_id: str, session_id: str) -> ExecutorIdentity:
         key = (str(task_id or ""), str(session_id or ""))
         if not all(key):
@@ -236,9 +255,7 @@ class ToolExecutorSupervisor:
     ) -> str:
         identity = self.identity_for(task_id=task_id, session_id=session_id)
         try:
-            egress_profile = self.egress_policy.select(function_name)
-            if egress_profile not in self.allowed_egress_profiles:
-                raise ExecutorIdentityInvalid("authenticated network egress is not configured")
+            egress_profile = self.admitted_egress_profile_for(function_name)
         except ExecutorIdentityInvalid:
             self._report(AuthorityAuditEvent.EGRESS_REJECTED, AuthorityAuditReason.EGRESS_PROFILE_REJECTED, identity)
             raise

@@ -108,6 +108,58 @@ class TestQuietModeCacheIsolation:
             "Eviction should keep the cache at the cap, not clear it or grow"
         )
 
+    def test_authenticated_policy_has_separate_cache_entry(self, monkeypatch):
+        from tui_gateway import server
+        from hermes_cli.owner_worker.executor_identity import ExecutorIdentityInvalid
+
+        class _Supervisor:
+            def __init__(self, label, denied=()):
+                self.egress_policy_fingerprint = (label,)
+                self.denied = set(denied)
+
+            def admitted_egress_profile_for(self, name):
+                if name in self.denied:
+                    raise ExecutorIdentityInvalid(
+                        "authenticated network egress is not configured"
+                    )
+                return "tool-none"
+
+        fake_defs = [
+            {"type": "function", "function": {"name": "web_search"}},
+            {"type": "function", "function": {"name": "browser_navigate"}},
+        ]
+        monkeypatch.setattr(
+            model_tools.registry, "get_definitions",
+            lambda *_args, **_kwargs: list(fake_defs),
+        )
+        monkeypatch.setattr(model_tools, "resolve_toolset", lambda _name: {"web_search", "browser_navigate"})
+        monkeypatch.setattr(model_tools, "validate_toolset", lambda _name: True)
+
+        denied = server.OwnerWorkerGatewayRuntime(
+            "owner-a", 1, "worker-a", 1, 0,
+            tool_executor_supervisor=_Supervisor("none", {"browser_navigate"}),
+        )
+        allowed = server.OwnerWorkerGatewayRuntime(
+            "owner-b", 1, "worker-b", 1, 0,
+            tool_executor_supervisor=_Supervisor("public"),
+        )
+        with server.owner_worker_gateway_runtime(denied):
+            denied_names = {
+                t["function"]["name"] for t in model_tools.get_tool_definitions(
+                    enabled_toolsets=["test"], quiet_mode=True,
+                )
+            }
+        with server.owner_worker_gateway_runtime(allowed):
+            allowed_names = {
+                t["function"]["name"] for t in model_tools.get_tool_definitions(
+                    enabled_toolsets=["test"], quiet_mode=True,
+                )
+            }
+
+        assert denied_names == {"web_search"}
+        assert allowed_names == {"web_search", "browser_navigate"}
+        assert len(model_tools._tool_defs_cache) == 2
+
     def test_non_quiet_mode_does_not_use_cache(self):
         """Sanity: quiet_mode=False (TUI path) skips the cache entirely \u2014
         explains why the bug only hit Gateway."""
