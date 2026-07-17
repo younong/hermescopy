@@ -1,5 +1,7 @@
 import { FileText } from "lucide-react";
+import { useEffect, useState } from "react";
 
+import { fetchJSON } from "@/lib/api";
 import { formatBytes } from "../attachments";
 import type { MessageAttachmentState } from "../types";
 
@@ -11,6 +13,7 @@ export function MessageAttachmentCard({
   variant?: "bubble" | "card";
 }) {
   const isPdf = attachment.kind === "pdf";
+  const previewUrl = useAttachmentPreviewUrl(attachment);
   const typeLabel = attachment.kind === "image" ? "Image" : isPdf ? "PDF" : "File";
   const meta = [
     typeLabel,
@@ -20,13 +23,13 @@ export function MessageAttachmentCard({
     .filter(Boolean)
     .join(" · ");
 
-  if (variant === "bubble" && attachment.kind === "image" && attachment.previewUrl) {
+  if (variant === "bubble" && attachment.kind === "image" && previewUrl) {
     return (
       <img
         alt={attachment.name}
         className="max-h-[320px] w-[180px] rounded-3xl object-cover shadow-sm sm:w-[220px]"
         draggable={false}
-        src={attachment.previewUrl}
+        src={previewUrl}
       />
     );
   }
@@ -34,12 +37,12 @@ export function MessageAttachmentCard({
   return (
     <div className="flex h-[64px] w-full max-w-[280px] items-center gap-3 rounded-2xl border border-current/10 bg-background-base/60 px-3 py-2 text-left shadow-sm sm:w-[260px]">
       <div className="flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-current/[0.04]">
-        {attachment.kind === "image" && attachment.previewUrl ? (
+        {attachment.kind === "image" && previewUrl ? (
           <img
             alt=""
             className="h-full w-full object-cover"
             draggable={false}
-            src={attachment.previewUrl}
+            src={previewUrl}
           />
         ) : (
           <div className="flex h-9 w-7 items-center justify-center rounded-md bg-destructive text-white">
@@ -55,4 +58,30 @@ export function MessageAttachmentCard({
       </div>
     </div>
   );
+}
+
+function useAttachmentPreviewUrl(attachment: MessageAttachmentState): string | undefined {
+  const source = attachment.previewUrl;
+  const [resolved, setResolved] = useState<{ source: string; url?: string }>();
+
+  useEffect(() => {
+    if (attachment.kind !== "image" || !source?.startsWith("/api/fs/read-data-url?")) {
+      return;
+    }
+    let cancelled = false;
+    void fetchJSON<{ dataUrl?: string }>(source)
+      .then((result) => {
+        if (!cancelled) setResolved({ source, url: result.dataUrl });
+      })
+      .catch(() => {
+        if (!cancelled) setResolved({ source });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [attachment.kind, source]);
+
+  if (attachment.kind !== "image" || !source) return undefined;
+  if (!source.startsWith("/api/fs/read-data-url?")) return source;
+  return resolved?.source === source ? resolved.url : undefined;
 }
