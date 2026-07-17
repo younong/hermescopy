@@ -282,6 +282,7 @@ def test_gated_require_token_routes_reject_cookie_session_in_owner_mode(
         ("/api/sessions/abc123/export", True),
         ("/api/analytics/usage", True),
         ("/api/model/info", True),
+        ("/api/fs/read-data-url", True),
         ("/api/sessions/abc123/unmigrated", False),
         ("/api/sessions-extra", False),
         ("/api/analytics/admin", False),

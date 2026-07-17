@@ -52,6 +52,7 @@ OWNER_WORKER_ROUTES: frozenset[tuple[str, str]] = frozenset({
     ("DELETE", "/api/files"),
     ("GET", "/api/files/read"),
     ("GET", "/api/files/download"),
+    ("GET", "/api/fs/read-data-url"),
     ("POST", "/api/files/upload"),
     ("POST", "/api/files/upload-stream"),
     ("POST", "/api/files/mkdir"),
