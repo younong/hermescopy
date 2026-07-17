@@ -2076,6 +2076,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 bundle_key,
                 user_instruction="",
                 task_id=str(job.get("id") or "") or None,
+                force_eager=True,
             )
             if bundle_payload:
                 bundle_message, _loaded_bundle_skills, _missing_bundle_skills = bundle_payload

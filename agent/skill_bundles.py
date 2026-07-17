@@ -1,9 +1,10 @@
 """Skill bundles — aliases that load multiple skills under one slash command.
 
 A skill bundle is a small YAML file that names a set of skills to load
-together. Invoking ``/<bundle-name>`` from the CLI or gateway loads every
-referenced skill's full content into a single user message, the same way
-``/<skill-name>`` does — but for N skills at once.
+together. Invoking ``/<bundle-name>`` from the CLI or gateway activates every
+referenced skill in one user turn. Small bundles embed their full content;
+oversized bundles keep compact references in history and attach the full
+instructions ephemerally for the active turn.
 
 Storage
 -------
@@ -34,7 +35,7 @@ Public API
 ----------
 - :func:`get_skill_bundles` — return ``{"/slug": bundle_info}``
 - :func:`resolve_bundle_command_key` — map a user-typed command to its slug
-- :func:`build_bundle_invocation_message` — produce the full user message
+- :func:`build_bundle_invocation_message` — produce the activation user message
 - :func:`reload_bundles` — re-scan disk and return a diff
 - :func:`list_bundles` — return rich info for display (``hermes bundles``)
 - :func:`save_bundle` / :func:`delete_bundle` — file-level operations
@@ -254,6 +255,8 @@ def build_bundle_invocation_message(
     cmd_key: str,
     user_instruction: str = "",
     task_id: str | None = None,
+    *,
+    force_eager: bool = False,
 ) -> Optional[Tuple[str, List[str], List[str]]]:
     """Build the user message content for a bundle slash command invocation.
 
@@ -272,11 +275,17 @@ def build_bundle_invocation_message(
 
     # Late import to avoid pulling tools/* at module import time and to
     # keep skill_bundles cheap to import in test environments.
-    from agent.skill_commands import _load_skill_payload, _build_skill_message
+    from agent.skill_commands import (
+        _MAX_EAGER_SKILL_CHARS,
+        _build_deferred_message,
+        _build_skill_message,
+        _load_skill_payload,
+        _skill_payload_size,
+    )
 
     loaded_names: List[str] = []
+    loaded_payloads: List[Tuple[dict[str, Any], Path | None, str, str]] = []
     missing: List[str] = []
-    skill_blocks: List[str] = []
     seen: set[str] = set()
 
     bundle_name = info["name"]
@@ -301,20 +310,10 @@ def build_bundle_invocation_message(
         except Exception:
             pass
 
-        activation_note = (
-            f'[Loaded as part of the "{bundle_name}" skill bundle.]'
-        )
-        skill_blocks.append(
-            _build_skill_message(
-                loaded_skill,
-                skill_dir,
-                activation_note,
-                session_id=task_id,
-            )
-        )
+        loaded_payloads.append((loaded_skill, skill_dir, skill_name, identifier))
         loaded_names.append(skill_name)
 
-    if not skill_blocks:
+    if not loaded_payloads:
         return None
 
     # Header — tells the agent this is a bundle, lists the skills, and
@@ -337,6 +336,24 @@ def build_bundle_invocation_message(
         )
 
     header = "\n".join(header_lines)
+    aggregate_size = sum(_skill_payload_size(item[0]) for item in loaded_payloads)
+    if not force_eager and aggregate_size > _MAX_EAGER_SKILL_CHARS:
+        message = _build_deferred_message(
+            header,
+            [item[3] for item in loaded_payloads],
+            bundle_name=bundle_name,
+        )
+        return message, loaded_names, missing
+
+    skill_blocks = [
+        _build_skill_message(
+            loaded_skill,
+            skill_dir,
+            f'[Loaded as part of the "{bundle_name}" skill bundle.]',
+            session_id=task_id,
+        )
+        for loaded_skill, skill_dir, _skill_name, _identifier in loaded_payloads
+    ]
     return ("\n\n".join([header, *skill_blocks]), loaded_names, missing)
 
 

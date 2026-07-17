@@ -3941,6 +3941,49 @@ class TestRunConversation:
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
 
+    def test_deferred_skill_context_is_ephemeral_across_tool_iterations(self, agent):
+        from agent.skill_commands import _build_deferred_message
+
+        self._setup_agent(agent)
+        compact = _build_deferred_message(
+            '[IMPORTANT: The user has invoked the "large" skill, indicating they '
+            "want you to follow its instructions. The full skill content is loaded below.]",
+            ["large"],
+            user_instruction="do it",
+        )
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc]),
+            _mock_response(content="Done", finish_reason="stop"),
+        ]
+
+        with (
+            patch(
+                "agent.skill_commands.build_deferred_skill_context",
+                return_value="FULL-DEFERRED-SKILL",
+            ),
+            patch("run_agent.handle_function_call", return_value="result"),
+            patch.object(agent, "_persist_session") as persist,
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(compact)
+
+        assert result["final_response"] == "Done"
+        assert agent.client.chat.completions.create.call_count == 2
+        for call in agent.client.chat.completions.create.call_args_list:
+            sent = call.kwargs["messages"]
+            current = next(m["content"] for m in sent if m.get("role") == "user")
+            assert "FULL-DEFERRED-SKILL" in current
+            assert "HERMES_DEFERRED_SKILLS_V1" not in current
+            assert "attached ephemerally" not in current
+        persisted_messages = persist.call_args_list[0].args[0]
+        persisted_user = next(
+            m["content"] for m in persisted_messages if m.get("role") == "user"
+        )
+        assert "FULL-DEFERRED-SKILL" not in persisted_user
+        assert "HERMES_DEFERRED_SKILLS_V1" in persisted_user
+
     def test_ollama_small_runtime_context_fails_before_api_call(self, agent, caplog):
         self._setup_agent(agent)
         agent.model = "qwen3.5:9b"

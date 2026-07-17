@@ -8,10 +8,15 @@ import pytest
 
 import tools.skills_tool as skills_tool_module
 from agent.skill_commands import (
+    _DEFERRED_SKILL_PREFIX,
+    _MAX_EAGER_SKILL_CHARS,
+    build_deferred_skill_context,
     build_preloaded_skills_prompt,
     build_skill_invocation_message,
+    extract_user_instruction_from_skill_message,
     resolve_skill_command_key,
     scan_skill_commands,
+    strip_deferred_skill_descriptor,
 )
 
 
@@ -485,6 +490,48 @@ Generate some audio.
         assert msg is not None
         assert "test-skill" in msg
         assert "do stuff" in msg
+
+    def test_large_skill_is_deferred_and_fully_resolved(self, tmp_path):
+        body = "COMPLETE-LARGE-SKILL\n" + ("x" * (_MAX_EAGER_SKILL_CHARS + 100))
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "large-skill", body=body)
+            scan_skill_commands()
+            msg = build_skill_invocation_message(
+                "/large-skill", "do the work", runtime_note="worker"
+            )
+            context = build_deferred_skill_context(msg, task_id="task-1")
+
+        assert msg is not None
+        assert _DEFERRED_SKILL_PREFIX in msg
+        assert "COMPLETE-LARGE-SKILL" not in msg
+        assert len(msg) < 2_000
+        assert "COMPLETE-LARGE-SKILL" in context
+        assert len(context) > _MAX_EAGER_SKILL_CHARS
+        assert _DEFERRED_SKILL_PREFIX not in strip_deferred_skill_descriptor(msg)
+        assert strip_deferred_skill_descriptor(msg, active=False) == "do the work"
+        assert extract_user_instruction_from_skill_message(msg) == "do the work"
+
+    def test_small_skill_remains_eager(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "small-skill", body="SMALL-BODY")
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/small-skill")
+
+        assert msg is not None
+        assert "SMALL-BODY" in msg
+        assert _DEFERRED_SKILL_PREFIX not in msg
+        assert build_deferred_skill_context(msg) == ""
+
+    def test_preloaded_large_skill_remains_eager(self, tmp_path):
+        body = "PRELOADED-BODY\n" + ("x" * (_MAX_EAGER_SKILL_CHARS + 100))
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "large-preload", body=body)
+            prompt, loaded, missing = build_preloaded_skills_prompt(["large-preload"])
+
+        assert loaded == ["large-preload"]
+        assert missing == []
+        assert "PRELOADED-BODY" in prompt
+        assert _DEFERRED_SKILL_PREFIX not in prompt
 
     def test_returns_none_for_unknown(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):

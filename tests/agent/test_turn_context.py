@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.context_compressor import ContextCompressor
+from agent.skill_commands import _build_deferred_message
 from agent.turn_context import TurnContext, build_turn_context
 from hermes_state import SessionDB
 
@@ -173,6 +174,27 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.messages[-1] == {"role": "user", "content": "hello"}
     assert ctx.current_turn_user_idx == len(ctx.messages) - 1
     assert ctx.active_system_prompt == "SYSTEM"
+
+
+def test_resolves_deferred_skill_after_persisting_compact_turn():
+    agent = _FakeAgent()
+    compact = _build_deferred_message(
+        '[IMPORTANT: The user has invoked the "large" skill, indicating they want '
+        "you to follow its instructions. The full skill content is loaded below.]",
+        ["large"],
+        user_instruction="do it",
+    )
+
+    with patch(
+        "agent.skill_commands.build_deferred_skill_context",
+        return_value="FULL-SKILL-CONTEXT",
+    ) as resolve:
+        ctx = _build(agent, user_message=compact, task_id="turn-task")
+
+    assert ctx.messages[-1]["content"] == compact
+    assert ctx.deferred_skill_context == "FULL-SKILL-CONTEXT"
+    resolve.assert_called_once_with(compact, task_id="turn-task")
+    assert agent._persist_calls == 1
 
 
 def test_applies_agent_side_effects():
