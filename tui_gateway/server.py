@@ -9040,11 +9040,32 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     from hermes_cli.config import load_config as _tui_load_config
 
                     _cfg = _tui_load_config()
-                    _mode = decide_image_input_mode(
-                        getattr(agent, "provider", "") or "",
-                        getattr(agent, "model", "") or "",
-                        _cfg,
-                    )
+                    _provider = getattr(agent, "provider", "") or ""
+                    _model = getattr(agent, "model", "") or ""
+                    _deployment_supports_vision = None
+                    try:
+                        from hermes_cli.deployment_inference import (
+                            deployment_descriptor_from_environment,
+                        )
+
+                        _descriptor = deployment_descriptor_from_environment()
+                        if (
+                            _descriptor is not None
+                            and _descriptor.provider == _provider.strip().lower()
+                            and _descriptor.model == _model.strip()
+                        ):
+                            _deployment_supports_vision = _descriptor.supports_vision
+                    except Exception:
+                        pass
+                    if _deployment_supports_vision is None:
+                        _mode = decide_image_input_mode(_provider, _model, _cfg)
+                    else:
+                        _mode = decide_image_input_mode(
+                            _provider,
+                            _model,
+                            _cfg,
+                            deployment_supports_vision=_deployment_supports_vision,
+                        )
                     if getattr(agent, "api_mode", "") == "codex_app_server":
                         _mode = "text"
                 except Exception as _img_exc:

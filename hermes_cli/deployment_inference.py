@@ -16,6 +16,25 @@ from urllib.parse import urlparse
 
 
 _SUPPORTED_API_MODES = frozenset({"chat_completions", "anthropic_messages"})
+_SUPPORTS_VISION_ENV = "HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION"
+
+
+def _parse_optional_bool(raw: object, *, field: str) -> bool | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, int) and raw in {0, 1}:
+        return bool(raw)
+    if isinstance(raw, str):
+        value = raw.strip().lower()
+        if not value:
+            return None
+        if value in {"true", "yes", "on", "1"}:
+            return True
+        if value in {"false", "no", "off", "0"}:
+            return False
+    raise DeploymentInferencePolicyInvalid(f"{field} must be true or false")
 
 
 class DeploymentInferencePolicyInvalid(RuntimeError):
@@ -35,6 +54,7 @@ class DeploymentInferenceDescriptor:
     api_mode: str
     policy_id: str
     allowed_models: tuple[str, ...]
+    supports_vision: bool | None = None
 
     def allows_model(self, model: str) -> bool:
         return str(model or "").strip() in self.allowed_models
@@ -76,6 +96,7 @@ class DeploymentInferencePolicy:
     runtime_resolver: Callable[[], Mapping[str, Any]]
     policy_id: str = "deployment-default-v1"
     allowed_models: tuple[str, ...] = ()
+    supports_vision: bool | None = None
 
     def __post_init__(self) -> None:
         provider = str(self.provider or "").strip().lower()
@@ -96,6 +117,14 @@ class DeploymentInferencePolicy:
         object.__setattr__(self, "model", model)
         object.__setattr__(self, "policy_id", policy_id)
         object.__setattr__(self, "allowed_models", allowed)
+        object.__setattr__(
+            self,
+            "supports_vision",
+            _parse_optional_bool(
+                self.supports_vision,
+                field="deployment inference supports_vision",
+            ),
+        )
 
     def descriptor(self) -> DeploymentInferenceDescriptor:
         return DeploymentInferenceDescriptor(
@@ -104,6 +133,7 @@ class DeploymentInferencePolicy:
             api_mode=self.api_mode,
             policy_id=self.policy_id,
             allowed_models=self.allowed_models,
+            supports_vision=self.supports_vision,
         )
 
     def resolve_runtime(self) -> dict[str, Any]:
@@ -146,7 +176,8 @@ def deployment_descriptor_from_environment(
     api_mode = str(env.get("HERMES_DEPLOYMENT_INFERENCE_API_MODE", "")).strip()
     policy_id = str(env.get("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", "")).strip()
     raw_allowed = str(env.get("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", ""))
-    if not any((provider, model, api_mode, policy_id, raw_allowed.strip())):
+    raw_supports_vision = env.get(_SUPPORTS_VISION_ENV)
+    if not any((provider, model, api_mode, policy_id, raw_allowed.strip(), raw_supports_vision)):
         return None
     if not all((provider, model, api_mode, policy_id)):
         raise DeploymentInferencePolicyInvalid("deployment inference descriptor is incomplete")
@@ -161,6 +192,10 @@ def deployment_descriptor_from_environment(
         api_mode=api_mode,
         policy_id=policy_id,
         allowed_models=allowed,
+        supports_vision=_parse_optional_bool(
+            raw_supports_vision,
+            field=_SUPPORTS_VISION_ENV,
+        ),
     )
 
 
@@ -185,6 +220,26 @@ def policy_from_control_plane_environment() -> DeploymentInferencePolicy:
     if not provider or not model or not api_mode:
         raise DeploymentInferencePolicyInvalid("deployment inference environment is incomplete")
 
+    raw_supports_vision = os.environ.get(_SUPPORTS_VISION_ENV)
+    if raw_supports_vision is not None:
+        supports_vision = _parse_optional_bool(
+            raw_supports_vision,
+            field=_SUPPORTS_VISION_ENV,
+        )
+    else:
+        supports_vision = None
+        try:
+            from agent.image_routing import _supports_vision_override
+            from hermes_cli.config import load_config_readonly
+
+            supports_vision = _supports_vision_override(
+                load_config_readonly(),
+                provider,
+                model,
+            )
+        except Exception:
+            pass
+
     def _resolve_runtime() -> Mapping[str, Any]:
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -197,6 +252,7 @@ def policy_from_control_plane_environment() -> DeploymentInferencePolicy:
         runtime_resolver=_resolve_runtime,
         policy_id=policy_id,
         allowed_models=allowed_models,
+        supports_vision=supports_vision,
     )
 
 

@@ -22,13 +22,18 @@ from hermes_cli.owner_worker.inference_relay import (
 )
 
 
-def _policy(*, api_mode: str = "chat_completions") -> DeploymentInferencePolicy:
+def _policy(
+    *,
+    api_mode: str = "chat_completions",
+    supports_vision: bool | None = None,
+) -> DeploymentInferencePolicy:
     return DeploymentInferencePolicy(
         provider="custom:deployment",
         model="gpt-safe",
         api_mode=api_mode,
         policy_id="test-deployment-v1",
         allowed_models=("gpt-safe", "gpt-safe-mini"),
+        supports_vision=supports_vision,
         runtime_resolver=lambda: {
             "provider": "custom:deployment",
             "api_mode": api_mode,
@@ -39,12 +44,13 @@ def _policy(*, api_mode: str = "chat_completions") -> DeploymentInferencePolicy:
 
 
 def test_policy_descriptor_and_worker_environment_are_secret_free(monkeypatch):
-    descriptor = _policy().descriptor()
+    descriptor = _policy(supports_vision=True).descriptor()
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_PROVIDER", descriptor.provider)
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", descriptor.model)
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_API_MODE", descriptor.api_mode)
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", descriptor.policy_id)
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", ",".join(descriptor.allowed_models))
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION", "true")
 
     parsed = deployment_descriptor_from_environment()
 
@@ -71,10 +77,50 @@ def test_control_plane_environment_factory_does_not_resolve_until_broker_use(mon
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", "gpt-safe")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_API_MODE", "chat_completions")
     monkeypatch.delenv("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", raising=False)
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION", "false")
 
     policy = policy_from_control_plane_environment()
 
     assert policy.descriptor().allowed_models == ("gpt-safe",)
+    assert policy.descriptor().supports_vision is False
+
+
+def test_control_plane_factory_uses_global_model_vision_capability(monkeypatch):
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_PROVIDER", "custom:deployment")
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", "gpt-safe")
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_API_MODE", "chat_completions")
+    monkeypatch.delenv("HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"model": {"supports_vision": True}},
+    )
+
+    assert policy_from_control_plane_environment().descriptor().supports_vision is True
+
+
+def test_descriptor_leaves_absent_vision_capability_unknown(monkeypatch):
+    descriptor = _policy().descriptor()
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_PROVIDER", descriptor.provider)
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", descriptor.model)
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_API_MODE", descriptor.api_mode)
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", descriptor.policy_id)
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", ",".join(descriptor.allowed_models))
+    monkeypatch.delenv("HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION", raising=False)
+
+    assert deployment_descriptor_from_environment().supports_vision is None
+
+
+def test_descriptor_rejects_invalid_vision_capability(monkeypatch):
+    descriptor = _policy().descriptor()
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_PROVIDER", descriptor.provider)
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", descriptor.model)
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_API_MODE", descriptor.api_mode)
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", descriptor.policy_id)
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", ",".join(descriptor.allowed_models))
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION", "maybe")
+
+    with pytest.raises(DeploymentInferencePolicyInvalid, match="true or false"):
+        deployment_descriptor_from_environment()
 
 
 def test_broker_rejects_requests_for_starting_or_revoked_worker(tmp_path):

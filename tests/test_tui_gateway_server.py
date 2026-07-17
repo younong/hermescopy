@@ -4167,7 +4167,11 @@ def test_prompt_submit_sets_approval_session_key(monkeypatch):
     assert captured["session_key"] == "session-key"
 
 
-def test_prompt_submit_routes_images_using_live_session_agent(monkeypatch, tmp_path):
+def test_prompt_submit_ignores_mismatched_deployment_vision_capability(
+    monkeypatch, tmp_path
+):
+    from hermes_cli.deployment_inference import DeploymentInferenceDescriptor
+
     captured = {}
     image_path = tmp_path / "attached.png"
     image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
@@ -4195,10 +4199,18 @@ def test_prompt_submit_routes_images_using_live_session_agent(monkeypatch, tmp_p
 
     routing_calls = []
 
-    def _decide(provider, model, _cfg):
-        routing_calls.append((provider, model))
+    def _decide(provider, model, _cfg, **kwargs):
+        routing_calls.append((provider, model, kwargs))
         return "native"
 
+    descriptor = DeploymentInferenceDescriptor(
+        provider="other-provider",
+        model="other-model",
+        api_mode="chat_completions",
+        policy_id="policy-v1",
+        allowed_models=("other-model",),
+        supports_vision=True,
+    )
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
     monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
@@ -4206,6 +4218,10 @@ def test_prompt_submit_routes_images_using_live_session_agent(monkeypatch, tmp_p
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr("agent.image_routing.decide_image_input_mode", _decide)
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    monkeypatch.setattr(
+        "hermes_cli.deployment_inference.deployment_descriptor_from_environment",
+        lambda: descriptor,
+    )
     server._sessions["sid"] = _session(
         agent=_Agent(), attached_images=[str(image_path)]
     )
@@ -4222,9 +4238,83 @@ def test_prompt_submit_routes_images_using_live_session_agent(monkeypatch, tmp_p
     finally:
         server._sessions.pop("sid", None)
 
-    assert routing_calls == [("live-provider", "live-vision-model")]
+    assert routing_calls == [("live-provider", "live-vision-model", {})]
     assert isinstance(captured["prompt"], list)
     assert any(part.get("type") == "image_url" for part in captured["prompt"])
+
+
+def test_prompt_submit_uses_matching_deployment_vision_capability(monkeypatch, tmp_path):
+    from hermes_cli.deployment_inference import DeploymentInferenceDescriptor
+
+    captured = {}
+    image_path = tmp_path / "attached.jpg"
+    image_path.write_bytes(b"\xff\xd8\xff\xe0image")
+
+    class _Agent:
+        provider = "custom:codex"
+        model = "gpt-5.6-sol"
+        api_mode = "chat_completions"
+
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            captured["prompt"] = prompt
+            return {
+                "final_response": "ok",
+                "messages": [{"role": "assistant", "content": "ok"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    descriptor = DeploymentInferenceDescriptor(
+        provider="custom:codex",
+        model="gpt-5.6-sol",
+        api_mode="chat_completions",
+        policy_id="policy-v1",
+        allowed_models=("gpt-5.6-sol",),
+        supports_vision=True,
+    )
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    monkeypatch.setattr(
+        "hermes_cli.deployment_inference.deployment_descriptor_from_environment",
+        lambda: descriptor,
+    )
+    monkeypatch.setattr(
+        server,
+        "_enrich_with_attached_images",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("aux vision must not run")),
+    )
+    server._sessions["sid"] = _session(
+        agent=_Agent(), attached_images=[str(image_path)]
+    )
+
+    try:
+        server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "describe it"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert isinstance(captured["prompt"], list)
+    image_part = next(
+        part for part in captured["prompt"] if part.get("type") == "image_url"
+    )
+    assert image_part["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    assert "/opt/hermes/shared" not in str(captured["prompt"])
 
 
 def test_file_attach_reference_reaches_model_input(monkeypatch, tmp_path):

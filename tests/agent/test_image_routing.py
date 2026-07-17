@@ -304,6 +304,52 @@ class TestAutoModeRespectsOverride:
         with patch("agent.models_dev.get_model_capabilities", return_value=None):
             assert decide_image_input_mode("custom", "qwen3.6-35b", cfg) == "text"
 
+    def test_deployment_capability_fills_blank_owner_config(self):
+        with patch("agent.models_dev.get_model_capabilities", return_value=None):
+            assert decide_image_input_mode(
+                "custom:deployment",
+                "gpt-safe",
+                {},
+                deployment_supports_vision=True,
+            ) == "native"
+
+    def test_explicit_image_mode_overrides_deployment_capability(self):
+        cfg = {"agent": {"image_input_mode": "text"}}
+        assert decide_image_input_mode(
+            "custom:deployment",
+            "gpt-safe",
+            cfg,
+            deployment_supports_vision=True,
+        ) == "text"
+
+    def test_owner_capability_overrides_deployment_capability(self):
+        cfg = {"model": {"supports_vision": False}}
+        assert decide_image_input_mode(
+            "custom:deployment",
+            "gpt-safe",
+            cfg,
+            deployment_supports_vision=True,
+        ) == "text"
+
+    def test_auxiliary_override_beats_deployment_capability(self):
+        cfg = {"auxiliary": {"vision": {"provider": "openrouter"}}}
+        assert decide_image_input_mode(
+            "custom:deployment",
+            "gpt-safe",
+            cfg,
+            deployment_supports_vision=True,
+        ) == "text"
+
+    def test_deployment_false_beats_catalog_capability(self):
+        fake_caps = type("Caps", (), {"supports_vision": True})()
+        with patch("agent.models_dev.get_model_capabilities", return_value=fake_caps):
+            assert decide_image_input_mode(
+                "openai",
+                "gpt-safe",
+                {},
+                deployment_supports_vision=False,
+            ) == "text"
+
 
 # ─── build_native_content_parts ──────────────────────────────────────────────
 
