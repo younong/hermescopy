@@ -26,6 +26,13 @@ describe("gui chat attachment helpers", () => {
     expect(attachmentKindFromFile(file("notes.txt", "text/plain"))).toBe("file");
   });
 
+  it("falls back to supported image extensions for missing or generic MIME types", () => {
+    expect(attachmentKindFromFile(file("cat.png", ""))).toBe("image");
+    expect(attachmentKindFromFile(file("photo.JPEG", "application/octet-stream"))).toBe("image");
+    expect(attachmentKindFromFile(file("vector.svg", "application/octet-stream"))).toBe("file");
+    expect(attachmentKindFromFile(file("cat.png", "text/plain"))).toBe("file");
+  });
+
   it("validates supported file sizes", () => {
     expect(validateComposerAttachment(file("cat.png", "image/png", IMAGE_ATTACHMENT_MAX_BYTES)).ok).toBe(
       true,

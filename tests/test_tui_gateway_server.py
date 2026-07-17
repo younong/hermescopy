@@ -4167,6 +4167,140 @@ def test_prompt_submit_sets_approval_session_key(monkeypatch):
     assert captured["session_key"] == "session-key"
 
 
+def test_prompt_submit_routes_images_using_live_session_agent(monkeypatch, tmp_path):
+    captured = {}
+    image_path = tmp_path / "attached.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    class _Agent:
+        provider = "live-provider"
+        model = "live-vision-model"
+        api_mode = ""
+
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            captured["prompt"] = prompt
+            return {
+                "final_response": "ok",
+                "messages": [{"role": "assistant", "content": "ok"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    routing_calls = []
+
+    def _decide(provider, model, _cfg):
+        routing_calls.append((provider, model))
+        return "native"
+
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr("agent.image_routing.decide_image_input_mode", _decide)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    server._sessions["sid"] = _session(
+        agent=_Agent(), attached_images=[str(image_path)]
+    )
+
+    try:
+        server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "describe it"},
+            }
+        )
+        assert server._sessions["sid"]["attached_images"] == []
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert routing_calls == [("live-provider", "live-vision-model")]
+    assert isinstance(captured["prompt"], list)
+    assert any(part.get("type") == "image_url" for part in captured["prompt"])
+
+
+def test_file_attach_reference_reaches_model_input(monkeypatch, tmp_path):
+    captured = {}
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    class _Agent:
+        model = "test/model"
+        provider = "test"
+        base_url = ""
+        api_key = ""
+
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            captured["prompt"] = prompt
+            return {
+                "final_response": "ok",
+                "messages": [{"role": "assistant", "content": "ok"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    fake_cli = types.ModuleType("cli")
+    fake_cli._detect_file_drop = lambda raw: None
+    fake_cli._split_path_input = lambda raw: (raw, "")
+    fake_cli._resolve_attachment_path = lambda raw: None
+
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *args, **kwargs: 100000,
+    )
+    server._sessions["sid"] = _session(agent=_Agent(), cwd=str(workspace))
+
+    try:
+        attached = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "path": "nonce.txt",
+                    "name": "nonce.txt",
+                    "data_url": "data:text/plain;base64,YXR0YWNobWVudC1ub25jZS03MzE=",
+                },
+            }
+        )
+        server.handle_request(
+            {
+                "id": "2",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "sid",
+                    "text": f"Read this attachment: {attached['result']['ref_text']}",
+                },
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert "attachment-nonce-731" in captured["prompt"]
+    assert "--- Attached Context ---" in captured["prompt"]
+
+
 def test_prompt_submit_expands_context_refs(monkeypatch):
     captured = {}
 

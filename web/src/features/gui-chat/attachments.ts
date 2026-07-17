@@ -4,6 +4,8 @@ export const IMAGE_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
 export const PDF_ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024;
 export const FILE_ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024;
 
+const IMAGE_ATTACHMENT_EXTENSIONS = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"];
+
 export function base64FromDataUrl(dataUrl: string): string {
   const comma = dataUrl.indexOf(",");
   return comma >= 0 ? dataUrl.slice(comma + 1) : "";
@@ -30,6 +32,12 @@ export function attachmentKindFromFile(file: File): GuiComposerAttachmentKind | 
 
   if (mimeType.startsWith("image/")) return "image";
   if (mimeType === "application/pdf" || name.endsWith(".pdf")) return "pdf";
+  if (
+    (!mimeType || mimeType === "application/octet-stream") &&
+    IMAGE_ATTACHMENT_EXTENSIONS.some((extension) => name.endsWith(extension))
+  ) {
+    return "image";
+  }
   return "file";
 }
 
