@@ -594,6 +594,7 @@ def run_conversation(
     turn_id = _ctx.turn_id
     current_turn_user_idx = _ctx.current_turn_user_idx
     _should_review_memory = _ctx.should_review_memory
+    _deferred_skill_context = _ctx.deferred_skill_context
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
@@ -779,9 +780,16 @@ def run_conversation(
                 agent.session_id or "-",
             )
 
+        from agent.skill_commands import strip_deferred_skill_descriptor
+
         api_messages = []
         for idx, msg in enumerate(messages):
             api_msg = msg.copy()
+            if msg.get("role") == "user":
+                api_msg["content"] = strip_deferred_skill_descriptor(
+                    api_msg.get("content"),
+                    active=(idx == current_turn_user_idx),
+                )
 
             # Inject ephemeral context into the current turn's user message.
             # Sources: memory manager prefetch + plugin pre_llm_call hooks
@@ -790,6 +798,8 @@ def run_conversation(
             # never mutated, so nothing leaks into session persistence.
             if idx == current_turn_user_idx and msg.get("role") == "user":
                 _injections = []
+                if _deferred_skill_context:
+                    _injections.append(_deferred_skill_context)
                 if _ext_prefetch_cache:
                     _fenced = build_memory_context_block(_ext_prefetch_cache)
                     if _fenced:

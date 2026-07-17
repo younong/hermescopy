@@ -5,6 +5,12 @@ from pathlib import Path
 
 import pytest
 
+from agent.skill_commands import (
+    _DEFERRED_SKILL_PREFIX,
+    _MAX_EAGER_SKILL_CHARS,
+    build_deferred_skill_context,
+    extract_user_instruction_from_skill_message,
+)
 from agent.skill_bundles import (
     _slugify,
     build_bundle_invocation_message,
@@ -248,6 +254,46 @@ class TestBuildBundleInvocationMessage:
         assert result is not None
         msg, _, _ = result
         assert "Always check tests first." in msg
+
+    def test_large_aggregate_is_deferred_and_resolves_every_skill(self, bundles_env):
+        bundles_dir, skills_dir = bundles_env
+        half = (_MAX_EAGER_SKILL_CHARS // 2) + 100
+        _make_skill(skills_dir, "skill-a", body="A-COMPLETE\n" + ("a" * half))
+        _make_skill(skills_dir, "skill-b", body="B-COMPLETE\n" + ("b" * half))
+        _make_bundle_yaml(bundles_dir, "combo", ["skill-a", "skill-b"])
+        scan_bundles()
+
+        result = build_bundle_invocation_message(
+            "/combo", user_instruction="fix it"
+        )
+        assert result is not None
+        msg, loaded, missing = result
+        context = build_deferred_skill_context(msg, task_id="task-1")
+
+        assert loaded == ["skill-a", "skill-b"]
+        assert missing == []
+        assert _DEFERRED_SKILL_PREFIX in msg
+        assert "A-COMPLETE" not in msg
+        assert "B-COMPLETE" not in msg
+        assert "A-COMPLETE" in context
+        assert "B-COMPLETE" in context
+        assert extract_user_instruction_from_skill_message(msg) == "fix it"
+
+    def test_force_eager_keeps_large_bundle_self_contained(self, bundles_env):
+        bundles_dir, skills_dir = bundles_env
+        _make_skill(
+            skills_dir,
+            "large-skill",
+            body="EAGER-COMPLETE\n" + ("x" * (_MAX_EAGER_SKILL_CHARS + 100)),
+        )
+        _make_bundle_yaml(bundles_dir, "combo", ["large-skill"])
+        scan_bundles()
+
+        result = build_bundle_invocation_message("/combo", force_eager=True)
+        assert result is not None
+        msg, _, _ = result
+        assert "EAGER-COMPLETE" in msg
+        assert _DEFERRED_SKILL_PREFIX not in msg
 
     def test_dedupes_skills(self, bundles_env):
         bundles_dir, skills_dir = bundles_env

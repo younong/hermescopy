@@ -4,6 +4,7 @@ Shared between CLI (cli.py) and gateway (gateway/run.py) so both surfaces
 can invoke skills via /skill-name commands.
 """
 
+import base64
 import json
 import logging
 import os
@@ -29,10 +30,11 @@ _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
 # ---------------------------------------------------------------------------
 # Skill-scaffolding markers and the canonical extractor.
 #
-# When a user invokes a /skill (or /bundle), Hermes expands the turn into a
-# model-facing message that embeds the full skill body plus scaffolding. That
-# expanded text is what flows into the agent loop — and into memory providers
-# via MemoryManager. Providers that store or embed the raw user turn (mem0,
+# When a user invokes a /skill (or /bundle), Hermes builds a model-facing turn
+# with scaffolding. Small skills embed the body directly; oversized skills keep
+# only a compact descriptor in durable history and attach the body ephemerally.
+# Either form flows through MemoryManager. Providers that store or embed the
+# raw user turn (mem0,
 # openviking, hindsight, retaindb, byterover, honcho, supermemory) would
 # otherwise capture the entire skill body instead of what the user actually
 # asked. ``extract_user_instruction_from_skill_message`` recovers just the
@@ -53,6 +55,167 @@ _RUNTIME_NOTE = "\n\n[Runtime note:"
 _BUNDLE_MARKER = " skill bundle,"
 _BUNDLE_USER_INSTRUCTION = "\nUser instruction: "
 _BUNDLE_FIRST_SKILL_BLOCK = "\n\n[Loaded as part of the "
+_DEFERRED_SKILL_PREFIX = "[HERMES_DEFERRED_SKILLS_V1:"
+_DEFERRED_SKILL_SUFFIX = "]"
+_DEFERRED_SKILL_NOTE = (
+    "[The complete skill instructions will be attached ephemerally for this turn.]"
+)
+# Keep ordinary skills on the established eager path. Large one-turn skills are
+# kept out of durable history and attached ephemerally after preflight.
+_MAX_EAGER_SKILL_CHARS = 48_000
+_INLINE_SHELL_EXPANSION_ALLOWANCE = 4_000
+
+
+def _skill_payload_size(loaded_skill: dict[str, Any]) -> int:
+    """Conservative size estimate before optional preprocessing executes."""
+    content = str(loaded_skill.get("content") or "")
+    allowance = (
+        content.count("!`") * _INLINE_SHELL_EXPANSION_ALLOWANCE
+        if _load_skills_config().get("inline_shell", False)
+        else 0
+    )
+    return len(content) + allowance
+
+
+def _encode_deferred_descriptor(payload: dict[str, Any]) -> str:
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+    return f"{_DEFERRED_SKILL_PREFIX}{encoded}{_DEFERRED_SKILL_SUFFIX}"
+
+
+def _decode_deferred_descriptor(content: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(content, str):
+        return None
+    start = content.find(_DEFERRED_SKILL_PREFIX)
+    if start < 0:
+        return None
+    encoded_start = start + len(_DEFERRED_SKILL_PREFIX)
+    end = content.find(_DEFERRED_SKILL_SUFFIX, encoded_start)
+    if end < 0:
+        return None
+    try:
+        payload = json.loads(
+            base64.urlsafe_b64decode(content[encoded_start:end].encode("ascii")).decode("utf-8")
+        )
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        return None
+    skills = payload.get("skills")
+    if (
+        not isinstance(skills, list)
+        or not skills
+        or len(skills) > 64
+        or not all(isinstance(s, str) and 0 < len(s) <= 4096 for s in skills)
+    ):
+        return None
+    bundle_name = payload.get("bundle_name", "")
+    if not isinstance(bundle_name, str) or len(bundle_name) > 256:
+        return None
+    return payload
+
+
+def strip_deferred_skill_descriptor(
+    content: Any,
+    *,
+    active: bool = True,
+) -> Any:
+    """Remove internal deferred scaffolding from a provider-facing copy.
+
+    Active turns keep their invocation header because the full body is attached
+    beside it. Historical turns lose that header as well, so a compact replay
+    cannot falsely claim that absent skill instructions are loaded.
+    """
+    if not isinstance(content, str):
+        return content
+    start = content.find(_DEFERRED_SKILL_PREFIX)
+    if start < 0:
+        return content
+    end = content.find(_DEFERRED_SKILL_SUFFIX, start + len(_DEFERRED_SKILL_PREFIX))
+    if end < 0:
+        return content
+    stripped = content[:start] + content[end + 1:]
+    stripped = stripped.replace(f"\n{_DEFERRED_SKILL_NOTE}", "").strip()
+    if active:
+        return stripped
+
+    instruction = extract_user_instruction_from_skill_message(content)
+    return instruction or "[A skill was invoked for this earlier turn.]"
+
+
+def build_deferred_skill_context(
+    content: Any,
+    task_id: str | None = None,
+) -> str:
+    """Resolve and fully render a compact deferred activation for this turn."""
+    payload = _decode_deferred_descriptor(content)
+    if not payload:
+        return ""
+
+    rendered: list[str] = []
+    failed: list[str] = []
+    bundle_name = str(payload.get("bundle_name") or "").strip()
+    for identifier in payload["skills"]:
+        loaded = _load_skill_payload(identifier, task_id=task_id)
+        if not loaded:
+            failed.append(identifier)
+            continue
+        loaded_skill, skill_dir, skill_name = loaded
+        activation_note = (
+            f'[Loaded as part of the "{bundle_name}" skill bundle.]'
+            if bundle_name
+            else (
+                f'[IMPORTANT: The user has invoked the "{skill_name}" skill, indicating '
+                "they want you to follow its instructions. The full skill content is "
+                "loaded below.]"
+            )
+        )
+        rendered.append(
+            _build_skill_message(
+                loaded_skill,
+                skill_dir,
+                activation_note,
+                session_id=task_id,
+            )
+        )
+
+    if failed:
+        rendered.insert(
+            0,
+            "[Deferred skill load failed for: " + ", ".join(failed) + "]",
+        )
+    return "\n\n".join(rendered)
+
+
+def _build_deferred_message(
+    header: str,
+    skill_identifiers: list[str],
+    *,
+    user_instruction: str = "",
+    runtime_note: str = "",
+    bundle_name: str = "",
+) -> str:
+    parts = [header]
+    if user_instruction:
+        marker = _BUNDLE_USER_INSTRUCTION.lstrip("\n") if bundle_name else _SINGLE_SKILL_INSTRUCTION
+        parts.extend(["", f"{marker}{user_instruction}"])
+    if runtime_note:
+        parts.extend(["", f"[Runtime note: {runtime_note}]"])
+    parts.extend(
+        [
+            "",
+            _DEFERRED_SKILL_NOTE,
+            _encode_deferred_descriptor(
+                {
+                    "version": 1,
+                    "skills": skill_identifiers,
+                    "bundle_name": bundle_name,
+                }
+            ),
+        ]
+    )
+    return "\n".join(parts)
 
 
 def extract_user_instruction_from_skill_message(content: Any) -> Optional[str]:
@@ -76,7 +239,7 @@ def extract_user_instruction_from_skill_message(content: Any) -> Optional[str]:
     if _BUNDLE_MARKER in content:
         return _extract_bundle_user_instruction(content)
 
-    if _SINGLE_SKILL_MARKER in content:
+    if _SINGLE_SKILL_MARKER in content or _DEFERRED_SKILL_PREFIX in content:
         return _extract_single_skill_user_instruction(content)
 
     return None
@@ -90,9 +253,17 @@ def _extract_single_skill_user_instruction(message: str) -> Optional[str]:
         return None
 
     instruction = message[marker_idx + len(_SINGLE_SKILL_INSTRUCTION):]
-    runtime_idx = instruction.find(_RUNTIME_NOTE)
-    if runtime_idx >= 0:
-        instruction = instruction[:runtime_idx]
+    cut_points = [
+        idx
+        for idx in (
+            instruction.find(_RUNTIME_NOTE),
+            instruction.find(_DEFERRED_SKILL_PREFIX),
+            instruction.find(f"\n\n{_DEFERRED_SKILL_NOTE}"),
+        )
+        if idx >= 0
+    ]
+    if cut_points:
+        instruction = instruction[:min(cut_points)]
     instruction = instruction.strip()
     return instruction or None
 
@@ -105,9 +276,17 @@ def _extract_bundle_user_instruction(message: str) -> Optional[str]:
         return None
 
     instruction = message[marker_idx + len(_BUNDLE_USER_INSTRUCTION):]
-    first_skill_idx = instruction.find(_BUNDLE_FIRST_SKILL_BLOCK)
-    if first_skill_idx >= 0:
-        instruction = instruction[:first_skill_idx]
+    cut_points = [
+        idx
+        for idx in (
+            instruction.find(_BUNDLE_FIRST_SKILL_BLOCK),
+            instruction.find(_DEFERRED_SKILL_PREFIX),
+            instruction.find(f"\n\n{_DEFERRED_SKILL_NOTE}"),
+        )
+        if idx >= 0
+    ]
+    if cut_points:
+        instruction = instruction[:min(cut_points)]
     instruction = instruction.strip()
     return instruction or None
 
@@ -551,6 +730,13 @@ def build_skill_invocation_message(
         f'[IMPORTANT: The user has invoked the "{skill_name}" skill, indicating they want '
         "you to follow its instructions. The full skill content is loaded below.]"
     )
+    if _skill_payload_size(loaded_skill) > _MAX_EAGER_SKILL_CHARS:
+        return _build_deferred_message(
+            activation_note,
+            [skill_info["skill_dir"]],
+            user_instruction=user_instruction,
+            runtime_note=runtime_note,
+        )
     return _build_skill_message(
         loaded_skill,
         skill_dir,

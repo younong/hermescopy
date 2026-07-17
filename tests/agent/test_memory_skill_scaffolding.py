@@ -12,7 +12,10 @@ MemoryManager._strip_skill_scaffolding.
 
 from agent.memory_manager import MemoryManager
 from agent.memory_provider import MemoryProvider
-from agent.skill_commands import extract_user_instruction_from_skill_message
+from agent.skill_commands import (
+    _build_deferred_message,
+    extract_user_instruction_from_skill_message,
+)
 
 
 _SINGLE_SKILL_TURN = (
@@ -32,6 +35,21 @@ _BUNDLE_TURN = (
     "User instruction: fix the failing retrieval test\n\n"
     '[Loaded as part of the "backend-dev" skill bundle.]\n\n'
     "Large bundled skill body that must not be searched or embedded."
+)
+
+_DEFERRED_SKILL_TURN = _build_deferred_message(
+    '[IMPORTANT: The user has invoked the "large-skill" skill, indicating they want '
+    "you to follow its instructions. The full skill content is loaded below.]",
+    ["large-skill"],
+    user_instruction="analyze this release",
+)
+
+_DEFERRED_BUNDLE_TURN = _build_deferred_message(
+    '[IMPORTANT: The user has invoked the "backend-dev" skill bundle, loading 2 '
+    "skills together. Treat every skill below as active guidance for this turn.]",
+    ["test-driven-development", "code-review"],
+    user_instruction="fix deferred bundle",
+    bundle_name="backend-dev",
 )
 
 _BARE_SKILL_TURN = (
@@ -107,6 +125,18 @@ class TestExtractUserInstruction:
             == "fix the failing retrieval test"
         )
 
+    def test_deferred_single_skill_with_instruction(self):
+        assert (
+            extract_user_instruction_from_skill_message(_DEFERRED_SKILL_TURN)
+            == "analyze this release"
+        )
+
+    def test_deferred_bundle_with_instruction(self):
+        assert (
+            extract_user_instruction_from_skill_message(_DEFERRED_BUNDLE_TURN)
+            == "fix deferred bundle"
+        )
+
     def test_bare_skill_returns_none(self):
         assert extract_user_instruction_from_skill_message(_BARE_SKILL_TURN) is None
 
@@ -123,6 +153,11 @@ class TestMemoryManagerStripsScaffolding:
         mgr, provider = _manager_with_recorder()
         mgr.prefetch_all(_SINGLE_SKILL_TURN)
         assert provider.prefetched == ["make a skill for release triage"]
+
+    def test_prefetch_all_strips_deferred_skill(self):
+        mgr, provider = _manager_with_recorder()
+        mgr.prefetch_all(_DEFERRED_SKILL_TURN)
+        assert provider.prefetched == ["analyze this release"]
 
     def test_prefetch_all_skips_bare_skill(self):
         mgr, provider = _manager_with_recorder()

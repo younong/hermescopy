@@ -110,6 +110,9 @@ class TurnContext:
     current_turn_user_idx: int
     # Whether the post-turn memory review should fire.
     should_review_memory: bool = False
+    # Full instructions for a large slash-invoked skill. Attached only to API
+    # copies of the current turn, never to persisted ``messages``.
+    deferred_skill_context: str = ""
     # Context contributed by ``pre_llm_call`` plugins (appended to user message).
     plugin_user_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
@@ -428,6 +431,31 @@ def build_turn_context(
                 if not _compressor.should_compress(_preflight_tokens):
                     break
 
+    # Resolve large slash-skill instructions only after persistence and preflight.
+    # The compact activation remains durable; the full body is current-turn-only.
+    deferred_skill_context = ""
+    try:
+        from agent.skill_commands import build_deferred_skill_context
+
+        deferred_skill_context = build_deferred_skill_context(
+            user_message,
+            task_id=effective_task_id,
+        )
+    except Exception:
+        logger.warning("Deferred skill activation failed", exc_info=True)
+
+    # Compression can replace/reindex messages. Re-find this turn's compact user
+    # message so ephemeral context is attached to the correct provider copy.
+    current_turn_user_idx = next(
+        (
+            idx
+            for idx in range(len(messages) - 1, -1, -1)
+            if messages[idx].get("role") == "user"
+            and messages[idx].get("content") == user_message
+        ),
+        len(messages) - 1,
+    )
+
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
     try:
@@ -501,6 +529,7 @@ def build_turn_context(
         turn_id=turn_id,
         current_turn_user_idx=current_turn_user_idx,
         should_review_memory=should_review_memory,
+        deferred_skill_context=deferred_skill_context,
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
     )
