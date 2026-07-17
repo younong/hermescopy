@@ -785,6 +785,51 @@ class TestMessageStorage:
         assert conv[0]["content"] == content
         assert isinstance(conv[0].get("timestamp"), float)
 
+    def test_attachment_metadata_round_trip(self, db):
+        db.create_session(session_id="s1", source="gui")
+        attachments = [
+            {
+                "kind": "image",
+                "name": "shot.png",
+                "mime_type": "image/png",
+                "size_bytes": 123,
+                "path": "/tmp/shot.png",
+                "source_paths": ["/tmp/shot.png"],
+            },
+            {
+                "kind": "pdf",
+                "name": "report.pdf",
+                "mime_type": "application/pdf",
+                "size_bytes": 456,
+                "pages_attached": 2,
+                "source_paths": ["/tmp/page-1.png", "/tmp/page-2.png"],
+            },
+        ]
+
+        db.append_message("s1", role="user", content="see attached", attachments=attachments)
+
+        assert db.get_messages("s1")[0]["attachments"] == attachments
+        assert db.get_messages_as_conversation("s1")[0]["attachments"] == attachments
+
+    def test_replace_messages_preserves_attachment_metadata(self, db):
+        db.create_session(session_id="s1", source="gui")
+        attachments = [
+            {
+                "kind": "file",
+                "name": "notes.txt",
+                "size_bytes": 12,
+                "path": "/tmp/notes.txt",
+                "ref_text": "@file:/tmp/notes.txt",
+            }
+        ]
+
+        db.replace_messages(
+            "s1",
+            [{"role": "user", "content": "notes", "attachments": attachments}],
+        )
+
+        assert db.get_messages_as_conversation("s1")[0]["attachments"] == attachments
+
     def test_dict_content_round_trip(self, db):
         """Dict-shaped content (e.g. provider wrappers) also round-trips."""
         db.create_session(session_id="s1", source="cli")

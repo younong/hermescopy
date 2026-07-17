@@ -5674,6 +5674,41 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
             captured[0][2], captured[1][2]
         ]
 
+    def test_authenticated_image_preview_proxies_to_owner_worker(self, monkeypatch):
+        import base64
+
+        import hermes_cli.owner_worker.client as owner_client
+
+        captured = {}
+
+        def fake_request(self, method, path, *, lease, headers=None, content=None):
+            import httpx
+
+            captured["method"] = method
+            captured["path"] = path
+            return httpx.Response(
+                200,
+                json={
+                    "dataUrl": "data:image/png;base64,"
+                    + base64.b64encode(b"pngbytes").decode("ascii")
+                },
+            )
+
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fake_request)
+
+        image_path = "/opt/hermes/shared/.hermes/users/owner/images/upload.png"
+        response = self.client.get(
+            "/api/fs/read-data-url",
+            params={"path": image_path},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["dataUrl"].startswith("data:image/png;base64,")
+        assert captured == {
+            "method": "GET",
+            "path": "/api/fs/read-data-url?path=%2Fopt%2Fhermes%2Fshared%2F.hermes%2Fusers%2Fowner%2Fimages%2Fupload.png",
+        }
+
     def test_authenticated_session_proxy_rejects_mismatched_owner_handle_before_request(self, monkeypatch):
         import hermes_cli.owner_worker.client as owner_client
 

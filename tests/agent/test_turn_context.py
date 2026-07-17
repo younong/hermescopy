@@ -153,6 +153,7 @@ def _build(agent, **overrides):
         task_id=None,
         stream_callback=None,
         persist_user_message=None,
+        persist_user_attachments=None,
         restore_or_build_system_prompt=lambda *a, **k: None,
         install_safe_stdio=lambda: None,
         sanitize_surrogates=lambda s: s,
@@ -226,6 +227,22 @@ def test_persist_user_message_becomes_original():
     assert ctx.original_user_message == "clean"
     # but the appended user turn carries the full (sanitized) message.
     assert ctx.messages[-1]["content"] == "api-prefixed"
+
+
+def test_persist_user_attachments_are_added_to_internal_user_message():
+    agent = _FakeAgent()
+    attachments = [
+        {
+            "kind": "image",
+            "name": "shot.png",
+            "size_bytes": 123,
+            "path": "/tmp/shot.png",
+        }
+    ]
+
+    ctx = _build(agent, persist_user_attachments=attachments)
+
+    assert ctx.messages[-1]["attachments"] == attachments
 
 
 def test_memory_nudge_fires_at_interval():

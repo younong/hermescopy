@@ -19,6 +19,9 @@ from starlette.requests import Request
 from starlette.responses import StreamingResponse
 
 
+_IMAGE_PREVIEW_MAX_BYTES = 16 * 1024 * 1024
+
+
 class BulkDeleteSessions(BaseModel):
     ids: list[str]
     profile: str | None = None
@@ -367,6 +370,30 @@ def create_app(
             raise HTTPException(status_code=400, detail="Path must be a relative workspace path")
         return value
 
+    def _owner_image_path(path: str | None) -> str:
+        value = str(path or "").strip()
+        if not value or "\x00" in value:
+            raise HTTPException(status_code=400, detail="Invalid image path")
+        try:
+            candidate = Path(value)
+            if not candidate.is_absolute():
+                raise ValueError
+            relative_path = candidate.relative_to(owner_home).as_posix()
+            components = relative_path.split("/")
+            if (
+                len(components) != 2
+                or components[0] != "images"
+                or any(part in {"", ".", ".."} for part in components)
+            ):
+                raise ValueError
+            app.state.owner_worker_controlled_roots._require_linux()
+        except (OSError, TypeError, ValueError, RuntimeError):
+            raise HTTPException(
+                status_code=400,
+                detail="Image path must be in the owner images directory",
+            )
+        return relative_path
+
     def _file_entry(relative_path: str):
         roots = app.state.owner_worker_controlled_roots
         fd = roots.open_relative(RootKind.WORKSPACE, relative_path, expected_type=ExpectedType.REGULAR_FILE)
@@ -554,6 +581,35 @@ def create_app(
         name = relative_path.rsplit("/", 1)[-1]
         mime_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
         return {"name": name, "path": relative_path, "size": len(data), "mime_type": mime_type, "data_url": f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}", "root": "", "locked_root": "", "can_change_path": False}
+
+    @app.get("/api/fs/read-data-url")
+    def read_image_data_url(path: str, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
+        relative_path = _owner_image_path(path)
+        try:
+            fd = app.state.owner_worker_controlled_roots.open_relative(
+                RootKind.OWNER_WRITABLE,
+                relative_path,
+                expected_type=ExpectedType.REGULAR_FILE,
+            )
+            try:
+                metadata = os.fstat(fd)
+                if metadata.st_size > _IMAGE_PREVIEW_MAX_BYTES:
+                    raise HTTPException(status_code=413, detail="File too large")
+                data = bytearray()
+                while chunk := os.read(
+                    fd,
+                    min(1024 * 1024, _IMAGE_PREVIEW_MAX_BYTES - len(data)),
+                ):
+                    data.extend(chunk)
+            finally:
+                os.close(fd)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise _files_error(exc) from exc
+        name = relative_path.rsplit("/", 1)[-1]
+        mime_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        return {"dataUrl": f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}"}
 
     @app.get("/api/files/download")
     def download_file(path: str, _: None = Depends(_require_owner_token)):

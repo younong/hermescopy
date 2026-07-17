@@ -755,6 +755,7 @@ CREATE TABLE IF NOT EXISTS messages (
     session_id TEXT NOT NULL REFERENCES sessions(id),
     role TEXT NOT NULL,
     content TEXT,
+    attachments TEXT,
     tool_call_id TEXT,
     tool_calls TEXT,
     tool_name TEXT,
@@ -3326,6 +3327,7 @@ class SessionDB:
         platform_message_id: str = None,
         observed: bool = False,
         timestamp: Any = None,
+        attachments: Any = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -3353,6 +3355,7 @@ class SessionDB:
             if codex_message_items else None
         )
         tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+        attachments_json = json.dumps(attachments) if attachments else None
         # Multimodal content (list of parts) must be JSON-encoded: sqlite3
         # cannot bind list/dict parameters directly.
         stored_content = self._encode_content(content)
@@ -3374,15 +3377,16 @@ class SessionDB:
 
         def _do(conn):
             cursor = conn.execute(
-                """INSERT INTO messages (session_id, role, content, tool_call_id,
+                """INSERT INTO messages (session_id, role, content, attachments, tool_call_id,
                    tool_calls, tool_name, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
                     stored_content,
+                    attachments_json,
                     tool_call_id,
                     tool_calls_json,
                     tool_name,
@@ -3458,6 +3462,8 @@ class SessionDB:
                 json.dumps(codex_message_items) if codex_message_items else None
             )
             tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+            attachments = msg.get("attachments")
+            attachments_json = json.dumps(attachments) if attachments else None
             # Accept either `platform_message_id` (new explicit name) or
             # `message_id` (yuanbao's existing convention on message dicts).
             platform_msg_id = (
@@ -3465,15 +3471,16 @@ class SessionDB:
             )
 
             conn.execute(
-                """INSERT INTO messages (session_id, role, content, tool_call_id,
+                """INSERT INTO messages (session_id, role, content, attachments, tool_call_id,
                    tool_calls, tool_name, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
                     self._encode_content(msg.get("content")),
+                    attachments_json,
                     msg.get("tool_call_id"),
                     tool_calls_json,
                     msg.get("tool_name"),
@@ -3644,6 +3651,12 @@ class SessionDB:
                 except (json.JSONDecodeError, TypeError):
                     logger.warning("Failed to deserialize tool_calls in get_messages, falling back to []")
                     msg["tool_calls"] = []
+            if msg.get("attachments"):
+                try:
+                    msg["attachments"] = json.loads(msg["attachments"])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning("Failed to deserialize attachments in get_messages, falling back to []")
+                    msg["attachments"] = []
             result.append(msg)
         return result
 
@@ -3987,7 +4000,7 @@ class SessionDB:
         with self._lock:
             placeholders = ",".join("?" for _ in session_ids)
             rows = self._conn.execute(
-                "SELECT m.role, m.content, m.tool_call_id, m.tool_calls, m.tool_name, "
+                "SELECT m.role, m.content, m.attachments, m.tool_call_id, m.tool_calls, m.tool_name, "
                 "m.finish_reason, m.reasoning, m.reasoning_content, m.reasoning_details, "
                 "m.codex_reasoning_items, m.codex_message_items, m.platform_message_id, m.observed, m.timestamp "
                 "FROM messages m JOIN sessions s ON s.id = m.session_id "
@@ -4010,6 +4023,13 @@ class SessionDB:
             if row["role"] in {"user", "assistant"} and isinstance(content, str):
                 content = sanitize_context(content).strip()
             msg = {"role": row["role"], "content": content}
+            if row["attachments"]:
+                try:
+                    attachments = json.loads(row["attachments"])
+                    if isinstance(attachments, list):
+                        msg["attachments"] = attachments
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning("Failed to deserialize attachments in conversation replay")
             if row["timestamp"]:
                 msg["timestamp"] = row["timestamp"]
             if row["tool_call_id"]:

@@ -1925,6 +1925,58 @@ def test_worker_managed_files_are_descriptor_scoped_to_its_owner(tmp_path, monke
     assert traversal.status_code == 400
 
 
+def test_worker_image_preview_is_descriptor_scoped_to_owner_images(tmp_path, monkeypatch):
+    import base64
+
+    from fastapi.testclient import TestClient
+    from hermes_cli.owner_worker.entrypoint import create_app
+
+    import hermes_cli.controlled_roots as controlled_roots
+
+    monkeypatch.setattr(controlled_roots.sys, "platform", "linux")
+    monkeypatch.setattr(controlled_roots, "_openat2", lambda *_args: None)
+    control_home = tmp_path / "control"
+    owner_a = ensure_owner_runtime_dirs(tmp_path / "owner-a")
+    owner_b = ensure_owner_runtime_dirs(tmp_path / "owner-b")
+    image = owner_a / "images" / "upload.png"
+    image.parent.mkdir(exist_ok=True)
+    image.write_bytes(b"pngbytes")
+    secret = owner_a / "secret.png"
+    secret.write_bytes(b"secret")
+    other_owner_image = owner_b / "images" / "upload.png"
+    other_owner_image.parent.mkdir(exist_ok=True)
+    other_owner_image.write_bytes(b"owner-b")
+    monkeypatch.setenv("HERMES_HOME", str(owner_a))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_owner_a")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+    app = create_app("ok1_owner_a", owner_a)
+    client = TestClient(app)
+
+    def request(path: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {_capability_for(app, path, control_home=control_home)}"}
+
+    preview = client.get(
+        "/api/fs/read-data-url",
+        headers=request("/api/fs/read-data-url"),
+        params={"path": str(image)},
+    )
+    assert preview.status_code == 200
+    assert preview.json() == {
+        "dataUrl": "data:image/png;base64," + base64.b64encode(b"pngbytes").decode("ascii")
+    }
+
+    for rejected_path in (secret, other_owner_image, Path("images/upload.png")):
+        response = client.get(
+            "/api/fs/read-data-url",
+            headers=request("/api/fs/read-data-url"),
+            params={"path": str(rejected_path)},
+        )
+        assert response.status_code == 400
+        assert "pngbytes" not in response.text
+        assert "secret" not in response.text
+        assert "owner-b" not in response.text
+
+
 def test_worker_http_token_validation_uses_stored_control_home(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 

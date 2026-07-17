@@ -1868,6 +1868,7 @@ class AIAgent:
                     session_id=self.session_id,
                     role=role,
                     content=content,
+                    attachments=msg.get("attachments") if role == "user" else None,
                     tool_name=msg.get("tool_name"),
                     tool_calls=tool_calls_data,
                     tool_call_id=msg.get("tool_call_id"),
@@ -5743,6 +5744,7 @@ class AIAgent:
         stream_callback: Optional[callable] = None,
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
+        persist_user_attachments: Optional[List[Dict[str, Any]]] = None,
         moa_config: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
@@ -5756,6 +5758,7 @@ class AIAgent:
             stream_callback,
             persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            persist_user_attachments=persist_user_attachments,
             moa_config=moa_config,
         )
 

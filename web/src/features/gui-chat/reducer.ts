@@ -3,6 +3,7 @@ import type {
   ApprovalPayload,
   ArtifactImagePayload,
   ErrorPayload,
+  GatewayTranscriptAttachment,
   GatewayTranscriptMessage,
   MessageCompletePayload,
   MessageDeltaPayload,
@@ -166,9 +167,20 @@ function transcriptToMessageWithArtifacts(
   }
 
   const id = `history-${index}`;
-  const refs = extractImageReferencesFromTranscriptMessage(message);
-  const text = clampRenderedText(stripRenderableImageReferencesFromText(textFromTranscriptMessage(message), refs));
-  if (!text.trim() && refs.length === 0) {
+  const attachments = transcriptAttachments(message.attachments, id, cwd);
+  const claimedSources = new Set(
+    (message.attachments ?? []).flatMap(attachmentSourcePaths).map(normalizeAttachmentSource),
+  );
+  const refs = extractImageReferencesFromTranscriptMessage(message).filter(
+    (ref) => !claimedSources.has(normalizeAttachmentSource(ref.url)),
+  );
+  const text = clampRenderedText(
+    stripAttachmentPromptHints(
+      stripRenderableImageReferencesFromText(textFromTranscriptMessage(message), refs),
+      message.attachments,
+    ),
+  );
+  if (!text.trim() && refs.length === 0 && attachments.length === 0) {
     return null;
   }
 
@@ -189,11 +201,81 @@ function transcriptToMessageWithArtifacts(
     artifacts,
     message: {
       artifactIds: artifacts.map((artifact) => artifact.id),
+      attachments: attachments.length > 0 ? attachments : undefined,
       id,
       role: message.role === "user" ? "user" : message.role === "assistant" ? "assistant" : "system",
       text,
     },
   };
+}
+
+function transcriptAttachments(
+  values: GatewayTranscriptAttachment[] | undefined,
+  messageId: string,
+  cwd?: string,
+): MessageAttachmentState[] {
+  if (!Array.isArray(values)) return [];
+  const attachments: MessageAttachmentState[] = [];
+  for (const [index, value] of values.entries()) {
+    if (!value || typeof value !== "object") continue;
+    const kind = value.kind;
+    const name = value.name;
+    if ((kind !== "image" && kind !== "pdf" && kind !== "file") || typeof name !== "string" || !name) {
+      continue;
+    }
+    const path = typeof value.path === "string" ? value.path : undefined;
+    attachments.push({
+      id: `${messageId}-attachment-${index}`,
+      kind,
+      mimeType: typeof value.mime_type === "string" ? value.mime_type : undefined,
+      name,
+      pagesAttached: finiteNonNegativeNumber(value.pages_attached),
+      previewUrl: kind === "image" && path ? imagePreviewUrl(path, cwd) : undefined,
+      refText: typeof value.ref_text === "string" ? value.ref_text : undefined,
+      sizeBytes: finiteNonNegativeNumber(value.size_bytes) ?? 0,
+    });
+  }
+  return attachments;
+}
+
+function finiteNonNegativeNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function attachmentSourcePaths(value: GatewayTranscriptAttachment): string[] {
+  const paths: string[] = [];
+  if (typeof value.path === "string") paths.push(value.path);
+  if (Array.isArray(value.source_paths)) {
+    paths.push(...value.source_paths.filter((path): path is string => typeof path === "string"));
+  }
+  return paths;
+}
+
+function normalizeAttachmentSource(value: string): string {
+  return value.replace(/^file:\/\//i, "");
+}
+
+function stripAttachmentPromptHints(
+  text: string,
+  values: GatewayTranscriptAttachment[] | undefined,
+): string {
+  if (!text || !Array.isArray(values) || values.length === 0) return text;
+  const sourcePaths = new Set(values.flatMap(attachmentSourcePaths).map(normalizeAttachmentSource));
+  const refTexts = new Set(
+    values
+      .map((value) => value.ref_text)
+      .filter((value): value is string => typeof value === "string" && value.length > 0),
+  );
+  const lines = text.split("\n").filter((line) => {
+    const trimmed = line.trim();
+    const hint = trimmed.match(/^\[Image attached at:\s*(.+)]$/);
+    if (hint && sourcePaths.has(normalizeAttachmentSource(hint[1].trim()))) return false;
+    if (sourcePaths.has(normalizeAttachmentSource(trimmed))) return false;
+    if (refTexts.has(trimmed)) return false;
+    if (trimmed === "附件：" && refTexts.size > 0) return false;
+    return true;
+  });
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 interface ExtractedImageReference {

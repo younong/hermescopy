@@ -2321,6 +2321,8 @@ async def fs_write_text(request: Request, payload: FsWriteText):
 
 @app.get("/api/fs/read-data-url")
 async def fs_read_data_url(request: Request, path: str, cwd: str | None = None):
+    if _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
     _reject_authenticated_filesystem_api(request)
     target, st = _fs_regular_file(_fs_path(path, cwd=cwd))
     if st.st_size > _FS_DATA_URL_MAX_BYTES:

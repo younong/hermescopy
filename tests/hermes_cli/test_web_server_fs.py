@@ -81,7 +81,7 @@ def test_authenticated_mode_rejects_control_plane_fs_apis(authenticated_client, 
         "/api/fs/write-text",
         json={"path": str(target), "content": "changed"},
     ).status_code == 403
-    assert client.get("/api/fs/read-data-url", params={"path": str(target)}).status_code == 403
+    assert client.get("/api/fs/read-data-url", params={"path": str(target)}).status_code == 503
     assert client.get("/api/fs/git-root", params={"path": str(target)}).status_code == 403
     assert client.get("/api/fs/default-cwd").status_code == 403
     assert client.get("/api/generated-images/generated.png").status_code == 403

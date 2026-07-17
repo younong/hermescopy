@@ -3928,6 +3928,40 @@ class TestRunConversation:
         agent.compression_enabled = False
         agent.save_trajectories = False
 
+    def test_attachment_metadata_is_persisted_but_not_sent_to_provider(self, agent):
+        self._setup_agent(agent)
+        attachments = [
+            {
+                "kind": "image",
+                "name": "shot.png",
+                "size_bytes": 123,
+                "path": "/tmp/shot.png",
+            }
+        ]
+        resp = _mock_response(content="Final answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+        persisted = []
+
+        with (
+            patch.object(agent, "_persist_session", side_effect=lambda messages, *_: persisted.append(list(messages))),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "hello",
+                persist_user_attachments=attachments,
+            )
+
+        assert result["final_response"] == "Final answer"
+        assert any(
+            message.get("attachments") == attachments
+            for snapshot in persisted
+            for message in snapshot
+            if message.get("role") == "user"
+        )
+        sent_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        assert all("attachments" not in message for message in sent_messages)
+
     def test_stop_finish_reason_returns_response(self, agent):
         self._setup_agent(agent)
         resp = _mock_response(content="Final answer", finish_reason="stop")
