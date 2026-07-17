@@ -50,6 +50,7 @@ OWNER_ENV_KEYS: tuple[str, ...] = (
     "HERMES_DEPLOYMENT_INFERENCE_API_MODE",
     "HERMES_DEPLOYMENT_INFERENCE_POLICY_ID",
     "HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS",
+    "HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION",
     "HERMES_DEPLOYMENT_INFERENCE_RELAY_FD",
     "HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL",
 )
@@ -208,6 +209,10 @@ def owner_worker_env_for(
             "HERMES_DEPLOYMENT_INFERENCE_POLICY_ID": deployment_inference_descriptor.policy_id,
             "HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS": ",".join(deployment_inference_descriptor.allowed_models),
         })
+        if deployment_inference_descriptor.supports_vision is not None:
+            env["HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION"] = (
+                "true" if deployment_inference_descriptor.supports_vision else "false"
+            )
     return env
 
 

@@ -21,6 +21,8 @@ In ``auto`` mode:
     (i.e. not ``auto`` and not empty), we assume they want the text pipeline
     regardless of the main model — they've opted in to a specific vision
     backend for a reason (cost, quality, local-only, etc.).
+  - Otherwise, owner-local model/provider capability overrides win, followed by
+    a matching deployment descriptor capability when one is supplied.
   - Otherwise, if the active model reports ``supports_vision=True`` in its
     models.dev metadata, we attach natively.
   - Otherwise (non-vision model, no explicit override), we fall back to text.
@@ -407,6 +409,8 @@ def decide_image_input_mode(
     provider: str,
     model: str,
     cfg: Optional[Dict[str, Any]],
+    *,
+    deployment_supports_vision: Optional[bool] = None,
 ) -> str:
     """Return ``"native"`` or ``"text"`` for the given turn.
 
@@ -414,6 +418,8 @@ def decide_image_input_mode(
       provider: active inference provider ID (e.g. ``"anthropic"``, ``"openrouter"``).
       model:    active model slug as it would be sent to the provider.
       cfg:      loaded config.yaml dict, or None. When None, behaves as auto.
+      deployment_supports_vision: safe capability supplied by a matching
+        deployment inference descriptor when owner-local config has no override.
     """
     mode_cfg = "auto"
     if isinstance(cfg, dict):
@@ -429,6 +435,12 @@ def decide_image_input_mode(
     # auto
     if _explicit_aux_vision_override(cfg):
         return "text"
+
+    owner_override = _supports_vision_override(cfg, provider, model)
+    if owner_override is not None:
+        return "native" if owner_override else "text"
+    if deployment_supports_vision is not None:
+        return "native" if deployment_supports_vision else "text"
 
     supports = _lookup_supports_vision(provider, model, cfg)
     if supports is True:

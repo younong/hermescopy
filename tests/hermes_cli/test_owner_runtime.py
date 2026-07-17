@@ -194,14 +194,43 @@ def test_owner_worker_environment_serializes_only_safe_deployment_descriptor(tmp
             api_mode="chat_completions",
             policy_id="policy-v1",
             allowed_models=("gpt-safe",),
+            supports_vision=True,
         ),
     )
 
     assert env["HERMES_DEPLOYMENT_INFERENCE_PROVIDER"] == "custom:deployment"
     assert env["HERMES_DEPLOYMENT_INFERENCE_MODEL"] == "gpt-safe"
+    assert env["HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION"] == "true"
     assert "API_KEY" not in " ".join(env)
     assert "BASE_URL" not in " ".join(env)
     validate_owner_worker_runtime_environment(owner_home=owner_home, source=env)
+
+
+def test_owner_worker_environment_omits_unknown_deployment_vision_capability(tmp_path):
+    from hermes_cli.deployment_inference import DeploymentInferenceDescriptor
+
+    owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
+    env = owner_worker_env_for(
+        owner_key="ok_owner",
+        owner_home=owner_home,
+        control_home=tmp_path / "control",
+        worker_generation=3,
+        worker_id="worker-3",
+        lease_version=2,
+        recovery_generation=0,
+        capability_issuer="owc1-1",
+        capability_public_key="public-key",
+        capability_retained_public_keys="{}",
+        deployment_inference_descriptor=DeploymentInferenceDescriptor(
+            provider="custom:deployment",
+            model="gpt-safe",
+            api_mode="chat_completions",
+            policy_id="policy-v1",
+            allowed_models=("gpt-safe",),
+        ),
+    )
+
+    assert "HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION" not in env
 
 
 def test_owner_worker_runtime_contract_rejects_unknown_or_wrong_owner_local_path(tmp_path):
