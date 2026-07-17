@@ -9037,16 +9037,12 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         decide_image_input_mode,
                         build_native_content_parts,
                     )
-                    from agent.auxiliary_client import (
-                        _read_main_model,
-                        _read_main_provider,
-                    )
                     from hermes_cli.config import load_config as _tui_load_config
 
                     _cfg = _tui_load_config()
                     _mode = decide_image_input_mode(
-                        _read_main_provider(),
-                        _read_main_model(),
+                        getattr(agent, "provider", "") or "",
+                        getattr(agent, "model", "") or "",
                         _cfg,
                     )
                     if getattr(agent, "api_mode", "") == "codex_app_server":
