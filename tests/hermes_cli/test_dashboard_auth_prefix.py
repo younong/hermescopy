@@ -366,6 +366,9 @@ class TestPublicUrlOverride:
             "ftp://example.com",
             "example.com",                          # missing scheme
             "https://",                             # missing host
+            "https://user:pass@example.com/hermes",  # embedded credentials
+            "https://example.com/hermes?next=/evil",  # query component
+            "https://example.com/hermes#fragment",  # fragment component
             'https://example.com/"injected',       # quote char
             "https://example.com/\nhttps://evil",  # CRLF injection
         ]:

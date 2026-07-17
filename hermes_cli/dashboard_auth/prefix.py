@@ -139,7 +139,9 @@ def _normalise_public_url(raw: Optional[str]) -> str:
         return ""
     if parsed.scheme not in {"http", "https"}:
         return ""
-    if not parsed.netloc:
+    if not parsed.netloc or parsed.username or parsed.password:
+        return ""
+    if parsed.query or parsed.fragment:
         return ""
     # Strip a single trailing slash so callers can append paths without
     # producing ``//`` double-slashes.

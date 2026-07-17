@@ -21,7 +21,14 @@ def restore_dashboard_app_state():
     state = web_server.app.state
     saved = {
         name: getattr(state, name, None)
-        for name in ("auth_required", "bound_host", "bound_port", "owner_worker_supervisor")
+        for name in (
+            "auth_required",
+            "bound_host",
+            "bound_port",
+            "owner_worker_supervisor",
+            "trusted_proxy_public_host",
+            "trusted_proxy_public_origin",
+        )
     }
     yield
     for name, value in saved.items():
@@ -267,6 +274,118 @@ def test_start_server_forced_loopback_gate_keeps_proxy_headers_off(monkeypatch):
         clear_providers()
         web_server.app.state.auth_required = None
         web_server.app.state.owner_worker_supervisor = None
+
+
+def test_start_server_trusted_loopback_proxy_is_restricted(monkeypatch):
+    """Trusted proxy metadata is accepted only for a declared gated loopback."""
+    _stub_uvicorn_run(monkeypatch)
+    for kwargs, match in (
+        (
+            {"host": "127.0.0.1", "require_auth": False},
+            "loopback bind and --require-auth",
+        ),
+        (
+            {"host": "0.0.0.0", "require_auth": True},
+            "loopback bind and --require-auth",
+        ),
+    ):
+        with pytest.raises(SystemExit, match=match):
+            web_server.start_server(
+                port=9119,
+                open_browser=False,
+                allow_public=False,
+                trust_proxy_headers=True,
+                **kwargs,
+            )
+
+
+def test_start_server_trusted_loopback_proxy_requires_public_url(monkeypatch):
+    _stub_uvicorn_run(monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.dashboard_auth.prefix.resolve_public_url", lambda: ""
+    )
+    with pytest.raises(SystemExit, match="dashboard.public_url"):
+        web_server.start_server(
+            host="127.0.0.1",
+            port=9119,
+            open_browser=False,
+            require_auth=True,
+            trust_proxy_headers=True,
+        )
+
+
+def test_start_server_trusted_loopback_proxy_sets_bounded_trust(monkeypatch):
+    from hermes_cli.dashboard_auth import clear_providers, register_provider
+    from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
+
+    clear_providers()
+    register_provider(StubAuthProvider())
+    captured = _stub_uvicorn_run(monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.dashboard_auth.prefix.resolve_public_url",
+        lambda: "https://abinllm.xyz/hermes",
+    )
+    try:
+        web_server.start_server(
+            host="127.0.0.1",
+            port=9119,
+            open_browser=False,
+            require_auth=True,
+            trust_proxy_headers=True,
+        )
+        assert captured["kwargs"]["proxy_headers"] is True
+        assert captured["kwargs"]["forwarded_allow_ips"] == "127.0.0.1,::1"
+        assert web_server.app.state.trusted_proxy_public_host == "abinllm.xyz"
+        assert (
+            web_server.app.state.trusted_proxy_public_origin
+            == "https://abinllm.xyz"
+        )
+        assert (
+            web_server._ws_host_origin_reason(
+                type(
+                    "ProxyWebSocket",
+                    (),
+                    {
+                        "app": web_server.app,
+                        "headers": {
+                            "host": "abinllm.xyz",
+                            "origin": "https://abinllm.xyz",
+                        },
+                    },
+                )()
+            )
+            is None
+        )
+        for origin in (
+            "https://evil.test",
+            "http://abinllm.xyz",
+            "https://abinllm.xyz:444",
+        ):
+            assert "origin_mismatch" in web_server._ws_host_origin_reason(
+                type(
+                    "RejectedProxyWebSocket",
+                    (),
+                    {
+                        "app": web_server.app,
+                        "headers": {
+                            "host": "abinllm.xyz",
+                            "origin": origin,
+                        },
+                    },
+                )()
+            )
+    finally:
+        clear_providers()
+
+
+def test_trusted_proxy_public_host_does_not_allow_other_hosts(client_loopback):
+    web_server.app.state.trusted_proxy_public_host = "abinllm.xyz"
+    assert client_loopback.get(
+        "/api/status", headers={"Host": "abinllm.xyz"}
+    ).status_code == 200
+    assert client_loopback.get(
+        "/api/status", headers={"Host": "evil.test"}
+    ).status_code == 400
 
 
 def test_start_server_gate_with_provider_proceeds_and_sets_proxy_headers(monkeypatch):

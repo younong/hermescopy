@@ -11707,6 +11707,8 @@ def cmd_dashboard(args):
             reexec_argv.append("--insecure")
         if getattr(args, "require_auth", False):
             reexec_argv.append("--require-auth")
+        if getattr(args, "trust_proxy_headers", False):
+            reexec_argv.append("--trust-proxy-headers")
         if getattr(args, "skip_build", False):
             reexec_argv.append("--skip-build")
         env = os.environ.copy()
@@ -11840,6 +11842,7 @@ def cmd_dashboard(args):
         open_browser=not args.no_open,
         allow_public=getattr(args, "insecure", False),
         require_auth=getattr(args, "require_auth", False),
+        trust_proxy_headers=getattr(args, "trust_proxy_headers", False),
         initial_profile=getattr(args, "open_profile", "") or "",
     )
 

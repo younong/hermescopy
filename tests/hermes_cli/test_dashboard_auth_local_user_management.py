@@ -60,7 +60,20 @@ def test_admin_create_reset_and_update_are_server_authorized(local_basic_client)
     store.create_account(username="admin", password="admin-password", role="admin")
     store.create_account(username="member", password="member-password")
     assert _login(client, "member", "member-password").status_code == 200
+    me = client.get("/api/auth/me")
+    assert me.status_code == 200
+    assert me.json()["role"] == "member"
+    assert me.json()["local_user_management"] == {
+        "enabled": True,
+        "is_admin": False,
+    }
+    assert client.get("/api/auth/users").status_code == 403
+    assert client.get("/api/auth/local-users").status_code == 403
     assert client.post("/api/auth/users", json={"username": "newuser"}).status_code == 403
+    assert client.patch(
+        "/api/auth/users/member", json={"display_name": "Nope"}
+    ).status_code == 403
+    assert client.post("/api/auth/users/member/reset-password").status_code == 403
 
     client.cookies.clear()
     assert _login(client, "admin", "admin-password").status_code == 200

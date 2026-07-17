@@ -19,9 +19,15 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert 'runtimes_dir="$remote_root/runtimes/python"' in source
     assert 'runtime_id="py311-${"${"}architecture}-${"${"}lock_hash}-sandbox4"' in source
     assert 'venv="$shared/venv"' not in source
-    assert "User=$service_user" in source
-    assert "Group=$service_group" in source
-    assert "Environment=HERMES_DISABLE_LAZY_INSTALLS=1" in source
+    assert 'service_user="hermes"' in source
+    assert 'service_group="hermes"' in source
+    assert 'chown -R "$service_user:$service_group" "$hermes_home"' in source
+    assert source.count("User=$service_user") == 2
+    assert source.count("Group=$service_group") == 2
+    assert "Environment=HERMES_DASHBOARD_PUBLIC_URL=$dashboard_public_url" in source
+    assert source.count("Environment=HERMES_SANDBOX_DEPLOYMENT_POLICY=") == 2
+    assert source.count("Environment=HERMES_DISABLE_LAZY_INSTALLS=1") == 2
+    assert "--require-auth --trust-proxy-headers" in source
     assert (
         "Environment=HERMES_SANDBOX_DEPLOYMENT_POLICY="
         "hermes_cli.owner_worker.host_sandbox:host_sandbox_deployment_policy"
@@ -42,6 +48,7 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert 'chown -R root:root "$release_tmp"' in source
     assert 'find "$release_tmp" -type d -exec chmod go-w {} +' in source
     assert source.index("host_sandbox_deployment_policy()") < source.index('ln -sfnT "$release" "$current"')
+    assert source.index('deployment_committed="1"', source.index("manage_hermes_proxy.py")) > source.index("manage_hermes_proxy.py")
     assert "restoring previous deployment state" in source
     assert "restore_deployment_state" in source
     assert "HERMES_EXECUTOR_START_GATE_FD" not in source

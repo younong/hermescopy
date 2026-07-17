@@ -23,6 +23,7 @@ const SSH_CONNECTION_ARGS = [
 const TAG_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const COMMIT_SHA_RE = /^[0-9a-f]{40}$/;
 const DEFAULT_KEEP_RELEASES = 5;
+const DEFAULT_DASHBOARD_PUBLIC_URL = "https://abinllm.xyz/hermes";
 const DEPLOY_NPM_WORKSPACES = ["web", "ui-tui"];
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -51,6 +52,11 @@ Options:
   --force                  Deprecated and rejected; immutable releases are never replaced.
   --keep-releases <n>      Keep the newest n remote releases after deploy. Default: ${DEFAULT_KEEP_RELEASES}
   --no-prune-releases      Do not delete old remote release directories.
+  --dashboard-public-url <url>
+                           Public dashboard URL used by the trusted loopback proxy.
+                           Default: ${DEFAULT_DASHBOARD_PUBLIC_URL}
+  --migrate-nginx-hermes   Explicitly replace the recognized legacy Hermes Nginx
+                           auth block after the new internal auth gate is healthy.
   --dry-run                Print commands without changing local or remote state.
   -h, --help               Show this help.
 
@@ -77,6 +83,9 @@ function parseArgs(argv) {
     force: false,
     keepReleases: DEFAULT_KEEP_RELEASES,
     pruneReleases: true,
+    dashboardPublicUrl:
+      process.env.HERMES_DEPLOY_DASHBOARD_PUBLIC_URL || DEFAULT_DASHBOARD_PUBLIC_URL,
+    migrateNginxHermes: false,
     dryRun: false,
   };
 
@@ -131,6 +140,12 @@ function parseArgs(argv) {
       case "--no-prune-releases":
         args.pruneReleases = false;
         break;
+      case "--dashboard-public-url":
+        args.dashboardPublicUrl = next();
+        break;
+      case "--migrate-nginx-hermes":
+        args.migrateNginxHermes = true;
+        break;
       case "--dry-run":
         args.dryRun = true;
         break;
@@ -148,6 +163,26 @@ function parseArgs(argv) {
     throw new Error("Pass exactly one of --tag, --create-tag, or --ref.");
   }
 
+  let publicUrl;
+  try {
+    publicUrl = new URL(args.dashboardPublicUrl);
+  } catch {
+    throw new Error("--dashboard-public-url must be an absolute http(s) URL.");
+  }
+  if (
+    !["http:", "https:"].includes(publicUrl.protocol) ||
+    !publicUrl.host ||
+    publicUrl.username ||
+    publicUrl.password ||
+    publicUrl.search ||
+    publicUrl.hash
+  ) {
+    throw new Error(
+      "--dashboard-public-url must be an absolute http(s) URL without credentials, query, or fragment.",
+    );
+  }
+  args.dashboardPublicUrl = args.dashboardPublicUrl.replace(/\/+$/, "");
+  args.dashboardPublicHost = publicUrl.host;
   args.sourceKind = args.ref ? "commit" : "tag";
   args.sourceRef = args.ref || args.createTag || args.tag;
   return args;
@@ -429,6 +464,9 @@ source_tag="$5"
 archive="$6"
 keep_releases="$7"
 prune_releases="$8"
+dashboard_public_url="$9"
+migrate_nginx_hermes="${"${"}10}"
+dashboard_public_host="${"${"}11}"
 tmp_dir="$remote_root/tmp"
 releases_dir="$remote_root/releases"
 release="$releases_dir/$release_id"
@@ -583,8 +621,16 @@ if ! [[ "$keep_releases" =~ ^[0-9]+$ ]] || [ "$keep_releases" -lt 1 ]; then
   echo "Invalid keep_releases value: $keep_releases" >&2
   exit 1
 fi
+if [[ "$dashboard_public_url" != http://* && "$dashboard_public_url" != https://* ]]; then
+  echo "Invalid dashboard public URL" >&2
+  exit 1
+fi
+if [[ "$migrate_nginx_hermes" != "0" && "$migrate_nginx_hermes" != "1" ]]; then
+  echo "Invalid Nginx migration mode" >&2
+  exit 1
+fi
 
-for required in tar systemctl sha256sum readlink realpath stat sort mv getent useradd groupadd install cp find ldd sed; do
+for required in tar systemctl sha256sum readlink realpath stat sort mv getent useradd groupadd install cp find ldd sed curl; do
   if ! command -v "$required" >/dev/null 2>&1; then
     echo "Missing required command: $required" >&2
     exit 1
@@ -855,11 +901,12 @@ Environment=HERMES_REMOTE_ROOT=$remote_root
 Environment=HERMES_HOME=$hermes_home
 Environment=HERMES_ENV_FILE=$env_file
 Environment=VIRTUAL_ENV=$venv
+Environment=HERMES_DASHBOARD_PUBLIC_URL=$dashboard_public_url
 Environment=HERMES_SANDBOX_DEPLOYMENT_POLICY=hermes_cli.owner_worker.host_sandbox:host_sandbox_deployment_policy
 Environment=HERMES_DISABLE_LAZY_INSTALLS=1
 WorkingDirectory=$current
 ExecStartPre=$venv/bin/python -c 'from hermes_cli.owner_worker.host_sandbox import host_sandbox_deployment_policy; host_sandbox_deployment_policy()'
-ExecStart=$runner dashboard --host 127.0.0.1 --port 9119 --no-open --skip-build --require-auth
+ExecStart=$runner dashboard --host 127.0.0.1 --port 9119 --no-open --skip-build --require-auth --trust-proxy-headers
 Restart=always
 RestartSec=5
 # Keep owner workers in the dashboard service cgroup so shutdown cleanup can
@@ -911,8 +958,44 @@ if ! systemctl restart hermes-gateway.service || ! systemctl start hermes-dashbo
   exit 1
 fi
 systemctl --no-pager --full status hermes-gateway.service hermes-dashboard.service || true
-deployment_committed="1"
 
+# Prove Hermes' own gate is active before touching the legacy outer Nginx gate.
+# systemd can report active before Uvicorn has opened its socket, so retry the
+# exact fail-closed contract for up to 30 seconds rather than racing startup.
+login_status="000"
+api_status="000"
+for _ in $(seq 1 30); do
+  login_status="$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "Host: $dashboard_public_host" \
+    -H "X-Forwarded-Host: $dashboard_public_host" \
+    -H 'X-Forwarded-Proto: https' \
+    -H 'X-Forwarded-Prefix: /hermes' \
+    http://127.0.0.1:9119/ || true)"
+  api_status="$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "Host: $dashboard_public_host" \
+    -H "X-Forwarded-Host: $dashboard_public_host" \
+    -H 'X-Forwarded-Proto: https' \
+    -H 'X-Forwarded-Prefix: /hermes' \
+    http://127.0.0.1:9119/api/sessions || true)"
+  if [ "$login_status" = "302" ] && [ "$api_status" = "401" ]; then
+    break
+  fi
+  sleep 1
+done
+if [ "$login_status" != "302" ] || [ "$api_status" != "401" ]; then
+  echo "Hermes internal auth preflight failed (html=$login_status api=$api_status)" >&2
+  exit 1
+fi
+
+action="reconcile"
+[ "$migrate_nginx_hermes" = "1" ] && action="migrate"
+"$venv/bin/python" "$release/deploy/nginx/manage_hermes_proxy.py" \
+  "$action" \
+  --vhost /etc/nginx/conf.d/abinllm.conf \
+  --snippet-source "$release/deploy/nginx/hermes-dashboard.conf" \
+  --snippet-target /etc/nginx/snippets/hermes-dashboard.conf
+
+deployment_committed="1"
 prune_old_releases
 
 echo "Hermes deployed from $source_kind source $source_commit at $release"
@@ -946,6 +1029,9 @@ function deployArchive(args, archivePath) {
       remoteArchive,
       String(args.keepReleases),
       args.pruneReleases ? "1" : "0",
+      args.dashboardPublicUrl,
+      args.migrateNginxHermes ? "1" : "0",
+      args.dashboardPublicHost,
     ],
     { input: remoteDeployScript() },
   );
@@ -960,6 +1046,10 @@ function printSummary(args) {
   console.log(`State dir: ${remoteRoot}/shared/.hermes`);
   console.log(`Env file: ${remoteRoot}/shared/.env`);
   console.log(`Services: hermes-gateway.service, hermes-dashboard.service`);
+  console.log(`Dashboard: ${args.dashboardPublicUrl} (Hermes user login only)`);
+  console.log(
+    `Nginx: ${args.migrateNginxHermes ? "explicit legacy-block migration" : "managed snippet reconciliation"}`,
+  );
   console.log("Remote staging archive is uniquely named and removed after extraction.");
   console.log(
     args.pruneReleases
