@@ -782,18 +782,28 @@ systemctl is-active --quiet hermes-dashboard.service
 systemctl --no-pager --full status hermes-gateway.service hermes-dashboard.service || true
 
 # Prove Hermes' own gate is active before touching the legacy outer Nginx gate.
-login_status="$(curl -sS -o /dev/null -w '%{http_code}' \
-  -H "Host: $dashboard_public_host" \
-  -H "X-Forwarded-Host: $dashboard_public_host" \
-  -H 'X-Forwarded-Proto: https' \
-  -H 'X-Forwarded-Prefix: /hermes' \
-  http://127.0.0.1:9119/ || true)"
-api_status="$(curl -sS -o /dev/null -w '%{http_code}' \
-  -H "Host: $dashboard_public_host" \
-  -H "X-Forwarded-Host: $dashboard_public_host" \
-  -H 'X-Forwarded-Proto: https' \
-  -H 'X-Forwarded-Prefix: /hermes' \
-  http://127.0.0.1:9119/api/sessions || true)"
+# systemd can report active before Uvicorn has opened its socket, so retry the
+# exact fail-closed contract for up to 30 seconds rather than racing startup.
+login_status="000"
+api_status="000"
+for _ in $(seq 1 30); do
+  login_status="$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "Host: $dashboard_public_host" \
+    -H "X-Forwarded-Host: $dashboard_public_host" \
+    -H 'X-Forwarded-Proto: https' \
+    -H 'X-Forwarded-Prefix: /hermes' \
+    http://127.0.0.1:9119/ || true)"
+  api_status="$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "Host: $dashboard_public_host" \
+    -H "X-Forwarded-Host: $dashboard_public_host" \
+    -H 'X-Forwarded-Proto: https' \
+    -H 'X-Forwarded-Prefix: /hermes' \
+    http://127.0.0.1:9119/api/sessions || true)"
+  if [ "$login_status" = "302" ] && [ "$api_status" = "401" ]; then
+    break
+  fi
+  sleep 1
+done
 if [ "$login_status" != "302" ] || [ "$api_status" != "401" ]; then
   echo "Hermes internal auth preflight failed (html=$login_status api=$api_status)" >&2
   exit 1
