@@ -20,7 +20,12 @@ from hermes_cli.owner_worker.tool_executor_sandbox import (
     SandboxVerificationRecord,
 )
 from hermes_cli.dashboard_auth.audit import AuthorityAuditEvent, AuthorityAuditReason
-from hermes_cli.owner_worker.executor_identity import EgressProfile, ExecutorInvocation, default_executor_resource_decision
+from hermes_cli.owner_worker.executor_identity import (
+    EgressProfile,
+    ExecutorIdentityInvalid,
+    ExecutorInvocation,
+    default_executor_resource_decision,
+)
 from hermes_cli.owner_worker.executor_tokens import AUD_PROCESS_REGISTRY, ExecutorCapabilityInvalid
 from hermes_cli.owner_worker.tool_executor_supervisor import ExecutorEgressPolicy, ToolExecutorSupervisor
 
@@ -198,6 +203,30 @@ def test_supervisor_rejects_missing_or_foreign_resource_decision_before_launch_p
     assert workspace_fd_calls == []
 
 
+def test_default_web_tools_use_tool_none_broker_while_other_network_tools_stay_public():
+    policy = ExecutorEgressPolicy()
+
+    assert policy.select("web_search") is EgressProfile.TOOL_NONE
+    assert policy.select("web_extract") is EgressProfile.TOOL_NONE
+    assert policy.select("browser_navigate") is EgressProfile.TOOL_PUBLIC
+
+
+def test_supervisor_exposes_deterministic_egress_admission_policy(tmp_path):
+    roots, supervisor = _supervisor(
+        tmp_path, lambda *_args, **_kwargs: _FakeProcess()
+    )
+    supervisor.allowed_egress_profiles = (EgressProfile.TOOL_NONE,)
+    try:
+        assert supervisor.admitted_egress_profile_for("web_search") is EgressProfile.TOOL_NONE
+        with pytest.raises(ExecutorIdentityInvalid, match="network egress is not configured"):
+            supervisor.admitted_egress_profile_for("browser_navigate")
+        assert supervisor.egress_policy_fingerprint == supervisor.egress_policy_fingerprint
+        assert supervisor.egress_policy_fingerprint[0] == ("tool-none",)
+    finally:
+        roots.close()
+        supervisor.web_tool_relay.close()
+
+
 def test_supervisor_uses_sandbox_fd_bootstrap_and_no_preexec_cwd(tmp_path):
     spawned = []
     received = []
@@ -257,6 +286,68 @@ def test_supervisor_uses_sandbox_fd_bootstrap_and_no_preexec_cwd(tmp_path):
     assert supervisor._live == {}
 
 
+def test_web_relay_identity_validation_rejects_revoked_executor(tmp_path):
+    roots, supervisor = _supervisor(tmp_path, lambda *_args, **_kwargs: _FakeProcess())
+    identity = supervisor.identity_for(task_id="task-a", session_id="session-a")
+    try:
+        supervisor.revoke_executor(identity)
+        with pytest.raises(PermissionError, match="revoked"):
+            supervisor._require_active_executor_identity(identity)
+    finally:
+        roots.close()
+        supervisor.web_tool_relay.close()
+
+
+def test_supervisor_passes_one_private_relay_fd_for_web_search(tmp_path):
+    spawned = []
+
+    def fake_process_factory(*args, **kwargs):
+        spawned.append((args, kwargs))
+        _publish_fake_sandbox_info(args[0])
+        gate_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_START_GATE_FD"]))
+        request_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_BOOTSTRAP_FD"]))
+        response_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_RESPONSE_FD"]))
+        relay_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_WEB_RELAY_FD"]))
+
+        def respond():
+            assert os.read(gate_fd, 1) == b"1"
+            os.close(gate_fd)
+            payload = json.loads(os.read(request_fd, 1 << 20))
+            from hermes_cli.tool_executor_runtime.entrypoint import invocation_from_payload
+            from hermes_cli.owner_worker.web_tool_relay import dispatch_web_tool_over_relay
+
+            invocation = invocation_from_payload(payload)
+
+            result = dispatch_web_tool_over_relay(relay_fd, invocation)
+            os.write(response_fd, json.dumps({"result": result}).encode())
+            os.close(request_fd)
+            os.close(response_fd)
+
+        threading.Thread(target=respond, daemon=True).start()
+        return _FakeProcess()
+
+    roots, supervisor = _supervisor(tmp_path, fake_process_factory)
+    supervisor.web_tool_relay._dispatcher = lambda name, args: json.dumps({"name": name, "query": args["query"]})
+    try:
+        result = supervisor.dispatch(
+            function_name="web_search", function_args={"query": "Hermes", "limit": 5},
+            task_id="task-a", session_id="session-a", tool_call_id="call-a",
+            turn_id="turn-a", api_request_id="request-a",
+        )
+    finally:
+        roots.close()
+        supervisor.web_tool_relay.close()
+
+    assert json.loads(result) == {"name": "web_search", "query": "Hermes"}
+    kwargs = spawned[0][1]
+    assert kwargs["env"]["HERMES_EXECUTOR_EGRESS_PROFILE"] == "tool-none"
+    assert kwargs["env"]["HERMES_EXECUTOR_WEB_RELAY_FD"] in {str(fd) for fd in kwargs["pass_fds"]}
+    assert len(kwargs["pass_fds"]) == 7
+    serialized = json.dumps({"argv": spawned[0][0][0], "env": kwargs["env"]})
+    assert "API_KEY" not in serialized
+    assert "TOKEN" not in serialized
+
+
 @pytest.mark.parametrize("profile", ["tool-none", "tool-public", "protected-target"])
 def test_supervisor_selects_only_trusted_tool_egress_profiles(tmp_path, profile):
     selected = []
@@ -294,7 +385,7 @@ def test_supervisor_selects_only_trusted_tool_egress_profiles(tmp_path, profile)
     assert [value.value for value in selected] == [profile]
 
 
-def test_deployment_policy_rejects_network_egress_before_launch_preparation(tmp_path):
+def test_deployment_policy_rejects_direct_network_egress_before_launch_preparation(tmp_path):
     spawned = []
     roots, supervisor = _supervisor(
         tmp_path, lambda *args, **kwargs: spawned.append((args, kwargs)),
@@ -303,7 +394,7 @@ def test_deployment_policy_rejects_network_egress_before_launch_preparation(tmp_
     try:
         with pytest.raises(Exception, match="network egress is not configured"):
             supervisor.dispatch(
-                function_name="web_search", function_args={}, task_id="task-a", session_id="session-a",
+                function_name="browser_navigate", function_args={}, task_id="task-a", session_id="session-a",
                 tool_call_id="call-a", turn_id="turn-a", api_request_id="request-a",
             )
     finally:
@@ -315,7 +406,7 @@ def test_egress_policy_default_mapping_is_immutable():
     policy = ExecutorEgressPolicy()
 
     assert policy.select("read_file").value == "tool-none"
-    assert policy.select("web_search").value == "tool-public"
+    assert policy.select("web_search").value == "tool-none"
     assert policy.select("browser_navigate").value == "tool-public"
     with pytest.raises(TypeError):
         policy.by_tool_name["read_file"] = "tool-public"

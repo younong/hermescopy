@@ -362,6 +362,21 @@ web:
 
 When per-capability keys are empty, both fall through to `web.backend`. When `web.backend` is also empty, the backend is auto-detected from whichever API key/URL is present.
 
+### DDGS search engine
+
+`web.backend` or `web.search_backend` selects the Hermes provider. When that provider is `ddgs`, `web.ddgs_backend` independently selects the single text-search engine used inside the pinned `ddgs` package:
+
+```yaml
+# ~/.hermes/config.yaml
+web:
+  search_backend: "ddgs"
+  ddgs_backend: "yandex"  # auto | bing | brave | duckduckgo | google | grokipedia | mojeek | startpage | wikipedia | yahoo | yandex
+```
+
+The default is `auto`, which preserves the package's portable multi-engine behavior. On networks where some search engines are blocked or DNS-filtered, choose one reachable engine instead; this prevents `auto` from waiting on unreachable workers. The value must be exactly one engine name—comma-delimited engine lists and unknown values are rejected rather than silently falling back.
+
+DDGS remains search-only. Configure `web.extract_backend` separately if you also need `web_extract`.
+
 **Priority order (per capability):**
 1. `web.search_backend` / `web.extract_backend` (explicit per-capability)
 2. `web.backend` (shared fallback)
@@ -412,6 +427,7 @@ This prints the active backend and its status:
 
 ### `web_search` returns `{"success": false}`
 
+- With DDGS, a 30-second timeout can mean one or more engines selected by `web.ddgs_backend: "auto"` are unreachable. Configure one reachable engine such as `yandex`; do not use a comma-delimited list.
 - Check `SEARXNG_URL` is reachable: `curl -s "http://localhost:8888/search?q=test&format=json"`
 - If you get HTTP 403, JSON format is disabled — add `json` to the `formats` list in `settings.yml` and restart
 - If you get a connection error, the container may not be running: `docker ps | grep searxng`

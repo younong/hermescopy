@@ -21,6 +21,7 @@ EXECUTOR_WORKSPACE_FD = "HERMES_EXECUTOR_WORKSPACE_FD"
 EXECUTOR_BOOTSTRAP_FD = "HERMES_EXECUTOR_BOOTSTRAP_FD"
 EXECUTOR_RESPONSE_FD = "HERMES_EXECUTOR_RESPONSE_FD"
 EXECUTOR_START_GATE_FD = "HERMES_EXECUTOR_START_GATE_FD"
+EXECUTOR_WEB_RELAY_FD = "HERMES_EXECUTOR_WEB_RELAY_FD"
 EXECUTOR_GENERATION = "HERMES_EXECUTOR_GENERATION"
 EXECUTOR_EGRESS_PROFILE = "HERMES_EXECUTOR_EGRESS_PROFILE"
 
@@ -35,7 +36,7 @@ _ALLOWED_ENV_KEYS = frozenset({
     "PYTHONPATH", "PYTHONUNBUFFERED", "PYTHONNOUSERSITE",
     EXECUTOR_RUNTIME_FLAG, EXECUTOR_HOME, EXECUTOR_TMP, EXECUTOR_WORKSPACE_FD,
     EXECUTOR_BOOTSTRAP_FD, EXECUTOR_RESPONSE_FD, EXECUTOR_START_GATE_FD,
-    EXECUTOR_GENERATION, EXECUTOR_EGRESS_PROFILE,
+    EXECUTOR_WEB_RELAY_FD, EXECUTOR_GENERATION, EXECUTOR_EGRESS_PROFILE,
 })
 
 # These names identify parent/control-plane authority. Their presence is a
@@ -75,6 +76,11 @@ def _validate_descriptor_numbers(environment: Mapping[str, str]) -> None:
             if value in {0, 1, 2} or value < 0:
                 raise ValueError
             values.append(value)
+        relay_value = int(str(environment.get(EXECUTOR_WEB_RELAY_FD, "-1")))
+        if relay_value != -1:
+            if relay_value in {0, 1, 2} or relay_value < 0:
+                raise ValueError
+            values.append(relay_value)
         if len(set(values)) != len(values) or int(str(environment[EXECUTOR_GENERATION])) < 1:
             raise ValueError
     except (KeyError, ValueError) as exc:
@@ -128,6 +134,7 @@ def build_executor_environment(
     response_fd: int,
     start_gate_fd: int,
     egress_profile: str,
+    web_relay_fd: int | None = None,
     path: str = SANDBOX_SYSTEM_PATH,
     locale: str = "C.UTF-8",
 ) -> dict[str, str]:
@@ -156,6 +163,8 @@ def build_executor_environment(
         EXECUTOR_GENERATION: str(identity.executor_generation),
         EXECUTOR_EGRESS_PROFILE: str(egress_profile),
     }
+    if web_relay_fd is not None:
+        result[EXECUTOR_WEB_RELAY_FD] = str(int(web_relay_fd))
     validate_executor_environment(result)
     return result
 

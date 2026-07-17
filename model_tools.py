@@ -276,6 +276,26 @@ def _clear_tool_defs_cache() -> None:
     _tool_defs_cache.clear()
 
 
+def _current_authenticated_executor_policy() -> tuple[tuple[Any, ...], Any, bool]:
+    """Return the active authenticated executor policy and cache fingerprint."""
+    try:
+        from tui_gateway.server import current_owner_worker_gateway_runtime
+
+        runtime = current_owner_worker_gateway_runtime()
+    except Exception:
+        runtime = None
+    if runtime is None:
+        return ("standalone",), None, False
+    supervisor = getattr(runtime, "tool_executor_supervisor", None)
+    if supervisor is None:
+        return ("authenticated-unavailable",), None, True
+    try:
+        fingerprint = supervisor.egress_policy_fingerprint
+    except Exception:
+        return ("authenticated-invalid",), None, True
+    return ("authenticated", fingerprint), supervisor, True
+
+
 def get_tool_definitions(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
@@ -300,6 +320,10 @@ def get_tool_definitions(
     Returns:
         Filtered list of OpenAI-format tool definitions.
     """
+    policy_fingerprint, _executor_supervisor, _authenticated_runtime = (
+        _current_authenticated_executor_policy()
+    )
+
     # Fast path: memoized result when the caller doesn't need stdout prints.
     # The cache key captures every argument-level input; the registry
     # generation captures registry mutations (MCP refresh, plugin load).
@@ -323,6 +347,7 @@ def get_tool_definitions(
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
+            policy_fingerprint,
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
@@ -441,11 +466,48 @@ def _compute_tool_definitions(
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
 
+    # Authenticated Owner Workers must not advertise a tool their mandatory
+    # executor boundary will reject. This is model-facing accuracy only;
+    # dispatch() repeats the same admission check as the authority boundary.
+    _, executor_supervisor, authenticated_runtime = (
+        _current_authenticated_executor_policy()
+    )
+    if authenticated_runtime:
+        if executor_supervisor is None:
+            filtered_tools = []
+        else:
+            admitted_tools = []
+            for definition in filtered_tools:
+                name = definition.get("function", {}).get("name", "")
+                try:
+                    executor_supervisor.admitted_egress_profile_for(name)
+                except Exception:
+                    continue
+                admitted_tools.append(definition)
+            filtered_tools = admitted_tools
+
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references
     # other tools by name — otherwise the model sees tools mentioned in
     # descriptions that don't actually exist, and hallucinates calls to them.
     available_tool_names = {t["function"]["name"] for t in filtered_tools}
+
+    # Remove browser fallback guidance when authenticated policy filtered the
+    # browser out. Otherwise the model may still attempt a guaranteed-denied
+    # tool after web_extract returns a provider or timeout error.
+    if "web_extract" in available_tool_names and "browser_navigate" not in available_tool_names:
+        for i, td in enumerate(filtered_tools):
+            if td.get("function", {}).get("name") == "web_extract":
+                desc = td["function"].get("description", "")
+                desc = desc.replace(
+                    " If a URL fails or times out, use the browser tool instead.",
+                    "",
+                )
+                filtered_tools[i] = {
+                    "type": "function",
+                    "function": {**td["function"], "description": desc},
+                }
+                break
 
     # Rebuild execute_code schema to only list sandbox tools that are actually
     # available.  Without this, the model sees "web_search is available in

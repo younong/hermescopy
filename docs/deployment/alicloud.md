@@ -195,7 +195,21 @@ nginx -t && systemctl reload nginx
 
 当前 bare-metal policy 只允许 `tool-none`：owner workspace 内的 `read_file`、`write_file`、`patch`、`search_files`、本地 skill 读取和无网络 terminal 可以在 Bubblewrap 中运行。terminal 提供部署时复制并绑定到 runtime 的最小命令集（`bash`、`sh`、`ls`、`pwd`、`printf`、`cat`、`grep`、`find`）以及 runtime Python，不会把宿主 `/usr` 整体暴露给 owner。每次调用使用独立 user/PID/IPC/mount/network namespace、non-root UID/GID、只读 release/runtime、私有 tmpfs、seccomp 和 post-spawn `/proc` attestation；executor 在 attestation 完成前阻塞在 start gate。
 
-`tool-public` 与 `protected-target` 继续在 spawn 前明确拒绝：`authenticated network egress is not configured`。不要通过关闭 `--unshare-net` 或回退到进程全局 tool registry 来恢复联网工具；后续必须使用独立 authenticated egress broker。
+`tool-public` 与 `protected-target` 继续在 spawn 前明确拒绝：`authenticated network egress is not configured`。Authenticated 会话会按当前 executor policy 过滤模型可见工具，因此只允许 `tool-none` 的生产环境不会向模型展示必然失败的 browser/media 直连工具；该过滤不替代 spawn 前的最终拒绝。不要通过关闭 `--unshare-net` 或回退到进程全局 tool registry 来恢复联网工具。
+
+Authenticated 会话中的 `web_search` 与 `web_extract` 使用独立的 one-shot web relay：Tool Executor 保持 `tool-none` 和私有 network namespace，只继承绑定 exact executor identity/invocation 的 socketpair descriptor；owner worker 校验绑定后，以 owner-scoped `config.yaml`、`.env` 和 `auth.json` 执行现有 web provider。API key/token 不进入 executor env、argv、mount 或 bootstrap。该 relay 不接受任意 tool name、provider、header 或通用 HTTP 请求，也不会给 browser、terminal、code execution、plugin 或 MCP 工具增加网络权限。
+
+生产 immutable runtime 通过单独的 locked `ddgs` extra 提供无密钥的 `web_search` 基线；已配置的付费/自托管 provider 仍按既有优先级覆盖它。工具可见性按能力判断：DDGS 只支持 search，因此没有 Firecrawl、Tavily、Exa 或 Parallel 等 extract provider 时，`web_extract` 不会向模型暴露，也不会因为 DDGS 已安装而错误显示为可用。
+
+`web.backend` / `web.search_backend` 选择 Hermes provider；`web.ddgs_backend` 只选择 DDGS 包内部的单个 text engine。默认 `auto` 会并发/轮询多个 engine，但当前阿里云网络无法稳定访问其中若干站点，可能等到 Hermes 的 30 秒总超时。每个 owner 的 `config.yaml` 应配置一个已验证可达的 engine：
+
+```yaml
+web:
+  search_backend: "ddgs"
+  ddgs_backend: "yandex"
+```
+
+该值是 owner-scoped 非敏感配置，只接受一个已知 engine；未知值和逗号分隔列表会 fail closed。查询仍由 exact one-shot owner-side relay 执行，executor 继续使用 `tool-none`、`--unshare-net` 和私有 network namespace；这不是给 browser、terminal 或其他工具放开直连网络。
 
 诊断 policy：
 
@@ -261,7 +275,7 @@ ssh root@106.15.186.104 'journalctl -u hermes-gateway -u hermes-dashboard --sinc
 
 迁移后使用隐私窗口访问 `https://abinllm.xyz/hermes/`：浏览器应直接显示 Hermes 登录页，不再弹出原生 Basic Auth。用一个 active member 验证 dashboard、WebSocket/PTY、sessions API 和普通 owner 功能，确认账号管理仍返回 403；再用独立 admin 会话确认管理读取可用。验证 logout、过期/篡改 cookie 和非 Hermes 站点未回归。
 
-APIYI smoke test 不是发布脚本必跑步骤；需要真实调用模型时再单独执行。发布脚本会做 host sandbox preflight、systemd 服务状态和 Hermes auth readiness 检查；生产验收还应使用真实 authenticated 用户验证本地文件/terminal、跨 owner 隔离，以及联网工具的预期拒绝。
+APIYI smoke test 不是发布脚本必跑步骤；需要真实调用模型时再单独执行。发布脚本会做 host sandbox preflight、systemd 服务状态和 Hermes auth readiness 检查；生产验收还应使用真实 authenticated 用户验证本地文件/terminal、跨 owner 隔离、`web_search` 经 relay 成功，以及 browser 等 direct-egress 工具继续按 policy 隐藏并在直接调用时拒绝。
 
 ## 常用参数
 

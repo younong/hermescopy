@@ -43,6 +43,10 @@ from hermes_cli.owner_worker.tool_executor_sandbox import (
     validate_sandbox_verification_record,
 )
 from hermes_cli.tool_executor_runtime.env import build_executor_environment
+from hermes_cli.owner_worker.web_tool_relay import (
+    WEB_RELAY_TOOL_NAMES,
+    WebToolRelayBroker,
+)
 
 
 @dataclass(frozen=True)
@@ -64,7 +68,7 @@ class _LiveInvocation:
 
 
 _NETWORK_TOOL_NAMES = frozenset({
-    "web_search", "web_extract", "browser_navigate", "browser_snapshot",
+    "browser_navigate", "browser_snapshot",
     "browser_click", "browser_type", "browser_scroll", "browser_back",
     "browser_press", "browser_get_images", "browser_vision", "browser_console",
     "image_generation", "text_to_speech", "speech_to_text",
@@ -109,6 +113,7 @@ class ToolExecutorSupervisor:
         lease: Any,
         process_factory: Callable[..., subprocess.Popen] = subprocess.Popen,
         credential_broker: CredentialBroker | None = None,
+        web_tool_relay: WebToolRelayBroker | None = None,
         sandbox_builder: Callable[..., BubblewrapLaunchSpec] = build_bubblewrap_launch_spec,
         control_home: str | Path | None = None,
         readonly_global_mount_roots: tuple[str | Path, ...] | None = None,
@@ -129,6 +134,9 @@ class ToolExecutorSupervisor:
         self.lease = lease
         self.process_factory = process_factory
         self.credential_broker = credential_broker or CredentialBroker()
+        self.web_tool_relay = web_tool_relay or WebToolRelayBroker(
+            identity_validator=self._require_active_executor_identity,
+        )
         self.sandbox_builder = sandbox_builder
         self.control_home = Path(control_home).resolve() if control_home else None
         if deployment_policy is not None:
@@ -197,6 +205,25 @@ class ToolExecutorSupervisor:
             # Audit delivery cannot relax executor admission or revocation.
             pass
 
+    @property
+    def egress_policy_fingerprint(self) -> tuple[Any, ...]:
+        """Return a deterministic fingerprint for model-visible policy caches."""
+        return (
+            tuple(sorted(profile.value for profile in self.allowed_egress_profiles)),
+            self.egress_policy.default.value,
+            tuple(sorted(
+                (name, profile.value)
+                for name, profile in self.egress_policy.by_tool_name.items()
+            )),
+        )
+
+    def admitted_egress_profile_for(self, function_name: str) -> EgressProfile:
+        """Select the trusted tool profile and fail if this host denies it."""
+        egress_profile = self.egress_policy.select(function_name)
+        if egress_profile not in self.allowed_egress_profiles:
+            raise ExecutorIdentityInvalid("authenticated network egress is not configured")
+        return egress_profile
+
     def identity_for(self, *, task_id: str, session_id: str) -> ExecutorIdentity:
         key = (str(task_id or ""), str(session_id or ""))
         if not all(key):
@@ -228,9 +255,7 @@ class ToolExecutorSupervisor:
     ) -> str:
         identity = self.identity_for(task_id=task_id, session_id=session_id)
         try:
-            egress_profile = self.egress_policy.select(function_name)
-            if egress_profile not in self.allowed_egress_profiles:
-                raise ExecutorIdentityInvalid("authenticated network egress is not configured")
+            egress_profile = self.admitted_egress_profile_for(function_name)
         except ExecutorIdentityInvalid:
             self._report(AuthorityAuditEvent.EGRESS_REJECTED, AuthorityAuditReason.EGRESS_PROFILE_REJECTED, identity)
             raise
@@ -305,8 +330,16 @@ class ToolExecutorSupervisor:
         if actual != expected:
             raise PermissionError("executor identity does not match the active owner-worker lease")
 
-    def _sandbox_binding(self, identity: ExecutorIdentity) -> SandboxLaunchBinding:
+    def _require_active_executor_identity(self, identity: ExecutorIdentity) -> None:
         self._require_current_lease_identity(identity)
+        with self._lock:
+            if identity.stable_key in self._revoked:
+                raise PermissionError("executor generation is revoked")
+            if self._identities.get((identity.task_id, identity.session_id)) != identity:
+                raise PermissionError("executor identity is not active")
+
+    def _sandbox_binding(self, identity: ExecutorIdentity) -> SandboxLaunchBinding:
+        self._require_active_executor_identity(identity)
         runtime_home = self.owner_home / "runtime" / "executors" / identity.executor_id / f"gen-{identity.executor_generation}"
         return SandboxLaunchBinding(
             identity=identity,
@@ -474,7 +507,7 @@ class ToolExecutorSupervisor:
             runtime_home.chmod(stat.S_IRWXU)
 
         workspace_fd = inherited_workspace_fd = request_read = request_write = response_read = response_write = -1
-        gate_read = gate_write = info_read = info_write = -1
+        gate_read = gate_write = info_read = info_write = web_relay_fd = -1
         process: Any | None = None
         spec: BubblewrapLaunchSpec | None = None
         completed = False
@@ -488,6 +521,9 @@ class ToolExecutorSupervisor:
             info_read, info_write = os.pipe()
             for fd in (inherited_workspace_fd, request_read, response_write, gate_read, info_write):
                 os.set_inheritable(fd, True)
+            if invocation.tool_name in WEB_RELAY_TOOL_NAMES:
+                web_relay_fd = self.web_tool_relay.register(invocation)
+                os.set_inheritable(web_relay_fd, True)
             environment = build_executor_environment(
                 identity,
                 runtime_home=runtime_home,
@@ -496,6 +532,7 @@ class ToolExecutorSupervisor:
                 response_fd=response_write,
                 start_gate_fd=gate_read,
                 egress_profile=invocation.egress_profile,
+                web_relay_fd=(web_relay_fd if web_relay_fd >= 0 else None),
             )
             spec = self.sandbox_builder(
                 environment=environment,
@@ -523,7 +560,9 @@ class ToolExecutorSupervisor:
                     close_fds=True,
                     pass_fds=tuple(dict.fromkeys((
                         inherited_workspace_fd, request_read, response_write, gate_read,
-                        info_write, inherited_security_fd, *spec.inherited_security_fds,
+                        info_write, inherited_security_fd,
+                        *((web_relay_fd,) if web_relay_fd >= 0 else ()),
+                        *spec.inherited_security_fds,
                     ))),
                     start_new_session=True,
                 )
@@ -533,6 +572,9 @@ class ToolExecutorSupervisor:
             for fd in (request_read, response_write, gate_read, info_write):
                 os.close(fd)
             request_read = response_write = gate_read = info_write = -1
+            if web_relay_fd >= 0:
+                os.close(web_relay_fd)
+                web_relay_fd = -1
             for fd in spec.inherited_security_fds:
                 if fd != inherited_security_fd:
                     os.close(fd)
@@ -575,6 +617,7 @@ class ToolExecutorSupervisor:
             completed = True
             return str(result)
         finally:
+            self.web_tool_relay.revoke_invocation(invocation)
             if process is not None:
                 if not completed:
                     self._terminate(process)
@@ -589,7 +632,8 @@ class ToolExecutorSupervisor:
             for fd in (
                 workspace_fd, inherited_workspace_fd, request_read, request_write,
                 response_read, response_write, gate_read, gate_write,
-                info_read, info_write, inherited_security_fd, *extra_spec_fds,
+                info_read, info_write, web_relay_fd,
+                inherited_security_fd, *extra_spec_fds,
             ):
                 if isinstance(fd, int) and fd >= 0:
                     try:
@@ -637,6 +681,7 @@ class ToolExecutorSupervisor:
         with self._lock:
             self._revoked.add(identity.stable_key)
         revoked = self.credential_broker.revoke_executor(identity)
+        self.web_tool_relay.revoke_executor(identity)
         self._reap_registry_descendants(identity)
         self._revoke_live(lambda candidate: candidate == identity)
         return revoked
@@ -654,6 +699,11 @@ class ToolExecutorSupervisor:
             for identity in identities:
                 self._revoked.add(identity.stable_key)
         revoked = self.credential_broker.revoke_worker_generation(
+            owner_key=self.lease.owner_key,
+            worker_generation=self.lease.worker_generation,
+            worker_id=self.lease.worker_id,
+        )
+        self.web_tool_relay.revoke_worker_generation(
             owner_key=self.lease.owner_key,
             worker_generation=self.lease.worker_generation,
             worker_id=self.lease.worker_id,

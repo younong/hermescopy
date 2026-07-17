@@ -22,13 +22,66 @@ logger = logging.getLogger(__name__)
 
 # Overall wall-clock cap for a single ddgs search. The DDGS constructor's
 # ``timeout`` only bounds individual HTTP requests; ddgs's multi-engine retry
-# loop has no overall cap, so a slow/rate-limited DuckDuckGo response can hang
-# the (single, shared) agent loop indefinitely and block every platform
-# (#36776). Enforce a hard cap here via a worker thread.
+# loop has no overall cap, so a slow or unreachable engine can hang the
+# (single, shared) agent loop indefinitely and block every platform (#36776).
+# Enforce a hard cap here via a worker thread.
 _SEARCH_TIMEOUT_SECS = 30
 
+# Keep this allowlist synchronized with the text engines shipped by the exact
+# pinned ddgs version. Accepting one engine only avoids reintroducing the
+# multi-engine wait that ``auto`` can trigger on filtered networks.
+_DDGS_TEXT_BACKENDS = frozenset({
+    "auto",
+    "bing",
+    "brave",
+    "duckduckgo",
+    "google",
+    "grokipedia",
+    "mojeek",
+    "startpage",
+    "wikipedia",
+    "yahoo",
+    "yandex",
+})
 
-def _run_ddgs_search(query: str, safe_limit: int) -> list[dict[str, Any]]:
+
+def _configured_ddgs_backend() -> str:
+    """Return the validated owner-scoped DDGS text engine."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+    except Exception as exc:  # pragma: no cover - defensive import/config guard
+        raise ValueError(
+            "web.ddgs_backend could not be loaded from Hermes configuration"
+        ) from exc
+
+    web_config = config.get("web", {})
+    if not isinstance(web_config, dict):
+        raise ValueError("web.ddgs_backend requires the web config to be a mapping")
+
+    configured = web_config.get("ddgs_backend", "auto")
+    if not isinstance(configured, str):
+        raise ValueError("web.ddgs_backend must be one text engine name")
+
+    backend = configured.strip().lower() or "auto"
+    if "," in backend:
+        raise ValueError(
+            "web.ddgs_backend must select exactly one text engine, not a list"
+        )
+    if backend not in _DDGS_TEXT_BACKENDS:
+        allowed = ", ".join(sorted(_DDGS_TEXT_BACKENDS))
+        raise ValueError(
+            f"unsupported web.ddgs_backend {backend!r}; choose one of: {allowed}"
+        )
+    return backend
+
+
+def _run_ddgs_search(
+    query: str,
+    safe_limit: int,
+    backend: str,
+) -> list[dict[str, Any]]:
     """Run the blocking ddgs query and return normalized hits.
 
     Module-level (not a closure) so tests can patch it directly without
@@ -40,7 +93,13 @@ def _run_ddgs_search(query: str, safe_limit: int) -> list[dict[str, Any]]:
 
     results: list[dict[str, Any]] = []
     with DDGS(timeout=10) as client:
-        for i, hit in enumerate(client.text(query, max_results=safe_limit)):
+        for i, hit in enumerate(
+            client.text(
+                query,
+                backend=backend,
+                max_results=safe_limit,
+            )
+        ):
             if i >= safe_limit:
                 break
             url = str(hit.get("href") or hit.get("url") or "")
@@ -109,6 +168,17 @@ class DDGSWebSearchProvider(WebSearchProvider):
         # DDGS().text yields at most `max_results` items; we cap defensively
         # in case the package ignores the hint.
         safe_limit = max(1, int(limit))
+        try:
+            backend = _configured_ddgs_backend()
+        except ValueError as exc:
+            logger.warning(
+                "DDGS search configuration rejected",
+                extra={"error_type": type(exc).__name__},
+            )
+            return {
+                "success": False,
+                "error": f"DDGS search configuration error: {exc}",
+            }
 
         # A fresh single-worker pool per call (rather than a module-level one)
         # is intentional: on timeout the blocking ddgs call cannot be cancelled
@@ -117,25 +187,37 @@ class DDGSWebSearchProvider(WebSearchProvider):
         # previously-hung one.
         pool = _cf.ThreadPoolExecutor(max_workers=1)
         try:
-            future = pool.submit(_run_ddgs_search, query, safe_limit)
+            future = pool.submit(_run_ddgs_search, query, safe_limit, backend)
             try:
                 web_results = future.result(timeout=_SEARCH_TIMEOUT_SECS)
             except _cf.TimeoutError:
                 logger.warning(
-                    "DDGS search timed out after %ds for query: %r",
-                    _SEARCH_TIMEOUT_SECS, query,
+                    "DDGS search timed out",
+                    extra={
+                        "backend": backend,
+                        "timeout_seconds": _SEARCH_TIMEOUT_SECS,
+                    },
                 )
                 return {
                     "success": False,
                     "error": (
-                        f"DuckDuckGo search timed out after {_SEARCH_TIMEOUT_SECS}s — "
-                        "DuckDuckGo may be rate-limiting or slow. Try again later "
-                        "or switch to a different search provider."
+                        f"DDGS search timed out after {_SEARCH_TIMEOUT_SECS}s "
+                        f"using the {backend!r} engine. Try again later or set "
+                        "web.ddgs_backend to a reachable single engine."
                     ),
                 }
         except Exception as exc:  # noqa: BLE001 — ddgs raises its own exceptions
-            logger.warning("DDGS search error: %s", exc)
-            return {"success": False, "error": f"DuckDuckGo search failed: {exc}"}
+            logger.warning(
+                "DDGS search failed",
+                extra={
+                    "backend": backend,
+                    "error_type": type(exc).__name__,
+                },
+            )
+            return {
+                "success": False,
+                "error": f"DDGS search failed ({type(exc).__name__})",
+            }
         finally:
             # Return immediately without joining the worker. On timeout the
             # already-running ddgs call can't be cancelled (cancel_futures only
@@ -143,7 +225,14 @@ class DDGSWebSearchProvider(WebSearchProvider):
             # on its own; it writes nothing shared, so leaking it is safe.
             pool.shutdown(wait=False, cancel_futures=True)
 
-        logger.info("DDGS search '%s': %d results (limit %d)", query, len(web_results), limit)
+        logger.info(
+            "DDGS search completed",
+            extra={
+                "backend": backend,
+                "results_count": len(web_results),
+                "limit": limit,
+            },
+        )
         return {"success": True, "data": {"web": web_results}}
 
     def get_setup_schema(self) -> Dict[str, Any]:
