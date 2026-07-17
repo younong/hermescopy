@@ -29,17 +29,23 @@ def _install_fake_ddgs(monkeypatch, *, text_results=None, text_raises=None, text
     import time as _time
 
     fake = types.ModuleType("ddgs")
+    fake.calls = []
 
     class _FakeDDGS:
         def __init__(self, **kwargs):
             # Accept timeout= (and any other constructor kwargs) — the provider
             # now passes DDGS(timeout=10).
-            pass
+            fake.constructor_kwargs = kwargs
         def __enter__(self):
             return self
         def __exit__(self, *_a):
             return False
-        def text(self, query, max_results=5):
+        def text(self, query, *, backend="auto", max_results=5):
+            fake.calls.append({
+                "query": query,
+                "backend": backend,
+                "max_results": max_results,
+            })
             if text_sleep is not None:
                 _time.sleep(text_sleep)
             if text_raises is not None:
@@ -93,7 +99,7 @@ class TestDDGSProviderIsConfigured:
 
 class TestDDGSProviderSearch:
     def test_happy_path_normalizes_results(self, monkeypatch):
-        _install_fake_ddgs(monkeypatch, text_results=[
+        fake = _install_fake_ddgs(monkeypatch, text_results=[
             {"title": "A", "href": "https://a.example.com", "body": "desc A"},
             {"title": "B", "href": "https://b.example.com", "body": "desc B"},
             {"title": "C", "href": "https://c.example.com", "body": "desc C"},
@@ -103,10 +109,89 @@ class TestDDGSProviderSearch:
         result = DDGSWebSearchProvider().search("q", limit=5)
 
         assert result["success"] is True
+        assert fake.calls == [{
+            "query": "q",
+            "backend": "auto",
+            "max_results": 5,
+        }]
         web = result["data"]["web"]
         assert len(web) == 3
         assert web[0] == {"title": "A", "url": "https://a.example.com", "description": "desc A", "position": 1}
         assert web[2]["position"] == 3
+
+    def test_default_config_uses_auto_backend(self):
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG["web"]["ddgs_backend"] == "auto"
+
+    def test_explicit_backend_is_normalized_and_forwarded(self, monkeypatch):
+        fake = _install_fake_ddgs(monkeypatch)
+        from hermes_cli import config
+        from plugins.web.ddgs.provider import DDGSWebSearchProvider
+
+        monkeypatch.setattr(
+            config,
+            "load_config_readonly",
+            lambda: {"web": {"ddgs_backend": "  YaNdEx  "}},
+        )
+
+        result = DDGSWebSearchProvider().search("q", limit=5)
+
+        assert result["success"] is True
+        assert fake.calls[0]["backend"] == "yandex"
+
+    @pytest.mark.parametrize(
+        "backend",
+        [
+            "auto",
+            "bing",
+            "brave",
+            "duckduckgo",
+            "google",
+            "grokipedia",
+            "mojeek",
+            "startpage",
+            "wikipedia",
+            "yahoo",
+            "yandex",
+        ],
+    )
+    def test_all_pinned_text_backends_are_accepted(self, monkeypatch, backend):
+        fake = _install_fake_ddgs(monkeypatch)
+        from hermes_cli import config
+        from plugins.web.ddgs.provider import DDGSWebSearchProvider
+
+        monkeypatch.setattr(
+            config,
+            "load_config_readonly",
+            lambda: {"web": {"ddgs_backend": backend}},
+        )
+
+        result = DDGSWebSearchProvider().search("q", limit=5)
+
+        assert result["success"] is True
+        assert fake.calls[0]["backend"] == backend
+
+    @pytest.mark.parametrize(
+        "configured",
+        ["unknown", "yandex,bing", ["yandex"], 3],
+    )
+    def test_invalid_backend_fails_before_network_work(self, monkeypatch, configured):
+        fake = _install_fake_ddgs(monkeypatch)
+        from hermes_cli import config
+        from plugins.web.ddgs.provider import DDGSWebSearchProvider
+
+        monkeypatch.setattr(
+            config,
+            "load_config_readonly",
+            lambda: {"web": {"ddgs_backend": configured}},
+        )
+
+        result = DDGSWebSearchProvider().search("q", limit=5)
+
+        assert result["success"] is False
+        assert "configuration error" in result["error"].lower()
+        assert fake.calls == []
 
     def test_accepts_url_key_as_fallback_for_href(self, monkeypatch):
         _install_fake_ddgs(monkeypatch, text_results=[
@@ -181,7 +266,7 @@ class TestDDGSProviderSearch:
 
         release = threading.Event()
 
-        def _blocking_search(query, safe_limit):
+        def _blocking_search(query, safe_limit, backend):
             release.wait(timeout=10)  # bounded so the worker can never truly leak
             return []
 
@@ -213,6 +298,63 @@ class TestDDGSProviderSearch:
         assert result["success"] is True
         assert result["data"]["web"][0]["url"] == "https://e.com"
         assert result["data"]["web"][0]["title"] == "T"
+
+    def test_success_logs_do_not_include_query(self, monkeypatch, caplog):
+        secret_query = "private-search-sentinel"
+        _install_fake_ddgs(monkeypatch)
+        from plugins.web.ddgs.provider import DDGSWebSearchProvider
+
+        with caplog.at_level("INFO", logger="plugins.web.ddgs.provider"):
+            result = DDGSWebSearchProvider().search(secret_query, limit=5)
+
+        assert result["success"] is True
+        assert secret_query not in "\n".join(
+            record.getMessage() for record in caplog.records
+        )
+
+    def test_timeout_logs_do_not_include_query(self, monkeypatch, caplog):
+        import threading
+
+        secret_query = "private-timeout-sentinel"
+        _install_fake_ddgs(monkeypatch)
+        monkeypatch.delitem(sys.modules, "plugins.web.ddgs.provider", raising=False)
+        import plugins.web.ddgs.provider as _prov
+
+        release = threading.Event()
+
+        def _blocking_search(query, safe_limit, backend):
+            release.wait(timeout=10)
+            return []
+
+        monkeypatch.setattr(_prov, "_run_ddgs_search", _blocking_search, raising=True)
+        monkeypatch.setattr(_prov, "_SEARCH_TIMEOUT_SECS", 0.1, raising=True)
+        try:
+            with caplog.at_level("WARNING", logger="plugins.web.ddgs.provider"):
+                result = _prov.DDGSWebSearchProvider().search(secret_query, limit=5)
+        finally:
+            release.set()
+
+        assert result["success"] is False
+        assert secret_query not in "\n".join(
+            record.getMessage() for record in caplog.records
+        )
+
+    def test_exception_logs_and_error_do_not_include_query(self, monkeypatch, caplog):
+        secret_query = "private-error-sentinel"
+        _install_fake_ddgs(
+            monkeypatch,
+            text_raises=RuntimeError(f"failed URL ?q={secret_query}"),
+        )
+        from plugins.web.ddgs.provider import DDGSWebSearchProvider
+
+        with caplog.at_level("WARNING", logger="plugins.web.ddgs.provider"):
+            result = DDGSWebSearchProvider().search(secret_query, limit=5)
+
+        assert result["success"] is False
+        assert secret_query not in result["error"]
+        assert secret_query not in "\n".join(
+            record.getMessage() for record in caplog.records
+        )
 
 
 # ---------------------------------------------------------------------------

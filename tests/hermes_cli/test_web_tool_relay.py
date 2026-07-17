@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import socket
 import struct
+import sys
 
 import pytest
 
@@ -262,6 +263,61 @@ def test_owner_side_dispatch_uses_current_owner_home_credentials(tmp_path, monke
         "Hermes:5:owner-a-secret",
         "Hermes:5:owner-b-secret",
     ]
+
+
+def test_owner_side_dispatch_uses_owner_scoped_ddgs_backend(tmp_path, monkeypatch):
+    import json
+
+    from hermes_cli import config
+    from plugins.web.ddgs import provider as ddgs_provider
+    from tools import web_tools
+
+    homes = [tmp_path / "owner-a", tmp_path / "owner-b"]
+    backends = ["yandex", "bing"]
+    for home, backend in zip(homes, backends, strict=True):
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            f"web:\n  backend: ddgs\n  ddgs_backend: {backend}\n",
+            encoding="utf-8",
+        )
+
+    seen_backends = []
+
+    def _search(query, safe_limit, backend):
+        seen_backends.append(backend)
+        return []
+
+    monkeypatch.setattr(ddgs_provider, "_run_ddgs_search", _search)
+    monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
+    monkeypatch.setattr(web_tools, "_get_search_backend", lambda: "ddgs")
+    monkeypatch.setattr(
+        "agent.web_search_registry.get_provider",
+        lambda _name: ddgs_provider.DDGSWebSearchProvider(),
+    )
+
+    import types
+
+    fake_ddgs = types.ModuleType("ddgs")
+    monkeypatch.setitem(sys.modules, "ddgs", fake_ddgs)
+
+    results = []
+    for index, home in enumerate(homes):
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        config._LOAD_CONFIG_CACHE.clear()
+        invocation = _invocation(
+            identity=_identity(f"ok1_owner_{index}"),
+            invocation_id=f"invoke-{index}",
+        )
+        assert backends[index] not in str(invocation.to_payload())
+        broker = WebToolRelayBroker(identity_validator=lambda _identity: None)
+        try:
+            relay_fd = broker.register(invocation)
+            results.append(json.loads(dispatch_web_tool_over_relay(relay_fd, invocation)))
+        finally:
+            broker.close()
+
+    assert seen_backends == backends
+    assert all(result["success"] is True for result in results)
 
 
 def test_owner_side_web_extract_keeps_private_url_guard(monkeypatch):
