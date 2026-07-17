@@ -207,3 +207,95 @@ class TestModelSupportsVision:
         with patch("hermes_cli.config.load_config", return_value={"model": {"supports_vision": False}}), \
              patch("agent.models_dev.get_model_capabilities", return_value=fake_caps):
             assert agent._model_supports_vision() is False
+
+    def test_matching_deployment_capability_preserves_final_request_image(self):
+        from hermes_cli.deployment_inference import DeploymentInferenceDescriptor
+
+        agent = _make_agent()
+        agent.provider = "custom:codex"
+        agent.model = "gpt-5.6-sol"
+        descriptor = DeploymentInferenceDescriptor(
+            provider="custom:codex",
+            model="gpt-5.6-sol",
+            api_mode="chat_completions",
+            policy_id="deployment-default-v1",
+            allowed_models=("gpt-5.6-sol",),
+            supports_vision=True,
+        )
+        messages = [IMG_PARTS_USER_MSG]
+
+        with patch("hermes_cli.config.load_config", return_value={}), \
+             patch(
+                 "hermes_cli.deployment_inference.deployment_descriptor_from_environment",
+                 return_value=descriptor,
+             ), \
+             patch("agent.models_dev.get_model_capabilities", return_value=None), \
+             patch.object(
+                 agent,
+                 "_describe_image_for_anthropic_fallback",
+                 side_effect=AssertionError("auxiliary vision must not run"),
+             ):
+            assert agent._model_supports_vision() is True
+            assert agent._prepare_messages_for_non_vision_model(messages) is messages
+
+    def test_owner_false_overrides_matching_deployment_capability(self):
+        from hermes_cli.deployment_inference import DeploymentInferenceDescriptor
+
+        agent = _make_agent()
+        agent.provider = "custom:codex"
+        agent.model = "gpt-5.6-sol"
+        descriptor = DeploymentInferenceDescriptor(
+            provider="custom:codex",
+            model="gpt-5.6-sol",
+            api_mode="chat_completions",
+            policy_id="deployment-default-v1",
+            allowed_models=("gpt-5.6-sol",),
+            supports_vision=True,
+        )
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"model": {"supports_vision": False}},
+        ), patch(
+            "hermes_cli.deployment_inference.deployment_descriptor_from_environment",
+            return_value=descriptor,
+        ):
+            assert agent._model_supports_vision() is False
+
+    def test_mismatched_deployment_capability_is_ignored(self):
+        from hermes_cli.deployment_inference import DeploymentInferenceDescriptor
+
+        agent = _make_agent()
+        agent.provider = "custom:other"
+        agent.model = "gpt-5.6-sol"
+        descriptor = DeploymentInferenceDescriptor(
+            provider="custom:codex",
+            model="gpt-5.6-sol",
+            api_mode="chat_completions",
+            policy_id="deployment-default-v1",
+            allowed_models=("gpt-5.6-sol",),
+            supports_vision=True,
+        )
+        with patch("hermes_cli.config.load_config", return_value={}), patch(
+            "hermes_cli.deployment_inference.deployment_descriptor_from_environment",
+            return_value=descriptor,
+        ), patch("agent.models_dev.get_model_capabilities", return_value=None):
+            assert agent._model_supports_vision() is False
+
+    def test_unknown_deployment_capability_falls_through_to_catalog(self):
+        from hermes_cli.deployment_inference import DeploymentInferenceDescriptor
+
+        agent = _make_agent()
+        descriptor = DeploymentInferenceDescriptor(
+            provider="anthropic",
+            model="claude-sonnet-4",
+            api_mode="anthropic_messages",
+            policy_id="deployment-default-v1",
+            allowed_models=("claude-sonnet-4",),
+        )
+        fake_caps = MagicMock()
+        fake_caps.supports_vision = True
+        with patch("hermes_cli.config.load_config", return_value={}), patch(
+            "hermes_cli.deployment_inference.deployment_descriptor_from_environment",
+            return_value=descriptor,
+        ), patch("agent.models_dev.get_model_capabilities", return_value=fake_caps):
+            assert agent._model_supports_vision() is True

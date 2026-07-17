@@ -4848,18 +4848,40 @@ class AIAgent:
         them natively (for vision-capable models).
 
         Resolution order (see ``agent.image_routing._supports_vision_override``):
-          1. ``model.supports_vision`` (top-level, single-model shortcut)
-          2. ``providers.<provider>.models.<model>.supports_vision``
-          3. models.dev capability lookup
+          1. owner-local ``model.supports_vision`` or provider/model override
+          2. matching deployment inference descriptor capability
+          3. models.dev capability lookup and existing provider probes
         Custom/local models absent from models.dev would otherwise be
         misclassified as non-vision and have their images stripped.
         """
         try:
             from hermes_cli.config import load_config
-            from agent.image_routing import _lookup_supports_vision
+            from agent.image_routing import (
+                _lookup_supports_vision,
+                _supports_vision_override,
+            )
+
             cfg = load_config()
             provider = (getattr(self, "provider", "") or "").strip()
             model = (getattr(self, "model", "") or "").strip()
+            owner_override = _supports_vision_override(cfg, provider, model)
+            if owner_override is not None:
+                return owner_override
+            try:
+                from hermes_cli.deployment_inference import (
+                    deployment_descriptor_from_environment,
+                )
+
+                descriptor = deployment_descriptor_from_environment()
+                if (
+                    descriptor is not None
+                    and descriptor.provider == provider.lower()
+                    and descriptor.model == model
+                    and descriptor.supports_vision is not None
+                ):
+                    return descriptor.supports_vision
+            except Exception:
+                pass
             return _lookup_supports_vision(provider, model, cfg) is True
         except Exception:
             return False
