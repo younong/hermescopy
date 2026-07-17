@@ -11534,7 +11534,10 @@ class SkillToggle(BaseModel):
 
 
 @app.get("/api/skills")
-async def get_skills(profile: Optional[str] = None):
+async def get_skills(request: Request, profile: Optional[str] = None):
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
     from tools.skills_tool import _find_all_skills
     from hermes_cli.skills_config import get_disabled_skills
     with _profile_scope(profile):
@@ -11547,7 +11550,11 @@ async def get_skills(profile: Optional[str] = None):
 
 
 @app.put("/api/skills/toggle")
-async def toggle_skill(body: SkillToggle, profile: Optional[str] = None):
+async def toggle_skill(request: Request, body: SkillToggle, profile: Optional[str] = None):
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(body.profile)
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
     from hermes_cli.skills_config import get_disabled_skills, save_disabled_skills
     with _profile_scope(body.profile or profile):
         config = load_config()
@@ -11587,8 +11594,11 @@ def _clear_skills_prompt_cache() -> None:
 
 
 @app.get("/api/skills/content")
-async def get_skill_content(name: str, profile: Optional[str] = None):
+async def get_skill_content(request: Request, name: str, profile: Optional[str] = None):
     """Return the raw SKILL.md text for a skill, for the dashboard editor."""
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
     from tools.skill_manager_tool import _find_skill
 
     with _profile_scope(profile):
@@ -11606,7 +11616,7 @@ async def get_skill_content(name: str, profile: Optional[str] = None):
 
 
 @app.post("/api/skills")
-async def create_skill(body: SkillCreate):
+async def create_skill(request: Request, body: SkillCreate):
     """Create a new custom skill (SKILL.md) from the dashboard editor.
 
     Calls the same validated write path as the agent's ``skill_manage``
@@ -11614,6 +11624,9 @@ async def create_skill(body: SkillCreate):
     optional security scan) — but bypasses the agent write-approval gate:
     a write from the authenticated dashboard IS the user acting directly.
     """
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(body.profile)
+        return await _proxy_authenticated_owner_http(request)
     from tools.skill_manager_tool import _create_skill
 
     with _profile_scope(body.profile):
@@ -11625,8 +11638,11 @@ async def create_skill(body: SkillCreate):
 
 
 @app.put("/api/skills/content")
-async def update_skill_content(body: SkillContentUpdate):
+async def update_skill_content(request: Request, body: SkillContentUpdate):
     """Replace the SKILL.md of an existing skill (full rewrite) from the editor."""
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(body.profile)
+        return await _proxy_authenticated_owner_http(request)
     from tools.skill_manager_tool import _edit_skill
 
     with _profile_scope(body.profile):
@@ -11640,39 +11656,15 @@ async def update_skill_content(body: SkillContentUpdate):
 
 
 @app.get("/api/tools/toolsets")
-async def get_toolsets(profile: Optional[str] = None):
-    from hermes_cli.tools_config import (
-        _get_effective_configurable_toolsets,
-        _get_platform_tools,
-        _toolset_has_keys,
-        gui_toolset_label,
-    )
-    from toolsets import resolve_toolset
+async def get_toolsets(request: Request, profile: Optional[str] = None):
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
+
+    from hermes_cli.dashboard_owner_payloads import toolsets_payload
 
     with _profile_scope(profile):
-        config = load_config()
-        enabled_toolsets = _get_platform_tools(
-            config,
-            "cli",
-            include_default_mcp_servers=False,
-        )
-    result = []
-    for name, label, desc in _get_effective_configurable_toolsets():
-        try:
-            tools = sorted(set(resolve_toolset(name)))
-        except Exception:
-            tools = []
-        is_enabled = name in enabled_toolsets
-        result.append({
-            "name": name,
-            "label": gui_toolset_label(label),
-            "description": desc,
-            "enabled": is_enabled,
-            "available": is_enabled,
-            "configured": _toolset_has_keys(name, config),
-            "tools": tools,
-        })
-    return result
+        return toolsets_payload(load_config())
 
 
 class ToolsetToggle(BaseModel):

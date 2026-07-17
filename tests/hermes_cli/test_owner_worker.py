@@ -1417,6 +1417,10 @@ def test_worker_health_over_unix_socket_reports_owner_env(tmp_path, monkeypatch)
     owner_home = ensure_owner_runtime_dirs(socket_root / "u")
     control_home = socket_root / "c"
     control_home.mkdir(parents=True)
+    (owner_home / "config.yaml").write_text(
+        "platform_toolsets:\n  cli:\n    - x_search\n",
+        encoding="utf-8",
+    )
     owner = _Owner("ok1_worker", owner_home)
     supervisor = OwnerWorkerSupervisor(
         control_home=control_home,
@@ -1481,6 +1485,16 @@ def test_worker_health_over_unix_socket_reports_owner_env(tmp_path, monkeypatch)
         assert health["pid"] == proc.pid
         assert health["workspace_root"] == str((owner_home / "workspaces").resolve())
         assert health["forbidden_env_present"] == []
+
+        response = OwnerWorkerClient(socket_path, control_home=control_home).request(
+            "GET",
+            "/api/tools/toolsets",
+            lease=lease,
+        )
+        assert response.status_code == 200
+        toolsets_by_name = {item["name"]: item for item in response.json()}
+        assert toolsets_by_name["x_search"]["enabled"] is True
+        assert toolsets_by_name["x_search"]["available"] is True
 
         transport = httpx.HTTPTransport(uds=str(socket_path))
         with httpx.Client(transport=transport, base_url="http://owner-worker") as client:
@@ -1720,6 +1734,145 @@ def test_worker_session_routes_require_owner_token(tmp_path, monkeypatch):
         control_home=tmp_path / "control",
     )
     assert client.get("/api/sessions", headers={"Authorization": f"Bearer {wrong}"}).status_code == 401
+
+
+def test_worker_skill_routes_are_capability_bound_and_owner_local(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
+    control_home = tmp_path / "control"
+    other_home = tmp_path / "other"
+    other_skill = other_home / "skills" / "other-only"
+    other_skill.mkdir(parents=True)
+    (other_skill / "SKILL.md").write_text(
+        "---\nname: other-only\ndescription: must not leak\n---\n",
+        encoding="utf-8",
+    )
+    owner_skill = owner_home / "skills" / "owner-skill"
+    owner_skill.mkdir(parents=True)
+    owner_content = "---\nname: owner-skill\ndescription: owner only\n---\n\n# Owner\n"
+    owner_skill.joinpath("SKILL.md").write_text(owner_content, encoding="utf-8")
+    owner_home.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_worker_skills")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+    from hermes_cli.owner_worker.entrypoint import create_app
+
+    app = create_app("ok1_worker_skills", owner_home)
+    client = TestClient(app)
+
+    def headers(path: str) -> dict[str, str]:
+        token = _capability_for(app, path=path, control_home=control_home)
+        return {"Authorization": f"Bearer {token}"}
+
+    assert client.get("/api/skills").status_code == 401
+    wrong_token = _capability_for(app, path="/api/sessions", control_home=control_home)
+    assert client.get(
+        "/api/skills",
+        headers={"Authorization": f"Bearer {wrong_token}"},
+    ).status_code == 401
+
+    listed = client.get("/api/skills", headers=headers("/api/skills"))
+    assert listed.status_code == 200
+    names = {skill["name"] for skill in listed.json()}
+    assert "owner-skill" in names
+    assert "other-only" not in names
+
+    content = client.get(
+        "/api/skills/content?name=owner-skill",
+        headers=headers("/api/skills/content"),
+    )
+    assert content.status_code == 200
+    assert content.json()["content"] == owner_content
+    assert str(other_home) not in content.text
+
+    rejected = client.get(
+        "/api/skills?profile=other",
+        headers=headers("/api/skills"),
+    )
+    assert rejected.status_code == 400
+
+
+def test_worker_skill_writes_mutate_only_owner_home(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    import yaml
+
+    owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
+    control_home = tmp_path / "control"
+    other_home = tmp_path / "other"
+    other_home.mkdir()
+    other_home.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    owner_home.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    existing = owner_home / "skills" / "owner-skill"
+    existing.mkdir(parents=True)
+    existing.joinpath("SKILL.md").write_text(
+        "---\nname: owner-skill\ndescription: before\n---\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_worker_skills")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+    from hermes_cli.owner_worker.entrypoint import create_app
+
+    app = create_app("ok1_worker_skills", owner_home)
+    client = TestClient(app)
+    # Direct app construction reuses this test process; production workers set
+    # HERMES_HOME before these owner-sensitive modules are ever imported.
+    import tools.skill_manager_tool as skill_manager_tool
+    import tools.skills_tool as skills_tool
+
+    monkeypatch.setattr(skills_tool, "HERMES_HOME", owner_home)
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", owner_home / "skills")
+    monkeypatch.setattr(skill_manager_tool, "HERMES_HOME", owner_home)
+    monkeypatch.setattr(skill_manager_tool, "SKILLS_DIR", owner_home / "skills")
+
+    def request(method: str, path: str, payload: dict):
+        token = _capability_for(app, path=path, control_home=control_home)
+        return client.request(
+            method,
+            path,
+            json=payload,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        )
+
+    toggled = request(
+        "PUT",
+        "/api/skills/toggle",
+        {"name": "owner-skill", "enabled": False},
+    )
+    assert toggled.status_code == 200
+    owner_config = yaml.safe_load(owner_home.joinpath("config.yaml").read_text()) or {}
+    assert "owner-skill" in owner_config.get("skills", {}).get("disabled", [])
+    assert yaml.safe_load(other_home.joinpath("config.yaml").read_text()) == {}
+
+    new_content = "---\nname: new-skill\ndescription: created\n---\n\n# New\n"
+    created = request(
+        "POST",
+        "/api/skills",
+        {"name": "new-skill", "content": new_content},
+    )
+    assert created.status_code == 200, created.text
+    assert owner_home.joinpath("skills/new-skill/SKILL.md").read_text() == new_content
+    assert not other_home.joinpath("skills/new-skill").exists()
+
+    updated_content = "---\nname: owner-skill\ndescription: after\n---\n\n# Updated\n"
+    updated = request(
+        "PUT",
+        "/api/skills/content",
+        {"name": "owner-skill", "content": updated_content},
+    )
+    assert updated.status_code == 200, updated.text
+    assert existing.joinpath("SKILL.md").read_text() == updated_content
+
+    rejected = request(
+        "POST",
+        "/api/skills",
+        {"name": "blocked", "content": new_content, "profile": "other"},
+    )
+    assert rejected.status_code == 400
+    assert not owner_home.joinpath("skills/blocked").exists()
 
 
 def test_worker_managed_files_are_descriptor_scoped_to_its_owner(tmp_path, monkeypatch):
@@ -2080,6 +2233,7 @@ def test_worker_analytics_and_model_info_routes_require_owner_token(tmp_path, mo
     assert client.get("/api/config").status_code == 401
     assert client.get("/api/dashboard/font").status_code == 401
     assert client.get("/api/dashboard/plugins").status_code == 401
+    assert client.get("/api/tools/toolsets").status_code == 401
 
 
 def test_worker_owner_startup_routes_return_owner_local_payloads(tmp_path, monkeypatch):
@@ -2096,6 +2250,7 @@ def test_worker_owner_startup_routes_return_owner_local_payloads(tmp_path, monke
     save_config({
         "model": {"default": "owner-model", "provider": "owner-provider"},
         "dashboard": {"font": "fraunces"},
+        "platform_toolsets": {"cli": ["x_search"]},
     })
     (owner_home / "skills" / "owner-skill").mkdir(parents=True)
     (owner_home / "skills" / "owner-skill" / "SKILL.md").write_text("# owner", encoding="utf-8")
@@ -2110,6 +2265,7 @@ def test_worker_owner_startup_routes_return_owner_local_payloads(tmp_path, monke
     config = get("/api/config")
     font = get("/api/dashboard/font")
     plugins = get("/api/dashboard/plugins")
+    toolsets = get("/api/tools/toolsets")
 
     assert profiles.status_code == 200
     assert profiles.json()["management_mode"] == "owner_singleton"
@@ -2126,6 +2282,10 @@ def test_worker_owner_startup_routes_return_owner_local_payloads(tmp_path, monke
     assert font.json() == {"font": "fraunces"}
     assert plugins.status_code == 200
     assert isinstance(plugins.json(), list)
+    assert toolsets.status_code == 200
+    toolsets_by_name = {item["name"]: item for item in toolsets.json()}
+    assert toolsets_by_name["x_search"]["enabled"] is True
+    assert toolsets_by_name["x_search"]["available"] is True
 
 
 def test_worker_analytics_routes_return_owner_local_data(tmp_path, monkeypatch):

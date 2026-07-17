@@ -51,6 +51,25 @@ class ManagedFileDelete(BaseModel):
     recursive: bool = False
 
 
+class SkillToggle(BaseModel):
+    name: str
+    enabled: bool
+    profile: str | None = None
+
+
+class SkillCreate(BaseModel):
+    name: str
+    content: str
+    category: str | None = None
+    profile: str | None = None
+
+
+class SkillContentUpdate(BaseModel):
+    name: str
+    content: str
+    profile: str | None = None
+
+
 from hermes_cli.dashboard_auth.authority import (
     AuthorityStore,
     OwnerWorkerAuthorityLease,
@@ -422,6 +441,14 @@ def create_app(
     def _open_db() -> Any:
         return SessionDB()
 
+    def _clear_skills_prompt_cache() -> None:
+        try:
+            from agent.prompt_builder import clear_skills_system_prompt_cache
+
+            clear_skills_system_prompt_cache(clear_snapshot=True)
+        except Exception:
+            pass
+
     try:
         hermes_home = get_hermes_home().resolve()
         if hermes_home != owner_home:
@@ -753,6 +780,97 @@ def create_app(
         from hermes_cli.dashboard_owner_payloads import active_dashboard_plugin_payload
 
         return active_dashboard_plugin_payload()
+
+    @app.get("/api/skills")
+    def get_skills(profile: str | None = None, _: None = Depends(_require_owner_token)) -> list[dict[str, Any]]:
+        _reject_profile(profile)
+        from hermes_cli.config import load_config
+        from hermes_cli.skills_config import get_disabled_skills
+        from tools.skills_tool import _find_all_skills
+
+        disabled = get_disabled_skills(load_config())
+        skills = _find_all_skills(skip_disabled=True)
+        for skill in skills:
+            skill["enabled"] = skill["name"] not in disabled
+        return skills
+
+    @app.put("/api/skills/toggle")
+    def toggle_skill(
+        body: SkillToggle,
+        profile: str | None = None,
+        _: None = Depends(_require_owner_token),
+    ) -> dict[str, Any]:
+        _reject_profile(body.profile)
+        _reject_profile(profile)
+        from hermes_cli.config import load_config
+        from hermes_cli.skills_config import get_disabled_skills, save_disabled_skills
+
+        config = load_config()
+        disabled = get_disabled_skills(config)
+        if body.enabled:
+            disabled.discard(body.name)
+        else:
+            disabled.add(body.name)
+        save_disabled_skills(config, disabled)
+        return {"ok": True, "name": body.name, "enabled": body.enabled}
+
+    @app.get("/api/skills/content")
+    def get_skill_content(
+        name: str,
+        profile: str | None = None,
+        _: None = Depends(_require_owner_token),
+    ) -> dict[str, Any]:
+        _reject_profile(profile)
+        from tools.skill_manager_tool import _find_skill
+
+        found = _find_skill(name)
+        if not found:
+            raise HTTPException(status_code=404, detail=f"Skill '{name}' not found.")
+        skill_md = found["path"] / "SKILL.md"
+        if not skill_md.exists():
+            raise HTTPException(status_code=404, detail=f"Skill '{name}' has no SKILL.md.")
+        try:
+            content = skill_md.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return {"name": name, "content": content, "path": str(skill_md)}
+
+    @app.post("/api/skills")
+    def create_skill(body: SkillCreate, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
+        _reject_profile(body.profile)
+        from tools.skill_manager_tool import _create_skill
+
+        result = _create_skill(body.name, body.content, body.category or None)
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Failed to create skill."))
+        _clear_skills_prompt_cache()
+        return result
+
+    @app.put("/api/skills/content")
+    def update_skill_content(
+        body: SkillContentUpdate,
+        _: None = Depends(_require_owner_token),
+    ) -> dict[str, Any]:
+        _reject_profile(body.profile)
+        from tools.skill_manager_tool import _edit_skill
+
+        result = _edit_skill(body.name, body.content)
+        if not result.get("success"):
+            error = result.get("error", "Failed to update skill.")
+            status = 404 if "not found" in str(error).lower() else 400
+            raise HTTPException(status_code=status, detail=error)
+        _clear_skills_prompt_cache()
+        return result
+
+    @app.get("/api/tools/toolsets")
+    def get_toolsets(
+        profile: str | None = None,
+        _: None = Depends(_require_owner_token),
+    ) -> list[dict[str, Any]]:
+        _reject_profile(profile)
+        from hermes_cli.dashboard_owner_payloads import toolsets_payload
+
+        return toolsets_payload()
 
     @app.get("/api/model/info")
     def get_model_info(profile: str | None = None, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
