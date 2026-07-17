@@ -33,6 +33,7 @@ from fastapi.testclient import TestClient
 
 from hermes_cli import web_server
 from hermes_cli.dashboard_auth import clear_providers, register_provider
+from hermes_cli.dashboard_auth.authority import AuthorityUnavailable, AuthorizationRejected
 from hermes_cli.dashboard_auth.cookies import (
     SESSION_AT_COOKIE,
     SESSION_RT_COOKIE,
@@ -162,6 +163,88 @@ class TestApi401Envelope:
             for c in set_cookies
         )
 
+    @pytest.mark.parametrize("code", ["session_revoked", "membership_revision_mismatch"])
+    def test_authority_rejection_expires_and_clears_session(
+        self, gated_app, monkeypatch, code
+    ):
+        from hermes_cli.dashboard_auth import middleware as middleware_mod
+
+        provider = next(iter(middleware_mod.list_session_providers()))
+        start = provider.start_login(
+            redirect_uri="https://fly-app.fly.dev/auth/callback"
+        )
+        state, verifier = (
+            start.cookie_payload["hermes_session_pkce"]
+            .removeprefix("state=")
+            .split(";verifier=", 1)
+        )
+        session = provider.complete_login(
+            code="stub_code",
+            state=state,
+            code_verifier=verifier,
+            redirect_uri="https://fly-app.fly.dev/auth/callback",
+        )
+        gated_app.cookies.set(SESSION_AT_COOKIE, session.access_token)
+        gated_app.cookies.set(SESSION_RT_COOKIE, session.refresh_token)
+
+        async def _reject(_request, _session):
+            raise AuthorizationRejected(code)
+
+        monkeypatch.setattr(
+            middleware_mod, "activate_verified_session_authority", _reject
+        )
+        r = gated_app.get("/api/sessions")
+
+        assert r.status_code == 401
+        assert r.json()["error"] == "session_expired"
+        set_cookies = r.headers.get_list("set-cookie")
+        assert any(
+            SESSION_AT_COOKIE in cookie and "Max-Age=0" in cookie
+            for cookie in set_cookies
+        )
+        assert any(
+            SESSION_RT_COOKIE in cookie and "Max-Age=0" in cookie
+            for cookie in set_cookies
+        )
+
+    def test_authority_unavailable_preserves_session(self, gated_app, monkeypatch):
+        from hermes_cli.dashboard_auth import middleware as middleware_mod
+
+        provider = next(iter(middleware_mod.list_session_providers()))
+        start = provider.start_login(
+            redirect_uri="https://fly-app.fly.dev/auth/callback"
+        )
+        state, verifier = (
+            start.cookie_payload["hermes_session_pkce"]
+            .removeprefix("state=")
+            .split(";verifier=", 1)
+        )
+        session = provider.complete_login(
+            code="stub_code",
+            state=state,
+            code_verifier=verifier,
+            redirect_uri="https://fly-app.fly.dev/auth/callback",
+        )
+        gated_app.cookies.set(SESSION_AT_COOKIE, session.access_token)
+        gated_app.cookies.set(SESSION_RT_COOKIE, session.refresh_token)
+
+        async def _unavailable(_request, _session):
+            raise AuthorityUnavailable("authority transaction failed")
+
+        monkeypatch.setattr(
+            middleware_mod, "activate_verified_session_authority", _unavailable
+        )
+        r = gated_app.get("/api/sessions")
+
+        assert r.status_code == 503
+        assert r.json() == {"detail": "Authorization state is unavailable"}
+        set_cookies = r.headers.get_list("set-cookie")
+        assert not any(
+            (SESSION_AT_COOKIE in cookie or SESSION_RT_COOKIE in cookie)
+            and "Max-Age=0" in cookie
+            for cookie in set_cookies
+        )
+
     def test_login_url_drops_next_for_deep_api_path(self, gated_app):
         """Bug fix: ``/api/*`` paths must NOT round-trip into ``next=``.
 
@@ -235,8 +318,9 @@ class TestTransparentRefreshOnAccessTokenEviction:
         gated_app.cookies.clear()
         gated_app.cookies.set(SESSION_RT_COOKIE, valid_rt)
 
-        r = gated_app.get("/api/sessions", follow_redirects=False)
-        # Transparent refresh — request served, NOT bounced.
+        r = gated_app.get("/api/auth/me", follow_redirects=False)
+        # Transparent refresh — request served, NOT bounced. Use a Control Plane
+        # auth route so this test does not require an Owner Worker supervisor.
         assert r.status_code == 200, (
             f"expected 200 (transparent refresh) got {r.status_code} "
             f"— the AT-evicted/RT-present case bounced to login"
@@ -251,6 +335,49 @@ class TestTransparentRefreshOnAccessTokenEviction:
             c.startswith(SESSION_RT_COOKIE) or f"-{SESSION_RT_COOKIE}" in c
             for c in set_cookies
         ), f"no rotated RT cookie in {set_cookies!r}"
+
+    @pytest.mark.parametrize(
+        ("activation_error", "expected_status", "clears_session"),
+        [
+            (AuthorizationRejected("session_revoked"), 401, True),
+            (AuthorityUnavailable("authority transaction failed"), 503, False),
+        ],
+    )
+    def test_refresh_authority_result_maps_to_session_or_outage_response(
+        self,
+        gated_app,
+        monkeypatch,
+        activation_error,
+        expected_status,
+        clears_session,
+    ):
+        from hermes_cli.dashboard_auth import middleware as middleware_mod
+
+        _provider, valid_rt = self._build_rt_only_app()
+        gated_app.cookies.clear()
+        gated_app.cookies.set(SESSION_RT_COOKIE, valid_rt)
+
+        async def _fail_activation(_request, _session):
+            raise activation_error
+
+        monkeypatch.setattr(
+            middleware_mod, "activate_verified_session_authority", _fail_activation
+        )
+        r = gated_app.get("/api/sessions", follow_redirects=False)
+
+        assert r.status_code == expected_status
+        if clears_session:
+            assert r.json()["error"] == "session_expired"
+        else:
+            assert r.json() == {"detail": "Authorization state is unavailable"}
+        set_cookies = r.headers.get_list("set-cookie")
+        deletions = [
+            cookie
+            for cookie in set_cookies
+            if (SESSION_AT_COOKIE in cookie or SESSION_RT_COOKIE in cookie)
+            and "Max-Age=0" in cookie
+        ]
+        assert bool(deletions) is clears_session
 
     def test_no_cookies_at_all_still_bounces(self, gated_app):
         """Guard the fix didn't over-reach: a request with NEITHER cookie

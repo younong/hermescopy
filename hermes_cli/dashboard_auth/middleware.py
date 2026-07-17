@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from hermes_cli.dashboard_auth import list_session_providers
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
+from hermes_cli.dashboard_auth.authority import AuthorityUnavailable, AuthorizationRejected
 from hermes_cli.dashboard_auth.base import ProviderError, RefreshExpiredError
 from hermes_cli.dashboard_auth.cookies import (
     clear_sso_attempt_cookie,
@@ -390,6 +391,26 @@ def _auto_sso_response(request: Request) -> Response | None:
     return resp
 
 
+def _rejected_session_response(request: Request, *, code: str) -> Response:
+    """Clear a provider-verified session rejected by the authority store."""
+    _log.info("dashboard-auth: session authority rejected: %s", code)
+    response = _unauth_response(request, reason="invalid_or_expired_session")
+
+    from hermes_cli.dashboard_auth.cookies import clear_session_cookies
+    from hermes_cli.dashboard_auth.prefix import prefix_from_request
+
+    clear_session_cookies(response, prefix=prefix_from_request(request))
+    return response
+
+
+def _authority_unavailable_response() -> Response:
+    """Fail closed without discarding cookies during a transient outage."""
+    return JSONResponse(
+        {"detail": "Authorization state is unavailable"},
+        status_code=503,
+    )
+
+
 def _safe_next_target(request: Request) -> str:
     """Build the URL-encoded ``next`` query value, or empty string.
 
@@ -539,17 +560,14 @@ async def gated_auth_middleware(
                 # any request; AuthorityStore atomically invalidates the old
                 # active scope for the same principal when necessary.
                 await activate_verified_session_authority(request, new_session)
-            except Exception as exc:
+            except AuthorizationRejected as exc:
+                return _rejected_session_response(request, code=exc.code)
+            except AuthorityUnavailable as exc:
                 _log.warning("dashboard-auth: refresh authority activation failed: %s", exc)
-                response = JSONResponse(
-                    {"detail": "Authorization state is unavailable"},
-                    status_code=503,
-                )
-                from hermes_cli.dashboard_auth.cookies import clear_session_cookies
-                from hermes_cli.dashboard_auth.prefix import prefix_from_request
-
-                clear_session_cookies(response, prefix=prefix_from_request(request))
-                return response
+                return _authority_unavailable_response()
+            except Exception:
+                _log.exception("dashboard-auth: unexpected refresh authority activation failure")
+                return _authority_unavailable_response()
             request.state.session = new_session
             try:
                 requires_password_change = _session_requires_password_change(new_session)
@@ -633,12 +651,14 @@ async def gated_auth_middleware(
 
     try:
         await activate_verified_session_authority(request, session)
-    except Exception as exc:
+    except AuthorizationRejected as exc:
+        return _rejected_session_response(request, code=exc.code)
+    except AuthorityUnavailable as exc:
         _log.warning("dashboard-auth: session authority activation failed: %s", exc)
-        return JSONResponse(
-            {"detail": "Authorization state is unavailable"},
-            status_code=503,
-        )
+        return _authority_unavailable_response()
+    except Exception:
+        _log.exception("dashboard-auth: unexpected session authority activation failure")
+        return _authority_unavailable_response()
     request.state.session = session
     try:
         requires_password_change = _session_requires_password_change(session)
