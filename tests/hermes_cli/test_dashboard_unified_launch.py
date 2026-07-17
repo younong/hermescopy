@@ -19,8 +19,8 @@ def main_mod():
 def _args(**kw):
     defaults = dict(
         status=False, stop=False, host="127.0.0.1", port=9119,
-        no_open=True, insecure=False, require_auth=False, skip_build=False,
-        isolated=False, open_profile="",
+        no_open=True, insecure=False, require_auth=False,
+        trust_proxy_headers=False, skip_build=False, isolated=False, open_profile="",
     )
     defaults.update(kw)
     return types.SimpleNamespace(**defaults)
@@ -101,9 +101,12 @@ class TestUnifiedDashboardRouting:
 
         monkeypatch.setattr(main_mod.os, "execvpe", fake_exec)
         with pytest.raises(SystemExit):
-            main_mod.cmd_dashboard(_args(require_auth=True))
+            main_mod.cmd_dashboard(
+                _args(require_auth=True, trust_proxy_headers=True)
+            )
 
         assert "--require-auth" in execs[0][1]
+        assert "--trust-proxy-headers" in execs[0][1]
 
     def test_reexec_pins_docker_machine_root(self, main_mod, monkeypatch):
         """In the Docker layout (HERMES_HOME=/opt/data, profiles under

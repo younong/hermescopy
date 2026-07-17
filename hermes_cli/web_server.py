@@ -321,8 +321,8 @@ _REVEAL_WINDOW_SECONDS = 30
 
 # CORS: restrict to localhost origins only.  The web UI is intended to run
 # locally; binding to 0.0.0.0 with allow_origins=["*"] would let any website
-# read/modify config and secrets.
-
+# read/modify config and secrets. A reverse-proxied browser remains same-origin
+# with its declared public URL, so trusted-proxy mode does not widen CORS.
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
@@ -716,47 +716,34 @@ def should_require_auth(host: str, allow_public: bool = False) -> bool:
     return host not in _LOOPBACK_HOST_VALUES
 
 
-def _is_accepted_host(host_header: str, bound_host: str) -> bool:
-    """True if the Host header targets the interface we bound to.
-
-    Accepts:
-    - Exact bound host (with or without port suffix)
-    - Loopback aliases when bound to loopback
-    - Any host when bound to 0.0.0.0 (explicit opt-in to non-loopback,
-      no protection possible at this layer)
-    """
-    if not host_header:
-        return False
-    # Strip port suffix. IPv6 addresses use bracket notation:
-    #   [::1]         — no port
-    #   [::1]:9119    — with port
-    # Plain hosts/v4:
-    #   localhost:9119
-    #   127.0.0.1:9119
-    h = host_header.strip()
+def _host_name(host_header: str) -> str:
+    """Return a lower-case hostname from a Host header or URL netloc."""
+    h = str(host_header or "").strip()
+    if not h:
+        return ""
     if h.startswith("["):
-        # IPv6 bracketed — port (if any) follows "]:"
         close = h.find("]")
-        if close != -1:
-            host_only = h[1:close]  # strip brackets
-        else:
-            host_only = h.strip("[]")
-    else:
-        host_only = h.rsplit(":", 1)[0] if ":" in h else h
-    host_only = host_only.lower()
+        return h[1:close].lower() if close != -1 else h.strip("[]").lower()
+    return (h.rsplit(":", 1)[0] if ":" in h else h).lower()
 
-    # 0.0.0.0 bind means operator explicitly opted into all-interfaces
-    # (requires --insecure per web_server.start_server). No Host-layer
-    # defence can protect that mode; rely on operator network controls.
+
+def _is_accepted_host(
+    host_header: str,
+    bound_host: str,
+    *,
+    trusted_proxy_host: str = "",
+) -> bool:
+    """True if the Host targets the bind or declared trusted-proxy origin."""
+    host_only = _host_name(host_header)
+    if not host_only:
+        return False
+    if trusted_proxy_host and host_only == _host_name(trusted_proxy_host):
+        return True
     if bound_host in {"0.0.0.0", "::"}:
         return True
-
-    # Loopback bind: accept the loopback names
     bound_lc = bound_host.lower()
     if bound_lc in _LOOPBACK_HOST_VALUES:
         return host_only in _LOOPBACK_HOST_VALUES
-
-    # Explicit non-loopback bind: require exact host match
     return host_only == bound_lc
 
 
@@ -777,7 +764,14 @@ async def host_header_middleware(request: Request, call_next):
     bound_host = getattr(app.state, "bound_host", None)
     if bound_host:
         host_header = request.headers.get("host", "")
-        if not _is_accepted_host(host_header, bound_host):
+        trusted_proxy_host = getattr(
+            request.app.state, "trusted_proxy_public_host", ""
+        )
+        if not _is_accepted_host(
+            host_header,
+            bound_host,
+            trusted_proxy_host=trusted_proxy_host,
+        ):
             return JSONResponse(
                 status_code=400,
                 content={
@@ -12210,8 +12204,14 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     if not bound_host:
         return None
 
+    trusted_proxy_host = getattr(state, "trusted_proxy_public_host", "")
+    trusted_proxy_origin = getattr(state, "trusted_proxy_public_origin", "")
     host_header = ws.headers.get("host", "")
-    if not _is_accepted_host(host_header, bound_host):
+    if not _is_accepted_host(
+        host_header,
+        bound_host,
+        trusted_proxy_host=trusted_proxy_host,
+    ):
         return f"host_mismatch host={host_header or '?'} bound={bound_host}"
 
     origin = ws.headers.get("origin", "")
@@ -12228,7 +12228,16 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     if not parsed.netloc:
         return f"origin_mismatch origin={origin} bound={bound_host}"
 
-    if not _is_accepted_host(parsed.netloc, bound_host):
+    if trusted_proxy_origin:
+        normalized_origin = f"{parsed.scheme}://{parsed.netloc}".lower()
+        if normalized_origin != str(trusted_proxy_origin).lower():
+            return f"origin_mismatch origin={origin} bound={bound_host}"
+
+    if not _is_accepted_host(
+        parsed.netloc,
+        bound_host,
+        trusted_proxy_host=trusted_proxy_host,
+    ):
         return f"origin_mismatch origin={origin} bound={bound_host}"
     return None
 
@@ -15204,6 +15213,7 @@ def start_server(
     open_browser: bool = True,
     allow_public: bool = False,
     require_auth: bool = False,
+    trust_proxy_headers: bool = False,
     initial_profile: str = "",
 ):
     """Start the web UI server.
@@ -15211,6 +15221,10 @@ def start_server(
     ``require_auth`` explicitly enables the cookie/session gate for a
     loopback-bound dashboard shared through an SSH tunnel or trusted proxy.
     It does not make the service publicly reachable.
+
+    ``trust_proxy_headers`` is restricted to an authenticated loopback bind
+    with an operator-declared ``dashboard.public_url``. It trusts forwarded
+    metadata only from loopback peers.
 
     ``initial_profile`` (when set) is appended to the auto-opened browser
     URL as ``?profile=<name>`` so the SPA's profile switcher preselects it
@@ -15230,10 +15244,28 @@ def start_server(
 
     # Stash the auth-gate flag on app.state so middleware / SPA-token injection
     # / WS-auth paths branch consistently. A public bind is always gated;
-    # --require-auth extends that same fail-closed mode to a loopback service
-    # deliberately shared through a tunnel without changing its network bind.
+    # --require-auth extends that same fail-closed mode to a loopback service.
     public_bind_requires_auth = should_require_auth(host)
     app.state.auth_required = require_auth or public_bind_requires_auth
+    app.state.trusted_proxy_public_host = ""
+    app.state.trusted_proxy_public_origin = ""
+    if trust_proxy_headers:
+        if host not in _LOOPBACK_HOST_VALUES or not require_auth:
+            raise SystemExit(
+                "--trust-proxy-headers requires a loopback bind and --require-auth"
+            )
+        from hermes_cli.dashboard_auth.prefix import resolve_public_url
+
+        public_url = resolve_public_url()
+        if not public_url:
+            raise SystemExit(
+                "--trust-proxy-headers requires a valid dashboard.public_url"
+            )
+        parsed_public_url = urllib.parse.urlparse(public_url)
+        app.state.trusted_proxy_public_host = parsed_public_url.netloc
+        app.state.trusted_proxy_public_origin = (
+            f"{parsed_public_url.scheme}://{parsed_public_url.netloc}"
+        )
     app.state.owner_worker_supervisor = None
     if app.state.auth_required:
         from hermes_cli.deployment_inference import (
@@ -15383,13 +15415,15 @@ def start_server(
     _is_loopback = host in ("127.0.0.1", "localhost", "::1")
     config = uvicorn.Config(
         app, host=host, port=port, log_level="warning",
-        # proxy_headers defaults to False so _ws_client_is_allowed sees
-        # the real connection peer rather than X-Forwarded-For's rewritten
-        # value. Public gated deployments sit behind a TLS terminator and need
-        # X-Forwarded-Proto for cookie Secure flags. A forced loopback gate is
-        # normally reached through an SSH tunnel, so it must not start trusting
-        # client-provided forwarded headers merely because cookie auth is on.
-        proxy_headers=public_bind_requires_auth,
+        # A forced loopback gate normally serves an SSH tunnel and must not
+        # trust forwarded metadata by default. An explicit trusted-proxy mode
+        # accepts it only from loopback peers and requires a declared public URL.
+        proxy_headers=public_bind_requires_auth or trust_proxy_headers,
+        **(
+            {"forwarded_allow_ips": "127.0.0.1,::1"}
+            if trust_proxy_headers
+            else {}
+        ),
         # Half-open detection for public binds only (see above). Loopback
         # disables the protocol ping (None) so an event-loop stall can never
         # trigger a false disconnect; a genuinely dead local client is still

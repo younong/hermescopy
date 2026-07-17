@@ -47,6 +47,14 @@ def _add_server_runtime_args(parser) -> None:
         ),
     )
     parser.add_argument(
+        "--trust-proxy-headers",
+        action="store_true",
+        help=(
+            "Trust forwarded request metadata from a loopback reverse proxy. "
+            "Requires --require-auth, a loopback bind, and dashboard.public_url."
+        ),
+    )
+    parser.add_argument(
         "--skip-build",
         action="store_true",
         help=(

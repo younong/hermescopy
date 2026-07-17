@@ -44,13 +44,21 @@
 /opt/hermes/shared/hermes-service-runner.sh
 ```
 
-Dashboard 默认只绑定 `127.0.0.1:9119`。需要访问时使用 SSH tunnel：
+Dashboard 只绑定 `127.0.0.1:9119`，生产入口为：
+
+```text
+https://abinllm.xyz/hermes/
+```
+
+Nginx 只负责 TLS、`/hermes` 路径和 HTTP/WebSocket 反代；Hermes durable local-user provider 是唯一登录层。现有 active member（例如 `user2`–`user5`）可直接登录，不需要先使用 admin 凭据。admin 角色仍只用于账号管理。
+
+SSH tunnel 仅作为紧急诊断入口：
 
 ```bash
 ssh -L 9119:localhost:9119 root@106.15.186.104
 ```
 
-然后在本机打开 `http://localhost:9119`。
+然后在本机打开 `http://localhost:9119`。Dashboard 仍以 `--require-auth` 运行，因此 tunnel 不会绕过 Hermes user 登录。
 
 ## 服务器前置依赖
 
@@ -151,13 +159,35 @@ npm run deploy -- --tag v2026.7.4 --keep-releases 8
 npm run deploy -- --tag v2026.7.4 --no-prune-releases
 ```
 
+## Nginx 单一登录层迁移
+
+仓库只维护 `deploy/nginx/hermes-dashboard.conf` 这个 server-context snippet，不覆盖完整 vhost、站点根应用或 Certbot/TLS 配置。首次从旧的 Nginx Basic Auth/remember-cookie 结构迁移时，必须显式执行：
+
+```bash
+npm run deploy -- --tag v2026.7.4 --migrate-nginx-hermes
+```
+
+迁移流程先启动 `--require-auth --trust-proxy-headers` 的新 Hermes，并从 loopback 验证 HTML 重定向和 API 401 均由 Hermes gate 提供；随后仅在旧 Hermes locations 唯一且完全匹配时备份 vhost、原子写入 include/snippet、执行 `nginx -t`，成功后 reload。未知、重复或部分迁移状态会 fail closed。后续普通发布只 reconcile 已存在的 include。
+
+仅查看状态、不修改服务器：
+
+```bash
+ssh root@106.15.186.104 \
+  'python3 /opt/hermes/current/deploy/nginx/manage_hermes_proxy.py status --vhost /etc/nginx/conf.d/abinllm.conf'
+```
+
+迁移前建议保存 `nginx -T` 和 vhost checksum。失败时优先恢复工具报告的 `abinllm.conf.hermes-backup-<timestamp>`，再执行 `nginx -t && systemctl reload nginx`。不要通过删除 `--require-auth`、清空 local-user SQLite、轮换 durable-store secret 或重跑 bootstrap 来回滚。旧 `.htpasswd-hermes` 只可在 `nginx -T` 确认不再引用后人工清理。
+
 ## 发布后检查
 
 ```bash
 ssh root@106.15.186.104 'readlink /opt/hermes/current'
 ssh root@106.15.186.104 'systemctl is-active hermes-gateway hermes-dashboard'
 ssh root@106.15.186.104 'systemctl status --no-pager hermes-gateway hermes-dashboard'
+ssh root@106.15.186.104 'nginx -t && nginx -T 2>/dev/null | grep -n -A25 -B5 hermes-dashboard.conf'
 ssh root@106.15.186.104 'journalctl -u hermes-gateway -u hermes-dashboard --since "10 min ago" --no-pager -n 200'
 ```
 
-APIYI smoke test 不是发布脚本的必跑步骤；需要真实调用模型时再单独执行。当前部署收尾只检查 systemd 服务状态。
+使用隐私窗口访问 `https://abinllm.xyz/hermes/`，应直接看到 Hermes 登录页而不是浏览器原生 Basic Auth challenge。用 active member 验证普通功能和 WebSocket/PTY；member 的账号管理 API 仍应为 403，admin 管理读取仍应成功。现有 local-user DB、stable secret 和角色都保持不变。
+
+APIYI smoke test 不是发布脚本的必跑步骤；需要真实调用模型时再单独执行。
