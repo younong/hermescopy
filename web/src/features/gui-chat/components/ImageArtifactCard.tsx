@@ -63,18 +63,50 @@ export function ImageArtifactCard({
   const openUrl = displayUrl ?? artifact.url;
 
   if (variant === "bubble") {
-    return displayUrl ? (
-      <a href={openUrl} target="_blank" rel="noreferrer" className="block">
-        <img
-          alt={artifact.title ?? "Image artifact"}
-          className="max-h-[320px] w-[180px] rounded-3xl object-cover shadow-sm sm:w-[220px]"
-          loading="lazy"
-          src={displayUrl}
-        />
-      </a>
-    ) : (
-      <div className="flex h-[220px] w-[180px] items-center justify-center rounded-3xl bg-current/[0.04] px-4 text-center text-xs text-text-secondary sm:w-[220px]">
-        {loadError ? "Image preview failed" : "Loading image…"}
+    return (
+      <div className="w-[180px] sm:w-[220px]">
+        {displayUrl ? (
+          <a href={openUrl} target="_blank" rel="noreferrer" className="block">
+            <img
+              alt={artifact.title ?? "Image artifact"}
+              className="max-h-[320px] w-full rounded-3xl object-cover shadow-sm"
+              loading="lazy"
+              src={displayUrl}
+            />
+          </a>
+        ) : (
+          <div className="flex h-[220px] w-full items-center justify-center rounded-3xl bg-current/[0.04] px-4 text-center text-xs text-text-secondary">
+            {loadError ? "Image preview failed" : "Loading image…"}
+          </div>
+        )}
+        <div className="mt-1 flex justify-end">
+          <a
+            aria-busy={downloading}
+            aria-disabled={downloading}
+            aria-describedby={downloadError ? `${artifact.id}-download-error` : undefined}
+            aria-label={`Download ${filename}`}
+            className="inline-flex h-7 items-center gap-1 px-2 text-xs text-midground hover:text-primary"
+            href={downloadUrl.startsWith("/api/") ? withHermesAssetAuth(downloadUrl) : downloadUrl}
+            download={filename}
+            onClick={download}
+          >
+            {downloading ? (
+              <LoaderCircle aria-hidden className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Download aria-hidden className="h-3.5 w-3.5" />
+            )}
+            Download
+          </a>
+        </div>
+        {downloadError ? (
+          <p
+            className="mt-1 text-xs text-destructive"
+            id={`${artifact.id}-download-error`}
+            role="alert"
+          >
+            {downloadError}
+          </p>
+        ) : null}
       </div>
     );
   }

@@ -39,26 +39,37 @@ export function MessageAttachmentCard({
   };
 
   if (variant === "bubble" && attachment.kind === "image" && previewUrl) {
-    return attachment.downloadUrl ? (
-      <div>
-        <a
-          aria-busy={downloading}
-          aria-disabled={downloading}
-          aria-describedby={downloadError ? `${attachment.id}-download-error` : undefined}
-          aria-label={`Download ${attachment.name}`}
-          href={withHermesAssetAuth(attachment.downloadUrl)}
-          onClick={download}
-        >
-          <img
-            alt={attachment.name}
-            className="max-h-[320px] w-[180px] rounded-3xl object-cover shadow-sm sm:w-[220px]"
-            draggable={false}
-            src={previewUrl}
-          />
-        </a>
+    return (
+      <div className="w-[180px] sm:w-[220px]">
+        <img
+          alt={attachment.name}
+          className="max-h-[320px] w-full rounded-3xl object-cover shadow-sm"
+          draggable={false}
+          src={previewUrl}
+        />
+        {attachment.downloadUrl ? (
+          <div className="mt-1 flex justify-end">
+            <a
+              aria-busy={downloading}
+              aria-disabled={downloading}
+              aria-describedby={downloadError ? `${attachment.id}-download-error` : undefined}
+              aria-label={`Download ${attachment.name}`}
+              className="inline-flex h-7 items-center gap-1 px-2 text-xs text-midground hover:text-primary"
+              href={withHermesAssetAuth(attachment.downloadUrl)}
+              onClick={download}
+            >
+              {downloading ? (
+                <LoaderCircle aria-hidden className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Download aria-hidden className="h-3.5 w-3.5" />
+              )}
+              Download
+            </a>
+          </div>
+        ) : null}
         {downloadError ? (
           <p
-            className="mt-1 max-w-[220px] text-xs text-destructive"
+            className="mt-1 text-xs text-destructive"
             id={`${attachment.id}-download-error`}
             role="alert"
           >
@@ -66,13 +77,6 @@ export function MessageAttachmentCard({
           </p>
         ) : null}
       </div>
-    ) : (
-      <img
-        alt={attachment.name}
-        className="max-h-[320px] w-[180px] rounded-3xl object-cover shadow-sm sm:w-[220px]"
-        draggable={false}
-        src={previewUrl}
-      />
     );
   }
 
