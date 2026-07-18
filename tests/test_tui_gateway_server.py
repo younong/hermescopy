@@ -531,6 +531,119 @@ def test_owner_runtime_propagates_to_notification_poller(monkeypatch):
     assert captured == [(runtime, runtime)]
 
 
+def test_owner_runtime_propagates_to_agent_callbacks_from_foreign_thread(monkeypatch):
+    runtime = server.OwnerWorkerGatewayRuntime("owner-a", 1, "worker-a", 1, 0)
+    captured: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, _sid, _payload=None: captured.append(
+            (event, server.current_owner_worker_gateway_runtime())
+        ),
+    )
+
+    with server.owner_worker_gateway_runtime(runtime):
+        callbacks = server._agent_cbs("same-session")
+
+    thread = threading.Thread(
+        target=lambda: (
+            callbacks["thinking_callback"]("thinking"),
+            callbacks["reasoning_callback"]("reasoning"),
+        )
+    )
+    thread.start()
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert captured == [
+        ("thinking.delta", runtime),
+        ("reasoning.delta", runtime),
+    ]
+
+
+def test_owner_runtime_propagates_to_stream_callback_from_foreign_thread(monkeypatch):
+    runtime = server.OwnerWorkerGatewayRuntime("owner-a", 1, "worker-a", 1, 0)
+    captured: list[tuple[str, object, dict | None]] = []
+    callback_ready = threading.Event()
+    callback_done = threading.Event()
+
+    class _Agent:
+        model = "model-live"
+
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+            assert prompt == "write a long answer"
+            assert conversation_history == []
+            callback_ready.set()
+
+            def stream_from_provider_thread():
+                stream_callback("partial ")
+                stream_callback("answer")
+                callback_done.set()
+
+            provider_thread = threading.Thread(target=stream_from_provider_thread)
+            provider_thread.start()
+            assert callback_done.wait(1)
+            provider_thread.join(timeout=1)
+            return {
+                "final_response": "partial answer",
+                "messages": [{"role": "assistant", "content": "partial answer"}],
+            }
+
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, _sid, payload=None: captured.append(
+            (event, server.current_owner_worker_gateway_runtime(), payload)
+        ),
+    )
+    monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
+    monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda _sid, _session: None)
+    monkeypatch.setattr(server, "_session_cwd", lambda _session: "/workspace")
+    monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda _agent, _session=None: {"model": "model-live"},
+    )
+
+    with server.owner_worker_gateway_runtime(runtime):
+        session = _session(agent=_Agent())
+        server._sessions["same-session"] = session
+        with session["history_lock"]:
+            session["running"] = True
+            server._start_inflight_turn(session, "write a long answer")
+        server._run_prompt_submit(
+            "submit",
+            "same-session",
+            session,
+            "write a long answer",
+        )
+
+    try:
+        assert callback_ready.wait(5), captured
+        assert callback_done.wait(1)
+        deadline = time.time() + 1
+        while not any(event == "message.complete" for event, *_ in captured):
+            assert time.time() < deadline
+            time.sleep(0.01)
+    finally:
+        with server.owner_worker_gateway_runtime(runtime):
+            server._sessions.pop("same-session", None)
+
+    deltas = [
+        (runtime_value, payload["text"])
+        for event, runtime_value, payload in captured
+        if event == "message.delta"
+    ]
+    assert deltas == [(runtime, "partial "), (runtime, "answer")]
+    complete = next(item for item in captured if item[0] == "message.complete")
+    assert complete[1] is runtime
+    assert complete[2]["text"] == "partial answer"
+
+
 def test_owner_runtime_propagates_to_late_mcp_refresh(monkeypatch):
     runtime = server.OwnerWorkerGatewayRuntime("owner-a", 1, "worker-a", 1, 0)
     agent = object()
