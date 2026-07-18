@@ -1924,6 +1924,35 @@ def test_worker_managed_files_are_descriptor_scoped_to_its_owner(tmp_path, monke
     )
     assert traversal.status_code == 400
 
+    downloaded = client.get(
+        "/api/files/download",
+        headers=request("/api/files/download"),
+        params={
+            "path": "note.txt",
+            "cwd": str(owner_a / "workspaces" / "project"),
+            "filename": "owner note.txt",
+        },
+    )
+    assert downloaded.status_code == 200
+    assert downloaded.content == b"owner-a"
+    assert "owner%20note.txt" in downloaded.headers["content-disposition"]
+
+    for rejected_path, rejected_cwd in (
+        (str(owner_b / "workspaces" / "secret.txt"), None),
+        ("../secret.txt", str(owner_a / "workspaces" / "project")),
+        ("secret.txt", str(owner_b / "workspaces")),
+    ):
+        params = {"path": rejected_path}
+        if rejected_cwd is not None:
+            params["cwd"] = rejected_cwd
+        response = client.get(
+            "/api/files/download",
+            headers=request("/api/files/download"),
+            params=params,
+        )
+        assert response.status_code == 400
+        assert b"owner-b-only" not in response.content
+
 
 def test_worker_image_preview_is_descriptor_scoped_to_owner_images(tmp_path, monkeypatch):
     import base64
@@ -1975,6 +2004,25 @@ def test_worker_image_preview_is_descriptor_scoped_to_owner_images(tmp_path, mon
         assert "pngbytes" not in response.text
         assert "secret" not in response.text
         assert "owner-b" not in response.text
+
+    downloaded = client.get(
+        "/api/files/download",
+        headers=request("/api/files/download"),
+        params={"path": str(image), "filename": "original upload.png"},
+    )
+    assert downloaded.status_code == 200
+    assert downloaded.content == b"pngbytes"
+    assert "original%20upload.png" in downloaded.headers["content-disposition"]
+
+    for rejected_path in (secret, other_owner_image, Path("images/upload.png")):
+        response = client.get(
+            "/api/files/download",
+            headers=request("/api/files/download"),
+            params={"path": str(rejected_path)},
+        )
+        assert response.status_code in {400, 404}
+        assert b"secret" not in response.content
+        assert b"owner-b" not in response.content
 
 
 def test_worker_http_token_validation_uses_stored_control_home(tmp_path, monkeypatch):

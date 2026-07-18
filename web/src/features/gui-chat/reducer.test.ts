@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { guiChatReducer } from "./reducer";
-import { initialGuiChatState } from "./types";
+import { initialGuiChatState, type GuiChatState, type ImageArtifactState } from "./types";
 
 const RENDERED_TEXT_TRUNCATION_NOTICE =
   "\n\n[… output truncated in Chat GUI to keep the browser responsive …]";
@@ -15,6 +15,12 @@ function restoreWithMessage(text: string, info?: { cwd?: string; model?: string 
       session_id: "sid",
     },
   });
+}
+
+function imageArtifact(state: GuiChatState, id: string): ImageArtifactState {
+  const artifact = state.artifacts[id];
+  if (!artifact || artifact.kind === "file") throw new Error(`Expected image artifact ${id}`);
+  return artifact;
 }
 
 describe("guiChatReducer history image restoration", () => {
@@ -85,6 +91,34 @@ describe("guiChatReducer history image restoration", () => {
     expect(state.toolCalls["tool-1"].output.endsWith(RENDERED_TEXT_TRUNCATION_NOTICE)).toBe(true);
   });
 
+  it("keeps filesystem image tool results downloadable from their original path", () => {
+    const withCwd = guiChatReducer(initialGuiChatState, {
+      event: { payload: { cwd: "/workspace" }, type: "session.info" },
+      type: "event",
+    });
+    const withTool = guiChatReducer(withCwd, {
+      event: { payload: { id: "tool-image", name: "image_generate" }, type: "tool.start" },
+      type: "event",
+    });
+    const state = guiChatReducer(withTool, {
+      event: {
+        payload: {
+          id: "tool-image",
+          name: "image_generate",
+          result: { image: "outputs/result.png", success: true },
+        },
+        type: "tool.complete",
+      },
+      type: "event",
+    });
+
+    expect(imageArtifact(state, "tool-image-image")).toMatchObject({
+      downloadUrl:
+        "/api/files/download?path=outputs%2Fresult.png&cwd=%2Fworkspace&filename=result.png",
+      url: "/api/fs/read-data-url?path=outputs%2Fresult.png&cwd=%2Fworkspace",
+    });
+  });
+
   it("does not retain large non-rendered tool results in chat state", () => {
     const state = guiChatReducer(initialGuiChatState, {
       event: {
@@ -115,6 +149,64 @@ describe("guiChatReducer history image restoration", () => {
     expect(state.toolCalls["tool-1"].input).toBe(
       "[… non-rendered tool result omitted in Chat GUI to keep the browser responsive …]",
     );
+  });
+
+  it("restores uploaded files with download URLs", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        info: { cwd: "/workspace" },
+        messages: [{
+          attachments: [{
+            kind: "pdf",
+            mime_type: "application/pdf",
+            name: "brief.pdf",
+            path: "/workspace/.hermes/desktop-attachments/brief.pdf",
+            size_bytes: 123,
+          }],
+          role: "user",
+          text: "",
+        }],
+        session_id: "sid",
+      },
+    });
+
+    expect(state.messages[0].attachments?.[0]).toMatchObject({
+      downloadUrl: "/api/files/download?path=%2Fworkspace%2F.hermes%2Fdesktop-attachments%2Fbrief.pdf&cwd=%2Fworkspace&filename=brief.pdf",
+      name: "brief.pdf",
+      sourcePath: "/workspace/.hermes/desktop-attachments/brief.pdf",
+    });
+  });
+
+  it("turns explicit generated file references into download artifacts", () => {
+    const state = restoreWithMessage(
+      "Done.\nFull output saved to: outputs/report.html\n[PDF](sandbox:/workspace/report.pdf)",
+      { cwd: "/workspace" },
+    );
+
+    const artifacts = state.messages[0].artifactIds.map((id) => state.artifacts[id]);
+    expect(artifacts).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "file",
+        mimeType: "text/html",
+        name: "report.html",
+        sourcePath: "outputs/report.html",
+      }),
+      expect.objectContaining({
+        kind: "file",
+        mimeType: "application/pdf",
+        name: "report.pdf",
+        sourcePath: "/workspace/report.pdf",
+      }),
+    ]));
+  });
+
+  it("ignores generated file references in code blocks and remote links", () => {
+    const state = restoreWithMessage(
+      "```\nFull output saved to: /tmp/secret.html\n```\n[remote](https://example.com/report.pdf)",
+    );
+
+    expect(state.messages[0].artifactIds).toEqual([]);
   });
 
   it("turns a standalone restored image URL into an image artifact", () => {
@@ -246,6 +338,7 @@ describe("guiChatReducer history image restoration", () => {
                 kind: "pdf",
                 mime_type: "application/pdf",
                 name: "report.pdf",
+                path: "/workspace/.hermes/desktop-attachments/report.pdf",
                 pages_attached: 2,
                 size_bytes: 456,
                 source_paths: ["/tmp/pdf-1.png", "/tmp/pdf-2.png"],
@@ -269,6 +362,7 @@ describe("guiChatReducer history image restoration", () => {
 
     expect(state.messages[0].attachments).toEqual([
       {
+        downloadUrl: "/api/files/download?path=%2Ftmp%2Fshot.png&cwd=%2Fworkspace&filename=shot.png",
         id: "history-0-attachment-0",
         kind: "image",
         mimeType: "image/png",
@@ -277,8 +371,10 @@ describe("guiChatReducer history image restoration", () => {
         previewUrl: "/api/fs/read-data-url?path=%2Ftmp%2Fshot.png",
         refText: undefined,
         sizeBytes: 123,
+        sourcePath: "/tmp/shot.png",
       },
       {
+        downloadUrl: "/api/files/download?path=%2Fworkspace%2F.hermes%2Fdesktop-attachments%2Freport.pdf&cwd=%2Fworkspace&filename=report.pdf",
         id: "history-0-attachment-1",
         kind: "pdf",
         mimeType: "application/pdf",
@@ -287,8 +383,10 @@ describe("guiChatReducer history image restoration", () => {
         previewUrl: undefined,
         refText: undefined,
         sizeBytes: 456,
+        sourcePath: "/workspace/.hermes/desktop-attachments/report.pdf",
       },
       {
+        downloadUrl: "/api/files/download?path=%2Fworkspace%2Fnotes.txt&cwd=%2Fworkspace&filename=notes.txt",
         id: "history-0-attachment-2",
         kind: "file",
         mimeType: "text/plain",
@@ -297,6 +395,7 @@ describe("guiChatReducer history image restoration", () => {
         previewUrl: undefined,
         refText: "@file:notes.txt",
         sizeBytes: 789,
+        sourcePath: "/workspace/notes.txt",
       },
     ]);
   });
@@ -415,16 +514,16 @@ describe("guiChatReducer history image restoration", () => {
     const parent = restoreWithMessage("../images/a.jpg", { cwd });
     const nested = restoreWithMessage("outputs/a.webp", { cwd });
 
-    expect(home.artifacts[home.messages[0].artifactIds[0]].url).toBe(
+    expect(imageArtifact(home, home.messages[0].artifactIds[0]).url).toBe(
       "/api/fs/read-data-url?path=~%2FDownloads%2Fa.jpg",
     );
-    expect(relative.artifacts[relative.messages[0].artifactIds[0]].url).toBe(
+    expect(imageArtifact(relative, relative.messages[0].artifactIds[0]).url).toBe(
       "/api/fs/read-data-url?path=.%2Foutputs%2Fa.png&cwd=%2FUsers%2Fme%2Fproject",
     );
-    expect(parent.artifacts[parent.messages[0].artifactIds[0]].url).toBe(
+    expect(imageArtifact(parent, parent.messages[0].artifactIds[0]).url).toBe(
       "/api/fs/read-data-url?path=..%2Fimages%2Fa.jpg&cwd=%2FUsers%2Fme%2Fproject",
     );
-    expect(nested.artifacts[nested.messages[0].artifactIds[0]].url).toBe(
+    expect(imageArtifact(nested, nested.messages[0].artifactIds[0]).url).toBe(
       "/api/fs/read-data-url?path=outputs%2Fa.webp&cwd=%2FUsers%2Fme%2Fproject",
     );
   });
@@ -432,7 +531,7 @@ describe("guiChatReducer history image restoration", () => {
   it("keeps existing path semantics when no session cwd is available", () => {
     const state = restoreWithMessage("./outputs/a.png");
 
-    expect(state.artifacts[state.messages[0].artifactIds[0]].url).toBe(
+    expect(imageArtifact(state, state.messages[0].artifactIds[0]).url).toBe(
       "/api/fs/read-data-url?path=.%2Foutputs%2Fa.png",
     );
   });
@@ -470,10 +569,10 @@ describe("guiChatReducer history image restoration", () => {
     const remote = restoreWithMessage("https://example.com/cat.png。");
     const local = restoreWithMessage("/tmp/cat.png）");
 
-    expect(remote.artifacts[remote.messages[0].artifactIds[0]].url).toBe(
+    expect(imageArtifact(remote, remote.messages[0].artifactIds[0]).url).toBe(
       "https://example.com/cat.png",
     );
-    expect(local.artifacts[local.messages[0].artifactIds[0]].url).toBe(
+    expect(imageArtifact(local, local.messages[0].artifactIds[0]).url).toBe(
       "/api/fs/read-data-url?path=%2Ftmp%2Fcat.png",
     );
   });
@@ -501,9 +600,66 @@ describe("guiChatReducer history image restoration", () => {
     });
 
     expect(state.cwd).toBe("/Users/me/project");
-    expect(state.artifacts["artifact-1"].url).toBe(
+    expect(imageArtifact(state, "artifact-1").url).toBe(
       "/api/fs/read-data-url?path=outputs%2Fa.png&cwd=%2FUsers%2Fme%2Fproject",
     );
+  });
+
+  it("creates downloadable file artifacts from structured artifact events", () => {
+    const withCwd = guiChatReducer(initialGuiChatState, {
+      event: { payload: { cwd: "/Users/me/project" }, type: "session.info" },
+      type: "event",
+    });
+    const withTool = guiChatReducer(withCwd, {
+      event: { payload: { id: "tool-1", name: "Write" }, type: "tool.start" },
+      type: "event",
+    });
+    const state = guiChatReducer(withTool, {
+      event: {
+        payload: {
+          id: "artifact-file-1",
+          mime_type: "text/html",
+          name: "report.html",
+          path: "outputs/report.html",
+          tool_call_id: "tool-1",
+        },
+        type: "artifact.created",
+      },
+      type: "event",
+    });
+
+    expect(state.artifacts["artifact-file-1"]).toEqual({
+      downloadUrl:
+        "/api/files/download?path=outputs%2Freport.html&cwd=%2FUsers%2Fme%2Fproject&filename=report.html",
+      id: "artifact-file-1",
+      kind: "file",
+      messageId: undefined,
+      mimeType: "text/html",
+      name: "report.html",
+      sourcePath: "outputs/report.html",
+      toolCallId: "tool-1",
+    });
+    expect(state.toolCalls["tool-1"].artifactIds).toEqual(["artifact-file-1"]);
+  });
+
+  it("keeps structured image artifacts on the image preview path", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      event: {
+        payload: {
+          id: "artifact-image-1",
+          mime_type: "image/png",
+          path: "/tmp/output.png",
+        },
+        type: "artifact.created",
+      },
+      type: "event",
+    });
+
+    expect(state.artifacts["artifact-image-1"]).toMatchObject({
+      mimeType: "image/png",
+      url: "/api/fs/read-data-url?path=%2Ftmp%2Foutput.png",
+    });
+    expect(state.artifacts["artifact-image-1"].kind).not.toBe("file");
   });
 
   it("maps generated image cache paths to the static image endpoint", () => {
@@ -511,7 +667,7 @@ describe("guiChatReducer history image restoration", () => {
       "/opt/hermes/shared/.hermes/cache/images/apiyi_gpt-image-2-medium_20260705_130933_211cd48c.png",
     );
 
-    expect(state.artifacts[state.messages[0].artifactIds[0]].url).toBe(
+    expect(imageArtifact(state, state.messages[0].artifactIds[0]).url).toBe(
       "/api/generated-images/apiyi_gpt-image-2-medium_20260705_130933_211cd48c.png",
     );
   });

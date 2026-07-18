@@ -100,12 +100,18 @@ export interface ArtifactImagePayload {
   messageId?: string;
   mime_type?: string;
   mimeType?: string;
+  path?: string;
   source?: { kind?: string; value?: string } | string;
   title?: string;
   tool_call_id?: string;
   toolCallId?: string;
   url?: string;
   width?: number;
+}
+
+export interface ArtifactFilePayload extends ArtifactImagePayload {
+  filename?: string;
+  name?: string;
 }
 
 export interface ErrorPayload {
@@ -115,6 +121,7 @@ export interface ErrorPayload {
 
 export type GuiGatewayEvent = GatewayEvent<
   | ApprovalPayload
+  | ArtifactFilePayload
   | ArtifactImagePayload
   | ErrorPayload
   | MessageCompletePayload

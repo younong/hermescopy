@@ -10,6 +10,7 @@ import base64
 import binascii
 import mimetypes
 import os
+import urllib.parse
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -612,11 +613,41 @@ def create_app(
         return {"dataUrl": f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}"}
 
     @app.get("/api/files/download")
-    def download_file(path: str, _: None = Depends(_require_owner_token)):
-        relative_path = _file_path(path)
+    def download_file(
+        path: str,
+        cwd: str | None = None,
+        filename: str | None = None,
+        _: None = Depends(_require_owner_token),
+    ):
+        value = str(path or "").strip()
+        workspace_root = app.state.owner_worker_controlled_roots.get(RootKind.WORKSPACE).canonical_path
+        root_kind = RootKind.WORKSPACE
         try:
+            candidate = Path(value)
+            if candidate.is_absolute():
+                try:
+                    relative_path = candidate.relative_to(workspace_root).as_posix()
+                except ValueError:
+                    relative_path = _owner_image_path(value)
+                    root_kind = RootKind.OWNER_WRITABLE
+            else:
+                relative_path = value
+                if cwd is not None:
+                    raw_cwd = str(cwd or "").strip()
+                    if not raw_cwd or "\x00" in raw_cwd:
+                        raise HTTPException(status_code=400, detail="Invalid cwd")
+                    cwd_path = Path(raw_cwd)
+                    if not cwd_path.is_absolute():
+                        raise HTTPException(status_code=400, detail="Invalid cwd")
+                    try:
+                        cwd_relative = cwd_path.relative_to(workspace_root).as_posix()
+                    except ValueError:
+                        raise HTTPException(status_code=400, detail="Invalid cwd") from None
+                    relative_path = f"{cwd_relative}/{relative_path}" if cwd_relative else relative_path
+                relative_path = _file_path(relative_path)
+
             fd = app.state.owner_worker_controlled_roots.open_relative(
-                RootKind.WORKSPACE, relative_path, expected_type=ExpectedType.REGULAR_FILE
+                root_kind, relative_path, expected_type=ExpectedType.REGULAR_FILE
             )
             metadata = os.fstat(fd)
             if metadata.st_size > 100 * 1024 * 1024:
@@ -634,11 +665,20 @@ def create_app(
             finally:
                 os.close(fd)
 
-        name = relative_path.rsplit("/", 1)[-1]
+        source_name = relative_path.rsplit("/", 1)[-1]
+        name = Path(str(filename or source_name)).name
+        if not name or name in {".", ".."} or "\x00" in name:
+            name = source_name
+        quoted_name = urllib.parse.quote(name, safe="")
+        ascii_name = "".join(char if 32 <= ord(char) < 127 and char not in {'"', '\\'} else "_" for char in name)
         return StreamingResponse(
             chunks(),
             media_type=mimetypes.guess_type(name)[0] or "application/octet-stream",
-            headers={"Content-Disposition": f'attachment; filename="{name}"'},
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quoted_name}'
+                )
+            },
         )
 
     @app.post("/api/files/upload")

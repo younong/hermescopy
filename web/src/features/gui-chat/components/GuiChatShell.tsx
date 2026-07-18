@@ -15,6 +15,7 @@ import { useDashboardAuthIdentity } from "@/lib/useDashboardAuthIdentity";
 import { cn } from "@/lib/utils";
 import { connectGuiChat, type GuiChatConnection } from "../api";
 import { connectMockGuiChat } from "../mock";
+import { buildSessionFileDownloadUrl } from "../files";
 import { guiChatReducer } from "../reducer";
 import {
   initialGuiChatState,
@@ -346,7 +347,7 @@ export function GuiChatShell() {
         for (const attachment of attachments) {
           let sentAttachment = attachment;
           if (attachment.status === "uploaded" && attachment.stagedSessionId === sessionId) {
-            messageAttachments.push(toMessageAttachment(sentAttachment));
+            messageAttachments.push(toMessageAttachment(sentAttachment, state.cwd));
             if (attachment.kind === "file" && attachment.refText) fileRefs.push(attachment.refText);
             continue;
           }
@@ -373,6 +374,7 @@ export function GuiChatShell() {
               }
               sentAttachment = {
                 ...attachment,
+                attachedPath: result.path,
                 error: undefined,
                 pagesAttached: result.pages_attached,
                 stagedSessionId: sessionId,
@@ -399,7 +401,7 @@ export function GuiChatShell() {
             const message = error instanceof Error ? error.message : String(error);
             throw new AttachmentError(attachment.id, message);
           }
-          messageAttachments.push(toMessageAttachment(sentAttachment));
+          messageAttachments.push(toMessageAttachment(sentAttachment, state.cwd));
         }
 
         const promptText = appendFileReferences(text, fileRefs);
@@ -603,8 +605,14 @@ class AttachmentError extends Error {
   }
 }
 
-function toMessageAttachment(attachment: GuiComposerAttachment): MessageAttachmentState {
+function toMessageAttachment(
+  attachment: GuiComposerAttachment,
+  cwd?: string,
+): MessageAttachmentState {
   return {
+    downloadUrl: attachment.attachedPath
+      ? buildSessionFileDownloadUrl(attachment.attachedPath, cwd, attachment.name)
+      : undefined,
     id: attachment.id,
     kind: attachment.kind,
     mimeType: attachment.mimeType,
@@ -613,6 +621,7 @@ function toMessageAttachment(attachment: GuiComposerAttachment): MessageAttachme
     previewUrl: attachment.previewUrl,
     refText: attachment.refText,
     sizeBytes: attachment.sizeBytes,
+    sourcePath: attachment.attachedPath,
   };
 }
 
