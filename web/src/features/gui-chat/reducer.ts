@@ -525,6 +525,10 @@ function extractGeneratedFileReferences(text: string): ExtractedFileReference[] 
   for (const match of text.matchAll(markdownLinkPattern)) {
     candidates.push({ index: match.index ?? 0, path: match[1].trim().replace(/^<|>$/g, "") });
   }
+  const labeledInlinePathPattern = /(?:文件路径|文件地址|file\s*path|saved\s*(?:file\s*)?(?:at|to))\s*[：:]\s*(?:\*{1,2})?\s*`([^`\n]+)`/gi;
+  for (const match of text.matchAll(labeledInlinePathPattern)) {
+    candidates.push({ index: match.index ?? 0, path: match[1].trim() });
+  }
 
   const seen = new Set<string>();
   const refs: ExtractedFileReference[] = [];

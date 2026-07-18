@@ -201,9 +201,51 @@ describe("guiChatReducer history image restoration", () => {
     ]));
   });
 
-  it("ignores generated file references in code blocks and remote links", () => {
+  it("restores a labeled inline HTML path as a download artifact", () => {
     const state = restoreWithMessage(
-      "```\nFull output saved to: /tmp/secret.html\n```\n[remote](https://example.com/report.pdf)",
+      "已生成互动版“乌鸦喝水”HTML：\n\n**文件路径：** `/workspace/crow-drinks-water.html`",
+      { cwd: "/workspace" },
+    );
+
+    const artifact = state.artifacts[state.messages[0].artifactIds[0]];
+    expect(artifact).toMatchObject({
+      downloadUrl:
+        "/api/files/download?path=%2Fworkspace%2Fcrow-drinks-water.html&cwd=%2Fworkspace&filename=crow-drinks-water.html",
+      kind: "file",
+      mimeType: "text/html",
+      name: "crow-drinks-water.html",
+      sourcePath: "/workspace/crow-drinks-water.html",
+    });
+  });
+
+  it("creates a download artifact when a live assistant message completes with a labeled path", () => {
+    const withDelta = guiChatReducer(initialGuiChatState, {
+      event: {
+        payload: { text: "文件路径： `/workspace/crow-drinks-water.html`" },
+        type: "message.delta",
+      },
+      type: "event",
+    });
+    const state = guiChatReducer(withDelta, {
+      event: {
+        payload: { text: "文件路径： `/workspace/crow-drinks-water.html`" },
+        type: "message.complete",
+      },
+      type: "event",
+    });
+
+    const artifact = state.artifacts[state.messages[0].artifactIds[0]];
+    expect(artifact).toMatchObject({
+      kind: "file",
+      mimeType: "text/html",
+      name: "crow-drinks-water.html",
+      sourcePath: "/workspace/crow-drinks-water.html",
+    });
+  });
+
+  it("does not treat unlabeled inline code, code blocks, or remote links as generated files", () => {
+    const state = restoreWithMessage(
+      "普通代码 `/workspace/secret.html`\n```\n文件路径： `/tmp/secret.html`\n```\n[remote](https://example.com/report.pdf)",
     );
 
     expect(state.messages[0].artifactIds).toEqual([]);
