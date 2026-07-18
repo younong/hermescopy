@@ -44,6 +44,8 @@ def test_ws_startup_starts_background_mcp_discovery(monkeypatch):
     )
 
     class FakeWS:
+        query_params = {}
+
         async def accept(self):
             pass
 
@@ -94,6 +96,8 @@ def _run_disconnect(monkeypatch, seed):
     )
 
     class FakeWS:
+        query_params = {}
+
         async def accept(self):
             pass
 
