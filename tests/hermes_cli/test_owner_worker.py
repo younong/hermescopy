@@ -702,21 +702,47 @@ def test_supervisor_shutdown_revoker_can_release_active_use_from_event_loop(tmp_
     assert supervisor._terminating_handles == {}
 
 
-def test_supervisor_get_or_start_health_retirement_releases_bridge_lease(tmp_path):
-    """A failed health check can synchronously revoke a bridged generation."""
-    owner = _Owner("ok1_health_release", tmp_path / "owner")
-    events = []
-    loop = asyncio.new_event_loop()
-    loop_ready = threading.Event()
+def test_supervisor_get_or_start_skips_health_probe_while_generation_is_in_use(tmp_path):
+    """A concurrent request must not retire a generation with a live bridge."""
+    owner = _Owner("ok1_health_in_use", tmp_path / "owner")
 
-    def run_loop():
-        asyncio.set_event_loop(loop)
-        loop_ready.set()
-        loop.run_forever()
+    class _FailsAfterStartupClient(_FakeClient):
+        health_calls = 0
 
-    loop_thread = threading.Thread(target=run_loop)
-    loop_thread.start()
-    assert loop_ready.wait(timeout=1)
+        def verify_health(self, **kwargs):
+            type(self).health_calls += 1
+            if type(self).health_calls > 1:
+                raise OwnerWorkerHealthError("worker temporarily unavailable")
+            return super().verify_health(**kwargs)
+
+    def fake_process_factory(*args, **kwargs):
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FailsAfterStartupClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+    first = supervisor.get_or_start(owner)
+    use_lease = supervisor.acquire_use(first)
+    try:
+        reused = supervisor.get_or_start(owner)
+    finally:
+        use_lease.release()
+
+    assert reused is first
+    assert _FailsAfterStartupClient.health_calls == 1
+    assert not first.process.terminated
+    assert supervisor._handles[owner.owner_key] is first
+
+
+def test_supervisor_get_or_start_failed_health_retires_idle_generation(tmp_path):
+    """A failed health check still retires a generation without active uses."""
+    owner = _Owner("ok1_health_idle", tmp_path / "owner")
 
     class _FailsAfterStartupClient(_FakeClient):
         health_calls = 0
@@ -740,30 +766,10 @@ def test_supervisor_get_or_start_health_retirement_releases_bridge_lease(tmp_pat
         startup_cooldown=0,
     )
     first = supervisor.get_or_start(owner)
-    use_lease = supervisor.acquire_use(first)
-
-    async def close_bridge():
-        use_lease.release()
-        events.append("lease_released")
-
-    def revoke_bridges(lease):
-        assert lease.state is WorkerLeaseState.DRAINING
-        future = asyncio.run_coroutine_threadsafe(close_bridge(), loop)
-        future.result(timeout=1)
-        events.append("bridges_closed")
-
-    supervisor.generation_bridge_revoker = revoke_bridges
-    try:
-        replacement = supervisor.get_or_start(owner)
-    finally:
-        loop.call_soon_threadsafe(loop.stop)
-        loop_thread.join(timeout=1)
-        loop.close()
+    replacement = supervisor.get_or_start(owner)
 
     assert replacement is not first
     assert first.process.terminated
-    assert first.active_uses == 0
-    assert events == ["lease_released", "bridges_closed"]
     assert supervisor._handles[owner.owner_key] is replacement
     assert supervisor._terminating_handles == {}
 

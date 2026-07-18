@@ -259,6 +259,16 @@ class OwnerWorkerSupervisor:
                     self.authority_store.assert_worker_lease(
                         self._lease_for_handle(existing), states=frozenset({WorkerLeaseState.ACTIVE})
                     )
+                    # An active use lease means an admitted HTTP stream or WebSocket
+                    # bridge still owns this exact generation. Do not let a new
+                    # request's best-effort health probe fence those live clients
+                    # when the worker event loop is temporarily busy.
+                    with self._lock:
+                        if (
+                            self._handles.get(owner_key) is existing
+                            and existing.active_uses > 0
+                        ):
+                            return existing
                     health = self.client_cls(existing.socket_path, control_home=self.control_home).verify_health(
                         owner_key=owner_key,
                         owner_home=owner_home,
