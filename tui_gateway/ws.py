@@ -29,8 +29,10 @@ import json
 import logging
 import socket
 import threading
+import time
 from typing import Any
 
+from hermes_cli.latency_trace import clean_latency_trace_id, log_latency_stage
 from tui_gateway import server
 
 _log = logging.getLogger(__name__)
@@ -361,6 +363,8 @@ async def handle_ws(
         await ws.close(code=1011, reason="owner gateway runtime unavailable")
         return
     peer = _ws_peer_label(ws)
+    latency_started_at = time.monotonic()
+    latency_trace_id = clean_latency_trace_id(ws.query_params.get("ws_trace", ""))
     transport: WSTransport | None = None
     messages = 0
     parse_errors = 0
@@ -370,6 +374,13 @@ async def handle_ws(
 
     try:
         await ws.accept()
+        log_latency_stage(
+            _log,
+            trace_id=latency_trace_id,
+            surface="gateway-runtime",
+            stage="ws.accepted",
+            started_at=latency_started_at,
+        )
         disconnect_reason = "connected"
         # Push small streamed frames out immediately instead of letting Nagle
         # batch them — keeps the live token cadence intact for GUI clients.
@@ -409,6 +420,13 @@ async def handle_ws(
             send_failures += 1
             _log.error("ws ready frame send failed peer=%s", peer)
             return
+        log_latency_stage(
+            _log,
+            trace_id=latency_trace_id,
+            surface="gateway-runtime",
+            stage="gateway.ready_sent",
+            started_at=latency_started_at,
+        )
 
         while True:
             try:

@@ -26,6 +26,7 @@ from hermes_constants import (
     set_hermes_home_override,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.latency_trace import clean_latency_trace_id, log_latency_stage
 from hermes_cli.owner_runtime import is_owner_worker_env, resolve_workspace_cwd
 from gateway.session import (
     current_historical_resume_scope,
@@ -5694,6 +5695,14 @@ def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
 
 @method("session.resume")
 def _(rid, params: dict) -> dict:
+    latency_started_at = time.monotonic()
+    latency_trace_id = clean_latency_trace_id(params.get("latency_trace_id", ""))
+    log_latency_stage(
+        logger,
+        trace_id=latency_trace_id,
+        surface="session-resume",
+        stage="request.received",
+    )
     target = params.get("session_id", "")
     if not target:
         return _err(rid, 4006, "session_id required")
@@ -5718,6 +5727,7 @@ def _(rid, params: dict) -> dict:
         return _db_unavailable_error(rid, code=5000)
 
     recovery_scope = current_historical_resume_scope()
+    stage_started_at = time.monotonic()
     if recovery_scope is not None:
         # Authenticated recovery starts with the scope-only row. Do not resolve
         # a title to a full row, inspect live child state, or follow lineage until
@@ -5747,6 +5757,13 @@ def _(rid, params: dict) -> dict:
                 found = {}
             else:
                 return _err(rid, 4007, "session not found")
+    log_latency_stage(
+        logger,
+        trace_id=latency_trace_id,
+        surface="session-resume",
+        stage="session.lookup",
+        started_at=stage_started_at,
+    )
 
     # Follow the compression-continuation chain to the live tip so a resume on
     # a rotated-out parent id binds to the descendant that actually holds the
@@ -5760,6 +5777,7 @@ def _(rid, params: dict) -> dict:
     # stale parent. Skipped for lazy watch windows, which intentionally attach
     # to the exact child branch they were opened on.
     if found and not is_truthy_value(params.get("lazy", False)):
+        stage_started_at = time.monotonic()
         try:
             tip = db.resolve_resume_session_id(target, recovery_scope=recovery_scope)
         except TypeError:
@@ -5779,6 +5797,13 @@ def _(rid, params: dict) -> dict:
                     return _err(rid, 4007, "session not found")
             else:
                 found = db.get_session(target) or found
+        log_latency_stage(
+            logger,
+            trace_id=latency_trace_id,
+            surface="session-resume",
+            stage="descendant.resolved",
+            started_at=stage_started_at,
+        )
 
     profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
         profile_home
@@ -5815,7 +5840,15 @@ def _(rid, params: dict) -> dict:
     with _session_resume_lock:
         live = _find_live_session_by_key(target)
         if live is not None:
-            return _ok(rid, _reuse_live_payload(*live))
+            response = _ok(rid, _reuse_live_payload(*live))
+            log_latency_stage(
+                logger,
+                trace_id=latency_trace_id,
+                surface="session-resume",
+                stage="response.ready_live",
+                started_at=latency_started_at,
+            )
+            return response
 
     # Lazy/watch resume: register the live session WITHOUT building an agent.
     # Used by the desktop's subagent windows — the child runs inside the
@@ -5896,12 +5929,36 @@ def _(rid, params: dict) -> dict:
         # the deferred build wires the remaining per-session callbacks.
         _enable_gateway_prompts()
         try:
+            stage_started_at = time.monotonic()
             _reopen_resume_session(db, target, recovery_scope=recovery_scope)
+            log_latency_stage(
+                logger,
+                trace_id=latency_trace_id,
+                surface="session-resume",
+                stage="session.reopened",
+                started_at=stage_started_at,
+            )
+            stage_started_at = time.monotonic()
             raw_history = _resume_history(
                 db, target, include_ancestors=False, recovery_scope=recovery_scope
             )
+            log_latency_stage(
+                logger,
+                trace_id=latency_trace_id,
+                surface="session-resume",
+                stage="history.model_loaded",
+                started_at=stage_started_at,
+            )
+            stage_started_at = time.monotonic()
             display_history = _resume_history(
                 db, target, include_ancestors=True, recovery_scope=recovery_scope
+            )
+            log_latency_stage(
+                logger,
+                trace_id=latency_trace_id,
+                surface="session-resume",
+                stage="history.display_loaded",
+                started_at=stage_started_at,
             )
         except Exception as e:
             if lease is not None:
@@ -5938,7 +5995,7 @@ def _(rid, params: dict) -> dict:
         _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
 
         messages = _history_to_messages(display_history)
-        return _ok(
+        response = _ok(
             rid,
             {
                 "session_id": sid,
@@ -5957,6 +6014,14 @@ def _(rid, params: dict) -> dict:
                 "status": "idle",
             },
         )
+        log_latency_stage(
+            logger,
+            trace_id=latency_trace_id,
+            surface="session-resume",
+            stage="response.ready_cold",
+            started_at=latency_started_at,
+        )
+        return response
 
     # Build the agent OUTSIDE the lock — _make_agent can block for seconds
     # (MCP discovery, prompt/skill build, AIAgent construction). Holding

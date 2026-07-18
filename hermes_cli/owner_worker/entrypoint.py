@@ -8,8 +8,10 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import logging
 import mimetypes
 import os
+import time
 import urllib.parse
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -20,6 +22,10 @@ from starlette.requests import Request
 from starlette.responses import StreamingResponse
 
 
+from hermes_cli.latency_trace import log_latency_stage
+
+
+_log = logging.getLogger(__name__)
 _IMAGE_PREVIEW_MAX_BYTES = 16 * 1024 * 1024
 
 
@@ -1017,9 +1023,21 @@ def create_app(
             db.close()
 
     @app.get("/api/sessions/{session_id}/latest-descendant")
-    def get_session_latest_descendant(session_id: str, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
+    def get_session_latest_descendant(
+        request: Request,
+        session_id: str,
+        _: None = Depends(_require_owner_token),
+    ) -> dict[str, Any]:
         from gateway.session import current_historical_resume_scope
 
+        latency_started_at = time.monotonic()
+        latency_trace_id = request.headers.get("x-request-id", "")
+        log_latency_stage(
+            _log,
+            trace_id=latency_trace_id,
+            surface="latest-descendant",
+            stage="request.received",
+        )
         db = _open_db()
         try:
             scope = current_historical_resume_scope()
@@ -1028,12 +1046,21 @@ def create_app(
             # metadata. Production app construction receives a UDS socket from
             # the supervisor and always enforces the historical scope.
             if socket_path is None or scope is None:
-                return session_api.latest_descendant_payload(db, session_id)
-            return session_api.latest_descendant_payload(
-                db,
-                session_id,
-                recovery_scope=scope,
+                payload = session_api.latest_descendant_payload(db, session_id)
+            else:
+                payload = session_api.latest_descendant_payload(
+                    db,
+                    session_id,
+                    recovery_scope=scope,
+                )
+            log_latency_stage(
+                _log,
+                trace_id=latency_trace_id,
+                surface="latest-descendant",
+                stage="response.ready",
+                started_at=latency_started_at,
             )
+            return payload
         finally:
             db.close()
 

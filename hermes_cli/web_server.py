@@ -75,6 +75,7 @@ from hermes_cli.memory_providers import (
     ProviderField,
     get_memory_provider,
 )
+from hermes_cli.latency_trace import clean_latency_trace_id, log_latency_stage
 from gateway.status import (
     derive_gateway_busy,
     derive_gateway_drainable,
@@ -528,6 +529,14 @@ def _release_owner_worker_iter(iterator: Any, lease: Any):
 
 async def _proxy_authenticated_owner_http(request: Request) -> Response:
     """Forward an authenticated owner-scoped HTTP request to its Owner Worker."""
+    latency_started_at = time.monotonic()
+    latency_trace_id = request.headers.get("x-request-id", "")
+    log_latency_stage(
+        _log,
+        trace_id=latency_trace_id,
+        surface="owner-http-proxy",
+        stage="request.received",
+    )
     if not _authenticated_owner_request(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -547,7 +556,15 @@ async def _proxy_authenticated_owner_http(request: Request) -> Response:
 
     lease: Any | None = None
     try:
+        stage_started_at = time.monotonic()
         handle = await asyncio.to_thread(supervisor.get_or_start, owner)
+        log_latency_stage(
+            _log,
+            trace_id=latency_trace_id,
+            surface="owner-http-proxy",
+            stage="owner_worker.ready",
+            started_at=stage_started_at,
+        )
         if str(handle.owner_key) != str(owner.owner_key):
             _log.error(
                 "owner worker returned a mismatched handle method=%s path=%s request_id=%s",
@@ -569,6 +586,7 @@ async def _proxy_authenticated_owner_http(request: Request) -> Response:
                 continue
             if lname in {"accept", "accept-encoding", "content-type", "user-agent", "x-request-id"}:
                 forwarded_headers[name] = value
+        stage_started_at = time.monotonic()
         response = await asyncio.to_thread(
             OwnerWorkerClient(handle.socket_path, control_home=getattr(supervisor, "control_home", None)).request,
             request.method,
@@ -576,6 +594,14 @@ async def _proxy_authenticated_owner_http(request: Request) -> Response:
             lease=_owner_worker_authority_lease(handle),
             headers=forwarded_headers,
             content=content,
+        )
+        log_latency_stage(
+            _log,
+            trace_id=latency_trace_id,
+            surface="owner-http-proxy",
+            stage="worker_http.response",
+            started_at=stage_started_at,
+            outcome="ok" if response.status_code < 500 else "error",
         )
     except HTTPException:
         if lease is not None:
@@ -619,6 +645,14 @@ async def _proxy_authenticated_owner_http(request: Request) -> Response:
         )
         raise HTTPException(status_code=500, detail="Internal server error") from exc
 
+    log_latency_stage(
+        _log,
+        trace_id=latency_trace_id,
+        surface="owner-http-proxy",
+        stage="request.complete",
+        started_at=latency_started_at,
+        outcome="ok" if response.status_code < 500 else "error",
+    )
     response_headers = {
         name: value
         for name, value in response.headers.items()
@@ -8318,15 +8352,31 @@ async def get_session_detail(request: Request, session_id: str, profile: Optiona
 async def get_session_latest_descendant(request: Request, session_id: str):
     if _authenticated_owner_request(request):
         return await _proxy_authenticated_owner_http(request)
+    latency_started_at = time.monotonic()
+    latency_trace_id = request.headers.get("x-request-id", "")
+    log_latency_stage(
+        _log,
+        trace_id=latency_trace_id,
+        surface="latest-descendant",
+        stage="request.received",
+    )
     latest, path = _session_latest_descendant(session_id)
     if not latest:
         raise HTTPException(status_code=404, detail="Session not found")
-    return {
+    payload = {
         "requested_session_id": path[0] if path else session_id,
         "session_id": latest,
         "path": path,
         "changed": bool(path and latest != path[0]),
     }
+    log_latency_stage(
+        _log,
+        trace_id=latency_trace_id,
+        surface="latest-descendant",
+        stage="response.ready",
+        started_at=latency_started_at,
+    )
+    return payload
 
 @app.get("/api/sessions/{session_id}/messages")
 async def get_session_messages(request: Request, session_id: str, profile: Optional[str] = None):
@@ -12494,6 +12544,10 @@ def _should_bridge_ws_to_owner_worker(ws: "WebSocket", auth_result: _WsAuthResul
     )
 
 
+def _ws_latency_trace_id(ws: "WebSocket") -> str:
+    return clean_latency_trace_id(ws.query_params.get("ws_trace", ""))
+
+
 def _ws_query_for_owner_worker(ws: "WebSocket", *, internal_owner_bootstrap: str) -> str:
     """Forward browser query params to the worker with external auth stripped."""
     # ``profile=default`` is a harmless management-profile hint in the Control
@@ -12883,6 +12937,14 @@ async def _bridge_websocket_to_owner_worker(
         await ws.close(code=4401, reason=_ws_close_reason("auth: owner credential required"))
         return
 
+    latency_started_at = time.monotonic()
+    latency_trace_id = _ws_latency_trace_id(ws)
+    log_latency_stage(
+        _log,
+        trace_id=latency_trace_id,
+        surface="owner-ws-bridge",
+        stage="request.received",
+    )
     profile = ws.query_params.get("profile", "")
     if profile and profile.strip().lower() not in {"default"}:
         await ws.close(code=4400, reason=_ws_close_reason("profile selection is not available in authenticated mode"))
@@ -12913,8 +12975,16 @@ async def _bridge_websocket_to_owner_worker(
 
     lease: Any | None = None
     try:
+        stage_started_at = time.monotonic()
         handle = await asyncio.to_thread(supervisor.get_or_start, owner)
         lease = _acquire_owner_worker_use(supervisor, handle)
+        log_latency_stage(
+            _log,
+            trace_id=latency_trace_id,
+            surface="owner-ws-bridge",
+            stage="owner_worker.ready",
+            started_at=stage_started_at,
+        )
     except Exception as exc:
         if lease is not None:
             lease.release()
@@ -12947,12 +13017,28 @@ async def _bridge_websocket_to_owner_worker(
 
     worker_ws = None
     try:
+        stage_started_at = time.monotonic()
         worker_ws = await _connect_owner_worker_ws(handle.socket_path, worker_uri)
+        log_latency_stage(
+            _log,
+            trace_id=latency_trace_id,
+            surface="owner-ws-bridge",
+            stage="worker_ws.connected",
+            started_at=stage_started_at,
+        )
+        stage_started_at = time.monotonic()
         await _relay_send(worker_ws, owp1_hello(bootstrap))
         ack = await asyncio.wait_for(
             worker_ws.recv(), timeout=_OWNER_WORKER_WS_HANDSHAKE_TIMEOUT
         )
         validate_owp1_control(ack, bootstrap, message_type="ack")
+        log_latency_stage(
+            _log,
+            trace_id=latency_trace_id,
+            surface="owner-ws-bridge",
+            stage="owp1.ack",
+            started_at=stage_started_at,
+        )
     except Exception as exc:
         if worker_ws is not None:
             try:
@@ -12966,6 +13052,13 @@ async def _bridge_websocket_to_owner_worker(
         return
 
     await ws.accept()
+    log_latency_stage(
+        _log,
+        trace_id=latency_trace_id,
+        surface="owner-ws-bridge",
+        stage="browser_ws.accepted",
+        started_at=latency_started_at,
+    )
     bridge = _OwnerWorkerWsBridge(ws, worker_ws, lease)
     if (
         auth_result.session_expires_at is not None
@@ -13833,11 +13926,28 @@ async def pty_ws(ws: WebSocket) -> None:
 
 @app.websocket("/api/ws")
 async def gateway_ws(ws: WebSocket) -> None:
+    latency_started_at = time.monotonic()
+    latency_trace_id = _ws_latency_trace_id(ws)
+    log_latency_stage(
+        _log,
+        trace_id=latency_trace_id,
+        surface="gateway-ws",
+        stage="upgrade.received",
+    )
     if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
         await ws.close(code=4403)
         return
 
+    stage_started_at = time.monotonic()
     auth_result = _ws_auth_result(ws)
+    log_latency_stage(
+        _log,
+        trace_id=latency_trace_id,
+        surface="gateway-ws",
+        stage="auth.checked",
+        started_at=stage_started_at,
+        outcome="error" if auth_result.reason is not None else "ok",
+    )
     if auth_result.reason is not None:
         await ws.close(code=4401, reason=_ws_close_reason(f"auth: {auth_result.reason}"))
         return
@@ -13847,11 +13957,25 @@ async def gateway_ws(ws: WebSocket) -> None:
         return
 
     if _should_bridge_ws_to_owner_worker(ws, auth_result):
+        log_latency_stage(
+            _log,
+            trace_id=latency_trace_id,
+            surface="gateway-ws",
+            stage="owner_bridge.start",
+            started_at=latency_started_at,
+        )
         await _bridge_websocket_to_owner_worker(ws, path="/api/ws", auth_result=auth_result)
         return
 
     from tui_gateway.ws import handle_ws
 
+    log_latency_stage(
+        _log,
+        trace_id=latency_trace_id,
+        surface="gateway-ws",
+        stage="local_gateway.start",
+        started_at=latency_started_at,
+    )
     await handle_ws(ws)
 
 

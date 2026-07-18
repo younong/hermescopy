@@ -38,6 +38,8 @@ interface ChatSessionListProps {
   className?: string;
   /** Optional callback fired after a row is picked (e.g. close mobile sheet). */
   onPicked?: () => void;
+  /** Called before navigation so the owning surface can start an end-to-end trace. */
+  onSessionPick?: (id: string) => void;
   /**
    * Starts a fresh chat. Chat surfaces can supply a handler that clears
    * `?resume` AND bumps their reconnect nonce so a brand-new session starts
@@ -60,6 +62,7 @@ export function ChatSessionList({
   profile,
   className,
   onPicked,
+  onSessionPick,
   onNewChat,
 }: ChatSessionListProps) {
   const { t } = useI18n();
@@ -116,6 +119,7 @@ export function ChatSessionList({
     (id: string) => {
       onPicked?.();
       if (id === activeSessionId) return;
+      onSessionPick?.(id);
       setSearchParams(
         (prev) => {
           const next = new URLSearchParams(prev);
@@ -125,7 +129,7 @@ export function ChatSessionList({
         { replace: false },
       );
     },
-    [activeSessionId, onPicked, setSearchParams],
+    [activeSessionId, onPicked, onSessionPick, setSearchParams],
   );
 
   // "New chat" prefers the owning chat surface's robust handler (clears resume

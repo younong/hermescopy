@@ -1,6 +1,7 @@
 import {
   GatewayClient,
   type ConnectionState,
+  type GatewayConnectTiming,
   type GatewayEvent,
 } from "@/lib/gatewayClient";
 import { getHermesBrowserId } from "@/lib/browserIdentity";
@@ -11,6 +12,7 @@ export interface ConnectGuiChatOptions {
   profile?: string;
   ownerKey?: string;
   resumeSessionId?: string | null;
+  timing?: GatewayConnectTiming;
 }
 
 export interface GuiChatEventSource {
@@ -80,11 +82,14 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
     client,
     close: () => client.close(),
     createOrResume: async () => {
-      await client.connect();
+      await client.connect(undefined, options.timing);
       const baseParams = {
         browser_id: browserId,
         close_on_disconnect: false,
         source: "dashboard-gui",
+        ...(options.timing?.traceId
+          ? { latency_trace_id: options.timing.traceId }
+          : {}),
         ...(options.profile ? { profile: options.profile } : {}),
       };
       if (options.resumeSessionId) {

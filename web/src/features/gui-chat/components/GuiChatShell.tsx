@@ -14,6 +14,7 @@ import { dashboardAuthTransition } from "@/lib/dashboardAuthTransition";
 import { useDashboardAuthIdentity } from "@/lib/useDashboardAuthIdentity";
 import { cn } from "@/lib/utils";
 import { connectGuiChat, type GuiChatConnection } from "../api";
+import { startGuiChatLatencyTrace, type GuiChatLatencyTrace } from "../latencyTrace";
 import { connectMockGuiChat } from "../mock";
 import { buildSessionFileDownloadUrl } from "../files";
 import { guiChatReducer } from "../reducer";
@@ -37,6 +38,7 @@ export function GuiChatShell() {
   const connectionRef = useRef<GuiChatConnection | null>(null);
   const pendingStreamEventsRef = useRef<GatewayEvent[]>([]);
   const streamFlushFrameRef = useRef<number | undefined>(undefined);
+  const latencyTraceRef = useRef<GuiChatLatencyTrace | null>(null);
   const [newChatNonce, setNewChatNonce] = useState(0);
   const [resumeResolutionNonce, setResumeResolutionNonce] = useState(0);
   const [resumeTarget, setResumeTarget] = useState<ResumeTargetState>({
@@ -66,6 +68,10 @@ export function GuiChatShell() {
   const terminalResumeId = state.storedSessionId ?? canonicalResumeSessionId ?? resumeSessionId;
   const forceBottomKey = `${activeSessionId ?? `new-${newChatNonce}`}:${sendScrollNonce}`;
   const closeMobilePanel = useCallback(() => setMobilePanelOpenRaw(false), []);
+  const startSessionSwitchTrace = useCallback((_sessionId: string) => {
+    latencyTraceRef.current?.mark("switch.superseded", "cancelled");
+    latencyTraceRef.current = startGuiChatLatencyTrace("session_list.click");
+  }, []);
 
   useEffect(() => dashboardAuthTransition.register(() => {
     connectionRef.current?.close();
@@ -140,12 +146,18 @@ export function GuiChatShell() {
       return;
     }
 
+    const trace = latencyTraceRef.current;
+    trace?.mark("latest_descendant.start");
     setResumeNotice(null);
     setResumeTarget({ error: null, requested: resumeSessionId, sessionId: null });
     void api
-      .getSessionLatestDescendant(resumeSessionId)
+      .getSessionLatestDescendant(resumeSessionId, trace?.id)
       .then(({ session_id }) => {
-        if (cancelled) return;
+        if (cancelled) {
+          trace?.mark("latest_descendant.response_ignored", "cancelled");
+          return;
+        }
+        trace?.mark("latest_descendant.end", "ok");
         if (session_id !== resumeSessionId) {
           setSearchParams(
             (prev) => {
@@ -160,7 +172,11 @@ export function GuiChatShell() {
         setResumeTarget({ error: null, requested: resumeSessionId, sessionId: session_id });
       })
       .catch((error: unknown) => {
-        if (cancelled) return;
+        if (cancelled) {
+          trace?.mark("latest_descendant.error_ignored", "cancelled");
+          return;
+        }
+        trace?.mark("latest_descendant.end", "error");
         if (error instanceof FetchJSONError && error.status === 404) {
           setResumeNotice("This session is no longer available. Started a new chat instead.");
           setSearchParams(
@@ -194,21 +210,48 @@ export function GuiChatShell() {
     }
     pendingStreamEventsRef.current = [];
     dispatch({ type: "reset" });
+    const trace = latencyTraceRef.current;
+    trace?.mark("connection.start");
     const connection = mockMode
       ? connectMockGuiChat()
-      : connectGuiChat({ ownerKey, profile, resumeSessionId: canonicalResumeSessionId });
+      : connectGuiChat({
+          ownerKey,
+          profile,
+          resumeSessionId: canonicalResumeSessionId,
+          timing: trace
+            ? {
+                onStage: (stage) => trace.mark(stage),
+                traceId: trace.id,
+              }
+            : undefined,
+        });
     connectionRef.current = connection;
     const offState = connection.client.onState((next) => {
       dispatch({ type: "connection", state: next });
     });
-    const offEvents = connection.client.onEvent(dispatchGatewayEvent);
+    const offEvents = connection.client.onEvent((event) => {
+      if (event.type === "gateway.ready") trace?.mark("gateway.ready");
+      dispatchGatewayEvent(event);
+    });
+    trace?.mark(canonicalResumeSessionId ? "session.resume.start" : "session.create.start");
     void connection
       .createOrResume()
       .then((response) => {
-        if (!disposed) dispatch({ type: "session.created", response });
+        if (disposed) {
+          trace?.mark("session.response_ignored", "cancelled");
+          return;
+        }
+        trace?.mark(canonicalResumeSessionId ? "session.resume.end" : "session.create.end", "ok");
+        dispatch({ type: "session.created", response });
+        requestAnimationFrame(() => {
+          trace?.mark("transcript.paint", "ok");
+          if (latencyTraceRef.current === trace) latencyTraceRef.current = null;
+        });
       })
       .catch((error: unknown) => {
         if (disposed) return;
+        trace?.mark(canonicalResumeSessionId ? "session.resume.end" : "session.create.end", "error");
+        if (latencyTraceRef.current === trace) latencyTraceRef.current = null;
         if (error instanceof JsonRpcGatewayError && error.code === 4007) {
           startNewGuiChat();
           setResumeNotice("This session is no longer available. Started a new chat instead.");
@@ -454,6 +497,7 @@ export function GuiChatShell() {
       activeSessionId={activeSessionId}
       profile={profile}
       onPicked={closeMobilePanel}
+      onSessionPick={startSessionSwitchTrace}
       onNewChat={startNewGuiChat}
     />
   );
