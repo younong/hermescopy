@@ -1,15 +1,15 @@
 import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Markdown } from "@/components/Markdown";
 import { cn } from "@/lib/utils";
-import type { ChatMessage, ImageArtifactState } from "../types";
-import { ImageArtifactCard } from "./ImageArtifactCard";
+import type { ArtifactState, ChatMessage } from "../types";
+import { ArtifactCard } from "./ArtifactCard";
 import { MessageAttachmentCard } from "./MessageAttachmentCard";
 
 export function MessageBubble({
   artifacts,
   message,
 }: {
-  artifacts: ImageArtifactState[];
+  artifacts: ArtifactState[];
   message: ChatMessage;
 }) {
   const isUser = message.role === "user";
@@ -33,7 +33,7 @@ export function MessageBubble({
           {artifacts.length > 0 ? (
             <div className="flex flex-col items-end gap-3">
               {artifacts.map((artifact) => (
-                <ImageArtifactCard artifact={artifact} key={artifact.id} variant="bubble" />
+                <ArtifactCard artifact={artifact} key={artifact.id} variant="bubble" />
               ))}
             </div>
           ) : null}
@@ -78,7 +78,7 @@ export function MessageBubble({
           </div>
         ) : null}
         {artifacts.map((artifact) => (
-          <ImageArtifactCard artifact={artifact} key={artifact.id} />
+          <ArtifactCard artifact={artifact} key={artifact.id} />
         ))}
       </div>
     </article>

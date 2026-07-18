@@ -151,6 +151,17 @@ function replayIntro(schedule: (delayMs: number, event: GatewayEvent) => void) {
       height: 540,
     },
   });
+  schedule(1250, {
+    type: "artifact.created",
+    session_id: MOCK_SESSION_ID,
+    payload: {
+      id: "mock-file-1",
+      messageId: "history-1",
+      mimeType: "text/html",
+      name: "mock-report.html",
+      path: "outputs/mock-report.html",
+    },
+  });
   schedule(1400, {
     type: "approval.request",
     session_id: MOCK_SESSION_ID,

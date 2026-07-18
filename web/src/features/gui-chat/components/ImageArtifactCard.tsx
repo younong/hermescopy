@@ -1,6 +1,7 @@
 import { Download, ExternalLink, Image as ImageIcon } from "lucide-react";
 import { useEffect, useState, type MouseEvent } from "react";
 import { fetchJSON, withHermesAssetAuth } from "@/lib/api";
+import { downloadSessionFile, triggerDownload } from "../files";
 import type { ImageArtifactState } from "../types";
 
 export function ImageArtifactCard({
@@ -44,9 +45,10 @@ export function ImageArtifactCard({
   const displayUrl = directUrl ?? (remotePreview?.sourceUrl === artifact.url ? remotePreview.dataUrl : null);
   const loadError = remotePreview?.sourceUrl === artifact.url ? remotePreview.error : null;
 
+  const downloadUrl = artifact.downloadUrl ?? artifact.url;
   const download = (event: MouseEvent<HTMLAnchorElement>) => {
     event.preventDefault();
-    void downloadImageArtifact(artifact.url, filename);
+    void downloadImageArtifact(downloadUrl, filename);
   };
 
   const openUrl = displayUrl ?? artifact.url;
@@ -101,7 +103,7 @@ export function ImageArtifactCard({
         </a>
         <a
           className="inline-flex h-7 items-center gap-1 px-2 text-xs text-midground hover:text-primary"
-          href={artifact.url}
+          href={downloadUrl.startsWith("/api/") ? withHermesAssetAuth(downloadUrl) : downloadUrl}
           download={filename}
           onClick={download}
         >
@@ -173,27 +175,8 @@ async function downloadImageArtifact(url: string, filename: string): Promise<voi
       return;
     }
 
-    const response = await fetch(assetUrl, { credentials: "include" });
-    if (!response.ok) throw new Error(`download failed: ${response.status}`);
-    const blob = await response.blob();
-    const objectUrl = URL.createObjectURL(blob);
-    try {
-      triggerDownload(objectUrl, filename);
-    } finally {
-      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
-    }
+    await downloadSessionFile(url, filename);
   } catch {
     direct();
   }
-}
-
-function triggerDownload(url: string, filename: string): void {
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = filename;
-  link.rel = "noreferrer";
-  link.style.display = "none";
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
 }

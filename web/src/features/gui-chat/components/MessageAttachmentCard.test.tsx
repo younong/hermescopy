@@ -51,6 +51,52 @@ describe("MessageAttachmentCard", () => {
     await act(async () => root.unmount());
   });
 
+  it("renders type-specific icons and a download action", async () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(
+        <MessageAttachmentCard
+          attachment={{
+            downloadUrl: "/api/files/download?path=report.html",
+            id: "html-file",
+            kind: "file",
+            mimeType: "text/html",
+            name: "report.html",
+            sizeBytes: 42,
+          }}
+        />,
+      );
+    });
+
+    expect(container.querySelector('[data-file-type="html"]')).not.toBeNull();
+    expect(container.querySelector("a")?.getAttribute("aria-label")).toBe("Download report.html");
+
+    await act(async () => root.unmount());
+  });
+
+  it("shows legacy PDFs without an original path as unavailable", async () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(
+        <MessageAttachmentCard
+          attachment={{ id: "legacy-pdf", kind: "pdf", name: "old.pdf", sizeBytes: 42 }}
+        />,
+      );
+    });
+
+    expect(container.querySelector('[data-file-type="pdf"]')).not.toBeNull();
+    expect(container.querySelector("a")).toBeNull();
+    expect(container.querySelector('[aria-disabled="true"]')).not.toBeNull();
+
+    await act(async () => root.unmount());
+  });
+
   it("keeps object URLs direct for newly queued image attachments", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch");
     const container = document.createElement("div");

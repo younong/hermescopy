@@ -23,6 +23,8 @@ export interface MessageAttachmentState {
   previewUrl?: string;
   pagesAttached?: number;
   refText?: string;
+  sourcePath?: string;
+  downloadUrl?: string;
 }
 
 export type ToolCallStatus = "running" | "succeeded" | "failed";
@@ -42,15 +44,30 @@ export interface ToolCallState {
 }
 
 export interface ImageArtifactState {
+  kind?: "image";
   id: string;
   title?: string;
   mimeType?: string;
   url: string;
+  downloadUrl?: string;
   messageId?: string;
   toolCallId?: string;
   width?: number;
   height?: number;
 }
+
+export interface FileArtifactState {
+  kind: "file";
+  id: string;
+  name: string;
+  mimeType?: string;
+  sourcePath: string;
+  downloadUrl: string;
+  messageId?: string;
+  toolCallId?: string;
+}
+
+export type ArtifactState = ImageArtifactState | FileArtifactState;
 
 export interface ApprovalState {
   id: string;
@@ -89,7 +106,7 @@ export interface GuiChatState {
   messages: ChatMessage[];
   toolCalls: Record<string, ToolCallState>;
   toolOrder: string[];
-  artifacts: Record<string, ImageArtifactState>;
+  artifacts: Record<string, ArtifactState>;
   approvals: Record<string, ApprovalState>;
   approvalOrder: string[];
   statusLines: string[];

@@ -9799,9 +9799,17 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 4018, f"PDF too large ({len(pdf_bytes)} bytes; cap is {mb} MB)")
             if pdf_bytes[:5] != b"%PDF-":
                 return _err(rid, 4017, "payload is not a PDF (missing %PDF- magic bytes)")
-            pdf_path = td_path / "input.pdf"
-            pdf_path.write_bytes(pdf_bytes)
-            display_name = str(params.get("filename", "") or "uploaded.pdf")
+            display_name = _sanitize_attachment_name(
+                str(params.get("filename", "") or "uploaded.pdf")
+            )
+            if Path(display_name).suffix.lower() != ".pdf":
+                display_name = f"{display_name}.pdf"
+            pdf_path, _uploaded = _stage_session_file_attachment(
+                session,
+                raw_path="",
+                data_url=f"data:application/pdf;base64,{raw_b64.split(',', 1)[-1]}",
+                name=display_name,
+            )
         else:
             try:
                 from cli import _resolve_attachment_path
@@ -9816,10 +9824,15 @@ def _(rid, params: dict) -> dict:
             if Path(resolved).stat().st_size > _PDF_ATTACH_MAX_BYTES:
                 mb = _PDF_ATTACH_MAX_BYTES // (1024 * 1024)
                 return _err(rid, 4018, f"PDF too large; cap is {mb} MB")
-            pdf_path = Path(resolved)
+            pdf_path, _uploaded = _stage_session_file_attachment(
+                session,
+                raw_path=str(resolved),
+                data_url="",
+                name=Path(resolved).name,
+            )
             display_name = pdf_path.name
 
-        pdf_size_bytes = len(pdf_bytes) if raw_b64 else pdf_path.stat().st_size
+        pdf_size_bytes = pdf_path.stat().st_size
         try:
             first_page = int(params.get("first_page") or 1)
             last_page_param = params.get("last_page")
@@ -9876,6 +9889,7 @@ def _(rid, params: dict) -> dict:
                 "name": display_name,
                 "mime_type": "application/pdf",
                 "size_bytes": pdf_size_bytes,
+                "path": str(pdf_path),
                 "pages_attached": len(attached_pages),
                 "source_paths": [page["path"] for page in attached_pages],
             },
@@ -9885,6 +9899,7 @@ def _(rid, params: dict) -> dict:
             {
                 "attached": True,
                 "filename": display_name,
+                "path": str(pdf_path),
                 "pages_attached": len(attached_pages),
                 "pages": attached_pages,
                 "count": len(session["attached_images"]),
