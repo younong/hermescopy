@@ -51,6 +51,53 @@ describe("MessageAttachmentCard", () => {
     await act(async () => root.unmount());
   });
 
+  it("shows and executes an explicit download action for bubble images", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("image-bytes", { status: 200 }),
+    );
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:downloaded-image");
+    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
+    const click = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => undefined);
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(
+        <MessageAttachmentCard
+          attachment={{
+            downloadUrl: "/api/files/download?path=%2Ftmp%2Fshot.png",
+            id: "history-0-attachment-0",
+            kind: "image",
+            name: "shot.png",
+            previewUrl: "data:image/png;base64,iVBORw0KGgo=",
+            sizeBytes: 12,
+          }}
+          variant="bubble"
+        />,
+      );
+    });
+
+    const download = container.querySelector('a[aria-label="Download shot.png"]');
+    expect(download?.textContent).toContain("Download");
+
+    await act(async () => {
+      download?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/files/download?path=%2Ftmp%2Fshot.png",
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(click).toHaveBeenCalledOnce();
+
+    await act(async () => root.unmount());
+  });
+
   it("renders type-specific icons and a download action", async () => {
     const container = document.createElement("div");
     document.body.appendChild(container);
