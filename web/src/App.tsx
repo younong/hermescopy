@@ -67,8 +67,8 @@ import { useSidebarStatus } from "@/hooks/useSidebarStatus";
 import { AuthWidget } from "@/components/AuthWidget";
 import { ForcedPasswordChangePage } from "@/components/ForcedPasswordChangePage";
 import { PageHeaderProvider } from "@/contexts/PageHeaderProvider";
-import { ProfileKeyedRoutes } from "@/contexts/ProfileKeyedRoutes";
 import { ProfileProvider } from "@/contexts/ProfileProvider";
+import { useProfileScope } from "@/contexts/useProfileScope";
 import { ProfileSwitcher } from "@/components/ProfileSwitcher";
 import { ProfileScopeBanner } from "@/components/ProfileScopeBanner";
 import { useSystemActions } from "@/contexts/useSystemActions";
@@ -836,6 +836,11 @@ export default function App() {
  * the new scope. The persistent ChatPage host below handles its own
  * remount (channel keyed on scopedProfile).
  */
+function ProfileKeyedRoutes({ children }: { children: ReactNode }) {
+  const { profile } = useProfileScope();
+  return <div key={profile || "__own__"} className="contents">{children}</div>;
+}
+
 function SidebarNavLink({
   closeMobile,
   collapsed,

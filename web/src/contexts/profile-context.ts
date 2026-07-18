@@ -12,8 +12,6 @@ export interface ProfileContextValue {
   profiles: string[];
   /** Whether the dashboard manages host profiles or one authenticated owner. */
   managementMode: ProfileManagementMode;
-  /** Whether the initial management profile has finished resolving. */
-  ready: boolean;
   setProfile: (name: string) => void;
 }
 
@@ -22,6 +20,5 @@ export const ProfileContext = createContext<ProfileContextValue>({
   currentProfile: "default",
   profiles: [],
   managementMode: "legacy_multi_profile",
-  ready: false,
   setProfile: () => {},
 });

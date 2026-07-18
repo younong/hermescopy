@@ -1,10 +1,19 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  createContext,
+  createElement,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 
 import { api, type AuthMeResponse } from "@/lib/api";
 import { getHermesBrowserId } from "@/lib/browserIdentity";
 import { dashboardAuthTransition } from "@/lib/dashboardAuthTransition";
 
-interface DashboardAuthIdentity {
+export interface DashboardAuthIdentity {
   authMe: AuthMeResponse | null;
   authRequired: boolean;
   error: string | null;
@@ -18,7 +27,22 @@ function isAuthRequired(): boolean {
   return typeof window !== "undefined" && !!window.__HERMES_AUTH_REQUIRED__;
 }
 
+const DashboardAuthIdentityContext = createContext<DashboardAuthIdentity | null>(null);
+
+export function DashboardAuthIdentityProvider({ children }: { children: ReactNode }) {
+  const identity = useDashboardAuthIdentityState();
+  return createElement(DashboardAuthIdentityContext.Provider, { value: identity }, children);
+}
+
 export function useDashboardAuthIdentity(): DashboardAuthIdentity {
+  const identity = useContext(DashboardAuthIdentityContext);
+  if (!identity) {
+    throw new Error("useDashboardAuthIdentity must be used within DashboardAuthIdentityProvider");
+  }
+  return identity;
+}
+
+function useDashboardAuthIdentityState(): DashboardAuthIdentity {
   const [authRequired] = useState(isAuthRequired);
   const [authMe, setAuthMe] = useState<AuthMeResponse | null>(null);
   const [loading, setLoading] = useState(authRequired);
