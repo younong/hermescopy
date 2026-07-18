@@ -93,3 +93,23 @@ real-path integration guidance in `AGENTS.md` for configuration propagation,
 security boundaries, session state, file/network I/O, and gateway transport. For
 frontend changes, run the applicable workspace typecheck and build described in
 `AGENTS.md`.
+
+### Dashboard browser authentication
+
+Before browser-validating a password-protected Hermes dashboard, run:
+
+```bash
+python3 scripts/playwright_dashboard_login.py [--url <dashboard-base-url>]
+```
+
+The helper reads the ignored local `.env.local`, logs in without exposing the
+credentials in command arguments, and leaves the authenticated
+`hermes-validation` Playwright CLI session open. The file must contain
+`HERMES_DASHBOARD_BROWSER_USERNAME` and `HERMES_DASHBOARD_BROWSER_PASSWORD`
+and have permissions `0600`. Continue validation with
+`playwright-cli -s=hermes-validation ...`, then close it with
+`playwright-cli -s=hermes-validation close`.
+
+Never read, print, copy, or `source` `.env.local`. If the helper reports missing
+or unsafe credentials, ask the user to edit the file locally; never ask them to
+paste a password into the conversation.
