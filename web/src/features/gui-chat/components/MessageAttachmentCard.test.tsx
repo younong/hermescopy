@@ -77,6 +77,46 @@ describe("MessageAttachmentCard", () => {
     await act(async () => root.unmount());
   });
 
+  it("shows a failed download instead of swallowing it", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ detail: "Path not found" }), {
+        headers: { "Content-Type": "application/json" },
+        status: 404,
+      }),
+    );
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(
+        <MessageAttachmentCard
+          attachment={{
+            downloadUrl: "/api/files/download?path=missing.txt",
+            id: "missing-file",
+            kind: "file",
+            name: "missing.txt",
+            sizeBytes: 42,
+          }}
+        />,
+      );
+    });
+    await act(async () => {
+      container.querySelector("a")?.dispatchEvent(
+        new MouseEvent("click", { bubbles: true, cancelable: true }),
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      "Download failed (404): Path not found",
+    );
+    expect(container.querySelector("a")?.getAttribute("aria-busy")).toBe("false");
+
+    await act(async () => root.unmount());
+  });
+
   it("shows legacy PDFs without an original path as unavailable", async () => {
     const container = document.createElement("div");
     document.body.appendChild(container);

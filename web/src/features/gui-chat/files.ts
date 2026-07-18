@@ -1,4 +1,4 @@
-import { withHermesAssetAuth } from "@/lib/api";
+import { authedFetch } from "@/lib/api";
 
 export type SessionFileType =
   | "archive"
@@ -49,14 +49,28 @@ export function sessionFileType(name: string, mimeType?: string): SessionFileTyp
 }
 
 export async function downloadSessionFile(url: string, filename: string): Promise<void> {
-  const assetUrl = url.startsWith("/api/") ? withHermesAssetAuth(url) : url;
   if (url.startsWith("data:") || url.startsWith("blob:")) {
-    triggerDownload(assetUrl, filename);
+    triggerDownload(url, filename);
     return;
   }
 
-  const response = await fetch(assetUrl, { credentials: "include" });
-  if (!response.ok) throw new Error(`download failed: ${response.status}`);
+  const response = url.startsWith("/api/")
+    ? await authedFetch(url)
+    : await fetch(url, { credentials: "include" });
+  if (!response.ok) {
+    let detail = "";
+    try {
+      const body = await response.clone().json() as { detail?: string; error?: string };
+      detail = String(body.detail ?? body.error ?? "").trim();
+    } catch {
+      detail = (await response.text().catch(() => "")).trim();
+    }
+    throw new Error(
+      detail
+        ? `Download failed (${response.status}): ${detail}`
+        : `Download failed (${response.status})`,
+    );
+  }
   const blob = await response.blob();
   const objectUrl = URL.createObjectURL(blob);
   try {

@@ -612,6 +612,28 @@ def create_app(
         mime_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
         return {"dataUrl": f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}"}
 
+    def _workspace_cwd_path(cwd: str) -> str:
+        raw_cwd = str(cwd or "").strip()
+        if not raw_cwd or "\x00" in raw_cwd:
+            raise HTTPException(status_code=400, detail="Invalid cwd")
+        sandbox_root = "/workspace"
+        if raw_cwd == sandbox_root:
+            return workspace_context.workspace_prefix
+        if raw_cwd.startswith(f"{sandbox_root}/"):
+            suffix = raw_cwd[len(sandbox_root) + 1 :]
+            return _file_path(f"{workspace_context.workspace_prefix}/{suffix}")
+
+        cwd_path = Path(raw_cwd)
+        if not cwd_path.is_absolute():
+            raise HTTPException(status_code=400, detail="Invalid cwd")
+        workspace_root = app.state.owner_worker_controlled_roots.get(
+            RootKind.WORKSPACE
+        ).canonical_path
+        try:
+            return _file_path(cwd_path.relative_to(workspace_root).as_posix())
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid cwd") from None
+
     @app.get("/api/files/download")
     def download_file(
         path: str,
@@ -623,28 +645,28 @@ def create_app(
         workspace_root = app.state.owner_worker_controlled_roots.get(RootKind.WORKSPACE).canonical_path
         root_kind = RootKind.WORKSPACE
         try:
-            candidate = Path(value)
-            if candidate.is_absolute():
-                try:
-                    relative_path = candidate.relative_to(workspace_root).as_posix()
-                except ValueError:
-                    relative_path = _owner_image_path(value)
-                    root_kind = RootKind.OWNER_WRITABLE
+            cwd_relative = _workspace_cwd_path(cwd) if cwd is not None else None
+            sandbox_root = "/workspace"
+            if value.startswith(f"{sandbox_root}/"):
+                suffix = value[len(sandbox_root) + 1 :]
+                relative_path = _file_path(
+                    f"{workspace_context.workspace_prefix}/{suffix}"
+                )
             else:
-                relative_path = value
-                if cwd is not None:
-                    raw_cwd = str(cwd or "").strip()
-                    if not raw_cwd or "\x00" in raw_cwd:
-                        raise HTTPException(status_code=400, detail="Invalid cwd")
-                    cwd_path = Path(raw_cwd)
-                    if not cwd_path.is_absolute():
-                        raise HTTPException(status_code=400, detail="Invalid cwd")
+                candidate = Path(value)
+                if candidate.is_absolute():
                     try:
-                        cwd_relative = cwd_path.relative_to(workspace_root).as_posix()
+                        relative_path = _file_path(
+                            candidate.relative_to(workspace_root).as_posix()
+                        )
                     except ValueError:
-                        raise HTTPException(status_code=400, detail="Invalid cwd") from None
-                    relative_path = f"{cwd_relative}/{relative_path}" if cwd_relative else relative_path
-                relative_path = _file_path(relative_path)
+                        relative_path = _owner_image_path(value)
+                        root_kind = RootKind.OWNER_WRITABLE
+                else:
+                    relative_path = value
+                    if cwd_relative is not None:
+                        relative_path = f"{cwd_relative}/{relative_path}"
+                    relative_path = _file_path(relative_path)
 
             fd = app.state.owner_worker_controlled_roots.open_relative(
                 root_kind, relative_path, expected_type=ExpectedType.REGULAR_FILE

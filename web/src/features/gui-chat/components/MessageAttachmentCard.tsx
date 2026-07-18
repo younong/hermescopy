@@ -1,4 +1,4 @@
-import { Download } from "lucide-react";
+import { Download, LoaderCircle } from "lucide-react";
 import { useEffect, useState, type MouseEvent } from "react";
 
 import { fetchJSON, withHermesAssetAuth } from "@/lib/api";
@@ -16,6 +16,8 @@ export function MessageAttachmentCard({
 }) {
   const isPdf = attachment.kind === "pdf";
   const previewUrl = useAttachmentPreviewUrl(attachment);
+  const [downloading, setDownloading] = useState(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
   const typeLabel = attachment.kind === "image" ? "Image" : isPdf ? "PDF" : "File";
   const meta = [
     typeLabel,
@@ -26,25 +28,44 @@ export function MessageAttachmentCard({
     .join(" · ");
   const download = (event: MouseEvent<HTMLAnchorElement>) => {
     event.preventDefault();
-    if (attachment.downloadUrl) {
-      void downloadSessionFile(attachment.downloadUrl, attachment.name);
-    }
+    if (!attachment.downloadUrl || downloading) return;
+    setDownloading(true);
+    setDownloadError(null);
+    void downloadSessionFile(attachment.downloadUrl, attachment.name)
+      .catch((error: unknown) => {
+        setDownloadError(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => setDownloading(false));
   };
 
   if (variant === "bubble" && attachment.kind === "image" && previewUrl) {
     return attachment.downloadUrl ? (
-      <a
-        aria-label={`Download ${attachment.name}`}
-        href={withHermesAssetAuth(attachment.downloadUrl)}
-        onClick={download}
-      >
-        <img
-          alt={attachment.name}
-          className="max-h-[320px] w-[180px] rounded-3xl object-cover shadow-sm sm:w-[220px]"
-          draggable={false}
-          src={previewUrl}
-        />
-      </a>
+      <div>
+        <a
+          aria-busy={downloading}
+          aria-disabled={downloading}
+          aria-describedby={downloadError ? `${attachment.id}-download-error` : undefined}
+          aria-label={`Download ${attachment.name}`}
+          href={withHermesAssetAuth(attachment.downloadUrl)}
+          onClick={download}
+        >
+          <img
+            alt={attachment.name}
+            className="max-h-[320px] w-[180px] rounded-3xl object-cover shadow-sm sm:w-[220px]"
+            draggable={false}
+            src={previewUrl}
+          />
+        </a>
+        {downloadError ? (
+          <p
+            className="mt-1 max-w-[220px] text-xs text-destructive"
+            id={`${attachment.id}-download-error`}
+            role="alert"
+          >
+            {downloadError}
+          </p>
+        ) : null}
+      </div>
     ) : (
       <img
         alt={attachment.name}
@@ -72,20 +93,40 @@ export function MessageAttachmentCard({
         </div>
         <div className="truncate text-xs leading-5 text-text-tertiary">{meta}</div>
       </div>
-      {attachment.downloadUrl ? <Download aria-hidden className="h-4 w-4 shrink-0" /> : null}
+      {attachment.downloadUrl ? (
+        downloading ? (
+          <LoaderCircle aria-hidden className="h-4 w-4 shrink-0 animate-spin" />
+        ) : (
+          <Download aria-hidden className="h-4 w-4 shrink-0" />
+        )
+      ) : null}
     </>
   );
   const className = "flex h-[64px] w-full max-w-[280px] items-center gap-3 rounded-2xl border border-current/10 bg-background-base/60 px-3 py-2 text-left shadow-sm sm:w-[260px]";
 
   return attachment.downloadUrl ? (
-    <a
-      aria-label={`Download ${attachment.name}`}
-      className={`${className} transition-colors hover:border-primary/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary`}
-      href={withHermesAssetAuth(attachment.downloadUrl)}
-      onClick={download}
-    >
-      {content}
-    </a>
+    <div className="w-full max-w-[280px] sm:w-[260px]">
+      <a
+        aria-busy={downloading}
+        aria-disabled={downloading}
+        aria-describedby={downloadError ? `${attachment.id}-download-error` : undefined}
+        aria-label={`Download ${attachment.name}`}
+        className={`${className} transition-colors hover:border-primary/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary`}
+        href={withHermesAssetAuth(attachment.downloadUrl)}
+        onClick={download}
+      >
+        {content}
+      </a>
+      {downloadError ? (
+        <p
+          className="mt-1 text-xs text-destructive"
+          id={`${attachment.id}-download-error`}
+          role="alert"
+        >
+          {downloadError}
+        </p>
+      ) : null}
+    </div>
   ) : (
     <div aria-disabled="true" className={className} title="Original file is unavailable">
       {content}

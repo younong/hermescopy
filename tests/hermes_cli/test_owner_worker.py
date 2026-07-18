@@ -1887,6 +1887,12 @@ def test_worker_managed_files_are_descriptor_scoped_to_its_owner(tmp_path, monke
     owner_a = ensure_owner_runtime_dirs(tmp_path / "owner-a")
     owner_b = ensure_owner_runtime_dirs(tmp_path / "owner-b")
     (owner_b / "workspaces" / "secret.txt").write_text("owner-b-only")
+    default_workspace = owner_a / "workspaces" / "default"
+    default_workspace.joinpath("subdir").mkdir()
+    default_workspace.joinpath("report.html").write_bytes(b"<h1>owner-a</h1>")
+    default_workspace.joinpath("subdir/report.pdf").write_bytes(b"%PDF-owner-a")
+    default_workspace.joinpath("directory").mkdir()
+    default_workspace.joinpath("report-link.html").symlink_to("report.html")
     monkeypatch.setenv("HERMES_HOME", str(owner_a))
     monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_owner_a")
     monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
@@ -1937,10 +1943,56 @@ def test_worker_managed_files_are_descriptor_scoped_to_its_owner(tmp_path, monke
     assert downloaded.content == b"owner-a"
     assert "owner%20note.txt" in downloaded.headers["content-disposition"]
 
+    for sandbox_path, sandbox_cwd, expected, expected_type in (
+        ("/workspace/report.html", None, b"<h1>owner-a</h1>", "text/html"),
+        (
+            "/workspace/subdir/report.pdf",
+            None,
+            b"%PDF-owner-a",
+            "application/pdf",
+        ),
+        ("report.html", "/workspace", b"<h1>owner-a</h1>", "text/html"),
+        (
+            "report.pdf",
+            "/workspace/subdir",
+            b"%PDF-owner-a",
+            "application/pdf",
+        ),
+    ):
+        params = {"path": sandbox_path}
+        if sandbox_cwd is not None:
+            params["cwd"] = sandbox_cwd
+        response = client.get(
+            "/api/files/download",
+            headers=request("/api/files/download"),
+            params=params,
+        )
+        assert response.status_code == 200, response.text
+        assert response.content == expected
+        assert response.headers["content-type"].startswith(expected_type)
+        assert response.headers["content-disposition"].startswith("attachment;")
+
+    sandbox_path_with_owner_cwd = client.get(
+        "/api/files/download",
+        headers=request("/api/files/download"),
+        params={
+            "path": "/workspace/report.html",
+            "cwd": str(default_workspace),
+        },
+    )
+    assert sandbox_path_with_owner_cwd.status_code == 200
+    assert sandbox_path_with_owner_cwd.content == b"<h1>owner-a</h1>"
+
     for rejected_path, rejected_cwd in (
         (str(owner_b / "workspaces" / "secret.txt"), None),
         ("../secret.txt", str(owner_a / "workspaces" / "project")),
         ("secret.txt", str(owner_b / "workspaces")),
+        ("/workspace", None),
+        ("/workspace2/report.html", None),
+        ("/workspace/../secret.txt", None),
+        ("/workspace/directory", None),
+        ("/workspace/report-link.html", None),
+        ("/workspace/report.html", str(owner_b / "workspaces")),
     ):
         params = {"path": rejected_path}
         if rejected_cwd is not None:
