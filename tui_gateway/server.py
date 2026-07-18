@@ -4015,56 +4015,96 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
             _child_mirrors.pop(child_key, None)
 
 
+def _bind_owner_runtime_callback(callback, runtime: OwnerWorkerGatewayRuntime | None):
+    """Bind owner-local gateway state when an agent calls back from another thread."""
+
+    def wrapped(*args, **kwargs):
+        runtime_token = _gateway_runtime.set(runtime)
+        try:
+            return callback(*args, **kwargs)
+        finally:
+            _gateway_runtime.reset(runtime_token)
+
+    return wrapped
+
+
 def _agent_cbs(sid: str) -> dict:
+    runtime = current_owner_worker_gateway_runtime()
+
+    def in_runtime(callback):
+        return _bind_owner_runtime_callback(callback, runtime)
+
     return {
-        "tool_start_callback": lambda tc_id, name, args: _on_tool_start(
-            sid, tc_id, name, args
+        "tool_start_callback": in_runtime(
+            lambda tc_id, name, args: _on_tool_start(sid, tc_id, name, args)
         ),
-        "tool_complete_callback": lambda tc_id, name, args, result: _on_tool_complete(
-            sid, tc_id, name, args, result
+        "tool_complete_callback": in_runtime(
+            lambda tc_id, name, args, result: _on_tool_complete(
+                sid, tc_id, name, args, result
+            )
         ),
-        "tool_progress_callback": lambda event_type, name=None, preview=None, args=None, **kwargs: _on_tool_progress(
-            sid, event_type, name, preview, args, **kwargs
+        "tool_progress_callback": in_runtime(
+            lambda event_type, name=None, preview=None, args=None, **kwargs: _on_tool_progress(
+                sid, event_type, name, preview, args, **kwargs
+            )
         ),
-        "tool_gen_callback": lambda name: _tool_progress_enabled(sid)
-        and _emit("tool.generating", sid, {"name": name}),
-        "thinking_callback": lambda text: _emit("thinking.delta", sid, {"text": text}),
-        "reasoning_callback": lambda text: _emit(
-            "reasoning.delta",
-            sid,
-            {"text": text, **({"verbose": True} if _session_verbose(sid) else {})},
+        "tool_gen_callback": in_runtime(
+            lambda name: _tool_progress_enabled(sid)
+            and _emit("tool.generating", sid, {"name": name})
         ),
-        "status_callback": lambda kind, text=None: _status_update(
-            sid, str(kind), None if text is None else str(text)
+        "thinking_callback": in_runtime(
+            lambda text: _emit("thinking.delta", sid, {"text": text})
+        ),
+        "reasoning_callback": in_runtime(
+            lambda text: _emit(
+                "reasoning.delta",
+                sid,
+                {"text": text, **({"verbose": True} if _session_verbose(sid) else {})},
+            )
+        ),
+        "status_callback": in_runtime(
+            lambda kind, text=None: _status_update(
+                sid, str(kind), None if text is None else str(text)
+            )
         ),
         # Credits/notice spine (L1): an AgentNotice fired by the agent becomes a
         # notification.show WS event; a recovery clear becomes notification.clear.
         # Snake_case payload to match the existing gateway-event convention.
-        "notice_callback": lambda n: _emit(
-            "notification.show",
-            sid,
-            {
-                "text": n.text,
-                "level": n.level,
-                "kind": n.kind,
-                "ttl_ms": n.ttl_ms,
-                "key": n.key,
-                "id": n.id,
-            },
+        "notice_callback": in_runtime(
+            lambda n: _emit(
+                "notification.show",
+                sid,
+                {
+                    "text": n.text,
+                    "level": n.level,
+                    "kind": n.kind,
+                    "ttl_ms": n.ttl_ms,
+                    "key": n.key,
+                    "id": n.id,
+                },
+            )
         ),
-        "notice_clear_callback": lambda key: _emit(
-            "notification.clear", sid, {"key": key}
+        "notice_clear_callback": in_runtime(
+            lambda key: _emit("notification.clear", sid, {"key": key})
         ),
-        "clarify_callback": lambda q, c: _block(
-            "clarify.request", sid, {"question": q, "choices": c}
+        "clarify_callback": in_runtime(
+            lambda q, c: _block(
+                "clarify.request", sid, {"question": q, "choices": c}
+            )
         ),
         # read_terminal tool (desktop GUI): same blocking bridge as clarify — the
         # renderer answers terminal.read.respond with the serialized buffer.
-        "read_terminal_callback": lambda start=None, count=None: _block(
-            "terminal.read.request",
-            sid,
-            {k: v for k, v in (("start", start), ("count", count)) if v is not None},
-            timeout=30,
+        "read_terminal_callback": in_runtime(
+            lambda start=None, count=None: _block(
+                "terminal.read.request",
+                sid,
+                {
+                    k: v
+                    for k, v in (("start", start), ("count", count))
+                    if v is not None
+                },
+                timeout=30,
+            )
         ),
     }
 
@@ -9235,7 +9275,11 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
 
             run_kwargs = {
                 "conversation_history": list(history),
-                "stream_callback": _stream,
+                # OpenAI-compatible clients iterate streams on a helper thread.
+                # Bind the immutable owner runtime at registration time so token
+                # callbacks still resolve this session's private map and transport
+                # instead of falling through to the standalone stdout transport.
+                "stream_callback": _bind_owner_runtime_callback(_stream, runtime),
             }
             try:
                 run_parameters = inspect.signature(agent.run_conversation).parameters

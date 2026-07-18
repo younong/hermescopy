@@ -57,9 +57,9 @@ _STREAMING_EVENT_TYPES = frozenset({
     "reasoning.delta",
     "thinking.delta",
 })
-# Max time a streamed token waits in the buffer before flush (~20 fps). This
-# stays visibly live while cutting React/WebSocket churn on long GUI replies.
-_TOKEN_COALESCE_S = 0.05
+# Max time a streamed token waits in the buffer before flush (~30 fps). This
+# keeps GUI replies visually fluid while still coalescing per-token loop wakeups.
+_TOKEN_COALESCE_S = 0.033
 
 
 def _merge_streaming_lines(lines: list[str]) -> list[str]:

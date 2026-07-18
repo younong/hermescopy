@@ -44,6 +44,8 @@ def test_ws_startup_starts_background_mcp_discovery(monkeypatch):
     )
 
     class FakeWS:
+        query_params = {}
+
         async def accept(self):
             pass
 
@@ -94,6 +96,8 @@ def _run_disconnect(monkeypatch, seed):
     )
 
     class FakeWS:
+        query_params = {}
+
         async def accept(self):
             pass
 
@@ -148,6 +152,125 @@ def test_ws_disconnect_preserves_and_repoints_reconnectable_session(monkeypatch)
         assert server._sessions["plain"]["transport"] is server._detached_ws_transport
     finally:
         server._sessions.clear()
+
+
+class _FakeTimerHandle:
+    def __init__(self, delay, callback):
+        self.delay = delay
+        self.callback = callback
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+    def fire(self):
+        assert not self.cancelled
+        self.callback()
+
+
+class _FakeTransportLoop:
+    def __init__(self):
+        self.timers = []
+
+    def call_soon_threadsafe(self, callback):
+        callback()
+
+    def call_later(self, delay, callback):
+        handle = _FakeTimerHandle(delay, callback)
+        self.timers.append(handle)
+        return handle
+
+    def create_task(self, coroutine):
+        return asyncio.run(coroutine)
+
+
+def _gateway_event(event_type, *, text=None, session_id="sid"):
+    payload = {} if text is None else {"text": text}
+    return {
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {
+            "payload": payload,
+            "session_id": session_id,
+            "type": event_type,
+        },
+    }
+
+
+def test_ws_transport_arms_one_30fps_timer_and_preserves_stream_boundaries():
+    sent = []
+
+    class FakeWS:
+        async def send_text(self, line):
+            sent.append(json.loads(line))
+
+    loop = _FakeTransportLoop()
+    transport = ws_mod.WSTransport(FakeWS(), loop)
+
+    assert transport.write(_gateway_event("message.delta", text="hel")) is True
+    assert transport.write(_gateway_event("message.delta", text="lo")) is True
+    assert transport.write(_gateway_event("reasoning.delta", text="why")) is True
+    assert transport.write(
+        _gateway_event("message.delta", text="other", session_id="other-sid")
+    ) is True
+
+    assert len(loop.timers) == 1
+    assert loop.timers[0].delay == ws_mod._TOKEN_COALESCE_S == 0.033
+
+    loop.timers[0].fire()
+
+    assert [item["params"]["type"] for item in sent] == [
+        "message.delta",
+        "reasoning.delta",
+        "message.delta",
+    ]
+    assert [item["params"]["payload"]["text"] for item in sent] == [
+        "hello",
+        "why",
+        "other",
+    ]
+    assert [item["params"]["session_id"] for item in sent] == [
+        "sid",
+        "sid",
+        "other-sid",
+    ]
+
+
+def test_ws_transport_control_frame_immediately_drains_pending_stream(monkeypatch):
+    sent = []
+
+    class FakeWS:
+        async def send_text(self, line):
+            sent.append(json.loads(line))
+
+    class FakeFuture:
+        def result(self, timeout):
+            return None
+
+    def schedule(coroutine, loop):
+        asyncio.run(coroutine)
+        return FakeFuture()
+
+    monkeypatch.setattr("agent.async_utils.safe_schedule_threadsafe", schedule)
+    loop = _FakeTransportLoop()
+    transport = ws_mod.WSTransport(FakeWS(), loop)
+
+    assert transport.write(_gateway_event("message.delta", text="partial ")) is True
+    assert transport.write(_gateway_event("message.delta", text="answer")) is True
+    assert transport.write(
+        _gateway_event("message.complete", text="partial answer")
+    ) is True
+
+    assert len(loop.timers) == 1
+    assert [item["params"]["type"] for item in sent] == [
+        "message.delta",
+        "message.complete",
+    ]
+    assert sent[0]["params"]["payload"]["text"] == "partial answer"
+    assert sent[1]["params"]["payload"]["text"] == "partial answer"
+
+    loop.timers[0].fire()
+    assert len(sent) == 2
 
 
 def test_ws_transport_merges_streaming_frames_in_one_flush():
