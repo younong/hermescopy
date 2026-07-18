@@ -513,20 +513,35 @@ class TestStreamingCallbacks:
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
-    def test_text_suppressed_when_tool_calls_present(self, mock_close, mock_create):
-        """Text deltas are suppressed when tool calls are also in the stream."""
+    def test_text_after_tool_call_reaches_all_stream_consumers(
+        self, mock_close, mock_create
+    ):
+        """Provider text after tool metadata reaches display and turn callbacks.
+
+        The production Codex relay can emit reasoning, tool-call metadata, and then
+        the visible answer.  The parser used to send those late text deltas only to
+        ``stream_delta_callback``, so gateway callers registered through
+        ``run_conversation(stream_callback=...)`` received no ``message.delta``
+        even though the final response contained the complete text.
+        """
         from run_agent import AIAgent
 
         chunks = [
-            _make_stream_chunk(content="thinking..."),
+            _make_stream_chunk(reasoning_content="Planning"),
             _make_stream_chunk(tool_calls=[
                 _make_tool_call_delta(index=0, tc_id="call_abc", name="read_file")
             ]),
-            _make_stream_chunk(content=" more text"),
+            _make_stream_chunk(tool_calls=[
+                _make_tool_call_delta(index=0, arguments='{"path": "x.py"}')
+            ]),
+            _make_stream_chunk(content="First part. "),
+            _make_stream_chunk(content="Second part."),
             _make_stream_chunk(finish_reason="tool_calls"),
         ]
 
-        deltas = []
+        display_deltas = []
+        turn_deltas = []
+        reasoning_deltas = []
 
         mock_client = MagicMock()
         mock_client.chat.completions.create.return_value = iter(chunks)
@@ -535,25 +550,84 @@ class TestStreamingCallbacks:
         agent = AIAgent(
             api_key="test-key",
             base_url="https://openrouter.ai/api/v1",
-            model="test/model",
+            model="gpt-5.6-sol",
+            provider="custom:codex",
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
-            stream_delta_callback=lambda t: deltas.append(t),
+            stream_delta_callback=display_deltas.append,
+            reasoning_callback=reasoning_deltas.append,
         )
         agent.api_mode = "chat_completions"
         agent._interrupt_requested = False
+        agent._stream_callback = turn_deltas.append
 
         response = agent._interruptible_streaming_api_call({})
 
-        # Text before tool call IS fired (we don't know yet it will have tools)
-        assert "thinking..." in deltas
-        # Text after tool call IS still routed to stream_delta_callback so that
-        # reasoning tag extraction can fire (PR #3566).  Display-level suppression
-        # of non-reasoning text happens in the CLI's _stream_delta, not here.
-        assert " more text" in deltas
-        # Content is still accumulated in the response
-        assert response.choices[0].message.content == "thinking... more text"
+        assert reasoning_deltas == ["Planning"]
+        assert display_deltas == ["First part. ", "Second part."]
+        assert turn_deltas == display_deltas
+        assert response.choices[0].message.content == "First part. Second part."
+        assert response.choices[0].message.reasoning_content == "Planning"
+        tool_calls = response.choices[0].message.tool_calls
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "read_file"
+        assert tool_calls[0].function.arguments == '{"path": "x.py"}'
+        assert agent._current_streamed_assistant_text == "First part. Second part."
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_text_after_tool_call_uses_shared_stream_scrubbers(
+        self, mock_close, mock_create
+    ):
+        """Late tool-associated text cannot bypass think or context scrubbers."""
+        from run_agent import AIAgent
+
+        chunks = [
+            _make_stream_chunk(tool_calls=[
+                _make_tool_call_delta(index=0, tc_id="call_safe", name="read_file")
+            ]),
+            _make_stream_chunk(tool_calls=[
+                _make_tool_call_delta(index=0, arguments='{"path": "x.py"}')
+            ]),
+            _make_stream_chunk(content="<thi"),
+            _make_stream_chunk(content="nk>private reasoning</think>Visible\n"),
+            _make_stream_chunk(content="<memory-context>\ninternal"),
+            _make_stream_chunk(content="\n</memory-context>answer"),
+            _make_stream_chunk(finish_reason="tool_calls"),
+        ]
+
+        display_deltas = []
+        turn_deltas = []
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="gpt-5.6-sol",
+            provider="custom:codex",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            stream_delta_callback=display_deltas.append,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+        agent._stream_callback = turn_deltas.append
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert "".join(display_deltas) == "Visible\nanswer"
+        assert turn_deltas == display_deltas
+        assert "private reasoning" not in "".join(display_deltas)
+        assert "internal" not in "".join(display_deltas)
+        assert response.choices[0].message.content == (
+            "<think>private reasoning</think>Visible\n"
+            "<memory-context>\ninternal\n</memory-context>answer"
+        )
+        assert agent._current_streamed_assistant_text == "Visible\nanswer"
 
 
 # ── Test: Streaming Fallback ────────────────────────────────────────────
