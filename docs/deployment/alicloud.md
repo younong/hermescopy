@@ -275,6 +275,8 @@ ssh root@106.15.186.104 'journalctl -u hermes-gateway -u hermes-dashboard --sinc
 
 迁移后使用隐私窗口访问 `https://abinllm.xyz/hermes/`：浏览器应直接显示 Hermes 登录页，不再弹出原生 Basic Auth。用一个 active member 验证 dashboard、WebSocket/PTY、sessions API 和普通 owner 功能，确认账号管理仍返回 403；再用独立 admin 会话确认管理读取可用。验证 logout、过期/篡改 cookie 和非 Hermes 站点未回归。
 
+AI 执行上述生产浏览器验收时，先运行 `python3 scripts/playwright_dashboard_login.py`；它从 Git 忽略的本机 `.env.local` 读取凭据，并保留已认证的 `hermes-validation` 会话。后续统一使用 `playwright-cli -s=hermes-validation ...`，结束后运行 `playwright-cli -s=hermes-validation close`。不得读取、输出或提交 `.env.local` 内容；member/admin 分别验收时使用各自独立的本机会话和凭据。
+
 APIYI smoke test 不是发布脚本必跑步骤；需要真实调用模型时再单独执行。发布脚本会做 host sandbox preflight、systemd 服务状态和 Hermes auth readiness 检查；生产验收还应使用真实 authenticated 用户验证本地文件/terminal、跨 owner 隔离、`web_search` 经 relay 成功，以及 browser 等 direct-egress 工具继续按 policy 隐藏并在直接调用时拒绝。
 
 ## 常用参数

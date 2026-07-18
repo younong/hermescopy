@@ -36,7 +36,7 @@ deploy/*.local.env
 !.claude/hooks/
 .claude/hooks/*
 !.claude/hooks/block-review-agents.py
-web/.playwright-cli
+.playwright-cli/
 compose.hermes.local.yml
 export*
 __pycache__/model_tools.cpython-310.pyc
