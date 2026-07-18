@@ -41,6 +41,7 @@ export function ProfileProvider({ children }: { children: ReactNode }) {
   const [managementMode, setManagementMode] = useState<ProfileManagementMode>(
     "legacy_multi_profile",
   );
+  const [ready, setReady] = useState(false);
 
   // Initial value comes from the URL (deep link / refresh / unified-launch
   // preselect); afterwards state leads and the URL follows.
@@ -85,9 +86,9 @@ export function ProfileProvider({ children }: { children: ReactNode }) {
     let cancelled = false;
     const urlProfile = searchParams.get("profile");
 
-    api
-      .getProfiles()
-      .then(async (profilesRes) => {
+    const resolveInitialProfile = async () => {
+      try {
+        const profilesRes = await api.getProfiles();
         if (cancelled) return;
         const mode = profilesRes.management_mode ?? "legacy_multi_profile";
         setManagementMode(mode);
@@ -117,9 +118,14 @@ export function ProfileProvider({ children }: { children: ReactNode }) {
           setManagementProfile(active);
           setProfileState(active);
         }
-      })
-      .catch(() => {});
+      } catch {
+        // Keep the URL/default scope usable when profile discovery is unavailable.
+      } finally {
+        if (!cancelled) setReady(true);
+      }
+    };
 
+    void resolveInitialProfile();
     return () => {
       cancelled = true;
     };
@@ -145,8 +151,8 @@ export function ProfileProvider({ children }: { children: ReactNode }) {
   );
 
   const value = useMemo(
-    () => ({ profile, currentProfile, profiles, managementMode, setProfile }),
-    [profile, currentProfile, profiles, managementMode, setProfile],
+    () => ({ profile, currentProfile, profiles, managementMode, ready, setProfile }),
+    [profile, currentProfile, profiles, managementMode, ready, setProfile],
   );
 
   return (
