@@ -702,21 +702,47 @@ def test_supervisor_shutdown_revoker_can_release_active_use_from_event_loop(tmp_
     assert supervisor._terminating_handles == {}
 
 
-def test_supervisor_get_or_start_health_retirement_releases_bridge_lease(tmp_path):
-    """A failed health check can synchronously revoke a bridged generation."""
-    owner = _Owner("ok1_health_release", tmp_path / "owner")
-    events = []
-    loop = asyncio.new_event_loop()
-    loop_ready = threading.Event()
+def test_supervisor_get_or_start_skips_health_probe_while_generation_is_in_use(tmp_path):
+    """A concurrent request must not retire a generation with a live bridge."""
+    owner = _Owner("ok1_health_in_use", tmp_path / "owner")
 
-    def run_loop():
-        asyncio.set_event_loop(loop)
-        loop_ready.set()
-        loop.run_forever()
+    class _FailsAfterStartupClient(_FakeClient):
+        health_calls = 0
 
-    loop_thread = threading.Thread(target=run_loop)
-    loop_thread.start()
-    assert loop_ready.wait(timeout=1)
+        def verify_health(self, **kwargs):
+            type(self).health_calls += 1
+            if type(self).health_calls > 1:
+                raise OwnerWorkerHealthError("worker temporarily unavailable")
+            return super().verify_health(**kwargs)
+
+    def fake_process_factory(*args, **kwargs):
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FailsAfterStartupClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+    first = supervisor.get_or_start(owner)
+    use_lease = supervisor.acquire_use(first)
+    try:
+        reused = supervisor.get_or_start(owner)
+    finally:
+        use_lease.release()
+
+    assert reused is first
+    assert _FailsAfterStartupClient.health_calls == 1
+    assert not first.process.terminated
+    assert supervisor._handles[owner.owner_key] is first
+
+
+def test_supervisor_get_or_start_failed_health_retires_idle_generation(tmp_path):
+    """A failed health check still retires a generation without active uses."""
+    owner = _Owner("ok1_health_idle", tmp_path / "owner")
 
     class _FailsAfterStartupClient(_FakeClient):
         health_calls = 0
@@ -740,30 +766,10 @@ def test_supervisor_get_or_start_health_retirement_releases_bridge_lease(tmp_pat
         startup_cooldown=0,
     )
     first = supervisor.get_or_start(owner)
-    use_lease = supervisor.acquire_use(first)
-
-    async def close_bridge():
-        use_lease.release()
-        events.append("lease_released")
-
-    def revoke_bridges(lease):
-        assert lease.state is WorkerLeaseState.DRAINING
-        future = asyncio.run_coroutine_threadsafe(close_bridge(), loop)
-        future.result(timeout=1)
-        events.append("bridges_closed")
-
-    supervisor.generation_bridge_revoker = revoke_bridges
-    try:
-        replacement = supervisor.get_or_start(owner)
-    finally:
-        loop.call_soon_threadsafe(loop.stop)
-        loop_thread.join(timeout=1)
-        loop.close()
+    replacement = supervisor.get_or_start(owner)
 
     assert replacement is not first
     assert first.process.terminated
-    assert first.active_uses == 0
-    assert events == ["lease_released", "bridges_closed"]
     assert supervisor._handles[owner.owner_key] is replacement
     assert supervisor._terminating_handles == {}
 
@@ -1887,6 +1893,12 @@ def test_worker_managed_files_are_descriptor_scoped_to_its_owner(tmp_path, monke
     owner_a = ensure_owner_runtime_dirs(tmp_path / "owner-a")
     owner_b = ensure_owner_runtime_dirs(tmp_path / "owner-b")
     (owner_b / "workspaces" / "secret.txt").write_text("owner-b-only")
+    default_workspace = owner_a / "workspaces" / "default"
+    default_workspace.joinpath("subdir").mkdir()
+    default_workspace.joinpath("report.html").write_bytes(b"<h1>owner-a</h1>")
+    default_workspace.joinpath("subdir/report.pdf").write_bytes(b"%PDF-owner-a")
+    default_workspace.joinpath("directory").mkdir()
+    default_workspace.joinpath("report-link.html").symlink_to("report.html")
     monkeypatch.setenv("HERMES_HOME", str(owner_a))
     monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_owner_a")
     monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
@@ -1923,6 +1935,81 @@ def test_worker_managed_files_are_descriptor_scoped_to_its_owner(tmp_path, monke
         params={"path": "../secret.txt"},
     )
     assert traversal.status_code == 400
+
+    downloaded = client.get(
+        "/api/files/download",
+        headers=request("/api/files/download"),
+        params={
+            "path": "note.txt",
+            "cwd": str(owner_a / "workspaces" / "project"),
+            "filename": "owner note.txt",
+        },
+    )
+    assert downloaded.status_code == 200
+    assert downloaded.content == b"owner-a"
+    assert "owner%20note.txt" in downloaded.headers["content-disposition"]
+
+    for sandbox_path, sandbox_cwd, expected, expected_type in (
+        ("/workspace/report.html", None, b"<h1>owner-a</h1>", "text/html"),
+        (
+            "/workspace/subdir/report.pdf",
+            None,
+            b"%PDF-owner-a",
+            "application/pdf",
+        ),
+        ("report.html", "/workspace", b"<h1>owner-a</h1>", "text/html"),
+        (
+            "report.pdf",
+            "/workspace/subdir",
+            b"%PDF-owner-a",
+            "application/pdf",
+        ),
+    ):
+        params = {"path": sandbox_path}
+        if sandbox_cwd is not None:
+            params["cwd"] = sandbox_cwd
+        response = client.get(
+            "/api/files/download",
+            headers=request("/api/files/download"),
+            params=params,
+        )
+        assert response.status_code == 200, response.text
+        assert response.content == expected
+        assert response.headers["content-type"].startswith(expected_type)
+        assert response.headers["content-disposition"].startswith("attachment;")
+
+    sandbox_path_with_owner_cwd = client.get(
+        "/api/files/download",
+        headers=request("/api/files/download"),
+        params={
+            "path": "/workspace/report.html",
+            "cwd": str(default_workspace),
+        },
+    )
+    assert sandbox_path_with_owner_cwd.status_code == 200
+    assert sandbox_path_with_owner_cwd.content == b"<h1>owner-a</h1>"
+
+    for rejected_path, rejected_cwd in (
+        (str(owner_b / "workspaces" / "secret.txt"), None),
+        ("../secret.txt", str(owner_a / "workspaces" / "project")),
+        ("secret.txt", str(owner_b / "workspaces")),
+        ("/workspace", None),
+        ("/workspace2/report.html", None),
+        ("/workspace/../secret.txt", None),
+        ("/workspace/directory", None),
+        ("/workspace/report-link.html", None),
+        ("/workspace/report.html", str(owner_b / "workspaces")),
+    ):
+        params = {"path": rejected_path}
+        if rejected_cwd is not None:
+            params["cwd"] = rejected_cwd
+        response = client.get(
+            "/api/files/download",
+            headers=request("/api/files/download"),
+            params=params,
+        )
+        assert response.status_code == 400
+        assert b"owner-b-only" not in response.content
 
 
 def test_worker_image_preview_is_descriptor_scoped_to_owner_images(tmp_path, monkeypatch):
@@ -1975,6 +2062,25 @@ def test_worker_image_preview_is_descriptor_scoped_to_owner_images(tmp_path, mon
         assert "pngbytes" not in response.text
         assert "secret" not in response.text
         assert "owner-b" not in response.text
+
+    downloaded = client.get(
+        "/api/files/download",
+        headers=request("/api/files/download"),
+        params={"path": str(image), "filename": "original upload.png"},
+    )
+    assert downloaded.status_code == 200
+    assert downloaded.content == b"pngbytes"
+    assert "original%20upload.png" in downloaded.headers["content-disposition"]
+
+    for rejected_path in (secret, other_owner_image, Path("images/upload.png")):
+        response = client.get(
+            "/api/files/download",
+            headers=request("/api/files/download"),
+            params={"path": str(rejected_path)},
+        )
+        assert response.status_code in {400, 404}
+        assert b"secret" not in response.content
+        assert b"owner-b" not in response.content
 
 
 def test_worker_http_token_validation_uses_stored_control_home(tmp_path, monkeypatch):

@@ -1,6 +1,7 @@
-import { Download, ExternalLink, Image as ImageIcon } from "lucide-react";
+import { Download, ExternalLink, Image as ImageIcon, LoaderCircle } from "lucide-react";
 import { useEffect, useState, type MouseEvent } from "react";
 import { fetchJSON, withHermesAssetAuth } from "@/lib/api";
+import { downloadSessionFile, triggerDownload } from "../files";
 import type { ImageArtifactState } from "../types";
 
 export function ImageArtifactCard({
@@ -11,6 +12,8 @@ export function ImageArtifactCard({
   variant?: "bubble" | "card";
 }) {
   const filename = filenameForArtifact(artifact);
+  const [downloading, setDownloading] = useState(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
   const [remotePreview, setRemotePreview] = useState<{
     dataUrl: string | null;
     error: string | null;
@@ -44,9 +47,17 @@ export function ImageArtifactCard({
   const displayUrl = directUrl ?? (remotePreview?.sourceUrl === artifact.url ? remotePreview.dataUrl : null);
   const loadError = remotePreview?.sourceUrl === artifact.url ? remotePreview.error : null;
 
+  const downloadUrl = artifact.downloadUrl ?? artifact.url;
   const download = (event: MouseEvent<HTMLAnchorElement>) => {
     event.preventDefault();
-    void downloadImageArtifact(artifact.url, filename);
+    if (downloading) return;
+    setDownloading(true);
+    setDownloadError(null);
+    void downloadImageArtifact(downloadUrl, filename)
+      .catch((error: unknown) => {
+        setDownloadError(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => setDownloading(false));
   };
 
   const openUrl = displayUrl ?? artifact.url;
@@ -100,14 +111,30 @@ export function ImageArtifactCard({
           Open
         </a>
         <a
+          aria-busy={downloading}
+          aria-disabled={downloading}
+          aria-describedby={downloadError ? `${artifact.id}-download-error` : undefined}
           className="inline-flex h-7 items-center gap-1 px-2 text-xs text-midground hover:text-primary"
-          href={artifact.url}
+          href={downloadUrl.startsWith("/api/") ? withHermesAssetAuth(downloadUrl) : downloadUrl}
           download={filename}
           onClick={download}
         >
-          <Download className="h-3.5 w-3.5" />
+          {downloading ? (
+            <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+          ) : (
+            <Download className="h-3.5 w-3.5" />
+          )}
           Download
         </a>
+        {downloadError ? (
+          <span
+            className="w-full text-xs text-destructive"
+            id={`${artifact.id}-download-error`}
+            role="alert"
+          >
+            {downloadError}
+          </span>
+        ) : null}
       </figcaption>
     </figure>
   );
@@ -158,42 +185,22 @@ function extensionFromUrl(url: string): string | null {
 }
 
 async function downloadImageArtifact(url: string, filename: string): Promise<void> {
-  const assetUrl = url.startsWith("/api/") ? withHermesAssetAuth(url) : url;
-  const direct = () => triggerDownload(assetUrl, filename);
   if (url.startsWith("data:") || url.startsWith("blob:")) {
-    direct();
+    triggerDownload(url, filename);
     return;
   }
 
-  try {
-    if (url.startsWith("/api/fs/read-data-url?")) {
-      const result = await fetchJSON<{ dataUrl?: string }>(url);
-      if (!result.dataUrl) throw new Error("missing data URL");
-      triggerDownload(result.dataUrl, filename);
-      return;
-    }
-
-    const response = await fetch(assetUrl, { credentials: "include" });
-    if (!response.ok) throw new Error(`download failed: ${response.status}`);
-    const blob = await response.blob();
-    const objectUrl = URL.createObjectURL(blob);
-    try {
-      triggerDownload(objectUrl, filename);
-    } finally {
-      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
-    }
-  } catch {
-    direct();
+  if (url.startsWith("/api/fs/read-data-url?")) {
+    const result = await fetchJSON<{ dataUrl?: string }>(url);
+    if (!result.dataUrl) throw new Error("Image download failed: missing data URL");
+    triggerDownload(result.dataUrl, filename);
+    return;
   }
-}
 
-function triggerDownload(url: string, filename: string): void {
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = filename;
-  link.rel = "noreferrer";
-  link.style.display = "none";
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
+  if (!url.startsWith("/api/")) {
+    triggerDownload(url, filename);
+    return;
+  }
+
+  await downloadSessionFile(url, filename);
 }

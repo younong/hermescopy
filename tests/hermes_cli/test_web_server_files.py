@@ -340,6 +340,42 @@ def test_download_returns_file_as_attachment(forced_files_client):
     assert "hello.txt" in disposition
 
 
+def test_download_accepts_session_cwd_and_display_filename(forced_files_client):
+    client, root = forced_files_client
+    target = root / "project" / "outputs" / "report.html"
+    target.parent.mkdir(parents=True)
+    target.write_text("<h1>report</h1>")
+
+    resp = client.get(
+        "/api/files/download",
+        params={
+            "path": "outputs/report.html",
+            "cwd": str(root / "project"),
+            "filename": "session report.html",
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.content == b"<h1>report</h1>"
+    assert "session%20report.html" in resp.headers["content-disposition"]
+    assert resp.headers["content-type"].startswith("text/html")
+
+
+def test_download_display_filename_cannot_change_source_path(forced_files_client):
+    client, root = forced_files_client
+    file_path = _seed_file(client, root)
+
+    resp = client.get(
+        "/api/files/download",
+        params={"path": str(file_path), "filename": "../../renamed.txt"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.content == b"hello"
+    assert "renamed.txt" in resp.headers["content-disposition"]
+    assert ".." not in resp.headers["content-disposition"]
+
+
 def test_download_authenticates_via_query_token(forced_files_client):
     client, root = forced_files_client
     file_path = _seed_file(client, root)

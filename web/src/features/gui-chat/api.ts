@@ -35,6 +35,7 @@ export interface ImageAttachResponse {
 export interface PdfAttachResponse {
   attached?: boolean;
   filename?: string;
+  path?: string;
   pages_attached?: number;
   pages?: Array<{
     path?: string;

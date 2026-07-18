@@ -2021,8 +2021,13 @@ async def read_managed_file(request: Request, path: str):
 
 
 @app.get("/api/files/download")
-async def download_managed_file(request: Request, path: str):
-    """Stream a managed file as an attachment download.
+async def download_managed_file(
+    request: Request,
+    path: str,
+    cwd: str | None = None,
+    filename: str | None = None,
+):
+    """Stream a managed or session file as an attachment download.
 
     Remote clients (desktop app, browser dashboard) open agent-written files
     that live on *this* gateway's disk, not theirs. Auth-gated like every other
@@ -2034,25 +2039,23 @@ async def download_managed_file(request: Request, path: str):
     if _authenticated_owner_request(request):
         return await _proxy_authenticated_owner_http(request)
     _reject_authenticated_filesystem_api(request)
-    policy, target, _display_path = _resolve_managed_path(path, request)
-    if not target.exists():
-        raise HTTPException(status_code=404, detail="File not found")
-    if not target.is_file():
-        raise HTTPException(status_code=400, detail="Path is not a file")
-
-    try:
-        size = target.stat().st_size
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"Could not stat file: {exc}")
-    if size > _MANAGED_FILE_MAX_BYTES:
+    if cwd is None:
+        _policy, target, _display_path = _resolve_managed_path(path, request)
+        target, size_info = _fs_regular_file(target)
+    else:
+        target, size_info = _fs_regular_file(_fs_path(path, cwd=cwd))
+    if size_info.st_size > _MANAGED_FILE_MAX_BYTES:
         raise HTTPException(status_code=413, detail="File is too large")
 
-    mime_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    download_name = Path(str(filename or target.name)).name
+    if not download_name or download_name in {".", ".."} or "\0" in download_name:
+        download_name = target.name
+    mime_type = mimetypes.guess_type(download_name)[0] or _fs_mime_type(target)
 
     return FileResponse(
         path=str(target),
         media_type=mime_type,
-        filename=target.name,
+        filename=download_name,
         content_disposition_type="attachment",
     )
 

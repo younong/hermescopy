@@ -8499,6 +8499,58 @@ def test_pdf_attach_rejects_non_pdf_bytes(monkeypatch, tmp_path):
     assert resp["error"]["code"] == 4017
 
 
+def test_pdf_attach_persists_original_and_metadata(monkeypatch, tmp_path):
+    import base64 as _b64
+
+    _attach_bytes_cli(monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session = _session(cwd=str(workspace))
+    server._sessions["pdf-persisted"] = session
+    monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/pdftoppm")
+
+    def fake_run(argv, **_kwargs):
+        output_prefix = Path(argv[-1])
+        output_prefix.with_name(f"{output_prefix.name}-1.png").write_bytes(
+            __import__("base64").b64decode(_PNG_1X1_B64)
+        )
+        return types.SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    pdf_bytes = b"%PDF-1.4\noriginal"
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "pdf.attach",
+            "params": {
+                "session_id": "pdf-persisted",
+                "content_base64": _b64.b64encode(pdf_bytes).decode("ascii"),
+                "filename": "report.pdf",
+            },
+        }
+    )
+
+    result = resp["result"]
+    stored = Path(result["path"])
+    assert result["attached"] is True
+    assert stored == workspace / ".hermes" / "desktop-attachments" / "report.pdf"
+    assert stored.read_bytes() == pdf_bytes
+    assert result["pages_attached"] == 1
+    assert not Path(result["pages"][0]["path"]).parent.name.startswith("pdf_attach_")
+    assert session["pending_attachments"] == [
+        {
+            "kind": "pdf",
+            "mime_type": "application/pdf",
+            "name": "report.pdf",
+            "pages_attached": 1,
+            "path": str(stored),
+            "size_bytes": len(pdf_bytes),
+            "source_paths": [result["pages"][0]["path"]],
+        }
+    ]
+
+
 def test_pdf_attach_requires_path_or_bytes(monkeypatch, tmp_path):
     _attach_bytes_cli(monkeypatch)
     monkeypatch.setattr(server, "_hermes_home", tmp_path)

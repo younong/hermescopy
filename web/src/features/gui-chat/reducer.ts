@@ -1,6 +1,7 @@
 import type { GatewayEvent } from "@/lib/gatewayClient";
 import type {
   ApprovalPayload,
+  ArtifactFilePayload,
   ArtifactImagePayload,
   ErrorPayload,
   GatewayTranscriptAttachment,
@@ -14,10 +15,12 @@ import type {
   ToolCompletePayload,
   ToolStartPayload,
 } from "./protocol";
+import { buildSessionFileDownloadUrl } from "./files";
 import { textFromTranscriptMessage } from "./protocol";
 import {
   initialGuiChatState,
   type ApprovalState,
+  type ArtifactState,
   type ChatMessage,
   type GuiChatConnectionState,
   type GuiChatState,
@@ -129,8 +132,9 @@ function applyGatewayEvent(state: GuiChatState, event: GatewayEvent): GuiChatSta
     case "approval.resolved":
       return resolveApprovalFromEvent(state, event.payload);
     case "artifact.image":
-    case "artifact.created":
       return addImageArtifact(state, event.payload as ArtifactImagePayload | undefined);
+    case "artifact.created":
+      return addCreatedArtifact(state, event.payload as ArtifactFilePayload | undefined);
     case "error":
       return applyError(state, event.payload as ErrorPayload | undefined);
     default:
@@ -141,8 +145,8 @@ function applyGatewayEvent(state: GuiChatState, event: GatewayEvent): GuiChatSta
 function transcriptToHistoryState(
   transcript: GatewayTranscriptMessage[],
   cwd?: string,
-): { artifacts: Record<string, ImageArtifactState>; messages: ChatMessage[] } {
-  const artifacts: Record<string, ImageArtifactState> = {};
+): { artifacts: Record<string, ArtifactState>; messages: ChatMessage[] } {
+  const artifacts: Record<string, ArtifactState> = {};
   const messages: ChatMessage[] = [];
 
   for (const [index, entry] of transcript.entries()) {
@@ -161,7 +165,7 @@ function transcriptToMessageWithArtifacts(
   message: GatewayTranscriptMessage,
   index: number,
   cwd?: string,
-): { artifacts: ImageArtifactState[]; message: ChatMessage } | null {
+): { artifacts: ArtifactState[]; message: ChatMessage } | null {
   if (message.role === "tool") {
     return null;
   }
@@ -174,19 +178,28 @@ function transcriptToMessageWithArtifacts(
   const refs = extractImageReferencesFromTranscriptMessage(message).filter(
     (ref) => !claimedSources.has(normalizeAttachmentSource(ref.url)),
   );
+  const fileRefs = extractGeneratedFileReferences(textFromTranscriptMessage(message)).filter(
+    (ref) =>
+      !claimedSources.has(normalizeAttachmentSource(ref.path)) &&
+      !refs.some((image) => normalizeAttachmentSource(image.url) === normalizeAttachmentSource(ref.path)),
+  );
   const text = clampRenderedText(
     stripAttachmentPromptHints(
       stripRenderableImageReferencesFromText(textFromTranscriptMessage(message), refs),
       message.attachments,
     ),
   );
-  if (!text.trim() && refs.length === 0 && attachments.length === 0) {
+  if (!text.trim() && refs.length === 0 && fileRefs.length === 0 && attachments.length === 0) {
     return null;
   }
 
-  const artifacts = refs.map((ref, imageIndex): ImageArtifactState => {
+  const artifacts: ArtifactState[] = refs.map((ref, imageIndex): ArtifactState => {
     const url = imagePreviewUrl(ref.url, cwd);
+    const name = filenameFromPath(ref.url) || ref.title || "image";
     return {
+      downloadUrl: looksLikeFilesystemPath(ref.url)
+        ? buildSessionFileDownloadUrl(ref.url, cwd, name)
+        : undefined,
       height: ref.height,
       id: `history-${index}-image-${imageIndex}`,
       messageId: id,
@@ -196,6 +209,17 @@ function transcriptToMessageWithArtifacts(
       width: ref.width,
     };
   });
+  artifacts.push(
+    ...fileRefs.map((ref, fileIndex) => ({
+      downloadUrl: buildSessionFileDownloadUrl(ref.path, cwd, ref.name),
+      id: `history-${index}-file-${fileIndex}`,
+      kind: "file" as const,
+      messageId: id,
+      mimeType: mimeTypeForFileName(ref.name),
+      name: ref.name,
+      sourcePath: ref.path,
+    })),
+  );
 
   return {
     artifacts,
@@ -225,6 +249,7 @@ function transcriptAttachments(
     }
     const path = typeof value.path === "string" ? value.path : undefined;
     attachments.push({
+      downloadUrl: path ? buildSessionFileDownloadUrl(path, cwd, name) : undefined,
       id: `${messageId}-attachment-${index}`,
       kind,
       mimeType: typeof value.mime_type === "string" ? value.mime_type : undefined,
@@ -233,6 +258,7 @@ function transcriptAttachments(
       previewUrl: kind === "image" && path ? imagePreviewUrl(path, cwd) : undefined,
       refText: typeof value.ref_text === "string" ? value.ref_text : undefined,
       sizeBytes: finiteNonNegativeNumber(value.size_bytes) ?? 0,
+      sourcePath: path,
     });
   }
   return attachments;
@@ -483,6 +509,78 @@ function extractBareImageReferences(
   return refs;
 }
 
+interface ExtractedFileReference {
+  name: string;
+  path: string;
+}
+
+function extractGeneratedFileReferences(text: string): ExtractedFileReference[] {
+  const codeRanges = rangesForFencedCodeBlocks(text);
+  const candidates: Array<{ index: number; path: string }> = [];
+  const savedPattern = /(?:Full output saved to:|Full text saved to:)\s*([^\n]+)/gi;
+  for (const match of text.matchAll(savedPattern)) {
+    candidates.push({ index: match.index ?? 0, path: match[1].trim() });
+  }
+  const markdownLinkPattern = /(?<!!)\[[^\]]+]\(([^)\n]+)\)/g;
+  for (const match of text.matchAll(markdownLinkPattern)) {
+    candidates.push({ index: match.index ?? 0, path: match[1].trim().replace(/^<|>$/g, "") });
+  }
+  const labeledInlinePathPattern = /(?:文件路径|文件地址|file\s*path|saved\s*(?:file\s*)?(?:at|to))\s*[：:]\s*(?:\*{1,2})?\s*`([^`\n]+)`/gi;
+  for (const match of text.matchAll(labeledInlinePathPattern)) {
+    candidates.push({ index: match.index ?? 0, path: match[1].trim() });
+  }
+
+  const seen = new Set<string>();
+  const refs: ExtractedFileReference[] = [];
+  for (const candidate of candidates) {
+    if (isIndexInRanges(candidate.index, codeRanges)) continue;
+    const path = normalizeGeneratedFilePath(candidate.path);
+    if (!path || seen.has(path)) continue;
+    const name = filenameFromPath(path);
+    if (!name) continue;
+    seen.add(path);
+    refs.push({ name, path });
+  }
+  return refs;
+}
+
+function normalizeGeneratedFilePath(value: string): string | null {
+  let path = value.trim().replace(/[.,;:!?。，、；：！？]+$/g, "");
+  const sandbox = path.match(/^sandbox:\/{0,2}(\/.*)$/i);
+  if (sandbox?.[1]) path = sandbox[1];
+  if (/^[a-z][a-z0-9+.-]*:/i.test(path) && !/^file:/i.test(path)) return null;
+  if (/^file:/i.test(path)) {
+    try {
+      const parsed = new URL(path);
+      if (parsed.hostname && parsed.hostname !== "localhost") return null;
+      path = decodeURIComponent(parsed.pathname);
+    } catch {
+      return null;
+    }
+  }
+  return path && !path.includes("\0") ? path : null;
+}
+
+function filenameFromPath(path: string): string {
+  const clean = path.split(/[?#]/, 1)[0] ?? path;
+  return clean.split(/[\\/]/).filter(Boolean).at(-1) ?? "";
+}
+
+function mimeTypeForFileName(name: string): string | undefined {
+  const extension = name.split(".").pop()?.toLowerCase();
+  const known: Record<string, string> = {
+    csv: "text/csv",
+    html: "text/html",
+    htm: "text/html",
+    json: "application/json",
+    md: "text/markdown",
+    pdf: "application/pdf",
+    txt: "text/plain",
+    zip: "application/zip",
+  };
+  return extension ? known[extension] : undefined;
+}
+
 function normalizeExtractedImageReference(value: string): string | null {
   const trimmed = trimImageReferenceBoundary(value);
   if (!trimmed) return null;
@@ -705,7 +803,11 @@ function completeAssistantMessage(
   const statusLines = payload?.warning
     ? [...working.statusLines, payload.warning].slice(-8)
     : working.statusLines;
-  return { ...working, isGenerating: false, messages, statusLines };
+  return addGeneratedFileArtifacts(
+    { ...working, isGenerating: false, messages, statusLines },
+    messages[idx]?.text ?? "",
+    { messageId: messages[idx]?.id },
+  );
 }
 
 function normalizeMessageStatus(status: string | undefined): ChatMessage["status"] {
@@ -804,10 +906,10 @@ function completeToolCall(
   if (!failed && isImageGenerationTool(toolName)) {
     return addImageArtifact(
       nextState,
-      imageArtifactPayloadFromToolResult(id, result, toolName, nextState.cwd),
+      imageArtifactPayloadFromToolResult(id, result, toolName),
     );
   }
-  return nextState;
+  return failed ? nextState : addGeneratedFileArtifacts(nextState, output, { toolCallId: id });
 }
 
 function addApproval(
@@ -865,7 +967,6 @@ function imageArtifactPayloadFromToolResult(
   toolCallId: string,
   result: unknown,
   toolName: string,
-  cwd?: string,
 ): ArtifactImagePayload | undefined {
   const record = recordFromUnknown(result);
   if (!record || record.success === false) return undefined;
@@ -876,7 +977,7 @@ function imageArtifactPayloadFromToolResult(
     mimeType: mimeTypeForImageSource(source),
     title: toolName === "image_generate" ? "Generated image" : "Image result",
     toolCallId,
-    url: imagePreviewUrl(source, cwd),
+    url: source,
   };
 }
 
@@ -963,12 +1064,111 @@ function mimeTypeForImageSource(source: string): string | undefined {
   }
 }
 
+function addGeneratedFileArtifacts(
+  state: GuiChatState,
+  text: string,
+  owner: { messageId?: string; toolCallId?: string },
+): GuiChatState {
+  let next = state;
+  for (const [index, ref] of extractGeneratedFileReferences(text).entries()) {
+    const id = `${owner.messageId ?? owner.toolCallId ?? "artifact"}-file-${index}`;
+    if (next.artifacts[id]) continue;
+    const artifact: ArtifactState = {
+      downloadUrl: buildSessionFileDownloadUrl(ref.path, next.cwd, ref.name),
+      id,
+      kind: "file",
+      messageId: owner.messageId,
+      mimeType: mimeTypeForFileName(ref.name),
+      name: ref.name,
+      sourcePath: ref.path,
+      toolCallId: owner.toolCallId,
+    };
+    const messages = owner.messageId
+      ? next.messages.map((message) =>
+          message.id === owner.messageId
+            ? { ...message, artifactIds: appendUnique(message.artifactIds, id) }
+            : message,
+        )
+      : next.messages;
+    const toolCalls = owner.toolCallId && next.toolCalls[owner.toolCallId]
+      ? {
+          ...next.toolCalls,
+          [owner.toolCallId]: {
+            ...next.toolCalls[owner.toolCallId],
+            artifactIds: appendUnique(next.toolCalls[owner.toolCallId].artifactIds, id),
+          },
+        }
+      : next.toolCalls;
+    next = {
+      ...next,
+      artifacts: { ...next.artifacts, [id]: artifact },
+      messages,
+      toolCalls,
+    };
+  }
+  return next;
+}
+
+function addCreatedArtifact(
+  state: GuiChatState,
+  payload: ArtifactFilePayload | undefined,
+): GuiChatState {
+  const source = payload?.source;
+  const sourcePath =
+    payload?.path ??
+    payload?.url ??
+    (typeof source === "string" ? source : source?.value);
+  if (!sourcePath) return state;
+  const mimeType = payload?.mimeType ?? payload?.mime_type;
+  if (mimeType?.toLowerCase().startsWith("image/") || isLikelyImageReference(sourcePath)) {
+    return addImageArtifact(state, payload);
+  }
+
+  const id = String(payload?.id ?? sourcePath ?? createClientId("artifact"));
+  const name = payload?.name ?? payload?.filename ?? payload?.title ?? filenameFromPath(sourcePath);
+  if (!name) return state;
+  const messageId = payload?.messageId ?? payload?.message_id;
+  const toolCallId = payload?.toolCallId ?? payload?.tool_call_id;
+  const artifact: ArtifactState = {
+    downloadUrl: buildSessionFileDownloadUrl(sourcePath, state.cwd, name),
+    id,
+    kind: "file",
+    messageId,
+    mimeType: mimeType ?? mimeTypeForFileName(name),
+    name,
+    sourcePath,
+    toolCallId,
+  };
+  let messages = state.messages;
+  let toolCalls = state.toolCalls;
+  if (messageId) {
+    messages = messages.map((message) =>
+      message.id === messageId
+        ? { ...message, artifactIds: appendUnique(message.artifactIds, id) }
+        : message,
+    );
+  } else if (toolCallId && toolCalls[toolCallId]) {
+    const tool = toolCalls[toolCallId];
+    toolCalls = {
+      ...toolCalls,
+      [toolCallId]: { ...tool, artifactIds: appendUnique(tool.artifactIds, id) },
+    };
+  } else if (messages.at(-1)?.role === "assistant") {
+    const last = messages.length - 1;
+    messages = messages.map((message, index) =>
+      index === last ? { ...message, artifactIds: appendUnique(message.artifactIds, id) } : message,
+    );
+  }
+  return { ...state, artifacts: { ...state.artifacts, [id]: artifact }, messages, toolCalls };
+}
+
 function addImageArtifact(
   state: GuiChatState,
   payload: ArtifactImagePayload | undefined,
 ): GuiChatState {
   const source = payload?.source;
   const rawUrl =
+    payload?.path ??
     payload?.url ??
     (typeof source === "string"
       ? source
@@ -987,7 +1187,11 @@ function addImageArtifact(
       : `/api/artifacts/${encodeURIComponent(rawUrl)}`;
   const messageId = payload?.messageId ?? payload?.message_id;
   const toolCallId = payload?.toolCallId ?? payload?.tool_call_id;
+  const name = filenameFromPath(rawUrl) || payload?.title || "image";
   const artifact: ImageArtifactState = {
+    downloadUrl: looksLikeFilesystemPath(rawUrl)
+      ? buildSessionFileDownloadUrl(rawUrl, state.cwd, name)
+      : undefined,
     height: payload?.height,
     id,
     messageId,

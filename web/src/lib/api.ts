@@ -111,27 +111,10 @@ export class FetchJSONError extends Error {
   }
 }
 
-export async function fetchJSON<T>(
-  url: string,
-  init?: RequestInit,
+async function applyFetchAuthRecovery(
+  res: Response,
   options?: FetchJSONOptions,
-): Promise<T> {
-  url = withManagementProfile(url);
-  // Inject the session token into all /api/ requests.
-  const headers = new Headers(init?.headers);
-  const token = window.__HERMES_SESSION_TOKEN__;
-  if (token) {
-    setSessionHeader(headers, token);
-  }
-  const res = await fetch(`${BASE}${url}`, {
-    ...init,
-    headers,
-    // ``credentials: 'include'`` so the cookie-auth path (gated mode) works
-    // for any fetch routed through here. Loopback mode is unaffected — the
-    // server doesn't read cookies and the legacy session-token header is
-    // already attached above.
-    credentials: init?.credentials ?? "include",
-  });
+): Promise<void> {
   if (res.status === 401) {
     // Phase 6: the gated middleware emits a structured envelope so the
     // SPA can full-page-navigate to /login on session expiry. Parse it,
@@ -164,7 +147,7 @@ export async function fetchJSON<T>(
       }
       window.location.assign(body.login_url);
       // Never resolve — the page is about to unload.
-      return new Promise<T>(() => {});
+      return new Promise<void>(() => {});
     }
     // Loopback mode: ``_SESSION_TOKEN`` rotates on every server restart
     // (``hermes update``, ``hermes gateway restart``, etc.). A tab kept
@@ -190,7 +173,7 @@ export async function fetchJSON<T>(
           /* SSR / privacy mode — best effort */
         }
         window.location.reload();
-        return new Promise<T>(() => {});
+        return new Promise<void>(() => {});
       }
     }
   }
@@ -204,6 +187,30 @@ export async function fetchJSON<T>(
       /* SSR / privacy mode — ignore */
     }
   }
+}
+
+export async function fetchJSON<T>(
+  url: string,
+  init?: RequestInit,
+  options?: FetchJSONOptions,
+): Promise<T> {
+  url = withManagementProfile(url);
+  // Inject the session token into all /api/ requests.
+  const headers = new Headers(init?.headers);
+  const token = window.__HERMES_SESSION_TOKEN__;
+  if (token) {
+    setSessionHeader(headers, token);
+  }
+  const res = await fetch(`${BASE}${url}`, {
+    ...init,
+    headers,
+    // ``credentials: 'include'`` so the cookie-auth path (gated mode) works
+    // for any fetch routed through here. Loopback mode is unaffected — the
+    // server doesn't read cookies and the legacy session-token header is
+    // already attached above.
+    credentials: init?.credentials ?? "include",
+  });
+  await applyFetchAuthRecovery(res, options);
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
     throw new FetchJSONError(res.status, `${res.status}: ${text}`);
@@ -276,26 +283,28 @@ export async function buildWsAuthParam(path: string): Promise<[string, string]> 
  *  - gated OAuth: no token header (it's absent by design); the
  *    ``hermes_session_at`` cookie rides along via ``credentials: 'include'``.
  *
- * Unlike ``fetchJSON`` this does NOT parse the body, does NOT throw on
- * non-2xx (the caller decides — a 404 on a download is meaningful), and
- * does NOT run the global 401 → /login redirect (binary endpoints aren't
- * navigation targets). Callers that want the redirect behaviour should use
- * ``fetchJSON``.
+ * Unlike ``fetchJSON`` this does NOT parse the body and does NOT throw on
+ * non-2xx (the caller decides — a 404 on a download is meaningful). It does
+ * share the global auth recovery path so expired gated sessions return to the
+ * login page and stale loopback tokens reload once.
  */
 export async function authedFetch(
   url: string,
   init?: RequestInit,
+  options?: FetchJSONOptions,
 ): Promise<Response> {
   const headers = new Headers(init?.headers);
   const token = window.__HERMES_SESSION_TOKEN__;
   if (token) {
     setSessionHeader(headers, token);
   }
-  return fetch(`${BASE}${url}`, {
+  const res = await fetch(`${BASE}${url}`, {
     ...init,
     headers,
     credentials: init?.credentials ?? "include",
   });
+  await applyFetchAuthRecovery(res, options);
+  return res;
 }
 
 /**

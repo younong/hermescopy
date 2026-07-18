@@ -3,8 +3,8 @@ import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { ChevronDown, ChevronRight, Wrench } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { ImageArtifactState, ToolCallState } from "../types";
-import { ImageArtifactCard } from "./ImageArtifactCard";
+import type { ArtifactState, ToolCallState } from "../types";
+import { ArtifactCard } from "./ArtifactCard";
 
 const STATUS_TONE = {
   failed: "destructive",
@@ -18,7 +18,7 @@ export function ToolCallCard({
   artifacts,
   tool,
 }: {
-  artifacts: ImageArtifactState[];
+  artifacts: ArtifactState[];
   tool: ToolCallState;
 }) {
   const [open, setOpen] = useState(tool.status !== "succeeded");
@@ -73,7 +73,7 @@ export function ToolCallCard({
             </Button>
           ) : null}
           {artifacts.map((artifact) => (
-            <ImageArtifactCard artifact={artifact} key={artifact.id} />
+            <ArtifactCard artifact={artifact} key={artifact.id} />
           ))}
         </div>
       ) : null}
