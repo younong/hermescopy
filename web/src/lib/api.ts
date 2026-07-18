@@ -245,11 +245,16 @@ async function getSessionToken(): Promise<string> {
  * Tickets are single-use and TTL=30s — every WS connect attempt must
  * fetch a fresh ticket.
  */
-export async function getWsTicket(path: string): Promise<{ ticket: string; ttl_seconds: number }> {
+export async function getWsTicket(
+  path: string,
+  traceId?: string,
+): Promise<{ ticket: string; ttl_seconds: number }> {
+  const headers = new Headers({ "Content-Type": "application/json" });
+  if (traceId) headers.set("X-Request-ID", traceId);
   const res = await fetch(`${BASE}/api/auth/ws-ticket`, {
     method: "POST",
     credentials: "include",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify({ audience: `browser-ws:${path}` }),
   });
   if (!res.ok) {
@@ -263,9 +268,12 @@ export async function getWsTicket(path: string): Promise<{ ticket: string; ttl_s
  * connect. In gated mode mints a fresh single-use ticket; in loopback
  * mode returns the injected session token.
  */
-export async function buildWsAuthParam(path: string): Promise<[string, string]> {
+export async function buildWsAuthParam(
+  path: string,
+  traceId?: string,
+): Promise<[string, string]> {
   if (window.__HERMES_AUTH_REQUIRED__) {
-    const { ticket } = await getWsTicket(path);
+    const { ticket } = await getWsTicket(path, traceId);
     return ["ticket", ticket];
   }
   const token = window.__HERMES_SESSION_TOKEN__ ?? "";
@@ -428,9 +436,10 @@ export const api = {
     fetchJSON<SessionInfo>(
       appendProfileParam(`/api/sessions/${encodeURIComponent(id)}`, profile),
     ),
-  getSessionLatestDescendant: (id: string) =>
+  getSessionLatestDescendant: (id: string, traceId?: string) =>
     fetchJSON<SessionLatestDescendantResponse>(
       `/api/sessions/${encodeURIComponent(id)}/latest-descendant`,
+      traceId ? { headers: { "X-Request-ID": traceId } } : undefined,
     ),
   deleteSession: (id: string, profile = getManagementProfile()) =>
     fetchJSON<{ ok: boolean }>(

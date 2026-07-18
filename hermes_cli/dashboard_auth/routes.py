@@ -66,6 +66,7 @@ from hermes_cli.dashboard_auth.owner_context import (
     owner_context_from_session,
     owner_public_summary,
 )
+from hermes_cli.latency_trace import log_latency_stage
 
 _log = logging.getLogger(__name__)
 
@@ -1015,6 +1016,14 @@ async def api_auth_ws_ticket(request: Request, body: _WsTicketBody):
     multiple times in quick succession (e.g. one ticket per WS) is the
     expected pattern.
     """
+    latency_started_at = time.monotonic()
+    latency_trace_id = request.headers.get("x-request-id", "")
+    log_latency_stage(
+        _log,
+        trace_id=latency_trace_id,
+        surface="ws-ticket",
+        stage="request.received",
+    )
     sess = getattr(request.state, "session", None)
     if sess is None:
         # Middleware should already have rejected, but check defensively.
@@ -1070,5 +1079,12 @@ async def api_auth_ws_ticket(request: Request, body: _WsTicketBody):
         AuthorityAuditEvent.TICKET_MINTED,
         correlation_id=correlation_id,
         reason=AuthorityAuditReason.MINTED,
+    )
+    log_latency_stage(
+        _log,
+        trace_id=latency_trace_id,
+        surface="ws-ticket",
+        stage="ticket.minted",
+        started_at=latency_started_at,
     )
     return {"ticket": ticket, "ttl_seconds": TTL_SECONDS}

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import secrets
@@ -31,6 +32,7 @@ from hermes_cli.dashboard_auth.audit import (
     new_authority_correlation_id,
 )
 from hermes_cli.owner_runtime import resolve_workspace_cwd
+from hermes_cli.latency_trace import clean_latency_trace_id, log_latency_stage
 from hermes_cli.dashboard_auth.authority import (
     AuthorityStore,
     AuthorityUnavailable,
@@ -59,6 +61,8 @@ except ImportError:  # pragma: no cover - optional platform dependency missing
     class PtyUnavailableError(RuntimeError):  # type: ignore[no-redef]
         """Stub when the platform PTY bridge cannot be imported."""
 
+
+_log = logging.getLogger(__name__)
 
 _RESIZE_RE = re.compile(rb"\x1b\[RESIZE:(\d+);(\d+)\]")
 _PTY_READ_CHUNK_TIMEOUT = 0.2
@@ -234,6 +238,14 @@ def _active_bootstrap_lease(app: Any, configured_lease: Any) -> Any:
 
 async def _admit_bootstrap_or_close(ws: WebSocket) -> _Owp1Peer | None:
     """Consume one bootstrap and complete `owp1` hello/ack before route work."""
+    latency_started_at = time.monotonic()
+    latency_trace_id = clean_latency_trace_id(ws.query_params.get("ws_trace", ""))
+    log_latency_stage(
+        _log,
+        trace_id=latency_trace_id,
+        surface="owner-worker-ws",
+        stage="bootstrap.received",
+    )
     token = ws.query_params.get("internal_owner_bootstrap", "")
     configured_lease = getattr(ws.app.state, "owner_worker_lease", None)
     verifier = getattr(ws.app.state, "owner_worker_capability_verifier", {})
@@ -243,6 +255,7 @@ async def _admit_bootstrap_or_close(ws: WebSocket) -> _Owp1Peer | None:
         return None
     lease = configured_lease
     try:
+        stage_started_at = time.monotonic()
         lease = _active_bootstrap_lease(ws.app, configured_lease)
         claims = admit_owner_worker_bootstrap(
             token,
@@ -253,10 +266,24 @@ async def _admit_bootstrap_or_close(ws: WebSocket) -> _Owp1Peer | None:
             issuer_key_version=verifier.get("HERMES_OWNER_WORKER_CAPABILITY_ISSUER"),
             retained_public_keys=verifier.get("HERMES_OWNER_WORKER_CAPABILITY_RETAINED_PUBLIC_KEYS"),
         )
+        log_latency_stage(
+            _log,
+            trace_id=latency_trace_id,
+            surface="owner-worker-ws",
+            stage="bootstrap.validated",
+            started_at=stage_started_at,
+        )
         await ws.accept()
         hello = await asyncio.wait_for(ws.receive_text(), timeout=5)
         validate_owp1_control(hello, claims, message_type="hello")
         await ws.send_text(owp1_ack(claims))
+        log_latency_stage(
+            _log,
+            trace_id=latency_trace_id,
+            surface="owner-worker-ws",
+            stage="owp1.ack_sent",
+            started_at=latency_started_at,
+        )
         _audit_bootstrap(AuthorityAuditReason.ADMITTED, lease)
         return _Owp1Peer(ws, claims)
     except (

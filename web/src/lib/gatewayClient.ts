@@ -27,6 +27,11 @@ import { HERMES_BASE_PATH, buildWsAuthParam } from "@/lib/api";
 export { JsonRpcGatewayError };
 export type { ConnectionState, GatewayEvent, GatewayEventName };
 
+export interface GatewayConnectTiming {
+  onStage?: (stage: "ticket.start" | "ticket.end" | "websocket.construct" | "websocket.open") => void;
+  traceId?: string;
+}
+
 export class GatewayClient extends JsonRpcGatewayClient {
   constructor() {
     super({
@@ -37,7 +42,7 @@ export class GatewayClient extends JsonRpcGatewayClient {
     });
   }
 
-  async connect(token?: string): Promise<void> {
+  async connect(token?: string, timing?: GatewayConnectTiming): Promise<void> {
     if (this.connectionState === "open" || this.connectionState === "connecting") {
       return;
     }
@@ -45,19 +50,26 @@ export class GatewayClient extends JsonRpcGatewayClient {
     // Gated mode: legacy ``?token=`` is rejected by ``_ws_auth_ok``; the SPA
     // must fetch a single-use ticket. Explicit ``token`` keeps the test-only
     // override path.
-    const authParam = token ? (["token", token] as const) : await buildWsAuthParam("/api/ws");
+    timing?.onStage?.("ticket.start");
+    const authParam = token
+      ? (["token", token] as const)
+      : await buildWsAuthParam("/api/ws", timing?.traceId);
+    timing?.onStage?.("ticket.end");
     if (!authParam[1]) {
       throw new Error(
         "Session token not available — page must be served by the Hermes dashboard server",
       );
     }
 
+    timing?.onStage?.("websocket.construct");
     await super.connect(
       buildHermesWebSocketUrl({
         authParam,
         basePath: HERMES_BASE_PATH,
         path: "/api/ws",
+        params: timing?.traceId ? { ws_trace: timing.traceId } : undefined,
       }),
     );
+    timing?.onStage?.("websocket.open");
   }
 }
