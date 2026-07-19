@@ -8,12 +8,13 @@ platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [PDF, Documents, Research, Arxiv, Text-Extraction, OCR]
-    related_skills: [powerpoint]
+    related_skills: [common-files, powerpoint]
 ---
 
 # PDF & Document Extraction
 
-For DOCX: use `python-docx` (parses actual document structure, far better than OCR).
+For DOCX and XLSX: use `read_file` for one-off reading or the `common-files` skill for normalized and batch output.
+For TXT, Markdown, CSV, TSV, and HTML: use the `common-files` skill.
 For PPTX: see the `powerpoint` skill (uses `python-pptx` with full slide/notes support).
 This skill covers **PDFs and scanned documents**.
 
@@ -168,5 +169,5 @@ No extra dependencies needed — pymupdf covers split, merge, search, and text e
 - marker-pdf is for OCR, scanned docs, equations, complex layouts — install only when needed
 - Both helper scripts accept `--help` for full usage
 - marker-pdf downloads ~2.5GB of models to `~/.cache/huggingface/` on first use
-- For Word docs: `pip install python-docx` (better than OCR — parses actual structure)
+- For Word, spreadsheet, text, CSV/TSV, and HTML files: use `read_file` or the `common-files` skill
 - For PowerPoint: see the `powerpoint` skill (uses python-pptx)
