@@ -1,7 +1,7 @@
 ---
 name: common-files
 description: Extract and normalize common local document files.
-version: 1.1.0
+version: 1.2.0
 author: Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -33,11 +33,12 @@ The common path uses Python's standard library and Hermes's installed `tools.rea
 
 - PDF text: PyMuPDF; load `ocr-and-documents` for setup and OCR guidance.
 - Scanned PDF OCR: marker-pdf, selected explicitly because its models require several gigabytes.
-- `.doc`, `.xls`, `.odt`, `.ods`, and best-effort iWork conversion: an existing LibreOffice installation.
+- `.numbers`: the packaged `numbers-parser` backend works directly on Linux, macOS, and Windows; LibreOffice and Apple export remain explicit alternatives.
+- `.doc`, `.xls`, `.odt`, `.ods`, and best-effort Pages/Keynote conversion: an existing LibreOffice installation.
 - RTF/RTFD on macOS: `/usr/bin/textutil`; LibreOffice is the cross-platform fallback.
 - Native iWork export: macOS, `/usr/bin/osascript`, and the matching Numbers, Pages, or Keynote app.
 
-Never install a dependency merely because `inspect` reports it missing. Explain the requirement and get the user's agreement first, especially for marker-pdf. Native iWork export can launch an Apple app and request Automation permission, so it is never selected automatically.
+Never install a dependency merely because `inspect` reports it missing. Do not run `pip install`, download parser source, manually decode iWork IWA/protobuf data, or start an exploratory fallback loop. If the helper exits with code 3, report its prerequisite immediately. Marker remains explicit because it can download several gigabytes of models. Native iWork export can launch an Apple app and request Automation permission, so it is never selected automatically.
 
 ## How to Run
 
@@ -48,6 +49,7 @@ python "${HERMES_SKILL_DIR}/scripts/common_files.py" inspect budget.numbers note
 python "${HERMES_SKILL_DIR}/scripts/common_files.py" extract page.html --format markdown
 python "${HERMES_SKILL_DIR}/scripts/common_files.py" extract settings.plist --format json
 python "${HERMES_SKILL_DIR}/scripts/common_files.py" extract notes.rtfd
+python "${HERMES_SKILL_DIR}/scripts/common_files.py" extract budget.numbers
 python "${HERMES_SKILL_DIR}/scripts/common_files.py" extract budget.numbers --iwork-backend libreoffice
 python "${HERMES_SKILL_DIR}/scripts/common_files.py" extract budget.numbers --iwork-backend apple
 python "${HERMES_SKILL_DIR}/scripts/common_files.py" batch documents --recursive --output-dir extracted
@@ -63,7 +65,8 @@ Use `--help` on the command or a subcommand for all options. Outputs are never o
 | CSV, TSV | helper `extract` | text or escaped Markdown table |
 | HTML | helper `extract` | ignores scripts/styles; no network access |
 | DOCX, XLSX, IPYNB | `read_file` or helper | helper is best for saved/batch output |
-| Numbers, Pages | helper with explicit iWork backend | Apple export is native; LibreOffice is best-effort |
+| Numbers | helper `extract` | packaged native parser by default; Apple/LibreOffice are explicit alternatives |
+| Pages | helper with explicit iWork backend | Apple export is native; LibreOffice is best-effort |
 | Keynote (`.key`, `.keynote`) | helper with explicit iWork backend | exports to PDF; animations, media, notes are not extracted |
 | RTF, RTFD | helper | macOS `textutil` or LibreOffice; RTFD attachments omitted |
 | XML/binary plist | helper | deterministic JSON text via stdlib |
@@ -79,7 +82,7 @@ Use `--help` on the command or a subcommand for all options. Outputs are never o
 
 1. **Classify first when uncertain.** Run `inspect` and confirm every requested input has the expected kind and backend candidates. Inspection has no conversion or GUI side effects.
 2. **Choose the narrow path.** For one DOCX, XLSX, or IPYNB that only needs paginated reading, call `read_file` directly. Use the helper for repeatable artifacts, macOS formats, HTML/CSV normalization, legacy conversion, or batches.
-3. **Opt in to iWork conversion.** Choose `--iwork-backend apple` for native fidelity on an interactive Mac with the matching app, or `--iwork-backend libreoffice` for headless best-effort conversion. The default `none` only recognizes the format and exits with an actionable prerequisite.
+3. **Use the bounded iWork path.** The default `auto` uses the packaged parser only for Numbers. Choose `--iwork-backend apple` for native fidelity on an interactive Mac with the matching app, or `--iwork-backend libreoffice` for best-effort conversion. Pages and Keynote without an explicitly selected available converter exit with code 3; report that prerequisite instead of reverse engineering the package.
 4. **Extract without modifying sources.** Apple conversion opens the source read-only for export and closes it without saving. Write to a new output path or stdout. For batch jobs, use a dedicated output directory and review the JSON summary until every input is accounted for.
 5. **Verify the content.** Check headings, row counts, representative values, and output encoding against the source. Successful text extraction can still omit visual-only, scanned, animated, or attached content.
 6. **Return artifacts explicitly.** Name each output path in the final response so the user or delivery surface can retrieve it.
@@ -87,7 +90,7 @@ Use `--help` on the command or a subcommand for all options. Outputs are never o
 ## Format Behavior
 
 - XLSX values are extracted from visible sheets only. Hidden sheets stay excluded, and formulas are not recalculated.
-- Numbers exports to XLSX before extraction; formulas are not recalculated by Hermes, and conversion fidelity depends on the selected backend.
+- Native Numbers extraction walks sheets and tables in source order and reads stored cell values. Formulas are not recalculated. Explicit Apple/LibreOffice backends export to XLSX and remain conversion-fidelity dependent.
 - Pages exports to DOCX before extraction. Native Apple export may launch Pages and trigger macOS Automation permission.
 - Keynote exports to PDF before extraction. The result represents visible PDF text, not transitions, embedded media, skipped-slide state, or speaker notes.
 - CSV/TSV text output is tab-separated. Markdown output treats the first row as the header and escapes pipes and embedded line breaks.

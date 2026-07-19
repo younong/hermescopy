@@ -14,7 +14,7 @@ metadata:
 # PDF & Document Extraction
 
 For DOCX and XLSX: use `read_file` for one-off reading or the `common-files` skill for normalized and batch output.
-For TXT, Markdown, CSV, TSV, and HTML: use the `common-files` skill.
+For TXT, Markdown, CSV, TSV, HTML, Numbers, Pages, Keynote, RTF/RTFD, plist, webarchive, and legacy Office: use `common-files` first. Its helper provides deterministic extraction or a prompt exit-code-3 prerequisite; do not install packages, download parser source, or reverse engineer the format after that result.
 For PPTX: see the `powerpoint` skill (uses `python-pptx` with full slide/notes support).
 This skill covers **PDFs and scanned documents**.
 

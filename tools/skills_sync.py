@@ -26,12 +26,23 @@ import json
 import logging
 import os
 import shutil
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from hermes_constants import get_bundled_skills_dir, get_hermes_home, get_optional_skills_dir
 from agent.skill_utils import is_excluded_skill_path
 from typing import Dict, List, Optional, Set, Tuple
 from utils import atomic_replace
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +59,44 @@ MANIFEST_FILE = SKILLS_DIR / ".bundled_manifest"
 # hermes_cli.profiles.NO_BUNDLED_SKILLS_MARKER (kept as a literal here to
 # avoid importing the CLI layer into this low-level sync module).
 NO_BUNDLED_SKILLS_MARKER = ".no-bundled-skills"
+SYNC_LOCK_TIMEOUT_SECONDS = 60.0
+
+
+@contextmanager
+def _sync_lock(timeout_seconds: float = SYNC_LOCK_TIMEOUT_SECONDS):
+    """Serialize one profile's full manifest read/modify/write transaction."""
+    lock_path = SKILLS_DIR / ".bundled_sync.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
+        lock_path.write_text(" ", encoding="utf-8")
+    with lock_path.open("r+" if msvcrt else "a+", encoding="utf-8") as handle:
+        if fcntl is None and msvcrt is None:
+            yield
+            return
+        deadline = time.monotonic() + max(1.0, timeout_seconds)
+        while True:
+            try:
+                if fcntl:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except (BlockingIOError, OSError, PermissionError):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("timed out waiting for bundled skill sync lock")
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            try:
+                if fcntl:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                else:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            except (OSError, IOError):
+                pass
 
 
 def _get_bundled_dir() -> Path:
@@ -480,7 +529,7 @@ def _backfill_optional_provenance(quiet: bool = False) -> List[str]:
     return backfilled
 
 
-def sync_skills(quiet: bool = False) -> dict:
+def _sync_skills_unlocked(quiet: bool = False) -> dict:
     """
     Sync bundled skills into ~/.hermes/skills/ using the manifest.
 
@@ -718,6 +767,14 @@ def sync_skills(quiet: bool = False) -> dict:
         "optional_provenance_backfilled": optional_provenance_backfilled,
         "shadowed_by_external": shadowed_by_external,
     }
+
+
+def sync_skills(quiet: bool = False) -> dict:
+    """Synchronize bundled skills under one profile-local transaction lock."""
+    if (HERMES_HOME / NO_BUNDLED_SKILLS_MARKER).exists():
+        return _sync_skills_unlocked(quiet=quiet)
+    with _sync_lock():
+        return _sync_skills_unlocked(quiet=quiet)
 
 
 def _rmtree_writable(path: Path) -> None:

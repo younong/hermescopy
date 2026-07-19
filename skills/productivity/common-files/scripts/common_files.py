@@ -17,7 +17,7 @@ import sys
 import tempfile
 import zipfile
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -424,9 +424,9 @@ def _extract_pdf(path: Path, backend: str) -> ExtractionResult:
     selected = "pymupdf" if backend == "auto" else backend
     module = "pymupdf" if selected == "pymupdf" else "marker"
     if importlib.util.find_spec(module) is None:
-        hint = "install pymupdf or load the ocr-and-documents skill"
+        hint = "requires preinstalled pymupdf; load the ocr-and-documents skill for guidance"
         if selected == "marker":
-            hint = "install marker-pdf after checking its multi-gigabyte disk requirement"
+            hint = "requires preinstalled marker-pdf and its multi-gigabyte model assets"
         raise BackendUnavailableError(f"{selected} backend unavailable; {hint}")
     script = _ocr_scripts_dir() / ("extract_pymupdf.py" if selected == "pymupdf" else "extract_marker.py")
     if not script.is_file():
@@ -611,12 +611,72 @@ def _extract_iwork_apple(path: Path, pdf_backend: str) -> ExtractionResult:
         return extracted
 
 
+def _numbers_value(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, timedelta):
+        return str(value)
+    if isinstance(value, (str, int, float)):
+        return str(value)
+    raise CommonFilesError(
+        f"unsupported Numbers cell value: {type(value).__name__}"
+    )
+
+
+def _extract_numbers(path: Path) -> ExtractionResult:
+    try:
+        from numbers_parser import Document
+        from numbers_parser.exceptions import NumbersError
+    except ImportError as exc:
+        raise BackendUnavailableError(
+            "numbers-parser backend unavailable; use the packaged documents extra"
+        ) from exc
+    try:
+        document = Document(path)
+        output: list[str] = []
+        for sheet in document.sheets:
+            output.append(f"# ── Sheet: {sheet.name} ──")
+            for table in sheet.tables:
+                output.append(f"## ── Table: {table.name} ──")
+                output.extend(
+                    "\t".join(_numbers_value(value) for value in row)
+                    for row in table.rows(values_only=True)
+                )
+                if not table.num_rows:
+                    output.append("(empty)")
+                output.append("")
+    except (NumbersError, OSError, ValueError, TypeError, IndexError) as exc:
+        raise CommonFilesError(f"cannot parse Numbers document {path}: {exc}") from exc
+    if not output:
+        raise CommonFilesError("Numbers document has no extractable sheets")
+    return ExtractionResult(
+        "\n".join(output).rstrip("\n") + "\n",
+        "numbers",
+        "numbers-parser",
+        ["formulas use stored computed values and were not recalculated"],
+    )
+
+
 def _extract_iwork(path: Path, backend: str, converter_option: str, pdf_backend: str) -> ExtractionResult:
     _check_structured_archive(path)
-    if backend == "none":
-        raise BackendUnavailableError("iWork extraction requires --iwork-backend libreoffice or apple")
-    app, target_ext, _ = IWORK_TARGETS[path.suffix.lower()]
-    if backend == "apple":
+    ext = path.suffix.lower()
+    selected = "numbers-parser" if backend == "auto" and ext == ".numbers" else backend
+    if selected == "numbers-parser":
+        if ext != ".numbers":
+            raise BackendUnavailableError(
+                "numbers-parser supports only .numbers; choose LibreOffice or Apple for this iWork format"
+            )
+        return _extract_numbers(path)
+    if selected in {"auto", "none"}:
+        raise BackendUnavailableError(
+            "iWork extraction requires the packaged Numbers parser or an explicit --iwork-backend libreoffice or apple"
+        )
+    app, target_ext, _ = IWORK_TARGETS[ext]
+    if selected == "apple":
         return _extract_iwork_apple(path, pdf_backend)
     if path.is_dir():
         raise BackendUnavailableError("LibreOffice cannot convert an iWork package directory; use --iwork-backend apple on macOS")
@@ -633,7 +693,7 @@ def extract_path(
     pdf_backend: str = "auto",
     office_converter: str = "auto",
     max_chars: int = DEFAULT_MAX_CHARS,
-    iwork_backend: str = "none",
+    iwork_backend: str = "auto",
     rich_text_backend: str = "auto",
 ) -> ExtractionResult:
     path = _require_source(source)
@@ -708,14 +768,21 @@ def inspect_path(source: Path) -> dict[str, object]:
         app = IWORK_TARGETS[path.suffix.lower()][0]
         libreoffice = bool(shutil.which("soffice") or shutil.which("libreoffice")) and path.is_file()
         apple = _apple_backend_available(app)
+        native = kind == "numbers" and importlib.util.find_spec("numbers_parser") is not None
+        backends = {
+            "libreoffice": {"available": libreoffice, "best_effort": True},
+            "apple": {"available": apple, "may_launch_app": True, "automation_permission": "unknown"},
+        }
+        if kind == "numbers":
+            backends = {"numbers-parser": {"available": native}, **backends}
         item.update({
-            "backend": "none",
-            "available": False,
-            "backends": {
-                "libreoffice": {"available": libreoffice, "best_effort": True},
-                "apple": {"available": apple, "may_launch_app": True, "automation_permission": "unknown"},
-            },
-            "requires": ["choose --iwork-backend libreoffice or apple"],
+            "backend": "numbers-parser" if native else "none",
+            "available": exists and native,
+            "backends": backends,
+            "requires": [] if native else [
+                "packaged numbers-parser" if kind == "numbers" else
+                "choose --iwork-backend libreoffice or apple"
+            ],
         })
     elif kind == "rich-text":
         textutil = _textutil_path()
@@ -835,7 +902,11 @@ def build_parser() -> argparse.ArgumentParser:
         target.add_argument("--encoding")
         target.add_argument("--pdf-backend", choices=("auto", "pymupdf", "marker"), default="auto")
         target.add_argument("--office-converter", default="auto", help="auto, none, or a LibreOffice executable path")
-        target.add_argument("--iwork-backend", choices=("none", "libreoffice", "apple"), default="none")
+        target.add_argument(
+            "--iwork-backend",
+            choices=("auto", "numbers-parser", "none", "libreoffice", "apple"),
+            default="auto",
+        )
         target.add_argument("--rich-text-backend", choices=("auto", "textutil", "libreoffice", "none"), default="auto")
         target.add_argument("--max-chars", type=int, default=DEFAULT_MAX_CHARS)
 

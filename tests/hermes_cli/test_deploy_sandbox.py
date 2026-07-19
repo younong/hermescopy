@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import tomllib
 from pathlib import Path
 
 
@@ -35,6 +36,11 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert "ExecStartPre=$venv/bin/python" in source
     assert "uv python install \"$python_version\" --install-dir \"$runtime_tmp/python-base\" --no-bin" in source
     assert "uv sync --extra all --extra ddgs --locked --no-editable --link-mode copy" in source
+    optional_dependencies = tomllib.loads(
+        (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]["optional-dependencies"]
+    assert "hermes-agent[documents]" in optional_dependencies["all"]
+    assert optional_dependencies["documents"] == ["numbers-parser==4.18.2"]
     assert 'resolved_python="$(readlink -f "$runtime_tmp/bin/python3")"' in source
     assert 'final_python_relative="$(realpath --relative-to="$venv/bin" "$final_python")"' in source
     assert 'ln -sfn "$final_python_relative" "$venv/bin/python"' in source

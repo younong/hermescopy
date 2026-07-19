@@ -70,6 +70,16 @@ class OwnerWorkerStartupError(OwnerWorkerUnavailableError):
     """Raised when an Owner Worker exits or fails health checks during startup."""
 
 
+def _seed_owner_worker_skills(owner_home: Path) -> dict[str, Any]:
+    """Synchronize bundled skills before an owner worker imports skill state."""
+    from hermes_cli.profiles import seed_profile_skills
+
+    result = seed_profile_skills(owner_home, quiet=True)
+    if result is None:
+        raise RuntimeError("owner bundled skill synchronization failed")
+    return result
+
+
 class OwnerWorkerLease:
     """Reference-counted active-use lease for an owner worker handle."""
 
@@ -296,7 +306,20 @@ class OwnerWorkerSupervisor:
             self._teardown_terminated_handle(eviction[0], eviction[1])
 
         try:
-            return self._start_owner_worker(owner, owner_key, owner_home, deadline=deadline or time.monotonic())
+            ensure_owner_runtime_dirs(owner_home)
+            try:
+                _seed_owner_worker_skills(owner_home)
+            except Exception as exc:
+                raise OwnerWorkerStartupError(
+                    f"owner bundled skill synchronization failed: {exc}"
+                ) from exc
+            process_deadline = time.monotonic() + startup_timeout
+            return self._start_owner_worker(
+                owner,
+                owner_key,
+                owner_home,
+                deadline=process_deadline,
+            )
         finally:
             with self._start_finished:
                 self._starting_owner_keys.remove(owner_key)

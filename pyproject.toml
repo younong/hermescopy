@@ -267,6 +267,12 @@ youtube = [
   # at first invocation with ModuleNotFoundError (issue #22243).
   "youtube-transcript-api==1.2.4",
 ]
+documents = [
+  # Native, read-only Apple Numbers extraction for the bundled common-files
+  # skill. Pin 4.18.2 rather than 4.18.3+ because later releases require
+  # protobuf>=7.34 while the current provider stack resolves protobuf 6.x.
+  "numbers-parser==4.18.2",
+]
 # `hermes dashboard` (localhost SPA + API).  Not in core to keep the default install lean.
 # starlette==1.0.1 pinned for CVE-2026-48710 (BadHost) — fastapi pulls Starlette
 # transitively and pre-1.0.1 is the vulnerable range. See the mcp extra above.
@@ -303,6 +309,7 @@ all = [
   "hermes-agent[google]",
   "hermes-agent[web]",
   "hermes-agent[youtube]",
+  "hermes-agent[documents]",
 ]
 
 [project.scripts]

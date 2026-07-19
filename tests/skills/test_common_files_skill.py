@@ -97,7 +97,10 @@ def test_skill_contract_and_routing() -> None:
     for heading in ("## When to Use", "## Prerequisites", "## How to Run", "## Quick Reference", "## Procedure", "## Pitfalls", "## Verification"):
         assert heading in content
     assert "${HERMES_SKILL_DIR}/scripts/common_files.py" in content
-    assert "common-files" in OCR_SKILL.read_text(encoding="utf-8")
+    for forbidden_fallback in ("Do not run `pip install`", "manually decode iWork"):
+        assert forbidden_fallback in content
+    ocr_content = OCR_SKILL.read_text(encoding="utf-8")
+    assert "common-files" in ocr_content and "do not install packages" in ocr_content
 
 
 def test_parser_has_documented_operations(common_files) -> None:
@@ -105,7 +108,7 @@ def test_parser_has_documented_operations(common_files) -> None:
     assert parser.parse_args(["inspect", "x.txt"]).operation == "inspect"
     extract = parser.parse_args(["extract", "x.txt"])
     assert extract.operation == "extract"
-    assert extract.iwork_backend == "none" and extract.rich_text_backend == "auto"
+    assert extract.iwork_backend == "auto" and extract.rich_text_backend == "auto"
     apple = parser.parse_args(["extract", "x.numbers", "--iwork-backend", "apple"])
     assert apple.iwork_backend == "apple"
     assert parser.parse_args(["batch", "in", "--output-dir", "out"]).operation == "batch"
@@ -271,6 +274,47 @@ def test_missing_legacy_converter_is_actionable(common_files, tmp_path: Path, mo
         common_files.extract_path(source)
 
 
+def test_unavailable_optional_backends_fail_fast_with_exit_three(
+    common_files, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    pdf = tmp_path / "scan.pdf"
+    pdf.write_bytes(b"%PDF")
+    rtf = tmp_path / "note.rtf"
+    rtf.write_text(r"{\rtf1 Note}", encoding="utf-8")
+    rtfd = tmp_path / "bundle.rtfd"
+    rtfd.mkdir()
+    (rtfd / "TXT.rtf").write_text(r"{\rtf1 Bundle}", encoding="utf-8")
+    legacy = tmp_path / "old.doc"
+    legacy.write_bytes(b"legacy")
+    pages = tmp_path / "letter.pages"
+    keynote = tmp_path / "slides.key"
+    for path in (pages, keynote):
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("Index/Document.iwa", b"data")
+
+    run = Mock()
+    monkeypatch.setattr(common_files.subprocess, "run", run)
+    monkeypatch.setattr(common_files.importlib.util, "find_spec", lambda _name: None)
+    monkeypatch.setattr(common_files.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(common_files, "_textutil_path", lambda: None)
+    monkeypatch.setattr(common_files, "_apple_backend_available", lambda _app: False)
+
+    commands = [
+        ["extract", str(pdf)],
+        ["extract", str(pdf), "--pdf-backend", "marker"],
+        ["extract", str(rtf)],
+        ["extract", str(rtfd)],
+        ["extract", str(legacy)],
+        ["extract", str(pages)],
+        ["extract", str(keynote)],
+    ]
+    for command in commands:
+        assert common_files.main(command) == 3
+        assert "error:" in capsys.readouterr().err
+
+    run.assert_not_called()
+
+
 def test_batch_is_deterministic_and_reports_skips(common_files, tmp_path: Path, capsys) -> None:
     inputs = tmp_path / "inputs"
     (inputs / "nested").mkdir(parents=True)
@@ -413,13 +457,68 @@ def test_iwork_is_explicit_and_inspection_has_no_side_effects(common_files, tmp_
     monkeypatch.setattr(common_files.subprocess, "run", run)
     monkeypatch.setattr(common_files.shutil, "which", lambda name: "/usr/bin/soffice" if name == "soffice" else None)
     monkeypatch.setattr(common_files, "_apple_backend_available", lambda app: True)
+    monkeypatch.setattr(common_files.importlib.util, "find_spec", lambda name: None)
     inspected = common_files.inspect_path(source)
     assert inspected["kind"] == "numbers" and inspected["backend"] == "none"
     assert inspected["backends"]["apple"]["automation_permission"] == "unknown"
     run.assert_not_called()
-    with pytest.raises(common_files.BackendUnavailableError, match="--iwork-backend"):
-        common_files.extract_path(source)
+    with pytest.raises(common_files.BackendUnavailableError, match="Numbers parser"):
+        common_files.extract_path(source, iwork_backend="none")
     run.assert_not_called()
+
+
+def test_numbers_parser_extracts_ordered_sheets_tables_and_values(
+    common_files, tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "budget.numbers"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("Index/Document.iwa", b"data")
+
+    class FakeTable:
+        def __init__(self, name, rows):
+            self.name = name
+            self._rows = rows
+            self.num_rows = len(rows)
+
+        def rows(self, values_only=False):
+            assert values_only is True
+            return self._rows
+
+    class FakeSheet:
+        def __init__(self, name, tables):
+            self.name = name
+            self.tables = tables
+
+    class FakeDocument:
+        def __init__(self, path):
+            assert Path(path) == source.resolve()
+            self.sheets = [
+                FakeSheet("Summary", [FakeTable("Totals", [["Name", 42, None], [True, datetime(2026, 7, 19), 3.5]])]),
+                FakeSheet("Details", [FakeTable("Items", [["A", "B"]])]),
+            ]
+
+    import types
+
+    package = types.ModuleType("numbers_parser")
+    package.Document = FakeDocument
+    errors = types.ModuleType("numbers_parser.exceptions")
+    errors.NumbersError = ValueError
+    monkeypatch.setitem(sys.modules, "numbers_parser", package)
+    monkeypatch.setitem(sys.modules, "numbers_parser.exceptions", errors)
+
+    result = common_files.extract_path(source)
+
+    assert result.backend == "numbers-parser" and result.kind == "numbers"
+    assert result.content == (
+        "# ── Sheet: Summary ──\n"
+        "## ── Table: Totals ──\n"
+        "Name\t42\t\n"
+        "true\t2026-07-19T00:00:00\t3.5\n\n"
+        "# ── Sheet: Details ──\n"
+        "## ── Table: Items ──\n"
+        "A\tB\n"
+    )
+    assert "not recalculated" in result.warnings[0]
 
 
 def test_iwork_libreoffice_reuses_structured_extractor(common_files, tmp_path: Path, monkeypatch) -> None:
