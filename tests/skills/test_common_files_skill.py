@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import plistlib
 import sys
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -101,7 +103,11 @@ def test_skill_contract_and_routing() -> None:
 def test_parser_has_documented_operations(common_files) -> None:
     parser = common_files.build_parser()
     assert parser.parse_args(["inspect", "x.txt"]).operation == "inspect"
-    assert parser.parse_args(["extract", "x.txt"]).operation == "extract"
+    extract = parser.parse_args(["extract", "x.txt"])
+    assert extract.operation == "extract"
+    assert extract.iwork_backend == "none" and extract.rich_text_backend == "auto"
+    apple = parser.parse_args(["extract", "x.numbers", "--iwork-backend", "apple"])
+    assert apple.iwork_backend == "apple"
     assert parser.parse_args(["batch", "in", "--output-dir", "out"]).operation == "batch"
 
 
@@ -308,3 +314,180 @@ def test_batch_partial_failure_returns_five(common_files, tmp_path: Path, monkey
     code = common_files.main(["batch", str(first), str(second), "--output-dir", str(tmp_path / "out")])
     payload = json.loads(capsys.readouterr().out)
     assert code == 5 and len(payload["successes"]) == 1 and len(payload["failures"]) == 1
+
+
+def test_mac_format_classification(common_files, tmp_path: Path) -> None:
+    expected = {
+        "budget.numbers": "numbers",
+        "letter.pages": "pages",
+        "slides.key": "keynote",
+        "slides.keynote": "keynote",
+        "notes.rtf": "rich-text",
+        "notes.rtfd": "rich-text",
+        "settings.plist": "property-list",
+        "saved.webarchive": "webarchive",
+    }
+    for name, kind in expected.items():
+        assert common_files.classify(tmp_path / name) == kind
+    with pytest.raises(common_files.UnsupportedFormatError):
+        common_files.classify(tmp_path / "photo.heic")
+
+
+def test_plist_xml_and_binary_are_deterministic(common_files, tmp_path: Path) -> None:
+    value = {
+        "message": "你好",
+        "data": b"abc",
+        "date": datetime(2026, 7, 19, 8, 30),
+        "enabled": True,
+    }
+    outputs = []
+    for name, fmt in (("xml.plist", plistlib.FMT_XML), ("binary.plist", plistlib.FMT_BINARY)):
+        path = tmp_path / name
+        path.write_bytes(plistlib.dumps(value, fmt=fmt, sort_keys=False))
+        result = common_files.extract_path(path)
+        assert result.backend == "python-stdlib-plist"
+        outputs.append(json.loads(result.content))
+    assert outputs[0] == outputs[1]
+    assert outputs[0]["data"] == {"$type": "data", "base64": "YWJj"}
+    assert outputs[0]["date"]["$type"] == "date"
+
+    binary = tmp_path / "uid.plist"
+    binary.write_bytes(plistlib.dumps({"uid": plistlib.UID(7)}, fmt=plistlib.FMT_BINARY))
+    assert json.loads(common_files.extract_path(binary).content)["uid"] == {"$type": "uid", "value": 7}
+
+
+def test_webarchive_extracts_main_resource_without_fetching(common_files, tmp_path: Path) -> None:
+    path = tmp_path / "saved.webarchive"
+    path.write_bytes(plistlib.dumps({
+        "WebMainResource": {
+            "WebResourceData": b"<h1>Saved</h1><script>bad()</script><p>Hello</p>",
+            "WebResourceMIMEType": "text/html",
+            "WebResourceTextEncodingName": "UTF-8",
+        },
+        "WebSubresources": [{"WebResourceURL": "https://example.test/image.png"}],
+        "WebSubframeArchives": [{"ignored": True}],
+    }, fmt=plistlib.FMT_BINARY))
+    result = common_files.extract_path(path, output_format="markdown")
+    assert "# Saved" in result.content and "Hello" in result.content
+    assert "bad()" not in result.content
+    assert result.backend == "python-stdlib-webarchive"
+    assert result.warnings == ["webarchive subresources were omitted", "webarchive subframes were omitted"]
+
+
+def test_rtf_textutil_and_rtfd_package(common_files, tmp_path: Path, monkeypatch) -> None:
+    rtf = tmp_path / "note with spaces.rtf"
+    rtf.write_text(r"{\rtf1 Hello}", encoding="utf-8")
+    monkeypatch.setattr(common_files, "_textutil_path", lambda: "/usr/bin/textutil")
+    run = Mock(return_value=Mock(returncode=0, stdout="Hello\n", stderr=""))
+    monkeypatch.setattr(common_files.subprocess, "run", run)
+    result = common_files.extract_path(rtf, rich_text_backend="textutil")
+    assert result.content == "Hello\n" and result.backend == "textutil"
+    command = run.call_args.args[0]
+    assert command[-1] == str(rtf.resolve()) and command[-2] == "--"
+    assert run.call_args.kwargs["shell"] is False
+
+    rtfd = tmp_path / "bundle.rtfd"
+    rtfd.mkdir()
+    (rtfd / "TXT.rtf").write_text(r"{\rtf1 Bundle}", encoding="utf-8")
+    (rtfd / "image.png").write_bytes(b"image")
+    result = common_files.extract_path(rtfd, rich_text_backend="textutil")
+    assert "attachments" in result.warnings[0]
+    assert run.call_args.args[0][-1] == str((rtfd / "TXT.rtf").resolve())
+
+
+def test_package_rejects_symlinks(common_files, tmp_path: Path) -> None:
+    package = tmp_path / "unsafe.pages"
+    package.mkdir()
+    target = tmp_path / "outside"
+    target.write_text("outside", encoding="utf-8")
+    (package / "link").symlink_to(target)
+    with pytest.raises(common_files.UnsafeDocumentError, match="symbolic link"):
+        common_files.extract_path(package)
+
+
+def test_iwork_is_explicit_and_inspection_has_no_side_effects(common_files, tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "budget.numbers"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("Index/Document.iwa", b"data")
+    run = Mock()
+    monkeypatch.setattr(common_files.subprocess, "run", run)
+    monkeypatch.setattr(common_files.shutil, "which", lambda name: "/usr/bin/soffice" if name == "soffice" else None)
+    monkeypatch.setattr(common_files, "_apple_backend_available", lambda app: True)
+    inspected = common_files.inspect_path(source)
+    assert inspected["kind"] == "numbers" and inspected["backend"] == "none"
+    assert inspected["backends"]["apple"]["automation_permission"] == "unknown"
+    run.assert_not_called()
+    with pytest.raises(common_files.BackendUnavailableError, match="--iwork-backend"):
+        common_files.extract_path(source)
+    run.assert_not_called()
+
+
+def test_iwork_libreoffice_reuses_structured_extractor(common_files, tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "budget.numbers"
+    converter = tmp_path / "Libre Office"
+    converter.write_text("binary", encoding="utf-8")
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("Index/Document.iwa", b"data")
+
+    def fake_run(command, **kwargs):
+        output_dir = Path(command[command.index("--outdir") + 1])
+        _write_xlsx(output_dir / "budget.xlsx")
+        return Mock(returncode=0, stdout="", stderr="")
+
+    run = Mock(side_effect=fake_run)
+    monkeypatch.setattr(common_files.subprocess, "run", run)
+    result = common_files.extract_path(source, office_converter=str(converter), iwork_backend="libreoffice")
+    assert result.kind == "numbers" and "Name\t42" in result.content
+    assert result.backend == "libreoffice+hermes-read-extract"
+    assert "best-effort" in result.warnings[0]
+    assert run.call_args.kwargs["shell"] is False
+
+
+def test_apple_iwork_uses_fixed_script_and_readonly_source(common_files, tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "private path.pages"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("Index/Document.iwa", b"data")
+    monkeypatch.setattr(common_files, "_apple_backend_available", lambda app: True)
+
+    def fake_run(command, **kwargs):
+        opened = Path(command[-2])
+        output = Path(command[-1])
+        assert opened == source.resolve() and opened.is_file()
+        assert str(source.resolve()) not in command[2]
+        assert command[:2] == ["/usr/bin/osascript", "-e"]
+        assert "close openedDocument saving no" in command[2]
+        _write_docx(output, "Apple Pages")
+        return Mock(returncode=0, stdout="", stderr="")
+
+    before = source.read_bytes()
+    run = Mock(side_effect=fake_run)
+    monkeypatch.setattr(common_files.subprocess, "run", run)
+    result = common_files.extract_path(source, iwork_backend="apple")
+    assert result.kind == "pages" and "Apple Pages" in result.content
+    assert result.backend == "apple-pages+hermes-read-extract"
+    assert source.read_bytes() == before
+    assert run.call_args.kwargs["shell"] is False
+
+
+def test_batch_treats_mac_packages_as_atomic(common_files, tmp_path: Path, monkeypatch, capsys) -> None:
+    root = tmp_path / "inputs"
+    root.mkdir()
+    numbers = root / "budget.numbers"
+    numbers.mkdir()
+    (numbers / "Index.zip").write_bytes(b"internal")
+    rtfd = root / "notes.rtfd"
+    rtfd.mkdir()
+    (rtfd / "TXT.rtf").write_text(r"{\rtf1 Notes}", encoding="utf-8")
+    (root / "plain.txt").write_text("plain", encoding="utf-8")
+    monkeypatch.setattr(common_files, "_textutil_path", lambda: "/usr/bin/textutil")
+    monkeypatch.setattr(common_files.subprocess, "run", Mock(return_value=Mock(returncode=0, stdout="Notes\n", stderr="")))
+    code = common_files.main([
+        "batch", str(root), "--recursive", "--output-dir", str(tmp_path / "out"),
+        "--rich-text-backend", "textutil",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 5
+    assert [Path(item["source"]).name for item in payload["successes"]] == ["notes.rtfd", "plain.txt"]
+    assert payload["failures"][0]["source"].endswith("budget.numbers")
+    paths = [item["source"] for item in payload["successes"] + payload["failures"]]
+    assert not any(path.endswith("Index.zip") or path.endswith("TXT.rtf") for path in paths)
