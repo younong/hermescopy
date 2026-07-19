@@ -9,11 +9,16 @@ import pytest
 
 from hermes_cli.dashboard_auth.authority import OwnerWorkerAuthorityLease, WorkerLeaseState
 from hermes_cli.owner_worker.executor_identity import ExecutorIdentity, ExecutorInvocation
-from hermes_cli.owner_worker.web_tool_relay import (
-    WebToolRelayBroker,
-    WebToolRelayError,
-    dispatch_web_tool_over_relay,
+from hermes_cli.owner_worker.owner_tool_relay import (
+    OWNER_RELAY_TOOL_NAMES,
+    OwnerToolRelayBroker,
+    OwnerToolRelayError,
+    dispatch_owner_tool_over_relay,
 )
+
+WebToolRelayBroker = OwnerToolRelayBroker
+WebToolRelayError = OwnerToolRelayError
+dispatch_web_tool_over_relay = dispatch_owner_tool_over_relay
 
 
 def _identity(owner_key: str = "ok1_owner") -> ExecutorIdentity:
@@ -31,7 +36,7 @@ def _invocation(tool_name="web_search", arguments=None, *, identity=None, invoca
     return ExecutorInvocation(
         identity or _identity(),
         tool_name,
-        arguments or {"query": "Hermes", "limit": 5},
+        {"query": "Hermes", "limit": 5} if arguments is None else arguments,
         "call-a",
         "turn-a",
         "request-a",
@@ -45,9 +50,9 @@ def test_web_relay_logs_only_safe_correlation_fields(caplog):
     invocation = _invocation(arguments={"query": secret_query, "limit": 5})
     broker = WebToolRelayBroker(
         identity_validator=lambda _identity: None,
-        dispatcher=lambda _name, _args: '{"success":true}',
+        dispatcher=lambda _name, _args, _invocation, _materializer: '{"success":true}',
     )
-    with caplog.at_level("INFO", logger="hermes_cli.owner_worker.web_tool_relay"):
+    with caplog.at_level("INFO", logger="hermes_cli.owner_worker.owner_tool_relay"):
         relay_fd = broker.register(invocation)
         assert dispatch_web_tool_over_relay(relay_fd, invocation) == '{"success":true}'
     broker.close()
@@ -67,7 +72,7 @@ def test_web_relay_dispatches_exact_search_and_extract_invocations():
     seen = []
     broker = WebToolRelayBroker(
         identity_validator=lambda identity: seen.append(("identity", identity)),
-        dispatcher=lambda name, args: seen.append((name, args)) or '{"success":true}',
+        dispatcher=lambda name, args, _invocation, _materializer: seen.append((name, args)) or '{"success":true}',
     )
     search = _invocation()
     search_fd = broker.register(search)
@@ -93,6 +98,12 @@ def test_web_relay_dispatches_exact_search_and_extract_invocations():
         ("web_search", {"query": "Hermes", "provider": "forged"}),
         ("web_extract", {"urls": ["https://example.com"] * 6}),
         ("web_extract", {"urls": ["https://example.com"], "headers": {"Authorization": "secret"}}),
+        ("skill_manage", {"action": "delete", "name": "common-files"}),
+        ("skills_list", {"task_id": "forged"}),
+        ("skills_list", {"category": "bad\x00category"}),
+        ("skill_view", {"name": ""}),
+        ("skill_view", {"name": "common-files", "preprocess": False}),
+        ("skill_view", {"name": "common-files", "file_path": "bad\x00path"}),
     ],
 )
 def test_web_relay_rejects_noncanonical_operations_and_arguments(tool_name, arguments):
@@ -102,11 +113,65 @@ def test_web_relay_rejects_noncanonical_operations_and_arguments(tool_name, argu
     broker.close()
 
 
+def test_owner_relay_allowlist_excludes_skill_manage():
+    assert OWNER_RELAY_TOOL_NAMES == {
+        "web_search", "web_extract", "skills_list", "skill_view",
+    }
+    assert "skill_manage" not in OWNER_RELAY_TOOL_NAMES
+
+
+def test_owner_relay_dispatches_canonical_skill_reads():
+    seen = []
+    broker = OwnerToolRelayBroker(
+        identity_validator=lambda _identity: None,
+        dispatcher=lambda name, args, invocation, materializer: (
+            seen.append((name, args, invocation.identity.task_id, materializer))
+            or '{"success":true}'
+        ),
+    )
+    listed = _invocation("skills_list", {}, invocation_id="skills-list")
+    list_fd = broker.register(listed)
+    assert dispatch_owner_tool_over_relay(list_fd, listed) == '{"success":true}'
+
+    viewed = _invocation(
+        "skill_view",
+        {"name": "common-files", "file_path": "references/guide.md"},
+        invocation_id="skill-view",
+    )
+    materializer = lambda source: f"/executor/{source}"
+    view_fd = broker.register(viewed, skill_dir_materializer=materializer)
+    assert dispatch_owner_tool_over_relay(view_fd, viewed) == '{"success":true}'
+    broker.close()
+
+    assert seen == [
+        ("skills_list", {}, "task-a", None),
+        (
+            "skill_view",
+            {"name": "common-files", "file_path": "references/guide.md"},
+            "task-a",
+            materializer,
+        ),
+    ]
+
+
+def test_owner_relay_rejects_result_over_executor_output_quota():
+    invocation = _invocation()
+    quota = invocation.resource_decision.quota
+    broker = OwnerToolRelayBroker(
+        identity_validator=lambda _identity: None,
+        dispatcher=lambda *_args: "x" * (quota.output_bytes + 1),
+    )
+    relay_fd = broker.register(invocation)
+    with pytest.raises(OwnerToolRelayError, match="rejected"):
+        dispatch_owner_tool_over_relay(relay_fd, invocation)
+    broker.close()
+
+
 def test_web_relay_rejects_forged_identity_and_invocation():
     expected = _invocation()
     broker = WebToolRelayBroker(
         identity_validator=lambda _identity: None,
-        dispatcher=lambda _name, _args: "should-not-run",
+        dispatcher=lambda _name, _args, _invocation, _materializer: "should-not-run",
     )
     child_fd = broker.register(expected)
     connection = socket.socket(fileno=child_fd)
@@ -189,7 +254,7 @@ def test_executor_runtime_dispatches_web_tool_through_real_socketpair(tmp_path, 
     invocation = _invocation()
     broker = WebToolRelayBroker(
         identity_validator=lambda identity: identity == invocation.identity or None,
-        dispatcher=lambda name, arguments: json.dumps({
+        dispatcher=lambda name, arguments, _invocation, _materializer: json.dumps({
             "tool": name,
             "query": arguments["query"],
         }),
@@ -208,7 +273,7 @@ def test_executor_runtime_dispatches_web_tool_through_real_socketpair(tmp_path, 
         bootstrap_fd=bootstrap_read,
         response_fd=response_write,
         start_gate_fd=gate_read,
-        web_relay_fd=relay_fd,
+        owner_relay_fd=relay_fd,
         egress_profile="tool-none",
     )
     os.write(gate_write, b"1")
@@ -318,6 +383,53 @@ def test_owner_side_dispatch_uses_owner_scoped_ddgs_backend(tmp_path, monkeypatc
 
     assert seen_backends == backends
     assert all(result["success"] is True for result in results)
+
+
+def test_owner_side_dispatch_reads_only_current_owner_skills(tmp_path, monkeypatch):
+    import json
+
+    from tools import skills_tool
+
+    owner_homes = [tmp_path / "owner-a", tmp_path / "owner-b"]
+    for owner_home, description in zip(owner_homes, ["owner-a-only", "owner-b-only"], strict=True):
+        skill = owner_home / "skills" / "productivity" / "common-files"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            f"---\nname: common-files\ndescription: {description}\n---\n{description}\n",
+            encoding="utf-8",
+        )
+
+    results = []
+    for index, owner_home in enumerate(owner_homes):
+        monkeypatch.setattr(skills_tool, "SKILLS_DIR", owner_home / "skills")
+        invocation = _invocation(
+            "skill_view",
+            {"name": "common-files"},
+            identity=_identity(f"ok1_owner_{index}"),
+            invocation_id=f"skill-view-{index}",
+        )
+        broker = OwnerToolRelayBroker(identity_validator=lambda _identity: None)
+        try:
+            relay_fd = broker.register(
+                invocation,
+                skill_dir_materializer=lambda _source, index=index: (
+                    f"/executor/skill-snapshots/owner-{index}"
+                ),
+            )
+            results.append(json.loads(dispatch_owner_tool_over_relay(relay_fd, invocation)))
+        finally:
+            broker.close()
+
+    assert [result["description"] for result in results] == [
+        "owner-a-only",
+        "owner-b-only",
+    ]
+    assert [result["skill_dir"] for result in results] == [
+        "/executor/skill-snapshots/owner-0",
+        "/executor/skill-snapshots/owner-1",
+    ]
+    assert "owner-b-only" not in results[0]["content"]
+    assert "owner-a-only" not in results[1]["content"]
 
 
 def test_owner_side_web_extract_keeps_private_url_guard(monkeypatch):

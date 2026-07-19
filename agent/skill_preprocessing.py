@@ -130,14 +130,25 @@ def preprocess_skill_content(
     skill_dir: Path | None,
     session_id: str | None = None,
     skills_cfg: dict | None = None,
+    *,
+    template_skill_dir: Path | None = None,
 ) -> str:
-    """Apply configured SKILL.md template and inline-shell preprocessing."""
+    """Apply configured SKILL.md template and inline-shell preprocessing.
+
+    ``skill_dir`` remains the trusted source directory used as the inline-shell
+    working directory. ``template_skill_dir`` may point at a separately
+    materialized, sandbox-visible copy used only for template substitution.
+    """
     if not content:
         return content
 
     cfg = skills_cfg if isinstance(skills_cfg, dict) else load_skills_config()
     if cfg.get("template_vars", True):
-        content = substitute_template_vars(content, skill_dir, session_id)
+        content = substitute_template_vars(
+            content,
+            template_skill_dir if template_skill_dir is not None else skill_dir,
+            session_id,
+        )
     if cfg.get("inline_shell", False):
         timeout = int(cfg.get("inline_shell_timeout", 10) or 10)
         content = expand_inline_shell(content, skill_dir, timeout)

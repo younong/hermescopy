@@ -413,6 +413,38 @@ class TestSkillView:
         assert f"Run {skill_dir}/scripts/do.sh in session-123" in result["content"]
         assert "${HERMES_SKILL_DIR}" not in result["content"]
 
+    def test_skill_view_renders_materialized_path_but_runs_inline_shell_from_source(self, tmp_path):
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch(
+                "agent.skill_preprocessing.load_skills_config",
+                return_value={"template_vars": True, "inline_shell": True},
+            ),
+        ):
+            skill_dir = _make_skill(
+                tmp_path,
+                "materialized",
+                body="Run ${HERMES_SKILL_DIR}/scripts/do.sh from !`pwd`",
+            )
+            seen = []
+
+            def materialize(source):
+                seen.append(source)
+                return "/executor/skill-snapshots/content-id"
+
+            raw = skill_view(
+                "materialized",
+                skill_dir_materializer=materialize,
+            )
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert seen == [skill_dir]
+        assert result["skill_dir"] == "/executor/skill-snapshots/content-id"
+        assert "/executor/skill-snapshots/content-id/scripts/do.sh" in result["content"]
+        assert f"from {skill_dir}" in result["content"]
+        assert str(tmp_path) not in result["skill_dir"]
+
     def test_skill_view_applies_inline_shell_when_enabled(self, tmp_path):
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
