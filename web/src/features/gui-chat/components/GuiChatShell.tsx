@@ -9,7 +9,6 @@ import { usePageHeader } from "@/contexts/usePageHeader";
 import { useProfileScope } from "@/contexts/useProfileScope";
 import { useI18n } from "@/i18n";
 import { JsonRpcGatewayError, type GatewayEvent } from "@/lib/gatewayClient";
-import { api, FetchJSONError } from "@/lib/api";
 import { dashboardAuthTransition } from "@/lib/dashboardAuthTransition";
 import { useDashboardAuthIdentity } from "@/lib/useDashboardAuthIdentity";
 import { cn } from "@/lib/utils";
@@ -19,6 +18,7 @@ import { createGatewayEventFrameQueue } from "../gatewayEventFrameQueue";
 import { startGuiChatLatencyTrace, type GuiChatLatencyTrace } from "../latencyTrace";
 import { connectMockGuiChat } from "../mock";
 import { guiChatReducer } from "../reducer";
+import { GuiChatSessionSwitchCoordinator } from "../sessionSwitch";
 import {
   initialGuiChatState,
   type GuiComposerAttachment,
@@ -42,13 +42,10 @@ export function GuiChatShell() {
     [],
   );
   const latencyTraceRef = useRef<GuiChatLatencyTrace | null>(null);
+  const switchCoordinatorRef = useRef<GuiChatSessionSwitchCoordinator | null>(null);
+  const canonicalRouteRef = useRef<string | null>(null);
+  const switchTraceByGenerationRef = useRef(new Map<number, GuiChatLatencyTrace>());
   const [newChatNonce, setNewChatNonce] = useState(0);
-  const [resumeResolutionNonce, setResumeResolutionNonce] = useState(0);
-  const [resumeTarget, setResumeTarget] = useState<ResumeTargetState>({
-    error: null,
-    requested: null,
-    sessionId: null,
-  });
   const [resumeNotice, setResumeNotice] = useState<string | null>(null);
   const [sendScrollNonce, setSendScrollNonce] = useState(0);
   const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false);
@@ -62,22 +59,19 @@ export function GuiChatShell() {
       : false,
   );
   const mobilePanelOpen = mobilePanelOpenRaw;
-  const canonicalResumeSessionId =
-    resumeTarget.requested === resumeSessionId ? resumeTarget.sessionId : null;
-  const resumeResolutionError =
-    resumeTarget.requested === resumeSessionId ? resumeTarget.error : null;
-  const resumeResolutionPending = Boolean(resumeSessionId) && !canonicalResumeSessionId && !resumeResolutionError;
-  const activeSessionId = state.storedSessionId ?? canonicalResumeSessionId ?? resumeSessionId;
-  const terminalResumeId = state.storedSessionId ?? canonicalResumeSessionId ?? resumeSessionId;
+  const activeSessionId = state.storedSessionId ?? resumeSessionId;
+  const terminalResumeId = state.storedSessionId ?? resumeSessionId;
   const forceBottomKey = `${activeSessionId ?? `new-${newChatNonce}`}:${sendScrollNonce}`;
   const closeMobilePanel = useCallback(() => setMobilePanelOpenRaw(false), []);
   const startSessionSwitchTrace = useCallback((_sessionId: string) => {
     latencyTraceRef.current?.mark("switch.superseded", "cancelled");
+    switchTraceByGenerationRef.current.clear();
     latencyTraceRef.current = startGuiChatLatencyTrace("session_list.click");
   }, []);
 
   useEffect(() => dashboardAuthTransition.register(() => {
-    connectionRef.current?.close();
+    switchCoordinatorRef.current?.dispose();
+    switchCoordinatorRef.current = null;
     connectionRef.current = null;
     eventFrameQueue.reset();
     dispatch({ type: "reset" });
@@ -89,7 +83,6 @@ export function GuiChatShell() {
 
   const startNewGuiChat = useCallback(() => {
     setResumeNotice(null);
-    setResumeTarget({ error: null, requested: null, sessionId: null });
     setSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev);
@@ -101,85 +94,73 @@ export function GuiChatShell() {
     setNewChatNonce((n) => n + 1);
   }, [setSearchParams]);
 
-  useEffect(() => {
-    let cancelled = false;
-    if (!resumeSessionId) {
-      setResumeTarget((current) =>
-        current.requested === null && current.sessionId === null && current.error === null
-          ? current
-          : { error: null, requested: null, sessionId: null },
-      );
-      return;
-    }
-    if (mockMode) {
-      setResumeTarget((current) =>
-        current.requested === resumeSessionId && current.sessionId === resumeSessionId && current.error === null
-          ? current
-          : { error: null, requested: resumeSessionId, sessionId: resumeSessionId },
-      );
-      return;
-    }
+  const switchCoordinator = useMemo(
+    () =>
+      new GuiChatSessionSwitchCoordinator({
+        onCommit: (connection, response, requestedSessionId, generation) => {
+          connectionRef.current = connection;
+          const trace = switchTraceByGenerationRef.current.get(generation);
+          switchTraceByGenerationRef.current.delete(generation);
+          trace?.mark(requestedSessionId ? "session.resume.end" : "session.create.end", "ok");
+          dispatch({ type: "session.created", response });
 
-    const trace = latencyTraceRef.current;
-    trace?.mark("latest_descendant.start");
-    setResumeNotice(null);
-    setResumeTarget({ error: null, requested: resumeSessionId, sessionId: null });
-    void api
-      .getSessionLatestDescendant(resumeSessionId, trace?.id)
-      .then(({ session_id }) => {
-        if (cancelled) {
-          trace?.mark("latest_descendant.response_ignored", "cancelled");
-          return;
-        }
-        trace?.mark("latest_descendant.end", "ok");
-        if (session_id !== resumeSessionId) {
-          setSearchParams(
-            (prev) => {
-              if (prev.get("resume") !== resumeSessionId) return prev;
-              const next = new URLSearchParams(prev);
-              next.set("resume", session_id);
-              return next;
-            },
-            { replace: true },
-          );
-        }
-        setResumeTarget({ error: null, requested: resumeSessionId, sessionId: session_id });
-      })
-      .catch((error: unknown) => {
-        if (cancelled) {
-          trace?.mark("latest_descendant.error_ignored", "cancelled");
-          return;
-        }
-        trace?.mark("latest_descendant.end", "error");
-        if (error instanceof FetchJSONError && error.status === 404) {
-          setResumeNotice("This session is no longer available. Started a new chat instead.");
-          setSearchParams(
-            (prev) => {
-              if (prev.get("resume") !== resumeSessionId) return prev;
-              const next = new URLSearchParams(prev);
-              next.delete("resume");
-              return next;
-            },
-            { replace: true },
-          );
-          return;
-        }
-        setResumeTarget({
-          error: error instanceof Error ? error.message : String(error),
-          requested: resumeSessionId,
-          sessionId: null,
-        });
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [mockMode, resumeResolutionNonce, resumeSessionId, setSearchParams]);
+          if (requestedSessionId && "resumed" in response) {
+            const canonicalSessionId = response.resumed ?? response.session_key ?? requestedSessionId;
+            if (canonicalSessionId !== requestedSessionId) {
+              trace?.mark("session.canonicalized", "ok");
+              canonicalRouteRef.current = canonicalSessionId;
+              setSearchParams(
+                (prev) => {
+                  if (prev.get("resume") !== requestedSessionId) return prev;
+                  const next = new URLSearchParams(prev);
+                  next.set("resume", canonicalSessionId);
+                  return next;
+                },
+                { replace: true },
+              );
+            }
+          }
+
+          requestAnimationFrame(() => {
+            if (!switchCoordinatorRef.current?.isGenerationCurrent(generation)) return;
+            trace?.mark("transcript.paint", "ok");
+            if (latencyTraceRef.current === trace) latencyTraceRef.current = null;
+          });
+        },
+        onError: (error, requestedSessionId, generation) => {
+          const trace = switchTraceByGenerationRef.current.get(generation);
+          switchTraceByGenerationRef.current.delete(generation);
+          trace?.mark(requestedSessionId ? "session.resume.end" : "session.create.end", "error");
+          if (latencyTraceRef.current === trace) latencyTraceRef.current = null;
+          if (error instanceof JsonRpcGatewayError && error.code === 4007) {
+            startNewGuiChat();
+            setResumeNotice("This session is no longer available. Started a new chat instead.");
+            return;
+          }
+          dispatch({
+            type: "error",
+            message: error instanceof Error ? error.message : String(error),
+          });
+        },
+        onEvent: (event) => dispatchGatewayEvent(event),
+        onEventObserved: (event, generation) => {
+          if (event.type === "gateway.ready") {
+            switchTraceByGenerationRef.current.get(generation)?.mark("gateway.ready");
+          }
+        },
+        onReset: () => {
+          connectionRef.current = null;
+          eventFrameQueue.reset();
+          dispatch({ type: "reset" });
+        },
+        onState: (next) => dispatch({ type: "connection", state: next }),
+      }),
+    [dispatchGatewayEvent, eventFrameQueue, setSearchParams, startNewGuiChat],
+  );
+  switchCoordinatorRef.current = switchCoordinator;
 
   const connect = useCallback(() => {
-    let disposed = false;
-    connectionRef.current?.close();
-    eventFrameQueue.reset();
-    dispatch({ type: "reset" });
+    setResumeNotice(null);
     const trace = latencyTraceRef.current;
     trace?.mark("connection.start");
     const connection = mockMode
@@ -187,7 +168,7 @@ export function GuiChatShell() {
       : connectGuiChat({
           ownerKey,
           profile,
-          resumeSessionId: canonicalResumeSessionId,
+          resumeSessionId,
           timing: trace
             ? {
                 onStage: (stage) => trace.mark(stage),
@@ -195,73 +176,31 @@ export function GuiChatShell() {
               }
             : undefined,
         });
-    connectionRef.current = connection;
-    const offState = connection.client.onState((next) => {
-      dispatch({ type: "connection", state: next });
-    });
-    const offEvents = connection.client.onEvent((event) => {
-      if (event.type === "gateway.ready") trace?.mark("gateway.ready");
-      dispatchGatewayEvent(event);
-    });
-    trace?.mark(canonicalResumeSessionId ? "session.resume.start" : "session.create.start");
-    void connection
-      .createOrResume()
-      .then((response) => {
-        if (disposed) {
-          trace?.mark("session.response_ignored", "cancelled");
-          return;
-        }
-        trace?.mark(canonicalResumeSessionId ? "session.resume.end" : "session.create.end", "ok");
-        dispatch({ type: "session.created", response });
-        requestAnimationFrame(() => {
-          trace?.mark("transcript.paint", "ok");
-          if (latencyTraceRef.current === trace) latencyTraceRef.current = null;
-        });
-      })
-      .catch((error: unknown) => {
-        if (disposed) return;
-        trace?.mark(canonicalResumeSessionId ? "session.resume.end" : "session.create.end", "error");
-        if (latencyTraceRef.current === trace) latencyTraceRef.current = null;
-        if (error instanceof JsonRpcGatewayError && error.code === 4007) {
-          startNewGuiChat();
-          setResumeNotice("This session is no longer available. Started a new chat instead.");
-          return;
-        }
-        dispatch({
-          type: "error",
-          message: error instanceof Error ? error.message : String(error),
-        });
-      });
-    return () => {
-      disposed = true;
-      offState();
-      offEvents();
-      eventFrameQueue.reset();
-      connection.close();
-      if (connectionRef.current === connection) {
-        connectionRef.current = null;
-      }
-    };
-  }, [
-    canonicalResumeSessionId,
-    dispatchGatewayEvent,
-    eventFrameQueue,
-    mockMode,
-    ownerKey,
-    profile,
-    startNewGuiChat,
-  ]);
+    trace?.mark(resumeSessionId ? "session.resume.start" : "session.create.start");
+    const nextGeneration = switchCoordinator.currentGeneration + 1;
+    if (trace) switchTraceByGenerationRef.current.set(nextGeneration, trace);
+    switchCoordinator.start(connection, resumeSessionId);
+  }, [mockMode, ownerKey, profile, resumeSessionId, switchCoordinator]);
 
   useEffect(() => {
-    if (!authIdentityReady || resumeResolutionPending || resumeResolutionError) return;
-    return connect();
-  }, [
-    authIdentityReady,
-    connect,
-    newChatNonce,
-    resumeResolutionError,
-    resumeResolutionPending,
-  ]);
+    if (!authIdentityReady) return;
+    if (canonicalRouteRef.current === resumeSessionId) {
+      canonicalRouteRef.current = null;
+      return;
+    }
+    connect();
+  }, [authIdentityReady, connect, newChatNonce, resumeSessionId]);
+
+  useEffect(
+    () => () => {
+      switchCoordinator.dispose();
+      switchTraceByGenerationRef.current.clear();
+      if (switchCoordinatorRef.current === switchCoordinator) {
+        switchCoordinatorRef.current = null;
+      }
+    },
+    [switchCoordinator],
+  );
 
   useEffect(() => {
     const mql = window.matchMedia("(max-width: 1023px)");
@@ -539,13 +478,7 @@ export function GuiChatShell() {
               ghost
               size="sm"
               className="h-7 px-2 text-xs"
-              onClick={() => {
-                if (resumeSessionId) {
-                  setResumeResolutionNonce((n) => n + 1);
-                  return;
-                }
-                void connect();
-              }}
+              onClick={connect}
             >
               <RefreshCw className="h-3.5 w-3.5" />
               {mockMode ? "Replay" : t.common.retry}
@@ -556,12 +489,6 @@ export function GuiChatShell() {
             <div className="flex shrink-0 items-start gap-2 border-b border-current/20 bg-background-alt px-3 py-2 text-sm text-text-secondary sm:px-5">
               <AlertCircle className="mt-0.5 h-4 w-4" />
               <span className="min-w-0 flex-1 whitespace-pre-wrap">{resumeNotice}</span>
-            </div>
-          ) : null}
-          {resumeResolutionError ? (
-            <div className="flex shrink-0 items-start gap-2 border-b border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive sm:px-5">
-              <AlertCircle className="mt-0.5 h-4 w-4" />
-              <span className="min-w-0 flex-1 whitespace-pre-wrap">{resumeResolutionError}</span>
             </div>
           ) : null}
           {state.error ? (
@@ -598,12 +525,6 @@ export function GuiChatShell() {
       </div>
     </div>
   );
-}
-
-interface ResumeTargetState {
-  error: string | null;
-  requested: string | null;
-  sessionId: string | null;
 }
 
 class AttachmentError extends Error {

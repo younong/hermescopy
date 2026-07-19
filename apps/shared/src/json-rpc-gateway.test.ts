@@ -45,6 +45,43 @@ class FakeWebSocket {
 }
 
 describe("JsonRpcGatewayClient", () => {
+  it("aborts a connection attempt without waiting for the timeout", async () => {
+    const socket = new FakeWebSocket();
+    const controller = new AbortController();
+    const client = new JsonRpcGatewayClient({
+      socketFactory: () => socket as unknown as WebSocketLike,
+    });
+
+    const connecting = client.connect("ws://gateway", controller.signal);
+    controller.abort();
+
+    await expect(connecting).rejects.toMatchObject({ name: "AbortError" });
+    expect(socket.readyState).toBe(FakeWebSocket.CLOSED);
+    expect(client.connectionState).toBe("closed");
+
+    socket.open();
+    expect(client.connectionState).toBe("closed");
+  });
+
+  it("rejects when the socket closes while connecting and can reconnect", async () => {
+    const closedSocket = new FakeWebSocket();
+    const retrySocket = new FakeWebSocket();
+    const sockets = [closedSocket, retrySocket];
+    const client = new JsonRpcGatewayClient({
+      socketFactory: () => sockets.shift() as unknown as WebSocketLike,
+    });
+
+    const closing = client.connect("ws://gateway");
+    closedSocket.close();
+    await expect(closing).rejects.toThrow("WebSocket closed");
+    expect(client.connectionState).toBe("closed");
+
+    const reconnecting = client.connect("ws://gateway");
+    retrySocket.open();
+    await expect(reconnecting).resolves.toBeUndefined();
+    expect(client.connectionState).toBe("open");
+  });
+
   it("preserves JSON-RPC error codes for callers", async () => {
     const socket = new FakeWebSocket();
     const client = new JsonRpcGatewayClient({
