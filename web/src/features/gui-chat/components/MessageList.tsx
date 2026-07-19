@@ -2,8 +2,8 @@ import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import type { UIEvent } from "react";
 import type { GuiChatState } from "../types";
 import { ApprovalCard } from "./ApprovalCard";
+import { ArtifactCard } from "./ArtifactCard";
 import { MessageBubble } from "./MessageBubble";
-import { ToolCallCard } from "./ToolCallCard";
 
 const BOTTOM_THRESHOLD_PX = 64;
 
@@ -137,21 +137,15 @@ export function MessageList({
           />
         ))}
 
-        {state.toolOrder.length > 0 ? (
-          <div className="space-y-3">
-            {state.toolOrder.map((id) => {
-              const tool = state.toolCalls[id];
-              if (!tool) return null;
-              return (
-                <ToolCallCard
-                  artifacts={tool.artifactIds.map((artifactId) => state.artifacts[artifactId]).filter(Boolean)}
-                  key={id}
-                  tool={tool}
-                />
-              );
-            })}
-          </div>
-        ) : null}
+        {state.toolOrder
+          .flatMap((id) => {
+            const tool = state.toolCalls[id];
+            return tool?.artifactIds.map((artifactId) => state.artifacts[artifactId]) ?? [];
+          })
+          .filter(Boolean)
+          .map((artifact) => (
+            <ArtifactCard artifact={artifact} key={artifact.id} />
+          ))}
 
         {state.approvalOrder.map((id) => {
           const approval = state.approvals[id];
