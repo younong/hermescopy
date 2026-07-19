@@ -326,6 +326,7 @@ _LONG_HANDLERS = frozenset(
         "session.branch",
         "session.compress",
         "session.list",
+        "session.attach",
         "session.resume",
         "shell.exec",
         "skills.manage",
@@ -5345,7 +5346,26 @@ def _inflight_snapshot(session: dict) -> dict | None:
 
 
 @method("session.create")
-def _(rid, params: dict) -> dict:
+def _session_create(rid, params: dict) -> dict:
+    dashboard_transport = None
+    dashboard_generation = None
+    if "switch_generation" in params:
+        dashboard_transport = _dashboard_attach_transport()
+        if dashboard_transport is None:
+            return _err(rid, 4002, "dashboard session.create requires a dashboard WebSocket")
+        dashboard_generation, error = _session_attach_generation(rid, params)
+        if error is not None:
+            return error
+        assert dashboard_generation is not None
+        begin_error = dashboard_transport.begin_dashboard_attach(
+            dashboard_generation,
+            browser_id=str(params.get("browser_id") or "").strip(),
+            profile=str(params.get("profile") or "").strip(),
+        )
+        if begin_error is not None:
+            code = 4091 if begin_error == "session attach superseded" else 4002
+            return _err(rid, code, begin_error)
+
     sid = uuid.uuid4().hex[:8]
     key = _new_session_key()
     cols = int(params.get("cols", 80))
@@ -5439,7 +5459,11 @@ def _(rid, params: dict) -> dict:
             "slash_worker": None,
             "tool_progress_mode": _load_tool_progress_mode(),
             "tool_started_at": {},
-            "transport": current_transport() or _stdio_transport,
+            "transport": (
+                _detached_ws_transport
+                if dashboard_transport is not None
+                else current_transport() or _stdio_transport
+            ),
         }
         _register_session_cwd(_sessions[sid])
 
@@ -5454,10 +5478,7 @@ def _(rid, params: dict) -> dict:
     # + skeleton panel, then build the real AIAgent just after this response is
     # flushed.  This keeps startup responsive while still hydrating tools/skills
     # without requiring the user to submit a first prompt.
-    _schedule_agent_build(sid)
-    _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
-
-    return _ok(
+    response = _ok(
         rid,
         {
             "session_id": sid,
@@ -5489,6 +5510,37 @@ def _(rid, params: dict) -> dict:
             },
         },
     )
+    if dashboard_transport is not None:
+        assert dashboard_generation is not None
+
+        def _bind_created_transport() -> bool:
+            with _sessions_lock:
+                current = _sessions.get(sid)
+                if current is None or current.get("_finalized"):
+                    return False
+                current["transport"] = dashboard_transport
+                current["last_active"] = time.time()
+                return True
+
+        if not dashboard_transport.commit_dashboard_attach(
+            dashboard_generation,
+            sid,
+            on_commit=_bind_created_transport,
+        ):
+            with _sessions_lock:
+                current = _sessions.get(sid)
+                if current is not None and current.get("transport") is _detached_ws_transport:
+                    _sessions.pop(sid, None)
+                    lease = current.get("active_session_lease")
+                    if lease is not None:
+                        lease.release()
+                        current["active_session_lease"] = None
+            return _err(rid, 4091, "session attach superseded")
+        response["result"]["switch_generation"] = dashboard_generation
+
+    _schedule_agent_build(sid)
+    _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
+    return response
 
 
 @method("session.list")
@@ -5733,8 +5785,120 @@ def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
     timer.start()
 
 
-@method("session.resume")
+def _dashboard_attach_transport():
+    transport = current_transport()
+    if not callable(getattr(transport, "begin_dashboard_attach", None)):
+        return None
+    if not callable(getattr(transport, "commit_dashboard_attach", None)):
+        return None
+    if not callable(getattr(transport, "dashboard_attach_is_current", None)):
+        return None
+    return transport
+
+
+def _session_attach_generation(rid, params: dict) -> tuple[int | None, dict | None]:
+    try:
+        generation = int(params.get("switch_generation"))
+    except (TypeError, ValueError):
+        return None, _err(rid, 4002, "switch_generation must be an integer")
+    if generation < 0:
+        return None, _err(rid, 4002, "switch_generation must be non-negative")
+    return generation, None
+
+
+def _commit_session_attach(
+    rid,
+    *,
+    transport,
+    generation: int,
+    response: dict,
+) -> dict:
+    if "error" in response:
+        return response
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return _err(rid, 5000, "invalid session attach response")
+    sid = str(result.get("session_id") or "")
+    session = _sessions.get(sid)
+    if not sid or session is None:
+        return _err(rid, 4007, "session not found")
+
+    def _bind_transport() -> bool:
+        with _session_resume_lock:
+            current = _sessions.get(sid)
+            if current is not session or current.get("_finalized"):
+                return False
+            current["transport"] = transport
+            current["last_active"] = time.time()
+            return True
+
+    attach_live = bool(result.pop("_attach_live", False))
+    attach_candidate = bool(result.pop("_attach_candidate", False))
+    if not transport.commit_dashboard_attach(
+        generation,
+        sid,
+        on_commit=_bind_transport,
+    ):
+        # A superseded cold attach may have allocated a deferred runtime. Reap
+        # only the candidate that is still detached; never close a live runtime
+        # another caller has already rebound or reused.
+        if attach_candidate and session.get("transport") is _detached_ws_transport:
+            with _sessions_lock:
+                if _sessions.get(sid) is session:
+                    _sessions.pop(sid, None)
+                    lease = session.get("active_session_lease")
+                    if lease is not None:
+                        lease.release()
+                        session["active_session_lease"] = None
+        return _err(rid, 4091, "session attach superseded")
+    if attach_candidate:
+        _schedule_agent_build(sid)
+        _schedule_session_cap_enforcement()
+    result["resume_kind"] = "live" if attach_live else "cold"
+    result["switch_generation"] = generation
+    return response
+
+
+@method("session.attach")
 def _(rid, params: dict) -> dict:
+    """Attach a dashboard socket to a persistent session id.
+
+    Unlike ``session.activate`` this resolves durable IDs (including compression
+    descendants) through the same owner/profile/recovery fences as
+    ``session.resume``. Generations make overlapping cold attaches safe: only the
+    newest request on a socket may rebind a runtime and become its subscription.
+    """
+    transport = _dashboard_attach_transport()
+    if transport is None:
+        return _err(rid, 4002, "session.attach requires a dashboard WebSocket")
+    generation, error = _session_attach_generation(rid, params)
+    if error is not None:
+        return error
+    assert generation is not None
+    browser_id = str(params.get("browser_id") or "").strip()
+    profile = str(params.get("profile") or "").strip()
+    begin_error = transport.begin_dashboard_attach(
+        generation,
+        browser_id=browser_id,
+        profile=profile,
+    )
+    if begin_error is not None:
+        code = 4091 if begin_error == "session attach superseded" else 4002
+        return _err(rid, code, begin_error)
+
+    resume_params = dict(params)
+    resume_params["_dashboard_attach"] = True
+    response = _session_resume(rid, resume_params)
+    return _commit_session_attach(
+        rid,
+        transport=transport,
+        generation=generation,
+        response=response,
+    )
+
+
+@method("session.resume")
+def _session_resume(rid, params: dict) -> dict:
     latency_started_at = time.monotonic()
     latency_trace_id = clean_latency_trace_id(params.get("latency_trace_id", ""))
     log_latency_stage(
@@ -5856,6 +6020,8 @@ def _(rid, params: dict) -> dict:
             return _owner_default_cwd()
         return os.getenv("TERMINAL_CWD", os.getcwd())
 
+    dashboard_attach = is_truthy_value(params.get("_dashboard_attach", False))
+
     def _reuse_live_payload(sid: str, session: dict) -> dict:
         source = str(params.get("source") or "").strip()
         if source:
@@ -5863,11 +6029,13 @@ def _(rid, params: dict) -> dict:
         payload = _live_session_payload(
             sid,
             session,
-            cols=cols,
-            touch=True,
-            transport=current_transport() or _stdio_transport,
+            cols=None if dashboard_attach else cols,
+            touch=not dashboard_attach,
+            transport=None if dashboard_attach else current_transport() or _stdio_transport,
         )
         payload["resumed"] = target
+        if dashboard_attach:
+            payload["_attach_live"] = True
         # A lazy watch session never owns a run loop, so its payload's running
         # flag is always False — overlay the child-run registry so a reconnecting
         # watch window keeps its busy indicator while the child is still mid-run.
@@ -6028,11 +6196,18 @@ def _(rid, params: dict) -> dict:
             model_override=overrides.get("model_override"),
             resume_runtime_overrides=overrides or None,
         )
+        if dashboard_attach:
+            # Register the candidate as detached from the outset. Setting this
+            # after registration leaves a race where a newer attach can commit
+            # the same runtime, only for the older worker to overwrite it back to
+            # detached.
+            record["transport"] = _detached_ws_transport
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
             return _ok(rid, _reuse_live_payload(*live))
 
-        _schedule_agent_build(sid)
-        _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
+        if not dashboard_attach:
+            _schedule_agent_build(sid)
+            _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
 
         messages = _history_to_messages(display_history)
         response = _ok(
@@ -6040,6 +6215,7 @@ def _(rid, params: dict) -> dict:
             {
                 "session_id": sid,
                 "resumed": target,
+                **({"_attach_candidate": True} if dashboard_attach else {}),
                 "message_count": len(messages),
                 "messages": messages,
                 "info": _lazy_resume_info(

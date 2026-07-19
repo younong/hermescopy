@@ -7,7 +7,10 @@ import { GuiChatSessionSwitchCoordinator } from "./sessionSwitch";
 
 class FakeConnection implements GuiChatConnection {
   readonly close = vi.fn();
-  readonly createOrResume = vi.fn((_signal?: AbortSignal) => this.result.promise);
+  readonly createOrAttach = vi.fn(
+    (_target: string | null, _generation: number, _signal?: AbortSignal) =>
+      this.results.shift()?.promise ?? Promise.reject(new Error("missing result")),
+  );
   readonly attachImage = vi.fn();
   readonly attachPdf = vi.fn();
   readonly attachFile = vi.fn();
@@ -16,7 +19,7 @@ class FakeConnection implements GuiChatConnection {
   readonly respondToApproval = vi.fn();
   private readonly eventHandlers = new Set<(event: GatewayEvent) => void>();
   private readonly stateHandlers = new Set<(state: ConnectionState) => void>();
-  readonly result = deferred<SessionResumeResponse>();
+  readonly results: Array<ReturnType<typeof deferred<SessionResumeResponse>>> = [];
 
   readonly client = {
     onEvent: (handler: (event: GatewayEvent) => void) => {
@@ -30,25 +33,36 @@ class FakeConnection implements GuiChatConnection {
     },
   };
 
+  nextResult(): ReturnType<typeof deferred<SessionResumeResponse>> {
+    const result = deferred<SessionResumeResponse>();
+    this.results.push(result);
+    return result;
+  }
+
   emitEvent(event: GatewayEvent): void {
     for (const handler of this.eventHandlers) handler(event);
   }
 }
 
 function createHarness() {
+  const connection = new FakeConnection();
   const commits: Array<{ connection: GuiChatConnection; generation: number; target: string | null }> = [];
-  const errors: unknown[] = [];
+  const errors: Array<{
+    committedTarget: string | null;
+    error: unknown;
+    target: string | null;
+  }> = [];
   const events: GatewayEvent[] = [];
-  const coordinator = new GuiChatSessionSwitchCoordinator({
-    onCommit: (connection, _response, target, generation) => {
-      commits.push({ connection, generation, target });
+  const coordinator = new GuiChatSessionSwitchCoordinator(connection, {
+    onCommit: (committedConnection, _response, target, generation) => {
+      commits.push({ connection: committedConnection, generation, target });
     },
-    onError: (error) => errors.push(error),
+    onError: (error, target, _generation, committedTarget) =>
+      errors.push({ committedTarget, error, target }),
     onEvent: (event) => events.push(event),
-    onReset: vi.fn(),
     onState: vi.fn(),
   });
-  return { commits, coordinator, errors, events };
+  return { commits, connection, coordinator, errors, events };
 }
 
 function resumeResponse(sessionId: string, persistedId = sessionId): SessionResumeResponse {
@@ -65,78 +79,88 @@ async function flushPromises(): Promise<void> {
 }
 
 describe("GuiChatSessionSwitchCoordinator", () => {
-  it("starts resume immediately and commits matching buffered events", async () => {
-    const connection = new FakeConnection();
-    const { commits, coordinator, events } = createHarness();
+  it("starts attach immediately and commits matching buffered events", async () => {
+    const { commits, connection, coordinator, events } = createHarness();
+    const result = connection.nextResult();
 
-    const generation = coordinator.start(connection, "parent-session");
-    expect(connection.createOrResume).toHaveBeenCalledOnce();
-    expect(connection.createOrResume.mock.calls[0]?.[0]).toBeInstanceOf(AbortSignal);
+    const generation = coordinator.start("parent-session");
+    expect(connection.createOrAttach).toHaveBeenCalledWith(
+      "parent-session",
+      generation,
+      expect.any(AbortSignal),
+      undefined,
+    );
 
     connection.emitEvent({ type: "message.start", session_id: "runtime-a" });
     connection.emitEvent({ type: "message.start", session_id: "runtime-other" });
-    connection.result.resolve(resumeResponse("runtime-a", "canonical-session"));
+    result.resolve(resumeResponse("runtime-a", "canonical-session"));
     await flushPromises();
 
     expect(commits).toEqual([{ connection, generation, target: "parent-session" }]);
+    expect(coordinator.committedSessionId).toBe("canonical-session");
     expect(events).toEqual([{ type: "message.start", session_id: "runtime-a" }]);
   });
 
-  it("keeps the committed connection open until its replacement succeeds", async () => {
-    const first = new FakeConnection();
-    const second = new FakeConnection();
-    const { coordinator } = createHarness();
-
-    coordinator.start(first, "session-a");
-    first.result.resolve(resumeResponse("runtime-a"));
+  it("keeps one socket while replacement is pending and after commit", async () => {
+    const { connection, coordinator } = createHarness();
+    const first = connection.nextResult();
+    coordinator.start("session-a");
+    first.resolve(resumeResponse("runtime-a", "session-a"));
     await flushPromises();
 
-    coordinator.start(second, "session-b");
-    expect(first.close).not.toHaveBeenCalled();
+    const second = connection.nextResult();
+    coordinator.start("session-b");
+    expect(connection.close).not.toHaveBeenCalled();
 
-    second.result.resolve(resumeResponse("runtime-b"));
+    second.resolve(resumeResponse("runtime-b"));
     await flushPromises();
-    expect(first.close).toHaveBeenCalledOnce();
+    expect(connection.close).not.toHaveBeenCalled();
   });
 
-  it("closes the detached committed connection when its replacement fails", async () => {
-    const first = new FakeConnection();
-    const second = new FakeConnection();
-    const { coordinator, errors } = createHarness();
-
-    coordinator.start(first, "session-a");
-    first.result.resolve(resumeResponse("runtime-a"));
+  it("keeps committed connection and transcript events when replacement fails", async () => {
+    const { connection, coordinator, errors, events } = createHarness();
+    const first = connection.nextResult();
+    coordinator.start("session-a");
+    first.resolve(resumeResponse("runtime-a", "session-a"));
     await flushPromises();
 
-    coordinator.start(second, "session-b");
-    second.result.reject(new Error("replacement failed"));
+    const second = connection.nextResult();
+    coordinator.start("session-b");
+    second.reject(new Error("replacement failed"));
     await flushPromises();
 
-    expect(first.close).toHaveBeenCalledOnce();
-    expect(second.close).toHaveBeenCalledOnce();
-    expect(errors).toHaveLength(1);
+    connection.emitEvent({ type: "message.delta", session_id: "runtime-a" });
+    expect(connection.close).not.toHaveBeenCalled();
+    expect(errors).toEqual([
+      {
+        committedTarget: "session-a",
+        error: expect.objectContaining({ message: "replacement failed" }),
+        target: "session-b",
+      },
+    ]);
+    expect(events).toEqual([{ type: "message.delta", session_id: "runtime-a" }]);
   });
 
-  it("aborts superseded switches and only commits the latest response", async () => {
-    const a = new FakeConnection();
-    const b = new FakeConnection();
-    const c = new FakeConnection();
-    const { commits, coordinator, errors } = createHarness();
+  it("aborts superseded switches without closing the reusable socket", async () => {
+    const { commits, connection, coordinator, errors } = createHarness();
+    const a = connection.nextResult();
+    coordinator.start("a");
+    const aSignal = connection.createOrAttach.mock.calls[0]?.[2];
 
-    coordinator.start(a, "a");
-    const aSignal = a.createOrResume.mock.calls[0]?.[0];
-    coordinator.start(b, "b");
-    const bSignal = b.createOrResume.mock.calls[0]?.[0];
-    coordinator.start(c, "c");
+    const b = connection.nextResult();
+    coordinator.start("b");
+    const bSignal = connection.createOrAttach.mock.calls[1]?.[2];
+
+    const c = connection.nextResult();
+    coordinator.start("c");
 
     expect(aSignal?.aborted).toBe(true);
     expect(bSignal?.aborted).toBe(true);
-    expect(a.close).toHaveBeenCalledOnce();
-    expect(b.close).toHaveBeenCalledOnce();
+    expect(connection.close).not.toHaveBeenCalled();
 
-    a.result.resolve(resumeResponse("runtime-a"));
-    b.result.reject(new Error("stale failure"));
-    c.result.resolve(resumeResponse("runtime-c"));
+    a.resolve(resumeResponse("runtime-a"));
+    b.reject(new Error("stale failure"));
+    c.resolve(resumeResponse("runtime-c"));
     await flushPromises();
 
     expect(commits).toHaveLength(1);
@@ -144,44 +168,40 @@ describe("GuiChatSessionSwitchCoordinator", () => {
     expect(errors).toEqual([]);
   });
 
-  it("drops events from stale and non-matching runtime sessions", async () => {
-    const first = new FakeConnection();
-    const second = new FakeConnection();
-    const { coordinator, events } = createHarness();
-
-    coordinator.start(first, "a");
-    first.result.resolve(resumeResponse("runtime-a"));
+  it("drops gateway-scoped, stale, and non-matching runtime events", async () => {
+    const { connection, coordinator, events } = createHarness();
+    const first = connection.nextResult();
+    coordinator.start("a");
+    connection.emitEvent({ type: "gateway.ready" });
+    first.resolve(resumeResponse("runtime-a"));
     await flushPromises();
-    first.emitEvent({ type: "message.start", session_id: "runtime-a" });
+    connection.emitEvent({ type: "message.start", session_id: "runtime-a" });
 
-    coordinator.start(second, "b");
-    first.emitEvent({ type: "message.delta", session_id: "runtime-a" });
-    second.result.resolve(resumeResponse("runtime-b"));
+    const second = connection.nextResult();
+    coordinator.start("b");
+    connection.emitEvent({ type: "message.delta", session_id: "runtime-a" });
+    second.resolve(resumeResponse("runtime-b"));
     await flushPromises();
-    second.emitEvent({ type: "message.start", session_id: "runtime-other" });
-    second.emitEvent({ type: "message.start", session_id: "runtime-b" });
+    connection.emitEvent({ type: "message.start", session_id: "runtime-other" });
+    connection.emitEvent({ type: "message.start", session_id: "runtime-b" });
 
     expect(events).toEqual([
       { type: "message.start", session_id: "runtime-a" },
+      { type: "message.delta", session_id: "runtime-a" },
       { type: "message.start", session_id: "runtime-b" },
     ]);
   });
 
-  it("closes candidate and committed connections on dispose", async () => {
-    const committed = new FakeConnection();
-    const candidate = new FakeConnection();
-    const { coordinator } = createHarness();
-
-    coordinator.start(committed, "a");
-    committed.result.resolve(resumeResponse("runtime-a"));
-    await flushPromises();
-    coordinator.start(candidate, "b");
+  it("closes the reusable connection only on dispose", async () => {
+    const { connection, coordinator } = createHarness();
+    connection.nextResult();
+    coordinator.start("a");
+    const signal = connection.createOrAttach.mock.calls[0]?.[2];
 
     coordinator.dispose();
 
-    expect(committed.close).toHaveBeenCalledOnce();
-    expect(candidate.close).toHaveBeenCalledOnce();
-    expect(candidate.createOrResume.mock.calls[0]?.[0]?.aborted).toBe(true);
+    expect(connection.close).toHaveBeenCalledOnce();
+    expect(signal?.aborted).toBe(true);
   });
 });
 

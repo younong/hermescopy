@@ -1,5 +1,5 @@
 import type { ConnectionState, GatewayEvent } from "@/lib/gatewayClient";
-import type { GuiChatConnection } from "./api";
+import type { GuiChatConnection, GuiChatSwitchTiming } from "./api";
 import type { SessionCreateResponse, SessionResumeResponse } from "./protocol";
 
 export type GuiChatSessionResponse = SessionCreateResponse | SessionResumeResponse;
@@ -11,184 +11,163 @@ export interface SessionSwitchCallbacks {
     targetSessionId: string | null,
     generation: number,
   ): void;
-  onError(error: unknown, targetSessionId: string | null, generation: number): void;
+  onError(
+    error: unknown,
+    targetSessionId: string | null,
+    generation: number,
+    committedTargetSessionId: string | null,
+  ): void;
   onEvent(event: GatewayEvent, generation: number): void;
   onEventObserved?(event: GatewayEvent, generation: number): void;
-  onReset(): void;
   onState(state: ConnectionState): void;
 }
 
-interface SessionSwitchCandidate {
+interface PendingSwitch {
   abortController: AbortController;
-  connection: GuiChatConnection;
   generation: number;
-  offEvents: () => void;
-  offState: () => void;
   pendingEvents: GatewayEvent[];
   runtimeSessionId: string | null;
-}
-
-interface CommittedConnection {
-  connection: GuiChatConnection;
-  offEvents: () => void;
-  offState: () => void;
+  targetSessionId: string | null;
 }
 
 export class GuiChatSessionSwitchCoordinator {
-  private candidate: SessionSwitchCandidate | null = null;
-  private committed: CommittedConnection | null = null;
-  private generation = 0;
+  private readonly connection: GuiChatConnection;
   private readonly callbacks: SessionSwitchCallbacks;
+  private readonly offEvents: () => void;
+  private readonly offState: () => void;
+  private pending: PendingSwitch | null = null;
+  private generation = 0;
+  private committedRuntimeSessionId: string | null = null;
+  private committedTargetSessionId: string | null = null;
+  private disposed = false;
 
-  constructor(callbacks: SessionSwitchCallbacks) {
+  constructor(connection: GuiChatConnection, callbacks: SessionSwitchCallbacks) {
+    this.connection = connection;
     this.callbacks = callbacks;
+    this.offState = connection.client.onState((state) => this.callbacks.onState(state));
+    this.offEvents = connection.client.onEvent((event) => this.observeEvent(event));
   }
 
   get currentGeneration(): number {
     return this.generation;
   }
 
-  start(connection: GuiChatConnection, targetSessionId: string | null): number {
-    const generation = ++this.generation;
-    this.cancelCandidate();
-    this.detachCommittedListeners();
-    this.callbacks.onReset();
+  get committedSessionId(): string | null {
+    return this.committedTargetSessionId;
+  }
 
-    const candidate: SessionSwitchCandidate = {
+  start(targetSessionId: string | null, timing?: GuiChatSwitchTiming): number {
+    const generation = ++this.generation;
+    this.cancelPending();
+
+    const pending: PendingSwitch = {
       abortController: new AbortController(),
-      connection,
       generation,
-      offEvents: () => undefined,
-      offState: () => undefined,
       pendingEvents: [],
       runtimeSessionId: null,
+      targetSessionId,
     };
-    candidate.offState = connection.client.onState((state) => {
-      if (this.isActive(candidate)) this.callbacks.onState(state);
-    });
-    candidate.offEvents = connection.client.onEvent((event) => {
-      if (!this.isActive(candidate)) return;
-      this.callbacks.onEventObserved?.(event, candidate.generation);
-      if (candidate.runtimeSessionId === null) {
-        candidate.pendingEvents.push(event);
-        return;
-      }
-      if (eventMatchesSession(event, candidate.runtimeSessionId)) {
-        this.callbacks.onEvent(event, candidate.generation);
-      }
-    });
-    this.candidate = candidate;
+    this.pending = pending;
 
-    void connection
-      .createOrResume(candidate.abortController.signal)
-      .then((response) => this.commit(candidate, response, targetSessionId))
-      .catch((error: unknown) => this.fail(candidate, error, targetSessionId));
+    void this.connection
+      .createOrAttach(targetSessionId, generation, pending.abortController.signal, timing)
+      .then((response) => this.commit(pending, response))
+      .catch((error: unknown) => this.fail(pending, error));
     return generation;
   }
 
   cancel(): void {
     this.generation += 1;
-    this.cancelCandidate();
+    this.cancelPending();
   }
 
   dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
     this.cancel();
-    this.closeCommitted();
+    this.offState();
+    this.offEvents();
+    this.connection.close();
   }
 
   isGenerationCurrent(generation: number): boolean {
     return generation === this.generation;
   }
 
-  private commit(
-    candidate: SessionSwitchCandidate,
-    response: GuiChatSessionResponse,
-    targetSessionId: string | null,
-  ): void {
-    if (!this.isCurrent(candidate)) {
-      this.closeCandidate(candidate);
+  private observeEvent(event: GatewayEvent): void {
+    if (this.disposed) return;
+    if (event.type === "gateway.ready" || event.type === "skin.changed") {
+      if (this.pending) {
+        this.callbacks.onEventObserved?.(event, this.pending.generation);
+      }
       return;
     }
 
-    candidate.runtimeSessionId = response.session_id;
+    const pending = this.pending;
+    if (pending) {
+      this.callbacks.onEventObserved?.(event, pending.generation);
+      if (event.session_id === this.committedRuntimeSessionId) {
+        this.callbacks.onEvent(event, pending.generation);
+        return;
+      }
+      if (event.session_id) pending.pendingEvents.push(event);
+      return;
+    }
+
+    if (event.session_id && event.session_id === this.committedRuntimeSessionId) {
+      this.callbacks.onEvent(event, this.generation);
+    }
+  }
+
+  private commit(pending: PendingSwitch, response: GuiChatSessionResponse): void {
+    if (!this.isCurrent(pending)) return;
+
+    pending.runtimeSessionId = response.session_id;
+    this.committedRuntimeSessionId = response.session_id;
+    this.committedTargetSessionId =
+      ("resumed" in response ? response.resumed ?? response.session_key : null) ??
+      response.stored_session_id ??
+      pending.targetSessionId;
+    this.pending = null;
     this.callbacks.onCommit(
-      candidate.connection,
+      this.connection,
       response,
-      targetSessionId,
-      candidate.generation,
+      pending.targetSessionId,
+      pending.generation,
     );
-    for (const event of candidate.pendingEvents) {
-      if (eventMatchesSession(event, candidate.runtimeSessionId)) {
-        this.callbacks.onEvent(event, candidate.generation);
+    for (const event of pending.pendingEvents) {
+      if (event.session_id === response.session_id) {
+        this.callbacks.onEvent(event, pending.generation);
       }
     }
-    candidate.pendingEvents = [];
-
-    this.closeCommitted();
-    this.committed = {
-      connection: candidate.connection,
-      offEvents: candidate.offEvents,
-      offState: candidate.offState,
-    };
-    this.candidate = null;
+    pending.pendingEvents = [];
   }
 
-  private fail(
-    candidate: SessionSwitchCandidate,
-    error: unknown,
-    targetSessionId: string | null,
-  ): void {
-    if (!this.isCurrent(candidate)) return;
-    this.closeCandidate(candidate);
-    this.candidate = null;
-    this.closeCommitted();
+  private fail(pending: PendingSwitch, error: unknown): void {
+    if (!this.isCurrent(pending)) return;
+    this.pending = null;
+    pending.pendingEvents = [];
     if (!isAbortError(error)) {
-      this.callbacks.onError(error, targetSessionId, candidate.generation);
+      this.callbacks.onError(
+        error,
+        pending.targetSessionId,
+        pending.generation,
+        this.committedTargetSessionId,
+      );
     }
   }
 
-  private isCurrent(candidate: SessionSwitchCandidate): boolean {
-    return this.candidate === candidate && candidate.generation === this.generation;
+  private isCurrent(pending: PendingSwitch): boolean {
+    return this.pending === pending && pending.generation === this.generation;
   }
 
-  private isActive(candidate: SessionSwitchCandidate): boolean {
-    return candidate.generation === this.generation && (
-      this.candidate === candidate || this.committed?.connection === candidate.connection
-    );
+  private cancelPending(): void {
+    const pending = this.pending;
+    if (!pending) return;
+    this.pending = null;
+    pending.abortController.abort();
+    pending.pendingEvents = [];
   }
-
-  private cancelCandidate(): void {
-    const candidate = this.candidate;
-    if (!candidate) return;
-    this.candidate = null;
-    candidate.abortController.abort();
-    this.closeCandidate(candidate);
-  }
-
-  private closeCandidate(candidate: SessionSwitchCandidate): void {
-    candidate.offState();
-    candidate.offEvents();
-    candidate.pendingEvents = [];
-    candidate.connection.close();
-  }
-
-  private detachCommittedListeners(): void {
-    this.committed?.offState();
-    this.committed?.offEvents();
-  }
-
-  private closeCommitted(): void {
-    const committed = this.committed;
-    if (!committed) return;
-    this.committed = null;
-    committed.offState();
-    committed.offEvents();
-    committed.connection.close();
-  }
-}
-
-function eventMatchesSession(event: GatewayEvent, runtimeSessionId: string): boolean {
-  return !event.session_id || event.session_id === runtimeSessionId;
 }
 
 function isAbortError(error: unknown): boolean {
