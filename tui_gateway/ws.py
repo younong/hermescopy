@@ -30,7 +30,7 @@ import logging
 import socket
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 from hermes_cli.latency_trace import clean_latency_trace_id, log_latency_stage
 from tui_gateway import server
@@ -60,6 +60,13 @@ _STREAMING_EVENT_TYPES = frozenset({
 # Max time a streamed token waits in the buffer before flush (~30 fps). This
 # keeps GUI replies visually fluid while still coalescing per-token loop wakeups.
 _TOKEN_COALESCE_S = 0.033
+
+# Once a dashboard connection starts using ``session.attach``, session events are
+# a subscription rather than a broadcast: only the committed runtime may reach
+# that socket. These two events are genuinely connection-scoped and remain
+# useful without a session id. Unknown sessionless events are fail-closed so a
+# newly added transcript event cannot accidentally bleed across a switch.
+_DASHBOARD_CONNECTION_EVENT_TYPES = frozenset({"gateway.ready", "skin.changed"})
 
 
 def _merge_streaming_lines(lines: list[str]) -> list[str]:
@@ -161,6 +168,14 @@ class WSTransport:
         self._loop = loop
         self._peer = peer
         self._closed = False
+        # ``session.attach`` state. The scope is immutable for this authenticated
+        # socket, while generation/active runtime advance atomically under the
+        # lock. A transport that never calls begin_dashboard_attach keeps the
+        # legacy unfiltered WS behavior used by desktop/TUI clients.
+        self._dashboard_lock = threading.Lock()
+        self._dashboard_scope: tuple[str, str] | None = None
+        self._dashboard_generation = -1
+        self._dashboard_active_session_id: str | None = None
         # Token-coalescing buffer (CF-2). Streamed token frames land here and a
         # short timer flushes the batch. The lock guards the buffer + the
         # "armed" flag against the worker threads that call write(); the timer
@@ -177,6 +192,87 @@ class WSTransport:
         if not isinstance(params, dict):
             return False
         return params.get("type") in _STREAMING_EVENT_TYPES
+
+    def begin_dashboard_attach(
+        self,
+        generation: int,
+        *,
+        browser_id: str,
+        profile: str = "",
+    ) -> str | None:
+        """Register a dashboard switch and return an error message on rejection.
+
+        Merely beginning a newer switch does not change the active subscription;
+        the old session remains visible until the winning attach commits.
+        """
+        scope = (browser_id.strip(), profile.strip())
+        if not scope[0]:
+            return "browser_id required"
+        with self._dashboard_lock:
+            if self._closed:
+                return "transport closed"
+            if self._dashboard_scope is not None and self._dashboard_scope != scope:
+                return "dashboard attach scope mismatch"
+            if generation <= self._dashboard_generation:
+                return "session attach superseded"
+            self._dashboard_scope = scope
+            self._dashboard_generation = generation
+        return None
+
+    def commit_dashboard_attach(
+        self,
+        generation: int,
+        session_id: str,
+        *,
+        on_commit: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Atomically activate ``session_id`` iff ``generation`` is still latest.
+
+        ``on_commit`` runs while the generation lock is held so the session's
+        transport rebind and the subscription flip cannot be interleaved by a
+        newer attach. It must be quick and return whether the rebind succeeded.
+        """
+        with self._dashboard_lock:
+            if (
+                self._closed
+                or self._dashboard_scope is None
+                or generation != self._dashboard_generation
+            ):
+                return False
+            if on_commit is not None and not on_commit():
+                return False
+            self._dashboard_active_session_id = session_id
+            return True
+
+    def dashboard_attach_is_current(self, generation: int) -> bool:
+        with self._dashboard_lock:
+            return (
+                not self._closed
+                and self._dashboard_scope is not None
+                and generation == self._dashboard_generation
+            )
+
+    def _dashboard_frame_allowed(self, obj: dict) -> bool:
+        with self._dashboard_lock:
+            if self._dashboard_scope is None:
+                return True
+            active_session_id = self._dashboard_active_session_id
+        if obj.get("method") != "event":
+            return True
+        params = obj.get("params")
+        if not isinstance(params, dict):
+            return False
+        session_id = str(params.get("session_id") or "")
+        if session_id:
+            return bool(active_session_id) and session_id == active_session_id
+        return params.get("type") in _DASHBOARD_CONNECTION_EVENT_TYPES
+
+    def _dashboard_line_allowed(self, line: str) -> bool:
+        try:
+            obj = json.loads(line)
+        except Exception:
+            return False
+        return isinstance(obj, dict) and self._dashboard_frame_allowed(obj)
 
     def write(self, obj: dict) -> bool:
         if self._closed:
@@ -288,6 +384,8 @@ class WSTransport:
         return not self._closed
 
     async def _safe_send(self, line: str) -> None:
+        if not self._dashboard_line_allowed(line):
+            return
         try:
             await self._ws.send_text(line)
         except Exception as exc:
@@ -301,6 +399,11 @@ class WSTransport:
         """Send a batch of pre-serialized frames in order on the loop thread."""
         try:
             for line in _merge_streaming_lines(lines):
+                # Check at the final wire boundary, not when write() enqueues the
+                # frame. A switch may commit while token deltas are waiting in the
+                # coalescing buffer; those stale deltas must then be dropped.
+                if not self._dashboard_line_allowed(line):
+                    continue
                 await self._ws.send_text(line)
         except Exception as exc:
             self._closed = True
@@ -310,7 +413,8 @@ class WSTransport:
             )
 
     def close(self) -> None:
-        self._closed = True
+        with self._dashboard_lock:
+            self._closed = True
         # Cancel any pending coalesce flush. close() runs on the loop thread
         # (the handle_ws finally), so touching the TimerHandle here is safe.
         handle = self._token_flush_handle

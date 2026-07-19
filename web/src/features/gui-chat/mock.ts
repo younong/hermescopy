@@ -56,7 +56,7 @@ export function connectMockGuiChat(): GuiChatConnection {
       emitState("closed");
       stateHandlers.clear();
     },
-    async createOrResume(): Promise<SessionCreateResponse> {
+    async createOrAttach(): Promise<SessionCreateResponse> {
       closed = false;
       emitState("connecting");
       schedule(120, {

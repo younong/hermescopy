@@ -33,6 +33,7 @@ export interface SessionCreateResponse {
   messages?: GatewayTranscriptMessage[];
   session_id: string;
   stored_session_id?: string;
+  switch_generation?: number;
 }
 
 export interface SessionResumeResponse extends SessionCreateResponse {
@@ -40,6 +41,11 @@ export interface SessionResumeResponse extends SessionCreateResponse {
   running?: boolean;
   session_key?: string;
   status?: string;
+}
+
+export interface SessionAttachResponse extends SessionResumeResponse {
+  resume_kind: "cold" | "live";
+  switch_generation: number;
 }
 
 export interface MessageDeltaPayload {
