@@ -116,6 +116,32 @@ describe("createGatewayEventFrameQueue", () => {
     expect(eventText(dispatched.at(-1)!)).toHaveLength(6);
   });
 
+  it("does not stall when a streamed status event has empty text", () => {
+    const frames = createFrameHarness();
+    const dispatched: GatewayEvent[] = [];
+    const queue = createGatewayEventFrameQueue(
+      (gatewayEvent) => dispatched.push(gatewayEvent),
+      frames.requestFrame,
+      frames.cancelFrame,
+    );
+
+    queue.enqueue(event("thinking.delta", ""));
+    queue.enqueue(event("thinking.delta", "done"));
+    queue.enqueue(event("message.delta", "answer"));
+
+    frames.flushFrame();
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0]).toMatchObject({ type: "thinking.delta" });
+    expect(eventText(dispatched[0])).toBe("d");
+
+    for (let index = 0; index < 3; index += 1) frames.flushFrame();
+    expect(eventText(dispatched.at(-1)!)).toBe("e");
+
+    frames.flushFrame();
+    expect(dispatched.at(-1)).toMatchObject({ type: "message.delta" });
+    expect(eventText(dispatched.at(-1)!)).toBe("a");
+  });
+
   it("does not split emoji or combined Unicode graphemes", () => {
     const frames = createFrameHarness();
     const dispatched: GatewayEvent[] = [];

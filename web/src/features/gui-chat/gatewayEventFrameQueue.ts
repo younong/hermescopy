@@ -124,7 +124,7 @@ function takeStreamChunk(
     const current = events[consumed];
     if (!current) break;
     const text = streamText(current);
-    if (text === undefined) {
+    if (!text) {
       merged = merged ? mergeStreamEventPayload(merged, current) : current;
       consumed += 1;
       continue;
