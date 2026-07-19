@@ -110,6 +110,9 @@ and have permissions `0600`. Continue validation with
 `playwright-cli -s=hermes-validation ...`, then close it with
 `playwright-cli -s=hermes-validation close`.
 
-Never read, print, copy, or `source` `.env.local`. If the helper reports missing
-or unsafe credentials, ask the user to edit the file locally; never ask them to
-paste a password into the conversation.
+Never read, print, manually copy, or `source` `.env.local`. The repository's
+`.worktreeinclude` is the only permitted propagation mechanism: Claude Code
+automatically copies the ignored file into newly created worktrees without the
+agent inspecting its contents. If the helper reports missing or unsafe
+credentials, ask the user to edit the file locally; never ask them to paste a
+password into the conversation.
