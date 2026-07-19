@@ -1402,6 +1402,7 @@ def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
     # The agent must bind to the continuation tip, and the returned transcript
     # must include the post-compression reply (which lives only in the tip).
     assert resp["result"]["session_key"] == "cont_tip"
+    assert resp["result"]["resumed"] == "cont_tip"
     assert captured["agent_session_id"] == "cont_tip"
     texts = [m.get("text") for m in resp["result"]["messages"]]
     assert "post-compression reply" in texts

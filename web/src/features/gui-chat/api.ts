@@ -65,7 +65,7 @@ export interface FileAttachResponse {
 export interface GuiChatConnection {
   client: GuiChatEventSource;
   close(): void;
-  createOrResume(): Promise<SessionCreateResponse | SessionResumeResponse>;
+  createOrResume(signal?: AbortSignal): Promise<SessionCreateResponse | SessionResumeResponse>;
   attachImage(sessionId: string, file: File): Promise<ImageAttachResponse>;
   attachPdf(sessionId: string, file: File): Promise<PdfAttachResponse>;
   attachFile(sessionId: string, file: File): Promise<FileAttachResponse>;
@@ -81,8 +81,8 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
   return {
     client,
     close: () => client.close(),
-    createOrResume: async () => {
-      await client.connect(undefined, options.timing);
+    createOrResume: async (signal) => {
+      await client.connect(undefined, signal, options.timing);
       const baseParams = {
         browser_id: browserId,
         close_on_disconnect: false,
@@ -96,9 +96,9 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
         return client.request<SessionResumeResponse>("session.resume", {
           ...baseParams,
           session_id: options.resumeSessionId,
-        });
+        }, undefined, signal);
       }
-      return client.request<SessionCreateResponse>("session.create", baseParams);
+      return client.request<SessionCreateResponse>("session.create", baseParams, undefined, signal);
     },
     attachImage: async (sessionId, file) => {
       const dataUrl = await readFileAsDataUrl(file);

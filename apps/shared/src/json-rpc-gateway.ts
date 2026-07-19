@@ -101,15 +101,19 @@ export class JsonRpcGatewayClient {
     return this.state
   }
 
-  async connect(wsUrl: string): Promise<void> {
+  async connect(wsUrl: string, signal?: AbortSignal): Promise<void> {
     if (this.socket?.readyState === WebSocket.OPEN || this.state === 'connecting') {
       return
+    }
+    if (signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError')
     }
 
     this.setState('connecting')
 
     const socket = this.options.socketFactory?.(wsUrl) ?? new WebSocket(wsUrl)
     this.socket = socket
+    let rejectConnecting: ((error: Error) => void) | null = null
 
     socket.addEventListener('message', message => {
       if (this.socket !== socket) {
@@ -126,7 +130,9 @@ export class JsonRpcGatewayClient {
 
       this.socket = null
       this.setState('closed')
-      this.rejectAllPending(new Error(this.options.closedErrorMessage))
+      const error = new Error(this.options.closedErrorMessage)
+      rejectConnecting?.(error)
+      this.rejectAllPending(error)
     })
 
     await new Promise<void>((resolve, reject) => {
@@ -134,12 +140,35 @@ export class JsonRpcGatewayClient {
       let timer: ReturnType<typeof setTimeout> | undefined
 
       const cleanup = () => {
+        rejectConnecting = null
         if (timer !== undefined) {
           clearTimeout(timer)
+        }
+        if (signal) {
+          signal.removeEventListener('abort', onAbort)
         }
 
         socket.removeEventListener('open', onOpen)
         socket.removeEventListener('error', onError)
+      }
+
+      const settleError = (error: Error, state: ConnectionState) => {
+        if (settled) {
+          return
+        }
+
+        settled = true
+        cleanup()
+        if (this.socket === socket) {
+          this.socket = null
+          try {
+            socket.close()
+          } catch {
+            // ignore
+          }
+        }
+        this.setState(state)
+        reject(error)
       }
 
       const onOpen = () => {
@@ -154,40 +183,21 @@ export class JsonRpcGatewayClient {
       }
 
       const onError = () => {
-        if (settled || this.socket !== socket) {
-          return
-        }
-
-        settled = true
-        cleanup()
-        this.setState('error')
-        reject(new Error(this.options.connectErrorMessage))
+        settleError(new Error(this.options.connectErrorMessage), 'error')
       }
 
+      const onAbort = () => {
+        settleError(new DOMException('Aborted', 'AbortError'), 'closed')
+      }
+
+      rejectConnecting = error => settleError(error, 'closed')
       socket.addEventListener('open', onOpen, { once: true })
       socket.addEventListener('error', onError, { once: true })
+      signal?.addEventListener('abort', onAbort, { once: true })
 
       if (this.options.connectTimeoutMs > 0) {
         timer = setTimeout(() => {
-          if (settled) {
-            return
-          }
-
-          settled = true
-          cleanup()
-          // Drop the half-open socket so the next connect() starts clean
-          // instead of short-circuiting on a zombie 'connecting' state.
-          if (this.socket === socket) {
-            try {
-              socket.close()
-            } catch {
-              // ignore
-            }
-
-            this.socket = null
-          }
-          this.setState('error')
-          reject(new Error(this.options.connectErrorMessage))
+          settleError(new Error(this.options.connectErrorMessage), 'error')
         }, this.options.connectTimeoutMs)
       }
     })
