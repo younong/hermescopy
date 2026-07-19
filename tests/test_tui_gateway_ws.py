@@ -273,6 +273,88 @@ def test_ws_transport_control_frame_immediately_drains_pending_stream(monkeypatc
     assert len(sent) == 2
 
 
+def test_ws_dashboard_attach_filters_inactive_and_unknown_sessionless_events(monkeypatch):
+    sent = []
+
+    class FakeWS:
+        async def send_text(self, line):
+            sent.append(json.loads(line))
+
+    class FakeFuture:
+        def result(self, timeout):
+            return None
+
+    def schedule(coroutine, loop):
+        asyncio.run(coroutine)
+        return FakeFuture()
+
+    monkeypatch.setattr("agent.async_utils.safe_schedule_threadsafe", schedule)
+    transport = ws_mod.WSTransport(FakeWS(), _FakeTransportLoop())
+
+    assert transport.begin_dashboard_attach(1, browser_id="browser-a") is None
+    assert transport.commit_dashboard_attach(1, "runtime-a") is True
+    assert transport.write(_gateway_event("message.complete", session_id="runtime-a")) is True
+    assert transport.write(_gateway_event("message.complete", session_id="runtime-b")) is True
+    assert transport.write(_gateway_event("approval.request", session_id="")) is True
+    assert transport.write(_gateway_event("skin.changed", session_id="")) is True
+    assert transport.write({"jsonrpc": "2.0", "id": "rpc", "result": {"ok": True}}) is True
+
+    assert [item.get("id") or item["params"]["type"] for item in sent] == [
+        "message.complete",
+        "skin.changed",
+        "rpc",
+    ]
+
+
+def test_ws_dashboard_attach_generation_and_scope_are_atomic():
+    transport = ws_mod.WSTransport(object(), _FakeTransportLoop())
+
+    assert transport.begin_dashboard_attach(
+        4, browser_id="browser-a", profile="worker"
+    ) is None
+    assert transport.begin_dashboard_attach(
+        4, browser_id="browser-a", profile="worker"
+    ) == "session attach superseded"
+    assert transport.begin_dashboard_attach(
+        5, browser_id="browser-b", profile="worker"
+    ) == "dashboard attach scope mismatch"
+    assert transport.begin_dashboard_attach(
+        5, browser_id="browser-a", profile="other"
+    ) == "dashboard attach scope mismatch"
+    assert transport.begin_dashboard_attach(
+        5, browser_id="browser-a", profile="worker"
+    ) is None
+
+    assert transport.commit_dashboard_attach(4, "runtime-old") is False
+    assert transport.commit_dashboard_attach(5, "runtime-new") is True
+    assert transport.dashboard_attach_is_current(4) is False
+    assert transport.dashboard_attach_is_current(5) is True
+
+
+def test_ws_dashboard_attach_drops_coalesced_tokens_after_subscription_switch():
+    sent = []
+
+    class FakeWS:
+        async def send_text(self, line):
+            sent.append(json.loads(line))
+
+    loop = _FakeTransportLoop()
+    transport = ws_mod.WSTransport(FakeWS(), loop)
+    assert transport.begin_dashboard_attach(1, browser_id="browser-a") is None
+    assert transport.commit_dashboard_attach(1, "runtime-a") is True
+
+    assert transport.write(
+        _gateway_event("message.delta", text="stale", session_id="runtime-a")
+    ) is True
+    assert len(loop.timers) == 1
+
+    assert transport.begin_dashboard_attach(2, browser_id="browser-a") is None
+    assert transport.commit_dashboard_attach(2, "runtime-b") is True
+    loop.timers[0].fire()
+
+    assert sent == []
+
+
 def test_ws_transport_merges_streaming_frames_in_one_flush():
     lines = [
         json.dumps(

@@ -42,9 +42,16 @@ export class GatewayClient extends JsonRpcGatewayClient {
     });
   }
 
-  async connect(token?: string, timing?: GatewayConnectTiming): Promise<void> {
+  async connect(
+    token?: string,
+    signal?: AbortSignal,
+    timing?: GatewayConnectTiming,
+  ): Promise<void> {
     if (this.connectionState === "open" || this.connectionState === "connecting") {
       return;
+    }
+    if (signal?.aborted) {
+      throw new DOMException("Aborted", "AbortError");
     }
 
     // Gated mode: legacy ``?token=`` is rejected by ``_ws_auth_ok``; the SPA
@@ -53,8 +60,11 @@ export class GatewayClient extends JsonRpcGatewayClient {
     timing?.onStage?.("ticket.start");
     const authParam = token
       ? (["token", token] as const)
-      : await buildWsAuthParam("/api/ws", timing?.traceId);
+      : await buildWsAuthParam("/api/ws", timing?.traceId, signal);
     timing?.onStage?.("ticket.end");
+    if (signal?.aborted) {
+      throw new DOMException("Aborted", "AbortError");
+    }
     if (!authParam[1]) {
       throw new Error(
         "Session token not available — page must be served by the Hermes dashboard server",
@@ -69,6 +79,7 @@ export class GatewayClient extends JsonRpcGatewayClient {
         path: "/api/ws",
         params: timing?.traceId ? { ws_trace: timing.traceId } : undefined,
       }),
+      signal,
     );
     timing?.onStage?.("websocket.open");
   }

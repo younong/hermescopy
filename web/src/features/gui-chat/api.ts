@@ -1,18 +1,35 @@
 import {
   GatewayClient,
   type ConnectionState,
+  JsonRpcGatewayError,
   type GatewayConnectTiming,
   type GatewayEvent,
 } from "@/lib/gatewayClient";
 import { getHermesBrowserId } from "@/lib/browserIdentity";
 import { base64FromDataUrl, readFileAsDataUrl } from "./attachments";
-import type { SessionCreateResponse, SessionResumeResponse } from "./protocol";
+import type {
+  SessionAttachResponse,
+  SessionCreateResponse,
+  SessionResumeResponse,
+} from "./protocol";
 
 export interface ConnectGuiChatOptions {
   profile?: string;
   ownerKey?: string;
-  resumeSessionId?: string | null;
   timing?: GatewayConnectTiming;
+}
+
+export interface GuiChatSwitchTiming extends GatewayConnectTiming {
+  onSwitchStage?: (
+    stage:
+      | "connection.reused"
+      | "session.attach.start"
+      | "session.attach.end"
+      | "session.attach.live"
+      | "session.attach.cold"
+      | "session.create.start"
+      | "session.create.end",
+  ) => void;
 }
 
 export interface GuiChatEventSource {
@@ -65,7 +82,12 @@ export interface FileAttachResponse {
 export interface GuiChatConnection {
   client: GuiChatEventSource;
   close(): void;
-  createOrResume(): Promise<SessionCreateResponse | SessionResumeResponse>;
+  createOrAttach(
+    targetSessionId: string | null,
+    generation: number,
+    signal?: AbortSignal,
+    timing?: GuiChatSwitchTiming,
+  ): Promise<SessionCreateResponse | SessionResumeResponse>;
   attachImage(sessionId: string, file: File): Promise<ImageAttachResponse>;
   attachPdf(sessionId: string, file: File): Promise<PdfAttachResponse>;
   attachFile(sessionId: string, file: File): Promise<FileAttachResponse>;
@@ -77,28 +99,97 @@ export interface GuiChatConnection {
 export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnection {
   const client = new GatewayClient();
   const browserId = getHermesBrowserId(options.ownerKey);
+  let connectPromise: Promise<void> | null = null;
+  let attachSupported = true;
+
+  const ensureConnected = async (
+    signal?: AbortSignal,
+    timing?: GatewayConnectTiming,
+  ): Promise<void> => {
+    if (client.connectionState === "open") {
+      return;
+    }
+    if (!connectPromise) {
+      // The shared physical handshake belongs to the scoped connection, not to
+      // whichever switch happened to start it. Callers can stop awaiting it,
+      // but superseding one attach must not tear down the socket all later
+      // generations intend to reuse.
+      connectPromise = client.connect(undefined, undefined, timing).finally(() => {
+        connectPromise = null;
+      });
+    }
+    await abortable(connectPromise, signal);
+  };
+
+  const baseParams = (timing?: GuiChatSwitchTiming) => ({
+    browser_id: browserId,
+    close_on_disconnect: false,
+    source: "dashboard-gui",
+    ...(timing?.traceId ? { latency_trace_id: timing.traceId } : {}),
+    ...(options.profile ? { profile: options.profile } : {}),
+  });
 
   return {
     client,
     close: () => client.close(),
-    createOrResume: async () => {
-      await client.connect(undefined, options.timing);
-      const baseParams = {
-        browser_id: browserId,
-        close_on_disconnect: false,
-        source: "dashboard-gui",
-        ...(options.timing?.traceId
-          ? { latency_trace_id: options.timing.traceId }
-          : {}),
-        ...(options.profile ? { profile: options.profile } : {}),
-      };
-      if (options.resumeSessionId) {
-        return client.request<SessionResumeResponse>("session.resume", {
-          ...baseParams,
-          session_id: options.resumeSessionId,
-        });
+    createOrAttach: async (targetSessionId, generation, signal, timing) => {
+      const reused = client.connectionState === "open";
+      await ensureConnected(signal, timing);
+      if (reused) timing?.onSwitchStage?.("connection.reused");
+
+      if (targetSessionId) {
+        timing?.onSwitchStage?.("session.attach.start");
+        try {
+          if (!attachSupported) throw new JsonRpcGatewayError("Method not found", -32601);
+          const response = await client.request<SessionAttachResponse>(
+            "session.attach",
+            {
+              ...baseParams(timing),
+              session_id: targetSessionId,
+              switch_generation: generation,
+            },
+            undefined,
+            signal,
+          );
+          timing?.onSwitchStage?.("session.attach.end");
+          timing?.onSwitchStage?.(
+            response.resume_kind === "live" ? "session.attach.live" : "session.attach.cold",
+          );
+          return response;
+        } catch (error) {
+          if (!(error instanceof JsonRpcGatewayError) || error.code !== -32601) throw error;
+          // Mixed-version compatibility only: an older backend does not know
+          // session.attach, so abandon the reusable socket and restore the old
+          // fresh-socket session.resume path. Auth/fence failures never fall back.
+          attachSupported = false;
+          client.close();
+          await ensureConnected(signal, timing);
+          const response = await client.request<SessionResumeResponse>(
+            "session.resume",
+            {
+              ...baseParams(timing),
+              session_id: targetSessionId,
+            },
+            undefined,
+            signal,
+          );
+          timing?.onSwitchStage?.("session.attach.end");
+          return response;
+        }
       }
-      return client.request<SessionCreateResponse>("session.create", baseParams);
+
+      timing?.onSwitchStage?.("session.create.start");
+      const response = await client.request<SessionCreateResponse>(
+        "session.create",
+        {
+          ...baseParams(timing),
+          switch_generation: generation,
+        },
+        undefined,
+        signal,
+      );
+      timing?.onSwitchStage?.("session.create.end");
+      return response;
     },
     attachImage: async (sessionId, file) => {
       const dataUrl = await readFileAsDataUrl(file);
@@ -142,4 +233,23 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
       await client.request("session.interrupt", { session_id: sessionId }, 30_000);
     },
   };
+}
+
+async function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new DOMException("Aborted", "AbortError"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    void promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }

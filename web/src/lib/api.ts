@@ -248,6 +248,7 @@ async function getSessionToken(): Promise<string> {
 export async function getWsTicket(
   path: string,
   traceId?: string,
+  signal?: AbortSignal,
 ): Promise<{ ticket: string; ttl_seconds: number }> {
   const headers = new Headers({ "Content-Type": "application/json" });
   if (traceId) headers.set("X-Request-ID", traceId);
@@ -256,6 +257,7 @@ export async function getWsTicket(
     credentials: "include",
     headers,
     body: JSON.stringify({ audience: `browser-ws:${path}` }),
+    signal,
   });
   if (!res.ok) {
     throw new Error(`/api/auth/ws-ticket: HTTP ${res.status}`);
@@ -271,9 +273,10 @@ export async function getWsTicket(
 export async function buildWsAuthParam(
   path: string,
   traceId?: string,
+  signal?: AbortSignal,
 ): Promise<[string, string]> {
   if (window.__HERMES_AUTH_REQUIRED__) {
-    const { ticket } = await getWsTicket(path, traceId);
+    const { ticket } = await getWsTicket(path, traceId, signal);
     return ["ticket", ticket];
   }
   const token = window.__HERMES_SESSION_TOKEN__ ?? "";

@@ -316,7 +316,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   }, [isActive, sessionTitle, setTitle]);
 
   useEffect(() => {
-    if (!resumeParam) return;
+    if (!isActive || !resumeParam) return;
 
     let cancelled = false;
 
@@ -333,10 +333,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     return () => {
       cancelled = true;
     };
-  }, [resumeParam, scopedProfile, handleSessionTitleChange]);
+  }, [isActive, resumeParam, scopedProfile, handleSessionTitleChange]);
 
   useEffect(() => {
-    if (!resumeParam) return;
+    if (!isActive || !resumeParam) return;
 
     let cancelled = false;
 
@@ -358,7 +358,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     return () => {
       cancelled = true;
     };
-  }, [resumeParam, searchParams, setSearchParams]);
+  }, [isActive, resumeParam, searchParams, setSearchParams]);
 
   useEffect(() => {
     const mql = window.matchMedia("(max-width: 1023px)");
@@ -543,6 +543,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   };
 
   useEffect(() => {
+    // The terminal host stays mounted behind display:none while users visit
+    // other dashboard routes. It must not create or retarget PTY/event sockets
+    // in response to Chat GUI's shared ?resume= parameter while inactive.
+    if (!isActive) return;
     const host = hostRef.current;
     if (!host) return;
 
@@ -1064,7 +1068,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         copyResetRef.current = null;
       }
     };
-  }, [authIdentityReady, browserId, channel, clearReconnectTimer, resumeParam, scopedProfile, reconnectNonce]);
+  }, [authIdentityReady, browserId, channel, clearReconnectTimer, isActive, resumeParam, scopedProfile, reconnectNonce]);
 
   // When the user returns to the chat tab (isActive: false → true), the
   // terminal host just transitioned from display:none to display:flex.
@@ -1293,7 +1297,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           </Button>
         </div>
 
-        {!narrow && (
+        {isActive && !narrow && (
           <div
             id="chat-side-panel"
             role="complementary"

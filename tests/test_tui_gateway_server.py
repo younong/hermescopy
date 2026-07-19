@@ -1402,6 +1402,7 @@ def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
     # The agent must bind to the continuation tip, and the returned transcript
     # must include the post-compression reply (which lives only in the tip).
     assert resp["result"]["session_key"] == "cont_tip"
+    assert resp["result"]["resumed"] == "cont_tip"
     assert captured["agent_session_id"] == "cont_tip"
     texts = [m.get("text") for m in resp["result"]["messages"]]
     assert "post-compression reply" in texts
@@ -6864,6 +6865,291 @@ def test_session_active_list_excludes_finalized_sessions(monkeypatch):
     session_rows = resp["result"]["sessions"]
     assert [row["id"] for row in session_rows] == ["sid-live"]
 
+
+
+class _DashboardAttachTransport:
+    def __init__(self):
+        self.scope = None
+        self.generation = -1
+        self.active_session_id = None
+
+    def write(self, _obj):
+        return True
+
+    def begin_dashboard_attach(self, generation, *, browser_id, profile=""):
+        scope = (browser_id, profile)
+        if not browser_id:
+            return "browser_id required"
+        if self.scope is not None and self.scope != scope:
+            return "dashboard attach scope mismatch"
+        if generation <= self.generation:
+            return "session attach superseded"
+        self.scope = scope
+        self.generation = generation
+        return None
+
+    def commit_dashboard_attach(self, generation, session_id, *, on_commit=None):
+        if generation != self.generation:
+            return False
+        if on_commit is not None and not on_commit():
+            return False
+        self.active_session_id = session_id
+        return True
+
+    def dashboard_attach_is_current(self, generation):
+        return generation == self.generation
+
+
+def test_dashboard_session_create_commits_active_runtime(monkeypatch):
+    transport = _DashboardAttachTransport()
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    token = server.bind_transport(transport)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "create",
+                "method": "session.create",
+                "params": {
+                    "browser_id": "browser-a",
+                    "profile": "worker",
+                    "source": "dashboard-gui",
+                    "switch_generation": 3,
+                },
+            }
+        )
+        sid = resp["result"]["session_id"]
+        session = server._sessions[sid]
+        assert resp["result"]["switch_generation"] == 3
+        assert transport.active_session_id == sid
+        assert session["transport"] is transport
+        assert session["source"] == "dashboard-gui"
+    finally:
+        server.reset_transport(token)
+        server._sessions.clear()
+
+
+def test_dashboard_session_create_superseded_generation_cleans_candidate(monkeypatch):
+    transport = _DashboardAttachTransport()
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+
+    original_commit = transport.commit_dashboard_attach
+
+    def _supersede(generation, session_id, *, on_commit=None):
+        transport.generation = generation + 1
+        return original_commit(generation, session_id, on_commit=on_commit)
+
+    transport.commit_dashboard_attach = _supersede
+    token = server.bind_transport(transport)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "create-stale",
+                "method": "session.create",
+                "params": {
+                    "browser_id": "browser-a",
+                    "switch_generation": 1,
+                },
+            }
+        )
+    finally:
+        server.reset_transport(token)
+
+    assert resp["error"]["code"] == 4091
+    assert server._sessions == {}
+
+
+def test_session_attach_uses_persistent_id_and_commits_live_runtime(monkeypatch):
+    transport = _DashboardAttachTransport()
+    previous_transport = object()
+    session = _session(
+        agent=types.SimpleNamespace(model="model-live"),
+        history=[{"role": "user", "content": "hello"}],
+        session_key="canonical-tip",
+        transport=previous_transport,
+    )
+    server._sessions["runtime-tip"] = session
+
+    class _DB:
+        def get_session(self, target):
+            return {"id": target}
+
+        def get_session_by_title(self, _title):
+            return None
+
+        def resolve_resume_session_id(self, target):
+            assert target == "parent-root"
+            return "canonical-tip"
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    token = server.bind_transport(transport)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "attach",
+                "method": "session.attach",
+                "params": {
+                    "browser_id": "browser-a",
+                    "session_id": "parent-root",
+                    "source": "dashboard-gui",
+                    "switch_generation": 7,
+                },
+            }
+        )
+    finally:
+        server.reset_transport(token)
+        server._sessions.pop("runtime-tip", None)
+
+    assert resp["result"]["session_id"] == "runtime-tip"
+    assert resp["result"]["session_key"] == "canonical-tip"
+    assert resp["result"]["resumed"] == "canonical-tip"
+    assert resp["result"]["resume_kind"] == "live"
+    assert resp["result"]["switch_generation"] == 7
+    assert transport.active_session_id == "runtime-tip"
+    assert session["transport"] is transport
+    assert session["source"] == "dashboard-gui"
+
+
+def test_session_attach_cold_resume_commits_deferred_runtime(monkeypatch):
+    transport = _DashboardAttachTransport()
+    target = "stored-cold"
+
+    class _DB:
+        def get_session(self, session_id):
+            return {"id": session_id, "model": "vendor/model"}
+
+        def get_session_by_title(self, _title):
+            return None
+
+        def resolve_resume_session_id(self, session_id):
+            return session_id
+
+        def reopen_session(self, _session_id):
+            return None
+
+        def get_messages_as_conversation(self, _session_id, include_ancestors=False):
+            return [{"role": "user", "content": "cold history"}]
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    token = server.bind_transport(transport)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "attach-cold",
+                "method": "session.attach",
+                "params": {
+                    "browser_id": "browser-a",
+                    "session_id": target,
+                    "switch_generation": 1,
+                },
+            }
+        )
+        sid = resp["result"]["session_id"]
+        session = server._sessions[sid]
+        assert resp["result"]["resume_kind"] == "cold"
+        assert resp["result"]["messages"] == [{"role": "user", "text": "cold history"}]
+        assert transport.active_session_id == sid
+        assert session["transport"] is transport
+        assert session["agent"] is None
+    finally:
+        server.reset_transport(token)
+        server._sessions.clear()
+
+
+def test_session_attach_superseded_generation_does_not_rebind_live_runtime(monkeypatch):
+    transport = _DashboardAttachTransport()
+    previous_transport = object()
+    session = _session(
+        agent=types.SimpleNamespace(model="model-live"),
+        session_key="stored-session",
+        transport=previous_transport,
+    )
+    server._sessions["runtime-live"] = session
+
+    class _DB:
+        def get_session(self, target):
+            return {"id": target}
+
+        def get_session_by_title(self, _title):
+            return None
+
+        def resolve_resume_session_id(self, target):
+            return target
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    token = server.bind_transport(transport)
+    try:
+        assert transport.begin_dashboard_attach(
+            2, browser_id="browser-a", profile=""
+        ) is None
+        resp = server._session_resume(
+            "old",
+            {
+                "_dashboard_attach": True,
+                "browser_id": "browser-a",
+                "session_id": "stored-session",
+                "switch_generation": 1,
+            },
+        )
+        result = server._commit_session_attach(
+            "old",
+            transport=transport,
+            generation=1,
+            response=resp,
+        )
+    finally:
+        server.reset_transport(token)
+        server._sessions.pop("runtime-live", None)
+
+    assert result["error"]["code"] == 4091
+    assert session["transport"] is previous_transport
+    assert transport.active_session_id is None
+
+
+def test_session_attach_rejects_non_dashboard_transport_and_scope_switch():
+    plain_token = server.bind_transport(object())
+    try:
+        resp = server.handle_request(
+            {
+                "id": "plain",
+                "method": "session.attach",
+                "params": {
+                    "browser_id": "browser-a",
+                    "session_id": "stored-session",
+                    "switch_generation": 1,
+                },
+            }
+        )
+    finally:
+        server.reset_transport(plain_token)
+    assert resp["error"]["code"] == 4002
+
+    transport = _DashboardAttachTransport()
+    token = server.bind_transport(transport)
+    try:
+        assert transport.begin_dashboard_attach(
+            1, browser_id="browser-a", profile="worker"
+        ) is None
+        resp = server.handle_request(
+            {
+                "id": "scope",
+                "method": "session.attach",
+                "params": {
+                    "browser_id": "browser-b",
+                    "profile": "worker",
+                    "session_id": "stored-session",
+                    "switch_generation": 2,
+                },
+            }
+        )
+    finally:
+        server.reset_transport(token)
+    assert resp["error"]["message"] == "dashboard attach scope mismatch"
 
 
 def test_session_activate_returns_inflight_stream_before_completion(monkeypatch):
