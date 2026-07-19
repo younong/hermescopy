@@ -21,6 +21,10 @@ follow the implementation and its closest focused tests.
    scope.
 7. For intent-sensitive behavior, follow the existing convention:
    `git log -p -S <symbol>`.
+8. For Claude API, Anthropic SDK, Claude Agent SDK, prompt caching, tool use,
+   streaming, model migration, or Managed Agents work, invoke the project
+   `claude-api-lite` skill. Do not invoke the disabled bundled `claude-api`
+   skill; its eager reference bundle exceeds this project's context budget.
 
 ## Bounded Code Reviews
 
