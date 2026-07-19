@@ -1651,6 +1651,9 @@ def test_worker_app_owns_and_closes_controlled_roots(tmp_path, monkeypatch):
     assert roots.get(RootKind.OWNER_WRITABLE).canonical_path == owner_home
     assert roots.get(RootKind.WORKSPACE).canonical_path == owner_home / "workspaces"
     assert roots.get(RootKind.TEMPORARY).canonical_path == owner_home / "runtime" / "tmp"
+    assert app.state.owner_worker_socket_path == owner_worker_socket_path(
+        owner_home, app.state.owner_worker_generation
+    )
     with TestClient(app):
         assert os.fstat(workspace_fd)
 
@@ -1764,6 +1767,9 @@ def test_owner_worker_pty_lifecycle_audit_is_admitted_then_terminal_once(monkeyp
         def close(self):
             self.closed += 1
 
+        def exit_code(self):
+            return 0
+
         def resize(self, **_kwargs):
             return None
 
@@ -1784,6 +1790,69 @@ def test_owner_worker_pty_lifecycle_audit_is_admitted_then_terminal_once(monkeyp
     assert websocket.accepted is True
     assert events == [AuthorityAuditReason.ADMITTED, AuthorityAuditReason.BRIDGE_CLOSED]
     assert bridge.closed >= 1
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "expected_close"),
+    [
+        (0, {}),
+        (1, {"code": 1001, "reason": "owner TUI exited unexpectedly"}),
+    ],
+)
+def test_owner_worker_pty_child_exit_controls_browser_reconnect(monkeypatch, exit_code, expected_close):
+    import asyncio
+    from types import SimpleNamespace
+
+    from hermes_cli.owner_worker import ws_routes
+
+    class _WebSocket:
+        def __init__(self):
+            self.app = SimpleNamespace(state=SimpleNamespace(owner_worker_generation=7))
+            self.query_params = SimpleNamespace(get=lambda _key, default="": default)
+            self.url = SimpleNamespace(path="/api/pty")
+            self.closed = []
+
+        async def accept(self):
+            return None
+
+        async def close(self, **kwargs):
+            self.closed.append(kwargs)
+
+        async def receive(self):
+            while not self.closed:
+                await asyncio.sleep(0)
+            return {"type": "websocket.disconnect"}
+
+        async def send_bytes(self, _data):
+            return None
+
+    class _Bridge:
+        def read(self, _timeout):
+            return None
+
+        def close(self):
+            return None
+
+        def exit_code(self):
+            return exit_code
+
+        def resize(self, **_kwargs):
+            return None
+
+        def write(self, _data):
+            return None
+
+    websocket = _WebSocket()
+    monkeypatch.setattr(ws_routes, "_admit_bootstrap_or_close", lambda _ws: asyncio.sleep(0, result=websocket))
+    monkeypatch.setattr(ws_routes, "_trusted_live_metadata", lambda *_args: ("trusted",))
+    monkeypatch.setattr(ws_routes, "_PTY_BRIDGE_AVAILABLE", True)
+    monkeypatch.setattr(ws_routes, "_resolve_chat_argv_async", lambda **_kwargs: asyncio.sleep(0, result=(["test"], None, {})))
+    monkeypatch.setattr(ws_routes, "PtyBridge", SimpleNamespace(spawn=lambda *_args, **_kwargs: _Bridge()))
+    monkeypatch.setattr(ws_routes, "_report_pty_lifecycle", lambda *_args: None)
+
+    asyncio.run(ws_routes.pty_ws(websocket))
+
+    assert websocket.closed == [expected_close]
 
 
 def test_worker_session_routes_require_owner_token(tmp_path, monkeypatch):
@@ -2816,6 +2885,9 @@ def test_worker_chat_argv_derives_cwd_from_workspace_descriptor(tmp_path, monkey
     app = SimpleNamespace(
         state=SimpleNamespace(
             owner_worker_mode=True,
+            owner_worker_owner_home=owner_home,
+            owner_worker_generation=1,
+            owner_worker_socket_path=owner_worker_socket_path(owner_home, 1),
             owner_worker_controlled_roots=roots,
             owner_worker_live_state=OwnerWorkerLiveState(),
         )
@@ -2835,11 +2907,46 @@ def test_worker_chat_argv_requires_owner_worker_gateway_attach(tmp_path, monkeyp
     from hermes_cli.owner_worker import ws_routes
     from hermes_cli.owner_worker.ws_routes import OwnerWorkerLiveState
 
+    owner_home = tmp_path / "owner"
+    socket_path = owner_worker_socket_path(owner_home, 7)
     monkeypatch.setattr(ws_routes, "resolve_workspace_cwd", lambda *_args, **_kwargs: tmp_path)
     monkeypatch.setattr("hermes_cli.main._make_tui_argv", lambda *_args, **_kwargs: (["node", "entry.js"], str(tmp_path)))
-    app = SimpleNamespace(state=SimpleNamespace(owner_worker_mode=True, owner_worker_live_state=OwnerWorkerLiveState()))
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            owner_worker_mode=True,
+            owner_worker_owner_home=owner_home,
+            owner_worker_generation=7,
+            owner_worker_socket_path=socket_path,
+            owner_worker_live_state=OwnerWorkerLiveState(),
+        )
+    )
 
     _argv, _cwd, env = ws_routes._resolve_chat_argv(app_obj=app)
 
     assert env["HERMES_OWNER_WORKER_TUI_ATTACH"] == "1"
     assert env["HERMES_TUI_GATEWAY_URL"].startswith("ws://owner-worker/api/ws?owner_tui_attach=")
+    assert env["HERMES_TUI_GATEWAY_SOCKET_PATH"] == str(socket_path)
+
+
+@pytest.mark.parametrize("configured", [None, "other.sock"])
+def test_worker_chat_argv_rejects_unbound_gateway_socket(tmp_path, monkeypatch, configured):
+    from types import SimpleNamespace
+
+    from hermes_cli.owner_worker import ws_routes
+    from hermes_cli.owner_worker.ws_routes import OwnerWorkerLiveState
+
+    owner_home = tmp_path / "owner"
+    monkeypatch.setattr(ws_routes, "resolve_workspace_cwd", lambda *_args, **_kwargs: tmp_path)
+    monkeypatch.setattr("hermes_cli.main._make_tui_argv", lambda *_args, **_kwargs: (["node", "entry.js"], str(tmp_path)))
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            owner_worker_mode=True,
+            owner_worker_owner_home=owner_home,
+            owner_worker_generation=7,
+            owner_worker_socket_path=(tmp_path / configured if configured else None),
+            owner_worker_live_state=OwnerWorkerLiveState(),
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="gateway socket"):
+        ws_routes._resolve_chat_argv(app_obj=app)

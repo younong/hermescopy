@@ -795,6 +795,15 @@ export function useMainApp(gw: GatewayClient) {
     const exitHandler = () => {
       turnController.reset()
 
+      if (gw.requiresFreshOwnerAttachOnExit()) {
+        patchUiState({ busy: false, status: 'gateway exited' })
+        turnController.pushActivity('gateway exited · reconnecting dashboard…', 'warn')
+        sys('gateway exited — reconnecting through a fresh dashboard session')
+        setTimeout(() => dieWithCode(1), 0)
+
+        return
+      }
+
       // A still-owned child dying while the TUI is alive is an *unexpected*
       // death — a user /quit exits Node before this fires, and a replaced child
       // is identity-skipped in GatewayClient. Rather than stranding a long
@@ -835,7 +844,7 @@ export function useMainApp(gw: GatewayClient) {
       gw.off('event', handler)
       gw.off('exit', exitHandler)
     }
-  }, [gw, sys])
+  }, [dieWithCode, gw, sys])
 
   useLongRunToolCharms()
 

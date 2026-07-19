@@ -5,7 +5,29 @@ interface ListenerEntry {
   once: boolean
 }
 
-const { FakeWebSocket } = vi.hoisted(() => {
+const { FakeAgent, FakeWebSocket } = vi.hoisted(() => {
+  class FakeAgent {
+    static instances: FakeAgent[] = []
+
+    readonly options: unknown
+    closed = false
+
+    constructor(options: unknown) {
+      this.options = options
+      FakeAgent.instances.push(this)
+    }
+
+    close() {
+      this.closed = true
+
+      return Promise.resolve()
+    }
+
+    static reset() {
+      FakeAgent.instances = []
+    }
+  }
+
   class FakeWebSocket {
     static CONNECTING = 0
     static OPEN = 1
@@ -16,10 +38,12 @@ const { FakeWebSocket } = vi.hoisted(() => {
     readyState = FakeWebSocket.CONNECTING
     sent: string[] = []
     readonly url: string
+    readonly options: unknown
     private listeners = new Map<string, ListenerEntry[]>()
 
-    constructor(url: string) {
+    constructor(url: string, options?: unknown) {
       this.url = url
+      this.options = options
       FakeWebSocket.instances.push(this)
     }
 
@@ -92,10 +116,10 @@ const { FakeWebSocket } = vi.hoisted(() => {
     }
   }
 
-  return { FakeWebSocket }
+  return { FakeAgent, FakeWebSocket }
 })
 
-vi.mock('undici', () => ({ WebSocket: FakeWebSocket }))
+vi.mock('undici', () => ({ Agent: FakeAgent, WebSocket: FakeWebSocket }))
 
 import { GatewayClient } from '../gatewayClient.js'
 
@@ -104,11 +128,14 @@ describe('GatewayClient websocket attach mode', () => {
   let originalGatewayUrl: string | undefined
   let originalSidecarUrl: string | undefined
   let originalOwnerWorkerAttach: string | undefined
+  let originalGatewaySocketPath: string | undefined
 
   beforeEach(() => {
     originalGatewayUrl = process.env.HERMES_TUI_GATEWAY_URL
     originalSidecarUrl = process.env.HERMES_TUI_SIDECAR_URL
     originalOwnerWorkerAttach = process.env.HERMES_OWNER_WORKER_TUI_ATTACH
+    originalGatewaySocketPath = process.env.HERMES_TUI_GATEWAY_SOCKET_PATH
+    FakeAgent.reset()
     FakeWebSocket.reset()
     ;(globalThis as { WebSocket?: unknown }).WebSocket = FakeWebSocket as unknown as typeof WebSocket
   })
@@ -132,6 +159,13 @@ describe('GatewayClient websocket attach mode', () => {
       process.env.HERMES_OWNER_WORKER_TUI_ATTACH = originalOwnerWorkerAttach
     }
 
+    if (originalGatewaySocketPath === undefined) {
+      delete process.env.HERMES_TUI_GATEWAY_SOCKET_PATH
+    } else {
+      process.env.HERMES_TUI_GATEWAY_SOCKET_PATH = originalGatewaySocketPath
+    }
+
+    FakeAgent.reset()
     FakeWebSocket.reset()
 
     if (originalWebSocket) {
@@ -152,6 +186,77 @@ describe('GatewayClient websocket attach mode', () => {
     expect(FakeWebSocket.instances).toHaveLength(0)
     expect(spawnGateway).not.toHaveBeenCalled()
     expect(gw.getLogTail(20)).toContain('[startup] owner-worker gateway attach URL unavailable')
+  })
+
+  it('connects owner-worker attach through the exact Unix socket dispatcher', () => {
+    process.env.HERMES_OWNER_WORKER_TUI_ATTACH = '1'
+    process.env.HERMES_TUI_GATEWAY_URL = 'ws://owner-worker/api/ws?owner_tui_attach=one-use-token'
+    process.env.HERMES_TUI_GATEWAY_SOCKET_PATH = '/run/hermes/worker.sock'
+    ;(globalThis as { WebSocket?: unknown }).WebSocket = class ThrowingGlobalWebSocket extends FakeWebSocket {
+      constructor(url: string) {
+        throw new Error(`unexpected global websocket: ${url}`)
+      }
+    } as unknown as typeof WebSocket
+
+    const gw = new GatewayClient()
+
+    gw.start()
+
+    expect(FakeAgent.instances).toHaveLength(1)
+    expect(FakeAgent.instances[0]?.options).toEqual({ connect: { socketPath: '/run/hermes/worker.sock' } })
+    expect(FakeWebSocket.instances).toHaveLength(1)
+    expect(FakeWebSocket.instances[0]?.url).toBe('ws://owner-worker/api/ws?owner_tui_attach=one-use-token')
+    expect(FakeWebSocket.instances[0]?.options).toEqual({ dispatcher: FakeAgent.instances[0] })
+    expect(gw.requiresFreshOwnerAttachOnExit()).toBe(true)
+
+    gw.kill()
+    expect(FakeAgent.instances[0]?.closed).toBe(true)
+  })
+
+  it.each([
+    ['missing socket', 'ws://owner-worker/api/ws?owner_tui_attach=abc', undefined],
+    ['relative socket', 'ws://owner-worker/api/ws?owner_tui_attach=abc', 'runtime/worker.sock'],
+    ['foreign host', 'ws://gateway.test/api/ws?owner_tui_attach=abc', '/run/hermes/worker.sock'],
+    ['wrong path', 'ws://owner-worker/other?owner_tui_attach=abc', '/run/hermes/worker.sock'],
+    ['duplicate token', 'ws://owner-worker/api/ws?owner_tui_attach=abc&owner_tui_attach=def', '/run/hermes/worker.sock'],
+    ['extra parameter', 'ws://owner-worker/api/ws?owner_tui_attach=abc&channel=demo', '/run/hermes/worker.sock']
+  ])('fails closed for invalid owner attach: %s', (_label, url, socketPath) => {
+    process.env.HERMES_OWNER_WORKER_TUI_ATTACH = '1'
+    process.env.HERMES_TUI_GATEWAY_URL = url
+
+    if (socketPath) {
+      process.env.HERMES_TUI_GATEWAY_SOCKET_PATH = socketPath
+    } else {
+      delete process.env.HERMES_TUI_GATEWAY_SOCKET_PATH
+    }
+
+    const spawnGateway = vi.spyOn(GatewayClient.prototype as any, 'startSpawnedGateway')
+    const gw = new GatewayClient()
+
+    gw.start()
+
+    expect(FakeAgent.instances).toHaveLength(0)
+    expect(FakeWebSocket.instances).toHaveLength(0)
+    expect(spawnGateway).not.toHaveBeenCalled()
+    expect(gw.getLogTail(20)).toContain('[startup] owner-worker gateway attach configuration invalid')
+  })
+
+  it('closes the owner dispatcher when the attached websocket closes', async () => {
+    process.env.HERMES_OWNER_WORKER_TUI_ATTACH = '1'
+    process.env.HERMES_TUI_GATEWAY_URL = 'ws://owner-worker/api/ws?owner_tui_attach=abc'
+    process.env.HERMES_TUI_GATEWAY_SOCKET_PATH = '/run/hermes/worker.sock'
+    const gw = new GatewayClient()
+
+    gw.start()
+    const dispatcher = FakeAgent.instances[0]!
+    const gatewaySocket = FakeWebSocket.instances[0]!
+
+    gatewaySocket.open()
+    gw.drain()
+    await Promise.resolve()
+    gatewaySocket.close(1006)
+
+    expect(dispatcher.closed).toBe(true)
   })
 
   it('waits for websocket open and resolves RPC requests', async () => {
