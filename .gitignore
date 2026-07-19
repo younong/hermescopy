@@ -25,14 +25,19 @@ deploy/*.local.env
 .uv-cache/
 .tmp/
 
-# Keep local Claude settings/transcripts out of git, but allow the project release skill.
+# Keep local Claude settings/transcripts out of git, but allow approved project skills and hooks.
 .claude/*
+!.claude/settings.json
 !.claude/skills/
 .claude/skills/*
 !.claude/skills/hermes-release/
 !.claude/skills/hermes-release/SKILL.md
 !.claude/skills/bounded-code-review/
 !.claude/skills/bounded-code-review/SKILL.md
+!.claude/skills/claude-api-lite/
+!.claude/skills/claude-api-lite/SKILL.md
+!.claude/skills/claude-api-lite/references/
+!.claude/skills/claude-api-lite/references/*.md
 !.claude/hooks/
 .claude/hooks/*
 !.claude/hooks/block-review-agents.py

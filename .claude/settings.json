@@ -1,0 +1,21 @@
+{
+  "skillOverrides": {
+    "claude-api": "off",
+    "code-review": "off"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/block-review-agents.py\"",
+            "timeout": 5,
+            "statusMessage": "Enforcing bounded review policy"
+          }
+        ]
+      }
+    ]
+  }
+}
