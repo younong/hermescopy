@@ -1,10 +1,10 @@
 import { type ChildProcess, spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { existsSync } from 'node:fs'
-import { delimiter, resolve } from 'node:path'
+import { delimiter, isAbsolute, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 
-import { WebSocket as UndiciWebSocket } from 'undici'
+import { Agent as UndiciAgent, WebSocket as UndiciWebSocket } from 'undici'
 
 import type { GatewayEvent } from './gatewayTypes.js'
 import { CircularBuffer } from './lib/circularBuffer.js'
@@ -42,6 +42,45 @@ const resolveGatewayAttachUrl = () => {
 }
 
 const ownerWorkerAttachRequired = () => process.env.HERMES_OWNER_WORKER_TUI_ATTACH === '1'
+
+const resolveGatewaySocketPath = () => {
+  const raw = process.env.HERMES_TUI_GATEWAY_SOCKET_PATH?.trim()
+
+  return raw ? raw : null
+}
+
+const validateOwnerWorkerAttach = (attachUrl: string, socketPath: string | null) => {
+  let url: URL
+
+  try {
+    url = new URL(attachUrl)
+  } catch {
+    throw new Error('owner-worker gateway attach URL is invalid')
+  }
+
+  const attachTokens = url.searchParams.getAll('owner_tui_attach')
+
+  if (
+    url.protocol !== 'ws:' ||
+    url.hostname !== 'owner-worker' ||
+    url.port ||
+    url.username ||
+    url.password ||
+    url.hash ||
+    url.pathname !== '/api/ws' ||
+    [...url.searchParams.keys()].some(key => key !== 'owner_tui_attach') ||
+    attachTokens.length !== 1 ||
+    !attachTokens[0]
+  ) {
+    throw new Error('owner-worker gateway attach URL is invalid')
+  }
+
+  if (!socketPath || !isAbsolute(socketPath) || socketPath.includes('\0')) {
+    throw new Error('owner-worker gateway socket path is invalid')
+  }
+
+  return socketPath
+}
 
 const resolveSidecarUrl = () => {
   const raw = process.env.HERMES_TUI_SIDECAR_URL?.trim()
@@ -136,10 +175,12 @@ interface Pending {
 export class GatewayClient extends EventEmitter {
   private proc: ChildProcess | null = null
   private ws: WebSocket | null = null
+  private wsDispatcher: UndiciAgent | null = null
   private wsConnectPromise: Promise<void> | null = null
   private sidecarWs: WebSocket | null = null
   private attachUrl: null | string = null
   private sidecarUrl: null | string = null
+  private ownerWorkerAttach = false
   private reqId = 0
   private logs = new CircularBuffer<string>(MAX_GATEWAY_LOG_LINES)
   private pending = new Map<string, Pending>()
@@ -202,7 +243,10 @@ export class GatewayClient extends EventEmitter {
     // so doing the swap up front is also what makes the identity guard
     // match real timing in tests.)
     const ws = this.ws
+    const dispatcher = this.wsDispatcher
+
     this.ws = null
+    this.wsDispatcher = null
     this.wsConnectPromise = null
 
     try {
@@ -210,6 +254,8 @@ export class GatewayClient extends EventEmitter {
     } catch {
       // best effort
     }
+
+    void dispatcher?.close().catch(() => {})
   }
 
   private resetStartupState() {
@@ -428,7 +474,27 @@ export class GatewayClient extends EventEmitter {
     const safeAttachUrl = redactUrl(attachUrl)
     this.startReadyTimer('websocket', safeAttachUrl)
 
-    const WebSocketCtor = getWebSocketCtor()
+    let WebSocketCtor: typeof WebSocket
+    let dispatcher: UndiciAgent | null = null
+
+    try {
+      if (this.ownerWorkerAttach) {
+        const socketPath = validateOwnerWorkerAttach(attachUrl, resolveGatewaySocketPath())
+
+        dispatcher = new UndiciAgent({ connect: { socketPath } })
+        WebSocketCtor = UndiciWebSocket as unknown as typeof WebSocket
+      } else {
+        WebSocketCtor = getWebSocketCtor()
+      }
+    } catch {
+      const line = '[startup] owner-worker gateway attach configuration invalid'
+
+      this.pushLog(line)
+      this.publish({ type: 'gateway.stderr', payload: { line } })
+      this.handleTransportExit(1, 'owner-worker gateway attach configuration invalid')
+
+      return
+    }
 
     if (typeof WebSocketCtor === 'undefined') {
       const line = `[startup] WebSocket API unavailable; cannot attach to ${safeAttachUrl}`
@@ -441,10 +507,15 @@ export class GatewayClient extends EventEmitter {
     }
 
     try {
-      const ws = new WebSocketCtor(attachUrl)
+      const ws = (this.ownerWorkerAttach
+        ? new UndiciWebSocket(attachUrl, { dispatcher: dispatcher! })
+        : new WebSocketCtor(attachUrl)) as unknown as WebSocket
+
+      const ownedDispatcher = dispatcher
       let settled = false
 
       this.ws = ws
+      this.wsDispatcher = ownedDispatcher
 
       const connectPromise = new Promise<void>((resolve, reject) => {
         ws.addEventListener(
@@ -508,6 +579,12 @@ export class GatewayClient extends EventEmitter {
         this.pushLog(`[lifecycle] websocket close code=${ev.code}`)
         this.ws = null
         this.wsConnectPromise = null
+
+        if (this.wsDispatcher === ownedDispatcher) {
+          this.wsDispatcher = null
+        }
+
+        void ownedDispatcher?.close().catch(() => {})
         this.handleTransportExit(ev.code, `gateway websocket closed${ev.code ? ` (${ev.code})` : ''}`)
       })
       ws.addEventListener('error', () => {
@@ -517,6 +594,7 @@ export class GatewayClient extends EventEmitter {
         this.publish({ type: 'gateway.stderr', payload: { line } })
       })
     } catch (err) {
+      void dispatcher?.close().catch(() => {})
       this.pushLog(`[startup] failed to connect websocket gateway ${safeAttachUrl} (constructor error)`)
       this.handleTransportExit(1, 'gateway websocket startup failed')
     }
@@ -529,6 +607,7 @@ export class GatewayClient extends EventEmitter {
 
     this.attachUrl = attachUrl
     this.sidecarUrl = sidecarUrl
+    this.ownerWorkerAttach = ownerWorkerAttachRequired()
     this.resetStartupState()
 
     if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
@@ -677,12 +756,20 @@ export class GatewayClient extends EventEmitter {
     return this.logs.tail(Math.max(1, limit)).join('\n')
   }
 
+  requiresFreshOwnerAttachOnExit(): boolean {
+    return this.ownerWorkerAttach
+  }
+
   private async ensureAttachedWebSocket(method: string): Promise<WebSocket> {
     if (!this.attachUrl) {
       throw new Error('gateway not running')
     }
 
     if (!this.ws || this.ws.readyState === WS_CLOSED || this.ws.readyState === WS_CLOSING) {
+      if (this.ownerWorkerAttach) {
+        throw new Error(`gateway not connected: ${method}`)
+      }
+
       this.start()
     }
 

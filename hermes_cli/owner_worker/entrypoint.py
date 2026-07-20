@@ -301,6 +301,7 @@ def create_app(
     app.state.owner_worker_owner_home = owner_home
     app.state.owner_worker_generation = worker_generation
     app.state.owner_worker_id = worker_id
+    app.state.owner_worker_socket_path = runtime_paths.worker_socket
     app.state.owner_worker_controlled_roots = controlled_roots
     app.state.owner_worker_control_home = os.environ.get("HERMES_CONTROL_HOME", "") or None
     app.state.owner_worker_lease = fallback_lease or _worker_lease_from_env(owner_key)

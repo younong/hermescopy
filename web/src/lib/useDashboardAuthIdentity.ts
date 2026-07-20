@@ -53,6 +53,7 @@ function useDashboardAuthIdentityState(): DashboardAuthIdentity {
     () => async () => {
       if (!authRequired) {
         if (mounted.current) {
+          dashboardAuthTransition.transition(undefined);
           setAuthMe(null);
           setLoading(false);
           setError(null);
@@ -66,7 +67,10 @@ function useDashboardAuthIdentityState(): DashboardAuthIdentity {
       }
       try {
         const identity = await api.getAuthMe();
-        if (mounted.current) setAuthMe(identity);
+        if (mounted.current) {
+          dashboardAuthTransition.transition(identity.owner_key);
+          setAuthMe(identity);
+        }
       } catch (err) {
         if (mounted.current) {
           setAuthMe(null);
@@ -88,13 +92,6 @@ function useDashboardAuthIdentityState(): DashboardAuthIdentity {
   }, [refresh, mounted]);
 
   const ownerKey = authMe?.owner_key;
-  const [transitionReady, setTransitionReady] = useState(!authRequired);
-
-  useEffect(() => {
-    const nextOwnerKey = authRequired ? ownerKey : undefined;
-    dashboardAuthTransition.transition(nextOwnerKey);
-    setTransitionReady(!authRequired || !!nextOwnerKey);
-  }, [authRequired, ownerKey]);
 
   return {
     authMe,
@@ -102,7 +99,7 @@ function useDashboardAuthIdentityState(): DashboardAuthIdentity {
     error,
     loading,
     ownerKey,
-    ready: (!authRequired || !!ownerKey) && transitionReady,
+    ready: !authRequired || !!ownerKey,
     refresh,
   };
 }

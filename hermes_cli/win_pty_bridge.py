@@ -113,6 +113,24 @@ class WinPtyBridge:
         except Exception:
             return False
 
+    def exit_code(self) -> Optional[int]:
+        """Return the child status when pywinpty exposes it."""
+        deadline = time.monotonic() + 0.5
+        while True:
+            try:
+                if not self._proc.isalive():
+                    break
+            except Exception:
+                return None
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.01)
+        for name in ("exitstatus", "exit_status", "returncode"):
+            status = getattr(self._proc, name, None)
+            if status is not None:
+                return int(status)
+        return None
+
     # -- I/O --------------------------------------------------------------
 
     def read(self, timeout: float = 0.2) -> Optional[bytes]:

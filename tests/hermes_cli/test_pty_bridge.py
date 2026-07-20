@@ -113,6 +113,17 @@ class TestPtyBridgeIO:
         finally:
             bridge.close()
 
+    @pytest.mark.parametrize("status", [0, 7])
+    def test_exit_code_reports_reaped_child_status(self, status):
+        bridge = PtyBridge.spawn(["/bin/sh", "-c", f"exit {status}"])
+        try:
+            deadline = time.monotonic() + 3.0
+            while bridge.read(timeout=0.1) is not None and time.monotonic() < deadline:
+                pass
+            assert bridge.exit_code() == status
+        finally:
+            bridge.close()
+
 
 @skip_on_windows
 class TestPtyBridgeResize:

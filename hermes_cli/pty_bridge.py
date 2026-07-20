@@ -187,6 +187,26 @@ class PtyBridge:
         except Exception:
             return False
 
+    def exit_code(self) -> Optional[int]:
+        """Return the reaped child status, or ``None`` while it is unavailable."""
+        deadline = time.monotonic() + 0.5
+        while True:
+            try:
+                if not self._proc.isalive():
+                    break
+            except Exception:
+                return None
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.01)
+        status = getattr(self._proc, "exitstatus", None)
+        if status is not None:
+            return int(status)
+        signal_status = getattr(self._proc, "signalstatus", None)
+        if signal_status is not None:
+            return 128 + int(signal_status)
+        return None
+
     # -- I/O --------------------------------------------------------------
 
     def read(self, timeout: float = 0.2) -> Optional[bytes]:

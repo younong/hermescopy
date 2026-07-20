@@ -43,6 +43,37 @@ afterEach(async () => {
 });
 
 describe("DashboardAuthIdentityProvider", () => {
+  it("does not expose an owner as ready before its transition completes", async () => {
+    const identity = deferred<AuthIdentity>();
+    apiMocks.getAuthMe.mockReturnValue(identity.promise);
+    const transition = vi.spyOn(dashboardAuthTransition, "transition");
+    const readiness: Array<{ owner: string; ready: string }> = [];
+    const observer = new MutationObserver(() => {
+      const probe = document.querySelector<HTMLElement>("[data-first-owner]");
+      if (!probe) return;
+      readiness.push({
+        owner: probe.textContent ?? "",
+        ready: probe.dataset.ready ?? "",
+      });
+    });
+    observer.observe(document.body, { attributes: true, childList: true, subtree: true });
+
+    renderIdentityTree();
+
+    await act(async () => {
+      identity.resolve(authIdentity());
+      await identity.promise;
+    });
+    observer.disconnect();
+
+    expect(transition).toHaveBeenCalledWith("owner-a");
+    expect(readiness).not.toContainEqual({ owner: "owner-a", ready: "false" });
+    expect(document.querySelector("[data-first-owner]")).toMatchObject({
+      textContent: "owner-a",
+    });
+    expect(document.querySelector("[data-first-owner]")?.getAttribute("data-ready")).toBe("true");
+  });
+
   it("shares a resolved owner with consumers that mount later", async () => {
     const identity = deferred<AuthIdentity>();
     apiMocks.getAuthMe.mockReturnValue(identity.promise);

@@ -193,7 +193,7 @@ export function GuiChatShell() {
 
   useEffect(() => {
     if (!authIdentityReady) return;
-    if (canonicalRouteRef.current === resumeSessionId) {
+    if (canonicalRouteRef.current !== null && canonicalRouteRef.current === resumeSessionId) {
       canonicalRouteRef.current = null;
       return;
     }

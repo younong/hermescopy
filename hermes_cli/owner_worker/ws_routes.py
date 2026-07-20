@@ -341,6 +341,24 @@ def _owner_tui_gateway_url(app: Any) -> str:
     return f"ws://owner-worker/api/ws?owner_tui_attach={_mint_gateway_attach_token(app)}"
 
 
+def _owner_tui_gateway_socket_path(app: Any) -> str:
+    """Return the exact generation socket already admitted for this Worker."""
+    state = getattr(app, "state", None)
+    owner_home = Path(getattr(state, "owner_worker_owner_home", "")).expanduser().resolve()
+    generation = int(getattr(state, "owner_worker_generation", 0) or 0)
+    configured = getattr(state, "owner_worker_socket_path", None)
+    if generation < 1 or configured is None:
+        raise RuntimeError("owner worker gateway socket is unavailable")
+
+    from hermes_cli.owner_runtime import owner_worker_socket_path
+
+    expected = owner_worker_socket_path(owner_home, generation).resolve(strict=False)
+    actual = Path(configured).expanduser().resolve(strict=False)
+    if actual != expected:
+        raise RuntimeError("owner worker gateway socket does not match worker generation")
+    return str(actual)
+
+
 def _trusted_live_metadata(peer: _Owp1Peer, path: str) -> tuple[str, int, str, int, int, str, str, str]:
     """Freeze the exact trusted admission fence for a worker live record."""
     claims = peer.claims
@@ -574,6 +592,7 @@ def _resolve_chat_argv(
             os.environ["HERMES_TUI_DIR"] = old_tui_dir
 
     env = os.environ.copy()
+    env.pop("HERMES_TUI_GATEWAY_SOCKET_PATH", None)
     # The terminal child talks only through the authenticated Gateway bridge.
     # It must not inherit deployment-default metadata intended for the owner
     # worker's local inference resolver, even though those fields are non-secret.
@@ -640,6 +659,7 @@ def _resolve_chat_argv(
         env["HERMES_TUI_BROWSER_ID"] = browser_id
     if gateway_ws_url := _build_gateway_ws_url(app_obj):
         env["HERMES_TUI_GATEWAY_URL"] = gateway_ws_url
+        env["HERMES_TUI_GATEWAY_SOCKET_PATH"] = _owner_tui_gateway_socket_path(app_obj)
         env["HERMES_OWNER_WORKER_TUI_ATTACH"] = "1"
 
     return list(argv), str(cwd_path if cwd_path else cwd) if (cwd_path or cwd) else None, env
@@ -713,7 +733,7 @@ async def pty_ws(ws: WebSocket) -> None:
             await _release_browser_pty_owner(ws.app, browser_id=browser_id, owner_id=browser_owner_id, metadata=metadata)
         await ws.close(code=1011)
         return
-    except SystemExit as exc:
+    except (SystemExit, RuntimeError) as exc:
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
         if browser_registered and browser_id:
             await _release_browser_pty_owner(ws.app, browser_id=browser_id, owner_id=browser_owner_id, metadata=metadata)
@@ -781,11 +801,21 @@ async def pty_ws(ws: WebSocket) -> None:
                     return
         finally:
             try:
+                exit_code = await asyncio.to_thread(bridge.exit_code)
+            except Exception:
+                exit_code = None
+            try:
                 await asyncio.to_thread(bridge.close)
             except Exception:
                 pass
             try:
-                await ws.close()
+                if exit_code not in (None, 0):
+                    await ws.close(
+                        code=1001,
+                        reason=_ws_close_reason("owner TUI exited unexpectedly"),
+                    )
+                else:
+                    await ws.close()
             except Exception:
                 pass
 
