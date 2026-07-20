@@ -3,6 +3,9 @@
     "claude-api": "off",
     "code-review": "off"
   },
+  "worktree": {
+    "baseRef": "fresh"
+  },
   "hooks": {
     "PreToolUse": [
       {
@@ -13,6 +16,17 @@
             "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/block-review-agents.py\"",
             "timeout": 5,
             "statusMessage": "Enforcing bounded review policy"
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/require-development-worktree.py\"",
+            "timeout": 5,
+            "statusMessage": "Enforcing worktree development policy"
           }
         ]
       }

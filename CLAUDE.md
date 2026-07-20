@@ -50,6 +50,31 @@ rg -n "session_detail_payload|resolve_resume_session_id" \
   hermes_cli/session_api.py tests/hermes_state/test_resolve_resume_session_id.py
 ```
 
+## Automated Development Lifecycle
+
+For every request that changes repository files:
+
+1. Before editing, use `EnterWorktree` to create a dedicated worktree. The
+   project setting `worktree.baseRef: "fresh"` makes it branch from the latest
+   `origin/main`; do not develop in the primary checkout or from its current
+   feature branch.
+2. Choose a descriptive worktree/branch name derived from the task. Keep all
+   implementation and validation inside that worktree.
+3. Run the focused validation required below. Do not publish changes when
+   required validation is failing; report the blocker instead.
+4. After validation succeeds, review the final diff and repository status,
+   commit all task changes with the required Claude co-author trailer, push the
+   branch to `origin`, and create a GitHub pull request targeting `main` with a
+   concise summary and test results.
+5. The repository owner has durably authorized commit, push, and PR creation as
+   the default completion steps for development tasks in this repository. Do
+   not ask for those instructions again. Still request confirmation for force
+   pushes, destructive operations, merging, deployment, release, or publishing
+   anywhere other than the task branch and its PR.
+6. Documentation-only changes to Claude workflow/configuration follow the same
+   lifecycle. Pure research, review, explanation, and read-only verification do
+   not require a worktree or PR.
+
 ## Choose a Work Path
 
 - **Fast:** the target file and closest focused test are known, the change is
