@@ -2604,6 +2604,71 @@ class TestTransientTransportRetry:
         assert primary.chat.completions.create.call_count == 2
         assert fb_client.chat.completions.create.call_count == 1
 
+    def test_compression_deadline_is_shared_with_fallback(self):
+        primary = MagicMock()
+        primary.base_url = "https://openrouter.ai/api/v1"
+        primary.chat.completions.create.side_effect = Exception(
+            "peer closed connection without sending complete message body"
+        )
+        fallback = MagicMock()
+        fallback.base_url = "https://api.openai.com/v1"
+        fallback.chat.completions.create.return_value = {"fallback": True}
+
+        p1, p2, p3 = self._patches(primary)
+        clock = iter([100.0, 100.0, 100.0, 101.0, 104.0, 104.0])
+        with (
+            p1, p2, p3,
+            patch("agent.auxiliary_client.time.monotonic", side_effect=lambda: next(clock)),
+            patch("agent.auxiliary_client.time.sleep"),
+            patch("agent.auxiliary_client._transient_retry_count", return_value=1),
+            patch("agent.auxiliary_client._TRANSIENT_RETRY_BACKOFF_BASE", 1.0),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(None, None, ""),
+            ),
+            patch(
+                "agent.auxiliary_client._try_main_agent_model_fallback",
+                return_value=(fallback, "fb-model", "openai"),
+            ),
+        ):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hi"}],
+                timeout=120,
+                deadline_monotonic=110.0,
+            )
+
+        assert result == {"fallback": True}
+        assert primary.chat.completions.create.call_args_list[0].kwargs["timeout"] == 10.0
+        assert primary.chat.completions.create.call_args_list[1].kwargs["timeout"] == 9.0
+        assert fallback.chat.completions.create.call_args.kwargs["timeout"] == 6.0
+
+    def test_compression_deadline_stops_before_retry_backoff(self):
+        primary = MagicMock()
+        primary.base_url = "https://openrouter.ai/api/v1"
+        primary.chat.completions.create.side_effect = Exception(
+            "peer closed connection without sending complete message body"
+        )
+        p1, p2, p3 = self._patches(primary)
+        clock = iter([100.0, 100.0, 104.5])
+        with (
+            p1, p2, p3,
+            patch("agent.auxiliary_client.time.monotonic", side_effect=lambda: next(clock)),
+            patch("agent.auxiliary_client.time.sleep") as sleep,
+            patch("agent.auxiliary_client._transient_retry_count", return_value=1),
+            patch("agent.auxiliary_client._TRANSIENT_RETRY_BACKOFF_BASE", 1.0),
+            pytest.raises(TimeoutError, match="aggregate deadline exhausted"),
+        ):
+            call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hi"}],
+                timeout=120,
+                deadline_monotonic=105.0,
+            )
+
+        sleep.assert_not_called()
+        assert primary.chat.completions.create.call_count == 1
+
     def test_compression_skips_same_provider_retry_on_timeout(self):
         """A timeout on the critical compression path must NOT retry the same
         provider (that doubles the user-visible stall, issue #54465) — it

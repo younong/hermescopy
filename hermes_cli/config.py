@@ -1352,9 +1352,9 @@ DEFAULT_CONFIG = {
                                       # non-JSON / timed out) aborts entirely instead of
                                       # dropping the middle window with a static
                                       # "summary unavailable" placeholder.  Messages are
-                                      # preserved unchanged and the session "freezes" at
-                                      # its current size until the user runs /compress
-                                      # (which bypasses the failure cooldown) or /new.
+                                      # preserved unchanged and the conversation continues;
+                                      # /compress bypasses the failure cooldown for an
+                                      # immediate manual retry, while /new starts fresh.
                                       # Default False matches historical behavior; set to
                                       # True if you'd rather pause than silently lose
                                       # context turns when your aux model is flaky.

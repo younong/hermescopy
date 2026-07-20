@@ -9724,23 +9724,23 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 )
 
                 raw = result.get("final_response", "")
+                is_error = bool(
+                    result.get("failed")
+                    or result.get("partial")
+                    or result.get("error")
+                )
                 status = (
                     "interrupted"
                     if result.get("interrupted")
-                    else "error" if result.get("error") else "complete"
+                    else "error" if is_error else "complete"
                 )
-                # When the backend produced no visible response AND reported a
-                # real error (e.g. invalid model slug → provider 4xx), surface
-                # that error as the visible text instead of shipping an empty
-                # turn to Ink. Mirrors classic CLI behavior at cli.py where
-                # (failed|partial) + no final_response → "Error: <detail>".
-                # Leaves the None-with-no-error path untouched: an empty
-                # successful turn still renders as empty, and the existing
-                # "(empty)" sentinel handling stays in its own lane.
-                if (not raw) and result.get("error") and (
-                    result.get("failed") or result.get("partial")
-                ):
-                    raw = f"Error: {result.get('error')}"
+                # Every failed/partial backend result must complete visibly,
+                # even if a malformed result omitted both final_response and
+                # error detail. Successful empty turns retain their existing
+                # downstream empty-sentinel behavior.
+                if not raw and is_error:
+                    detail = result.get("error")
+                    raw = f"Error: {detail}" if detail else "Error: Agent turn failed."
                 lr = result.get("last_reasoning")
                 if isinstance(lr, str) and lr.strip():
                     last_reasoning = lr.strip()

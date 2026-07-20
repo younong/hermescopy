@@ -88,6 +88,34 @@ describe("guiChatReducer live attach restoration", () => {
   });
 });
 
+describe("guiChatReducer terminal error completion", () => {
+  it("clears generating state and preserves visible error text", () => {
+    const streaming = guiChatReducer(
+      { ...initialGuiChatState, isGenerating: true },
+      {
+        type: "event",
+        event: { payload: { text: "partial" }, type: "message.delta" },
+      },
+    );
+
+    const state = guiChatReducer(streaming, {
+      type: "event",
+      event: {
+        payload: { status: "error", text: "Error: upstream returned 502" },
+        type: "message.complete",
+      },
+    });
+
+    expect(state.isGenerating).toBe(false);
+    expect(state.messages.at(-1)).toMatchObject({
+      role: "assistant",
+      status: "error",
+      streaming: false,
+      text: "Error: upstream returned 502",
+    });
+  });
+});
+
 describe("guiChatReducer history image restoration", () => {
   it("keeps a sent prompt with two WeChat article URLs as plain message text", () => {
     const prompt =

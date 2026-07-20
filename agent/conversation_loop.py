@@ -606,6 +606,8 @@ def run_conversation(
     final_response = None
     interrupted = False
     failed = False
+    terminal_error = None
+    terminal_failure_reason = None
     codex_ack_continuations = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
@@ -3904,7 +3906,6 @@ def run_conversation(
                         agent._dump_api_request_debug(
                             api_kwargs, reason="max_retries_exhausted", error=api_error,
                         )
-                    agent._persist_session(messages, conversation_history)
                     if classified.reason == FailoverReason.billing:
                         _final_response = f"Billing or credits exhausted: {_final_summary}"
                         if _billing_guidance:
@@ -3935,20 +3936,21 @@ def run_conversation(
                             "execute_code with Python's open() for large "
                             "files, or to write in smaller sections."
                         )
-                    return {
-                        "final_response": _final_response,
-                        "messages": messages,
-                        "api_calls": api_call_count,
-                        "completed": False,
-                        "failed": True,
-                        "error": _final_summary,
-                        # Surface the classified reason so callers (notably the
-                        # kanban worker path in cli.py) can distinguish a
-                        # transient throttle from a real failure and choose a
-                        # different exit code. ``rate_limit`` / ``billing`` here
-                        # mean "quota wall, not a task error".
-                        "failure_reason": classified.reason.value,
-                    }
+                    # Route the terminal failure through finalize_turn so the
+                    # visible error also closes the durable assistant transcript.
+                    # Direct returns here previously let live gateway clients see
+                    # the failure while resume/history still ended at the user row.
+                    final_response = _final_response
+                    failed = True
+                    terminal_error = _final_summary
+                    # Surface the classified reason so callers (notably the
+                    # kanban worker path in cli.py) can distinguish a transient
+                    # throttle from a real failure and choose a different exit
+                    # code. ``rate_limit`` / ``billing`` here mean "quota wall,
+                    # not a task error".
+                    terminal_failure_reason = classified.reason.value
+                    _turn_exit_reason = "api_retries_exhausted"
+                    break
 
                 # For rate limits, respect the Retry-After header if present
                 _retry_after = None
@@ -4076,9 +4078,12 @@ def run_conversation(
         # (e.g. repeated context-length errors that exhausted retry_count),
         # the `response` variable is still None. Break out cleanly.
         if response is None:
-            _turn_exit_reason = "all_retries_exhausted_no_response"
-            print(f"{agent.log_prefix}❌ All API retries exhausted with no successful response.")
-            agent._persist_session(messages, conversation_history)
+            if final_response is None:
+                terminal_error = "All API retries exhausted with no successful response."
+                final_response = terminal_error
+                failed = True
+                _turn_exit_reason = "all_retries_exhausted_no_response"
+                print(f"{agent.log_prefix}❌ {terminal_error}")
             break
 
         try:
@@ -5155,6 +5160,8 @@ def run_conversation(
         api_call_count=api_call_count,
         interrupted=interrupted,
         failed=failed,
+        error=terminal_error,
+        failure_reason=terminal_failure_reason,
         messages=messages,
         conversation_history=conversation_history,
         effective_task_id=effective_task_id,
