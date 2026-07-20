@@ -37,6 +37,8 @@ def test_generated_smoke_uses_public_ticket_and_full_session_lifecycle(smoke_mod
         timeout_ms=15_000,
     )
 
+    assert "page.evaluate(async (config)" in javascript
+    assert "page.evaluate(async (url)" not in javascript
     assert "api/auth/ws-ticket" in javascript
     assert "audience: 'browser-ws:/api/ws'" in javascript
     assert "config.pathPrefix.replace" in javascript

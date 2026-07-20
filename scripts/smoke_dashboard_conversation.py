@@ -49,6 +49,7 @@ def _smoke_javascript(*, base: str, path_prefix: str, marker: str, timeout_ms: i
     )
     return rf"""async (page) => {{
   const config = {config};
+  return await page.evaluate(async (config) => {{
   const checks = [];
   let socket = null;
   let liveSessionId = '';
@@ -110,20 +111,18 @@ def _smoke_javascript(*, base: str, path_prefix: str, marker: str, timeout_ms: i
 
   const connect = async () => {{
     const ticketUrl = new URL('api/auth/ws-ticket', config.base).toString();
-    const ticketResponse = await page.evaluate(async (url) => {{
-      const response = await fetch(url, {{
-        method: 'POST',
-        credentials: 'include',
-        headers: {{ 'Content-Type': 'application/json' }},
-        body: JSON.stringify({{ audience: 'browser-ws:/api/ws' }}),
-      }});
-      if (!response.ok) throw new Error(`ticket HTTP ${{response.status}}`);
-      const payload = await response.json();
-      if (!payload || typeof payload.ticket !== 'string' || !payload.ticket) {{
-        throw new Error('ticket response missing ticket');
-      }}
-      return payload.ticket;
-    }}, ticketUrl);
+    const response = await fetch(ticketUrl, {{
+      method: 'POST',
+      credentials: 'include',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ audience: 'browser-ws:/api/ws' }}),
+    }});
+    if (!response.ok) throw new Error(`ticket HTTP ${{response.status}}`);
+    const payload = await response.json();
+    if (!payload || typeof payload.ticket !== 'string' || !payload.ticket) {{
+      throw new Error('ticket response missing ticket');
+    }}
+    const ticketResponse = payload.ticket;
     const endpoint = new URL(config.base);
     endpoint.protocol = endpoint.protocol === 'https:' ? 'wss:' : 'ws:';
     endpoint.pathname = `${{config.pathPrefix.replace(/\/$/, '')}}/api/ws`;
@@ -269,6 +268,7 @@ def _smoke_javascript(*, base: str, path_prefix: str, marker: str, timeout_ms: i
       try {{ await closeSocket(); }} catch (_) {{}}
     }}
   }}
+  }}, config);
 }}
 """
 
