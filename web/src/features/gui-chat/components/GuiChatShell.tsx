@@ -70,7 +70,8 @@ export function GuiChatShell() {
   }, []);
 
   useEffect(() => dashboardAuthTransition.register(() => {
-    switchCoordinatorRef.current?.cancel();
+    switchCoordinatorRef.current?.dispose();
+    switchCoordinatorRef.current = null;
     connectionRef.current = null;
     eventFrameQueue.reset();
     dispatch({ type: "reset" });
@@ -192,7 +193,7 @@ export function GuiChatShell() {
 
   useEffect(() => {
     if (!authIdentityReady) return;
-    if (canonicalRouteRef.current === resumeSessionId) {
+    if (canonicalRouteRef.current !== null && canonicalRouteRef.current === resumeSessionId) {
       canonicalRouteRef.current = null;
       return;
     }
