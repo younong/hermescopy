@@ -2,7 +2,7 @@
 
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { GuiChatConnection } from "../api";
@@ -198,6 +198,60 @@ describe("GuiChatShell", () => {
 
     expect(connection.createOrAttach).toHaveBeenCalledOnce();
   });
+
+  it("reuses one connection while navigating between resumed sessions", async () => {
+    window.__HERMES_AUTH_REQUIRED__ = false;
+    const connection = createConnection();
+    mocks.connectGuiChat.mockReturnValue(connection);
+    let navigate: ReturnType<typeof useNavigate> | null = null;
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => {
+      root?.render(
+        <MemoryRouter initialEntries={["/chat-gui?resume=session-a"]}>
+          <DashboardAuthIdentityProvider>
+            <NavigationProbe
+              onReady={(nextNavigate) => {
+                navigate = nextNavigate;
+              }}
+            />
+            <GuiChatShell />
+          </DashboardAuthIdentityProvider>
+        </MemoryRouter>,
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(navigate).not.toBeNull();
+    for (const sessionId of ["session-b", "session-c", "session-d"]) {
+      await act(async () => {
+        navigate?.(`/chat-gui?resume=${sessionId}`);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+    }
+
+    expect(mocks.connectGuiChat).toHaveBeenCalledOnce();
+    expect(
+      connection.createOrAttachMock.mock.calls.map(([sessionId, generation]) => ({
+        generation,
+        sessionId,
+      })),
+    ).toEqual([
+      { generation: 1, sessionId: "session-a" },
+      { generation: 2, sessionId: "session-b" },
+      { generation: 3, sessionId: "session-c" },
+      { generation: 4, sessionId: "session-d" },
+    ]);
+    expect(connection.close).not.toHaveBeenCalled();
+
+    await act(async () => root?.unmount());
+    root = null;
+    expect(connection.close).toHaveBeenCalledOnce();
+  });
 });
 
 function ReadyProbe() {
@@ -205,9 +259,29 @@ function ReadyProbe() {
   return <span data-ready={ready} />;
 }
 
-function createConnection(): GuiChatConnection & { emitState(state: ConnectionState): void } {
+function NavigationProbe({
+  onReady,
+}: {
+  onReady(navigate: ReturnType<typeof useNavigate>): void;
+}) {
+  const navigate = useNavigate();
+  onReady(navigate);
+  return null;
+}
+
+type TestGuiChatConnection = GuiChatConnection & {
+  createOrAttachMock: ReturnType<typeof vi.fn<GuiChatConnection["createOrAttach"]>>;
+  emitState(state: ConnectionState): void;
+};
+
+function createConnection(): TestGuiChatConnection {
   const eventHandlers = new Set<(event: never) => void>();
   const stateHandlers = new Set<(state: ConnectionState) => void>();
+  const createOrAttachMock = vi.fn<GuiChatConnection["createOrAttach"]>().mockResolvedValue({
+    info: { cwd: "/tmp", model: "test-model" },
+    session_id: "runtime-a",
+    stored_session_id: "stored-a",
+  });
   const connection = {
     attachFile: vi.fn(),
     attachImage: vi.fn(),
@@ -224,12 +298,8 @@ function createConnection(): GuiChatConnection & { emitState(state: ConnectionSt
       },
     },
     close: vi.fn(),
-    createOrAttach: vi.fn().mockResolvedValue({
-      cwd: "/tmp",
-      model: "test-model",
-      session_id: "runtime-a",
-      stored_session_id: "stored-a",
-    }),
+    createOrAttach: createOrAttachMock,
+    createOrAttachMock,
     emitState: (state: ConnectionState) => {
       for (const handler of stateHandlers) handler(state);
     },
