@@ -91,6 +91,11 @@ export interface GuiChatConnection {
   attachImage(sessionId: string, file: File): Promise<ImageAttachResponse>;
   attachPdf(sessionId: string, file: File): Promise<PdfAttachResponse>;
   attachFile(sessionId: string, file: File): Promise<FileAttachResponse>;
+  loadEarlier(
+    sessionId: string,
+    cursor: string,
+    signal?: AbortSignal,
+  ): Promise<SessionResumeResponse>;
   send(sessionId: string, text: string): Promise<void>;
   stop(sessionId: string): Promise<void>;
   respondToApproval(sessionId: string, request: unknown, approved: boolean): Promise<void>;
@@ -125,6 +130,7 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
     browser_id: browserId,
     close_on_disconnect: false,
     source: "dashboard-gui",
+    display_history: { limit: 100 },
     ...(timing?.traceId ? { latency_trace_id: timing.traceId } : {}),
     ...(options.profile ? { profile: options.profile } : {}),
   });
@@ -219,6 +225,15 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
         path: file.name,
         session_id: sessionId,
       });
+    },
+    loadEarlier: async (sessionId, cursor, signal) => {
+      await ensureConnected(signal);
+      return client.request<SessionResumeResponse>(
+        "session.history",
+        { cursor, limit: 100, session_id: sessionId },
+        undefined,
+        signal,
+      );
     },
     respondToApproval: async (sessionId, _request, approved) => {
       await client.request("approval.respond", {

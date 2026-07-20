@@ -1089,11 +1089,26 @@ def create_app(
             db.close()
 
     @app.get("/api/sessions/{session_id}/messages")
-    def get_session_messages(session_id: str, profile: str | None = None, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
+    def get_session_messages(
+        session_id: str,
+        profile: str | None = None,
+        limit: int | None = None,
+        before: str | None = None,
+        _: None = Depends(_require_owner_token),
+    ) -> dict[str, Any]:
         _reject_profile(profile)
+        from gateway.session import current_historical_resume_scope
+
         db = _open_db()
         try:
-            return session_api.session_messages_payload(db, session_id)
+            scope = current_historical_resume_scope()
+            return session_api.session_messages_payload(
+                db,
+                session_id,
+                limit=limit,
+                before=before,
+                recovery_scope=(scope if socket_path is not None and scope is not None else None),
+            )
         finally:
             db.close()
 

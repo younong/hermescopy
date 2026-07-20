@@ -8379,18 +8379,24 @@ async def get_session_latest_descendant(request: Request, session_id: str):
     return payload
 
 @app.get("/api/sessions/{session_id}/messages")
-async def get_session_messages(request: Request, session_id: str, profile: Optional[str] = None):
+async def get_session_messages(
+    request: Request,
+    session_id: str,
+    profile: Optional[str] = None,
+    limit: Optional[int] = None,
+    before: Optional[str] = None,
+):
     if _authenticated_owner_request(request):
         _reject_authenticated_profile_param(profile)
         return await _proxy_authenticated_owner_http(request)
     db = _open_session_db_for_profile(profile)
     try:
-        sid = db.resolve_session_id(session_id)
-        if not sid:
-            raise HTTPException(status_code=404, detail="Session not found")
-        sid = db.resolve_resume_session_id(sid)
-        messages = db.get_messages(sid)
-        return {"session_id": sid, "messages": messages}
+        return session_api.session_messages_payload(
+            db,
+            session_id,
+            limit=limit,
+            before=before,
+        )
     finally:
         db.close()
 

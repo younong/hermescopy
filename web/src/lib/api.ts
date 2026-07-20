@@ -431,10 +431,21 @@ export const api = {
         profile,
       ),
     ),
-  getSessionMessages: (id: string, profile = getManagementProfile()) =>
-    fetchJSON<SessionMessagesResponse>(
-      appendProfileParam(`/api/sessions/${encodeURIComponent(id)}/messages`, profile),
-    ),
+  getSessionMessages: (
+    id: string,
+    options: { before?: string; limit?: number } = {},
+    profile = getManagementProfile(),
+  ) => {
+    const params = new URLSearchParams();
+    params.set("limit", String(Math.max(1, Math.min(options.limit ?? 100, 200))));
+    if (options.before) params.set("before", options.before);
+    return fetchJSON<SessionMessagesResponse>(
+      appendProfileParam(
+        `/api/sessions/${encodeURIComponent(id)}/messages?${params.toString()}`,
+        profile,
+      ),
+    );
+  },
   getSessionDetail: (id: string, profile = getManagementProfile()) =>
     fetchJSON<SessionInfo>(
       appendProfileParam(`/api/sessions/${encodeURIComponent(id)}`, profile),
@@ -1868,6 +1879,12 @@ export interface SessionMessage {
 }
 
 export interface SessionMessagesResponse {
+  history_page?: {
+    cursor?: string | null;
+    has_more: boolean;
+    returned_count: number;
+    truncated_count?: number;
+  };
   session_id: string;
   messages: SessionMessage[];
 }

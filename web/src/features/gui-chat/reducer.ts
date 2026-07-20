@@ -34,10 +34,16 @@ const RENDERED_TEXT_TRUNCATION_NOTICE =
   "\n\n[… output truncated in Chat GUI to keep the browser responsive …]";
 const NON_RENDERED_TOOL_RESULT_NOTICE =
   "[… non-rendered tool result omitted in Chat GUI to keep the browser responsive …]";
+const MAX_DISPLAY_MESSAGES = 1_500;
+const MAX_DISPLAY_TEXT_CHARS = 16_000_000;
+const MAX_DISPLAY_ARTIFACTS = 500;
 
 export type GuiChatAction =
   | { type: "connection"; state: GuiChatConnectionState }
   | { type: "session.created"; response: SessionCreateResponse | SessionResumeResponse }
+  | { type: "history.prepend.started" }
+  | { type: "history.prepend.succeeded"; response: SessionResumeResponse }
+  | { type: "history.prepend.failed"; message: string }
   | { type: "event"; event: GatewayEvent }
   | { type: "user.sent"; attachments?: MessageAttachmentState[]; id: string; text: string }
   | { type: "error"; message: string }
@@ -53,6 +59,12 @@ export function guiChatReducer(
       return { ...state, connection: action.state };
     case "session.created":
       return applySessionResponse(state, action.response);
+    case "history.prepend.started":
+      return { ...state, historyError: undefined, historyLoading: true };
+    case "history.prepend.succeeded":
+      return prependHistoryPage(state, action.response);
+    case "history.prepend.failed":
+      return { ...state, historyError: action.message, historyLoading: false };
     case "event":
       return applyGatewayEvent(state, action.event);
     case "user.sent":
@@ -83,13 +95,19 @@ function applySessionResponse(
     ? transcriptToHistoryState(response.messages, cwd)
     : null;
 
+  const messages = history ? history.messages : state.messages;
   return {
     ...state,
     artifacts: history ? history.artifacts : state.artifacts,
     cwd,
     error: undefined,
+    historyCursor: response.history_page?.cursor ?? undefined,
+    historyHasMore: !!response.history_page?.has_more,
+    historyLoading: false,
+    loadedTextChars: estimateMessageChars(messages),
+    safeguardReached: false,
     isGenerating: !!("running" in response && response.running),
-    messages: history ? history.messages : state.messages,
+    messages,
     model: response.info?.model ?? state.model,
     sessionId: response.session_id,
     storedSessionId:
@@ -98,6 +116,70 @@ function applySessionResponse(
       ("resumed" in response ? response.resumed : undefined) ??
       state.storedSessionId,
   };
+}
+
+function prependHistoryPage(
+  state: GuiChatState,
+  response: SessionResumeResponse,
+): GuiChatState {
+  if (response.session_id !== state.sessionId || !Array.isArray(response.messages)) {
+    return { ...state, historyLoading: false };
+  }
+  const history = transcriptToHistoryState(response.messages, state.cwd);
+  const knownIds = new Set(state.messages.map((message) => message.id));
+  let older = history.messages.filter((message) => !knownIds.has(message.id));
+  const remainingMessages = Math.max(0, MAX_DISPLAY_MESSAGES - state.messages.length);
+  const remainingChars = Math.max(0, MAX_DISPLAY_TEXT_CHARS - state.loadedTextChars);
+  let acceptedChars = 0;
+  older = older.slice(-remainingMessages).filter((message) => {
+    const size = message.text.length;
+    if (acceptedChars + size > remainingChars) return false;
+    acceptedChars += size;
+    return true;
+  });
+  const acceptedIds = new Set(older.map((message) => message.id));
+  const artifacts = { ...state.artifacts };
+  let remainingArtifacts = Math.max(
+    0,
+    MAX_DISPLAY_ARTIFACTS - countDisplayArtifacts(state.messages, state.artifacts),
+  );
+  let omittedArtifacts = 0;
+  for (const artifact of Object.values(history.artifacts)) {
+    if (artifact.messageId && !acceptedIds.has(artifact.messageId)) continue;
+    if (artifacts[artifact.id]) continue;
+    if (remainingArtifacts <= 0) {
+      omittedArtifacts += 1;
+      continue;
+    }
+    artifacts[artifact.id] = artifact;
+    remainingArtifacts -= 1;
+  }
+  const safeguardReached = older.length < history.messages.length || omittedArtifacts > 0;
+  return {
+    ...state,
+    artifacts,
+    historyCursor: safeguardReached ? undefined : response.history_page?.cursor ?? undefined,
+    historyError: undefined,
+    historyHasMore: !safeguardReached && !!response.history_page?.has_more,
+    historyLoading: false,
+    loadedTextChars: state.loadedTextChars + acceptedChars,
+    messages: [...older, ...state.messages],
+    safeguardReached,
+  };
+}
+
+function estimateMessageChars(messages: ChatMessage[]): number {
+  return messages.reduce((total, message) => total + message.text.length, 0);
+}
+
+function countDisplayArtifacts(
+  messages: ChatMessage[],
+  artifacts: Record<string, ArtifactState>,
+): number {
+  const artifactIds = new Set(Object.keys(artifacts));
+  let attachmentCount = 0;
+  for (const message of messages) attachmentCount += message.attachments?.length ?? 0;
+  return artifactIds.size + attachmentCount;
 }
 
 function applyGatewayEvent(state: GuiChatState, event: GatewayEvent): GuiChatState {
@@ -170,7 +252,7 @@ function transcriptToMessageWithArtifacts(
     return null;
   }
 
-  const id = `history-${index}`;
+  const id = message.id || `history-${index}`;
   const attachments = transcriptAttachments(message.attachments, id, cwd);
   const claimedSources = new Set(
     (message.attachments ?? []).flatMap(attachmentSourcePaths).map(normalizeAttachmentSource),
@@ -201,7 +283,7 @@ function transcriptToMessageWithArtifacts(
         ? buildSessionFileDownloadUrl(ref.url, cwd, name)
         : undefined,
       height: ref.height,
-      id: `history-${index}-image-${imageIndex}`,
+      id: `${id}-image-${imageIndex}`,
       messageId: id,
       mimeType: ref.mimeType ?? mimeTypeForImageSource(ref.url),
       title: ref.title || "Historical image",
@@ -212,7 +294,7 @@ function transcriptToMessageWithArtifacts(
   artifacts.push(
     ...fileRefs.map((ref, fileIndex) => ({
       downloadUrl: buildSessionFileDownloadUrl(ref.path, cwd, ref.name),
-      id: `history-${index}-file-${fileIndex}`,
+      id: `${id}-file-${fileIndex}`,
       kind: "file" as const,
       messageId: id,
       mimeType: mimeTypeForFileName(ref.name),
@@ -733,7 +815,50 @@ function preserveToolResult(name: string | undefined): boolean {
 }
 
 function appendMessage(state: GuiChatState, message: ChatMessage): GuiChatState {
-  return { ...state, messages: [...state.messages, message] };
+  const messages = [...state.messages, message];
+  const nextChars = state.loadedTextChars + message.text.length;
+  if (
+    messages.length <= MAX_DISPLAY_MESSAGES
+    && nextChars <= MAX_DISPLAY_TEXT_CHARS
+    && countDisplayArtifacts(messages, state.artifacts) <= MAX_DISPLAY_ARTIFACTS
+  ) {
+    return { ...state, loadedTextChars: nextChars, messages };
+  }
+
+  const protectedIds = new Set(
+    messages
+      .filter((value) => value.streaming)
+      .map((value) => value.id),
+  );
+  let loadedTextChars = nextChars;
+  while (
+    messages.length > 1
+    && (
+      messages.length > MAX_DISPLAY_MESSAGES
+      || loadedTextChars > MAX_DISPLAY_TEXT_CHARS
+      || countDisplayArtifacts(messages, state.artifacts) > MAX_DISPLAY_ARTIFACTS
+    )
+  ) {
+    const removable = messages.findIndex((value) => !protectedIds.has(value.id));
+    if (removable < 0) break;
+    loadedTextChars -= messages[removable].text.length;
+    messages.splice(removable, 1);
+  }
+  const liveArtifactIds = new Set(messages.flatMap((value) => value.artifactIds));
+  const artifacts = Object.fromEntries(
+    Object.entries(state.artifacts).filter(([id, artifact]) =>
+      liveArtifactIds.has(id) || (artifact.toolCallId && state.toolCalls[artifact.toolCallId]),
+    ),
+  );
+  return {
+    ...state,
+    artifacts,
+    historyCursor: undefined,
+    historyHasMore: false,
+    loadedTextChars,
+    messages,
+    safeguardReached: true,
+  };
 }
 
 function applySessionInfo(

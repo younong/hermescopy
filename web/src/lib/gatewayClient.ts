@@ -23,6 +23,7 @@ import {
 } from "@hermes/shared";
 
 import { HERMES_BASE_PATH, buildWsAuthParam } from "@/lib/api";
+import { diagnosticId, emitChatDiagnostic } from "@/lib/chatDiagnostics";
 
 export { JsonRpcGatewayError };
 export type { ConnectionState, GatewayEvent, GatewayEventName };
@@ -34,10 +35,21 @@ export interface GatewayConnectTiming {
 
 export class GatewayClient extends JsonRpcGatewayClient {
   constructor() {
+    const connectionId = diagnosticId("gui");
     super({
       closedErrorMessage: "WebSocket closed",
       connectErrorMessage: "WebSocket connection failed",
       notConnectedErrorMessage: "gateway not connected",
+      onLifecycle: (event) => emitChatDiagnostic({
+        clientInitiated: event.clientInitiated,
+        closeCode: event.code,
+        connectionId,
+        event: "closed",
+        opened: event.opened,
+        pendingCount: event.pendingCount,
+        surface: "gui_gateway",
+        wasClean: event.wasClean,
+      }),
       requestIdPrefix: "w",
     });
   }

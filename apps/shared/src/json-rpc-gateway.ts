@@ -56,6 +56,15 @@ type PendingCall = {
   timer?: ReturnType<typeof setTimeout>
 }
 
+export interface GatewayLifecycleEvent {
+  clientInitiated: boolean
+  code: number
+  event: 'closed'
+  opened: boolean
+  pendingCount: number
+  wasClean: boolean
+}
+
 export interface GatewayClientOptions {
   closedErrorMessage?: string
   connectErrorMessage?: string
@@ -65,6 +74,7 @@ export interface GatewayClientOptions {
   requestTimeoutMs?: number
   socketFactory?: (url: string) => WebSocketLike
   notConnectedErrorMessage?: string
+  onLifecycle?: (event: GatewayLifecycleEvent) => void
 }
 
 const ANY = '*'
@@ -79,10 +89,12 @@ export class JsonRpcGatewayClient {
   private pending = new Map<GatewayRequestId, PendingCall>()
   private socket: WebSocketLike | null = null
   private state: ConnectionState = 'idle'
+  private clientClosing = false
+  private socketOpened = false
   private readonly eventHandlers = new Map<string, Set<(event: GatewayEvent) => void>>()
   private readonly stateHandlers = new Set<(state: ConnectionState) => void>()
-  private readonly options: Required<Omit<GatewayClientOptions, 'socketFactory'>> &
-    Pick<GatewayClientOptions, 'socketFactory'>
+  private readonly options: Required<Omit<GatewayClientOptions, 'socketFactory' | 'onLifecycle'>> &
+    Pick<GatewayClientOptions, 'onLifecycle' | 'socketFactory'>
 
   constructor(options: GatewayClientOptions = {}) {
     this.options = {
@@ -91,6 +103,7 @@ export class JsonRpcGatewayClient {
       connectTimeoutMs: options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
       createRequestId: options.createRequestId ?? ((nextId: number) => `${options.requestIdPrefix ?? 'r'}${nextId}`),
       notConnectedErrorMessage: options.notConnectedErrorMessage ?? 'gateway not connected',
+      onLifecycle: options.onLifecycle,
       requestIdPrefix: options.requestIdPrefix ?? 'r',
       requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
       socketFactory: options.socketFactory
@@ -113,6 +126,8 @@ export class JsonRpcGatewayClient {
 
     const socket = this.options.socketFactory?.(wsUrl) ?? new WebSocket(wsUrl)
     this.socket = socket
+    this.clientClosing = false
+    this.socketOpened = false
     let rejectConnecting: ((error: Error) => void) | null = null
 
     socket.addEventListener('message', message => {
@@ -123,11 +138,19 @@ export class JsonRpcGatewayClient {
       this.handleMessage(message.data)
     })
 
-    socket.addEventListener('close', () => {
+    socket.addEventListener('close', event => {
       if (this.socket !== socket) {
         return
       }
 
+      this.options.onLifecycle?.({
+        clientInitiated: this.clientClosing,
+        code: event.code,
+        event: 'closed',
+        opened: this.socketOpened,
+        pendingCount: this.pending.size,
+        wasClean: event.wasClean
+      })
       this.socket = null
       this.setState('closed')
       const error = new Error(this.options.closedErrorMessage)
@@ -178,6 +201,7 @@ export class JsonRpcGatewayClient {
 
         settled = true
         cleanup()
+        this.socketOpened = true
         this.setState('open')
         resolve()
       }
@@ -211,6 +235,7 @@ export class JsonRpcGatewayClient {
     }
 
     try {
+      this.clientClosing = true
       socket.close()
     } finally {
       this.socket = null

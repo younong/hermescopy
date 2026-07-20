@@ -387,6 +387,8 @@ function SessionRow({
   resumeInChatEnabled,
 }: SessionRowProps) {
   const [messages, setMessages] = useState<SessionMessage[] | null>(null);
+  const [historyCursor, setHistoryCursor] = useState<string | null>(null);
+  const [historyHasMore, setHistoryHasMore] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [renaming, setRenaming] = useState(false);
@@ -398,13 +400,37 @@ function SessionRow({
   useEffect(() => {
     if (isExpanded && messages === null && !loading) {
       setLoading(true);
+      setError(null);
       api
-        .getSessionMessages(session.id)
-        .then((resp) => setMessages(resp.messages))
+        .getSessionMessages(session.id, { limit: 100 })
+        .then((resp) => {
+          setMessages(resp.messages);
+          setHistoryCursor(resp.history_page?.cursor ?? null);
+          setHistoryHasMore(!!resp.history_page?.has_more);
+        })
         .catch((err) => setError(String(err)))
         .finally(() => setLoading(false));
     }
   }, [isExpanded, session.id, messages, loading]);
+
+  const loadEarlierMessages = async () => {
+    if (!historyCursor || loading) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const resp = await api.getSessionMessages(session.id, {
+        before: historyCursor,
+        limit: 100,
+      });
+      setMessages((current) => [...resp.messages, ...(current ?? [])]);
+      setHistoryCursor(resp.history_page?.cursor ?? null);
+      setHistoryHasMore(!!resp.history_page?.has_more);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const sourceInfo = (session.source
     ? SOURCE_CONFIG[session.source]
@@ -653,7 +679,21 @@ function SessionRow({
             </p>
           )}
           {messages && messages.length > 0 && (
-            <MessageList messages={messages} highlight={searchQuery} />
+            <>
+              {historyHasMore && (
+                <div className="mb-3 flex justify-center">
+                  <Button
+                    outlined
+                    size="sm"
+                    disabled={loading || !historyCursor}
+                    onClick={() => void loadEarlierMessages()}
+                  >
+                    {loading ? "Loading earlier messages…" : "Load earlier messages"}
+                  </Button>
+                </div>
+              )}
+              <MessageList messages={messages} highlight={searchQuery} />
+            </>
           )}
         </div>
       )}

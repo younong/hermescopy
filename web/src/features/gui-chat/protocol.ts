@@ -19,6 +19,7 @@ export interface GatewayTranscriptAttachment {
 }
 
 export interface GatewayTranscriptMessage {
+  id?: string;
   role: "assistant" | "system" | "tool" | "user";
   text?: string;
   content?: unknown;
@@ -27,7 +28,16 @@ export interface GatewayTranscriptMessage {
   context?: string;
 }
 
+export interface HistoryPagePayload {
+  cursor?: string | null;
+  has_more: boolean;
+  returned_count: number;
+  truncated_count?: number;
+  live_only?: boolean;
+}
+
 export interface SessionCreateResponse {
+  history_page?: HistoryPagePayload;
   info?: SessionInfoPayload;
   message_count?: number;
   messages?: GatewayTranscriptMessage[];

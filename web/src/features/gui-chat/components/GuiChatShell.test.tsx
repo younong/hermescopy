@@ -191,6 +191,7 @@ function createConnection(): GuiChatConnection {
       session_id: "runtime-a",
       stored_session_id: "stored-a",
     }),
+    loadEarlier: vi.fn(),
     respondToApproval: vi.fn(),
     send: vi.fn(),
     stop: vi.fn(),

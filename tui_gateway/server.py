@@ -1054,6 +1054,43 @@ def _resume_history(db, target: str, *, include_ancestors: bool, recovery_scope:
     return db.get_messages_as_conversation(target, **kwargs)
 
 
+def _display_history_request(params: dict) -> tuple[bool, int]:
+    config = params.get("display_history")
+    if not isinstance(config, dict):
+        return False, 100
+    try:
+        limit = int(config.get("limit", 100))
+    except (TypeError, ValueError):
+        limit = 100
+    return True, max(1, min(limit, 200))
+
+
+def _display_history_page(
+    db,
+    target: str,
+    *,
+    limit: int,
+    cursor: str | None = None,
+    recovery_scope: dict | None,
+) -> dict:
+    return db.get_conversation_page(
+        target,
+        before_cursor=cursor,
+        limit=limit,
+        include_ancestors=True,
+        recovery_scope=recovery_scope,
+    )
+
+
+def _history_page_payload(page: dict) -> dict:
+    return {
+        "cursor": page.get("next_cursor"),
+        "has_more": bool(page.get("has_more")),
+        "returned_count": int(page.get("returned_count") or 0),
+        "truncated_count": int(page.get("filtered_count") or 0),
+    }
+
+
 def _reopen_resume_session(db, target: str, *, recovery_scope: dict | None) -> None:
     """Reopen only the previously validated durable resume target."""
     if recovery_scope is None:
@@ -5121,11 +5158,22 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if role == "tool":
             tc_id = m.get("tool_call_id", "")
             tc_info = tool_call_args.get(tc_id) if tc_id else None
-            name = (tc_info[0] if tc_info else None) or m.get("tool_name") or "tool"
-            args = (tc_info[1] if tc_info else None) or {}
-            messages.append(
-                {"role": "tool", "name": name, "context": _tool_ctx(name, args)}
+            name = (
+                (tc_info[0] if tc_info else None)
+                or m.get("_display_tool_name")
+                or m.get("tool_name")
+                or "tool"
             )
+            args = (
+                (tc_info[1] if tc_info else None)
+                or m.get("_display_tool_args")
+                or {}
+            )
+            message = {"role": "tool", "name": name, "context": _tool_ctx(name, args)}
+            row_id = m.get("_row_id")
+            if row_id is not None:
+                message["id"] = f"db-{m.get('_session_id') or 'session'}-{row_id}"
+            messages.append(message)
             continue
         # An assistant turn may carry only reasoning/thinking content with no
         # visible text (extended-thinking turns, thinking-only recovery
@@ -5147,6 +5195,9 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if not content_text.strip() and not has_reasoning and not attachments:
             continue
         msg = {"role": role, "text": content_text}
+        row_id = m.get("_row_id")
+        if row_id is not None:
+            msg["id"] = f"db-{m.get('_session_id') or 'session'}-{row_id}"
         if attachments:
             msg["attachments"] = attachments
         if role == "assistant":
@@ -6021,6 +6072,7 @@ def _session_resume(rid, params: dict) -> dict:
         return os.getenv("TERMINAL_CWD", os.getcwd())
 
     dashboard_attach = is_truthy_value(params.get("_dashboard_attach", False))
+    paged_display, display_limit = _display_history_request(params)
 
     def _reuse_live_payload(sid: str, session: dict) -> dict:
         source = str(params.get("source") or "").strip()
@@ -6032,6 +6084,7 @@ def _session_resume(rid, params: dict) -> dict:
             cols=None if dashboard_attach else cols,
             touch=not dashboard_attach,
             transport=None if dashboard_attach else current_transport() or _stdio_transport,
+            display_limit=display_limit if paged_display else None,
         )
         payload["resumed"] = target
         if dashboard_attach:
@@ -6158,9 +6211,19 @@ def _session_resume(rid, params: dict) -> dict:
                 started_at=stage_started_at,
             )
             stage_started_at = time.monotonic()
-            display_history = _resume_history(
-                db, target, include_ancestors=True, recovery_scope=recovery_scope
-            )
+            display_page = None
+            if paged_display:
+                display_page = _display_history_page(
+                    db,
+                    target,
+                    limit=display_limit,
+                    recovery_scope=recovery_scope,
+                )
+                display_history = display_page["messages"]
+            else:
+                display_history = _resume_history(
+                    db, target, include_ancestors=True, recovery_scope=recovery_scope
+                )
             log_latency_stage(
                 logger,
                 trace_id=latency_trace_id,
@@ -6175,7 +6238,11 @@ def _session_resume(rid, params: dict) -> dict:
         # Display keeps the full transcript; the model-fed history drops a
         # dangling/interrupted tool-call tail so a session killed mid-loop does
         # not replay the unanswered call forever (#29086).
-        prefix = display_history[: max(0, len(display_history) - len(raw_history))]
+        prefix = (
+            []
+            if paged_display
+            else display_history[: max(0, len(display_history) - len(raw_history))]
+        )
         history = sanitize_replay_history(raw_history)
         # Restore the model/provider/reasoning/tier this chat last used so the
         # deferred build (and the info below) match the eager path — without them
@@ -6218,6 +6285,11 @@ def _session_resume(rid, params: dict) -> dict:
                 **({"_attach_candidate": True} if dashboard_attach else {}),
                 "message_count": len(messages),
                 "messages": messages,
+                **(
+                    {"history_page": _history_page_payload(display_page)}
+                    if display_page is not None
+                    else {}
+                ),
                 "info": _lazy_resume_info(
                     cwd,
                     model=model_override.get("model") or "",
@@ -6252,11 +6324,23 @@ def _session_resume(rid, params: dict) -> dict:
         set_hermes_home_override(str(profile_home)) if profile_home is not None else None
     )
     try:
-        db.reopen_session(target)
-        raw_history = db.get_messages_as_conversation(target)
-        display_history = db.get_messages_as_conversation(
-            target, include_ancestors=True
+        _reopen_resume_session(db, target, recovery_scope=recovery_scope)
+        raw_history = _resume_history(
+            db, target, include_ancestors=False, recovery_scope=recovery_scope
         )
+        display_page = None
+        if paged_display:
+            display_page = _display_history_page(
+                db,
+                target,
+                limit=display_limit,
+                recovery_scope=recovery_scope,
+            )
+            display_history = display_page["messages"]
+        else:
+            display_history = _resume_history(
+                db, target, include_ancestors=True, recovery_scope=recovery_scope
+            )
         # The display transcript keeps every row so the user still sees their
         # full history.  The model-fed history is sanitized: a session whose
         # last turn died mid-tool-loop persists a dangling assistant(tool_calls)
@@ -6264,9 +6348,11 @@ def _session_resume(rid, params: dict) -> dict:
         # re-issue the unanswered call forever — the permanent-"thinking" stuck
         # session in #29086.  The messaging gateway already strips this; this is
         # the WebUI/TUI resume path picking up the same cleanup.
-        display_history_prefix = display_history[
-            : max(0, len(display_history) - len(raw_history))
-        ]
+        display_history_prefix = (
+            []
+            if paged_display
+            else display_history[: max(0, len(display_history) - len(raw_history))]
+        )
         history = sanitize_replay_history(raw_history)
         messages = _history_to_messages(display_history)
         tokens = _set_session_context(target)
@@ -6360,6 +6446,11 @@ def _session_resume(rid, params: dict) -> dict:
             "resumed": target,
             "message_count": len(messages),
             "messages": messages,
+            **(
+                {"history_page": _history_page_payload(display_page)}
+                if display_page is not None
+                else {}
+            ),
             "info": _session_info(agent, session),
             "inflight": None,
             "running": False,
@@ -6499,6 +6590,7 @@ def _live_session_payload(
     cols: int | None = None,
     touch: bool = False,
     transport: Transport | None = None,
+    display_limit: int | None = None,
 ) -> dict:
     with session["history_lock"]:
         if cols is not None:
@@ -6512,16 +6604,58 @@ def _live_session_payload(
         )
         inflight = _inflight_snapshot(session)
         running = bool(session.get("running"))
+    session_key = _session_lookup_key(session, fallback=sid)
+    display_page = None
+    if display_limit is not None:
+        recovery_scope = current_historical_resume_scope()
+        try:
+            with _session_db(session) as db:
+                if db is not None:
+                    if recovery_scope is not None:
+                        row = db.get_session_for_recovery(
+                            session_key, recovery_scope=recovery_scope
+                        )
+                        if (
+                            not row
+                            or not owner_metadata_matches_historical_resume_scope(row)
+                        ):
+                            raise ValueError("session not found")
+                    display_page = _display_history_page(
+                        db,
+                        session_key,
+                        limit=display_limit,
+                        recovery_scope=recovery_scope,
+                    )
+        except Exception:
+            logger.warning(
+                "live session display history page failed; using bounded in-memory history",
+                exc_info=True,
+            )
+        if display_page is not None:
+            history = display_page["messages"]
+        elif len(history) > display_limit:
+            history = history[-display_limit:]
     payload = {
         "info": _fallback_session_info(session),
         "message_count": len(history),
         "messages": _history_to_messages(history),
         "running": running,
         "session_id": sid,
-        "session_key": _session_lookup_key(session, fallback=sid),
+        "session_key": session_key,
         "started_at": float(session.get("created_at") or time.time()),
         "status": _session_live_status(sid, session),
     }
+    if display_limit is not None:
+        if display_page is not None:
+            payload["history_page"] = _history_page_payload(display_page)
+        else:
+            payload["history_page"] = {
+                "cursor": None,
+                "has_more": False,
+                "returned_count": len(payload["messages"]),
+                "truncated_count": 0,
+                "live_only": True,
+            }
     if inflight:
         payload["inflight"] = inflight
     return payload
@@ -8275,25 +8409,63 @@ def _(rid, params: dict) -> dict:
 
 @method("session.history")
 def _(rid, params: dict) -> dict:
-    session, err = _sess_nowait(params, rid)
-    if err:
-        return err
-    history = list(session.get("history", []))
-    db = _get_db()
-    if db is not None and session.get("session_key"):
+    sid = str(params.get("session_id") or "")
+    if not sid:
+        return _err(rid, 4006, "session_id required")
+    session = _sessions.get(sid)
+    if session is None or session.get("_finalized"):
+        return _err(rid, 4007, "session not found")
+    target = _session_lookup_key(session, fallback=sid)
+    cursor = params.get("cursor")
+    paged = cursor is not None or "limit" in params
+    if cursor is not None and not isinstance(cursor, str):
+        return _err(rid, 4002, "cursor must be a string")
+    try:
+        limit = max(1, min(int(params.get("limit", 100)), 200))
+    except (TypeError, ValueError):
+        return _err(rid, 4002, "limit must be an integer")
+    recovery_scope = current_historical_resume_scope()
+    with _session_db(session) as db:
+        if db is None:
+            return _db_unavailable_error(rid, code=5000)
+        if recovery_scope is not None:
+            row = db.get_session_for_recovery(target, recovery_scope=recovery_scope)
+            if not row or not owner_metadata_matches_historical_resume_scope(row):
+                return _err(rid, 4007, "session not found")
         try:
-            history = db.get_messages_as_conversation(
-                session["session_key"], include_ancestors=True
-            )
+            if paged:
+                page = _display_history_page(
+                    db,
+                    target,
+                    cursor=cursor,
+                    limit=limit,
+                    recovery_scope=recovery_scope,
+                )
+                history = page["messages"]
+            else:
+                history = _resume_history(
+                    db,
+                    target,
+                    include_ancestors=True,
+                    recovery_scope=recovery_scope,
+                )
+                page = None
+        except ValueError as exc:
+            return _err(rid, 4002, str(exc))
         except Exception:
-            pass
-    return _ok(
-        rid,
-        {
-            "count": len(history),
-            "messages": _history_to_messages(history),
-        },
-    )
+            logger.exception("session.history failed")
+            return _err(rid, 5000, "history load failed")
+    messages = _history_to_messages(history)
+    result = {
+        "count": len(messages),
+        "session_id": sid,
+        "session_key": target,
+        "message_count": len(messages),
+        "messages": messages,
+    }
+    if page is not None:
+        result["history_page"] = _history_page_payload(page)
+    return _ok(rid, result)
 
 
 @method("session.undo")

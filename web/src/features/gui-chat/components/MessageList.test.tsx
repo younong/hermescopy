@@ -2,10 +2,20 @@
 
 import { act } from "react";
 import { createRoot } from "react-dom/client";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { initialGuiChatState } from "../types";
 import { MessageList } from "./MessageList";
+
+beforeEach(() => {
+  (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
+    .IS_REACT_ACT_ENVIRONMENT = true;
+  document.body.innerHTML = "";
+  Object.defineProperties(HTMLElement.prototype, {
+    offsetHeight: { configurable: true, get: () => 600 },
+    offsetWidth: { configurable: true, get: () => 800 },
+  });
+});
 
 afterEach(() => {
   document.body.innerHTML = "";

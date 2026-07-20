@@ -9,6 +9,7 @@ import { usePageHeader } from "@/contexts/usePageHeader";
 import { useProfileScope } from "@/contexts/useProfileScope";
 import { useI18n } from "@/i18n";
 import { JsonRpcGatewayError, type GatewayEvent } from "@/lib/gatewayClient";
+import { emitChatDiagnostic } from "@/lib/chatDiagnostics";
 import { dashboardAuthTransition } from "@/lib/dashboardAuthTransition";
 import { useDashboardAuthIdentity } from "@/lib/useDashboardAuthIdentity";
 import { cn } from "@/lib/utils";
@@ -37,6 +38,7 @@ export function GuiChatShell() {
   const mockMode = searchParams.get("mock") === "1";
   const [state, dispatch] = useReducer(guiChatReducer, initialGuiChatState);
   const connectionRef = useRef<GuiChatConnection | null>(null);
+  const historyAbortRef = useRef<AbortController | null>(null);
   const eventFrameQueue = useMemo(
     () => createGatewayEventFrameQueue((event) => dispatch({ type: "event", event })),
     [],
@@ -70,6 +72,8 @@ export function GuiChatShell() {
   }, []);
 
   useEffect(() => dashboardAuthTransition.register(() => {
+    historyAbortRef.current?.abort();
+    historyAbortRef.current = null;
     switchCoordinatorRef.current?.dispose();
     switchCoordinatorRef.current = null;
     connectionRef.current = null;
@@ -82,6 +86,7 @@ export function GuiChatShell() {
   }, [eventFrameQueue]);
 
   const startNewGuiChat = useCallback(() => {
+    historyAbortRef.current?.abort();
     setResumeNotice(null);
     skipClearedRouteRef.current = true;
     setSearchParams(
@@ -102,9 +107,17 @@ export function GuiChatShell() {
     connectionRef.current = connection;
     return new GuiChatSessionSwitchCoordinator(connection, {
       onCommit: (_connection, response, requestedSessionId, generation) => {
+        historyAbortRef.current?.abort();
         const trace = switchTraceByGenerationRef.current.get(generation);
         switchTraceByGenerationRef.current.delete(generation);
         dispatch({ type: "session.created", response });
+        emitChatDiagnostic({
+          event: "initial_page",
+          loadedCount: response.messages?.length ?? 0,
+          outcome: "ok",
+          renderedCount: response.messages?.length ?? 0,
+          surface: "gui_history",
+        });
 
         if (requestedSessionId && "resumed" in response) {
           const canonicalSessionId = response.resumed ?? response.session_key ?? requestedSessionId;
@@ -206,6 +219,7 @@ export function GuiChatShell() {
 
   useEffect(
     () => () => {
+      historyAbortRef.current?.abort();
       switchCoordinator.dispose();
       switchTraceByGenerationRef.current.clear();
       if (switchCoordinatorRef.current === switchCoordinator) {
@@ -396,6 +410,48 @@ export function GuiChatShell() {
       .catch((error: Error) => dispatch({ type: "error", message: error.message }));
   }, [state.sessionId]);
 
+  const loadEarlier = useCallback(async () => {
+    const connection = connectionRef.current;
+    const sessionId = state.sessionId;
+    const cursor = state.historyCursor;
+    if (!connection || !sessionId || !cursor || state.historyLoading) return;
+    historyAbortRef.current?.abort();
+    const controller = new AbortController();
+    historyAbortRef.current = controller;
+    dispatch({ type: "history.prepend.started" });
+    const startedAt = performance.now();
+    try {
+      const response = await connection.loadEarlier(sessionId, cursor, controller.signal);
+      if (controller.signal.aborted) return;
+      dispatch({ type: "history.prepend.succeeded", response });
+      emitChatDiagnostic({
+        durationMs: Math.round(performance.now() - startedAt),
+        event: "page_loaded",
+        loadedCount: response.messages?.length ?? 0,
+        outcome: "ok",
+        surface: "gui_history",
+      });
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      emitChatDiagnostic({
+        durationMs: Math.round(performance.now() - startedAt),
+        event: "page_loaded",
+        outcome: "error",
+        surface: "gui_history",
+      });
+      if (error instanceof JsonRpcGatewayError && error.code === -32601) {
+        dispatch({ type: "history.prepend.failed", message: "Earlier history is unavailable on this server version." });
+        return;
+      }
+      dispatch({
+        type: "history.prepend.failed",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      if (historyAbortRef.current === controller) historyAbortRef.current = null;
+    }
+  }, [state.historyCursor, state.historyLoading, state.sessionId]);
+
   const respondToApproval = useCallback(
     (id: string, approved: boolean) => {
       const sessionId = state.sessionId;
@@ -515,6 +571,7 @@ export function GuiChatShell() {
             disabled={disabled}
             forceBottomKey={forceBottomKey}
             onApprovalRespond={respondToApproval}
+            onLoadEarlier={loadEarlier}
             state={state}
           />
           <Composer
