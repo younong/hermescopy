@@ -6,6 +6,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { GuiChatConnection } from "../api";
+import type { ConnectionState } from "@/lib/gatewayClient";
 import {
   DashboardAuthIdentityProvider,
   useDashboardAuthIdentity,
@@ -83,6 +84,7 @@ afterEach(async () => {
   dashboardAuthTransition.reset();
   delete window.__HERMES_AUTH_REQUIRED__;
   document.body.innerHTML = "";
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -137,6 +139,43 @@ describe("GuiChatShell", () => {
     );
   });
 
+  it("reattaches the committed stored session after a transport close", async () => {
+    vi.useFakeTimers();
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => {
+      root?.render(
+        <MemoryRouter initialEntries={["/chat-gui"]}>
+          <DashboardAuthIdentityProvider>
+            <GuiChatShell />
+          </DashboardAuthIdentityProvider>
+        </MemoryRouter>,
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(connection.createOrAttach).toHaveBeenCalledOnce();
+    await act(async () => {
+      connection.emitState("closed");
+      await vi.advanceTimersByTimeAsync(1_200);
+    });
+
+    expect(connection.createOrAttach).toHaveBeenCalledTimes(2);
+    expect(connection.createOrAttach).toHaveBeenLastCalledWith(
+      "stored-a",
+      expect.any(Number),
+      expect.any(AbortSignal),
+      undefined,
+    );
+    vi.useRealTimers();
+  });
+
   it("connects once when loading a resumed route", async () => {
     const connection = createConnection();
     mocks.getAuthMe.mockResolvedValue(authIdentity());
@@ -166,19 +205,19 @@ function ReadyProbe() {
   return <span data-ready={ready} />;
 }
 
-function createConnection(): GuiChatConnection {
+function createConnection(): GuiChatConnection & { emitState(state: ConnectionState): void } {
   const eventHandlers = new Set<(event: never) => void>();
-  const stateHandlers = new Set<(state: "idle") => void>();
-  return {
+  const stateHandlers = new Set<(state: ConnectionState) => void>();
+  const connection = {
     attachFile: vi.fn(),
     attachImage: vi.fn(),
     attachPdf: vi.fn(),
     client: {
-      onEvent: (handler) => {
+      onEvent: (handler: (event: never) => void) => {
         eventHandlers.add(handler);
         return () => eventHandlers.delete(handler);
       },
-      onState: (handler) => {
+      onState: (handler: (state: ConnectionState) => void) => {
         stateHandlers.add(handler);
         handler("idle");
         return () => stateHandlers.delete(handler);
@@ -191,11 +230,16 @@ function createConnection(): GuiChatConnection {
       session_id: "runtime-a",
       stored_session_id: "stored-a",
     }),
+    emitState: (state: ConnectionState) => {
+      for (const handler of stateHandlers) handler(state);
+    },
     loadEarlier: vi.fn(),
+    ping: vi.fn(),
     respondToApproval: vi.fn(),
     send: vi.fn(),
     stop: vi.fn(),
   };
+  return connection;
 }
 
 interface AuthIdentity {

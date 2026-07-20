@@ -259,6 +259,7 @@ export async function getWsTicket(
     body: JSON.stringify({ audience: `browser-ws:${path}` }),
     signal,
   });
+  await applyFetchAuthRecovery(res);
   if (!res.ok) {
     throw new Error(`/api/auth/ws-ticket: HTTP ${res.status}`);
   }

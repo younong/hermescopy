@@ -8,9 +8,10 @@
 @import '@nous-research/ui/styles/fonts.css';
 @import '@nous-research/ui/styles/globals.css';
 
-/* Scan the published design-system bundle so its utility classes survive
+/* Scan published dependency bundles so their utility classes survive
    Tailwind's JIT purge. */
 @source '../node_modules/@nous-research/ui/dist';
+@source '../../node_modules/streamdown/dist';
 
 /* ------------------------------------------------------------------ */
 /* JetBrains Mono — bundled for the embedded TUI (/chat tab).          */

@@ -19,6 +19,7 @@ import { createGatewayEventFrameQueue } from "../gatewayEventFrameQueue";
 import { startGuiChatLatencyTrace, type GuiChatLatencyTrace } from "../latencyTrace";
 import { connectMockGuiChat } from "../mock";
 import { guiChatReducer } from "../reducer";
+import { GuiChatReconnectLifecycle } from "../reconnectLifecycle";
 import { GuiChatSessionSwitchCoordinator } from "../sessionSwitch";
 import {
   initialGuiChatState,
@@ -39,6 +40,7 @@ export function GuiChatShell() {
   const [state, dispatch] = useReducer(guiChatReducer, initialGuiChatState);
   const connectionRef = useRef<GuiChatConnection | null>(null);
   const historyAbortRef = useRef<AbortController | null>(null);
+  const reconnectLifecycleRef = useRef<GuiChatReconnectLifecycle | null>(null);
   const eventFrameQueue = useMemo(
     () => createGatewayEventFrameQueue((event) => dispatch({ type: "event", event })),
     [],
@@ -52,6 +54,10 @@ export function GuiChatShell() {
   const [sendScrollNonce, setSendScrollNonce] = useState(0);
   const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false);
   const { ownerKey, ready: authIdentityReady } = useDashboardAuthIdentity();
+  const stateRef = useRef(state);
+  const resumeSessionIdRef = useRef(resumeSessionId);
+  stateRef.current = state;
+  resumeSessionIdRef.current = resumeSessionId;
   const [portalRoot] = useState<HTMLElement | null>(() =>
     typeof document !== "undefined" ? document.body : null,
   );
@@ -66,6 +72,7 @@ export function GuiChatShell() {
   const forceBottomKey = `${activeSessionId ?? "new"}:${sendScrollNonce}`;
   const closeMobilePanel = useCallback(() => setMobilePanelOpenRaw(false), []);
   const startSessionSwitchTrace = useCallback((_sessionId: string) => {
+    reconnectLifecycleRef.current?.cancelRecovery();
     latencyTraceRef.current?.mark("switch.superseded", "cancelled");
     switchTraceByGenerationRef.current.clear();
     latencyTraceRef.current = startGuiChatLatencyTrace("session_list.click");
@@ -74,6 +81,8 @@ export function GuiChatShell() {
   useEffect(() => dashboardAuthTransition.register(() => {
     historyAbortRef.current?.abort();
     historyAbortRef.current = null;
+    reconnectLifecycleRef.current?.dispose();
+    reconnectLifecycleRef.current = null;
     switchCoordinatorRef.current?.dispose();
     switchCoordinatorRef.current = null;
     connectionRef.current = null;
@@ -87,6 +96,7 @@ export function GuiChatShell() {
 
   const startNewGuiChat = useCallback(() => {
     historyAbortRef.current?.abort();
+    reconnectLifecycleRef.current?.cancelRecovery();
     setResumeNotice(null);
     skipClearedRouteRef.current = true;
     setSearchParams(
@@ -100,12 +110,13 @@ export function GuiChatShell() {
     switchCoordinatorRef.current?.start(null);
   }, [setSearchParams]);
 
-  const switchCoordinator = useMemo(() => {
+  const switchScope = useMemo(() => {
     const connection = mockMode
       ? connectMockGuiChat()
       : connectGuiChat({ ownerKey, profile });
     connectionRef.current = connection;
-    return new GuiChatSessionSwitchCoordinator(connection, {
+    let coordinator: GuiChatSessionSwitchCoordinator;
+    coordinator = new GuiChatSessionSwitchCoordinator(connection, {
       onCommit: (_connection, response, requestedSessionId, generation) => {
         historyAbortRef.current?.abort();
         const trace = switchTraceByGenerationRef.current.get(generation);
@@ -118,6 +129,7 @@ export function GuiChatShell() {
           renderedCount: response.messages?.length ?? 0,
           surface: "gui_history",
         });
+        reconnectLifecycleRef.current?.onSwitchSettled(generation, true);
 
         if (requestedSessionId && "resumed" in response) {
           const canonicalSessionId = response.resumed ?? response.session_key ?? requestedSessionId;
@@ -145,6 +157,7 @@ export function GuiChatShell() {
       onError: (error, requestedSessionId, generation, committedSessionId) => {
         const trace = switchTraceByGenerationRef.current.get(generation);
         switchTraceByGenerationRef.current.delete(generation);
+        reconnectLifecycleRef.current?.onSwitchSettled(generation, false);
         trace?.mark(requestedSessionId ? "session.attach.end" : "session.create.end", "error");
         if (latencyTraceRef.current === trace) latencyTraceRef.current = null;
 
@@ -181,12 +194,31 @@ export function GuiChatShell() {
           switchTraceByGenerationRef.current.get(generation)?.mark("gateway.ready");
         }
       },
-      onState: (next) => dispatch({ type: "connection", state: next }),
+      onState: (next) => {
+        dispatch({ type: "connection", state: next });
+        reconnectLifecycleRef.current?.onConnectionState(next);
+      },
     });
+    const reconnectLifecycle = mockMode
+      ? null
+      : new GuiChatReconnectLifecycle({
+          close: () => connection.close(),
+          ping: () => connection.ping(),
+          reconnect: () =>
+            coordinator.start(
+              coordinator.committedSessionId ??
+                stateRef.current.storedSessionId ??
+                resumeSessionIdRef.current,
+            ),
+        });
+    reconnectLifecycleRef.current = reconnectLifecycle;
+    return { coordinator, reconnectLifecycle };
   }, [dispatchGatewayEvent, mockMode, ownerKey, profile, setSearchParams, startNewGuiChat]);
+  const switchCoordinator = switchScope.coordinator;
   switchCoordinatorRef.current = switchCoordinator;
 
-  const connect = useCallback(() => {
+  const connectRoute = useCallback(() => {
+    reconnectLifecycleRef.current?.cancelRecovery();
     setResumeNotice(null);
     const trace = latencyTraceRef.current;
     trace?.mark("connection.start");
@@ -204,6 +236,15 @@ export function GuiChatShell() {
     );
   }, [resumeSessionId, switchCoordinator]);
 
+  const retryConnection = useCallback(() => {
+    setResumeNotice(null);
+    if (mockMode) {
+      connectRoute();
+      return;
+    }
+    reconnectLifecycleRef.current?.retryNow();
+  }, [connectRoute, mockMode]);
+
   useEffect(() => {
     if (!authIdentityReady) return;
     if (canonicalRouteRef.current !== null && canonicalRouteRef.current === resumeSessionId) {
@@ -214,19 +255,23 @@ export function GuiChatShell() {
       skipClearedRouteRef.current = false;
       return;
     }
-    connect();
-  }, [authIdentityReady, connect, resumeSessionId]);
+    connectRoute();
+  }, [authIdentityReady, connectRoute, resumeSessionId]);
 
   useEffect(
     () => () => {
       historyAbortRef.current?.abort();
+      switchScope.reconnectLifecycle?.dispose();
       switchCoordinator.dispose();
       switchTraceByGenerationRef.current.clear();
+      if (reconnectLifecycleRef.current === switchScope.reconnectLifecycle) {
+        reconnectLifecycleRef.current = null;
+      }
       if (switchCoordinatorRef.current === switchCoordinator) {
         switchCoordinatorRef.current = null;
       }
     },
-    [switchCoordinator],
+    [switchCoordinator, switchScope.reconnectLifecycle],
   );
 
   useEffect(() => {
@@ -547,7 +592,7 @@ export function GuiChatShell() {
               ghost
               size="sm"
               className="h-7 px-2 text-xs"
-              onClick={connect}
+              onClick={retryConnection}
             >
               <RefreshCw className="h-3.5 w-3.5" />
               {mockMode ? "Replay" : t.common.retry}

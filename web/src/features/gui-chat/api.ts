@@ -99,6 +99,7 @@ export interface GuiChatConnection {
   send(sessionId: string, text: string): Promise<void>;
   stop(sessionId: string): Promise<void>;
   respondToApproval(sessionId: string, request: unknown, approved: boolean): Promise<void>;
+  ping(): Promise<void>;
 }
 
 export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnection {
@@ -234,6 +235,9 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
         undefined,
         signal,
       );
+    },
+    ping: async () => {
+      await client.request("gateway.ping", {}, 10_000);
     },
     respondToApproval: async (sessionId, _request, approved) => {
       await client.request("approval.respond", {

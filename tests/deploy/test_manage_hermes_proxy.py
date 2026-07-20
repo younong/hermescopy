@@ -214,3 +214,5 @@ def test_repository_snippet_has_single_auth_layer_contract():
     assert "proxy_set_header X-Forwarded-Prefix /hermes;" in snippet
     assert 'proxy_set_header Upgrade $http_upgrade;' in snippet
     assert 'proxy_set_header Connection "upgrade";' in snippet
+    assert "proxy_read_timeout 3600s;" in snippet
+    assert "proxy_send_timeout 3600s;" in snippet

@@ -16,6 +16,25 @@ from hermes_cli.active_sessions import active_session_registry_snapshot
 from tui_gateway import server
 
 
+def test_gateway_ping_is_sessionless_and_side_effect_free():
+    sentinel = {"session-a": {"last_active": 123.0, "running": True}}
+    previous = dict(server._sessions.items())
+    server._sessions.clear()
+    server._sessions.update(sentinel)
+    try:
+        before = {sid: dict(session) for sid, session in server._sessions.items()}
+
+        response = server.handle_request(
+            {"jsonrpc": "2.0", "id": "ping-1", "method": "gateway.ping", "params": {}}
+        )
+
+        assert response == {"jsonrpc": "2.0", "id": "ping-1", "result": {"ok": True}}
+        assert server._sessions == before
+    finally:
+        server._sessions.clear()
+        server._sessions.update(previous)
+
+
 def test_session_create_rejects_at_active_session_limit(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()

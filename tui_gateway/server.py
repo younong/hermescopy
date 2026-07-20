@@ -1345,6 +1345,11 @@ def method(name: str):
     return dec
 
 
+@method("gateway.ping")
+def _gateway_ping(rid, _params: dict) -> dict:
+    return _ok(rid, {"ok": True})
+
+
 def _normalize_request(req: Any) -> tuple[Any, str, dict] | dict:
     """Validate a JSON-RPC request enough for safe local dispatch."""
     if not isinstance(req, dict):

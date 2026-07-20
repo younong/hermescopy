@@ -46,7 +46,14 @@ export interface SessionCreateResponse {
   switch_generation?: number;
 }
 
+export interface SessionInflightTurn {
+  assistant?: string;
+  streaming?: boolean;
+  user?: string;
+}
+
 export interface SessionResumeResponse extends SessionCreateResponse {
+  inflight?: SessionInflightTurn | null;
   resumed?: string;
   running?: boolean;
   session_key?: string;
