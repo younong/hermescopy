@@ -1504,7 +1504,7 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
-            "timeout": 180,        # seconds — align one compression attempt with the automatic deadline
+            "timeout": 360,        # seconds — align one compression attempt with the automatic deadline
             "extra_body": {},
         },
         # Note: session_search no longer uses an auxiliary LLM (PR #27590 —

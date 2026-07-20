@@ -54,7 +54,7 @@ COMPACTION_STATUS = (
 
 # Automatic compression is user-blocking preflight work. Manual /compress keeps
 # the configured task timeout because the user explicitly requested it.
-_AUTOMATIC_COMPRESSION_DEADLINE_SECONDS = 180.0
+_AUTOMATIC_COMPRESSION_DEADLINE_SECONDS = 360.0
 
 
 def _compression_lock_holder(agent: Any) -> str:
