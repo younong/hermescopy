@@ -1,4 +1,4 @@
-import { useMemo, type ReactNode } from "react";
+import { memo, useMemo, type ReactNode } from "react";
 
 import { parseInline } from "./markdownInline";
 
@@ -11,7 +11,7 @@ import { parseInline } from "./markdownInline";
  * appears to hug the final character instead of wrapping onto a new line
  * after a block element (paragraph/list/code/…).
  */
-export function Markdown({
+export const Markdown = memo(function Markdown({
   content,
   highlightTerms,
   streaming,
@@ -36,7 +36,7 @@ export function Markdown({
       {blocks.length === 0 && caret}
     </div>
   );
-}
+});
 
 function StreamingCaret() {
   return (
