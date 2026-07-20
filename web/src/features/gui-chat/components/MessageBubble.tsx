@@ -1,4 +1,6 @@
 import { Badge } from "@nous-research/ui/ui/components/badge";
+import { useDeferredValue } from "react";
+
 import { Markdown } from "@/components/Markdown";
 import { cn } from "@/lib/utils";
 import type { ArtifactState, ChatMessage } from "../types";
@@ -62,11 +64,7 @@ export function MessageBubble({
           {message.status === "interrupted" ? <Badge tone="secondary">stopped</Badge> : null}
         </div>
         {message.text ? (
-          message.streaming ? (
-            <StreamingPlainText text={message.text} />
-          ) : (
-            <Markdown content={message.text} streaming={message.streaming} />
-          )
+          <AssistantMarkdown text={message.text} streaming={message.streaming} />
         ) : message.streaming ? (
           <div className="text-sm text-text-secondary">Thinking…</div>
         ) : null}
@@ -85,14 +83,8 @@ export function MessageBubble({
   );
 }
 
-function StreamingPlainText({ text }: { text: string }) {
-  return (
-    <div className="min-w-0 whitespace-pre-wrap text-sm leading-relaxed break-words text-foreground [overflow-wrap:anywhere]">
-      {text}
-      <span
-        aria-hidden
-        className="ml-0.5 inline-block h-[1em] w-[0.5em] align-[-0.15em] bg-foreground/50 animate-pulse"
-      />
-    </div>
-  );
+function AssistantMarkdown({ text, streaming }: { text: string; streaming?: boolean }) {
+  const deferredText = useDeferredValue(text);
+
+  return <Markdown content={streaming ? deferredText : text} streaming={streaming} />;
 }
