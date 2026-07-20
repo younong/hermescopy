@@ -82,17 +82,18 @@ class _FakeProcess:
 
 
 @pytest.fixture(autouse=True)
-def _simulate_linux_controlled_roots(monkeypatch):
+def _simulate_linux_controlled_roots(monkeypatch, request):
     import hermes_cli.controlled_roots as controlled_roots
     import hermes_cli.owner_worker.supervisor as supervisor_module
 
     monkeypatch.setattr(controlled_roots.ControlledRoots, "_require_linux", lambda _self: None)
     monkeypatch.setattr(controlled_roots, "_openat2", lambda *_args: None)
-    monkeypatch.setattr(
-        supervisor_module,
-        "_seed_owner_worker_skills",
-        lambda _owner_home: {"copied": [], "updated": []},
-    )
+    if not request.node.name.startswith("test_owner_worker_skill_sync_cache"):
+        monkeypatch.setattr(
+            supervisor_module,
+            "_seed_owner_worker_skills",
+            lambda _owner_home: {"copied": [], "updated": []},
+        )
 
 
 class _FakeClient:
@@ -456,11 +457,133 @@ def test_child_token_ttl_is_bounded(monkeypatch):
     assert child_token_ttl_seconds() == 24 * 60 * 60
 
 
+def test_owner_worker_skill_sync_cache_skips_fresh_owner(tmp_path, monkeypatch):
+    import hermes_cli.owner_worker.supervisor as supervisor_module
+    import hermes_cli.profiles as profiles_module
+
+    owner_home = tmp_path / "owner"
+    syncs: list[Path] = []
+    monkeypatch.setattr(
+        supervisor_module,
+        "_owner_worker_skills_fingerprint",
+        lambda _owner_home: "fingerprint-1",
+    )
+    monkeypatch.setattr(
+        profiles_module,
+        "seed_profile_skills",
+        lambda profile_dir, quiet: syncs.append(profile_dir) or {"copied": ["test"]},
+    )
+
+    first = supervisor_module._seed_owner_worker_skills(owner_home)
+    second = supervisor_module._seed_owner_worker_skills(owner_home)
+
+    assert first == {"copied": ["test"]}
+    assert second == {"copied": [], "updated": [], "skipped_fresh": True}
+    assert syncs == [owner_home]
+    assert supervisor_module._owner_worker_skills_stamp_path(owner_home).read_text(
+        encoding="utf-8"
+    ) == "fingerprint-1\n"
+
+
+def test_owner_worker_skill_sync_cache_invalidates_source_revision(tmp_path, monkeypatch):
+    import hermes_cli.owner_worker.supervisor as supervisor_module
+    import hermes_cli.profiles as profiles_module
+
+    project_root = tmp_path / "project"
+    bundled_dir = project_root / "skills"
+    bundled_dir.mkdir(parents=True)
+    owner_home = tmp_path / "owner"
+    revision = ["git:refs/heads/main:aaaa"]
+    syncs: list[Path] = []
+    monkeypatch.setattr(supervisor_module, "_PROJECT_ROOT", project_root)
+    monkeypatch.setattr(
+        supervisor_module,
+        "get_bundled_skills_dir",
+        lambda default: default,
+    )
+    monkeypatch.setattr(
+        supervisor_module,
+        "read_git_revision_fingerprint",
+        lambda _root: revision[0],
+    )
+    monkeypatch.setattr(
+        profiles_module,
+        "seed_profile_skills",
+        lambda profile_dir, quiet: syncs.append(profile_dir) or {"copied": []},
+    )
+
+    supervisor_module._seed_owner_worker_skills(owner_home)
+    supervisor_module._seed_owner_worker_skills(owner_home)
+    revision[0] = "git:refs/heads/main:bbbb"
+    supervisor_module._seed_owner_worker_skills(owner_home)
+
+    assert syncs == [owner_home, owner_home]
+
+
+def test_owner_worker_skill_sync_cache_invalidates_opt_out_state(tmp_path, monkeypatch):
+    import hermes_cli.owner_worker.supervisor as supervisor_module
+    import hermes_cli.profiles as profiles_module
+
+    project_root = tmp_path / "project"
+    bundled_dir = project_root / "skills"
+    bundled_dir.mkdir(parents=True)
+    owner_home = tmp_path / "owner"
+    syncs: list[Path] = []
+    monkeypatch.setattr(supervisor_module, "_PROJECT_ROOT", project_root)
+    monkeypatch.setattr(
+        supervisor_module,
+        "get_bundled_skills_dir",
+        lambda default: default,
+    )
+    monkeypatch.setattr(
+        supervisor_module,
+        "read_git_revision_fingerprint",
+        lambda _root: "git:HEAD:aaaa",
+    )
+    monkeypatch.setattr(
+        profiles_module,
+        "seed_profile_skills",
+        lambda profile_dir, quiet: syncs.append(profile_dir) or {"copied": []},
+    )
+
+    supervisor_module._seed_owner_worker_skills(owner_home)
+    owner_home.joinpath(".no-bundled-skills").touch()
+    supervisor_module._seed_owner_worker_skills(owner_home)
+    supervisor_module._seed_owner_worker_skills(owner_home)
+    owner_home.joinpath(".no-bundled-skills").unlink()
+    supervisor_module._seed_owner_worker_skills(owner_home)
+
+    assert syncs == [owner_home, owner_home, owner_home]
+
+
+def test_owner_worker_skill_sync_cache_does_not_stamp_failed_sync(tmp_path, monkeypatch):
+    import hermes_cli.owner_worker.supervisor as supervisor_module
+    import hermes_cli.profiles as profiles_module
+
+    owner_home = tmp_path / "owner"
+    monkeypatch.setattr(
+        supervisor_module,
+        "_owner_worker_skills_fingerprint",
+        lambda _owner_home: "fingerprint-1",
+    )
+    monkeypatch.setattr(profiles_module, "seed_profile_skills", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="skill synchronization failed"):
+        supervisor_module._seed_owner_worker_skills(owner_home)
+
+    assert not supervisor_module._owner_worker_skills_stamp_path(owner_home).exists()
+
+
 def test_supervisor_syncs_owner_skills_before_process_launch(tmp_path, monkeypatch):
     import hermes_cli.owner_worker.supervisor as supervisor_module
 
     owner = _Owner("ok1_skill_sync", tmp_path / "owner")
     events: list[tuple[str, Path]] = []
+    real_ensure_owner_runtime_dirs = supervisor_module.ensure_owner_runtime_dirs
+
+    def tracked_ensure_owner_runtime_dirs(owner_home: Path):
+        events.append(("prepare", Path(owner_home)))
+        return real_ensure_owner_runtime_dirs(owner_home)
 
     def fake_seed(owner_home: Path):
         events.append(("seed", Path(owner_home)))
@@ -482,6 +605,11 @@ def test_supervisor_syncs_owner_skills_before_process_launch(tmp_path, monkeypat
         Path(argv[argv.index("--socket") + 1]).touch()
         return _FakeProcess()
 
+    monkeypatch.setattr(
+        supervisor_module,
+        "ensure_owner_runtime_dirs",
+        tracked_ensure_owner_runtime_dirs,
+    )
     monkeypatch.setattr(supervisor_module, "_seed_owner_worker_skills", fake_seed)
     supervisor = OwnerWorkerSupervisor(
         control_home=tmp_path / "control",
@@ -492,7 +620,11 @@ def test_supervisor_syncs_owner_skills_before_process_launch(tmp_path, monkeypat
 
     supervisor.get_or_start(owner)
 
-    assert events == [("seed", owner.owner_home), ("spawn", owner.owner_home)]
+    assert events == [
+        ("prepare", owner.owner_home),
+        ("seed", owner.owner_home),
+        ("spawn", owner.owner_home),
+    ]
     supervisor.shutdown()
 
 
