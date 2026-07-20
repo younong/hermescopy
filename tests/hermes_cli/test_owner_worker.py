@@ -1502,6 +1502,10 @@ def test_worker_health_over_unix_socket_reports_owner_env(tmp_path, monkeypatch)
         "platform_toolsets:\n  cli:\n    - x_search\n",
         encoding="utf-8",
     )
+    (owner_home / "logs" / "agent.log").write_text(
+        "2026-07-20 10:00:00 WARNING tools.terminal_tool: subprocess owner marker\n",
+        encoding="utf-8",
+    )
     owner = _Owner("ok1_worker", owner_home)
     supervisor = OwnerWorkerSupervisor(
         control_home=control_home,
@@ -1576,6 +1580,20 @@ def test_worker_health_over_unix_socket_reports_owner_env(tmp_path, monkeypatch)
         toolsets_by_name = {item["name"]: item for item in response.json()}
         assert toolsets_by_name["x_search"]["enabled"] is True
         assert toolsets_by_name["x_search"]["available"] is True
+
+        if sys.platform.startswith("linux"):
+            logs = OwnerWorkerClient(socket_path, control_home=control_home).request(
+                "GET",
+                "/api/logs?file=agent&level=WARNING&component=tools&search=marker",
+                lease=lease,
+            )
+            assert logs.status_code == 200
+            assert logs.json() == {
+                "file": "agent",
+                "lines": [
+                    "2026-07-20 10:00:00 WARNING tools.terminal_tool: subprocess owner marker\n"
+                ],
+            }
 
         transport = httpx.HTTPTransport(uds=str(socket_path))
         with httpx.Client(transport=transport, base_url="http://owner-worker") as client:
@@ -2531,6 +2549,7 @@ def test_worker_analytics_and_model_info_routes_require_owner_token(tmp_path, mo
     assert client.get("/api/analytics/usage").status_code == 401
     assert client.get("/api/analytics/models").status_code == 401
     assert client.get("/api/model/info").status_code == 401
+    assert client.get("/api/logs").status_code == 401
     assert client.get("/api/profiles").status_code == 401
     assert client.get("/api/config").status_code == 401
     assert client.get("/api/dashboard/font").status_code == 401
@@ -2619,6 +2638,52 @@ def test_worker_analytics_routes_return_owner_local_data(tmp_path, monkeypatch):
     assert usage.json()["period_days"] == 36500
     assert models.status_code == 200
     assert models.json()["period_days"] == 36500
+
+
+def test_worker_logs_return_owner_local_filtered_data(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    import hermes_cli.controlled_roots as controlled_roots
+
+    owner_home = tmp_path / "owner"
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_worker_routes")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(tmp_path / "control"))
+    monkeypatch.setattr(controlled_roots.sys, "platform", "linux")
+    monkeypatch.setattr(controlled_roots, "_openat2", lambda *_args: None)
+    from hermes_cli.owner_worker.entrypoint import create_app
+
+    ensure_owner_runtime_dirs(owner_home)
+    (owner_home / "logs" / "agent.log").write_text(
+        "2026-07-20 10:00:00 INFO tools.terminal_tool: ignore me\n"
+        "2026-07-20 10:00:01 WARNING tools.terminal_tool: owner needle\n"
+        "2026-07-20 10:00:02 ERROR gateway.run: wrong component needle\n",
+        encoding="utf-8",
+    )
+    app = create_app("ok1_worker_routes", owner_home)
+    client = TestClient(app)
+    token = _capability_for(
+        app,
+        audience=AUD_OWNER_WORKER_HTTP,
+        path="/api/logs",
+        control_home=tmp_path / "control",
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+
+    response = client.get(
+        "/api/logs?file=agent&lines=10&level=WARNING&component=tools&search=NEEDLE",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "file": "agent",
+        "lines": ["2026-07-20 10:00:01 WARNING tools.terminal_tool: owner needle\n"],
+    }
+    assert client.get("/api/logs?file=unknown", headers=headers).status_code == 400
+    assert client.get("/api/logs?component=unknown", headers=headers).status_code == 400
+    missing = client.get("/api/logs?file=errors", headers=headers)
+    assert missing.status_code == 200
+    assert missing.json() == {"file": "errors", "lines": []}
 
 
 def test_worker_model_info_returns_owner_local_config(tmp_path, monkeypatch):

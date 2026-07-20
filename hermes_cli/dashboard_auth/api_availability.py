@@ -39,6 +39,7 @@ OWNER_WORKER_ROUTES: frozenset[tuple[str, str]] = frozenset({
     ("PUT", "/api/skills/toggle"),
     ("GET", "/api/tools/toolsets"),
     ("GET", "/api/model/info"),
+    ("GET", "/api/logs"),
     ("GET", "/api/analytics/usage"),
     ("GET", "/api/analytics/models"),
     ("GET", "/api/sessions"),

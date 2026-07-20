@@ -295,6 +295,70 @@ def _read_owner_log_tail(roots: ControlledRoots, filename: str, num_lines: int) 
         os.close(fd)
 
 
+def log_viewer_payload(
+    *,
+    file: str = "agent",
+    lines: int = 100,
+    level: Optional[str] = None,
+    component: Optional[str] = None,
+    search: Optional[str] = None,
+    controlled_roots: ControlledRoots | None = None,
+) -> dict[str, object]:
+    """Build the dashboard log response from local or owner-controlled logs."""
+    filename = LOG_FILES.get(file)
+    if not filename:
+        raise ValueError(f"Unknown log file: {file}")
+
+    from hermes_logging import COMPONENT_PREFIXES
+
+    min_level = level if level and level.upper() != "ALL" else None
+    if component and component.lower() != "all":
+        component_prefixes = COMPONENT_PREFIXES.get(component)
+        if component_prefixes is None:
+            available = ", ".join(sorted(COMPONENT_PREFIXES))
+            raise ValueError(f"Unknown component: {component}. Available: {available}")
+    else:
+        component_prefixes = None
+
+    requested_lines = min(lines, 500)
+    has_filters = bool(min_level or component_prefixes or search)
+    try:
+        if controlled_roots is None:
+            log_path = get_hermes_home() / "logs" / filename
+            if not log_path.exists():
+                return {"file": file, "lines": []}
+            result = _read_tail(
+                log_path,
+                requested_lines if not search else 2000,
+                has_filters=has_filters,
+                min_level=min_level,
+                component_prefixes=component_prefixes,
+            )
+        else:
+            read_lines = requested_lines if not search else 2000
+            raw_lines = _read_owner_log_tail(
+                controlled_roots,
+                filename,
+                max(read_lines * 20, 2000) if has_filters else read_lines,
+            )
+            result = [
+                line
+                for line in raw_lines
+                if _matches_filters(
+                    line,
+                    min_level=min_level,
+                    component_prefixes=component_prefixes,
+                )
+            ][-read_lines:]
+    except FileNotFoundError:
+        return {"file": file, "lines": []}
+
+    if search:
+        needle = search.lower()
+        result = [line for line in result if needle in line.lower()][-requested_lines:]
+    return {"file": file, "lines": result}
+
+
 def _read_tail(
     path: Path,
     num_lines: int,

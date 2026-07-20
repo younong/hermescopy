@@ -1009,6 +1009,29 @@ def create_app(
             deployment_descriptor=deployment_descriptor_from_environment(),
         )
 
+    @app.get("/api/logs")
+    def get_logs(
+        file: str = "agent",
+        lines: int = 100,
+        level: str | None = None,
+        component: str | None = None,
+        search: str | None = None,
+        _: None = Depends(_require_owner_token),
+    ) -> dict[str, object]:
+        from hermes_cli.logs import log_viewer_payload
+
+        try:
+            return log_viewer_payload(
+                file=file,
+                lines=lines,
+                level=level,
+                component=component,
+                search=search,
+                controlled_roots=app.state.owner_worker_controlled_roots,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/api/sessions/prune")
     def prune_sessions(body: SessionPrune, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(body.profile)

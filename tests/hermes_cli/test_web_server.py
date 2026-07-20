@@ -5592,6 +5592,7 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
             "/api/sessions/session-1?profile=default",
             "/api/analytics/usage?profile=default",
             "/api/model/info?profile=default",
+            "/api/logs?file=agent",
             "/api/tools/toolsets?profile=default",
         ],
     )
@@ -5929,7 +5930,6 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         [
             "/api/memory",
             "/api/credentials/pool",
-            "/api/logs",
             "/api/media?path=/tmp/example.png",
             "/api/ops/checkpoints",
             "/api/ops/checkpoints/prune",
@@ -5971,6 +5971,31 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         assert response.json()["period_days"] == 7
         assert captured["method"] == "GET"
         assert captured["path"] == "/api/analytics/usage?days=7"
+        assert captured["owner_key"] == self.supervisor.owners[0].owner_key
+
+    def test_authenticated_logs_are_proxied_to_owner_worker(self, monkeypatch):
+        import hermes_cli.owner_worker.client as owner_client
+
+        captured = {}
+
+        def fake_request(self, method, path, *, lease, headers=None, content=None):
+            import httpx
+
+            captured.update({"method": method, "path": path, "owner_key": lease.owner_key})
+            return httpx.Response(200, json={"file": "agent", "lines": ["owner log\n"]})
+
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fake_request)
+
+        response = self.client.get(
+            "/api/logs?file=agent&lines=25&level=WARNING&component=tools&search=needle"
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"file": "agent", "lines": ["owner log\n"]}
+        assert captured["method"] == "GET"
+        assert captured["path"] == (
+            "/api/logs?file=agent&lines=25&level=WARNING&component=tools&search=needle"
+        )
         assert captured["owner_key"] == self.supervisor.owners[0].owner_key
 
     def test_authenticated_model_info_is_proxied_to_owner_worker(self, monkeypatch):
