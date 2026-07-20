@@ -865,8 +865,11 @@ test -f "$release/ui-tui/dist/entry.js"
 lock_hash="$(sha256sum "$release/uv.lock" | cut -d ' ' -f1)"
 architecture="$(uname -m)"
 python_version="3.11"
-runtime_id="py311-${"${"}architecture}-${"${"}lock_hash}-sandbox4"
+runtime_id="py311-${"${"}architecture}-${"${"}lock_hash}-sandbox5"
 venv="$runtimes_dir/$runtime_id"
+# One manifest drives both packaging and preflight. Keep it aligned with
+# ShellFileOperations' target-side scripts, especially atomic writes.
+executor_commands="bash sh ls pwd printf cat chmod grep find head mktemp mv rm stat"
 
 if [ ! -x "$venv/bin/python3" ]; then
   echo "Bootstrapping immutable Python runtime $runtime_id"
@@ -922,7 +925,7 @@ if [ ! -x "$venv/bin/python3" ]; then
       cp -aL -- "$library" "$library_target"
     done < <(ldd "$extension" | sed -nE 's#.*=> (/[^ ]+).*#\1#p; s#^[[:space:]]*(/[^ ]+).*#\1#p')
   done < <(find "$runtime_tmp/lib/python3.11/site-packages" -type f -name '*.so' -print0)
-  for command in bash sh ls pwd printf cat grep find; do
+  for command in $executor_commands; do
     command_path="$(type -P "$command" || true)"
     if [ -z "$command_path" ]; then
       echo "Missing local executor command: $command" >&2
@@ -985,7 +988,7 @@ chmod 0644 "$policy_tmp"
 mv -- "$policy_tmp" "$sandbox_policy"
 
 PYTHONPATH="$release" "$venv/bin/python" -c 'from hermes_cli.owner_worker.host_sandbox import host_sandbox_deployment_policy; host_sandbox_deployment_policy()'
-for command in bash sh ls pwd printf cat grep find; do
+for command in $executor_commands; do
   PATH="$venv/toolchain/usr/bin:$venv/toolchain/bin" command -v "$command" >/dev/null
 done
 PYTHONPATH="$release" "$venv/bin/python" -c 'import hermes_cli.tool_executor_runtime.entrypoint, tools.registry'

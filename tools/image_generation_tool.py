@@ -1083,46 +1083,40 @@ def _build_no_backend_setup_message() -> str:
     return "\n".join(lines)
 
 
+def _resolve_image_provider():
+    """Discover plugins and return the registry's single selection result."""
+    from agent.image_gen_registry import register_provider, resolve_active_provider
+    from hermes_cli.plugins import _ensure_plugins_discovered
+
+    _ensure_plugins_discovered()
+    resolution = resolve_active_provider()
+    if resolution.provider is None and not resolution.explicit:
+        # Direct imports and isolated tests can legitimately reach this module
+        # before plugin discovery has registered the in-tree legacy adapter.
+        # Register that adapter only when its backend is actually available.
+        try:
+            from plugins.image_gen.fal import FalImageGenProvider
+
+            fal = FalImageGenProvider()
+            if fal.is_available():
+                register_provider(fal)
+                resolution = resolve_active_provider()
+        except Exception:
+            pass
+    return resolution
+
+
 def check_image_generation_requirements() -> bool:
-    """True if any image gen backend is available.
-
-    Providers are considered in this order:
-
-    1. The in-tree FAL backend (FAL_KEY or managed gateway).
-    2. Any plugin-registered provider whose ``is_available()`` returns True.
-
-    Plugins win only when the in-tree FAL path is NOT ready, which matches
-    the historical behavior: shipping hermes with a FAL key configured
-    should still expose the tool. The active selection among ready
-    providers is resolved per-call by ``image_gen.provider``.
-    """
+    """True when the selected image backend is available."""
     try:
-        if check_fal_api_key():
-            # Trigger the lazy fal_client import here as the SDK presence
-            # check. Raises ImportError if the optional ``fal-client``
-            # package isn't installed; the caller's except ImportError
-            # below catches that and continues to plugin probing.
+        resolution = _resolve_image_provider()
+        if not resolution.available or resolution.provider is None:
+            return False
+        if resolution.provider.name == "fal":
             _load_fal_client()
-            return True
-    except ImportError:
-        pass
-
-    # Probe plugin providers. Discovery is idempotent and cheap.
-    try:
-        from agent.image_gen_registry import list_providers
-        from hermes_cli.plugins import _ensure_plugins_discovered
-
-        _ensure_plugins_discovered()
-        for provider in list_providers():
-            try:
-                if provider.is_available():
-                    return True
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    return False
+        return True
+    except Exception:  # providers and discovery are optional
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1173,19 +1167,19 @@ IMAGE_GENERATE_SCHEMA = {
     # editing). See _build_dynamic_image_schema() below and the
     # dynamic-tool-schemas skill.
     "description": (
-        "Generate high-quality images from text prompts (text-to-image), or "
-        "edit / transform an existing image (image-to-image) when the active "
-        "model supports it. Pass `image_url` to edit that image; add "
-        "`reference_image_urls` for style/composition references; omit both "
-        "for text-to-image. The underlying backend (FAL, OpenAI, xAI, etc.) "
-        "and model are user-configured and not selectable by the agent. "
-        "Returns the result in the `image` field — either a URL or an absolute "
-        "file path. To show it to the user, reference that path/URL in your "
-        "response using the file-delivery convention for the current platform "
-        "(your platform guidance describes how files are delivered here). When "
-        "the active terminal backend has a different filesystem, successful "
-        "local-file results may also include `agent_visible_image` for "
-        "follow-up terminal/file operations."
+        "Generate the final raster image for image, poster, cover, or infographic "
+        "requests; do not substitute hand-written SVG/HTML unless the user "
+        "explicitly asks for editable vector/source output. Generate from text, "
+        "or edit / transform an existing image when the active model supports "
+        "it. Pass a conversation attachment's absolute local path as `image_url` "
+        "and additional paths as `reference_image_urls`; omit both for "
+        "text-to-image. The underlying backend and model are user-configured "
+        "and not selectable by the agent. Returns the result in the `image` "
+        "field — either a URL or an absolute file path. To show it to the user, "
+        "reference that path/URL in your response using the file-delivery "
+        "convention for the current platform. When the active terminal backend "
+        "has a different filesystem, successful local-file results may also "
+        "include `agent_visible_image` for follow-up terminal/file operations."
     ),
     "parameters": {
         "type": "object",
@@ -1277,60 +1271,41 @@ def _dispatch_to_plugin_provider(
     image_url: Optional[str] = None,
     reference_image_urls: Optional[list] = None,
 ):
-    """Route the call to a plugin-registered provider when one is selected.
-
-    Returns a JSON string on dispatch, or ``None`` to fall through to the
-    in-tree FAL fallback in ``image_generate_tool``.
-
-    Dispatch fires when ``image_gen.provider`` is explicitly set — including
-    ``"fal"`` itself, which now resolves to the
-    ``plugins/image_gen/fal/`` plugin (the plugin re-enters this module's
-    pipeline via ``_it`` indirection so behavior is identical to the
-    direct call, just routed through the registry).
-
-    ``image_url`` / ``reference_image_urls`` enable image-to-image / editing:
-    they are forwarded to the provider's ``generate()`` so the backend can
-    route to its edit endpoint.
-    """
-    configured = _read_configured_image_provider()
-    if not configured:
-        return None
-
-    # Also read configured model so we can pass it to the plugin
+    """Dispatch through the same active-provider resolution used by the schema."""
     configured_model = _read_configured_image_model()
-
     try:
-        # Import locally so plugin discovery isn't triggered just by
-        # importing this module (tests rely on that).
-        from agent.image_gen_registry import get_provider
-        from hermes_cli.plugins import _ensure_plugins_discovered
-
-        _ensure_plugins_discovered()
-        provider = get_provider(configured)
+        resolution = _resolve_image_provider()
     except Exception as exc:
-        logger.debug("image_gen plugin dispatch skipped: %s", exc)
+        logger.debug("image_gen provider resolution failed: %s", exc)
         return None
 
-    if provider is None:
-        try:
-            # Long-lived sessions may have discovered plugins before a bundled
-            # backend was patched in or before config changed. Retry once with
-            # a forced refresh before surfacing a missing-provider error.
-            _ensure_plugins_discovered(force=True)
-            provider = get_provider(configured)
-        except Exception as exc:
-            logger.debug("image_gen plugin force-refresh skipped: %s", exc)
+    if resolution.provider is None:
+        if resolution.explicit:
+            configured = resolution.configured_name
+            return json.dumps({
+                "success": False,
+                "image": None,
+                "error": (
+                    f"image_gen.provider='{configured}' is set but no plugin "
+                    "registered that name. Run `hermes plugins list` to see "
+                    "available image gen backends."
+                ),
+                "error_type": "provider_not_registered",
+            })
+        return None
 
-    if provider is None:
+    provider = resolution.provider
+    if not resolution.available:
         return json.dumps({
             "success": False,
             "image": None,
             "error": (
-                f"image_gen.provider='{configured}' is set but no plugin "
-                f"registered that name. Run `hermes plugins list` to see "
-                f"available image gen backends."
+                f"Image generation provider '{provider.name}' is configured "
+                "but unavailable. Check its required credentials with "
+                "`hermes tools` → Image Generation."
             ),
-            "error_type": "provider_not_registered",
+            "error_type": "provider_unavailable",
+            "provider": provider.name,
         })
 
     kwargs: Dict[str, Any] = {"prompt": prompt, "aspect_ratio": aspect_ratio}
@@ -1568,55 +1543,38 @@ _GENERIC_IMAGE_DESCRIPTION = IMAGE_GENERATE_SCHEMA["description"]
 
 
 def _active_image_capabilities() -> Dict[str, Any]:
-    """Best-effort: return the active backend/model's image capabilities.
-
-    Resolution order mirrors the runtime dispatch:
-    1. If ``image_gen.provider`` is set, ask that plugin provider.
-    2. Otherwise inspect the in-tree FAL model catalog for the active model.
-
-    Returns a dict like ``{"modalities": [...], "max_reference_images": N,
-    "model": "...", "provider": "..."}``. Never raises.
-    """
+    """Return capabilities for the same provider runtime dispatch will use."""
     info: Dict[str, Any] = {"modalities": ["text"], "max_reference_images": 0}
-
-    configured_provider = _read_configured_image_provider()
-    if configured_provider and configured_provider != "fal":
-        try:
-            from agent.image_gen_registry import get_provider
-            from hermes_cli.plugins import _ensure_plugins_discovered
-
-            _ensure_plugins_discovered()
-            provider = get_provider(configured_provider)
-            if provider is not None:
-                caps = {}
-                try:
-                    caps = provider.capabilities() or {}
-                except Exception:  # noqa: BLE001
-                    caps = {}
-                info["provider"] = provider.display_name
-                info["model"] = _read_configured_image_model() or (provider.default_model() or "")
-                if caps.get("modalities"):
-                    info["modalities"] = list(caps["modalities"])
-                if caps.get("max_reference_images"):
-                    info["max_reference_images"] = int(caps["max_reference_images"])
-                return info
-        except Exception:  # noqa: BLE001
-            pass
-
-    # In-tree FAL path (provider unset or == "fal").
     try:
-        model_id, meta = _resolve_fal_model()
-        info["provider"] = "FAL.ai"
-        info["model"] = meta.get("display", model_id)
-        if meta.get("edit_endpoint"):
-            info["modalities"] = ["text", "image"]
-            info["max_reference_images"] = int(meta.get("max_reference_images") or 1)
-        else:
-            info["modalities"] = ["text"]
-            info["max_reference_images"] = 0
+        resolution = _resolve_image_provider()
+        provider = resolution.provider
+        if provider is None:
+            if resolution.configured_name:
+                info["provider"] = resolution.configured_name
+                info["availability_error"] = resolution.error_type
+                return info
+            # Preserve the legacy FAL catalog description even when credentials
+            # are absent. Tool availability remains false, but direct imports and
+            # setup UI can still describe the configured model accurately.
+            model_id, meta = _resolve_fal_model()
+            info["provider"] = "FAL.ai"
+            info["model"] = meta.get("display", model_id)
+            if meta.get("edit_endpoint"):
+                info["modalities"] = ["text", "image"]
+                info["max_reference_images"] = int(
+                    meta.get("max_reference_images") or 1
+                )
+            return info
+        caps = provider.capabilities() or {}
+        info["provider"] = provider.display_name
+        info["model"] = _read_configured_image_model() or (provider.default_model() or "")
+        if caps.get("modalities"):
+            info["modalities"] = list(caps["modalities"])
+        info["max_reference_images"] = int(caps.get("max_reference_images") or 0)
+        if not resolution.available:
+            info["availability_error"] = resolution.error_type
     except Exception:  # noqa: BLE001
         pass
-
     return info
 
 

@@ -5333,9 +5333,21 @@ def _inflight_text(value: Any) -> str:
     return _content_display_text(value).strip()
 
 
-def _start_inflight_turn(session: dict, text: Any) -> None:
+def _next_turn_generation(session: dict) -> int:
+    generation = int(session.get("_turn_generation", 0)) + 1
+    session["_turn_generation"] = generation
+    session["_active_turn_generation"] = generation
+    return generation
+
+
+def _start_inflight_turn(
+    session: dict, text: Any, generation: int | None = None
+) -> None:
     now = time.time()
+    if generation is None:
+        generation = session.get("_active_turn_generation")
     session["inflight_turn"] = {
+        "generation": generation,
         "assistant": "",
         "started_at": now,
         "streaming": True,
@@ -5344,20 +5356,42 @@ def _start_inflight_turn(session: dict, text: Any) -> None:
     }
 
 
-def _append_inflight_delta(session: dict, delta: Any) -> None:
+def _append_inflight_delta(
+    session: dict, delta: Any, generation: int | None = None
+) -> None:
     text = "" if delta is None else str(delta)
     if not text:
         return
     turn = session.get("inflight_turn")
+    if (
+        generation is not None
+        and isinstance(turn, dict)
+        and turn.get("generation") != generation
+    ):
+        return
     if not isinstance(turn, dict):
-        turn = {"assistant": "", "streaming": True, "user": ""}
+        turn = {
+            "assistant": "",
+            "generation": generation,
+            "streaming": True,
+            "user": "",
+        }
     turn["assistant"] = f"{turn.get('assistant') or ''}{text}"
     turn["streaming"] = True
     turn["updated_at"] = time.time()
     session["inflight_turn"] = turn
 
 
-def _clear_inflight_turn(session: dict) -> None:
+def _clear_inflight_turn(
+    session: dict, generation: int | None = None
+) -> None:
+    turn = session.get("inflight_turn")
+    if (
+        generation is not None
+        and isinstance(turn, dict)
+        and turn.get("generation") != generation
+    ):
+        return
     session["inflight_turn"] = None
 
 
@@ -5378,7 +5412,11 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
     ):
         prev = existing["text"]
         text = f"{prev}\n\n{text}" if prev and text else (prev or text)
-    session["queued_prompt"] = {"text": text, "transport": transport}
+    session["queued_prompt"] = {
+        "text": text,
+        "transport": transport,
+        "owner_generation": session.get("_active_turn_generation"),
+    }
 
 
 def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any) -> dict:
@@ -5428,10 +5466,15 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             return False
         session["queued_prompt"] = None
         session["running"] = True
+        generation = _next_turn_generation(session)
+        session["_turn_cancel_requested"] = False
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
+        _start_inflight_turn(session, queued["text"], generation)
     try:
-        _run_prompt_submit(rid, sid, session, queued["text"])
+        _run_prompt_submit(
+            rid, sid, session, queued["text"], generation=generation
+        )
     except Exception as exc:
         print(
             f"[tui_gateway] queued prompt dispatch failed: "
@@ -5439,7 +5482,9 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             file=sys.stderr,
         )
         with session["history_lock"]:
-            session["running"] = False
+            if session.get("_active_turn_generation") == generation:
+                session["running"] = False
+                _clear_inflight_turn(session, generation)
     return True
 
 
@@ -8818,17 +8863,28 @@ def _(rid, params: dict) -> dict:
     # entry. This keeps a stale/missing thread handle from making Stop a no-op.
     run_thread = session.get("_run_thread")
     run_thread_alive = run_thread is not None and run_thread.is_alive()
+    interrupted_generation = session.get("_active_turn_generation")
     should_interrupt = bool(session.get("running"))
     if should_interrupt and hasattr(session["agent"], "interrupt"):
         session["agent"].interrupt()
     with session["history_lock"]:
         session["_turn_cancel_requested"] = True
-        session["queued_prompt"] = None
+        session["_turn_cancel_generation"] = interrupted_generation
+        queued = session.get("queued_prompt")
+        if (
+            not queued
+            or queued.get("owner_generation") == interrupted_generation
+        ):
+            session["queued_prompt"] = None
     if not run_thread_alive:
         with session["history_lock"]:
-            if session.get("running"):
+            if (
+                session.get("running")
+                and session.get("_active_turn_generation")
+                == interrupted_generation
+            ):
                 session["running"] = False
-                _clear_inflight_turn(session)
+                _clear_inflight_turn(session, interrupted_generation)
 
     # Stop = stop the TURN (cooperative interrupt above also kills the in-flight
     # foreground subprocess). Background processes the agent started (dev servers,
@@ -9159,9 +9215,11 @@ def _(rid, params: dict) -> dict:
                 except Exception as exc:
                     print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
         session["running"] = True
+        generation = _next_turn_generation(session)
         session["_turn_cancel_requested"] = False
+        session["_turn_cancel_generation"] = None
         session["last_active"] = time.time()
-        _start_inflight_turn(session, text)
+        _start_inflight_turn(session, text, generation)
 
     # Persist the DB row lazily, now that the user has actually sent a message.
     _ensure_session_db_row(session)
@@ -9187,15 +9245,28 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 with session["history_lock"]:
-                    session["running"] = False
-                    _clear_inflight_turn(session)
+                    if session.get("_active_turn_generation") == generation:
+                        session["running"] = False
+                        _clear_inflight_turn(session, generation)
                 return
             with session["history_lock"]:
-                if session.get("_turn_cancel_requested") or not session.get("running"):
+                stale = session.get("_active_turn_generation") != generation
+                cancelled = (
+                    session.get("_turn_cancel_requested")
+                    and session.get("_turn_cancel_generation") == generation
+                )
+                inactive = not session.get("running")
+                if not stale and (cancelled or inactive):
                     session["running"] = False
-                    _clear_inflight_turn(session)
-                    return
-            _run_prompt_submit(rid, sid, session, text)
+                    _clear_inflight_turn(session, generation)
+            if stale:
+                return
+            if cancelled or inactive:
+                _drain_queued_prompt(rid, sid, session)
+                return
+            _run_prompt_submit(
+                rid, sid, session, text, generation=generation
+            )
         finally:
             _gateway_runtime.reset(runtime_token)
 
@@ -9401,11 +9472,15 @@ def _notification_poller_loop_bound(
                 process_registry.completion_queue.put(evt)
                 continue
             session["running"] = True
+            generation = _next_turn_generation(session)
+            session["_turn_cancel_requested"] = False
+            session["_turn_cancel_generation"] = None
+            _start_inflight_turn(session, text, generation)
 
         rid = f"__notif__{int(time.time() * 1000)}"
         try:
             _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, text)
+            _run_prompt_submit(rid, sid, session, text, generation=generation)
         except Exception as exc:
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
@@ -9413,7 +9488,9 @@ def _notification_poller_loop_bound(
                 file=sys.stderr,
             )
             with session["history_lock"]:
-                session["running"] = False
+                if session.get("_active_turn_generation") == generation:
+                    session["running"] = False
+                    _clear_inflight_turn(session, generation)
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
@@ -9444,11 +9521,15 @@ def _notification_poller_loop_bound(
                 process_registry.completion_queue.put(evt)
                 break
             session["running"] = True
+            generation = _next_turn_generation(session)
+            session["_turn_cancel_requested"] = False
+            session["_turn_cancel_generation"] = None
+            _start_inflight_turn(session, text, generation)
 
         rid = f"__notif__{int(time.time() * 1000)}"
         try:
             _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, text)
+            _run_prompt_submit(rid, sid, session, text, generation=generation)
         except Exception as exc:
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
@@ -9456,7 +9537,9 @@ def _notification_poller_loop_bound(
                 file=sys.stderr,
             )
             with session["history_lock"]:
-                session["running"] = False
+                if session.get("_active_turn_generation") == generation:
+                    session["running"] = False
+                    _clear_inflight_turn(session, generation)
 
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
@@ -9530,8 +9613,17 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
-def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+def _run_prompt_submit(
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    *,
+    generation: int | None = None,
+) -> None:
     with session["history_lock"]:
+        if generation is None:
+            generation = session.get("_active_turn_generation")
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
         images = list(session.get("attached_images", []))
@@ -9539,7 +9631,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         session["attached_images"] = []
         session["pending_attachments"] = []
         if not isinstance(session.get("inflight_turn"), dict):
-            _start_inflight_turn(session, text)
+            _start_inflight_turn(session, text, generation)
     agent = session["agent"]
     if hasattr(agent, "clear_interrupt"):
         try:
@@ -9688,7 +9780,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
 
             def _stream(delta):
                 with session["history_lock"]:
-                    _append_inflight_delta(session, delta)
+                    _append_inflight_delta(session, delta, generation)
                 payload = {"text": delta}
                 if streamer and (r := streamer.feed(delta)) is not None:
                     payload["rendered"] = r
@@ -9825,7 +9917,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             if rendered:
                 payload["rendered"] = rendered
             with session["history_lock"]:
-                _clear_inflight_turn(session)
+                _clear_inflight_turn(session, generation)
             _emit("message.complete", sid, payload)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
@@ -9978,10 +10070,15 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             _clear_session_context(session_tokens)
             _gateway_runtime.reset(runtime_token)
             with session["history_lock"]:
-                session["running"] = False
-                session["last_active"] = time.time()
-                _clear_inflight_turn(session)
+                owns_turn = session.get("_active_turn_generation") == generation
+                if owns_turn:
+                    session["running"] = False
+                    session["last_active"] = time.time()
+                    _clear_inflight_turn(session, generation)
             _emit("session.info", sid, _session_info(agent, session))
+
+        if not owns_turn:
+            return
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;
@@ -10002,9 +10099,19 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     # the judge will re-run on the next turn anyway.
                     return
                 session["running"] = True
+                followup_generation = _next_turn_generation(session)
+                session["_turn_cancel_requested"] = False
+                session["_turn_cancel_generation"] = None
+                _start_inflight_turn(session, goal_followup, followup_generation)
             try:
                 _emit("message.start", sid)
-                _run_prompt_submit(rid, sid, session, goal_followup)
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    goal_followup,
+                    generation=followup_generation,
+                )
             except Exception as _cont_exc:
                 print(
                     f"[tui_gateway] goal continuation dispatch failed: "
@@ -10012,7 +10119,12 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     file=sys.stderr,
                 )
                 with session["history_lock"]:
-                    session["running"] = False
+                    if (
+                        session.get("_active_turn_generation")
+                        == followup_generation
+                    ):
+                        session["running"] = False
+                        _clear_inflight_turn(session, followup_generation)
 
         # Drain completion notifications that arrived during this turn.
         # The background poller handles between-turn delivery; this is
@@ -10026,9 +10138,21 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         process_registry.completion_queue.put(_evt)
                         break
                     session["running"] = True
+                    notification_generation = _next_turn_generation(session)
+                    session["_turn_cancel_requested"] = False
+                    session["_turn_cancel_generation"] = None
+                    _start_inflight_turn(
+                        session, synth, notification_generation
+                    )
                 try:
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
+                    _run_prompt_submit(
+                        rid,
+                        sid,
+                        session,
+                        synth,
+                        generation=notification_generation,
+                    )
                 except Exception as _n_exc:
                     print(
                         f"[tui_gateway] completion notification dispatch failed: "
@@ -10036,7 +10160,14 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         file=sys.stderr,
                     )
                     with session["history_lock"]:
-                        session["running"] = False
+                        if (
+                            session.get("_active_turn_generation")
+                            == notification_generation
+                        ):
+                            session["running"] = False
+                            _clear_inflight_turn(
+                                session, notification_generation
+                            )
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "
