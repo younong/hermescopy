@@ -40,7 +40,7 @@ Usage:
 
 Options:
   --tag <tag>              Deploy an existing local git tag.
-  --create-tag <tag>       Create an annotated tag at HEAD, push it, then deploy it.
+  --create-tag <tag>       Rebase onto origin/main, push the branch and one annotated tag, then deploy it.
   --ref <commit-sha>       Deploy an already-pushed immutable 40-hex commit SHA without creating a tag.
   --host <host>            SSH host. Default: ${DEFAULT_HOST}
   --user <user>            SSH user. Default: ${DEFAULT_USER}
@@ -241,8 +241,8 @@ function run(command, commandArgs, options = {}) {
   return result;
 }
 
-function runText(command, commandArgs) {
-  return run(command, commandArgs, { quiet: true }).stdout.trim();
+function runText(command, commandArgs, options = {}) {
+  return run(command, commandArgs, { ...options, quiet: true }).stdout.trim();
 }
 
 function requireBinary(name) {
@@ -281,8 +281,8 @@ function releaseIdFor(args) {
   return args.sourceKind === "commit" ? `commit-${args.sourceCommit}` : args.sourceTag;
 }
 
-function assertCleanWorktree({ allowDirty, dryRun = false }) {
-  const status = runText("git", ["status", "--porcelain"]);
+function assertCleanWorktree({ allowDirty, dryRun = false, cwd = repoRoot }) {
+  const status = runText("git", ["status", "--porcelain"], { cwd });
   if (status && dryRun) {
     console.log("! Working tree has local changes; continuing because this is a dry run.");
     return;
@@ -295,27 +295,181 @@ function assertCleanWorktree({ allowDirty, dryRun = false }) {
   }
 }
 
-function assertMainBranch({ allowNonMain }) {
-  const branch = runText("git", ["branch", "--show-current"]);
-  if (branch !== "main" && !allowNonMain) {
-    throw new Error(`Current branch is '${branch || "detached HEAD"}', not 'main'. Use --allow-non-main to override.`);
+function currentBranch({ cwd = repoRoot } = {}) {
+  try {
+    return runText("git", ["symbolic-ref", "--quiet", "--short", "HEAD"], { cwd });
+  } catch {
+    throw new Error("Creating a release tag requires a named branch; detached HEAD is not supported.");
   }
 }
 
-function tagExists(tag) {
+function assertReleaseBranch(branch, { allowNonMain }) {
+  if (branch !== "main" && !allowNonMain) {
+    throw new Error(`Current branch is '${branch}', not 'main'. Use --allow-non-main to override.`);
+  }
+}
+
+function tagExists(tag, { cwd = repoRoot } = {}) {
   const result = spawnSync("git", ["rev-parse", "--quiet", "--verify", `refs/tags/${tag}`], {
-    cwd: repoRoot,
+    cwd,
     encoding: "utf8",
   });
   return result.status === 0;
 }
 
-function createAnnotatedTag(tag, { dryRun }) {
-  if (tagExists(tag)) {
+function remoteRefs(refs, { cwd = repoRoot } = {}) {
+  const output = runText("git", ["ls-remote", "origin", ...refs], { cwd });
+  return new Map(
+    output
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        const [commit, ref] = line.split(/\s+/, 2);
+        return [ref, commit];
+      }),
+  );
+}
+
+function remoteTagCommit(tag, { cwd = repoRoot } = {}) {
+  const tagRef = `refs/tags/${tag}`;
+  const refs = remoteRefs([tagRef, `${tagRef}^{}`], { cwd });
+  return refs.get(`${tagRef}^{}`) || refs.get(tagRef) || "";
+}
+
+function remoteBranchCommit(branch, { cwd = repoRoot } = {}) {
+  return remoteRefs([`refs/heads/${branch}`], { cwd }).get(`refs/heads/${branch}`) || "";
+}
+
+function assertRemoteTagMissing(tag, { cwd = repoRoot } = {}) {
+  if (remoteTagCommit(tag, { cwd })) {
+    throw new Error(`Tag already exists on origin: ${tag}`);
+  }
+}
+
+function cleanupFailedLocalTag(tag, preparedCommit, { cwd = repoRoot } = {}) {
+  if (!tagExists(tag, { cwd })) {
+    return;
+  }
+  const localCommit = runText("git", ["rev-parse", "--verify", `${tag}^{commit}`], { cwd });
+  const originCommit = remoteTagCommit(tag, { cwd });
+  if (localCommit === preparedCommit && originCommit !== preparedCommit) {
+    run("git", ["tag", "-d", tag], { cwd });
+  }
+}
+
+function verifyPublishedRelease(tag, branch, preparedCommit, { cwd = repoRoot } = {}) {
+  const localTagCommit = runText("git", ["rev-parse", "--verify", `${tag}^{commit}`], { cwd });
+  const originTagCommit = remoteTagCommit(tag, { cwd });
+  const originBranchCommit = remoteBranchCommit(branch, { cwd });
+  if (
+    localTagCommit !== preparedCommit ||
+    originTagCommit !== preparedCommit ||
+    originBranchCommit !== preparedCommit
+  ) {
+    throw new Error(
+      `Published release verification failed for ${tag}; deployment was withheld. Inspect origin before retrying with --tag.`,
+    );
+  }
+}
+
+export function prepareCreateTag(tag, { allowNonMain = false, dryRun = false, cwd = repoRoot } = {}) {
+  validateTag(tag);
+  const branch = currentBranch({ cwd });
+  assertReleaseBranch(branch, { allowNonMain });
+  assertCleanWorktree({ allowDirty: false, cwd });
+  if (tagExists(tag, { cwd })) {
     throw new Error(`Tag already exists: ${tag}`);
   }
-  run("git", ["tag", "-a", tag, "-m", `Hermes deploy ${tag}`], { dryRun });
-  run("git", ["push", "origin", "HEAD", "--tags"], { dryRun });
+  assertRemoteTagMissing(tag, { cwd });
+
+  const remoteMain = remoteBranchCommit("main", { cwd });
+  if (!remoteMain) {
+    throw new Error("origin/main does not exist; cannot establish the release baseline.");
+  }
+
+  const fetchArgs = [
+    "fetch",
+    "--no-tags",
+    "origin",
+    "+refs/heads/main:refs/remotes/origin/main",
+  ];
+  if (dryRun) {
+    run("git", ["fetch", "--dry-run", "--no-tags", "origin", "refs/heads/main"], {
+      cwd,
+      quiet: true,
+    });
+    const head = runText("git", ["rev-parse", "--verify", "HEAD^{commit}"], { cwd });
+    const preparedCommit = head === remoteMain ? head : "<post-rebase-commit>";
+    const branchRefspec = `${preparedCommit}:refs/heads/${branch}`;
+    const tagRefspec = `refs/tags/${tag}:refs/tags/${tag}`;
+    run("git", fetchArgs, { cwd, dryRun: true });
+    run("git", ["rebase", "--no-autostash", "refs/remotes/origin/main"], {
+      cwd,
+      dryRun: true,
+    });
+    run("git", ["push", "origin", branchRefspec], { cwd, dryRun: true });
+    run("git", ["tag", "-a", tag, "-m", `Hermes deploy ${tag}`, preparedCommit], {
+      cwd,
+      dryRun: true,
+    });
+    run("git", ["push", "--atomic", "origin", branchRefspec, tagRefspec], {
+      cwd,
+      dryRun: true,
+    });
+    if (preparedCommit === "<post-rebase-commit>") {
+      console.log("! The release commit will be known only after rebasing onto the latest origin/main.");
+    }
+    return { branch, sourceCommit: preparedCommit };
+  }
+
+  run("git", fetchArgs, { cwd });
+  try {
+    run("git", ["rebase", "--no-autostash", "refs/remotes/origin/main"], { cwd });
+  } catch (error) {
+    try {
+      run("git", ["rebase", "--abort"], { cwd, quiet: true });
+    } catch {
+      // Preserve the original rebase error; Git reports when there is nothing to abort.
+    }
+    throw new Error(`Rebase onto origin/main failed and the release was stopped:\n${error.message}`);
+  }
+
+  if (currentBranch({ cwd }) !== branch) {
+    throw new Error("The current branch changed during release preparation.");
+  }
+  assertCleanWorktree({ allowDirty: false, cwd });
+  const preparedCommit = runText("git", ["rev-parse", "--verify", "HEAD^{commit}"], { cwd });
+  const localBranchCommit = runText("git", ["rev-parse", "--verify", `refs/heads/${branch}^{commit}`], {
+    cwd,
+  });
+  if (localBranchCommit !== preparedCommit) {
+    throw new Error("HEAD no longer matches the prepared release branch.");
+  }
+
+  const branchRefspec = `${preparedCommit}:refs/heads/${branch}`;
+  run("git", ["push", "origin", branchRefspec], { cwd });
+  if (remoteBranchCommit(branch, { cwd }) !== preparedCommit) {
+    throw new Error("The release branch could not be verified on origin; no tag was created.");
+  }
+  assertRemoteTagMissing(tag, { cwd });
+
+  run("git", ["tag", "-a", tag, "-m", `Hermes deploy ${tag}`, preparedCommit], { cwd });
+  const tagRefspec = `refs/tags/${tag}:refs/tags/${tag}`;
+  try {
+    run("git", ["push", "--atomic", "origin", branchRefspec, tagRefspec], { cwd });
+  } catch (error) {
+    const originTagCommit = remoteTagCommit(tag, { cwd });
+    const originBranchCommit = remoteBranchCommit(branch, { cwd });
+    if (originTagCommit === preparedCommit && originBranchCommit === preparedCommit) {
+      console.log("! Atomic push reported an error, but exact remote refs confirm publication succeeded.");
+    } else {
+      cleanupFailedLocalTag(tag, preparedCommit, { cwd });
+      throw error;
+    }
+  }
+
+  verifyPublishedRelease(tag, branch, preparedCommit, { cwd });
+  return { branch, sourceCommit: preparedCommit };
 }
 
 function createArchive(args, { dryRun }) {
@@ -1076,14 +1230,12 @@ function main() {
   }
 
   if (args.createTag) {
-    validateTag(args.createTag);
-    assertMainBranch({ allowNonMain: args.allowNonMain });
-    assertCleanWorktree({ allowDirty: false, dryRun: args.dryRun });
-    createAnnotatedTag(args.createTag, { dryRun: args.dryRun });
+    const prepared = prepareCreateTag(args.createTag, {
+      allowNonMain: args.allowNonMain,
+      dryRun: args.dryRun,
+    });
     args.sourceTag = args.createTag;
-    args.sourceCommit = args.dryRun
-      ? runText("git", ["rev-parse", "--verify", "HEAD^{commit}"])
-      : runText("git", ["rev-parse", "--verify", `${args.createTag}^{commit}`]);
+    args.sourceCommit = prepared.sourceCommit;
   } else if (args.ref) {
     if (args.force || args.allowDirty) {
       throw new Error("--ref does not allow --force or --allow-dirty.");
@@ -1113,9 +1265,11 @@ function main() {
   }
 }
 
-try {
-  main();
-} catch (error) {
-  console.error(`deploy failed: ${error.message}`);
-  process.exit(1);
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try {
+    main();
+  } catch (error) {
+    console.error(`deploy failed: ${error.message}`);
+    process.exit(1);
+  }
 }

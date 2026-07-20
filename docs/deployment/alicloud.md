@@ -113,19 +113,33 @@ Hermes 中选择 APIYI 图像后端后，可用模型包括 `gpt-image-2-low`、
 
 ## 发布并部署新 tag
 
-从当前 `main` 创建 tag、推送 tag，然后部署：
+先人工检查并提交所有要发布的代码；发布工具不会执行 `git add`、`commit` 或 `stash`。工作区（包括未跟踪文件）不干净时，新 tag 发布会直接拒绝：
 
 ```bash
+git status --short
+git commit  # 按实际改动选择并提交
 npm run deploy -- --create-tag v2026.7.4
 ```
 
-如果当前分支不是 `main`，工具会拒绝创建 tag。确实需要从其他分支发布时显式加：
+`--create-tag` 会先精确获取最新 `origin/main`，将当前发布分支 rebase 到该基线，再无 force 地把 prepared commit 推送到远端同名分支。分支推送成功后才创建 annotated tag，并通过 atomic push 同时守卫远端分支和发布唯一目标 tag；不会使用 `--tags` 推送其他本地 tag。这样，即使本地 `main` 干净但过期，也不能在同步最新 `origin/main` 前发布。
+
+如果当前分支不是 `main`，工具会拒绝创建 tag。确实需要从其他具名分支发布时显式加：
 
 ```bash
 npm run deploy -- --create-tag v2026.7.4-test --allow-non-main
 ```
 
-部署过程会：
+`--allow-non-main` 仍会把当前分支 rebase 到最新 `origin/main`，再推送远端同名分支；它不允许 detached HEAD，也不会在 non-fast-forward 时 force push。遇到 rebase 冲突或远端分支并发更新时，工具会停止且不发布新 tag，需要人工检查并解决后重试。
+
+新 tag 的 Git 准备和部署过程会：
+
+1. 要求具名发布分支和干净工作区，并确认本地/远端目标 tag 都不存在。
+2. Fetch 最新 `origin/main`，以 `--no-autostash` rebase 当前发布分支；冲突时 abort 并停止。
+3. 无 force 地推送 prepared commit 到远端同名分支。
+4. 在 prepared commit 创建 annotated tag，并 atomic push 该分支守卫和唯一目标 tag。
+5. 校验本地 tag、远端 tag 和远端分支都指向同一 prepared commit；不一致时停止部署。
+
+随后部署会：
 
 1. 在本机基于 tag 解出干净源码。
 2. 在本机安装 Node workspace 依赖并构建 web dashboard 和 TUI。
@@ -253,9 +267,17 @@ npm run deploy -- --tag v2026.7.4 --keep-releases 8
 npm run deploy -- --tag v2026.7.4 --no-prune-releases
 ```
 
+## 新 tag Git 失败处理
+
+- 工作区不干净：人工选择要提交的文件并 commit，或自行 stash；发布工具不会自动处理。
+- Rebase 冲突：工具会尝试 `git rebase --abort` 并停止。检查分支状态，人工解决与最新 `origin/main` 的冲突后重试。
+- 分支 push 被拒绝：说明远端同名分支存在 non-fast-forward 或并发更新；fetch 并检查新增提交，禁止 force push 发布。
+- Atomic tag push 失败：工具不会降级为无守卫的 tag-only push，也不会覆盖/删除远端 tag；未发布且由本次创建的本地 tag会安全清理。
+- Tag 已验证发布但后续校验、构建或部署停止：tag 是不可变发布来源，不会自动删除。检查远端分支/tag 后，只有明确要部署该 commit 时才用 `npm run deploy -- --tag <tag>` 重试。
+
 ## Dry run
 
-预览将执行的步骤，不创建本地 tag、不上传、不改服务器：
+预览将执行的步骤，不 rebase、不 push、不创建本地 tag、不上传、不改服务器。新 tag dry-run 仍要求具名分支和干净工作区，并做远端只读检查；如果 rebase 后 commit 尚不可知，输出使用 `<post-rebase-commit>`：
 
 ```bash
 npm run deploy -- --create-tag v2026.7.4 --dry-run
