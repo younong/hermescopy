@@ -7066,12 +7066,15 @@ class _DashboardAttachTransport:
     def __init__(self):
         self.scope = None
         self.generation = -1
+        self.pending_generation = None
         self.active_session_id = None
 
     def write(self, _obj):
         return True
 
-    def begin_dashboard_attach(self, generation, *, browser_id, profile=""):
+    def begin_dashboard_attach(
+        self, generation, *, browser_id, profile="", pending=True
+    ):
         scope = (browser_id, profile)
         if not browser_id:
             return "browser_id required"
@@ -7081,6 +7084,7 @@ class _DashboardAttachTransport:
             return "session attach superseded"
         self.scope = scope
         self.generation = generation
+        self.pending_generation = generation if pending else None
         return None
 
     def commit_dashboard_attach(self, generation, session_id, *, on_commit=None):
@@ -7089,10 +7093,207 @@ class _DashboardAttachTransport:
         if on_commit is not None and not on_commit():
             return False
         self.active_session_id = session_id
+        if self.pending_generation == generation:
+            self.pending_generation = None
         return True
+
+    def abort_dashboard_attach(self, generation):
+        if self.pending_generation == generation:
+            self.pending_generation = None
+
+    def dashboard_mutation_error(self, session_id):
+        if self.scope is None:
+            return None
+        if self.pending_generation is not None:
+            return "dashboard session switch in progress"
+        if not session_id or session_id != self.active_session_id:
+            return "dashboard mutation targets an inactive session"
+        return None
 
     def dashboard_attach_is_current(self, generation):
         return generation == self.generation
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    [
+        "approval.respond",
+        "file.attach",
+        "image.attach_bytes",
+        "pdf.attach",
+        "prompt.submit",
+        "session.interrupt",
+    ],
+)
+def test_dashboard_mutations_reject_inactive_runtime_before_handler(
+    monkeypatch, method_name
+):
+    transport = _DashboardAttachTransport()
+    assert transport.begin_dashboard_attach(
+        1, browser_id="browser-a", pending=False
+    ) is None
+    assert transport.commit_dashboard_attach(1, "runtime-a") is True
+    called = []
+    monkeypatch.setitem(
+        server._methods,
+        method_name,
+        lambda rid, params: called.append((rid, params)) or server._ok(rid, {}),
+    )
+
+    token = server.bind_transport(transport)
+    try:
+        response = server.handle_request(
+            {
+                "id": "stale",
+                "method": method_name,
+                "params": {"session_id": "runtime-b"},
+            }
+        )
+    finally:
+        server.reset_transport(token)
+
+    assert response["error"] == {
+        "code": 4092,
+        "message": "dashboard mutation targets an inactive session",
+    }
+    assert called == []
+
+
+def test_dashboard_mutation_guard_allows_active_and_legacy_transports(monkeypatch):
+    called = []
+    monkeypatch.setitem(
+        server._methods,
+        "prompt.submit",
+        lambda rid, params: called.append(params["session_id"]) or server._ok(rid, {}),
+    )
+    transport = _DashboardAttachTransport()
+    assert transport.begin_dashboard_attach(
+        1, browser_id="browser-a", pending=False
+    ) is None
+    assert transport.commit_dashboard_attach(1, "runtime-a") is True
+
+    token = server.bind_transport(transport)
+    try:
+        active = server.handle_request(
+            {
+                "id": "active",
+                "method": "prompt.submit",
+                "params": {"session_id": "runtime-a"},
+            }
+        )
+    finally:
+        server.reset_transport(token)
+
+    token = server.bind_transport(object())
+    try:
+        legacy = server.handle_request(
+            {
+                "id": "legacy",
+                "method": "prompt.submit",
+                "params": {"session_id": "runtime-legacy"},
+            }
+        )
+    finally:
+        server.reset_transport(token)
+
+    assert active["result"] == {}
+    assert legacy["result"] == {}
+    assert called == ["runtime-a", "runtime-legacy"]
+
+
+def test_session_attach_dispatch_fences_mutation_before_pool_worker(monkeypatch):
+    class _ControlledPool:
+        def __init__(self):
+            self.jobs = []
+
+        def submit(self, job):
+            self.jobs.append(job)
+            return object()
+
+    pool = _ControlledPool()
+    monkeypatch.setattr(server, "_pool", pool)
+    transport = _DashboardAttachTransport()
+    assert transport.begin_dashboard_attach(
+        1, browser_id="browser-a", pending=False
+    ) is None
+    assert transport.commit_dashboard_attach(1, "runtime-a") is True
+    previous_transport = object()
+    session = _session(
+        agent=object(),
+        history=[{"role": "user", "content": "existing"}],
+        session_key="stored-a",
+        transport=previous_transport,
+    )
+    server._sessions["runtime-a"] = session
+    try:
+        queued = server.dispatch(
+            {
+                "id": "attach",
+                "method": "session.attach",
+                "params": {
+                    "browser_id": "browser-a",
+                    "session_id": "stored-b",
+                    "switch_generation": 2,
+                },
+            },
+            transport,
+        )
+        stale = server.dispatch(
+            {
+                "id": "prompt",
+                "method": "prompt.submit",
+                "params": {"session_id": "runtime-a", "text": "wrong chat"},
+            },
+            transport,
+        )
+    finally:
+        server._sessions.pop("runtime-a", None)
+
+    assert queued is None
+    assert len(pool.jobs) == 1
+    assert stale["error"] == {
+        "code": 4092,
+        "message": "dashboard session switch in progress",
+    }
+    assert session["transport"] is previous_transport
+    assert session["history"] == [{"role": "user", "content": "existing"}]
+    assert session["running"] is False
+
+
+def test_failed_session_attach_restores_previous_mutation_owner(monkeypatch):
+    transport = _DashboardAttachTransport()
+    assert transport.begin_dashboard_attach(
+        1, browser_id="browser-a", pending=False
+    ) is None
+    assert transport.commit_dashboard_attach(1, "runtime-a") is True
+
+    class _DB:
+        def get_session(self, _target):
+            return None
+
+        def get_session_by_title(self, _target):
+            return None
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    token = server.bind_transport(transport)
+    try:
+        response = server.handle_request(
+            {
+                "id": "attach-missing",
+                "method": "session.attach",
+                "params": {
+                    "browser_id": "browser-a",
+                    "session_id": "missing",
+                    "switch_generation": 2,
+                },
+            }
+        )
+    finally:
+        server.reset_transport(token)
+
+    assert response["error"]["code"] == 4007
+    assert transport.pending_generation is None
+    assert transport.dashboard_mutation_error("runtime-a") is None
 
 
 def test_dashboard_session_create_commits_active_runtime(monkeypatch):

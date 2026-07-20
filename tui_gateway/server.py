@@ -168,6 +168,9 @@ class OwnerWorkerGatewayRuntime:
 _gateway_runtime: contextvars.ContextVar[OwnerWorkerGatewayRuntime | None] = contextvars.ContextVar(
     "gateway_runtime", default=None
 )
+_dashboard_attach_preregistered: contextvars.ContextVar[tuple[Any, int] | None] = (
+    contextvars.ContextVar("dashboard_attach_preregistered", default=None)
+)
 _standalone_gateway_state = _GatewayMutableState()
 
 
@@ -276,6 +279,17 @@ _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
 # everything else stays on the main thread so ordering stays sane for the
 # fast path.  write_json is already _stdout_lock-guarded, so concurrent
 # response writes are safe.
+_DASHBOARD_MUTATION_METHODS = frozenset(
+    {
+        "approval.respond",
+        "file.attach",
+        "image.attach_bytes",
+        "pdf.attach",
+        "prompt.submit",
+        "session.interrupt",
+    }
+)
+
 _LONG_HANDLERS = frozenset(
     {
         "billing.step_up",
@@ -1378,6 +1392,12 @@ def handle_request(req: dict) -> dict | None:
     fn = _methods.get(method)
     if not fn:
         return _err(rid, -32601, f"unknown method: {method}")
+    if method in _DASHBOARD_MUTATION_METHODS:
+        mutation_error = getattr(current_transport(), "dashboard_mutation_error", None)
+        if callable(mutation_error):
+            message = mutation_error(str(params.get("session_id") or "").strip())
+            if message is not None:
+                return _err(rid, 4092, message)
     return fn(rid, params)
 
 
@@ -1420,12 +1440,41 @@ def dispatch(
         if isinstance(normalized, dict):
             return normalized
 
-        _rid, method, _params = normalized
+        rid, method, params = normalized
         if method not in _LONG_HANDLERS:
             return handle_request(req)
 
-        # Snapshot the context so the pool worker sees the bound transport.
-        ctx = contextvars.copy_context()
+        attach_generation = None
+        if method == "session.attach":
+            attach_transport = _dashboard_attach_transport()
+            if attach_transport is None:
+                return _err(rid, 4002, "session.attach requires a dashboard WebSocket")
+            attach_generation, error = _session_attach_generation(rid, params)
+            if error is not None:
+                return error
+            assert attach_generation is not None
+            begin_error = attach_transport.begin_dashboard_attach(
+                attach_generation,
+                browser_id=str(params.get("browser_id") or "").strip(),
+                profile=str(params.get("profile") or "").strip(),
+                pending=True,
+            )
+            if begin_error is not None:
+                code = 4091 if begin_error == "session attach superseded" else 4002
+                return _err(rid, code, begin_error)
+
+        # Snapshot the context so the pool worker sees the bound transport and
+        # trusted attach registration performed above.
+        preregistered_token = None
+        if attach_generation is not None:
+            preregistered_token = _dashboard_attach_preregistered.set(
+                (t, attach_generation)
+            )
+        try:
+            ctx = contextvars.copy_context()
+        finally:
+            if preregistered_token is not None:
+                _dashboard_attach_preregistered.reset(preregistered_token)
 
         def run():
             try:
@@ -1435,7 +1484,14 @@ def dispatch(
             if resp is not None:
                 t.write(resp)
 
-        _pool.submit(lambda: ctx.run(run))
+        try:
+            _pool.submit(lambda: ctx.run(run))
+        except Exception:
+            if attach_generation is not None:
+                abort_attach = getattr(t, "abort_dashboard_attach", None)
+                if callable(abort_attach):
+                    abort_attach(attach_generation)
+            raise
 
         return None
     finally:
@@ -5417,6 +5473,7 @@ def _session_create(rid, params: dict) -> dict:
             dashboard_generation,
             browser_id=str(params.get("browser_id") or "").strip(),
             profile=str(params.get("profile") or "").strip(),
+            pending=False,
         )
         if begin_error is not None:
             code = 4091 if begin_error == "session attach superseded" else 4002
@@ -5849,6 +5906,8 @@ def _dashboard_attach_transport():
         return None
     if not callable(getattr(transport, "dashboard_attach_is_current", None)):
         return None
+    if not callable(getattr(transport, "abort_dashboard_attach", None)):
+        return None
     return transport
 
 
@@ -5931,26 +5990,30 @@ def _(rid, params: dict) -> dict:
     if error is not None:
         return error
     assert generation is not None
-    browser_id = str(params.get("browser_id") or "").strip()
-    profile = str(params.get("profile") or "").strip()
-    begin_error = transport.begin_dashboard_attach(
-        generation,
-        browser_id=browser_id,
-        profile=profile,
-    )
-    if begin_error is not None:
-        code = 4091 if begin_error == "session attach superseded" else 4002
-        return _err(rid, code, begin_error)
+    preregistered = _dashboard_attach_preregistered.get()
+    if preregistered != (transport, generation):
+        begin_error = transport.begin_dashboard_attach(
+            generation,
+            browser_id=str(params.get("browser_id") or "").strip(),
+            profile=str(params.get("profile") or "").strip(),
+            pending=True,
+        )
+        if begin_error is not None:
+            code = 4091 if begin_error == "session attach superseded" else 4002
+            return _err(rid, code, begin_error)
 
-    resume_params = dict(params)
-    resume_params["_dashboard_attach"] = True
-    response = _session_resume(rid, resume_params)
-    return _commit_session_attach(
-        rid,
-        transport=transport,
-        generation=generation,
-        response=response,
-    )
+    try:
+        resume_params = dict(params)
+        resume_params["_dashboard_attach"] = True
+        response = _session_resume(rid, resume_params)
+        return _commit_session_attach(
+            rid,
+            transport=transport,
+            generation=generation,
+            response=response,
+        )
+    finally:
+        transport.abort_dashboard_attach(generation)
 
 
 @method("session.resume")

@@ -380,6 +380,72 @@ def test_ws_dashboard_attach_generation_and_scope_are_atomic():
     assert transport.dashboard_attach_is_current(5) is True
 
 
+def test_ws_dashboard_mutation_fence_tracks_pending_and_committed_runtime():
+    transport = ws_mod.WSTransport(object(), _FakeTransportLoop())
+
+    assert transport.dashboard_mutation_error("runtime-any") is None
+    assert transport.begin_dashboard_attach(1, browser_id="browser-a") is None
+    assert transport.dashboard_mutation_error("runtime-a") == (
+        "dashboard session switch in progress"
+    )
+    assert transport.commit_dashboard_attach(1, "runtime-a") is True
+    assert transport.dashboard_mutation_error("runtime-a") is None
+    assert transport.dashboard_mutation_error("runtime-b") == (
+        "dashboard mutation targets an inactive session"
+    )
+    assert transport.dashboard_mutation_error("") == (
+        "dashboard mutation targets an inactive session"
+    )
+
+
+def test_ws_dashboard_attach_abort_restores_previous_runtime_without_clearing_newer():
+    transport = ws_mod.WSTransport(object(), _FakeTransportLoop())
+    assert transport.begin_dashboard_attach(1, browser_id="browser-a") is None
+    assert transport.commit_dashboard_attach(1, "runtime-a") is True
+
+    assert transport.begin_dashboard_attach(2, browser_id="browser-a") is None
+    transport.abort_dashboard_attach(2)
+    assert transport.dashboard_mutation_error("runtime-a") is None
+
+    assert transport.begin_dashboard_attach(3, browser_id="browser-a") is None
+    assert transport.begin_dashboard_attach(4, browser_id="browser-a") is None
+    transport.abort_dashboard_attach(3)
+    assert transport.dashboard_mutation_error("runtime-a") == (
+        "dashboard session switch in progress"
+    )
+    assert transport.commit_dashboard_attach(4, "runtime-b") is True
+    assert transport.dashboard_mutation_error("runtime-b") is None
+    assert transport.dashboard_mutation_error("runtime-a") == (
+        "dashboard mutation targets an inactive session"
+    )
+
+
+def test_ws_dashboard_pending_attach_keeps_previous_outbound_subscription():
+    sent = []
+
+    class FakeWS:
+        async def send_text(self, line):
+            sent.append(json.loads(line))
+
+    transport = ws_mod.WSTransport(FakeWS(), _FakeTransportLoop())
+    assert transport.begin_dashboard_attach(1, browser_id="browser-a") is None
+    assert transport.commit_dashboard_attach(1, "runtime-a") is True
+    assert transport.begin_dashboard_attach(2, browser_id="browser-a") is None
+
+    asyncio.run(
+        transport._safe_send(
+            json.dumps(_gateway_event("message.delta", session_id="runtime-a"))
+        )
+    )
+    asyncio.run(
+        transport._safe_send(
+            json.dumps(_gateway_event("message.delta", session_id="runtime-b"))
+        )
+    )
+
+    assert [item["params"]["session_id"] for item in sent] == ["runtime-a"]
+
+
 def test_ws_dashboard_attach_drops_coalesced_tokens_after_subscription_switch():
     sent = []
 
