@@ -1073,6 +1073,37 @@ class TestWebServerEndpoints:
         assert payload["session_id"] == "desktop-tip"
         assert [m["content"] for m in payload["messages"]] == ["after compression"]
 
+    def test_get_session_messages_supports_bounded_history_pages(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="paged-history", source="cli")
+            for index in range(5):
+                db.append_message(
+                    session_id="paged-history",
+                    role="user",
+                    content=f"message-{index}",
+                )
+        finally:
+            db.close()
+
+        newest = self.client.get("/api/sessions/paged-history/messages?limit=2")
+        assert newest.status_code == 200
+        payload = newest.json()
+        assert [m["content"] for m in payload["messages"]] == ["message-3", "message-4"]
+        assert payload["history_page"]["has_more"] is True
+
+        older = self.client.get(
+            "/api/sessions/paged-history/messages",
+            params={"limit": 2, "before": payload["history_page"]["cursor"]},
+        )
+        assert older.status_code == 200
+        assert [m["content"] for m in older.json()["messages"]] == [
+            "message-1",
+            "message-2",
+        ]
+
     def test_get_sessions_archived_is_boolean(self):
         from hermes_state import SessionDB
 

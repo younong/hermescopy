@@ -243,12 +243,49 @@ def session_detail_payload(db: Any, session_id: str, *, profile_name: str | None
     return session
 
 
-def session_messages_payload(db: Any, session_id: str) -> dict[str, Any]:
+def session_messages_payload(
+    db: Any,
+    session_id: str,
+    *,
+    limit: int | None = None,
+    before: str | None = None,
+    recovery_scope: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     sid = db.resolve_session_id(session_id)
     if not sid:
         raise HTTPException(status_code=404, detail="Session not found")
-    sid = db.resolve_resume_session_id(sid)
-    return {"session_id": sid, "messages": db.get_messages(sid)}
+    if recovery_scope is not None and not db.get_session_for_recovery(
+        sid, recovery_scope=recovery_scope
+    ):
+        raise HTTPException(status_code=404, detail="Session not found")
+    try:
+        sid = db.resolve_resume_session_id(sid, recovery_scope=recovery_scope)
+    except TypeError:
+        if recovery_scope is not None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        sid = db.resolve_resume_session_id(sid)
+    if limit is None and before is None:
+        return {"session_id": sid, "messages": db.get_messages(sid)}
+    try:
+        page = db.get_conversation_page(
+            sid,
+            before_cursor=before,
+            limit=limit or 100,
+            include_ancestors=True,
+            recovery_scope=recovery_scope,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "session_id": sid,
+        "messages": page["messages"],
+        "history_page": {
+            "cursor": page["next_cursor"],
+            "has_more": page["has_more"],
+            "returned_count": page["returned_count"],
+            "truncated_count": page["filtered_count"],
+        },
+    }
 
 
 def export_session_payload(db: Any, session_id: str) -> dict[str, Any]:

@@ -9,21 +9,30 @@ class FakeWebSocket {
 
   readyState = FakeWebSocket.CONNECTING;
   sent: string[] = [];
-  private listeners = new Map<string, Set<(event: { data?: string }) => void>>();
+  private listeners = new Map<
+    string,
+    Set<(event: { code?: number; data?: string; reason?: string; wasClean?: boolean }) => void>
+  >();
 
-  addEventListener(type: string, callback: (event: { data?: string }) => void): void {
+  addEventListener(
+    type: string,
+    callback: (event: { code?: number; data?: string; reason?: string; wasClean?: boolean }) => void,
+  ): void {
     const entries = this.listeners.get(type) ?? new Set();
     entries.add(callback);
     this.listeners.set(type, entries);
   }
 
-  removeEventListener(type: string, callback: (event: { data?: string }) => void): void {
+  removeEventListener(
+    type: string,
+    callback: (event: { code?: number; data?: string; reason?: string; wasClean?: boolean }) => void,
+  ): void {
     this.listeners.get(type)?.delete(callback);
   }
 
-  close(): void {
+  close(code = 1000, reason = ""): void {
     this.readyState = FakeWebSocket.CLOSED;
-    this.emit("close", {});
+    this.emit("close", { code, reason, wasClean: code === 1000 });
   }
 
   send(payload: string): void {
@@ -39,7 +48,10 @@ class FakeWebSocket {
     this.emit("message", { data: JSON.stringify(payload) });
   }
 
-  private emit(type: string, event: { data?: string }): void {
+  private emit(
+    type: string,
+    event: { code?: number; data?: string; reason?: string; wasClean?: boolean },
+  ): void {
     for (const callback of this.listeners.get(type) ?? []) callback(event);
   }
 }
@@ -80,6 +92,36 @@ describe("JsonRpcGatewayClient", () => {
     retrySocket.open();
     await expect(reconnecting).resolves.toBeUndefined();
     expect(client.connectionState).toBe("open");
+  });
+
+  it("reports only normalized lifecycle metadata when a socket closes", async () => {
+    const socket = new FakeWebSocket();
+    const lifecycle: object[] = [];
+    const client = new JsonRpcGatewayClient({
+      onLifecycle: (event) => lifecycle.push(event),
+      socketFactory: () => socket as unknown as WebSocketLike,
+    });
+
+    const connecting = client.connect("ws://gateway?ticket=secret");
+    socket.open();
+    await connecting;
+    const pending = client.request("session.history", { content: "private transcript" });
+    socket.close(1006, "sensitive reason");
+
+    await expect(pending).rejects.toThrow("WebSocket closed");
+    expect(lifecycle).toEqual([
+      {
+        clientInitiated: false,
+        code: 1006,
+        event: "closed",
+        opened: true,
+        pendingCount: 1,
+        wasClean: false,
+      },
+    ]);
+    expect(JSON.stringify(lifecycle)).not.toContain("secret");
+    expect(JSON.stringify(lifecycle)).not.toContain("private transcript");
+    expect(JSON.stringify(lifecycle)).not.toContain("sensitive reason");
   });
 
   it("preserves JSON-RPC error codes for callers", async () => {

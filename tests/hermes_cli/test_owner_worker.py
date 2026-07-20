@@ -1571,7 +1571,7 @@ def test_worker_health_over_unix_socket_reports_owner_env(tmp_path, monkeypatch)
         assert health["workspace_root"] == str((owner_home / "workspaces").resolve())
         assert health["forbidden_env_present"] == []
 
-        response = OwnerWorkerClient(socket_path, control_home=control_home).request(
+        response = OwnerWorkerClient(socket_path, control_home=control_home, timeout=10).request(
             "GET",
             "/api/tools/toolsets",
             lease=lease,

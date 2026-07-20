@@ -112,6 +112,12 @@ export interface GuiChatState {
   statusLines: string[];
   isGenerating: boolean;
   error?: string;
+  historyCursor?: string;
+  historyHasMore: boolean;
+  historyLoading: boolean;
+  historyError?: string;
+  safeguardReached: boolean;
+  loadedTextChars: number;
 }
 
 export const initialGuiChatState: GuiChatState = {
@@ -119,8 +125,12 @@ export const initialGuiChatState: GuiChatState = {
   approvalOrder: [],
   artifacts: {},
   connection: "idle",
+  historyHasMore: false,
+  historyLoading: false,
   isGenerating: false,
+  loadedTextChars: 0,
   messages: [],
+  safeguardReached: false,
   statusLines: [],
   toolCalls: {},
   toolOrder: [],

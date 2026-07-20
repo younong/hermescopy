@@ -1206,6 +1206,94 @@ def test_history_to_messages_preserves_tool_calls_for_resume_display():
     ]
 
 
+def test_history_to_messages_uses_stable_row_ids_and_page_tool_context():
+    history = [
+        {
+            "_row_id": 42,
+            "_session_id": "tip",
+            "role": "tool",
+            "content": "result",
+            "tool_call_id": "call-1",
+            "_display_tool_name": "search_files",
+            "_display_tool_args": {"pattern": "resume"},
+        }
+    ]
+
+    assert server._history_to_messages(history) == [
+        {
+            "context": "Searching files for resume",
+            "id": "db-tip-42",
+            "name": "search_files",
+            "role": "tool",
+        }
+    ]
+
+
+def test_session_history_uses_live_runtime_authority(monkeypatch):
+    class FakeDB:
+        def get_conversation_page(self, target, **kwargs):
+            assert target == "stored-session"
+            assert kwargs["before_cursor"] == "cursor-1"
+            assert kwargs["limit"] == 25
+            return {
+                "messages": [
+                    {
+                        "_row_id": 7,
+                        "_session_id": target,
+                        "role": "assistant",
+                        "content": "older",
+                    }
+                ],
+                "next_cursor": None,
+                "has_more": False,
+                "returned_count": 1,
+                "filtered_count": 0,
+            }
+
+    fake_db = FakeDB()
+    monkeypatch.setattr(server, "_session_db", lambda _session: _NullContext(fake_db))
+    monkeypatch.setattr(server, "current_historical_resume_scope", lambda: None)
+    monkeypatch.setattr(
+        server,
+        "_display_history_page",
+        lambda db, target, **kwargs: db.get_conversation_page(
+            target,
+            before_cursor=kwargs.get("cursor"),
+            limit=kwargs["limit"],
+            include_ancestors=True,
+            recovery_scope=kwargs.get("recovery_scope"),
+        ),
+    )
+    server._sessions["runtime-id"] = {
+        "session_key": "stored-session",
+        "history": [],
+        "history_lock": threading.Lock(),
+    }
+    try:
+        response = server._methods["session.history"](
+            "r1",
+            {"session_id": "runtime-id", "cursor": "cursor-1", "limit": 25},
+        )
+    finally:
+        server._sessions.pop("runtime-id", None)
+
+    assert response["result"]["messages"] == [
+        {"id": "db-stored-session-7", "role": "assistant", "text": "older"}
+    ]
+    assert response["result"]["history_page"]["has_more"] is False
+
+
+class _NullContext:
+    def __init__(self, value):
+        self.value = value
+
+    def __enter__(self):
+        return self.value
+
+    def __exit__(self, *_args):
+        return False
+
+
 def test_history_to_messages_preserves_attachment_metadata_and_attachment_only_turns():
     attachments = [
         {
@@ -7029,6 +7117,84 @@ def test_session_attach_uses_persistent_id_and_commits_live_runtime(monkeypatch)
     assert transport.active_session_id == "runtime-tip"
     assert session["transport"] is transport
     assert session["source"] == "dashboard-gui"
+
+
+def test_session_attach_live_returns_cursor_capable_display_page(monkeypatch):
+    transport = _DashboardAttachTransport()
+    previous_transport = object()
+    session = _session(
+        agent=types.SimpleNamespace(model="model-live"),
+        history=[{"role": "user", "content": "in-memory history"}],
+        session_key="canonical-tip",
+        transport=previous_transport,
+    )
+    server._sessions["runtime-tip"] = session
+
+    class _DB:
+        def get_session(self, target):
+            return {"id": target}
+
+        def get_session_by_title(self, _title):
+            return None
+
+        def resolve_resume_session_id(self, target):
+            return target
+
+        def get_conversation_page(self, target, **kwargs):
+            assert target == "canonical-tip"
+            assert kwargs["limit"] == 2
+            assert kwargs["before_cursor"] is None
+            return {
+                "messages": [
+                    {
+                        "_row_id": 7,
+                        "_session_id": target,
+                        "role": "assistant",
+                        "content": "latest durable history",
+                    }
+                ],
+                "next_cursor": "older-cursor",
+                "has_more": True,
+                "returned_count": 1,
+                "filtered_count": 0,
+            }
+
+    fake_db = _DB()
+    monkeypatch.setattr(server, "_get_db", lambda: fake_db)
+    monkeypatch.setattr(server, "_session_db", lambda _session: _NullContext(fake_db))
+    monkeypatch.setattr(server, "current_historical_resume_scope", lambda: None)
+    token = server.bind_transport(transport)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "attach-live-page",
+                "method": "session.attach",
+                "params": {
+                    "browser_id": "browser-a",
+                    "display_history": {"limit": 2},
+                    "session_id": "canonical-tip",
+                    "source": "dashboard-gui",
+                    "switch_generation": 8,
+                },
+            }
+        )
+    finally:
+        server.reset_transport(token)
+        server._sessions.pop("runtime-tip", None)
+
+    assert resp["result"]["messages"] == [
+        {
+            "id": "db-canonical-tip-7",
+            "role": "assistant",
+            "text": "latest durable history",
+        }
+    ]
+    assert resp["result"]["history_page"] == {
+        "cursor": "older-cursor",
+        "has_more": True,
+        "returned_count": 1,
+        "truncated_count": 0,
+    }
 
 
 def test_session_attach_cold_resume_commits_deferred_runtime(monkeypatch):

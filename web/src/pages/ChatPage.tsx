@@ -35,6 +35,7 @@ import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
 import { dashboardAuthTransition } from "@/lib/dashboardAuthTransition";
+import { diagnosticId, emitChatDiagnostic } from "@/lib/chatDiagnostics";
 import { useDashboardBrowserIdentity } from "@/lib/useDashboardAuthIdentity";
 import { normalizeSessionTitle } from "@/lib/chat-title";
 import {
@@ -860,6 +861,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     const inputMouseScrubber = createTerminalInputMouseReportScrubber();
     const forceFresh = forceFreshPtyRef.current;
     forceFreshPtyRef.current = false;
+    const connectionId = diagnosticId("pty");
+    let socketOpened = false;
     const scheduleReconnect = (code: number) => {
       if (reconnectTimerRef.current) {
         return;
@@ -867,6 +870,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       const attempt = Math.min(reconnectAttemptRef.current + 1, 5);
       reconnectAttemptRef.current = attempt;
       const delayMs = Math.min(250 * 2 ** (attempt - 1), 3000);
+      emitChatDiagnostic({ closeCode: code, connectionId, event: "retry", outcome: "scheduled", retryAttempt: attempt, surface: "terminal_pty" });
       setSessionEnded(false);
       setBanner(
         `Chat connection interrupted (code ${code}). Reconnecting…`,
@@ -891,6 +895,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       wsRef.current = ws;
 
     ws.onopen = () => {
+      socketOpened = true;
+      emitChatDiagnostic({ connectionId, event: "opened", opened: true, outcome: "ok", retryAttempt: reconnectAttemptRef.current, surface: "terminal_pty" });
       clearReconnectTimer();
       reconnectAttemptRef.current = 0;
       setBanner(null);
@@ -938,12 +944,15 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       if (unmounting) {
         return;
       }
-      // Surface the real cause to the browser console on every close so a
-      // "chat won't connect" report can be diagnosed without server access.
-      // The server sends a machine-parseable reason on every rejection (see
-      // pty_ws in web_server.py); echo it verbatim alongside the close code.
-      const why = ev.reason ? ` reason=${ev.reason}` : "";
-      console.warn(`[chat] PTY WebSocket closed code=${ev.code}${why}`);
+      emitChatDiagnostic({
+        clientInitiated: unmounting,
+        closeCode: ev.code,
+        connectionId,
+        event: "closed",
+        opened: socketOpened,
+        surface: "terminal_pty",
+        wasClean: ev.wasClean,
+      });
       if (ev.code === 4401) {
         setBanner(
           ev.reason

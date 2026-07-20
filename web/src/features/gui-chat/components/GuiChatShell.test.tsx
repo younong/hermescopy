@@ -233,6 +233,7 @@ function createConnection(): GuiChatConnection & { emitState(state: ConnectionSt
     emitState: (state: ConnectionState) => {
       for (const handler of stateHandlers) handler(state);
     },
+    loadEarlier: vi.fn(),
     ping: vi.fn(),
     respondToApproval: vi.fn(),
     send: vi.fn(),

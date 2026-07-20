@@ -15,6 +15,8 @@ Key design decisions:
 """
 
 import asyncio
+import base64
+import hashlib
 import json
 import logging
 import random
@@ -800,6 +802,8 @@ CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(ex
 DEFERRED_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_messages_session_active
     ON messages(session_id, active, timestamp);
+CREATE INDEX IF NOT EXISTS idx_messages_session_active_id
+    ON messages(session_id, active, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_session_key
     ON sessions(session_key, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
@@ -3970,6 +3974,309 @@ class SessionDB:
                 current = child_id
 
             return best if best is not None else session_id
+
+    _CONVERSATION_PAGE_CURSOR_VERSION = 1
+    _CONVERSATION_PAGE_DEFAULT_LIMIT = 100
+    _CONVERSATION_PAGE_MAX_LIMIT = 200
+    _CONVERSATION_PAGE_CONTEXT_ROWS = 32
+    _CONVERSATION_PAGE_MAX_TEXT_CHARS = 120_000
+    _CONVERSATION_PAGE_MAX_ATTACHMENTS = 64
+    _CONVERSATION_PAGE_MAX_SERIALIZED_BYTES = 2 * 1024 * 1024
+
+    @classmethod
+    def _encode_conversation_page_cursor(cls, payload: Dict[str, Any]) -> str:
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        return base64.urlsafe_b64encode(encoded).decode("ascii").rstrip("=")
+
+    @classmethod
+    def _decode_conversation_page_cursor(cls, cursor: str) -> Dict[str, Any]:
+        if not isinstance(cursor, str) or not cursor or len(cursor) > 2048:
+            raise ValueError("invalid conversation history cursor")
+        try:
+            padded = cursor + "=" * (-len(cursor) % 4)
+            body = json.loads(base64.b64decode(padded, altchars=b"-_", validate=True))
+        except (ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid conversation history cursor") from exc
+        required = {"v", "tip", "lineage", "snapshot", "before"}
+        if (
+            not isinstance(body, dict)
+            or set(body) != required
+            or body.get("v") != cls._CONVERSATION_PAGE_CURSOR_VERSION
+        ):
+            raise ValueError("unsupported conversation history cursor")
+        if not isinstance(body.get("tip"), str) or not isinstance(body.get("lineage"), str):
+            raise ValueError("invalid conversation history cursor")
+        for key in ("snapshot", "before"):
+            if not isinstance(body.get(key), int) or body[key] < 0:
+                raise ValueError("invalid conversation history cursor")
+        if body["before"] > body["snapshot"] + 1:
+            raise ValueError("invalid conversation history cursor")
+        return body
+
+    @staticmethod
+    def _conversation_lineage_fingerprint(session_ids: List[str]) -> str:
+        joined = "\x00".join(session_ids).encode("utf-8")
+        return hashlib.sha256(joined).hexdigest()[:24]
+
+    @classmethod
+    def _conversation_message_from_row(
+        cls,
+        row: Any,
+        *,
+        include_row_identity: bool = False,
+    ) -> Dict[str, Any]:
+        content = cls._decode_content(row["content"])
+        if row["role"] in {"user", "assistant"} and isinstance(content, str):
+            content = sanitize_context(content).strip()
+        msg: Dict[str, Any] = {"role": row["role"], "content": content}
+        if include_row_identity:
+            msg["_row_id"] = int(row["id"])
+            msg["_session_id"] = str(row["session_id"])
+        if row["attachments"]:
+            try:
+                attachments = json.loads(row["attachments"])
+                if isinstance(attachments, list):
+                    msg["attachments"] = attachments
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("Failed to deserialize attachments in conversation replay")
+        if row["timestamp"]:
+            msg["timestamp"] = row["timestamp"]
+        if row["tool_call_id"]:
+            msg["tool_call_id"] = row["tool_call_id"]
+        if row["tool_name"]:
+            msg["tool_name"] = row["tool_name"]
+        if row["tool_calls"]:
+            try:
+                msg["tool_calls"] = json.loads(row["tool_calls"])
+            except (json.JSONDecodeError, TypeError):
+                logger.warning(
+                    "Failed to deserialize tool_calls in conversation replay, falling back to []"
+                )
+                msg["tool_calls"] = []
+        if row["platform_message_id"]:
+            msg["message_id"] = row["platform_message_id"]
+        if row["observed"]:
+            msg["observed"] = True
+        if row["role"] == "assistant":
+            if row["finish_reason"]:
+                msg["finish_reason"] = row["finish_reason"]
+            if row["reasoning"]:
+                msg["reasoning"] = row["reasoning"]
+            if row["reasoning_content"] is not None:
+                msg["reasoning_content"] = row["reasoning_content"]
+            for key in (
+                "reasoning_details",
+                "codex_reasoning_items",
+                "codex_message_items",
+            ):
+                if not row[key]:
+                    continue
+                try:
+                    msg[key] = json.loads(row[key])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning("Failed to deserialize %s, falling back to None", key)
+                    msg[key] = None
+        return msg
+
+    @classmethod
+    def _sanitize_conversation_page_message(
+        cls, message: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        sanitized = dict(message)
+        for key in ("content", "reasoning", "reasoning_content"):
+            value = sanitized.get(key)
+            if isinstance(value, str) and len(value) > cls._CONVERSATION_PAGE_MAX_TEXT_CHARS:
+                sanitized[key] = value[: cls._CONVERSATION_PAGE_MAX_TEXT_CHARS]
+        attachments = sanitized.get("attachments")
+        if isinstance(attachments, list):
+            sanitized["attachments"] = attachments[
+                : cls._CONVERSATION_PAGE_MAX_ATTACHMENTS
+            ]
+        return sanitized
+
+    @classmethod
+    def _bound_conversation_page_messages(
+        cls, messages: List[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        bounded_reversed: List[Dict[str, Any]] = []
+        serialized_bytes = 2
+        for offset, message in enumerate(reversed(messages)):
+            sanitized = cls._sanitize_conversation_page_message(message)
+            encoded_size = len(
+                json.dumps(sanitized, ensure_ascii=False, default=str).encode("utf-8")
+            )
+            separator_size = 1 if bounded_reversed else 0
+            if serialized_bytes + separator_size + encoded_size > cls._CONVERSATION_PAGE_MAX_SERIALIZED_BYTES:
+                omitted = len(messages) - offset
+                bounded_reversed.reverse()
+                return bounded_reversed, omitted
+            bounded_reversed.append(sanitized)
+            serialized_bytes += separator_size + encoded_size
+        bounded_reversed.reverse()
+        return bounded_reversed, 0
+
+    def get_conversation_page(
+        self,
+        session_id: str,
+        *,
+        before_cursor: Optional[str] = None,
+        limit: int = _CONVERSATION_PAGE_DEFAULT_LIMIT,
+        include_ancestors: bool = True,
+        recovery_scope: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Return a scoped, stable keyset page in chronological order.
+
+        The opaque cursor binds the canonical tip, its root-to-tip lineage, and
+        the maximum row id visible to the first request. It is not an
+        authorization credential: every page rebuilds the lineage under
+        ``recovery_scope`` before reading message rows.
+        """
+        try:
+            safe_limit = int(limit)
+        except (TypeError, ValueError):
+            safe_limit = self._CONVERSATION_PAGE_DEFAULT_LIMIT
+        safe_limit = max(1, min(safe_limit, self._CONVERSATION_PAGE_MAX_LIMIT))
+
+        session_ids = [session_id]
+        if include_ancestors:
+            session_ids = self._session_lineage_root_to_tip(
+                session_id, recovery_scope=recovery_scope
+            )
+        scope_clause, scope_params = self._recovery_scope_clause(
+            recovery_scope, alias="s"
+        )
+        placeholders = ",".join("?" for _ in session_ids)
+        lineage_fingerprint = self._conversation_lineage_fingerprint(session_ids)
+
+        with self._lock:
+            tip_row = self._conn.execute(
+                f"SELECT 1 FROM sessions s WHERE s.id = ?{scope_clause} LIMIT 1",
+                (session_id, *scope_params),
+            ).fetchone()
+            if tip_row is None:
+                raise ValueError("conversation session not found in recovery scope")
+
+            if before_cursor:
+                decoded = self._decode_conversation_page_cursor(before_cursor)
+                if (
+                    decoded["tip"] != session_id
+                    or decoded["lineage"] != lineage_fingerprint
+                ):
+                    raise ValueError("conversation history cursor does not match session")
+                snapshot_id = decoded["snapshot"]
+                before_id = decoded["before"]
+            else:
+                snapshot_row = self._conn.execute(
+                    "SELECT COALESCE(MAX(m.id), 0) FROM messages m "
+                    "JOIN sessions s ON s.id = m.session_id "
+                    f"WHERE m.session_id IN ({placeholders}) AND m.active = 1"
+                    f"{scope_clause}",
+                    (*session_ids, *scope_params),
+                ).fetchone()
+                snapshot_id = int(snapshot_row[0] if snapshot_row else 0)
+                before_id = snapshot_id + 1
+
+            select_columns = (
+                "m.id, m.session_id, m.role, m.content, m.attachments, "
+                "m.tool_call_id, m.tool_calls, m.tool_name, m.finish_reason, "
+                "m.reasoning, m.reasoning_content, m.reasoning_details, "
+                "m.codex_reasoning_items, m.codex_message_items, "
+                "m.platform_message_id, m.observed, m.timestamp"
+            )
+            rows_desc = self._conn.execute(
+                f"SELECT {select_columns} FROM messages m "
+                "JOIN sessions s ON s.id = m.session_id "
+                f"WHERE m.session_id IN ({placeholders}) AND m.active = 1 "
+                "AND m.id <= ? AND m.id < ?"
+                f"{scope_clause} ORDER BY m.id DESC LIMIT ?",
+                (
+                    *session_ids,
+                    snapshot_id,
+                    before_id,
+                    *scope_params,
+                    safe_limit + 1,
+                ),
+            ).fetchall()
+            page_rows_desc = rows_desc[:safe_limit]
+            page_rows = list(reversed(page_rows_desc))
+            oldest_id = int(page_rows[0]["id"]) if page_rows else before_id
+            context_rows = self._conn.execute(
+                f"SELECT {select_columns} FROM messages m "
+                "JOIN sessions s ON s.id = m.session_id "
+                f"WHERE m.session_id IN ({placeholders}) AND m.active = 1 "
+                "AND m.id <= ? AND m.id < ?"
+                f"{scope_clause} ORDER BY m.id DESC LIMIT ?",
+                (
+                    *session_ids,
+                    snapshot_id,
+                    oldest_id,
+                    *scope_params,
+                    self._CONVERSATION_PAGE_CONTEXT_ROWS,
+                ),
+            ).fetchall()
+
+        context_rows = list(reversed(context_rows))
+        page_ids = {int(row["id"]) for row in page_rows}
+        hydrated: List[Dict[str, Any]] = []
+        for row in [*context_rows, *page_rows]:
+            msg = self._conversation_message_from_row(row, include_row_identity=True)
+            if include_ancestors and self._is_duplicate_replayed_user_message(hydrated, msg):
+                continue
+            hydrated.append(msg)
+        hydrated = _strip_background_review_harness(hydrated)
+        messages = [msg for msg in hydrated if msg.get("_row_id") in page_ids]
+
+        tool_calls: Dict[str, Tuple[str, Any]] = {}
+        for msg in hydrated:
+            for call in msg.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function") or {}
+                call_id = call.get("id")
+                name = function.get("name") if isinstance(function, dict) else None
+                if call_id and name:
+                    arguments: Any = {}
+                    try:
+                        arguments = json.loads(function.get("arguments") or "{}")
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                    tool_calls[str(call_id)] = (str(name), arguments)
+        for msg in messages:
+            call_id = msg.get("tool_call_id")
+            if msg.get("role") == "tool" and call_id in tool_calls:
+                msg["_display_tool_name"], msg["_display_tool_args"] = tool_calls[call_id]
+
+        filtered_count = len(page_rows) - len(messages)
+        messages, budget_omitted_count = self._bound_conversation_page_messages(messages)
+        filtered_count += budget_omitted_count
+        raw_has_more = len(rows_desc) > safe_limit
+        has_more = raw_has_more or filtered_count > 0
+        next_cursor = None
+        if has_more and page_rows:
+            cursor_before_id = oldest_id
+            if budget_omitted_count and messages:
+                cursor_before_id = int(messages[0]["_row_id"])
+            next_cursor = self._encode_conversation_page_cursor(
+                {
+                    "v": self._CONVERSATION_PAGE_CURSOR_VERSION,
+                    "tip": session_id,
+                    "lineage": lineage_fingerprint,
+                    "snapshot": snapshot_id,
+                    "before": cursor_before_id,
+                }
+            )
+        return {
+            "session_id": session_id,
+            "messages": messages,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+            "returned_count": len(messages),
+            "raw_count": len(page_rows),
+            "filtered_count": filtered_count,
+            "snapshot_id": snapshot_id,
+        }
 
     def get_messages_as_conversation(
         self,

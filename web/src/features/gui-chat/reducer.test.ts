@@ -216,6 +216,66 @@ describe("guiChatReducer history image restoration", () => {
     );
   });
 
+  it("prepends an earlier display page with stable IDs and deduplicates overlap", () => {
+    const current = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        history_page: { cursor: "cursor-2", has_more: true, returned_count: 2 },
+        messages: [
+          { id: "db-s-2", role: "user", text: "second" },
+          { id: "db-s-3", role: "assistant", text: "third" },
+        ],
+        session_id: "runtime",
+      },
+    });
+    const loading = guiChatReducer(current, { type: "history.prepend.started" });
+    const state = guiChatReducer(loading, {
+      type: "history.prepend.succeeded",
+      response: {
+        history_page: { cursor: null, has_more: false, returned_count: 2 },
+        messages: [
+          { id: "db-s-1", role: "assistant", text: "first" },
+          { id: "db-s-2", role: "user", text: "second" },
+        ],
+        session_id: "runtime",
+      },
+    });
+
+    expect(state.messages.map((message) => message.id)).toEqual([
+      "db-s-1",
+      "db-s-2",
+      "db-s-3",
+    ]);
+    expect(state.historyCursor).toBeUndefined();
+    expect(state.historyHasMore).toBe(false);
+    expect(state.historyLoading).toBe(false);
+  });
+
+  it("ignores a stale earlier-history response for another runtime", () => {
+    const current = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        history_page: { cursor: "cursor-2", has_more: true, returned_count: 1 },
+        messages: [{ id: "db-s-2", role: "assistant", text: "current" }],
+        session_id: "runtime-current",
+      },
+    });
+    const state = guiChatReducer(
+      guiChatReducer(current, { type: "history.prepend.started" }),
+      {
+        type: "history.prepend.succeeded",
+        response: {
+          history_page: { cursor: null, has_more: false, returned_count: 1 },
+          messages: [{ id: "db-other-1", role: "assistant", text: "stale" }],
+          session_id: "runtime-stale",
+        },
+      },
+    );
+
+    expect(state.messages).toEqual(current.messages);
+    expect(state.historyLoading).toBe(false);
+  });
+
   it("restores uploaded files with download URLs", () => {
     const state = guiChatReducer(initialGuiChatState, {
       type: "session.created",

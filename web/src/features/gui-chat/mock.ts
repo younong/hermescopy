@@ -93,6 +93,9 @@ export function connectMockGuiChat(): GuiChatConnection {
       await wait(120);
       return { attached: true, name: "mock.txt", ref_text: "@file:.hermes/desktop-attachments/mock.txt" };
     },
+    async loadEarlier(sessionId) {
+      return { history_page: { cursor: null, has_more: false, returned_count: 0 }, messages: [], session_id: sessionId };
+    },
     async ping() {},
     async respondToApproval(_sessionId, _request, approved) {
       emitEvent({

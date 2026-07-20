@@ -1,62 +1,82 @@
-import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
+import { useCallback, useLayoutEffect, useMemo, useRef } from "react";
 import type { UIEvent } from "react";
-import type { GuiChatState } from "../types";
+import type { ArtifactState, GuiChatState } from "../types";
 import { ApprovalCard } from "./ApprovalCard";
 import { ArtifactCard } from "./ArtifactCard";
 import { MessageBubble } from "./MessageBubble";
 
 const BOTTOM_THRESHOLD_PX = 64;
+const OVERSCAN_ROWS = 12;
+
+type RenderRow =
+  | { id: string; kind: "history" }
+  | { id: string; kind: "message"; messageId: string }
+  | { artifact: ArtifactState; id: string; kind: "artifact" }
+  | { approvalId: string; id: string; kind: "approval" }
+  | { id: string; kind: "status" };
 
 function isNearBottom(element: HTMLElement): boolean {
-  return (
-    element.scrollHeight - element.scrollTop - element.clientHeight <=
-    BOTTOM_THRESHOLD_PX
-  );
+  return element.scrollHeight - element.scrollTop - element.clientHeight <= BOTTOM_THRESHOLD_PX;
 }
 
 export function MessageList({
   disabled,
   forceBottomKey,
   onApprovalRespond,
+  onLoadEarlier,
   state,
 }: {
   disabled?: boolean;
   forceBottomKey?: string;
   onApprovalRespond: (id: string, approved: boolean) => void;
+  onLoadEarlier?: () => void;
   state: GuiChatState;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const contentRef = useRef<HTMLDivElement | null>(null);
   const followBottomRef = useRef(true);
   const lastForceBottomKeyRef = useRef<string | undefined>(undefined);
-  const scrollFrameRef = useRef<number | undefined>(undefined);
+  const previousFirstMessageRef = useRef<string | undefined>(undefined);
+  const anchorRef = useRef<{ id: string; offset: number } | null>(null);
 
-  const scrollToBottom = useCallback((options?: { force?: boolean }) => {
-    const container = containerRef.current;
-    if (!container) return;
-    if (options?.force) {
-      followBottomRef.current = true;
-    } else if (!followBottomRef.current) {
-      return;
+  const rows = useMemo<RenderRow[]>(() => {
+    const result: RenderRow[] = [];
+    if (state.historyHasMore || state.historyLoading || state.historyError || state.safeguardReached) {
+      result.push({ id: "history-control", kind: "history" });
     }
-    container.scrollTop = container.scrollHeight;
-  }, []);
-
-  const scheduleScrollToBottom = useCallback(
-    (options?: { force?: boolean }) => {
-      if (options?.force) {
-        followBottomRef.current = true;
-      } else if (!followBottomRef.current) {
-        return;
+    for (const message of state.messages) {
+      result.push({ id: `message:${message.id}`, kind: "message", messageId: message.id });
+    }
+    for (const id of state.toolOrder) {
+      const tool = state.toolCalls[id];
+      for (const artifactId of tool?.artifactIds ?? []) {
+        const artifact = state.artifacts[artifactId];
+        if (artifact) result.push({ artifact, id: `artifact:${artifact.id}`, kind: "artifact" });
       }
-      if (scrollFrameRef.current !== undefined) return;
-      scrollFrameRef.current = requestAnimationFrame(() => {
-        scrollFrameRef.current = undefined;
-        scrollToBottom(options);
-      });
-    },
-    [scrollToBottom],
-  );
+    }
+    for (const approvalId of state.approvalOrder) {
+      if (state.approvals[approvalId]) {
+        result.push({ approvalId, id: `approval:${approvalId}`, kind: "approval" });
+      }
+    }
+    if (state.statusLines.length > 0) result.push({ id: "status", kind: "status" });
+    return result;
+  }, [state]);
+
+  const virtualizer = useVirtualizer({
+    count: rows.length,
+    estimateSize: (index) => rows[index]?.kind === "message" ? 140 : 72,
+    getItemKey: (index) => rows[index]?.id ?? index,
+    getScrollElement: () => containerRef.current,
+    initialRect: { height: 600, width: 800 },
+    overscan: OVERSCAN_ROWS,
+  });
+
+  const scrollToBottom = useCallback((force = false) => {
+    if (force) followBottomRef.current = true;
+    if (!followBottomRef.current || rows.length === 0) return;
+    virtualizer.scrollToIndex(rows.length - 1, { align: "end" });
+  }, [rows.length, virtualizer]);
 
   const handleScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
     followBottomRef.current = isNearBottom(event.currentTarget);
@@ -65,110 +85,87 @@ export function MessageList({
   useLayoutEffect(() => {
     if (forceBottomKey === lastForceBottomKeyRef.current) return;
     lastForceBottomKeyRef.current = forceBottomKey;
-    scrollToBottom({ force: true });
-    scheduleScrollToBottom({ force: true });
-  }, [forceBottomKey, scheduleScrollToBottom, scrollToBottom]);
+    scrollToBottom(true);
+  }, [forceBottomKey, scrollToBottom]);
 
   useLayoutEffect(() => {
-    scheduleScrollToBottom();
-  }, [
-    scheduleScrollToBottom,
-    state.approvalOrder,
-    state.approvals,
-    state.artifacts,
-    state.messages,
-    state.statusLines,
-    state.toolCalls,
-    state.toolOrder,
-  ]);
-
-  useEffect(() => {
-    const content = contentRef.current;
-    if (!content || typeof ResizeObserver === "undefined") return;
-
-    let frame: number | undefined;
-    const observer = new ResizeObserver(() => {
-      if (!followBottomRef.current) return;
-      if (frame !== undefined) cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(() => {
-        frame = undefined;
-        scheduleScrollToBottom();
-      });
-    });
-    observer.observe(content);
-
-    return () => {
-      if (frame !== undefined) cancelAnimationFrame(frame);
-      observer.disconnect();
-    };
-  }, [scheduleScrollToBottom]);
-
-  useEffect(() => {
-    return () => {
-      if (scrollFrameRef.current !== undefined) {
-        cancelAnimationFrame(scrollFrameRef.current);
+    const first = state.messages[0]?.id;
+    const previous = previousFirstMessageRef.current;
+    if (first && previous && first !== previous && anchorRef.current) {
+      const index = rows.findIndex((row) => row.id === anchorRef.current?.id);
+      if (index >= 0) {
+        virtualizer.scrollToIndex(index, { align: "start" });
+        const element = containerRef.current;
+        if (element) element.scrollTop += anchorRef.current.offset;
       }
-    };
-  }, []);
+      anchorRef.current = null;
+    }
+    previousFirstMessageRef.current = first;
+    if (followBottomRef.current) scrollToBottom();
+  }, [rows, scrollToBottom, state.messages, virtualizer]);
+
+  const prepareLoadEarlier = useCallback(() => {
+    const container = containerRef.current;
+    const firstVisible = virtualizer.getVirtualItems()[0];
+    const row = firstVisible ? rows[firstVisible.index] : undefined;
+    if (container && row && firstVisible) {
+      anchorRef.current = { id: row.id, offset: firstVisible.start - container.scrollTop };
+      followBottomRef.current = false;
+    }
+    onLoadEarlier?.();
+  }, [onLoadEarlier, rows, virtualizer]);
+
+  if (rows.length === 0) {
+    return (
+      <div className="flex min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5">
+        <div className="m-auto max-w-xl border border-current/15 bg-midground/5 px-6 py-5 text-center">
+          <h2 className="mb-2 font-display text-lg uppercase tracking-[0.12em] text-midground">Hermes GUI Chat beta</h2>
+          <p className="text-sm text-text-secondary">Structured chat over /api/ws. Terminal Chat remains available at /chat.</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div
-      className="min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5"
-      onScroll={handleScroll}
-      ref={containerRef}
-    >
-      <div className="flex min-h-full flex-col gap-4" ref={contentRef}>
-        {state.messages.length === 0 && state.toolOrder.length === 0 ? (
-          <div className="m-auto max-w-xl border border-current/15 bg-midground/5 px-6 py-5 text-center">
-            <h2 className="mb-2 font-display text-lg uppercase tracking-[0.12em] text-midground">
-              Hermes GUI Chat beta
-            </h2>
-            <p className="text-sm text-text-secondary">
-              Structured chat over /api/ws. Terminal Chat remains available at /chat.
-            </p>
-          </div>
-        ) : null}
-
-        {state.messages.map((message) => (
-          <MessageBubble
-            artifacts={message.artifactIds.map((id) => state.artifacts[id]).filter(Boolean)}
-            key={message.id}
-            message={message}
-          />
-        ))}
-
-        {state.toolOrder
-          .flatMap((id) => {
-            const tool = state.toolCalls[id];
-            return tool?.artifactIds.map((artifactId) => state.artifacts[artifactId]) ?? [];
-          })
-          .filter(Boolean)
-          .map((artifact) => (
-            <ArtifactCard artifact={artifact} key={artifact.id} />
-          ))}
-
-        {state.approvalOrder.map((id) => {
-          const approval = state.approvals[id];
-          if (!approval) return null;
+    <div className="min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5" onScroll={handleScroll} ref={containerRef}>
+      <div className="relative w-full" style={{ height: `${virtualizer.getTotalSize()}px` }}>
+        {virtualizer.getVirtualItems().map((item) => {
+          const row = rows[item.index];
+          if (!row) return null;
           return (
-            <ApprovalCard
-              approval={approval}
-              disabled={disabled}
-              key={id}
-              onRespond={(approved) => onApprovalRespond(id, approved)}
-            />
+            <div
+              className="absolute left-0 top-0 w-full pb-4"
+              data-index={item.index}
+              key={row.id}
+              ref={virtualizer.measureElement}
+              style={{ transform: `translateY(${item.start}px)` }}
+            >
+              {row.kind === "history" ? (
+                <div className="flex flex-col items-center gap-2 text-xs text-text-tertiary">
+                  {state.safeguardReached ? <span>Earlier history remains on the server; this tab stopped loading it to stay responsive.</span> : null}
+                  {state.historyError ? <span>{state.historyError}</span> : null}
+                  {state.historyHasMore && !state.safeguardReached ? (
+                    <button className="border border-current/20 px-3 py-1.5 hover:bg-midground/5 disabled:opacity-50" disabled={state.historyLoading} onClick={prepareLoadEarlier} type="button">
+                      {state.historyLoading ? "Loading earlier messages…" : "Load earlier messages"}
+                    </button>
+                  ) : null}
+                </div>
+              ) : row.kind === "message" ? (() => {
+                const message = state.messages.find((value) => value.id === row.messageId);
+                return message ? <MessageBubble artifacts={message.artifactIds.map((id) => state.artifacts[id]).filter(Boolean)} message={message} /> : null;
+              })() : row.kind === "artifact" ? (
+                <ArtifactCard artifact={row.artifact} />
+              ) : row.kind === "approval" ? (() => {
+                const approval = state.approvals[row.approvalId];
+                return approval ? <ApprovalCard approval={approval} disabled={disabled} onRespond={(approved) => onApprovalRespond(row.approvalId, approved)} /> : null;
+              })() : (
+                <div className="space-y-1 text-xs text-text-tertiary">
+                  {state.statusLines.slice(-3).map((line, index) => <div className="truncate" key={`${index}-${line}`}>{line}</div>)}
+                </div>
+              )}
+            </div>
           );
         })}
-
-        {state.statusLines.length > 0 ? (
-          <div className="space-y-1 text-xs text-text-tertiary">
-            {state.statusLines.slice(-3).map((line, index) => (
-              <div key={`${index}-${line}`} className="truncate">
-                {line}
-              </div>
-            ))}
-          </div>
-        ) : null}
       </div>
     </div>
   );
