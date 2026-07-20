@@ -30,6 +30,55 @@ def test_owner_worker_ws_rejects_missing_runtime_before_gateway_dispatch(monkeyp
     assert discovery_calls == []
 
 
+def test_ws_gateway_ping_round_trip_requires_no_session(monkeypatch):
+    sent = []
+    requests = iter(
+        [
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "ping-1",
+                    "method": "gateway.ping",
+                    "params": {},
+                }
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        mcp_startup, "start_background_mcp_discovery", lambda **_kwargs: None
+    )
+
+    class FakeWS:
+        query_params = {}
+
+        async def accept(self):
+            pass
+
+        async def send_text(self, line):
+            sent.append(json.loads(line))
+
+        async def receive_text(self):
+            try:
+                return next(requests)
+            except StopIteration:
+                raise ws_mod._WebSocketDisconnect()
+
+        async def close(self):
+            pass
+
+    previous = dict(server._sessions.items())
+    server._sessions.clear()
+    try:
+        asyncio.run(ws_mod.handle_ws(FakeWS()))
+    finally:
+        server._sessions.clear()
+        server._sessions.update(previous)
+
+    assert sent[0]["method"] == "event"
+    assert sent[0]["params"]["type"] == "gateway.ready"
+    assert sent[1] == {"jsonrpc": "2.0", "id": "ping-1", "result": {"ok": True}}
+
+
 def test_ws_startup_starts_background_mcp_discovery(monkeypatch):
     """The desktop app and dashboard chat reach the agent through this WS
     sidecar, not through tui_gateway.entry.main() (which spawns the discovery
