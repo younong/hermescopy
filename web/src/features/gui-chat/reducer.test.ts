@@ -23,6 +23,71 @@ function imageArtifact(state: GuiChatState, id: string): ImageArtifactState {
   return artifact;
 }
 
+describe("guiChatReducer live attach restoration", () => {
+  it("restores an in-flight user prompt and partial assistant response", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        inflight: { assistant: "partial answer", streaming: true, user: "question" },
+        messages: [{ role: "assistant", text: "previous" }],
+        running: true,
+        session_id: "runtime-a",
+      },
+    });
+
+    expect(state.messages.map(({ role, streaming, text }) => ({ role, streaming, text }))).toEqual([
+      { role: "assistant", streaming: undefined, text: "previous" },
+      { role: "user", streaming: undefined, text: "question" },
+      { role: "assistant", streaming: true, text: "partial answer" },
+    ]);
+    expect(state.isGenerating).toBe(true);
+  });
+
+  it("hydrates an empty streaming assistant turn", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        inflight: { streaming: true, user: "question" },
+        session_id: "runtime-a",
+      },
+    });
+
+    expect(state.messages.at(-1)).toMatchObject({ role: "assistant", streaming: true, text: "" });
+    expect(state.isGenerating).toBe(true);
+  });
+
+  it("does not duplicate in-flight content already present in persisted messages", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        inflight: { assistant: "partial answer", streaming: true, user: "question" },
+        messages: [
+          { role: "user", text: "question" },
+          { role: "assistant", text: "partial answer" },
+        ],
+        session_id: "runtime-a",
+      },
+    });
+
+    expect(state.messages).toHaveLength(2);
+    expect(state.messages.at(-1)).toMatchObject({
+      role: "assistant",
+      streaming: true,
+      text: "partial answer",
+    });
+  });
+
+  it("leaves a cold attach without inflight idle", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: { messages: [{ role: "user", text: "saved" }], session_id: "runtime-a" },
+    });
+
+    expect(state.messages).toHaveLength(1);
+    expect(state.isGenerating).toBe(false);
+  });
+});
+
 describe("guiChatReducer history image restoration", () => {
   it("keeps a sent prompt with two WeChat article URLs as plain message text", () => {
     const prompt =
