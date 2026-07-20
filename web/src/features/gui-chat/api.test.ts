@@ -135,6 +135,17 @@ describe("connectGuiChat", () => {
     expect(client.connect).toHaveBeenCalledOnce();
   });
 
+  it("sends a sessionless heartbeat over the open connection", async () => {
+    const connection = connectGuiChat({ ownerKey: "owner-a" });
+    await connection.createOrAttach("stored-a", 1);
+
+    await connection.ping();
+
+    const client = mocks.gatewayInstances[0];
+    expect(client.connect).toHaveBeenCalledOnce();
+    expect(client.request).toHaveBeenLastCalledWith("gateway.ping", {}, 10_000);
+  });
+
   it("creates a new session on the same authenticated connection", async () => {
     const connection = connectGuiChat({ ownerKey: "owner-a" });
     await connection.createOrAttach(null, 1);

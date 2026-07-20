@@ -82,14 +82,49 @@ function applySessionResponse(
   const history = Array.isArray(response.messages)
     ? transcriptToHistoryState(response.messages, cwd)
     : null;
+  const inflight = "inflight" in response ? response.inflight : null;
+  let messages = history ? history.messages : state.messages;
+  const inflightUser = String(inflight?.user ?? "").trim();
+  const inflightAssistant = String(inflight?.assistant ?? "");
+  const lastMessage = messages.at(-1);
+  const assistantAlreadyPersisted =
+    lastMessage?.role === "assistant" && lastMessage.text === inflightAssistant;
+  const userAlreadyPersisted =
+    (lastMessage?.role === "user" && lastMessage.text === inflightUser) ||
+    (assistantAlreadyPersisted &&
+      messages.at(-2)?.role === "user" &&
+      messages.at(-2)?.text === inflightUser);
+  if (inflightUser && !userAlreadyPersisted) {
+    messages = [
+      ...messages,
+      { artifactIds: [], id: createClientId("user"), role: "user", text: inflightUser },
+    ];
+  }
+  if ((inflightAssistant || inflight?.streaming) && !assistantAlreadyPersisted) {
+    messages = [
+      ...messages,
+      {
+        artifactIds: [],
+        id: createClientId("assistant"),
+        role: "assistant",
+        streaming: true,
+        text: clampRenderedText(inflightAssistant),
+      },
+    ];
+  } else if (inflight?.streaming && assistantAlreadyPersisted) {
+    messages = messages.map((message, index) =>
+      index === messages.length - 1 ? { ...message, streaming: true } : message,
+    );
+  }
 
   return {
     ...state,
     artifacts: history ? history.artifacts : state.artifacts,
     cwd,
     error: undefined,
-    isGenerating: !!("running" in response && response.running),
-    messages: history ? history.messages : state.messages,
+    isGenerating:
+      !!("running" in response && response.running) || Boolean(inflight?.streaming),
+    messages,
     model: response.info?.model ?? state.model,
     sessionId: response.session_id,
     storedSessionId:
