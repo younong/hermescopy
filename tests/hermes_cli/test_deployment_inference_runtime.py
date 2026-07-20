@@ -17,7 +17,7 @@ def test_blank_owner_uses_deployment_relay(monkeypatch):
     _deployment_env(monkeypatch)
     monkeypatch.setattr(rp, "read_raw_config", lambda: {})
 
-    resolved = rp.resolve_runtime_provider(target_model="gpt-safe")
+    resolved = rp.resolve_runtime_provider()
 
     assert resolved == {
         "provider": "custom:deployment",
