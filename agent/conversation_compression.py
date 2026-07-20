@@ -405,6 +405,7 @@ def compress_context(
     task_id: str = "default",
     focus_topic: Optional[str] = None,
     force: bool = False,
+    emit_abort_warning: bool = True,
 ) -> Tuple[list, str]:
     """Compress conversation context and split the session in SQLite.
 
@@ -421,6 +422,9 @@ def compress_context(
             by the manual ``/compress`` slash command so users can retry
             immediately after an auto-compress abort.  Auto-compress
             callers use the default ``False``.
+        emit_abort_warning: Emit the generic compression-aborted warning.
+            The post-tool loop disables this because it returns one terminal
+            response instead.
 
     Returns:
         ``(compressed_messages, new_system_prompt)`` tuple.  When
@@ -429,6 +433,10 @@ def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
+    # This marker describes only this high-level attempt. The compressor's
+    # own flag can predate an early return (for example lock contention).
+    agent._last_compression_attempt_aborted = False
+
     # Lazy feasibility check — run the auxiliary-provider probe + context
     # length lookup just-in-time on the first compression attempt instead of
     # at AIAgent.__init__. Saves ~400ms cold off every short session that
@@ -616,13 +624,17 @@ def compress_context(
     # session has logically ended), and let auto-compress callers detect
     # the no-op via len(returned) == len(input).
     if getattr(agent.context_compressor, "_last_compress_aborted", False):
+        agent._last_compression_attempt_aborted = True
         try:
             _err = getattr(agent.context_compressor, "_last_summary_error", None) or "unknown error"
-            if getattr(agent, "_last_compression_summary_warning", None) != _err:
+            if (
+                emit_abort_warning
+                and getattr(agent, "_last_compression_summary_warning", None) != _err
+            ):
                 agent._last_compression_summary_warning = _err
                 agent._emit_warning(
                     f"⚠ Compression aborted: {_err}. "
-                    "No messages were dropped — conversation continues unchanged. "
+                    "No messages were dropped and the session is unchanged. "
                     "Run /compress to retry, or /new to start a fresh session."
                 )
             _existing_sp = getattr(agent, "_cached_system_prompt", None)

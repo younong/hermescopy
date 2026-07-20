@@ -2113,6 +2113,77 @@ class TestAuxiliaryFallbackLayering:
         assert result.choices[0].message.content == "part one\npart two"
         mock_chain.assert_not_called()
 
+    def test_raw_chat_completions_sse_is_recovered_before_fallback(self):
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.return_value = (
+            'data: {"object":"chat.completion.chunk","choices":'
+            '[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\r\n\r\n'
+            'data: {"object":"chat.completion.chunk","choices":'
+            '[{"index":0,"delta":{"content":"摘要"},"finish_reason":null}]}\r\n\r\n'
+            'data: {"object":"chat.completion.chunk","choices":'
+            '[{"index":0,"delta":{"content":"\\n完成"},"finish_reason":null}]}\r\n\r\n'
+            'data: {"object":"chat.completion.chunk","choices":'
+            '[{"index":0,"delta":{},"finish_reason":"stop"}]}\r\n\r\n'
+            'data: [DONE]\r\n\r\n'
+        ).encode("utf-8")
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "custom-model")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("custom", "custom-model", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain") as mock_chain:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "摘要\n完成"
+        mock_chain.assert_not_called()
+        request = primary_client.chat.completions.create.call_args.kwargs
+        assert request["messages"] == [{"role": "user", "content": "summarize"}]
+        assert "stream" not in request
+
+    @pytest.mark.parametrize("payload", [
+        "plain text",
+        '{"object":"chat.completion.chunk","choices":[]}',
+        'data: {not json}\n\ndata: [DONE]\n\n',
+        ('data: {"object":"response.output_text.delta","delta":"oops"}\n\n'
+         'data: [DONE]\n\n'),
+        ('data: {"object":"chat.completion.chunk","choices":'
+         '[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}\n\n'),
+        ('data: {"object":"chat.completion.chunk","choices":'
+         '[{"index":0,"delta":{"tool_calls":[]},"finish_reason":"tool_calls"}]}\n\n'
+         'data: [DONE]\n\n'),
+        ('data: {"object":"chat.completion.chunk","choices":'
+         '[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n'
+         'data: [DONE]\n\n'
+         'data: {"object":"chat.completion.chunk","choices":[]}\n\n'),
+        b"data: \xff\n\ndata: [DONE]\n\n",
+    ])
+    def test_invalid_raw_sse_still_triggers_fallback(self, payload):
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.return_value = payload
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from fallback"))
+        ])
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "custom-model")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("custom", "custom-model", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(fallback_client, "fallback-model", "fallback_chain[0](openai)")) as mock_chain:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "from fallback"
+        mock_chain.assert_called_once_with(
+            "compression", "custom", reason="invalid provider response"
+        )
+
     def test_invalid_empty_choices_response_triggers_fallback(self, monkeypatch):
         """HTTP-200 malformed chat completions should not abort aux fallback."""
         primary_client = MagicMock()

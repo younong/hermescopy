@@ -11339,16 +11339,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # to avoid false positives on transient errors like "rate limit
             # exceeded" or "invalid auth token". Matches run_agent.py's
             # own context-length classifier.
-            is_context_overflow_failure = agent_failed_early and (
-                bool(agent_result.get("compression_exhausted"))
-                or any(p in _err_str_for_classify for p in (
-                    "context length", "context size", "context window",
-                    "maximum context", "token limit", "too many tokens",
-                    "reduce the length", "exceeds the limit",
-                    "request entity too large", "prompt is too long",
-                    "payload too large", "input is too long",
-                ))
-                or ("400" in _err_str_for_classify and len(history) > 50)
+            is_context_overflow_failure = (
+                agent_failed_early
+                and agent_result.get("failure_reason") != "compression_aborted"
+                and (
+                    bool(agent_result.get("compression_exhausted"))
+                    or any(p in _err_str_for_classify for p in (
+                        "context length", "context size", "context window",
+                        "maximum context", "token limit", "too many tokens",
+                        "reduce the length", "exceeds the limit",
+                        "request entity too large", "prompt is too long",
+                        "payload too large", "input is too long",
+                    ))
+                    or ("400" in _err_str_for_classify and len(history) > 50)
+                )
             )
             if is_context_overflow_failure:
                 logger.info(
