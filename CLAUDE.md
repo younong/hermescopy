@@ -60,8 +60,12 @@ For every request that changes repository files:
    feature branch.
 2. Choose a descriptive worktree/branch name derived from the task. Keep all
    implementation and validation inside that worktree.
-3. Run the focused validation required below. Do not publish changes when
-   required validation is failing; report the blocker instead.
+3. Run the focused validation required by the **Validation** section below.
+   Here, "required validation" means those prescribed local checks for the
+   current change; do not expand it into an implicit requirement to wait for
+   GitHub CI or other remote checks. If a prescribed local check fails, do not
+   publish changes; report the blocker instead. A release waits for remote CI
+   only when its release procedure explicitly requires that gate.
 4. After validation succeeds, review the final diff and repository status,
    commit all task changes with the required Claude co-author trailer, push the
    branch to `origin`, and create a GitHub pull request targeting `main` with a
