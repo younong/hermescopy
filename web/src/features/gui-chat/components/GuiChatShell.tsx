@@ -56,8 +56,17 @@ export function GuiChatShell() {
   const { ownerKey, ready: authIdentityReady } = useDashboardAuthIdentity();
   const stateRef = useRef(state);
   const resumeSessionIdRef = useRef(resumeSessionId);
+  const setSearchParamsRef = useRef(setSearchParams);
   stateRef.current = state;
   resumeSessionIdRef.current = resumeSessionId;
+  setSearchParamsRef.current = setSearchParams;
+  const updateSearchParams = useCallback(
+    (
+      nextInit: Parameters<typeof setSearchParams>[0],
+      navigateOptions?: Parameters<typeof setSearchParams>[1],
+    ) => setSearchParamsRef.current(nextInit, navigateOptions),
+    [],
+  );
   const [portalRoot] = useState<HTMLElement | null>(() =>
     typeof document !== "undefined" ? document.body : null,
   );
@@ -99,7 +108,7 @@ export function GuiChatShell() {
     reconnectLifecycleRef.current?.cancelRecovery();
     setResumeNotice(null);
     skipClearedRouteRef.current = true;
-    setSearchParams(
+    updateSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev);
         next.delete("resume");
@@ -108,7 +117,7 @@ export function GuiChatShell() {
       { replace: true },
     );
     switchCoordinatorRef.current?.start(null);
-  }, [setSearchParams]);
+  }, [updateSearchParams]);
 
   const switchScope = useMemo(() => {
     const connection = mockMode
@@ -136,7 +145,7 @@ export function GuiChatShell() {
           if (canonicalSessionId !== requestedSessionId) {
             trace?.mark("session.canonicalized", "ok");
             canonicalRouteRef.current = canonicalSessionId;
-            setSearchParams(
+            updateSearchParams(
               (prev) => {
                 if (prev.get("resume") !== requestedSessionId) return prev;
                 const next = new URLSearchParams(prev);
@@ -163,7 +172,7 @@ export function GuiChatShell() {
 
         if (requestedSessionId && committedSessionId && requestedSessionId !== committedSessionId) {
           canonicalRouteRef.current = committedSessionId;
-          setSearchParams(
+          updateSearchParams(
             (prev) => {
               if (prev.get("resume") !== requestedSessionId) return prev;
               const next = new URLSearchParams(prev);
@@ -213,7 +222,7 @@ export function GuiChatShell() {
         });
     reconnectLifecycleRef.current = reconnectLifecycle;
     return { coordinator, reconnectLifecycle };
-  }, [dispatchGatewayEvent, mockMode, ownerKey, profile, setSearchParams, startNewGuiChat]);
+  }, [dispatchGatewayEvent, mockMode, ownerKey, profile, startNewGuiChat, updateSearchParams]);
   const switchCoordinator = switchScope.coordinator;
   switchCoordinatorRef.current = switchCoordinator;
 
