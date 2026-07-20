@@ -175,6 +175,7 @@ class WSTransport:
         self._dashboard_lock = threading.Lock()
         self._dashboard_scope: tuple[str, str] | None = None
         self._dashboard_generation = -1
+        self._dashboard_pending_generation: int | None = None
         self._dashboard_active_session_id: str | None = None
         # Token-coalescing buffer (CF-2). Streamed token frames land here and a
         # short timer flushes the batch. The lock guards the buffer + the
@@ -199,11 +200,15 @@ class WSTransport:
         *,
         browser_id: str,
         profile: str = "",
+        pending: bool = True,
     ) -> str | None:
         """Register a dashboard switch and return an error message on rejection.
 
         Merely beginning a newer switch does not change the active subscription;
-        the old session remains visible until the winning attach commits.
+        the old session remains visible until the winning attach commits. Long
+        ``session.attach`` handlers set ``pending`` so mutations fail closed while
+        their worker is resolving the new runtime. Inline ``session.create`` does
+        not yield to another request between begin and commit.
         """
         scope = (browser_id.strip(), profile.strip())
         if not scope[0]:
@@ -217,6 +222,7 @@ class WSTransport:
                 return "session attach superseded"
             self._dashboard_scope = scope
             self._dashboard_generation = generation
+            self._dashboard_pending_generation = generation if pending else None
         return None
 
     def commit_dashboard_attach(
@@ -242,7 +248,26 @@ class WSTransport:
             if on_commit is not None and not on_commit():
                 return False
             self._dashboard_active_session_id = session_id
+            if self._dashboard_pending_generation == generation:
+                self._dashboard_pending_generation = None
             return True
+
+    def abort_dashboard_attach(self, generation: int) -> None:
+        """Clear only the pending attach owned by ``generation``."""
+        with self._dashboard_lock:
+            if self._dashboard_pending_generation == generation:
+                self._dashboard_pending_generation = None
+
+    def dashboard_mutation_error(self, session_id: str) -> str | None:
+        """Return why a dashboard mutation must be rejected, if applicable."""
+        with self._dashboard_lock:
+            if self._dashboard_scope is None:
+                return None
+            if self._dashboard_pending_generation is not None:
+                return "dashboard session switch in progress"
+            if not session_id or session_id != self._dashboard_active_session_id:
+                return "dashboard mutation targets an inactive session"
+            return None
 
     def dashboard_attach_is_current(self, generation: int) -> bool:
         with self._dashboard_lock:
