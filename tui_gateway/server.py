@@ -2421,9 +2421,13 @@ def _resolve_model() -> str:
         return env
     m = _load_cfg().get("model", "")
     if isinstance(m, dict):
-        return str(m.get("default", "") or "").strip()
-    if isinstance(m, str) and m:
-        return m.strip()
+        configured = str(m.get("default", "") or "").strip()
+        if configured:
+            return configured
+    elif isinstance(m, str):
+        configured = m.strip()
+        if configured:
+            return configured
     try:
         from hermes_cli.deployment_inference import deployment_descriptor_from_environment
 
@@ -4873,6 +4877,7 @@ def _make_agent(
             "requested": requested_provider,
             "target_model": model or None,
         })
+    model = str(model or runtime.get("model") or "").strip()
     _pr = _load_provider_routing()
     return AIAgent(
         model=model,

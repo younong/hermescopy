@@ -60,6 +60,120 @@ def test_make_agent_passes_resolved_provider():
         assert call_kwargs.kwargs["api_mode"] == "anthropic_messages"
 
 
+def test_make_agent_uses_runtime_model_when_gateway_model_is_blank():
+    fake_runtime = {
+        "provider": "custom:codex",
+        "base_url": "http://127.0.0.1:39123/v1",
+        "api_key": "deployment-inference-relay",
+        "api_mode": "chat_completions",
+        "model": "gpt-5.6-sol",
+        "command": None,
+        "args": None,
+        "credential_pool": None,
+    }
+
+    with (
+        patch("tui_gateway.server._load_cfg", return_value={}),
+        patch("tui_gateway.server._resolve_startup_runtime", return_value=("", None)),
+        patch("tui_gateway.server._get_db", return_value=MagicMock()),
+        patch("tui_gateway.server._load_reasoning_config", return_value=None),
+        patch("tui_gateway.server._load_service_tier", return_value=None),
+        patch("tui_gateway.server._load_enabled_toolsets", return_value=None),
+        patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value=fake_runtime,
+        ),
+        patch("run_agent.AIAgent") as mock_agent,
+    ):
+        from tui_gateway.server import _make_agent
+
+        _make_agent("sid-runtime-model", "key-runtime-model")
+
+    assert mock_agent.call_args.kwargs["model"] == "gpt-5.6-sol"
+
+
+def test_make_agent_does_not_replace_explicit_model_with_runtime_model():
+    fake_runtime = {
+        "provider": "custom:codex",
+        "base_url": "http://127.0.0.1:39123/v1",
+        "api_key": "deployment-inference-relay",
+        "api_mode": "chat_completions",
+        "model": "gpt-5.6-sol",
+        "command": None,
+        "args": None,
+        "credential_pool": None,
+    }
+
+    with (
+        patch("tui_gateway.server._load_cfg", return_value={}),
+        patch(
+            "tui_gateway.server._resolve_startup_runtime",
+            return_value=("owner/explicit-model", None),
+        ),
+        patch("tui_gateway.server._get_db", return_value=MagicMock()),
+        patch("tui_gateway.server._load_reasoning_config", return_value=None),
+        patch("tui_gateway.server._load_service_tier", return_value=None),
+        patch("tui_gateway.server._load_enabled_toolsets", return_value=None),
+        patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value=fake_runtime,
+        ),
+        patch("run_agent.AIAgent") as mock_agent,
+    ):
+        from tui_gateway.server import _make_agent
+
+        _make_agent("sid-explicit-model", "key-explicit-model")
+
+    assert mock_agent.call_args.kwargs["model"] == "owner/explicit-model"
+
+
+def test_blank_owner_home_builds_agent_with_deployment_runtime(monkeypatch, tmp_path):
+    home = tmp_path / "owner-home"
+    home.mkdir()
+    (home / "config.yaml").write_text("model:\n", encoding="utf-8")
+    deployment_env = {
+        "HERMES_HOME": str(home),
+        "HERMES_OWNER_KEY": "ok1_test",
+        "HERMES_DEPLOYMENT_INFERENCE_PROVIDER": "custom:codex",
+        "HERMES_DEPLOYMENT_INFERENCE_MODEL": "gpt-5.6-sol",
+        "HERMES_DEPLOYMENT_INFERENCE_API_MODE": "chat_completions",
+        "HERMES_DEPLOYMENT_INFERENCE_POLICY_ID": "policy-v1",
+        "HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS": "gpt-5.6-sol",
+        "HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL": "http://127.0.0.1:39123/v1",
+    }
+    for name in (
+        "HERMES_MODEL",
+        "HERMES_INFERENCE_MODEL",
+        "HERMES_TUI_PROVIDER",
+        "HERMES_TUI_SKILLS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    with (
+        patch.dict(os.environ, deployment_env),
+        patch("tui_gateway.server._get_db", return_value=MagicMock()),
+        patch("tui_gateway.server._load_reasoning_config", return_value=None),
+        patch("tui_gateway.server._load_service_tier", return_value=None),
+        patch("tui_gateway.server._load_enabled_toolsets", return_value=None),
+        patch("hermes_cli.mcp_startup.wait_for_mcp_discovery"),
+        patch("tui_gateway.entry.wait_for_mcp_discovery"),
+        patch("run_agent.AIAgent") as mock_agent,
+    ):
+        from tui_gateway import server
+
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+        server._make_agent("sid-real-path", "key-real-path")
+
+    kwargs = mock_agent.call_args.kwargs
+    assert kwargs["model"] == "gpt-5.6-sol"
+    assert kwargs["provider"] == "custom:codex"
+    assert kwargs["api_mode"] == "chat_completions"
+    assert kwargs["api_key"] == "deployment-inference-relay"
+    assert kwargs["base_url"] == "http://127.0.0.1:39123/v1"
+
+
 def test_make_agent_forwards_provider_routing():
     """Parity with the messaging gateway + CLI: ``provider_routing`` in
     config.yaml must reach AIAgent so OpenRouter honors the user's sort /
