@@ -93,18 +93,37 @@ class TestGetActiveProvider:
         active = image_gen_registry.get_active_provider()
         assert active is not None and active.name == "openai"
 
-    def test_missing_configured_provider_falls_back(self, tmp_path, monkeypatch):
+    def test_missing_configured_provider_does_not_fall_back(self, tmp_path, monkeypatch):
         import yaml
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         (tmp_path / "config.yaml").write_text(
             yaml.safe_dump({"image_gen": {"provider": "replicate"}})
         )
-        # Only FAL is registered — configured provider doesn't exist
+        # Only FAL is registered — configured provider doesn't exist.
         image_gen_registry.register_provider(_FakeProvider("fal"))
-        active = image_gen_registry.get_active_provider()
-        # Falls back to FAL preference (legacy default) rather than None
-        assert active is not None and active.name == "fal"
+        resolution = image_gen_registry.resolve_active_provider()
+        assert resolution.provider is None
+        assert resolution.explicit is True
+        assert resolution.error_type == "provider_not_registered"
+        assert image_gen_registry.get_active_provider() is None
+
+
+    def test_explicit_unavailable_provider_is_authoritative(self, tmp_path, monkeypatch):
+        import yaml
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump({"image_gen": {"provider": "offline"}})
+        )
+        provider = _FakeProvider("offline", available=False)
+        image_gen_registry.register_provider(provider)
+        image_gen_registry.register_provider(_FakeProvider("fal"))
+
+        resolution = image_gen_registry.resolve_active_provider()
+        assert resolution.provider is provider
+        assert resolution.available is False
+        assert resolution.error_type == "provider_unavailable"
 
     def test_none_when_empty(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

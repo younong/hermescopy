@@ -1587,3 +1587,23 @@ class TestMemoryInjectionRejectsMalformedSchema:
         names = {t["function"]["name"] for t in agent.tools}
         assert names == {"good_tool"}
         assert agent.valid_tool_names == {"good_tool"}
+
+
+def test_prefetch_timeout_does_not_block_other_provider(monkeypatch):
+    import threading
+    from agent.memory_manager import MemoryManager
+
+    class WedgedProvider:
+        name = "builtin"
+        def prefetch(self, query, **kwargs):
+            threading.Event().wait()
+
+    class FastProvider:
+        name = "external"
+        def prefetch(self, query, **kwargs):
+            return "fast context"
+
+    manager = MemoryManager()
+    manager._providers = [WedgedProvider(), FastProvider()]
+    monkeypatch.setattr("agent.memory_manager._TURN_PROVIDER_TIMEOUT_S", 0.01)
+    assert manager.prefetch_all("hello") == "fast context"

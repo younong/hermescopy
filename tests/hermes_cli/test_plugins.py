@@ -709,6 +709,24 @@ class TestPluginHooks:
         # Should not raise despite 1/0
         mgr.invoke_hook("post_tool_call", tool_name="x", args={}, result="r", task_id="")
 
+    def test_hook_timeout_skips_wedged_callback_and_runs_next(self):
+        import threading
+
+        mgr = PluginManager()
+        mgr._hooks["pre_llm_call"] = [
+            lambda **_kw: threading.Event().wait(),
+            lambda **_kw: {"context": "fast"},
+        ]
+
+        results = mgr.invoke_hook(
+            "pre_llm_call",
+            timeout_seconds=0.01,
+            session_id="s1",
+            user_message="hi",
+        )
+
+        assert results == [{"context": "fast"}]
+
     def test_hook_return_values_collected(self, tmp_path, monkeypatch):
         """invoke_hook() collects non-None return values from callbacks."""
         plugins_dir = tmp_path / "hermes_test" / "plugins"

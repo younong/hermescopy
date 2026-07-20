@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -36,6 +37,40 @@ from agent.model_metadata import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _TurnPhase:
+    """Emit one compact, activity-aware timing record for a prologue phase."""
+
+    def __init__(self, agent, turn_id: str, phase: str):
+        self.agent = agent
+        self.turn_id = turn_id
+        self.phase = phase
+        self.started = 0.0
+
+    def __enter__(self):
+        self.started = time.monotonic()
+        touch = getattr(self.agent, "_touch_activity", None)
+        if callable(touch):
+            touch(f"turn context: {self.phase}")
+        logger.info(
+            "turn_context phase_start session=%s turn=%s phase=%s",
+            self.agent.session_id or "none", self.turn_id, self.phase,
+        )
+        return self
+
+    def __exit__(self, exc_type, exc, _tb):
+        elapsed_ms = int((time.monotonic() - self.started) * 1000)
+        level = logger.warning if exc is not None else logger.info
+        level(
+            "turn_context phase_%s session=%s turn=%s phase=%s elapsed_ms=%d",
+            "failed" if exc is not None else "done",
+            self.agent.session_id or "none",
+            self.turn_id,
+            self.phase,
+            elapsed_ms,
+        )
+        return False
 
 
 def _compression_made_progress(
@@ -321,145 +356,149 @@ def build_turn_context(
         )
 
     # ── System prompt (cached per session for prefix caching) ──
-    if agent._cached_system_prompt is None:
-        restore_or_build_system_prompt(agent, system_message, conversation_history)
+    with _TurnPhase(agent, turn_id, "system_prompt"):
+        if agent._cached_system_prompt is None:
+            restore_or_build_system_prompt(agent, system_message, conversation_history)
 
     active_system_prompt = agent._cached_system_prompt
 
     # Create the DB session row now that _cached_system_prompt is populated, so
     # the persisted snapshot is written non-NULL on the first turn (Issue
     # #45499). Idempotent: _ensure_db_session() no-ops once the row exists.
-    agent._ensure_db_session()
+    with _TurnPhase(agent, turn_id, "session_persistence"):
+        agent._ensure_db_session()
 
-    # Crash-resilience: persist the inbound user turn as soon as the session row exists.
-    try:
-        agent._persist_session(messages, conversation_history)
-    except Exception:
-        logger.warning(
-            "Early turn-start session persistence failed for session=%s",
-            agent.session_id or "none",
-            exc_info=True,
-        )
-
-    # Commit a stable deterministic tool-only checkpoint before the expensive
-    # full request estimate. The inbound user turn was persisted above, while
-    # the protected tail keeps it and recent tool work byte-for-byte intact.
-    _tool_checkpoint = getattr(agent, "_maybe_compact_tool_payloads", None)
-    if agent.compression_enabled and _tool_checkpoint is not None:
-        messages, _tool_checkpoint_changed = _tool_checkpoint(
-            messages, task_id=effective_task_id
-        )
-        if _tool_checkpoint_changed:
-            conversation_history = conversation_history_after_compression(
-                agent, messages
-            )
-
-    # ── Preflight context compression ──
-    # Gate the (expensive) full token estimate behind a cheap pre-check.
-    # See ``_should_run_preflight_estimate`` for the OR semantics that fix
-    # issue #27405 (a few very large messages slipping past the count gate).
-    if agent.compression_enabled and _should_run_preflight_estimate(
-        messages,
-        agent.context_compressor.protect_first_n,
-        agent.context_compressor.protect_last_n,
-        agent.context_compressor.threshold_tokens,
-    ):
-        _preflight_tokens = estimate_request_tokens_rough(
-            messages,
-            system_prompt=active_system_prompt or "",
-            tools=agent.tools or None,
-        )
-        _compressor = agent.context_compressor
-        _defer_preflight = getattr(
-            _compressor,
-            "should_defer_preflight_to_real_usage",
-            lambda _tokens: False,
-        )
-        _preflight_deferred = _defer_preflight(_preflight_tokens)
-
-        if not _preflight_deferred:
-            _last = _compressor.last_prompt_tokens
-            # Do NOT overwrite the -1 sentinel (#36718).
-            if _last >= 0 and _preflight_tokens > _last:
-                _compressor.last_prompt_tokens = _preflight_tokens
-
-        _compression_cooldown = getattr(
-            _compressor,
-            "get_active_compression_failure_cooldown",
-            lambda: None,
-        )()
-
-        if _preflight_deferred:
-            logger.info(
-                "Skipping preflight compression: rough estimate ~%s >= %s, "
-                "but last real provider prompt was %s after compression",
-                f"{_preflight_tokens:,}",
-                f"{_compressor.threshold_tokens:,}",
-                f"{_compressor.last_real_prompt_tokens:,}",
-            )
-        elif _compression_cooldown:
-            logger.info(
-                "Skipping preflight compression: same-session cooldown active "
-                "(~%s seconds remaining, session %s)",
-                int(_compression_cooldown.get("remaining_seconds", 0.0)),
+        # Crash-resilience: persist the inbound user turn as soon as the session row exists.
+        try:
+            agent._persist_session(messages, conversation_history)
+        except Exception:
+            logger.warning(
+                "Early turn-start session persistence failed for session=%s",
                 agent.session_id or "none",
+                exc_info=True,
             )
-        elif _compressor.should_compress(_preflight_tokens):
-            logger.info(
-                "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
-                f"{_preflight_tokens:,}",
-                f"{_compressor.threshold_tokens:,}",
-                agent.model,
-                f"{_compressor.context_length:,}",
+
+    with _TurnPhase(agent, turn_id, "preflight_compression"):
+        # Commit a stable deterministic tool-only checkpoint before the expensive
+        # full request estimate. The inbound user turn was persisted above, while
+        # the protected tail keeps it and recent tool work byte-for-byte intact.
+        _tool_checkpoint = getattr(agent, "_maybe_compact_tool_payloads", None)
+        if agent.compression_enabled and _tool_checkpoint is not None:
+            messages, _tool_checkpoint_changed = _tool_checkpoint(
+                messages, task_id=effective_task_id
             )
-            agent._emit_status(
-                f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
-                f">= {_compressor.threshold_tokens:,} threshold. "
-                "This may take a moment."
-            )
-            for _pass in range(3):
-                _orig_len = len(messages)
-                _orig_tokens = _preflight_tokens
-                messages, active_system_prompt = agent._compress_context(
-                    messages, system_message, approx_tokens=_preflight_tokens,
-                    task_id=effective_task_id,
-                )
-                # Re-estimate now so size-only compression (same row count,
-                # lower token count — e.g. summarising tool outputs) is
-                # recognised as progress instead of being misread as
-                # "Cannot compress further". Fixes #39548.
-                _preflight_tokens = estimate_request_tokens_rough(
-                    messages,
-                    system_prompt=active_system_prompt or "",
-                    tools=agent.tools or None,
-                )
-                if not _compression_made_progress(
-                    _orig_len, len(messages), _orig_tokens, _preflight_tokens
-                ):
-                    break  # Cannot compress further: neither rows nor tokens moved
+            if _tool_checkpoint_changed:
                 conversation_history = conversation_history_after_compression(
                     agent, messages
                 )
-                agent._empty_content_retries = 0
-                agent._thinking_prefill_retries = 0
-                agent._last_content_with_tools = None
-                agent._last_content_tools_all_housekeeping = False
-                agent._mute_post_response = False
-                if not _compressor.should_compress(_preflight_tokens):
-                    break
 
-    # Resolve large slash-skill instructions only after persistence and preflight.
-    # The compact activation remains durable; the full body is current-turn-only.
-    deferred_skill_context = ""
-    try:
-        from agent.skill_commands import build_deferred_skill_context
+        # ── Preflight context compression ──
+        # Gate the (expensive) full token estimate behind a cheap pre-check.
+        # See ``_should_run_preflight_estimate`` for the OR semantics that fix
+        # issue #27405 (a few very large messages slipping past the count gate).
+        if agent.compression_enabled and _should_run_preflight_estimate(
+            messages,
+            agent.context_compressor.protect_first_n,
+            agent.context_compressor.protect_last_n,
+            agent.context_compressor.threshold_tokens,
+        ):
+            _preflight_tokens = estimate_request_tokens_rough(
+                messages,
+                system_prompt=active_system_prompt or "",
+                tools=agent.tools or None,
+            )
+            _compressor = agent.context_compressor
+            _defer_preflight = getattr(
+                _compressor,
+                "should_defer_preflight_to_real_usage",
+                lambda _tokens: False,
+            )
+            _preflight_deferred = _defer_preflight(_preflight_tokens)
 
-        deferred_skill_context = build_deferred_skill_context(
-            user_message,
-            task_id=effective_task_id,
-        )
-    except Exception:
-        logger.warning("Deferred skill activation failed", exc_info=True)
+            if not _preflight_deferred:
+                _last = _compressor.last_prompt_tokens
+                # Do NOT overwrite the -1 sentinel (#36718).
+                if _last >= 0 and _preflight_tokens > _last:
+                    _compressor.last_prompt_tokens = _preflight_tokens
+
+            _compression_cooldown = getattr(
+                _compressor,
+                "get_active_compression_failure_cooldown",
+                lambda: None,
+            )()
+
+            if _preflight_deferred:
+                logger.info(
+                    "Skipping preflight compression: rough estimate ~%s >= %s, "
+                    "but last real provider prompt was %s after compression",
+                    f"{_preflight_tokens:,}",
+                    f"{_compressor.threshold_tokens:,}",
+                    f"{_compressor.last_real_prompt_tokens:,}",
+                )
+            elif _compression_cooldown:
+                logger.info(
+                    "Skipping preflight compression: same-session cooldown active "
+                    "(~%s seconds remaining, session %s)",
+                    int(_compression_cooldown.get("remaining_seconds", 0.0)),
+                    agent.session_id or "none",
+                )
+            elif _compressor.should_compress(_preflight_tokens):
+                logger.info(
+                    "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
+                    f"{_preflight_tokens:,}",
+                    f"{_compressor.threshold_tokens:,}",
+                    agent.model,
+                    f"{_compressor.context_length:,}",
+                )
+                agent._emit_status(
+                    f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
+                    f">= {_compressor.threshold_tokens:,} threshold. "
+                    "This may take a moment."
+                )
+                for _pass in range(3):
+                    _orig_len = len(messages)
+                    _orig_tokens = _preflight_tokens
+                    messages, active_system_prompt = agent._compress_context(
+                        messages, system_message, approx_tokens=_preflight_tokens,
+                        task_id=effective_task_id,
+                    )
+                    # Re-estimate now so size-only compression (same row count,
+                    # lower token count — e.g. summarising tool outputs) is
+                    # recognised as progress instead of being misread as
+                    # "Cannot compress further". Fixes #39548.
+                    _preflight_tokens = estimate_request_tokens_rough(
+                        messages,
+                        system_prompt=active_system_prompt or "",
+                        tools=agent.tools or None,
+                    )
+                    if not _compression_made_progress(
+                        _orig_len, len(messages), _orig_tokens, _preflight_tokens
+                    ):
+                        break  # Cannot compress further: neither rows nor tokens moved
+                    conversation_history = conversation_history_after_compression(
+                        agent, messages
+                    )
+                    agent._empty_content_retries = 0
+                    agent._thinking_prefill_retries = 0
+                    agent._last_content_with_tools = None
+                    agent._last_content_tools_all_housekeeping = False
+                    agent._mute_post_response = False
+                    if not _compressor.should_compress(_preflight_tokens):
+                        break
+
+    with _TurnPhase(agent, turn_id, "deferred_skill"):
+        # Resolve large slash-skill instructions only after persistence and preflight.
+        # The compact activation remains durable; the full body is current-turn-only.
+        deferred_skill_context = ""
+        try:
+            from agent.skill_commands import build_deferred_skill_context
+
+            deferred_skill_context = build_deferred_skill_context(
+                user_message,
+                task_id=effective_task_id,
+            )
+        except Exception:
+            logger.warning("Deferred skill activation failed", exc_info=True)
 
     # Compression can replace/reindex messages. Re-find this turn's compact user
     # message so ephemeral context is attached to the correct provider copy.
@@ -477,18 +516,20 @@ def build_turn_context(
     plugin_user_context = ""
     try:
         from hermes_cli.plugins import invoke_hook as _invoke_hook
-        _pre_results = _invoke_hook(
-            "pre_llm_call",
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            user_message=original_user_message,
-            conversation_history=list(messages),
-            is_first_turn=(not bool(conversation_history)),
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-            sender_id=getattr(agent, "_user_id", None) or "",
-        )
+        with _TurnPhase(agent, turn_id, "pre_llm_call"):
+            _pre_results = _invoke_hook(
+                "pre_llm_call",
+                timeout_seconds=5.0,
+                session_id=agent.session_id,
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                user_message=original_user_message,
+                conversation_history=list(messages),
+                is_first_turn=(not bool(conversation_history)),
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+                sender_id=getattr(agent, "_user_id", None) or "",
+            )
         _ctx_parts: list[str] = []
         for r in _pre_results:
             if isinstance(r, dict) and r.get("context"):
@@ -523,7 +564,8 @@ def build_turn_context(
     if agent._memory_manager:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
-            agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
+            with _TurnPhase(agent, turn_id, "memory_on_turn_start"):
+                agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
         except Exception:
             pass
 
@@ -532,7 +574,8 @@ def build_turn_context(
     if agent._memory_manager:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
-            ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+            with _TurnPhase(agent, turn_id, "memory_prefetch"):
+                ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
         except Exception:
             pass
 
