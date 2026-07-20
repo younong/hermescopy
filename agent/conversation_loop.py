@@ -4635,14 +4635,32 @@ def run_conversation(
                         messages, system_message,
                         approx_tokens=agent.context_compressor.last_prompt_tokens,
                         task_id=effective_task_id,
+                        emit_abort_warning=False,
                     )
+                    if getattr(agent, "_last_compression_attempt_aborted", False):
+                        _summary_error = (
+                            getattr(_compressor, "_last_summary_error", None)
+                            or "the compression provider returned no usable summary"
+                        )
+                        terminal_error = f"Automatic compression failed: {_summary_error}"
+                        terminal_failure_reason = "compression_aborted"
+                        _turn_exit_reason = "post_tool_compression_aborted"
+                        failed = True
+                        final_response = (
+                            "I stopped this turn after the tool result because automatic "
+                            f"context compression failed: {_summary_error}. No existing "
+                            "messages were dropped and the session was not reset. Run "
+                            "/compress to retry now, or /new to start a fresh session."
+                        )
+                        agent._session_messages = messages
+                        break
                     conversation_history = conversation_history_after_compression(
                         agent, messages
                     )
-                
+
                 # Save session log incrementally (so progress is visible even if interrupted)
                 agent._session_messages = messages
-                
+
                 # Continue loop for next response
                 continue
             

@@ -4061,6 +4061,51 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
+    def test_post_tool_compression_abort_stops_current_turn(self, agent):
+        self._setup_agent(agent)
+        agent.compression_enabled = True
+        agent.context_compressor.should_compress = MagicMock(return_value=True)
+        agent.context_compressor.last_prompt_tokens = 100_000
+        agent.context_compressor._last_summary_error = "raw SSE response was malformed"
+
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[tc]
+        )
+        original_session_id = agent.session_id
+        original_system_prompt = agent._cached_system_prompt
+        persisted = []
+
+        def abort_compression(messages, system_message, **kwargs):
+            assert kwargs["emit_abort_warning"] is False
+            agent._last_compression_attempt_aborted = True
+            return messages, original_system_prompt
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_compress_context", side_effect=abort_compression),
+            patch.object(agent, "_persist_session", side_effect=lambda messages, *_: persisted.append(list(messages))),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("search something")
+
+        assert agent.client.chat.completions.create.call_count == 1
+        assert result["failed"] is True
+        assert result["completed"] is False
+        assert result["failure_reason"] == "compression_aborted"
+        assert result["turn_exit_reason"] == "post_tool_compression_aborted"
+        assert result.get("compression_exhausted") is not True
+        assert "No existing messages were dropped" in result["final_response"]
+        assert "/compress" in result["final_response"]
+        assert result["session_id"] == original_session_id
+        assert agent._cached_system_prompt == original_system_prompt
+        assert [message["role"] for message in result["messages"][-3:]] == [
+            "assistant", "tool", "assistant"
+        ]
+        assert result["messages"][-2]["tool_call_id"] == "c1"
+        assert persisted[-1][-1]["content"] == result["final_response"]
+
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")

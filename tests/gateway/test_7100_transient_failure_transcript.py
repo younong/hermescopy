@@ -24,16 +24,20 @@ def _classify(agent_result: dict, history_len: int) -> tuple[bool, bool]:
     """
     agent_failed_early = bool(agent_result.get("failed"))
     err = str(agent_result.get("error", "")).lower()
-    is_context_overflow_failure = agent_failed_early and (
-        bool(agent_result.get("compression_exhausted"))
-        or any(p in err for p in (
-            "context length", "context size", "context window",
-            "maximum context", "token limit", "too many tokens",
-            "reduce the length", "exceeds the limit",
-            "request entity too large", "prompt is too long",
-            "payload too large", "input is too long",
-        ))
-        or ("400" in err and history_len > 50)
+    is_context_overflow_failure = (
+        agent_failed_early
+        and agent_result.get("failure_reason") != "compression_aborted"
+        and (
+            bool(agent_result.get("compression_exhausted"))
+            or any(p in err for p in (
+                "context length", "context size", "context window",
+                "maximum context", "token limit", "too many tokens",
+                "reduce the length", "exceeds the limit",
+                "request entity too large", "prompt is too long",
+                "payload too large", "input is too long",
+            ))
+            or ("400" in err and history_len > 50)
+        )
     )
     return agent_failed_early, is_context_overflow_failure
 
@@ -101,6 +105,16 @@ class TestTransientFailureKeepsUserMessage:
             "error": "ConnectionError: [Errno 54] Connection reset by peer",
         }
         failed, ctx_overflow = _classify(agent_result, history_len=10)
+        assert failed
+        assert not ctx_overflow
+
+    def test_automatic_compression_failure_is_not_context_overflow(self):
+        agent_result = {
+            "failed": True,
+            "failure_reason": "compression_aborted",
+            "error": "Context compression failed: input exceeds token limit",
+        }
+        failed, ctx_overflow = _classify(agent_result, history_len=100)
         assert failed
         assert not ctx_overflow
 

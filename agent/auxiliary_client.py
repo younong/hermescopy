@@ -5916,6 +5916,9 @@ def _recover_aux_response_message(response: Any) -> Optional[Any]:
 
 
 def _extract_aux_response_text(response: Any) -> str:
+    if isinstance(response, (str, bytes)):
+        return _extract_chat_completions_sse_text(response)
+
     output_text = _obj_get(response, "output_text")
     if isinstance(output_text, str) and output_text.strip():
         return output_text.strip()
@@ -5936,6 +5939,103 @@ def _extract_aux_response_text(response: Any) -> str:
                 if isinstance(text, str) and text.strip():
                     parts.append(text.strip())
     return "\n".join(parts).strip()
+
+
+def _extract_chat_completions_sse_text(response: Any) -> str:
+    """Aggregate a complete raw Chat Completions SSE response.
+
+    Some OpenAI-compatible endpoints return the raw SSE body even when the
+    caller requested a non-streaming completion. Recover that observed wire
+    shape without treating arbitrary strings or partial streams as valid.
+    """
+    if isinstance(response, bytes):
+        try:
+            body = response.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            return ""
+    elif isinstance(response, str):
+        body = response.lstrip("\ufeff")
+    else:
+        return ""
+
+    # splitlines() normalizes LF, CRLF, and CR. Append a blank line so the
+    # final event is processed even without a trailing separator.
+    events: List[List[str]] = []
+    event_lines: List[str] = []
+    for line in [*body.splitlines(), ""]:
+        if line == "":
+            if event_lines:
+                events.append(event_lines)
+                event_lines = []
+            continue
+        event_lines.append(line)
+
+    if not events:
+        return ""
+
+    content_parts: List[str] = []
+    saw_chunk = False
+    saw_terminal = False
+    saw_done = False
+
+    for lines in events:
+        data_fields: List[str] = []
+        for line in lines:
+            if line.startswith(":"):
+                continue
+            field, separator, value = line.partition(":")
+            if not separator:
+                return ""
+            if value.startswith(" "):
+                value = value[1:]
+            if field == "data":
+                data_fields.append(value)
+            elif field not in {"event", "id", "retry"}:
+                return ""
+
+        if not data_fields:
+            continue
+        payload = "\n".join(data_fields)
+        if payload.strip() == "[DONE]":
+            if saw_done:
+                return ""
+            saw_done = True
+            saw_terminal = True
+            continue
+        if saw_done:
+            return ""
+
+        try:
+            chunk = json.loads(payload)
+        except (TypeError, ValueError):
+            return ""
+        if not isinstance(chunk, dict) or chunk.get("object") != "chat.completion.chunk":
+            return ""
+        choices = chunk.get("choices")
+        if not isinstance(choices, list):
+            return ""
+
+        saw_chunk = True
+        for choice in choices:
+            if not isinstance(choice, dict):
+                return ""
+            if choice.get("index", 0) != 0:
+                continue
+            delta = choice.get("delta")
+            if delta is not None and not isinstance(delta, dict):
+                return ""
+            content = (delta or {}).get("content")
+            if content is not None:
+                if not isinstance(content, str):
+                    return ""
+                content_parts.append(content)
+            if choice.get("finish_reason") is not None:
+                saw_terminal = True
+
+    text = "".join(content_parts)
+    if not saw_chunk or not saw_terminal or not text.strip():
+        return ""
+    return text
 
 
 def _obj_get(obj: Any, key: str, default: Any = None) -> Any:

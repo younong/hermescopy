@@ -14,6 +14,7 @@ this from a real user-initiated /new.
 import os
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 
@@ -253,3 +254,75 @@ class TestSessionCompressEvent:
             )
             assert compressed
             assert agent.session_id != original_sid
+
+
+def test_compression_attempt_marker_ignores_stale_abort_on_lock_skip(monkeypatch):
+    from agent.conversation_compression import compress_context
+
+    class LockDB:
+        def try_acquire_compression_lock(self, *_args, **_kwargs):
+            return False
+
+        def get_compression_lock_holder(self, *_args, **_kwargs):
+            return "other"
+
+    compressor = SimpleNamespace(_last_compress_aborted=True)
+    agent = SimpleNamespace(
+        context_compressor=compressor,
+        _last_compression_attempt_aborted=True,
+        _compression_feasibility_checked=True,
+        _session_db=LockDB(),
+        session_id="session-1",
+        compression_in_place=False,
+        model="model",
+        _cached_system_prompt="cached system",
+        _emit_status=lambda *_args, **_kwargs: None,
+        _emit_warning=lambda *_args, **_kwargs: None,
+        _build_system_prompt=lambda _system: "rebuilt system",
+    )
+    messages = [{"role": "user", "content": "hello"}]
+
+    returned, system_prompt = compress_context(agent, messages, "system")
+
+    assert returned is messages
+    assert system_prompt == "cached system"
+    assert agent._last_compression_attempt_aborted is False
+
+
+def test_compression_attempt_abort_marker_can_suppress_interim_warning():
+    from agent.conversation_compression import compress_context
+
+    messages = [{"role": "user", "content": "hello"}] * 10
+
+    class Compressor:
+        _last_compress_aborted = False
+        _last_summary_error = None
+
+        def compress(self, incoming, **_kwargs):
+            self._last_compress_aborted = True
+            self._last_summary_error = "upstream stream closed"
+            return incoming
+
+    warnings = []
+    agent = SimpleNamespace(
+        context_compressor=Compressor(),
+        _compression_feasibility_checked=True,
+        _session_db=None,
+        session_id="session-1",
+        compression_in_place=False,
+        model="model",
+        _cached_system_prompt="cached system",
+        _memory_manager=None,
+        _emit_status=lambda *_args, **_kwargs: None,
+        _emit_warning=warnings.append,
+        _build_system_prompt=lambda _system: "rebuilt system",
+    )
+
+    returned, system_prompt = compress_context(
+        agent, messages, "system", emit_abort_warning=False
+    )
+
+    assert returned is messages
+    assert system_prompt == "cached system"
+    assert agent._last_compression_attempt_aborted is True
+    assert warnings == []
