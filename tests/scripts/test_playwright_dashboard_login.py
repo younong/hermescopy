@@ -208,6 +208,58 @@ def test_login_dashboard_keeps_secrets_out_of_argv_and_removes_script(
     assert sum("close" in call for call in calls) == 1
 
 
+def test_secure_playwright_code_uses_private_temp_file_and_removes_it(
+    login_module, monkeypatch
+):
+    credentials = login_module.Credentials("member@example.com", "secret value")
+    observed: dict[str, object] = {}
+
+    def fake_run(args, *, capture_output, text, check, timeout=None):
+        args = [str(value) for value in args]
+        filename_arg = next(value for value in args if value.startswith("--filename="))
+        script = Path(filename_arg.split("=", 1)[1])
+        observed["path"] = script
+        observed["mode"] = stat.S_IMODE(script.stat().st_mode)
+        assert script.read_text(encoding="utf-8") == "secret value"
+        assert timeout == 12
+        return subprocess.CompletedProcess(args, 0, "secret value", "")
+
+    monkeypatch.setattr(login_module.subprocess, "run", fake_run)
+
+    output = login_module.run_secure_playwright_code(
+        playwright_cli="playwright-cli",
+        session="hermes-validation",
+        javascript=credentials.password,
+        credentials=credentials,
+        timeout=12,
+    )
+
+    assert output == "[REDACTED]"
+    assert observed["mode"] == 0o600
+    assert not observed["path"].exists()
+
+
+def test_secure_playwright_code_removes_script_after_timeout(login_module, monkeypatch):
+    observed: dict[str, Path] = {}
+
+    def fake_run(args, **_kwargs):
+        filename_arg = next(str(value) for value in args if str(value).startswith("--filename="))
+        observed["path"] = Path(filename_arg.split("=", 1)[1])
+        raise subprocess.TimeoutExpired(args, 1)
+
+    monkeypatch.setattr(login_module.subprocess, "run", fake_run)
+
+    with pytest.raises(login_module.LoginError, match="timed out"):
+        login_module.run_secure_playwright_code(
+            playwright_cli="playwright-cli",
+            session="hermes-validation",
+            javascript="async () => ({ ok: true })",
+            timeout=1,
+        )
+
+    assert not observed["path"].exists()
+
+
 def test_login_dashboard_redacts_failure_and_closes_session(login_module, monkeypatch, tmp_path):
     credentials = login_module.Credentials("member@example.com", "secret value")
     monkeypatch.setattr(login_module, "load_credentials", lambda _root: credentials)

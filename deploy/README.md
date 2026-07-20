@@ -24,7 +24,7 @@
 
 新发布前必须人工提交代码。`--create-tag` 要求具名分支和干净工作区，fetch 最新 `origin/main`，以 `--no-autostash` rebase 当前分支，无 force 地推送远端同名分支，然后只创建并 atomic push 指定的 annotated tag。默认只允许 `main`；`--allow-non-main` 保留，但同样必须 rebase 最新 `origin/main`，且不允许 detached HEAD 或 force push。rebase、non-fast-forward、tag 冲突或远端校验失败都会在部署前 fail closed。工具不会自动 commit/stash，也不会用 `--tags` 推送无关 tag。
 
-工具使用 `git archive <tag>` 生成干净源码，在本机临时源码目录中安装 Node 依赖并构建 web/ui-tui 产物，然后把源码 + 构建产物打包上传到服务器。服务器只解包到 `/opt/hermes/releases/<tag>`、按 `uv.lock + 架构` 创建或复用 root-owned immutable Python runtime、验证 host sandbox policy、切换 `/opt/hermes/current`，最后以稳定的非 root `hermes` user/group 重启 systemd 服务。发布成功后会清理本次上传的远端 tarball，并按保留策略回收旧 release。
+工具使用 `git archive <tag>` 生成干净源码，在本机临时源码目录中安装 Node 依赖并构建 web/ui-tui 产物，然后把源码 + 构建产物打包上传到服务器。服务器只解包到 `/opt/hermes/releases/<tag>`、按 `uv.lock + 架构` 创建或复用 root-owned immutable Python runtime、验证 host sandbox policy、切换 `/opt/hermes/current`，最后以稳定的非 root `hermes` user/group 重启 systemd 服务。提交部署事务前会自动运行无 secret、仅 loopback 的确定性对话冒烟；远端提交后，本机再通过公开 Dashboard 运行一次 authenticated 真实模型冒烟。发布成功后会清理本次上传的远端 tarball 和临时冒烟数据，并按保留策略回收旧 release。
 
 ## 服务器运行方式
 
@@ -154,6 +154,30 @@ APIYI_GEMINI_BASE_URL=https://api.apiyi.com/v1beta
 
 部署脚本生成的 systemd runner 会读取 `/opt/hermes/shared/.env`，但不会打印其中内容。
 
+## 自动两层对话冒烟
+
+每次非 dry-run 发布都自动执行两层检查：
+
+1. **事务内确定性冒烟**：systemd 和 Hermes 内部认证 readiness 通过后、Nginx reconcile 和 `deployment_committed` 之前，在服务器上以 `hermes` 用户、`env -i`、独立 `HOME`/`TMPDIR` 运行 `deploy/smoke-conversation.py`。它使用 loopback 假模型且禁止非 loopback 网络，不读取 `/opt/hermes/shared/.env`，覆盖 session create、provider/model 传播、附件、terminal、危险命令拒绝、流式输出、持久化、第二 gateway 进程 cold resume、继续对话和清理。失败会退出当前事务，由 EXIT trap 恢复旧 symlink/unit/policy 并重启旧版本。
+2. **提交后公开真实 AI 冒烟**：远端 Nginx 校验成功并写入 commit marker 后，本机自动运行 `scripts/smoke_dashboard_conversation.py`。它通过安全登录 helper 读取 Git 忽略且权限为 `0600` 的 `.env.local`，申请单次 WebSocket ticket，连接带 path prefix 的公开 `/api/ws`，创建会话、验证真实模型 delta/completion、关闭后 cold resume、确认持久化并删除会话。
+
+本机需要安装 `playwright-cli`，且仓库根目录 `.env.local` 只包含：
+
+```dotenv
+HERMES_DASHBOARD_BROWSER_USERNAME=...
+HERMES_DASHBOARD_BROWSER_PASSWORD=...
+```
+
+不得读取、打印、手工复制、`source` 或提交该文件；凭据、cookie、ticket、prompt 输出和临时 JavaScript 不进入命令参数或发布总结。临时 Playwright 脚本使用 `0600` 并始终删除，浏览器、WebSocket、session 和远端临时目录执行 best-effort/bounded cleanup。
+
+最终总结会明确区分：
+
+- `rolled back before commit`
+- `deployment committed and all smoke passed`
+- `deployment committed but public smoke failed`
+
+两层任一失败均返回非零。公开冒烟发生在部署提交之后，因此其失败**不会自动回滚已提交版本**；此时先查看公开认证/WebSocket/Owner Worker/模型日志，决定修复后重试还是经人工判断发布上一个稳定 tag。两个 runner 也会分别输出可机器解析且已脱敏的 JSON（schema、状态、named checks、duration、cleanup、稳定 failure code/check）。`--dry-run` 只打印两层计划，不登录 Dashboard、不连接真实模型，也不修改远端。
+
 ## Release 保留与清理
 
 发布成功后会删除本次上传的远端 tarball：`/opt/hermes/tmp/hermes-<tag>.tar.gz`。
@@ -196,4 +220,4 @@ ssh root@106.15.186.104 'journalctl -u hermes-gateway -u hermes-dashboard --sinc
 
 使用隐私窗口访问 `https://abinllm.xyz/hermes/`，应直接看到 Hermes 登录页而不是浏览器原生 Basic Auth challenge。用 active member 验证 sessions API、普通功能和 WebSocket/PTY；member 的账号管理 API 仍应为 403，admin 管理读取仍应成功。gateway、dashboard、Owner Worker 和 `/opt/hermes/shared/.hermes/users/<owner-key>` 应使用同一个稳定 `hermes` UID/GID。现有 local-user DB、stable secret 和角色都保持不变。
 
-发布脚本会执行 host sandbox preflight、systemd health、Hermes auth readiness 和 Nginx validation。APIYI smoke test 不是必跑步骤；需要真实调用模型时再单独执行。
+发布脚本会执行 host sandbox preflight、systemd health、Hermes auth readiness、事务内确定性核心对话冒烟、Nginx validation，以及提交后的 authenticated 公开真实 AI 对话冒烟。APIYI 图像模型专项 smoke 仍不是必跑步骤；需要验证图像能力时再单独执行。
