@@ -60,6 +60,43 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert "HERMES_EXECUTOR_START_GATE_FD" not in source
 
 
+def test_deploy_gates_commit_on_isolated_conversation_smoke():
+    source = DEPLOY.read_text(encoding="utf-8")
+
+    auth_ready = source.index('if [ "$login_status" != "302" ] || [ "$api_status" != "401" ]')
+    smoke = source.index('"$release/deploy/smoke-conversation.py" --timeout 90')
+    nginx = source.index('action="reconcile"', smoke)
+    commit = source.index('deployment_committed="1"', nginx)
+    assert auth_ready < smoke < nginx < commit
+    assert 'runuser -u "$service_user" -- env -i' in source
+    assert 'HOME="$smoke_root"' in source
+    assert 'TMPDIR="$smoke_root"' in source
+    assert 'PYTHONPATH="$release"' in source
+    smoke_block = source[source.index("if ! (", auth_ready) : nginx]
+    assert "$env_file" not in smoke_block
+    assert ". $env_file" not in smoke_block
+    assert 'rm -rf -- "$smoke_root"' in source[source.index("cleanup_release_tmp"):source.index("trap cleanup_release_tmp EXIT")]
+    assert "HERMES_DEPLOY_STAGE deterministic_smoke=passed" in source
+    assert "HERMES_DEPLOY_STAGE deployment=committed" in source
+
+
+def test_deploy_runs_public_smoke_only_after_remote_commit_and_does_not_roll_back():
+    source = DEPLOY.read_text(encoding="utf-8")
+
+    orchestration = source[source.index("const remoteResult = deployArchive") : source.index("} finally {", source.index("const remoteResult = deployArchive"))]
+    assert orchestration.index("deployment=committed") < orchestration.index("runPublicConversationSmoke(args)")
+    assert "deployment committed but public smoke failed" in orchestration
+    assert "automatic rollback was not attempted" in orchestration
+    assert "restore_deployment_state" not in orchestration
+    public_runner = source[source.index("function runPublicConversationSmoke") : source.index("function printSummary")]
+    assert "smoke_dashboard_conversation.py" in public_runner
+    assert '"--url"' in public_runner
+    assert "args.dashboardPublicUrl" in public_runner
+    assert "dryRun: args.dryRun" in public_runner
+    assert "deployment committed and all smoke passed" in source
+    assert "rolled back before commit" in source
+
+
 def test_seccomp_artifact_is_reproducible_and_manifest_bound(tmp_path):
     output = tmp_path / "executor.bpf"
     manifest = tmp_path / "executor.json"

@@ -293,13 +293,19 @@ def _run_playwright(
     args: Sequence[str],
     *,
     credentials: Credentials | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(
-        [playwright_cli, *args],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    run_kwargs: dict[str, object] = {
+        "capture_output": True,
+        "text": True,
+        "check": False,
+    }
+    if timeout is not None:
+        run_kwargs["timeout"] = timeout
+    try:
+        completed = subprocess.run([playwright_cli, *args], **run_kwargs)
+    except subprocess.TimeoutExpired as exc:
+        raise LoginError("playwright-cli command timed out.") from exc
     if completed.returncode != 0:
         detail = _redact((completed.stderr or completed.stdout).strip(), credentials)
         if len(detail) > 1200:
@@ -309,16 +315,52 @@ def _run_playwright(
     return completed
 
 
+def run_secure_playwright_code(
+    *,
+    playwright_cli: str,
+    session: str,
+    javascript: str,
+    credentials: Credentials | None = None,
+    timeout: float | None = None,
+    prefix: str = "hermes-playwright-",
+) -> str:
+    """Run JavaScript from a mode-0600 temporary file, then remove it."""
+    validate_session_name(session)
+    fd, temporary_name = tempfile.mkstemp(prefix=prefix, suffix=".js")
+    script_path = Path(temporary_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(javascript)
+        completed = _run_playwright(
+            playwright_cli,
+            [f"-s={session}", "--raw", "run-code", f"--filename={script_path}"],
+            credentials=credentials,
+            timeout=timeout,
+        )
+        return _redact(completed.stdout.strip(), credentials)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            script_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+
 def login_dashboard(
     *,
     repo_root: Path,
     raw_url: str,
     session: str,
     playwright_cli: str | None = None,
+    credentials: Credentials | None = None,
 ) -> dict[str, object]:
     session = validate_session_name(session)
     urls = normalize_dashboard_url(raw_url)
-    credentials = load_credentials(repo_root)
+    credentials = credentials or load_credentials(repo_root)
     cli = playwright_cli or shutil.which("playwright-cli")
     if not cli:
         raise LoginError("playwright-cli is not installed or is not available on PATH.")
@@ -332,28 +374,17 @@ def login_dashboard(
     )
 
     opened = False
-    script_path: Path | None = None
     try:
         _run_playwright(cli, [f"-s={session}", "open", "about:blank"], credentials=credentials)
         opened = True
 
-        fd, temporary_name = tempfile.mkstemp(prefix="hermes-dashboard-login-", suffix=".js")
-        script_path = Path(temporary_name)
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                fd = -1
-                handle.write(_login_javascript(urls, credentials))
-        finally:
-            if fd >= 0:
-                os.close(fd)
-
-        completed = _run_playwright(
-            cli,
-            [f"-s={session}", "--raw", "run-code", f"--filename={script_path}"],
+        output = run_secure_playwright_code(
+            playwright_cli=cli,
+            session=session,
+            javascript=_login_javascript(urls, credentials),
             credentials=credentials,
+            prefix="hermes-dashboard-login-",
         )
-        output = _redact(completed.stdout.strip(), credentials)
         if output.startswith("### Error"):
             detail = output.removeprefix("### Error").strip()
             raise LoginError(f"playwright-cli login failed. {detail}" if detail else "playwright-cli login failed.")
@@ -373,12 +404,6 @@ def login_dashboard(
                 check=False,
             )
         raise
-    finally:
-        if script_path is not None:
-            try:
-                script_path.unlink()
-            except FileNotFoundError:
-                pass
 
 
 def _build_parser() -> argparse.ArgumentParser:

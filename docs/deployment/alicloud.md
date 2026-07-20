@@ -150,8 +150,10 @@ npm run deploy -- --create-tag v2026.7.4-test --allow-non-main
 7. 只有 preflight 成功后才切换 `/opt/hermes/current` 并写入 systemd unit。
 8. 以稳定的非 root `hermes` user/group 重启 gateway 和 dashboard；unit 的 `ExecStartPre` 会再次验证 sandbox policy。
 9. 从 loopback 带生产代理头验证 Hermes 自己的登录 gate 已生效。
-10. 首次迁移时显式替换旧 Nginx 外层认证；后续发布只同步已托管 snippet，并在 `nginx -t` 成功后 reload。
-11. 服务、认证或 Nginx 检查失败时恢复部署前的 current symlink、runner、systemd units、sandbox policy 和 seccomp artifact，再重启旧版本；成功后再清理旧 release。
+10. 在部署事务内以 `hermes` 用户和干净环境运行确定性核心对话冒烟；它只连接 loopback 假模型，不读取生产 `.env`，并覆盖附件、tool/approval、流、持久化和 cold resume。
+11. 首次迁移时显式替换旧 Nginx 外层认证；后续发布只同步已托管 snippet，并在 `nginx -t` 成功后 reload；随后写入远端 deployment commit marker。
+12. 远端提交成功后，本机通过 authenticated 公开 Dashboard、单次 WebSocket ticket、prefixed `/api/ws` 和真实模型运行第二层对话冒烟。
+13. 服务、认证、确定性冒烟或 Nginx 检查失败时恢复部署前的 current symlink、runner、systemd units、sandbox policy 和 seccomp artifact，再重启旧版本；公开冒烟失败发生在 commit 之后，返回非零并报告验证失败，但不会自动回滚已提交版本。
 
 ## 首次移除 Nginx 外层认证
 
@@ -177,7 +179,7 @@ ssh root@106.15.186.104 \
   'python3 /opt/hermes/current/deploy/nginx/manage_hermes_proxy.py status --vhost /etc/nginx/conf.d/abinllm.conf'
 ```
 
-`--dry-run` 不连接或修改服务器；它会打印将执行的远端脚本和 migration/reconcile 模式。实际迁移前另行保存 `nginx -T`、vhost checksum、systemd unit 和服务状态。
+`--dry-run` 不连接或修改服务器；它会打印将执行的远端脚本、migration/reconcile 模式，以及两层冒烟计划，但不会登录 Dashboard 或调用真实模型。实际迁移前另行保存 `nginx -T`、vhost checksum、systemd unit 和服务状态。
 
 此次迁移不修改 local-user SQLite、stable durable-store secret 或现有 admin/member 角色，不重跑 bootstrap，也不会自动删除 `.htpasswd-hermes`。只有通过 `nginx -T` 确认旧文件不再被引用后，才可人工清理。
 
@@ -285,6 +287,25 @@ npm run deploy -- --tag v2026.7.4 --dry-run
 npm run deploy -- --tag v2026.7.4 --keep-releases 3 --dry-run
 ```
 
+## 自动冒烟、凭据与结果判定
+
+公开真实 AI 冒烟需要在执行发布的本机安装 `playwright-cli`，并在仓库根目录准备 Git 忽略、当前用户所有、权限严格为 `0600` 的 `.env.local`：
+
+```dotenv
+HERMES_DASHBOARD_BROWSER_USERNAME=...
+HERMES_DASHBOARD_BROWSER_PASSWORD=...
+```
+
+不要读取、打印、手工复制、`source` 或提交 `.env.local`。登录 helper 只在进程内加载凭据，用 mode-`0600` 临时 JavaScript 驱动浏览器，并对异常做脱敏；凭据、cookie、WebSocket ticket、模型回复均不写入 argv 或最终总结。公开 smoke 有总 timeout，且无论成功失败都会 best-effort close/delete session、关闭 WebSocket/Playwright 并删除临时脚本。事务内 smoke 使用独立临时 `HOME`/workspace，完成后由 runner 和部署 EXIT trap 双重清理。
+
+两个 smoke runner 输出独立的 machine-readable JSON，部署脚本再输出 aggregate release summary。只接受以下结果语义：
+
+- `rolled back before commit`：远端事务未提交；旧部署已由 trap 恢复。排查 deterministic smoke 的 failure `code/check` 后重试。
+- `deployment committed and all smoke passed`：部署与发布验证均成功。
+- `deployment committed but public smoke failed`：线上版本已提交，但公开路径/真实模型验证失败；命令返回非零，且不会自动回滚。立即检查 auth、ticket、WebSocket、Owner Worker、模型配置和日志，再人工决定修复重试或发布上一稳定 tag。
+
+`--dry-run` 只展示两层 smoke 命令和 `planned` 总结，不读取本机凭据、不打开浏览器、不调用模型。
+
 ## 服务器状态检查
 
 ```bash
@@ -299,7 +320,7 @@ ssh root@106.15.186.104 'journalctl -u hermes-gateway -u hermes-dashboard --sinc
 
 AI 执行上述生产浏览器验收时，先运行 `python3 scripts/playwright_dashboard_login.py`；它从 Git 忽略的本机 `.env.local` 读取凭据，并保留已认证的 `hermes-validation` 会话。后续统一使用 `playwright-cli -s=hermes-validation ...`，结束后运行 `playwright-cli -s=hermes-validation close`。不得读取、输出或提交 `.env.local` 内容；member/admin 分别验收时使用各自独立的本机会话和凭据。
 
-APIYI smoke test 不是发布脚本必跑步骤；需要真实调用模型时再单独执行。发布脚本会做 host sandbox preflight、systemd 服务状态和 Hermes auth readiness 检查；生产验收还应使用真实 authenticated 用户验证本地文件/terminal、跨 owner 隔离、`web_search` 经 relay 成功，以及 browser 等 direct-egress 工具继续按 policy 隐藏并在直接调用时拒绝。
+APIYI 图像模型专项 smoke 不是发布脚本必跑步骤；需要验证图像能力时再单独执行。发布脚本已自动执行 host sandbox preflight、systemd 状态、Hermes auth readiness、确定性核心对话 smoke、Nginx validation 和 authenticated 公开真实文本模型 smoke；更宽的生产验收仍应使用真实 authenticated 用户验证跨 owner 隔离、`web_search` 经 relay 成功，以及 browser 等 direct-egress 工具继续按 policy 隐藏并在直接调用时拒绝。
 
 ## 常用参数
 

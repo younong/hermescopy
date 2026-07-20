@@ -644,6 +644,7 @@ release_target=""
 rollback_dir=""
 deployment_committed="0"
 services_touched="0"
+smoke_root=""
 
 gateway_unit="/etc/systemd/system/hermes-gateway.service"
 dashboard_unit="/etc/systemd/system/hermes-dashboard.service"
@@ -685,6 +686,7 @@ cleanup_release_tmp() {
     fi
   fi
   rm -rf -- "$release_tmp"
+  [ -z "$smoke_root" ] || rm -rf -- "$smoke_root"
   [ -z "$rollback_dir" ] || rm -rf -- "$rollback_dir"
   rm -f -- "$archive"
   rmdir -- "$release_lock" 2>/dev/null || true
@@ -784,7 +786,7 @@ if [[ "$migrate_nginx_hermes" != "0" && "$migrate_nginx_hermes" != "1" ]]; then
   exit 1
 fi
 
-for required in tar systemctl sha256sum readlink realpath stat sort mv getent useradd groupadd install cp find ldd sed curl; do
+for required in tar systemctl sha256sum readlink realpath stat sort mv getent useradd groupadd runuser install cp find ldd sed curl; do
   if ! command -v "$required" >/dev/null 2>&1; then
     echo "Missing required command: $required" >&2
     exit 1
@@ -1141,6 +1143,33 @@ if [ "$login_status" != "302" ] || [ "$api_status" != "401" ]; then
   exit 1
 fi
 
+# Gate the transaction with a real gateway conversation while the previous
+# deployment is still restorable. The runner receives no production env file or
+# model credentials and enforces loopback-only network access itself.
+smoke_root="$(mktemp -d "$tmp_dir/hermes-conversation-smoke.XXXXXX")"
+chown "$service_user:$service_group" "$smoke_root"
+chmod 0700 "$smoke_root"
+echo "Running deterministic conversation smoke before deployment commit"
+if ! (
+  cd "$smoke_root"
+  exec runuser -u "$service_user" -- env -i \
+    HOME="$smoke_root" \
+    TMPDIR="$smoke_root" \
+    PATH="$venv/bin:/usr/local/bin:/usr/bin:/bin" \
+    PYTHONPATH="$release" \
+    PYTHONUNBUFFERED=1 \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    "$venv/bin/python" "$release/deploy/smoke-conversation.py" --timeout 90
+); then
+  echo "HERMES_DEPLOY_STAGE deterministic_smoke=failed" >&2
+  echo "Deterministic conversation smoke failed; deployment remains uncommitted and will be rolled back" >&2
+  exit 1
+fi
+echo "HERMES_DEPLOY_STAGE deterministic_smoke=passed"
+rm -rf -- "$smoke_root"
+smoke_root=""
+
 action="reconcile"
 [ "$migrate_nginx_hermes" = "1" ] && action="migrate"
 "$venv/bin/python" "$release/deploy/nginx/manage_hermes_proxy.py" \
@@ -1150,6 +1179,7 @@ action="reconcile"
   --snippet-target /etc/nginx/snippets/hermes-dashboard.conf
 
 deployment_committed="1"
+echo "HERMES_DEPLOY_STAGE deployment=committed"
 prune_old_releases
 
 echo "Hermes deployed from $source_kind source $source_commit at $release"
@@ -1169,7 +1199,7 @@ function deployArchive(args, archivePath) {
 
   runSsh(args, ["mkdir", "-p", `${remoteRoot}/tmp`, `${remoteRoot}/releases`, `${remoteRoot}/shared/.hermes`]);
   runScp(args, archivePath, remoteArchive);
-  runSsh(
+  return runSsh(
     args,
     [
       "bash",
@@ -1191,10 +1221,28 @@ function deployArchive(args, archivePath) {
   );
 }
 
-function printSummary(args) {
+function runPublicConversationSmoke(args) {
+  const commandArgs = [
+    path.join(repoRoot, "scripts", "smoke_dashboard_conversation.py"),
+    "--url",
+    args.dashboardPublicUrl,
+    "--timeout",
+    "180",
+  ];
+  try {
+    run("python3", commandArgs, { dryRun: args.dryRun });
+    return args.dryRun ? "planned" : "passed";
+  } catch (error) {
+    console.error(`Public dashboard conversation smoke failed: ${error.message}`);
+    return "failed";
+  }
+}
+
+function printSummary(args, result) {
   const remoteRoot = args.remoteRoot.replace(/\/+$/, "");
   const target = `${args.user}@${args.host}`;
-  console.log(`\nDeploy target: ${target}:${remoteRoot}`);
+  console.log(`\nRelease validation summary`);
+  console.log(`Deploy target: ${target}:${remoteRoot}`);
   console.log(`${args.sourceKind === "commit" ? "Commit SHA" : "Tag"}: ${args.sourceKind === "commit" ? args.sourceCommit : args.sourceTag}`);
   console.log(`Current symlink: ${remoteRoot}/current -> ${remoteRoot}/releases/${args.releaseId}`);
   console.log(`State dir: ${remoteRoot}/shared/.hermes`);
@@ -1204,7 +1252,10 @@ function printSummary(args) {
   console.log(
     `Nginx: ${args.migrateNginxHermes ? "explicit legacy-block migration" : "managed snippet reconciliation"}`,
   );
-  console.log("Remote staging archive is uniquely named and removed after extraction.");
+  console.log(`Deterministic conversation smoke: ${result.deterministicSmoke}`);
+  console.log(`Public real-AI conversation smoke: ${result.publicSmoke}`);
+  console.log(`Release outcome: ${result.outcome}`);
+  console.log("Remote staging archive and deterministic smoke state are removed after use.");
   console.log(
     args.pruneReleases
       ? `Release retention: keep newest ${args.keepReleases} releases plus protected current/deployed releases`
@@ -1255,9 +1306,37 @@ function main() {
 
   args.releaseId = releaseIdFor(args);
   const { tmp, archivePath } = createArchive(args, { dryRun: args.dryRun });
+  let deploymentCommitted = false;
   try {
-    deployArchive(args, archivePath);
-    printSummary(args);
+    try {
+      const remoteResult = deployArchive(args, archivePath);
+      deploymentCommitted = args.dryRun || remoteResult.stdout.includes("HERMES_DEPLOY_STAGE deployment=committed");
+      if (!deploymentCommitted) {
+        throw new Error("remote deployment completed without a commit marker");
+      }
+    } catch (error) {
+      printSummary(args, {
+        deterministicSmoke: "failed or not reached",
+        publicSmoke: "not run",
+        outcome: "rolled back before commit",
+      });
+      throw error;
+    }
+
+    const publicSmoke = runPublicConversationSmoke(args);
+    const outcome = args.dryRun
+      ? "dry-run: deployment and both smoke layers planned"
+      : publicSmoke === "passed"
+        ? "deployment committed and all smoke passed"
+        : "deployment committed but public smoke failed";
+    printSummary(args, {
+      deterministicSmoke: args.dryRun ? "planned" : "passed",
+      publicSmoke,
+      outcome,
+    });
+    if (publicSmoke === "failed") {
+      throw new Error("deployment committed but public smoke failed; automatic rollback was not attempted");
+    }
   } finally {
     if (tmp && !args.dryRun) {
       rmSync(tmp, { recursive: true, force: true });

@@ -41,6 +41,11 @@ allowed-tools:
    - 在执行非 dry-run 发布前，确认用户确实要发布到服务器。
    - 如果用户已经明确说“现在发布/直接发布/执行部署”，可以继续。
 
+5. **两层冒烟是发布结果的一部分**
+   - 事务内确定性对话 smoke 在 Nginx/commit 前运行；失败必须报告 `rolled back before commit`。
+   - 远端 commit 后自动运行 authenticated 公开真实 AI smoke；失败必须报告 `deployment committed but public smoke failed`、返回非零，且不得自动回滚已提交版本。
+   - `--dry-run` 只确认两层 smoke 均为 `planned`，不得登录或调用模型。
+
 ## 常用命令
 
 ### 查看帮助
@@ -130,6 +135,17 @@ npm run deploy -- --help
 
 注意：创建新 tag 时，发布工具默认要求当前分支为 `main` 且工作区（含未跟踪文件）干净。工具会 fetch 并 rebase 最新 `origin/main`，无 force 推送当前分支，然后精确发布目标 tag。确实要从非 main 分支发布时，必须显式使用 `--allow-non-main`；该路径同样 rebase `origin/main`，且 detached HEAD 始终拒绝。
 
+## 自动两层冒烟
+
+发布命令自动执行：
+
+1. 远端 deterministic smoke：以非 root `hermes`、`env -i` 和隔离临时目录运行 loopback 假模型核心对话，覆盖 attachment、terminal、approval deny、stream、persistence/cold resume/continuation/delete。它不读取 `/opt/hermes/shared/.env`，也不允许非 loopback 网络。失败仍在 deployment commit 前，现有 trap 自动恢复旧版本。
+2. 本机 public smoke：远端 commit 后用 `scripts/smoke_dashboard_conversation.py` 登录公开 Dashboard，申请单次 WebSocket ticket，经 prefixed `/api/ws` 和 Owner Worker 调用真实模型，再 cold resume 并删除 session。
+
+第二层要求本机 `playwright-cli` 和仓库根目录 Git 忽略、`0600` 的 `.env.local`，其中配置 `HERMES_DASHBOARD_BROWSER_USERNAME`、`HERMES_DASHBOARD_BROWSER_PASSWORD`。绝不读取、打印、手工复制、`source` 或提交该文件；不要让凭据、cookie、ticket 或模型回复进入命令参数和总结。
+
+始终读取最终 aggregate summary 和两个 runner 的脱敏 JSON。若 public smoke 失败，线上部署已经 committed；先查 auth/WebSocket/Owner Worker/model 日志，人工决定修复重试或发布上一稳定 tag，禁止脚本自动回滚。
+
 ## 发布后验证
 
 ```bash
@@ -156,6 +172,8 @@ ssh -L 9119:localhost:9119 root@106.15.186.104
 - SSH 失败：检查 SSH key、密码、端口、安全组。
 - Python 依赖/bootstrap 失败：查看部署输出中的 `uv`/系统依赖错误，按服务器缺失依赖补齐。
 - systemd 服务启动失败：查看 `systemctl status --no-pager hermes-gateway hermes-dashboard` 和 `journalctl -u hermes-gateway -u hermes-dashboard --since "10 min ago" --no-pager -n 200`。
+- `rolled back before commit`：查看 deterministic smoke 的稳定 failure `code/check`；旧版本应已恢复，不要声称新版本发布成功。
+- `deployment committed but public smoke failed`：命令非零但新版本已在线；不要声称全部成功，也不要自动回滚。检查公开 auth/ticket/WebSocket/Owner Worker/model 后人工决策。
 - 发布错版本：用 `npm run deploy -- --tag <previous-tag>` 回滚。
 
 ## 输出要求
@@ -165,5 +183,7 @@ ssh -L 9119:localhost:9119 root@106.15.186.104
 - 发布/部署的 tag。
 - 是否真实部署，还是 dry-run。
 - 服务器路径 `/opt/hermes/releases/<tag>` 和 `/opt/hermes/current`。
+- deterministic smoke 和 public smoke 的各自状态、稳定 failure `code/check`（如有）及 cleanup 结果；不得包含 assistant 内容或认证材料。
+- aggregate outcome 必须原样归类为 `rolled back before commit`、`deployment committed and all smoke passed` 或 `deployment committed but public smoke failed`；dry-run 标记两层均为 `planned`。
 - 验证命令结果。
-- 如果失败，说明失败在哪一步，不要声称发布成功。
+- 如果失败，说明失败在哪一步，不要声称发布成功；public smoke 失败时同时明确部署已经 committed 且未自动回滚。
