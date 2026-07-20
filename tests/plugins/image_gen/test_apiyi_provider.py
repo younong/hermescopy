@@ -149,7 +149,7 @@ class TestGenerate:
         assert result["upstream_model"] == "gpt-image-2"
         saved = Path(result["image"])
         assert saved.exists()
-        assert saved.parent == tmp_path / "cache" / "images"
+        assert saved.parent == tmp_path / "images"
 
         url, kwargs = calls[0]
         assert url == "https://api.apiyi.com/v1/images/generations"

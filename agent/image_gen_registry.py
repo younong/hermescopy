@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from agent.image_gen_provider import ImageGenProvider
@@ -72,24 +73,18 @@ def get_provider(name: str) -> Optional[ImageGenProvider]:
         return _providers.get(name.strip())
 
 
-def get_active_provider() -> Optional[ImageGenProvider]:
-    """Resolve the currently-active provider.
+@dataclass(frozen=True)
+class ImageGenResolution:
+    """One provider-selection result shared by tool checks and dispatch."""
 
-    Reads ``image_gen.provider`` from config.yaml; falls back per the
-    module docstring.
+    provider: Optional[ImageGenProvider]
+    configured_name: Optional[str]
+    explicit: bool
+    available: bool
+    error_type: Optional[str] = None
 
-    **Availability semantics** (mirrors :mod:`agent.web_search_registry`):
 
-    - When ``image_gen.provider`` is explicitly set, the configured
-      provider is returned even if :meth:`ImageGenProvider.is_available`
-      reports False — the dispatcher surfaces a precise "X_API_KEY is not
-      set" error rather than silently switching backends.
-    - When ``image_gen.provider`` is unset, the fallback path (single-
-      provider shortcut and the FAL legacy preference) is filtered by
-      ``is_available()`` so we don't pick a provider the user has no
-      credentials for.
-    """
-    configured: Optional[str] = None
+def _configured_provider_name() -> Optional[str]:
     try:
         from hermes_cli.config import load_config
 
@@ -98,45 +93,81 @@ def get_active_provider() -> Optional[ImageGenProvider]:
         if isinstance(section, dict):
             raw = section.get("provider")
             if isinstance(raw, str) and raw.strip():
-                configured = raw.strip()
+                return raw.strip()
     except Exception as exc:
         logger.debug("Could not read image_gen.provider from config: %s", exc)
+    return None
+
+
+def _is_available_safe(provider: ImageGenProvider) -> bool:
+    try:
+        return bool(provider.is_available())
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "image_gen provider %s.is_available() raised %s",
+            provider.name,
+            exc,
+        )
+        return False
+
+
+def resolve_active_provider(
+    configured_name: Optional[str] = None,
+    *,
+    read_config: bool = True,
+) -> ImageGenResolution:
+    """Resolve selection, availability, and explicit-config errors once.
+
+    ``read_config=False`` lets callers that already loaded the setting pass an
+    authoritative value without a second config read. Explicit configuration
+    never falls back to another backend.
+    """
+    configured = _configured_provider_name() if read_config else configured_name
+    if isinstance(configured, str):
+        configured = configured.strip() or None
 
     with _lock:
         snapshot = dict(_providers)
 
-    def _is_available_safe(p: ImageGenProvider) -> bool:
-        """Wrap ``is_available()`` so a buggy provider doesn't kill resolution."""
-        try:
-            return bool(p.is_available())
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("image_gen provider %s.is_available() raised %s", p.name, exc)
-            return False
-
-    # 1. Explicit config wins — return regardless of is_available() so the
-    #    user gets a precise downstream error message rather than a silent
-    #    backend switch.
     if configured:
         provider = snapshot.get(configured)
-        if provider is not None:
-            return provider
-        logger.debug(
-            "image_gen.provider='%s' configured but not registered; falling back",
-            configured,
+        if provider is None:
+            return ImageGenResolution(
+                provider=None,
+                configured_name=configured,
+                explicit=True,
+                available=False,
+                error_type="provider_not_registered",
+            )
+        available = _is_available_safe(provider)
+        return ImageGenResolution(
+            provider=provider,
+            configured_name=configured,
+            explicit=True,
+            available=available,
+            error_type=None if available else "provider_unavailable",
         )
 
-    # 2. Fallback: single registered provider — but only if it's actually
-    #    available (no credentials = don't surface it as "active").
     available = [p for p in snapshot.values() if _is_available_safe(p)]
     if len(available) == 1:
-        return available[0]
+        return ImageGenResolution(available[0], None, False, True)
 
-    # 3. Fallback: prefer legacy FAL for backward compat, when available.
     fal = snapshot.get("fal")
-    if fal is not None and _is_available_safe(fal):
-        return fal
+    if fal is not None and fal in available:
+        return ImageGenResolution(fal, None, False, True)
 
-    return None
+    return ImageGenResolution(
+        provider=None,
+        configured_name=None,
+        explicit=False,
+        available=False,
+        error_type="provider_ambiguous" if available else "provider_unavailable",
+    )
+
+
+def get_active_provider() -> Optional[ImageGenProvider]:
+    """Return the active provider, preserving the historical convenience API."""
+    return resolve_active_provider().provider
 
 
 def _reset_for_tests() -> None:

@@ -207,12 +207,18 @@ Combine:
 
 Save the assembled prompt to `prompts/infographic.md` using `write_file`.
 
-### Step 6: Generate Image
+### Step 6: Generate Image (Required)
 
-Use the `image_generate` tool with the assembled prompt from Step 5.
+Use the `image_generate` tool with the assembled prompt from Step 5. For a final
+poster or infographic, this call is mandatory: do not replace it with hand-written
+SVG/HTML or another file-generation workflow. If `image_generate` is unavailable,
+report the provider/configuration error instead of silently changing output format.
+Only generate editable SVG/HTML source when the user explicitly requests editable
+vector/source output.
 
 - Map aspect ratio to image_generate's format: `16:9` → `landscape`, `9:16` → `portrait`, `1:1` → `square`
 - For custom ratios, pick the closest named aspect
+- When source/reference images were attached and the active model supports image input, pass their absolute local paths via `image_url` / `reference_image_urls`
 - On failure, auto-retry once
 - Save the resulting image URL/path to the output directory
 

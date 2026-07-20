@@ -9172,10 +9172,11 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
     turns = []
     emitted = []
 
-    def _fake_run_prompt_submit(rid, sid, session, text):
-        turns.append(text)
+    def _fake_run_prompt_submit(rid, sid, session, text, *, generation=None):
+        turns.append((text, generation))
         with session["history_lock"]:
-            session["running"] = False
+            if session.get("_active_turn_generation") == generation:
+                session["running"] = False
 
     sess = _session()
     server._sessions["sid_watch_dedup"] = sess

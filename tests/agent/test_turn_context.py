@@ -74,6 +74,7 @@ class _FakeAgent:
         self._invalid_tool_retries = -1
         self._vision_supported = None
         self._persist_calls = 0
+        self._activity = []
         # Records _cached_system_prompt at the moment _ensure_db_session()
         # is called (regression guard for #45499 turn-setup ordering).
         self._ensure_db_prompt_at_call = "<unset>"
@@ -102,6 +103,9 @@ class _FakeAgent:
 
     def _persist_session(self, *_a, **_k):
         self._persist_calls += 1
+
+    def _touch_activity(self, desc):
+        self._activity.append(desc)
 
 
 def _make_agent_with_cooldown(db_path, session_id, *, cooldown_until=None):
@@ -403,3 +407,30 @@ def test_expired_cooldown_allows_preflight(tmp_path):
     agent._emit_status.assert_called_once()
     agent._compress_context.assert_called()
 
+
+
+def test_turn_context_records_phase_activity():
+    agent = _FakeAgent()
+    _build(agent)
+    assert agent._activity == [
+        "turn context: system_prompt",
+        "turn context: session_persistence",
+        "turn context: preflight_compression",
+        "turn context: deferred_skill",
+        "turn context: pre_llm_call",
+    ]
+
+
+def test_pre_llm_hook_timeout_degrades_without_blocking(monkeypatch):
+    agent = _FakeAgent()
+    seen = {}
+
+    def fake_hook(_name, *, timeout_seconds=None, **_kwargs):
+        seen["timeout"] = timeout_seconds
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_hook)
+    ctx = _build(agent)
+    assert seen["timeout"] == 5.0
+    assert ctx.plugin_user_context == ""
+    assert agent._execution_thread_id is not None

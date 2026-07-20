@@ -18,7 +18,7 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     source = DEPLOY.read_text(encoding="utf-8")
 
     assert 'runtimes_dir="$remote_root/runtimes/python"' in source
-    assert 'runtime_id="py311-${"${"}architecture}-${"${"}lock_hash}-sandbox4"' in source
+    assert 'runtime_id="py311-${"${"}architecture}-${"${"}lock_hash}-sandbox5"' in source
     assert 'venv="$shared/venv"' not in source
     assert 'service_user="hermes"' in source
     assert 'service_group="hermes"' in source
@@ -49,6 +49,8 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert 'ldd "$extension"' in source
     assert 'for destination in /bin /usr/bin /lib /lib64 /usr/lib /usr/lib64; do' in source
     assert 'runtime_tmp/toolchain' in source
+    assert 'executor_commands="bash sh ls pwd printf cat chmod grep find head mktemp mv rm stat"' in source
+    assert source.count('for command in $executor_commands; do') == 2
     assert 'command_path="$(type -P "$command" || true)"' in source
     assert 'command_path="$(command -v "$command" || true)"' not in source
     assert 'chown -R root:root "$release_tmp"' in source

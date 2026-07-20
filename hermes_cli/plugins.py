@@ -1844,7 +1844,13 @@ class PluginManager:
     # Hook invocation
     # -----------------------------------------------------------------------
 
-    def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
+    def invoke_hook(
+        self,
+        hook_name: str,
+        *,
+        timeout_seconds: Optional[float] = None,
+        **kwargs: Any,
+    ) -> List[Any]:
         """Call all registered callbacks for *hook_name*.
 
         Each callback is wrapped in its own try/except so a misbehaving
@@ -1868,15 +1874,46 @@ class PluginManager:
         callbacks = self._hooks.get(hook_name, [])
         results: List[Any] = []
         for cb in callbacks:
+            callback_name = getattr(cb, "__name__", repr(cb))
             try:
-                ret = cb(**kwargs)
+                if timeout_seconds is None:
+                    ret = cb(**kwargs)
+                else:
+                    outcome: Dict[str, Any] = {}
+                    done = threading.Event()
+
+                    def _call() -> None:
+                        try:
+                            outcome["value"] = cb(**kwargs)
+                        except BaseException as exc:  # surfaced on caller thread
+                            outcome["error"] = exc
+                        finally:
+                            done.set()
+
+                    worker = threading.Thread(
+                        target=_call,
+                        daemon=True,
+                        name=f"plugin-hook-{hook_name}",
+                    )
+                    worker.start()
+                    if not done.wait(max(0.0, timeout_seconds)):
+                        logger.warning(
+                            "Hook '%s' callback %s timed out after %.1fs; skipped",
+                            hook_name,
+                            callback_name,
+                            timeout_seconds,
+                        )
+                        continue
+                    if "error" in outcome:
+                        raise outcome["error"]
+                    ret = outcome.get("value")
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:
                 logger.warning(
                     "Hook '%s' callback %s raised: %s",
                     hook_name,
-                    getattr(cb, "__name__", repr(cb)),
+                    callback_name,
                     exc,
                 )
         return results
@@ -2001,12 +2038,16 @@ def discover_plugins(force: bool = False) -> None:
     get_plugin_manager().discover_and_load(force=force)
 
 
-def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
-    """Invoke a lifecycle hook on all loaded plugins.
-
-    Returns a list of non-``None`` return values from plugin callbacks.
-    """
-    return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+def invoke_hook(
+    hook_name: str,
+    *,
+    timeout_seconds: Optional[float] = None,
+    **kwargs: Any,
+) -> List[Any]:
+    """Invoke a lifecycle hook on all loaded plugins."""
+    return get_plugin_manager().invoke_hook(
+        hook_name, timeout_seconds=timeout_seconds, **kwargs
+    )
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
