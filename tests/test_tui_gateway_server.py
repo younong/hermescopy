@@ -1806,6 +1806,27 @@ def test_resolve_model_strips_config_model(monkeypatch):
     assert server._resolve_model() == "nous/hermes-test"
 
 
+def _set_deployment_model_env(monkeypatch):
+    monkeypatch.delenv("HERMES_MODEL", raising=False)
+    monkeypatch.delenv("HERMES_INFERENCE_MODEL", raising=False)
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_PROVIDER", "custom:codex")
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", "gpt-5.6-sol")
+    monkeypatch.setenv(
+        "HERMES_DEPLOYMENT_INFERENCE_API_MODE", "chat_completions"
+    )
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", "policy-v1")
+    monkeypatch.setenv(
+        "HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", "gpt-5.6-sol"
+    )
+
+
+def test_resolve_model_uses_deployment_default_when_model_field_is_missing(monkeypatch):
+    _set_deployment_model_env(monkeypatch)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"agent": {"max_turns": 90}})
+
+    assert server._resolve_model() == "gpt-5.6-sol"
+
+
 @pytest.mark.parametrize(
     "configured_model",
     [
@@ -1818,34 +1839,14 @@ def test_resolve_model_strips_config_model(monkeypatch):
 def test_resolve_model_uses_deployment_default_for_blank_config(
     monkeypatch, configured_model
 ):
-    monkeypatch.delenv("HERMES_MODEL", raising=False)
-    monkeypatch.delenv("HERMES_INFERENCE_MODEL", raising=False)
-    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_PROVIDER", "custom:codex")
-    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", "gpt-5.6-sol")
-    monkeypatch.setenv(
-        "HERMES_DEPLOYMENT_INFERENCE_API_MODE", "chat_completions"
-    )
-    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", "policy-v1")
-    monkeypatch.setenv(
-        "HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", "gpt-5.6-sol"
-    )
+    _set_deployment_model_env(monkeypatch)
     monkeypatch.setattr(server, "_load_cfg", lambda: {"model": configured_model})
 
     assert server._resolve_model() == "gpt-5.6-sol"
 
 
 def test_resolve_model_config_wins_over_deployment_default(monkeypatch):
-    monkeypatch.delenv("HERMES_MODEL", raising=False)
-    monkeypatch.delenv("HERMES_INFERENCE_MODEL", raising=False)
-    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_PROVIDER", "custom:codex")
-    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", "gpt-5.6-sol")
-    monkeypatch.setenv(
-        "HERMES_DEPLOYMENT_INFERENCE_API_MODE", "chat_completions"
-    )
-    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", "policy-v1")
-    monkeypatch.setenv(
-        "HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", "gpt-5.6-sol"
-    )
+    _set_deployment_model_env(monkeypatch)
     monkeypatch.setattr(
         server, "_load_cfg", lambda: {"model": {"default": "owner/model"}}
     )

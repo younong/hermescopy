@@ -127,10 +127,14 @@ def test_make_agent_does_not_replace_explicit_model_with_runtime_model():
     assert mock_agent.call_args.kwargs["model"] == "owner/explicit-model"
 
 
-def test_blank_owner_home_builds_agent_with_deployment_runtime(monkeypatch, tmp_path):
+def test_owner_home_without_model_field_builds_agent_with_deployment_runtime(
+    monkeypatch, tmp_path
+):
     home = tmp_path / "owner-home"
     home.mkdir()
-    (home / "config.yaml").write_text("model:\n", encoding="utf-8")
+    (home / "config.yaml").write_text(
+        "agent:\n  max_turns: 90\n", encoding="utf-8"
+    )
     deployment_env = {
         "HERMES_HOME": str(home),
         "HERMES_OWNER_KEY": "ok1_test",
