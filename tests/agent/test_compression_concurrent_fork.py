@@ -654,7 +654,7 @@ def test_auto_compression_passes_deadline_but_manual_does_not(tmp_path: Path) ->
     with patch("agent.conversation_compression.time.monotonic", return_value=100.0):
         agent._compress_context(messages, "sys", approx_tokens=120_000)
     auto_kwargs = agent.context_compressor.compress.call_args.kwargs
-    assert auto_kwargs["deadline_monotonic"] == 145.0
+    assert auto_kwargs["deadline_monotonic"] == 280.0
 
     agent.context_compressor.compress.reset_mock()
     agent._compress_context(messages, "sys", approx_tokens=120_000, force=True)
