@@ -1,15 +1,30 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 
 
 DEPLOY_SCRIPT = Path(__file__).parents[2] / "deploy" / "deploy.mjs"
 
 
-def _run(args: list[str], cwd: Path, *, check: bool = True) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(args, cwd=cwd, check=False, capture_output=True, text=True)
+def _run(
+    args: list[str],
+    cwd: Path,
+    *,
+    check: bool = True,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        args,
+        cwd=cwd,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
     if check and result.returncode != 0:
         raise AssertionError(
             f"command failed ({result.returncode}): {' '.join(args)}\n"
@@ -57,6 +72,7 @@ def _prepare(
     *,
     allow_non_main: bool = False,
     dry_run: bool = False,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     script_url = DEPLOY_SCRIPT.as_uri()
     source = f"""
@@ -86,11 +102,44 @@ try {{
         ],
         work,
         check=False,
+        env=env,
     )
 
 
 def _ref(repo: Path, ref: str) -> str:
     return _git(repo, "rev-parse", ref).stdout.strip()
+
+
+def _move_remote_branch_before_push(
+    tmp_path: Path,
+    origin: Path,
+    branch: str,
+    commit: str,
+    *,
+    push_number: int,
+) -> dict[str, str]:
+    wrapper_dir = tmp_path / "git-wrapper"
+    wrapper_dir.mkdir()
+    wrapper = wrapper_dir / "git"
+    counter = wrapper_dir / "push-count"
+    real_git = shutil.which("git")
+    assert real_git is not None
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        f'counter="{counter}"\n'
+        'if [ "$1" = push ]; then\n'
+        '  count=0\n'
+        '  [ ! -f "$counter" ] || count="$(cat "$counter")"\n'
+        '  count=$((count + 1))\n'
+        '  printf "%s\n" "$count" > "$counter"\n'
+        f'  if [ "$count" -eq {push_number} ]; then\n'
+        f'    "{real_git}" --git-dir="{origin}" update-ref refs/heads/{branch} {commit}\n'
+        "  fi\n"
+        "fi\n"
+        f'exec "{real_git}" "$@"\n'
+    )
+    wrapper.chmod(0o755)
+    return {**os.environ, "PATH": f"{wrapper_dir}{os.pathsep}{os.environ['PATH']}"}
 
 
 def test_stale_clean_main_is_updated_before_the_release_tag(tmp_path):
@@ -175,11 +224,20 @@ def test_dry_run_reports_sync_without_changing_refs(tmp_path):
     assert _git(origin, "show-ref").stdout == before_remote
     assert "git fetch --no-tags origin" in result.stdout
     assert "git rebase --no-autostash refs/remotes/origin/main" in result.stdout
-    assert "git push origin <post-rebase-commit>:refs/heads/main" in result.stdout
+    remote_main = _ref(origin, "refs/heads/main")
+    assert (
+        f"git push --force-with-lease=refs/heads/main:{remote_main} origin "
+        "<post-rebase-commit>:refs/heads/main"
+    ) in result.stdout
     assert "git tag -a v-test-dry-run" in result.stdout
-    assert "git push --atomic origin" in result.stdout
+    assert (
+        "git push --atomic "
+        "--force-with-lease=refs/heads/main:<post-rebase-commit> origin"
+    ) in result.stdout
+    push_lines = [line for line in result.stdout.splitlines() if "git push" in line]
+    assert all(" --force " not in line and " +" not in line for line in push_lines)
+    assert all("--force-with-lease=refs/heads/main:" in line for line in push_lines)
     assert "--tags" not in result.stdout
-    assert "--force" not in result.stdout
 
 
 def test_existing_remote_tag_is_not_overwritten(tmp_path):
@@ -207,21 +265,68 @@ def test_detached_head_is_rejected_even_with_non_main_override(tmp_path):
     assert _git(origin, "show-ref").stdout == before_remote
 
 
-def test_non_fast_forward_branch_push_stops_before_tag_creation(tmp_path):
+def test_exact_lease_rewrites_existing_remote_branch_after_rebase(tmp_path):
     origin, seed, work = _repositories(tmp_path)
     _git(seed, "checkout", "-b", "release/candidate")
-    remote_branch = _commit_file(seed, "remote-branch.txt", "remote branch\n", "remote branch")
+    old_remote = _commit_file(seed, "remote-branch.txt", "remote branch\n", "remote branch")
     _git(seed, "push", "origin", "release/candidate")
     _git(work, "checkout", "-b", "release/candidate")
-    _commit_file(work, "local-branch.txt", "local branch\n", "local branch")
+    old_local = _commit_file(work, "local-branch.txt", "local branch\n", "local branch")
 
     result = _prepare(work, "v-test-non-ff", allow_non_main=True)
 
+    assert result.returncode == 0, result.stderr
+    prepared = _ref(work, "HEAD")
+    assert prepared == old_local
+    assert prepared != old_remote
+    assert _ref(origin, "refs/heads/release/candidate") == prepared
+    assert _ref(origin, "refs/tags/v-test-non-ff^{commit}") == prepared
+
+
+def test_exact_lease_preserves_branch_that_moves_before_initial_push(tmp_path):
+    origin, seed, work = _repositories(tmp_path)
+    _git(seed, "checkout", "-b", "release/candidate")
+    _commit_file(seed, "remote-branch.txt", "remote branch\n", "remote branch")
+    _git(seed, "push", "origin", "release/candidate")
+    concurrent = _commit_file(seed, "concurrent.txt", "concurrent\n", "concurrent update")
+    _git(seed, "push", "origin", "HEAD:refs/heads/race-source")
+    _git(work, "checkout", "-b", "release/candidate")
+    _commit_file(work, "local-branch.txt", "local branch\n", "local branch")
+    env = _move_remote_branch_before_push(
+        tmp_path, origin, "release/candidate", concurrent, push_number=1
+    )
+
+    result = _prepare(work, "v-test-initial-race", allow_non_main=True, env=env)
+
     assert result.returncode != 0
-    assert "git push origin" in result.stderr
-    assert _ref(origin, "refs/heads/release/candidate") == remote_branch
-    assert _git(work, "rev-parse", "--verify", "refs/tags/v-test-non-ff", check=False).returncode != 0
-    assert _git(origin, "rev-parse", "--verify", "refs/tags/v-test-non-ff", check=False).returncode != 0
+    assert "stale info" in result.stderr or "rejected" in result.stderr
+    assert _ref(origin, "refs/heads/release/candidate") == concurrent
+    assert _git(work, "rev-parse", "--verify", "refs/tags/v-test-initial-race", check=False).returncode != 0
+    assert _git(origin, "rev-parse", "--verify", "refs/tags/v-test-initial-race", check=False).returncode != 0
+
+
+def test_exact_lease_rejects_branch_move_before_atomic_tag_push(tmp_path):
+    origin, seed, work = _repositories(tmp_path)
+    _git(seed, "checkout", "-b", "release/candidate")
+    _commit_file(seed, "remote-branch.txt", "remote branch\n", "remote branch")
+    _git(seed, "push", "origin", "release/candidate")
+    concurrent = _commit_file(seed, "concurrent.txt", "concurrent\n", "concurrent update")
+    _git(seed, "push", "origin", "HEAD:refs/heads/race-source")
+    _git(work, "checkout", "-b", "release/candidate")
+    _commit_file(work, "local-branch.txt", "local branch\n", "local branch")
+    _git(work, "tag", "unrelated-local-tag")
+    env = _move_remote_branch_before_push(
+        tmp_path, origin, "release/candidate", concurrent, push_number=2
+    )
+
+    result = _prepare(work, "v-test-atomic-race", allow_non_main=True, env=env)
+
+    assert result.returncode != 0
+    assert "stale info" in result.stderr or "rejected" in result.stderr
+    assert _ref(origin, "refs/heads/release/candidate") == concurrent
+    assert _git(work, "rev-parse", "--verify", "refs/tags/v-test-atomic-race", check=False).returncode != 0
+    assert _git(origin, "rev-parse", "--verify", "refs/tags/v-test-atomic-race", check=False).returncode != 0
+    assert _git(work, "rev-parse", "--verify", "refs/tags/unrelated-local-tag").returncode == 0
 
 
 def test_atomic_tag_rejection_cleans_only_the_new_local_tag(tmp_path):

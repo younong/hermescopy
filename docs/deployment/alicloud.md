@@ -121,7 +121,7 @@ git commit  # 按实际改动选择并提交
 npm run deploy -- --create-tag v2026.7.4
 ```
 
-`--create-tag` 会先精确获取最新 `origin/main`，将当前发布分支 rebase 到该基线，再无 force 地把 prepared commit 推送到远端同名分支。分支推送成功后才创建 annotated tag，并通过 atomic push 同时守卫远端分支和发布唯一目标 tag；不会使用 `--tags` 推送其他本地 tag。这样，即使本地 `main` 干净但过期，也不能在同步最新 `origin/main` 前发布。
+`--create-tag` 会先同时快照最新 `origin/main` 和远端同名 PR/源分支的精确 SHA，将当前发布分支 rebase 到该 main 基线，再用 `--force-with-lease=<完整分支 ref>:<observed SHA>` 把 prepared commit 更新到原远端分支。只有 lease 匹配且分支更新成功后才创建 annotated tag；随后通过带 prepared commit 精确 lease 的 atomic push 同时守卫远端分支和发布唯一目标 tag。不会使用无守卫的 `--force`、裸/隐式 lease、`+` refspec 或 `--tags`。这样既能保证 PR 远端分支包含 rebase 结果，也不会覆盖快照后出现的并发更新。
 
 如果当前分支不是 `main`，工具会拒绝创建 tag。确实需要从其他具名分支发布时显式加：
 
@@ -129,14 +129,14 @@ npm run deploy -- --create-tag v2026.7.4
 npm run deploy -- --create-tag v2026.7.4-test --allow-non-main
 ```
 
-`--allow-non-main` 仍会把当前分支 rebase 到最新 `origin/main`，再推送远端同名分支；它不允许 detached HEAD，也不会在 non-fast-forward 时 force push。遇到 rebase 冲突或远端分支并发更新时，工具会停止且不发布新 tag，需要人工检查并解决后重试。
+`--allow-non-main` 仍会把当前分支 rebase 到最新 `origin/main`，再用相同的精确 lease 更新远端同名分支；它不允许 detached HEAD。rebase 导致的 non-fast-forward 更新只允许走这条完整 ref + observed SHA 的 lease 路径。遇到 rebase 冲突或远端分支在快照后发生并发更新时，工具会停止且不发布新 tag，需要 fetch、检查并重试。
 
 新 tag 的 Git 准备和部署过程会：
 
 1. 要求具名发布分支和干净工作区，并确认本地/远端目标 tag 都不存在。
 2. Fetch 最新 `origin/main`，以 `--no-autostash` rebase 当前发布分支；冲突时 abort 并停止。
-3. 无 force 地推送 prepared commit 到远端同名分支。
-4. 在 prepared commit 创建 annotated tag，并 atomic push 该分支守卫和唯一目标 tag。
+3. 用绑定 rebase 前远端分支 SHA 的精确 `--force-with-lease` 更新远端同名 PR/源分支；远端原本不存在时用空 expected-value lease 守卫创建。
+4. 在 prepared commit 创建 annotated tag，并用绑定 prepared commit 的精确 lease atomic push 该分支守卫和唯一目标 tag。
 5. 校验本地 tag、远端 tag 和远端分支都指向同一 prepared commit；不一致时停止部署。
 
 随后部署会：
@@ -273,8 +273,8 @@ npm run deploy -- --tag v2026.7.4 --no-prune-releases
 
 - 工作区不干净：人工选择要提交的文件并 commit，或自行 stash；发布工具不会自动处理。
 - Rebase 冲突：工具会尝试 `git rebase --abort` 并停止。检查分支状态，人工解决与最新 `origin/main` 的冲突后重试。
-- 分支 push 被拒绝：说明远端同名分支存在 non-fast-forward 或并发更新；fetch 并检查新增提交，禁止 force push 发布。
-- Atomic tag push 失败：工具不会降级为无守卫的 tag-only push，也不会覆盖/删除远端 tag；未发布且由本次创建的本地 tag会安全清理。
+- 精确 lease push 被拒绝：说明远端同名分支在发布快照后发生了并发更新；fetch 并检查新增提交后重新 rebase/retry。禁止改用无守卫的 `--force`、裸/隐式 lease 或 `+` refspec。
+- Atomic tag push 失败：工具不会降级为无守卫的 tag-only push，也不会覆盖/删除远端 tag；若 prepared commit lease 失效，atomic transaction 会整体拒绝；未发布且由本次创建的本地 tag 会安全清理。
 - Tag 已验证发布但后续校验、构建或部署停止：tag 是不可变发布来源，不会自动删除。检查远端分支/tag 后，只有明确要部署该 commit 时才用 `npm run deploy -- --tag <tag>` 重试。
 
 ## Dry run
