@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import math
 import os
 import socket
@@ -13,9 +14,11 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any, Callable
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_bundled_skills_dir, get_hermes_home
+from hermes_cli import __release_date__, __version__
 from hermes_cli.dashboard_auth.audit import (
     AuthorityAuditEvent,
     AuthorityAuditReason,
@@ -40,6 +43,7 @@ from hermes_cli.owner_runtime import (
     owner_worker_runtime_paths,
     owner_worker_socket_path,
 )
+from hermes_cli.revision_fingerprint import read_git_revision_fingerprint
 
 from .client import OwnerWorkerClient, OwnerWorkerHealthError
 from .tokens import owner_worker_capability_public_config
@@ -70,13 +74,89 @@ class OwnerWorkerStartupError(OwnerWorkerUnavailableError):
     """Raised when an Owner Worker exits or fails health checks during startup."""
 
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_OWNER_WORKER_SKILLS_STAMP = ".owner_worker_bundled_sync_stamp"
+
+
+def _path_state(path: Path) -> str:
+    try:
+        metadata = path.stat()
+        return f"{path.resolve()}:{metadata.st_mtime_ns}:{metadata.st_size}"
+    except OSError:
+        return f"{path}:missing"
+
+
+def _owner_worker_skills_fingerprint(owner_home: Path) -> str:
+    """Return a cheap invalidation key for owner startup skill synchronization."""
+    checkout_skills_dir = (_PROJECT_ROOT / "skills").resolve()
+    bundled_dir = get_bundled_skills_dir(checkout_skills_dir).resolve()
+    source = (
+        read_git_revision_fingerprint(_PROJECT_ROOT)
+        if bundled_dir == checkout_skills_dir
+        else None
+    )
+    if not source:
+        source = (
+            f"skills:{__version__}:{__release_date__}:"
+            f"{_path_state(bundled_dir)}"
+        )
+
+    # These owner-local inputs can change sync behavior without a Hermes update.
+    # Record metadata only; no config or skill content enters the stamp.
+    owner_inputs = (
+        _path_state(owner_home / ".no-bundled-skills"),
+        _path_state(owner_home / "config.yaml"),
+        _path_state(owner_home / "skills" / ".curator_suppressed"),
+    )
+    payload = "\n".join((source, *owner_inputs))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _owner_worker_skills_stamp_path(owner_home: Path) -> Path:
+    return owner_home / "skills" / _OWNER_WORKER_SKILLS_STAMP
+
+
+def _mark_owner_worker_skills_synced(owner_home: Path, fingerprint: str) -> None:
+    """Best-effort atomic stamp; failure merely forces another real sync."""
+    stamp = _owner_worker_skills_stamp_path(owner_home)
+    temp_path: Path | None = None
+    try:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        with NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=stamp.parent,
+            prefix=f".{stamp.name}.",
+            delete=False,
+        ) as handle:
+            handle.write(fingerprint + "\n")
+            temp_path = Path(handle.name)
+        os.replace(temp_path, stamp)
+    except OSError:
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
 def _seed_owner_worker_skills(owner_home: Path) -> dict[str, Any]:
-    """Synchronize bundled skills before an owner worker imports skill state."""
+    """Synchronize changed bundled skills before the worker imports skill state."""
+    fingerprint = _owner_worker_skills_fingerprint(owner_home)
+    try:
+        if _owner_worker_skills_stamp_path(owner_home).read_text(
+            encoding="utf-8"
+        ).strip() == fingerprint:
+            return {"copied": [], "updated": [], "skipped_fresh": True}
+    except OSError:
+        pass
+
     from hermes_cli.profiles import seed_profile_skills
 
     result = seed_profile_skills(owner_home, quiet=True)
     if result is None:
         raise RuntimeError("owner bundled skill synchronization failed")
+    _mark_owner_worker_skills_synced(owner_home, fingerprint)
     return result
 
 
@@ -344,7 +424,6 @@ class OwnerWorkerSupervisor:
         *,
         deadline: float,
     ) -> OwnerWorkerHandle:
-        ensure_owner_runtime_dirs(owner_home)
         try:
             claim = self.authority_store.claim_worker_start(owner_key, worker_id=uuid.uuid4().hex)
         except AuthorizationRejected as exc:
