@@ -70,8 +70,7 @@ export function GuiChatShell() {
   }, []);
 
   useEffect(() => dashboardAuthTransition.register(() => {
-    switchCoordinatorRef.current?.dispose();
-    switchCoordinatorRef.current = null;
+    switchCoordinatorRef.current?.cancel();
     connectionRef.current = null;
     eventFrameQueue.reset();
     dispatch({ type: "reset" });

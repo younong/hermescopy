@@ -192,6 +192,27 @@ describe("GuiChatSessionSwitchCoordinator", () => {
     ]);
   });
 
+  it("can start after cancellation without disposing the reusable connection", async () => {
+    const { commits, connection, coordinator } = createHarness();
+    const stale = connection.nextResult();
+    coordinator.start("stale");
+    const staleSignal = connection.createOrAttach.mock.calls[0]?.[2];
+
+    coordinator.cancel();
+    expect(staleSignal?.aborted).toBe(true);
+    expect(connection.close).not.toHaveBeenCalled();
+
+    const current = connection.nextResult();
+    coordinator.start("current");
+    stale.resolve(resumeResponse("runtime-stale"));
+    current.resolve(resumeResponse("runtime-current"));
+    await flushPromises();
+
+    expect(commits).toHaveLength(1);
+    expect(commits[0]?.target).toBe("current");
+    expect(connection.close).not.toHaveBeenCalled();
+  });
+
   it("closes the reusable connection only on dispose", async () => {
     const { connection, coordinator } = createHarness();
     connection.nextResult();
