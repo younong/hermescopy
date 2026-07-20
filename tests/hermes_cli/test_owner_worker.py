@@ -84,9 +84,15 @@ class _FakeProcess:
 @pytest.fixture(autouse=True)
 def _simulate_linux_controlled_roots(monkeypatch):
     import hermes_cli.controlled_roots as controlled_roots
+    import hermes_cli.owner_worker.supervisor as supervisor_module
 
     monkeypatch.setattr(controlled_roots.ControlledRoots, "_require_linux", lambda _self: None)
     monkeypatch.setattr(controlled_roots, "_openat2", lambda *_args: None)
+    monkeypatch.setattr(
+        supervisor_module,
+        "_seed_owner_worker_skills",
+        lambda _owner_home: {"copied": [], "updated": []},
+    )
 
 
 class _FakeClient:
@@ -448,6 +454,75 @@ def test_child_token_ttl_is_bounded(monkeypatch):
     monkeypatch.setenv("HERMES_OWNER_WORKER_CHILD_TOKEN_TTL_SECONDS", str(99 * 60 * 60))
 
     assert child_token_ttl_seconds() == 24 * 60 * 60
+
+
+def test_supervisor_syncs_owner_skills_before_process_launch(tmp_path, monkeypatch):
+    import hermes_cli.owner_worker.supervisor as supervisor_module
+
+    owner = _Owner("ok1_skill_sync", tmp_path / "owner")
+    events: list[tuple[str, Path]] = []
+
+    def fake_seed(owner_home: Path):
+        events.append(("seed", Path(owner_home)))
+        skill = Path(owner_home) / "skills" / "productivity" / "common-files"
+        skill.mkdir(parents=True)
+        skill.joinpath("SKILL.md").write_text(
+            "---\nname: common-files\ndescription: test\n---\n",
+            encoding="utf-8",
+        )
+        return {"copied": ["common-files"]}
+
+    def fake_process_factory(*args, **kwargs):
+        del kwargs
+        argv = args[0]
+        events.append(("spawn", owner.owner_home))
+        assert owner.owner_home.joinpath(
+            "skills/productivity/common-files/SKILL.md"
+        ).is_file()
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    monkeypatch.setattr(supervisor_module, "_seed_owner_worker_skills", fake_seed)
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+    )
+
+    supervisor.get_or_start(owner)
+
+    assert events == [("seed", owner.owner_home), ("spawn", owner.owner_home)]
+    supervisor.shutdown()
+
+
+def test_supervisor_skill_sync_failure_prevents_generation_claim(tmp_path, monkeypatch):
+    import hermes_cli.owner_worker.supervisor as supervisor_module
+
+    owner = _Owner("ok1_skill_sync_failure", tmp_path / "owner")
+    spawned = False
+
+    def fail_seed(_owner_home: Path):
+        raise TimeoutError("sync lock unavailable")
+
+    def fake_process_factory(*_args, **_kwargs):
+        nonlocal spawned
+        spawned = True
+        return _FakeProcess()
+
+    monkeypatch.setattr(supervisor_module, "_seed_owner_worker_skills", fail_seed)
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+    )
+
+    with pytest.raises(OwnerWorkerStartupError, match="skill synchronization failed"):
+        supervisor.get_or_start(owner)
+
+    assert spawned is False
+    assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key) is None
 
 
 def test_supervisor_spawns_the_canonical_session_owner_context(tmp_path, monkeypatch):

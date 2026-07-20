@@ -1198,7 +1198,7 @@ class TestNoBundledSkillsOptOut:
         assert result["skipped_opt_out"] is True
         assert result["copied"] == []
         assert result["total_bundled"] == 0
-        assert not (skills_dir / "category" / "new-skill" / "SKILL.md").exists()
+        assert not skills_dir.exists()
 
     def test_no_marker_seeds_normally(self, tmp_path):
         bundled = self._setup_bundled(tmp_path)

@@ -21,6 +21,7 @@ from hermes_cli.owner_worker.tool_executor_sandbox import (
     SandboxVerificationPolicy,
     SandboxVerificationRecord,
     build_bubblewrap_launch_spec,
+    default_readonly_global_mount_roots,
     load_sandbox_deployment_policy,
     validate_sandbox_verification_record,
 )
@@ -193,6 +194,20 @@ def test_readonly_mount_destinations_must_be_unique_reserved_and_non_overlapping
                 binding, (), workspace, None, readonly_mounts=mounts,
                 python_executable=Path(str(mounts[0].destination)) / "bin/python3",
             )
+
+
+def test_default_readonly_roots_collapse_nested_virtualenv_paths(tmp_path, monkeypatch):
+    runtime = tmp_path / "runtime"
+    application = runtime / "src" / "hermes"
+    application.mkdir(parents=True)
+    monkeypatch.setattr(sys, "prefix", str(runtime))
+    monkeypatch.setattr(sys, "base_prefix", str(runtime.parent))
+    monkeypatch.setattr(
+        "hermes_cli.owner_worker.tool_executor_sandbox.__file__",
+        str(application / "hermes_cli" / "owner_worker" / "tool_executor_sandbox.py"),
+    )
+
+    assert default_readonly_global_mount_roots() == (runtime.parent.resolve(),)
 
 
 def test_non_linux_or_missing_or_unsupported_bubblewrap_fails_before_launch_spec(tmp_path):

@@ -559,14 +559,16 @@ def _compatible_python_destination(mounts: Sequence[SandboxReadonlyMount]) -> Pu
 
 
 def default_readonly_global_mount_roots() -> tuple[Path, ...]:
-    """Return deployment-local interpreter/application roots for test compatibility."""
+    """Return non-overlapping interpreter/application roots for test compatibility."""
     application_root = Path(__file__).resolve().parents[2]
     candidates = (Path(os.sys.prefix), Path(os.sys.base_prefix), application_root)
     result: list[Path] = []
     for candidate in candidates:
         resolved = _canonical(candidate, field="executor runtime dependency root")
-        if resolved not in result:
-            result.append(resolved)
+        if any(root == resolved or root in resolved.parents for root in result):
+            continue
+        result = [root for root in result if resolved not in root.parents]
+        result.append(resolved)
     return tuple(result)
 
 

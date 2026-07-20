@@ -43,10 +43,11 @@ from hermes_cli.owner_worker.tool_executor_sandbox import (
     validate_sandbox_verification_record,
 )
 from hermes_cli.tool_executor_runtime.env import build_executor_environment
-from hermes_cli.owner_worker.web_tool_relay import (
-    WEB_RELAY_TOOL_NAMES,
-    WebToolRelayBroker,
+from hermes_cli.owner_worker.owner_tool_relay import (
+    OWNER_RELAY_TOOL_NAMES,
+    OwnerToolRelayBroker,
 )
+from hermes_cli.owner_worker.skill_snapshot import materialize_skill_snapshot
 
 
 @dataclass(frozen=True)
@@ -113,7 +114,8 @@ class ToolExecutorSupervisor:
         lease: Any,
         process_factory: Callable[..., subprocess.Popen] = subprocess.Popen,
         credential_broker: CredentialBroker | None = None,
-        web_tool_relay: WebToolRelayBroker | None = None,
+        owner_tool_relay: OwnerToolRelayBroker | None = None,
+        web_tool_relay: OwnerToolRelayBroker | None = None,
         sandbox_builder: Callable[..., BubblewrapLaunchSpec] = build_bubblewrap_launch_spec,
         control_home: str | Path | None = None,
         readonly_global_mount_roots: tuple[str | Path, ...] | None = None,
@@ -134,9 +136,13 @@ class ToolExecutorSupervisor:
         self.lease = lease
         self.process_factory = process_factory
         self.credential_broker = credential_broker or CredentialBroker()
-        self.web_tool_relay = web_tool_relay or WebToolRelayBroker(
+        if owner_tool_relay is not None and web_tool_relay is not None:
+            raise ExecutorIdentityInvalid("owner tool relay is ambiguous")
+        self.owner_tool_relay = owner_tool_relay or web_tool_relay or OwnerToolRelayBroker(
             identity_validator=self._require_active_executor_identity,
         )
+        # Compatibility alias for callers that only knew the original web relay.
+        self.web_tool_relay = self.owner_tool_relay
         self.sandbox_builder = sandbox_builder
         self.control_home = Path(control_home).resolve() if control_home else None
         if deployment_policy is not None:
@@ -507,7 +513,7 @@ class ToolExecutorSupervisor:
             runtime_home.chmod(stat.S_IRWXU)
 
         workspace_fd = inherited_workspace_fd = request_read = request_write = response_read = response_write = -1
-        gate_read = gate_write = info_read = info_write = web_relay_fd = -1
+        gate_read = gate_write = info_read = info_write = owner_relay_fd = -1
         process: Any | None = None
         spec: BubblewrapLaunchSpec | None = None
         completed = False
@@ -521,9 +527,24 @@ class ToolExecutorSupervisor:
             info_read, info_write = os.pipe()
             for fd in (inherited_workspace_fd, request_read, response_write, gate_read, info_write):
                 os.set_inheritable(fd, True)
-            if invocation.tool_name in WEB_RELAY_TOOL_NAMES:
-                web_relay_fd = self.web_tool_relay.register(invocation)
-                os.set_inheritable(web_relay_fd, True)
+            if invocation.tool_name in OWNER_RELAY_TOOL_NAMES:
+                skill_dir_materializer = None
+                if invocation.tool_name == "skill_view":
+                    quota = invocation.resource_decision.quota
+
+                    def skill_dir_materializer(source):
+                        return materialize_skill_snapshot(
+                            source,
+                            runtime_home,
+                            max_bytes=min(quota.disk_bytes, 16 << 20),
+                            max_files=min(quota.disk_inodes, 1024),
+                        )
+
+                owner_relay_fd = self.owner_tool_relay.register(
+                    invocation,
+                    skill_dir_materializer=skill_dir_materializer,
+                )
+                os.set_inheritable(owner_relay_fd, True)
             environment = build_executor_environment(
                 identity,
                 runtime_home=runtime_home,
@@ -532,7 +553,7 @@ class ToolExecutorSupervisor:
                 response_fd=response_write,
                 start_gate_fd=gate_read,
                 egress_profile=invocation.egress_profile,
-                web_relay_fd=(web_relay_fd if web_relay_fd >= 0 else None),
+                owner_relay_fd=(owner_relay_fd if owner_relay_fd >= 0 else None),
             )
             spec = self.sandbox_builder(
                 environment=environment,
@@ -561,7 +582,7 @@ class ToolExecutorSupervisor:
                     pass_fds=tuple(dict.fromkeys((
                         inherited_workspace_fd, request_read, response_write, gate_read,
                         info_write, inherited_security_fd,
-                        *((web_relay_fd,) if web_relay_fd >= 0 else ()),
+                        *((owner_relay_fd,) if owner_relay_fd >= 0 else ()),
                         *spec.inherited_security_fds,
                     ))),
                     start_new_session=True,
@@ -572,9 +593,9 @@ class ToolExecutorSupervisor:
             for fd in (request_read, response_write, gate_read, info_write):
                 os.close(fd)
             request_read = response_write = gate_read = info_write = -1
-            if web_relay_fd >= 0:
-                os.close(web_relay_fd)
-                web_relay_fd = -1
+            if owner_relay_fd >= 0:
+                os.close(owner_relay_fd)
+                owner_relay_fd = -1
             for fd in spec.inherited_security_fds:
                 if fd != inherited_security_fd:
                     os.close(fd)
@@ -617,7 +638,7 @@ class ToolExecutorSupervisor:
             completed = True
             return str(result)
         finally:
-            self.web_tool_relay.revoke_invocation(invocation)
+            self.owner_tool_relay.revoke_invocation(invocation)
             if process is not None:
                 if not completed:
                     self._terminate(process)
@@ -632,7 +653,7 @@ class ToolExecutorSupervisor:
             for fd in (
                 workspace_fd, inherited_workspace_fd, request_read, request_write,
                 response_read, response_write, gate_read, gate_write,
-                info_read, info_write, web_relay_fd,
+                info_read, info_write, owner_relay_fd,
                 inherited_security_fd, *extra_spec_fds,
             ):
                 if isinstance(fd, int) and fd >= 0:
@@ -681,10 +702,31 @@ class ToolExecutorSupervisor:
         with self._lock:
             self._revoked.add(identity.stable_key)
         revoked = self.credential_broker.revoke_executor(identity)
-        self.web_tool_relay.revoke_executor(identity)
+        self.owner_tool_relay.revoke_executor(identity)
         self._reap_registry_descendants(identity)
         self._revoke_live(lambda candidate: candidate == identity)
         return revoked
+
+    def _remove_runtime_generation(self, identity: ExecutorIdentity) -> None:
+        runtime_home = (
+            self.owner_home
+            / "runtime"
+            / "executors"
+            / identity.executor_id
+            / f"gen-{identity.executor_generation}"
+        )
+        try:
+            import shutil
+
+            for entry in runtime_home.rglob("*"):
+                try:
+                    entry.chmod(0o700 if entry.is_dir() else 0o600)
+                except OSError:
+                    pass
+            runtime_home.chmod(0o700)
+            shutil.rmtree(runtime_home)
+        except FileNotFoundError:
+            pass
 
     def stop_generation(self) -> int:
         with self._lock:
@@ -703,7 +745,7 @@ class ToolExecutorSupervisor:
             worker_generation=self.lease.worker_generation,
             worker_id=self.lease.worker_id,
         )
-        self.web_tool_relay.revoke_worker_generation(
+        self.owner_tool_relay.revoke_worker_generation(
             owner_key=self.lease.owner_key,
             worker_generation=self.lease.worker_generation,
             worker_id=self.lease.worker_id,
@@ -717,4 +759,6 @@ class ToolExecutorSupervisor:
                 and identity.worker_generation == self.lease.worker_generation
             )
         )
+        for identity in identities:
+            self._remove_runtime_generation(identity)
         return revoked

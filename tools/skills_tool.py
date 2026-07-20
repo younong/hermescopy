@@ -764,6 +764,7 @@ def _serve_plugin_skill(
     *,
     preprocess: bool = True,
     session_id: str | None = None,
+    skill_dir_materializer=None,
 ) -> str:
     """Read a plugin-provided skill, apply guards, return JSON."""
     from hermes_cli.plugins import _get_disabled_plugins, get_plugin_manager
@@ -833,6 +834,11 @@ def _serve_plugin_skill(
     except Exception:
         banner = ""
 
+    sandbox_skill_dir = (
+        skill_dir_materializer(skill_md.parent)
+        if skill_dir_materializer is not None
+        else None
+    )
     rendered_content = content
     if preprocess:
         try:
@@ -842,6 +848,9 @@ def _serve_plugin_skill(
                 content,
                 skill_md.parent,
                 session_id=session_id,
+                template_skill_dir=(
+                    Path(sandbox_skill_dir) if sandbox_skill_dir is not None else None
+                ),
             )
         except Exception:
             logger.debug(
@@ -854,6 +863,11 @@ def _serve_plugin_skill(
             "name": f"{namespace}:{bare}",
             "content": f"{banner}{rendered_content}" if banner else rendered_content,
             "description": description,
+            "skill_dir": (
+                str(sandbox_skill_dir)
+                if sandbox_skill_dir is not None
+                else str(skill_md.parent)
+            ),
             "linked_files": None,
             "readiness_status": SkillReadinessStatus.AVAILABLE.value,
         },
@@ -866,6 +880,8 @@ def skill_view(
     file_path: str = None,
     task_id: str = None,
     preprocess: bool = True,
+    *,
+    skill_dir_materializer=None,
 ) -> str:
     """
     View the content of a skill or a specific file within a skill directory.
@@ -878,6 +894,9 @@ def skill_view(
         preprocess: Apply configured SKILL.md template and inline shell rendering
             to main skill content. Internal slash/preload callers disable this
             because they render the skill message themselves.
+        skill_dir_materializer: Trusted internal callback that snapshots the
+            resolved skill directory and returns its sandbox-visible path.
+            Inline shell preprocessing still runs from the real source directory.
 
     Returns:
         JSON string with skill content or error message
@@ -945,6 +964,7 @@ def skill_view(
                     bare,
                     preprocess=preprocess,
                     session_id=task_id,
+                    skill_dir_materializer=skill_dir_materializer,
                 )
 
             # Plugin exists but this specific skill is missing?
@@ -1448,6 +1468,11 @@ def skill_view(
                     exc_info=True,
                 )
 
+        materialized_skill_dir = (
+            skill_dir_materializer(skill_dir)
+            if skill_dir is not None and skill_dir_materializer is not None
+            else None
+        )
         rendered_content = content
         if preprocess:
             try:
@@ -1457,6 +1482,11 @@ def skill_view(
                     content,
                     skill_dir,
                     session_id=task_id,
+                    template_skill_dir=(
+                        Path(materialized_skill_dir)
+                        if materialized_skill_dir is not None
+                        else None
+                    ),
                 )
             except Exception:
                 logger.debug(
@@ -1471,7 +1501,11 @@ def skill_view(
             "related_skills": related_skills,
             "content": rendered_content,
             "path": rel_path,
-            "skill_dir": str(skill_dir) if skill_dir else None,
+            "skill_dir": (
+                str(materialized_skill_dir)
+                if materialized_skill_dir is not None
+                else (str(skill_dir) if skill_dir else None)
+            ),
             "linked_files": linked_files if linked_files else None,
             "usage_hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'"
             if linked_files
@@ -1632,7 +1666,10 @@ def _skill_view_with_bump(args, **kw):
     telemetry failure never breaks the tool call."""
     name = args.get("name", "")
     result = skill_view(
-        name, file_path=args.get("file_path"), task_id=kw.get("task_id")
+        name,
+        file_path=args.get("file_path"),
+        task_id=kw.get("task_id"),
+        skill_dir_materializer=kw.get("skill_dir_materializer"),
     )
     try:
         parsed = json.loads(result)

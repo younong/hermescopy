@@ -307,7 +307,7 @@ def test_supervisor_passes_one_private_relay_fd_for_web_search(tmp_path):
         gate_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_START_GATE_FD"]))
         request_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_BOOTSTRAP_FD"]))
         response_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_RESPONSE_FD"]))
-        relay_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_WEB_RELAY_FD"]))
+        relay_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_OWNER_RELAY_FD"]))
 
         def respond():
             assert os.read(gate_fd, 1) == b"1"
@@ -327,7 +327,7 @@ def test_supervisor_passes_one_private_relay_fd_for_web_search(tmp_path):
         return _FakeProcess()
 
     roots, supervisor = _supervisor(tmp_path, fake_process_factory)
-    supervisor.web_tool_relay._dispatcher = lambda name, args: json.dumps({"name": name, "query": args["query"]})
+    supervisor.web_tool_relay._dispatcher = lambda name, args, _invocation, _materializer: json.dumps({"name": name, "query": args["query"]})
     try:
         result = supervisor.dispatch(
             function_name="web_search", function_args={"query": "Hermes", "limit": 5},
@@ -341,11 +341,71 @@ def test_supervisor_passes_one_private_relay_fd_for_web_search(tmp_path):
     assert json.loads(result) == {"name": "web_search", "query": "Hermes"}
     kwargs = spawned[0][1]
     assert kwargs["env"]["HERMES_EXECUTOR_EGRESS_PROFILE"] == "tool-none"
-    assert kwargs["env"]["HERMES_EXECUTOR_WEB_RELAY_FD"] in {str(fd) for fd in kwargs["pass_fds"]}
+    assert kwargs["env"]["HERMES_EXECUTOR_OWNER_RELAY_FD"] in {str(fd) for fd in kwargs["pass_fds"]}
     assert len(kwargs["pass_fds"]) == 7
     serialized = json.dumps({"argv": spawned[0][0][0], "env": kwargs["env"]})
     assert "API_KEY" not in serialized
     assert "TOKEN" not in serialized
+
+
+def test_supervisor_skill_view_materializes_only_selected_skill(tmp_path):
+    def fake_process_factory(*args, **kwargs):
+        _publish_fake_sandbox_info(args[0])
+        gate_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_START_GATE_FD"]))
+        request_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_BOOTSTRAP_FD"]))
+        response_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_RESPONSE_FD"]))
+        relay_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_OWNER_RELAY_FD"]))
+
+        def respond():
+            assert os.read(gate_fd, 1) == b"1"
+            os.close(gate_fd)
+            payload = json.loads(os.read(request_fd, 1 << 20))
+            from hermes_cli.tool_executor_runtime.entrypoint import invocation_from_payload
+            from hermes_cli.owner_worker.owner_tool_relay import dispatch_owner_tool_over_relay
+
+            invocation = invocation_from_payload(payload)
+            result = dispatch_owner_tool_over_relay(relay_fd, invocation)
+            os.write(response_fd, json.dumps({"result": result}).encode())
+            os.close(request_fd)
+            os.close(response_fd)
+
+        threading.Thread(target=respond, daemon=True).start()
+        return _FakeProcess()
+
+    roots, supervisor = _supervisor(tmp_path, fake_process_factory)
+    owner_skill = supervisor.owner_home / "skills" / "productivity" / "common-files"
+    (owner_skill / "scripts").mkdir(parents=True)
+    (owner_skill / "SKILL.md").write_text(
+        "---\nname: common-files\ndescription: files\n---\n"
+        "Run ${HERMES_SKILL_DIR}/scripts/common_files.py\n",
+        encoding="utf-8",
+    )
+    (owner_skill / "scripts" / "common_files.py").write_text("print('ok')\n")
+    original = (owner_skill / "SKILL.md").read_bytes()
+
+    try:
+        with patch("tools.skills_tool.SKILLS_DIR", supervisor.owner_home / "skills"):
+            result = json.loads(supervisor.dispatch(
+                function_name="skill_view", function_args={"name": "common-files"},
+                task_id="task-a", session_id="session-a", tool_call_id="call-a",
+                turn_id="turn-a", api_request_id="request-a",
+            ))
+        identity = next(iter(supervisor._identities.values()))
+        runtime_home = (
+            supervisor.owner_home / "runtime" / "executors" / identity.executor_id
+            / f"gen-{identity.executor_generation}"
+        )
+        snapshot = runtime_home / result["skill_dir"].removeprefix("/executor/")
+        assert result["success"] is True
+        assert result["skill_dir"].startswith("/executor/skill-snapshots/")
+        assert result["skill_dir"] in result["content"]
+        assert (snapshot / "scripts" / "common_files.py").read_text() == "print('ok')\n"
+        assert (owner_skill / "SKILL.md").read_bytes() == original
+        assert supervisor.stop_generation() == 0
+        assert not runtime_home.exists()
+    finally:
+        roots.close()
+        supervisor.owner_tool_relay.close()
 
 
 @pytest.mark.parametrize("profile", ["tool-none", "tool-public", "protected-target"])
