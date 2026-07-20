@@ -22,7 +22,7 @@
 - 重试/回滚：`--tag <existing-tag>`
 - 无 tag 的受限例外：`--ref <40-hex-commit-sha>`，仅发布已推送到 `origin` 的不可变完整 commit SHA；不会打 tag，也绝不会上传当前工作区或接受分支名、`HEAD`、短 SHA。
 
-新发布前必须人工提交代码。`--create-tag` 要求具名分支和干净工作区，fetch 最新 `origin/main`，以 `--no-autostash` rebase 当前分支，无 force 地推送远端同名分支，然后只创建并 atomic push 指定的 annotated tag。默认只允许 `main`；`--allow-non-main` 保留，但同样必须 rebase 最新 `origin/main`，且不允许 detached HEAD 或 force push。rebase、non-fast-forward、tag 冲突或远端校验失败都会在部署前 fail closed。工具不会自动 commit/stash，也不会用 `--tags` 推送无关 tag。
+新发布前必须人工提交代码。`--create-tag` 要求具名分支和干净工作区，fetch 最新 `origin/main`，以 `--no-autostash` rebase 当前分支，再用绑定 rebase 前远端分支精确 SHA 的 `--force-with-lease=<完整分支 ref>:<observed SHA>` 更新远端同名 PR/源分支，然后只创建并 atomic push 指定的 annotated tag。默认只允许 `main`；`--allow-non-main` 保留，但同样必须 rebase 最新 `origin/main`，且不允许 detached HEAD。远端分支在快照后发生任何变化时 lease 会失效，发布会在 tag 创建/发布前 fail closed。工具不会自动 commit/stash，也禁止无守卫的 `--force`、裸/隐式 lease、`+` refspec、覆盖 tag、tag-only 降级或用 `--tags` 推送无关 tag。
 
 工具使用 `git archive <tag>` 生成干净源码，在本机临时源码目录中安装 Node 依赖并构建 web/ui-tui 产物，然后把源码 + 构建产物打包上传到服务器。服务器只解包到 `/opt/hermes/releases/<tag>`、按 `uv.lock + 架构` 创建或复用 root-owned immutable Python runtime、验证 host sandbox policy、切换 `/opt/hermes/current`，最后以稳定的非 root `hermes` user/group 重启 systemd 服务。提交部署事务前会自动运行无 secret、仅 loopback 的确定性对话冒烟；远端提交后，本机再通过公开 Dashboard 运行一次 authenticated 真实模型冒烟。发布成功后会清理本次上传的远端 tarball 和临时冒烟数据，并按保留策略回收旧 release。
 

@@ -24,7 +24,7 @@ allowed-tools:
 
 1. **必须先有 tag，再发布**
    - 新版本发布：先人工提交代码，再使用 `--create-tag <tag>`。
-   - `--create-tag` 要求具名分支和干净工作区，自动 rebase 最新 `origin/main`、无 force 推送当前分支，并 atomic push 唯一目标 tag；不会自动 commit/stash，也不会推送其他本地 tag。
+   - `--create-tag` 要求具名分支和干净工作区，自动 rebase 最新 `origin/main`，再以绑定 rebase 前远端分支精确 SHA 的 `--force-with-lease=<完整 ref>:<observed SHA>` 更新原 PR/源分支，并以 prepared commit 精确 lease atomic push 唯一目标 tag；不会自动 commit/stash，也不会推送其他本地 tag。
    - 重试或回滚：使用 `--tag <existing-tag>`。
    - 不允许发布未打 tag 的当前工作区。
 
@@ -133,7 +133,7 @@ node --check ui-tui/scripts/build.mjs
 npm run deploy -- --help
 ```
 
-注意：创建新 tag 时，发布工具默认要求当前分支为 `main` 且工作区（含未跟踪文件）干净。工具会 fetch 并 rebase 最新 `origin/main`，无 force 推送当前分支，然后精确发布目标 tag。确实要从非 main 分支发布时，必须显式使用 `--allow-non-main`；该路径同样 rebase `origin/main`，且 detached HEAD 始终拒绝。
+注意：创建新 tag 时，发布工具默认要求当前分支为 `main` 且工作区（含未跟踪文件）干净。工具会 fetch 并 rebase 最新 `origin/main`，用完整分支 ref 和 rebase 前 observed SHA 的精确 lease 更新原远端分支，然后精确发布目标 tag。确实要从非 main 分支发布时，必须显式使用 `--allow-non-main`；该路径同样 rebase `origin/main`，且 detached HEAD 始终拒绝。远端分支并发变化会使 lease 失效并停止发布。
 
 ## 自动两层冒烟
 
@@ -167,7 +167,7 @@ ssh -L 9119:localhost:9119 root@106.15.186.104
 
 - tag 创建失败：检查 tag 是否已存在（本地或远端）、工作区是否干净。
 - rebase 失败：工具会尝试 abort 并停止；人工检查与最新 `origin/main` 的冲突，解决并提交后重试。
-- branch/tag push 失败：检查 Git remote 权限及远端并发更新；不得 force push。Atomic push 不会降级为无守卫的 tag-only push。
+- branch/tag push 失败：检查 Git remote 权限及远端并发更新；精确 lease 失效时 fetch、检查并重新 rebase/retry。除该发布路径的完整 ref + observed SHA lease 外，仍禁止无守卫的 `--force`、裸/隐式 lease 和 `+` refspec；Atomic push 不会降级为无守卫的 tag-only push。
 - tag 已验证发布但部署中止：检查远端 refs；明确要部署该不可变 commit 时再使用 `--tag <tag>` 重试，不要覆盖或删除远端 tag。
 - SSH 失败：检查 SSH key、密码、端口、安全组。
 - Python 依赖/bootstrap 失败：查看部署输出中的 `uv`/系统依赖错误，按服务器缺失依赖补齐。

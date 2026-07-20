@@ -382,10 +382,14 @@ export function prepareCreateTag(tag, { allowNonMain = false, dryRun = false, cw
   }
   assertRemoteTagMissing(tag, { cwd });
 
-  const remoteMain = remoteBranchCommit("main", { cwd });
+  const branchRef = `refs/heads/${branch}`;
+  const remoteBranchSnapshot = remoteRefs(["refs/heads/main", branchRef], { cwd });
+  const remoteMain = remoteBranchSnapshot.get("refs/heads/main") || "";
   if (!remoteMain) {
     throw new Error("origin/main does not exist; cannot establish the release baseline.");
   }
+  const remoteBranchBeforeRebase = remoteBranchSnapshot.get(branchRef) || "";
+  const initialBranchLease = `--force-with-lease=${branchRef}:${remoteBranchBeforeRebase}`;
 
   const fetchArgs = [
     "fetch",
@@ -407,12 +411,16 @@ export function prepareCreateTag(tag, { allowNonMain = false, dryRun = false, cw
       cwd,
       dryRun: true,
     });
-    run("git", ["push", "origin", branchRefspec], { cwd, dryRun: true });
+    run("git", ["push", initialBranchLease, "origin", branchRefspec], {
+      cwd,
+      dryRun: true,
+    });
     run("git", ["tag", "-a", tag, "-m", `Hermes deploy ${tag}`, preparedCommit], {
       cwd,
       dryRun: true,
     });
-    run("git", ["push", "--atomic", "origin", branchRefspec, tagRefspec], {
+    const publicationLease = `--force-with-lease=${branchRef}:${preparedCommit}`;
+    run("git", ["push", "--atomic", publicationLease, "origin", branchRefspec, tagRefspec], {
       cwd,
       dryRun: true,
     });
@@ -446,8 +454,8 @@ export function prepareCreateTag(tag, { allowNonMain = false, dryRun = false, cw
     throw new Error("HEAD no longer matches the prepared release branch.");
   }
 
-  const branchRefspec = `${preparedCommit}:refs/heads/${branch}`;
-  run("git", ["push", "origin", branchRefspec], { cwd });
+  const branchRefspec = `${preparedCommit}:${branchRef}`;
+  run("git", ["push", initialBranchLease, "origin", branchRefspec], { cwd });
   if (remoteBranchCommit(branch, { cwd }) !== preparedCommit) {
     throw new Error("The release branch could not be verified on origin; no tag was created.");
   }
@@ -455,8 +463,11 @@ export function prepareCreateTag(tag, { allowNonMain = false, dryRun = false, cw
 
   run("git", ["tag", "-a", tag, "-m", `Hermes deploy ${tag}`, preparedCommit], { cwd });
   const tagRefspec = `refs/tags/${tag}:refs/tags/${tag}`;
+  const publicationLease = `--force-with-lease=${branchRef}:${preparedCommit}`;
   try {
-    run("git", ["push", "--atomic", "origin", branchRefspec, tagRefspec], { cwd });
+    run("git", ["push", "--atomic", publicationLease, "origin", branchRefspec, tagRefspec], {
+      cwd,
+    });
   } catch (error) {
     const originTagCommit = remoteTagCommit(tag, { cwd });
     const originBranchCommit = remoteBranchCommit(branch, { cwd });
