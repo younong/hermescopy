@@ -186,19 +186,29 @@ function replayUserTurn(
   schedule(520, {
     type: "message.delta",
     session_id: MOCK_SESSION_ID,
-    payload: { text: "这是 mock 流式回复，支持 **Markdown**、列表和代码块：\n\n" },
+    payload: { text: "这是 mock 流式回复，支持 **Markdown**、列表、表格和代码块：\n\n" },
   });
   schedule(780, {
     type: "message.delta",
     session_id: MOCK_SESSION_ID,
-    payload: { text: "- 消息气泡\n- 工具卡片\n- 图片 artifact\n- 审批卡片\n\n```ts\nconsole.log('gui chat mock');\n```" },
+    payload: {
+      text:
+        "- 消息气泡\n- 工具卡片\n- 图片 artifact\n- 审批卡片\n\n" +
+        "| 平台 | 内容方向 |\n|---|---|\n| B站 | 科技类 UP 主 |\n" +
+        "| 微信视频号 | 电影分段剪辑 |\n\n",
+    },
   });
-  schedule(1100, {
+  schedule(980, {
+    type: "message.delta",
+    session_id: MOCK_SESSION_ID,
+    payload: { text: "```ts\nconsole.log('gui chat mock');\n```" },
+  });
+  schedule(1300, {
     type: "message.complete",
     session_id: MOCK_SESSION_ID,
     payload: {
       status: "complete",
-      text: `收到：${text}\n\n这是 mock 流式回复，支持 **Markdown**、列表和代码块：\n\n- 消息气泡\n- 工具卡片\n- 图片 artifact\n- 审批卡片\n\n\`\`\`ts\nconsole.log('gui chat mock');\n\`\`\``,
+      text: `收到：${text}\n\n这是 mock 流式回复，支持 **Markdown**、列表、表格和代码块：\n\n- 消息气泡\n- 工具卡片\n- 图片 artifact\n- 审批卡片\n\n| 平台 | 内容方向 |\n|---|---|\n| B站 | 科技类 UP 主 |\n| 微信视频号 | 电影分段剪辑 |\n\n\`\`\`ts\nconsole.log('gui chat mock');\n\`\`\``,
     },
   });
 }

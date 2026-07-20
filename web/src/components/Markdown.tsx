@@ -1,16 +1,247 @@
-import { memo, useMemo, type ReactNode } from "react";
+import { Autolinker } from "autolinker";
+import {
+  Children,
+  createContext,
+  memo,
+  useContext,
+  type ComponentProps,
+  type ElementType,
+  type FC,
+  type ReactNode,
+} from "react";
+import {
+  defaultRemarkPlugins,
+  Streamdown,
+  type Components,
+  type UrlTransform,
+} from "streamdown";
 
-import { parseInline } from "./markdownInline";
+import { cn } from "@/lib/utils";
 
-/**
- * Lightweight markdown renderer for LLM output.
- * Handles: code blocks, inline code, bold, italic, headers, links, lists, horizontal rules.
- * NOT a full CommonMark parser — optimized for typical assistant message patterns.
- *
- * `streaming` renders a blinking caret at the tail of the last block so it
- * appears to hug the final character instead of wrapping onto a new line
- * after a block element (paragraph/list/code/…).
- */
+const TAG_CLASSES = {
+  blockquote:
+    "my-2 border-l-2 border-border/70 pl-3 italic text-text-secondary",
+  del: "text-text-secondary line-through",
+  em: "italic",
+  h1: "mt-4 mb-2 text-base font-bold first:mt-0",
+  h2: "mt-3 mb-2 text-sm font-bold first:mt-0",
+  h3: "mt-3 mb-1.5 text-sm font-semibold first:mt-0",
+  h4: "mt-2 mb-1 text-sm font-medium first:mt-0",
+  hr: "my-3 border-border",
+  li: "marker:text-text-tertiary",
+  ol: "mb-2 list-decimal space-y-0.5 pl-5 last:mb-0",
+  p: "mb-2 last:mb-0",
+  pre: "mb-2 overflow-x-auto border border-border bg-secondary/60 px-3 py-2.5 font-mono text-xs leading-relaxed last:mb-0",
+  strong: "font-semibold",
+  td: "border-r border-border/50 px-3 py-2 align-top last:border-r-0",
+  th: "border-r border-border/60 px-3 py-2 text-left font-semibold last:border-r-0",
+  thead: "bg-secondary/50",
+  ul: "mb-2 list-disc space-y-0.5 pl-5 last:mb-0",
+} as const;
+
+const HighlightTermsContext = createContext<readonly string[]>([]);
+
+type MarkdownElementProps<T extends keyof React.JSX.IntrinsicElements> =
+  ComponentProps<T> & { node?: unknown };
+
+function tagged<T extends keyof typeof TAG_CLASSES>(Tag: T, highlight = false) {
+  const Component = (({
+    children,
+    className,
+    node,
+    ...rest
+  }: MarkdownElementProps<T>) => {
+    const Element = Tag as ElementType;
+    void node;
+
+    return (
+      <Element className={cn(TAG_CLASSES[Tag], className)} {...rest}>
+        {highlight ? <HighlightedChildren>{children}</HighlightedChildren> : children}
+      </Element>
+    );
+  }) as FC<MarkdownElementProps<T>>;
+
+  Component.displayName = `Markdown.${Tag}`;
+  return Component;
+}
+
+function MarkdownAnchor({
+  children,
+  className,
+  href,
+  node,
+  ...rest
+}: MarkdownElementProps<"a">) {
+  void node;
+  if (!href || !/^(https?:|mailto:)/i.test(href)) {
+    return (
+      <span className={className}>
+        <HighlightedChildren>{children}</HighlightedChildren>
+      </span>
+    );
+  }
+
+  return (
+    <a
+      className={cn(
+        "break-words text-primary underline decoration-primary/30 underline-offset-2 transition-colors [overflow-wrap:anywhere] hover:decoration-primary/60",
+        className,
+      )}
+      href={href}
+      rel="noreferrer"
+      target="_blank"
+      {...rest}
+    >
+      <HighlightedChildren>{children}</HighlightedChildren>
+    </a>
+  );
+}
+
+function MarkdownCode({ className, node, ...rest }: MarkdownElementProps<"code">) {
+  void node;
+  return (
+    <code
+      className={cn(
+        "bg-secondary/60 px-1.5 py-0.5 font-mono text-xs text-primary/90",
+        className,
+      )}
+      {...rest}
+    />
+  );
+}
+
+function MarkdownImage({ alt, className, node }: MarkdownElementProps<"img">) {
+  void node;
+  return alt ? <span className={className}>{alt}</span> : null;
+}
+
+function MarkdownTable({
+  className,
+  node,
+  ...rest
+}: MarkdownElementProps<"table">) {
+  void node;
+  return (
+    <div
+      className="mb-2 max-w-full overflow-x-auto border border-border last:mb-0"
+      data-markdown-table-wrapper
+    >
+      <table
+        className={cn(
+          "w-full min-w-max border-collapse text-left text-xs [&_tr]:border-b [&_tr]:border-border/50 [&_tr:last-child]:border-b-0",
+          className,
+        )}
+        {...rest}
+      />
+    </div>
+  );
+}
+
+const COMPONENTS: Components = {
+  a: MarkdownAnchor,
+  blockquote: tagged("blockquote", true),
+  code: MarkdownCode,
+  del: tagged("del", true),
+  em: tagged("em", true),
+  h1: tagged("h1", true),
+  h2: tagged("h2", true),
+  h3: tagged("h3", true),
+  h4: tagged("h4", true),
+  hr: tagged("hr"),
+  img: MarkdownImage,
+  li: tagged("li", true),
+  ol: tagged("ol"),
+  p: tagged("p", true),
+  pre: tagged("pre"),
+  strong: tagged("strong", true),
+  table: MarkdownTable,
+  td: tagged("td", true),
+  th: tagged("th", true),
+  thead: tagged("thead"),
+  ul: tagged("ul"),
+};
+
+const safeUrlTransform: UrlTransform = (url, key) => {
+  if (key !== "href") return null;
+  return /^(https?:|mailto:)/i.test(url.trim()) ? url : null;
+};
+
+const bareUrlParser = new Autolinker({
+  email: false,
+  phone: false,
+  sanitizeHtml: false,
+  stripPrefix: false,
+});
+
+function linkifyBareUrls() {
+  return (tree: MarkdownAstNode) => {
+    visitMarkdownText(tree);
+  };
+}
+
+function visitMarkdownText(node: MarkdownAstNode) {
+  if (!node.children || node.type === "code" || node.type === "inlineCode") return;
+
+  const children: MarkdownAstNode[] = [];
+  for (const child of node.children) {
+    if (child.type === "text" && child.value) {
+      children.push(...linkifyTextNode(child.value));
+      continue;
+    }
+
+    const repaired = repairGfmBareUrl(child);
+    if (repaired) {
+      children.push(...repaired);
+      continue;
+    }
+
+    visitMarkdownText(child);
+    children.push(child);
+  }
+  node.children = children;
+}
+
+function repairGfmBareUrl(node: MarkdownAstNode): MarkdownAstNode[] | null {
+  const text = node.children?.length === 1 ? node.children[0].value : undefined;
+  if (node.type !== "link" || !text || node.url !== text) return null;
+
+  const repaired = linkifyTextNode(text);
+  return repaired.length === 1 && repaired[0].type === "link" ? null : repaired;
+}
+
+function linkifyTextNode(value: string): MarkdownAstNode[] {
+  const matches = bareUrlParser.parse(value).filter((match) => match.getType() === "url");
+  if (matches.length === 0) return [{ type: "text", value }];
+
+  const nodes: MarkdownAstNode[] = [];
+  let cursor = 0;
+  for (const match of matches) {
+    const start = match.getOffset();
+    const matchedText = match.getMatchedText();
+    if (start > cursor) nodes.push({ type: "text", value: value.slice(cursor, start) });
+    nodes.push({
+      children: [{ type: "text", value: matchedText }],
+      type: "link",
+      url: match.getAnchorHref(),
+    });
+    cursor = start + matchedText.length;
+  }
+  if (cursor < value.length) nodes.push({ type: "text", value: value.slice(cursor) });
+  return nodes;
+}
+
+type MarkdownAstNode = {
+  children?: MarkdownAstNode[];
+  type: string;
+  url?: string;
+  value?: string;
+};
+
+const REMARK_PLUGINS = [
+  linkifyBareUrls,
+  ...Object.values(defaultRemarkPlugins),
+];
+
 export const Markdown = memo(function Markdown({
   content,
   highlightTerms,
@@ -20,313 +251,59 @@ export const Markdown = memo(function Markdown({
   highlightTerms?: string[];
   streaming?: boolean;
 }) {
-  const blocks = useMemo(() => parseBlocks(content), [content]);
-  const caret = streaming ? <StreamingCaret /> : null;
+  const terms = highlightTerms ?? [];
 
   return (
-    <div className="min-w-0 space-y-2 text-sm leading-relaxed break-words text-foreground [overflow-wrap:anywhere]">
-      {blocks.map((block, i) => (
-        <Block
-          key={i}
-          block={block}
-          highlightTerms={highlightTerms}
-          caret={caret && i === blocks.length - 1 ? caret : null}
-        />
-      ))}
-      {blocks.length === 0 && caret}
-    </div>
+    <HighlightTermsContext.Provider value={terms}>
+      <div
+        className="min-w-0 break-words text-sm leading-relaxed text-foreground [overflow-wrap:anywhere]"
+        data-markdown-streaming={streaming ? "true" : undefined}
+      >
+        <Streamdown
+          caret="block"
+          components={COMPONENTS}
+          controls={false}
+          isAnimating={Boolean(streaming)}
+          lineNumbers={false}
+          mode={streaming ? "streaming" : "static"}
+          parseIncompleteMarkdown={Boolean(streaming)}
+          remarkPlugins={REMARK_PLUGINS}
+          skipHtml
+          urlTransform={safeUrlTransform}
+        >
+          {content}
+        </Streamdown>
+      </div>
+    </HighlightTermsContext.Provider>
   );
 });
 
-function StreamingCaret() {
-  return (
-    <span
-      aria-hidden
-      className="inline-block w-[0.5em] h-[1em] ml-0.5 align-[-0.15em] bg-foreground/50 animate-pulse"
-    />
+function HighlightedChildren({ children }: { children: ReactNode }) {
+  const terms = useContext(HighlightTermsContext);
+
+  return Children.map(children, (child) =>
+    typeof child === "string" ? <HighlightedText text={child} terms={terms} /> : child,
   );
 }
 
-/* ------------------------------------------------------------------ */
-/*  Types                                                              */
-/* ------------------------------------------------------------------ */
+function HighlightedText({ text, terms }: { text: string; terms: readonly string[] }) {
+  const escaped = terms
+    .filter(Boolean)
+    .map((term) => term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  if (escaped.length === 0) return <>{text}</>;
 
-type BlockNode =
-  | { type: "code"; lang: string; content: string }
-  | { type: "heading"; level: number; content: string }
-  | { type: "hr" }
-  | { type: "list"; ordered: boolean; items: string[] }
-  | { type: "paragraph"; content: string };
-
-/* ------------------------------------------------------------------ */
-/*  Block parser                                                       */
-/* ------------------------------------------------------------------ */
-
-function parseBlocks(text: string): BlockNode[] {
-  const lines = text.split("\n");
-  const blocks: BlockNode[] = [];
-  let i = 0;
-
-  while (i < lines.length) {
-    const line = lines[i];
-
-    // Fenced code block
-    const fenceMatch = line.match(/^```(\w*)/);
-    if (fenceMatch) {
-      const lang = fenceMatch[1] || "";
-      const codeLines: string[] = [];
-      i++;
-      while (i < lines.length && !lines[i].startsWith("```")) {
-        codeLines.push(lines[i]);
-        i++;
-      }
-      i++; // skip closing ```
-      blocks.push({ type: "code", lang, content: codeLines.join("\n") });
-      continue;
-    }
-
-    // Heading
-    const headingMatch = line.match(/^(#{1,4})\s+(.+)/);
-    if (headingMatch) {
-      blocks.push({
-        type: "heading",
-        level: headingMatch[1].length,
-        content: headingMatch[2],
-      });
-      i++;
-      continue;
-    }
-
-    // Horizontal rule
-    if (/^[-*_]{3,}\s*$/.test(line)) {
-      blocks.push({ type: "hr" });
-      i++;
-      continue;
-    }
-
-    // Unordered list
-    if (/^[-*+]\s/.test(line)) {
-      const items: string[] = [];
-      while (i < lines.length && /^[-*+]\s/.test(lines[i])) {
-        items.push(lines[i].replace(/^[-*+]\s/, ""));
-        i++;
-      }
-      blocks.push({ type: "list", ordered: false, items });
-      continue;
-    }
-
-    // Ordered list
-    if (/^\d+[.)]\s/.test(line)) {
-      const items: string[] = [];
-      while (i < lines.length && /^\d+[.)]\s/.test(lines[i])) {
-        items.push(lines[i].replace(/^\d+[.)]\s/, ""));
-        i++;
-      }
-      blocks.push({ type: "list", ordered: true, items });
-      continue;
-    }
-
-    // Empty line
-    if (line.trim() === "") {
-      i++;
-      continue;
-    }
-
-    // Paragraph — collect consecutive non-empty, non-special lines
-    const paraLines: string[] = [];
-    while (
-      i < lines.length &&
-      lines[i].trim() !== "" &&
-      !lines[i].match(/^```/) &&
-      !lines[i].match(/^#{1,4}\s/) &&
-      !lines[i].match(/^[-*+]\s/) &&
-      !lines[i].match(/^\d+[.)]\s/) &&
-      !lines[i].match(/^[-*_]{3,}\s*$/)
-    ) {
-      paraLines.push(lines[i]);
-      i++;
-    }
-    if (paraLines.length > 0) {
-      blocks.push({ type: "paragraph", content: paraLines.join("\n") });
-    }
-  }
-
-  return blocks;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Block renderer                                                     */
-/* ------------------------------------------------------------------ */
-
-function Block({
-  block,
-  highlightTerms,
-  caret,
-}: {
-  block: BlockNode;
-  highlightTerms?: string[];
-  caret?: ReactNode;
-}) {
-  switch (block.type) {
-    case "code":
-      return (
-        <pre className="bg-secondary/60 border border-border px-3 py-2.5 text-xs font-mono leading-relaxed overflow-x-auto">
-          <code>
-            {block.content}
-            {caret}
-          </code>
-        </pre>
-      );
-
-    case "heading": {
-      const Tag = `h${Math.min(block.level, 4)}` as "h1" | "h2" | "h3" | "h4";
-      const sizes: Record<string, string> = {
-        h1: "text-base font-bold",
-        h2: "text-sm font-bold",
-        h3: "text-sm font-semibold",
-        h4: "text-sm font-medium",
-      };
-      return (
-        <Tag className={sizes[Tag]}>
-          <InlineContent text={block.content} highlightTerms={highlightTerms} />
-          {caret}
-        </Tag>
-      );
-    }
-
-    case "hr":
-      return (
-        <>
-          <hr className="border-border" />
-          {caret}
-        </>
-      );
-
-    case "list": {
-      const Tag = block.ordered ? "ol" : "ul";
-      const last = block.items.length - 1;
-      return (
-        <Tag
-          className={`space-y-0.5 ${block.ordered ? "list-decimal" : "list-disc"} pl-5 text-sm`}
-        >
-          {block.items.map((item, i) => (
-            <li key={i}>
-              <InlineContent text={item} highlightTerms={highlightTerms} />
-              {i === last ? caret : null}
-            </li>
-          ))}
-        </Tag>
-      );
-    }
-
-    case "paragraph":
-      return (
-        <p>
-          <InlineContent text={block.content} highlightTerms={highlightTerms} />
-          {caret}
-        </p>
-      );
-  }
-}
-
-/* ------------------------------------------------------------------ */
-/*  Inline parser + renderer                                           */
-/* ------------------------------------------------------------------ */
-
-function InlineContent({
-  text,
-  highlightTerms,
-}: {
-  text: string;
-  highlightTerms?: string[];
-}) {
-  const nodes = useMemo(() => parseInline(text), [text]);
-
-  return (
-    <>
-      {nodes.map((node, i) => {
-        switch (node.type) {
-          case "text":
-            return (
-              <HighlightedText
-                key={i}
-                text={node.content}
-                terms={highlightTerms}
-              />
-            );
-          case "code":
-            return (
-              <code
-                key={i}
-                className="bg-secondary/60 px-1.5 py-0.5 text-xs font-mono text-primary/90"
-              >
-                {node.content}
-              </code>
-            );
-          case "bold":
-            return (
-              <strong key={i} className="font-semibold">
-                <HighlightedText text={node.content} terms={highlightTerms} />
-              </strong>
-            );
-          case "italic":
-            return (
-              <em key={i}>
-                <HighlightedText text={node.content} terms={highlightTerms} />
-              </em>
-            );
-          case "link": {
-            // Security: only render http(s)/mailto links. Other schemes
-            // (javascript:, data:, vbscript:) are dropped to plain text so a
-            // crafted link in agent/message content can't execute on click.
-            const href = node.href.trim();
-            if (!/^(https?:|mailto:)/i.test(href)) {
-              return (
-                <HighlightedText
-                  key={i}
-                  text={node.text}
-                  terms={highlightTerms}
-                />
-              );
-            }
-            return (
-              <a
-                key={i}
-                href={href}
-                target="_blank"
-                rel="noreferrer"
-                className="break-words text-primary underline underline-offset-2 decoration-primary/30 transition-colors [overflow-wrap:anywhere] hover:decoration-primary/60"
-              >
-                {node.text}
-              </a>
-            );
-          }
-          case "br":
-            return <br key={i} />;
-        }
-      })}
-    </>
-  );
-}
-
-/** Highlight search terms within a plain text string. */
-function HighlightedText({ text, terms }: { text: string; terms?: string[] }) {
-  if (!terms || terms.length === 0) return <>{text}</>;
-
-  // Build a regex that matches any of the search terms (case-insensitive)
-  const escaped = terms.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
   const regex = new RegExp(`(${escaped.join("|")})`, "gi");
-  const parts = text.split(regex);
+  const exactMatch = new RegExp(`^(?:${escaped.join("|")})$`, "i");
 
   return (
     <>
-      {parts.map((part, i) =>
-        regex.test(part) ? (
-          <mark key={i} className="bg-warning/30 text-warning px-0.5">
+      {text.split(regex).map((part, index) =>
+        exactMatch.test(part) ? (
+          <mark className="bg-warning/30 px-0.5 text-warning" key={index}>
             {part}
           </mark>
         ) : (
-          <span key={i}>{part}</span>
+          part
         ),
       )}
     </>
