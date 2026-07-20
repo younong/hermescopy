@@ -1,5 +1,6 @@
 """Tests for agent/context_compressor.py — compression logic, thresholds, truncation fallback."""
 
+import json
 import pytest
 import time
 from unittest.mock import patch, MagicMock
@@ -111,6 +112,67 @@ class TestPreflightDeferral:
         # short-circuit applies => no deferral.
         assert compressor.should_defer_preflight_to_real_usage(95_000) is False
 
+
+
+class TestCustomCodexResponsesThresholdCap:
+    def test_custom_codex_route_caps_large_window_at_128k(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=400_000):
+            c = ContextCompressor(
+                model="gpt-5.6-sol",
+                provider="custom:codex",
+                api_mode="codex_responses",
+                threshold_percent=0.50,
+                quiet_mode=True,
+            )
+        assert c.threshold_tokens == 128_000
+
+    def test_lower_user_threshold_is_preserved(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
+            c = ContextCompressor(
+                model="gpt-5.6-sol",
+                provider="custom",
+                api_mode="codex_responses",
+                threshold_percent=0.40,
+                quiet_mode=True,
+            )
+        assert c.threshold_tokens == 80_000
+
+    def test_non_custom_or_non_codex_routes_are_unchanged(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=400_000):
+            direct = ContextCompressor(
+                model="gpt-5.6-sol",
+                provider="openai",
+                api_mode="codex_responses",
+                quiet_mode=True,
+            )
+            chat = ContextCompressor(
+                model="gpt-5.6-sol",
+                provider="custom:codex",
+                api_mode="chat_completions",
+                quiet_mode=True,
+            )
+        assert direct.threshold_tokens == 200_000
+        assert chat.threshold_tokens == 200_000
+
+    def test_update_model_recalculates_route_cap(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=400_000):
+            c = ContextCompressor(
+                model="other-model",
+                provider="custom:codex",
+                api_mode="codex_responses",
+                quiet_mode=True,
+            )
+        assert c.threshold_tokens == 200_000
+
+        c.update_model(
+            "gpt-5.6-sol",
+            context_length=400_000,
+            provider="custom:codex",
+            api_mode="codex_responses",
+        )
+
+        assert c.threshold_tokens == 128_000
+        assert c.tail_token_budget == int(128_000 * c.summary_target_ratio)
 
 
 class TestCompress:
@@ -706,7 +768,7 @@ class TestAuthFailureAborts:
 
     def test_generate_summary_flags_network_failure(self):
         """A connection/network error on the summary call flags
-        _last_summary_network_failure (#29559)."""
+        _last_summary_transient_failure (#29559)."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
         with patch(
@@ -715,8 +777,39 @@ class TestAuthFailureAborts:
         ):
             result = c._generate_summary(self._msgs())
         assert result is None
-        assert c._last_summary_network_failure is True
+        assert c._last_summary_transient_failure is True
         assert c._last_summary_auth_failure is False
+
+    @pytest.mark.parametrize(
+        ("error", "label"),
+        [
+            (type("Err408", (Exception,), {"status_code": 408})("request timeout"), "408"),
+            (type("Err429", (Exception,), {"status_code": 429})("rate limited"), "429"),
+            (type("Err502", (Exception,), {"status_code": 502})("bad gateway"), "502"),
+            (type("Err504", (Exception,), {"status_code": 504})("gateway timeout"), "504"),
+            (json.JSONDecodeError("Expecting value", "<html>", 0), "invalid-json"),
+            (RuntimeError("Context compression LLM returned empty content"), "empty"),
+            (TimeoutError("Auxiliary compression aggregate deadline exhausted"), "deadline"),
+        ],
+    )
+    def test_transient_summary_failures_abort_losslessly(self, error, label):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                abort_on_summary_failure=False,
+            )
+        msgs = self._msgs(12)
+        with patch("agent.context_compressor.call_llm", side_effect=error):
+            result = c.compress(msgs, current_tokens=999999, force=True)
+
+        assert result == msgs, label
+        assert c._last_compress_aborted is True, label
+        assert c._last_summary_transient_failure is True, label
+        assert c._last_summary_fallback_used is False, label
+        assert c._last_summary_dropped_count == 0, label
 
     def test_compress_aborts_on_network_failure_despite_flag_false(self):
         """#29559/#25585: abort_on_summary_failure=False (default), but a
@@ -741,7 +834,7 @@ class TestAuthFailureAborts:
         assert result == msgs
         assert len(result) == len(msgs)
         assert c._last_compress_aborted is True
-        assert c._last_summary_network_failure is True
+        assert c._last_summary_transient_failure is True
         # Did NOT fall through to the static-fallback (drop-the-middle) path.
         assert c._last_summary_fallback_used is False
 
@@ -1279,7 +1372,10 @@ class TestSummaryFailureTrackingForGatewayWarning:
             {"role": "user", "content": "current live request should stay in tail"},
         ]
 
-        with patch("agent.context_compressor.call_llm", side_effect=Exception("timeout")):
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=Exception("unsupported summary format"),
+        ):
             result = c.compress(msgs)
 
         fallback = next(m["content"] for m in result if "Summary generation was unavailable" in m.get("content", ""))
@@ -1307,7 +1403,10 @@ class TestSummaryFailureTrackingForGatewayWarning:
             {"role": "user", "content": "tail task"},
         ]
 
-        with patch("agent.context_compressor.call_llm", side_effect=Exception("timeout")):
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=Exception("unsupported summary format"),
+        ):
             result = c.compress(msgs)
 
         fallback = next(m["content"] for m in result if "Summary generation was unavailable" in m.get("content", ""))
@@ -1335,7 +1434,10 @@ class TestSummaryFailureTrackingForGatewayWarning:
             {"role": "user", "content": "protected tail request must not be copied from dropped window"},
         ]
 
-        with patch("agent.context_compressor.call_llm", side_effect=Exception("timeout")):
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=Exception("unsupported summary format"),
+        ):
             result = c.compress(msgs)
 
         fallback = next(m["content"] for m in result if "Summary generation was unavailable" in m.get("content", ""))
@@ -1360,7 +1462,10 @@ class TestSummaryFailureTrackingForGatewayWarning:
             {"role": "user", "content": "tail"},
         ]
 
-        with patch("agent.context_compressor.call_llm", side_effect=Exception("timeout")):
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=Exception("unsupported summary format"),
+        ):
             result = c.compress(msgs)
 
         fallback = next(m["content"] for m in result if "Summary generation was unavailable" in m.get("content", ""))
@@ -1542,6 +1647,20 @@ class TestAbortOnSummaryFailure:
         assert c._last_compress_aborted is False
         assert len(result) < len(msgs)
         assert db.get_compression_failure_cooldown("s1") is None
+
+    @pytest.mark.parametrize("lifecycle", ["on_session_reset", "on_session_end"])
+    def test_session_boundary_clears_failure_classification(self, lifecycle):
+        c = self._make_compressor()
+        c._last_summary_auth_failure = True
+        c._last_summary_transient_failure = True
+
+        if lifecycle == "on_session_end":
+            c.on_session_end("s1", [])
+        else:
+            c.on_session_reset()
+
+        assert c._last_summary_auth_failure is False
+        assert c._last_summary_transient_failure is False
 
     def test_session_end_does_not_clear_persisted_session_cooldown(self, tmp_path):
         db = SessionDB(db_path=tmp_path / "state.db")
@@ -3128,7 +3247,7 @@ class TestCooldownReentryAbort:
     """Regression: a second compress() call during the failure cooldown must
     still abort when the original failure was a network/auth error.
 
-    Before the fix, compress() unconditionally reset _last_summary_network_failure
+    Before the fix, compress() unconditionally reset _last_summary_transient_failure
     and _last_summary_auth_failure at the top of every call.  When
     _generate_summary() returned None from the cooldown early-return (without
     re-setting the flags), the abort guard saw False and fell through to the
@@ -3163,7 +3282,7 @@ class TestCooldownReentryAbort:
             first = c.compress(msgs, current_tokens=999999, force=True)
         assert first == msgs
         assert c._last_compress_aborted is True
-        assert c._last_summary_network_failure is True
+        assert c._last_summary_transient_failure is True
 
         second = c.compress(msgs, current_tokens=999999)
         assert second == msgs, (

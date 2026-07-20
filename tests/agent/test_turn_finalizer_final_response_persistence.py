@@ -110,3 +110,40 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     assert result["messages"][-1] == {"role": "assistant", "content": "Done."}
     assert agent.persisted_messages is not None
     assert agent.persisted_messages[-1] == {"role": "assistant", "content": "Done."}
+
+
+def test_failed_final_response_is_durable_with_error_metadata(monkeypatch):
+    """Terminal provider failures use the same durable finalization path."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    messages = [{"role": "user", "content": "try again"}]
+
+    result = finalize_turn(
+        agent,
+        final_response="API call failed after 3 retries: 502 Bad Gateway",
+        api_call_count=1,
+        interrupted=False,
+        failed=True,
+        error="502 Bad Gateway",
+        failure_reason="server_error",
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="try again",
+        original_user_message="try again",
+        _should_review_memory=False,
+        _turn_exit_reason="api_retries_exhausted",
+    )
+
+    expected = {
+        "role": "assistant",
+        "content": "API call failed after 3 retries: 502 Bad Gateway",
+    }
+    assert result["failed"] is True
+    assert result["completed"] is False
+    assert result["error"] == "502 Bad Gateway"
+    assert result["failure_reason"] == "server_error"
+    assert result["turn_exit_reason"] == "api_retries_exhausted"
+    assert result["messages"][-1] == expected
+    assert agent.persisted_messages[-1] == expected

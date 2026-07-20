@@ -24,7 +24,12 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-from agent.auxiliary_client import call_llm, _is_connection_error, aux_interrupt_protection
+from agent.auxiliary_client import (
+    _compression_token_cap_for_route,
+    _is_connection_error,
+    aux_interrupt_protection,
+    call_llm,
+)
 from agent.context_engine import ContextEngine
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -650,6 +655,8 @@ class ContextCompressor(ContextEngine):
         self._summary_failure_cooldown_until = 0.0  # transient errors must not block a fresh session
         self._last_summary_error = None
         self._last_compress_aborted = False
+        self._last_summary_auth_failure = False
+        self._last_summary_transient_failure = False
         self.last_real_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
@@ -684,6 +691,8 @@ class ContextCompressor(ContextEngine):
         self._ineffective_compression_count = 0
         self._summary_failure_cooldown_until = 0.0
         self._last_compress_aborted = False
+        self._last_summary_auth_failure = False
+        self._last_summary_transient_failure = False
         self._context_probed = False
         self._context_probe_persistable = False
         self.last_real_prompt_tokens = 0
@@ -811,8 +820,8 @@ class ContextCompressor(ContextEngine):
         # passes the new value explicitly. (#43547)
         if max_tokens is not None:
             self.max_tokens = self._coerce_max_tokens(max_tokens)
-        self.threshold_tokens = self._compute_threshold_tokens(
-            context_length, self.threshold_percent, self.max_tokens,
+        self.threshold_tokens = self._effective_threshold_tokens(
+            context_length,
         )
         # Recalculate token budgets for the new context length so the
         # compressor stays calibrated after a model switch (e.g. 200K → 32K).
@@ -867,6 +876,15 @@ class ContextCompressor(ContextEngine):
         except (TypeError, ValueError):
             return None
         return ivalue if ivalue > 0 else None
+
+    def _effective_threshold_tokens(self, context_length: int) -> int:
+        threshold = self._compute_threshold_tokens(
+            context_length, self.threshold_percent, self.max_tokens,
+        )
+        route_cap = _compression_token_cap_for_route(
+            self.model, self.provider, self.api_mode,
+        )
+        return min(threshold, route_cap) if route_cap is not None else threshold
 
     @staticmethod
     def _compute_threshold_tokens(
@@ -961,8 +979,8 @@ class ContextCompressor(ContextEngine):
         # for models right at the minimum. _compute_threshold_tokens also
         # guards the degenerate case where the floor would equal/exceed the
         # window (small models), so auto-compression can still fire (#14690).
-        self.threshold_tokens = self._compute_threshold_tokens(
-            self.context_length, threshold_percent, self.max_tokens,
+        self.threshold_tokens = self._effective_threshold_tokens(
+            self.context_length,
         )
         self.compression_count = 0
 
@@ -1008,11 +1026,9 @@ class ContextCompressor(ContextEngine):
         # (gateway hygiene, /compress) can surface a visible warning.
         self._last_summary_dropped_count: int = 0
         self._last_summary_fallback_used: bool = False
-        # When summary generation fails we now ABORT compression entirely
-        # and return the original messages unchanged instead of dropping
-        # the middle window with a static placeholder.  Callers inspect
-        # this flag to know "compression was attempted but aborted, freeze
-        # the chat until the user manually retries via /compress".
+        # When compression aborts, callers preserve the original transcript
+        # and continue the conversation unchanged. A manual /compress can retry
+        # immediately after the transient cooldown is cleared.
         self._last_compress_aborted: bool = False
         # Set True when the summary call failed with an authentication /
         # permission error (HTTP 401/403). Auth failures are non-recoverable
@@ -1023,14 +1039,10 @@ class ContextCompressor(ContextEngine):
         # rotating on a broken credential is never the right behavior.
         self._last_summary_auth_failure: bool = False
         # Set when summary generation ultimately fails due to a transient
-        # network/connection error (httpx/httpcore connection drop, premature
-        # stream close, etc.) — distinct from auth failures but treated the
-        # same way by compress(): ABORT and preserve the session unchanged
-        # rather than destroy the middle window for a deterministic
-        # "summary unavailable" marker. Retrying once the network recovers is
-        # strictly better than discarding context for a transient blip
-        # (#29559, #25585). Independent of abort_on_summary_failure.
-        self._last_summary_network_failure: bool = False
+        # provider condition: timeout/deadline, 408/429/5xx, malformed or empty
+        # response, or connection/stream closure. compress() always aborts
+        # losslessly for these failures, independent of abort_on_summary_failure.
+        self._last_summary_transient_failure: bool = False
         # retrying on the main model, record the failure so gateway /
         # CLI callers can still warn the user even though compression
         # succeeded.  Silent recovery would hide the broken config.
@@ -1603,6 +1615,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         self,
         turns_to_summarize: List[Dict[str, Any]],
         focus_topic: Optional[str] = None,
+        deadline_monotonic: Optional[float] = None,
     ) -> Optional[str]:
         """Generate a structured summary of conversation turns.
 
@@ -1804,7 +1817,9 @@ This compaction should PRIORITISE preserving all information related to the focu
                 },
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": int(summary_budget * 1.3),
-                # timeout resolved from auxiliary.compression.timeout config by call_llm
+                "deadline_monotonic": deadline_monotonic,
+                # Per-request timeout is resolved from config and clamped to the
+                # aggregate automatic-compression deadline by call_llm.
             }
             if self.summary_model:
                 call_kwargs["model"] = self.summary_model
@@ -1852,7 +1867,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             self._summary_model_fallen_back = False
             self._last_summary_error = None
             self._last_summary_auth_failure = False
-            self._last_summary_network_failure = False
+            self._last_summary_transient_failure = False
             return self._with_summary_prefix(summary)
         except Exception as e:
             # ``call_llm`` raises ``RuntimeError`` for two very different cases:
@@ -1891,8 +1906,9 @@ This compaction should PRIORITISE preserving all information related to the focu
                 or "no available channel" in _err_str
             )
             _is_timeout = (
-                _status in {408, 429, 502, 504}
+                _status in {408, 429} or (_status is not None and 500 <= _status < 600)
                 or "timeout" in _err_str
+                or "deadline exhausted" in _err_str
             )
             # Non-JSON / malformed-body responses from misconfigured providers
             # or proxies (e.g. an HTML 502 page returned with
@@ -1905,6 +1921,13 @@ This compaction should PRIORITISE preserving all information related to the focu
             _is_json_decode = (
                 isinstance(e, json.JSONDecodeError)
                 or "expecting value" in _err_str
+            )
+            _is_invalid_response = (
+                _is_json_decode
+                or "returned empty content" in _err_str
+                or "returned none response" in _err_str
+                or "returned invalid response" in _err_str
+                or "missing choices[0].message" in _err_str
             )
             # httpcore / httpx streaming premature-close errors surface as
             # ConnectionError subclasses or plain Exception with characteristic
@@ -1946,7 +1969,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                     e,
                 )
             if (
-                (_is_model_not_found or _is_timeout or _is_json_decode or _is_streaming_closed)
+                (_is_model_not_found or _is_timeout or _is_invalid_response or _is_streaming_closed)
                 and self.summary_model
                 and self.summary_model != self.model
                 and not getattr(self, "_summary_model_fallen_back", False)
@@ -1960,7 +1983,11 @@ This compaction should PRIORITISE preserving all information related to the focu
                 else:
                     _reason = "timed out"
                 self._fallback_to_main_for_compression(e, _reason)
-                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)  # retry immediately
+                return self._generate_summary(
+                    turns_to_summarize,
+                    focus_topic=focus_topic,
+                    deadline_monotonic=deadline_monotonic,
+                )  # retry immediately
 
             # Unknown-error best-effort retry on main model.  Losing N turns of
             # context is almost always worse than one extra summary attempt, so
@@ -1977,7 +2004,11 @@ This compaction should PRIORITISE preserving all information related to the focu
                 and not getattr(self, "_summary_model_fallen_back", False)
             ):
                 self._fallback_to_main_for_compression(e, "failed")
-                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
+                return self._generate_summary(
+                    turns_to_summarize,
+                    focus_topic=focus_topic,
+                    deadline_monotonic=deadline_monotonic,
+                )
 
             # Transient errors (timeout, rate limit, network, JSON decode,
             # streaming premature-close) — shorter cooldown for JSON decode and
@@ -1995,8 +2026,8 @@ This compaction should PRIORITISE preserving all information related to the focu
             # placeholder marker — retrying once the network recovers is
             # strictly better than dropping context (#29559, #25585). Mirrors
             # the auth-failure carve-out; independent of abort_on_summary_failure.
-            if _is_streaming_closed:
-                self._last_summary_network_failure = True
+            if _is_timeout or _is_invalid_response or _is_streaming_closed:
+                self._last_summary_transient_failure = True
             logger.warning(
                 "Failed to generate context summary: %s. "
                 "Further summary attempts paused for %d seconds.",
@@ -2627,7 +2658,14 @@ This compaction should PRIORITISE preserving all information related to the focu
     # Main compression entry point
     # ------------------------------------------------------------------
 
-    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None, focus_topic: str = None, force: bool = False) -> List[Dict[str, Any]]:
+    def compress(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: int = None,
+        focus_topic: str = None,
+        force: bool = False,
+        deadline_monotonic: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
         """Compress conversation messages by summarizing middle turns.
 
         Algorithm:
@@ -2658,7 +2696,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         self._last_aux_model_failure_model = None
         self._last_compress_aborted = False
         # NOTE: do NOT reset _last_summary_auth_failure or
-        # _last_summary_network_failure here.  These flags are set by
+        # _last_summary_transient_failure here.  These flags are set by
         # _generate_summary() on a terminal failure and are already cleared on
         # a successful summary.  Resetting them eagerly defeats the cooldown
         # protection: _generate_summary() returns None from the cooldown
@@ -2769,7 +2807,11 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         # Phase 3: Generate structured summary
         summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
-        summary = self._generate_summary(turns_to_summarize, focus_topic=summary_focus_topic)
+        summary = self._generate_summary(
+            turns_to_summarize,
+            focus_topic=summary_focus_topic,
+            deadline_monotonic=deadline_monotonic,
+        )
 
         # If summary generation failed, behavior splits on
         # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):
@@ -2783,20 +2825,16 @@ This compaction should PRIORITISE preserving all information related to the focu
         #           surface a warning.
         # Default is False (historical behavior).
         #
-        # EXCEPTION — auth AND transient network failures always abort. A
-        # 401/403 from the summary call means the credential or endpoint is
-        # broken (invalid/blocked key, or a token pointed at the wrong
-        # inference host). A connection/stream-close error means the network
-        # blipped at the compaction moment (#29559). In BOTH cases rotating into
-        # a child session with a placeholder summary on a broken credential
-        # strands the user on a degraded session for zero benefit — every
-        # subsequent call fails the same way. So when the failure was an auth
-        # error we abort regardless of abort_on_summary_failure, preserving
-        # the conversation unchanged until the credential is fixed.
+        # EXCEPTION — auth AND transient provider failures always abort. A
+        # 401/403 means the credential/endpoint is broken. Timeout/deadline,
+        # 408/429/5xx, malformed/empty responses, and connection/stream closure
+        # are transient provider failures. In all of these cases, dropping the
+        # middle window is worse than preserving it for a later retry, so abort
+        # regardless of abort_on_summary_failure.
         if not summary and (
             self.abort_on_summary_failure
             or self._last_summary_auth_failure
-            or self._last_summary_network_failure
+            or self._last_summary_transient_failure
         ):
             n_skipped = compress_end - compress_start
             self._last_summary_dropped_count = 0  # nothing actually dropped
@@ -2812,12 +2850,12 @@ This compaction should PRIORITISE preserving all information related to the focu
                         "with /compress or start fresh with /new.",
                         n_skipped,
                     )
-                elif self._last_summary_network_failure:
+                elif self._last_summary_transient_failure:
                     logger.warning(
-                        "Summary generation failed with a network/connection "
+                        "Summary generation failed with a transient provider "
                         "error — aborting compression. %d message(s) preserved "
                         "unchanged; the session was NOT rotated. This is "
-                        "transient: retry with /compress once connectivity "
+                        "transient: retry with /compress once the provider "
                         "recovers, or continue the conversation as-is.",
                         n_skipped,
                     )
@@ -2825,8 +2863,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                     logger.warning(
                         "Summary generation failed — aborting compression "
                         "(compression.abort_on_summary_failure=true). "
-                        "%d message(s) preserved unchanged. Conversation is "
-                        "frozen until the next /compress or /new.",
+                        "%d message(s) preserved unchanged. Conversation "
+                        "continues as-is; retry with /compress or start /new.",
                         n_skipped,
                     )
             return messages

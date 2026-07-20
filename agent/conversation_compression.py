@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import time
 import uuid
 import threading
 from datetime import datetime
@@ -50,6 +51,10 @@ COMPACTION_STATUS_MARKER = "Compacting context"
 COMPACTION_STATUS = (
     f"🗜️ {COMPACTION_STATUS_MARKER} — summarizing earlier conversation so I can continue..."
 )
+
+# Automatic compression is user-blocking preflight work. Manual /compress keeps
+# the configured task timeout because the user explicitly requested it.
+_AUTOMATIC_COMPRESSION_DEADLINE_SECONDS = 45.0
 
 
 def _compression_lock_holder(agent: Any) -> str:
@@ -579,8 +584,18 @@ def compress_context(
         except Exception:
             pass
 
+    deadline_monotonic = None
+    if not force:
+        deadline_monotonic = time.monotonic() + _AUTOMATIC_COMPRESSION_DEADLINE_SECONDS
+
     try:
-        compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic, force=force)
+        compressed = agent.context_compressor.compress(
+            messages,
+            current_tokens=approx_tokens,
+            focus_topic=focus_topic,
+            force=force,
+            deadline_monotonic=deadline_monotonic,
+        )
     except TypeError:
         # Plugin context engine with strict signature that doesn't accept
         # focus_topic / force — fall back to calling without them.

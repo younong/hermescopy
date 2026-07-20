@@ -324,6 +324,23 @@ def _is_arcee_trinity_thinking(model: Optional[str]) -> bool:
 # We raise the trigger to 85% (~231K) on this exact route so Codex gpt-5.5
 # sessions use the window they actually have.
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
+_CUSTOM_CODEX_RESPONSES_COMPACTION_TOKEN_CAP = 128_000
+
+
+def _compression_token_cap_for_route(
+    model: Optional[str],
+    provider: Optional[str],
+    api_mode: Optional[str],
+) -> Optional[int]:
+    """Return a proactive input-token cap for unstable custom Codex routes."""
+    prov = (provider or "").strip().lower()
+    mode = (api_mode or "").strip().lower()
+    bare = (model or "").strip().lower().rsplit("/", 1)[-1]
+    is_custom = prov == "custom" or prov.startswith("custom:")
+    is_codex_family = bare.startswith("gpt-5") or bare.startswith("codex")
+    if is_custom and mode == "codex_responses" and is_codex_family:
+        return _CUSTOM_CODEX_RESPONSES_COMPACTION_TOKEN_CAP
+    return None
 
 
 def _is_codex_gpt55(model: Optional[str], provider: Optional[str] = None) -> bool:
@@ -3168,6 +3185,7 @@ def _retry_same_provider_sync(
     tools: Optional[list],
     effective_timeout: float,
     effective_extra_body: dict,
+    deadline_monotonic: Optional[float] = None,
 ) -> Any:
     if task == "vision":
         _, retry_client, retry_model = resolve_vision_provider_client(
@@ -3205,8 +3223,8 @@ def _retry_same_provider_sync(
     )
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
-    return _validate_llm_response(
-        retry_client.chat.completions.create(**retry_kwargs), task,
+    return _sync_create_with_deadline(
+        retry_client, retry_kwargs, task, deadline_monotonic,
     )
 
 
@@ -5526,6 +5544,40 @@ def _resolve_task_provider_model(
 _DEFAULT_AUX_TIMEOUT = 30.0
 
 
+class AuxiliaryDeadlineExceeded(TimeoutError):
+    """An aggregate auxiliary-task deadline expired across retries/fallbacks."""
+
+
+def _remaining_deadline_timeout(
+    configured_timeout: float,
+    deadline_monotonic: Optional[float],
+) -> float:
+    if deadline_monotonic is None:
+        return configured_timeout
+    remaining = deadline_monotonic - time.monotonic()
+    if remaining <= 0:
+        raise AuxiliaryDeadlineExceeded(
+            "Auxiliary compression aggregate deadline exhausted"
+        )
+    return min(configured_timeout, remaining)
+
+
+def _sync_create_with_deadline(
+    client: Any,
+    kwargs: Dict[str, Any],
+    task: Optional[str],
+    deadline_monotonic: Optional[float],
+) -> Any:
+    request_kwargs = dict(kwargs)
+    request_kwargs["timeout"] = _remaining_deadline_timeout(
+        float(request_kwargs.get("timeout", _DEFAULT_AUX_TIMEOUT)),
+        deadline_monotonic,
+    )
+    return _validate_llm_response(
+        client.chat.completions.create(**request_kwargs), task,
+    )
+
+
 def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
     """Return the config dict for auxiliary.<task>, or {} when unavailable.
 
@@ -5910,6 +5962,7 @@ def call_llm(
     api_mode: str = None,
     stream: bool = False,
     stream_options: dict = None,
+    deadline_monotonic: float = None,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -5936,6 +5989,9 @@ def call_llm(
             output can stream to the user.
         stream_options: Passed through to the request when stream is True
             (e.g. {"include_usage": True}).
+        deadline_monotonic: Optional aggregate deadline shared by all retries
+            and fallbacks for this call. Each request timeout is clamped to the
+            remaining budget.
 
     Returns:
         Response object with .choices[0].message.content, OR — when stream=True —
@@ -6019,6 +6075,9 @@ def call_llm(
                 f"Run: hermes setup")
 
     effective_timeout = timeout if timeout is not None else _get_task_timeout(task)
+    effective_timeout = _remaining_deadline_timeout(
+        effective_timeout, deadline_monotonic,
+    )
 
     # Log what we're about to do — makes auxiliary operations visible
     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
@@ -6075,8 +6134,8 @@ def call_llm(
         # ``first_err`` and the existing fallback handling unchanged. Unified home
         # for the transient retry every auxiliary task shares. (PR #16587)
         try:
-            return _validate_llm_response(
-                client.chat.completions.create(**kwargs), task)
+            return _sync_create_with_deadline(
+                client, kwargs, task, deadline_monotonic)
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
                 raise
@@ -6105,10 +6164,16 @@ def call_llm(
                     task or "call", _attempt, _max_transient_retries, _backoff,
                     _last_transient,
                 )
+                if deadline_monotonic is not None:
+                    remaining = deadline_monotonic - time.monotonic()
+                    if remaining <= _backoff:
+                        raise AuxiliaryDeadlineExceeded(
+                            "Auxiliary compression aggregate deadline exhausted"
+                        )
                 time.sleep(_backoff)
                 try:
-                    return _validate_llm_response(
-                        client.chat.completions.create(**kwargs), task)
+                    return _sync_create_with_deadline(
+                        client, kwargs, task, deadline_monotonic)
                 except Exception as retry_transient:
                     if not _is_transient_transport_error(retry_transient):
                         raise
@@ -6124,8 +6189,8 @@ def call_llm(
                 task or "call",
             )
             try:
-                return _validate_llm_response(
-                    client.chat.completions.create(**retry_kwargs), task)
+                return _sync_create_with_deadline(
+                    client, retry_kwargs, task, deadline_monotonic)
             except Exception as retry_err:
                 retry_err_str = str(retry_err)
                 # If retry still fails, fall through to the max_tokens /
@@ -6162,8 +6227,8 @@ def call_llm(
             kwargs.pop("max_tokens", None)
             kwargs.pop("max_completion_tokens", None)
             try:
-                return _validate_llm_response(
-                    client.chat.completions.create(**kwargs), task)
+                return _sync_create_with_deadline(
+                    client, kwargs, task, deadline_monotonic)
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
@@ -6192,8 +6257,8 @@ def call_llm(
                 )
                 kwargs["model"] = healed_model
                 try:
-                    return _validate_llm_response(
-                        client.chat.completions.create(**kwargs), task)
+                    return _sync_create_with_deadline(
+                        client, kwargs, task, deadline_monotonic)
                 except Exception as retry_err:
                     first_err = retry_err
 
@@ -6225,8 +6290,8 @@ def call_llm(
                 if refreshed_model and refreshed_model != kwargs.get("model"):
                     kwargs["model"] = refreshed_model
                 try:
-                    return _validate_llm_response(
-                        refreshed_client.chat.completions.create(**kwargs), task)
+                    return _sync_create_with_deadline(
+                        refreshed_client, kwargs, task, deadline_monotonic)
                 except Exception as retry_err:
                     if not (
                         _is_auth_error(retry_err)
@@ -6253,8 +6318,8 @@ def call_llm(
                             task or "call")
                 if refreshed_model and refreshed_model != kwargs.get("model"):
                     kwargs["model"] = refreshed_model
-                return _validate_llm_response(
-                    refreshed_client.chat.completions.create(**kwargs), task)
+                return _sync_create_with_deadline(
+                    refreshed_client, kwargs, task, deadline_monotonic)
 
         # ── Auth refresh retry ───────────────────────────────────────
         if (_is_auth_error(first_err)
@@ -6280,6 +6345,7 @@ def call_llm(
                     tools=tools,
                     effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
+                    deadline_monotonic=deadline_monotonic,
                 )
 
         # ── Same-provider credential-pool recovery ─────────────────────
@@ -6295,8 +6361,8 @@ def call_llm(
             # won't accept another request with the same exhausted key.
             if _is_rate_limit_error(first_err) and not _is_payment_error(first_err):
                 try:
-                    return _validate_llm_response(
-                        client.chat.completions.create(**kwargs), task)
+                    return _sync_create_with_deadline(
+                        client, kwargs, task, deadline_monotonic)
                 except Exception as retry_err:
                     if not (_is_auth_error(retry_err) or _is_payment_error(retry_err) or _is_rate_limit_error(retry_err)):
                         raise
@@ -6322,6 +6388,7 @@ def call_llm(
                         tools=tools,
                         effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
+                        deadline_monotonic=deadline_monotonic,
                     )
                 except Exception as retry2_err:
                     # The rotated key also hit a quota/auth wall.  Mark it
@@ -6444,8 +6511,8 @@ def call_llm(
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
                     base_url=str(getattr(fb_client, "base_url", "") or ""))
-                return _validate_llm_response(
-                    fb_client.chat.completions.create(**fb_kwargs), task)
+                return _sync_create_with_deadline(
+                    fb_client, fb_kwargs, task, deadline_monotonic)
             # All fallback layers exhausted — emit a single user-visible
             # warning so the operator knows aux task is about to fail.
             # (#26882) The error itself is re-raised below.

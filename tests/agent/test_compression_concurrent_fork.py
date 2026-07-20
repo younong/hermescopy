@@ -77,6 +77,9 @@ def _build_agent_with_db(db: SessionDB, session_id: str):
     compressor._last_aux_model_failure_model = None
     compressor._last_aux_model_failure_error = None
     agent.context_compressor = compressor
+    # The fixture supplies its own compressor, so skip the unrelated live
+    # auxiliary-provider feasibility probe before exercising the lock path.
+    agent._compression_feasibility_checked = True
     # These tests cover the ROTATION fallback path (forking, child sessions,
     # lock contention) — pin in_place=False so they keep exercising it
     # regardless of the global default (which flipped to True in #38763).
@@ -638,3 +641,22 @@ def test_lease_refresher_stops_on_persistent_raise() -> None:
     _no_sleep(refresher)
     refresher._run()  # must not propagate
     assert db.calls == refresher._max_consecutive_failures
+
+
+def test_auto_compression_passes_deadline_but_manual_does_not(tmp_path: Path) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "DEADLINE_TEST_SESSION"
+    db.create_session(session_id, source="test")
+    agent = _build_agent_with_db(db, session_id)
+    agent.compression_in_place = True
+    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+
+    with patch("agent.conversation_compression.time.monotonic", return_value=100.0):
+        agent._compress_context(messages, "sys", approx_tokens=120_000)
+    auto_kwargs = agent.context_compressor.compress.call_args.kwargs
+    assert auto_kwargs["deadline_monotonic"] == 145.0
+
+    agent.context_compressor.compress.reset_mock()
+    agent._compress_context(messages, "sys", approx_tokens=120_000, force=True)
+    manual_kwargs = agent.context_compressor.compress.call_args.kwargs
+    assert manual_kwargs["deadline_monotonic"] is None

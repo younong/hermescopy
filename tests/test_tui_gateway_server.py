@@ -6817,6 +6817,94 @@ def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):
     assert "kimi-k2.6" in payload.get("text", "")
 
 
+def test_prompt_submit_failed_result_without_detail_is_visible_error(monkeypatch):
+    """Malformed failed results still terminate with visible error text."""
+
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            return {
+                "final_response": None,
+                "messages": [],
+                "completed": False,
+                "failed": True,
+            }
+
+    session = _session(agent=_Agent())
+    session["inflight_turn"] = {
+        "user": "hello",
+        "assistant": "",
+        "streaming": True,
+    }
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+
+    emitted: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, sid, payload or {})),
+    )
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    server.handle_request(
+        {
+            "id": "1",
+            "method": "prompt.submit",
+            "params": {"session_id": "sid", "text": "hello"},
+        }
+    )
+
+    complete_events = [event for event in emitted if event[0] == "message.complete"]
+    assert len(complete_events) == 1
+    assert complete_events[0][2]["status"] == "error"
+    assert complete_events[0][2]["text"] == "Error: Agent turn failed."
+    assert session.get("inflight_turn") is None
+
+
+def test_prompt_submit_partial_result_is_error_even_with_visible_text(monkeypatch):
+    """Partial backend results cannot masquerade as successful completions."""
+
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            return {
+                "final_response": "Partial answer before the provider failed.",
+                "messages": [],
+                "completed": False,
+                "partial": True,
+            }
+
+    server._sessions["sid"] = _session(agent=_Agent())
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+
+    emitted: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, sid, payload or {})),
+    )
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    server.handle_request(
+        {
+            "id": "1",
+            "method": "prompt.submit",
+            "params": {"session_id": "sid", "text": "hello"},
+        }
+    )
+
+    complete = next(event for event in emitted if event[0] == "message.complete")
+    assert complete[2]["status"] == "error"
+    assert complete[2]["text"] == "Partial answer before the provider failed."
+
+
 def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):
     """An empty final_response with NO backend error must stay empty — do not
     synthesize an error string. Preserves the existing None/empty-sentinel

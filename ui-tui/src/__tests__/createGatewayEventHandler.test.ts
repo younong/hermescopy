@@ -66,6 +66,21 @@ describe('createGatewayEventHandler', () => {
     patchUiState({ showReasoning: true })
   })
 
+  it('clears busy state and preserves visible text on error completion', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    patchUiState({ busy: true, status: 'running…' })
+    onEvent({
+      payload: { status: 'error', text: 'Error: upstream returned 502' },
+      type: 'message.complete'
+    } as any)
+
+    expect(getUiState().busy).toBe(false)
+    expect(getUiState().status).toBe('ready')
+    expect(appended).toContainEqual({ role: 'assistant', text: 'Error: upstream returned 502' })
+  })
+
   it('archives incomplete todos into transcript flow at end of turn so they scroll up', () => {
     const appended: Msg[] = []
 

@@ -5545,7 +5545,7 @@ class TestRetryExhaustion:
         agent.client.chat.completions.create.side_effect = RuntimeError("rate limited")
         from agent import conversation_loop as _conv_loop
         with (
-            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_persist_session") as persist,
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
             patch("run_agent.time", self._make_fast_time_mock()),
@@ -5557,6 +5557,13 @@ class TestRetryExhaustion:
         assert result.get("failed") is True
         assert "error" in result
         assert "rate limited" in result["error"]
+        assert result["turn_exit_reason"] == "api_retries_exhausted"
+        assert result["messages"][-1] == {
+            "role": "assistant",
+            "content": result["final_response"],
+        }
+        persisted_messages = persist.call_args.args[0]
+        assert persisted_messages[-1] == result["messages"][-1]
 
     def test_build_api_kwargs_error_no_unbound_local(self, agent):
         """When _build_api_kwargs raises, except handler must not crash with UnboundLocalError.
