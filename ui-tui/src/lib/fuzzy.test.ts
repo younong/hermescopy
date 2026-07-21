@@ -1,8 +1,27 @@
 import { describe, expect, it } from 'vitest'
 
-import { fuzzyRank, fuzzyScore, fuzzyScoreMulti } from './fuzzy.js'
+import { fuzzyRank, fuzzyScore, fuzzyScoreMulti } from '@hermes/shared/fuzzy'
 
 describe('fuzzyScore', () => {
+  it.each([
+    ['gpt-4o', 'g4o', 15.94, [0, 4, 5]],
+    ['gpt-4o', 'gpt', 28.94, [0, 1, 2]],
+    ['claude-sonnet-4', 'sonnet', 33.85, [7, 8, 9, 10, 11, 12]],
+    ['GptO', 'gpto', 57.96, [0, 1, 2, 3]]
+  ])('matches Python parity fixture %s / %s', (target, query, score, positions) => {
+    const match = fuzzyScoreMulti(target, query)
+
+    expect(match?.score).toBeCloseTo(score as number, 10)
+    expect(match?.positions).toEqual(positions)
+  })
+
+  it('matches the multi-token Python parity fixture', () => {
+    const match = fuzzyScoreMulti('claude-sonnet-4', 'clad snnt')
+
+    expect(match?.score).toBeCloseTo(30.7, 10)
+    expect(match?.positions).toEqual([0, 1, 2, 4, 7, 9, 10, 12])
+  })
+
   it('matches a query as a subsequence (g4o → gpt-4o)', () => {
     expect(fuzzyScore('gpt-4o', 'g4o')).not.toBeNull()
     expect(fuzzyScore('gpt-4o', 'gpt')).not.toBeNull()

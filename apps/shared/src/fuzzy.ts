@@ -8,13 +8,8 @@
 // The scoring favours, in rough order: exact full match, prefix match, matches
 // that start on a word boundary (after `-`, `_`, `/`, `.`, space, or a
 // lower→upper case transition), contiguous runs, and earlier matches. This is
-// intentionally simple — no external dependency — but good enough to make
-// `son4` rank `claude-sonnet-4` above an incidental scattered hit.
-//
-// The WebUI ships a logically identical copy of this module at
-// web/src/lib/fuzzy.ts (only prettier formatting differs); keep the two in
-// sync. The TUI copy carries the vitest suite (the web package has no test
-// runner), so changes should be validated here.
+// intentionally simple, but good enough to make `son4` rank
+// `claude-sonnet-4` above an incidental scattered hit.
 
 export interface FuzzyMatch {
   /** Total score; higher is better. */
