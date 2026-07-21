@@ -8,6 +8,7 @@ import { initialGuiChatState } from "../types";
 import { MessageList } from "./MessageList";
 
 const resizeObservers: TestResizeObserver[] = [];
+let contentHeight = 0;
 
 class TestResizeObserver implements ResizeObserver {
   readonly callback: ResizeObserverCallback;
@@ -46,13 +47,22 @@ function scroll(element: HTMLElement, scrollTop: number) {
   element.dispatchEvent(new Event("scroll", { bubbles: true }));
 }
 
+function waitForFrame() {
+  return new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+}
+
 beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
     .IS_REACT_ACT_ENVIRONMENT = true;
   document.body.innerHTML = "";
   resizeObservers.length = 0;
+  contentHeight = 0;
   vi.stubGlobal("ResizeObserver", TestResizeObserver);
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) =>
+    setTimeout(() => callback(0), 0));
+  vi.stubGlobal("cancelAnimationFrame", (handle: number) => clearTimeout(handle));
   Object.defineProperties(HTMLElement.prototype, {
+    clientHeight: { configurable: true, get: () => 600 },
     offsetHeight: {
       configurable: true,
       get() {
@@ -60,10 +70,18 @@ beforeEach(() => {
       },
     },
     offsetWidth: { configurable: true, get: () => 800 },
+    scrollHeight: {
+      configurable: true,
+      get() {
+        return contentHeight || 600;
+      },
+    },
     scrollTo: {
       configurable: true,
       value(options: ScrollToOptions) {
-        if (typeof options.top === "number") this.scrollTop = options.top;
+        if (typeof options.top === "number") {
+          this.scrollTop = Math.min(options.top, Math.max(0, this.scrollHeight - this.offsetHeight));
+        }
       },
     },
   });
@@ -156,13 +174,22 @@ describe("MessageList", () => {
 
     const scroller = container.querySelector<HTMLElement>("[aria-busy=false]")!;
     const imageRow = container.querySelector<HTMLElement>('[data-index="7"]')!;
+    contentHeight = 1120;
     await act(async () => scroll(scroller, 520));
 
-    await act(async () => resize(imageRow, 340));
+    await act(async () => {
+      resize(imageRow, 340);
+    });
+    contentHeight = 1320;
+    await act(async () => waitForFrame());
     expect(scroller.scrollTop).toBe(720);
 
+    await act(async () => waitForFrame());
     await act(async () => scroll(scroller, 400));
-    await act(async () => resize(imageRow, 440));
+    await act(async () => {
+      resize(imageRow, 440);
+      contentHeight = 1420;
+    });
     expect(scroller.scrollTop).toBe(400);
 
     await act(async () => root.unmount());
