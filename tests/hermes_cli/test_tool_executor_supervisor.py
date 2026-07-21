@@ -125,7 +125,7 @@ def _record(binding, mount_policy, invocation, *, observed_at=90, expires_at=110
 
 def _supervisor(
     tmp_path, process_factory, *, sandbox_builder=_launch_spec, verification_source=_record,
-    egress_policy=None, audit_reporter=None, clock=lambda: 100,
+    egress_policy=None, audit_reporter=None, image_dispatcher=None, clock=lambda: 100,
 ):
     roots, locations = _roots(tmp_path)
     lease = OwnerWorkerAuthorityLease("ok1_owner", 1, "worker-a", WorkerLeaseState.ACTIVE, 1, 0)
@@ -140,6 +140,7 @@ def _supervisor(
         sandbox_syscall_filter_source=_syscall_filter,
         egress_policy=egress_policy,
         audit_reporter=audit_reporter,
+        image_dispatcher=image_dispatcher,
         clock=clock,
     )
 
@@ -208,6 +209,7 @@ def test_default_web_tools_use_tool_none_broker_while_other_network_tools_stay_p
 
     assert policy.select("web_search") is EgressProfile.TOOL_NONE
     assert policy.select("web_extract") is EgressProfile.TOOL_NONE
+    assert policy.select("image_generate") is EgressProfile.TOOL_NONE
     assert policy.select("browser_navigate") is EgressProfile.TOOL_PUBLIC
 
 
@@ -346,6 +348,69 @@ def test_supervisor_passes_one_private_relay_fd_for_web_search(tmp_path):
     serialized = json.dumps({"argv": spawned[0][0][0], "env": kwargs["env"]})
     assert "API_KEY" not in serialized
     assert "TOKEN" not in serialized
+
+
+def test_supervisor_passes_one_private_relay_fd_for_image_generate(tmp_path, monkeypatch):
+    monkeypatch.setenv("APIYI_API_KEY", "ambient-control-plane-image-secret")
+    spawned = []
+
+    def fake_process_factory(*args, **kwargs):
+        spawned.append((args, kwargs))
+        _publish_fake_sandbox_info(args[0])
+        gate_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_START_GATE_FD"]))
+        request_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_BOOTSTRAP_FD"]))
+        response_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_RESPONSE_FD"]))
+        relay_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_OWNER_RELAY_FD"]))
+
+        def respond():
+            assert os.read(gate_fd, 1) == b"1"
+            os.close(gate_fd)
+            payload = json.loads(os.read(request_fd, 1 << 20))
+            from hermes_cli.tool_executor_runtime.entrypoint import invocation_from_payload
+            from hermes_cli.owner_worker.owner_tool_relay import dispatch_owner_tool_over_relay
+
+            invocation = invocation_from_payload(payload)
+            result = dispatch_owner_tool_over_relay(relay_fd, invocation)
+            os.write(response_fd, json.dumps({"result": result}).encode())
+            os.close(request_fd)
+            os.close(response_fd)
+
+        threading.Thread(target=respond, daemon=True).start()
+        return _FakeProcess()
+
+    image_dispatcher = lambda name, args, _invocation, _materializer: json.dumps({
+        "name": name, "prompt": args["prompt"],
+    })
+    roots, supervisor = _supervisor(
+        tmp_path, fake_process_factory, image_dispatcher=image_dispatcher,
+    )
+    try:
+        result = supervisor.dispatch(
+            function_name="image_generate",
+            function_args={"prompt": "Draw a poster", "aspect_ratio": "portrait"},
+            task_id="task-a", session_id="session-a", tool_call_id="call-a",
+            turn_id="turn-a", api_request_id="request-a",
+        )
+    finally:
+        roots.close()
+        supervisor.owner_tool_relay.close()
+
+    assert json.loads(result) == {"name": "image_generate", "prompt": "Draw a poster"}
+    args, kwargs = spawned[0]
+    assert kwargs["env"]["HERMES_EXECUTOR_EGRESS_PROFILE"] == "tool-none"
+    relay_fd = kwargs["env"]["HERMES_EXECUTOR_OWNER_RELAY_FD"]
+    assert relay_fd in {str(fd) for fd in kwargs["pass_fds"]}
+    assert len(kwargs["pass_fds"]) == 7
+    serialized = json.dumps({"argv": args[0], "env": kwargs["env"]})
+    for forbidden in (
+        "ambient-control-plane-image-secret",
+        "APIYI_API_KEY",
+        "API_KEY",
+        "TOKEN",
+        "BASE_URL",
+        "DEPLOYMENT_IMAGE_RELAY_FD",
+    ):
+        assert forbidden not in serialized
 
 
 def test_supervisor_skill_view_materializes_only_selected_skill(tmp_path):

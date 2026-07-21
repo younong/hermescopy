@@ -1,4 +1,4 @@
-"""One-shot authenticated relay for owner-scoped read-only tool execution.
+"""One-shot authenticated relay for exact owner-scoped tool execution.
 
 The Tool Executor receives no owner credentials or owner-home mount. An exact
 allowlisted invocation may receive one socket endpoint; the owner worker checks
@@ -25,7 +25,7 @@ from hermes_cli.owner_worker.executor_identity import (
 logger = logging.getLogger(__name__)
 
 OWNER_RELAY_TOOL_NAMES = frozenset({
-    "web_search", "web_extract", "skills_list", "skill_view",
+    "web_search", "web_extract", "skills_list", "skill_view", "image_generate",
 })
 _MAX_REQUEST_BYTES = 256 * 1024
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -101,6 +101,29 @@ def _validated_arguments(tool_name: str, arguments: object) -> dict[str, Any]:
         result: dict[str, Any] = {"urls": list(urls)}
         if char_limit is not None:
             result["char_limit"] = char_limit
+        return result
+    if tool_name == "image_generate":
+        if set(arguments) - {"prompt", "aspect_ratio", "image_url", "reference_image_urls"}:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        prompt = arguments.get("prompt")
+        aspect_ratio = arguments.get("aspect_ratio", "landscape")
+        image_url = arguments.get("image_url")
+        references = arguments.get("reference_image_urls")
+        if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 32_768 or "\x00" in prompt:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        if aspect_ratio not in {"landscape", "square", "portrait"}:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        if image_url is not None and (not isinstance(image_url, str) or not image_url.strip() or len(image_url) > 4096 or "\x00" in image_url):
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        if references is not None and (not isinstance(references, list) or len(references) > 16 or any(
+            not isinstance(item, str) or not item.strip() or len(item) > 4096 or "\x00" in item for item in references
+        )):
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        result = {"prompt": prompt.strip(), "aspect_ratio": aspect_ratio}
+        if image_url is not None:
+            result["image_url"] = image_url.strip()
+        if references is not None:
+            result["reference_image_urls"] = [item.strip() for item in references]
         return result
     if tool_name == "skills_list":
         if set(arguments) - {"category"}:
@@ -203,9 +226,11 @@ class OwnerToolRelayBroker:
         *,
         identity_validator: Callable[[ExecutorIdentity], None],
         dispatcher: Callable[..., str] = _dispatch_owner_tool,
+        image_dispatcher: Callable[..., str] | None = None,
     ) -> None:
         self._identity_validator = identity_validator
         self._dispatcher = dispatcher
+        self._image_dispatcher = image_dispatcher
         self._endpoints: dict[tuple[tuple[Any, ...], str], _RelayEndpoint] = {}
         self._lock = threading.RLock()
         self._closed = False
@@ -227,6 +252,8 @@ class OwnerToolRelayBroker:
             raise OwnerToolRelayError("owner tool relay requires isolated network egress")
         self._identity_validator(invocation.identity)
         _validated_arguments(invocation.tool_name, invocation.arguments)
+        if invocation.tool_name == "image_generate" and self._image_dispatcher is None:
+            raise OwnerToolRelayError("owner tool relay image dispatcher is unavailable")
         if invocation.tool_name == "skill_view" and skill_dir_materializer is None:
             raise OwnerToolRelayError("owner tool relay skill materializer is unavailable")
         if invocation.tool_name != "skill_view" and skill_dir_materializer is not None:
@@ -323,7 +350,8 @@ class OwnerToolRelayBroker:
         }
         logger.info("Authenticated owner relay dispatch started", extra=correlation)
         try:
-            result = self._dispatcher(
+            dispatcher = self._image_dispatcher if expected.tool_name == "image_generate" else self._dispatcher
+            result = dispatcher(
                 expected.tool_name,
                 arguments,
                 expected,

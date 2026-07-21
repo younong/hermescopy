@@ -751,6 +751,58 @@ def test_supervisor_passes_only_safe_deployment_descriptor(tmp_path):
     supervisor.shutdown()
 
 
+def test_supervisor_passes_only_safe_deployment_image_descriptor(tmp_path, monkeypatch):
+    from hermes_cli.deployment_image import DeploymentImagePolicy
+
+    monkeypatch.setenv("APIYI_API_KEY", "ambient-control-plane-image-secret")
+    owner = _Owner("ok1_image_deployment", tmp_path / "owner")
+    spawned = []
+    child_relay_fds = []
+
+    def fake_process_factory(*args, **kwargs):
+        spawned.append({"args": args, "kwargs": kwargs})
+        child_relay_fds.append(os.dup(int(kwargs["env"]["HERMES_DEPLOYMENT_IMAGE_RELAY_FD"])))
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    policy = DeploymentImagePolicy(
+        runtime_resolver=lambda: {
+            "api_key": "control-plane-image-secret",
+            "openai_base_url": "https://api.example.test/v1",
+            "gemini_base_url": "https://api.example.test/v1beta",
+        },
+        image_generator=lambda **_kwargs: {"image_bytes": b"png", "mime_type": "image/png"},
+        allowed_models=("gpt-image-2-medium",),
+    )
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        deployment_image_policy=policy,
+    )
+
+    supervisor.get_or_start(owner)
+
+    child_env = spawned[0]["kwargs"]["env"]
+    assert child_env["HERMES_DEPLOYMENT_IMAGE_PROVIDER"] == "apiyi"
+    assert child_env["HERMES_DEPLOYMENT_IMAGE_MODEL"] == "gpt-image-2-medium"
+    assert "HERMES_DEPLOYMENT_IMAGE_RELAY_FD" in child_env
+    assert int(child_env["HERMES_DEPLOYMENT_IMAGE_RELAY_FD"]) in spawned[0]["kwargs"]["pass_fds"]
+    serialized = repr({"argv": spawned[0]["args"][0], "env": child_env})
+    for forbidden in (
+        "control-plane-image-secret",
+        "ambient-control-plane-image-secret",
+        "https://api.example.test",
+        "APIYI_API_KEY",
+    ):
+        assert forbidden not in serialized
+    supervisor.shutdown()
+    for fd in child_relay_fds:
+        os.close(fd)
+
+
 def test_supervisor_reclaims_conclusively_absent_orphan_lease(tmp_path):
     owner = _Owner("ok1_orphan", tmp_path / "owner")
     spawned: list[dict] = []
@@ -1480,6 +1532,57 @@ def test_supervisor_startup_throttle_is_per_owner(tmp_path):
 
     assert second.owner_key == owners[1].owner_key
     assert len(spawned) == 2
+
+
+def test_supervisor_relay_activation_failure_revokes_active_worker(tmp_path, monkeypatch):
+    from hermes_cli.deployment_image import DeploymentImagePolicy
+
+    owner = _Owner("ok1_relay_activation", tmp_path / "owner")
+    process = _FakeProcess()
+    child_relay_fds = []
+
+    def fake_process_factory(*args, **kwargs):
+        child_relay_fds.append(os.dup(int(kwargs["env"]["HERMES_DEPLOYMENT_IMAGE_RELAY_FD"])))
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return process
+
+    policy = DeploymentImagePolicy(
+        runtime_resolver=lambda: {
+            "api_key": "secret",
+            "openai_base_url": "https://api.example.test/v1",
+            "gemini_base_url": "https://api.example.test/v1beta",
+        },
+        image_generator=lambda **_kwargs: {"image_bytes": b"png", "mime_type": "image/png"},
+        allowed_models=("gpt-image-2-medium",),
+    )
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+        deployment_image_policy=policy,
+    )
+    monkeypatch.setattr(
+        supervisor.deployment_image_broker,
+        "activate",
+        lambda _lease: (_ for _ in ()).throw(RuntimeError("activation failed")),
+    )
+
+    try:
+        with pytest.raises(OwnerWorkerStartupError, match="relay activation"):
+            supervisor.get_or_start(owner)
+    finally:
+        for fd in child_relay_fds:
+            os.close(fd)
+        supervisor.shutdown()
+
+    assert supervisor._handles == {}
+    assert process.returncode is not None
+    assert not supervisor.socket_path_for(owner, 1).exists()
+    assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.REVOKED
+    assert supervisor.authority_store.read_worker_generation(owner.owner_key, 1).state is WorkerGenerationState.FAILED
 
 
 def test_supervisor_startup_exit_is_typed_and_releases_the_fence(tmp_path):
@@ -3094,6 +3197,7 @@ def test_worker_chat_argv_derives_cwd_from_workspace_descriptor(tmp_path, monkey
         assert cwd == str(owner_home / "workspaces" / "default")
         assert "HERMES_CWD" not in env
         assert "TERMINAL_CWD" not in env
+        assert not any(key.startswith("HERMES_DEPLOYMENT_IMAGE_") for key in env)
     finally:
         roots.close()
 

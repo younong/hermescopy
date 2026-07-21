@@ -115,9 +115,80 @@ def test_web_relay_rejects_noncanonical_operations_and_arguments(tool_name, argu
 
 def test_owner_relay_allowlist_excludes_skill_manage():
     assert OWNER_RELAY_TOOL_NAMES == {
-        "web_search", "web_extract", "skills_list", "skill_view",
+        "web_search", "web_extract", "skills_list", "skill_view", "image_generate",
     }
     assert "skill_manage" not in OWNER_RELAY_TOOL_NAMES
+
+
+def test_owner_relay_dispatches_canonical_image_generation():
+    seen = []
+    broker = OwnerToolRelayBroker(
+        identity_validator=lambda _identity: None,
+        image_dispatcher=lambda name, args, invocation, materializer: (
+            seen.append((name, args, invocation.invocation_id, materializer))
+            or '{"success":true}'
+        ),
+    )
+    invocation = _invocation(
+        "image_generate",
+        {
+            "prompt": "  Draw a poster  ",
+            "aspect_ratio": "portrait",
+            "image_url": " /owner/images/source.png ",
+            "reference_image_urls": [" /owner/workspaces/default/reference.webp "],
+        },
+        invocation_id="image-generate",
+    )
+    relay_fd = broker.register(invocation)
+    assert dispatch_owner_tool_over_relay(relay_fd, invocation) == '{"success":true}'
+    broker.close()
+
+    assert seen == [(
+        "image_generate",
+        {
+            "prompt": "Draw a poster",
+            "aspect_ratio": "portrait",
+            "image_url": "/owner/images/source.png",
+            "reference_image_urls": ["/owner/workspaces/default/reference.webp"],
+        },
+        "image-generate",
+        None,
+    )]
+
+
+def test_owner_relay_rejects_image_without_dispatcher():
+    broker = OwnerToolRelayBroker(identity_validator=lambda _identity: None)
+    try:
+        with pytest.raises(OwnerToolRelayError, match="image dispatcher"):
+            broker.register(_invocation(
+                "image_generate",
+                {"prompt": "draw", "aspect_ratio": "square"},
+                invocation_id="image-generate",
+            ))
+    finally:
+        broker.close()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"prompt": "", "aspect_ratio": "square"},
+        {"prompt": "draw", "aspect_ratio": "wide"},
+        {"prompt": "draw", "aspect_ratio": "square", "model": "forged"},
+        {"prompt": "draw", "aspect_ratio": "square", "image_url": "bad\x00path"},
+        {"prompt": "draw", "aspect_ratio": "square", "reference_image_urls": ["x.png"] * 17},
+    ],
+)
+def test_owner_relay_rejects_noncanonical_image_arguments(arguments):
+    broker = OwnerToolRelayBroker(
+        identity_validator=lambda _identity: None,
+        image_dispatcher=lambda *_args: '{"success":true}',
+    )
+    try:
+        with pytest.raises(OwnerToolRelayError):
+            broker.register(_invocation("image_generate", arguments, invocation_id="bad-image"))
+    finally:
+        broker.close()
 
 
 def test_owner_relay_dispatches_canonical_skill_reads():

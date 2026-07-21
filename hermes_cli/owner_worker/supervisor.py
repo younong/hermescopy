@@ -34,7 +34,9 @@ from hermes_cli.dashboard_auth.authority import (
     WorkerLeaseState,
 )
 from hermes_cli.controlled_roots import ControlledRoots, ExpectedType, RootKind, controlled_roots_for
+from hermes_cli.deployment_image import DeploymentImagePolicy
 from hermes_cli.deployment_inference import DeploymentInferencePolicy
+from hermes_cli.owner_worker.image_relay import DeploymentImageBroker
 from hermes_cli.owner_worker.inference_relay import DeploymentInferenceBroker
 from hermes_cli.owner_runtime import (
     OwnerWorkerRuntimePaths,
@@ -246,6 +248,7 @@ class OwnerWorkerSupervisor:
         authority_store_factory: Callable[[Path], AuthorityStore] = AuthorityStore,
         generation_bridge_revoker: Callable[[OwnerWorkerAuthorityLease], None] | None = None,
         deployment_inference_policy: DeploymentInferencePolicy | None = None,
+        deployment_image_policy: DeploymentImagePolicy | None = None,
     ) -> None:
         self.global_home = Path(global_home).resolve() if global_home else get_hermes_home().resolve()
         self.control_home = Path(control_home).resolve() if control_home else self.global_home / "control-plane"
@@ -282,6 +285,11 @@ class OwnerWorkerSupervisor:
             )
             if deployment_inference_policy is not None
             else None
+        )
+        self.deployment_image_policy = deployment_image_policy
+        self.deployment_image_broker = (
+            DeploymentImageBroker(policy=deployment_image_policy, authority_store=self.authority_store)
+            if deployment_image_policy is not None else None
         )
         self._handles: dict[str, OwnerWorkerHandle] = {}
         # A detached handle remains counted until its synchronous bridge revocation
@@ -437,9 +445,13 @@ class OwnerWorkerSupervisor:
         socket_path = self.socket_path_for(owner, generation.worker_generation)
         env = self._env_for(owner, generation, claim.lease)
         relay_fd = None
+        image_relay_fd = None
         if self.deployment_inference_broker is not None:
             relay_fd = self.deployment_inference_broker.register(claim.lease)
             env["HERMES_DEPLOYMENT_INFERENCE_RELAY_FD"] = str(relay_fd)
+        if self.deployment_image_broker is not None:
+            image_relay_fd = self.deployment_image_broker.register(claim.lease)
+            env["HERMES_DEPLOYMENT_IMAGE_RELAY_FD"] = str(image_relay_fd)
         runtime_paths = owner_worker_runtime_paths(
             owner_home=owner_home,
             worker_generation=generation.worker_generation,
@@ -489,7 +501,7 @@ class OwnerWorkerSupervisor:
                     close_fds=True,
                     preexec_fn=_set_descriptor_cwd,
                     pass_fds=tuple(
-                        fd for fd in (inherited_cwd_fd, relay_fd) if fd is not None
+                        fd for fd in (inherited_cwd_fd, relay_fd, image_relay_fd) if fd is not None
                     ),
                 )
             finally:
@@ -497,9 +509,14 @@ class OwnerWorkerSupervisor:
                 if relay_fd is not None:
                     os.close(relay_fd)
                     relay_fd = None
+                if image_relay_fd is not None:
+                    os.close(image_relay_fd)
+                    image_relay_fd = None
         except Exception as exc:
             if self.deployment_inference_broker is not None:
                 self.deployment_inference_broker.revoke(claim.lease)
+            if self.deployment_image_broker is not None:
+                self.deployment_image_broker.revoke(claim.lease)
             self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, claim.lease)
             try:
                 self.authority_store.transition_worker_lease(
@@ -539,6 +556,8 @@ class OwnerWorkerSupervisor:
         except Exception as exc:
             if self.deployment_inference_broker is not None:
                 self.deployment_inference_broker.revoke(claim.lease)
+            if self.deployment_image_broker is not None:
+                self.deployment_image_broker.revoke(claim.lease)
             self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, claim.lease)
             try:
                 self.authority_store.transition_worker_lease(
@@ -576,12 +595,39 @@ class OwnerWorkerSupervisor:
             pid=int(health["pid"]),
             last_health=health,
         )
-        if self.deployment_inference_broker is not None:
-            try:
+        try:
+            if self.deployment_inference_broker is not None:
                 self.deployment_inference_broker.activate(active_lease)
-            except Exception:
+            if self.deployment_image_broker is not None:
+                self.deployment_image_broker.activate(active_lease)
+        except Exception as exc:
+            if self.deployment_inference_broker is not None:
                 self.deployment_inference_broker.revoke(active_lease)
-                raise
+            if self.deployment_image_broker is not None:
+                self.deployment_image_broker.revoke(active_lease)
+            self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, active_lease)
+            try:
+                self.authority_store.transition_worker_lease(
+                    active_lease,
+                    state=WorkerLeaseState.REVOKED,
+                    generation_state=WorkerGenerationState.FAILED,
+                )
+            except AuthorizationRejected:
+                pass
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        pass
+            else:
+                process.wait()
+            self._cleanup_generation_socket(handle)
+            raise OwnerWorkerStartupError("owner worker relay activation failed") from exc
         with self._lock:
             self._handles[owner_key] = handle
         self._audit_generation(AuthorityAuditReason.GENERATION_ACTIVE, active_lease)
@@ -680,6 +726,8 @@ class OwnerWorkerSupervisor:
             self._teardown_terminated_handle(owner_key, handle)
         if self.deployment_inference_broker is not None:
             self.deployment_inference_broker.close()
+        if self.deployment_image_broker is not None:
+            self.deployment_image_broker.close()
 
     def _admit_start(
         self, owner_key: str, owner_home: Path, *, now: float
@@ -854,6 +902,8 @@ class OwnerWorkerSupervisor:
             retired_lease = draining or self._lease_for_handle(handle)
             if self.deployment_inference_broker is not None:
                 self.deployment_inference_broker.revoke(retired_lease)
+            if self.deployment_image_broker is not None:
+                self.deployment_image_broker.revoke(retired_lease)
             if self.generation_bridge_revoker is not None:
                 self.generation_bridge_revoker(retired_lease)
 
@@ -1038,8 +1088,11 @@ class OwnerWorkerSupervisor:
                 ],
                 deployment_inference_descriptor=(
                     self.deployment_inference_policy.descriptor()
-                    if self.deployment_inference_policy is not None
-                    else None
+                    if self.deployment_inference_policy is not None else None
+                ),
+                deployment_image_descriptor=(
+                    self.deployment_image_policy.descriptor()
+                    if self.deployment_image_policy is not None else None
                 ),
             )
         )
