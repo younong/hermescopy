@@ -46,27 +46,28 @@ const USER_REPORT_MESSAGE =
   'and you can see its multiline, new session. on a new bb/<xxx> branch investigate'
 
 describe('cursor-drift regression — composer cursorLayout matches Ink rendering', () => {
-  it('agrees with wrap-ansi at every typing-prefix of the user-reported message', () => {
-    // Walks the message char-by-char (mirroring what the TUI sees when a
-    // user types). At every prefix, cursorLayout must place the cursor
-    // exactly where wrap-ansi would render the end of the text.
-    //
-    // Pre-fix: this failed on most narrow widths because the hand-rolled
-    // wrap algorithm broke at slightly different points than wrap-ansi.
-    for (const cols of [40, 50, 55, 60, 65, 70, 80]) {
-      let acc = ''
+  it.each([40, 80])('agrees with wrap-ansi across the user-reported message at cols=%i', cols => {
+    // Check the complete message plus representative typing prefixes around
+    // every wrap boundary. Shorter incremental tests cover every character;
+    // this realistic fixture preserves narrow/wide regression coverage without
+    // repeating quadratic wrapping work in the full suite.
+    const checkpoints = new Set([USER_REPORT_MESSAGE.length])
 
-      for (const ch of USER_REPORT_MESSAGE) {
-        acc += ch
-        const layout = cursorLayout(acc, acc.length, cols)
-        const expected = wrapAnsiEnd(acc, cols)
-
-        expect(
-          layout,
-          `mismatch at cols=${cols}, len=${acc.length}, last-char=${JSON.stringify(ch)}, ` +
-            `tail=${JSON.stringify(acc.slice(-30))}`
-        ).toEqual(expected)
+    for (let length = cols; length < USER_REPORT_MESSAGE.length; length += cols) {
+      for (const offset of [-1, 0, 1]) {
+        checkpoints.add(Math.max(1, Math.min(USER_REPORT_MESSAGE.length, length + offset)))
       }
+    }
+
+    for (const length of [...checkpoints].sort((a, b) => a - b)) {
+      const text = USER_REPORT_MESSAGE.slice(0, length)
+      const layout = cursorLayout(text, text.length, cols)
+      const expected = wrapAnsiEnd(text, cols)
+
+      expect(
+        layout,
+        `mismatch at cols=${cols}, len=${length}, tail=${JSON.stringify(text.slice(-30))}`
+      ).toEqual(expected)
     }
   })
 

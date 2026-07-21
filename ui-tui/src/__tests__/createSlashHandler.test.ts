@@ -10,7 +10,7 @@ import { TUI_SESSION_MODEL_FLAG } from '../domain/slash.js'
 // DASHBOARD_TUI_MODE resolves once at module load from HERMES_TUI_DASHBOARD,
 // so toggling process.env in a test body can't move it. Mock just that one
 // export (everything else stays real) and flip the holder per test.
-const envState = { dashboardTuiMode: false }
+const envState = vi.hoisted(() => ({ dashboardTuiMode: false }))
 vi.mock('../config/env.js', async importActual => {
   const actual = await importActual<typeof EnvModule>()
 
