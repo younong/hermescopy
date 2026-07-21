@@ -66,7 +66,13 @@ For every request that changes repository files:
      `origin/main`; do not develop in the primary checkout or from its current
      feature branch.
    Context compaction and session resumption continue the existing task; they
-   never justify creating a replacement worktree.
+   never justify creating a replacement worktree. If the primary-checkout guard
+   blocks an edit after either event, use the registered candidates in its error
+   message to identify the task's original worktree, then call
+   `EnterWorktree(path=...)` with that exact path. Do not create a replacement
+   with `EnterWorktree(name=...)` or a pathless call. If multiple candidates are
+   ambiguous, resolve them from the current task and branch or ask the user; only
+   create a worktree after confirming that none belongs to the current task.
 2. Keep all implementation and validation inside that task's worktree.
 3. Run the focused validation required by the **Validation** section below.
    Here, "required validation" means those prescribed local checks for the
