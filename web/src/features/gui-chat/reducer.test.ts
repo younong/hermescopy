@@ -1025,4 +1025,31 @@ describe("guiChatReducer history image restoration", () => {
       expect(state.artifacts).toEqual({});
     }
   });
+
+  it("retains pagination state after a failed page and clears the error on retry", () => {
+    const current = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        history_page: { cursor: "cursor-2", has_more: true, returned_count: 1 },
+        messages: [{ id: "db-s-2", role: "assistant", text: "current" }],
+        session_id: "runtime",
+      },
+    });
+    const failed = guiChatReducer(
+      guiChatReducer(current, { type: "history.prepend.started" }),
+      { type: "history.prepend.failed", message: "Network unavailable" },
+    );
+
+    expect(failed.historyCursor).toBe("cursor-2");
+    expect(failed.historyHasMore).toBe(true);
+    expect(failed.historyLoading).toBe(false);
+    expect(failed.historyError).toBe("Network unavailable");
+
+    const retrying = guiChatReducer(failed, { type: "history.prepend.started" });
+    expect(retrying.historyCursor).toBe("cursor-2");
+    expect(retrying.historyHasMore).toBe(true);
+    expect(retrying.historyLoading).toBe(true);
+    expect(retrying.historyError).toBeUndefined();
+  });
+
 });

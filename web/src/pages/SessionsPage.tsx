@@ -66,6 +66,7 @@ import { useI18n } from "@/i18n";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { PluginSlot } from "@/plugins";
 import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
+import { useLoadEarlierOnScroll } from "@/hooks/useLoadEarlierOnScroll";
 
 const SOURCE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> =
   {
@@ -339,33 +340,93 @@ function MessageBubble({
   );
 }
 
-/** Message list with auto-scroll to first search hit. */
-function MessageList({
-  messages,
+/** Message list with automatic earlier-history loading and stable prepend anchoring. */
+export function SessionMessageList({
+  canLoadEarlier,
+  historyError,
+  historyLoading,
   highlight,
+  messages,
+  onLoadEarlier,
+  sessionId,
 }: {
-  messages: SessionMessage[];
+  canLoadEarlier: boolean;
+  historyError?: string | null;
+  historyLoading: boolean;
   highlight?: string;
+  messages: SessionMessage[];
+  onLoadEarlier: () => void | Promise<void>;
+  sessionId: string;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const anchorRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
+
+  const captureAnchor = useCallback(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    anchorRef.current = {
+      scrollHeight: container.scrollHeight,
+      scrollTop: container.scrollTop,
+    };
+  }, []);
+
+  const { handleScroll, retry, syncScrollPosition } = useLoadEarlierOnScroll({
+    autoEnabled: !historyError,
+    canLoad: canLoadEarlier,
+    loading: historyLoading,
+    onBeforeLoad: captureAnchor,
+    onLoadEarlier,
+    resetKey: sessionId,
+  });
+
+  useLayoutEffect(() => {
+    const container = containerRef.current;
+    const anchor = anchorRef.current;
+    if (!container || !anchor || historyLoading) return;
+    container.scrollTop = anchor.scrollTop + (container.scrollHeight - anchor.scrollHeight);
+    syncScrollPosition(container.scrollTop);
+    anchorRef.current = null;
+  }, [historyLoading, messages, syncScrollPosition]);
 
   useEffect(() => {
     if (!highlight || !containerRef.current) return;
-    // Scroll to first hit after render
     const timer = setTimeout(() => {
-      const hit = containerRef.current?.querySelector("[data-search-hit]");
-      if (hit) {
-        hit.scrollIntoView({ behavior: "smooth", block: "center" });
+      const container = containerRef.current;
+      const hit = container?.querySelector("[data-search-hit]");
+      if (hit && container) {
+        hit.scrollIntoView({ block: "center" });
+        syncScrollPosition(container.scrollTop);
       }
     }, 50);
     return () => clearTimeout(timer);
-  }, [messages, highlight]);
+  }, [highlight, syncScrollPosition]);
 
   return (
     <div
+      aria-busy={historyLoading}
       ref={containerRef}
-      className="flex flex-col gap-3 max-h-[600px] overflow-y-auto pr-2"
+      className="flex max-h-[600px] flex-col gap-3 overflow-y-auto pr-2"
+      onScroll={handleScroll}
+      style={{ overflowAnchor: "none" }}
     >
+      {(historyError || historyLoading || canLoadEarlier) && (
+        <div className="flex min-h-9 flex-col items-center justify-center gap-2 text-xs text-muted-foreground">
+          {historyError ? (
+            <>
+              <span role="alert">{historyError}</span>
+              {canLoadEarlier && (
+                <Button outlined size="sm" onClick={retry}>
+                  Retry loading earlier messages
+                </Button>
+              )}
+            </>
+          ) : historyLoading ? (
+            <span aria-live="polite" role="status">Loading earlier messages…</span>
+          ) : (
+            <span>Scroll up for earlier messages</span>
+          )}
+        </div>
+      )}
       {messages.map((msg, i) => (
         <MessageBubble key={i} msg={msg} highlight={highlight} />
       ))}
@@ -389,8 +450,10 @@ function SessionRow({
   const [messages, setMessages] = useState<SessionMessage[] | null>(null);
   const [historyCursor, setHistoryCursor] = useState<string | null>(null);
   const [historyHasMore, setHistoryHasMore] = useState(false);
-  const [loading, setLoading] = useState(false);
+  const [initialLoading, setInitialLoading] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [historyError, setHistoryError] = useState<string | null>(null);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(session.title ?? "");
   const [renameSaving, setRenameSaving] = useState(false);
@@ -398,8 +461,8 @@ function SessionRow({
   const navigate = useNavigate();
 
   useEffect(() => {
-    if (isExpanded && messages === null && !loading) {
-      setLoading(true);
+    if (isExpanded && messages === null && !initialLoading) {
+      setInitialLoading(true);
       setError(null);
       api
         .getSessionMessages(session.id, { limit: 100 })
@@ -409,14 +472,14 @@ function SessionRow({
           setHistoryHasMore(!!resp.history_page?.has_more);
         })
         .catch((err) => setError(String(err)))
-        .finally(() => setLoading(false));
+        .finally(() => setInitialLoading(false));
     }
-  }, [isExpanded, session.id, messages, loading]);
+  }, [isExpanded, session.id, messages, initialLoading]);
 
   const loadEarlierMessages = async () => {
-    if (!historyCursor || loading) return;
-    setLoading(true);
-    setError(null);
+    if (!historyCursor || historyLoading) return;
+    setHistoryLoading(true);
+    setHistoryError(null);
     try {
       const resp = await api.getSessionMessages(session.id, {
         before: historyCursor,
@@ -426,9 +489,9 @@ function SessionRow({
       setHistoryCursor(resp.history_page?.cursor ?? null);
       setHistoryHasMore(!!resp.history_page?.has_more);
     } catch (err) {
-      setError(String(err));
+      setHistoryError(String(err));
     } finally {
-      setLoading(false);
+      setHistoryLoading(false);
     }
   };
 
@@ -665,7 +728,7 @@ function SessionRow({
 
       {isExpanded && (
         <div className="min-w-0 border-t border-border bg-background/50 p-4">
-          {loading && (
+          {initialLoading && messages === null && (
             <div className="flex items-center justify-center py-8">
               <Spinner className="text-xl text-primary" />
             </div>
@@ -679,21 +742,15 @@ function SessionRow({
             </p>
           )}
           {messages && messages.length > 0 && (
-            <>
-              {historyHasMore && (
-                <div className="mb-3 flex justify-center">
-                  <Button
-                    outlined
-                    size="sm"
-                    disabled={loading || !historyCursor}
-                    onClick={() => void loadEarlierMessages()}
-                  >
-                    {loading ? "Loading earlier messages…" : "Load earlier messages"}
-                  </Button>
-                </div>
-              )}
-              <MessageList messages={messages} highlight={searchQuery} />
-            </>
+            <SessionMessageList
+              canLoadEarlier={historyHasMore && !!historyCursor}
+              historyError={historyError}
+              historyLoading={historyLoading}
+              highlight={searchQuery}
+              messages={messages}
+              onLoadEarlier={loadEarlierMessages}
+              sessionId={session.id}
+            />
           )}
         </div>
       )}
