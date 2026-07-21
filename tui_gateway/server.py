@@ -27,7 +27,11 @@ from hermes_constants import (
 )
 from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_cli.latency_trace import clean_latency_trace_id, log_latency_stage
-from hermes_cli.owner_runtime import is_owner_worker_env, resolve_workspace_cwd
+from hermes_cli.owner_runtime import (
+    is_owner_worker_env,
+    resolve_workspace_cwd,
+    strip_owner_worker_deployment_runtime_env,
+)
 from gateway.session import (
     current_historical_resume_scope,
     current_recovery_scope,
@@ -410,6 +414,9 @@ class _SlashWorker:
         self._closed = False
         from hermes_cli._subprocess_compat import windows_hide_flags
 
+        child_env = hermes_subprocess_env(inherit_credentials=True)
+        strip_owner_worker_deployment_runtime_env(child_env)
+
         # start_new_session=True detaches the slash worker into its own
         # process group / session. Without this, the worker inherits the
         # gateway's pgid (= TUI parent PID). When mcp_tool's
@@ -427,8 +434,9 @@ class _SlashWorker:
             bufsize=1,
             cwd=os.getcwd(),
             # slash_worker runs the Hermes agent → needs provider credentials.
-            # Tier-1 secrets (gateway/GitHub/infra) are still stripped (#29157).
-            env=hermes_subprocess_env(inherit_credentials=True),
+            # Tier-1 secrets and owner-worker deployment runtime metadata are
+            # still stripped from this nested child.
+            env=child_env,
             creationflags=windows_hide_flags(),
             start_new_session=True,
         )

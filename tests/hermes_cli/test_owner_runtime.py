@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli.owner_runtime import (
+    OWNER_WORKER_DEPLOYMENT_RUNTIME_ENV_KEYS,
     REQUIRED_OWNER_DIRS,
     assert_owner_runtime_paths,
     ensure_owner_runtime_dirs,
@@ -14,6 +15,7 @@ from hermes_cli.owner_runtime import (
     owner_worker_runtime_paths,
     propagate_owner_env,
     resolve_workspace_cwd,
+    strip_owner_worker_deployment_runtime_env,
     validate_owner_worker_runtime_environment,
 )
 
@@ -128,6 +130,16 @@ def test_propagate_owner_env_includes_workspace(monkeypatch, tmp_path):
     assert env["HERMES_HOME"] == str(tmp_path / "owner")
     assert env["HERMES_OWNER_KEY"] == "ok_owner"
     assert env["HERMES_WORKSPACE_ROOT"] == str(tmp_path / "owner" / "workspaces")
+
+
+def test_strip_owner_worker_deployment_runtime_env_removes_only_runtime_metadata():
+    env = {key: "deployment-value" for key in OWNER_WORKER_DEPLOYMENT_RUNTIME_ENV_KEYS}
+    env.update({"OPENAI_API_KEY": "provider-key", "HERMES_OWNER_KEY": "ok_owner"})
+
+    strip_owner_worker_deployment_runtime_env(env)
+
+    assert not set(OWNER_WORKER_DEPLOYMENT_RUNTIME_ENV_KEYS) & env.keys()
+    assert env == {"OPENAI_API_KEY": "provider-key", "HERMES_OWNER_KEY": "ok_owner"}
 
 
 def _worker_env(tmp_path) -> tuple[Path, dict[str, str]]:

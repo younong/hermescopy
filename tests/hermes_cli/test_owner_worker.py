@@ -3182,6 +3182,10 @@ def test_worker_chat_argv_derives_cwd_from_workspace_descriptor(tmp_path, monkey
     roots = controlled_roots_for(owner_worker_runtime_paths(owner_home=owner_home, worker_generation=1))
     monkeypatch.setattr("hermes_cli.main._make_tui_argv", lambda *_args, **_kwargs: (["node", "entry.js"], str(tmp_path)))
     monkeypatch.setattr(ws_routes.os, "readlink", lambda _path: str(owner_home / "workspaces" / "default"))
+    from hermes_cli.owner_runtime import OWNER_WORKER_DEPLOYMENT_RUNTIME_ENV_KEYS
+
+    for key in OWNER_WORKER_DEPLOYMENT_RUNTIME_ENV_KEYS:
+        monkeypatch.setenv(key, "owner-worker-only")
     app = SimpleNamespace(
         state=SimpleNamespace(
             owner_worker_mode=True,
@@ -3197,7 +3201,7 @@ def test_worker_chat_argv_derives_cwd_from_workspace_descriptor(tmp_path, monkey
         assert cwd == str(owner_home / "workspaces" / "default")
         assert "HERMES_CWD" not in env
         assert "TERMINAL_CWD" not in env
-        assert not any(key.startswith("HERMES_DEPLOYMENT_IMAGE_") for key in env)
+        assert not set(OWNER_WORKER_DEPLOYMENT_RUNTIME_ENV_KEYS) & env.keys()
     finally:
         roots.close()
 

@@ -1789,6 +1789,39 @@ def test_status_callback_accepts_single_message_argument():
     )
 
 
+def test_slash_worker_strips_owner_runtime_metadata_but_keeps_provider_credentials(monkeypatch):
+    from hermes_cli.owner_runtime import OWNER_WORKER_DEPLOYMENT_RUNTIME_ENV_KEYS
+
+    captured = []
+
+    class _Proc:
+        stdin = types.SimpleNamespace()
+        stdout = []
+        stderr = []
+
+    def fake_popen(cmd, **kwargs):
+        captured.append((cmd, kwargs))
+        return _Proc()
+
+    for key in OWNER_WORKER_DEPLOYMENT_RUNTIME_ENV_KEYS:
+        monkeypatch.setenv(key, "owner-worker-only")
+    monkeypatch.setenv("OPENAI_API_KEY", "provider-key")
+    monkeypatch.setenv("GH_TOKEN", "tier-one-secret")
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        server.threading,
+        "Thread",
+        lambda *args, **kwargs: types.SimpleNamespace(start=lambda: None),
+    )
+
+    server._SlashWorker("session-key", "model-x")
+
+    child_env = captured[0][1]["env"]
+    assert not set(OWNER_WORKER_DEPLOYMENT_RUNTIME_ENV_KEYS) & child_env.keys()
+    assert "GH_TOKEN" not in child_env
+    assert child_env["OPENAI_API_KEY"] == "provider-key"
+
+
 def test_resolve_model_uses_inference_model_env(monkeypatch):
     monkeypatch.delenv("HERMES_MODEL", raising=False)
     monkeypatch.setenv("HERMES_INFERENCE_MODEL", " anthropic/claude-sonnet-4.6\n")
