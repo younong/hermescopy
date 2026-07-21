@@ -13867,8 +13867,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await self._send_update_notification()
             return
 
-        def _strip_ansi(text: str) -> str:
-            return re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', text)
+        from tools.ansi_strip import strip_ansi
 
         bytes_sent = 0
         last_stream_time = loop.time()
@@ -13881,7 +13880,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 buffer = ""
                 return
             # Chunk to fit message limits (Telegram: 4096, others: generous)
-            clean = _strip_ansi(buffer).strip()
+            clean = strip_ansi(buffer).strip()
             buffer = ""
             last_stream_time = loop.time()
             if not clean:

@@ -288,6 +288,68 @@ class TestWatchUpdateProgress:
         assert "update finished" in all_sent.lower()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("output", "expected"),
+        [
+            ("\x1b[32mfirst line\x1b[0m\nsecond line\n", "first line\nsecond line"),
+            ("\x1b]0;private title\x07visible\n", "visible"),
+        ],
+    )
+    async def test_streamed_output_strips_ansi(self, tmp_path, output, expected):
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / ".update_pending.json").write_text(json.dumps({
+            "platform": "telegram",
+            "chat_id": "111",
+            "session_key": "agent:main:telegram:dm:111",
+        }))
+        (hermes_home / ".update_output.txt").write_text(output, encoding="utf-8")
+        (hermes_home / ".update_exit_code").write_text("0")
+
+        mock_adapter = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: mock_adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            await runner._watch_update_progress(
+                poll_interval=0.01,
+                stream_interval=0.01,
+                timeout=1.0,
+            )
+
+        streamed = mock_adapter.send.call_args_list[0].args[1]
+        assert streamed == f"```\n{expected}\n```"
+
+    @pytest.mark.asyncio
+    async def test_streamed_output_does_not_send_ansi_only_chunk(self, tmp_path):
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / ".update_pending.json").write_text(json.dumps({
+            "platform": "telegram",
+            "chat_id": "111",
+            "session_key": "agent:main:telegram:dm:111",
+        }))
+        (hermes_home / ".update_output.txt").write_text("\x1b[32m\x1b[0m")
+        (hermes_home / ".update_exit_code").write_text("0")
+
+        mock_adapter = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: mock_adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            await runner._watch_update_progress(
+                poll_interval=0.01,
+                stream_interval=0.01,
+                timeout=1.0,
+            )
+
+        mock_adapter.send.assert_awaited_once_with(
+            "111",
+            "✅ Hermes update finished.",
+            metadata=None,
+        )
+
+    @pytest.mark.asyncio
     async def test_detects_and_forwards_prompt(self, tmp_path):
         """Detects .update_prompt.json and sends it to the user."""
         runner = _make_runner()
