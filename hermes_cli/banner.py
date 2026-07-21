@@ -15,6 +15,8 @@ from urllib.parse import urlparse
 from hermes_constants import get_hermes_home
 from typing import TYPE_CHECKING, Dict, List, Optional
 
+from packaging.version import InvalidVersion, Version
+
 # rich and prompt_toolkit are imported lazily (inside the functions that use
 # them) rather than at module level.  Importing this module is on the TUI
 # gateway's critical startup path purely to reach the lightweight update-check
@@ -252,15 +254,9 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     return None
 
 
-def _version_tuple(v: str) -> tuple[int, ...]:
-    """Parse '0.13.0' into (0, 13, 0) for comparison. Non-numeric segments become 0."""
-    parts = []
-    for segment in v.split("."):
-        try:
-            parts.append(int(segment))
-        except ValueError:
-            parts.append(0)
-    return tuple(parts)
+def _version_tuple(v: str) -> Version:
+    """Parse a version using standard PEP 440 ordering."""
+    return Version(v)
 
 
 def _fetch_pypi_latest(package: str = "hermes-agent") -> Optional[str]:
@@ -287,11 +283,9 @@ def check_via_pypi() -> Optional[int]:
     if latest == VERSION:
         return 0
     try:
-        if _version_tuple(latest) > _version_tuple(VERSION):
-            return 1
-        return 0
-    except Exception:
-        return 1 if latest != VERSION else 0
+        return 1 if _version_tuple(latest) > _version_tuple(VERSION) else 0
+    except (InvalidVersion, TypeError):
+        return 1
 
 
 def check_for_updates() -> Optional[int]:

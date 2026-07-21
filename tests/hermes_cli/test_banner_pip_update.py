@@ -33,3 +33,45 @@ def test_version_tuple_comparison():
     assert _version_tuple("0.13.0") > _version_tuple("0.12.0")
     assert _version_tuple("0.13.0") == _version_tuple("0.13.0")
     assert _version_tuple("1.0.0") > _version_tuple("0.99.99")
+
+
+def testcheck_via_pypi_uses_standard_prerelease_ordering():
+    from hermes_cli.banner import check_via_pypi
+    with patch("hermes_cli.banner.VERSION", "1.0rc1"):
+        with patch("hermes_cli.banner._fetch_pypi_latest", return_value="1.0"):
+            assert check_via_pypi() == 1
+
+
+def testcheck_via_pypi_recognizes_post_release_update():
+    from hermes_cli.banner import check_via_pypi
+    with patch("hermes_cli.banner.VERSION", "1.0"):
+        with patch("hermes_cli.banner._fetch_pypi_latest", return_value="1.0.post1"):
+            assert check_via_pypi() == 1
+
+
+def testcheck_via_pypi_does_not_crash_on_invalid_version():
+    from hermes_cli.banner import check_via_pypi
+    with patch("hermes_cli.banner.VERSION", "1.0"):
+        with patch("hermes_cli.banner._fetch_pypi_latest", return_value="not a version"):
+            assert check_via_pypi() == 1
+
+
+def testcheck_via_pypi_ignores_older_version():
+    from hermes_cli.banner import check_via_pypi
+    with patch("hermes_cli.banner.VERSION", "1.0"):
+        with patch("hermes_cli.banner._fetch_pypi_latest", return_value="1.0rc1"):
+            assert check_via_pypi() == 0
+
+
+def testcheck_via_pypi_compares_local_metadata():
+    from hermes_cli.banner import check_via_pypi
+    with patch("hermes_cli.banner.VERSION", "1.0"):
+        with patch("hermes_cli.banner._fetch_pypi_latest", return_value="1.0+local"):
+            assert check_via_pypi() == 1
+
+
+def testcheck_via_pypi_does_not_crash_on_invalid_installed_version():
+    from hermes_cli.banner import check_via_pypi
+    with patch("hermes_cli.banner.VERSION", "not a version"):
+        with patch("hermes_cli.banner._fetch_pypi_latest", return_value="1.0"):
+            assert check_via_pypi() == 1
