@@ -6,7 +6,9 @@ export interface ClarifyRequest {
   requestId: string
   question: string
   choices: string[] | null
+  expiresAtMs?: number
   sessionId: string | null
+  timeoutMs?: number
 }
 
 // Pending clarify requests keyed by the runtime session id that raised them.

@@ -384,10 +384,20 @@ export interface SessionMessagesResponse {
   session_id: string
 }
 
+export interface SessionPendingClarifyPrompt {
+  choices?: string[] | null
+  expires_at_ms?: number
+  question: string
+  request_id: string
+  timeout_ms?: number
+  type: 'clarify'
+}
+
 export interface SessionResumeResponse {
   info?: SessionRuntimeInfo
   message_count: number
   messages: SessionMessage[]
+  pending_prompts?: SessionPendingClarifyPrompt[]
   resumed: string
   session_id: string
 }

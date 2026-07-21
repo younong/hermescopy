@@ -4,6 +4,7 @@ import { useEffect } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { getSessionMessages, type SessionInfo } from '@/hermes'
+import { $clarifyRequest, clearClarifyRequest } from '@/store/clarify'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $activeGatewayProfile, $newChatProfile } from '@/store/profile'
 import {
@@ -166,12 +167,17 @@ function ResumeHarness({
   onReady,
   requestGateway,
   runtimeIdByStoredSessionIdRef,
-  sessionStateByRuntimeIdRef
+  sessionStateByRuntimeIdRef,
+  updateSessionState
 }: {
   onReady: (resume: (storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
   runtimeIdByStoredSessionIdRef?: MutableRefObject<Map<string, string>>
   sessionStateByRuntimeIdRef?: MutableRefObject<Map<string, ClientSessionState>>
+  updateSessionState?: (
+    sessionId: string,
+    updater: (state: ClientSessionState) => ClientSessionState
+  ) => ClientSessionState
 }) {
   const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
 
@@ -189,7 +195,8 @@ function ResumeHarness({
     selectedStoredSessionIdRef: ref<string | null>(null),
     sessionStateByRuntimeIdRef: sessionStateByRuntimeIdRef ?? ref(new Map<string, ClientSessionState>()),
     syncSessionStateToView: vi.fn(),
-    updateSessionState: (_sessionId, updater) => updater({} as ClientSessionState)
+    updateSessionState:
+      updateSessionState ?? ((_sessionId, updater) => updater({} as ClientSessionState))
   })
 
   useEffect(() => {
@@ -206,6 +213,7 @@ describe('resumeSession failure recovery', () => {
     setResumeFailedSessionId(null)
     setMessages([])
     setSessions([])
+    clearClarifyRequest()
     vi.restoreAllMocks()
   })
 
@@ -214,6 +222,10 @@ describe('resumeSession failure recovery', () => {
     options: {
       runtimeIdByStoredSessionIdRef?: MutableRefObject<Map<string, string>>
       sessionStateByRuntimeIdRef?: MutableRefObject<Map<string, ClientSessionState>>
+      updateSessionState?: (
+        sessionId: string,
+        updater: (state: ClientSessionState) => ClientSessionState
+      ) => ClientSessionState
     } = {}
   ): Promise<void> {
     let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
@@ -303,6 +315,83 @@ describe('resumeSession failure recovery', () => {
     await runResume(requestGateway)
 
     expect($resumeFailedSessionId.get()).toBeNull()
+  })
+
+  it('restores pending clarify and needs-input state from the resume snapshot', async () => {
+    let updatedState: ClientSessionState | null = null
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.resume') {
+        return {
+          session_id: 'runtime-1',
+          resumed: params?.session_id,
+          messages: [],
+          info: {},
+          running: true,
+          pending_prompts: [
+            {
+              type: 'clarify',
+              request_id: 'clarify-1',
+              question: 'Which target?',
+              choices: ['staging', 'production'],
+              timeout_ms: 60_000,
+              expires_at_ms: 123_456
+            }
+          ]
+        } as never
+      }
+
+      return {} as never
+    })
+    vi.mocked(getSessionMessages).mockResolvedValue({ messages: [] } as never)
+
+    await runResume(requestGateway, {
+      updateSessionState: (_sessionId, updater) => {
+        updatedState = updater(createClientSessionState('stored-1'))
+        return updatedState
+      }
+    })
+
+    expect($clarifyRequest.get()).toMatchObject({
+      requestId: 'clarify-1',
+      sessionId: 'runtime-1',
+      timeoutMs: 60_000,
+      expiresAtMs: 123_456
+    })
+    expect(updatedState).not.toBeNull()
+    expect((updatedState as unknown as ClientSessionState).needsInput).toBe(true)
+  })
+
+  it('clears stale needs-input state when resume has no pending clarify', async () => {
+    let updatedState: ClientSessionState | null = null
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.resume') {
+        return {
+          session_id: 'runtime-1',
+          resumed: params?.session_id,
+          messages: [],
+          info: {},
+          running: false,
+          pending_prompts: []
+        } as never
+      }
+
+      return {} as never
+    })
+    vi.mocked(getSessionMessages).mockResolvedValue({ messages: [] } as never)
+
+    await runResume(requestGateway, {
+      updateSessionState: (_sessionId, updater) => {
+        updatedState = updater({
+          ...createClientSessionState('stored-1'),
+          needsInput: true
+        })
+        return updatedState
+      }
+    })
+
+    expect($clarifyRequest.get()).toBeNull()
+    expect(updatedState).not.toBeNull()
+    expect((updatedState as unknown as ClientSessionState).needsInput).toBe(false)
   })
 
   it('resumes via the gateway default (deferred build) — not lazy, no eager opt-out', async () => {

@@ -5,6 +5,7 @@ import { useLoadEarlierOnScroll } from "@/hooks/useLoadEarlierOnScroll";
 import type { ArtifactState, GuiChatState } from "../types";
 import { ApprovalCard } from "./ApprovalCard";
 import { ArtifactCard } from "./ArtifactCard";
+import { ClarifyCard } from "./ClarifyCard";
 import { MessageBubble } from "./MessageBubble";
 
 const BOTTOM_THRESHOLD_PX = 64;
@@ -15,6 +16,7 @@ type RenderRow =
   | { id: string; kind: "message"; messageId: string }
   | { artifact: ArtifactState; id: string; kind: "artifact" }
   | { approvalId: string; id: string; kind: "approval" }
+  | { clarificationId: string; id: string; kind: "clarify" }
   | { id: string; kind: "status" };
 
 function isNearBottom(element: HTMLElement): boolean {
@@ -25,12 +27,14 @@ export function MessageList({
   disabled,
   forceBottomKey,
   onApprovalRespond,
+  onClarifyRespond,
   onLoadEarlier,
   state,
 }: {
   disabled?: boolean;
   forceBottomKey?: string;
   onApprovalRespond: (id: string, approved: boolean) => void;
+  onClarifyRespond: (id: string, answer: string) => void;
   onLoadEarlier?: () => void;
   state: GuiChatState;
 }) {
@@ -57,6 +61,15 @@ export function MessageList({
     for (const approvalId of state.approvalOrder) {
       if (state.approvals[approvalId]) {
         result.push({ approvalId, id: `approval:${approvalId}`, kind: "approval" });
+      }
+    }
+    for (const clarificationId of state.clarificationOrder) {
+      if (state.clarifications[clarificationId]) {
+        result.push({
+          clarificationId,
+          id: `clarify:${clarificationId}`,
+          kind: "clarify",
+        });
       }
     }
     if (state.statusLines.length > 0) result.push({ id: "status", kind: "status" });
@@ -183,6 +196,15 @@ export function MessageList({
               ) : row.kind === "approval" ? (() => {
                 const approval = state.approvals[row.approvalId];
                 return approval ? <ApprovalCard approval={approval} disabled={disabled} onRespond={(approved) => onApprovalRespond(row.approvalId, approved)} /> : null;
+              })() : row.kind === "clarify" ? (() => {
+                const clarification = state.clarifications[row.clarificationId];
+                return clarification ? (
+                  <ClarifyCard
+                    clarification={clarification}
+                    disabled={disabled}
+                    onRespond={(answer) => onClarifyRespond(row.clarificationId, answer)}
+                  />
+                ) : null;
               })() : (
                 <div className="space-y-1 text-xs text-text-tertiary">
                   {state.statusLines.slice(-3).map((line, index) => <div className="truncate" key={`${index}-${line}`}>{line}</div>)}

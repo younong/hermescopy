@@ -353,6 +353,9 @@ export function GuiChatShell() {
   }, [mobilePanelOpen, narrow, navigate, setEnd, setTitle, terminalResumeId]);
 
   const disabled = state.connection !== "open" || !state.sessionId;
+  const hasPendingClarification = state.clarificationOrder.some((id) =>
+    ["pending", "submitting"].includes(state.clarifications[id]?.status ?? ""),
+  );
   const statusTone = useMemo(() => {
     if (state.connection === "open") return "success";
     if (state.connection === "error") return "destructive";
@@ -506,6 +509,21 @@ export function GuiChatShell() {
     }
   }, [state.historyCursor, state.historyLoading, state.sessionId]);
 
+  const respondToClarify = useCallback(
+    (id: string, answer: string) => {
+      const sessionId = state.sessionId;
+      const connection = connectionRef.current;
+      const clarification = state.clarifications[id];
+      if (!sessionId || !connection || clarification?.status !== "pending") return;
+      setSendScrollNonce((n) => n + 1);
+      dispatch({ type: "clarify.submitting", id });
+      void connection
+        .respondToClarify(sessionId, id, answer)
+        .catch((error: Error) => dispatch({ type: "error", message: error.message }));
+    },
+    [state.clarifications, state.sessionId],
+  );
+
   const respondToApproval = useCallback(
     (id: string, approved: boolean) => {
       const sessionId = state.sessionId;
@@ -625,10 +643,12 @@ export function GuiChatShell() {
             disabled={disabled}
             forceBottomKey={forceBottomKey}
             onApprovalRespond={respondToApproval}
+            onClarifyRespond={respondToClarify}
             onLoadEarlier={loadEarlier}
             state={state}
           />
           <Composer
+            allowSendWhileGenerating={hasPendingClarification}
             disabled={disabled}
             isGenerating={state.isGenerating}
             onSend={send}

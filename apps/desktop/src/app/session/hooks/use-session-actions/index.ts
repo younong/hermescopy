@@ -6,6 +6,7 @@ import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { setSessionYolo } from '@/lib/yolo-session'
+import { clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { clearQueuedPrompts } from '@/store/composer-queue'
 import { $pinnedSessionIds } from '@/store/layout'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
@@ -542,6 +543,20 @@ export function useSessionActions({
 
         setActiveSessionId(resumed.session_id)
         activeSessionIdRef.current = resumed.session_id
+        clearClarifyRequest(undefined, resumed.session_id)
+        const pendingClarify = resumed.pending_prompts?.find(prompt => prompt.type === 'clarify')
+
+        if (pendingClarify) {
+          setClarifyRequest({
+            choices: pendingClarify.choices ?? null,
+            expiresAtMs: pendingClarify.expires_at_ms,
+            question: pendingClarify.question,
+            requestId: pendingClarify.request_id,
+            sessionId: resumed.session_id,
+            timeoutMs: pendingClarify.timeout_ms
+          })
+        }
+
         const runtimeInfo = applyRuntimeInfo(resumed.info)
 
         patchSessionWorkspace(storedSessionId, runtimeInfo?.cwd)
@@ -555,7 +570,8 @@ export function useSessionActions({
             ...(runtimeInfo ?? {}),
             messages: messagesForView,
             busy: resumedRunning,
-            awaitingResponse: resumedRunning
+            awaitingResponse: resumedRunning,
+            needsInput: Boolean(pendingClarify)
           }),
           storedSessionId
         )

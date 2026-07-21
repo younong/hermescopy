@@ -13,6 +13,7 @@ export type GatewayEventName =
   | 'tool.complete'
   | 'tool.generating'
   | 'clarify.request'
+  | 'clarify.resolved'
   | 'approval.request'
   | 'sudo.request'
   | 'secret.request'

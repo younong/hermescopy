@@ -146,7 +146,7 @@ class _GatewayMutableState:
     sessions: dict[str, dict] = field(default_factory=dict)
     pending: dict[str, tuple[str, threading.Event]] = field(default_factory=dict)
     pending_prompt_payloads: dict[str, tuple[str, dict]] = field(default_factory=dict)
-    answers: dict[str, str] = field(default_factory=dict)
+    answers: dict[str, Any] = field(default_factory=dict)
     child_mirrors: dict[str, dict] = field(default_factory=dict)
     active_child_runs: dict[str, float] = field(default_factory=dict)
     sessions_lock: threading.RLock = field(default_factory=threading.RLock)
@@ -237,7 +237,7 @@ _sessions: MutableMapping[str, dict] = _RuntimeMapping("sessions")
 _methods: dict[str, callable] = {}
 _pending: MutableMapping[str, tuple[str, threading.Event]] = _RuntimeMapping("pending")
 _pending_prompt_payloads: MutableMapping[str, tuple[str, dict]] = _RuntimeMapping("pending_prompt_payloads")
-_answers: MutableMapping[str, str] = _RuntimeMapping("answers")
+_answers: MutableMapping[str, Any] = _RuntimeMapping("answers")
 _db = None
 _db_error: str | None = None
 _stdout_lock = threading.Lock()
@@ -776,6 +776,7 @@ def _close_session_by_id(sid: str, *, end_reason: str = "tui_close") -> bool:
         session = _sessions.pop(sid, None)
     if session is None:
         return False
+    _clear_pending(sid)
     _teardown_session(session, end_reason=end_reason)
     return True
 
@@ -2364,25 +2365,47 @@ def _enable_gateway_prompts() -> None:
 # ── Blocking prompt factory ──────────────────────────────────────────
 
 
-def _block(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
+CLARIFY_TIMEOUT_SECONDS = 60
+
+
+def _block_result(event: str, sid: str, payload: dict, timeout: int = 300) -> dict[str, Any]:
     rid = uuid.uuid4().hex[:8]
     ev = threading.Event()
+    payload = dict(payload)
+    payload["request_id"] = rid
+    if event == "clarify.request":
+        payload["timeout_ms"] = int(timeout * 1000)
+        payload["expires_at_ms"] = int((time.time() + timeout) * 1000)
     with _prompt_lock:
         _pending[rid] = (sid, ev)
-        payload["request_id"] = rid
         _pending_prompt_payloads[rid] = (event, dict(payload))
-    try:
-        _emit(event, sid, payload)
-        ev.wait(timeout=timeout)
-    finally:
-        with _prompt_lock:
+    _emit(event, sid, payload)
+    signalled = ev.wait(timeout=timeout)
+    with _prompt_lock:
+        if not signalled and rid in _pending:
             _pending.pop(rid, None)
             _pending_prompt_payloads.pop(rid, None)
-    with _prompt_lock:
-        return _answers.pop(rid, "")
+            _answers[rid] = {"outcome": "timed_out", "answer": None}
+        result = _answers.pop(rid, {"outcome": "cancelled", "answer": None})
+        _pending.pop(rid, None)
+        _pending_prompt_payloads.pop(rid, None)
+    if not isinstance(result, dict):
+        result = {"outcome": "answered", "answer": str(result)}
+    if event == "clarify.request":
+        _emit(
+            "clarify.resolved",
+            sid,
+            {"request_id": rid, "outcome": str(result.get("outcome") or "cancelled")},
+        )
+    return result
 
 
-def _clear_pending(sid: str | None = None) -> None:
+def _block(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
+    result = _block_result(event, sid, payload, timeout=timeout)
+    return str(result.get("answer") or "")
+
+
+def _clear_pending(sid: str | None = None, *, event: str | None = None) -> None:
     """Release pending prompts with an empty answer.
 
     When *sid* is provided, only prompts owned by that session are
@@ -2393,8 +2416,11 @@ def _clear_pending(sid: str | None = None) -> None:
     """
     with _prompt_lock:
         for rid, (owner_sid, ev) in list(_pending.items()):
-            if sid is None or owner_sid == sid:
-                _answers[rid] = ""
+            prompt_event, _payload = _pending_prompt_payloads.get(rid, ("input.request", {}))
+            if (sid is None or owner_sid == sid) and (event is None or prompt_event == event):
+                _pending.pop(rid, None)
+                _pending_prompt_payloads.pop(rid, None)
+                _answers[rid] = {"outcome": "cancelled", "answer": None}
                 ev.set()
 
 
@@ -4199,8 +4225,11 @@ def _agent_cbs(sid: str) -> dict:
             lambda key: _emit("notification.clear", sid, {"key": key})
         ),
         "clarify_callback": in_runtime(
-            lambda q, c: _block(
-                "clarify.request", sid, {"question": q, "choices": c}
+            lambda q, c: _block_result(
+                "clarify.request",
+                sid,
+                {"question": q, "choices": c},
+                timeout=CLARIFY_TIMEOUT_SECONDS,
             )
         ),
         # read_terminal tool (desktop GUI): same blocking bridge as clarify — the
@@ -5443,6 +5472,7 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any)
     else queue.
     """
     mode = _load_busy_input_mode()
+    _clear_pending(sid, event="clarify.request")
     agent = session.get("agent")
     if mode == "steer" and agent is not None and hasattr(agent, "steer"):
         try:
@@ -6620,6 +6650,28 @@ def _session_pending_kind(sid: str) -> str:
     return ""
 
 
+def _pending_clarifications(sid: str) -> list[dict[str, Any]]:
+    prompts: list[dict[str, Any]] = []
+    with _prompt_lock:
+        for rid, (owner_sid, _ev) in list(_pending.items()):
+            if owner_sid != sid:
+                continue
+            event, payload = _pending_prompt_payloads.get(rid, ("", {}))
+            if event != "clarify.request":
+                continue
+            prompts.append(
+                {
+                    "type": "clarify",
+                    "request_id": rid,
+                    "question": str(payload.get("question") or ""),
+                    "choices": payload.get("choices"),
+                    "timeout_ms": payload.get("timeout_ms"),
+                    "expires_at_ms": payload.get("expires_at_ms"),
+                }
+            )
+    return prompts
+
+
 def _session_live_status(sid: str, session: dict) -> str:
     if _session_pending_kind(sid):
         return "waiting"
@@ -6765,6 +6817,7 @@ def _live_session_payload(
         "info": _fallback_session_info(session),
         "message_count": len(history),
         "messages": _history_to_messages(history),
+        "pending_prompts": _pending_clarifications(sid),
         "running": running,
         "session_id": sid,
         "session_key": session_key,
@@ -11027,21 +11080,44 @@ def _(rid, params: dict) -> dict:
 # ── Methods: respond ─────────────────────────────────────────────────
 
 
-def _respond(rid, params, key):
+def _respond(
+    rid,
+    params,
+    key,
+    *,
+    event: str | None = None,
+    require_session_id: bool = False,
+):
     r = params.get("request_id", "")
     with _prompt_lock:
         entry = _pending.get(r)
         if not entry:
             return _err(rid, 4009, f"no pending {key} request")
-        _, ev = entry
-        _answers[r] = params.get(key, "")
+        owner_sid, ev = entry
+        requested_sid = str(params.get("session_id") or "")
+        if (require_session_id and not requested_sid) or (
+            requested_sid and requested_sid != owner_sid
+        ):
+            return _err(rid, 4009, f"no pending {key} request")
+        prompt_event, _payload = _pending_prompt_payloads.get(r, ("input.request", {}))
+        if event is not None and prompt_event != event:
+            return _err(rid, 4009, f"no pending {key} request")
+        _pending.pop(r, None)
+        _pending_prompt_payloads.pop(r, None)
+        _answers[r] = {"outcome": "answered", "answer": params.get(key, "")}
         ev.set()
     return _ok(rid, {"status": "ok"})
 
 
 @method("clarify.respond")
 def _(rid, params: dict) -> dict:
-    return _respond(rid, params, "answer")
+    return _respond(
+        rid,
+        params,
+        "answer",
+        event="clarify.request",
+        require_session_id=True,
+    )
 
 
 @method("terminal.read.respond")

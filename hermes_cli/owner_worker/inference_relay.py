@@ -10,15 +10,19 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import socket
 import struct
 import threading
+import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
+from agent.redact import redact_sensitive_text
+from agent.stream_diag import flatten_exception_chain, stream_diag_init
 from hermes_cli.dashboard_auth.authority import AuthorityStore, AuthorizationRejected, OwnerWorkerAuthorityLease, WorkerLeaseState
 from hermes_cli.deployment_inference import DeploymentInferencePolicy
 
@@ -32,6 +36,62 @@ _HOP_BY_HOP_HEADERS = frozenset({
     "proxy-authorization",
     "transfer-encoding",
 })
+_RELAY_DIAG_HEADERS = (
+    "cf-ray",
+    "x-request-id",
+    "x-openrouter-id",
+    "x-vercel-id",
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _capture_relay_response_diag(diag: dict[str, Any], response: Any) -> None:
+    """Capture bounded, allowlisted provider metadata without response content."""
+    diag["http_status"] = getattr(response, "status_code", None)
+    response_headers = getattr(response, "headers", None) or {}
+    diag["headers"] = {
+        name: str(value)[:120]
+        for name in _RELAY_DIAG_HEADERS
+        if (value := response_headers.get(name))
+    }
+
+
+def _log_relay_outcome(
+    outcome: str,
+    diag: dict[str, Any],
+    *,
+    error: BaseException | None = None,
+) -> None:
+    """Emit one content-free diagnostic record for an upstream relay attempt."""
+    now = time.time()
+    started = float(diag.get("started_at") or now)
+    first_chunk_at = diag.get("first_chunk_at")
+    ttfb = (
+        max(0.0, float(first_chunk_at) - started)
+        if first_chunk_at is not None
+        else None
+    )
+    headers = diag.get("headers") or {}
+    request_ids = " ".join(f"{name}={value}" for name, value in headers.items()) or "-"
+    chain = "-"
+    if error is not None:
+        chain = redact_sensitive_text(
+            flatten_exception_chain(error), force=True, file_read=True
+        )[:600]
+    log = logger.info if outcome == "complete" else logger.warning
+    log(
+        "deployment inference relay outcome=%s http_status=%s elapsed=%.2fs "
+        "ttfb=%s bytes=%d chunks=%d request_ids=[%s] error_chain=%s",
+        outcome,
+        diag.get("http_status") if diag.get("http_status") is not None else "-",
+        max(0.0, now - started),
+        f"{ttfb:.2f}s" if ttfb is not None else "-",
+        int(diag.get("bytes") or 0),
+        int(diag.get("chunks") or 0),
+        request_ids,
+        chain,
+    )
 
 
 class DeploymentInferenceRelayError(RuntimeError):
@@ -285,11 +345,15 @@ class DeploymentInferenceBroker:
         emit: Any,
     ) -> None:
         upstream, body, headers = self._request_parts(lease, request)
+        diag = stream_diag_init()
+        response_started = False
         try:
             import httpx
 
             with httpx.Client(timeout=900.0) as client:
                 with client.stream("POST", upstream, content=body, headers=headers) as response:
+                    response_started = True
+                    _capture_relay_response_diag(diag, response)
                     safe_headers = {
                         name: value
                         for name, value in response.headers.items()
@@ -304,15 +368,37 @@ class DeploymentInferenceBroker:
                     # than collecting the response before the worker can consume it.
                     for chunk in response.iter_raw(chunk_size=48 * 1024):
                         if chunk:
+                            if diag["first_chunk_at"] is None:
+                                diag["first_chunk_at"] = time.time()
+                            diag["chunks"] += 1
+                            diag["bytes"] += len(chunk)
                             emit({
                                 "type": "response_chunk",
                                 "body": base64.b64encode(chunk).decode("ascii"),
                             })
                     emit({"type": "response_end"})
-        except DeploymentInferenceRelayError:
+        except DeploymentInferenceRelayError as exc:
+            _log_relay_outcome(
+                "midstream_failure" if response_started else "pre_header_transport_failure",
+                diag,
+                error=exc,
+            )
             raise
         except Exception as exc:
+            _log_relay_outcome(
+                "midstream_failure" if response_started else "pre_header_transport_failure",
+                diag,
+                error=exc,
+            )
             raise DeploymentInferenceRelayError("deployment inference upstream is unavailable") from exc
+        else:
+            _log_relay_outcome(
+                "upstream_http_error"
+                if int(diag.get("http_status") or 0) >= 400
+                else "complete",
+                diag,
+            )
+
 
 
 class OwnerInferenceRelay:
@@ -364,6 +450,7 @@ class OwnerInferenceRelay:
         self._connection.close()
 
     def _handle_http(self, handler: BaseHTTPRequestHandler) -> None:
+        headers_sent = False
         try:
             path = urlparse(handler.path).path
             length = int(handler.headers.get("Content-Length", "0"))
@@ -394,6 +481,7 @@ class OwnerInferenceRelay:
                 # add Content-Length: provider SSE responses are streamed as they
                 # arrive over the private broker connection.
                 handler.end_headers()
+                headers_sent = True
                 while True:
                     response = _recv_frame(self._connection)
                     response_type = response.get("type")
@@ -407,5 +495,20 @@ class OwnerInferenceRelay:
                     if body:
                         handler.wfile.write(body)
                         handler.wfile.flush()
-        except Exception:
-            handler.send_error(502, "deployment inference relay unavailable")
+        except Exception as exc:
+            logger.warning(
+                "owner inference relay response failed phase=%s error_chain=%s",
+                "midstream" if headers_sent else "pre_header",
+                redact_sensitive_text(
+                    flatten_exception_chain(exc), force=True, file_read=True
+                )[:600],
+            )
+            if headers_sent:
+                # HTTP status and headers are already on the wire. Sending a second
+                # response would corrupt the provider stream; close it instead.
+                handler.close_connection = True
+                return
+            try:
+                handler.send_error(502, "deployment inference relay unavailable")
+            except (BrokenPipeError, ConnectionError, OSError):
+                handler.close_connection = True

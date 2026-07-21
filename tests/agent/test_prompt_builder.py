@@ -1587,6 +1587,26 @@ class TestOpenAIModelExecutionGuidance:
         assert "missing_context" in text or "missing context" in text
         assert "hallucinate" in text or "guess" in text
 
+    def test_guidance_defaults_reversible_low_stakes_choices(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "conventional default" in text
+        assert "reversible low-stakes" in text
+        assert "advisory" in text
+        assert "formatting" in text
+        assert "design" in text
+        assert "library" in text
+        assert "disclose" in text
+
+    def test_guidance_limits_clarify_and_avoids_immediate_retry(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "user-specific information" in text
+        assert "identity/credentials/destination" in text
+        assert "irreversible" in text
+        assert "external action" in text
+        assert "cancelled or times out" in text
+        assert "do not immediately ask the same question again" in text
+        assert "essential blocker" in text
+
     def test_guidance_uses_xml_tags(self):
         assert "<tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE
         assert "</tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE

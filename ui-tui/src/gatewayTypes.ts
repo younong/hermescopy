@@ -227,11 +227,21 @@ export interface SessionCreateResponse {
   session_id: string
 }
 
+export interface PendingClarifyPrompt {
+  choices?: string[] | null
+  expires_at_ms?: number
+  question: string
+  request_id: string
+  timeout_ms?: number
+  type: 'clarify'
+}
+
 export interface SessionResumeResponse {
   inflight?: null | SessionInflightTurn
   info?: SessionInfo
   message_count?: number
   messages: GatewayTranscriptMessage[]
+  pending_prompts?: PendingClarifyPrompt[]
   resumed?: string
   running?: boolean
   session_id: string
@@ -269,6 +279,7 @@ export interface SessionActivateResponse {
   info?: SessionInfo
   message_count?: number
   messages: GatewayTranscriptMessage[]
+  pending_prompts?: PendingClarifyPrompt[]
   running?: boolean
   session_id: string
   session_key?: string
@@ -686,9 +697,20 @@ export type GatewayEvent =
       type: 'tool.complete'
     }
   | {
-      payload: { choices: string[] | null; question: string; request_id: string }
+      payload: {
+        choices: string[] | null
+        expires_at_ms?: number
+        question: string
+        request_id: string
+        timeout_ms?: number
+      }
       session_id?: string
       type: 'clarify.request'
+    }
+  | {
+      payload: { outcome: 'answered' | 'cancelled' | 'timed_out'; request_id: string }
+      session_id?: string
+      type: 'clarify.resolved'
     }
   | {
       payload: { allow_permanent?: boolean; command: string; description: string }

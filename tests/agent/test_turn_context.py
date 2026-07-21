@@ -8,6 +8,7 @@ confirm the prologue produces the right ``TurnContext`` and applies the
 
 from __future__ import annotations
 
+import logging
 import types
 from unittest.mock import MagicMock, patch
 
@@ -358,12 +359,13 @@ def test_between_turns_refresh_no_churn_when_unchanged():
     assert agent.tools is same  # not replaced → no churn
 
 
-def test_preflight_skips_when_persisted_cooldown_survives_restart(tmp_path):
+def test_preflight_skips_when_persisted_cooldown_survives_restart(tmp_path, caplog):
     agent = _make_agent_with_cooldown(
         tmp_path / "state.db",
         "sess-1",
         cooldown_until=4_000_000_000.0,
     )
+    caplog.set_level(logging.INFO, logger="agent.turn_context")
 
     with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
          patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
@@ -372,6 +374,8 @@ def test_preflight_skips_when_persisted_cooldown_survives_restart(tmp_path):
     assert isinstance(ctx, TurnContext)
     agent._emit_status.assert_not_called()
     agent._compress_context.assert_not_called()
+    assert "reason=failure_cooldown" in caplog.text
+    assert "effective_threshold=85000" in caplog.text
 
 
 def test_preflight_still_runs_for_other_session_with_same_db(tmp_path):
@@ -392,12 +396,13 @@ def test_preflight_still_runs_for_other_session_with_same_db(tmp_path):
     agent._compress_context.assert_called()
 
 
-def test_expired_cooldown_allows_preflight(tmp_path):
+def test_expired_cooldown_allows_preflight(tmp_path, caplog):
     agent = _make_agent_with_cooldown(
         tmp_path / "state.db",
         "sess-1",
         cooldown_until=1.0,
     )
+    caplog.set_level(logging.INFO, logger="agent.turn_context")
 
     with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
          patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
@@ -406,6 +411,8 @@ def test_expired_cooldown_allows_preflight(tmp_path):
     assert isinstance(ctx, TurnContext)
     agent._emit_status.assert_called_once()
     agent._compress_context.assert_called()
+    assert "decision=compress reason=threshold_reached" in caplog.text
+    assert "decision=stop reason=no_progress" in caplog.text
 
 
 

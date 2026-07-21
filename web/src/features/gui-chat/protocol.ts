@@ -36,11 +36,31 @@ export interface HistoryPagePayload {
   live_only?: boolean;
 }
 
+export type ClarifyOutcome = "answered" | "cancelled" | "timed_out";
+
+export interface ClarifyRequestPayload {
+  choices?: string[] | null;
+  expires_at_ms?: number;
+  question: string;
+  request_id: string;
+  timeout_ms?: number;
+}
+
+export interface ClarifyResolvedPayload {
+  outcome: ClarifyOutcome;
+  request_id: string;
+}
+
+export interface PendingClarifyPrompt extends ClarifyRequestPayload {
+  type: "clarify";
+}
+
 export interface SessionCreateResponse {
   history_page?: HistoryPagePayload;
   info?: SessionInfoPayload;
   message_count?: number;
   messages?: GatewayTranscriptMessage[];
+  pending_prompts?: PendingClarifyPrompt[];
   session_id: string;
   stored_session_id?: string;
   switch_generation?: number;
@@ -145,6 +165,8 @@ export interface ErrorPayload {
 export type GuiGatewayEvent = GatewayEvent<
   | ApprovalPayload
   | ArtifactFilePayload
+  | ClarifyRequestPayload
+  | ClarifyResolvedPayload
   | ArtifactImagePayload
   | ErrorPayload
   | MessageCompletePayload

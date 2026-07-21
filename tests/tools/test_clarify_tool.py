@@ -26,6 +26,7 @@ class TestClarifyToolBasics:
         result = json.loads(clarify_tool("What color?", callback=mock_callback))
         assert result["question"] == "What color?"
         assert result["choices_offered"] is None
+        assert result["outcome"] == "answered"
         assert result["user_response"] == "blue"
 
     def test_question_with_choices(self):
@@ -156,6 +157,22 @@ class TestClarifyToolCallbackHandling:
         result = json.loads(clarify_tool("Q?", callback=mock_callback))
         assert result["user_response"] == "response with spaces"
 
+    def test_structured_timeout_is_explicit(self):
+        result = json.loads(clarify_tool(
+            "Still there?",
+            callback=lambda _q, _c: {"outcome": "timed_out", "answer": None},
+        ))
+        assert result["outcome"] == "timed_out"
+        assert result["user_response"] is None
+
+    def test_structured_cancellation_is_explicit(self):
+        result = json.loads(clarify_tool(
+            "Still there?",
+            callback=lambda _q, _c: {"outcome": "cancelled", "answer": None},
+        ))
+        assert result["outcome"] == "cancelled"
+        assert result["user_response"] is None
+
 
 class TestCheckClarifyRequirements:
     """Tests for the requirements check function."""
@@ -240,6 +257,23 @@ class TestClarifySchema:
         """Schema should have a description."""
         assert "description" in CLARIFY_SCHEMA
         assert len(CLARIFY_SCHEMA["description"]) > 50
+
+    def test_schema_reserves_clarify_for_essential_user_context(self):
+        description = CLARIFY_SCHEMA["description"].lower()
+        assert "user-specific" in description
+        assert "correctness or safety" in description
+        assert "identity/credentials/destination" in description
+        assert "irreversible or external" in description
+        assert "cannot be recovered" in description
+
+    def test_schema_directs_low_stakes_defaults_and_no_immediate_retry(self):
+        description = CLARIFY_SCHEMA["description"].lower()
+        assert "reversible low-stakes" in description
+        assert "formatting/design/library" in description
+        assert "conventional default" in description
+        assert "disclose the assumption" in description
+        assert "cancelled or timed out" in description
+        assert "do not immediately ask the same question again" in description
 
     def test_schema_question_required(self):
         """Question parameter should be required."""

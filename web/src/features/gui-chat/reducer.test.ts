@@ -88,6 +88,112 @@ describe("guiChatReducer live attach restoration", () => {
   });
 });
 
+describe("guiChatReducer clarification lifecycle", () => {
+  it("hydrates only the current session snapshot and clears stale prompts", () => {
+    const previous = {
+      ...initialGuiChatState,
+      clarificationOrder: ["old"],
+      clarifications: {
+        old: {
+          choices: null,
+          id: "old",
+          question: "Old question",
+          status: "pending" as const,
+        },
+      },
+    };
+
+    const state = guiChatReducer(previous, {
+      type: "session.created",
+      response: {
+        pending_prompts: [
+          {
+            choices: ["A", "B"],
+            expires_at_ms: 123_456,
+            question: "Pick one",
+            request_id: "current",
+            timeout_ms: 60_000,
+            type: "clarify",
+          },
+        ],
+        session_id: "runtime-a",
+      },
+    });
+
+    expect(state.clarificationOrder).toEqual(["current"]);
+    expect(state.clarifications).toEqual({
+      current: {
+        choices: ["A", "B"],
+        expiresAtMs: 123_456,
+        id: "current",
+        question: "Pick one",
+        status: "pending",
+        timeoutMs: 60_000,
+      },
+    });
+  });
+
+  it("deduplicates live requests and applies explicit terminal outcomes", () => {
+    const requested = guiChatReducer(initialGuiChatState, {
+      type: "event",
+      event: {
+        payload: {
+          choices: null,
+          question: "What value?",
+          request_id: "clarify-1",
+        },
+        session_id: "sid",
+        type: "clarify.request",
+      },
+    });
+    const duplicate = guiChatReducer(requested, {
+      type: "event",
+      event: {
+        payload: {
+          choices: null,
+          question: "What value?",
+          request_id: "clarify-1",
+        },
+        session_id: "sid",
+        type: "clarify.request",
+      },
+    });
+    const submitting = guiChatReducer(duplicate, {
+      id: "clarify-1",
+      type: "clarify.submitting",
+    });
+    const resolved = guiChatReducer(submitting, {
+      type: "event",
+      event: {
+        payload: { outcome: "timed_out", request_id: "clarify-1" },
+        session_id: "sid",
+        type: "clarify.resolved",
+      },
+    });
+
+    expect(duplicate.clarificationOrder).toEqual(["clarify-1"]);
+    expect(submitting.clarifications["clarify-1"].status).toBe("submitting");
+    expect(resolved.clarifications["clarify-1"].status).toBe("timed_out");
+    expect(resolved.statusLines.at(-1)).toBe("Hermes needs your answer.");
+  });
+
+  it("ignores clarification events from another live session", () => {
+    const state = guiChatReducer(
+      { ...initialGuiChatState, sessionId: "session-a" },
+      {
+        type: "event",
+        event: {
+          payload: { question: "Wrong session", request_id: "other" },
+          session_id: "session-b",
+          type: "clarify.request",
+        },
+      },
+    );
+
+    expect(state.clarificationOrder).toEqual([]);
+  });
+});
+
 describe("guiChatReducer terminal error completion", () => {
   it("clears generating state and preserves visible error text", () => {
     const streaming = guiChatReducer(

@@ -59,6 +59,9 @@ export type GatewayEventPayload = {
   request_id?: string
   question?: string
   choices?: string[] | null
+  expires_at_ms?: number
+  timeout_ms?: number
+  outcome?: 'answered' | 'cancelled' | 'timed_out'
   // approval.request (dangerous command / execute_code) — session-keyed
   command?: string
   description?: string

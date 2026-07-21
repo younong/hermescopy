@@ -631,7 +631,7 @@ export function useMainApp(gw: GatewayClient) {
       turnController.turnTools = turnController.turnTools.filter(line => !sameToolTrailGroup(label, line))
       patchTurnState({ turnTrail: turnController.turnTools })
 
-      rpc<ClarifyRespondResponse>('clarify.respond', { answer, request_id: clarify.requestId }).then(r => {
+      rpc<ClarifyRespondResponse>('clarify.respond', { answer, request_id: clarify.requestId, session_id: ui.sid }).then(r => {
         if (!r) {
           return
         }
@@ -659,7 +659,7 @@ export function useMainApp(gw: GatewayClient) {
         patchOverlayState({ clarify: null })
       })
     },
-    [appendMessage, overlay.clarify, rpc]
+    [appendMessage, overlay.clarify, rpc, ui.sid]
   )
 
   const paste = useCallback(

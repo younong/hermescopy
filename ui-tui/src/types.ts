@@ -107,8 +107,10 @@ export interface ConfirmReq {
 
 export interface ClarifyReq {
   choices: string[] | null
+  expiresAtMs?: number
   question: string
   requestId: string
+  timeoutMs?: number
 }
 
 export interface Msg {

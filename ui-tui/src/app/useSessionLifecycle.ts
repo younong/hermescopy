@@ -73,6 +73,7 @@ export const scheduleResumeScrollToBottom = (
   delays: readonly number[] = [0, 80, 240]
 ) => {
   const startedAt = Date.now()
+
   const timers = delays.map((delay, index) =>
     setTimeout(() => {
       const scroll = scrollRef.current
@@ -148,6 +149,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       targetSid ? rpc<SessionCloseResponse>('session.close', { session_id: targetSid }) : Promise.resolve(null),
     [rpc]
   )
+
   const cancelResumeScrollRef = useRef<null | (() => void)>(null)
 
   const resetSession = useCallback(() => {
@@ -318,6 +320,19 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             usage: usageFrom(info)
           })
           hydrateLiveSessionInflight(r.inflight)
+          const pendingClarify = r.pending_prompts?.find(prompt => prompt.type === 'clarify')
+
+          patchOverlayState({
+            clarify: pendingClarify
+              ? {
+                  choices: pendingClarify.choices ?? null,
+                  expiresAtMs: pendingClarify.expires_at_ms,
+                  question: pendingClarify.question,
+                  requestId: pendingClarify.request_id,
+                  timeoutMs: pendingClarify.timeout_ms
+                }
+              : null
+          })
           cancelResumeScrollRef.current?.()
           cancelResumeScrollRef.current = scheduleResumeScrollToBottom(scrollRef)
         })
@@ -372,6 +387,19 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               usage: usageFrom(info)
             })
             hydrateLiveSessionInflight(r.inflight)
+            const pendingClarify = r.pending_prompts?.find(prompt => prompt.type === 'clarify')
+
+            patchOverlayState({
+              clarify: pendingClarify
+                ? {
+                    choices: pendingClarify.choices ?? null,
+                    expiresAtMs: pendingClarify.expires_at_ms,
+                    question: pendingClarify.question,
+                    requestId: pendingClarify.request_id,
+                    timeoutMs: pendingClarify.timeout_ms
+                  }
+                : null
+            })
             cancelResumeScrollRef.current?.()
             cancelResumeScrollRef.current = scheduleResumeScrollToBottom(scrollRef)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import socket
 import threading
 from contextlib import contextmanager
@@ -187,6 +188,20 @@ def _upstream_server():
         thread.join(timeout=2)
 
 
+def _request_for_model(model: str = "gpt-safe") -> dict[str, object]:
+    import base64
+    import json
+
+    return {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": {},
+        "body": base64.b64encode(
+            json.dumps({"model": model, "messages": []}).encode()
+        ).decode("ascii"),
+    }
+
+
 def _activate_relay(store: AuthorityStore, policy: DeploymentInferencePolicy):
     claim = store.claim_worker_start("ok1_owner", worker_id="worker-1")
     broker = DeploymentInferenceBroker(policy=policy, authority_store=store)
@@ -200,6 +215,294 @@ def _activate_relay(store: AuthorityStore, policy: DeploymentInferencePolicy):
     relay = OwnerInferenceRelay(worker_fd)
     relay.start()
     return broker, active, relay
+
+
+def test_broker_logs_safe_complete_diagnostics(tmp_path, caplog):
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.send_header("cf-ray", "ray-safe")
+            self.send_header("x-request-id", "request-safe")
+            self.send_header("x-secret-header", "must-not-log")
+            self.end_headers()
+            self.wfile.write(b"data: safe-output\n\n")
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    policy = DeploymentInferencePolicy(
+        provider="custom:deployment",
+        model="gpt-safe",
+        api_mode="chat_completions",
+        runtime_resolver=lambda: {
+            "provider": "custom:deployment",
+            "api_mode": "chat_completions",
+            "base_url": f"http://127.0.0.1:{server.server_port}",
+            "api_key": "sk-super-secret-value-123456789",
+        },
+    )
+    store = AuthorityStore(tmp_path / "control")
+    claim = store.claim_worker_start("ok1_owner", worker_id="worker-1")
+    broker = DeploymentInferenceBroker(policy=policy, authority_store=store)
+    active = store.transition_worker_lease(
+        claim.lease,
+        state=WorkerLeaseState.ACTIVE,
+        generation_state=WorkerGenerationState.ACTIVE,
+    )
+    try:
+        with caplog.at_level(logging.INFO, logger="hermes_cli.owner_worker.inference_relay"):
+            frames = []
+            broker._stream_request(active, _request_for_model(), frames.append)
+        message = caplog.messages[-1]
+        assert "outcome=complete" in message
+        assert "http_status=200" in message
+        assert "bytes=19" in message
+        assert "chunks=1" in message
+        assert "cf-ray=ray-safe" in message
+        assert "x-request-id=request-safe" in message
+        assert "must-not-log" not in caplog.text
+        assert "safe-output" not in caplog.text
+        assert "super-secret" not in caplog.text
+    finally:
+        broker.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_broker_logs_upstream_http_error(tmp_path, caplog):
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(503)
+            self.send_header("x-vercel-id", "vercel-safe")
+            self.end_headers()
+            self.wfile.write(b"provider body must stay private")
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    policy = DeploymentInferencePolicy(
+        provider="custom:deployment",
+        model="gpt-safe",
+        api_mode="chat_completions",
+        runtime_resolver=lambda: {
+            "provider": "custom:deployment",
+            "api_mode": "chat_completions",
+            "base_url": f"http://127.0.0.1:{server.server_port}",
+            "api_key": "control-plane-secret",
+        },
+    )
+    store = AuthorityStore(tmp_path / "control")
+    claim = store.claim_worker_start("ok1_owner", worker_id="worker-1")
+    broker = DeploymentInferenceBroker(policy=policy, authority_store=store)
+    active = store.transition_worker_lease(
+        claim.lease,
+        state=WorkerLeaseState.ACTIVE,
+        generation_state=WorkerGenerationState.ACTIVE,
+    )
+    try:
+        with caplog.at_level(
+            logging.WARNING,
+            logger="hermes_cli.owner_worker.inference_relay",
+        ):
+            frames = []
+            broker._stream_request(active, _request_for_model(), frames.append)
+        assert frames[0]["status"] == 503
+        assert "outcome=upstream_http_error" in caplog.text
+        assert "http_status=503" in caplog.text
+        assert "x-vercel-id=vercel-safe" in caplog.text
+        assert "provider body" not in caplog.text
+    finally:
+        broker.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_broker_logs_pre_header_failure_without_secret_or_url(
+    tmp_path, caplog, monkeypatch
+):
+    import httpx
+
+    class FailingClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def stream(self, *_args, **_kwargs):
+            raise httpx.ConnectError(
+                "connect failed token=sk-super-secret-value-123456789"
+            )
+
+    monkeypatch.setattr(httpx, "Client", FailingClient)
+    policy = DeploymentInferencePolicy(
+        provider="custom:deployment",
+        model="gpt-safe",
+        api_mode="chat_completions",
+        runtime_resolver=lambda: {
+            "provider": "custom:deployment",
+            "api_mode": "chat_completions",
+            "base_url": "https://provider.example.test/private?token=hidden",
+            "api_key": "sk-super-secret-value-123456789",
+        },
+    )
+    store = AuthorityStore(tmp_path / "control")
+    claim = store.claim_worker_start("ok1_owner", worker_id="worker-1")
+    broker = DeploymentInferenceBroker(policy=policy, authority_store=store)
+    active = store.transition_worker_lease(
+        claim.lease,
+        state=WorkerLeaseState.ACTIVE,
+        generation_state=WorkerGenerationState.ACTIVE,
+    )
+    try:
+        with caplog.at_level(
+            logging.WARNING,
+            logger="hermes_cli.owner_worker.inference_relay",
+        ):
+            with pytest.raises(DeploymentInferenceRelayError, match="unavailable"):
+                broker._stream_request(
+                    active,
+                    _request_for_model(),
+                    lambda _frame: None,
+                )
+        assert "outcome=pre_header_transport_failure" in caplog.text
+        assert "ConnectError" in caplog.text
+        assert "token=hidden" not in caplog.text
+        assert "super-secret" not in caplog.text
+        assert "sk-super-secret-value-123456789" not in caplog.text
+        assert "«redacted:sk-…»" in caplog.text
+    finally:
+        broker.close()
+
+
+def test_broker_logs_midstream_failure_with_counts(tmp_path, caplog):
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):  # noqa: N802
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.send_header("x-openrouter-id", "openrouter-safe")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.wfile.write(b"7\r\npartial\r\n")
+            self.wfile.flush()
+            # Close before the terminating zero-size chunk. httpx must classify
+            # this as an incomplete response rather than a normal EOF.
+            self.connection.shutdown(socket.SHUT_RDWR)
+            self.connection.close()
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    policy = DeploymentInferencePolicy(
+        provider="custom:deployment",
+        model="gpt-safe",
+        api_mode="chat_completions",
+        runtime_resolver=lambda: {
+            "provider": "custom:deployment",
+            "api_mode": "chat_completions",
+            "base_url": f"http://127.0.0.1:{server.server_port}",
+            "api_key": "control-plane-secret",
+        },
+    )
+    store = AuthorityStore(tmp_path / "control")
+    claim = store.claim_worker_start("ok1_owner", worker_id="worker-1")
+    broker = DeploymentInferenceBroker(policy=policy, authority_store=store)
+    active = store.transition_worker_lease(
+        claim.lease,
+        state=WorkerLeaseState.ACTIVE,
+        generation_state=WorkerGenerationState.ACTIVE,
+    )
+    try:
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.owner_worker.inference_relay"):
+            with pytest.raises(DeploymentInferenceRelayError, match="unavailable"):
+                broker._stream_request(active, _request_for_model(), lambda _frame: None)
+        assert "outcome=midstream_failure" in caplog.text
+        assert "http_status=200" in caplog.text
+        # The transport can detect an incomplete chunk before yielding it to
+        # iter_raw; counters report bytes delivered to the worker, not bytes read
+        # internally by httpcore.
+        assert "bytes=0" in caplog.text
+        assert "chunks=0" in caplog.text
+        assert "x-openrouter-id=openrouter-safe" in caplog.text
+        assert "partial" not in caplog.text
+    finally:
+        broker.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_owner_relay_does_not_send_second_error_after_headers(monkeypatch, caplog):
+    import hermes_cli.owner_worker.inference_relay as relay_module
+
+    relay = OwnerInferenceRelay.__new__(OwnerInferenceRelay)
+    relay._connection = object()
+    relay._lock = threading.Lock()
+    responses = iter([
+        {"type": "response_start", "status": 200, "headers": {}},
+        {"type": "error", "message": "upstream stream failed"},
+    ])
+    monkeypatch.setattr(relay_module, "_send_frame", lambda *_args: None)
+    monkeypatch.setattr(relay_module, "_recv_frame", lambda _conn: next(responses))
+
+    class Handler:
+        path = "/v1/chat/completions"
+        command = "POST"
+        headers = {"Content-Length": "0"}
+        rfile = type("Reader", (), {"read": staticmethod(lambda _length: b"")})()
+        wfile = type("Writer", (), {
+            "write": staticmethod(lambda _body: None),
+            "flush": staticmethod(lambda: None),
+        })()
+        close_connection = False
+
+        def __init__(self):
+            self.sent_status = None
+            self.ended = False
+            self.error_calls = []
+
+        def send_response(self, status):
+            self.sent_status = status
+
+        def send_header(self, _name, _value):
+            pass
+
+        def end_headers(self):
+            self.ended = True
+
+        def send_error(self, status, message):
+            self.error_calls.append((status, message))
+
+    handler = Handler()
+    with caplog.at_level(
+        logging.WARNING,
+        logger="hermes_cli.owner_worker.inference_relay",
+    ):
+        relay._handle_http(handler)
+
+    assert handler.sent_status == 200
+    assert handler.ended is True
+    assert handler.error_calls == []
+    assert handler.close_connection is True
+    assert "phase=midstream" in caplog.text
 
 
 @pytest.mark.parametrize("base_path", ["", "/v1"])

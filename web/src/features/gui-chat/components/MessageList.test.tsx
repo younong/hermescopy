@@ -30,6 +30,7 @@ describe("MessageList", () => {
     await act(async () => {
       root.render(
         <MessageList
+        onClarifyRespond={() => undefined}
           onApprovalRespond={() => undefined}
           state={{
             ...initialGuiChatState,
@@ -76,6 +77,7 @@ describe("MessageList", () => {
     await act(async () => {
       root.render(
         <MessageList
+        onClarifyRespond={() => undefined}
           onApprovalRespond={() => undefined}
           state={{
             ...initialGuiChatState,
@@ -136,6 +138,45 @@ describe("MessageList", () => {
   });
 
 
+  it("renders and answers a pending clarification", async () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    const onClarifyRespond = vi.fn();
+
+    await act(async () => {
+      root.render(
+        <MessageList
+          onApprovalRespond={() => undefined}
+          onClarifyRespond={onClarifyRespond}
+          state={{
+            ...initialGuiChatState,
+            clarificationOrder: ["clarify-1"],
+            clarifications: {
+              "clarify-1": {
+                choices: ["A", "B"],
+                expiresAtMs: Date.now() + 60_000,
+                id: "clarify-1",
+                question: "Pick one",
+                status: "pending",
+              },
+            },
+          }}
+        />,
+      );
+    });
+
+    expect(container.textContent).toContain("Hermes needs your answer");
+    expect(container.textContent).toContain("Pick one");
+    const choice = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent === "B",
+    );
+    await act(async () => choice?.click());
+    expect(onClarifyRespond).toHaveBeenCalledWith("clarify-1", "B");
+
+    await act(async () => root.unmount());
+  });
+
   it("automatically loads near the top and keeps manual loading for errors only", async () => {
     const container = document.createElement("div");
     document.body.appendChild(container);
@@ -151,6 +192,7 @@ describe("MessageList", () => {
 
     await act(async () => root.render(
       <MessageList
+        onClarifyRespond={() => undefined}
         onApprovalRespond={() => undefined}
         onLoadEarlier={onLoadEarlier}
         state={baseState}
@@ -170,6 +212,7 @@ describe("MessageList", () => {
 
     await act(async () => root.render(
       <MessageList
+        onClarifyRespond={() => undefined}
         onApprovalRespond={() => undefined}
         onLoadEarlier={onLoadEarlier}
         state={{ ...baseState, historyLoading: true }}
@@ -177,6 +220,7 @@ describe("MessageList", () => {
     ));
     await act(async () => root.render(
       <MessageList
+        onClarifyRespond={() => undefined}
         onApprovalRespond={() => undefined}
         onLoadEarlier={onLoadEarlier}
         state={{ ...baseState, historyError: "Network unavailable" }}
@@ -200,6 +244,7 @@ describe("MessageList", () => {
 
     await act(async () => root.render(
       <MessageList
+        onClarifyRespond={() => undefined}
         onApprovalRespond={() => undefined}
         state={{
           ...initialGuiChatState,

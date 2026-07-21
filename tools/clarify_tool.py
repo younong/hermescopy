@@ -106,10 +106,21 @@ def clarify_tool(
             ensure_ascii=False,
         )
 
+    if isinstance(user_response, dict):
+        outcome = str(user_response.get("outcome") or "cancelled")
+        answer = user_response.get("answer")
+    else:
+        outcome = "answered"
+        answer = user_response
+    if outcome not in {"answered", "cancelled", "timed_out"}:
+        outcome = "cancelled"
+    normalized_answer = str(answer).strip() if answer is not None else None
+
     return json.dumps({
         "question": question,
         "choices_offered": choices,
-        "user_response": str(user_response).strip(),
+        "outcome": outcome,
+        "user_response": normalized_answer if outcome == "answered" else None,
     }, ensure_ascii=False)
 
 
@@ -125,8 +136,8 @@ def check_clarify_requirements() -> bool:
 CLARIFY_SCHEMA = {
     "name": "clarify",
     "description": (
-        "Ask the user a question when you need clarification, feedback, or a "
-        "decision before proceeding. Supports two modes:\n\n"
+        "Ask the user a blocking question only when missing user-specific "
+        "information is essential before proceeding. Supports two modes:\n\n"
         "1. **Multiple choice** — provide up to 4 choices. The user picks one "
         "or types their own answer via a 5th 'Other' option.\n"
         "2. **Open-ended** — omit choices entirely. The user types a free-form "
@@ -137,14 +148,21 @@ CLARIFY_SCHEMA = {
         "into the question string render as dead prose the user can't pick. "
         "Right: question='Which deployment target?', choices=['staging', "
         "'prod']. Wrong: question='Which target? 1) staging 2) prod', choices=[].\n\n"
-        "Use this tool when:\n"
-        "- The task is ambiguous and you need the user to choose an approach\n"
-        "- You want post-task feedback ('How did that work out?')\n"
-        "- You want to offer to save a skill or update memory\n"
-        "- A decision has meaningful trade-offs the user should weigh in on\n\n"
-        "Do NOT use this tool for simple yes/no confirmation of dangerous "
-        "commands (the terminal tool handles that). Prefer making a reasonable "
-        "default choice yourself when the decision is low-stakes."
+        "Use this tool only when all of these are true:\n"
+        "- Missing user-specific information materially affects correctness or "
+        "safety, identity/credentials/destination, or an irreversible or external "
+        "action.\n"
+        "- The information cannot be recovered from tools, repository context, "
+        "or an explicit user instruction.\n"
+        "- No safe conventional default lets you continue.\n\n"
+        "Do NOT use this tool for ordinary advice, reversible low-stakes actions, "
+        "formatting/design/library preferences, or choices with a conventional "
+        "default. Proceed with the reasonable default and disclose the assumption. "
+        "Do NOT use it for simple yes/no confirmation of dangerous commands (the "
+        "terminal tool handles that). If a prior clarify request was cancelled or "
+        "timed out, do not immediately ask the same question again; use a safe "
+        "default where possible, otherwise explain the essential blocker."
+
     ),
     "parameters": {
         "type": "object",

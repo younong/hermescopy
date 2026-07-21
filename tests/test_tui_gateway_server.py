@@ -498,7 +498,10 @@ def test_owner_gateway_runtimes_keep_live_maps_and_prompt_state_isolated():
     with server.owner_worker_gateway_runtime(runtime_a):
         server._sessions["same-session"] = {"owner": "a"}
         server._pending["same-request"] = ("same-session", threading.Event())
-        server._answers["same-request"] = "answer-a"
+        server._answers["same-request"] = {
+            "outcome": "answered",
+            "answer": "answer-a",
+        }
         server._active_child_runs["same-child"] = 1.0
         server._child_mirrors["same-child"] = {"owner": "a"}
 
@@ -512,7 +515,10 @@ def test_owner_gateway_runtimes_keep_live_maps_and_prompt_state_isolated():
 
     with server.owner_worker_gateway_runtime(runtime_a):
         assert server._sessions["same-session"] == {"owner": "a"}
-        assert server._answers["same-request"] == "answer-a"
+        assert server._answers["same-request"] == {
+            "outcome": "answered",
+            "answer": "answer-a",
+        }
 
 
 def test_owner_runtime_propagates_to_deferred_agent_build(monkeypatch):
@@ -5799,7 +5805,10 @@ def test_interrupt_only_clears_own_session_pending():
 
         # Session A's pending must be released to empty.
         assert ev_a.is_set(), "sid_a pending Event should be set after interrupt"
-        assert server._answers.get("rid-a") == ""
+        assert server._answers.get("rid-a") == {
+            "outcome": "cancelled",
+            "answer": None,
+        }
 
         # Session B's pending MUST remain untouched — no cross-session blast.
         assert not ev_b.is_set(), (
@@ -5836,12 +5845,110 @@ def test_interrupt_clears_multiple_own_pending():
         )
         assert resp.get("result")
         assert ev1.is_set() and ev2.is_set()
-        assert server._answers.get("r1") == "" and server._answers.get("r2") == ""
+        assert server._answers.get("r1") == {
+            "outcome": "cancelled",
+            "answer": None,
+        }
+        assert server._answers.get("r2") == {
+            "outcome": "cancelled",
+            "answer": None,
+        }
     finally:
         server._sessions.pop("sid", None)
         for key in ("r1", "r2"):
             server._pending.pop(key, None)
             server._answers.pop(key, None)
+
+
+def test_busy_submit_cancels_only_own_clarify(monkeypatch):
+    class _Agent:
+        def __init__(self):
+            self.interrupted = False
+
+        def interrupt(self):
+            self.interrupted = True
+
+    agent = _Agent()
+    session = _session(agent=agent, running=True)
+    own_clarify = threading.Event()
+    own_secret = threading.Event()
+    other_clarify = threading.Event()
+    server._pending["own-clarify"] = ("sid", own_clarify)
+    server._pending["own-secret"] = ("sid", own_secret)
+    server._pending["other-clarify"] = ("other", other_clarify)
+    server._pending_prompt_payloads["own-clarify"] = (
+        "clarify.request",
+        {"question": "Continue?"},
+    )
+    server._pending_prompt_payloads["own-secret"] = (
+        "secret.request",
+        {"prompt": "Secret"},
+    )
+    server._pending_prompt_payloads["other-clarify"] = (
+        "clarify.request",
+        {"question": "Other?"},
+    )
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
+
+    try:
+        result = server._handle_busy_submit("1", "sid", session, "new message", None)
+
+        assert result["result"]["status"] == "queued"
+        assert own_clarify.is_set()
+        assert server._answers["own-clarify"]["outcome"] == "cancelled"
+        assert not own_secret.is_set()
+        assert not other_clarify.is_set()
+        assert session["queued_prompt"]["text"] == "new message"
+        assert agent.interrupted is True
+    finally:
+        for request_id in ("own-clarify", "own-secret", "other-clarify"):
+            server._pending.pop(request_id, None)
+            server._pending_prompt_payloads.pop(request_id, None)
+            server._answers.pop(request_id, None)
+
+
+def test_live_session_payload_snapshots_only_own_clarify():
+    session = _session(created_at=123.0)
+    server._pending["own-clarify"] = ("sid", threading.Event())
+    server._pending["own-secret"] = ("sid", threading.Event())
+    server._pending["other-clarify"] = ("other", threading.Event())
+    server._pending_prompt_payloads["own-clarify"] = (
+        "clarify.request",
+        {
+            "question": "Pick one",
+            "choices": ["A", "B"],
+            "timeout_ms": 60_000,
+            "expires_at_ms": 123_456,
+        },
+    )
+    server._pending_prompt_payloads["own-secret"] = (
+        "secret.request",
+        {"prompt": "do not expose"},
+    )
+    server._pending_prompt_payloads["other-clarify"] = (
+        "clarify.request",
+        {"question": "Other session"},
+    )
+
+    try:
+        payload = server._live_session_payload("sid", session)
+        assert payload["pending_prompts"] == [
+            {
+                "type": "clarify",
+                "request_id": "own-clarify",
+                "question": "Pick one",
+                "choices": ["A", "B"],
+                "timeout_ms": 60_000,
+                "expires_at_ms": 123_456,
+            }
+        ]
+        assert payload["status"] == "waiting"
+        assert "do not expose" not in json.dumps(payload)
+    finally:
+        for request_id in ("own-clarify", "own-secret", "other-clarify"):
+            server._pending.pop(request_id, None)
+            server._pending_prompt_payloads.pop(request_id, None)
+            server._answers.pop(request_id, None)
 
 
 def test_run_prompt_submit_registers_turn_thread_for_interrupt(monkeypatch):
@@ -5978,6 +6085,35 @@ def test_interrupt_before_agent_ready_prevents_late_turn_start(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_session_close_releases_pending_clarify(monkeypatch):
+    session = _session()
+    ev = threading.Event()
+    server._sessions["sid"] = session
+    server._pending["rid-close"] = ("sid", ev)
+    server._pending_prompt_payloads["rid-close"] = (
+        "clarify.request",
+        {"question": "Still there?"},
+    )
+    monkeypatch.setattr(server, "_teardown_session", lambda *_args, **_kwargs: None)
+
+    try:
+        response = server._methods["session.close"]("1", {"session_id": "sid"})
+
+        assert response["result"]["closed"] is True
+        assert ev.is_set()
+        assert "rid-close" not in server._pending
+        assert "rid-close" not in server._pending_prompt_payloads
+        assert server._answers["rid-close"] == {
+            "outcome": "cancelled",
+            "answer": None,
+        }
+    finally:
+        server._sessions.pop("sid", None)
+        server._pending.pop("rid-close", None)
+        server._pending_prompt_payloads.pop("rid-close", None)
+        server._answers.pop("rid-close", None)
+
+
 def test_clear_pending_without_sid_clears_all():
     """_clear_pending(None) is the shutdown path — must still release
     every pending prompt regardless of owning session."""
@@ -5994,23 +6130,74 @@ def test_clear_pending_without_sid_clears_all():
             server._answers.pop(key, None)
 
 
-def test_respond_unpacks_sid_tuple_correctly():
-    """After the (sid, Event) tuple change, _respond must still work."""
+def test_clarify_respond_requires_owner_session_and_claims_request():
     ev = threading.Event()
     server._pending["rid-x"] = ("sid_x", ev)
+    server._pending_prompt_payloads["rid-x"] = (
+        "clarify.request",
+        {"request_id": "rid-x", "question": "Pick?"},
+    )
     try:
-        resp = server.handle_request(
+        missing_session = server.handle_request(
             {
                 "id": "1",
                 "method": "clarify.respond",
                 "params": {"request_id": "rid-x", "answer": "the answer"},
             }
         )
+        assert missing_session["error"]["code"] == 4009
+        assert not ev.is_set()
+
+        wrong_session = server.handle_request(
+            {
+                "id": "2",
+                "method": "clarify.respond",
+                "params": {
+                    "session_id": "sid_y",
+                    "request_id": "rid-x",
+                    "answer": "the answer",
+                },
+            }
+        )
+        assert wrong_session["error"]["code"] == 4009
+        assert not ev.is_set()
+
+        resp = server.handle_request(
+            {
+                "id": "3",
+                "method": "clarify.respond",
+                "params": {
+                    "session_id": "sid_x",
+                    "request_id": "rid-x",
+                    "answer": "the answer",
+                },
+            }
+        )
         assert resp.get("result")
         assert ev.is_set()
-        assert server._answers.get("rid-x") == "the answer"
+        assert "rid-x" not in server._pending
+        assert "rid-x" not in server._pending_prompt_payloads
+        assert server._answers.get("rid-x") == {
+            "outcome": "answered",
+            "answer": "the answer",
+        }
+
+        duplicate = server.handle_request(
+            {
+                "id": "4",
+                "method": "clarify.respond",
+                "params": {
+                    "session_id": "sid_x",
+                    "request_id": "rid-x",
+                    "answer": "different",
+                },
+            }
+        )
+        assert duplicate["error"]["code"] == 4009
+        assert server._answers["rid-x"]["answer"] == "the answer"
     finally:
         server._pending.pop("rid-x", None)
+        server._pending_prompt_payloads.pop("rid-x", None)
         server._answers.pop("rid-x", None)
 
 

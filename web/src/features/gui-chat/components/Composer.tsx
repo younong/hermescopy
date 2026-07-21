@@ -19,11 +19,13 @@ const ATTACHMENT_ACCEPT = "*/*";
 export function Composer({
   disabled,
   isGenerating,
+  allowSendWhileGenerating = false,
   onSend,
   onStop,
 }: {
   disabled?: boolean;
   isGenerating: boolean;
+  allowSendWhileGenerating?: boolean;
   onSend: (
     text: string,
     attachments: GuiComposerAttachment[],
@@ -52,9 +54,13 @@ export function Composer({
     };
   }, []);
 
+  const generationBlocksSend = isGenerating && !allowSendWhileGenerating;
   const canSend =
-    (text.trim().length > 0 || attachments.length > 0) && !disabled && !isGenerating && !isSubmitting;
-  const controlsDisabled = disabled || isGenerating || isSubmitting;
+    (text.trim().length > 0 || attachments.length > 0) &&
+    !disabled &&
+    !generationBlocksSend &&
+    !isSubmitting;
+  const controlsDisabled = disabled || generationBlocksSend || isSubmitting;
 
   const updateAttachment = (id: string, patch: Partial<GuiComposerAttachment>) => {
     setAttachments((current) =>
@@ -79,7 +85,12 @@ export function Composer({
 
   const submit = async () => {
     const next = text.trim();
-    if ((!next && attachments.length === 0) || disabled || isGenerating || isSubmitting) return;
+    if (
+      (!next && attachments.length === 0) ||
+      disabled ||
+      generationBlocksSend ||
+      isSubmitting
+    ) return;
 
     const attachmentsToSend = attachments;
     setLocalError(null);
@@ -253,23 +264,26 @@ export function Composer({
             <Paperclip className="h-4 w-4" />
           </Button>
 
-          {isGenerating ? (
-            <Button
-              type="button"
-              ghost
-              className="text-destructive"
-              onClick={onStop}
-              disabled={disabled}
-            >
-              <Square className="h-4 w-4" />
-              Stop
-            </Button>
-          ) : (
-            <Button type="submit" disabled={!canSend}>
-              <Send className="h-4 w-4" />
-              {isSubmitting ? "Sending…" : "Send"}
-            </Button>
-          )}
+          <div className="flex items-center gap-2">
+            {isGenerating ? (
+              <Button
+                type="button"
+                ghost
+                className="text-destructive"
+                onClick={onStop}
+                disabled={disabled}
+              >
+                <Square className="h-4 w-4" />
+                Stop
+              </Button>
+            ) : null}
+            {!isGenerating || allowSendWhileGenerating ? (
+              <Button type="submit" disabled={!canSend}>
+                <Send className="h-4 w-4" />
+                {isSubmitting ? "Sending…" : "Send"}
+              </Button>
+            ) : null}
+          </div>
         </div>
       </div>
     </form>

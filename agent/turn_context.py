@@ -396,12 +396,34 @@ def build_turn_context(
         # Gate the (expensive) full token estimate behind a cheap pre-check.
         # See ``_should_run_preflight_estimate`` for the OR semantics that fix
         # issue #27405 (a few very large messages slipping past the count gate).
-        if agent.compression_enabled and _should_run_preflight_estimate(
-            messages,
-            agent.context_compressor.protect_first_n,
-            agent.context_compressor.protect_last_n,
-            agent.context_compressor.threshold_tokens,
-        ):
+        _preflight_gate = False
+        if agent.compression_enabled:
+            _preflight_gate = _should_run_preflight_estimate(
+                messages,
+                agent.context_compressor.protect_first_n,
+                agent.context_compressor.protect_last_n,
+                agent.context_compressor.threshold_tokens,
+            )
+        logger.info(
+            "compression preflight decision=%s reason=%s session=%s messages=%d "
+            "protected=%d threshold=%d",
+            "estimate" if _preflight_gate else "skip",
+            (
+                "gate_open"
+                if _preflight_gate
+                else "compression_disabled"
+                if not agent.compression_enabled
+                else "below_cheap_gate"
+            ),
+            agent.session_id or "none",
+            len(messages),
+            (
+                agent.context_compressor.protect_first_n
+                + agent.context_compressor.protect_last_n
+            ),
+            getattr(agent.context_compressor, "threshold_tokens", 0),
+        )
+        if _preflight_gate:
             _preflight_tokens = estimate_request_tokens_rough(
                 messages,
                 system_prompt=active_system_prompt or "",
@@ -429,26 +451,34 @@ def build_turn_context(
 
             if _preflight_deferred:
                 logger.info(
-                    "Skipping preflight compression: rough estimate ~%s >= %s, "
-                    "but last real provider prompt was %s after compression",
-                    f"{_preflight_tokens:,}",
-                    f"{_compressor.threshold_tokens:,}",
-                    f"{_compressor.last_real_prompt_tokens:,}",
+                    "compression preflight decision=skip reason=defer_to_real_usage "
+                    "session=%s rough_tokens=%d effective_threshold=%d "
+                    "last_real_prompt_tokens=%d",
+                    agent.session_id or "none",
+                    _preflight_tokens,
+                    _compressor.threshold_tokens,
+                    _compressor.last_real_prompt_tokens,
                 )
             elif _compression_cooldown:
                 logger.info(
-                    "Skipping preflight compression: same-session cooldown active "
-                    "(~%s seconds remaining, session %s)",
-                    int(_compression_cooldown.get("remaining_seconds", 0.0)),
+                    "compression preflight decision=skip reason=failure_cooldown "
+                    "session=%s rough_tokens=%d effective_threshold=%d "
+                    "remaining_seconds=%d",
                     agent.session_id or "none",
+                    _preflight_tokens,
+                    _compressor.threshold_tokens,
+                    int(_compression_cooldown.get("remaining_seconds", 0.0)),
                 )
             elif _compressor.should_compress(_preflight_tokens):
                 logger.info(
-                    "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
-                    f"{_preflight_tokens:,}",
-                    f"{_compressor.threshold_tokens:,}",
+                    "compression preflight decision=compress reason=threshold_reached "
+                    "session=%s rough_tokens=%d effective_threshold=%d model=%s "
+                    "context_length=%d",
+                    agent.session_id or "none",
+                    _preflight_tokens,
+                    _compressor.threshold_tokens,
                     agent.model,
-                    f"{_compressor.context_length:,}",
+                    _compressor.context_length,
                 )
                 agent._emit_status(
                     f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
@@ -474,6 +504,17 @@ def build_turn_context(
                     if not _compression_made_progress(
                         _orig_len, len(messages), _orig_tokens, _preflight_tokens
                     ):
+                        logger.info(
+                            "compression preflight decision=stop reason=no_progress "
+                            "session=%s pass=%d messages_before=%d messages_after=%d "
+                            "rough_tokens_before=%d rough_tokens_after=%d",
+                            agent.session_id or "none",
+                            _pass + 1,
+                            _orig_len,
+                            len(messages),
+                            _orig_tokens,
+                            _preflight_tokens,
+                        )
                         break  # Cannot compress further: neither rows nor tokens moved
                     conversation_history = conversation_history_after_compression(
                         agent, messages
@@ -484,7 +525,23 @@ def build_turn_context(
                     agent._last_content_tools_all_housekeeping = False
                     agent._mute_post_response = False
                     if not _compressor.should_compress(_preflight_tokens):
+                        logger.info(
+                            "compression preflight decision=stop reason=below_threshold "
+                            "session=%s pass=%d rough_tokens=%d effective_threshold=%d",
+                            agent.session_id or "none",
+                            _pass + 1,
+                            _preflight_tokens,
+                            _compressor.threshold_tokens,
+                        )
                         break
+            else:
+                logger.info(
+                    "compression preflight decision=skip reason=below_threshold "
+                    "session=%s rough_tokens=%d effective_threshold=%d",
+                    agent.session_id or "none",
+                    _preflight_tokens,
+                    _compressor.threshold_tokens,
+                )
 
     with _TurnPhase(agent, turn_id, "deferred_skill"):
         # Resolve large slash-skill instructions only after persistence and preflight.
