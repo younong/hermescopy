@@ -110,6 +110,16 @@ def _ref(repo: Path, ref: str) -> str:
     return _git(repo, "rev-parse", ref).stdout.strip()
 
 
+def _install_deploy_script(repo: Path) -> Path:
+    script = repo / "deploy" / "deploy.mjs"
+    script.parent.mkdir()
+    shutil.copy2(DEPLOY_SCRIPT, script)
+    _git(repo, "add", script.relative_to(repo).as_posix())
+    _git(repo, "commit", "-m", "add deploy script")
+    _git(repo, "push", "origin", "main")
+    return script
+
+
 def _move_remote_branch_before_push(
     tmp_path: Path,
     origin: Path,
@@ -238,6 +248,46 @@ def test_dry_run_reports_sync_without_changing_refs(tmp_path):
     assert all(" --force " not in line and " +" not in line for line in push_lines)
     assert all("--force-with-lease=refs/heads/main:" in line for line in push_lines)
     assert "--tags" not in result.stdout
+
+
+def test_create_tag_cli_dry_run_remains_tag_sourced(tmp_path):
+    _origin, _seed, work = _repositories(tmp_path)
+    script = _install_deploy_script(work)
+
+    result = _run(
+        ["node", str(script), "--create-tag", "v-test-cli", "--dry-run"],
+        work,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Tag: v-test-cli" in result.stdout
+    assert "/releases/v-test-cli" in result.stdout
+    assert "Commit SHA:" not in result.stdout
+    assert "/releases/commit-" not in result.stdout
+
+
+def test_create_tag_cli_rejects_commit_ref_override(tmp_path):
+    _origin, _seed, work = _repositories(tmp_path)
+    script = _install_deploy_script(work)
+    commit = _ref(work, "HEAD")
+
+    result = _run(
+        [
+            "node",
+            str(script),
+            "--create-tag",
+            "v-test-cli",
+            "--ref",
+            commit,
+            "--dry-run",
+        ],
+        work,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "Pass exactly one of --tag, --create-tag, or --ref." in result.stderr
 
 
 def test_existing_remote_tag_is_not_overwritten(tmp_path):
