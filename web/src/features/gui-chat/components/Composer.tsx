@@ -1,4 +1,12 @@
-import { useEffect, useRef, useState, type ChangeEvent, type KeyboardEvent } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type ClipboardEvent,
+  type DragEvent,
+  type KeyboardEvent,
+} from "react";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Paperclip, Send, Square } from "lucide-react";
 
@@ -26,9 +34,11 @@ export function Composer({
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<GuiComposerAttachment[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const attachmentsRef = useRef<GuiComposerAttachment[]>([]);
+  const dragDepthRef = useRef(0);
 
   useEffect(() => {
     attachmentsRef.current = attachments;
@@ -125,6 +135,43 @@ export function Composer({
     event.target.value = "";
   };
 
+  const onPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const files = filesFromTransfer(event.clipboardData);
+    if (files.length === 0 || controlsDisabled) return;
+    event.preventDefault();
+    addFiles(files);
+  };
+
+  const onDragEnter = (event: DragEvent<HTMLDivElement>) => {
+    if (!transferHasFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    if (controlsDisabled) return;
+    dragDepthRef.current += 1;
+    setIsDraggingFiles(true);
+  };
+
+  const onDragOver = (event: DragEvent<HTMLDivElement>) => {
+    if (!transferHasFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = controlsDisabled ? "none" : "copy";
+  };
+
+  const onDragLeave = (event: DragEvent<HTMLDivElement>) => {
+    if (!transferHasFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setIsDraggingFiles(false);
+  };
+
+  const onDrop = (event: DragEvent<HTMLDivElement>) => {
+    if (!transferHasFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    dragDepthRef.current = 0;
+    setIsDraggingFiles(false);
+    const files = filesFromTransfer(event.dataTransfer);
+    if (!controlsDisabled && files.length > 0) addFiles(files);
+  };
+
   const removeAttachment = (id: string) => {
     setAttachments((current) => {
       const removed = current.find((attachment) => attachment.id === id);
@@ -149,7 +196,24 @@ export function Composer({
         onChange={onFileChange}
         type="file"
       />
-      <div className="rounded-[28px] border border-current/20 bg-background-base p-3 shadow-sm transition focus-within:border-blue-300 focus-within:ring-2 focus-within:ring-blue-200/50">
+      <div
+        className={[
+          "rounded-[28px] border bg-background-base p-3 shadow-sm transition focus-within:border-blue-300 focus-within:ring-2 focus-within:ring-blue-200/50",
+          isDraggingFiles
+            ? "border-blue-400 bg-blue-500/5 ring-2 ring-blue-200/70"
+            : "border-current/20",
+        ].join(" ")}
+        onDragEnter={onDragEnter}
+        onDragLeave={onDragLeave}
+        onDragOver={onDragOver}
+        onDrop={onDrop}
+      >
+        {isDraggingFiles ? (
+          <div className="mb-2 px-1 text-sm font-medium text-blue-500" role="status">
+            Drop files to attach
+          </div>
+        ) : null}
+
         {attachments.length > 0 ? (
           <div className="scrollbar-none -mx-1 mb-3 flex gap-3 overflow-x-auto px-1 py-1">
             {attachments.map((attachment) => (
@@ -169,6 +233,7 @@ export function Composer({
           disabled={disabled || isSubmitting}
           onChange={(event) => setText(event.target.value)}
           onKeyDown={onKeyDown}
+          onPaste={onPaste}
           placeholder={disabled ? "Connecting to Hermes…" : "Message Hermes…"}
           rows={2}
           value={text}
@@ -208,6 +273,23 @@ export function Composer({
         </div>
       </div>
     </form>
+  );
+}
+
+function filesFromTransfer(dataTransfer: DataTransfer): File[] {
+  const files = Array.from(dataTransfer.files);
+  if (files.length > 0) return files;
+  return Array.from(dataTransfer.items)
+    .filter((item) => item.kind === "file")
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => file !== null);
+}
+
+function transferHasFiles(dataTransfer: DataTransfer): boolean {
+  return (
+    dataTransfer.files.length > 0 ||
+    Array.from(dataTransfer.items).some((item) => item.kind === "file") ||
+    Array.from(dataTransfer.types).includes("Files")
   );
 }
 
