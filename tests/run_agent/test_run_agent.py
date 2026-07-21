@@ -4743,9 +4743,10 @@ class TestRunConversation:
         assert result["final_response"] == "Recovered after remint"
 
     def test_context_compression_triggered(self, agent):
-        """When compressor says should_compress, compression runs."""
+        """The legacy synchronous post-tool path still runs when async is disabled."""
         self._setup_agent(agent)
         agent.compression_enabled = True
+        agent.compression_async_prepare = False
 
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
         resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
