@@ -341,6 +341,19 @@ def build_turn_context(
             exc_info=True,
         )
 
+    # Commit a stable deterministic tool-only checkpoint before the expensive
+    # full request estimate. The inbound user turn was persisted above, while
+    # the protected tail keeps it and recent tool work byte-for-byte intact.
+    _tool_checkpoint = getattr(agent, "_maybe_compact_tool_payloads", None)
+    if agent.compression_enabled and _tool_checkpoint is not None:
+        messages, _tool_checkpoint_changed = _tool_checkpoint(
+            messages, task_id=effective_task_id
+        )
+        if _tool_checkpoint_changed:
+            conversation_history = conversation_history_after_compression(
+                agent, messages
+            )
+
     # ── Preflight context compression ──
     # Gate the (expensive) full token estimate behind a cheap pre-check.
     # See ``_should_run_preflight_estimate`` for the OR semantics that fix

@@ -192,6 +192,52 @@ class TestFlushAfterCompression:
             ]
 
 
+    def test_tool_checkpoint_preserves_full_archived_rows_and_resumes_compacted(self):
+        """Tool-only checkpoints archive full payloads without deleting history."""
+        from agent.conversation_compression import maybe_compact_tool_payloads
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            agent._ensure_db_session()
+            agent.context_compressor.tail_token_budget = 64
+
+            large_args = '{"command":"run","payload":"' + ("a" * 120000) + '"}'
+            large_result = "full-result-" + ("z" * 120000)
+            messages = [
+                {"role": "user", "content": "start"},
+                {"role": "assistant", "content": None, "tool_calls": [{
+                    "id": "call-1", "type": "function",
+                    "function": {"name": "terminal", "arguments": large_args},
+                }]},
+                {"role": "tool", "tool_call_id": "call-1", "tool_name": "terminal",
+                 "content": large_result},
+                {"role": "assistant", "content": "consumed"},
+                {"role": "user", "content": "recent"},
+                {"role": "assistant", "content": "recent answer"},
+                {"role": "user", "content": "newest"},
+                {"role": "assistant", "content": "newest answer"},
+            ]
+            agent._flush_messages_to_session_db(messages, [])
+
+            compacted, changed = maybe_compact_tool_payloads(agent, messages)
+
+            assert changed is True
+            assert compacted[2]["content"] != large_result
+            assert len(compacted[2]["content"].encode("utf-8")) <= len(large_result.encode("utf-8")) * 0.20
+            active = db.get_messages("original-session")
+            assert active[2]["content"] == compacted[2]["content"]
+            all_rows = db.get_messages("original-session", include_inactive=True)
+            assert any(row["content"] == large_result for row in all_rows)
+            assert any(
+                call.get("function", {}).get("arguments") == large_args
+                for row in all_rows for call in (row.get("tool_calls") or [])
+            )
+            assert agent._last_compaction_in_place is True
+            assert len(active) == len(messages)
+
+
 # ---------------------------------------------------------------------------
 # Part 2: Gateway-side — history_offset after session split
 # ---------------------------------------------------------------------------

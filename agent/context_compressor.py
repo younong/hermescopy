@@ -16,6 +16,7 @@ Improvements over v2:
   - Richer tool call/result detail in summarizer input
 """
 
+import copy
 import hashlib
 import json
 import logging
@@ -191,6 +192,15 @@ _AUTO_FOCUS_MAX_CHARS = 700
 # high for small/light tails, but using all 20 as a hard floor here would bring
 # back the old large-tool-output case where nothing can be compacted.
 _MAX_TAIL_MESSAGE_FLOOR = 8
+
+# Deterministic tool-payload checkpoints run before LLM summarization. A field
+# is eligible only when it is large enough to shrink materially, and every
+# transformed field must fit inside 20% of its original UTF-8 payload. Keeping
+# these as internal invariants avoids conflating tool pruning with the
+# user-facing summary target ratio.
+_TOOL_COMPACTION_RETAINED_RATIO = 0.20
+_TOOL_COMPACTION_MIN_FIELD_BYTES = 512
+_TOOL_COMPACTION_TRIGGER_BYTES = 20_000 * _CHARS_PER_TOKEN
 
 
 _PATH_MENTION_RE = re.compile(r"(?:/|~/?|[A-Za-z]:\\)[^\s`'\")\]}<>]+")
@@ -500,6 +510,56 @@ def _strip_historical_media(messages: List[Dict[str, Any]]) -> List[Dict[str, An
         changed = True
 
     return result if changed else messages
+
+
+def _utf8_size(value: Any) -> int:
+    """Return the UTF-8 payload size used by tool-compaction accounting."""
+    if isinstance(value, str):
+        return len(value.encode("utf-8"))
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _truncate_utf8(value: str, max_bytes: int) -> str:
+    """Truncate text at a UTF-8 code-point boundary."""
+    if max_bytes <= 0:
+        return ""
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _compact_tool_arguments(args: str, max_bytes: int) -> Optional[str]:
+    """Return valid compact JSON within *max_bytes*, or ``None`` if unsafe."""
+    if not isinstance(args, str) or "[tool payload compacted" in args:
+        return None
+    try:
+        parsed = json.loads(args)
+    except (ValueError, TypeError):
+        return None
+
+    original_bytes = _utf8_size(args)
+    for head_chars in (200, 80, 24, 0):
+        def _shrink(value: Any) -> Any:
+            if isinstance(value, str) and len(value) > head_chars:
+                retained = value[:head_chars] if head_chars else ""
+                return (
+                    retained
+                    + ("…" if retained else "")
+                    + f"[tool payload compacted from {_utf8_size(value)} bytes]"
+                )
+            if isinstance(value, dict):
+                return {key: _shrink(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [_shrink(item) for item in value]
+            return value
+
+        compacted = json.dumps(
+            _shrink(parsed), ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        )
+        if _utf8_size(compacted) <= max_bytes and _utf8_size(compacted) < original_bytes:
+            return compacted
+    return None
 
 
 def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) -> str:
@@ -2310,6 +2370,154 @@ This compaction should PRIORITISE preserving all information related to the focu
             idx = check
         return idx
 
+    def compact_tool_payloads(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        trigger_bytes: int = _TOOL_COMPACTION_TRIGGER_BYTES,
+        force: bool = False,
+    ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Build a deterministic checkpoint with old, consumed tool payloads shrunk.
+
+        The protected tail remains byte-for-byte unchanged. Only complete
+        assistant/tool groups followed by a later assistant response are eligible,
+        so an unconsumed tool result can never be discarded. The input list and
+        nested tool-call dictionaries are never mutated.
+        """
+        stats: Dict[str, Any] = {
+            "eligible_original_bytes": 0,
+            "eligible_compacted_bytes": 0,
+            "tool_results_compacted": 0,
+            "tool_arguments_compacted": 0,
+            "ineligible_bytes": 0,
+            "changed": False,
+        }
+        if not messages:
+            return messages, stats
+
+        head_end = self._protect_head_size(messages)
+        tail_start = self._find_tail_cut_by_tokens(messages, head_end)
+        tail_start = min(len(messages), tail_start)
+        tail_start = self._align_boundary_backward(messages, tail_start)
+        if tail_start <= head_end:
+            return messages, stats
+
+        # A group is consumed only after a later assistant response exists. This
+        # deliberately excludes the current assistant(tool_calls) -> tool tail.
+        consumed_cutoff = -1
+        for idx in range(tail_start - 1, -1, -1):
+            msg = messages[idx]
+            if msg.get("role") == "assistant" and not msg.get("tool_calls"):
+                consumed_cutoff = idx
+                break
+        if consumed_cutoff < 0:
+            return messages, stats
+
+        call_groups: list[tuple[int, list[int], Dict[str, tuple[str, str]]]] = []
+        idx = 0
+        while idx < min(tail_start, len(messages)):
+            msg = messages[idx]
+            tool_calls = msg.get("tool_calls") if msg.get("role") == "assistant" else None
+            if not tool_calls:
+                idx += 1
+                continue
+            calls: Dict[str, tuple[str, str]] = {}
+            complete = True
+            for tc in tool_calls:
+                call_id = self._get_tool_call_id(tc)
+                if not call_id or call_id in calls:
+                    complete = False
+                    break
+                calls[call_id] = _extract_tool_call_name_and_args(tc)
+            result_indexes: list[int] = []
+            cursor = idx + 1
+            result_ids: set[str] = set()
+            while cursor < len(messages) and messages[cursor].get("role") == "tool":
+                result_indexes.append(cursor)
+                result_id = str(messages[cursor].get("tool_call_id") or "")
+                if not result_id or result_id in result_ids:
+                    complete = False
+                result_ids.add(result_id)
+                cursor += 1
+            if (
+                complete
+                and set(calls) == result_ids
+                and cursor <= tail_start
+                and cursor <= consumed_cutoff
+            ):
+                call_groups.append((idx, result_indexes, calls))
+            idx = max(cursor, idx + 1)
+
+        if not call_groups:
+            return messages, stats
+
+        candidates: list[tuple[str, int, Any, int, int]] = []
+        for assistant_idx, result_indexes, calls in call_groups:
+            for result_idx in result_indexes:
+                content = messages[result_idx].get("content")
+                if not isinstance(content, str):
+                    stats["ineligible_bytes"] += _utf8_size(content)
+                    continue
+                original_bytes = _utf8_size(content)
+                if original_bytes < _TOOL_COMPACTION_MIN_FIELD_BYTES:
+                    stats["ineligible_bytes"] += original_bytes
+                    continue
+                call_id = str(messages[result_idx].get("tool_call_id") or "")
+                tool_name, tool_args = calls[call_id]
+                budget = int(original_bytes * _TOOL_COMPACTION_RETAINED_RATIO)
+                summary = _summarize_tool_result(tool_name, tool_args, content)
+                summary = _truncate_utf8(summary, budget)
+                if not summary or _utf8_size(summary) > budget:
+                    stats["ineligible_bytes"] += original_bytes
+                    continue
+                candidates.append(("result", result_idx, summary, original_bytes, _utf8_size(summary)))
+
+            for tc_idx, tc in enumerate(messages[assistant_idx].get("tool_calls") or []):
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                args = fn.get("arguments")
+                if not isinstance(args, str):
+                    continue
+                original_bytes = _utf8_size(args)
+                if original_bytes < _TOOL_COMPACTION_MIN_FIELD_BYTES:
+                    stats["ineligible_bytes"] += original_bytes
+                    continue
+                compacted = _compact_tool_arguments(
+                    args, int(original_bytes * _TOOL_COMPACTION_RETAINED_RATIO)
+                )
+                if compacted is None:
+                    stats["ineligible_bytes"] += original_bytes
+                    continue
+                candidates.append((
+                    "argument", (assistant_idx, tc_idx), compacted, original_bytes,
+                    _utf8_size(compacted),
+                ))
+
+        eligible_bytes = sum(item[3] for item in candidates)
+        stats["eligible_original_bytes"] = eligible_bytes
+        if not force and eligible_bytes < trigger_bytes:
+            return messages, stats
+        if not candidates:
+            return messages, stats
+
+        result = copy.deepcopy(messages)
+        for kind, location, compacted, original_bytes, compacted_bytes in candidates:
+            if kind == "result":
+                result[location]["content"] = compacted
+                stats["tool_results_compacted"] += 1
+            else:
+                assistant_idx, tc_idx = location
+                result[assistant_idx]["tool_calls"][tc_idx]["function"]["arguments"] = compacted
+                stats["tool_arguments_compacted"] += 1
+            stats["eligible_compacted_bytes"] += compacted_bytes
+
+        stats["changed"] = True
+        stats["reduction_ratio"] = 1.0 - (
+            stats["eligible_compacted_bytes"] / stats["eligible_original_bytes"]
+        )
+        return result, stats
+
     # ------------------------------------------------------------------
     # Tail protection by token budget
     # ------------------------------------------------------------------
@@ -2724,7 +2932,21 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
 
-        # Phase 1: Prune old tool results (cheap, no LLM call)
+        # Phase 1: deterministically shrink eligible old tool payloads. Full
+        # compression force-enables this pre-pass even below the standalone
+        # checkpoint trigger, then falls back to the legacy summarizer for any
+        # remaining context pressure.
+        messages, tool_stats = self.compact_tool_payloads(messages, force=True)
+        if tool_stats.get("changed") and not self.quiet_mode:
+            logger.info(
+                "Pre-compression tool payloads: %d -> %d bytes (%.1f%% reduction)",
+                tool_stats["eligible_original_bytes"],
+                tool_stats["eligible_compacted_bytes"],
+                tool_stats["reduction_ratio"] * 100.0,
+            )
+
+        # Keep the historical fallback for old/incomplete transcript shapes that
+        # cannot satisfy the stricter complete-consumed-group contract above.
         messages, pruned_count = self._prune_old_tool_results(
             messages, protect_tail_count=self.protect_last_n,
             protect_tail_tokens=self.tail_token_budget,

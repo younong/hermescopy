@@ -3418,3 +3418,90 @@ class TestDoubleCompactionSummaryRole:
             "summary of earlier turns" in (m.get("content") or "")
             for m in result
         )
+
+
+class TestDeterministicToolPayloadCheckpoint:
+    @staticmethod
+    def _messages(*, malformed=False, codex=False):
+        tool_call = {
+            "id": "response-item" if codex else "call-old",
+            "type": "function",
+            "function": {
+                "name": "terminal",
+                "arguments": "not-json" if malformed else json.dumps({
+                    "command": "python task.py",
+                    "payload": "参数" * 6000,
+                }, ensure_ascii=False),
+            },
+        }
+        if codex:
+            tool_call["call_id"] = "call-old"
+        return [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "content": None, "tool_calls": [tool_call]},
+            {"role": "tool", "tool_call_id": "call-old", "content": "结果" * 15000},
+            {"role": "assistant", "content": "I consumed that result."},
+            {"role": "user", "content": "recent question"},
+            {"role": "assistant", "content": "recent answer"},
+            {"role": "user", "content": "newest"},
+            {"role": "assistant", "content": "newest answer"},
+        ]
+
+    def test_reduces_eligible_payloads_at_least_80_percent_without_mutation(self, compressor):
+        messages = self._messages()
+        original = json.loads(json.dumps(messages, ensure_ascii=False))
+
+        compacted, stats = compressor.compact_tool_payloads(messages, force=True)
+
+        assert stats["changed"] is True
+        assert stats["eligible_compacted_bytes"] <= stats["eligible_original_bytes"] * 0.20
+        assert stats["reduction_ratio"] >= 0.80
+        assert stats["tool_results_compacted"] == 1
+        assert stats["tool_arguments_compacted"] == 1
+        assert messages == original
+        assert compacted is not messages
+        assert compacted[1]["tool_calls"] is not messages[1]["tool_calls"]
+        assert json.loads(compacted[1]["tool_calls"][0]["function"]["arguments"])
+        assert compacted[-4:] == messages[-4:]
+
+    def test_output_is_deterministic_and_codex_call_id_pairs_survive(self, compressor):
+        messages = self._messages(codex=True)
+        first, first_stats = compressor.compact_tool_payloads(messages, force=True)
+        second, second_stats = compressor.compact_tool_payloads(messages, force=True)
+
+        assert first == second
+        assert first_stats == second_stats
+        assert first[1]["tool_calls"][0]["call_id"] == "call-old"
+        assert first[1]["tool_calls"][0]["id"] == "response-item"
+        assert first[2]["tool_call_id"] == "call-old"
+        assert compressor._sanitize_tool_pairs(first) == first
+
+    def test_malformed_arguments_stay_verbatim_but_result_can_compact(self, compressor):
+        messages = self._messages(malformed=True)
+        compacted, stats = compressor.compact_tool_payloads(messages, force=True)
+
+        assert stats["changed"] is True
+        assert stats["tool_arguments_compacted"] == 0
+        assert compacted[1]["tool_calls"][0]["function"]["arguments"] == "not-json"
+        assert stats["tool_results_compacted"] == 1
+
+    def test_unconsumed_and_incomplete_groups_remain_verbatim(self, compressor):
+        unconsumed = self._messages()[:3]
+        compacted, stats = compressor.compact_tool_payloads(unconsumed, force=True)
+        assert compacted is unconsumed
+        assert stats["changed"] is False
+
+        incomplete = self._messages()
+        incomplete[2]["tool_call_id"] = "wrong-id"
+        compacted, stats = compressor.compact_tool_payloads(incomplete, force=True)
+        assert compacted is incomplete
+        assert stats["changed"] is False
+
+    def test_trigger_requires_large_enough_eligible_payload(self, compressor):
+        messages = self._messages()
+        compacted, stats = compressor.compact_tool_payloads(
+            messages, trigger_bytes=10**9
+        )
+        assert compacted is messages
+        assert stats["changed"] is False
+        assert stats["eligible_original_bytes"] > 0

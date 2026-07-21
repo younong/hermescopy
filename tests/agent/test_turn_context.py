@@ -403,3 +403,36 @@ def test_expired_cooldown_allows_preflight(tmp_path):
     agent._emit_status.assert_called_once()
     agent._compress_context.assert_called()
 
+
+
+def test_tool_checkpoint_runs_after_inbound_persistence_and_rebaselines_history():
+    agent = _FakeAgent()
+    agent.compression_enabled = True
+    events = []
+    agent._persist_session = lambda *_a, **_k: events.append("persist")
+
+    def _checkpoint(messages, **_kwargs):
+        events.append("checkpoint")
+        compacted = [dict(message) for message in messages]
+        compacted[0] = {"role": "user", "content": "compacted history"}
+        agent._last_compaction_in_place = True
+        return compacted, True
+
+    agent._maybe_compact_tool_payloads = _checkpoint
+    agent.context_compressor = types.SimpleNamespace(
+        protect_first_n=2,
+        protect_last_n=2,
+        threshold_tokens=10**9,
+    )
+    history = [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+
+    ctx = _build(agent, conversation_history=history)
+
+    assert events == ["persist", "checkpoint"]
+    assert ctx.messages[0]["content"] == "compacted history"
+    assert ctx.messages[-1]["content"] == "hello"
+    assert ctx.conversation_history == ctx.messages
+    assert ctx.conversation_history is not ctx.messages
