@@ -70,6 +70,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from packaging.version import InvalidVersion, Version
+
 from agent.skill_utils import is_excluded_skill_path
 
 
@@ -282,17 +284,11 @@ def write_manifest(profile_dir: Path, manifest: DistributionManifest) -> Path:
 _VERSION_OP_RE = re.compile(r"^\s*(>=|<=|==|!=|>|<)\s*(.+?)\s*$")
 
 
-def _parse_semver(v: str) -> Tuple[int, int, int]:
-    """Very small semver parser — major.minor.patch only.  Extra labels stripped."""
-    s = str(v).strip().lstrip("v")
-    # Strip any pre-release / build metadata (e.g. "0.12.0-rc1+abc")
-    s = re.split(r"[-+]", s, 1)[0]
-    parts = s.split(".")
-    while len(parts) < 3:
-        parts.append("0")
+def _parse_semver(v: str) -> Version:
+    """Parse a Hermes version using standard PEP 440 ordering."""
     try:
-        return (int(parts[0]), int(parts[1]), int(parts[2]))
-    except ValueError as exc:
+        return Version(str(v).strip())
+    except InvalidVersion as exc:
         raise DistributionError(f"Unparseable version: {v!r}") from exc
 
 

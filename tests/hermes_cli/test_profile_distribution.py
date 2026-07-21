@@ -190,17 +190,47 @@ class TestVersionRequires:
             with pytest.raises(DistributionError, match="requires Hermes"):
                 check_hermes_requires(spec, cur)
 
-    def test_parse_semver_handles_prerelease(self):
-        assert _parse_semver("0.12.0-rc1") == (0, 12, 0)
-        assert _parse_semver("v0.12.0+abc") == (0, 12, 0)
+    def test_parse_semver_handles_prerelease_and_local_metadata(self):
+        assert str(_parse_semver("0.12.0-rc1")) == "0.12.0rc1"
+        assert str(_parse_semver("v0.12.0+abc")) == "0.12.0+abc"
 
-    def test_parse_semver_pads(self):
-        assert _parse_semver("1") == (1, 0, 0)
-        assert _parse_semver("1.2") == (1, 2, 0)
+    def test_parse_semver_normalizes_short_versions(self):
+        assert _parse_semver("1") == _parse_semver("1.0.0")
+        assert _parse_semver("1.2") == _parse_semver("1.2.0")
 
     def test_parse_semver_rejects_garbage(self):
         with pytest.raises(DistributionError, match="Unparseable"):
             _parse_semver("not-a-version")
+
+    @pytest.mark.parametrize(
+        ("spec", "current", "invalid"),
+        [
+            (">=not-a-version", "1.0", "not-a-version"),
+            (">=1.0", "not-a-version", "not-a-version"),
+        ],
+    )
+    def test_check_rejects_invalid_versions(self, spec, current, invalid):
+        with pytest.raises(
+            DistributionError,
+            match=rf"Unparseable version: '{invalid}'",
+        ):
+            check_hermes_requires(spec, current)
+
+    @pytest.mark.parametrize(
+        ("spec", "current", "ok"),
+        [
+            (">=1.0", "v1.0", True),
+            (">=1.0", "1.0rc1", False),
+            (">1.0", "1.0.post1", True),
+            ("==1.0+local", "1.0+local", True),
+        ],
+    )
+    def test_check_uses_standard_version_ordering(self, spec, current, ok):
+        if ok:
+            check_hermes_requires(spec, current)
+        else:
+            with pytest.raises(DistributionError, match="requires Hermes"):
+                check_hermes_requires(spec, current)
 
 
 # ===========================================================================
