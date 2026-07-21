@@ -31,10 +31,14 @@ def _session(agent=None, **extra):
 
 # ── _enqueue_prompt ────────────────────────────────────────────────────────
 
-def test_enqueue_pins_text_and_transport():
-    session = _session()
+def test_enqueue_pins_text_transport_and_active_generation():
+    session = _session(_active_turn_generation=7)
     server._enqueue_prompt(session, "hello", "ws-1")
-    assert session["queued_prompt"] == {"text": "hello", "transport": "ws-1"}
+    assert session["queued_prompt"] == {
+        "text": "hello",
+        "transport": "ws-1",
+        "owner_generation": 7,
+    }
 
 
 def test_enqueue_merges_second_arrival_losslessly():
@@ -102,13 +106,21 @@ def test_drain_fires_queued_prompt_and_claims_running(monkeypatch):
     fired = {}
     monkeypatch.setattr(
         server, "_run_prompt_submit",
-        lambda rid, sid, session, text: fired.update(rid=rid, sid=sid, text=text),
+        lambda rid, sid, session, text, **kwargs: fired.update(
+            rid=rid, sid=sid, text=text, generation=kwargs.get("generation")
+        ),
     )
     session = _session(queued_prompt={"text": "go", "transport": "ws-9"})
 
     assert server._drain_queued_prompt("r1", "sid", session) is True
-    assert fired == {"rid": "r1", "sid": "sid", "text": "go"}
+    assert fired == {
+        "rid": "r1",
+        "sid": "sid",
+        "text": "go",
+        "generation": 1,
+    }
     assert session["running"] is True
+    assert session["_active_turn_generation"] == 1
     assert session["queued_prompt"] is None
     assert session["transport"] == "ws-9"
 
@@ -138,3 +150,71 @@ def test_drain_releases_running_on_dispatch_failure(monkeypatch):
     assert server._drain_queued_prompt("r1", "sid", session) is True
     # Failure must not leave the session wedged as running.
     assert session["running"] is False
+
+
+def test_stop_discards_only_same_generation_queued_prompt(monkeypatch):
+    interrupted = []
+    agent = types.SimpleNamespace(interrupt=lambda: interrupted.append(True))
+    session = _session(
+        agent=agent,
+        running=True,
+        _active_turn_generation=4,
+        queued_prompt={
+            "text": "same turn replacement",
+            "transport": None,
+            "owner_generation": 4,
+        },
+    )
+    monkeypatch.setattr(server, "_sess", lambda _params, _rid: (session, None))
+    monkeypatch.setattr(server, "_clear_pending", lambda *_a, **_k: None)
+
+    response = server._methods["session.interrupt"](
+        "r1", {"session_id": "sid"}
+    )
+
+    assert response["result"]["status"] == "interrupted"
+    assert interrupted == [True]
+    assert session["queued_prompt"] is None
+    assert session["_turn_cancel_generation"] == 4
+
+
+def test_stale_turn_cleanup_cannot_clear_new_generation():
+    session = _session(
+        running=True,
+        _active_turn_generation=2,
+        inflight_turn={"generation": 2, "user": "new"},
+    )
+
+    server._clear_inflight_turn(session, generation=1)
+
+    assert session["inflight_turn"] == {"generation": 2, "user": "new"}
+    assert session["running"] is True
+
+
+def test_prompt_after_stop_is_owned_by_new_generation(monkeypatch):
+    session = _session(
+        running=False,
+        _turn_generation=5,
+        _active_turn_generation=5,
+        _turn_cancel_requested=True,
+        _turn_cancel_generation=5,
+        queued_prompt={
+            "text": "after stop",
+            "transport": "ws-2",
+            "owner_generation": 5,
+        },
+    )
+    fired = {}
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda rid, sid, session, text, **kwargs: fired.update(
+            text=text, generation=kwargs["generation"]
+        ),
+    )
+
+    assert server._drain_queued_prompt("r2", "sid", session) is True
+
+    assert fired == {"text": "after stop", "generation": 6}
+    assert session["_active_turn_generation"] == 6
+    assert session["_turn_cancel_requested"] is False

@@ -44,6 +44,8 @@ logger = logging.getLogger(__name__)
 # teardown indefinitely — the worker threads are daemon, so anything still
 # running past this window dies with the interpreter.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
+# Turn-start provider hooks are useful context, not a reason to wedge a turn.
+_TURN_PROVIDER_TIMEOUT_S = 5.0
 
 
 def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
@@ -492,19 +494,54 @@ class MemoryManager:
         """
         return extract_user_instruction_from_skill_message(text)
 
-    def prefetch_all(self, query: str, *, session_id: str = "") -> str:
-        """Collect prefetch context from all providers.
+    @staticmethod
+    def _run_provider_bounded(provider, operation: str, callback):
+        """Run best-effort turn-start work without letting it wedge the turn."""
+        outcome: Dict[str, Any] = {}
+        done = threading.Event()
 
-        Returns merged context text labeled by provider. Empty providers
-        are skipped. Failures in one provider don't block others.
-        """
+        def _call() -> None:
+            try:
+                outcome["value"] = callback()
+            except BaseException as exc:
+                outcome["error"] = exc
+            finally:
+                done.set()
+
+        worker = threading.Thread(
+            target=_call,
+            daemon=True,
+            name=f"memory-{operation}-{provider.name}",
+        )
+        worker.start()
+        if not done.wait(_TURN_PROVIDER_TIMEOUT_S):
+            logger.warning(
+                "Memory provider '%s' %s timed out after %.1fs; skipped",
+                provider.name,
+                operation,
+                _TURN_PROVIDER_TIMEOUT_S,
+            )
+            return None
+        error = outcome.get("error")
+        if error is not None:
+            raise error
+        return outcome.get("value")
+
+    def prefetch_all(self, query: str, *, session_id: str = "") -> str:
+        """Collect bounded prefetch context from all providers."""
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
             return ""
         parts = []
         for provider in self._providers:
             try:
-                result = provider.prefetch(clean_query, session_id=session_id)
+                result = self._run_provider_bounded(
+                    provider,
+                    "prefetch",
+                    lambda p=provider: p.prefetch(
+                        clean_query, session_id=session_id
+                    ),
+                )
                 if result and result.strip():
                     parts.append(result)
             except Exception as e:
@@ -764,7 +801,13 @@ class MemoryManager:
         """
         for provider in self._providers:
             try:
-                provider.on_turn_start(turn_number, message, **kwargs)
+                self._run_provider_bounded(
+                    provider,
+                    "on_turn_start",
+                    lambda p=provider: p.on_turn_start(
+                        turn_number, message, **kwargs
+                    ),
+                )
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' on_turn_start failed: %s",

@@ -116,6 +116,7 @@ class ToolExecutorSupervisor:
         credential_broker: CredentialBroker | None = None,
         owner_tool_relay: OwnerToolRelayBroker | None = None,
         web_tool_relay: OwnerToolRelayBroker | None = None,
+        image_dispatcher: Callable[..., str] | None = None,
         sandbox_builder: Callable[..., BubblewrapLaunchSpec] = build_bubblewrap_launch_spec,
         control_home: str | Path | None = None,
         readonly_global_mount_roots: tuple[str | Path, ...] | None = None,
@@ -140,6 +141,7 @@ class ToolExecutorSupervisor:
             raise ExecutorIdentityInvalid("owner tool relay is ambiguous")
         self.owner_tool_relay = owner_tool_relay or web_tool_relay or OwnerToolRelayBroker(
             identity_validator=self._require_active_executor_identity,
+            image_dispatcher=image_dispatcher,
         )
         # Compatibility alias for callers that only knew the original web relay.
         self.web_tool_relay = self.owner_tool_relay

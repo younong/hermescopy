@@ -31,7 +31,10 @@ from hermes_cli.dashboard_auth.audit import (
     audit_authority,
     new_authority_correlation_id,
 )
-from hermes_cli.owner_runtime import resolve_workspace_cwd
+from hermes_cli.owner_runtime import (
+    resolve_workspace_cwd,
+    strip_owner_worker_deployment_runtime_env,
+)
 from hermes_cli.latency_trace import clean_latency_trace_id, log_latency_stage
 from hermes_cli.dashboard_auth.authority import (
     AuthorityStore,
@@ -594,18 +597,9 @@ def _resolve_chat_argv(
     env = os.environ.copy()
     env.pop("HERMES_TUI_GATEWAY_SOCKET_PATH", None)
     # The terminal child talks only through the authenticated Gateway bridge.
-    # It must not inherit deployment-default metadata intended for the owner
-    # worker's local inference resolver, even though those fields are non-secret.
-    for key in (
-        "HERMES_DEPLOYMENT_INFERENCE_PROVIDER",
-        "HERMES_DEPLOYMENT_INFERENCE_MODEL",
-        "HERMES_DEPLOYMENT_INFERENCE_API_MODE",
-        "HERMES_DEPLOYMENT_INFERENCE_POLICY_ID",
-        "HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS",
-        "HERMES_DEPLOYMENT_INFERENCE_RELAY_FD",
-        "HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL",
-    ):
-        env.pop(key, None)
+    # It must not inherit owner-worker deployment metadata, even though those
+    # fields are non-secret.
+    strip_owner_worker_deployment_runtime_env(env)
     try:
         from hermes_cli.config import apply_terminal_config_to_env
 
