@@ -67,4 +67,72 @@ describe("MessageList", () => {
 
     await act(async () => root.unmount());
   });
+
+  it("renders a message-owned generated image before later conversation messages", async () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(
+        <MessageList
+          onApprovalRespond={() => undefined}
+          state={{
+            ...initialGuiChatState,
+            artifacts: {
+              "generated-image": {
+                id: "generated-image",
+                messageId: "assistant-image",
+                title: "Generated image",
+                toolCallId: "tool-image",
+                url: "data:image/png;base64,AAAA",
+              },
+            },
+            messages: [
+              {
+                artifactIds: ["generated-image"],
+                id: "assistant-image",
+                role: "assistant",
+                text: "First reply",
+              },
+              {
+                artifactIds: [],
+                id: "assistant-later",
+                role: "assistant",
+                text: "Later reply",
+              },
+            ],
+            toolCalls: {
+              "tool-image": {
+                artifactIds: [],
+                id: "tool-image",
+                name: "image_generate",
+                output: "",
+                status: "succeeded",
+              },
+            },
+            toolOrder: ["tool-image"],
+          }}
+        />,
+      );
+    });
+
+    const image = container.querySelector('img[alt="Generated image"]');
+    expect(image).not.toBeNull();
+    expect(container.querySelectorAll('img[alt="Generated image"]')).toHaveLength(1);
+    const articles = Array.from(container.querySelectorAll("article"));
+    const firstReply = articles.find((article) => article.textContent?.includes("First reply"));
+    const laterReply = articles.find((article) => article.textContent?.includes("Later reply"));
+    expect(firstReply?.contains(image)).toBe(true);
+    expect(firstReply).toBeDefined();
+    expect(laterReply).toBeDefined();
+    expect(
+      firstReply && laterReply
+        ? firstReply.compareDocumentPosition(laterReply) & Node.DOCUMENT_POSITION_FOLLOWING
+        : 0,
+    ).toBeTruthy();
+
+    await act(async () => root.unmount());
+  });
+
 });

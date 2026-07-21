@@ -790,27 +790,42 @@ function stripRenderableImageReferencesFromText(
   refs: ExtractedImageReference[],
 ): string {
   if (!text || refs.length === 0) return text;
-  const markdownRanges = refs
-    .filter((ref) => ref.source === "markdown" && ref.start !== undefined && ref.end !== undefined)
+  const rangedRefs = refs
+    .filter(
+      (ref) =>
+        ref.source !== "structured" &&
+        ref.start !== undefined &&
+        ref.end !== undefined,
+    )
     .sort((a, b) => (b.start ?? 0) - (a.start ?? 0));
   let next = text;
-  for (const ref of markdownRanges) {
-    next = `${next.slice(0, ref.start)}${next.slice(ref.end)}`;
+  for (const ref of rangedRefs) {
+    const start = ref.start ?? 0;
+    const end = ref.end ?? start;
+    next = `${next.slice(0, start)}${next.slice(end)}`;
   }
 
-  const standaloneUrls = new Set(refs.filter((ref) => ref.source === "url").map((ref) => ref.url));
   const hasStructuredImage = refs.some((ref) => ref.source === "structured");
   next = next
     .split("\n")
     .filter((line) => {
       const trimmed = line.trim();
-      if (standaloneUrls.has(trimImageReferenceBoundary(trimmed))) return false;
       if (hasStructuredImage && isNativeImageAttachmentHintLine(trimmed)) return false;
       return true;
     })
+    .map((line) => stripEmptyImageReferenceLabel(line))
     .join("\n");
 
   return next.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function stripEmptyImageReferenceLabel(line: string): string {
+  return line
+    .replace(
+      /(?:生成路径|图片路径|图片地址|存储地址|已生成|文件路径|文件地址|image\s*(?:path|url)|saved\s*(?:image\s*)?(?:at|to))\s*[：:]\s*(?:\*{1,2})?\s*`?\s*`?\s*$/i,
+      "",
+    )
+    .trimEnd();
 }
 
 function rangesForFencedCodeBlocks(text: string): Array<{ end: number; start: number }> {
@@ -946,27 +961,34 @@ function completeAssistantMessage(
     working = startAssistantMessage(working);
   }
   const idx = working.messages.length - 1;
+  const current = working.messages[idx];
+  const completedText =
+    finalText !== undefined && finalText !== current.text
+      ? clampRenderedText(finalText)
+      : current.text;
+  const imageRefs = extractImageReferencesFromText(completedText);
+  const visibleText = clampRenderedText(
+    stripRenderableImageReferencesFromText(completedText, imageRefs),
+  );
   const messages = working.messages.map((message, i) =>
     i === idx
       ? {
           ...message,
           status,
           streaming: false,
-          text:
-            finalText !== undefined && finalText !== message.text
-              ? clampRenderedText(finalText)
-              : message.text,
+          text: visibleText,
         }
       : message,
   );
   const statusLines = payload?.warning
     ? [...working.statusLines, payload.warning].slice(-8)
     : working.statusLines;
-  return addGeneratedFileArtifacts(
+  const withImages = addAssistantImageArtifacts(
     { ...working, isGenerating: false, messages, statusLines },
-    messages[idx]?.text ?? "",
-    { messageId: messages[idx]?.id },
+    current.id,
+    imageRefs,
   );
+  return addGeneratedFileArtifacts(withImages, visibleText, { messageId: current.id });
 }
 
 function normalizeMessageStatus(status: string | undefined): ChatMessage["status"] {
@@ -1063,9 +1085,14 @@ function completeToolCall(
     toolOrder: state.toolOrder.includes(id) ? state.toolOrder : [...state.toolOrder, id],
   };
   if (!failed && isImageGenerationTool(toolName)) {
+    const activeMessage = nextState.messages.at(-1);
+    const messageId =
+      activeMessage?.role === "assistant" && activeMessage.streaming
+        ? activeMessage.id
+        : undefined;
     return addImageArtifact(
       nextState,
-      imageArtifactPayloadFromToolResult(id, result, toolName),
+      imageArtifactPayloadFromToolResult(id, result, toolName, messageId),
     );
   }
   return failed ? nextState : addGeneratedFileArtifacts(nextState, output, { toolCallId: id });
@@ -1126,6 +1153,7 @@ function imageArtifactPayloadFromToolResult(
   toolCallId: string,
   result: unknown,
   toolName: string,
+  messageId?: string,
 ): ArtifactImagePayload | undefined {
   const record = recordFromUnknown(result);
   if (!record || record.success === false) return undefined;
@@ -1133,6 +1161,7 @@ function imageArtifactPayloadFromToolResult(
   if (!source) return undefined;
   return {
     id: `${toolCallId}-image`,
+    messageId,
     mimeType: mimeTypeForImageSource(source),
     title: toolName === "image_generate" ? "Generated image" : "Image result",
     toolCallId,
@@ -1221,6 +1250,39 @@ function mimeTypeForImageSource(source: string): string | undefined {
     default:
       return undefined;
   }
+}
+
+function addAssistantImageArtifacts(
+  state: GuiChatState,
+  messageId: string,
+  refs: ExtractedImageReference[],
+): GuiChatState {
+  let next = state;
+  const message = next.messages.find((value) => value.id === messageId);
+  if (!message) return next;
+
+  const ownedImages = message.artifactIds.flatMap((id) => {
+    const artifact = next.artifacts[id];
+    return artifact && artifact.kind !== "file" ? [artifact] : [];
+  });
+  const ownedImageUrls = new Set(ownedImages.map((artifact) => artifact.url));
+  for (const [index, ref] of refs.entries()) {
+    const url = imagePreviewUrl(ref.url, next.cwd);
+    if (ownedImageUrls.has(url)) continue;
+    if (refs.length === 1 && ownedImages.length === 1 && ownedImages[0].toolCallId) continue;
+    const id = `${messageId}-image-${index}`;
+    next = addImageArtifact(next, {
+      height: ref.height,
+      id,
+      messageId,
+      mimeType: ref.mimeType ?? mimeTypeForImageSource(ref.url),
+      title: ref.title || "Generated image",
+      url: ref.url,
+      width: ref.width,
+    });
+    ownedImageUrls.add(url);
+  }
+  return next;
 }
 
 function addGeneratedFileArtifacts(
