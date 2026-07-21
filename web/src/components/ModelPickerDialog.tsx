@@ -10,7 +10,7 @@ import { Check, Search, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { cn, themedBody } from "@/lib/utils";
-import { fuzzyRank } from "@/lib/fuzzy";
+import { fuzzyRank } from "@hermes/shared/fuzzy";
 
 /**
  * Two-stage model picker modal.
