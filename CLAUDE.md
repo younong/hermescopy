@@ -54,12 +54,20 @@ rg -n "session_detail_payload|resolve_resume_session_id" \
 
 For every request that changes repository files:
 
-1. Before editing, use `EnterWorktree` to create a dedicated worktree. The
-   project setting `worktree.baseRef: "fresh"` makes it branch from the latest
-   `origin/main`; do not develop in the primary checkout or from its current
-   feature branch.
-2. Choose a descriptive worktree/branch name derived from the task. Keep all
-   implementation and validation inside that worktree.
+1. Use exactly one dedicated worktree for the entire task, including after
+   context compaction or session resumption. Before editing, determine whether
+   the task already has an active worktree:
+   - If the current checkout is already under `.claude/worktrees/`, continue in
+     it and do not call `EnterWorktree` again.
+   - If this task already has another registered worktree, re-enter it with
+     `EnterWorktree(path=...)` instead of creating a new one.
+   - Otherwise, use `EnterWorktree` once to create a descriptive worktree. The
+     project setting `worktree.baseRef: "fresh"` makes it branch from the latest
+     `origin/main`; do not develop in the primary checkout or from its current
+     feature branch.
+   Context compaction and session resumption continue the existing task; they
+   never justify creating a replacement worktree.
+2. Keep all implementation and validation inside that task's worktree.
 3. Run the focused validation required by the **Validation** section below.
    Here, "required validation" means those prescribed local checks for the
    current change; do not expand it into an implicit requirement to wait for
