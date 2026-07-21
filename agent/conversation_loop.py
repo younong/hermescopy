@@ -3009,6 +3009,14 @@ def run_conversation(
                             provider=agent.provider,
                             api_mode=agent.api_mode,
                         )
+                        try:
+                            from agent.async_context_compression import (
+                                invalidate_compression_runtime,
+                            )
+
+                            invalidate_compression_runtime(agent, reason="model changed")
+                        except Exception:
+                            pass
                         # Context probing flags — only set on built-in
                         # compressor (plugin engines manage their own).
                         if hasattr(compressor, "_context_probed"):
@@ -3456,6 +3464,14 @@ def run_conversation(
                             provider=agent.provider,
                             api_mode=agent.api_mode,
                         )
+                        try:
+                            from agent.async_context_compression import (
+                                invalidate_compression_runtime,
+                            )
+
+                            invalidate_compression_runtime(agent, reason="model changed")
+                        except Exception:
+                            pass
                         # Context probing flags — only set on built-in
                         # compressor (plugin engines manage their own).  This
                         # value came from the provider, so it is safe to cache.
@@ -4645,7 +4661,33 @@ def run_conversation(
                             messages, tools=agent.tools or None
                         )
 
-                if agent.compression_enabled and _compressor.should_compress(_real_tokens):
+                _post_tool_compacted = False
+                if (
+                    agent.compression_enabled
+                    and getattr(agent, "compression_async_prepare", False)
+                    and getattr(agent, "_using_builtin_context_compressor", False)
+                ):
+                    from agent.async_context_compression import (
+                        AsyncCompressionAction,
+                        maybe_handle_async_compression,
+                    )
+
+                    _async_outcome = maybe_handle_async_compression(
+                        agent,
+                        messages,
+                        active_system_prompt or system_message or "",
+                        current_tokens=_real_tokens,
+                        task_id=effective_task_id,
+                        emit_abort_warning=False,
+                    )
+                    if _async_outcome.action in {
+                        AsyncCompressionAction.COMMITTED,
+                        AsyncCompressionAction.SYNCHRONOUS_FALLBACK,
+                    }:
+                        messages = _async_outcome.messages
+                        active_system_prompt = _async_outcome.system_prompt
+                        _post_tool_compacted = True
+                elif agent.compression_enabled and _compressor.should_compress(_real_tokens):
                     agent._safe_print("  ⟳ compacting context…")
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
@@ -4653,6 +4695,9 @@ def run_conversation(
                         task_id=effective_task_id,
                         emit_abort_warning=False,
                     )
+                    _post_tool_compacted = True
+
+                if _post_tool_compacted:
                     if getattr(agent, "_last_compression_attempt_aborted", False):
                         _summary_error = (
                             getattr(_compressor, "_last_summary_error", None)

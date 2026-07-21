@@ -23,6 +23,7 @@ import logging
 import sqlite3
 import re
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from agent.auxiliary_client import (
@@ -40,6 +41,16 @@ from agent.model_metadata import (
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
+
+@dataclass(frozen=True)
+class PreparedCompression:
+    """Detached compression output safe to pass between worker and owner threads."""
+
+    compressed_messages: List[Dict[str, Any]]
+    compressor_state: Dict[str, Any]
+    aborted: bool
+    applied: bool = True
+
 
 HISTORICAL_TASK_HEADING = "## Historical Task Snapshot"
 HISTORICAL_IN_PROGRESS_HEADING = "## Historical In-Progress State"
@@ -2861,6 +2872,95 @@ This compaction should PRIORITISE preserving all information related to the focu
         compress_start = self._align_boundary_forward(messages, self._protect_head_size(messages))
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
         return compress_start < compress_end
+
+    # ------------------------------------------------------------------
+    # Speculative preparation
+    # ------------------------------------------------------------------
+
+    _PREPARED_STATE_FIELDS = (
+        "_previous_summary",
+        "_last_summary_error",
+        "_last_summary_dropped_count",
+        "_last_summary_fallback_used",
+        "_last_compress_aborted",
+        "_last_summary_auth_failure",
+        "_last_summary_transient_failure",
+        "_last_aux_model_failure_error",
+        "_last_aux_model_failure_model",
+        "_summary_model_fallen_back",
+        "summary_model",
+    )
+
+    def prepare_compression(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        current_tokens: Optional[int] = None,
+        focus_topic: Optional[str] = None,
+        deadline_monotonic: Optional[float] = None,
+    ) -> PreparedCompression:
+        """Build a compression projection without mutating live session state."""
+        snapshot = copy.deepcopy(messages)
+        detached = copy.copy(self)
+        initial_compression_count = int(
+            getattr(detached, "compression_count", 0) or 0
+        )
+        detached._session_db = None
+        detached._session_id = ""
+        compressed = detached.compress(
+            snapshot,
+            current_tokens=current_tokens,
+            focus_topic=focus_topic,
+            deadline_monotonic=deadline_monotonic,
+        )
+        state = {
+            field: copy.deepcopy(getattr(detached, field, None))
+            for field in self._PREPARED_STATE_FIELDS
+        }
+        return PreparedCompression(
+            compressed_messages=copy.deepcopy(compressed),
+            compressor_state=state,
+            aborted=bool(detached._last_compress_aborted),
+            applied=(
+                int(getattr(detached, "compression_count", 0) or 0)
+                > initial_compression_count
+            ),
+        )
+
+    def apply_prepared_compression(
+        self,
+        prepared: PreparedCompression,
+        delta: List[Dict[str, Any]],
+        *,
+        current_tokens: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Apply validated prepared state and append turns added after its snapshot."""
+        for field in self._PREPARED_STATE_FIELDS:
+            if field in prepared.compressor_state:
+                setattr(self, field, copy.deepcopy(prepared.compressor_state[field]))
+
+        compressed = copy.deepcopy(prepared.compressed_messages)
+        compressed.extend(copy.deepcopy(delta))
+        compressed = self._sanitize_tool_pairs(compressed)
+        compressed = _strip_historical_media(compressed)
+
+        if not prepared.applied:
+            return compressed
+
+        self.compression_count += 1
+        display_tokens = current_tokens or estimate_messages_tokens_rough(compressed)
+        new_estimate = estimate_messages_tokens_rough(compressed)
+        savings_pct = (
+            (display_tokens - new_estimate) / display_tokens * 100
+            if display_tokens > 0
+            else 0.0
+        )
+        self._last_compression_savings_pct = savings_pct
+        if savings_pct < 10:
+            self._ineffective_compression_count += 1
+        else:
+            self._ineffective_compression_count = 0
+        return compressed
 
     # ------------------------------------------------------------------
     # Main compression entry point

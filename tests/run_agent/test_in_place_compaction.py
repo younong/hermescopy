@@ -12,7 +12,8 @@ exactly as before.
 import os
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from concurrent.futures import Future
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -320,3 +321,116 @@ class TestCompactedTurnsStaySearchable:
             )
             assert len(recovered) == 1
 
+
+class TestAsyncInPlaceCompactionRealPath:
+    def test_prepared_commit_persists_projection_and_canonical_history(self):
+        """Async prepare stays pure, then commits through real SQLite in place."""
+        from agent.async_context_compression import (
+            AsyncCompressionAction,
+            _reset_async_compression_for_tests,
+            compression_thresholds,
+            maybe_handle_async_compression,
+        )
+        from hermes_state import SessionDB
+
+        class _ControlledExecutor:
+            def __init__(self):
+                self.submissions = []
+
+            def submit(self, fn, *args, **kwargs):
+                future = Future()
+                self.submissions.append((future, fn, args, kwargs))
+                return future
+
+            def complete(self):
+                future, fn, args, kwargs = self.submissions[0]
+                future.set_result(fn(*args, **kwargs))
+
+        _reset_async_compression_for_tests()
+        try:
+            with tempfile.TemporaryDirectory() as tmp, patch.dict(
+                os.environ,
+                {"HERMES_HOME": tmp},
+            ):
+                db = SessionDB(db_path=Path(tmp) / "state.db")
+                sid = "20260721_async_real_path"
+                db.create_session(sid, "cli", model="test/model")
+                source = []
+                for i in range(12):
+                    message = {
+                        "role": "user" if i % 2 == 0 else "assistant",
+                        "content": f"canonical-{i} " + " ".join(["payload"] * 300),
+                    }
+                    source.append(message)
+                    db.append_message(session_id=sid, **message)
+
+                agent = _make_agent(db, sid, in_place=True)
+                # Restore the real class method replaced by _make_agent's narrow
+                # synchronous test seam, then make the protected tail small enough
+                # for this deterministic fixture to contain a summary window.
+                del agent.context_compressor.compress
+                agent.context_compressor.compression_count = 0
+                agent.context_compressor.tail_token_budget = 200
+                agent.compression_async_prepare = True
+                agent.compression_prepare_threshold = 0.50
+                agent.compression_commit_threshold = 0.80
+                agent.compression_emergency_threshold = 0.88
+                agent.compression_emergency_wait_seconds = 15.0
+                agent._compression_feasibility_checked = True
+                executor = _ControlledExecutor()
+                agent._async_compression_executor = executor
+                thresholds = compression_thresholds(agent)
+
+                response = MagicMock()
+                response.choices = [MagicMock()]
+                response.choices[0].message.content = "deterministic async summary"
+                with patch(
+                    "agent.context_compressor.call_llm",
+                    return_value=response,
+                ):
+                    preparing = maybe_handle_async_compression(
+                        agent,
+                        source,
+                        "SYSTEM",
+                        current_tokens=thresholds.prepare,
+                    )
+                    assert preparing.action is AsyncCompressionAction.PREPARING
+                    assert preparing.messages is source
+                    assert len(executor.submissions) == 1
+                    # Background preparation is pure: active SQLite context and
+                    # canonical display remain byte-for-byte source history.
+                    assert [
+                        m["content"] for m in db.get_messages_as_conversation(sid)
+                    ] == [m["content"] for m in source]
+
+                    executor.complete()
+                    delta = {
+                        "role": "user",
+                        "content": "append-only delta after prepare",
+                    }
+                    current = source + [delta]
+                    db.append_message(session_id=sid, **delta)
+                    committed = maybe_handle_async_compression(
+                        agent,
+                        current,
+                        "SYSTEM",
+                        current_tokens=thresholds.commit,
+                    )
+
+                assert committed.action is AsyncCompressionAction.COMMITTED
+                assert committed.messages[-1] == delta
+                assert agent.session_id == sid
+                reloaded = db.get_messages_as_conversation(sid)
+                assert [m["content"] for m in reloaded] == [
+                    m["content"] for m in committed.messages
+                ]
+                display = db.get_conversation_page(sid, limit=50)["messages"]
+                assert [m["content"] for m in display] == [
+                    m["content"] for m in current
+                ]
+                assert db.search_messages(
+                    "canonical",
+                    role_filter=["user", "assistant"],
+                )
+        finally:
+            _reset_async_compression_for_tests()

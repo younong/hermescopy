@@ -4061,9 +4061,58 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
+    def test_post_tool_async_prepare_keeps_full_context_for_next_call(
+        self, agent
+    ):
+        self._setup_agent(agent)
+        agent.compression_enabled = True
+        agent.compression_async_prepare = True
+        agent._using_builtin_context_compressor = True
+        agent.context_compressor.last_prompt_tokens = 128_000
+
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc]),
+            _mock_response(content="Done searching", finish_reason="stop"),
+        ]
+        source_messages = None
+
+        def _prepare(_agent, messages, system_prompt, **_kwargs):
+            nonlocal source_messages
+            source_messages = list(messages)
+            from agent.async_context_compression import AsyncCompressionAction
+
+            return SimpleNamespace(
+                action=AsyncCompressionAction.PREPARING,
+                messages=messages,
+                system_prompt=system_prompt,
+            )
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch(
+                "agent.async_context_compression.maybe_handle_async_compression",
+                side_effect=_prepare,
+            ) as prepare,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("search something")
+
+        assert result["final_response"] == "Done searching"
+        prepare.assert_called_once()
+        assert source_messages is not None
+        second_request = agent.client.chat.completions.create.call_args_list[1]
+        sent = second_request.kwargs["messages"]
+        assert any(message.get("content") == "search result" for message in sent)
+        assert len(sent) == len(source_messages) + 1  # includes system message
     def test_post_tool_compression_abort_stops_current_turn(self, agent):
         self._setup_agent(agent)
         agent.compression_enabled = True
+        # This regression targets the terminal behavior of the existing
+        # synchronous fallback after a post-tool compression abort.
+        agent.compression_async_prepare = False
         agent.context_compressor.should_compress = MagicMock(return_value=True)
         agent.context_compressor.last_prompt_tokens = 100_000
         agent.context_compressor._last_summary_error = "raw SSE response was malformed"

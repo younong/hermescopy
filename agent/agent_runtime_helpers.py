@@ -1170,6 +1170,12 @@ def restore_primary_runtime(agent) -> bool:
             provider=rt["compressor_provider"],
             api_mode=rt.get("compressor_api_mode", ""),
         )
+        try:
+            from agent.async_context_compression import invalidate_compression_runtime
+
+            invalidate_compression_runtime(agent, reason="model changed")
+        except Exception:
+            pass
 
         # ── Re-select from the credential pool if one is available ──
         # The snapshot's api_key was captured at construction time.  Across
@@ -1911,6 +1917,13 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             provider=agent.provider,
             api_mode=agent.api_mode,
         )
+
+    try:
+        from agent.async_context_compression import invalidate_compression_runtime
+
+        invalidate_compression_runtime(agent, reason="model changed")
+    except Exception:
+        pass
 
     # ── Invalidate cached system prompt so it rebuilds next turn ──
     agent._cached_system_prompt = None

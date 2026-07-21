@@ -221,9 +221,15 @@ class TestFlushAfterCompression:
             ]
             agent._flush_messages_to_session_db(messages, [])
 
-            compacted, changed = maybe_compact_tool_payloads(agent, messages)
+            with patch(
+                "agent.async_context_compression.invalidate_preparation"
+            ) as invalidate:
+                compacted, changed = maybe_compact_tool_payloads(agent, messages)
 
             assert changed is True
+            invalidate.assert_called_once_with(
+                agent, reason="tool payload checkpoint"
+            )
             assert compacted[2]["content"] != large_result
             assert len(compacted[2]["content"].encode("utf-8")) <= len(large_result.encode("utf-8")) * 0.20
             active = db.get_messages("original-session")

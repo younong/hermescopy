@@ -97,11 +97,40 @@ def test_auto_corrects_threshold_when_aux_context_below_threshold(
     assert "threshold:" in messages[0]
     # Warning stored for gateway replay
     assert agent._compression_warning is not None
-    # Threshold on the live compressor was actually lowered to aux_context.
+    # Threshold on the live compressor and async preparation cap were both
+    # lowered to the auxiliary model's safe input window.
     assert agent.context_compressor.threshold_tokens == 80_000
+    assert agent._compression_prepare_token_cap == 80_000
     assert "decision=adjust_threshold" in caplog.text
     assert "original_threshold=100000" in caplog.text
     assert "effective_threshold=80000" in caplog.text
+
+
+@patch("agent.model_metadata.get_model_context_length", return_value=140_000)
+@patch("agent.auxiliary_client.get_text_auxiliary_client")
+def test_caps_raised_async_prepare_without_raising_sync_threshold(
+    mock_get_client,
+    mock_ctx_len,
+):
+    """A user-raised async trigger must still fit the auxiliary model."""
+    agent = _make_agent(main_context=200_000, threshold_percent=0.50)
+    agent.compression_async_prepare = True
+    agent.compression_prepare_threshold = 0.75
+    mock_client = MagicMock()
+    mock_client.base_url = "https://openrouter.ai/api/v1"
+    mock_client.api_key = "sk-aux"
+    mock_get_client.return_value = (mock_client, "medium-aux-model")
+    messages = []
+    agent._emit_status = messages.append
+
+    agent._check_compression_model_feasibility()
+
+    assert agent.context_compressor.threshold_tokens == 100_000
+    assert agent._compression_prepare_token_cap == 140_000
+    assert len(messages) == 1
+    assert "async preparation threshold" in messages[0]
+    assert "150,000" in messages[0]
+    assert "140,000" in messages[0]
 
 
 @patch("agent.model_metadata.get_model_context_length", return_value=32_768)

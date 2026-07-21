@@ -1337,7 +1337,12 @@ DEFAULT_CONFIG = {
 
     "compression": {
         "enabled": True,
-        "threshold": 0.50,            # compress when context usage exceeds this ratio
+        "threshold": 0.50,            # legacy/synchronous trigger and prepare default
+        "async_prepare": True,        # prepare a summary in the background at threshold
+        "prepare_threshold": 0.50,    # begin speculative preparation without switching
+        "commit_threshold": 0.80,     # apply a ready preparation at a safe boundary
+        "emergency_threshold": 0.88,  # bounded wait, then synchronous fallback
+        "emergency_wait_seconds": 15, # wait on the same background task (clamped 10-20s)
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
         "hygiene_hard_message_limit": 5000,  # gateway session-hygiene force-compress threshold by message count

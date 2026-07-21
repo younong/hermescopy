@@ -592,6 +592,7 @@ class TestPreflightCompression:
     def test_preflight_compresses_oversized_history(self, agent):
         """When loaded history exceeds the model's context threshold, compress before API call."""
         agent.compression_enabled = True
+        agent.compression_async_prepare = False
         # Set a small context so the history is "oversized", but large enough
         # that the compressed result (2 short messages) fits in a single pass.
         agent.context_compressor.context_length = 2000
@@ -685,6 +686,7 @@ class TestPreflightCompression:
     def test_preflight_compresses_when_rough_growth_after_fit_is_large(self, agent):
         """Large rough growth after a fitting request still triggers preflight."""
         agent.compression_enabled = True
+        agent.compression_async_prepare = False
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 100_000
         agent.context_compressor.last_prompt_tokens = 58_000
@@ -791,6 +793,9 @@ class TestPreflightCompression:
         <10% (the canonical infinite-compression-loop signal).
         """
         agent.compression_enabled = True
+        # This regression directly rewrites the legacy synchronous threshold to
+        # exercise its anti-thrash gate rather than the async prepare threshold.
+        agent.compression_async_prepare = False
         agent.context_compressor.context_length = 2000
         agent.context_compressor.threshold_tokens = 200
 
@@ -894,6 +899,7 @@ class TestToolResultPreflightCompression:
     def test_large_tool_results_trigger_compression(self, agent):
         """When tool results push estimated tokens past threshold, compress before next call."""
         agent.compression_enabled = True
+        agent.compression_async_prepare = False
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 130_000  # below the 135k reported usage
         agent.context_compressor.last_prompt_tokens = 130_000

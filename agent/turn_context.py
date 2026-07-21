@@ -469,6 +469,35 @@ def build_turn_context(
                     _compressor.threshold_tokens,
                     int(_compression_cooldown.get("remaining_seconds", 0.0)),
                 )
+            elif getattr(agent, "compression_async_prepare", False) and getattr(
+                agent, "_using_builtin_context_compressor", False
+            ):
+                from agent.async_context_compression import (
+                    AsyncCompressionAction,
+                    maybe_handle_async_compression,
+                )
+
+                _async_outcome = maybe_handle_async_compression(
+                    agent,
+                    messages,
+                    active_system_prompt or system_message or "",
+                    current_tokens=_preflight_tokens,
+                    task_id=effective_task_id,
+                )
+                if _async_outcome.action in {
+                    AsyncCompressionAction.COMMITTED,
+                    AsyncCompressionAction.SYNCHRONOUS_FALLBACK,
+                }:
+                    messages = _async_outcome.messages
+                    active_system_prompt = _async_outcome.system_prompt
+                    conversation_history = conversation_history_after_compression(
+                        agent, messages
+                    )
+                    agent._empty_content_retries = 0
+                    agent._thinking_prefill_retries = 0
+                    agent._last_content_with_tools = None
+                    agent._last_content_tools_all_housekeeping = False
+                    agent._mute_post_response = False
             elif _compressor.should_compress(_preflight_tokens):
                 logger.info(
                     "compression preflight decision=compress reason=threshold_reached "
