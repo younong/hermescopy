@@ -53,6 +53,15 @@ OWNER_ENV_KEYS: tuple[str, ...] = (
     "HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION",
     "HERMES_DEPLOYMENT_INFERENCE_RELAY_FD",
     "HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL",
+    "HERMES_DEPLOYMENT_IMAGE_PROVIDER",
+    "HERMES_DEPLOYMENT_IMAGE_MODEL",
+    "HERMES_DEPLOYMENT_IMAGE_POLICY_ID",
+    "HERMES_DEPLOYMENT_IMAGE_ALLOWED_MODELS",
+    "HERMES_DEPLOYMENT_IMAGE_MAX_REFERENCES",
+    "HERMES_DEPLOYMENT_IMAGE_MAX_REFERENCE_BYTES",
+    "HERMES_DEPLOYMENT_IMAGE_MAX_TOTAL_REFERENCE_BYTES",
+    "HERMES_DEPLOYMENT_IMAGE_MAX_OUTPUT_BYTES",
+    "HERMES_DEPLOYMENT_IMAGE_RELAY_FD",
 )
 
 FORBIDDEN_OWNER_WORKER_ENV_KEYS: tuple[str, ...] = (
@@ -156,6 +165,7 @@ def owner_worker_env_for(
     capability_public_key: str = "",
     capability_retained_public_keys: str = "",
     deployment_inference_descriptor: object | None = None,
+    deployment_image_descriptor: object | None = None,
 ) -> dict[str, str]:
     """Return the canonical owner-worker environment values."""
     home = Path(owner_home).expanduser().resolve()
@@ -213,6 +223,21 @@ def owner_worker_env_for(
             env["HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION"] = (
                 "true" if deployment_inference_descriptor.supports_vision else "false"
             )
+    if deployment_image_descriptor is not None:
+        from hermes_cli.deployment_image import DeploymentImageDescriptor
+
+        if not isinstance(deployment_image_descriptor, DeploymentImageDescriptor):
+            raise ValueError("deployment image descriptor is invalid")
+        env.update({
+            "HERMES_DEPLOYMENT_IMAGE_PROVIDER": deployment_image_descriptor.provider,
+            "HERMES_DEPLOYMENT_IMAGE_MODEL": deployment_image_descriptor.model,
+            "HERMES_DEPLOYMENT_IMAGE_POLICY_ID": deployment_image_descriptor.policy_id,
+            "HERMES_DEPLOYMENT_IMAGE_ALLOWED_MODELS": ",".join(deployment_image_descriptor.allowed_models),
+            "HERMES_DEPLOYMENT_IMAGE_MAX_REFERENCES": str(deployment_image_descriptor.max_reference_images),
+            "HERMES_DEPLOYMENT_IMAGE_MAX_REFERENCE_BYTES": str(deployment_image_descriptor.max_reference_bytes),
+            "HERMES_DEPLOYMENT_IMAGE_MAX_TOTAL_REFERENCE_BYTES": str(deployment_image_descriptor.max_total_reference_bytes),
+            "HERMES_DEPLOYMENT_IMAGE_MAX_OUTPUT_BYTES": str(deployment_image_descriptor.max_output_bytes),
+        })
     return env
 
 

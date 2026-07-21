@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -289,3 +290,20 @@ class TestGenerate:
         assert result["success"] is False
         assert result["error_type"] == "api_error"
         assert "bad model" in result["error"]
+
+
+def test_explicit_transport_does_not_mutate_environment(monkeypatch):
+    from plugins.image_gen import apiyi
+
+    monkeypatch.delenv("APIYI_API_KEY", raising=False)
+    class Response:
+        headers = {}
+        def raise_for_status(self): pass
+        def json(self): return {"data": [{"b64_json": "cG5n"}]}
+    monkeypatch.setattr("requests.post", lambda *args, **kwargs: Response())
+    result = apiyi.generate_apiyi_image_bytes(
+        prompt="draw", aspect_ratio="square", model="gpt-image-2-medium", references=[],
+        api_key="trusted", openai_base_url="https://api.example/v1", gemini_base_url="https://api.example/v1beta",
+    )
+    assert result["image_bytes"] == b"png"
+    assert "APIYI_API_KEY" not in os.environ

@@ -253,6 +253,91 @@ def _save_image_ref(image_ref: str, *, prefix: str) -> str:
     return str(save_b64_image(image_ref, prefix=prefix))
 
 
+def _decode_apiyi_image_payload(payload: Dict[str, Any]) -> Tuple[bytes, str]:
+    b64, url, _ = _extract_openai_image(payload)
+    if b64:
+        return base64.b64decode(b64), "image/png"
+    if url:
+        import requests
+        response = requests.get(url, timeout=60)
+        response.raise_for_status()
+        mime = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        return response.content, mime if mime.startswith("image/") else "image/png"
+    raise ValueError("APIYI response contained no image data")
+
+
+def generate_apiyi_image_bytes(
+    *,
+    prompt: str,
+    aspect_ratio: str,
+    model: str,
+    references: List[Dict[str, Any]],
+    api_key: str,
+    openai_base_url: str,
+    gemini_base_url: str,
+) -> Dict[str, Any]:
+    """Call APIYI using trusted explicit runtime inputs without filesystem writes."""
+    import requests
+
+    model_id, meta = _resolve_model(model)
+    aspect = resolve_aspect_ratio(aspect_ratio)
+    if model_id == _NANO_MODEL:
+        if references:
+            raise ValueError("nano-banana-2 does not accept reference images")
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "responseModalities": ["IMAGE", "TEXT"],
+                "imageConfig": {"aspectRatio": _GEMINI_ASPECT_RATIOS.get(aspect, "1:1")},
+            },
+        }
+        response = requests.post(
+            f"{gemini_base_url.rstrip('/')}/models/{_upstream_model(model_id)}:generateContent",
+            headers={"Authorization": f"Bearer {api_key}", "x-goog-api-key": api_key, "Content-Type": "application/json"},
+            json=payload,
+            timeout=_REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        images = _extract_gemini_images(response.json())
+        if not images:
+            raise ValueError("APIYI response contained no image data")
+        first = images[0]
+        if first.startswith("data:"):
+            header, encoded = first.split(",", 1)
+            mime_type = header[5:].split(";", 1)[0].lower()
+            image_bytes = base64.b64decode(encoded)
+        else:
+            downloaded = requests.get(first, timeout=60)
+            downloaded.raise_for_status()
+            mime_type = downloaded.headers.get("Content-Type", "image/png").split(";", 1)[0].lower()
+            image_bytes = downloaded.content
+        return {"image_bytes": image_bytes, "mime_type": mime_type, "metadata": {"upstream_model": _upstream_model(model_id)}}
+    size = _SIZES.get(aspect, _SIZES["square"])
+    headers = {"Authorization": f"Bearer {api_key}"}
+    if references:
+        files = [("image", (item["name"], item["data"], item["mime_type"])) for item in references]
+        response = requests.post(
+            f"{openai_base_url.rstrip('/')}/images/edits", headers=headers,
+            data={"model": _upstream_model(model_id), "prompt": prompt, "size": size, "n": "1", "quality": str(meta["quality"])},
+            files=files, timeout=_REQUEST_TIMEOUT,
+        )
+    else:
+        response = requests.post(
+            f"{openai_base_url.rstrip('/')}/images/generations",
+            headers={**headers, "Content-Type": "application/json"},
+            json={"model": _upstream_model(model_id), "prompt": prompt, "size": size, "n": 1, "quality": meta["quality"]},
+            timeout=_REQUEST_TIMEOUT,
+        )
+    response.raise_for_status()
+    payload = response.json()
+    image_bytes, mime_type = _decode_apiyi_image_payload(payload)
+    _, _, revised_prompt = _extract_openai_image(payload)
+    metadata: Dict[str, Any] = {"size": size, "quality": meta["quality"], "upstream_model": _upstream_model(model_id)}
+    if revised_prompt:
+        metadata["revised_prompt"] = revised_prompt
+    return {"image_bytes": image_bytes, "mime_type": mime_type, "metadata": metadata}
+
+
 class ApiyiImageGenProvider(ImageGenProvider):
     """APIYI image-generation provider for GPT-Image-2 and Nano Banana 2."""
 

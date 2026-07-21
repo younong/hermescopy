@@ -1106,8 +1106,20 @@ def _resolve_image_provider():
     return resolution
 
 
+def _deployment_image_descriptor():
+    try:
+        from hermes_cli.deployment_image import deployment_image_descriptor_from_environment
+        from hermes_cli.owner_runtime import is_owner_worker_env
+
+        return deployment_image_descriptor_from_environment() if is_owner_worker_env() else None
+    except Exception:
+        return None
+
+
 def check_image_generation_requirements() -> bool:
-    """True when the selected image backend is available."""
+    """True when the selected image backend or deployment relay is available."""
+    if _deployment_image_descriptor() is not None:
+        return True
     try:
         resolution = _resolve_image_provider()
         if not resolution.available or resolution.provider is None:
@@ -1546,6 +1558,9 @@ def _active_image_capabilities() -> Dict[str, Any]:
     """Return capabilities for the same provider runtime dispatch will use."""
     info: Dict[str, Any] = {"modalities": ["text"], "max_reference_images": 0}
     try:
+        descriptor = _deployment_image_descriptor()
+        if descriptor is not None:
+            return descriptor.capabilities_for()
         resolution = _resolve_image_provider()
         provider = resolution.provider
         if provider is None:
