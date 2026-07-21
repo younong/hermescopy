@@ -607,7 +607,7 @@ function extractBareImageReferences(
 ): ExtractedImageReference[] {
   const refs: ExtractedImageReference[] = [];
   const bareReferenceRe = new RegExp(
-    String.raw`(?:https?:\/\/[^\s<>()]+|file:\/\/[^\n<>()]+|sandbox:\/{0,2}[^\n<>()]+|data:image\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+|\/api\/(?:fs\/read-data-url|artifacts)\?[^\s<>()]+|\/api\/artifacts\/[^\s<>()]+|(?:~|\.{1,2})\/[^\n<>()]+?\.(?:png|jpe?g|gif|webp|svg|avif|bmp|ico)(?:[?#][^\s<>()]+)?|\/[^\n<>()]+?\.(?:png|jpe?g|gif|webp|svg|avif|bmp|ico)(?:[?#][^\s<>()]+)?|[A-Za-z]:[\\/][^\n<>()]+?\.(?:png|jpe?g|gif|webp|svg|avif|bmp|ico)(?:[?#][^\s<>()]+)?|(?:[^\s<>()]+\/)+[^\n<>()]+?\.(?:png|jpe?g|gif|webp|svg|avif|bmp|ico)(?:[?#][^\s<>()]+)?)`,
+    String.raw`(?:https?:\/\/[^\s<>()]+|file:\/\/[^\n<>()]+|sandbox:\/{0,2}[^\n<>()]+|data:image\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+|\/api\/(?:fs\/read-data-url|artifacts)\?[^\s<>()]+|\/api\/artifacts\/[^\s<>()]+|(?:~|\.{1,2})\/[^\n<>()]+?\.(?:png|jpe?g|gif|webp|svg|avif|bmp|ico)(?:[?#][^\s<>()]+)?|\/[^\n<>()\x60]+?\.(?:png|jpe?g|gif|webp|svg|avif|bmp|ico)(?:[?#][^\s<>()\x60]+)?|[A-Za-z]:[\\/][^\n<>()\x60]+?\.(?:png|jpe?g|gif|webp|svg|avif|bmp|ico)(?:[?#][^\s<>()\x60]+)?|(?:[^\s<>()\x60:：]+\/)+[^\n<>()\x60]+?\.(?:png|jpe?g|gif|webp|svg|avif|bmp|ico)(?:[?#][^\s<>()\x60]+)?)`,
     "gi",
   );
   for (const match of text.matchAll(bareReferenceRe)) {
