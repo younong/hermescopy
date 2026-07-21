@@ -1,6 +1,7 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useCallback, useLayoutEffect, useMemo, useRef } from "react";
 import type { UIEvent } from "react";
+import { useLoadEarlierOnScroll } from "@/hooks/useLoadEarlierOnScroll";
 import type { ArtifactState, GuiChatState } from "../types";
 import { ApprovalCard } from "./ApprovalCard";
 import { ArtifactCard } from "./ArtifactCard";
@@ -36,7 +37,6 @@ export function MessageList({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const followBottomRef = useRef(true);
   const lastForceBottomKeyRef = useRef<string | undefined>(undefined);
-  const previousFirstMessageRef = useRef<string | undefined>(undefined);
   const anchorRef = useRef<{ id: string; offset: number } | null>(null);
 
   const rows = useMemo<RenderRow[]>(() => {
@@ -72,15 +72,42 @@ export function MessageList({
     overscan: OVERSCAN_ROWS,
   });
 
+  const captureAnchor = useCallback(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const firstVisible = virtualizer.getVirtualItems().find((item) => {
+      const row = rows[item.index];
+      return row?.kind === "message" && item.end > container.scrollTop;
+    });
+    const row = firstVisible ? rows[firstVisible.index] : undefined;
+    if (firstVisible && row) {
+      anchorRef.current = { id: row.id, offset: firstVisible.start - container.scrollTop };
+      followBottomRef.current = false;
+    }
+  }, [rows, virtualizer]);
+
+  const { handleScroll: handleHistoryScroll, retry, syncScrollPosition } =
+    useLoadEarlierOnScroll({
+      autoEnabled: !state.historyError && !state.safeguardReached,
+      canLoad: state.historyHasMore && !!state.historyCursor,
+      loading: state.historyLoading,
+      onBeforeLoad: captureAnchor,
+      onLoadEarlier,
+      resetKey: state.sessionId,
+    });
+
   const scrollToBottom = useCallback((force = false) => {
     if (force) followBottomRef.current = true;
     if (!followBottomRef.current || rows.length === 0) return;
     virtualizer.scrollToIndex(rows.length - 1, { align: "end" });
-  }, [rows.length, virtualizer]);
+    const element = containerRef.current;
+    if (element) syncScrollPosition(element.scrollTop);
+  }, [rows.length, syncScrollPosition, virtualizer]);
 
   const handleScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
     followBottomRef.current = isNearBottom(event.currentTarget);
-  }, []);
+    handleHistoryScroll(event);
+  }, [handleHistoryScroll]);
 
   useLayoutEffect(() => {
     if (forceBottomKey === lastForceBottomKeyRef.current) return;
@@ -89,31 +116,21 @@ export function MessageList({
   }, [forceBottomKey, scrollToBottom]);
 
   useLayoutEffect(() => {
-    const first = state.messages[0]?.id;
-    const previous = previousFirstMessageRef.current;
-    if (first && previous && first !== previous && anchorRef.current) {
-      const index = rows.findIndex((row) => row.id === anchorRef.current?.id);
+    if (!state.historyLoading && anchorRef.current) {
+      const anchor = anchorRef.current;
+      const index = rows.findIndex((row) => row.id === anchor.id);
       if (index >= 0) {
         virtualizer.scrollToIndex(index, { align: "start" });
         const element = containerRef.current;
-        if (element) element.scrollTop += anchorRef.current.offset;
+        if (element) {
+          element.scrollTop -= anchor.offset;
+          syncScrollPosition(element.scrollTop);
+        }
       }
       anchorRef.current = null;
     }
-    previousFirstMessageRef.current = first;
     if (followBottomRef.current) scrollToBottom();
-  }, [rows, scrollToBottom, state.messages, virtualizer]);
-
-  const prepareLoadEarlier = useCallback(() => {
-    const container = containerRef.current;
-    const firstVisible = virtualizer.getVirtualItems()[0];
-    const row = firstVisible ? rows[firstVisible.index] : undefined;
-    if (container && row && firstVisible) {
-      anchorRef.current = { id: row.id, offset: firstVisible.start - container.scrollTop };
-      followBottomRef.current = false;
-    }
-    onLoadEarlier?.();
-  }, [onLoadEarlier, rows, virtualizer]);
+  }, [rows, scrollToBottom, state.historyLoading, syncScrollPosition, virtualizer]);
 
   if (rows.length === 0) {
     return (
@@ -127,7 +144,7 @@ export function MessageList({
   }
 
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5" onScroll={handleScroll} ref={containerRef}>
+    <div aria-busy={state.historyLoading} className="min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5" onScroll={handleScroll} ref={containerRef}>
       <div className="relative w-full" style={{ height: `${virtualizer.getTotalSize()}px` }}>
         {virtualizer.getVirtualItems().map((item) => {
           const row = rows[item.index];
@@ -141,13 +158,21 @@ export function MessageList({
               style={{ transform: `translateY(${item.start}px)` }}
             >
               {row.kind === "history" ? (
-                <div className="flex flex-col items-center gap-2 text-xs text-text-tertiary">
+                <div className="flex min-h-9 flex-col items-center justify-center gap-2 text-xs text-text-tertiary">
                   {state.safeguardReached ? <span>Earlier history remains on the server; this tab stopped loading it to stay responsive.</span> : null}
-                  {state.historyError ? <span>{state.historyError}</span> : null}
-                  {state.historyHasMore && !state.safeguardReached ? (
-                    <button className="border border-current/20 px-3 py-1.5 hover:bg-midground/5 disabled:opacity-50" disabled={state.historyLoading} onClick={prepareLoadEarlier} type="button">
-                      {state.historyLoading ? "Loading earlier messages…" : "Load earlier messages"}
-                    </button>
+                  {state.historyError ? (
+                    <>
+                      <span role="alert">{state.historyError}</span>
+                      {state.historyHasMore && !state.safeguardReached ? (
+                        <button className="border border-current/20 px-3 py-1.5 hover:bg-midground/5 disabled:opacity-50" disabled={state.historyLoading} onClick={retry} type="button">
+                          Retry loading earlier messages
+                        </button>
+                      ) : null}
+                    </>
+                  ) : state.historyLoading ? (
+                    <span aria-live="polite" role="status">Loading earlier messages…</span>
+                  ) : state.historyHasMore && !state.safeguardReached ? (
+                    <span>Scroll up for earlier messages</span>
                   ) : null}
                 </div>
               ) : row.kind === "message" ? (() => {

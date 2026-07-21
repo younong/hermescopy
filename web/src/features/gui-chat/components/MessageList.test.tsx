@@ -2,7 +2,7 @@
 
 import { act } from "react";
 import { createRoot } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { initialGuiChatState } from "../types";
 import { MessageList } from "./MessageList";
@@ -132,6 +132,88 @@ describe("MessageList", () => {
         : 0,
     ).toBeTruthy();
 
+    await act(async () => root.unmount());
+  });
+
+
+  it("automatically loads near the top and keeps manual loading for errors only", async () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    const onLoadEarlier = vi.fn();
+    const baseState = {
+      ...initialGuiChatState,
+      historyCursor: "cursor-1",
+      historyHasMore: true,
+      messages: [{ artifactIds: [], id: "message-1", role: "user" as const, text: "Hello" }],
+      sessionId: "session-1",
+    };
+
+    await act(async () => root.render(
+      <MessageList
+        onApprovalRespond={() => undefined}
+        onLoadEarlier={onLoadEarlier}
+        state={baseState}
+      />,
+    ));
+
+    expect(container.textContent).toContain("Scroll up for earlier messages");
+    expect(container.textContent).not.toContain("Load earlier messages");
+    const scroller = container.querySelector<HTMLElement>("[aria-busy=false]")!;
+    await act(async () => {
+      scroller.scrollTop = 300;
+      scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+      scroller.scrollTop = 100;
+      scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+    });
+    expect(onLoadEarlier).toHaveBeenCalledTimes(1);
+
+    await act(async () => root.render(
+      <MessageList
+        onApprovalRespond={() => undefined}
+        onLoadEarlier={onLoadEarlier}
+        state={{ ...baseState, historyLoading: true }}
+      />,
+    ));
+    await act(async () => root.render(
+      <MessageList
+        onApprovalRespond={() => undefined}
+        onLoadEarlier={onLoadEarlier}
+        state={{ ...baseState, historyError: "Network unavailable" }}
+      />,
+    ));
+    const retry = Array.from(container.querySelectorAll("button")).find((button) =>
+      button.textContent?.includes("Retry loading earlier messages"),
+    );
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe("Network unavailable");
+    expect(retry).toBeDefined();
+
+    await act(async () => retry?.click());
+    expect(onLoadEarlier).toHaveBeenCalledTimes(2);
+    await act(async () => root.unmount());
+  });
+
+  it("announces earlier-history loading without hiding messages", async () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    await act(async () => root.render(
+      <MessageList
+        onApprovalRespond={() => undefined}
+        state={{
+          ...initialGuiChatState,
+          historyCursor: "cursor-1",
+          historyHasMore: true,
+          historyLoading: true,
+          messages: [{ artifactIds: [], id: "message-1", role: "user", text: "Still visible" }],
+        }}
+      />,
+    ));
+
+    expect(container.querySelector('[role="status"]')?.textContent).toContain("Loading earlier messages");
+    expect(container.textContent).toContain("Still visible");
+    expect(container.querySelector("[aria-busy=true]")).not.toBeNull();
     await act(async () => root.unmount());
   });
 
