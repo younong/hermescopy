@@ -772,7 +772,8 @@ CREATE TABLE IF NOT EXISTS messages (
     platform_message_id TEXT,
     observed INTEGER DEFAULT 0,
     active INTEGER NOT NULL DEFAULT 1,
-    compacted INTEGER NOT NULL DEFAULT 0
+    compacted INTEGER NOT NULL DEFAULT 0,
+    context_projection INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS state_meta (
@@ -804,6 +805,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_session_active
     ON messages(session_id, active, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_session_active_id
     ON messages(session_id, active, id);
+CREATE INDEX IF NOT EXISTS idx_messages_session_display_id
+    ON messages(session_id, context_projection, active, compacted, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_session_key
     ON sessions(session_key, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
@@ -3384,8 +3387,8 @@ class SessionDB:
                 """INSERT INTO messages (session_id, role, content, attachments, tool_call_id,
                    tool_calls, tool_name, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, context_projection)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -3404,6 +3407,7 @@ class SessionDB:
                     codex_message_items_json,
                     platform_message_id,
                     1 if observed else 0,
+                    0,
                 ),
             )
             msg_id = cursor.lastrowid
@@ -3424,12 +3428,21 @@ class SessionDB:
 
         return self._execute_write(_do)
 
-    def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
+    def _insert_message_rows(
+        self,
+        conn,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        *,
+        context_projection: bool = False,
+    ) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.
 
         Shared by :meth:`replace_messages` (delete-then-insert) and
-        :meth:`archive_and_compact` (soft-archive-then-insert). Runs inside the
-        caller's write transaction (takes the live ``conn``). Returns
+        :meth:`archive_and_compact` (soft-archive-then-insert). Compaction sets
+        ``context_projection`` so its model-only summary/tail is distinguishable
+        from the canonical transcript shown to users. Runs inside the caller's
+        write transaction (takes the live ``conn``). Returns
         ``(inserted_count, tool_call_count)``. Does NOT touch sessions.* counters
         — the caller owns that, since the two flows reconcile counts differently.
         """
@@ -3478,8 +3491,8 @@ class SessionDB:
                 """INSERT INTO messages (session_id, role, content, attachments, tool_call_id,
                    tool_calls, tool_name, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, context_projection)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -3498,6 +3511,7 @@ class SessionDB:
                     codex_message_items_json,
                     platform_msg_id,
                     1 if msg.get("observed") else 0,
+                    1 if context_projection else 0,
                 ),
             )
             inserted += 1
@@ -3583,12 +3597,14 @@ class SessionDB:
         - The live-context load (:meth:`get_messages_as_conversation`,
           :meth:`get_messages`) filters ``active = 1`` by default, so the model
           reloads ONLY the compacted set.
-        - The archived pre-compaction turns stay on disk (active=0) and stay
-          DISCOVERABLE: they are marked compacted=1, and search_messages()
-          includes compacted=1 rows by default — so session_search still finds
-          them, unlike rewind/undo rows (active=0, compacted=0) which stay
-          hidden. They remain in the FTS index (the messages_fts* triggers
-          index on INSERT / drop on DELETE and don't key on active/compacted;
+        - Canonical pre-compaction turns stay on disk (active=0, compacted=1)
+          and remain discoverable/displayable. The replacement summary/tail is
+          marked ``context_projection=1``: the model reloads it while user-facing
+          transcript readers exclude it. On repeated compaction an older
+          projection stays non-canonical instead of being promoted into history.
+          Rewind/undo rows (active=0, compacted=0) stay hidden. Canonical archived
+          rows remain in the FTS index (the messages_fts* triggers index on INSERT
+          / drop on DELETE and don't key on active/compacted;
           flipping to active=0 is a content-preserving UPDATE) and are
           recoverable via get_messages(..., include_inactive=True).
 
@@ -3605,12 +3621,16 @@ class SessionDB:
             # the pre-compaction transcript stays discoverable; live-context
             # loads (active=1 only) still exclude them.
             conn.execute(
-                "UPDATE messages SET active = 0, compacted = 1 "
+                "UPDATE messages SET active = 0, "
+                "compacted = CASE WHEN context_projection = 0 THEN 1 ELSE compacted END "
                 "WHERE session_id = ? AND active = 1",
                 (session_id,),
             )
             inserted, tool_calls_total = self._insert_message_rows(
-                conn, session_id, compacted_messages
+                conn,
+                session_id,
+                compacted_messages,
+                context_projection=True,
             )
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.
@@ -3975,7 +3995,7 @@ class SessionDB:
 
             return best if best is not None else session_id
 
-    _CONVERSATION_PAGE_CURSOR_VERSION = 1
+    _CONVERSATION_PAGE_CURSOR_VERSION = 2
     _CONVERSATION_PAGE_DEFAULT_LIMIT = 100
     _CONVERSATION_PAGE_MAX_LIMIT = 200
     _CONVERSATION_PAGE_CONTEXT_ROWS = 32
@@ -4126,7 +4146,12 @@ class SessionDB:
         include_ancestors: bool = True,
         recovery_scope: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Return a scoped, stable keyset page in chronological order.
+        """Return canonical user-visible history in chronological order.
+
+        Display history includes live canonical turns plus turns archived by
+        in-place compaction, while excluding model-only compaction projections
+        and user-rewound rows. Model replay uses :meth:`get_messages_as_conversation`
+        and remains active-only.
 
         The opaque cursor binds the canonical tip, its root-to-tip lineage, and
         the maximum row id visible to the first request. It is not an
@@ -4149,6 +4174,9 @@ class SessionDB:
         )
         placeholders = ",".join("?" for _ in session_ids)
         lineage_fingerprint = self._conversation_lineage_fingerprint(session_ids)
+        display_predicate = (
+            "m.context_projection = 0 AND (m.active = 1 OR m.compacted = 1)"
+        )
 
         with self._lock:
             tip_row = self._conn.execute(
@@ -4171,7 +4199,7 @@ class SessionDB:
                 snapshot_row = self._conn.execute(
                     "SELECT COALESCE(MAX(m.id), 0) FROM messages m "
                     "JOIN sessions s ON s.id = m.session_id "
-                    f"WHERE m.session_id IN ({placeholders}) AND m.active = 1"
+                    f"WHERE m.session_id IN ({placeholders}) AND {display_predicate}"
                     f"{scope_clause}",
                     (*session_ids, *scope_params),
                 ).fetchone()
@@ -4188,7 +4216,7 @@ class SessionDB:
             rows_desc = self._conn.execute(
                 f"SELECT {select_columns} FROM messages m "
                 "JOIN sessions s ON s.id = m.session_id "
-                f"WHERE m.session_id IN ({placeholders}) AND m.active = 1 "
+                f"WHERE m.session_id IN ({placeholders}) AND {display_predicate} "
                 "AND m.id <= ? AND m.id < ?"
                 f"{scope_clause} ORDER BY m.id DESC LIMIT ?",
                 (
@@ -4205,7 +4233,7 @@ class SessionDB:
             context_rows = self._conn.execute(
                 f"SELECT {select_columns} FROM messages m "
                 "JOIN sessions s ON s.id = m.session_id "
-                f"WHERE m.session_id IN ({placeholders}) AND m.active = 1 "
+                f"WHERE m.session_id IN ({placeholders}) AND {display_predicate} "
                 "AND m.id <= ? AND m.id < ?"
                 f"{scope_clause} ORDER BY m.id DESC LIMIT ?",
                 (
@@ -4277,6 +4305,60 @@ class SessionDB:
             "filtered_count": filtered_count,
             "snapshot_id": snapshot_id,
         }
+
+    def get_display_messages(
+        self,
+        session_id: str,
+        *,
+        include_ancestors: bool = True,
+        recovery_scope: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Load the complete canonical transcript intended for user display."""
+        messages: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+        while True:
+            page = self.get_conversation_page(
+                session_id,
+                before_cursor=cursor,
+                limit=self._CONVERSATION_PAGE_MAX_LIMIT,
+                include_ancestors=include_ancestors,
+                recovery_scope=recovery_scope,
+            )
+            messages = page["messages"] + messages
+            if not page["has_more"]:
+                return messages
+            cursor = page["next_cursor"]
+            if not cursor:
+                return messages
+
+    def display_message_count(
+        self,
+        session_id: str,
+        *,
+        include_ancestors: bool = True,
+        recovery_scope: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Count canonical user-visible messages without loading their payloads."""
+        session_ids = [session_id]
+        if include_ancestors:
+            session_ids = self._session_lineage_root_to_tip(
+                session_id, recovery_scope=recovery_scope
+            )
+        placeholders = ",".join("?" for _ in session_ids)
+        scope_clause, scope_params = self._recovery_scope_clause(
+            recovery_scope, alias="s"
+        )
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM messages m "
+                "JOIN sessions s ON s.id = m.session_id "
+                f"WHERE m.session_id IN ({placeholders}) "
+                "AND m.context_projection = 0 "
+                "AND (m.active = 1 OR m.compacted = 1)"
+                f"{scope_clause}",
+                (*session_ids, *scope_params),
+            ).fetchone()
+        return int(row[0] if row else 0)
 
     def get_messages_as_conversation(
         self,
@@ -5206,11 +5288,11 @@ class SessionDB:
     # =========================================================================
 
     def export_session(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Export a single session with all its messages as a dict."""
+        """Export a single session with its complete canonical transcript."""
         session = self.get_session(session_id)
         if not session:
             return None
-        messages = self.get_messages(session_id)
+        messages = self.get_display_messages(session_id, include_ancestors=True)
         return {**session, "messages": messages}
 
     def export_all(self, source: str = None) -> List[Dict[str, Any]]:

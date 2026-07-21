@@ -99,6 +99,8 @@ class TestInPlaceCompaction:
                 "[CONTEXT COMPACTION] summary of prior turns",
                 "recent reply",
             ]
+            display = db.get_conversation_page(sid, limit=20)["messages"]
+            assert [m.get("content") for m in display] == [f"msg {i}" for i in range(8)]
             assert row["message_count"] == 2  # live (active) count
             # NON-DESTRUCTIVE: the 8 seeded originals survive at active=0
             # alongside the 2 compacted rows — nothing was DELETEd.

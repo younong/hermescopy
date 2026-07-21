@@ -1686,6 +1686,10 @@ class APIServerAdapter(BasePlatformAdapter):
             include_children=include_children,
             order_by_last_active=True,
         )
+        for session in sessions:
+            session["message_count"] = db.display_message_count(
+                session["id"], include_ancestors=True
+            )
         return web.json_response({
             "object": "list",
             "data": [self._session_response(s) for s in sessions],
@@ -1794,7 +1798,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return err
         db = self._ensure_session_db()
         resolved_id = db.resolve_resume_session_id(session_id)
-        messages = db.get_messages(resolved_id)
+        messages = db.get_display_messages(resolved_id, include_ancestors=True)
         return web.json_response({
             "object": "list",
             "session_id": resolved_id,

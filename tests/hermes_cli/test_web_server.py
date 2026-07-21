@@ -1073,6 +1073,35 @@ class TestWebServerEndpoints:
         assert payload["session_id"] == "desktop-tip"
         assert [m["content"] for m in payload["messages"]] == ["after compression"]
 
+    def test_get_session_messages_shows_full_in_place_compaction_history(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="desktop-in-place", source="cli")
+            db.append_message(
+                session_id="desktop-in-place", role="user", content="original question"
+            )
+            db.append_message(
+                session_id="desktop-in-place", role="assistant", content="original answer"
+            )
+            db.archive_and_compact(
+                "desktop-in-place",
+                [
+                    {"role": "user", "content": "compressed summary"},
+                    {"role": "assistant", "content": "compressed tail"},
+                ],
+            )
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions/desktop-in-place/messages")
+        assert resp.status_code == 200
+        assert [message["content"] for message in resp.json()["messages"]] == [
+            "original question",
+            "original answer",
+        ]
+
     def test_get_session_messages_supports_bounded_history_pages(self):
         from hermes_state import SessionDB
 

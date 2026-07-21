@@ -236,6 +236,16 @@ class TestFlushAfterCompression:
             )
             assert agent._last_compaction_in_place is True
             assert len(active) == len(messages)
+            display = db.get_conversation_page("original-session", limit=20)["messages"]
+            assert len(display) == len(messages)
+            assert [row["content"] for row in display[:2]] == [
+                row["content"] for row in messages[:2]
+            ]
+            assert [row["content"] for row in display[3:]] == [
+                row["content"] for row in messages[3:]
+            ]
+            assert display[1]["tool_calls"][0]["function"]["arguments"] == large_args
+            assert display[2]["content"] == large_result[: db._CONVERSATION_PAGE_MAX_TEXT_CHARS]
 
 
 # ---------------------------------------------------------------------------

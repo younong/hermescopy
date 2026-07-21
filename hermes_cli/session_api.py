@@ -65,6 +65,14 @@ def list_sessions_payload(
             session.get("ended_at") is None
             and (now - session.get("last_active", session.get("started_at", 0))) < 300
         )
+        try:
+            session["message_count"] = db.display_message_count(
+                session["id"],
+                include_ancestors=True,
+                recovery_scope=recovery_scope,
+            )
+        except (AttributeError, TypeError):
+            pass
         session["archived"] = bool(session.get("archived"))
         if profile_name:
             session["profile"] = profile_name
@@ -265,7 +273,14 @@ def session_messages_payload(
             raise HTTPException(status_code=404, detail="Session not found")
         sid = db.resolve_resume_session_id(sid)
     if limit is None and before is None:
-        return {"session_id": sid, "messages": db.get_messages(sid)}
+        return {
+            "session_id": sid,
+            "messages": db.get_display_messages(
+                sid,
+                include_ancestors=True,
+                recovery_scope=recovery_scope,
+            ),
+        }
     try:
         page = db.get_conversation_page(
             sid,
