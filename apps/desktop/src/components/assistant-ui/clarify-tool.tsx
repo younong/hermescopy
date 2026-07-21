@@ -171,6 +171,7 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
       try {
         await gateway.request<{ ok?: boolean }>('clarify.respond', {
           request_id: matchingRequest.requestId,
+          session_id: matchingRequest.sessionId,
           answer
         })
         triggerHaptic('submit')

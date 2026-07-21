@@ -336,14 +336,20 @@ def check_compression_model_feasibility(agent: Any) -> None:
             agent._compression_warning = msg
             agent._emit_status(msg)
             logger.warning(
-                "Auxiliary compression model %s has %d token context, "
-                "below the main model's compression threshold of %d "
-                "tokens — auto-lowered session threshold to %d to "
-                "keep compression working.",
+                "compression feasibility decision=adjust_threshold model=%s "
+                "auxiliary_context=%d original_threshold=%d effective_threshold=%d",
                 aux_model,
                 aux_context,
                 old_threshold,
                 new_threshold,
+            )
+        else:
+            logger.info(
+                "compression feasibility decision=keep_threshold model=%s "
+                "auxiliary_context=%d effective_threshold=%d",
+                aux_model,
+                aux_context,
+                threshold,
             )
     except ValueError:
         # Hard rejections (aux below minimum context) must propagate
@@ -731,6 +737,13 @@ def compress_context(
         agent._last_compression_attempt_aborted = True
         try:
             _err = getattr(agent.context_compressor, "_last_summary_error", None) or "unknown error"
+            logger.warning(
+                "context compression outcome=aborted reason=summary_failure "
+                "session=%s messages_before=%d messages_after=%d",
+                agent.session_id or "none",
+                _pre_msg_count,
+                len(compressed),
+            )
             if (
                 emit_abort_warning
                 and getattr(agent, "_last_compression_summary_warning", None) != _err

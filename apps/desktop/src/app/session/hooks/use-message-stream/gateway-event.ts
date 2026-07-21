@@ -429,7 +429,9 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             requestId,
             question,
             choices: Array.isArray(payload?.choices) ? payload!.choices!.filter(c => typeof c === 'string') : null,
-            sessionId: sessionId ?? null
+            expiresAtMs: typeof payload?.expires_at_ms === 'number' ? payload.expires_at_ms : undefined,
+            sessionId: sessionId ?? null,
+            timeoutMs: typeof payload?.timeout_ms === 'number' ? payload.timeout_ms : undefined
           })
 
           // The transcript only renders the active session, so a background
@@ -447,6 +449,16 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             sessionId,
             title: translateNow('notifications.native.inputTitle')
           })
+        }
+      } else if (event.type === 'clarify.resolved') {
+        const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
+
+        if (requestId) {
+          clearClarifyRequest(requestId, sessionId ?? null)
+        }
+
+        if (sessionId) {
+          updateSessionState(sessionId, state => (state.needsInput ? { ...state, needsInput: false } : state))
         }
       } else if (event.type === 'approval.request') {
         // Dangerous-command / execute_code approval. The Python side is blocked

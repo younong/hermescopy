@@ -100,6 +100,34 @@ describe("Composer attachment transfers", () => {
     expect(container.querySelector('[title="blocked.txt"]')).toBeNull();
   });
 
+  it("allows a new text message while generation waits for clarification", async () => {
+    const onSend = vi.fn().mockResolvedValue(undefined);
+    const container = renderComposer({
+      allowSendWhileGenerating: true,
+      isGenerating: true,
+      onSend,
+    });
+    const textarea = getTextarea(container);
+
+    await act(async () => {
+      const valueSetter = Object.getOwnPropertyDescriptor(
+        HTMLTextAreaElement.prototype,
+        "value",
+      )?.set;
+      valueSetter?.call(textarea, "Use the default");
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    const sendButton = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent?.includes("Send"),
+    );
+    expect(sendButton).toBeDefined();
+    await dispatch(sendButton ?? null, new MouseEvent("click", { bubbles: true, cancelable: true }));
+
+    expect(onSend).toHaveBeenCalledOnce();
+    expect(onSend.mock.calls[0]?.[0]).toBe("Use the default");
+    expect(container.textContent).toContain("Stop");
+  });
+
   it("does not accept new drops while a message is submitting", async () => {
     let resolveSend: (() => void) | undefined;
     const onSend = vi.fn(
@@ -147,10 +175,12 @@ describe("Composer attachment transfers", () => {
 });
 
 function renderComposer({
+  allowSendWhileGenerating = false,
   disabled = false,
   isGenerating = false,
   onSend = vi.fn().mockResolvedValue(undefined),
 }: {
+  allowSendWhileGenerating?: boolean;
   disabled?: boolean;
   isGenerating?: boolean;
   onSend?: ComponentProps<typeof Composer>["onSend"];
@@ -161,6 +191,7 @@ function renderComposer({
   act(() => {
     root?.render(
       <Composer
+        allowSendWhileGenerating={allowSendWhileGenerating}
         disabled={disabled}
         isGenerating={isGenerating}
         onSend={onSend}

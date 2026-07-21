@@ -2,6 +2,8 @@ import type { GatewayEvent } from "@/lib/gatewayClient";
 import type {
   ApprovalPayload,
   ArtifactFilePayload,
+  ClarifyRequestPayload,
+  ClarifyResolvedPayload,
   ArtifactImagePayload,
   ErrorPayload,
   GatewayTranscriptAttachment,
@@ -22,6 +24,7 @@ import {
   type ApprovalState,
   type ArtifactState,
   type ChatMessage,
+  type ClarificationState,
   type GuiChatConnectionState,
   type GuiChatState,
   type ImageArtifactState,
@@ -48,6 +51,7 @@ export type GuiChatAction =
   | { type: "user.sent"; attachments?: MessageAttachmentState[]; id: string; text: string }
   | { type: "error"; message: string }
   | { type: "approval.resolved"; id: string; approved: boolean }
+  | { type: "clarify.submitting"; id: string }
   | { type: "reset" };
 
 export function guiChatReducer(
@@ -81,6 +85,8 @@ export function guiChatReducer(
       return updateApproval(state, action.id, {
         status: action.approved ? "approved" : "denied",
       });
+    case "clarify.submitting":
+      return updateClarification(state, action.id, { status: "submitting" });
     case "reset":
       return initialGuiChatState;
   }
@@ -132,6 +138,7 @@ function applySessionResponse(
   return {
     ...state,
     artifacts: history ? history.artifacts : state.artifacts,
+    ...clarificationsFromSnapshot(response.pending_prompts),
     cwd,
     error: undefined,
     historyCursor: response.history_page?.cursor ?? undefined,
@@ -247,6 +254,13 @@ function applyGatewayEvent(state: GuiChatState, event: GatewayEvent): GuiChatSta
       return addApproval(state, event.payload as ApprovalPayload | undefined);
     case "approval.resolved":
       return resolveApprovalFromEvent(state, event.payload);
+    case "clarify.request":
+      return addClarification(state, event.payload as ClarifyRequestPayload | undefined);
+    case "clarify.resolved":
+      return resolveClarification(
+        state,
+        event.payload as ClarifyResolvedPayload | undefined,
+      );
     case "artifact.image":
       return addImageArtifact(state, event.payload as ArtifactImagePayload | undefined);
     case "artifact.created":
@@ -1143,6 +1157,79 @@ function resolveApprovalFromEvent(state: GuiChatState, payload: unknown): GuiCha
       : "";
   if (!id) return state;
   return updateApproval(state, id, { status: "approved" });
+}
+
+function clarificationFromPayload(
+  payload: ClarifyRequestPayload,
+): ClarificationState {
+  return {
+    choices: Array.isArray(payload.choices)
+      ? payload.choices.filter((choice): choice is string => typeof choice === "string")
+      : null,
+    expiresAtMs:
+      typeof payload.expires_at_ms === "number" ? payload.expires_at_ms : undefined,
+    id: payload.request_id,
+    question: String(payload.question ?? ""),
+    status: "pending",
+    timeoutMs: typeof payload.timeout_ms === "number" ? payload.timeout_ms : undefined,
+  };
+}
+
+function clarificationsFromSnapshot(
+  prompts: SessionCreateResponse["pending_prompts"],
+): Pick<GuiChatState, "clarifications" | "clarificationOrder"> {
+  const clarifications: Record<string, ClarificationState> = {};
+  const clarificationOrder: string[] = [];
+  for (const prompt of prompts ?? []) {
+    if (prompt?.type !== "clarify" || !prompt.request_id) continue;
+    const clarification = clarificationFromPayload(prompt);
+    clarifications[clarification.id] = clarification;
+    clarificationOrder.push(clarification.id);
+  }
+  return { clarifications, clarificationOrder };
+}
+
+function addClarification(
+  state: GuiChatState,
+  payload: ClarifyRequestPayload | undefined,
+): GuiChatState {
+  if (!payload?.request_id || !payload.question) return state;
+  const clarification = clarificationFromPayload(payload);
+  return {
+    ...state,
+    clarifications: { ...state.clarifications, [clarification.id]: clarification },
+    clarificationOrder: state.clarificationOrder.includes(clarification.id)
+      ? state.clarificationOrder
+      : [...state.clarificationOrder, clarification.id],
+    statusLines: [...state.statusLines, "Hermes needs your answer."].slice(-8),
+  };
+}
+
+function updateClarification(
+  state: GuiChatState,
+  id: string,
+  patch: Partial<ClarificationState>,
+): GuiChatState {
+  const clarification = state.clarifications[id];
+  if (!clarification) return state;
+  return {
+    ...state,
+    clarifications: {
+      ...state.clarifications,
+      [id]: { ...clarification, ...patch },
+    },
+  };
+}
+
+function resolveClarification(
+  state: GuiChatState,
+  payload: ClarifyResolvedPayload | undefined,
+): GuiChatState {
+  if (!payload?.request_id) return state;
+  const status = ["answered", "cancelled", "timed_out"].includes(payload.outcome)
+    ? payload.outcome
+    : "cancelled";
+  return updateClarification(state, payload.request_id, { status });
 }
 
 function isImageGenerationTool(name: string | undefined): boolean {

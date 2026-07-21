@@ -1279,6 +1279,44 @@ describe('createGatewayEventHandler', () => {
     expect(getOverlayState().clarify).toBeNull()
   })
 
+  it('uses explicit clarify.resolved outcomes and ignores mismatched request ids', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: {
+        choices: ['A'],
+        expires_at_ms: 123456,
+        question: 'Pick?',
+        request_id: 'req-explicit',
+        timeout_ms: 60000
+      },
+      type: 'clarify.request'
+    } as any)
+
+    expect(getOverlayState().clarify).toMatchObject({
+      expiresAtMs: 123456,
+      requestId: 'req-explicit',
+      timeoutMs: 60000
+    })
+
+    onEvent({
+      payload: { outcome: 'timed_out', request_id: 'other' },
+      type: 'clarify.resolved'
+    } as any)
+    expect(getOverlayState().clarify?.requestId).toBe('req-explicit')
+
+    onEvent({
+      payload: { outcome: 'cancelled', request_id: 'req-explicit' },
+      type: 'clarify.resolved'
+    } as any)
+
+    expect(getOverlayState().clarify).toBeNull()
+    expect(appended.find(msg => msg.role === 'system' && msg.text.startsWith('ask Pick?'))?.text).toContain(
+      'cancelled — no selection'
+    )
+  })
+
   it('only persists an abandoned clarify once even if tool.complete fires twice', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))

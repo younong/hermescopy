@@ -99,6 +99,7 @@ export interface GuiChatConnection {
   send(sessionId: string, text: string): Promise<void>;
   stop(sessionId: string): Promise<void>;
   respondToApproval(sessionId: string, request: unknown, approved: boolean): Promise<void>;
+  respondToClarify(sessionId: string, requestId: string, answer: string): Promise<void>;
   ping(): Promise<void>;
 }
 
@@ -242,6 +243,13 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
     respondToApproval: async (sessionId, _request, approved) => {
       await client.request("approval.respond", {
         choice: approved ? "allow" : "deny",
+        session_id: sessionId,
+      });
+    },
+    respondToClarify: async (sessionId, requestId, answer) => {
+      await client.request("clarify.respond", {
+        answer,
+        request_id: requestId,
         session_id: sessionId,
       });
     },

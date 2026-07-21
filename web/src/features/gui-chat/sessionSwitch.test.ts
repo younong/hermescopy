@@ -18,6 +18,7 @@ class FakeConnection implements GuiChatConnection {
   readonly send = vi.fn();
   readonly stop = vi.fn();
   readonly respondToApproval = vi.fn();
+  readonly respondToClarify = vi.fn();
   readonly ping = vi.fn();
   private readonly eventHandlers = new Set<(event: GatewayEvent) => void>();
   private readonly stateHandlers = new Set<(state: ConnectionState) => void>();

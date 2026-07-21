@@ -109,6 +109,18 @@ export function connectMockGuiChat(): GuiChatConnection {
         payload: { id: "mock-approval" },
       });
     },
+    async respondToClarify(_sessionId, requestId, answer) {
+      emitEvent({
+        type: "clarify.resolved",
+        session_id: MOCK_SESSION_ID,
+        payload: { outcome: "answered", request_id: requestId },
+      });
+      emitEvent({
+        type: "status.update",
+        session_id: MOCK_SESSION_ID,
+        payload: { kind: "clarify", text: `Mock answer: ${answer}` },
+      });
+    },
     async send(_sessionId, text) {
       replayUserTurn(schedule, text);
     },

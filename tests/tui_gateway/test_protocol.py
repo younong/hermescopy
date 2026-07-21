@@ -40,6 +40,7 @@ def server():
         # via reload (which we don't do).
         mod._sessions.clear()
         mod._pending.clear()
+        mod._pending_prompt_payloads.clear()
         mod._answers.clear()
 
 
@@ -255,7 +256,7 @@ def test_block_and_respond(capture):
         threading.Event().wait(0.01)
 
     rid = next(iter(server._pending))
-    server._answers[rid] = "my_answer"
+    server._answers[rid] = {"outcome": "answered", "answer": "my_answer"}
     # _pending values are (sid, Event) tuples — unpack to set the Event
     _, ev = server._pending[rid]
     ev.set()
@@ -271,7 +272,90 @@ def test_clear_pending(server):
     server._clear_pending()
 
     assert ev.is_set()
-    assert server._answers["r1"] == ""
+    assert server._answers["r1"] == {"outcome": "cancelled", "answer": None}
+
+
+def test_clarify_block_reports_timeout_and_resolution(capture):
+    server, buf = capture
+    result = server._block_result(
+        "clarify.request", "s1", {"question": "Pick?", "choices": ["A"]}, timeout=0.01
+    )
+
+    assert result == {"outcome": "timed_out", "answer": None}
+    frames = [json.loads(line) for line in buf.getvalue().splitlines()]
+    request = frames[0]["params"]
+    resolved = frames[1]["params"]
+    assert request["type"] == "clarify.request"
+    assert request["payload"]["timeout_ms"] == 10
+    assert request["payload"]["expires_at_ms"] > 0
+    assert resolved["type"] == "clarify.resolved"
+    request_id = request["payload"]["request_id"]
+    assert resolved["payload"] == {
+        "request_id": request_id,
+        "outcome": "timed_out",
+    }
+
+    late_response = server._methods["clarify.respond"](
+        "rpc",
+        {"request_id": request_id, "session_id": "s1", "answer": "too late"},
+    )
+    assert late_response["error"]["code"] == 4009
+    assert len([frame for frame in frames if frame["params"]["type"] == "clarify.resolved"]) == 1
+
+
+def test_clarify_answer_emits_one_resolution(capture):
+    server, buf = capture
+    result: dict = {}
+
+    def wait_for_answer():
+        result.update(
+            server._block_result(
+                "clarify.request",
+                "s1",
+                {"question": "Pick?", "choices": ["A"]},
+                timeout=1,
+            )
+        )
+
+    thread = threading.Thread(target=wait_for_answer)
+    thread.start()
+    deadline = time.monotonic() + 1
+    while not server._pending and time.monotonic() < deadline:
+        threading.Event().wait(0.01)
+    request_id = next(iter(server._pending))
+
+    response = server._methods["clarify.respond"](
+        "rpc",
+        {"request_id": request_id, "session_id": "s1", "answer": "A"},
+    )
+    thread.join(timeout=1)
+
+    assert response["result"]["status"] == "ok"
+    assert result == {"outcome": "answered", "answer": "A"}
+    assert not thread.is_alive()
+    frames = [json.loads(line) for line in buf.getvalue().splitlines()]
+    resolutions = [frame for frame in frames if frame["params"]["type"] == "clarify.resolved"]
+    assert [frame["params"]["payload"] for frame in resolutions] == [
+        {"request_id": request_id, "outcome": "answered"}
+    ]
+
+
+def test_respond_rejects_wrong_clarify_session(server):
+    ev = threading.Event()
+    server._pending["req"] = ("session-a", ev)
+    server._pending_prompt_payloads["req"] = ("clarify.request", {})
+
+    response = server._respond(
+        "rpc",
+        {"request_id": "req", "session_id": "session-b", "answer": "A"},
+        "answer",
+        event="clarify.request",
+        require_session_id=True,
+    )
+
+    assert response["error"]["code"] == 4009
+    assert not ev.is_set()
+    assert "req" not in server._answers
 
 
 # ── Session lookup ───────────────────────────────────────────────────

@@ -77,6 +77,15 @@ export interface ApprovalState {
   status: "pending" | "approved" | "denied";
 }
 
+export interface ClarificationState {
+  id: string;
+  choices: string[] | null;
+  expiresAtMs?: number;
+  question: string;
+  status: "pending" | "submitting" | "answered" | "cancelled" | "timed_out";
+  timeoutMs?: number;
+}
+
 export type GuiComposerAttachmentKind = "image" | "pdf" | "file";
 
 export type GuiComposerAttachmentStatus = "queued" | "uploading" | "uploaded" | "error";
@@ -109,6 +118,8 @@ export interface GuiChatState {
   artifacts: Record<string, ArtifactState>;
   approvals: Record<string, ApprovalState>;
   approvalOrder: string[];
+  clarifications: Record<string, ClarificationState>;
+  clarificationOrder: string[];
   statusLines: string[];
   isGenerating: boolean;
   error?: string;
@@ -124,6 +135,8 @@ export const initialGuiChatState: GuiChatState = {
   approvals: {},
   approvalOrder: [],
   artifacts: {},
+  clarifications: {},
+  clarificationOrder: [],
   connection: "idle",
   historyHasMore: false,
   historyLoading: false,

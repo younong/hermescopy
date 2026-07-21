@@ -8,6 +8,7 @@ Two-phase design:
      status_callback (gateway platforms)
 """
 
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -67,7 +68,9 @@ def _make_agent(
 
 @patch("agent.model_metadata.get_model_context_length", return_value=80_000)
 @patch("agent.auxiliary_client.get_text_auxiliary_client")
-def test_auto_corrects_threshold_when_aux_context_below_threshold(mock_get_client, mock_ctx_len):
+def test_auto_corrects_threshold_when_aux_context_below_threshold(
+    mock_get_client, mock_ctx_len, caplog
+):
     """Auto-correction: aux >= 64K floor but < threshold → lower threshold
     to aux_context so compression still works this session."""
     agent = _make_agent(main_context=200_000, threshold_percent=0.50)
@@ -96,6 +99,9 @@ def test_auto_corrects_threshold_when_aux_context_below_threshold(mock_get_clien
     assert agent._compression_warning is not None
     # Threshold on the live compressor was actually lowered to aux_context.
     assert agent.context_compressor.threshold_tokens == 80_000
+    assert "decision=adjust_threshold" in caplog.text
+    assert "original_threshold=100000" in caplog.text
+    assert "effective_threshold=80000" in caplog.text
 
 
 @patch("agent.model_metadata.get_model_context_length", return_value=32_768)
@@ -123,10 +129,13 @@ def test_rejects_aux_below_minimum_context(mock_get_client, mock_ctx_len):
 
 @patch("agent.model_metadata.get_model_context_length", return_value=200_000)
 @patch("agent.auxiliary_client.get_text_auxiliary_client")
-def test_no_warning_when_aux_context_sufficient(mock_get_client, mock_ctx_len):
+def test_no_warning_when_aux_context_sufficient(
+    mock_get_client, mock_ctx_len, caplog
+):
     """No warning when aux model context >= main model threshold."""
     agent = _make_agent(main_context=200_000, threshold_percent=0.50)
     # threshold = 100,000 — aux has 200,000 (sufficient)
+    caplog.set_level(logging.INFO, logger="agent.conversation_compression")
     mock_client = MagicMock()
     mock_client.base_url = "https://openrouter.ai/api/v1"
     mock_client.api_key = "sk-aux"
@@ -139,6 +148,8 @@ def test_no_warning_when_aux_context_sufficient(mock_get_client, mock_ctx_len):
 
     assert len(messages) == 0
     assert agent._compression_warning is None
+    assert "decision=keep_threshold" in caplog.text
+    assert "effective_threshold=100000" in caplog.text
 
 
 def test_feasibility_check_passes_live_main_runtime():

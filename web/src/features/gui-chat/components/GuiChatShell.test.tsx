@@ -54,11 +54,19 @@ vi.mock("@/components/ChatSessionList", () => ({
 }));
 
 vi.mock("./Composer", () => ({
-  Composer: () => null,
+  Composer: (props: Record<string, unknown>) => (
+    <button data-composer-send onClick={() => void (props.onSend as Function)("new message", [], () => undefined)}>
+      Composer send
+    </button>
+  ),
 }));
 
 vi.mock("./MessageList", () => ({
-  MessageList: () => null,
+  MessageList: (props: Record<string, unknown>) => (
+    <button data-clarify-answer onClick={() => (props.onClarifyRespond as Function)("clarify-1", "A")}>
+      Clarify answer
+    </button>
+  ),
 }));
 
 let root: Root | null = null;
@@ -138,6 +146,45 @@ describe("GuiChatShell", () => {
       undefined,
     );
   });
+
+  it("responds to clarify with the owning runtime session", async () => {
+    const connection = createConnection()
+    connection.createOrAttachMock.mockResolvedValue({
+      pending_prompts: [
+        {
+          choices: ["A"],
+          question: "Pick one",
+          request_id: "clarify-1",
+          type: "clarify",
+        },
+      ],
+      session_id: "runtime-a",
+      stored_session_id: "stored-a",
+    })
+    mocks.getAuthMe.mockResolvedValue(authIdentity())
+    mocks.connectGuiChat.mockReturnValue(connection)
+
+    const container = document.createElement("div")
+    document.body.appendChild(container)
+    root = createRoot(container)
+    await act(async () => {
+      root?.render(
+        <MemoryRouter initialEntries={["/chat-gui"]}>
+          <DashboardAuthIdentityProvider>
+            <GuiChatShell />
+          </DashboardAuthIdentityProvider>
+        </MemoryRouter>,
+      )
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("[data-clarify-answer]")?.click()
+    })
+
+    expect(connection.respondToClarify).toHaveBeenCalledWith("runtime-a", "clarify-1", "A")
+  })
 
   it("reattaches the committed stored session after a transport close", async () => {
     vi.useFakeTimers();
@@ -305,8 +352,9 @@ function createConnection(): TestGuiChatConnection {
     },
     loadEarlier: vi.fn(),
     ping: vi.fn(),
-    respondToApproval: vi.fn(),
-    send: vi.fn(),
+    respondToApproval: vi.fn().mockResolvedValue(undefined),
+    respondToClarify: vi.fn().mockResolvedValue(undefined),
+    send: vi.fn().mockResolvedValue(undefined),
     stop: vi.fn(),
   };
   return connection;

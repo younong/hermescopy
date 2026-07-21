@@ -105,7 +105,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   // still set on a timeout, but already cleared by answerClarify() on a real
   // answer (so this no-ops there).  Flush the question + options into the
   // transcript as a persistent system line, then clear the overlay.
-  const flushAbandonedClarify = () => {
+  const flushAbandonedClarify = (outcome: 'cancelled' | 'timed_out' = 'timed_out') => {
     const { clarify } = getOverlayState()
 
     if (!clarify || persistedAbandonedClarify.has(clarify.requestId)) {
@@ -115,7 +115,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
     persistedAbandonedClarify.add(clarify.requestId)
     appendMessage({
       role: 'system',
-      text: formatAbandonedClarify(clarify.question, clarify.choices, 'timed out')
+      text: formatAbandonedClarify(clarify.question, clarify.choices, outcome === 'timed_out' ? 'timed out' : 'cancelled')
     })
     patchOverlayState({ clarify: null })
   }
@@ -767,11 +767,35 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
       case 'clarify.request':
         patchOverlayState({
-          clarify: { choices: ev.payload.choices, question: ev.payload.question, requestId: ev.payload.request_id }
+          clarify: {
+            choices: ev.payload.choices,
+            expiresAtMs: ev.payload.expires_at_ms,
+            question: ev.payload.question,
+            requestId: ev.payload.request_id,
+            timeoutMs: ev.payload.timeout_ms
+          }
         })
         setStatus('waiting for input…')
 
         return
+      case 'clarify.resolved': {
+        const clarify = getOverlayState().clarify
+
+        if (!clarify || clarify.requestId !== ev.payload.request_id) {
+          return
+        }
+
+        if (ev.payload.outcome === 'cancelled' || ev.payload.outcome === 'timed_out') {
+          flushAbandonedClarify(ev.payload.outcome)
+        } else {
+          patchOverlayState({ clarify: null })
+        }
+
+        setStatus(getUiState().busy ? 'running…' : 'ready')
+
+        return
+      }
+
       case 'approval.request': {
         const description = String(ev.payload.description ?? 'dangerous command')
         // Only an explicit false (tirith warning) drops the permanent-allow option.
