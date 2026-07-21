@@ -25,6 +25,9 @@ follow the implementation and its closest focused tests.
    streaming, model migration, or Managed Agents work, invoke the project
    `claude-api-lite` skill. Do not invoke the disabled bundled `claude-api`
    skill; its eager reference bundle exceeds this project's context budget.
+9. Before reading release instructions or running commands for any publish,
+   deploy, tag, rollback, or production-status operation, first invoke the
+   project `hermes-release` skill.
 
 ## Bounded Code Reviews
 
