@@ -44,6 +44,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 import httpx
 
 from hermes_cli.config import get_hermes_home, get_config_path, read_raw_config
+from hermes_cli.oauth_jwt import decode_unverified_oauth_jwt_claims
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
@@ -1946,16 +1947,8 @@ def _nous_portal_env_override() -> Optional[str]:
 
 
 def _decode_jwt_claims(token: Any) -> Dict[str, Any]:
-    if not isinstance(token, str) or token.count(".") != 2:
-        return {}
-    payload = token.split(".")[1]
-    payload += "=" * ((4 - len(payload) % 4) % 4)
-    try:
-        raw = base64.urlsafe_b64decode(payload.encode("utf-8"))
-        claims = json.loads(raw.decode("utf-8"))
-    except Exception:
-        return {}
-    return claims if isinstance(claims, dict) else {}
+    """Compatibility wrapper for metadata-only OAuth JWT decoding."""
+    return decode_unverified_oauth_jwt_claims(token)
 
 
 def _scope_values(raw_scope: Any) -> set[str]:
@@ -3985,21 +3978,10 @@ def _save_xai_oauth_tokens(
 
 
 def _xai_access_token_is_expiring(access_token: str, skew_seconds: int = 0) -> bool:
-    if not isinstance(access_token, str) or "." not in access_token:
+    exp = decode_unverified_oauth_jwt_claims(access_token).get("exp")
+    if not isinstance(exp, (int, float)):
         return False
-    try:
-        parts = access_token.split(".")
-        if len(parts) < 2:
-            return False
-        payload_b64 = parts[1]
-        payload_b64 += "=" * (-len(payload_b64) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode("ascii")).decode("utf-8"))
-        exp = payload.get("exp")
-        if not isinstance(exp, (int, float)):
-            return False
-        return float(exp) <= (time.time() + max(0, int(skew_seconds)))
-    except Exception:
-        return False
+    return float(exp) <= (time.time() + max(0, int(skew_seconds)))
 
 
 def _xai_proactive_refresh_skew_seconds(access_token: str) -> int:
@@ -4014,26 +3996,15 @@ def _xai_proactive_refresh_skew_seconds(access_token: str) -> int:
     ``invalid_grant`` quarantine.
     """
     max_skew = XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS
-    if not isinstance(access_token, str) or "." not in access_token:
+    exp = decode_unverified_oauth_jwt_claims(access_token).get("exp")
+    if not isinstance(exp, (int, float)):
         return max_skew
-    try:
-        parts = access_token.split(".")
-        if len(parts) < 2:
-            return max_skew
-        payload_b64 = parts[1]
-        payload_b64 += "=" * (-len(payload_b64) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode("ascii")).decode("utf-8"))
-        exp = payload.get("exp")
-        if not isinstance(exp, (int, float)):
-            return max_skew
-        remaining = float(exp) - time.time()
-        if remaining <= 0:
-            return max_skew
-        if remaining <= 45 * 60:
-            return min(120, max_skew)
+    remaining = float(exp) - time.time()
+    if remaining <= 0:
         return max_skew
-    except Exception:
-        return max_skew
+    if remaining <= 45 * 60:
+        return min(120, max_skew)
+    return max_skew
 
 
 def _xai_validate_oauth_endpoint(url: str, *, field: str) -> str:

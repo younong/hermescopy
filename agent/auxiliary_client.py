@@ -51,6 +51,8 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
+from hermes_cli.oauth_jwt import decode_unverified_oauth_jwt_claims
+
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # openai SDK pulls a large type tree (~240 ms cold, including responses/*,
 # graders/*). We expose `OpenAI` here as a thin proxy that imports the SDK on
@@ -663,20 +665,12 @@ def _codex_cloudflare_headers(access_token: str) -> Dict[str, str]:
         "User-Agent": "codex_cli_rs/0.0.0 (Hermes Agent)",
         "originator": "codex_cli_rs",
     }
-    if not isinstance(access_token, str) or not access_token.strip():
-        return headers
-    try:
-        import base64
-        parts = access_token.split(".")
-        if len(parts) < 2:
-            return headers
-        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
-        claims = json.loads(base64.urlsafe_b64decode(payload_b64))
-        acct_id = claims.get("https://api.openai.com/auth", {}).get("chatgpt_account_id")
+    claims = decode_unverified_oauth_jwt_claims(access_token)
+    account_claims = claims.get("https://api.openai.com/auth", {})
+    if isinstance(account_claims, dict):
+        acct_id = account_claims.get("chatgpt_account_id")
         if isinstance(acct_id, str) and acct_id:
             headers["ChatGPT-Account-ID"] = acct_id
-    except Exception:
-        pass
     return headers
 
 
@@ -1669,17 +1663,10 @@ def _read_codex_access_token() -> Optional[str]:
 
         # Check JWT expiry — expired tokens block the auto chain and
         # prevent fallback to working providers (e.g. Anthropic).
-        try:
-            import base64
-            payload = access_token.split(".")[1]
-            payload += "=" * (-len(payload) % 4)
-            claims = json.loads(base64.urlsafe_b64decode(payload))
-            exp = claims.get("exp", 0)
-            if exp and time.time() > exp:
-                logger.debug("Codex access token expired (exp=%s), skipping", exp)
-                return None
-        except Exception:
-            pass  # Non-JWT token or decode error — use as-is
+        exp = decode_unverified_oauth_jwt_claims(access_token).get("exp", 0)
+        if isinstance(exp, (int, float)) and exp and time.time() > exp:
+            logger.debug("Codex access token expired (exp=%s), skipping", exp)
+            return None
 
         return access_token.strip()
     except Exception as exc:
