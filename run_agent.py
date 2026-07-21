@@ -5569,6 +5569,15 @@ class AIAgent:
         """
         return self.api_mode != "codex_responses"
 
+    def _maybe_compact_tool_payloads(
+        self, messages: list, *, task_id: str = "default", force: bool = False
+    ) -> tuple:
+        """Forwarder for deterministic, non-destructive tool checkpoints."""
+        from agent.conversation_compression import maybe_compact_tool_payloads
+        return maybe_compact_tool_payloads(
+            self, messages, task_id=task_id, force=force
+        )
+
     def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default", focus_topic: str = None, force: bool = False, emit_abort_warning: bool = True) -> tuple:
         """Forwarder — see ``agent.conversation_compression.compress_context``.
 

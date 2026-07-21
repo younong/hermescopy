@@ -4629,6 +4629,22 @@ def run_conversation(
                         messages, tools=agent.tools or None
                     )
 
+                # Tool outputs can dominate the next prompt long before the
+                # overall context threshold is reached. Once the model has consumed
+                # them, advance a deterministic non-destructive checkpoint first.
+                _tool_checkpoint = getattr(agent, "_maybe_compact_tool_payloads", None)
+                if agent.compression_enabled and _tool_checkpoint is not None:
+                    messages, _tool_checkpoint_changed = _tool_checkpoint(
+                        messages, task_id=effective_task_id
+                    )
+                    if _tool_checkpoint_changed:
+                        conversation_history = conversation_history_after_compression(
+                            agent, messages
+                        )
+                        _real_tokens = estimate_request_tokens_rough(
+                            messages, tools=agent.tools or None
+                        )
+
                 if agent.compression_enabled and _compressor.should_compress(_real_tokens):
                     agent._safe_print("  ⟳ compacting context…")
                     messages, active_system_prompt = agent._compress_context(

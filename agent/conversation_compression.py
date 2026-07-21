@@ -396,6 +396,110 @@ def conversation_history_after_compression(agent: Any, messages: list) -> Option
     return None
 
 
+def maybe_compact_tool_payloads(
+    agent: Any,
+    messages: list,
+    *,
+    task_id: str = "default",
+    force: bool = False,
+) -> tuple[list, bool]:
+    """Persist a deterministic tool-only context checkpoint when worthwhile.
+
+    Full historical rows remain on disk through ``archive_and_compact``; only
+    the active model-facing transcript is replaced. The cached system prompt and
+    session id stay unchanged, so cache invalidation is limited to checkpoint
+    advances rather than happening on every request.
+    """
+    compressor = getattr(agent, "context_compressor", None)
+    compact = getattr(compressor, "compact_tool_payloads", None)
+    if compact is None or not getattr(agent, "compression_enabled", False):
+        return messages, False
+
+    compacted, stats = compact(messages, force=force)
+    if not stats.get("changed"):
+        return messages, False
+    original_bytes = int(stats.get("eligible_original_bytes") or 0)
+    compacted_bytes = int(stats.get("eligible_compacted_bytes") or 0)
+    if original_bytes <= 0 or compacted_bytes > int(original_bytes * 0.20):
+        logger.warning(
+            "tool payload checkpoint rejected: session=%s original_bytes=%d "
+            "compacted_bytes=%d",
+            getattr(agent, "session_id", None) or "none", original_bytes, compacted_bytes,
+        )
+        return messages, False
+
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None) or ""
+    # A stable checkpoint must be durable. Without the SQLite archive path an
+    # in-memory projection would disappear on resume (and rewriting a gateway
+    # transcript would destroy the only full-fidelity copy), so fail closed.
+    if session_db is None or not session_id:
+        return messages, False
+
+    holder = None
+    locked = False
+    if session_db is not None and session_id:
+        holder = _compression_lock_holder(agent)
+        try:
+            locked = bool(session_db.try_acquire_compression_lock(
+                session_id, holder, ttl_seconds=60.0
+            ))
+        except Exception as exc:
+            logger.warning(
+                "tool payload checkpoint skipped: compression lock unavailable "
+                "for session=%s (%s)", session_id, exc,
+            )
+            return messages, False
+        if not locked:
+            logger.info(
+                "tool payload checkpoint skipped: session=%s is already compacting",
+                session_id,
+            )
+            return messages, False
+
+    try:
+        session_db.archive_and_compact(session_id, compacted)
+        agent._flushed_db_message_ids = set()
+        agent._last_flushed_db_idx = 0
+        agent._last_compaction_in_place = True
+        try:
+            compressor.on_session_start(
+                session_id,
+                boundary_reason="tool_payload_checkpoint",
+                old_session_id=session_id,
+                session_db=session_db,
+                platform=getattr(agent, "platform", None) or "cli",
+                conversation_id=getattr(agent, "_gateway_session_key", None),
+            )
+        except Exception as exc:
+            logger.debug("context engine tool checkpoint notification failed: %s", exc)
+        try:
+            from tools.file_tools import reset_file_dedup
+            reset_file_dedup(task_id)
+        except Exception:
+            pass
+        logger.info(
+            "tool payload checkpoint committed: session=%s original_bytes=%d "
+            "compacted_bytes=%d reduction=%.1f%% results=%d arguments=%d",
+            session_id or "none", original_bytes, compacted_bytes,
+            float(stats.get("reduction_ratio") or 0.0) * 100.0,
+            int(stats.get("tool_results_compacted") or 0),
+            int(stats.get("tool_arguments_compacted") or 0),
+        )
+        return compacted, True
+    except Exception as exc:
+        logger.warning(
+            "tool payload checkpoint failed; canonical transcript preserved: %s", exc
+        )
+        return messages, False
+    finally:
+        if session_db is not None and session_id and holder and locked:
+            try:
+                session_db.release_compression_lock(session_id, holder)
+            except Exception as exc:
+                logger.debug("tool checkpoint lock release failed: %s", exc)
+
+
 def compress_context(
     agent: Any,
     messages: list,
