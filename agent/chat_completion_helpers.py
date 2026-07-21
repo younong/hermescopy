@@ -1476,6 +1476,13 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 api_mode=agent.api_mode,
             )
 
+        try:
+            from agent.async_context_compression import invalidate_compression_runtime
+
+            invalidate_compression_runtime(agent, reason="model changed")
+        except Exception:
+            pass
+
         # Keep the prompt's self-identity in sync with the model actually
         # answering, so "what model are you?" doesn't report the primary.
         rewrite_prompt_model_identity(agent, fb_model, fb_provider)

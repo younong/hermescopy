@@ -1452,6 +1452,53 @@ def init_agent(
     except Exception:
         pass
     compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
+    compression_async_prepare = str(
+        _compression_cfg.get("async_prepare", True)
+    ).lower() in {"true", "1", "yes"}
+    try:
+        _configured_prepare_threshold = float(
+            _compression_cfg.get("prepare_threshold", compression_threshold)
+        )
+        compression_commit_threshold = float(
+            _compression_cfg.get("commit_threshold", 0.80)
+        )
+        compression_emergency_threshold = float(
+            _compression_cfg.get("emergency_threshold", 0.88)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "compression prepare/commit/emergency thresholds must be numeric ratios"
+        ) from exc
+    if not (
+        0 < _configured_prepare_threshold < 1
+        and 0 < compression_commit_threshold < 1
+        and 0 < compression_emergency_threshold < 1
+    ):
+        raise ValueError(
+            "compression thresholds must be greater than 0 and less than 1"
+        )
+    # Provider/model overrides can raise the built-in compressor threshold
+    # (for example Codex gpt-5.5 to 85%). Keep all async stages monotonic.
+    compression_prepare_threshold = max(
+        _configured_prepare_threshold, compression_threshold
+    )
+    compression_commit_threshold = max(
+        compression_prepare_threshold, compression_commit_threshold
+    )
+    compression_emergency_threshold = max(
+        compression_commit_threshold, compression_emergency_threshold
+    )
+    if compression_emergency_threshold >= 1:
+        raise ValueError("compression emergency threshold must remain below 1")
+    try:
+        compression_emergency_wait_seconds = float(
+            _compression_cfg.get("emergency_wait_seconds", 15.0)
+        )
+    except (TypeError, ValueError):
+        compression_emergency_wait_seconds = 15.0
+    compression_emergency_wait_seconds = max(
+        10.0, min(compression_emergency_wait_seconds, 20.0)
+    )
     compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
     compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
     # protect_first_n is the number of non-system messages to protect at
@@ -1676,6 +1723,7 @@ def init_agent(
     # else: config says "compressor" — use built-in, don't auto-activate plugins
 
     if _selected_engine is not None:
+        agent._using_builtin_context_compressor = False
         agent.context_compressor = _selected_engine
         # Resolve context_length for plugin engines — mirrors switch_model() path
         from agent.model_metadata import get_model_context_length
@@ -1698,6 +1746,7 @@ def init_agent(
         if not agent.quiet_mode:
             _ra().logger.info("Using context engine: %s", _selected_engine.name)
     else:
+        agent._using_builtin_context_compressor = True
         agent.context_compressor = ContextCompressor(
             model=agent.model,
             threshold_percent=compression_threshold,
@@ -1722,6 +1771,11 @@ def init_agent(
             pass
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
+    agent.compression_async_prepare = compression_async_prepare
+    agent.compression_prepare_threshold = compression_prepare_threshold
+    agent.compression_commit_threshold = compression_commit_threshold
+    agent.compression_emergency_threshold = compression_emergency_threshold
+    agent.compression_emergency_wait_seconds = compression_emergency_wait_seconds
 
     # Reject models whose context window is below the minimum required
     # for reliable tool-calling workflows (64K tokens).
@@ -1927,6 +1981,7 @@ def init_agent(
     # ``ensure_compression_feasibility_checked`` (called from
     # ``run_conversation``'s preflight) runs it at most once per agent.
     agent._compression_feasibility_checked = False
+    agent._compression_prepare_token_cap = None
 
     # Snapshot primary runtime for per-turn restoration.  When fallback
     # activates during a turn, the next turn restores these values so the

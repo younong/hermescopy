@@ -269,6 +269,46 @@ def check_compression_model_feasibility(agent: Any) -> None:
             )
 
         threshold = agent.context_compressor.threshold_tokens
+        # Async preparation may be configured above the synchronous compressor
+        # threshold. Cap that speculative snapshot independently so it always
+        # fits the auxiliary model without changing synchronous semantics.
+        main_ctx = agent.context_compressor.context_length
+        max_tokens = int(getattr(agent.context_compressor, "max_tokens", 0) or 0)
+        usable = max(1, int(main_ctx or 0) - max_tokens)
+        configured_prepare = int(
+            usable
+            * float(
+                getattr(
+                    agent,
+                    "compression_prepare_threshold",
+                    getattr(agent.context_compressor, "threshold_percent", 0.50),
+                )
+            )
+        )
+        async_prepare = max(int(threshold), configured_prepare)
+        agent._compression_prepare_token_cap = (
+            int(aux_context) if aux_context < async_prepare else None
+        )
+        if (
+            aux_context >= threshold
+            and aux_context < async_prepare
+            and getattr(agent, "compression_async_prepare", False)
+        ):
+            msg = (
+                f"⚠ Compression model {aux_model} context is {aux_context:,} "
+                f"tokens, below the async preparation threshold of "
+                f"{async_prepare:,} tokens. Capped background preparation at "
+                f"{aux_context:,} tokens for this session."
+            )
+            agent._compression_warning = msg
+            agent._emit_status(msg)
+            logger.warning(
+                "Auxiliary compression model %s capped async preparation from "
+                "%d to %d tokens.",
+                aux_model,
+                async_prepare,
+                aux_context,
+            )
         if aux_context < threshold:
             # Auto-correct: lower the live session threshold so
             # compression actually works this session.  The hard floor
@@ -282,10 +322,13 @@ def check_compression_model_feasibility(agent: Any) -> None:
             old_threshold = threshold
             new_threshold = aux_context
             agent.context_compressor.threshold_tokens = new_threshold
+            # Async preparation must obey the auxiliary model's absolute
+            # input limit even when compression.prepare_threshold is configured
+            # as a higher ratio of the main model's context window.
+            agent._compression_prepare_token_cap = new_threshold
             # Keep threshold_percent in sync so future main-model
             # context_length changes (update_model) re-derive from a
             # sensible number rather than the original too-high value.
-            main_ctx = agent.context_compressor.context_length
             if main_ctx:
                 agent.context_compressor.threshold_percent = (
                     new_threshold / main_ctx
@@ -469,6 +512,12 @@ def maybe_compact_tool_payloads(
         agent._last_flushed_db_idx = 0
         agent._last_compaction_in_place = True
         try:
+            from agent.async_context_compression import invalidate_preparation
+
+            invalidate_preparation(agent, reason="tool payload checkpoint")
+        except Exception:
+            pass
+        try:
             compressor.on_session_start(
                 session_id,
                 boundary_reason="tool_payload_checkpoint",
@@ -506,6 +555,34 @@ def maybe_compact_tool_payloads(
                 logger.debug("tool checkpoint lock release failed: %s", exc)
 
 
+def _prepared_snapshot_is_current(prepared: Any, agent: Any, messages: list) -> bool:
+    from agent.async_context_compression import prepared_snapshot_is_current
+
+    return prepared_snapshot_is_current(prepared, agent, messages)
+
+
+def commit_prepared_context(
+    agent: Any,
+    messages: list,
+    system_message: str,
+    *,
+    prepared: Any,
+    approx_tokens: Optional[int] = None,
+    task_id: str = "default",
+    emit_abort_warning: bool = True,
+) -> Tuple[list, str]:
+    """Atomically validate and commit a detached background preparation."""
+    return compress_context(
+        agent,
+        messages,
+        system_message,
+        approx_tokens=approx_tokens,
+        task_id=task_id,
+        emit_abort_warning=emit_abort_warning,
+        _prepared=prepared,
+    )
+
+
 def compress_context(
     agent: Any,
     messages: list,
@@ -516,6 +593,7 @@ def compress_context(
     focus_topic: Optional[str] = None,
     force: bool = False,
     emit_abort_warning: bool = True,
+    _prepared: Any = None,
 ) -> Tuple[list, str]:
     """Compress conversation context and split the session in SQLite.
 
@@ -546,6 +624,16 @@ def compress_context(
     # This marker describes only this high-level attempt. The compressor's
     # own flag can predate an early return (for example lock contention).
     agent._last_compression_attempt_aborted = False
+
+    # Any synchronous attempt supersedes a speculative snapshot. Prepared
+    # commits pass the matching record explicitly and invalidate it only after
+    # the coordinator has completed the atomic commit.
+    if _prepared is None:
+        try:
+            from agent.async_context_compression import invalidate_preparation
+            invalidate_preparation(agent, reason="synchronous compression")
+        except Exception:
+            pass
 
     # Lazy feasibility check — run the auxiliary-provider probe + context
     # length lookup just-in-time on the first compression attempt instead of
@@ -695,26 +783,32 @@ def compress_context(
             except Exception as _rel_err:
                 logger.debug("compression lock release failed: %s", _rel_err)
 
-    # Notify external memory provider before compression discards context
-    if agent._memory_manager:
-        try:
-            agent._memory_manager.on_pre_compress(messages)
-        except Exception:
-            pass
-
     deadline_monotonic = None
     if not force:
         deadline_monotonic = time.monotonic() + _AUTOMATIC_COMPRESSION_DEADLINE_SECONDS
 
     try:
-        compressed = agent.context_compressor.compress(
-            messages,
-            current_tokens=approx_tokens,
-            focus_topic=focus_topic,
-            force=force,
-            deadline_monotonic=deadline_monotonic,
-        )
+        if _prepared is not None:
+            if not _prepared_snapshot_is_current(_prepared, agent, messages):
+                raise ValueError("prepared compression snapshot is stale")
+            delta = messages[_prepared.snapshot_length:]
+            compressed = agent.context_compressor.apply_prepared_compression(
+                _prepared.compression,
+                delta,
+                current_tokens=approx_tokens,
+            )
+        else:
+            compressed = agent.context_compressor.compress(
+                messages,
+                current_tokens=approx_tokens,
+                focus_topic=focus_topic,
+                force=force,
+                deadline_monotonic=deadline_monotonic,
+            )
     except TypeError:
+        if _prepared is not None:
+            _release_lock()
+            raise
         # Plugin context engine with strict signature that doesn't accept
         # focus_topic / force — fall back to calling without them.
         try:
@@ -762,6 +856,14 @@ def compress_context(
             _release_lock()
 
     try:
+        # Preparation is pure. Notify memory only after a valid projection exists
+        # and immediately before live transcript state is committed.
+        if agent._memory_manager:
+            try:
+                agent._memory_manager.on_pre_compress(messages)
+            except Exception:
+                pass
+
         summary_error = getattr(agent.context_compressor, "_last_summary_error", None)
         if summary_error:
             if getattr(agent, "_last_compression_summary_warning", None) != summary_error:

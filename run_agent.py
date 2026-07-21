@@ -642,6 +642,15 @@ class AIAgent:
         reset runtime counters, bind to the new session, and optionally
         carry retained context forward.
         """
+        try:
+            from agent.async_context_compression import invalidate_compression_runtime
+
+            invalidate_compression_runtime(
+                self, reason="context engine session transition"
+            )
+        except Exception:
+            pass
+
         engine = getattr(self, "context_compressor", None)
         if not engine:
             return
@@ -792,6 +801,14 @@ class AIAgent:
                         provider=self.provider,
                         api_mode=self.api_mode,
                     )
+                    try:
+                        from agent.async_context_compression import (
+                            invalidate_compression_runtime,
+                        )
+
+                        invalidate_compression_runtime(self, reason="model changed")
+                    except Exception:
+                        pass
         except Exception as err:
             logger.debug("LM Studio preload skipped: %s", err)
 
@@ -3449,6 +3466,11 @@ class AIAgent:
         independently guarded so a failure in one does not prevent the rest.
         """
         task_id = getattr(self, "session_id", None) or ""
+        try:
+            from agent.async_context_compression import invalidate_preparation
+            invalidate_preparation(self, reason="agent close")
+        except Exception:
+            pass
 
         # 1. Kill background processes for this task
         try:
