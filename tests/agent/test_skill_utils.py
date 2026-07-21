@@ -10,9 +10,53 @@ from agent.skill_utils import (
     is_external_skill_path,
     is_skill_support_path,
     iter_skill_index_files,
+    parse_frontmatter,
     resolve_skill_config_values,
     skill_matches_platform,
 )
+
+
+def test_parse_frontmatter_returns_original_body_without_header():
+    content = "# Body\n"
+    assert parse_frontmatter(content) == ({}, content)
+
+
+def test_parse_frontmatter_returns_original_body_without_closing_delimiter():
+    content = "---\nname: broken\n# Body\n"
+    assert parse_frontmatter(content) == ({}, content)
+
+
+def test_parse_frontmatter_parses_nested_mapping_and_body():
+    content = "---\nname: demo\nmetadata:\n  hermes:\n    tags: [a, b]\n---\n\n# Body\n"
+    frontmatter, body = parse_frontmatter(content)
+    assert frontmatter == {
+        "name": "demo",
+        "metadata": {"hermes": {"tags": ["a", "b"]}},
+    }
+    assert body == "# Body\n"
+
+
+def test_parse_frontmatter_ignores_non_mapping_yaml():
+    frontmatter, body = parse_frontmatter("---\n- one\n- two\n---\nBody\n")
+    assert frontmatter == {}
+    assert body == "Body\n"
+
+
+def test_parse_frontmatter_falls_back_for_malformed_yaml():
+    frontmatter, body = parse_frontmatter(
+        "---\nname: demo\ndescription: [broken\n---\nBody\n"
+    )
+    assert frontmatter == {"name": "demo", "description": "[broken"}
+    assert body == "Body\n"
+
+
+def test_parse_frontmatter_can_disable_malformed_yaml_fallback():
+    frontmatter, body = parse_frontmatter(
+        "---\nname: demo\ndescription: [broken\n---\nBody\n",
+        fallback_on_error=False,
+    )
+    assert frontmatter == {}
+    assert body == "Body\n"
 
 
 def test_metadata_as_dict_with_hermes():

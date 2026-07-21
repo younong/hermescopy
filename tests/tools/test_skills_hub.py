@@ -74,6 +74,18 @@ class TestParseFrontmatterQuick:
         assert fm == {}
 
 
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("---\nname: optional\nmetadata:\n  tags: [a, b]\n---\nBody\n", {"name": "optional", "metadata": {"tags": ["a", "b"]}}),
+        ("---\nname: optional\ndescription: [broken\n---\nBody\n", {}),
+        ("---\n- one\n- two\n---\nBody\n", {}),
+    ],
+)
+def test_optional_skill_frontmatter_compatibility(content, expected):
+    assert OptionalSkillSource._parse_frontmatter(content) == expected
+
+
 # ---------------------------------------------------------------------------
 # GitHubSource skills.sh.json grouping sidecar (category support)
 # ---------------------------------------------------------------------------

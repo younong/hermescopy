@@ -120,11 +120,13 @@ def yaml_load(content: str):
 # ── Frontmatter parsing ──────────────────────────────────────────────────
 
 
-def parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
+def parse_frontmatter(
+    content: str, *, fallback_on_error: bool = True
+) -> Tuple[Dict[str, Any], str]:
     """Parse YAML frontmatter from a markdown string.
 
     Uses yaml with CSafeLoader for full YAML support (nested metadata, lists)
-    with a fallback to simple key:value splitting for robustness.
+    with an optional fallback to simple key:value splitting for robustness.
 
     Returns:
         (frontmatter_dict, remaining_body)
@@ -147,6 +149,8 @@ def parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
         if isinstance(parsed, dict):
             frontmatter = parsed
     except Exception:
+        if not fallback_on_error:
+            return frontmatter, body
         # Fallback: simple key:value parsing for malformed YAML
         for line in yaml_content.strip().split("\n"):
             if ":" not in line:
