@@ -212,6 +212,133 @@ describe("guiChatReducer history image restoration", () => {
     });
   });
 
+  it("attaches generated images to the active reply and hides the storage path", () => {
+    const imagePath = "/workspace/.hermes/users/owner/images/result.png";
+    const actions = [
+      { event: { payload: { cwd: "/workspace" }, type: "session.info" }, type: "event" },
+      { event: { type: "message.start" }, type: "event" },
+      {
+        event: { payload: { id: "tool-image", name: "image_generate" }, type: "tool.start" },
+        type: "event",
+      },
+      {
+        event: {
+          payload: {
+            id: "tool-image",
+            name: "image_generate",
+            result: { image: imagePath, success: true },
+          },
+          type: "tool.complete",
+        },
+        type: "event",
+      },
+      {
+        event: {
+          payload: { text: `图片已生成。\n\n生成路径：\`${imagePath}\`` },
+          type: "message.complete",
+        },
+        type: "event",
+      },
+    ] as const;
+    const state = actions.reduce(guiChatReducer, initialGuiChatState);
+    const message = state.messages[0];
+
+    expect(message.text).toBe("图片已生成。");
+    expect(message.artifactIds).toEqual(["tool-image-image"]);
+    expect(state.toolCalls["tool-image"].artifactIds).toEqual([]);
+    expect(Object.keys(state.artifacts)).toEqual(["tool-image-image"]);
+    expect(imageArtifact(state, "tool-image-image")).toMatchObject({
+      downloadUrl:
+        "/api/files/download?path=%2Fworkspace%2F.hermes%2Fusers%2Fowner%2Fimages%2Fresult.png&cwd=%2Fworkspace&filename=result.png",
+      messageId: message.id,
+      toolCallId: "tool-image",
+      url: "/api/fs/read-data-url?path=%2Fworkspace%2F.hermes%2Fusers%2Fowner%2Fimages%2Fresult.png",
+    });
+    expect(message.streaming).toBe(false);
+    expect(message.status).toBe("complete");
+  });
+
+  it("reconciles translated tool and reply image paths without duplicating the image", () => {
+    const started = guiChatReducer(initialGuiChatState, {
+      event: { type: "message.start" },
+      type: "event",
+    });
+    const completedTool = guiChatReducer(started, {
+      event: {
+        payload: {
+          id: "tool-image",
+          name: "image_generate",
+          result: {
+            host_image: "/host/.hermes/users/owner/images/result.png",
+            image: "/sandbox/.hermes/cache/images/result.png",
+            success: true,
+          },
+        },
+        type: "tool.complete",
+      },
+      type: "event",
+    });
+    const state = guiChatReducer(completedTool, {
+      event: {
+        payload: { text: "已生成： `/sandbox/.hermes/cache/images/result.png`" },
+        type: "message.complete",
+      },
+      type: "event",
+    });
+
+    expect(state.messages[0].text).toBe("");
+    expect(state.messages[0].artifactIds).toEqual(["tool-image-image"]);
+    expect(Object.keys(state.artifacts)).toEqual(["tool-image-image"]);
+  });
+
+  it("creates message-owned image artifacts from final reply references", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      event: {
+        payload: {
+          text: "结果如下：\n![cat](https://example.com/cat.png)\n文件路径： `/workspace/report.html`",
+        },
+        type: "message.complete",
+      },
+      type: "event",
+    });
+    const message = state.messages[0];
+    const artifacts = message.artifactIds.map((id) => state.artifacts[id]);
+
+    expect(message.text).toBe("结果如下：\n\n文件路径： `/workspace/report.html`");
+    expect(artifacts).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        messageId: message.id,
+        url: "https://example.com/cat.png",
+      }),
+      expect.objectContaining({
+        kind: "file",
+        messageId: message.id,
+        sourcePath: "/workspace/report.html",
+      }),
+    ]));
+  });
+
+  it("keeps image results tool-owned when no assistant reply is active", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      event: {
+        payload: {
+          id: "tool-image",
+          name: "image_generate",
+          result: { image: "/tmp/result.png", success: true },
+        },
+        type: "tool.complete",
+      },
+      type: "event",
+    });
+
+    expect(state.messages).toEqual([]);
+    expect(state.toolCalls["tool-image"].artifactIds).toEqual(["tool-image-image"]);
+    expect(imageArtifact(state, "tool-image-image")).toMatchObject({
+      messageId: undefined,
+      toolCallId: "tool-image",
+    });
+  });
+
   it("does not retain large non-rendered tool results in chat state", () => {
     const state = guiChatReducer(initialGuiChatState, {
       event: {
