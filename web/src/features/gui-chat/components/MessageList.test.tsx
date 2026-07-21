@@ -7,13 +7,65 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { initialGuiChatState } from "../types";
 import { MessageList } from "./MessageList";
 
+const resizeObservers: TestResizeObserver[] = [];
+
+class TestResizeObserver implements ResizeObserver {
+  readonly callback: ResizeObserverCallback;
+  readonly targets = new Set<Element>();
+
+  constructor(callback: ResizeObserverCallback) {
+    this.callback = callback;
+    resizeObservers.push(this);
+  }
+
+  disconnect() {
+    this.targets.clear();
+  }
+
+  observe(target: Element) {
+    this.targets.add(target);
+  }
+
+  unobserve(target: Element) {
+    this.targets.delete(target);
+  }
+}
+
+function resize(element: Element, blockSize: number) {
+  resizeObservers.find((observer) => observer.targets.has(element))?.callback(
+    [{
+      borderBoxSize: [{ blockSize, inlineSize: 800 }],
+      target: element,
+    } as unknown as ResizeObserverEntry],
+    {} as ResizeObserver,
+  );
+}
+
+function scroll(element: HTMLElement, scrollTop: number) {
+  element.scrollTop = scrollTop;
+  element.dispatchEvent(new Event("scroll", { bubbles: true }));
+}
+
 beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
     .IS_REACT_ACT_ENVIRONMENT = true;
   document.body.innerHTML = "";
+  resizeObservers.length = 0;
+  vi.stubGlobal("ResizeObserver", TestResizeObserver);
   Object.defineProperties(HTMLElement.prototype, {
-    offsetHeight: { configurable: true, get: () => 600 },
+    offsetHeight: {
+      configurable: true,
+      get() {
+        return this.hasAttribute("data-index") ? 140 : 600;
+      },
+    },
     offsetWidth: { configurable: true, get: () => 800 },
+    scrollTo: {
+      configurable: true,
+      value(options: ScrollToOptions) {
+        if (typeof options.top === "number") this.scrollTop = options.top;
+      },
+    },
   });
 });
 
@@ -65,6 +117,53 @@ describe("MessageList", () => {
     expect(
       container.querySelector('a[href="/api/files/download?path=%2Fworkspace%2Freport.html"]'),
     ).not.toBeNull();
+
+    await act(async () => root.unmount());
+  });
+
+  it("keeps image history pinned only while the user is at the bottom", async () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    const messages = Array.from({ length: 8 }, (_, index) => ({
+      artifactIds: index === 7 ? ["generated-image"] : [],
+      id: `message-${index}`,
+      role: "assistant" as const,
+      text: `Reply ${index}`,
+    }));
+
+    await act(async () => root.render(
+      <MessageList
+        forceBottomKey="history-session"
+        onClarifyRespond={() => undefined}
+        onApprovalRespond={() => undefined}
+        state={{
+          ...initialGuiChatState,
+          artifacts: {
+            "generated-image": {
+              id: "generated-image",
+              messageId: "message-7",
+              title: "Generated image",
+              toolCallId: "tool-image",
+              url: "data:image/png;base64,AAAA",
+            },
+          },
+          messages,
+          sessionId: "history-session",
+        }}
+      />,
+    ));
+
+    const scroller = container.querySelector<HTMLElement>("[aria-busy=false]")!;
+    const imageRow = container.querySelector<HTMLElement>('[data-index="7"]')!;
+    await act(async () => scroll(scroller, 520));
+
+    await act(async () => resize(imageRow, 340));
+    expect(scroller.scrollTop).toBe(720);
+
+    await act(async () => scroll(scroller, 400));
+    await act(async () => resize(imageRow, 440));
+    expect(scroller.scrollTop).toBe(400);
 
     await act(async () => root.unmount());
   });

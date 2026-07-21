@@ -77,6 +77,7 @@ export function MessageList({
   }, [state]);
 
   const virtualizer = useVirtualizer({
+    anchorTo: "end",
     count: rows.length,
     estimateSize: (index) => rows[index]?.kind === "message" ? 140 : 72,
     getItemKey: (index) => rows[index]?.id ?? index,
