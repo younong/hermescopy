@@ -203,34 +203,69 @@ def test_ws_disconnect_preserves_and_repoints_reconnectable_session(monkeypatch)
         server._sessions.clear()
 
 
+class _FakeClock:
+    def __init__(self):
+        self.value = 0.0
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += seconds
+
+
 class _FakeTimerHandle:
-    def __init__(self, delay, callback):
+    def __init__(self, delay, callback, *, due_at=None):
         self.delay = delay
         self.callback = callback
+        self.due_at = due_at
         self.cancelled = False
+        self.fired = False
 
     def cancel(self):
         self.cancelled = True
 
     def fire(self):
         assert not self.cancelled
+        assert not self.fired
+        self.fired = True
         self.callback()
 
 
 class _FakeTransportLoop:
-    def __init__(self):
+    def __init__(self, clock=None):
+        self.clock = clock
         self.timers = []
 
     def call_soon_threadsafe(self, callback):
         callback()
 
     def call_later(self, delay, callback):
-        handle = _FakeTimerHandle(delay, callback)
+        due_at = self.clock() + delay if self.clock is not None else None
+        handle = _FakeTimerHandle(delay, callback, due_at=due_at)
         self.timers.append(handle)
         return handle
 
     def create_task(self, coroutine):
         return asyncio.run(coroutine)
+
+    def advance(self, seconds):
+        assert self.clock is not None
+        self.clock.advance(seconds)
+        while True:
+            due = next(
+                (
+                    timer
+                    for timer in self.timers
+                    if not timer.cancelled
+                    and not timer.fired
+                    and timer.due_at <= self.clock() + 1e-9
+                ),
+                None,
+            )
+            if due is None:
+                break
+            due.fire()
 
 
 def _gateway_event(event_type, *, text=None, session_id="sid"):
@@ -538,8 +573,184 @@ def test_ws_dashboard_attach_drops_coalesced_tokens_after_subscription_switch():
     assert transport.begin_dashboard_attach(2, browser_id="browser-a") is None
     assert transport.commit_dashboard_attach(2, "runtime-b") is True
     loop.timers[0].fire()
+    assert sent == []
+
+    jitter_timer = next(
+        timer for timer in loop.timers if not timer.cancelled and not timer.fired
+    )
+    jitter_timer.fire()
+    assert sent == []
+    assert transport.metrics_snapshot()["subscription_dropped"] == 1
+
+
+def _attached_jitter_transport(*, config=None):
+    sent = []
+
+    class FakeWS:
+        async def send_text(self, line):
+            sent.append(json.loads(line))
+
+    clock = _FakeClock()
+    loop = _FakeTransportLoop(clock)
+    transport = ws_mod.WSTransport(
+        FakeWS(),
+        loop,
+        monotonic=clock,
+        jitter_config=config or ws_mod._DEFAULT_JITTER_CONFIG,
+    )
+    assert transport.begin_dashboard_attach(1, browser_id="browser-a") is None
+    assert transport.commit_dashboard_attach(1, "sid") is True
+    return sent, clock, loop, transport
+
+
+def test_ws_dashboard_jitter_sparse_stream_releases_after_probe():
+    sent, _clock, loop, transport = _attached_jitter_transport()
+
+    transport.write(_gateway_event("message.delta", text="hello"))
+    loop.advance(ws_mod._TOKEN_COALESCE_S)
+    assert sent == []
+
+    loop.advance(ws_mod._DEFAULT_JITTER_CONFIG.probe_s)
+
+    assert [item["params"]["payload"]["text"] for item in sent] == ["hello"]
+    summary = transport.metrics_snapshot()
+    assert summary["jitter_sparse_releases"] == 1
+    assert summary["jitter_burst_activations"] == 0
+    assert summary["jitter_wait_max_ms"] == 120
+
+
+def test_ws_dashboard_jitter_confirmed_burst_reserves_then_drains_adaptively():
+    config = ws_mod._JitterConfig(
+        probe_s=0.120,
+        reserve_s=0.500,
+        target_latency_s=0.900,
+        max_latency_s=1.250,
+        max_backlog_chars=5000,
+        low_interval_s=0.100,
+        medium_interval_s=0.066,
+        high_interval_s=0.033,
+        low_budget_chars=3,
+        medium_budget_chars=5,
+        high_budget_chars=8,
+    )
+    sent, _clock, loop, transport = _attached_jitter_transport(config=config)
+
+    transport.write(_gateway_event("message.delta", text="aaa"))
+    loop.advance(ws_mod._TOKEN_COALESCE_S)
+    transport.write(_gateway_event("message.delta", text="bbbb"))
+    loop.advance(ws_mod._TOKEN_COALESCE_S)
+    assert sent == []
+
+    loop.advance(config.reserve_s - ws_mod._TOKEN_COALESCE_S)
+    assert [item["params"]["payload"]["text"] for item in sent] == ["aaa"]
+    assert any(
+        not timer.cancelled
+        and not timer.fired
+        and timer.delay == config.low_interval_s
+        for timer in loop.timers
+    )
+
+    loop.advance(config.low_interval_s)
+    assert [item["params"]["payload"]["text"] for item in sent] == ["aaa", "bbbb"]
+    summary = transport.metrics_snapshot()
+    assert summary["jitter_burst_activations"] == 1
+    assert summary["jitter_timer_drains"] == 2
+    assert summary["jitter_backlog_frames_max"] == 2
+    assert summary["jitter_backlog_chars_max"] == 7
+
+
+def test_ws_dashboard_jitter_backlog_cap_releases_without_waiting():
+    config = ws_mod._JitterConfig(max_backlog_chars=6)
+    sent, _clock, loop, transport = _attached_jitter_transport(config=config)
+
+    transport.write(_gateway_event("message.delta", text="abcdef"))
+    loop.advance(ws_mod._TOKEN_COALESCE_S)
+
+    assert [item["params"]["payload"]["text"] for item in sent] == ["abcdef"]
+    assert transport.metrics_snapshot()["jitter_cap_drains"] == 1
+
+
+def test_ws_dashboard_jitter_barrier_drains_text_before_control():
+    sent, _clock, loop, transport = _attached_jitter_transport()
+
+    transport.write(_gateway_event("message.delta", text="partial"))
+    loop.advance(ws_mod._TOKEN_COALESCE_S)
+    transport.write(_gateway_event("thinking.delta", text="working"))
+    loop.advance(ws_mod._TOKEN_COALESCE_S)
+
+    assert [item["params"]["type"] for item in sent] == [
+        "message.delta",
+        "thinking.delta",
+    ]
+    assert transport.metrics_snapshot()["jitter_barrier_drains"] == 1
+
+
+def test_ws_dashboard_jitter_completion_flushes_text_and_disables_turn_buffer(
+    monkeypatch,
+):
+    sent, _clock, loop, transport = _attached_jitter_transport()
+
+    class FakeFuture:
+        def result(self, timeout):
+            return None
+
+    def schedule(coroutine, _loop):
+        asyncio.run(coroutine)
+        return FakeFuture()
+
+    monkeypatch.setattr("agent.async_utils.safe_schedule_threadsafe", schedule)
+    transport.write(_gateway_event("message.delta", text="partial "))
+    loop.advance(ws_mod._TOKEN_COALESCE_S)
+    assert transport.write(
+        _gateway_event("message.complete", text="partial answer")
+    ) is True
+
+    assert transport.write(_gateway_event("message.delta", text="late")) is True
+    loop.advance(ws_mod._TOKEN_COALESCE_S)
+
+    assert [item["params"]["type"] for item in sent] == [
+        "message.delta",
+        "message.complete",
+        "message.delta",
+    ]
+    assert sent[-1]["params"]["payload"]["text"] == "late"
+
+    assert transport.write(_gateway_event("message.start")) is True
+    assert transport.write(_gateway_event("message.delta", text="next")) is True
+    loop.advance(ws_mod._TOKEN_COALESCE_S)
+    assert [item["params"]["type"] for item in sent][-1] == "message.start"
+    loop.advance(ws_mod._DEFAULT_JITTER_CONFIG.probe_s)
+    assert sent[-1]["params"]["payload"]["text"] == "next"
+    assert transport.metrics_snapshot()["jitter_barrier_drains"] == 1
+
+
+def test_ws_jitter_is_dashboard_only_and_legacy_ws_keeps_33ms_coalescing():
+    sent = []
+
+    class FakeWS:
+        async def send_text(self, line):
+            sent.append(json.loads(line))
+
+    clock = _FakeClock()
+    loop = _FakeTransportLoop(clock)
+    transport = ws_mod.WSTransport(FakeWS(), loop, monotonic=clock)
+    transport.write(_gateway_event("message.delta", text="legacy"))
+    loop.advance(ws_mod._TOKEN_COALESCE_S)
+
+    assert [item["params"]["payload"]["text"] for item in sent] == ["legacy"]
+    assert transport.metrics_snapshot()["jitter_message_frames"] == 0
+
+
+def test_ws_dashboard_close_counts_jitter_backlog_without_content():
+    sent, _clock, loop, transport = _attached_jitter_transport()
+    transport.write(_gateway_event("message.delta", text="secret-jitter"))
+    loop.advance(ws_mod._TOKEN_COALESCE_S)
+
+    summary = transport.close()
 
     assert sent == []
+    assert summary["jitter_close_dropped"] == 1
+    assert "secret-jitter" not in json.dumps(summary)
 
 
 def test_ws_transport_merges_streaming_frames_in_one_flush():
@@ -575,6 +786,45 @@ def test_ws_transport_merges_streaming_frames_in_one_flush():
     first = json.loads(merged[0])
     assert first["params"]["payload"] == {"text": "hello", "rendered": "hello"}
     assert json.loads(merged[1])["params"]["type"] == "tool.start"
+
+
+def test_ws_dashboard_jitter_real_loop_preserves_worker_barrier_order():
+    sent = []
+    sent_ready = threading.Event()
+
+    class FakeWS:
+        async def send_text(self, line):
+            sent.append(json.loads(line))
+            if len(sent) >= 2:
+                sent_ready.set()
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    try:
+        transport = ws_mod.WSTransport(
+            FakeWS(),
+            loop,
+            jitter_config=ws_mod._JitterConfig(probe_s=0.05, reserve_s=0.2),
+        )
+        assert transport.begin_dashboard_attach(1, browser_id="browser-a") is None
+        assert transport.commit_dashboard_attach(1, "sid") is True
+
+        transport.write(_gateway_event("message.delta", text="worker text"))
+        transport.write(_gateway_event("message.complete", text="worker text"))
+
+        assert sent_ready.wait(timeout=2)
+        assert [item["params"]["type"] for item in sent] == [
+            "message.delta",
+            "message.complete",
+        ]
+        assert transport._closed is False
+    finally:
+        if "transport" in locals():
+            loop.call_soon_threadsafe(transport.close)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+        loop.close()
 
 
 def test_ws_write_loop_stall_does_not_latch_transport(monkeypatch):

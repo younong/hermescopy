@@ -30,6 +30,7 @@ import logging
 import socket
 import threading
 import time
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from agent.stream_diag import (
@@ -67,6 +68,41 @@ _STREAMING_EVENT_TYPES = frozenset({
 _TOKEN_COALESCE_S = 0.033
 _WS_TIMING_BUCKETS_MS = (1, 5, 10, 25, 33, 50, 100, 250, 500, 1000)
 _WS_BATCH_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128)
+_JITTER_TIMING_BUCKETS_MS = (25, 50, 100, 120, 250, 500, 750, 1000, 1250)
+
+
+@dataclass(frozen=True)
+class _JitterConfig:
+    probe_s: float = 0.120
+    reserve_s: float = 0.500
+    target_latency_s: float = 0.900
+    max_latency_s: float = 1.250
+    max_backlog_chars: int = 3200
+    low_interval_s: float = 0.100
+    medium_interval_s: float = 0.066
+    high_interval_s: float = 0.033
+    low_budget_chars: int = 250
+    medium_budget_chars: int = 700
+    high_budget_chars: int = 1600
+
+
+_DEFAULT_JITTER_CONFIG = _JitterConfig()
+
+
+@dataclass
+class _QueuedStreamingFrame:
+    line: str
+    queued_at: float
+    event_type: str | None = None
+    text_chars: int = 0
+
+
+@dataclass
+class _JitterState:
+    mode: str = "idle"
+    frames: list[_QueuedStreamingFrame] = field(default_factory=list)
+    chars: int = 0
+    started_at: float | None = None
 
 # Once a dashboard connection starts using ``session.attach``, session events are
 # a subscription rather than a broadcast: only the committed runtime may reach
@@ -140,6 +176,23 @@ def _merge_streaming_lines(lines: list[str]) -> list[str]:
     return merged
 
 
+def _streaming_frame_metadata(line: str, queued_at: float) -> _QueuedStreamingFrame:
+    """Parse only the bounded metadata needed by the private jitter policy."""
+    try:
+        obj = json.loads(line)
+    except Exception:
+        return _QueuedStreamingFrame(line=line, queued_at=queued_at)
+    params = obj.get("params") if isinstance(obj, dict) else None
+    payload = params.get("payload") if isinstance(params, dict) else None
+    text = payload.get("text") if isinstance(payload, dict) else None
+    return _QueuedStreamingFrame(
+        line=line,
+        queued_at=queued_at,
+        event_type=str(params.get("type") or "") if isinstance(params, dict) else None,
+        text_chars=len(text) if isinstance(text, str) else 0,
+    )
+
+
 # Keep starlette optional at import time; handle_ws uses the real class when
 # it's available and falls back to a generic Exception sentinel otherwise.
 try:
@@ -170,10 +223,14 @@ class WSTransport:
         loop: asyncio.AbstractEventLoop,
         *,
         peer: str = "unknown",
+        monotonic: Callable[[], float] = time.monotonic,
+        jitter_config: _JitterConfig = _DEFAULT_JITTER_CONFIG,
     ) -> None:
         self._ws = ws
         self._loop = loop
         self._peer = peer
+        self._monotonic = monotonic
+        self._jitter_config = jitter_config
         self._closed = False
         # ``session.attach`` state. The scope is immutable for this authenticated
         # socket, while generation/active runtime advance atomically under the
@@ -197,6 +254,8 @@ class WSTransport:
         self._token_flush_handle: asyncio.TimerHandle | None = None
         self._token_flush_armed = False
         self._token_flush_requested_at: float | None = None
+        self._jitter = _JitterState()
+        self._jitter_flush_handle: asyncio.TimerHandle | None = None
         self._metrics = {
             "stream_frames": 0,
             "batches": 0,
@@ -216,6 +275,17 @@ class WSTransport:
             "schedule_delay_hist": fixed_histogram(_WS_TIMING_BUCKETS_MS),
             "send_duration_max_ms": 0.0,
             "send_duration_hist": fixed_histogram(_WS_TIMING_BUCKETS_MS),
+            "jitter_message_frames": 0,
+            "jitter_burst_activations": 0,
+            "jitter_sparse_releases": 0,
+            "jitter_timer_drains": 0,
+            "jitter_barrier_drains": 0,
+            "jitter_cap_drains": 0,
+            "jitter_backlog_frames_max": 0,
+            "jitter_backlog_chars_max": 0,
+            "jitter_close_dropped": 0,
+            "jitter_wait_max_ms": 0.0,
+            "jitter_wait_hist": fixed_histogram(_JITTER_TIMING_BUCKETS_MS),
         }
         self._metrics_snapshot: dict[str, Any] | None = None
 
@@ -321,6 +391,15 @@ class WSTransport:
                 return "dashboard diagnostic requires an active session"
             return None
 
+    def _dashboard_jitter_enabled(self) -> bool:
+        """Limit presentation smoothing to the attached browser chat surface."""
+        with self._dashboard_lock:
+            return bool(
+                not self._closed
+                and self._dashboard_scope is not None
+                and self._dashboard_active_session_id
+            )
+
     def _dashboard_frame_allowed(self, obj: dict) -> bool:
         with self._dashboard_lock:
             if self._dashboard_scope is None:
@@ -343,11 +422,166 @@ class WSTransport:
             return False
         return isinstance(obj, dict) and self._dashboard_frame_allowed(obj)
 
+    def _cancel_jitter_timer_locked(self) -> None:
+        handle = self._jitter_flush_handle
+        if handle is not None:
+            handle.cancel()
+        self._jitter_flush_handle = None
+
+    def _reset_jitter_locked(self, *, mode: str = "idle") -> None:
+        self._cancel_jitter_timer_locked()
+        self._jitter = _JitterState(mode=mode)
+
+    def _arm_jitter_timer_locked(self, delay: float) -> None:
+        self._cancel_jitter_timer_locked()
+        if self._closed or not self._jitter.frames:
+            return
+        self._jitter_flush_handle = self._loop.call_later(
+            max(0.0, delay), self._flush_jitter
+        )
+
+    def _record_jitter_wait_locked(
+        self, frames: list[_QueuedStreamingFrame], now: float
+    ) -> None:
+        for frame in frames:
+            wait_ms = round(max(0.0, now - frame.queued_at) * 1000.0, 6)
+            self._metrics["jitter_wait_max_ms"] = max(
+                self._metrics["jitter_wait_max_ms"], wait_ms
+            )
+            fixed_histogram_observe(
+                self._metrics["jitter_wait_hist"],
+                _JITTER_TIMING_BUCKETS_MS,
+                wait_ms,
+            )
+
+    def _drain_all_jitter_locked(
+        self, *, reason: str, now: float
+    ) -> list[tuple[str, float]]:
+        frames = list(self._jitter.frames or [])
+        if not frames:
+            self._reset_jitter_locked()
+            return []
+        if reason == "barrier":
+            self._metrics["jitter_barrier_drains"] += 1
+        elif reason == "cap":
+            self._metrics["jitter_cap_drains"] += 1
+        elif reason == "sparse":
+            self._metrics["jitter_sparse_releases"] += 1
+        self._record_jitter_wait_locked(frames, now)
+        self._reset_jitter_locked(mode="passthrough")
+        return [(frame.line, frame.queued_at) for frame in frames]
+
+    def _jitter_pressure_locked(self, now: float) -> tuple[int, float]:
+        config = self._jitter_config
+        frames = self._jitter.frames or []
+        oldest_age = max(0.0, now - frames[0].queued_at) if frames else 0.0
+        if oldest_age >= config.target_latency_s or self._jitter.chars >= 1600:
+            return config.high_budget_chars, config.high_interval_s
+        if self._jitter.chars >= 500:
+            return config.medium_budget_chars, config.medium_interval_s
+        return config.low_budget_chars, config.low_interval_s
+
+    def _drain_jitter_budget_locked(
+        self, *, now: float
+    ) -> tuple[list[tuple[str, float]], float | None]:
+        frames = self._jitter.frames or []
+        if not frames:
+            self._reset_jitter_locked()
+            return [], None
+        config = self._jitter_config
+        oldest_age = max(0.0, now - frames[0].queued_at)
+        if (
+            oldest_age >= config.max_latency_s
+            or self._jitter.chars >= config.max_backlog_chars
+        ):
+            return self._drain_all_jitter_locked(reason="cap", now=now), None
+
+        budget, interval = self._jitter_pressure_locked(now)
+        drained: list[_QueuedStreamingFrame] = []
+        used = 0
+        while frames and (not drained or used + frames[0].text_chars <= budget):
+            frame = frames.pop(0)
+            drained.append(frame)
+            used += frame.text_chars
+        self._jitter.chars = max(0, self._jitter.chars - used)
+        self._record_jitter_wait_locked(drained, now)
+        if not frames:
+            self._reset_jitter_locked(mode="passthrough")
+            next_interval = None
+        else:
+            self._jitter.mode = "draining"
+            next_interval = interval
+        return [(frame.line, frame.queued_at) for frame in drained], next_interval
+
+    def _enqueue_jitter_locked(
+        self, frame: _QueuedStreamingFrame, *, now: float
+    ) -> list[tuple[str, float]]:
+        frames = self._jitter.frames
+        assert frames is not None
+        frames.append(frame)
+        self._jitter.chars += frame.text_chars
+        self._metrics["jitter_message_frames"] += 1
+        self._metrics["jitter_backlog_frames_max"] = max(
+            self._metrics["jitter_backlog_frames_max"], len(frames)
+        )
+        self._metrics["jitter_backlog_chars_max"] = max(
+            self._metrics["jitter_backlog_chars_max"], self._jitter.chars
+        )
+
+        if self._jitter.mode == "passthrough":
+            frames.pop()
+            self._jitter.chars = max(0, self._jitter.chars - frame.text_chars)
+            self._record_jitter_wait_locked([frame], now)
+            return [(frame.line, frame.queued_at)]
+
+        config = self._jitter_config
+        oldest_age = max(0.0, now - frames[0].queued_at)
+        if (
+            oldest_age >= config.max_latency_s
+            or self._jitter.chars >= config.max_backlog_chars
+        ):
+            return self._drain_all_jitter_locked(reason="cap", now=now)
+
+        if self._jitter.mode == "idle":
+            self._jitter.mode = "probe"
+            self._jitter.started_at = frame.queued_at
+            self._arm_jitter_timer_locked(config.probe_s)
+        elif self._jitter.mode == "probe" and len(frames) >= 2:
+            self._jitter.mode = "reserve"
+            self._metrics["jitter_burst_activations"] += 1
+            started_at = self._jitter.started_at or frames[0].queued_at
+            self._arm_jitter_timer_locked(
+                max(0.0, config.reserve_s - (now - started_at))
+            )
+        return []
+
+    def _route_coalesced_locked(
+        self, lines: list[str], *, now: float, jitter_enabled: bool
+    ) -> list[tuple[str, float]]:
+        immediate: list[tuple[str, float]] = []
+        if not jitter_enabled and self._jitter.mode == "passthrough":
+            self._reset_jitter_locked()
+        for line in lines:
+            frame = _streaming_frame_metadata(line, now)
+            if self._jitter.mode == "passthrough" and frame.event_type != "message.delta":
+                self._reset_jitter_locked()
+            if jitter_enabled and frame.event_type == "message.delta":
+                immediate.extend(self._enqueue_jitter_locked(frame, now=now))
+                continue
+            if self._jitter.frames:
+                immediate.extend(
+                    self._drain_all_jitter_locked(reason="barrier", now=now)
+                )
+            immediate.append((line, now))
+        return immediate
+
     def write(self, obj: dict) -> bool:
         if self._closed:
             return False
 
         line = json.dumps(obj, ensure_ascii=False)
+        params = obj.get("params") if isinstance(obj, dict) else None
+        event_type = params.get("type") if isinstance(params, dict) else None
 
         try:
             on_loop = asyncio.get_running_loop() is self._loop
@@ -361,7 +595,7 @@ class WSTransport:
         # itself.
         if self._is_streaming_frame(obj):
             with self._token_lock:
-                queued_at = time.monotonic()
+                queued_at = self._monotonic()
                 self._pending_tokens.append((line, queued_at))
                 self._metrics["stream_frames"] += 1
                 self._metrics["max_backlog"] = max(
@@ -381,12 +615,27 @@ class WSTransport:
         # scheduled INSIDE the lock so the on-the-wire order matches the buffer
         # order even if the coalesce timer fires on the loop at the same moment.
         from agent.async_utils import safe_schedule_threadsafe
+        jitter_enabled = self._dashboard_jitter_enabled()
         with self._token_lock:
-            self._pending_tokens.append((line, time.monotonic()))
-            batch = self._pending_tokens
+            now = self._monotonic()
+            pending = self._pending_tokens
             self._pending_tokens = []
             self._metrics["control_drains"] += 1
-            self._record_batch_locked(batch)
+            self._record_batch_locked([*pending, (line, now)])
+            batch = self._route_coalesced_locked(
+                _merge_streaming_lines([item for item, _queued_at in pending]),
+                now=now,
+                jitter_enabled=jitter_enabled,
+            )
+            if self._jitter.frames:
+                batch.extend(
+                    self._drain_all_jitter_locked(reason="barrier", now=now)
+                )
+            batch.append((line, now))
+            if event_type == "message.start":
+                self._reset_jitter_locked()
+            elif self._jitter.mode == "passthrough":
+                self._reset_jitter_locked(mode="passthrough")
             if on_loop:
                 # Fire-and-forget — don't block the loop waiting on itself.
                 self._loop.create_task(self._safe_send_many(batch))
@@ -440,7 +689,7 @@ class WSTransport:
         fixed_histogram_observe(
             self._metrics["batch_hist"], _WS_BATCH_BUCKETS, float(size)
         )
-        now = time.monotonic()
+        now = self._monotonic()
         for _line, queued_at in batch:
             self._record_timing_locked(
                 "buffer_wait", (now - queued_at) * 1000.0
@@ -455,49 +704,92 @@ class WSTransport:
             self._token_flush_requested_at = None
             if requested_at is not None:
                 self._record_timing_locked(
-                    "schedule_delay", (time.monotonic() - requested_at) * 1000.0
+                    "schedule_delay", (self._monotonic() - requested_at) * 1000.0
                 )
         self._token_flush_handle = self._loop.call_later(
             _TOKEN_COALESCE_S, self._flush_tokens
         )
 
     def _flush_tokens(self) -> None:
-        """Send buffered tokens as one batch. Runs on the loop thread (timer).
-
-        The send is scheduled under the lock so its wire order is fixed relative
-        to a concurrent non-streaming flush in :meth:`write`.
-        """
+        """Coalesce pending stream frames, then route through bounded jitter."""
+        jitter_enabled = self._dashboard_jitter_enabled()
         with self._token_lock:
             self._token_flush_handle = None
             self._token_flush_armed = False
             if not self._pending_tokens or self._closed:
                 self._pending_tokens = []
                 return
-            batch = self._pending_tokens
+            pending = self._pending_tokens
             self._pending_tokens = []
             self._metrics["timer_drains"] += 1
-            self._record_batch_locked(batch)
-            self._loop.create_task(self._safe_send_many(batch))
+            self._record_batch_locked(pending)
+            now = self._monotonic()
+            batch = self._route_coalesced_locked(
+                _merge_streaming_lines([line for line, _queued_at in pending]),
+                now=now,
+                jitter_enabled=jitter_enabled,
+            )
+            if batch:
+                self._loop.create_task(self._safe_send_many(batch))
+
+    def _flush_jitter(self) -> None:
+        """Advance the probe/reserve/drain state on the owning event loop."""
+        with self._token_lock:
+            self._jitter_flush_handle = None
+            if self._closed or not self._jitter.frames:
+                self._reset_jitter_locked()
+                return
+            now = self._monotonic()
+            self._metrics["jitter_timer_drains"] += 1
+            if self._jitter.mode == "probe":
+                batch = self._drain_all_jitter_locked(reason="sparse", now=now)
+                next_interval = None
+            elif self._jitter.mode == "reserve":
+                self._jitter.mode = "draining"
+                batch, next_interval = self._drain_jitter_budget_locked(now=now)
+            else:
+                batch, next_interval = self._drain_jitter_budget_locked(now=now)
+            if next_interval is not None:
+                self._arm_jitter_timer_locked(next_interval)
+            if batch:
+                self._loop.create_task(self._safe_send_many(batch))
 
     async def write_async(self, obj: dict) -> bool:
         """Send from the owning event loop. Awaits until the frame is on the wire."""
         if self._closed:
             return False
-        # Flush any buffered streamed tokens ahead of this frame (RPC response /
-        # control frame) so it can't overtake the tokens that preceded it.
+        params = obj.get("params") if isinstance(obj, dict) else None
+        event_type = params.get("type") if isinstance(params, dict) else None
+        # Flush any buffered streamed tokens and jittered text ahead of this
+        # frame (RPC response / control frame) so it cannot overtake them.
+        jitter_enabled = self._dashboard_jitter_enabled()
         with self._token_lock:
             pending = self._pending_tokens
             self._pending_tokens = []
+            now = self._monotonic()
             if pending:
                 self._metrics["write_async_drains"] += 1
                 self._record_batch_locked(pending)
-        if pending:
-            await self._safe_send_many(pending)
+            batch = self._route_coalesced_locked(
+                _merge_streaming_lines([line for line, _queued_at in pending]),
+                now=now,
+                jitter_enabled=jitter_enabled,
+            )
+            if self._jitter.frames:
+                batch.extend(
+                    self._drain_all_jitter_locked(reason="barrier", now=now)
+                )
+            if event_type == "message.start":
+                self._reset_jitter_locked()
+            elif self._jitter.mode == "passthrough":
+                self._reset_jitter_locked(mode="passthrough")
+        if batch:
+            await self._safe_send_many(batch)
         await self._safe_send(json.dumps(obj, ensure_ascii=False))
         return not self._closed
 
     async def _safe_send(self, line: str) -> None:
-        started = time.monotonic()
+        started = self._monotonic()
         if not self._dashboard_line_allowed(line):
             with self._token_lock:
                 self._metrics["subscription_dropped"] += 1
@@ -517,12 +809,12 @@ class WSTransport:
         finally:
             with self._token_lock:
                 self._record_timing_locked(
-                    "send_duration", (time.monotonic() - started) * 1000.0
+                    "send_duration", (self._monotonic() - started) * 1000.0
                 )
 
     async def _safe_send_many(self, items: list[tuple[str, float]]) -> None:
         """Send a private timestamped batch in order on the loop thread."""
-        started = time.monotonic()
+        started = self._monotonic()
         merged = _merge_streaming_lines([line for line, _queued_at in items])
         try:
             for line in merged:
@@ -547,7 +839,7 @@ class WSTransport:
         finally:
             with self._token_lock:
                 self._record_timing_locked(
-                    "send_duration", (time.monotonic() - started) * 1000.0
+                    "send_duration", (self._monotonic() - started) * 1000.0
                 )
 
     @staticmethod
@@ -571,6 +863,17 @@ class WSTransport:
             "schedule_delay_p95_ms": 0.0,
             "send_duration_max_ms": 0.0,
             "send_duration_p95_ms": 0.0,
+            "jitter_message_frames": 0,
+            "jitter_burst_activations": 0,
+            "jitter_sparse_releases": 0,
+            "jitter_timer_drains": 0,
+            "jitter_barrier_drains": 0,
+            "jitter_cap_drains": 0,
+            "jitter_backlog_frames_max": 0,
+            "jitter_backlog_chars_max": 0,
+            "jitter_close_dropped": 0,
+            "jitter_wait_max_ms": 0.0,
+            "jitter_wait_p95_ms": 0.0,
         }
 
     def metrics_snapshot(self) -> dict[str, Any]:
@@ -601,6 +904,27 @@ class WSTransport:
                     for name in ("buffer_wait", "schedule_delay", "send_duration")
                     for suffix in ("max", "p95")
                 },
+                **{
+                    name: metrics[name]
+                    for name in (
+                        "jitter_message_frames",
+                        "jitter_burst_activations",
+                        "jitter_sparse_releases",
+                        "jitter_timer_drains",
+                        "jitter_barrier_drains",
+                        "jitter_cap_drains",
+                        "jitter_backlog_frames_max",
+                        "jitter_backlog_chars_max",
+                        "jitter_close_dropped",
+                    )
+                },
+                "jitter_wait_max_ms": metrics["jitter_wait_max_ms"],
+                "jitter_wait_p95_ms": fixed_histogram_percentile(
+                    metrics["jitter_wait_hist"],
+                    _JITTER_TIMING_BUCKETS_MS,
+                    metrics["jitter_wait_max_ms"],
+                    0.95,
+                ),
             }
 
     def close(self) -> dict[str, Any]:
@@ -617,7 +941,11 @@ class WSTransport:
         with self._token_lock:
             if self._metrics_snapshot is None:
                 self._metrics["close_dropped"] += len(self._pending_tokens)
+                self._metrics["jitter_close_dropped"] += len(
+                    self._jitter.frames or []
+                )
                 self._pending_tokens = []
+                self._reset_jitter_locked()
         snapshot = self.metrics_snapshot()
         self._metrics_snapshot = snapshot
         return snapshot
@@ -857,7 +1185,13 @@ async def handle_ws(
             "subscription_dropped=%d batch_max=%d batch_p95=%d "
             "buffer_wait_max_ms=%.1f buffer_wait_p95_ms=%.1f "
             "schedule_delay_max_ms=%.1f schedule_delay_p95_ms=%.1f "
-            "send_duration_max_ms=%.1f send_duration_p95_ms=%.1f",
+            "send_duration_max_ms=%.1f send_duration_p95_ms=%.1f "
+            "jitter_message_frames=%d jitter_burst_activations=%d "
+            "jitter_sparse_releases=%d jitter_timer_drains=%d "
+            "jitter_barrier_drains=%d jitter_cap_drains=%d "
+            "jitter_backlog_frames_max=%d jitter_backlog_chars_max=%d "
+            "jitter_close_dropped=%d jitter_wait_max_ms=%.1f "
+            "jitter_wait_p95_ms=%.1f",
             peer,
             disconnect_reason,
             messages,
@@ -883,4 +1217,15 @@ async def handle_ws(
             aggregate["schedule_delay_p95_ms"],
             aggregate["send_duration_max_ms"],
             aggregate["send_duration_p95_ms"],
+            aggregate["jitter_message_frames"],
+            aggregate["jitter_burst_activations"],
+            aggregate["jitter_sparse_releases"],
+            aggregate["jitter_timer_drains"],
+            aggregate["jitter_barrier_drains"],
+            aggregate["jitter_cap_drains"],
+            aggregate["jitter_backlog_frames_max"],
+            aggregate["jitter_backlog_chars_max"],
+            aggregate["jitter_close_dropped"],
+            aggregate["jitter_wait_max_ms"],
+            aggregate["jitter_wait_p95_ms"],
         )
