@@ -352,6 +352,7 @@ function createConnection(): TestGuiChatConnection {
     },
     loadEarlier: vi.fn(),
     ping: vi.fn(),
+    reportFrameQueueDiagnostic: vi.fn(),
     respondToApproval: vi.fn().mockResolvedValue(undefined),
     respondToClarify: vi.fn().mockResolvedValue(undefined),
     send: vi.fn().mockResolvedValue(undefined),

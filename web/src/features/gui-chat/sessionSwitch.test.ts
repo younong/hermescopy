@@ -20,6 +20,7 @@ class FakeConnection implements GuiChatConnection {
   readonly respondToApproval = vi.fn();
   readonly respondToClarify = vi.fn();
   readonly ping = vi.fn();
+  readonly reportFrameQueueDiagnostic = vi.fn();
   private readonly eventHandlers = new Set<(event: GatewayEvent) => void>();
   private readonly stateHandlers = new Set<(state: ConnectionState) => void>();
   readonly results: Array<ReturnType<typeof deferred<SessionResumeResponse>>> = [];

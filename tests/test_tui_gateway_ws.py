@@ -285,6 +285,40 @@ def test_ws_transport_arms_one_30fps_timer_and_preserves_stream_boundaries():
     ]
 
 
+def test_ws_transport_reports_content_free_batch_metrics():
+    sent = []
+
+    class FakeWS:
+        async def send_text(self, line):
+            sent.append(json.loads(line))
+
+    loop = _FakeTransportLoop()
+    transport = ws_mod.WSTransport(FakeWS(), loop)
+    transport.write(_gateway_event("message.delta", text="secret-a"))
+    transport.write(_gateway_event("message.delta", text="secret-b"))
+    loop.timers[0].fire()
+
+    summary = transport.close()
+
+    assert summary["stream_frames"] == 2
+    assert summary["batches"] == 1
+    assert summary["timer_drains"] == 1
+    assert summary["wire_frames"] == 1
+    assert summary["batch_max"] == 2
+    assert summary["batch_p95"] == 2
+    assert summary["max_backlog"] == 2
+    assert "secret" not in json.dumps(summary)
+    assert transport.close() == summary
+
+
+def test_ws_transport_close_counts_buffered_frames_as_dropped():
+    transport = ws_mod.WSTransport(object(), _FakeTransportLoop())
+    transport.write(_gateway_event("message.delta", text="pending"))
+    summary = transport.close()
+    assert summary["close_dropped"] == 1
+    assert summary["wire_frames"] == 0
+
+
 def test_ws_transport_control_frame_immediately_drains_pending_stream(monkeypatch):
     sent = []
 
@@ -355,6 +389,33 @@ def test_ws_dashboard_attach_filters_inactive_and_unknown_sessionless_events(mon
     ]
 
 
+def test_ws_transport_counts_control_send_and_subscription_drop_metrics():
+    sent = []
+
+    class FakeWS:
+        async def send_text(self, line):
+            sent.append(json.loads(line))
+
+    transport = ws_mod.WSTransport(FakeWS(), _FakeTransportLoop())
+    assert transport.begin_dashboard_attach(1, browser_id="browser-a") is None
+    assert transport.commit_dashboard_attach(1, "runtime-a") is True
+    asyncio.run(
+        transport._safe_send(
+            json.dumps(_gateway_event("message.complete", session_id="runtime-a"))
+        )
+    )
+    asyncio.run(
+        transport._safe_send(
+            json.dumps(_gateway_event("message.complete", session_id="runtime-b"))
+        )
+    )
+
+    summary = transport.metrics_snapshot()
+    assert summary["wire_frames"] == 1
+    assert summary["subscription_dropped"] == 1
+    assert summary["send_duration_max_ms"] >= 0
+
+
 def test_ws_dashboard_attach_generation_and_scope_are_atomic():
     transport = ws_mod.WSTransport(object(), _FakeTransportLoop())
 
@@ -378,6 +439,17 @@ def test_ws_dashboard_attach_generation_and_scope_are_atomic():
     assert transport.commit_dashboard_attach(5, "runtime-new") is True
     assert transport.dashboard_attach_is_current(4) is False
     assert transport.dashboard_attach_is_current(5) is True
+
+
+def test_ws_dashboard_diagnostic_requires_committed_active_session():
+    transport = ws_mod.WSTransport(object(), _FakeTransportLoop())
+    assert transport.dashboard_diagnostic_error() == (
+        "dashboard diagnostic requires an attached WebSocket"
+    )
+    assert transport.begin_dashboard_attach(1, browser_id="browser-a") is None
+    assert transport.dashboard_diagnostic_error() == "dashboard session switch in progress"
+    assert transport.commit_dashboard_attach(1, "runtime-a") is True
+    assert transport.dashboard_diagnostic_error() is None
 
 
 def test_ws_dashboard_mutation_fence_tracks_pending_and_committed_runtime():

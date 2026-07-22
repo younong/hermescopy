@@ -32,6 +32,11 @@ import threading
 import time
 from typing import Any, Callable
 
+from agent.stream_diag import (
+    fixed_histogram,
+    fixed_histogram_observe,
+    fixed_histogram_percentile,
+)
 from hermes_cli.latency_trace import clean_latency_trace_id, log_latency_stage
 from tui_gateway import server
 
@@ -60,6 +65,8 @@ _STREAMING_EVENT_TYPES = frozenset({
 # Max time a streamed token waits in the buffer before flush (~30 fps). This
 # keeps GUI replies visually fluid while still coalescing per-token loop wakeups.
 _TOKEN_COALESCE_S = 0.033
+_WS_TIMING_BUCKETS_MS = (1, 5, 10, 25, 33, 50, 100, 250, 500, 1000)
+_WS_BATCH_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128)
 
 # Once a dashboard connection starts using ``session.attach``, session events are
 # a subscription rather than a broadcast: only the committed runtime may reach
@@ -181,10 +188,36 @@ class WSTransport:
         # short timer flushes the batch. The lock guards the buffer + the
         # "armed" flag against the worker threads that call write(); the timer
         # handle is only ever touched on the loop thread.
-        self._token_lock = threading.Lock()
-        self._pending_tokens: list[str] = []
+        # RLock preserves safety when a synchronous test/event-loop shim invokes
+        # call_soon_threadsafe callbacks immediately from inside write().
+        self._token_lock = threading.RLock()
+        # Each private queue item carries only serialization and enqueue time;
+        # the timestamp is never written onto the WebSocket.
+        self._pending_tokens: list[tuple[str, float]] = []
         self._token_flush_handle: asyncio.TimerHandle | None = None
         self._token_flush_armed = False
+        self._token_flush_requested_at: float | None = None
+        self._metrics = {
+            "stream_frames": 0,
+            "batches": 0,
+            "timer_drains": 0,
+            "control_drains": 0,
+            "write_async_drains": 0,
+            "wire_frames": 0,
+            "max_backlog": 0,
+            "close_dropped": 0,
+            "subscription_dropped": 0,
+            "send_failures": 0,
+            "batch_max": 0.0,
+            "batch_hist": fixed_histogram(_WS_BATCH_BUCKETS),
+            "buffer_wait_max_ms": 0.0,
+            "buffer_wait_hist": fixed_histogram(_WS_TIMING_BUCKETS_MS),
+            "schedule_delay_max_ms": 0.0,
+            "schedule_delay_hist": fixed_histogram(_WS_TIMING_BUCKETS_MS),
+            "send_duration_max_ms": 0.0,
+            "send_duration_hist": fixed_histogram(_WS_TIMING_BUCKETS_MS),
+        }
+        self._metrics_snapshot: dict[str, Any] | None = None
 
     @staticmethod
     def _is_streaming_frame(obj: dict) -> bool:
@@ -277,6 +310,17 @@ class WSTransport:
                 and generation == self._dashboard_generation
             )
 
+    def dashboard_diagnostic_error(self) -> str | None:
+        """Require a committed dashboard subscription for browser metrics."""
+        with self._dashboard_lock:
+            if self._closed or self._dashboard_scope is None:
+                return "dashboard diagnostic requires an attached WebSocket"
+            if self._dashboard_pending_generation is not None:
+                return "dashboard session switch in progress"
+            if not self._dashboard_active_session_id:
+                return "dashboard diagnostic requires an active session"
+            return None
+
     def _dashboard_frame_allowed(self, obj: dict) -> bool:
         with self._dashboard_lock:
             if self._dashboard_scope is None:
@@ -317,9 +361,15 @@ class WSTransport:
         # itself.
         if self._is_streaming_frame(obj):
             with self._token_lock:
-                self._pending_tokens.append(line)
+                queued_at = time.monotonic()
+                self._pending_tokens.append((line, queued_at))
+                self._metrics["stream_frames"] += 1
+                self._metrics["max_backlog"] = max(
+                    self._metrics["max_backlog"], len(self._pending_tokens)
+                )
                 if not self._token_flush_armed:
                     self._token_flush_armed = True
+                    self._token_flush_requested_at = queued_at
                     # call_soon_threadsafe arms the call_later timer on the loop
                     # thread and is safe to call from a worker or the loop.
                     self._loop.call_soon_threadsafe(self._arm_token_flush)
@@ -332,9 +382,11 @@ class WSTransport:
         # order even if the coalesce timer fires on the loop at the same moment.
         from agent.async_utils import safe_schedule_threadsafe
         with self._token_lock:
-            self._pending_tokens.append(line)
+            self._pending_tokens.append((line, time.monotonic()))
             batch = self._pending_tokens
             self._pending_tokens = []
+            self._metrics["control_drains"] += 1
+            self._record_batch_locked(batch)
             if on_loop:
                 # Fire-and-forget — don't block the loop waiting on itself.
                 self._loop.create_task(self._safe_send_many(batch))
@@ -370,10 +422,41 @@ class WSTransport:
             )
             return False
 
+    def _record_timing_locked(self, name: str, value_ms: float) -> None:
+        value_ms = round(max(0.0, value_ms), 6)
+        self._metrics[f"{name}_max_ms"] = max(
+            self._metrics[f"{name}_max_ms"], value_ms
+        )
+        fixed_histogram_observe(
+            self._metrics[f"{name}_hist"], _WS_TIMING_BUCKETS_MS, value_ms
+        )
+
+    def _record_batch_locked(self, batch: list[tuple[str, float]]) -> None:
+        if not batch:
+            return
+        size = len(batch)
+        self._metrics["batches"] += 1
+        self._metrics["batch_max"] = max(self._metrics["batch_max"], size)
+        fixed_histogram_observe(
+            self._metrics["batch_hist"], _WS_BATCH_BUCKETS, float(size)
+        )
+        now = time.monotonic()
+        for _line, queued_at in batch:
+            self._record_timing_locked(
+                "buffer_wait", (now - queued_at) * 1000.0
+            )
+
     def _arm_token_flush(self) -> None:
         """Arm the coalesce timer. Runs on the loop thread (call_soon_threadsafe)."""
         if self._closed:
             return
+        with self._token_lock:
+            requested_at = self._token_flush_requested_at
+            self._token_flush_requested_at = None
+            if requested_at is not None:
+                self._record_timing_locked(
+                    "schedule_delay", (time.monotonic() - requested_at) * 1000.0
+                )
         self._token_flush_handle = self._loop.call_later(
             _TOKEN_COALESCE_S, self._flush_tokens
         )
@@ -392,6 +475,8 @@ class WSTransport:
                 return
             batch = self._pending_tokens
             self._pending_tokens = []
+            self._metrics["timer_drains"] += 1
+            self._record_batch_locked(batch)
             self._loop.create_task(self._safe_send_many(batch))
 
     async def write_async(self, obj: dict) -> bool:
@@ -403,41 +488,124 @@ class WSTransport:
         with self._token_lock:
             pending = self._pending_tokens
             self._pending_tokens = []
+            if pending:
+                self._metrics["write_async_drains"] += 1
+                self._record_batch_locked(pending)
         if pending:
             await self._safe_send_many(pending)
         await self._safe_send(json.dumps(obj, ensure_ascii=False))
         return not self._closed
 
     async def _safe_send(self, line: str) -> None:
+        started = time.monotonic()
         if not self._dashboard_line_allowed(line):
+            with self._token_lock:
+                self._metrics["subscription_dropped"] += 1
             return
         try:
             await self._ws.send_text(line)
+            with self._token_lock:
+                self._metrics["wire_frames"] += 1
         except Exception as exc:
             self._closed = True
+            with self._token_lock:
+                self._metrics["send_failures"] += 1
             _log.warning(
                 "ws send failed peer=%s error_type=%s error=%s",
                 self._peer, type(exc).__name__, exc,
             )
+        finally:
+            with self._token_lock:
+                self._record_timing_locked(
+                    "send_duration", (time.monotonic() - started) * 1000.0
+                )
 
-    async def _safe_send_many(self, lines: list[str]) -> None:
-        """Send a batch of pre-serialized frames in order on the loop thread."""
+    async def _safe_send_many(self, items: list[tuple[str, float]]) -> None:
+        """Send a private timestamped batch in order on the loop thread."""
+        started = time.monotonic()
+        merged = _merge_streaming_lines([line for line, _queued_at in items])
         try:
-            for line in _merge_streaming_lines(lines):
+            for line in merged:
                 # Check at the final wire boundary, not when write() enqueues the
                 # frame. A switch may commit while token deltas are waiting in the
                 # coalescing buffer; those stale deltas must then be dropped.
                 if not self._dashboard_line_allowed(line):
+                    with self._token_lock:
+                        self._metrics["subscription_dropped"] += 1
                     continue
                 await self._ws.send_text(line)
+                with self._token_lock:
+                    self._metrics["wire_frames"] += 1
         except Exception as exc:
             self._closed = True
+            with self._token_lock:
+                self._metrics["send_failures"] += 1
             _log.warning(
                 "ws send failed peer=%s error_type=%s error=%s",
                 self._peer, type(exc).__name__, exc,
             )
+        finally:
+            with self._token_lock:
+                self._record_timing_locked(
+                    "send_duration", (time.monotonic() - started) * 1000.0
+                )
 
-    def close(self) -> None:
+    @staticmethod
+    def empty_metrics_snapshot() -> dict[str, Any]:
+        return {
+            "stream_frames": 0,
+            "batches": 0,
+            "timer_drains": 0,
+            "control_drains": 0,
+            "write_async_drains": 0,
+            "wire_frames": 0,
+            "max_backlog": 0,
+            "close_dropped": 0,
+            "subscription_dropped": 0,
+            "send_failures": 0,
+            "batch_max": 0,
+            "batch_p95": 0,
+            "buffer_wait_max_ms": 0.0,
+            "buffer_wait_p95_ms": 0.0,
+            "schedule_delay_max_ms": 0.0,
+            "schedule_delay_p95_ms": 0.0,
+            "send_duration_max_ms": 0.0,
+            "send_duration_p95_ms": 0.0,
+        }
+
+    def metrics_snapshot(self) -> dict[str, Any]:
+        with self._token_lock:
+            metrics = self._metrics
+            return {
+                "stream_frames": metrics["stream_frames"],
+                "batches": metrics["batches"],
+                "timer_drains": metrics["timer_drains"],
+                "control_drains": metrics["control_drains"],
+                "write_async_drains": metrics["write_async_drains"],
+                "wire_frames": metrics["wire_frames"],
+                "max_backlog": metrics["max_backlog"],
+                "close_dropped": metrics["close_dropped"],
+                "subscription_dropped": metrics["subscription_dropped"],
+                "send_failures": metrics["send_failures"],
+                "batch_max": int(metrics["batch_max"]),
+                "batch_p95": int(fixed_histogram_percentile(
+                    metrics["batch_hist"], _WS_BATCH_BUCKETS, metrics["batch_max"], 0.95
+                )),
+                **{
+                    f"{name}_{suffix}_ms": fixed_histogram_percentile(
+                        metrics[f"{name}_hist"],
+                        _WS_TIMING_BUCKETS_MS,
+                        metrics[f"{name}_max_ms"],
+                        0.95,
+                    ) if suffix == "p95" else metrics[f"{name}_max_ms"]
+                    for name in ("buffer_wait", "schedule_delay", "send_duration")
+                    for suffix in ("max", "p95")
+                },
+            }
+
+    def close(self) -> dict[str, Any]:
+        if self._metrics_snapshot is not None:
+            return self._metrics_snapshot
         with self._dashboard_lock:
             self._closed = True
         # Cancel any pending coalesce flush. close() runs on the loop thread
@@ -446,6 +614,13 @@ class WSTransport:
         if handle is not None:
             handle.cancel()
             self._token_flush_handle = None
+        with self._token_lock:
+            if self._metrics_snapshot is None:
+                self._metrics["close_dropped"] += len(self._pending_tokens)
+                self._pending_tokens = []
+        snapshot = self.metrics_snapshot()
+        self._metrics_snapshot = snapshot
+        return snapshot
 
 
 def _ws_peer_label(ws: Any) -> str:
@@ -498,8 +673,8 @@ async def handle_ws(
     messages = 0
     parse_errors = 0
     dispatch_crashes = 0
-    send_failures = 0
     disconnect_reason = "not_connected"
+    ws_metrics: dict[str, Any] | None = None
 
     try:
         await ws.accept()
@@ -546,7 +721,6 @@ async def handle_ws(
         )
         if not ready_ok:
             disconnect_reason = "ready_send_failed"
-            send_failures += 1
             _log.error("ws ready frame send failed peer=%s", peer)
             return
         log_latency_stage(
@@ -597,7 +771,6 @@ async def handle_ws(
                 )
                 if not ok:
                     disconnect_reason = "send_failed_after_parse_error"
-                    send_failures += 1
                     _log.warning("ws parse-error reply send failed peer=%s", peer)
                     break
                 continue
@@ -628,7 +801,6 @@ async def handle_ws(
                 )
                 if not ok:
                     disconnect_reason = "send_failed_after_dispatch_crash"
-                    send_failures += 1
                     _log.warning(
                         "ws dispatch-crash reply send failed peer=%s id=%s method=%s",
                         peer,
@@ -639,7 +811,6 @@ async def handle_ws(
                 continue
             if resp is not None and not await transport.write_async(resp):
                 disconnect_reason = "send_failed_after_response"
-                send_failures += 1
                 _log.warning(
                     "ws response send failed peer=%s id=%s method=%s",
                     peer,
@@ -651,7 +822,7 @@ async def handle_ws(
         reaped_sessions = 0
         detached_sessions = 0
         if transport is not None:
-            transport.close()
+            ws_metrics = transport.close()
 
             # Reap sessions this transport owned (close_on_disconnect sidecar
             # sessions) or detach the rest to the drop sentinel so later emits
@@ -677,15 +848,39 @@ async def handle_ws(
             await ws.close()
         except Exception as exc:
             _log.debug("ws close failed peer=%s error=%s", peer, exc)
+        aggregate = ws_metrics or WSTransport.empty_metrics_snapshot()
         _log.info(
             "ws closed peer=%s reason=%s messages=%d parse_errors=%d "
-            "dispatch_crashes=%d send_failures=%d reaped_sessions=%d detached_sessions=%d",
+            "dispatch_crashes=%d send_failures=%d reaped_sessions=%d detached_sessions=%d "
+            "stream_frames=%d batches=%d timer_drains=%d control_drains=%d "
+            "write_async_drains=%d wire_frames=%d max_backlog=%d close_dropped=%d "
+            "subscription_dropped=%d batch_max=%d batch_p95=%d "
+            "buffer_wait_max_ms=%.1f buffer_wait_p95_ms=%.1f "
+            "schedule_delay_max_ms=%.1f schedule_delay_p95_ms=%.1f "
+            "send_duration_max_ms=%.1f send_duration_p95_ms=%.1f",
             peer,
             disconnect_reason,
             messages,
             parse_errors,
             dispatch_crashes,
-            send_failures,
+            aggregate["send_failures"],
             reaped_sessions,
             detached_sessions,
+            aggregate["stream_frames"],
+            aggregate["batches"],
+            aggregate["timer_drains"],
+            aggregate["control_drains"],
+            aggregate["write_async_drains"],
+            aggregate["wire_frames"],
+            aggregate["max_backlog"],
+            aggregate["close_dropped"],
+            aggregate["subscription_dropped"],
+            aggregate["batch_max"],
+            aggregate["batch_p95"],
+            aggregate["buffer_wait_max_ms"],
+            aggregate["buffer_wait_p95_ms"],
+            aggregate["schedule_delay_max_ms"],
+            aggregate["schedule_delay_p95_ms"],
+            aggregate["send_duration_max_ms"],
+            aggregate["send_duration_p95_ms"],
         )

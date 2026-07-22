@@ -42,7 +42,16 @@ export function GuiChatShell() {
   const historyAbortRef = useRef<AbortController | null>(null);
   const reconnectLifecycleRef = useRef<GuiChatReconnectLifecycle | null>(null);
   const eventFrameQueue = useMemo(
-    () => createGatewayEventFrameQueue((event) => dispatch({ type: "event", event })),
+    () => createGatewayEventFrameQueue(
+      (event) => dispatch({ type: "event", event }),
+      undefined,
+      undefined,
+      {
+        onDiagnostic: (summary) => {
+          connectionRef.current?.reportFrameQueueDiagnostic(summary);
+        },
+      },
+    ),
     [],
   );
   const latencyTraceRef = useRef<GuiChatLatencyTrace | null>(null);
@@ -270,6 +279,7 @@ export function GuiChatShell() {
   useEffect(
     () => () => {
       historyAbortRef.current?.abort();
+      eventFrameQueue.reset();
       switchScope.reconnectLifecycle?.dispose();
       switchCoordinator.dispose();
       switchTraceByGenerationRef.current.clear();
@@ -280,7 +290,7 @@ export function GuiChatShell() {
         switchCoordinatorRef.current = null;
       }
     },
-    [switchCoordinator, switchScope.reconnectLifecycle],
+    [eventFrameQueue, switchCoordinator, switchScope.reconnectLifecycle],
   );
 
   useEffect(() => {
