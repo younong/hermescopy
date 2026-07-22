@@ -26,6 +26,7 @@ export function MessageAttachmentCard({
   ]
     .filter(Boolean)
     .join(" · ");
+  const dimensions = validImageDimensions(attachment.width, attachment.height);
   const download = (event: MouseEvent<HTMLAnchorElement>) => {
     event.preventDefault();
     if (!attachment.downloadUrl || downloading) return;
@@ -38,15 +39,29 @@ export function MessageAttachmentCard({
       .finally(() => setDownloading(false));
   };
 
-  if (variant === "bubble" && attachment.kind === "image" && previewUrl) {
+  if (variant === "bubble" && attachment.kind === "image" && (previewUrl || dimensions)) {
     return (
       <div className="w-[180px] sm:w-[220px]">
-        <img
-          alt={attachment.name}
-          className="max-h-[320px] w-full rounded-3xl object-cover shadow-sm"
-          draggable={false}
-          src={previewUrl}
-        />
+        <div
+          className={dimensions ? "max-h-[320px] w-full overflow-hidden rounded-3xl bg-current/[0.04] shadow-sm" : undefined}
+          data-image-geometry={dimensions ? `${dimensions.width}x${dimensions.height}` : undefined}
+          style={dimensions ? { aspectRatio: `${dimensions.width} / ${dimensions.height}` } : undefined}
+        >
+          {previewUrl ? (
+            <img
+              alt={attachment.name}
+              className={dimensions ? "h-full w-full object-cover" : "max-h-[320px] w-full rounded-3xl object-cover shadow-sm"}
+              draggable={false}
+              height={dimensions?.height}
+              src={previewUrl}
+              width={dimensions?.width}
+            />
+          ) : (
+            <div className="flex h-full w-full items-center justify-center px-4 text-center text-xs text-text-secondary">
+              Loading image…
+            </div>
+          )}
+        </div>
         {attachment.downloadUrl ? (
           <div className="mt-1 flex justify-end">
             <a
@@ -136,6 +151,19 @@ export function MessageAttachmentCard({
       {content}
     </div>
   );
+}
+
+function validImageDimensions(
+  width: unknown,
+  height: unknown,
+): { height: number; width: number } | undefined {
+  if (
+    typeof width !== "number" || !Number.isFinite(width) || width <= 0 ||
+    typeof height !== "number" || !Number.isFinite(height) || height <= 0
+  ) {
+    return undefined;
+  }
+  return { height, width };
 }
 
 function useAttachmentPreviewUrl(attachment: MessageAttachmentState): string | undefined {

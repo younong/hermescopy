@@ -12,6 +12,53 @@ afterEach(() => {
 });
 
 describe("MessageAttachmentCard", () => {
+  it("keeps uploaded image geometry while its preview resolves", async () => {
+    let resolveFetch!: (response: Response) => void;
+    vi.spyOn(globalThis, "fetch").mockReturnValue(
+      new Promise<Response>((resolve) => {
+        resolveFetch = resolve;
+      }),
+    );
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(
+        <MessageAttachmentCard
+          attachment={{
+            height: 300,
+            id: "history-image",
+            kind: "image",
+            name: "shot.png",
+            previewUrl: "/api/fs/read-data-url?path=shot.png",
+            sizeBytes: 12,
+            width: 500,
+          }}
+          variant="bubble"
+        />,
+      );
+    });
+
+    const geometry = container.querySelector<HTMLElement>('[data-image-geometry="500x300"]');
+    expect(geometry?.style.aspectRatio).toBe("500 / 300");
+    expect(container.querySelector("img")).toBeNull();
+
+    await act(async () => {
+      resolveFetch(new Response(JSON.stringify({ dataUrl: "data:image/png;base64,AAAA" }), {
+        headers: { "Content-Type": "application/json" },
+      }));
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector('[data-image-geometry="500x300"]')).toBe(geometry);
+    const image = container.querySelector("img");
+    expect(image?.getAttribute("width")).toBe("500");
+    expect(image?.getAttribute("height")).toBe("300");
+
+    await act(async () => root.unmount());
+  });
+
   it("resolves filesystem image previews before rendering the image", async () => {
     const dataUrl = "data:image/png;base64,iVBORw0KGgo=";
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(

@@ -396,8 +396,10 @@ export function GuiChatShell() {
                 ...attachment,
                 attachedPath: result.path,
                 error: undefined,
+                height: validImageDimensions(result.width, result.height)?.height,
                 stagedSessionId: sessionId,
                 status: "uploaded",
+                width: validImageDimensions(result.width, result.height)?.width,
               };
               updateAttachment(attachment.id, sentAttachment);
             } else if (attachment.kind === "pdf") {
@@ -698,7 +700,22 @@ function toMessageAttachment(
     refText: attachment.refText,
     sizeBytes: attachment.sizeBytes,
     sourcePath: attachment.attachedPath,
+    height: attachment.height,
+    width: attachment.width,
   };
+}
+
+function validImageDimensions(
+  width: unknown,
+  height: unknown,
+): { height: number; width: number } | undefined {
+  if (
+    typeof width !== "number" || !Number.isFinite(width) || width <= 0 ||
+    typeof height !== "number" || !Number.isFinite(height) || height <= 0
+  ) {
+    return undefined;
+  }
+  return { height, width };
 }
 
 function appendFileReferences(text: string, fileRefs: string[]): string {

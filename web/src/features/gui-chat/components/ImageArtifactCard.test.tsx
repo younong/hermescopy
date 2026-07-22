@@ -12,6 +12,51 @@ afterEach(() => {
 });
 
 describe("ImageArtifactCard", () => {
+  it("reserves persisted geometry before a filesystem preview resolves", async () => {
+    let resolveFetch!: (response: Response) => void;
+    vi.spyOn(globalThis, "fetch").mockReturnValue(
+      new Promise<Response>((resolve) => {
+        resolveFetch = resolve;
+      }),
+    );
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(
+        <ImageArtifactCard
+          artifact={{
+            height: 450,
+            id: "history-image",
+            title: "cat",
+            url: "/api/fs/read-data-url?path=cat.png",
+            width: 800,
+          }}
+          variant="bubble"
+        />,
+      );
+    });
+
+    const geometry = container.querySelector<HTMLElement>('[data-image-geometry="800x450"]');
+    expect(geometry?.style.aspectRatio).toBe("800 / 450");
+    expect(container.querySelector("img")).toBeNull();
+
+    await act(async () => {
+      resolveFetch(new Response(JSON.stringify({ dataUrl: "data:image/png;base64,AAAA" }), {
+        headers: { "Content-Type": "application/json" },
+      }));
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector('[data-image-geometry="800x450"]')).toBe(geometry);
+    const image = container.querySelector("img");
+    expect(image?.getAttribute("width")).toBe("800");
+    expect(image?.getAttribute("height")).toBe("450");
+
+    await act(async () => root.unmount());
+  });
+
   it("keeps the preview link and shows an explicit bubble download action", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response("image-bytes", { status: 200 }),

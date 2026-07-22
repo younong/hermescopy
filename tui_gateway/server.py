@@ -1284,19 +1284,41 @@ def _estimate_image_tokens(width: int, height: int) -> int:
     return max(1, (width + 511) // 512) * max(1, (height + 511) // 512) * 85
 
 
-def _image_meta(path: Path) -> dict:
-    meta = {"name": path.name}
+def _read_image_dimensions(source: Any) -> tuple[int, int] | None:
     try:
         from PIL import Image
 
-        with Image.open(path) as img:
-            width, height = img.size
-        meta["width"] = int(width)
-        meta["height"] = int(height)
-        meta["token_estimate"] = _estimate_image_tokens(int(width), int(height))
+        with Image.open(source) as img:
+            width, height = (int(value) for value in img.size)
+        return (width, height) if width > 0 and height > 0 else None
     except Exception:
-        pass
+        return None
+
+
+def _image_meta(path: Path) -> dict:
+    meta = {"name": path.name}
+    dimensions = _read_image_dimensions(path)
+    if dimensions is not None:
+        width, height = dimensions
+        meta["width"] = width
+        meta["height"] = height
+        meta["token_estimate"] = _estimate_image_tokens(width, height)
     return meta
+
+
+def _positive_image_dimensions(value: dict) -> tuple[int, int] | None:
+    width = value.get("width")
+    height = value.get("height")
+    if (
+        isinstance(width, int)
+        and not isinstance(width, bool)
+        and width > 0
+        and isinstance(height, int)
+        and not isinstance(height, bool)
+        and height > 0
+    ):
+        return width, height
+    return None
 
 
 def _queue_attachment_metadata(session: dict, attachment: dict) -> None:
@@ -1310,8 +1332,15 @@ def _queue_attachment_metadata(session: dict, attachment: dict) -> None:
         "ref_text",
         "pages_attached",
         "source_paths",
+        "width",
+        "height",
     }
     metadata = {key: attachment[key] for key in allowed if attachment.get(key) is not None}
+    dimensions = _positive_image_dimensions(metadata)
+    metadata.pop("width", None)
+    metadata.pop("height", None)
+    if metadata.get("kind") == "image" and dimensions is not None:
+        metadata["width"], metadata["height"] = dimensions
     if metadata.get("kind") not in {"image", "pdf", "file"}:
         return
     if not isinstance(metadata.get("name"), str) or not metadata["name"]:
@@ -1326,7 +1355,7 @@ def _image_attachment_metadata(path: Path, *, name: str | None = None) -> dict:
         size_bytes = path.stat().st_size
     except OSError:
         size_bytes = 0
-    return {
+    metadata = {
         "kind": "image",
         "name": name or path.name,
         "mime_type": mimetypes.guess_type(name or path.name)[0] or "image/png",
@@ -1334,9 +1363,67 @@ def _image_attachment_metadata(path: Path, *, name: str | None = None) -> dict:
         "path": str(path),
         "source_paths": [str(path)],
     }
+    dimensions = _positive_image_dimensions(_image_meta(path))
+    if dimensions is not None:
+        metadata["width"], metadata["height"] = dimensions
+    return metadata
 
 
-def _valid_history_attachments(value: Any) -> list[dict]:
+def _history_image_dimensions(
+    path: object, session: dict | None
+) -> tuple[int, int] | None:
+    if not isinstance(path, str) or not path.strip() or path.lower().startswith(
+        ("http:", "https:", "data:", "blob:")
+    ):
+        return None
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute() and session is not None:
+        candidate = Path(_session_cwd(session)) / candidate
+
+    runtime = current_owner_worker_gateway_runtime()
+    if runtime is not None:
+        from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
+        from hermes_cli.controlled_roots import ExpectedType, RootKind
+
+        context = runtime.filesystem_context
+        if not isinstance(context, AuthenticatedWorkspaceContext) or not candidate.is_absolute():
+            return None
+        for kind in (RootKind.WORKSPACE, RootKind.OWNER_WRITABLE):
+            root = context.roots.get(kind).canonical_path
+            try:
+                relative = candidate.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if not relative:
+                continue
+            try:
+                fd = context.roots.open_relative(
+                    kind, relative, expected_type=ExpectedType.REGULAR_FILE
+                )
+            except Exception:
+                return None
+            try:
+                with os.fdopen(fd, "rb") as image_file:
+                    return _read_image_dimensions(image_file)
+            except Exception:
+                return None
+        return None
+
+    allowed_roots = [Path(get_hermes_home()).resolve(strict=False)]
+    if session is not None:
+        allowed_roots.append(Path(_session_cwd(session)).resolve(strict=False))
+    resolved = candidate.resolve(strict=False)
+    if not any(resolved == root or root in resolved.parents for root in allowed_roots):
+        return None
+    try:
+        if not resolved.is_file():
+            return None
+    except OSError:
+        return None
+    return _read_image_dimensions(resolved)
+
+
+def _valid_history_attachments(value: Any, *, session: dict | None = None) -> list[dict]:
     """Return the persisted attachment subset safe to expose to clients."""
     if not isinstance(value, list):
         return []
@@ -1348,7 +1435,16 @@ def _valid_history_attachments(value: Any) -> list[dict]:
         name = item.get("name")
         if kind not in {"image", "pdf", "file"} or not isinstance(name, str) or not name:
             continue
-        valid.append(dict(item))
+        attachment = dict(item)
+        dimensions = _positive_image_dimensions(attachment)
+        attachment.pop("width", None)
+        attachment.pop("height", None)
+        if kind == "image":
+            if dimensions is None:
+                dimensions = _history_image_dimensions(attachment.get("path"), session)
+            if dimensions is not None:
+                attachment["width"], attachment["height"] = dimensions
+        valid.append(attachment)
     return valid
 
 
@@ -3921,6 +4017,18 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         parsed_result = json.loads(result)
     except Exception:
         parsed_result = result
+    if name in {"image_generate", "image_generation"} and isinstance(parsed_result, dict):
+        source = next(
+            (
+                parsed_result.get(key)
+                for key in ("host_image", "image")
+                if isinstance(parsed_result.get(key), str) and parsed_result.get(key).strip()
+            ),
+            None,
+        )
+        dimensions = _history_image_dimensions(source, session)
+        if dimensions is not None:
+            parsed_result["width"], parsed_result["height"] = dimensions
     if _preserve_live_tool_result(sid, name):
         payload["result"] = parsed_result
     elif compact_gui:
@@ -5235,9 +5343,12 @@ def _coerce_message_text(content: Any) -> str:
     return str(content)
 
 
-def _history_to_messages(history: list[dict]) -> list[dict]:
+def _history_to_messages(
+    history: list[dict], *, session: dict | None = None
+) -> list[dict]:
     messages = []
     tool_call_args = {}
+    pending_image_artifacts: list[dict] = []
 
     for m in history:
         if not isinstance(m, dict):
@@ -5272,6 +5383,34 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
                 or m.get("_display_tool_args")
                 or {}
             )
+            if name in {"image_generate", "image_generation"}:
+                try:
+                    result = json.loads(m.get("content") or "")
+                except (json.JSONDecodeError, TypeError):
+                    result = None
+                if isinstance(result, dict) and result.get("success") is not False:
+                    source = next(
+                        (
+                            result.get(key)
+                            for key in ("host_image", "image", "url")
+                            if isinstance(result.get(key), str) and result.get(key).strip()
+                        ),
+                        None,
+                    )
+                    if source:
+                        artifact = {
+                            "type": "artifact.image",
+                            "url": source,
+                            "title": "Generated image",
+                            "tool_call_id": tc_id or None,
+                        }
+                        dimensions = _positive_image_dimensions(result)
+                        if dimensions is None:
+                            dimensions = _history_image_dimensions(source, session)
+                        if dimensions is not None:
+                            artifact["width"], artifact["height"] = dimensions
+                        pending_image_artifacts.append(artifact)
+                continue
             message = {"role": "tool", "name": name, "context": _tool_ctx(name, args)}
             row_id = m.get("_row_id")
             if row_id is not None:
@@ -5294,10 +5433,14 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         has_reasoning = role == "assistant" and any(
             m.get(key) for key in reasoning_keys
         )
-        attachments = _valid_history_attachments(m.get("attachments"))
-        if not content_text.strip() and not has_reasoning and not attachments:
+        attachments = _valid_history_attachments(m.get("attachments"), session=session)
+        image_artifacts = pending_image_artifacts if role == "assistant" else []
+        if not content_text.strip() and not has_reasoning and not attachments and not image_artifacts:
             continue
         msg = {"role": role, "text": content_text}
+        if image_artifacts:
+            msg["content"] = list(image_artifacts)
+            pending_image_artifacts.clear()
         row_id = m.get("_row_id")
         if row_id is not None:
             msg["id"] = f"db-{m.get('_session_id') or 'session'}-{row_id}"
@@ -5685,7 +5828,7 @@ def _session_create(rid, params: dict) -> dict:
             "session_id": sid,
             "stored_session_id": key,
             "message_count": len(history),
-            "messages": _history_to_messages(history),
+            "messages": _history_to_messages(history, session=_sessions[sid]),
             "info": {
                 # Reflect the per-session model override (desktop composer pick)
                 # in the immediate response so the client doesn't briefly clobber
@@ -6307,7 +6450,7 @@ def _session_resume(rid, params: dict) -> dict:
         # A delegated child mid-run emits no session events of its own — report
         # its liveness from the relay registry so the window shows a busy turn.
         child_running = _child_run_active(target)
-        messages = _history_to_messages(history)
+        messages = _history_to_messages(history, session=record)
         return _ok(
             rid,
             {
@@ -6432,7 +6575,7 @@ def _session_resume(rid, params: dict) -> dict:
             _schedule_agent_build(sid)
             _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
 
-        messages = _history_to_messages(display_history)
+        messages = _history_to_messages(display_history, session=record)
         response = _ok(
             rid,
             {
@@ -6510,7 +6653,10 @@ def _session_resume(rid, params: dict) -> dict:
             else display_history[: max(0, len(display_history) - len(raw_history))]
         )
         history = sanitize_replay_history(raw_history)
-        messages = _history_to_messages(display_history)
+        messages = _history_to_messages(
+            display_history,
+            session={"cwd": _resume_fallback_cwd(), "session_key": target},
+        )
         tokens = _set_session_context(target)
         try:
             # Pass the profile's db so the agent persists turns to the right
@@ -6816,7 +6962,7 @@ def _live_session_payload(
     payload = {
         "info": _fallback_session_info(session),
         "message_count": len(history),
-        "messages": _history_to_messages(history),
+        "messages": _history_to_messages(history, session=session),
         "pending_prompts": _pending_clarifications(sid),
         "running": running,
         "session_id": sid,
@@ -8634,7 +8780,7 @@ def _(rid, params: dict) -> dict:
         except Exception:
             logger.exception("session.history failed")
             return _err(rid, 5000, "history load failed")
-    messages = _history_to_messages(history)
+    messages = _history_to_messages(history, session=session)
     result = {
         "count": len(messages),
         "session_id": sid,

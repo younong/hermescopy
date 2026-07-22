@@ -26,6 +26,7 @@ import os
 import datetime
 import threading
 import uuid
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 # fal_client is imported lazily — see _load_fal_client(). Pulling it
@@ -822,17 +823,29 @@ def _postprocess_image_generate_result(raw: str, task_id: str | None = None) -> 
     if not isinstance(image, str) or not _looks_like_absolute_file_path(image):
         return raw
 
+    changed = False
+    try:
+        from PIL import Image
+
+        with Image.open(Path(image)) as generated:
+            width, height = generated.size
+        if width > 0 and height > 0:
+            payload["width"] = int(width)
+            payload["height"] = int(height)
+            changed = True
+    except Exception as exc:  # noqa: BLE001 - image generation still succeeded
+        logger.debug("Could not inspect generated image dimensions: %s", exc)
+
     env = _active_terminal_env(task_id)
     agent_path = _agent_visible_cache_path(image, env)
-    if not agent_path or agent_path == image:
-        return raw
+    if agent_path and agent_path != image:
+        if env is not None:
+            _force_artifact_sync(env)
+        payload.setdefault("host_image", image)
+        payload.setdefault("agent_visible_image", agent_path)
+        changed = True
 
-    if env is not None:
-        _force_artifact_sync(env)
-
-    payload.setdefault("host_image", image)
-    payload.setdefault("agent_visible_image", agent_path)
-    return json.dumps(payload, ensure_ascii=False)
+    return json.dumps(payload, ensure_ascii=False) if changed else raw
 
 
 def image_generate_tool(
