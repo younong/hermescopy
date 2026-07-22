@@ -43,6 +43,9 @@ export const en: Translations = {
     expand: "Expand",
     general: "General",
     messaging: "Messaging",
+    copyCode: "Copy code",
+    copied: "Copied",
+    copyFailed: "Copy failed",
     gateway: "Gateway",
     gatewayHint:
       "Messaging platforms, the API server and webhooks are configured on the Channels page. These are gateway-wide settings (proxy/relay mode and the global allowlist).",

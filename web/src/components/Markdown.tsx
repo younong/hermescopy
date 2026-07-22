@@ -1,9 +1,16 @@
+import { Button } from "@nous-research/ui/ui/components/button";
 import { Autolinker } from "autolinker";
+import { Check, CircleAlert, Copy } from "lucide-react";
 import {
   Children,
   createContext,
+  isValidElement,
   memo,
+  useCallback,
   useContext,
+  useEffect,
+  useRef,
+  useState,
   type ComponentProps,
   type ElementType,
   type FC,
@@ -16,6 +23,7 @@ import {
   type UrlTransform,
 } from "streamdown";
 
+import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
 
 const TAG_CLASSES = {
@@ -31,7 +39,7 @@ const TAG_CLASSES = {
   li: "marker:text-text-tertiary",
   ol: "mb-2 list-decimal space-y-0.5 pl-5 last:mb-0",
   p: "mb-2 last:mb-0",
-  pre: "mb-2 overflow-x-auto border border-border bg-secondary/60 px-3 py-2.5 font-mono text-xs leading-relaxed last:mb-0",
+  pre: "overflow-x-auto border border-border bg-secondary/60 px-3 py-2.5 pr-11 font-mono text-xs leading-relaxed",
   strong: "font-semibold",
   td: "border-r border-border/50 px-3 py-2 align-top last:border-r-0",
   th: "border-r border-border/60 px-3 py-2 text-left font-semibold last:border-r-0",
@@ -110,6 +118,122 @@ function MarkdownCode({ className, node, ...rest }: MarkdownElementProps<"code">
   );
 }
 
+type CopyState = "copied" | "error";
+type CopyFeedback = { state: CopyState; text: string } | null;
+
+function codeBlockText(children: ReactNode): string {
+  return Children.toArray(children)
+    .map((child) => {
+      if (typeof child === "string" || typeof child === "number") return String(child);
+      if (!isValidElement<{ children?: ReactNode }>(child)) return "";
+      return codeBlockText(child.props.children);
+    })
+    .join("");
+}
+
+async function copyText(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // Fall through for HTTP/LAN dashboards where the modern API is unavailable.
+  }
+
+  const activeElement = document.activeElement;
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.readOnly = true;
+  textarea.setAttribute("aria-hidden", "true");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+
+  let copied = false;
+  try {
+    copied = document.execCommand?.("copy") ?? false;
+  } catch {
+    copied = false;
+  } finally {
+    textarea.remove();
+    if (activeElement instanceof HTMLElement) activeElement.focus();
+  }
+  return copied;
+}
+
+function MarkdownPre({
+  children,
+  className,
+  node,
+  ...rest
+}: MarkdownElementProps<"pre">) {
+  const { t } = useI18n();
+  const [copyFeedback, setCopyFeedback] = useState<CopyFeedback>(null);
+  const resetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const text = codeBlockText(children);
+  const copyState = copyFeedback?.text === text ? copyFeedback.state : "idle";
+  void node;
+
+  const clearResetTimer = useCallback(() => {
+    if (resetTimer.current !== null) clearTimeout(resetTimer.current);
+    resetTimer.current = null;
+  }, []);
+
+  useEffect(() => clearResetTimer, [clearResetTimer]);
+
+  const handleCopy = useCallback(async () => {
+    clearResetTimer();
+    const copied = await copyText(text);
+    setCopyFeedback({ state: copied ? "copied" : "error", text });
+    resetTimer.current = setTimeout(() => {
+      setCopyFeedback(null);
+      resetTimer.current = null;
+    }, 1800);
+  }, [clearResetTimer, text]);
+
+  const copyCode = t.common.copyCode ?? "Copy code";
+  const copied = t.common.copied ?? "Copied";
+  const copyFailed = t.common.copyFailed ?? "Copy failed";
+  const label = copyState === "copied" ? copied : copyState === "error" ? copyFailed : copyCode;
+
+  return (
+    <div className="relative mb-2 last:mb-0" data-markdown-code-block>
+      <pre className={cn(TAG_CLASSES.pre, className)} {...rest}>
+        {children}
+      </pre>
+      <Button
+        aria-label={label}
+        className={cn(
+          "absolute right-1.5 top-1.5 border border-border/70 bg-background/80 text-text-secondary backdrop-blur-sm hover:text-foreground",
+          copyState === "copied" && "text-success",
+          copyState === "error" && "text-destructive",
+        )}
+        ghost
+        onClick={() => void handleCopy()}
+        size="xs"
+        title={label}
+        type="button"
+      >
+        {copyState === "copied" ? (
+          <Check aria-hidden />
+        ) : copyState === "error" ? (
+          <CircleAlert aria-hidden />
+        ) : (
+          <Copy aria-hidden />
+        )}
+      </Button>
+      <span
+        className="sr-only"
+        role={copyState === "error" ? "alert" : "status"}
+      >
+        {copyState === "idle" ? "" : label}
+      </span>
+    </div>
+  );
+}
+
 function MarkdownImage({ alt, className, node }: MarkdownElementProps<"img">) {
   void node;
   return alt ? <span className={className}>{alt}</span> : null;
@@ -152,7 +276,7 @@ const COMPONENTS: Components = {
   li: tagged("li", true),
   ol: tagged("ol"),
   p: tagged("p", true),
-  pre: tagged("pre"),
+  pre: MarkdownPre,
   strong: tagged("strong", true),
   table: MarkdownTable,
   td: tagged("td", true),

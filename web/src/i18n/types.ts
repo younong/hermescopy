@@ -62,6 +62,9 @@ export interface Translations {
     messaging: string;
     // Optional: non-English locales fall back to the English literal in the
     // component until translated, matching the enriched-profiles keys.
+    copyCode?: string;
+    copied?: string;
+    copyFailed?: string;
     gateway?: string;
     gatewayHint?: string;
     pluginLoadFailed: string;
