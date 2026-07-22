@@ -378,8 +378,10 @@ function transcriptAttachments(
       continue;
     }
     const path = typeof value.path === "string" ? value.path : undefined;
+    const dimensions = positiveImageDimensions(value.width, value.height);
     attachments.push({
       downloadUrl: path ? buildSessionFileDownloadUrl(path, cwd, name) : undefined,
+      ...(kind === "image" && dimensions ? dimensions : {}),
       id: `${messageId}-attachment-${index}`,
       kind,
       mimeType: typeof value.mime_type === "string" ? value.mime_type : undefined,
@@ -477,13 +479,14 @@ function extractImageReferencesFromContent(content: unknown): ExtractedImageRefe
   const refs: ExtractedImageReference[] = [];
 
   if (candidate && isImageContentType(type) && isLikelyImageReference(candidate)) {
+    const dimensions = positiveImageDimensions(record.width, record.height);
     refs.push({
-      height: numberFromUnknown(record.height),
+      height: dimensions?.height,
       mimeType: firstString(record.mimeType, record.mime_type) ?? mimeTypeForImageSource(candidate),
       source: "structured",
       title: firstString(record.title, record.name, record.alt),
       url: candidate,
-      width: numberFromUnknown(record.width),
+      width: dimensions?.width,
     });
   }
 
@@ -516,8 +519,17 @@ function isImageContentType(type: string): boolean {
   return type === "image" || type === "image_url" || type === "input_image" || type === "artifact.image";
 }
 
-function numberFromUnknown(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+function positiveImageDimensions(
+  width: unknown,
+  height: unknown,
+): { height: number; width: number } | undefined {
+  if (
+    typeof width !== "number" || !Number.isFinite(width) || width <= 0 ||
+    typeof height !== "number" || !Number.isFinite(height) || height <= 0
+  ) {
+    return undefined;
+  }
+  return { height, width };
 }
 
 function extractImageReferencesFromText(text: string): ExtractedImageReference[] {
@@ -765,13 +777,25 @@ function countChar(value: string, char: string): number {
 }
 
 function dedupeImageReferences(refs: ExtractedImageReference[]): ExtractedImageReference[] {
-  const seen = new Set<string>();
+  const indices = new Map<string, number>();
   const deduped: ExtractedImageReference[] = [];
   for (const ref of refs) {
     const key = ref.url;
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    deduped.push(ref);
+    if (!key) continue;
+    const existingIndex = indices.get(key);
+    if (existingIndex === undefined) {
+      indices.set(key, deduped.length);
+      deduped.push(ref);
+      continue;
+    }
+    const existing = deduped[existingIndex];
+    deduped[existingIndex] = {
+      ...existing,
+      height: ref.height ?? existing.height,
+      mimeType: ref.mimeType ?? existing.mimeType,
+      title: ref.title ?? existing.title,
+      width: ref.width ?? existing.width,
+    };
   }
   return deduped;
 }
@@ -1246,13 +1270,16 @@ function imageArtifactPayloadFromToolResult(
   if (!record || record.success === false) return undefined;
   const source = firstString(record.host_image, record.image, record.url);
   if (!source) return undefined;
+  const dimensions = positiveImageDimensions(record.width, record.height);
   return {
+    height: dimensions?.height,
     id: `${toolCallId}-image`,
     messageId,
-    mimeType: mimeTypeForImageSource(source),
+    mimeType: firstString(record.mime_type, record.mimeType) ?? mimeTypeForImageSource(source),
     title: toolName === "image_generate" ? "Generated image" : "Image result",
     toolCallId,
     url: source,
+    width: dimensions?.width,
   };
 }
 
@@ -1496,18 +1523,21 @@ function addImageArtifact(
   const messageId = payload?.messageId ?? payload?.message_id;
   const toolCallId = payload?.toolCallId ?? payload?.tool_call_id;
   const name = filenameFromPath(rawUrl) || payload?.title || "image";
+  const existing = state.artifacts[id];
+  const existingImage = existing && existing.kind !== "file" ? existing : undefined;
+  const dimensions = positiveImageDimensions(payload?.width, payload?.height);
   const artifact: ImageArtifactState = {
     downloadUrl: looksLikeFilesystemPath(rawUrl)
       ? buildSessionFileDownloadUrl(rawUrl, state.cwd, name)
       : undefined,
-    height: payload?.height,
+    height: dimensions?.height ?? existingImage?.height,
     id,
-    messageId,
-    mimeType: payload?.mimeType ?? payload?.mime_type,
-    title: payload?.title,
-    toolCallId,
+    messageId: messageId ?? existingImage?.messageId,
+    mimeType: payload?.mimeType ?? payload?.mime_type ?? existingImage?.mimeType,
+    title: payload?.title ?? existingImage?.title,
+    toolCallId: toolCallId ?? existingImage?.toolCallId,
     url,
-    width: payload?.width,
+    width: dimensions?.width ?? existingImage?.width,
   };
   let messages = state.messages;
   let toolCalls = state.toolCalls;

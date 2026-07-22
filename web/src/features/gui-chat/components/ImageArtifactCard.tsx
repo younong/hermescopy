@@ -61,24 +61,36 @@ export function ImageArtifactCard({
   };
 
   const openUrl = displayUrl ?? artifact.url;
+  const dimensions = validImageDimensions(artifact.width, artifact.height);
+  const geometryStyle = dimensions
+    ? { aspectRatio: `${dimensions.width} / ${dimensions.height}` }
+    : undefined;
 
   if (variant === "bubble") {
     return (
       <div className="w-[180px] sm:w-[220px]">
-        {displayUrl ? (
-          <a href={openUrl} target="_blank" rel="noreferrer" className="block">
-            <img
-              alt={artifact.title ?? "Image artifact"}
-              className="max-h-[320px] w-full rounded-3xl object-cover shadow-sm"
-              loading="lazy"
-              src={displayUrl}
-            />
-          </a>
-        ) : (
-          <div className="flex h-[220px] w-full items-center justify-center rounded-3xl bg-current/[0.04] px-4 text-center text-xs text-text-secondary">
-            {loadError ? "Image preview failed" : "Loading image…"}
-          </div>
-        )}
+        <div
+          className={dimensions ? "max-h-[320px] w-full overflow-hidden rounded-3xl bg-current/[0.04] shadow-sm" : undefined}
+          data-image-geometry={dimensions ? `${dimensions.width}x${dimensions.height}` : undefined}
+          style={geometryStyle}
+        >
+          {displayUrl ? (
+            <a href={openUrl} target="_blank" rel="noreferrer" className="block h-full w-full">
+              <img
+                alt={artifact.title ?? "Image artifact"}
+                className={dimensions ? "h-full w-full object-cover" : "max-h-[320px] w-full rounded-3xl object-cover shadow-sm"}
+                height={dimensions?.height}
+                loading="lazy"
+                src={displayUrl}
+                width={dimensions?.width}
+              />
+            </a>
+          ) : (
+            <div className={dimensions ? "flex h-full w-full items-center justify-center px-4 text-center text-xs text-text-secondary" : "flex h-[220px] w-full items-center justify-center rounded-3xl bg-current/[0.04] px-4 text-center text-xs text-text-secondary"}>
+              {loadError ? "Image preview failed" : "Loading image…"}
+            </div>
+          )}
+        </div>
         <div className="mt-1 flex justify-end">
           <a
             aria-busy={downloading}
@@ -113,16 +125,25 @@ export function ImageArtifactCard({
 
   return (
     <figure className="mt-3 overflow-hidden border border-current/15 bg-background-base/60">
-      <a href={openUrl} target="_blank" rel="noreferrer" className="block bg-black/20">
+      <a
+        href={openUrl}
+        target="_blank"
+        rel="noreferrer"
+        className={dimensions ? "block max-h-80 overflow-hidden bg-black/20" : "block bg-black/20"}
+        data-image-geometry={dimensions ? `${dimensions.width}x${dimensions.height}` : undefined}
+        style={geometryStyle}
+      >
         {displayUrl ? (
           <img
             alt={artifact.title ?? "Image artifact"}
-            className="max-h-80 w-full object-contain"
+            className={dimensions ? "h-full w-full object-contain" : "max-h-80 w-full object-contain"}
+            height={dimensions?.height}
             loading="lazy"
             src={displayUrl}
+            width={dimensions?.width}
           />
         ) : (
-          <div className="flex min-h-40 items-center justify-center px-4 py-8 text-sm text-text-secondary">
+          <div className={dimensions ? "flex h-full w-full items-center justify-center px-4 py-8 text-sm text-text-secondary" : "flex min-h-40 items-center justify-center px-4 py-8 text-sm text-text-secondary"}>
             {loadError ? `Image preview failed: ${loadError}` : "Loading image preview…"}
           </div>
         )}
@@ -170,6 +191,19 @@ export function ImageArtifactCard({
       </figcaption>
     </figure>
   );
+}
+
+function validImageDimensions(
+  width: unknown,
+  height: unknown,
+): { height: number; width: number } | undefined {
+  if (
+    typeof width !== "number" || !Number.isFinite(width) || width <= 0 ||
+    typeof height !== "number" || !Number.isFinite(height) || height <= 0
+  ) {
+    return undefined;
+  }
+  return { height, width };
 }
 
 function directDisplayUrl(url: string): string | null {

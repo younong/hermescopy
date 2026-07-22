@@ -25,6 +25,8 @@ export interface MessageAttachmentState {
   refText?: string;
   sourcePath?: string;
   downloadUrl?: string;
+  width?: number;
+  height?: number;
 }
 
 export type ToolCallStatus = "running" | "succeeded" | "failed";
@@ -104,6 +106,8 @@ export interface GuiComposerAttachment {
   attachedPath?: string;
   pagesAttached?: number;
   refText?: string;
+  width?: number;
+  height?: number;
 }
 
 export interface GuiChatState {

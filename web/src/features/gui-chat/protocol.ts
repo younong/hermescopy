@@ -16,6 +16,8 @@ export interface GatewayTranscriptAttachment {
   ref_text?: unknown;
   size_bytes?: unknown;
   source_paths?: unknown;
+  width?: unknown;
+  height?: unknown;
 }
 
 export interface GatewayTranscriptMessage {

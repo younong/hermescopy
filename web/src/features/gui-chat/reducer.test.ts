@@ -746,6 +746,60 @@ describe("guiChatReducer history image restoration", () => {
     });
   });
 
+  it("keeps structured image dimensions when a text reference appears first", () => {
+    const imagePath = "/workspace/generated.png";
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        info: { cwd: "/workspace" },
+        messages: [
+          {
+            content: [
+              {
+                type: "artifact.image",
+                url: imagePath,
+                width: 800,
+                height: 450,
+              },
+            ],
+            role: "assistant",
+            text: `Generated: ${imagePath}`,
+          },
+        ],
+        session_id: "sid",
+      },
+    });
+
+    expect(state.messages[0].artifactIds).toHaveLength(1);
+    expect(imageArtifact(state, state.messages[0].artifactIds[0])).toMatchObject({
+      height: 450,
+      width: 800,
+    });
+  });
+
+  it("drops incomplete or malformed image dimensions", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        messages: [
+          {
+            content: [
+              { type: "artifact.image", url: "https://example.com/a.png", width: 640 },
+              { type: "artifact.image", url: "https://example.com/b.png", width: -1, height: 20 },
+            ],
+            role: "assistant",
+          },
+        ],
+        session_id: "sid",
+      },
+    });
+
+    for (const artifact of Object.values(state.artifacts)) {
+      expect(artifact).not.toMatchObject({ width: expect.any(Number) });
+      expect(artifact).not.toMatchObject({ height: expect.any(Number) });
+    }
+  });
+
   it("restores image, PDF, and file attachment cards from transcript metadata", () => {
     const state = guiChatReducer(initialGuiChatState, {
       type: "session.created",
@@ -761,6 +815,8 @@ describe("guiChatReducer history image restoration", () => {
                 path: "/tmp/shot.png",
                 size_bytes: 123,
                 source_paths: ["/tmp/shot.png"],
+                width: 640,
+                height: 360,
               },
               {
                 kind: "pdf",
@@ -791,6 +847,7 @@ describe("guiChatReducer history image restoration", () => {
     expect(state.messages[0].attachments).toEqual([
       {
         downloadUrl: "/api/files/download?path=%2Ftmp%2Fshot.png&cwd=%2Fworkspace&filename=shot.png",
+        height: 360,
         id: "history-0-attachment-0",
         kind: "image",
         mimeType: "image/png",
@@ -800,6 +857,7 @@ describe("guiChatReducer history image restoration", () => {
         refText: undefined,
         sizeBytes: 123,
         sourcePath: "/tmp/shot.png",
+        width: 640,
       },
       {
         downloadUrl: "/api/files/download?path=%2Fworkspace%2F.hermes%2Fdesktop-attachments%2Freport.pdf&cwd=%2Fworkspace&filename=report.pdf",

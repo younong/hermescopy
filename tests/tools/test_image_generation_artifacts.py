@@ -1,6 +1,8 @@
 import json
 from types import SimpleNamespace
 
+from PIL import Image
+
 
 def test_postprocess_adds_agent_visible_image_for_active_ssh_env(monkeypatch, tmp_path):
     from tools import image_generation_tool
@@ -36,6 +38,24 @@ def test_postprocess_adds_agent_visible_image_for_active_ssh_env(monkeypatch, tm
         "/home/remotesshuser/.hermes/cache/images/xai_grok-imagine-image_test.jpg"
     )
     assert sync_calls == [True]
+
+
+def test_postprocess_reads_dimensions_from_final_image_bytes(monkeypatch, tmp_path):
+    from tools import image_generation_tool
+
+    image_path = tmp_path / "generated.png"
+    Image.new("RGB", (17, 9)).save(image_path)
+    monkeypatch.setattr(image_generation_tool, "_active_terminal_env", lambda task_id: None)
+    monkeypatch.setattr(image_generation_tool, "_agent_visible_cache_path", lambda *_args: None)
+
+    result = json.loads(
+        image_generation_tool._postprocess_image_generate_result(
+            json.dumps({"success": True, "image": str(image_path), "width": 999, "height": 999})
+        )
+    )
+
+    assert result["width"] == 17
+    assert result["height"] == 9
 
 
 def test_postprocess_maps_docker_cache_path_without_active_env(monkeypatch, tmp_path):

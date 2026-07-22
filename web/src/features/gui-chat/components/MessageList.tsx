@@ -40,6 +40,8 @@ export function MessageList({
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const followBottomRef = useRef(true);
+  const pendingBottomAdjustmentRef = useRef(0);
+  const bottomAdjustmentFrameRef = useRef<number | null>(null);
   const lastForceBottomKeyRef = useRef<string | undefined>(undefined);
   const anchorRef = useRef<{ id: string; offset: number } | null>(null);
 
@@ -77,13 +79,24 @@ export function MessageList({
   }, [state]);
 
   const virtualizer = useVirtualizer({
+    anchorTo: "end",
     count: rows.length,
     estimateSize: (index) => rows[index]?.kind === "message" ? 140 : 72,
     getItemKey: (index) => rows[index]?.id ?? index,
     getScrollElement: () => containerRef.current,
     initialRect: { height: 600, width: 800 },
+    onChange: (instance) => {
+      const sizer = containerRef.current?.firstElementChild as HTMLElement | null;
+      if (!sizer) return;
+      const renderedTotalSize = Number.parseFloat(sizer.style.height);
+      const pendingAdjustment = instance.getTotalSize() - renderedTotalSize;
+      if (followBottomRef.current && pendingAdjustment > 0) {
+        pendingBottomAdjustmentRef.current = pendingAdjustment;
+      }
+    },
     overscan: OVERSCAN_ROWS,
   });
+  const totalSize = virtualizer.getTotalSize();
 
   const captureAnchor = useCallback(() => {
     const container = containerRef.current;
@@ -129,6 +142,25 @@ export function MessageList({
   }, [forceBottomKey, scrollToBottom]);
 
   useLayoutEffect(() => {
+    const element = containerRef.current;
+    if (!element || !followBottomRef.current || pendingBottomAdjustmentRef.current <= 0) return;
+    const pendingAdjustment = pendingBottomAdjustmentRef.current;
+    pendingBottomAdjustmentRef.current = 0;
+    bottomAdjustmentFrameRef.current = requestAnimationFrame(() => {
+      bottomAdjustmentFrameRef.current = null;
+      if (!followBottomRef.current) return;
+      element.scrollTop += pendingAdjustment;
+      syncScrollPosition(element.scrollTop);
+    });
+    return () => {
+      if (bottomAdjustmentFrameRef.current !== null) {
+        cancelAnimationFrame(bottomAdjustmentFrameRef.current);
+        bottomAdjustmentFrameRef.current = null;
+      }
+    };
+  }, [syncScrollPosition, totalSize]);
+
+  useLayoutEffect(() => {
     if (!state.historyLoading && anchorRef.current) {
       const anchor = anchorRef.current;
       const index = rows.findIndex((row) => row.id === anchor.id);
@@ -143,7 +175,7 @@ export function MessageList({
       anchorRef.current = null;
     }
     if (followBottomRef.current) scrollToBottom();
-  }, [rows, scrollToBottom, state.historyLoading, syncScrollPosition, virtualizer]);
+  }, [rows, scrollToBottom, state.historyLoading, syncScrollPosition, totalSize, virtualizer]);
 
   if (rows.length === 0) {
     return (
@@ -158,7 +190,7 @@ export function MessageList({
 
   return (
     <div aria-busy={state.historyLoading} className="min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5" onScroll={handleScroll} ref={containerRef}>
-      <div className="relative w-full" style={{ height: `${virtualizer.getTotalSize()}px` }}>
+      <div className="relative w-full" style={{ height: `${totalSize}px` }}>
         {virtualizer.getVirtualItems().map((item) => {
           const row = rows[item.index];
           if (!row) return null;

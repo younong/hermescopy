@@ -1317,6 +1317,109 @@ def test_history_to_messages_preserves_attachment_metadata_and_attachment_only_t
     ) == [{"role": "user", "text": "", "attachments": attachments}]
 
 
+def test_history_to_messages_backfills_local_image_dimensions(tmp_path):
+    from PIL import Image
+
+    image_path = tmp_path / "workspace" / "shot.png"
+    image_path.parent.mkdir()
+    Image.new("RGB", (7, 11)).save(image_path)
+
+    messages = server._history_to_messages(
+        [
+            {
+                "role": "user",
+                "content": "",
+                "attachments": [
+                    {"kind": "image", "name": "shot.png", "path": str(image_path)}
+                ],
+            }
+        ],
+        session={"cwd": str(image_path.parent)},
+    )
+
+    assert messages[0]["attachments"][0]["width"] == 7
+    assert messages[0]["attachments"][0]["height"] == 11
+
+
+def test_history_to_messages_does_not_probe_external_or_out_of_scope_images(
+    monkeypatch, tmp_path
+):
+    opened = []
+
+    class FailImage:
+        @staticmethod
+        def open(path):
+            opened.append(path)
+            raise AssertionError("unexpected image open")
+
+    monkeypatch.setitem(sys.modules, "PIL", types.SimpleNamespace(Image=FailImage))
+    history = [
+        {
+            "role": "user",
+            "content": "",
+            "attachments": [
+                {"kind": "image", "name": "remote.png", "path": "https://example.com/remote.png"},
+                {"kind": "image", "name": "outside.png", "path": str(tmp_path.parent / "outside.png")},
+            ],
+        }
+    ]
+
+    messages = server._history_to_messages(
+        history, session={"cwd": str(tmp_path / "workspace")}
+    )
+
+    assert opened == []
+    assert all("width" not in item for item in messages[0]["attachments"])
+    assert all("height" not in item for item in messages[0]["attachments"])
+
+
+def test_history_to_messages_hydrates_generated_image_metadata(tmp_path):
+    from PIL import Image
+
+    image_path = tmp_path / "workspace" / "generated.png"
+    image_path.parent.mkdir()
+    Image.new("RGB", (13, 5)).save(image_path)
+    history = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-image",
+                    "function": {"name": "image_generate", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-image",
+            "content": json.dumps({"success": True, "image": str(image_path)}),
+        },
+        {"role": "assistant", "content": "Done"},
+    ]
+
+    messages = server._history_to_messages(
+        history, session={"cwd": str(image_path.parent)}
+    )
+
+    assert messages == [
+        {
+            "role": "assistant",
+            "text": "Done",
+            "content": [
+                {
+                    "type": "artifact.image",
+                    "url": str(image_path),
+                    "title": "Generated image",
+                    "tool_call_id": "call-image",
+                    "width": 13,
+                    "height": 5,
+                }
+            ],
+        }
+    ]
+
+
 def test_history_to_messages_rejects_invalid_attachment_metadata():
     history = [
         {
@@ -9505,8 +9608,14 @@ def test_image_attach_bytes_writes_to_gateway_dir(monkeypatch, tmp_path):
             "path": str(written),
             "size_bytes": written.stat().st_size,
             "source_paths": [str(written)],
+            "width": 1,
+            "height": 1,
         }
     ]
+    assert server._sessions["abx"]["pending_attachments"][0]["width"] == 1
+    assert server._sessions["abx"]["pending_attachments"][0]["height"] == 1
+    assert res["width"] == 1
+    assert res["height"] == 1
     assert res["bytes"] > 0
 
 
