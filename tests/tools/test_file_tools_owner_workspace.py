@@ -132,6 +132,64 @@ def test_authenticated_read_does_not_resolve_ambient_cwd(owner_a_workspace, monk
         _gateway_runtime.reset(token)
 
 
+def test_authenticated_artifact_paths_stay_in_selected_workspace(
+    owner_a_workspace, owner_b_workspace, monkeypatch
+):
+    owner_a_workspace.replace_bytes(
+        RootKind.WORKSPACE, "default/slides/slide-01.jpg", b"image"
+    )
+    owner_b_workspace.replace_bytes(
+        RootKind.WORKSPACE, "default/slides/secret.jpg", b"secret"
+    )
+    selected = ControlledWorkspaceFileOperations(
+        AuthenticatedWorkspaceContext(owner_a_workspace)
+    )
+    token = _bind_runtime(owner_a_workspace)
+    try:
+        ambient_root = owner_b_workspace.get(RootKind.WORKSPACE).canonical_path
+        monkeypatch.setenv("TERMINAL_CWD", str(ambient_root))
+        relative = file_tools.resolve_delegated_artifact_path("slides/slide-01.jpg")
+        diagnostic = file_tools.resolve_delegated_artifact_path(
+            selected.diagnostic_path("slides/slide-01.jpg")
+        )
+
+        assert relative["path"] == "slides/slide-01.jpg"
+        assert diagnostic["path"] == "slides/slide-01.jpg"
+        assert relative["diagnostic_path"] == diagnostic["diagnostic_path"]
+        assert str(ambient_root) not in relative["diagnostic_path"]
+    finally:
+        _gateway_runtime.reset(token)
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    ["/workspace/slide.jpg", "../outside.jpg", "slides", "/etc/passwd"],
+)
+def test_authenticated_artifact_paths_fail_closed(
+    owner_a_workspace, bad_path
+):
+    owner_a_workspace.replace_bytes(RootKind.WORKSPACE, "default/slides/file.jpg", b"x")
+    token = _bind_runtime(owner_a_workspace)
+    try:
+        with pytest.raises(ValueError, match="invalid delegated artifact"):
+            file_tools.resolve_delegated_artifact_path(bad_path)
+    finally:
+        _gateway_runtime.reset(token)
+
+
+def test_authenticated_artifact_rejects_symlink_escape(owner_a_workspace, tmp_path):
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(b"outside")
+    link = owner_a_workspace.get(RootKind.WORKSPACE).canonical_path / "default/link.jpg"
+    link.symlink_to(outside)
+    token = _bind_runtime(owner_a_workspace)
+    try:
+        with pytest.raises(ValueError, match="invalid delegated artifact"):
+            file_tools.resolve_delegated_artifact_path("link.jpg")
+    finally:
+        _gateway_runtime.reset(token)
+
+
 def test_authenticated_write_does_not_resolve_ambient_cwd(owner_a_workspace, monkeypatch):
     token = _bind_runtime(owner_a_workspace)
     try:

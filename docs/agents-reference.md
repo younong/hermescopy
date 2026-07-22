@@ -1004,10 +1004,20 @@ conversation later through the async-delegation completion queue.
 
 Two shapes:
 
-- **Single:** pass `goal` (+ optional `context`, `toolsets`).
+- **Single:** pass `goal` (+ optional `context` and `artifact_paths`).
 - **Batch (parallel):** pass `tasks: [...]` — each gets its own subagent
-  running concurrently. Concurrency is capped by
-  `delegation.max_concurrent_children` (default 3).
+  running concurrently. Each item may include its own `artifact_paths`.
+  Concurrency is capped by `delegation.max_concurrent_children` (default 3).
+
+Use `artifact_paths` whenever a delegated task must inspect existing local
+files. Hermes validates the complete single task or batch before resolving
+child credentials or spawning any child. Normal sessions resolve relative paths
+against the authoritative task/session cwd. Authenticated owner workers accept
+only files in the selected workspace capability (workspace-relative paths or
+exact diagnostic paths returned by file tools). Missing files, directories,
+outside paths, traversal/symlink escapes, and invented `/workspace/...` paths
+fail immediately. Put expectations and constraints in `context`; do not embed a
+guessed artifact path there.
 
 Roles:
 

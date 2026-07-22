@@ -1,5 +1,9 @@
 # PptxGenJS Tutorial
 
+## Fast Creation Contract
+
+For ordinary from-scratch decks, combine the outline, palette, typography, visual motif, and per-slide layouts in one planning decision. Write one PptxGenJS program, run it once, and use the deterministic validation in `SKILL.md`. Do not split slide generation across subagents, browse for optional assets, rasterize slides, or force a repair when those checks pass. The normal workflow should stay within roughly 2-4 substantive model decisions and deliver the generated artifact immediately after validation.
+
 ## Setup & Basic Structure
 
 ```javascript

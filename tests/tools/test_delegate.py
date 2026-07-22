@@ -14,6 +14,7 @@ import os
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from tools.delegate_tool import (
@@ -51,6 +52,7 @@ def _make_mock_parent(depth=0):
     parent.provider_sort = None
     parent._session_db = None
     parent._delegate_depth = depth
+    parent._current_task_id = None
     parent._active_children = []
     parent._active_children_lock = threading.Lock()
     parent._print_fn = None
@@ -69,6 +71,8 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("goal", props)
         self.assertIn("tasks", props)
         self.assertIn("context", props)
+        self.assertIn("artifact_paths", props)
+        self.assertIn("artifact_paths", props["tasks"]["items"]["properties"])
         # toolsets is intentionally NOT exposed to the model — subagents always
         # inherit the parent's toolsets. Letting the model name toolsets was a
         # capability-selection surface the model should not control.
@@ -146,6 +150,28 @@ class TestChildSystemPrompt(unittest.TestCase):
     def test_empty_context_ignored(self):
         prompt = _build_child_system_prompt("Do something", "  ")
         self.assertNotIn("CONTEXT", prompt)
+
+    def test_validated_artifacts_are_explicit_and_fail_closed(self):
+        prompt = _build_child_system_prompt(
+            "Review slides",
+            artifacts=[{
+                "path": "/tmp/slide-01.jpg",
+                "diagnostic_path": "/tmp/slide-01.jpg",
+            }],
+        )
+        self.assertIn("VALIDATED ARTIFACTS", prompt)
+        self.assertIn("/tmp/slide-01.jpg", prompt)
+        self.assertIn("Never guess a replacement path", prompt)
+        self.assertIn("search the web for a substitute", prompt)
+
+    @patch("agent.runtime_cwd.resolve_agent_cwd")
+    def test_workspace_hint_prefers_runtime_session_cwd(self, mock_resolve):
+        from tools.delegate_tool import _resolve_workspace_hint
+
+        mock_resolve.return_value = Path.cwd()
+        parent = _make_mock_parent()
+        parent.cwd = "/does/not/exist"
+        self.assertEqual(_resolve_workspace_hint(parent), str(Path.cwd()))
 
 
 class TestStripBlockedTools(unittest.TestCase):
@@ -233,6 +259,94 @@ class TestDelegateTask(unittest.TestCase):
         self.assertEqual(result["results"][0]["status"], "completed")
         self.assertEqual(result["results"][0]["summary"], "Done!")
         mock_run.assert_called_once()
+
+    def test_normal_artifact_resolves_against_registered_task_cwd(self):
+        from tools.file_tools import resolve_delegated_artifact_path
+        from tools.terminal_tool import register_task_env_overrides
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as workspace:
+            artifact = Path(workspace) / "slide.jpg"
+            artifact.write_bytes(b"image")
+            register_task_env_overrides("artifact-task", {"cwd": workspace})
+            resolved = resolve_delegated_artifact_path(
+                "slide.jpg", "artifact-task"
+            )
+
+        self.assertEqual(Path(resolved["path"]), artifact.resolve())
+        self.assertEqual(Path(resolved["diagnostic_path"]), artifact.resolve())
+
+    @patch("tools.delegate_tool._run_single_child")
+    def test_single_task_artifacts_are_preflighted_and_reach_child(self, mock_run):
+        mock_run.return_value = {
+            "task_index": 0, "status": "completed", "summary": "Done",
+            "api_calls": 1, "duration_seconds": 1.0,
+        }
+        parent = _make_mock_parent()
+        validated = {
+            "input_path": "slide.jpg",
+            "path": "/tmp/slide.jpg",
+            "diagnostic_path": "/tmp/slide.jpg",
+        }
+        with patch(
+            "tools.file_tools.resolve_delegated_artifact_path",
+            return_value=validated,
+        ) as resolve, patch("tools.delegate_tool._build_child_agent") as build:
+            build.return_value = MagicMock()
+            result = json.loads(delegate_task(
+                goal="Review slide",
+                artifact_paths=["slide.jpg"],
+                parent_agent=parent,
+            ))
+
+        self.assertIn("results", result)
+        resolve.assert_called_once_with("slide.jpg", "default")
+        self.assertEqual(build.call_args.kwargs["artifacts"], [validated])
+
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_missing_artifact_fails_before_credentials_or_child(
+        self, mock_credentials, mock_build
+    ):
+        parent = _make_mock_parent()
+        with patch(
+            "tools.file_tools.resolve_delegated_artifact_path",
+            side_effect=ValueError("missing /workspace/deck.pptx"),
+        ):
+            result = json.loads(delegate_task(
+                goal="Review deck",
+                artifact_paths=["/workspace/deck.pptx"],
+                parent_agent=parent,
+            ))
+
+        self.assertIn("artifact preflight failed", result["error"])
+        mock_credentials.assert_not_called()
+        mock_build.assert_not_called()
+
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_batch_artifact_preflight_is_all_or_nothing(
+        self, mock_credentials, mock_build
+    ):
+        parent = _make_mock_parent()
+        with patch(
+            "tools.file_tools.resolve_delegated_artifact_path",
+            side_effect=[
+                {"input_path": "ok", "path": "/tmp/ok", "diagnostic_path": "/tmp/ok"},
+                ValueError("missing"),
+            ],
+        ):
+            result = json.loads(delegate_task(
+                tasks=[
+                    {"goal": "First", "artifact_paths": ["ok"]},
+                    {"goal": "Second", "artifact_paths": ["missing"]},
+                ],
+                parent_agent=parent,
+            ))
+
+        self.assertIn("Task 1 artifact preflight failed", result["error"])
+        mock_credentials.assert_not_called()
+        mock_build.assert_not_called()
 
     @patch("tools.delegate_tool._run_single_child")
     def test_batch_mode(self, mock_run):
