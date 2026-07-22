@@ -17,6 +17,8 @@ function createFrameHarness() {
     callbacks.delete(handle);
   });
 
+  let now = 0;
+
   return {
     cancelFrame,
     flushFrame() {
@@ -24,12 +26,16 @@ function createFrameHarness() {
       if (!entry) throw new Error("expected a queued animation frame");
       const [handle, callback] = entry;
       callbacks.delete(handle);
-      callback(0);
+      callback(now);
     },
+    now: () => now,
     pendingFrames() {
       return callbacks.size;
     },
     requestFrame,
+    setNow(value: number) {
+      now = value;
+    },
   };
 }
 
@@ -212,6 +218,102 @@ describe("createGatewayEventFrameQueue", () => {
 
     expect(dispatch).toHaveBeenCalledWith(controlEvent);
     expect(frames.requestFrame).not.toHaveBeenCalled();
+  });
+
+  it("reports one content-free aggregate only after completion drains", () => {
+    const frames = createFrameHarness();
+    const diagnostics: unknown[] = [];
+    const queue = createGatewayEventFrameQueue(
+      vi.fn(),
+      frames.requestFrame,
+      frames.cancelFrame,
+      { now: frames.now, onDiagnostic: (summary) => diagnostics.push(summary) },
+    );
+
+    frames.setNow(10);
+    queue.enqueue(event("message.start"));
+    queue.enqueue(event("message.delta", "👨‍👩‍👧‍👦abc"));
+    queue.enqueue(event("message.complete", "ignored-complete-content"));
+
+    frames.setNow(70);
+    frames.flushFrame();
+    expect(diagnostics).toEqual([]);
+    frames.setNow(86);
+    frames.flushFrame();
+    frames.setNow(102);
+    frames.flushFrame();
+    frames.setNow(118);
+    frames.flushFrame();
+    expect(diagnostics).toEqual([]);
+    frames.setNow(134);
+    frames.flushFrame();
+
+    expect(diagnostics).toEqual([
+      {
+        duration_ms: 124,
+        graphemes_consumed: 4,
+        graphemes_per_frame_max: 1,
+        graphemes_per_frame_p95: 1,
+        input_graphemes: 4,
+        input_stream_events: 1,
+        long_frames: 1,
+        max_queued_events: 2,
+        max_queued_graphemes: 4,
+        outcome: "completed",
+        render_frames: 5,
+        schedule_delay_max_ms: 60,
+        schedule_delay_p95_ms: 100,
+        schema_version: 1,
+      },
+    ]);
+    expect(JSON.stringify(diagnostics)).not.toContain("ignored-complete-content");
+  });
+
+  it("drops superseded queued deltas before dispatching the new stream", () => {
+    const frames = createFrameHarness();
+    const dispatched: GatewayEvent[] = [];
+    const queue = createGatewayEventFrameQueue(
+      (gatewayEvent) => dispatched.push(gatewayEvent),
+      frames.requestFrame,
+      frames.cancelFrame,
+      { now: frames.now },
+    );
+
+    queue.enqueue(event("message.start"));
+    queue.enqueue(event("message.delta", "stale"));
+    queue.enqueue(event("message.complete", "stale"));
+    queue.enqueue(event("message.start"));
+    queue.enqueue(event("message.delta", "new"));
+    frames.flushFrame();
+
+    expect(dispatched.map(eventText).filter(Boolean)).toEqual(["stale", "n"]);
+    expect(dispatched.map(({ type }) => type)).toEqual([
+      "message.start",
+      "message.complete",
+      "message.start",
+      "message.delta",
+    ]);
+  });
+
+  it("reports superseded and cancelled lifecycles without carrying content", () => {
+    const frames = createFrameHarness();
+    const diagnostics: Array<{ outcome: string }> = [];
+    const queue = createGatewayEventFrameQueue(
+      vi.fn(),
+      frames.requestFrame,
+      frames.cancelFrame,
+      { now: frames.now, onDiagnostic: (summary) => diagnostics.push(summary) },
+    );
+
+    queue.enqueue(event("message.start"));
+    queue.enqueue(event("message.delta", "private"));
+    frames.setNow(20);
+    queue.enqueue(event("message.start"));
+    frames.setNow(30);
+    queue.reset();
+
+    expect(diagnostics.map(({ outcome }) => outcome)).toEqual(["superseded", "cancelled"]);
+    expect(JSON.stringify(diagnostics)).not.toContain("private");
   });
 
   it("cancels queued stream and completion events on reset", () => {

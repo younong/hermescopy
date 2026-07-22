@@ -6,6 +6,7 @@ import {
   type GatewayEvent,
 } from "@/lib/gatewayClient";
 import { getHermesBrowserId } from "@/lib/browserIdentity";
+import type { GuiFrameQueueDiagnostic } from "@/lib/chatDiagnostics";
 import { base64FromDataUrl, readFileAsDataUrl } from "./attachments";
 import type {
   SessionAttachResponse,
@@ -101,6 +102,7 @@ export interface GuiChatConnection {
   respondToApproval(sessionId: string, request: unknown, approved: boolean): Promise<void>;
   respondToClarify(sessionId: string, requestId: string, answer: string): Promise<void>;
   ping(): Promise<void>;
+  reportFrameQueueDiagnostic(summary: GuiFrameQueueDiagnostic): void;
 }
 
 export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnection {
@@ -239,6 +241,9 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
     },
     ping: async () => {
       await client.request("gateway.ping", {}, 10_000);
+    },
+    reportFrameQueueDiagnostic: (summary) => {
+      void client.request("diagnostics.gui_frame_queue", { ...summary }).catch(() => undefined);
     },
     respondToApproval: async (sessionId, _request, approved) => {
       await client.request("approval.respond", {

@@ -72,6 +72,99 @@ def test_err_envelope(server):
     }
 
 
+def _gui_frame_diagnostic(**overrides):
+    value = {
+        "schema_version": 1,
+        "outcome": "completed",
+        "duration_ms": 120.0,
+        "input_stream_events": 2,
+        "input_graphemes": 8,
+        "max_queued_events": 3,
+        "max_queued_graphemes": 8,
+        "render_frames": 4,
+        "graphemes_consumed": 8,
+        "graphemes_per_frame_max": 3,
+        "graphemes_per_frame_p95": 3,
+        "schedule_delay_max_ms": 64.0,
+        "schedule_delay_p95_ms": 100.0,
+        "long_frames": 1,
+    }
+    value.update(overrides)
+    return value
+
+
+def test_gui_frame_diagnostic_requires_committed_dashboard_transport(server, monkeypatch):
+    monkeypatch.setattr(server, "current_transport", lambda: None)
+    response = server.handle_request(
+        {"id": "d1", "method": "diagnostics.gui_frame_queue", "params": _gui_frame_diagnostic()}
+    )
+    assert response["error"] == {
+        "code": 4092,
+        "message": "dashboard diagnostic requires an attached WebSocket",
+    }
+
+
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        "dashboard diagnostic requires an active session",
+        "dashboard session switch in progress",
+    ],
+)
+def test_gui_frame_diagnostic_rejects_uncommitted_dashboard_state(
+    server, monkeypatch, transport_error
+):
+    transport = MagicMock()
+    transport.dashboard_diagnostic_error.return_value = transport_error
+    monkeypatch.setattr(server, "current_transport", lambda: transport)
+    response = server.handle_request(
+        {"id": "d1", "method": "diagnostics.gui_frame_queue", "params": _gui_frame_diagnostic()}
+    )
+    assert response["error"] == {"code": 4092, "message": transport_error}
+
+
+def test_gui_frame_diagnostic_logs_identifier_free_aggregate(server, monkeypatch, caplog):
+    transport = MagicMock()
+    transport.dashboard_diagnostic_error.return_value = None
+    monkeypatch.setattr(server, "current_transport", lambda: transport)
+    with caplog.at_level("INFO", logger=server.__name__):
+        response = server.handle_request(
+            {"id": "d1", "method": "diagnostics.gui_frame_queue", "params": _gui_frame_diagnostic()}
+        )
+    assert response == {"jsonrpc": "2.0", "id": "d1", "result": {"ok": True}}
+    message = next(
+        record.getMessage()
+        for record in caplog.records
+        if "gui frame queue aggregate" in record.getMessage()
+    )
+    assert "outcome=completed" in message
+    assert not any(name in message for name in ("session", "browser", "owner", "connection", "token"))
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        _gui_frame_diagnostic(text="secret-content"),
+        _gui_frame_diagnostic(session_id="secret-session"),
+        _gui_frame_diagnostic(duration_ms=float("nan")),
+        _gui_frame_diagnostic(input_stream_events=1.5),
+        _gui_frame_diagnostic(outcome="secret-outcome"),
+    ],
+)
+def test_gui_frame_diagnostic_rejects_unsafe_schema_without_echo(server, monkeypatch, params):
+    transport = MagicMock()
+    transport.dashboard_diagnostic_error.return_value = None
+    monkeypatch.setattr(server, "current_transport", lambda: transport)
+    response = server.handle_request(
+        {"id": "d1", "method": "diagnostics.gui_frame_queue", "params": params}
+    )
+    assert response["error"] == {
+        "code": -32602,
+        "message": "invalid GUI frame queue diagnostic",
+    }
+    assert "secret" not in json.dumps(response)
+
+
 # ── write_json ───────────────────────────────────────────────────────
 
 

@@ -6,6 +6,7 @@ import copy
 import inspect
 import json
 import logging
+import math
 import os
 import queue
 import subprocess
@@ -1466,6 +1467,102 @@ def method(name: str):
 
 @method("gateway.ping")
 def _gateway_ping(rid, _params: dict) -> dict:
+    return _ok(rid, {"ok": True})
+
+
+_GUI_FRAME_DIAGNOSTIC_FIELDS = frozenset(
+    {
+        "schema_version",
+        "outcome",
+        "duration_ms",
+        "input_stream_events",
+        "input_graphemes",
+        "max_queued_events",
+        "max_queued_graphemes",
+        "render_frames",
+        "graphemes_consumed",
+        "graphemes_per_frame_max",
+        "graphemes_per_frame_p95",
+        "schedule_delay_max_ms",
+        "schedule_delay_p95_ms",
+        "long_frames",
+    }
+)
+_GUI_FRAME_DIAGNOSTIC_COUNTS = frozenset(
+    {
+        "input_stream_events",
+        "input_graphemes",
+        "max_queued_events",
+        "max_queued_graphemes",
+        "render_frames",
+        "graphemes_consumed",
+        "long_frames",
+    }
+)
+_GUI_FRAME_DIAGNOSTIC_DURATIONS = frozenset(
+    {
+        "duration_ms",
+        "graphemes_per_frame_max",
+        "graphemes_per_frame_p95",
+        "schedule_delay_max_ms",
+        "schedule_delay_p95_ms",
+    }
+)
+
+
+def _valid_gui_frame_diagnostic(params: dict) -> bool:
+    if set(params) != _GUI_FRAME_DIAGNOSTIC_FIELDS:
+        return False
+    if params.get("schema_version") != 1 or isinstance(params.get("schema_version"), bool):
+        return False
+    if params.get("outcome") not in {"completed", "cancelled", "superseded"}:
+        return False
+    for name in _GUI_FRAME_DIAGNOSTIC_COUNTS:
+        value = params.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 10_000_000:
+            return False
+    for name in _GUI_FRAME_DIAGNOSTIC_DURATIONS:
+        value = params.get(name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or not 0 <= value <= 3_600_000
+        ):
+            return False
+    return True
+
+
+@method("diagnostics.gui_frame_queue")
+def _diagnostics_gui_frame_queue(rid, params: dict) -> dict:
+    eligibility = getattr(current_transport(), "dashboard_diagnostic_error", None)
+    if not callable(eligibility):
+        return _err(rid, 4092, "dashboard diagnostic requires an attached WebSocket")
+    message = eligibility()
+    if message is not None:
+        return _err(rid, 4092, message)
+    if not _valid_gui_frame_diagnostic(params):
+        return _err(rid, -32602, "invalid GUI frame queue diagnostic")
+    logger.info(
+        "gui frame queue aggregate outcome=%s duration_ms=%.1f input_stream_events=%d "
+        "input_graphemes=%d max_queued_events=%d max_queued_graphemes=%d "
+        "render_frames=%d graphemes_consumed=%d graphemes_per_frame_max=%.1f "
+        "graphemes_per_frame_p95=%.1f schedule_delay_max_ms=%.1f "
+        "schedule_delay_p95_ms=%.1f long_frames=%d",
+        params["outcome"],
+        params["duration_ms"],
+        params["input_stream_events"],
+        params["input_graphemes"],
+        params["max_queued_events"],
+        params["max_queued_graphemes"],
+        params["render_frames"],
+        params["graphemes_consumed"],
+        params["graphemes_per_frame_max"],
+        params["graphemes_per_frame_p95"],
+        params["schedule_delay_max_ms"],
+        params["schedule_delay_p95_ms"],
+        params["long_frames"],
+    )
     return _ok(rid, {"ok": True})
 
 

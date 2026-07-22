@@ -146,6 +146,35 @@ describe("connectGuiChat", () => {
     expect(client.request).toHaveBeenLastCalledWith("gateway.ping", {}, 10_000);
   });
 
+  it("reports frame diagnostics over the existing connection without awaiting failures", async () => {
+    const connection = connectGuiChat({ ownerKey: "owner-a" });
+    const client = mocks.gatewayInstances[0];
+    client.request.mockRejectedValueOnce(new Error("offline"));
+
+    expect(() => connection.reportFrameQueueDiagnostic({
+      duration_ms: 10,
+      graphemes_consumed: 1,
+      graphemes_per_frame_max: 1,
+      graphemes_per_frame_p95: 1,
+      input_graphemes: 1,
+      input_stream_events: 1,
+      long_frames: 0,
+      max_queued_events: 1,
+      max_queued_graphemes: 1,
+      outcome: "completed",
+      render_frames: 1,
+      schedule_delay_max_ms: 8,
+      schedule_delay_p95_ms: 8,
+      schema_version: 1,
+    })).not.toThrow();
+
+    expect(client.request).toHaveBeenCalledWith(
+      "diagnostics.gui_frame_queue",
+      expect.objectContaining({ schema_version: 1, outcome: "completed" }),
+    );
+    await Promise.resolve();
+  });
+
   it("creates a new session on the same authenticated connection", async () => {
     const connection = connectGuiChat({ ownerKey: "owner-a" });
     await connection.createOrAttach(null, 1);

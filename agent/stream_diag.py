@@ -1,29 +1,22 @@
-"""Stream diagnostics — per-attempt counters, exception chains, retry logging.
+"""Content-free diagnostics for provider streaming attempts.
 
-When a streaming chat-completions request dies mid-response, we want to
-know why: which Cloudflare edge served the request, which OpenRouter
-downstream provider answered, how many bytes/chunks we got before the
-drop, the HTTP status, the underlying httpx error class.  These helpers
-collect that info and emit it both to ``agent.log`` (full detail) and to
-the user-facing status line (compact).
-
-All helpers are extracted from :class:`AIAgent` for cleanliness.
-``run_agent`` keeps thin forwarder methods so existing call sites and
-tests that patch ``run_agent.<helper>`` keep working.
+The hot path keeps only counters, timestamps, and fixed-bucket histograms. Raw
+chunks, deltas, reasoning, tool payloads, and request identifiers are never
+retained by the aggregate metrics.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
 
-# Per-attempt stream diagnostic headers.  Lowercased; httpx returns
-# CIMultiDict so case-insensitive lookups already work, but we read .get()
-# on the dict from agent.log for free-form post-hoc analysis.
+# Failure-forensics-only response headers. These are never emitted by the
+# aggregate stream summary below. In particular, do not collect forwarded IPs.
 STREAM_DIAG_HEADERS = (
     "cf-ray",
     "cf-cache-status",
@@ -34,35 +27,88 @@ STREAM_DIAG_HEADERS = (
     "x-vercel-id",
     "via",
     "server",
-    "x-forwarded-for",
 )
+
+STREAM_GAP_BUCKETS_MS: tuple[float, ...] = (
+    5,
+    10,
+    25,
+    50,
+    100,
+    250,
+    500,
+    1000,
+    2500,
+    5000,
+    10000,
+    30000,
+)
+_STREAM_OUTCOMES = frozenset({"success", "error", "interrupted"})
+
+
+def fixed_histogram(bounds: Sequence[float]) -> list[int]:
+    """Return zeroed fixed buckets, including one overflow bucket."""
+    return [0] * (len(bounds) + 1)
+
+
+def fixed_histogram_observe(
+    counts: list[int], bounds: Sequence[float], value: float
+) -> None:
+    """Record one finite non-negative sample into fixed buckets."""
+    if not math.isfinite(value) or value < 0:
+        return
+    for index, upper in enumerate(bounds):
+        if value <= upper:
+            counts[index] += 1
+            return
+    counts[-1] += 1
+
+
+def fixed_histogram_percentile(
+    counts: Sequence[int], bounds: Sequence[float], maximum: float, percentile: float
+) -> float:
+    """Return the covering bucket upper bound, or exact max for overflow."""
+    total = sum(max(0, int(count)) for count in counts)
+    if total <= 0:
+        return 0.0
+    rank = max(1, math.ceil(percentile * total))
+    cumulative = 0
+    for index, count in enumerate(counts):
+        cumulative += max(0, int(count))
+        if cumulative >= rank:
+            return float(bounds[index]) if index < len(bounds) else max(0.0, maximum)
+    return max(0.0, maximum)
 
 
 def stream_diag_init() -> Dict[str, Any]:
-    """Return a fresh per-attempt diagnostic dict.
-
-    Mutated in-place by the streaming functions and read from the retry
-    block when a stream dies.  Lives on ``request_client_holder`` so it
-    survives across the closure boundary.
-    """
+    """Return fresh, constant-memory state for one provider stream attempt."""
     return {
+        # Preserve wall-clock fields consumed by the existing retry UI/logging.
         "started_at": time.time(),
         "first_chunk_at": None,
+        # Monotonic fields drive aggregate durations and are immune to clock jumps.
+        "started_monotonic": time.monotonic(),
+        "response_opened_monotonic": None,
+        "first_event_monotonic": None,
+        "first_visible_monotonic": None,
+        "last_event_monotonic": None,
+        "event_gap_max_ms": 0.0,
+        "event_gap_histogram": fixed_histogram(STREAM_GAP_BUCKETS_MS),
         "chunks": 0,
         "bytes": 0,
         "headers": {},
         "http_status": None,
+        "finalized": False,
     }
 
 
 def stream_diag_capture_response(agent: Any, diag: Dict[str, Any], http_response: Any) -> None:
-    """Snapshot interesting headers + HTTP status from the live stream.
-
-    Called once at stream open (before iterating chunks) so the metadata
-    survives even if the stream dies before any chunk arrives.  Failures
-    are swallowed — diag is best-effort.
-    """
-    if http_response is None or not isinstance(diag, dict):
+    """Mark response-open and snapshot failure-forensics HTTP metadata."""
+    if not isinstance(diag, dict):
+        return
+    if diag.get("response_opened_monotonic") is None:
+        diag["response_opened_monotonic"] = time.monotonic()
+    if http_response is None:
         return
     try:
         diag["http_status"] = getattr(http_response, "status_code", None)
@@ -71,13 +117,11 @@ def stream_diag_capture_response(agent: Any, diag: Dict[str, Any], http_response
     try:
         headers = getattr(http_response, "headers", None) or {}
         captured: Dict[str, str] = {}
-        # Allow per-agent override of the headers list (back-compat).
         target_headers = getattr(agent, "_STREAM_DIAG_HEADERS", STREAM_DIAG_HEADERS)
         for name in target_headers:
             try:
                 val = headers.get(name)
                 if val:
-                    # Truncate single-value to keep log lines bounded.
                     captured[name] = str(val)[:120]
             except Exception:
                 continue
@@ -86,34 +130,117 @@ def stream_diag_capture_response(agent: Any, diag: Dict[str, Any], http_response
         pass
 
 
-def flatten_exception_chain(error: BaseException) -> str:
-    """Return a compact ``Outer(msg) <- Inner(msg) <- ...`` rendering.
+def stream_diag_record_event(
+    diag: Dict[str, Any], event: Any = None, *, now: float | None = None
+) -> None:
+    """Record one raw SDK event without retaining its content."""
+    if not isinstance(diag, dict) or diag.get("finalized"):
+        return
+    observed = time.monotonic() if now is None else now
+    previous = diag.get("last_event_monotonic")
+    if previous is not None:
+        # Round sub-nanosecond float noise so exact bucket boundaries remain
+        # stable (for example 50 ms must not spill into the 100 ms bucket).
+        gap_ms = round(max(0.0, (observed - float(previous)) * 1000.0), 6)
+        diag["event_gap_max_ms"] = max(float(diag.get("event_gap_max_ms") or 0.0), gap_ms)
+        fixed_histogram_observe(
+            diag["event_gap_histogram"], STREAM_GAP_BUCKETS_MS, gap_ms
+        )
+    else:
+        diag["first_event_monotonic"] = observed
+        # Preserve the existing wall-clock TTFB field.
+        diag["first_chunk_at"] = time.time()
+    diag["last_event_monotonic"] = observed
+    diag["chunks"] = int(diag.get("chunks") or 0) + 1
+    try:
+        diag["bytes"] = int(diag.get("bytes") or 0) + len(repr(event))
+    except Exception:
+        pass
 
-    OpenAI SDK wraps httpx errors as ``APIConnectionError`` /
-    ``APIError`` and only the wrapper's class is visible at the catch
-    site — but the underlying ``RemoteProtocolError`` /
-    ``ConnectError`` / ``ReadError`` is what tells us WHY the stream
-    died.  Walks ``__cause__`` then ``__context__`` (deduped, max 4
-    deep) to surface the chain in one line.
-    """
+
+def stream_diag_mark_visible(diag: Dict[str, Any], *, now: float | None = None) -> None:
+    """Mark the first delta that reaches an existing display callback seam."""
+    if not isinstance(diag, dict) or diag.get("finalized"):
+        return
+    if diag.get("first_visible_monotonic") is None:
+        diag["first_visible_monotonic"] = time.monotonic() if now is None else now
+
+
+def _elapsed_ms(diag: Dict[str, Any], key: str) -> float | None:
+    value = diag.get(key)
+    if value is None:
+        return None
+    return max(0.0, (float(value) - float(diag["started_monotonic"])) * 1000.0)
+
+
+def stream_diag_finalize(
+    diag: Dict[str, Any], *, outcome: str, now: float | None = None
+) -> Dict[str, Any] | None:
+    """Log and return one identifier-free summary; subsequent calls are no-ops."""
+    if not isinstance(diag, dict) or diag.get("finalized"):
+        return None
+    if outcome not in _STREAM_OUTCOMES:
+        outcome = "error"
+    diag["finalized"] = True
+    ended = time.monotonic() if now is None else now
+    counts = tuple(int(count) for count in diag.get("event_gap_histogram") or ())
+    maximum = float(diag.get("event_gap_max_ms") or 0.0)
+    summary = {
+        "outcome": outcome,
+        "duration_ms": max(
+            0.0, (ended - float(diag.get("started_monotonic") or ended)) * 1000.0
+        ),
+        "response_open_ms": _elapsed_ms(diag, "response_opened_monotonic"),
+        "first_event_ms": _elapsed_ms(diag, "first_event_monotonic"),
+        "first_visible_ms": _elapsed_ms(diag, "first_visible_monotonic"),
+        "events": int(diag.get("chunks") or 0),
+        "estimated_event_bytes": int(diag.get("bytes") or 0),
+        "event_gap_max_ms": maximum,
+        "event_gap_p95_ms": fixed_histogram_percentile(
+            counts, STREAM_GAP_BUCKETS_MS, maximum, 0.95
+        ),
+    }
+    logger.info(
+        "stream aggregate outcome=%s duration_ms=%.1f response_open_ms=%s "
+        "first_event_ms=%s first_visible_ms=%s events=%d "
+        "estimated_event_bytes=%d event_gap_max_ms=%.1f event_gap_p95_ms=%.1f",
+        summary["outcome"],
+        summary["duration_ms"],
+        _format_optional_ms(summary["response_open_ms"]),
+        _format_optional_ms(summary["first_event_ms"]),
+        _format_optional_ms(summary["first_visible_ms"]),
+        summary["events"],
+        summary["estimated_event_bytes"],
+        summary["event_gap_max_ms"],
+        summary["event_gap_p95_ms"],
+    )
+    return summary
+
+
+def _format_optional_ms(value: float | None) -> str:
+    return "-" if value is None else f"{value:.1f}"
+
+
+def flatten_exception_chain(error: BaseException) -> str:
+    """Return a compact ``Outer(msg) <- Inner(msg) <- ...`` rendering."""
     seen: List[BaseException] = []
     link: Optional[BaseException] = error
     while link is not None and len(seen) < 4:
         if link in seen:
             break
         seen.append(link)
-        nxt = getattr(link, "__cause__", None) or getattr(
-            link, "__context__", None
-        )
+        nxt = getattr(link, "__cause__", None) or getattr(link, "__context__", None)
         if nxt is None or nxt is link:
             break
         link = nxt
     parts: List[str] = []
-    for e in seen:
-        msg = str(e).strip().replace("\n", " ")
+    for error_item in seen:
+        msg = str(error_item).strip().replace("\n", " ")
         if len(msg) > 140:
             msg = msg[:140] + "…"
-        parts.append(f"{type(e).__name__}({msg})" if msg else type(e).__name__)
+        parts.append(
+            f"{type(error_item).__name__}({msg})" if msg else type(error_item).__name__
+        )
     return " <- ".join(parts) if parts else type(error).__name__
 
 
@@ -127,67 +254,48 @@ def log_stream_retry(
     mid_tool_call: bool,
     diag: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Record a transient stream-drop and retry to ``agent.log``.
-
-    Always logs a structured WARNING so users have a breadcrumb regardless
-    of UI verbosity.  Subagents in particular benefit because their
-    retries no longer spam the parent's terminal — but the file log keeps
-    full detail (provider, error class, attempt, base_url, subagent_id).
-
-    When *diag* is provided (the per-attempt stream-diagnostic dict from
-    :func:`stream_diag_init`), the WARNING also captures upstream headers
-    (cf-ray, x-openrouter-provider, x-openrouter-id), HTTP status, bytes
-    streamed before the drop, and elapsed time on the dying attempt.
-    These are the breadcrumbs needed to answer "is one CF edge / one
-    downstream provider responsible, or is it random across runs?"
-    """
+    """Record a transient stream drop with failure-forensics detail."""
     try:
         try:
-            _summary = agent._summarize_api_error(error)
+            summary = agent._summarize_api_error(error)
         except Exception:
-            _summary = str(error)
-        if _summary and len(_summary) > 240:
-            _summary = _summary[:240] + "…"
-
-        # Inner-cause chain (httpx errors hide under openai.APIError).
+            summary = str(error)
+        if summary and len(summary) > 240:
+            summary = summary[:240] + "…"
         try:
-            _chain = flatten_exception_chain(error)
+            chain = flatten_exception_chain(error)
         except Exception:
-            _chain = type(error).__name__
+            chain = type(error).__name__
 
-        # Per-attempt counters and upstream headers.
-        _now = time.time()
-        _bytes = 0
-        _chunks = 0
-        _elapsed = 0.0
-        _ttfb = None
-        _headers_repr = "-"
-        _http_status = "-"
+        current = time.time()
+        estimated_bytes = 0
+        chunks = 0
+        elapsed = 0.0
+        ttfb = None
+        headers_repr = "-"
+        http_status = "-"
         if isinstance(diag, dict):
             try:
-                _bytes = int(diag.get("bytes") or 0)
-                _chunks = int(diag.get("chunks") or 0)
-                _started = float(diag.get("started_at") or _now)
-                _elapsed = max(0.0, _now - _started)
-                _first = diag.get("first_chunk_at")
-                if _first is not None:
-                    _ttfb = max(0.0, float(_first) - _started)
+                estimated_bytes = int(diag.get("bytes") or 0)
+                chunks = int(diag.get("chunks") or 0)
+                started = float(diag.get("started_at") or current)
+                elapsed = max(0.0, current - started)
+                first = diag.get("first_chunk_at")
+                if first is not None:
+                    ttfb = max(0.0, float(first) - started)
                 headers = diag.get("headers") or {}
                 if isinstance(headers, dict) and headers:
-                    _headers_repr = " ".join(
-                        f"{k}={v}" for k, v in headers.items()
-                    )
+                    headers_repr = " ".join(f"{k}={v}" for k, v in headers.items())
                 if diag.get("http_status") is not None:
-                    _http_status = str(diag.get("http_status"))
+                    http_status = str(diag.get("http_status"))
             except Exception:
                 pass
 
         logger.warning(
             "Stream %s on attempt %s/%s — retrying. "
             "subagent_id=%s depth=%s provider=%s base_url=%s "
-            "error_type=%s error=%s "
-            "chain=%s "
-            "http_status=%s bytes=%d chunks=%d elapsed=%.2fs ttfb=%s "
+            "error_type=%s error=%s chain=%s "
+            "http_status=%s estimated_event_bytes=%d chunks=%d elapsed=%.2fs ttfb=%s "
             "upstream=[%s]",
             kind,
             attempt,
@@ -197,14 +305,14 @@ def log_stream_retry(
             agent.provider or "-",
             agent.base_url or "-",
             type(error).__name__,
-            _summary,
-            _chain,
-            _http_status,
-            _bytes,
-            _chunks,
-            _elapsed,
-            f"{_ttfb:.2f}s" if _ttfb is not None else "-",
-            _headers_repr,
+            summary,
+            chain,
+            http_status,
+            estimated_bytes,
+            chunks,
+            elapsed,
+            f"{ttfb:.2f}s" if ttfb is not None else "-",
+            headers_repr,
             extra={"mid_tool_call": mid_tool_call},
         )
     except Exception:
@@ -220,21 +328,7 @@ def emit_stream_drop(
     mid_tool_call: bool,
     diag: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Emit a single user-visible line for a stream drop+retry.
-
-    Both top-level agents and subagents announce drops in the UI — the
-    parent prefixes subagent lines with ``[subagent-N]`` via ``log_prefix``
-    so they're easy to attribute.  All cases also write a structured
-    WARNING to ``agent.log`` via :func:`log_stream_retry` with the full
-    diagnostic detail (subagent_id, provider, base_url, error_type,
-    cf-ray, x-openrouter-provider, bytes/chunks, elapsed) for post-hoc
-    analysis.
-
-    The user-visible status line is intentionally compact: provider,
-    error class, attempt N/M, plus ``after Xs`` when the stream dropped
-    mid-flight.  Full diagnostic detail goes to ``agent.log`` only —
-    ``hermes logs --level WARNING | grep "Stream drop"`` to inspect.
-    """
+    """Emit the existing compact user-visible stream drop status."""
     kind = "drop mid tool-call" if mid_tool_call else "drop"
     log_stream_retry(
         agent,
@@ -246,25 +340,21 @@ def emit_stream_drop(
         diag=diag,
     )
     provider = agent.provider or "provider"
-    # Compose a brief "after Xs" suffix when we have timing data — helps
-    # the user distinguish "couldn't connect" (0s) from "died after 30s
-    # of streaming" (likely upstream idle-kill or proxy timeout).
-    _suffix = ""
+    suffix = ""
     if isinstance(diag, dict):
         try:
             started = diag.get("started_at")
             if started is not None:
-                _suffix = f" after {max(0.0, time.time() - float(started)):.1f}s"
+                suffix = f" after {max(0.0, time.time() - float(started)):.1f}s"
         except Exception:
             pass
     try:
         agent._buffer_status(
-            f"⚠️ {provider} stream {kind} ({type(error).__name__}){_suffix} "
+            f"⚠️ {provider} stream {kind} ({type(error).__name__}){suffix} "
             f"— reconnecting, retry {attempt}/{max_attempts}"
         )
         agent._touch_activity(
-            f"stream retry {attempt}/{max_attempts} "
-            f"after {type(error).__name__}"
+            f"stream retry {attempt}/{max_attempts} after {type(error).__name__}"
         )
     except Exception:
         pass
@@ -272,8 +362,15 @@ def emit_stream_drop(
 
 __all__ = [
     "STREAM_DIAG_HEADERS",
+    "STREAM_GAP_BUCKETS_MS",
+    "fixed_histogram",
+    "fixed_histogram_observe",
+    "fixed_histogram_percentile",
     "stream_diag_init",
     "stream_diag_capture_response",
+    "stream_diag_record_event",
+    "stream_diag_mark_visible",
+    "stream_diag_finalize",
     "flatten_exception_chain",
     "log_stream_retry",
     "emit_stream_drop",

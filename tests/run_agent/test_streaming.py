@@ -1062,8 +1062,17 @@ class TestCodexStreamCallbacks:
         mock_client = MagicMock()
         mock_client.responses.create.return_value = _FakeCreateStream()
 
+        finalized = []
+        agent._stream_diag_finalize = lambda diag, *, outcome: finalized.append(
+            (diag.copy(), outcome)
+        )
+
         agent._run_codex_stream({}, client=mock_client)
         assert "Hello from Codex!" in deltas
+        assert len(finalized) == 1
+        assert finalized[0][1] == "success"
+        assert finalized[0][0]["chunks"] == len(events)
+        assert finalized[0][0]["first_visible_monotonic"] is not None
 
     def test_codex_stream_refreshes_activity_on_every_event(self):
         from run_agent import AIAgent
@@ -1243,9 +1252,18 @@ class TestAnthropicStreamCallbacks:
         agent._anthropic_client = MagicMock()
         agent._anthropic_client.messages.stream.return_value = mock_stream
 
+        finalized = []
+        agent._stream_diag_finalize = lambda diag, *, outcome: finalized.append(
+            (diag.copy(), outcome)
+        )
+
         agent._interruptible_streaming_api_call({})
 
         assert touch_calls.count("receiving stream response") == len(events)
+        assert len(finalized) == 1
+        assert finalized[0][1] == "success"
+        assert finalized[0][0]["chunks"] == len(events)
+        assert finalized[0][0]["first_visible_monotonic"] is not None
 
     @patch("run_agent.AIAgent._rebuild_anthropic_client")
     @patch("run_agent.AIAgent._replace_primary_openai_client")
