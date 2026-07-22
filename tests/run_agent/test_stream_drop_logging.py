@@ -21,7 +21,18 @@ import logging
 import time
 from unittest.mock import patch
 
+import pytest
 
+
+from agent.stream_diag import (
+    STREAM_DIAG_HEADERS,
+    fixed_histogram,
+    fixed_histogram_observe,
+    fixed_histogram_percentile,
+    stream_diag_finalize,
+    stream_diag_mark_visible,
+    stream_diag_record_event,
+)
 from run_agent import AIAgent
 
 
@@ -83,6 +94,52 @@ def test_stream_diag_capture_response_safe_with_none():
     agent._stream_diag_capture_response(diag, None)
     # Must not raise; diag stays initialized.
     assert diag["headers"] == {}
+
+
+def test_stream_diag_uses_monotonic_fixed_histograms_and_finalizes_once(caplog):
+    diag = AIAgent._stream_diag_init()
+    diag["started_monotonic"] = 10.0
+    diag["response_opened_monotonic"] = 10.01
+
+    stream_diag_record_event(diag, object(), now=10.02)
+    stream_diag_record_event(diag, object(), now=10.03)
+    stream_diag_record_event(diag, object(), now=10.08)
+    stream_diag_mark_visible(diag, now=10.04)
+
+    with caplog.at_level(logging.INFO, logger="agent.stream_diag"):
+        summary = stream_diag_finalize(diag, outcome="success", now=10.10)
+        duplicate = stream_diag_finalize(diag, outcome="error", now=10.20)
+
+    assert summary is not None
+    assert summary["outcome"] == "success"
+    assert summary["duration_ms"] == pytest.approx(100.0)
+    assert summary["response_open_ms"] == pytest.approx(10.0)
+    assert summary["first_event_ms"] == pytest.approx(20.0)
+    assert summary["first_visible_ms"] == pytest.approx(40.0)
+    assert summary["events"] == 3
+    assert summary["estimated_event_bytes"] > 0
+    assert summary["event_gap_max_ms"] == 50.0
+    assert summary["event_gap_p95_ms"] == 50.0
+    assert duplicate is None
+    messages = [record.getMessage() for record in caplog.records if "stream aggregate" in record.getMessage()]
+    assert len(messages) == 1
+    assert "success" in messages[0]
+
+
+def test_fixed_histogram_overflow_percentile_uses_exact_maximum():
+    counts = fixed_histogram((1.0, 5.0))
+    for value in (0.5, 2.0, 12.0):
+        fixed_histogram_observe(counts, (1.0, 5.0), value)
+    assert fixed_histogram_percentile(counts, (1.0, 5.0), 12.0, 0.95) == 12.0
+
+
+def test_stream_diag_does_not_collect_forwarded_ip():
+    assert "x-forwarded-for" not in STREAM_DIAG_HEADERS
+    agent = _make_agent()
+    diag = AIAgent._stream_diag_init()
+    response = _FakeResponse({"x-forwarded-for": "203.0.113.7", "server": "edge"})
+    agent._stream_diag_capture_response(diag, response)
+    assert "x-forwarded-for" not in diag["headers"]
 
 
 def test_flatten_exception_chain_walks_cause():
@@ -158,7 +215,7 @@ def test_log_stream_retry_includes_diagnostic_fields(caplog):
 
     # Counters and timing
     assert "http_status=200" in msg
-    assert "bytes=4096" in msg
+    assert "estimated_event_bytes=4096" in msg
     assert "chunks=12" in msg
     # elapsed should be roughly 5s; allow some slack.
     assert "elapsed=" in msg
@@ -189,7 +246,7 @@ def test_log_stream_retry_works_without_diag(caplog):
     # Without diag, the structured fields show "-" placeholders.
     assert "http_status=-" in msg
     assert "upstream=[-]" in msg
-    assert "bytes=0" in msg
+    assert "estimated_event_bytes=0" in msg
     assert "chunks=0" in msg
     assert "ttfb=-" in msg
 

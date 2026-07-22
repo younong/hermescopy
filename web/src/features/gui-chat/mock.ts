@@ -97,6 +97,7 @@ export function connectMockGuiChat(): GuiChatConnection {
       return { history_page: { cursor: null, has_more: false, returned_count: 0 }, messages: [], session_id: sessionId };
     },
     async ping() {},
+    reportFrameQueueDiagnostic() {},
     async respondToApproval(_sessionId, _request, approved) {
       emitEvent({
         type: "status.update",

@@ -1081,6 +1081,21 @@ class AIAgent:
         stream_diag_capture_response(self, diag, http_response)
 
     @staticmethod
+    def _stream_diag_record_event(diag: Dict[str, Any], event: Any = None) -> None:
+        from agent.stream_diag import stream_diag_record_event
+        stream_diag_record_event(diag, event)
+
+    @staticmethod
+    def _stream_diag_mark_visible(diag: Dict[str, Any]) -> None:
+        from agent.stream_diag import stream_diag_mark_visible
+        stream_diag_mark_visible(diag)
+
+    @staticmethod
+    def _stream_diag_finalize(diag: Dict[str, Any], *, outcome: str) -> Dict[str, Any] | None:
+        from agent.stream_diag import stream_diag_finalize
+        return stream_diag_finalize(diag, outcome=outcome)
+
+    @staticmethod
     def _flatten_exception_chain(error: BaseException) -> str:
         """Forwarder — see ``agent.stream_diag.flatten_exception_chain``."""
         from agent.stream_diag import flatten_exception_chain

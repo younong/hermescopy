@@ -724,15 +724,27 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
 
+    diag_holder: dict[str, Any] = {"diag": None}
+
+    def _mark_visible() -> None:
+        diag = diag_holder.get("diag")
+        if isinstance(diag, dict):
+            agent._stream_diag_mark_visible(diag)
+
     def _on_text_delta(text: str) -> None:
+        _mark_visible()
         agent._codex_streamed_text_parts.append(text)
         agent._fire_stream_delta(text)
 
     def _on_reasoning_delta(text: str) -> None:
+        _mark_visible()
         agent._fire_reasoning_delta(text)
 
     def _on_event(event: Any) -> None:
         # TTFB watchdog and activity touch — runs once per SSE event.
+        diag = diag_holder.get("diag")
+        if isinstance(diag, dict):
+            agent._stream_diag_record_event(diag, event)
         agent._codex_stream_last_event_ts = time.time()
         agent._touch_activity("receiving stream response")
 
@@ -745,10 +757,16 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
         stream_kwargs = dict(api_kwargs)
         stream_kwargs["stream"] = True
+        diag = agent._stream_diag_init()
+        diag_holder["diag"] = diag
 
         try:
             event_stream = active_client.responses.create(**stream_kwargs)
+            agent._stream_diag_capture_response(
+                diag, getattr(event_stream, "response", None)
+            )
         except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+            agent._stream_diag_finalize(diag, outcome="error")
             if attempt < max_stream_retries:
                 logger.debug(
                     "Codex Responses stream connect failed (attempt %s/%s); retrying. %s error=%s",
@@ -760,8 +778,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
         try:
             # Compatibility: some mocks/providers return a concrete response
-            # instead of an iterable.  Pass it straight through.
+            # instead of an iterable. Pass it straight through as a successful
+            # request with no raw stream events.
             if hasattr(event_stream, "output") and not hasattr(event_stream, "__iter__"):
+                agent._stream_diag_finalize(diag, outcome="success")
                 return event_stream
 
             try:
@@ -775,6 +795,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     interrupt_check=_interrupt_check,
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+                agent._stream_diag_finalize(diag, outcome="error")
                 if attempt < max_stream_retries:
                     logger.debug(
                         "Codex Responses stream transport failed mid-iteration "
@@ -794,7 +815,21 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     agent._client_log_context(),
                 )
 
+            agent._stream_diag_finalize(
+                diag,
+                outcome="interrupted" if agent._interrupt_requested else "success",
+            )
             return final
+        except BaseException as exc:
+            agent._stream_diag_finalize(
+                diag,
+                outcome=(
+                    "interrupted"
+                    if agent._interrupt_requested or isinstance(exc, InterruptedError)
+                    else "error"
+                ),
+            )
+            raise
         finally:
             close_fn = getattr(event_stream, "close", None)
             if callable(close_fn):

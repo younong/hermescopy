@@ -1803,8 +1803,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         result = {"response": None, "error": None}
         first_delta_fired = {"done": False}
         deltas_were_sent = {"yes": False}
+        diag = agent._stream_diag_init()
 
         def _fire_first():
+            agent._stream_diag_mark_visible(diag)
             if not first_delta_fired["done"] and on_first_delta:
                 first_delta_fired["done"] = True
                 try:
@@ -1827,6 +1829,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 client = _get_bedrock_runtime_client(region)
                 try:
                     raw_response = client.converse_stream(**api_kwargs)
+                    agent._stream_diag_capture_response(diag, None)
                 except Exception as _bedrock_exc:
                     # IAM policies scoped to bedrock:InvokeModel only (no
                     # InvokeModelWithResponseStream) reject converse_stream()
@@ -1876,9 +1879,19 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     on_tool_start=_on_tool,
                     on_reasoning_delta=_on_reasoning if agent.reasoning_callback or agent.stream_delta_callback else None,
                     on_interrupt_check=lambda: agent._interrupt_requested,
+                    on_event=lambda event: agent._stream_diag_record_event(diag, event),
                 )
             except Exception as e:
                 result["error"] = e
+            finally:
+                agent._stream_diag_finalize(
+                    diag,
+                    outcome=(
+                        "interrupted"
+                        if agent._interrupt_requested
+                        else "error" if result["error"] is not None else "success"
+                    ),
+                )
 
         t = threading.Thread(target=_bedrock_call, daemon=True)
         t.start()
@@ -1948,6 +1961,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     _stream_stale_timeout = None
 
     def _fire_first_delta():
+        diag = request_client_holder.get("diag")
+        if isinstance(diag, dict):
+            agent._stream_diag_mark_visible(diag)
         if not first_delta_fired["done"] and on_first_delta:
             first_delta_fired["done"] = True
             try:
@@ -2039,6 +2055,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
         stream = request_client.chat.completions.create(**stream_kwargs)
+        # ``capture_response`` also marks the SDK stream as opened when an
+        # adapter does not expose a raw httpx response.
+        agent._stream_diag_capture_response(_diag, getattr(stream, "response", None))
 
         # Some OpenAI-compatible adapters (for example copilot-acp, and the MoA
         # openai-codex aggregator) accept stream=True but still return a
@@ -2088,11 +2107,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # response via .response before any chunks are consumed.
         agent._capture_rate_limits(getattr(stream, "response", None))
         agent._capture_credits(getattr(stream, "response", None))
-        # Snapshot diagnostic headers (cf-ray, x-openrouter-provider, etc.)
-        # so they survive even when the stream dies before any chunk
-        # arrives.  Best-effort; never raises.
-        agent._stream_diag_capture_response(_diag, getattr(stream, "response", None))
-
         # Log OpenRouter response cache status when present.
         agent._check_openrouter_cache_status(getattr(stream, "response", None))
 
@@ -2114,21 +2128,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             last_chunk_time["t"] = time.time()
             agent._touch_activity("receiving stream response")
 
-            # Update per-attempt diagnostic counters.  Best-effort —
-            # failures are swallowed so the streaming hot path is never
-            # interrupted by diagnostic accounting.
+            # Constant-memory accounting only; raw chunk content is not retained.
             try:
-                _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
-                if _diag.get("first_chunk_at") is None:
-                    _diag["first_chunk_at"] = last_chunk_time["t"]
-                # Approximate byte size from the chunk's repr — exact wire
-                # bytes aren't exposed by the SDK, but len(repr(chunk)) is
-                # a stable proxy for "how much content arrived" that
-                # survives stub provider differences.
-                try:
-                    _diag["bytes"] = int(_diag.get("bytes", 0)) + len(repr(chunk))
-                except Exception:
-                    pass
+                agent._stream_diag_record_event(_diag, chunk)
             except Exception:
                 pass
 
@@ -2403,6 +2405,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             except Exception:
                 pass
             for event in stream:
+                try:
+                    agent._stream_diag_record_event(_diag, event)
+                except Exception:
+                    pass
                 # Update stale-stream timer on every event so the
                 # outer poll loop knows data is flowing.  Without
                 # this, the detector kills healthy long-running
@@ -2411,18 +2417,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # already does this at the top of its chunk loop).
                 last_chunk_time["t"] = time.time()
                 agent._touch_activity("receiving stream response")
-
-                # Update per-attempt diagnostic counters (best-effort).
-                try:
-                    _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
-                    if _diag.get("first_chunk_at") is None:
-                        _diag["first_chunk_at"] = last_chunk_time["t"]
-                    try:
-                        _diag["bytes"] = int(_diag.get("bytes", 0)) + len(repr(event))
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
 
                 if agent._interrupt_requested:
                     break
@@ -2486,8 +2480,26 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         result["response"] = _call_anthropic()
                     else:
                         result["response"] = _call_chat_completions()
+                    diag = request_client_holder.get("diag")
+                    if isinstance(diag, dict):
+                        agent._stream_diag_finalize(
+                            diag,
+                            outcome=(
+                                "interrupted" if agent._interrupt_requested else "success"
+                            ),
+                        )
                     return  # success
                 except Exception as e:
+                    diag = request_client_holder.get("diag")
+                    if isinstance(diag, dict):
+                        agent._stream_diag_finalize(
+                            diag,
+                            outcome=(
+                                "interrupted"
+                                if agent._interrupt_requested or isinstance(e, InterruptedError)
+                                else "error"
+                            ),
+                        )
                     # If the main poll loop force-closed this request because
                     # of an interrupt, the resulting transport error is the
                     # expected consequence of our own close — NOT a transient

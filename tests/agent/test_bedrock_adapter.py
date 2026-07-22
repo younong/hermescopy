@@ -981,6 +981,21 @@ class TestStreamConverseWithCallbacks:
         assert deltas == ["Hello", " world"]
         assert result.choices[0].message.content == "Hello world"
 
+    def test_raw_event_observer_fires_before_interpretation(self):
+        from agent.bedrock_adapter import stream_converse_with_callbacks
+
+        raw_events = [
+            {"messageStart": {"role": "assistant"}},
+            {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "private"}}},
+            {"messageStop": {"stopReason": "end_turn"}},
+        ]
+        observed = []
+        stream_converse_with_callbacks(
+            {"stream": raw_events},
+            on_event=lambda event: observed.append(event),
+        )
+        assert observed == raw_events
+
     def test_text_deltas_suppressed_when_tool_use_present(self):
         """Text deltas should NOT fire when tool_use blocks are present."""
         from agent.bedrock_adapter import stream_converse_with_callbacks
