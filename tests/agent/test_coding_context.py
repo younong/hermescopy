@@ -353,6 +353,23 @@ class TestRuntimeMode:
         assert any("coding agent" in b for b in blocks)
         assert any("Workspace" in b for b in blocks)
 
+    def test_coding_brief_requires_reuse_discovery(self, tmp_path):
+        _git_init(tmp_path)
+        mode = cc.resolve_runtime_mode(
+            platform="cli",
+            cwd=tmp_path,
+            config={"agent": {"coding_context": "on"}},
+        )
+        brief = mode.system_blocks()[0]
+
+        assert "Reuse before writing" in brief
+        assert "search the current module and the repository" in brief
+        assert "existing project APIs and helpers" in brief
+        assert "already-installed dependencies" in brief
+        assert "language standard library" in brief
+        assert "do not add a new dependency when an existing option fits" in brief
+        assert "keep single-use logic local" in brief
+
     def test_coding_instructions_append_their_own_block(self, tmp_path):
         _git_init(tmp_path)
         cfg = {
