@@ -3422,6 +3422,34 @@ class TestDoubleCompactionSummaryRole:
 
 class TestDeterministicToolPayloadCheckpoint:
     @staticmethod
+    def _small_consumed_messages(group_count):
+        messages = []
+        for index in range(group_count):
+            call_id = f"call-{index}"
+            prefix = f'{{"exit_code":0,"item":{index},"data":"'
+            content = prefix + ("x" * (192 - len(prefix) - 2)) + '"}'
+            messages.extend([
+                {"role": "user", "content": f"run check {index}"},
+                {"role": "assistant", "content": None, "tool_calls": [{
+                    "id": f"response-{index}",
+                    "call_id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": json.dumps({"command": "true"}),
+                    },
+                }]},
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "tool_name": "terminal",
+                    "content": content,
+                },
+                {"role": "assistant", "content": f"consumed result {index}"},
+            ])
+        return messages
+
+    @staticmethod
     def _messages(*, malformed=False, codex=False):
         tool_call = {
             "id": "response-item" if codex else "call-old",
@@ -3505,3 +3533,36 @@ class TestDeterministicToolPayloadCheckpoint:
         assert compacted is messages
         assert stats["changed"] is False
         assert stats["eligible_original_bytes"] > 0
+
+    def test_small_consumed_tool_results_accumulate_into_one_checkpoint(self, compressor):
+        messages = self._small_consumed_messages(430)
+        original = json.loads(json.dumps(messages))
+        compressor.compression_count = 1
+        compressor.tail_token_budget = 64
+
+        compacted, stats = compressor.compact_tool_payloads(messages)
+
+        assert stats["changed"] is True
+        assert stats["eligible_original_bytes"] >= 80_000
+        assert stats["eligible_compacted_bytes"] <= stats["eligible_original_bytes"] * 0.20
+        assert stats["tool_results_compacted"] >= 420
+        assert stats["tool_arguments_compacted"] == 0
+        assert messages == original
+        assert len(compacted) == len(messages)
+        assert compacted[2]["content"] == "[tool result compacted]"
+        assert compacted[-4:] == messages[-4:]
+        for index in range(1, len(compacted), 4):
+            assert compacted[index]["tool_calls"] == messages[index]["tool_calls"]
+            assert compacted[index + 1]["tool_call_id"] == messages[index + 1]["tool_call_id"]
+        assert compressor._sanitize_tool_pairs(compacted) == compacted
+
+    def test_small_consumed_tool_results_below_batch_threshold_are_unchanged(self, compressor):
+        messages = self._small_consumed_messages(400)
+        compressor.compression_count = 1
+        compressor.tail_token_budget = 64
+
+        compacted, stats = compressor.compact_tool_payloads(messages)
+
+        assert compacted is messages
+        assert stats["changed"] is False
+        assert stats["eligible_original_bytes"] < 80_000

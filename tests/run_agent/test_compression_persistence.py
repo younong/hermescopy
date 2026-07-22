@@ -253,6 +253,66 @@ class TestFlushAfterCompression:
             assert display[1]["tool_calls"][0]["function"]["arguments"] == large_args
             assert display[2]["content"] == large_result[: db._CONVERSATION_PAGE_MAX_TEXT_CHARS]
 
+    def test_small_tool_checkpoint_archives_once_and_keeps_canonical_history(self):
+        """Many consumed sub-512-byte results share one durable checkpoint."""
+        from agent.conversation_compression import maybe_compact_tool_payloads
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            agent._ensure_db_session()
+            agent.context_compressor.compression_count = 1
+            agent.context_compressor.tail_token_budget = 64
+
+            messages = []
+            original_results = []
+            for index in range(430):
+                call_id = f"call-{index}"
+                prefix = f'{{"exit_code":0,"item":{index},"data":"'
+                result = prefix + ("x" * (192 - len(prefix) - 2)) + '"}'
+                original_results.append(result)
+                messages.extend([
+                    {"role": "user", "content": f"run check {index}"},
+                    {"role": "assistant", "content": None, "tool_calls": [{
+                        "id": f"response-{index}",
+                        "call_id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": '{"command":"true"}',
+                        },
+                    }]},
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "tool_name": "terminal",
+                        "content": result,
+                    },
+                    {"role": "assistant", "content": f"consumed result {index}"},
+                ])
+            agent._flush_messages_to_session_db(messages, [])
+
+            compacted, changed = maybe_compact_tool_payloads(agent, messages)
+
+            assert changed is True
+            active = db.get_messages("original-session")
+            assert len(active) == len(messages)
+            assert active[2]["content"] == "[tool result compacted]"
+            assert active[-6]["content"] == original_results[-2]
+            archived_once = db.get_messages("original-session", include_inactive=True)
+            assert any(row["content"] == original_results[0] for row in archived_once)
+            display = db.get_display_messages("original-session")
+            assert len(display) == len(messages)
+            assert display[2]["content"] == original_results[0]
+            assert display[1]["tool_calls"][0]["call_id"] == "call-0"
+
+            second, second_changed = maybe_compact_tool_payloads(agent, compacted)
+
+            assert second is compacted
+            assert second_changed is False
+            assert len(db.get_messages("original-session", include_inactive=True)) == len(archived_once)
+
 
 # ---------------------------------------------------------------------------
 # Part 2: Gateway-side — history_offset after session split
