@@ -204,14 +204,16 @@ _AUTO_FOCUS_MAX_CHARS = 700
 # back the old large-tool-output case where nothing can be compacted.
 _MAX_TAIL_MESSAGE_FLOOR = 8
 
-# Deterministic tool-payload checkpoints run before LLM summarization. A field
-# is eligible only when it is large enough to shrink materially, and every
-# transformed field must fit inside 20% of its original UTF-8 payload. Keeping
-# these as internal invariants avoids conflating tool pruning with the
-# user-facing summary target ratio.
+# Deterministic tool-payload checkpoints run before LLM summarization. Small
+# consumed results can add up, so fields enter the batch from 128 bytes while
+# the 80K aggregate trigger below prevents checkpoint churn. Every transformed
+# field must still fit inside 20% of its original UTF-8 payload. Keeping these
+# as internal invariants avoids conflating tool pruning with the user-facing
+# summary target ratio.
 _TOOL_COMPACTION_RETAINED_RATIO = 0.20
-_TOOL_COMPACTION_MIN_FIELD_BYTES = 512
+_TOOL_COMPACTION_MIN_FIELD_BYTES = 128
 _TOOL_COMPACTION_TRIGGER_BYTES = 20_000 * _CHARS_PER_TOKEN
+_TOOL_RESULT_COMPACTED_MARKER = "[tool result compacted]"
 
 
 _PATH_MENTION_RE = re.compile(r"(?:/|~/?|[A-Za-z]:\\)[^\s`'\")\]}<>]+")
@@ -530,14 +532,24 @@ def _utf8_size(value: Any) -> int:
     return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
 
-def _truncate_utf8(value: str, max_bytes: int) -> str:
-    """Truncate text at a UTF-8 code-point boundary."""
-    if max_bytes <= 0:
-        return ""
-    encoded = value.encode("utf-8")
-    if len(encoded) <= max_bytes:
-        return value
-    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+def _compact_tool_result(
+    tool_name: str, tool_args: str, content: str, max_bytes: int
+) -> Optional[str]:
+    """Return a complete deterministic receipt within *max_bytes*.
+
+    Prefer the informative one-line summary used by full compression. For small
+    fields its 20% budget can be narrower than that summary, so use a complete
+    marker rather than leaving a misleadingly truncated fragment. The marker
+    also makes a committed checkpoint idempotent on its next scan.
+    """
+    if not isinstance(content, str) or content.startswith(_TOOL_RESULT_COMPACTED_MARKER):
+        return None
+    summary = _summarize_tool_result(tool_name, tool_args, content)
+    if _utf8_size(summary) <= max_bytes:
+        return summary
+    if _utf8_size(_TOOL_RESULT_COMPACTED_MARKER) <= max_bytes:
+        return _TOOL_RESULT_COMPACTED_MARKER
+    return None
 
 
 def _compact_tool_arguments(args: str, max_bytes: int) -> Optional[str]:
@@ -2476,9 +2488,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                 call_id = str(messages[result_idx].get("tool_call_id") or "")
                 tool_name, tool_args = calls[call_id]
                 budget = int(original_bytes * _TOOL_COMPACTION_RETAINED_RATIO)
-                summary = _summarize_tool_result(tool_name, tool_args, content)
-                summary = _truncate_utf8(summary, budget)
-                if not summary or _utf8_size(summary) > budget:
+                summary = _compact_tool_result(tool_name, tool_args, content, budget)
+                if summary is None:
                     stats["ineligible_bytes"] += original_bytes
                     continue
                 candidates.append(("result", result_idx, summary, original_bytes, _utf8_size(summary)))
