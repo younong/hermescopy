@@ -10,7 +10,10 @@ import {
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Paperclip, Send, Square } from "lucide-react";
 
-import { validateComposerAttachment } from "../attachments";
+import {
+  COMPOSER_ATTACHMENT_MAX_COUNT,
+  validateComposerAttachment,
+} from "../attachments";
 import type { GuiComposerAttachment } from "../types";
 import { ComposerAttachmentCard } from "./ComposerAttachmentCard";
 
@@ -115,12 +118,17 @@ export function Composer({
   const addFiles = (files: FileList | File[]) => {
     const nextAttachments: GuiComposerAttachment[] = [];
     const errors: string[] = [];
+    const availableSlots = COMPOSER_ATTACHMENT_MAX_COUNT - attachments.length;
 
     for (const file of Array.from(files)) {
       const validation = validateComposerAttachment(file);
       if (!validation.ok) {
         errors.push(validation.message);
         continue;
+      }
+      if (nextAttachments.length >= availableSlots) {
+        errors.push(`每条消息最多添加 ${COMPOSER_ATTACHMENT_MAX_COUNT} 个附件。`);
+        break;
       }
 
       nextAttachments.push({
