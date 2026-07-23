@@ -5714,6 +5714,7 @@ class AIAgent:
             goal=function_args.get("goal"),
             context=function_args.get("context"),
             tasks=function_args.get("tasks"),
+            artifact_paths=function_args.get("artifact_paths"),
             max_iterations=function_args.get("max_iterations"),
             acp_command=function_args.get("acp_command"),
             acp_args=function_args.get("acp_args"),

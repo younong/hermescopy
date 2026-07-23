@@ -879,6 +879,47 @@ def _is_internal_file_tool_content(content: str) -> bool:
     )
 
 
+def resolve_delegated_artifact_path(
+    path: str, task_id: str = "default"
+) -> dict[str, str]:
+    """Validate a local artifact before it is exposed to a delegated child.
+
+    Authenticated owner-worker dispatches stay descriptor-bound to the selected
+    workspace. Other runtimes use the same authoritative task/session cwd as
+    ordinary file tools and return a canonical absolute path.
+    """
+    if not isinstance(path, str) or not path.strip() or "\x00" in path:
+        raise ValueError("artifact path must be a non-empty string")
+    path = path.strip()
+
+    file_ops = _authenticated_workspace_file_ops()
+    if file_ops is not None:
+        try:
+            child_path, diagnostic_path = file_ops.resolve_artifact_path(path)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError(f"invalid delegated artifact {path!r}: {exc}") from exc
+        return {
+            "input_path": path,
+            "path": child_path,
+            "diagnostic_path": diagnostic_path,
+        }
+
+    resolved = _resolve_path_for_task(path, task_id)
+    try:
+        if not resolved.is_file():
+            raise ValueError("expected a regular file")
+        with resolved.open("rb"):
+            pass
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"invalid delegated artifact {path!r}: {exc}") from exc
+    canonical = str(resolved)
+    return {
+        "input_path": path,
+        "path": canonical,
+        "diagnostic_path": canonical,
+    }
+
+
 def _authenticated_workspace_file_ops() -> ControlledWorkspaceFileOperations | None:
     """Return the current dispatch's descriptor-backed workspace adapter.
 

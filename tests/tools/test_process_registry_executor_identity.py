@@ -148,6 +148,7 @@ def test_authenticated_spawn_uses_explicit_env_and_close_fds(tmp_path, monkeypat
     assert captured["close_fds"] is True
     assert captured["env"] == {
         "HOME": "/executor", "TMPDIR": "/executor/tmp", "PATH": "/usr/bin",
+        "NODE_PATH": "/opt/hermes/python/powerpoint/node_modules",
         "LANG": "C.UTF-8", "PYTHONUNBUFFERED": "1", "PYTHONNOUSERSITE": "1",
     }
     assert "pass_fds" not in captured

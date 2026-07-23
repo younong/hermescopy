@@ -1,0 +1,10 @@
+{
+  "name": "hermes-powerpoint-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Locked runtime-only dependencies for the bundled PowerPoint skill",
+  "license": "MIT",
+  "dependencies": {
+    "pptxgenjs": "4.0.1"
+  }
+}

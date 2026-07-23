@@ -123,6 +123,8 @@ def test_linux_spec_uses_private_namespaces_minimal_mounts_and_exact_environment
     assert ["--proc", "/proc"] == argv[argv.index("--proc"):argv.index("--proc") + 2]
     assert ["--dev", "/dev"] == argv[argv.index("--dev"):argv.index("--dev") + 2]
     assert ["--bind-fd", "10", "/workspace"] == argv[argv.index("--bind-fd"):argv.index("--bind-fd") + 3]
+    assert ["--symlink", "executor/tmp", "/tmp"] == argv[argv.index("--symlink"):argv.index("--symlink") + 3]
+    assert argv.index("--symlink") < argv.index("--remount-ro")
     assert "--clearenv" in argv
     assert "--share-net" not in argv
     assert "--" in argv

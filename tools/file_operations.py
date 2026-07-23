@@ -522,6 +522,45 @@ class ControlledWorkspaceFileOperations(FileOperations):
         relative_path = self._relative_path(path)
         return str(self._context.roots.get(RootKind.WORKSPACE).canonical_path / relative_path)
 
+    def resolve_artifact_path(self, path: str) -> tuple[str, str]:
+        """Validate an existing artifact and return child + diagnostic paths.
+
+        Relative inputs are interpreted inside the authenticated selected
+        workspace. Absolute inputs are accepted only when they are exact
+        diagnostic paths beneath that workspace; they are converted back to a
+        workspace-relative path for descriptor-backed child file operations.
+        """
+        if not isinstance(path, str) or not path or "\x00" in path:
+            raise ValueError("artifact path must be a non-empty string")
+
+        workspace_root = (
+            self._context.roots.get(RootKind.WORKSPACE).canonical_path
+            / self._context.workspace_prefix
+        )
+        if os.path.isabs(path):
+            candidate = Path(path)
+            try:
+                relative = candidate.relative_to(workspace_root)
+            except ValueError as exc:
+                raise ValueError(
+                    "absolute artifact path is outside the authenticated workspace"
+                ) from exc
+            child_path = relative.as_posix()
+        else:
+            child_path = path
+
+        relative_path = self._relative_path(child_path)
+        fd = self._context.roots.open_relative(
+            RootKind.WORKSPACE,
+            relative_path,
+            expected_type=ExpectedType.REGULAR_FILE,
+        )
+        os.close(fd)
+        return child_path, str(
+            self._context.roots.get(RootKind.WORKSPACE).canonical_path
+            / relative_path
+        )
+
     @staticmethod
     def _read_all(fd: int, *, maximum: int | None = None) -> bytes:
         maximum = _CONTROLLED_MAX_READ_BYTES if maximum is None else maximum

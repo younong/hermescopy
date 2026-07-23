@@ -18,7 +18,25 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     source = DEPLOY.read_text(encoding="utf-8")
 
     assert 'runtimes_dir="$remote_root/runtimes/python"' in source
-    assert 'runtime_id="py311-${"${"}architecture}-${"${"}lock_hash}-sandbox5"' in source
+    assert 'runtime_id="py311-${"${"}architecture}-${"${"}runtime_inputs_hash}-sandbox9"' in source
+    assert 'powerpoint_lock_hash="$(sha256sum "$release/deploy/powerpoint-runtime/package-lock.json"' in source
+    assert 'powerpoint_package_hash=' in source
+    assert 'node_identity=' in source
+    powerpoint_packages = {
+        package["name"]
+        for package in json.loads(
+            (ROOT / "deploy/runtime/alicloud3-powerpoint-packages.json").read_text(
+                encoding="utf-8"
+            )
+        )["packages"]
+    }
+    assert {
+        "nss-softokn",
+        "nss-softokn-freebl",
+        "nss-sysinit",
+        "p11-kit-trust",
+        "sqlite-libs",
+    } <= powerpoint_packages
     assert 'venv="$shared/venv"' not in source
     assert 'service_user="hermes"' in source
     assert 'service_group="hermes"' in source
@@ -35,6 +53,8 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     ) in source
     assert "ExecStartPre=$venv/bin/python" in source
     assert "uv python install \"$python_version\" --install-dir \"$runtime_tmp/python-base\" --no-bin" in source
+    assert 'const DEFAULT_PYTHON_PACKAGE_INDEX = "https://mirrors.aliyun.com/pypi/simple"' in source
+    assert 'UV_DEFAULT_INDEX="$python_package_index"' in source
     assert "uv sync --extra all --extra ddgs --locked --no-editable --link-mode copy" in source
     optional_dependencies = tomllib.loads(
         (ROOT / "pyproject.toml").read_text(encoding="utf-8")
@@ -47,15 +67,49 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert 'ldd "$resolved_python"' in source
     assert 'find "$runtime_tmp/lib/python3.11/site-packages" -type f -name \'*.so\' -print0' in source
     assert 'ldd "$extension"' in source
-    assert 'for destination in /bin /usr/bin /lib /lib64 /usr/lib /usr/lib64; do' in source
+    assert 'for destination in /bin /usr/bin /lib /lib64 /usr/lib /usr/lib64 /usr/share /etc/fonts; do' in source
+    assert '/etc/X11/fontpath.d/*)' in source
+    assert 'if [ ! -L "$packaged_path" ]; then' in source
+    assert '/usr/share/fonts/*) ;;' in source
+    assert '/etc/X11' not in source[source.index("readonly_mounts=''") : source.index('policy_tmp="$sandbox_policy.tmp.$$"')]
     assert 'runtime_tmp/toolchain' in source
-    assert 'executor_commands="bash sh ls pwd printf cat chmod grep find head mktemp mv rm stat"' in source
+    assert 'cp -a "$release/deploy/powerpoint-runtime/runtime-modules" "$runtime_tmp/powerpoint/node_modules"' in source
+    assert 'path.join(buildDir, "deploy/powerpoint-runtime/node_modules")' in source
+    assert 'path.join(buildDir, "deploy/powerpoint-runtime/runtime-modules")' in source
+    assert 'test -d "$release/deploy/powerpoint-runtime/runtime-modules/pptxgenjs"' in source
+    archive_block = source[source.index('"-czf"') : source.index('return { tmp, archivePath }')]
+    assert '"--exclude=./node_modules"' in archive_block
+    assert '"--exclude=./deploy/powerpoint-runtime/runtime-modules/.package-lock.json"' in archive_block
+    assert '"--exclude=./deploy/powerpoint-runtime/runtime-modules"' not in archive_block
+    assert "maxBuffer: 64 * 1024 * 1024" in source
+    assert '"--no-xattrs"' in source
+    assert 'executor_commands="bash sh /bin/sh ls pwd printf cat chmod grep find head mktemp mv rm stat awk basename dirname sed uname which node soffice"' in source
     assert source.count('for command in $executor_commands; do') == 2
+    assert '[ "$command" != "soffice" ] || continue' in source
+    assert '/*) command_path="$command" ;;' in source
+    assert '/*) test -x "$venv/toolchain$command" ;;' in source
+    assert 'soffice_source="$(type -P soffice || true)"' in source
+    assert '[ "$soffice_source" != "/usr/bin/soffice" ]' in source
+    assert 'soffice_link="$(readlink "$soffice_source")"' in source
+    assert '[ "$soffice_link" != "/usr/lib64/libreoffice/program/soffice" ]' in source
+    assert 'rm -f -- "$soffice_target"' in source
+    assert 'ln -s ../lib64/libreoffice/program/soffice "$soffice_target"' in source
+    assert source.index('rm -f -- "$soffice_target"') < source.index(
+        'ln -s ../lib64/libreoffice/program/soffice "$soffice_target"'
+    )
     assert 'command_path="$(type -P "$command" || true)"' in source
     assert 'command_path="$(command -v "$command" || true)"' not in source
     assert 'chown -R root:root "$release_tmp"' in source
     assert 'find "$release_tmp" -type d -exec chmod go-w {} +' in source
     assert source.index("host_sandbox_deployment_policy()") < source.index('ln -sfnT "$release" "$current"')
+    assert source.index("smoke-powerpoint-runtime.py") < source.index('ln -sfnT "$release" "$current"')
+    assert "HERMES_DEPLOY_STAGE powerpoint_runtime_smoke=passed" in source
+    assert 'function_args={"command": inside_command, "timeout": timeout}' in (
+        ROOT / "deploy" / "smoke-powerpoint-runtime.py"
+    ).read_text(encoding="utf-8")
+    assert '--policy "$sandbox_policy"' in source
+    assert "NODE_PATH=\"$venv/powerpoint/node_modules\"" not in source
+    assert "npm ci" not in source[source.index("function remoteDeployScript"):]
     assert source.index('deployment_committed="1"', source.index("manage_hermes_proxy.py")) > source.index("manage_hermes_proxy.py")
     assert "restoring previous deployment state" in source
     assert "restore_deployment_state" in source
@@ -97,6 +151,8 @@ def test_deploy_runs_public_smoke_only_after_remote_commit_and_does_not_roll_bac
     assert "dryRun: args.dryRun" in public_runner
     assert "deployment committed and all smoke passed" in source
     assert "rolled back before commit" in source
+    assert 'remoteStagePassed(error, "powerpoint_runtime_smoke")' in source
+    assert 'console.log(`PowerPoint runtime smoke: ${result.powerpointSmoke}`)' in source
 
 
 def test_seccomp_artifact_is_reproducible_and_manifest_bound(tmp_path):

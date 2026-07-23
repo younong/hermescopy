@@ -416,6 +416,11 @@ def test_run_agent_dispatch_forces_background():
         )
         assert captured["background"] is True
 
+        run_agent.AIAgent._dispatch_delegate_task(
+            agent, {"goal": "review", "artifact_paths": ["slide.jpg"]}
+        )
+        assert captured["artifact_paths"] == ["slide.jpg"]
+
         sub = _FakeAgent()
         sub._delegate_depth = 1
         run_agent.AIAgent._dispatch_delegate_task(sub, {"goal": "x"})

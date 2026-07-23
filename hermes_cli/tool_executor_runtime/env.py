@@ -29,11 +29,12 @@ SANDBOX_EXECUTOR_HOME = "/executor"
 SANDBOX_EXECUTOR_TMP = "/executor/tmp"
 SANDBOX_RUNTIME_BIN = "/opt/hermes/python/bin"
 SANDBOX_RELEASE_ROOT = "/opt/hermes/release"
+SANDBOX_POWERPOINT_NODE_PATH = "/opt/hermes/python/powerpoint/node_modules"
 SANDBOX_SYSTEM_PATH = f"{SANDBOX_RUNTIME_BIN}:/usr/bin:/bin"
 
 _ALLOWED_ENV_KEYS = frozenset({
     "HOME", "TMPDIR", "PATH", "PWD", "LANG", "LC_ALL", "LC_CTYPE", "__CF_USER_TEXT_ENCODING",
-    "PYTHONPATH", "PYTHONUNBUFFERED", "PYTHONNOUSERSITE",
+    "PYTHONPATH", "PYTHONUNBUFFERED", "PYTHONNOUSERSITE", "NODE_PATH",
     EXECUTOR_RUNTIME_FLAG, EXECUTOR_HOME, EXECUTOR_TMP, EXECUTOR_WORKSPACE_FD,
     EXECUTOR_BOOTSTRAP_FD, EXECUTOR_RESPONSE_FD, EXECUTOR_START_GATE_FD,
     EXECUTOR_OWNER_RELAY_FD, EXECUTOR_GENERATION, EXECUTOR_EGRESS_PROFILE,
@@ -99,6 +100,8 @@ def validate_executor_environment(environment: Mapping[str, str]) -> None:
         upper = key.upper()
         if key in _FORBIDDEN_EXACT or any(part in upper for part in _FORBIDDEN_PARTS):
             raise ExecutorEnvironmentInvalid("executor environment contains forbidden authority")
+    if str(environment.get("NODE_PATH", "")).strip() != SANDBOX_POWERPOINT_NODE_PATH:
+        raise ExecutorEnvironmentInvalid("executor NODE_PATH is not the packaged runtime")
     required = {
         EXECUTOR_RUNTIME_FLAG: "1",
         EXECUTOR_HOME: SANDBOX_EXECUTOR_HOME,
@@ -113,6 +116,7 @@ def validate_executor_environment(environment: Mapping[str, str]) -> None:
         "TMPDIR": SANDBOX_EXECUTOR_TMP,
         "PWD": "/workspace",
         "PYTHONPATH": SANDBOX_RELEASE_ROOT,
+        "NODE_PATH": SANDBOX_POWERPOINT_NODE_PATH,
     }
     for key, expected in required.items():
         value = str(environment.get(key, "") or "").strip()
@@ -155,6 +159,7 @@ def build_executor_environment(
         "PWD": "/workspace",
         "PATH": str(path),
         "PYTHONPATH": SANDBOX_RELEASE_ROOT,
+        "NODE_PATH": SANDBOX_POWERPOINT_NODE_PATH,
         "LANG": str(locale),
         "PYTHONUNBUFFERED": "1",
         "PYTHONNOUSERSITE": "1",
@@ -176,7 +181,7 @@ def build_executor_environment(
 
 _NESTED_CHILD_ALLOWED_ENV_KEYS = frozenset({
     "HOME", "TMPDIR", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "__CF_USER_TEXT_ENCODING",
-    "PYTHONUNBUFFERED", "PYTHONNOUSERSITE",
+    "PYTHONUNBUFFERED", "PYTHONNOUSERSITE", "NODE_PATH",
 })
 
 
@@ -197,10 +202,14 @@ def build_authenticated_child_environment(environment: Mapping[str, str] | None 
         upper = key.upper()
         if key in _FORBIDDEN_EXACT or key.startswith("HERMES_EXECUTOR_") or any(part in upper for part in _FORBIDDEN_PARTS):
             raise ExecutorEnvironmentInvalid("authenticated child environment contains forbidden authority")
+    supplied_node_path = supplied.get("NODE_PATH")
+    if supplied_node_path is not None and str(supplied_node_path).strip() != SANDBOX_POWERPOINT_NODE_PATH:
+        raise ExecutorEnvironmentInvalid("authenticated child NODE_PATH is not the packaged runtime")
     result = {
         "HOME": SANDBOX_EXECUTOR_HOME,
         "TMPDIR": SANDBOX_EXECUTOR_TMP,
         "PATH": SANDBOX_SYSTEM_PATH,
+        "NODE_PATH": SANDBOX_POWERPOINT_NODE_PATH,
         "LANG": "C.UTF-8",
         "PYTHONUNBUFFERED": "1",
         "PYTHONNOUSERSITE": "1",

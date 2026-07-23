@@ -18,6 +18,19 @@ def _load_package_data():
     return tool["setuptools"]["package-data"]
 
 
+def test_uv_uses_locked_domestic_default_index():
+    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject_path.open("rb") as handle:
+        indexes = tomllib.load(handle)["tool"]["uv"]["index"]
+
+    assert indexes == [
+        {
+            "url": "https://mirrors.aliyun.com/pypi/simple",
+            "default": True,
+        }
+    ]
+
+
 def test_matrix_extra_not_in_all():
     """The [matrix] extra pulls `mautrix[encryption]` -> `python-olm`,
     which has Linux-only wheels and no native build path on Windows or
@@ -191,6 +204,13 @@ def test_documents_extra_is_exact_pinned_and_in_all():
 
     assert optional_dependencies["documents"] == ["numbers-parser==4.18.2"]
     assert "hermes-agent[documents]" in optional_dependencies["all"]
+
+
+def test_powerpoint_extra_is_exact_pinned_and_in_all():
+    optional_dependencies = _load_optional_dependencies()
+
+    assert optional_dependencies["powerpoint"] == ["markitdown[pptx]==0.1.6"]
+    assert "hermes-agent[powerpoint]" in optional_dependencies["all"]
 
 
 def test_dev_extra_excluded_from_all():

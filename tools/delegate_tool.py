@@ -663,6 +663,7 @@ def _build_child_system_prompt(
     context: Optional[str] = None,
     *,
     workspace_path: Optional[str] = None,
+    artifacts: Optional[List[Dict[str, str]]] = None,
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
@@ -687,6 +688,19 @@ def _build_child_system_prompt(
             "\nWORKSPACE PATH:\n"
             f"{workspace_path}\n"
             "Use this exact path for local repository/workdir operations unless the task explicitly says otherwise."
+        )
+    if artifacts:
+        artifact_lines = [
+            f"- {artifact['path']} (diagnostic: {artifact['diagnostic_path']})"
+            for artifact in artifacts
+        ]
+        parts.append(
+            "\nVALIDATED ARTIFACTS:\n"
+            + "\n".join(artifact_lines)
+            + "\nUse only these validated paths for the delegated file work. "
+            "If an artifact disappears, stop and report that exact failure. "
+            "Never guess a replacement path, synthesize /workspace paths, "
+            "search the web for a substitute, or continue unrelated research."
         )
     parts.append(
         "\nComplete this task using the tools available to you. "
@@ -743,7 +757,14 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     teaching subagents a fake container path while still helping them avoid
     guessing `/workspace/...` for local repo tasks.
     """
+    try:
+        from agent.runtime_cwd import resolve_agent_cwd
+
+        runtime_cwd = resolve_agent_cwd()
+    except Exception:
+        runtime_cwd = None
     candidates = [
+        runtime_cwd,
         os.getenv("TERMINAL_CWD"),
         getattr(
             getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None
@@ -1058,6 +1079,7 @@ def _build_child_agent(
     # ACP transport overrides — lets a non-ACP parent spawn ACP child agents
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    artifacts: Optional[List[Dict[str, str]]] = None,
     # Per-call role controlling whether the child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
@@ -1146,6 +1168,7 @@ def _build_child_agent(
         goal,
         context,
         workspace_path=workspace_hint,
+        artifacts=artifacts,
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
@@ -2345,6 +2368,7 @@ def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
+    artifact_paths: Optional[List[str]] = None,
     max_iterations: Optional[int] = None,
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
@@ -2421,16 +2445,6 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -2450,21 +2464,52 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "role": top_role}]
+        task_list = [{
+            "goal": goal,
+            "context": context,
+            "role": top_role,
+            "artifact_paths": artifact_paths,
+        }]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
     if not task_list:
         return tool_error("No tasks provided.")
 
-    # Validate each task has a goal
+    # Validate all goals and artifacts atomically before credential resolution,
+    # child construction, or background dispatch.
+    from tools.file_tools import resolve_delegated_artifact_path
+
+    parent_task_id = getattr(parent_agent, "_current_task_id", None) or "default"
     for i, task in enumerate(task_list):
         if not isinstance(task, dict):
             return tool_error(
                 f"Task {i} must be an object, got {type(task).__name__}."
             )
-        if not task.get("goal", "").strip():
+        task_goal = task.get("goal", "")
+        if not isinstance(task_goal, str) or not task_goal.strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+        paths = task.get("artifact_paths")
+        if paths is None:
+            task["_validated_artifacts"] = []
+            continue
+        if not isinstance(paths, list) or any(
+            not isinstance(path, str) for path in paths
+        ):
+            return tool_error(f"Task {i} artifact_paths must be an array of strings.")
+        try:
+            task["_validated_artifacts"] = [
+                resolve_delegated_artifact_path(path, parent_task_id)
+                for path in paths
+            ]
+        except ValueError as exc:
+            return tool_error(f"Task {i} artifact preflight failed: {exc}")
+
+    # Resolve delegation credentials only after every artifact has passed.
+    try:
+        creds = _resolve_delegation_credentials(cfg, parent_agent)
+    except ValueError as exc:
+        return tool_error(str(exc))
 
     overall_start = time.monotonic()
     results = []
@@ -2513,6 +2558,7 @@ def delegate_task(
                     if task_acp_args is not None
                     else (acp_args if acp_args is not None else creds.get("args"))
                 ),
+                artifacts=t["_validated_artifacts"],
                 role=effective_role,
             )
             # Override with correct parent tool names (before child construction mutated global)
@@ -3386,9 +3432,17 @@ DELEGATE_TASK_SCHEMA = {
             "context": {
                 "type": "string",
                 "description": (
-                    "Background information the subagent needs: file paths, "
-                    "error messages, project structure, constraints. The more "
-                    "specific you are, the better the subagent performs."
+                    "Background information the subagent needs: error messages, "
+                    "project structure, constraints. Use artifact_paths, not "
+                    "context, for existing local files the child must inspect."
+                ),
+            },
+            "artifact_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Existing local files required by a single delegated task. "
+                    "Every path is validated before any child is spawned."
                 ),
             },
             "tasks": {
@@ -3400,6 +3454,14 @@ DELEGATE_TASK_SCHEMA = {
                         "context": {
                             "type": "string",
                             "description": "Task-specific context",
+                        },
+                        "artifact_paths": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Existing local files required by this task; "
+                                "validated before any batch child is spawned."
+                            ),
                         },
                         "acp_command": {
                             "type": "string",
@@ -3500,6 +3562,7 @@ registry.register(
         goal=args.get("goal"),
         context=args.get("context"),
         tasks=args.get("tasks"),
+        artifact_paths=args.get("artifact_paths"),
         max_iterations=args.get("max_iterations"),
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
