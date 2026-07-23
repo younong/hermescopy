@@ -43,6 +43,9 @@ export const zh: Translations = {
     expand: "展开",
     general: "通用",
     messaging: "消息平台",
+    copyCode: "复制代码",
+    copied: "已复制",
+    copyFailed: "复制失败",
     pluginLoadFailed:
       "无法加载此插件的脚本。请检查网络请求（dashboard-plugins/…）以及服务器上的插件路径。",
     pluginNotRegistered: "插件脚本未调用 register()，或执行出错。请打开浏览器控制台查看详情。",

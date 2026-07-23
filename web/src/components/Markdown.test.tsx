@@ -2,7 +2,7 @@
 
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Markdown } from "./Markdown";
 
@@ -21,6 +21,10 @@ afterEach(async () => {
   if (root) await act(async () => root?.unmount());
   root = undefined;
   document.body.innerHTML = "";
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+  Reflect.deleteProperty(navigator, "clipboard");
+  Reflect.deleteProperty(document, "execCommand");
 });
 
 async function renderMarkdown(
@@ -36,6 +40,21 @@ async function renderMarkdown(
   });
 
   return container;
+}
+
+function mockClipboard(writeText = vi.fn<() => Promise<void>>().mockResolvedValue(undefined)) {
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: { writeText },
+  });
+  return writeText;
+}
+
+async function click(element: Element | null) {
+  expect(element).not.toBeNull();
+  await act(async () => {
+    (element as HTMLElement).click();
+  });
 }
 
 describe("Markdown", () => {
@@ -84,6 +103,99 @@ const complete = true;
       "https://example.com/a",
     ]);
     expect(links.every((link) => link.target === "_blank")).toBe(true);
+  });
+
+  it("copies each block code section without exposing controls for inline code", async () => {
+    const writeText = mockClipboard();
+    const container = await renderMarkdown(`说明文字和 \`行内代码\`。
+
+\`\`\`prompt
+你是一名内容策划。
+  保留这一层缩进。
+
+请直接输出结果。
+\`\`\`
+
+中间说明。
+
+\`\`\`
+第二段提示词
+\`\`\``);
+    const buttons = Array.from(container.querySelectorAll('button[aria-label="Copy code"]'));
+
+    expect(container.querySelectorAll("[data-markdown-code-block]")).toHaveLength(2);
+    expect(container.querySelector("p code")?.textContent).toBe("行内代码");
+    expect(buttons).toHaveLength(2);
+
+    await click(buttons[0]);
+    expect(writeText).toHaveBeenLastCalledWith(
+      "你是一名内容策划。\n  保留这一层缩进。\n\n请直接输出结果。\n",
+    );
+
+    await click(buttons[1]);
+    expect(writeText).toHaveBeenLastCalledWith("第二段提示词\n");
+    expect(writeText).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports success and restores the copy label after a delay", async () => {
+    vi.useFakeTimers();
+    mockClipboard();
+    const container = await renderMarkdown("```\n复制我\n```");
+    const button = container.querySelector('button[aria-label="Copy code"]');
+
+    await click(button);
+    expect(container.querySelector('button[aria-label="Copied"]')).not.toBeNull();
+    expect(container.querySelector('[role="status"]')?.textContent).toBe("Copied");
+
+    await act(async () => {
+      vi.advanceTimersByTime(1800);
+    });
+    expect(container.querySelector('button[aria-label="Copy code"]')).not.toBeNull();
+  });
+
+  it("falls back to a temporary textarea when the Clipboard API fails", async () => {
+    mockClipboard(vi.fn().mockRejectedValue(new Error("permission denied")));
+    const execCommand = vi.fn(() => {
+      expect(document.querySelector("textarea")?.value).toBe("fallback text\n");
+      return true;
+    });
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: execCommand,
+    });
+    const container = await renderMarkdown("```\nfallback text\n```");
+
+    await click(container.querySelector('button[aria-label="Copy code"]'));
+
+    expect(execCommand).toHaveBeenCalledWith("copy");
+    expect(document.querySelector("textarea")).toBeNull();
+    expect(container.querySelector('button[aria-label="Copied"]')).not.toBeNull();
+  });
+
+  it("shows an error instead of false success when every copy path fails", async () => {
+    mockClipboard(vi.fn().mockRejectedValue(new Error("permission denied")));
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: vi.fn(() => false),
+    });
+    const container = await renderMarkdown("```\nno copy\n```");
+
+    await click(container.querySelector('button[aria-label="Copy code"]'));
+
+    expect(container.querySelector('button[aria-label="Copy failed"]')).not.toBeNull();
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe("Copy failed");
+  });
+
+  it("copies the latest code while a response is streaming", async () => {
+    const writeText = mockClipboard();
+    const container = await renderMarkdown("```\nfirst", { streaming: true });
+
+    await act(async () => {
+      root?.render(<Markdown content={"```\nfirst\nsecond"} streaming />);
+    });
+    await click(container.querySelector('button[aria-label="Copy code"]'));
+
+    expect(writeText).toHaveBeenCalledWith("first\nsecond\n");
   });
 
   it("does not activate unsafe links, images, or raw HTML", async () => {
