@@ -962,12 +962,14 @@ if [ -z "$node_path" ]; then
 fi
 node_identity="$(printf '%s\n' "$(node --version)" "$(sha256sum "$node_path" | cut -d ' ' -f1)" | sha256sum | cut -d ' ' -f1)"
 python_version="3.11"
-runtime_inputs_hash="$(printf '%s\n' "$lock_hash" "$powerpoint_lock_hash" "$powerpoint_package_hash" "$node_identity" 'sandbox7' | sha256sum | cut -d ' ' -f1)"
-runtime_id="py311-${"${"}architecture}-${"${"}runtime_inputs_hash}-sandbox7"
+runtime_inputs_hash="$(printf '%s\n' "$lock_hash" "$powerpoint_lock_hash" "$powerpoint_package_hash" "$node_identity" 'sandbox8' | sha256sum | cut -d ' ' -f1)"
+runtime_id="py311-${"${"}architecture}-${"${"}runtime_inputs_hash}-sandbox8"
 venv="$runtimes_dir/$runtime_id"
 # One manifest drives both packaging and preflight. Keep it aligned with
-# ShellFileOperations' target-side scripts, especially atomic writes.
-executor_commands="bash sh ls pwd printf cat chmod grep find head mktemp mv rm stat awk basename dirname sed uname which node soffice"
+# ShellFileOperations' target-side scripts, especially atomic writes. Keep
+# /bin/sh explicit because LibreOffice's launcher uses that absolute shebang,
+# while this host resolves the sh command from /usr/bin.
+executor_commands="bash sh /bin/sh ls pwd printf cat chmod grep find head mktemp mv rm stat awk basename dirname sed uname which node soffice"
 
 if [ ! -x "$venv/bin/python3" ]; then
   echo "Bootstrapping immutable Python runtime $runtime_id"
@@ -1027,8 +1029,11 @@ if [ ! -x "$venv/bin/python3" ]; then
   done < <(find "$runtime_tmp/lib/python3.11/site-packages" -type f -name '*.so' -print0)
   for command in $executor_commands; do
     [ "$command" != "soffice" ] || continue
-    command_path="$(type -P "$command" || true)"
-    if [ -z "$command_path" ]; then
+    case "$command" in
+      /*) command_path="$command" ;;
+      *) command_path="$(type -P "$command" || true)" ;;
+    esac
+    if [ ! -x "$command_path" ]; then
       echo "Missing local executor command: $command" >&2
       exit 1
     fi
@@ -1148,7 +1153,10 @@ mv -- "$policy_tmp" "$sandbox_policy"
 
 PYTHONPATH="$release" "$venv/bin/python" -c 'from hermes_cli.owner_worker.host_sandbox import host_sandbox_deployment_policy; host_sandbox_deployment_policy()'
 for command in $executor_commands; do
-  PATH="$venv/toolchain/usr/bin:$venv/toolchain/bin" command -v "$command" >/dev/null
+  case "$command" in
+    /*) test -x "$venv/toolchain$command" ;;
+    *) PATH="$venv/toolchain/usr/bin:$venv/toolchain/bin" command -v "$command" >/dev/null ;;
+  esac
 done
 PYTHONPATH="$release" "$venv/bin/python" -c 'import hermes_cli.tool_executor_runtime.entrypoint, tools.registry'
 powerpoint_smoke_owner="$owner_root/.deploy-powerpoint-smoke.$$"
