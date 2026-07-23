@@ -24,9 +24,13 @@ from hermes_cli.owner_worker.executor_identity import (
 
 logger = logging.getLogger(__name__)
 
-OWNER_RELAY_TOOL_NAMES = frozenset({
+OWNER_FILE_TOOL_NAMES = frozenset({
+    "read_file", "write_file", "patch", "search_files",
+})
+_OWNER_ALWAYS_RELAY_TOOL_NAMES = frozenset({
     "web_search", "web_extract", "skills_list", "skill_view", "image_generate",
 })
+OWNER_RELAY_TOOL_NAMES = _OWNER_ALWAYS_RELAY_TOOL_NAMES | OWNER_FILE_TOOL_NAMES
 _MAX_REQUEST_BYTES = 256 * 1024
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
@@ -102,6 +106,86 @@ def _validated_arguments(tool_name: str, arguments: object) -> dict[str, Any]:
         if char_limit is not None:
             result["char_limit"] = char_limit
         return result
+    if tool_name == "read_file":
+        if set(arguments) - {"path", "offset", "limit"}:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        path = arguments.get("path")
+        offset = arguments.get("offset", 1)
+        limit = arguments.get("limit", 500)
+        if not isinstance(path, str) or not path or len(path) > 4096 or "\x00" in path:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 1:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 2000:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        return {"path": path, "offset": offset, "limit": limit}
+    if tool_name == "write_file":
+        if set(arguments) - {"path", "content", "cross_profile"}:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        path = arguments.get("path")
+        content = arguments.get("content")
+        cross_profile = arguments.get("cross_profile", False)
+        if not isinstance(path, str) or not path or len(path) > 4096 or "\x00" in path:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        if not isinstance(content, str) or not isinstance(cross_profile, bool):
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        return {"path": path, "content": content, "cross_profile": cross_profile}
+    if tool_name == "patch":
+        allowed = {"mode", "path", "old_string", "new_string", "replace_all", "patch", "cross_profile"}
+        if set(arguments) - allowed:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        mode = arguments.get("mode", "replace")
+        if mode not in {"replace", "patch"}:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        if mode == "replace":
+            required = (arguments.get("path"), arguments.get("old_string"), arguments.get("new_string"))
+            if (
+                not isinstance(required[0], str)
+                or not required[0]
+                or len(required[0]) > 4096
+                or "\x00" in required[0]
+                or not isinstance(required[1], str)
+                or not isinstance(required[2], str)
+            ):
+                raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        elif not isinstance(arguments.get("patch"), str) or not arguments["patch"]:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        if not isinstance(arguments.get("replace_all", False), bool) or not isinstance(
+            arguments.get("cross_profile", False), bool
+        ):
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        return dict(arguments, mode=mode)
+    if tool_name == "search_files":
+        allowed = {"pattern", "target", "path", "file_glob", "limit", "offset", "output_mode", "context"}
+        if set(arguments) - allowed:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        pattern = arguments.get("pattern")
+        target = arguments.get("target", "content")
+        path = arguments.get("path", ".")
+        file_glob = arguments.get("file_glob")
+        limit = arguments.get("limit", 50)
+        offset = arguments.get("offset", 0)
+        output_mode = arguments.get("output_mode", "content")
+        context = arguments.get("context", 0)
+        if not isinstance(pattern, str) or len(pattern) > 16_384 or "\x00" in pattern:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        if target not in {"content", "files"} or output_mode not in {"content", "files_only", "count"}:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        if not isinstance(path, str) or not path or len(path) > 4096 or "\x00" in path:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        if file_glob is not None and (not isinstance(file_glob, str) or len(file_glob) > 4096 or "\x00" in file_glob):
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 10_000:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        if not isinstance(context, int) or isinstance(context, bool) or context < 0:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        return {
+            "pattern": pattern, "target": target, "path": path,
+            **({"file_glob": file_glob} if file_glob is not None else {}),
+            "limit": limit, "offset": offset, "output_mode": output_mode, "context": context,
+        }
     if tool_name == "image_generate":
         if set(arguments) - {"prompt", "aspect_ratio", "image_url", "reference_image_urls"}:
             raise OwnerToolRelayError("owner tool relay arguments are invalid")
@@ -163,12 +247,53 @@ def _validated_arguments(tool_name: str, arguments: object) -> dict[str, Any]:
     raise OwnerToolRelayError("owner tool relay operation is not allowed")
 
 
+def owner_file_tool_relay_admissible(invocation: ExecutorInvocation) -> bool:
+    """Return whether an exact native file invocation can use the owner relay."""
+    if (
+        invocation.tool_name not in OWNER_FILE_TOOL_NAMES
+        or invocation.egress_profile is not EgressProfile.TOOL_NONE
+    ):
+        return False
+    try:
+        _validated_arguments(invocation.tool_name, invocation.arguments)
+    except OwnerToolRelayError:
+        return False
+    return True
+
+
 def _dispatch_owner_tool(
     tool_name: str,
     arguments: dict[str, Any],
     invocation: ExecutorInvocation,
     skill_dir_materializer: Callable[[Any], str] | None,
+    workspace_context: Any | None = None,
 ) -> str:
+    if tool_name in OWNER_FILE_TOOL_NAMES:
+        if workspace_context is None:
+            raise OwnerToolRelayError("owner file relay workspace is unavailable")
+        from tools import file_tools
+        from tui_gateway.server import OwnerWorkerGatewayRuntime, owner_worker_gateway_runtime
+
+        runtime = OwnerWorkerGatewayRuntime(
+            owner_key=invocation.identity.owner_key,
+            worker_generation=invocation.identity.worker_generation,
+            worker_id=invocation.identity.worker_id,
+            lease_version=invocation.identity.lease_version,
+            recovery_generation=invocation.identity.recovery_generation,
+            filesystem_context=workspace_context,
+        )
+        with owner_worker_gateway_runtime(runtime):
+            entry = file_tools.registry.get_entry(tool_name)
+            if entry is None or entry.toolset != "file":
+                raise OwnerToolRelayError("owner tool relay operation is not allowed")
+            return str(entry.handler(
+                dict(arguments),
+                task_id=invocation.identity.task_id,
+                session_id=invocation.identity.session_id,
+                executor_identity=invocation.identity,
+                executor_invocation=invocation,
+            ))
+
     if tool_name in {"web_search", "web_extract"}:
         from hermes_cli.config import reload_env
         from tools.web_tools import web_extract_tool, web_search_tool
@@ -227,10 +352,12 @@ class OwnerToolRelayBroker:
         identity_validator: Callable[[ExecutorIdentity], None],
         dispatcher: Callable[..., str] = _dispatch_owner_tool,
         image_dispatcher: Callable[..., str] | None = None,
+        workspace_context: Any | None = None,
     ) -> None:
         self._identity_validator = identity_validator
         self._dispatcher = dispatcher
         self._image_dispatcher = image_dispatcher
+        self._workspace_context = workspace_context
         self._endpoints: dict[tuple[tuple[Any, ...], str], _RelayEndpoint] = {}
         self._lock = threading.RLock()
         self._closed = False
@@ -351,12 +478,12 @@ class OwnerToolRelayBroker:
         logger.info("Authenticated owner relay dispatch started", extra=correlation)
         try:
             dispatcher = self._image_dispatcher if expected.tool_name == "image_generate" else self._dispatcher
-            result = dispatcher(
-                expected.tool_name,
-                arguments,
-                expected,
-                skill_dir_materializer,
+            dispatcher_args = (
+                (expected.tool_name, arguments, expected, skill_dir_materializer, self._workspace_context)
+                if expected.tool_name in OWNER_FILE_TOOL_NAMES
+                else (expected.tool_name, arguments, expected, skill_dir_materializer)
             )
+            result = dispatcher(*dispatcher_args)
             if not isinstance(result, str):
                 raise OwnerToolRelayError("owner tool relay result is invalid")
             if len(result.encode("utf-8")) > expected.resource_decision.quota.output_bytes:
