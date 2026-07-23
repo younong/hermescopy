@@ -51,7 +51,8 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
         "Environment=HERMES_SANDBOX_DEPLOYMENT_POLICY="
         "hermes_cli.owner_worker.host_sandbox:host_sandbox_deployment_policy"
     ) in source
-    assert "ExecStartPre=$venv/bin/python" in source
+    assert "ExecStartPre=$venv/bin/python" not in source
+    assert "Gateway does not execute authenticated tools" in source
     assert "uv python install \"$python_version\" --install-dir \"$runtime_tmp/python-base\" --no-bin" in source
     assert 'const DEFAULT_PYTHON_PACKAGE_INDEX = "https://mirrors.aliyun.com/pypi/simple"' in source
     assert 'UV_DEFAULT_INDEX="$python_package_index"' in source
@@ -101,12 +102,41 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert 'command_path="$(command -v "$command" || true)"' not in source
     assert 'chown -R root:root "$release_tmp"' in source
     assert 'find "$release_tmp" -type d -exec chmod go-w {} +' in source
-    assert source.index("host_sandbox_deployment_policy()") < source.index('ln -sfnT "$release" "$current"')
-    assert source.index("smoke-powerpoint-runtime.py") < source.index('ln -sfnT "$release" "$current"')
+    service_start = source.index("systemctl start hermes-dashboard.service")
+    resource_preflight = source.index("check-executor-cgroup-host.py", service_start)
+    resource_smoke = source.index("smoke-executor-resources.py", resource_preflight)
+    powerpoint_smoke = source.index("smoke-powerpoint-runtime.py", resource_smoke)
+    assert service_start < resource_preflight < resource_smoke < powerpoint_smoke
+    assert '"schema_version":2' in source
+    assert '"cpu_millis":1500' in source
+    assert '"memory_bytes":2415919104' in source
+    assert '"max_owner_workers":5' in source
+    assert '"cpu_millis":750' in source
+    assert '"memory_bytes":536870912' in source
+    assert "Delegate=cpu memory pids" in source
+    assert "CPUAccounting=yes" in source
+    assert "MemoryAccounting=yes" in source
+    assert "TasksAccounting=yes" in source
+    assert "HERMES_DEPLOY_STAGE executor_resource_preflight=passed" in source
+    assert "HERMES_DEPLOY_STAGE executor_resource_smoke=passed" in source
     assert "HERMES_DEPLOY_STAGE powerpoint_runtime_smoke=passed" in source
-    assert 'function_args={"command": inside_command, "timeout": timeout}' in (
-        ROOT / "deploy" / "smoke-powerpoint-runtime.py"
-    ).read_text(encoding="utf-8")
+    preflight_source = (ROOT / "deploy" / "check-executor-cgroup-host.py").read_text(encoding="utf-8")
+    assert "service_processes == 0" in preflight_source
+    assert "managed_processes == 0" in preflight_source
+    resource_source = (ROOT / "deploy" / "smoke-executor-resources.py").read_text(encoding="utf-8")
+    assert 'checks["cpu_throttle_event"] = "passed"' in resource_source
+    assert 'checks["memory_oom_event"] = "passed"' in resource_source
+    assert 'checks["pids_limit_event"] = "passed"' in resource_source
+    cgroup_test_source = (ROOT / "tests" / "hermes_cli" / "test_cgroup_v2.py").read_text(encoding="utf-8")
+    assert "test_startup_cleans_managed_stale_scopes_before_admission" in cgroup_test_source
+    powerpoint_source = (ROOT / "deploy" / "smoke-powerpoint-runtime.py").read_text(encoding="utf-8")
+    assert 'function_args={"command": inside_command, "timeout": timeout}' in powerpoint_source
+    assert 'checks[check] = "passed"' in powerpoint_source
+    assert '"deadline_enforced"' in powerpoint_source
+    assert '"output_enforced"' in powerpoint_source
+    assert "CgroupV2Manager(deployment_policy.resource_policy)" in powerpoint_source
+    assert 'checks["startup_recovery"]' in powerpoint_source
+    assert "resource_controller=resource_controller" in powerpoint_source
     assert '--policy "$sandbox_policy"' in source
     assert "NODE_PATH=\"$venv/powerpoint/node_modules\"" not in source
     assert "npm ci" not in source[source.index("function remoteDeployScript"):]

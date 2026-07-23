@@ -16,7 +16,12 @@ from hermes_cli.dashboard_auth.audit import (
     audit_authority,
     audit_log,
 )
-from hermes_cli.owner_worker.audit import report_worker_lifecycle
+from hermes_cli.owner_worker.audit import (
+    report_executor_authority_decision,
+    report_worker_lifecycle,
+)
+from hermes_cli.owner_worker.cgroup_v2 import CgroupResourceEvents
+from hermes_cli.owner_worker.executor_identity import ExecutorIdentity
 
 
 @pytest.fixture
@@ -155,6 +160,53 @@ def test_persisted_scope_audit_is_allowlisted(tmp_path, monkeypatch):
         "audience_class": "owner-persisted-scope",
         "worker_generation": 7,
     }
+
+
+def test_executor_resource_audit_is_allowlisted_and_deidentified(tmp_path, monkeypatch):
+    control_home = tmp_path / "control-plane"
+    control_home.mkdir()
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_owner")
+    identity = ExecutorIdentity(
+        owner_key="ok1_owner",
+        workspace_prefix="default",
+        worker_id="worker-a",
+        worker_generation=7,
+        lease_version=1,
+        recovery_generation=0,
+        task_id="task-secret",
+        session_id="session-secret",
+        executor_id="executor-a",
+        executor_generation=2,
+    )
+    report_executor_authority_decision(
+        AuthorityAuditEvent.RESOURCE_OBSERVED,
+        AuthorityAuditReason.RESOURCE_MEMORY_OOM,
+        identity,
+        "resource:" + "a" * 64,
+        CgroupResourceEvents(
+            populated=True,
+            frozen=False,
+            cpu={"nr_throttled": 2, "throttled_usec": 11},
+            memory={"oom": 1, "oom_kill": 1},
+            pids={"max": 3},
+        ),
+    )
+
+    raw = (control_home / "logs" / "authority.log").read_text()
+    entry = json.loads(raw)
+    assert entry["event"] == "authority_resource_observed"
+    assert entry["reason"] == "resource_memory_oom"
+    assert entry["worker_generation"] == 7
+    assert entry["executor_generation"] == 2
+    assert entry["policy_digest"] != "a" * 64
+    assert entry["cpu_nr_throttled"] == 2
+    assert entry["cpu_throttled_usec"] == 11
+    assert entry["memory_oom"] == 1
+    assert entry["memory_oom_kill"] == 1
+    assert entry["pids_max"] == 3
+    for forbidden in ("ok1_owner", "task-secret", "session-secret", "executor-a", "resource:"):
+        assert forbidden not in raw
 
 
 def test_worker_lifecycle_audit_is_deidentified_and_best_effort(tmp_path, monkeypatch):

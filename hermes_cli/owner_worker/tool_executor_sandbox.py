@@ -18,9 +18,15 @@ import stat
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
-from hermes_cli.owner_worker.executor_identity import EgressProfile, ExecutorIdentity, ExecutorIdentityInvalid, parse_egress_profile
+from hermes_cli.owner_worker.executor_identity import (
+    EgressProfile,
+    ExecutorIdentity,
+    ExecutorIdentityInvalid,
+    ExecutorResourceQuota,
+    parse_egress_profile,
+)
 
 
 class ExecutorIsolationUnavailable(RuntimeError):
@@ -135,6 +141,140 @@ class SandboxReadonlyMount:
 
 
 @dataclass(frozen=True)
+class SandboxResourceLimits:
+    """Host-enforced limits for one cgroup v2 resource-policy layer.
+
+    CPU, memory, swap, and PIDs map to cgroup controls. Concurrency is enforced
+    by admission, while file descriptors, duration, and output are enforced at
+    the trusted executor launch/runtime boundary.
+    """
+
+    cpu_millis: int
+    memory_bytes: int
+    pids: int
+    max_concurrent_executors: int
+    max_owner_workers: int | None = None
+    swap_bytes: int | None = None
+    file_descriptors: int | None = None
+    duration_seconds: int | None = None
+    output_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        required = {
+            "cpu_millis": self.cpu_millis,
+            "memory_bytes": self.memory_bytes,
+            "pids": self.pids,
+            "max_concurrent_executors": self.max_concurrent_executors,
+        }
+        optional = {
+            "max_owner_workers": self.max_owner_workers,
+            "swap_bytes": self.swap_bytes,
+            "file_descriptors": self.file_descriptors,
+            "duration_seconds": self.duration_seconds,
+            "output_bytes": self.output_bytes,
+        }
+        if any(_invalid_positive_integer(value) for value in required.values()):
+            raise SandboxVerificationInvalid("sandbox cgroup limits are invalid")
+        if any(
+            value is not None
+            and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or (value < 0 if name == "swap_bytes" else value <= 0)
+            )
+            for name, value in optional.items()
+        ):
+            raise SandboxVerificationInvalid("sandbox cgroup limits are invalid")
+
+    @classmethod
+    def from_executor_quota(cls, quota: ExecutorResourceQuota) -> "SandboxResourceLimits":
+        """Select only limits the host resource boundary will enforce."""
+        if not isinstance(quota, ExecutorResourceQuota):
+            raise SandboxVerificationInvalid("sandbox executor resource quota is invalid")
+        return cls(
+            cpu_millis=quota.cpu_millis,
+            memory_bytes=quota.memory_bytes,
+            pids=quota.pids,
+            max_concurrent_executors=quota.concurrent_tools,
+            swap_bytes=0,
+            file_descriptors=quota.file_descriptors,
+            duration_seconds=quota.duration_seconds,
+            output_bytes=quota.output_bytes,
+        )
+
+    def to_payload(self) -> dict[str, int]:
+        return {
+            name: value
+            for name, value in (
+                ("cpu_millis", self.cpu_millis),
+                ("memory_bytes", self.memory_bytes),
+                ("pids", self.pids),
+                ("max_concurrent_executors", self.max_concurrent_executors),
+                ("max_owner_workers", self.max_owner_workers),
+                ("swap_bytes", self.swap_bytes),
+                ("file_descriptors", self.file_descriptors),
+                ("duration_seconds", self.duration_seconds),
+                ("output_bytes", self.output_bytes),
+            )
+            if value is not None
+        }
+
+
+@dataclass(frozen=True)
+class SandboxResourcePolicy:
+    """Complete host-governed resource contract for authenticated executors."""
+
+    cgroup_root: Path
+    required_controllers: tuple[str, ...]
+    global_limits: SandboxResourceLimits
+    owner_limits: SandboxResourceLimits
+    executor_limits: SandboxResourceLimits
+    cleanup_grace_seconds: int
+    cleanup_timeout_seconds: int
+    cgroup_kill_required: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.cgroup_root, (str, Path)):
+            raise SandboxVerificationInvalid("sandbox cgroup root is invalid")
+        root = Path(self.cgroup_root)
+        if not root.is_absolute() or "\x00" in str(root) or root == Path("/") or ".." in root.parts:
+            raise SandboxVerificationInvalid("sandbox cgroup root is invalid")
+        controllers = tuple(self.required_controllers)
+        if controllers != ("cpu", "memory", "pids"):
+            raise SandboxVerificationInvalid("sandbox required cgroup controllers are invalid")
+        if not all(
+            isinstance(value, SandboxResourceLimits)
+            for value in (self.global_limits, self.owner_limits, self.executor_limits)
+        ):
+            raise SandboxVerificationInvalid("sandbox resource limits are invalid")
+        if self.global_limits.max_owner_workers is None:
+            raise SandboxVerificationInvalid("sandbox global owner worker limit is required")
+        if self.owner_limits.max_owner_workers is not None or self.executor_limits.max_owner_workers is not None:
+            raise SandboxVerificationInvalid("sandbox owner worker limit is only valid globally")
+        if any(
+            getattr(self.executor_limits, field_name) is None
+            for field_name in ("swap_bytes", "file_descriptors", "duration_seconds", "output_bytes")
+        ):
+            raise SandboxVerificationInvalid("sandbox executor enforced limits are incomplete")
+        for field_name in ("cpu_millis", "memory_bytes", "pids", "max_concurrent_executors"):
+            global_value = getattr(self.global_limits, field_name)
+            owner_value = getattr(self.owner_limits, field_name)
+            executor_value = getattr(self.executor_limits, field_name)
+            if not executor_value <= owner_value <= global_value:
+                raise SandboxVerificationInvalid("sandbox resource limit hierarchy is invalid")
+        if (
+            _invalid_positive_integer(self.cleanup_grace_seconds)
+            or _invalid_positive_integer(self.cleanup_timeout_seconds)
+            or self.cleanup_grace_seconds > self.cleanup_timeout_seconds
+        ):
+            raise SandboxVerificationInvalid("sandbox resource cleanup timing is invalid")
+        if not isinstance(self.cgroup_kill_required, bool):
+            raise SandboxVerificationInvalid("sandbox cgroup kill policy is invalid")
+        object.__setattr__(self, "cgroup_root", root)
+        object.__setattr__(self, "required_controllers", controllers)
+
+
+@dataclass(frozen=True)
 class SandboxDeploymentPolicy:
     """Operator-owned inputs required to admit authenticated executors.
 
@@ -158,6 +298,7 @@ class SandboxDeploymentPolicy:
     )
     root_tmpfs_bytes: int = 64 << 20
     executor_tmpfs_bytes: int = 32 << 20
+    resource_policy: SandboxResourcePolicy | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.verification_policy, SandboxVerificationPolicy):
@@ -166,6 +307,8 @@ class SandboxDeploymentPolicy:
             raise SandboxVerificationInvalid("sandbox deployment sources are required")
         if self.post_spawn_verification_source is not None and not callable(self.post_spawn_verification_source):
             raise SandboxVerificationInvalid("sandbox post-spawn verification source is invalid")
+        if self.resource_policy is not None and not isinstance(self.resource_policy, SandboxResourcePolicy):
+            raise SandboxVerificationInvalid("sandbox deployment resource policy is invalid")
         try:
             allowed_egress_profiles = tuple(
                 parse_egress_profile(value, executor_admissible=True)
@@ -280,6 +423,10 @@ class SandboxLaunchBinding:
 
 
 _MAX_TMPFS_BYTES = 1 << 30
+
+
+def _invalid_positive_integer(value: object) -> bool:
+    return isinstance(value, bool) or not isinstance(value, int) or value <= 0
 
 
 @dataclass(frozen=True)

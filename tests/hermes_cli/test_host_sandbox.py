@@ -26,8 +26,12 @@ def _tree(tmp_path: Path):
     policy_dir = tmp_path / "etc-hermes"
     seccomp = policy_dir / "executor.seccomp.bpf"
     bwrap = tmp_path / "bwrap"
-    for directory in (owner_root, release, runtime, policy_dir):
-        directory.mkdir(mode=(0o750 if directory == owner_root else 0o755))
+    cgroup_root = tmp_path / "cgroup" / "hermes-dashboard.service"
+    for directory in (owner_root, release, runtime, policy_dir, cgroup_root):
+        directory.mkdir(
+            mode=(0o750 if directory == owner_root else 0o755),
+            parents=(directory == cgroup_root),
+        )
     (runtime / "bin").mkdir()
     (runtime / "bin/python3").write_text("python")
     (runtime / "bin/python3").chmod(0o755)
@@ -42,7 +46,7 @@ def _document(tmp_path: Path):
     owner_root, release, runtime, policy_dir, seccomp, bwrap = _tree(tmp_path)
     digest = "sha256:" + hashlib.sha256(seccomp.read_bytes()).hexdigest()
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "architecture": "x86_64",
         "owner_root": str(owner_root),
         "uid": 65532,
@@ -67,6 +71,26 @@ def _document(tmp_path: Path):
         "root_tmpfs_bytes": 64 << 20,
         "executor_tmpfs_bytes": 32 << 20,
         "allowed_egress_profiles": ["tool-none"],
+        "resource_policy": {
+            "cgroup_root": str(tmp_path / "cgroup" / "hermes-dashboard.service"),
+            "required_controllers": ["cpu", "memory", "pids"],
+            "global": {
+                "cpu_millis": 3000, "memory_bytes": 3 << 30, "pids": 512,
+                "max_owner_workers": 5, "max_concurrent_executors": 4,
+            },
+            "owner": {
+                "cpu_millis": 2000, "memory_bytes": 2 << 30, "pids": 256,
+                "max_concurrent_executors": 2,
+            },
+            "executor": {
+                "cpu_millis": 1000, "memory_bytes": 1 << 30, "swap_bytes": 0,
+                "pids": 64, "file_descriptors": 64, "duration_seconds": 120,
+                "output_bytes": 200_000, "max_concurrent_executors": 1,
+            },
+            "cleanup_grace_seconds": 2,
+            "cleanup_timeout_seconds": 10,
+            "cgroup_kill_required": False,
+        },
     }, policy_dir / "executor-sandbox.json"
 
 
@@ -164,6 +188,9 @@ def test_load_host_policy_validates_architecture_artifacts_mounts_and_modes(tmp_
     assert config.architecture == "x86_64"
     assert config.uid == config.gid == 65532
     assert config.python_executable == PurePosixPath("/opt/hermes/python/bin/python3")
+    assert config.resource_policy.required_controllers == ("cpu", "memory", "pids")
+    assert config.resource_policy.executor_limits.swap_bytes == 0
+    assert config.resource_policy.executor_limits.output_bytes == 200_000
     assert [(str(item.source), str(item.destination)) for item in config.readonly_mounts] == [
         (document["readonly_mounts"][0]["source"], "/opt/hermes/release"),
         (document["readonly_mounts"][1]["source"], "/opt/hermes/python"),
@@ -190,11 +217,39 @@ def test_host_policy_rejects_unknown_schema_wrong_arch_root_ids_and_egress(tmp_p
     config, document, policy_path = _config(tmp_path)
     del config
     cases = (
+        {**document, "schema_version": 1},
         {**document, "unknown": True},
         {**document, "architecture": "aarch64"},
         {**document, "uid": 0},
         {**document, "allowed_egress_profiles": ["tool-public"]},
     )
+    for invalid in cases:
+        _write_policy(invalid, policy_path)
+        with pytest.raises(HostSandboxInvalid):
+            load_host_sandbox_config(
+                policy_path, require_root_owner=False, platform_name="Linux", machine="x86_64"
+            )
+
+
+def test_host_policy_rejects_missing_unknown_or_incoherent_resource_governance(tmp_path):
+    _config_value, document, policy_path = _config(tmp_path)
+    resource_policy = document["resource_policy"]
+    cases = []
+    missing = dict(document)
+    del missing["resource_policy"]
+    cases.append(missing)
+    cases.append({**document, "resource_policy": {**resource_policy, "unknown": True}})
+    cases.append({
+        **document,
+        "resource_policy": {
+            **resource_policy,
+            "executor": {**resource_policy["executor"], "memory_bytes": 3 << 30},
+        },
+    })
+    cases.append({
+        **document,
+        "resource_policy": {**resource_policy, "required_controllers": ["cpu", "memory"]},
+    })
     for invalid in cases:
         _write_policy(invalid, policy_path)
         with pytest.raises(HostSandboxInvalid):
@@ -270,6 +325,7 @@ def test_seccomp_source_opens_fresh_nofollow_verified_descriptor_per_call(tmp_pa
     config, _document, _policy_path = _config(tmp_path)
     policy = build_host_sandbox_deployment_policy(config)
     assert policy.allowed_egress_profiles == (EgressProfile.TOOL_NONE,)
+    assert policy.resource_policy is config.resource_policy
     binding, mount_policy = _binding(config)
     opened_flags = []
     original_open = os.open

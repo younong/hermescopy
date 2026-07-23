@@ -155,6 +155,7 @@ def test_propagate_owner_env_includes_workspace(monkeypatch, tmp_path):
 
 
 def test_strip_owner_worker_deployment_runtime_env_removes_only_runtime_metadata():
+    assert "HERMES_DEPLOYMENT_RESOURCE_BROKER_FD" in OWNER_WORKER_DEPLOYMENT_RUNTIME_ENV_KEYS
     env = {key: "deployment-value" for key in OWNER_WORKER_DEPLOYMENT_RUNTIME_ENV_KEYS}
     env.update({"OPENAI_API_KEY": "provider-key", "HERMES_OWNER_KEY": "ok_owner"})
 

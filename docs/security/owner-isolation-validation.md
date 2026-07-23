@@ -1,7 +1,8 @@
 # Owner Isolation Release Evidence Index
 
-> 更新时间：2026-07-10  
-> 状态：Phase 0 evidence index；当前 owner-isolation foundation 的验证入口，不是 GA 认证或完整安全声明。  
+> 更新时间：2026-07-23
+>
+> 状态：Phase 0 evidence index；已加入计算资源治理候选实现，但真实 cgroup v2 release evidence 尚未签核，不是 GA 认证或完整安全声明。
 > 权威路线图：[多用户隔离分阶段发布计划](../plans/2026-07-10-ws-ticket-logout-revocation-plan.md)。架构规范见 [Control Plane、Owner Runtime 与执行沙箱](../plans/2026-07-07-multi-user-isolation-plan.md)，部署基线见 [Docker 执行沙箱方案](../plans/docker.md)。
 
 ## 1. 使用规则与当前声明
@@ -29,7 +30,7 @@
 | 4 safe filesystem/workspace compatibility | `planned` | `hermes_cli/owner_runtime.py`、`tools/{checkpoint_manager,process_registry}.py`、`tests/hermes_cli/test_web_server_{files,fs}.py` | current path/cwd tests are regression candidates only | Safe Filesystem Abstraction, FD-relative/openat2 or equivalent protocol, traversal/symlink/TOCTOU/FD/checkpoint adversarial matrix; gate `safe_owner_filesystem` |
 | 5 isolated Tool Executor and credential broker | `planned` | `tools/{checkpoint_manager,process_registry}.py` are only integration surfaces | no phase-complete evidence currently indexed | per-task process/container, minimal credentials/FD/mount/env, revoke cleanup and adversarial OS tests; gate `isolated_tool_executor` |
 | 6 mandatory egress and deployment verification | `planned` | [Docker plan](../plans/docker.md) defines the target contract | no implementation proof currently indexed | production-like Docker profile, host-observed record, mandatory egress reachability/drift tests; gate `mandatory_egress_verification` |
-| 7 resource, audit, observability | `planned` | dashboard auth and runtime modules are future event sources | no phase-complete evidence currently indexed | quota/noisy-neighbor, audit completeness/redaction, cleanup soak and incident drill; gate `multi_user_resource_governance` |
+| 7 resource, audit, observability | `foundation_present` / `not_ga` | `owner_worker/{cgroup_v2,resource_broker,tool_executor_supervisor}.py`、strict host policy v2、deployment preflight/smoke | fake cgroup lifecycle/admission/cleanup tests；broker/worker/executor focused tests；Linux resource smoke runner | 生产等价 unified-v2 evidence、A/B noisy-neighbor、OOM/PID/output/deadline/cleanup events、restart soak、audit redaction review；workspace bytes/inodes 仍未硬限制；gate `multi_user_resource_governance` |
 | 8 migration, canary, adversarial validation and GA | `planned` / `not_ga` | phase plans define target inputs | no GA evidence currently indexed | versioned migration parity, non-host-network canary, independent adversarial validation and all phase sign-offs; gate `multi_user_isolated_ga` |
 
 ## 3. Current foundation validation matrix (phases 0–3)
@@ -80,6 +81,36 @@ pytest -q \
 ```
 
 If the frontend test command or dependency set differs in the checked-out worktree, record the exact substitute command and reason rather than marking the frontend evidence as passed.
+
+### Phase 7 计算资源候选证据
+
+本地 fake/unit 证据必须使用 canonical runner：
+
+```bash
+scripts/run_tests.sh \
+  tests/hermes_cli/test_cgroup_v2.py \
+  tests/hermes_cli/test_cgroup_bootstrap.py \
+  tests/hermes_cli/test_resource_broker.py \
+  tests/hermes_cli/test_host_sandbox.py \
+  tests/hermes_cli/test_tool_executor_sandbox.py \
+  tests/hermes_cli/test_tool_executor_supervisor.py \
+  tests/hermes_cli/test_tool_executor_launcher.py \
+  tests/hermes_cli/test_owner_worker.py \
+  tests/hermes_cli/test_owner_runtime.py \
+  tests/hermes_cli/test_web_server_boot_handshake.py \
+  tests/hermes_cli/test_deploy_sandbox.py
+```
+
+以上只证明状态机、schema、admission、lease-bound broker、deadline/output bounds 和 cleanup contract，不能证明真实 kernel boundary。签核 `multi_user_resource_governance` 前必须在 production-equivalent delegated cgroup v2 host 附上：
+
+- `check-executor-cgroup-host.py --require-ready` 的去敏 JSON；
+- `smoke-executor-resources.py` 的 limit/event/cleanup JSON；
+- PowerPoint smoke 通过同一 `CgroupV2Manager` + `ToolExecutorSupervisor` 路径的 JSON；
+- owner A 达到并发与 CPU/内存/PID 边界时 owner B 小任务仍成功的 A/B 记录；
+- Dashboard/Worker 异常终止、重启后无 populated stale invocation 且容量恢复的记录；
+- `cpu.stat`、`memory.events`、`pids.events` 只含计数，不含 owner key、task/session、路径、参数或输出的审计检查。
+
+计算资源候选治理覆盖 CPU、memory、swap、PID、FD、并发、deadline、output 和 invocation cgroup 后代清理；它**不覆盖 workspace 字节数/inode**。cgroup 不能提供 per-owner 文件系统 quota，当前 root ext4 也未启用 project quota。磁盘 gate 必须维持 `planned`：第二阶段在支持 project quota 的独立 ext4/XFS 上配置每 owner 字节及 inode 硬上限。在此之前即使所有计算 smoke 通过，也不得宣称完整 noisy-neighbor 或 multi-user resource GA。
 
 ## 6. Historical application-layer checklist (foundation only)
 

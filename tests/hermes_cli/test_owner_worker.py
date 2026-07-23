@@ -803,6 +803,188 @@ def test_supervisor_passes_only_safe_deployment_image_descriptor(tmp_path, monke
         os.close(fd)
 
 
+def test_supervisor_resource_policy_controls_capacity_and_gates_worker_before_health(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    owner = _Owner("ok1_resource", tmp_path / "owner")
+    spawned = []
+    operations = []
+    child_gate_fds = []
+    child_resource_fds = []
+
+    class _Scope:
+        released = False
+
+        def attach(self, pid):
+            operations.append(("attach", pid))
+
+        def verify_membership(self, pid):
+            operations.append(("verify", pid))
+            return True
+
+        def cleanup(self):
+            self.released = True
+            operations.append(("cleanup",))
+
+    class _Manager:
+        policy = SimpleNamespace(global_limits=SimpleNamespace(max_owner_workers=3))
+
+        def __init__(self):
+            self.scope = _Scope()
+
+        def admit_worker(self, lease):
+            operations.append(("reserve", lease.worker_generation))
+            return self.scope
+
+        def admit_executor(self, identity, invocation_id):
+            raise AssertionError((identity, invocation_id))
+
+    manager = _Manager()
+
+    def fake_process_factory(*args, **kwargs):
+        spawned.append({"args": args, "kwargs": kwargs})
+        argv = args[0]
+        child_gate_fds.append(os.dup(int(argv[argv.index("--start-fd") + 1])))
+        child_resource_fds.append(os.dup(int(kwargs["env"]["HERMES_DEPLOYMENT_RESOURCE_BROKER_FD"])))
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    monkeypatch.setenv("HERMES_OWNER_WORKER_MAX", "99")
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control", client_cls=_FakeClient,
+        process_factory=fake_process_factory, startup_timeout=0.1,
+        resource_manager=manager,
+    )
+
+    handle = supervisor.get_or_start(owner)
+
+    assert supervisor.max_workers == 3
+    assert "hermes_cli.owner_worker.launch_gate" in spawned[0]["args"][0]
+    assert "preexec_fn" not in spawned[0]["kwargs"]
+    resource_fd = int(spawned[0]["kwargs"]["env"]["HERMES_DEPLOYMENT_RESOURCE_BROKER_FD"])
+    assert resource_fd in spawned[0]["kwargs"]["pass_fds"]
+    assert operations[:3] == [("reserve", 1), ("attach", handle.pid), ("verify", handle.pid)]
+
+    supervisor.shutdown()
+    assert manager.scope.released
+    assert operations[-1] == ("cleanup",)
+    for fd in (*child_gate_fds, *child_resource_fds):
+        os.close(fd)
+
+
+def test_supervisor_resource_setup_failure_closes_child_descriptor_and_reservation(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    owner = _Owner("ok1_resource_setup_failure", tmp_path / "owner")
+
+    class _Scope:
+        released = False
+
+        def cleanup(self):
+            self.released = True
+
+    class _Manager:
+        policy = SimpleNamespace(global_limits=SimpleNamespace(max_owner_workers=1))
+
+        def __init__(self):
+            self.scope = _Scope()
+
+        def admit_worker(self, _lease):
+            return self.scope
+
+        def admit_executor(self, _identity, _invocation_id):
+            raise AssertionError
+
+    manager = _Manager()
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control", client_cls=_FakeClient,
+        process_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("spawned")),
+        startup_timeout=0.1, resource_manager=manager,
+    )
+    captured_fd = None
+    original_register = supervisor.deployment_resource_broker.register
+
+    def register(lease):
+        nonlocal captured_fd
+        captured_fd = original_register(lease)
+        return captured_fd
+
+    supervisor.deployment_resource_broker.register = register
+
+    class _Roots:
+        def mkdirs(self, *_args):
+            raise RuntimeError("mkdir failed")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(supervisor, "_controlled_roots_for", lambda _paths: _Roots())
+
+    with pytest.raises(RuntimeError, match="mkdir failed"):
+        supervisor.get_or_start(owner)
+
+    assert captured_fd is not None
+    with pytest.raises(OSError):
+        os.fstat(captured_fd)
+    assert manager.scope.released
+    assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.REVOKED
+
+
+def test_supervisor_resource_membership_failure_releases_reservation(tmp_path):
+    from types import SimpleNamespace
+
+    owner = _Owner("ok1_resource_failure", tmp_path / "owner")
+    child_gate_fds = []
+    child_resource_fds = []
+
+    class _Scope:
+        released = False
+
+        def attach(self, _pid):
+            return None
+
+        def verify_membership(self, _pid):
+            return False
+
+        def cleanup(self):
+            self.released = True
+
+    class _Manager:
+        policy = SimpleNamespace(global_limits=SimpleNamespace(max_owner_workers=1))
+
+        def __init__(self):
+            self.scope = _Scope()
+
+        def admit_worker(self, _lease):
+            return self.scope
+
+        def admit_executor(self, _identity, _invocation_id):
+            raise AssertionError
+
+    manager = _Manager()
+
+    def fake_process_factory(*args, **kwargs):
+        argv = args[0]
+        child_gate_fds.append(os.dup(int(argv[argv.index("--start-fd") + 1])))
+        child_resource_fds.append(os.dup(int(kwargs["env"]["HERMES_DEPLOYMENT_RESOURCE_BROKER_FD"])))
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control", client_cls=_FakeClient,
+        process_factory=fake_process_factory, startup_timeout=0.1,
+        resource_manager=manager,
+    )
+
+    with pytest.raises(OwnerWorkerStartupError, match="resource membership"):
+        supervisor.get_or_start(owner)
+
+    assert manager.scope.released
+    assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.REVOKED
+    for fd in (*child_gate_fds, *child_resource_fds):
+        os.close(fd)
+
+
 def test_supervisor_reclaims_conclusively_absent_orphan_lease(tmp_path):
     owner = _Owner("ok1_orphan", tmp_path / "owner")
     spawned: list[dict] = []
@@ -907,6 +1089,36 @@ def test_supervisor_shutdown_drains_all_local_workers_in_order(tmp_path):
     assert supervisor._handles == {}
     assert not handle.socket_path.exists()
     assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.REVOKED
+
+
+def test_supervisor_shutdown_failure_still_releases_resource_scope(tmp_path):
+    owner = _Owner("ok1_shutdown_failure", tmp_path / "owner")
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control", client_cls=_FakeClient,
+        process_factory=lambda *args, **_kwargs: (
+            Path(args[0][args[0].index("--socket") + 1]).touch() or _FakeProcess()
+        ),
+        startup_timeout=0.1,
+        generation_bridge_revoker=lambda _lease: (_ for _ in ()).throw(RuntimeError("bridge cleanup failed")),
+    )
+    handle = supervisor.get_or_start(owner)
+
+    class _Scope:
+        released = False
+
+        def cleanup(self):
+            self.released = True
+
+    scope = _Scope()
+    handle.resource_scope = scope
+
+    with pytest.raises(RuntimeError, match="bridge cleanup failed"):
+        supervisor.shutdown()
+
+    assert handle.process.terminated
+    assert scope.released
+    assert supervisor._handles == {}
+    assert supervisor._terminating_handles == {}
 
 
 def test_supervisor_shutdown_revoker_can_release_active_use_from_event_loop(tmp_path):
@@ -2067,13 +2279,35 @@ def test_worker_entrypoint_wires_only_explicit_deployment_policy(tmp_path, monke
     monkeypatch.setattr(supervisor_module, "ToolExecutorSupervisor", _Supervisor)
     monkeypatch.setenv("HERMES_SANDBOX_DEPLOYMENT_POLICY", "operator_policy:build")
 
-    app = entrypoint.create_app("ok1_worker_policy", owner_home)
+    resource_controller = object()
+    app = entrypoint.create_app(
+        "ok1_worker_policy", owner_home, resource_controller=resource_controller,
+    )
 
     assert len(constructed) == 1
     assert constructed[0]["deployment_policy"] is policy
+    assert constructed[0]["resource_controller"] is resource_controller
     assert constructed[0]["owner_home"] == owner_home
     assert app.state.tool_executor_supervisor is not None
     assert app.state.owner_worker_live_state.gateway_runtime.tool_executor_supervisor is app.state.tool_executor_supervisor
+
+
+def test_worker_entrypoint_policy_without_resource_broker_disables_executor(tmp_path, monkeypatch):
+    import hermes_cli.owner_worker.entrypoint as entrypoint
+    import hermes_cli.owner_worker.tool_executor_sandbox as sandbox
+
+    owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_worker_policy")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(tmp_path / "control"))
+    monkeypatch.setenv("HERMES_SANDBOX_DEPLOYMENT_POLICY", "operator_policy:build")
+    monkeypatch.setattr(sandbox, "load_sandbox_deployment_policy", lambda _spec: object())
+
+    app = entrypoint.create_app("ok1_worker_policy", owner_home)
+
+    assert app.state.tool_executor_supervisor is None
+    assert app.state.tool_executor_startup_error == "resource broker unavailable"
+    assert app.state.owner_worker_live_state.gateway_runtime.tool_executor_supervisor is None
 
 
 def test_worker_entrypoint_missing_deployment_policy_disables_executor(tmp_path, monkeypatch):

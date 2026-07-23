@@ -8,13 +8,19 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from hermes_cli.dashboard_auth.authority import OwnerWorkerAuthorityLease, WorkerLeaseState
-from hermes_cli.owner_worker.executor_identity import EgressProfile, ExecutorIdentity
+from hermes_cli.owner_worker.executor_identity import (
+    EgressProfile,
+    ExecutorIdentity,
+    ExecutorResourceQuota,
+)
 from hermes_cli.owner_worker.tool_executor_sandbox import (
     ExecutorIsolationUnavailable,
+    SandboxResourceLimits,
     SandboxDeploymentPolicy,
     SandboxLaunchBinding,
     SandboxMountPolicy,
     SandboxReadonlyMount,
+    SandboxResourcePolicy,
     SandboxSecurityPolicy,
     SandboxSyscallFilter,
     SandboxVerificationInvalid,
@@ -255,6 +261,79 @@ def test_deployment_policy_rejects_owner_root_and_sibling_mounts(tmp_path):
     with pytest.raises(ExecutorIsolationUnavailable, match="overlaps protected owner data"):
         SandboxMountPolicy(binding, (owner_root,), workspace, None, owner_root)
     assert policy.owner_root == owner_root.resolve()
+
+
+def _resource_policy(tmp_path):
+    return SandboxResourcePolicy(
+        cgroup_root=tmp_path / "cgroup" / "hermes-dashboard.service",
+        required_controllers=("cpu", "memory", "pids"),
+        global_limits=SandboxResourceLimits(3000, 3 << 30, 512, 4, max_owner_workers=5),
+        owner_limits=SandboxResourceLimits(2000, 2 << 30, 256, 2),
+        executor_limits=SandboxResourceLimits(
+            1000, 1 << 30, 64, 1, swap_bytes=0, file_descriptors=64,
+            duration_seconds=120, output_bytes=200_000,
+        ),
+        cleanup_grace_seconds=2,
+        cleanup_timeout_seconds=10,
+        cgroup_kill_required=False,
+    )
+
+
+def test_resource_policy_reuses_only_enforced_executor_quota_fields():
+    quota = ExecutorResourceQuota(
+        workers=1, cpu_millis=1000, memory_bytes=1 << 30, pids=64,
+        disk_bytes=123, disk_inodes=456, file_descriptors=64, duration_seconds=120,
+        concurrent_tools=1, pty_sessions=2, websocket_connections=3, gateway_channels=4,
+        output_bytes=200_000, network_bytes=789, network_requests=10,
+    )
+
+    limits = SandboxResourceLimits.from_executor_quota(quota)
+
+    assert limits.to_payload() == {
+        "cpu_millis": 1000,
+        "memory_bytes": 1 << 30,
+        "pids": 64,
+        "max_concurrent_executors": 1,
+        "swap_bytes": 0,
+        "file_descriptors": 64,
+        "duration_seconds": 120,
+        "output_bytes": 200_000,
+    }
+    unenforced = {"disk_bytes", "disk_inodes", "network_bytes", "network_requests", "pty_sessions"}
+    assert not (unenforced & limits.to_payload().keys())
+
+
+def test_resource_policy_rejects_incomplete_or_incoherent_limits(tmp_path):
+    policy = _resource_policy(tmp_path)
+    with pytest.raises(SandboxVerificationInvalid, match="hierarchy"):
+        SandboxResourcePolicy(
+            **{
+                **policy.__dict__,
+                "executor_limits": SandboxResourceLimits(
+                    1000, 3 << 30, 64, 1, swap_bytes=0, file_descriptors=64,
+                    duration_seconds=120, output_bytes=200_000,
+                ),
+            }
+        )
+    with pytest.raises(SandboxVerificationInvalid, match="incomplete"):
+        SandboxResourcePolicy(
+            **{
+                **policy.__dict__,
+                "executor_limits": SandboxResourceLimits(1000, 1 << 30, 64, 1),
+            }
+        )
+
+
+def test_deployment_policy_accepts_optional_direct_resource_policy(tmp_path):
+    owner, _runtime, _workspace, _dependency, _bwrap = _inputs(tmp_path)
+    global_dependency = tmp_path.parent / f"{tmp_path.name}-resource-global"
+    global_dependency.mkdir()
+    policy = SandboxDeploymentPolicy(
+        _verification_policy(), lambda *_args: None, lambda *_args: None,
+        (global_dependency,), owner.parent, resource_policy=_resource_policy(tmp_path),
+    )
+
+    assert policy.resource_policy.executor_limits.file_descriptors == 64
 
 
 def test_deployment_policy_loader_requires_explicit_valid_operator_factory(tmp_path, monkeypatch):
