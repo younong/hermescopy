@@ -753,6 +753,11 @@ def build_bubblewrap_launch_spec(
     # `--bind-fd` consumes only the descriptor passed through Popen.pass_fds;
     # the workspace host path is never an argv or environment authority input.
     argv.extend((
+        # LibreOffice's Unix launcher requires a writable literal /tmp or
+        # /var/tmp for its startup pipe and ignores TMPDIR for that check.
+        # Keep a single bounded writable temp filesystem by pointing /tmp at
+        # the executor-private tmpfs rather than mounting another host path.
+        "--symlink", "executor/tmp", "/tmp",
         "--remount-ro", "/",
         "--bind-fd", str(workspace_fd), "/workspace",
         "--bind", str(runtime), "/executor",
