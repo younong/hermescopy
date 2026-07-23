@@ -27,6 +27,8 @@ from hermes_cli.tool_executor_runtime.env import (
     EXECUTOR_BOOTSTRAP_FD,
     EXECUTOR_HOME,
     ExecutorEnvironmentInvalid,
+    SANDBOX_POWERPOINT_NODE_PATH,
+    build_authenticated_child_environment,
     build_executor_environment,
     validate_executor_environment,
 )
@@ -56,6 +58,7 @@ def test_executor_environment_is_fresh_allowlist_and_binds_runtime_dirs(tmp_path
     assert environment[EXECUTOR_HOME] == "/executor"
     assert environment["PWD"] == "/workspace"
     assert environment["PYTHONPATH"] == "/opt/hermes/release"
+    assert environment["NODE_PATH"] == SANDBOX_POWERPOINT_NODE_PATH
     assert str(home.resolve()) not in environment.values()
     assert str(tmp.resolve()) not in environment.values()
     assert environment[EXECUTOR_BOOTSTRAP_FD] == "12"
@@ -64,11 +67,22 @@ def test_executor_environment_is_fresh_allowlist_and_binds_runtime_dirs(tmp_path
     assert "HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY" not in environment
     assert "ANTHROPIC_API_KEY" not in environment
     assert set(environment) <= {
-        "HOME", "TMPDIR", "PATH", "PWD", "LANG", "LC_ALL", "LC_CTYPE", "__CF_USER_TEXT_ENCODING", "PYTHONPATH", "PYTHONUNBUFFERED", "PYTHONNOUSERSITE",
+        "HOME", "TMPDIR", "PATH", "PWD", "LANG", "LC_ALL", "LC_CTYPE", "__CF_USER_TEXT_ENCODING", "PYTHONPATH", "PYTHONUNBUFFERED", "PYTHONNOUSERSITE", "NODE_PATH",
         "HERMES_EXECUTOR_RUNTIME", "HERMES_EXECUTOR_HOME", "HERMES_EXECUTOR_TMP", "HERMES_EXECUTOR_WORKSPACE_FD",
         "HERMES_EXECUTOR_BOOTSTRAP_FD", "HERMES_EXECUTOR_RESPONSE_FD", "HERMES_EXECUTOR_START_GATE_FD",
         "HERMES_EXECUTOR_OWNER_RELAY_FD", "HERMES_EXECUTOR_GENERATION", "HERMES_EXECUTOR_EGRESS_PROFILE",
     }
+
+
+def test_authenticated_child_environment_pins_powerpoint_node_path():
+    environment = build_authenticated_child_environment()
+
+    assert environment["NODE_PATH"] == SANDBOX_POWERPOINT_NODE_PATH
+    assert build_authenticated_child_environment(
+        {"NODE_PATH": SANDBOX_POWERPOINT_NODE_PATH}
+    )["NODE_PATH"] == SANDBOX_POWERPOINT_NODE_PATH
+    with pytest.raises(ExecutorEnvironmentInvalid, match="NODE_PATH"):
+        build_authenticated_child_environment({"NODE_PATH": "/workspace/node_modules"})
 
 
 def test_executor_environment_allows_only_unique_optional_web_relay_descriptor(tmp_path):
@@ -102,6 +116,8 @@ def test_executor_environment_rejects_parent_authority_and_unknown_keys(tmp_path
         validate_executor_environment(dict(environment, PWD="/tmp"))
     with pytest.raises(ExecutorEnvironmentInvalid, match="PYTHONPATH"):
         validate_executor_environment(dict(environment, PYTHONPATH="/tmp"))
+    with pytest.raises(ExecutorEnvironmentInvalid, match="NODE_PATH"):
+        validate_executor_environment(dict(environment, NODE_PATH="/tmp/node_modules"))
 
 
 def test_executor_start_gate_requires_one_explicit_release_byte():

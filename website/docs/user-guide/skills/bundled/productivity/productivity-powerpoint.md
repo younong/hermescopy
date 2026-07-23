@@ -41,6 +41,24 @@ Use this skill any time a .pptx file is involved in any way — as input, output
 
 ---
 
+## Default Fast Workflow
+
+Use this path unless the user explicitly asks for independent visual review, pixel-perfect polish, or another high-assurance deliverable. Aim for 2-4 substantive model decisions: one combined content/design plan, one generation pass, an optional repair only when validation finds a concrete defect, and delivery.
+
+1. **Plan once**: decide the outline, slide count, palette, typography, visual motif, and per-slide layouts together. Do not delegate planning. Do not browse the web unless the user asks for current facts or required source material is missing.
+2. **Generate once**: use one PptxGenJS program for a from-scratch deck, or complete template structure and content edits in one owned workflow. Prefer local shapes, charts, icons, and user-supplied assets over exploratory image searches.
+3. **Validate deterministically**:
+   - Confirm the `.pptx` exists and is non-empty.
+   - Run `python -m markitdown output.pptx` once and compare its slide order and key content with the outline.
+   - For template work, grep the extracted text for leftover placeholders.
+   - Run one headless LibreOffice conversion to PDF to prove the package opens.
+4. **Repair only concrete failures**: regenerate or patch only when a check reports missing content, placeholders, corruption, or another specific defect. Do not invent a cosmetic change to force a revision cycle.
+5. **Deliver immediately**: return the exact artifact path reported by the file or terminal operation. Do not block ordinary delivery on rasterization, subagents, or visual-image inspection.
+
+Do not use `delegate_task`, `pdftoppm`, or web research in the default path. Provider retries and real validation failures may require extra turns, but the workflow should not create them by design.
+
+---
+
 ## Reading Content
 
 ```bash
@@ -163,84 +181,56 @@ Choose colors that match your topic — don't default to generic blue. Use these
 
 ---
 
-## QA (Required)
+## Default Validation
 
-**Assume there are problems. Your job is to find them.**
-
-Your first render is almost never correct. Approach QA as a bug hunt, not a confirmation step. If you found zero issues on first inspection, you weren't looking hard enough.
-
-### Content QA
+Run these checks for every generated or edited deck:
 
 ```bash
+# Content and ordering
 python -m markitdown output.pptx
-```
 
-Check for missing content, typos, wrong order.
-
-**When using templates, check for leftover placeholder text:**
-
-```bash
+# Template placeholder check (no output means clean)
 python -m markitdown output.pptx | grep -iE "xxxx|lorem|ipsum|this.*(page|slide).*layout"
+
+# Structural/openability check
+python "${HERMES_SKILL_DIR}/scripts/office/soffice.py" --headless --convert-to pdf output.pptx
 ```
 
-If grep returns results, fix them before declaring success.
-
-### Visual QA
-
-**⚠️ USE SUBAGENTS** — even for 2-3 slides. You've been staring at the code and will see what you expect, not what's there. Subagents have fresh eyes.
-
-Convert slides to images (see [Converting to Images](#converting-to-images)), then use this prompt:
-
-```
-Visually inspect these slides. Assume there are issues — find them.
-
-Look for:
-- Overlapping elements (text through shapes, lines through words, stacked elements)
-- Text overflow or cut off at edges/box boundaries
-- Decorative lines positioned for single-line text but title wrapped to two lines
-- Source citations or footers colliding with content above
-- Elements too close (< 0.3" gaps) or cards/sections nearly touching
-- Uneven gaps (large empty area in one place, cramped in another)
-- Insufficient margin from slide edges (< 0.5")
-- Columns or similar elements not aligned consistently
-- Low-contrast text (e.g., light gray text on cream-colored background)
-- Low-contrast icons (e.g., dark icons on dark backgrounds without a contrasting circle)
-- Text boxes too narrow causing excessive wrapping
-- Leftover placeholder content
-
-For each slide, list issues or areas of concern, even if minor.
-
-Read and analyze these images:
-1. /path/to/slide-01.jpg (Expected: [brief description])
-2. /path/to/slide-02.jpg (Expected: [brief description])
-
-Report ALL issues found, including minor ones.
-```
-
-### Verification Loop
-
-1. Generate slides → Convert to images → Inspect
-2. **List issues found** (if none found, look again more critically)
-3. Fix issues
-4. **Re-verify affected slides** — one fix often creates another problem
-5. Repeat until a full pass reveals no new issues
-
-**Do not declare success until you've completed at least one fix-and-verify cycle.**
+Also confirm the `.pptx` is non-empty. Fix and repeat only a check that found a concrete defect. A clean deterministic pass is sufficient for ordinary delivery.
 
 ---
 
-## Converting to Images
+## Thorough Visual QA (Opt-in)
 
-Convert presentations to individual slide images for visual inspection:
+Use this path only when the user explicitly asks for independent visual inspection, pixel-perfect polish, or another high-assurance review. It is not part of ordinary generation.
+
+1. Complete the default validation first.
+2. Convert the deck to slide images once.
+3. Delegate one independent visual inspection. Pass the actual rendered image paths through `delegate_task.artifact_paths`; put expected slide descriptions in `context`.
+4. Fix concrete findings only.
+5. Re-render and re-check affected slides where possible. Stop when a full pass finds no concrete issue; do not make a fake change.
+
+Before delegation, use the exact canonical/result paths returned by the generation or rendering command. If file tools created an artifact, use their `resolved_path` or `files_modified` result. Never synthesize `/workspace/<name>`, forward an attachment label as a path, or ask the reviewer to discover a missing file. Locate or regenerate the artifact in the parent and retry delegation.
+
+The reviewer prompt should inspect the validated images for:
+
+- Overlapping or cut-off elements
+- Text overflow and excessive wrapping
+- Misaligned columns, cards, titles, citations, or footers
+- Uneven or insufficient spacing and slide-edge margins
+- Low-contrast text or icons
+- Leftover placeholders
+
+### Converting to Images
 
 ```bash
-python scripts/office/soffice.py --headless --convert-to pdf output.pptx
+python "${HERMES_SKILL_DIR}/scripts/office/soffice.py" --headless --convert-to pdf output.pptx
 pdftoppm -jpeg -r 150 output.pdf slide
 ```
 
-This creates `slide-01.jpg`, `slide-02.jpg`, etc.
+This creates `slide-01.jpg`, `slide-02.jpg`, etc. Pass those real files in `artifact_paths`.
 
-To re-render specific slides after fixes:
+To re-render only an affected slide:
 
 ```bash
 pdftoppm -jpeg -r 150 -f N -l N output.pdf slide-fixed
@@ -250,8 +240,10 @@ pdftoppm -jpeg -r 150 -f N -l N output.pdf slide-fixed
 
 ## Dependencies
 
+Managed Hermes production provides locked MarkItDown, PptxGenJS, and LibreOffice dependencies inside the immutable executor runtime. Local installations may need:
+
 - `pip install "markitdown[pptx]"` - text extraction
 - `pip install Pillow` - thumbnail grids
 - `npm install -g pptxgenjs` - creating from scratch
-- LibreOffice (`soffice`) - PDF conversion (auto-configured for sandboxed environments via `scripts/office/soffice.py`)
-- Poppler (`pdftoppm`) - PDF to images
+- LibreOffice (`soffice`) - PDF conversion through `${HERMES_SKILL_DIR}/scripts/office/soffice.py`
+- Poppler (`pdftoppm`) - opt-in thorough visual QA only

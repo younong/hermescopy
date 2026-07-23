@@ -273,6 +273,12 @@ documents = [
   # protobuf>=7.34 while the current provider stack resolves protobuf 6.x.
   "numbers-parser==4.18.2",
 ]
+powerpoint = [
+  # The bundled PowerPoint skill uses MarkItDown for its ordinary deterministic
+  # content/order check. Managed executors are sealed against lazy installs, so
+  # this must be present in the immutable production runtime.
+  "markitdown[pptx]==0.1.6",
+]
 # `hermes dashboard` (localhost SPA + API).  Not in core to keep the default install lean.
 # starlette==1.0.1 pinned for CVE-2026-48710 (BadHost) — fastapi pulls Starlette
 # transitively and pre-1.0.1 is the vulnerable range. See the mcp extra above.
@@ -310,6 +316,7 @@ all = [
   "hermes-agent[web]",
   "hermes-agent[youtube]",
   "hermes-agent[documents]",
+  "hermes-agent[powerpoint]",
 ]
 
 [project.scripts]

@@ -24,7 +24,7 @@
 
 新发布前必须人工提交代码。`--create-tag` 要求具名分支和干净工作区，fetch 最新 `origin/main`，以 `--no-autostash` rebase 当前分支，再用绑定 rebase 前远端分支精确 SHA 的 `--force-with-lease=<完整分支 ref>:<observed SHA>` 更新远端同名 PR/源分支，然后只创建并 atomic push 指定的 annotated tag。默认只允许 `main`；`--allow-non-main` 保留，但同样必须 rebase 最新 `origin/main`，且不允许 detached HEAD。远端分支在快照后发生任何变化时 lease 会失效，发布会在 tag 创建/发布前 fail closed。工具不会自动 commit/stash，也禁止无守卫的 `--force`、裸/隐式 lease、`+` refspec、覆盖 tag、tag-only 降级或用 `--tags` 推送无关 tag。
 
-工具使用 `git archive <tag>` 生成干净源码，在本机临时源码目录中安装 Node 依赖并构建 web/ui-tui 产物，然后把源码 + 构建产物打包上传到服务器。服务器只解包到 `/opt/hermes/releases/<tag>`、按 `uv.lock + 架构` 创建或复用 root-owned immutable Python runtime、验证 host sandbox policy、切换 `/opt/hermes/current`，最后以稳定的非 root `hermes` user/group 重启 systemd 服务。提交部署事务前会自动运行无 secret、仅 loopback 的确定性对话冒烟；远端提交后，本机再通过公开 Dashboard 运行一次 authenticated 真实模型冒烟。发布成功后会清理本次上传的远端 tarball 和临时冒烟数据，并按保留策略回收旧 release。
+工具使用 `git archive <tag>` 生成干净源码，在本机临时源码目录中安装 Node 依赖、构建 web/ui-tui，并用独立 lockfile 生成只含 PptxGenJS 的 PowerPoint payload，然后把源码 + 构建产物打包上传到服务器。服务器只解包到 `/opt/hermes/releases/<tag>`、按 locked Python/PowerPoint 输入和架构创建或复用 root-owned immutable runtime、验证 host sandbox policy、切换 `/opt/hermes/current`，最后以稳定的非 root `hermes` user/group 重启 systemd 服务。切换前会通过真实 authenticated Bubblewrap executor 生成两页 PPTX、用 MarkItDown 校验顺序，并用 LibreOffice 转换一次 PDF。提交部署事务前还会自动运行无 secret、仅 loopback 的确定性对话冒烟；远端提交后，本机再通过公开 Dashboard 运行一次 authenticated 真实模型冒烟。发布成功后会清理本次上传的远端 tarball 和临时冒烟数据，并按保留策略回收旧 release。
 
 ## 服务器运行方式
 
@@ -75,9 +75,19 @@ ssh -L 9119:localhost:9119 root@106.15.186.104
 - Bubblewrap 必须安装为 `/usr/bin/bwrap` 并支持发布脚本检查的 namespace、bind-fd、seccomp 与 attestation 参数
 - 内核必须允许非 root user namespace 和 seccomp filter
 - 如果服务器没有 `uv`，部署脚本会用 `curl` 安装一次
+- PowerPoint 的 LibreOffice/font 前置依赖由 `deploy/runtime/alicloud3-powerpoint-packages.json` 精确约束。普通部署只校验并 fail closed；首次补齐时显式传 `--provision-powerpoint-deps`，仅执行该 manifest 中的 additive `dnf install`
 - 常见编译/运行依赖按服务器实际错误补充，例如 `gcc`、`g++`、`make`、`cmake`、`python3-dev`、`python3-venv`、`ffmpeg`、`ripgrep`
 
-Node.js/npm 只要求在本机可用。部署脚本会在从 Git tag 解出的本机临时源码目录中执行 `npm install --prefer-offline --no-audit`，并把 `web`、`ui-tui` 构建产物直接写入临时发布 artifact；服务器不再运行 npm install/build，当前 checkout 也不会留下发布构建产物。
+Node.js/npm 只要求在本机可用。部署脚本会在从 Git tag 解出的本机临时源码目录中执行 workspace 构建，并在 `deploy/powerpoint-runtime` 执行 `npm ci --omit=dev --ignore-scripts --no-audit`。服务器不运行 npm install/build；PptxGenJS payload、Node、LibreOffice、字体与 MarkItDown 都进入 root-owned immutable runtime，authenticated executor 只读挂载它们。
+
+首次在符合 manifest 的 Alibaba Cloud Linux 3 x86_64 主机上补齐 PowerPoint 前置包：
+
+```bash
+npm run deploy -- --tag <tag> --provision-powerpoint-deps --dry-run
+npm run deploy -- --tag <tag> --provision-powerpoint-deps
+```
+
+Dry-run 会披露 provisioning 与 PowerPoint runtime smoke 均为 planned，但不安装包。真实部署若在后续 pre-commit 步骤失败会恢复旧 release/policy；已经 additive 安装到主机的 RPM 不会自动卸载，但旧 runtime 不会引用它们。后续普通发布无需该 flag，只会核对精确 NEVRA 并从 package-owned 文件重新构建不可变快照。
 
 ## 常用命令
 

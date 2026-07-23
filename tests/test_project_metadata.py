@@ -193,6 +193,13 @@ def test_documents_extra_is_exact_pinned_and_in_all():
     assert "hermes-agent[documents]" in optional_dependencies["all"]
 
 
+def test_powerpoint_extra_is_exact_pinned_and_in_all():
+    optional_dependencies = _load_optional_dependencies()
+
+    assert optional_dependencies["powerpoint"] == ["markitdown[pptx]==0.1.6"]
+    assert "hermes-agent[powerpoint]" in optional_dependencies["all"]
+
+
 def test_dev_extra_excluded_from_all():
     """End-user installs should not pull test/lint/debug tooling."""
     optional_dependencies = _load_optional_dependencies()

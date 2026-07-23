@@ -123,6 +123,41 @@ def test_host_policy_accepts_packaged_usr_lib64_mount(tmp_path):
     assert config.readonly_mounts[-1].destination == PurePosixPath("/usr/lib64")
 
 
+@pytest.mark.parametrize("destination", ["/usr/share", "/etc/fonts"])
+def test_host_policy_accepts_packaged_powerpoint_data_mounts(tmp_path, destination):
+    _loaded_config, document, policy_path = _config(tmp_path)
+    runtime = Path(document["runtime_root"])
+    source = runtime / "toolchain" / destination.lstrip("/")
+    source.mkdir(parents=True)
+    document["readonly_mounts"].append({
+        "source": str(source),
+        "destination": destination,
+    })
+    _write_policy(document, policy_path)
+
+    config = load_host_sandbox_config(
+        policy_path, require_root_owner=False, platform_name="Linux", machine="x86_64"
+    )
+
+    assert config.readonly_mounts[-1].destination == PurePosixPath(destination)
+
+
+def test_host_policy_rejects_host_powerpoint_data_mount(tmp_path):
+    _loaded_config, document, policy_path = _config(tmp_path)
+    host_share = tmp_path / "host-share"
+    host_share.mkdir()
+    document["readonly_mounts"].append({
+        "source": str(host_share),
+        "destination": "/usr/share",
+    })
+    _write_policy(document, policy_path)
+
+    with pytest.raises(HostSandboxInvalid, match="packaged runtime"):
+        load_host_sandbox_config(
+            policy_path, require_root_owner=False, platform_name="Linux", machine="x86_64"
+        )
+
+
 def test_load_host_policy_validates_architecture_artifacts_mounts_and_modes(tmp_path):
     config, document, _policy_path = _config(tmp_path)
 

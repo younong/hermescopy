@@ -18,7 +18,10 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     source = DEPLOY.read_text(encoding="utf-8")
 
     assert 'runtimes_dir="$remote_root/runtimes/python"' in source
-    assert 'runtime_id="py311-${"${"}architecture}-${"${"}lock_hash}-sandbox5"' in source
+    assert 'runtime_id="py311-${"${"}architecture}-${"${"}runtime_inputs_hash}-sandbox6"' in source
+    assert 'powerpoint_lock_hash="$(sha256sum "$release/deploy/powerpoint-runtime/package-lock.json"' in source
+    assert 'powerpoint_package_hash=' in source
+    assert 'node_identity=' in source
     assert 'venv="$shared/venv"' not in source
     assert 'service_user="hermes"' in source
     assert 'service_group="hermes"' in source
@@ -47,15 +50,34 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert 'ldd "$resolved_python"' in source
     assert 'find "$runtime_tmp/lib/python3.11/site-packages" -type f -name \'*.so\' -print0' in source
     assert 'ldd "$extension"' in source
-    assert 'for destination in /bin /usr/bin /lib /lib64 /usr/lib /usr/lib64; do' in source
+    assert 'for destination in /bin /usr/bin /lib /lib64 /usr/lib /usr/lib64 /usr/share /etc/fonts; do' in source
     assert 'runtime_tmp/toolchain' in source
-    assert 'executor_commands="bash sh ls pwd printf cat chmod grep find head mktemp mv rm stat"' in source
+    assert 'cp -a "$release/deploy/powerpoint-runtime/node_modules" "$runtime_tmp/powerpoint/node_modules"' in source
+    assert 'executor_commands="bash sh ls pwd printf cat chmod grep find head mktemp mv rm stat node soffice"' in source
     assert source.count('for command in $executor_commands; do') == 2
+    assert '[ "$command" != "soffice" ] || continue' in source
+    assert 'soffice_source="$(type -P soffice || true)"' in source
+    assert '[ "$soffice_source" != "/usr/bin/soffice" ]' in source
+    assert 'soffice_link="$(readlink "$soffice_source")"' in source
+    assert '[ "$soffice_link" != "/usr/lib64/libreoffice/program/soffice" ]' in source
+    assert 'rm -f -- "$soffice_target"' in source
+    assert 'ln -s ../lib64/libreoffice/program/soffice "$soffice_target"' in source
+    assert source.index('rm -f -- "$soffice_target"') < source.index(
+        'ln -s ../lib64/libreoffice/program/soffice "$soffice_target"'
+    )
     assert 'command_path="$(type -P "$command" || true)"' in source
     assert 'command_path="$(command -v "$command" || true)"' not in source
     assert 'chown -R root:root "$release_tmp"' in source
     assert 'find "$release_tmp" -type d -exec chmod go-w {} +' in source
     assert source.index("host_sandbox_deployment_policy()") < source.index('ln -sfnT "$release" "$current"')
+    assert source.index("smoke-powerpoint-runtime.py") < source.index('ln -sfnT "$release" "$current"')
+    assert "HERMES_DEPLOY_STAGE powerpoint_runtime_smoke=passed" in source
+    assert 'function_args={"command": inside_command, "timeout": timeout}' in (
+        ROOT / "deploy" / "smoke-powerpoint-runtime.py"
+    ).read_text(encoding="utf-8")
+    assert '--policy "$sandbox_policy"' in source
+    assert "NODE_PATH=\"$venv/powerpoint/node_modules\"" not in source
+    assert "npm ci" not in source[source.index("function remoteDeployScript"):]
     assert source.index('deployment_committed="1"', source.index("manage_hermes_proxy.py")) > source.index("manage_hermes_proxy.py")
     assert "restoring previous deployment state" in source
     assert "restore_deployment_state" in source

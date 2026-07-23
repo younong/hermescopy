@@ -36,8 +36,9 @@ def test_default_workflow_is_fast_and_deterministic() -> None:
     assert "Do not use `delegate_task`, `pdftoppm`, or web research" in fast
     assert "python -m markitdown" in validation
     assert "grep -iE" in validation
-    assert "soffice.py --headless --convert-to pdf" in validation
+    assert 'python "${HERMES_SKILL_DIR}/scripts/office/soffice.py"' in validation
     assert "Fix and repeat only a check that found a concrete defect" in validation
+    assert (SKILL_DIR / "scripts" / "office" / "soffice.py").is_file()
 
 
 def test_visual_qa_is_opt_in_and_uses_validated_artifacts() -> None:

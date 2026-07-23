@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "distribution": {
+    "id": "alinux",
+    "versionId": "3",
+    "platformId": "platform:al8",
+    "architecture": "x86_64"
+  },
+  "packages": [
+    {"name": "dejavu-fonts-common", "nevra": "dejavu-fonts-common-0:2.35-7.1.al8.noarch"},
+    {"name": "dejavu-sans-fonts", "nevra": "dejavu-sans-fonts-0:2.35-7.1.al8.noarch"},
+    {"name": "dejavu-sans-mono-fonts", "nevra": "dejavu-sans-mono-fonts-0:2.35-7.1.al8.noarch"},
+    {"name": "dejavu-serif-fonts", "nevra": "dejavu-serif-fonts-0:2.35-7.1.al8.noarch"},
+    {"name": "fontconfig", "nevra": "fontconfig-0:2.13.1-5.al8.x86_64"},
+    {"name": "liberation-fonts-common", "nevra": "liberation-fonts-common-1:2.1.3-5.al8.noarch"},
+    {"name": "liberation-mono-fonts", "nevra": "liberation-mono-fonts-1:2.1.3-5.al8.noarch"},
+    {"name": "liberation-narrow-fonts", "nevra": "liberation-narrow-fonts-2:1.07.6-9.al8.noarch"},
+    {"name": "liberation-sans-fonts", "nevra": "liberation-sans-fonts-1:2.1.3-5.al8.noarch"},
+    {"name": "liberation-serif-fonts", "nevra": "liberation-serif-fonts-1:2.1.3-5.al8.noarch"},
+    {"name": "libreoffice-core", "nevra": "libreoffice-core-1:7.1.8.1-15.0.1.2.al8.2.x86_64"},
+    {"name": "libreoffice-data", "nevra": "libreoffice-data-1:7.1.8.1-15.0.1.2.al8.2.noarch"},
+    {"name": "libreoffice-graphicfilter", "nevra": "libreoffice-graphicfilter-1:7.1.8.1-15.0.1.2.al8.2.x86_64"},
+    {"name": "libreoffice-help-en", "nevra": "libreoffice-help-en-1:7.1.8.1-15.0.1.2.al8.2.x86_64"},
+    {"name": "libreoffice-impress", "nevra": "libreoffice-impress-1:7.1.8.1-15.0.1.2.al8.2.x86_64"},
+    {"name": "libreoffice-langpack-en", "nevra": "libreoffice-langpack-en-1:7.1.8.1-15.0.1.2.al8.2.x86_64"},
+    {"name": "libreoffice-ogltrans", "nevra": "libreoffice-ogltrans-1:7.1.8.1-15.0.1.2.al8.2.x86_64"},
+    {"name": "libreoffice-opensymbol-fonts", "nevra": "libreoffice-opensymbol-fonts-1:7.1.8.1-15.0.1.2.al8.2.noarch"},
+    {"name": "libreoffice-pdfimport", "nevra": "libreoffice-pdfimport-1:7.1.8.1-15.0.1.2.al8.2.x86_64"},
+    {"name": "libreoffice-pyuno", "nevra": "libreoffice-pyuno-1:7.1.8.1-15.0.1.2.al8.2.x86_64"},
+    {"name": "libreoffice-ure", "nevra": "libreoffice-ure-1:7.1.8.1-15.0.1.2.al8.2.x86_64"},
+    {"name": "libreoffice-x11", "nevra": "libreoffice-x11-1:7.1.8.1-15.0.1.2.al8.2.x86_64"},
+    {"name": "libreoffice-ure-common", "nevra": "libreoffice-ure-common-1:7.1.8.1-15.0.1.2.al8.2.noarch"}
+  ]
+}

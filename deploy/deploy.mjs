@@ -57,6 +57,9 @@ Options:
                            Default: ${DEFAULT_DASHBOARD_PUBLIC_URL}
   --migrate-nginx-hermes   Explicitly replace the recognized legacy Hermes Nginx
                            auth block after the new internal auth gate is healthy.
+  --provision-powerpoint-deps
+                           Add reviewed LibreOffice/font host prerequisites before
+                           building the immutable PowerPoint executor runtime.
   --dry-run                Print commands without changing local or remote state.
   -h, --help               Show this help.
 
@@ -86,6 +89,7 @@ function parseArgs(argv) {
     dashboardPublicUrl:
       process.env.HERMES_DEPLOY_DASHBOARD_PUBLIC_URL || DEFAULT_DASHBOARD_PUBLIC_URL,
     migrateNginxHermes: false,
+    provisionPowerpointDeps: false,
     dryRun: false,
   };
 
@@ -145,6 +149,9 @@ function parseArgs(argv) {
         break;
       case "--migrate-nginx-hermes":
         args.migrateNginxHermes = true;
+        break;
+      case "--provision-powerpoint-deps":
+        args.provisionPowerpointDeps = true;
         break;
       case "--dry-run":
         args.dryRun = true;
@@ -516,6 +523,7 @@ function createArchive(args, { dryRun }) {
       "--exclude=./web/node_modules",
       "--exclude=./ui-tui/node_modules",
       "--exclude=./apps/*/node_modules",
+      "--exclude=./deploy/powerpoint-runtime/node_modules/.package-lock.json",
       "-C",
       buildDir,
       ".",
@@ -552,6 +560,11 @@ function buildArtifact(buildDir, { dryRun }) {
     cwd: buildDir,
     env: { HERMES_TUI_OUTFILE: tuiOutFile },
   });
+  run(
+    "npm",
+    ["ci", "--omit=dev", "--ignore-scripts", "--no-audit"],
+    { dryRun, cwd: path.join(buildDir, "deploy/powerpoint-runtime") },
+  );
   run("test", ["-f", path.join(buildDir, "hermes_cli/web_dist/index.html")], { dryRun, cwd: buildDir });
   run("test", ["-f", path.join(buildDir, "ui-tui/dist/entry.js")], { dryRun, cwd: buildDir });
 }
@@ -632,6 +645,7 @@ prune_releases="$8"
 dashboard_public_url="$9"
 migrate_nginx_hermes="${"${"}10}"
 dashboard_public_host="${"${"}11}"
+provision_powerpoint_deps="${"${"}12}"
 tmp_dir="$remote_root/tmp"
 releases_dir="$remote_root/releases"
 release="$releases_dir/$release_id"
@@ -656,6 +670,7 @@ rollback_dir=""
 deployment_committed="0"
 services_touched="0"
 smoke_root=""
+powerpoint_smoke_owner=""
 
 gateway_unit="/etc/systemd/system/hermes-gateway.service"
 dashboard_unit="/etc/systemd/system/hermes-dashboard.service"
@@ -698,6 +713,7 @@ cleanup_release_tmp() {
   fi
   rm -rf -- "$release_tmp"
   [ -z "$smoke_root" ] || rm -rf -- "$smoke_root"
+  [ -z "$powerpoint_smoke_owner" ] || rm -rf -- "$powerpoint_smoke_owner"
   [ -z "$rollback_dir" ] || rm -rf -- "$rollback_dir"
   rm -f -- "$archive"
   rmdir -- "$release_lock" 2>/dev/null || true
@@ -796,8 +812,12 @@ if [[ "$migrate_nginx_hermes" != "0" && "$migrate_nginx_hermes" != "1" ]]; then
   echo "Invalid Nginx migration mode" >&2
   exit 1
 fi
+if [[ "$provision_powerpoint_deps" != "0" && "$provision_powerpoint_deps" != "1" ]]; then
+  echo "Invalid PowerPoint provisioning mode" >&2
+  exit 1
+fi
 
-for required in tar systemctl sha256sum readlink realpath stat sort mv getent useradd groupadd runuser install cp find ldd sed curl; do
+for required in tar systemctl sha256sum readlink realpath stat sort mv getent useradd groupadd runuser install cp find ldd sed curl rpm python3; do
   if ! command -v "$required" >/dev/null 2>&1; then
     echo "Missing required command: $required" >&2
     exit 1
@@ -861,15 +881,75 @@ export HERMES_HOME="$hermes_home"
 
 test -f "$release/hermes_cli/web_dist/index.html"
 test -f "$release/ui-tui/dist/entry.js"
+test -f "$release/deploy/powerpoint-runtime/package-lock.json"
+test -d "$release/deploy/powerpoint-runtime/node_modules/pptxgenjs"
+test -f "$release/deploy/runtime/alicloud3-powerpoint-packages.json"
+test -f "$release/deploy/smoke-powerpoint-runtime.py"
+test -f "$release/skills/productivity/powerpoint/scripts/office/soffice.py"
+
+powerpoint_manifest="$release/deploy/runtime/alicloud3-powerpoint-packages.json"
+manifest_values() {
+  python3 - "$powerpoint_manifest" "$1" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    document = json.load(handle)
+key = sys.argv[2]
+if key == "packages":
+    print(" ".join(item["nevra"] for item in document["packages"]))
+elif key == "entries":
+    print("\n".join(f'{item["name"]}|{item["nevra"]}' for item in document["packages"]))
+else:
+    print(document["distribution"][key])
+PY
+}
+expected_distro="$(manifest_values id)"
+expected_version="$(manifest_values versionId)"
+expected_platform="$(manifest_values platformId)"
+expected_architecture="$(manifest_values architecture)"
+. /etc/os-release
+architecture="$(uname -m)"
+if [ "$ID" != "$expected_distro" ] || [ "$VERSION_ID" != "$expected_version" ] || [ "${"${"}PLATFORM_ID:-}" != "$expected_platform" ] || [ "$architecture" != "$expected_architecture" ]; then
+  echo "PowerPoint runtime package manifest does not match this host" >&2
+  exit 1
+fi
+powerpoint_packages="$(manifest_values packages)"
+powerpoint_package_entries="$(manifest_values entries)"
+if [ "$provision_powerpoint_deps" = "1" ]; then
+  if ! command -v dnf >/dev/null 2>&1; then
+    echo "Missing required command: dnf (needed to provision PowerPoint dependencies)" >&2
+    exit 1
+  fi
+  echo "Provisioning reviewed PowerPoint host prerequisites"
+  dnf install -y --setopt=install_weak_deps=False $powerpoint_packages
+fi
+installed_powerpoint_packages=''
+while IFS='|' read -r package expected; do
+  [ -n "$package" ] || continue
+  installed="$(rpm -q --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}' "$package" 2>/dev/null || true)"
+  if [ "$installed" != "$expected" ]; then
+    echo "Missing or incompatible PowerPoint package: $package${"${"}installed:+ ($installed)}" >&2
+    echo "Re-run with --provision-powerpoint-deps for the reviewed additive install" >&2
+    exit 1
+  fi
+  installed_powerpoint_packages="${"${"}installed_powerpoint_packages}${"${"}installed}\n"
+done <<<"$powerpoint_package_entries"
 
 lock_hash="$(sha256sum "$release/uv.lock" | cut -d ' ' -f1)"
-architecture="$(uname -m)"
+powerpoint_lock_hash="$(sha256sum "$release/deploy/powerpoint-runtime/package-lock.json" | cut -d ' ' -f1)"
+powerpoint_package_hash="$(printf '%b' "$installed_powerpoint_packages" | sort | sha256sum | cut -d ' ' -f1)"
+node_path="$(type -P node || true)"
+if [ -z "$node_path" ]; then
+  echo "Missing required command: node" >&2
+  exit 1
+fi
+node_identity="$(printf '%s\n' "$(node --version)" "$(sha256sum "$node_path" | cut -d ' ' -f1)" | sha256sum | cut -d ' ' -f1)"
 python_version="3.11"
-runtime_id="py311-${"${"}architecture}-${"${"}lock_hash}-sandbox5"
+runtime_inputs_hash="$(printf '%s\n' "$lock_hash" "$powerpoint_lock_hash" "$powerpoint_package_hash" "$node_identity" 'sandbox6' | sha256sum | cut -d ' ' -f1)"
+runtime_id="py311-${"${"}architecture}-${"${"}runtime_inputs_hash}-sandbox6"
 venv="$runtimes_dir/$runtime_id"
 # One manifest drives both packaging and preflight. Keep it aligned with
 # ShellFileOperations' target-side scripts, especially atomic writes.
-executor_commands="bash sh ls pwd printf cat chmod grep find head mktemp mv rm stat"
+executor_commands="bash sh ls pwd printf cat chmod grep find head mktemp mv rm stat node soffice"
 
 if [ ! -x "$venv/bin/python3" ]; then
   echo "Bootstrapping immutable Python runtime $runtime_id"
@@ -887,7 +967,8 @@ if [ ! -x "$venv/bin/python3" ]; then
   fi
   runtime_tmp="$runtimes_dir/.${"${"}runtime_id}.tmp.$$"
   rm -rf -- "$runtime_tmp"
-  mkdir -p "$runtime_tmp/python-base" "$runtime_tmp/venv" "$runtime_tmp/toolchain"
+  mkdir -p "$runtime_tmp/python-base" "$runtime_tmp/venv" "$runtime_tmp/toolchain" "$runtime_tmp/powerpoint"
+  cp -a "$release/deploy/powerpoint-runtime/node_modules" "$runtime_tmp/powerpoint/node_modules"
   uv python install "$python_version" --install-dir "$runtime_tmp/python-base" --no-bin
   base_python="$(find "$runtime_tmp/python-base" -type f -path '*/bin/python3*' -perm -u+x | sort | head -n 1)"
   if [ -z "$base_python" ]; then
@@ -926,6 +1007,7 @@ if [ ! -x "$venv/bin/python3" ]; then
     done < <(ldd "$extension" | sed -nE 's#.*=> (/[^ ]+).*#\1#p; s#^[[:space:]]*(/[^ ]+).*#\1#p')
   done < <(find "$runtime_tmp/lib/python3.11/site-packages" -type f -name '*.so' -print0)
   for command in $executor_commands; do
+    [ "$command" != "soffice" ] || continue
     command_path="$(type -P "$command" || true)"
     if [ -z "$command_path" ]; then
       echo "Missing local executor command: $command" >&2
@@ -941,6 +1023,50 @@ if [ ! -x "$venv/bin/python3" ]; then
       cp -aL -- "$library" "$library_target"
     done < <(ldd "$command_path" | sed -nE 's#.*=> (/[^ ]+).*#\1#p; s#^[[:space:]]*(/[^ ]+).*#\1#p')
   done
+  while IFS= read -r package; do
+    [ -n "$package" ] || continue
+    while IFS= read -r packaged_path; do
+      case "$packaged_path" in
+        /usr/bin/*|/usr/lib/*|/usr/lib64/*|/usr/share/*|/etc/fonts|/etc/fonts/*)
+          if [ -e "$packaged_path" ] && [ ! -d "$packaged_path" ]; then
+            package_target="$runtime_tmp/toolchain$packaged_path"
+            mkdir -p "$(dirname "$package_target")"
+            cp -aL -- "$packaged_path" "$package_target"
+          fi
+          ;;
+        /etc/*|/bin/*|/lib/*|/lib64/*)
+          echo "PowerPoint package owns an unexpected protected path: $packaged_path" >&2
+          exit 1
+          ;;
+      esac
+    done < <(rpm -ql "$package")
+  done < <(printf '%s\n' "$powerpoint_package_entries" | cut -d'|' -f1)
+  soffice_source="$(type -P soffice || true)"
+  if [ "$soffice_source" != "/usr/bin/soffice" ] || [ ! -L "$soffice_source" ]; then
+    echo "Host soffice launcher is not the reviewed /usr/bin/soffice symlink" >&2
+    exit 1
+  fi
+  soffice_link="$(readlink "$soffice_source")"
+  if [ "$soffice_link" != "/usr/lib64/libreoffice/program/soffice" ]; then
+    echo "Host soffice launcher target is unexpected: $soffice_link" >&2
+    exit 1
+  fi
+  soffice_target="$runtime_tmp/toolchain/usr/bin/soffice"
+  soffice_launcher="$runtime_tmp/toolchain/usr/lib64/libreoffice/program/soffice"
+  if [ ! -f "$soffice_launcher" ]; then
+    echo "Packaged soffice launcher is unavailable" >&2
+    exit 1
+  fi
+  rm -f -- "$soffice_target"
+  ln -s ../lib64/libreoffice/program/soffice "$soffice_target"
+  while IFS= read -r -d '' executable; do
+    while read -r library; do
+      [ -n "$library" ] || continue
+      library_target="$runtime_tmp/toolchain$library"
+      mkdir -p "$(dirname "$library_target")"
+      cp -aL -- "$library" "$library_target"
+    done < <(ldd "$executable" 2>/dev/null | sed -nE 's#.*=> (/[^ ]+).*#\1#p; s#^[[:space:]]*(/[^ ]+).*#\1#p')
+  done < <(find "$runtime_tmp/toolchain/usr/lib64/libreoffice" -type f -print0 2>/dev/null)
   chown -R root:root "$runtime_tmp"
   find "$runtime_tmp" -type d -exec chmod 0755 {} +
   find "$runtime_tmp" -type f -exec chmod go-w {} +
@@ -974,7 +1100,7 @@ seccomp_digest="$(sha256sum "$release/deploy/sandbox/executor-x86_64.bpf" | cut 
 install -o root -g root -m 0444 "$release/deploy/sandbox/executor-x86_64.bpf" "$sandbox_seccomp"
 image_digest="$(printf '%s:%s' "$source_commit" "$runtime_id" | sha256sum | cut -d ' ' -f1)"
 readonly_mounts=''
-for destination in /bin /usr/bin /lib /lib64 /usr/lib /usr/lib64; do
+for destination in /bin /usr/bin /lib /lib64 /usr/lib /usr/lib64 /usr/share /etc/fonts; do
   source="$venv/toolchain$destination"
   [ -d "$source" ] || continue
   readonly_mounts="$readonly_mounts,{\"source\":\"$source\",\"destination\":\"$destination\"}"
@@ -992,6 +1118,23 @@ for command in $executor_commands; do
   PATH="$venv/toolchain/usr/bin:$venv/toolchain/bin" command -v "$command" >/dev/null
 done
 PYTHONPATH="$release" "$venv/bin/python" -c 'import hermes_cli.tool_executor_runtime.entrypoint, tools.registry'
+powerpoint_smoke_owner="$owner_root/.deploy-powerpoint-smoke.$$"
+if ! runuser -u "$service_user" -- env -i \
+  HOME="$shared" \
+  PATH="$venv/bin:/usr/bin:/bin" \
+  PYTHONPATH="$release" \
+  PYTHONNOUSERSITE=1 \
+  "$venv/bin/python" "$release/deploy/smoke-powerpoint-runtime.py" \
+  --owner-home "$powerpoint_smoke_owner" \
+  --policy "$sandbox_policy" \
+  --timeout 45; then
+  echo "PowerPoint runtime smoke failed" >&2
+  rm -rf -- "$powerpoint_smoke_owner"
+  exit 1
+fi
+rm -rf -- "$powerpoint_smoke_owner"
+powerpoint_smoke_owner=""
+echo "HERMES_DEPLOY_STAGE powerpoint_runtime_smoke=passed"
 
 ln -sfnT "$release" "$current"
 release_target="$(resolved_path "$release")"
@@ -1230,6 +1373,7 @@ function deployArchive(args, archivePath) {
       args.dashboardPublicUrl,
       args.migrateNginxHermes ? "1" : "0",
       args.dashboardPublicHost,
+      args.provisionPowerpointDeps ? "1" : "0",
     ],
     { input: remoteDeployScript() },
   );
@@ -1266,6 +1410,8 @@ function printSummary(args, result) {
   console.log(
     `Nginx: ${args.migrateNginxHermes ? "explicit legacy-block migration" : "managed snippet reconciliation"}`,
   );
+  console.log(`PowerPoint runtime smoke: ${args.dryRun ? "planned" : "passed"}`);
+  console.log(`PowerPoint host provisioning: ${args.provisionPowerpointDeps ? "enabled" : "preflight only"}`);
   console.log(`Deterministic conversation smoke: ${result.deterministicSmoke}`);
   console.log(`Public real-AI conversation smoke: ${result.publicSmoke}`);
   console.log(`Release outcome: ${result.outcome}`);

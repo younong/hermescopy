@@ -173,7 +173,7 @@ python -m markitdown output.pptx
 python -m markitdown output.pptx | grep -iE "xxxx|lorem|ipsum|this.*(page|slide).*layout"
 
 # Structural/openability check
-python scripts/office/soffice.py --headless --convert-to pdf output.pptx
+python "${HERMES_SKILL_DIR}/scripts/office/soffice.py" --headless --convert-to pdf output.pptx
 ```
 
 Also confirm the `.pptx` is non-empty. Fix and repeat only a check that found a concrete defect. A clean deterministic pass is sufficient for ordinary delivery.
@@ -204,7 +204,7 @@ The reviewer prompt should inspect the validated images for:
 ### Converting to Images
 
 ```bash
-python scripts/office/soffice.py --headless --convert-to pdf output.pptx
+python "${HERMES_SKILL_DIR}/scripts/office/soffice.py" --headless --convert-to pdf output.pptx
 pdftoppm -jpeg -r 150 output.pdf slide
 ```
 
@@ -220,8 +220,10 @@ pdftoppm -jpeg -r 150 -f N -l N output.pdf slide-fixed
 
 ## Dependencies
 
+Managed Hermes production provides locked MarkItDown, PptxGenJS, and LibreOffice dependencies inside the immutable executor runtime. Local installations may need:
+
 - `pip install "markitdown[pptx]"` - text extraction
 - `pip install Pillow` - thumbnail grids
 - `npm install -g pptxgenjs` - creating from scratch
-- LibreOffice (`soffice`) - PDF conversion (auto-configured for sandboxed environments via `scripts/office/soffice.py`)
-- Poppler (`pdftoppm`) - PDF to images
+- LibreOffice (`soffice`) - PDF conversion through `${HERMES_SKILL_DIR}/scripts/office/soffice.py`
+- Poppler (`pdftoppm`) - opt-in thorough visual QA only
