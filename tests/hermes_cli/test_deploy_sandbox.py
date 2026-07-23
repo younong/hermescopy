@@ -52,7 +52,14 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert 'ldd "$extension"' in source
     assert 'for destination in /bin /usr/bin /lib /lib64 /usr/lib /usr/lib64 /usr/share /etc/fonts; do' in source
     assert 'runtime_tmp/toolchain' in source
-    assert 'cp -a "$release/deploy/powerpoint-runtime/node_modules" "$runtime_tmp/powerpoint/node_modules"' in source
+    assert 'cp -a "$release/deploy/powerpoint-runtime/runtime-modules" "$runtime_tmp/powerpoint/node_modules"' in source
+    assert 'path.join(buildDir, "deploy/powerpoint-runtime/node_modules")' in source
+    assert 'path.join(buildDir, "deploy/powerpoint-runtime/runtime-modules")' in source
+    assert 'test -d "$release/deploy/powerpoint-runtime/runtime-modules/pptxgenjs"' in source
+    archive_block = source[source.index('"-czf"') : source.index('return { tmp, archivePath }')]
+    assert '"--exclude=./node_modules"' in archive_block
+    assert '"--exclude=./deploy/powerpoint-runtime/runtime-modules/.package-lock.json"' in archive_block
+    assert '"--exclude=./deploy/powerpoint-runtime/runtime-modules"' not in archive_block
     assert "maxBuffer: 64 * 1024 * 1024" in source
     assert '"--no-xattrs"' in source
     assert 'executor_commands="bash sh ls pwd printf cat chmod grep find head mktemp mv rm stat node soffice"' in source

@@ -514,6 +514,14 @@ function createArchive(args, { dryRun }) {
 
   buildArtifact(buildDir, { dryRun });
   run(
+    "mv",
+    [
+      path.join(buildDir, "deploy/powerpoint-runtime/node_modules"),
+      path.join(buildDir, "deploy/powerpoint-runtime/runtime-modules"),
+    ],
+    { dryRun },
+  );
+  run(
     "tar",
     [
       "-czf",
@@ -525,7 +533,7 @@ function createArchive(args, { dryRun }) {
       "--exclude=./web/node_modules",
       "--exclude=./ui-tui/node_modules",
       "--exclude=./apps/*/node_modules",
-      "--exclude=./deploy/powerpoint-runtime/node_modules/.package-lock.json",
+      "--exclude=./deploy/powerpoint-runtime/runtime-modules/.package-lock.json",
       "-C",
       buildDir,
       ".",
@@ -884,7 +892,7 @@ export HERMES_HOME="$hermes_home"
 test -f "$release/hermes_cli/web_dist/index.html"
 test -f "$release/ui-tui/dist/entry.js"
 test -f "$release/deploy/powerpoint-runtime/package-lock.json"
-test -d "$release/deploy/powerpoint-runtime/node_modules/pptxgenjs"
+test -d "$release/deploy/powerpoint-runtime/runtime-modules/pptxgenjs"
 test -f "$release/deploy/runtime/alicloud3-powerpoint-packages.json"
 test -f "$release/deploy/smoke-powerpoint-runtime.py"
 test -f "$release/skills/productivity/powerpoint/scripts/office/soffice.py"
@@ -970,7 +978,7 @@ if [ ! -x "$venv/bin/python3" ]; then
   runtime_tmp="$runtimes_dir/.${"${"}runtime_id}.tmp.$$"
   rm -rf -- "$runtime_tmp"
   mkdir -p "$runtime_tmp/python-base" "$runtime_tmp/venv" "$runtime_tmp/toolchain" "$runtime_tmp/powerpoint"
-  cp -a "$release/deploy/powerpoint-runtime/node_modules" "$runtime_tmp/powerpoint/node_modules"
+  cp -a "$release/deploy/powerpoint-runtime/runtime-modules" "$runtime_tmp/powerpoint/node_modules"
   uv python install "$python_version" --install-dir "$runtime_tmp/python-base" --no-bin
   base_python="$(find "$runtime_tmp/python-base" -type f -path '*/bin/python3*' -perm -u+x | sort | head -n 1)"
   if [ -z "$base_python" ]; then
