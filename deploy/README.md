@@ -78,7 +78,7 @@ ssh -L 9119:localhost:9119 root@106.15.186.104
 - PowerPoint 的 LibreOffice/font 前置依赖由 `deploy/runtime/alicloud3-powerpoint-packages.json` 精确约束。普通部署只校验并 fail closed；首次补齐时显式传 `--provision-powerpoint-deps`，仅执行该 manifest 中的 additive `dnf install`
 - 常见编译/运行依赖按服务器实际错误补充，例如 `gcc`、`g++`、`make`、`cmake`、`python3-dev`、`python3-venv`、`ffmpeg`、`ripgrep`
 
-Node.js/npm 只要求在本机可用。部署脚本会在从 Git tag 解出的本机临时源码目录中执行 workspace 构建，并在 `deploy/powerpoint-runtime` 执行 `npm ci --omit=dev --ignore-scripts --no-audit`。服务器不运行 npm install/build；PptxGenJS payload、Node、LibreOffice、字体与 MarkItDown 都进入 root-owned immutable runtime，authenticated executor 只读挂载它们。
+Node.js/npm 只要求在本机可用。部署脚本会在从 Git tag 解出的本机临时源码目录中执行 workspace 构建，并在 `deploy/powerpoint-runtime` 执行 `npm ci --omit=dev --ignore-scripts --no-audit`。服务器不运行 npm install/build；PptxGenJS payload、Node、LibreOffice、字体与 MarkItDown 都进入 root-owned immutable runtime，authenticated executor 只读挂载它们。生产 `uv sync` 从阿里云 PyPI 镜像下载 `uv.lock` 已锁定的 Python wheel，避免官方 PyPI CDN 在国内链路上的大文件下载瓶颈；锁文件和校验仍决定最终版本与内容。
 
 首次在符合 manifest 的 Alibaba Cloud Linux 3 x86_64 主机上补齐 PowerPoint 前置包：
 

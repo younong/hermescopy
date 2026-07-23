@@ -11,6 +11,7 @@ const DEFAULT_HOST = "106.15.186.104";
 const DEFAULT_USER = "root";
 const DEFAULT_REMOTE_ROOT = "/opt/hermes";
 const DEFAULT_NPM_REGISTRY = "https://registry.npmmirror.com";
+const DEFAULT_PYTHON_PACKAGE_INDEX = "https://mirrors.aliyun.com/pypi/simple";
 const DEFAULT_IDENTITY_FILE = path.join(homedir(), ".ssh", "hermes_apiyi_ed25519");
 const SSH_CONNECTION_ARGS = [
   "-o",
@@ -656,6 +657,7 @@ dashboard_public_url="$9"
 migrate_nginx_hermes="${"${"}10}"
 dashboard_public_host="${"${"}11}"
 provision_powerpoint_deps="${"${"}12}"
+python_package_index="${"${"}13}"
 tmp_dir="$remote_root/tmp"
 releases_dir="$remote_root/releases"
 release="$releases_dir/$release_id"
@@ -826,6 +828,10 @@ if [[ "$provision_powerpoint_deps" != "0" && "$provision_powerpoint_deps" != "1"
   echo "Invalid PowerPoint provisioning mode" >&2
   exit 1
 fi
+if [[ "$python_package_index" != https://* ]]; then
+  echo "Invalid Python package index" >&2
+  exit 1
+fi
 
 for required in tar systemctl sha256sum readlink realpath stat sort mv getent useradd groupadd runuser install cp find ldd sed curl rpm python3; do
   if ! command -v "$required" >/dev/null 2>&1; then
@@ -987,7 +993,8 @@ if [ ! -x "$venv/bin/python3" ]; then
   fi
   UV_PYTHON_DOWNLOADS=never uv venv --relocatable --python "$base_python" "$runtime_tmp/venv"
   cd "$release"
-  UV_PROJECT_ENVIRONMENT="$runtime_tmp/venv" uv sync --extra all --extra ddgs --locked --no-editable --link-mode copy
+  UV_PROJECT_ENVIRONMENT="$runtime_tmp/venv" UV_DEFAULT_INDEX="$python_package_index" \
+    uv sync --extra all --extra ddgs --locked --no-editable --link-mode copy
   cp -a "$runtime_tmp/venv/." "$runtime_tmp/"
   rm -rf -- "$runtime_tmp/venv"
   python_target="$(readlink "$runtime_tmp/bin/python3" || true)"
@@ -1384,6 +1391,7 @@ function deployArchive(args, archivePath) {
       args.migrateNginxHermes ? "1" : "0",
       args.dashboardPublicHost,
       args.provisionPowerpointDeps ? "1" : "0",
+      DEFAULT_PYTHON_PACKAGE_INDEX,
     ],
     { input: remoteDeployScript() },
   );

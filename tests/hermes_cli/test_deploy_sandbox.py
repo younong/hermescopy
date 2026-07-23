@@ -38,6 +38,8 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     ) in source
     assert "ExecStartPre=$venv/bin/python" in source
     assert "uv python install \"$python_version\" --install-dir \"$runtime_tmp/python-base\" --no-bin" in source
+    assert 'const DEFAULT_PYTHON_PACKAGE_INDEX = "https://mirrors.aliyun.com/pypi/simple"' in source
+    assert 'UV_DEFAULT_INDEX="$python_package_index"' in source
     assert "uv sync --extra all --extra ddgs --locked --no-editable --link-mode copy" in source
     optional_dependencies = tomllib.loads(
         (ROOT / "pyproject.toml").read_text(encoding="utf-8")
