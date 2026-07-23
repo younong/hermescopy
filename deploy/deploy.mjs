@@ -237,7 +237,9 @@ function run(command, commandArgs, options = {}) {
   const stdout = result.stdout?.trim() ?? "";
   const stderr = result.stderr?.trim() ?? "";
   if (result.status !== 0) {
-    throw new Error(`${formatCommand(command, commandArgs)} failed${stderr ? `:\n${stderr}` : stdout ? `:\n${stdout}` : ""}`);
+    const error = new Error(`${formatCommand(command, commandArgs)} failed${stderr ? `:\n${stderr}` : stdout ? `:\n${stdout}` : ""}`);
+    error.commandResult = result;
+    throw error;
   }
   if (!quiet) {
     if (stdout) {
@@ -1051,6 +1053,20 @@ if [ ! -x "$venv/bin/python3" ]; then
             cp -aL -- "$packaged_path" "$package_target"
           fi
           ;;
+        /etc/X11/fontpath.d/*)
+          if [ ! -L "$packaged_path" ]; then
+            echo "PowerPoint package owns an unexpected non-symlink X11 font path: $packaged_path" >&2
+            exit 1
+          fi
+          fontpath_target="$(readlink "$packaged_path")"
+          case "$fontpath_target" in
+            /usr/share/fonts/*) ;;
+            *)
+              echo "PowerPoint package X11 font path has an unexpected target: $packaged_path -> $fontpath_target" >&2
+              exit 1
+              ;;
+          esac
+          ;;
         /etc/*|/bin/*|/lib/*|/lib64/*)
           echo "PowerPoint package owns an unexpected protected path: $packaged_path" >&2
           exit 1
@@ -1414,6 +1430,13 @@ function runPublicConversationSmoke(args) {
   }
 }
 
+function remoteStagePassed(error, stage) {
+  const output = [error?.commandResult?.stdout, error?.commandResult?.stderr]
+    .filter(Boolean)
+    .join("\n");
+  return output.includes(`HERMES_DEPLOY_STAGE ${stage}=passed`);
+}
+
 function printSummary(args, result) {
   const remoteRoot = args.remoteRoot.replace(/\/+$/, "");
   const target = `${args.user}@${args.host}`;
@@ -1428,7 +1451,7 @@ function printSummary(args, result) {
   console.log(
     `Nginx: ${args.migrateNginxHermes ? "explicit legacy-block migration" : "managed snippet reconciliation"}`,
   );
-  console.log(`PowerPoint runtime smoke: ${args.dryRun ? "planned" : "passed"}`);
+  console.log(`PowerPoint runtime smoke: ${result.powerpointSmoke}`);
   console.log(`PowerPoint host provisioning: ${args.provisionPowerpointDeps ? "enabled" : "preflight only"}`);
   console.log(`Deterministic conversation smoke: ${result.deterministicSmoke}`);
   console.log(`Public real-AI conversation smoke: ${result.publicSmoke}`);
@@ -1494,6 +1517,11 @@ function main() {
       }
     } catch (error) {
       printSummary(args, {
+        powerpointSmoke: args.dryRun
+          ? "planned"
+          : remoteStagePassed(error, "powerpoint_runtime_smoke")
+            ? "passed"
+            : "failed or not reached",
         deterministicSmoke: "failed or not reached",
         publicSmoke: "not run",
         outcome: "rolled back before commit",
@@ -1508,6 +1536,7 @@ function main() {
         ? "deployment committed and all smoke passed"
         : "deployment committed but public smoke failed";
     printSummary(args, {
+      powerpointSmoke: args.dryRun ? "planned" : "passed",
       deterministicSmoke: args.dryRun ? "planned" : "passed",
       publicSmoke,
       outcome,

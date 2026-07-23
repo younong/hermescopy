@@ -53,6 +53,10 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert 'find "$runtime_tmp/lib/python3.11/site-packages" -type f -name \'*.so\' -print0' in source
     assert 'ldd "$extension"' in source
     assert 'for destination in /bin /usr/bin /lib /lib64 /usr/lib /usr/lib64 /usr/share /etc/fonts; do' in source
+    assert '/etc/X11/fontpath.d/*)' in source
+    assert 'if [ ! -L "$packaged_path" ]; then' in source
+    assert '/usr/share/fonts/*) ;;' in source
+    assert '/etc/X11' not in source[source.index("readonly_mounts=''") : source.index('policy_tmp="$sandbox_policy.tmp.$$"')]
     assert 'runtime_tmp/toolchain' in source
     assert 'cp -a "$release/deploy/powerpoint-runtime/runtime-modules" "$runtime_tmp/powerpoint/node_modules"' in source
     assert 'path.join(buildDir, "deploy/powerpoint-runtime/node_modules")' in source
@@ -130,6 +134,8 @@ def test_deploy_runs_public_smoke_only_after_remote_commit_and_does_not_roll_bac
     assert "dryRun: args.dryRun" in public_runner
     assert "deployment committed and all smoke passed" in source
     assert "rolled back before commit" in source
+    assert 'remoteStagePassed(error, "powerpoint_runtime_smoke")' in source
+    assert 'console.log(`PowerPoint runtime smoke: ${result.powerpointSmoke}`)' in source
 
 
 def test_seccomp_artifact_is_reproducible_and_manifest_bound(tmp_path):
