@@ -962,12 +962,12 @@ if [ -z "$node_path" ]; then
 fi
 node_identity="$(printf '%s\n' "$(node --version)" "$(sha256sum "$node_path" | cut -d ' ' -f1)" | sha256sum | cut -d ' ' -f1)"
 python_version="3.11"
-runtime_inputs_hash="$(printf '%s\n' "$lock_hash" "$powerpoint_lock_hash" "$powerpoint_package_hash" "$node_identity" 'sandbox6' | sha256sum | cut -d ' ' -f1)"
-runtime_id="py311-${"${"}architecture}-${"${"}runtime_inputs_hash}-sandbox6"
+runtime_inputs_hash="$(printf '%s\n' "$lock_hash" "$powerpoint_lock_hash" "$powerpoint_package_hash" "$node_identity" 'sandbox7' | sha256sum | cut -d ' ' -f1)"
+runtime_id="py311-${"${"}architecture}-${"${"}runtime_inputs_hash}-sandbox7"
 venv="$runtimes_dir/$runtime_id"
 # One manifest drives both packaging and preflight. Keep it aligned with
 # ShellFileOperations' target-side scripts, especially atomic writes.
-executor_commands="bash sh ls pwd printf cat chmod grep find head mktemp mv rm stat node soffice"
+executor_commands="bash sh ls pwd printf cat chmod grep find head mktemp mv rm stat awk basename dirname sed uname which node soffice"
 
 if [ ! -x "$venv/bin/python3" ]; then
   echo "Bootstrapping immutable Python runtime $runtime_id"

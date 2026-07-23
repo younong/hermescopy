@@ -18,7 +18,7 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     source = DEPLOY.read_text(encoding="utf-8")
 
     assert 'runtimes_dir="$remote_root/runtimes/python"' in source
-    assert 'runtime_id="py311-${"${"}architecture}-${"${"}runtime_inputs_hash}-sandbox6"' in source
+    assert 'runtime_id="py311-${"${"}architecture}-${"${"}runtime_inputs_hash}-sandbox7"' in source
     assert 'powerpoint_lock_hash="$(sha256sum "$release/deploy/powerpoint-runtime/package-lock.json"' in source
     assert 'powerpoint_package_hash=' in source
     assert 'node_identity=' in source
@@ -68,7 +68,7 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert '"--exclude=./deploy/powerpoint-runtime/runtime-modules"' not in archive_block
     assert "maxBuffer: 64 * 1024 * 1024" in source
     assert '"--no-xattrs"' in source
-    assert 'executor_commands="bash sh ls pwd printf cat chmod grep find head mktemp mv rm stat node soffice"' in source
+    assert 'executor_commands="bash sh ls pwd printf cat chmod grep find head mktemp mv rm stat awk basename dirname sed uname which node soffice"' in source
     assert source.count('for command in $executor_commands; do') == 2
     assert '[ "$command" != "soffice" ] || continue' in source
     assert 'soffice_source="$(type -P soffice || true)"' in source
