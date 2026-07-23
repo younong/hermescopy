@@ -407,3 +407,7 @@ select = ["PLW1514"]
 "skills/**" = ["PLW1514"]
 "optional-skills/**" = ["PLW1514"]
 "plugins/**" = ["PLW1514"]
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple"
+default = true
