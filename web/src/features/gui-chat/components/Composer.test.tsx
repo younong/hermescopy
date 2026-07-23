@@ -4,7 +4,10 @@ import { act, type ComponentProps } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { IMAGE_ATTACHMENT_MAX_BYTES } from "../attachments";
+import {
+  COMPOSER_ATTACHMENT_MAX_COUNT,
+  IMAGE_ATTACHMENT_MAX_BYTES,
+} from "../attachments";
 import { Composer } from "./Composer";
 
 let root: Root | null = null;
@@ -162,15 +165,82 @@ describe("Composer attachment transfers", () => {
     await act(async () => resolveSend?.());
   });
 
-  it("applies existing attachment validation to transferred files", async () => {
+  it("accepts a 10MB image and rejects a larger image", async () => {
     const container = renderComposer();
-    const oversized = new File(["image"], "too-large.png", { type: "image/png" });
-    Object.defineProperty(oversized, "size", { value: IMAGE_ATTACHMENT_MAX_BYTES + 1 });
+    const allowed = fileWithSize("allowed.png", "image/png", IMAGE_ATTACHMENT_MAX_BYTES);
+    const oversized = fileWithSize(
+      "too-large.png",
+      "image/png",
+      IMAGE_ATTACHMENT_MAX_BYTES + 1,
+    );
 
-    await dispatch(getDropTarget(container), transferEvent("drop", transfer([oversized])));
+    await dispatch(getDropTarget(container), transferEvent("drop", transfer([allowed, oversized])));
 
-    expect(container.textContent).toContain("too-large.png 超过 25MB，无法上传。");
+    expect(container.querySelector('[title="allowed.png"]')).not.toBeNull();
+    expect(container.textContent).toContain("too-large.png 超过 10MB，无法上传。");
     expect(container.querySelector('[title="too-large.png"]')).toBeNull();
+  });
+
+  it("limits a single batch to 10 attachments", async () => {
+    const container = renderComposer();
+    const files = Array.from(
+      { length: COMPOSER_ATTACHMENT_MAX_COUNT + 1 },
+      (_, index) => new File([String(index)], `file-${index + 1}.txt`, { type: "text/plain" }),
+    );
+
+    await dispatch(getDropTarget(container), transferEvent("drop", transfer(files)));
+
+    expect(container.querySelectorAll('[aria-label^="Remove "]')).toHaveLength(
+      COMPOSER_ATTACHMENT_MAX_COUNT,
+    );
+    expect(container.querySelector('[title="file-10.txt"]')).not.toBeNull();
+    expect(container.querySelector('[title="file-11.txt"]')).toBeNull();
+    expect(container.textContent).toContain("每条消息最多添加 10 个附件。");
+  });
+
+  it("limits cumulative additions and allows another attachment after removal", async () => {
+    const container = renderComposer();
+    const dropTarget = getDropTarget(container);
+    const firstBatch = Array.from(
+      { length: COMPOSER_ATTACHMENT_MAX_COUNT - 1 },
+      (_, index) => new File([String(index)], `initial-${index + 1}.txt`, { type: "text/plain" }),
+    );
+
+    await dispatch(dropTarget, transferEvent("drop", transfer(firstBatch)));
+    await dispatch(
+      dropTarget,
+      transferEvent(
+        "drop",
+        transfer([
+          new File(["accepted"], "accepted.txt", { type: "text/plain" }),
+          new File(["overflow"], "overflow.txt", { type: "text/plain" }),
+        ]),
+      ),
+    );
+
+    expect(container.querySelectorAll('[aria-label^="Remove "]')).toHaveLength(
+      COMPOSER_ATTACHMENT_MAX_COUNT,
+    );
+    expect(container.querySelector('[title="accepted.txt"]')).not.toBeNull();
+    expect(container.querySelector('[title="overflow.txt"]')).toBeNull();
+
+    const removeButton = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Remove initial-1.txt"]',
+    );
+    await dispatch(removeButton, new MouseEvent("click", { bubbles: true, cancelable: true }));
+    await dispatch(
+      dropTarget,
+      transferEvent(
+        "drop",
+        transfer([new File(["replacement"], "replacement.txt", { type: "text/plain" })]),
+      ),
+    );
+
+    expect(container.querySelectorAll('[aria-label^="Remove "]')).toHaveLength(
+      COMPOSER_ATTACHMENT_MAX_COUNT,
+    );
+    expect(container.querySelector('[title="replacement.txt"]')).not.toBeNull();
+    expect(container.textContent).not.toContain("每条消息最多添加 10 个附件。");
   });
 });
 
@@ -214,6 +284,12 @@ function getDropTarget(container: HTMLElement): HTMLElement {
   const target = getTextarea(container).parentElement;
   if (!target) throw new Error("Composer drop target not found");
   return target;
+}
+
+function fileWithSize(name: string, type: string, size: number): File {
+  const file = new File(["content"], name, { type });
+  Object.defineProperty(file, "size", { value: size });
+  return file;
 }
 
 function transfer(files: File[], types = files.length > 0 ? ["Files"] : []): DataTransfer {

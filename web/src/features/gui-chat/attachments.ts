@@ -1,6 +1,7 @@
 import type { GuiComposerAttachmentKind } from "./types";
 
-export const IMAGE_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
+export const COMPOSER_ATTACHMENT_MAX_COUNT = 10;
+export const IMAGE_ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
 export const PDF_ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024;
 export const FILE_ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024;
 
@@ -50,7 +51,7 @@ export function validateComposerAttachment(file: File):
   }
 
   if (kind === "image" && file.size > IMAGE_ATTACHMENT_MAX_BYTES) {
-    return { ok: false, message: `${file.name} 超过 25MB，无法上传。` };
+    return { ok: false, message: `${file.name} 超过 10MB，无法上传。` };
   }
 
   if (kind === "pdf" && file.size > PDF_ATTACHMENT_MAX_BYTES) {
