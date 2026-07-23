@@ -197,6 +197,7 @@ export function Composer({
       if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
       return current.filter((attachment) => attachment.id !== id);
     });
+    setLocalError(null);
   };
 
   return (

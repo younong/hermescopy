@@ -228,6 +228,12 @@ describe("Composer attachment transfers", () => {
       '[aria-label="Remove initial-1.txt"]',
     );
     await dispatch(removeButton, new MouseEvent("click", { bubbles: true, cancelable: true }));
+
+    expect(container.querySelectorAll('[aria-label^="Remove "]')).toHaveLength(
+      COMPOSER_ATTACHMENT_MAX_COUNT - 1,
+    );
+    expect(container.textContent).not.toContain("每条消息最多添加 10 个附件。");
+
     await dispatch(
       dropTarget,
       transferEvent(
