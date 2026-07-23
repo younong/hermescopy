@@ -53,6 +53,8 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert 'for destination in /bin /usr/bin /lib /lib64 /usr/lib /usr/lib64 /usr/share /etc/fonts; do' in source
     assert 'runtime_tmp/toolchain' in source
     assert 'cp -a "$release/deploy/powerpoint-runtime/node_modules" "$runtime_tmp/powerpoint/node_modules"' in source
+    assert "maxBuffer: 64 * 1024 * 1024" in source
+    assert '"--no-xattrs"' in source
     assert 'executor_commands="bash sh ls pwd printf cat chmod grep find head mktemp mv rm stat node soffice"' in source
     assert source.count('for command in $executor_commands; do') == 2
     assert '[ "$command" != "soffice" ] || continue' in source

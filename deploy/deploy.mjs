@@ -227,6 +227,7 @@ function run(command, commandArgs, options = {}) {
     input,
     stdio: input === undefined ? "pipe" : ["pipe", "pipe", "pipe"],
     env: env ? { ...process.env, ...env } : process.env,
+    maxBuffer: 64 * 1024 * 1024,
   });
 
   if (result.error) {
@@ -517,6 +518,7 @@ function createArchive(args, { dryRun }) {
     [
       "-czf",
       archivePath,
+      "--no-xattrs",
       "--exclude=._*",
       "--exclude=*/._*",
       "--exclude=./node_modules",
