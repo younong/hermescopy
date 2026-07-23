@@ -44,8 +44,10 @@ from hermes_cli.owner_worker.tool_executor_sandbox import (
 )
 from hermes_cli.tool_executor_runtime.env import build_executor_environment
 from hermes_cli.owner_worker.owner_tool_relay import (
+    OWNER_FILE_TOOL_NAMES,
     OWNER_RELAY_TOOL_NAMES,
     OwnerToolRelayBroker,
+    owner_file_tool_relay_admissible,
 )
 from hermes_cli.owner_worker.skill_snapshot import materialize_skill_snapshot
 
@@ -142,6 +144,7 @@ class ToolExecutorSupervisor:
         self.owner_tool_relay = owner_tool_relay or web_tool_relay or OwnerToolRelayBroker(
             identity_validator=self._require_active_executor_identity,
             image_dispatcher=image_dispatcher,
+            workspace_context=workspace_context,
         )
         # Compatibility alias for callers that only knew the original web relay.
         self.web_tool_relay = self.owner_tool_relay
@@ -529,7 +532,11 @@ class ToolExecutorSupervisor:
             info_read, info_write = os.pipe()
             for fd in (inherited_workspace_fd, request_read, response_write, gate_read, info_write):
                 os.set_inheritable(fd, True)
-            if invocation.tool_name in OWNER_RELAY_TOOL_NAMES:
+            relay_file_tool = owner_file_tool_relay_admissible(invocation)
+            relay_tool = invocation.tool_name in OWNER_RELAY_TOOL_NAMES and (
+                invocation.tool_name not in OWNER_FILE_TOOL_NAMES or relay_file_tool
+            )
+            if relay_tool:
                 skill_dir_materializer = None
                 if invocation.tool_name == "skill_view":
                     quota = invocation.resource_decision.quota

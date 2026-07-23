@@ -460,7 +460,7 @@ def create_app(
     def _files_error(exc: Exception) -> HTTPException:
         if isinstance(exc, FileNotFoundError):
             return HTTPException(status_code=404, detail="Path not found")
-        if isinstance(exc, (PermissionError, RuntimeError, OSError)):
+        if isinstance(exc, (PermissionError, RuntimeError, OSError, ValueError)):
             return HTTPException(status_code=400, detail="Unsafe or invalid filesystem path")
         return HTTPException(status_code=500, detail="Filesystem operation failed")
 
@@ -649,12 +649,13 @@ def create_app(
         raw_cwd = str(cwd or "").strip()
         if not raw_cwd or "\x00" in raw_cwd:
             raise HTTPException(status_code=400, detail="Invalid cwd")
-        sandbox_root = "/workspace"
-        if raw_cwd == sandbox_root:
-            return workspace_context.workspace_prefix
-        if raw_cwd.startswith(f"{sandbox_root}/"):
-            suffix = raw_cwd[len(sandbox_root) + 1 :]
-            return _file_path(f"{workspace_context.workspace_prefix}/{suffix}")
+        if raw_cwd == "/workspace" or raw_cwd.startswith("/workspace/"):
+            try:
+                return workspace_context.controlled_workspace_path(
+                    raw_cwd, allow_workspace_root=True
+                )
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid cwd") from None
 
         cwd_path = Path(raw_cwd)
         if not cwd_path.is_absolute():
@@ -679,12 +680,8 @@ def create_app(
         root_kind = RootKind.WORKSPACE
         try:
             cwd_relative = _workspace_cwd_path(cwd) if cwd is not None else None
-            sandbox_root = "/workspace"
-            if value.startswith(f"{sandbox_root}/"):
-                suffix = value[len(sandbox_root) + 1 :]
-                relative_path = _file_path(
-                    f"{workspace_context.workspace_prefix}/{suffix}"
-                )
+            if value == "/workspace" or value.startswith("/workspace/"):
+                relative_path = workspace_context.controlled_workspace_path(value)
             else:
                 candidate = Path(value)
                 if candidate.is_absolute():
