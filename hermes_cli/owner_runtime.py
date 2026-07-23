@@ -98,6 +98,7 @@ class OwnerWorkerRuntimePaths:
     owner_home: Path
     workspace_root: Path
     default_workspace: Path
+    worker_runtime_dir: Path
     worker_socket: Path
     paths: Mapping[str, Path]
 
@@ -150,13 +151,18 @@ def ensure_owner_runtime_dirs(owner_home: str | Path | None = None) -> Path:
     return home
 
 
-def owner_worker_socket_path(owner_home: str | Path, worker_generation: int) -> Path:
-    """Return the sole authenticated worker socket location for a generation."""
+def owner_worker_runtime_dir(owner_home: str | Path, worker_generation: int) -> Path:
+    """Return the canonical runtime directory for one worker generation."""
     home = Path(owner_home).expanduser().resolve()
     generation = int(worker_generation)
     if generation < 1:
         raise ValueError("worker_generation must be positive")
-    return home / "runtime" / "workers" / str(generation) / "worker.sock"
+    return home / "runtime" / "workers" / str(generation)
+
+
+def owner_worker_socket_path(owner_home: str | Path, worker_generation: int) -> Path:
+    """Return the sole authenticated worker socket location for a generation."""
+    return owner_worker_runtime_dir(owner_home, worker_generation) / "worker.sock"
 
 
 def owner_worker_env_for(
@@ -354,11 +360,13 @@ def owner_worker_runtime_paths(
         "workspace_root": workspace_root,
         "default_workspace": workspace_root / "default",
     }
+    worker_runtime_dir = owner_worker_runtime_dir(home, generation)
     return OwnerWorkerRuntimePaths(
         owner_home=home,
         workspace_root=workspace_root,
         default_workspace=(workspace_root / "default").resolve(),
-        worker_socket=owner_worker_socket_path(home, generation),
+        worker_runtime_dir=worker_runtime_dir,
+        worker_socket=worker_runtime_dir / "worker.sock",
         paths={label: path.resolve() for label, path in paths.items()},
     )
 

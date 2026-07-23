@@ -1,5 +1,6 @@
 import errno
 import os
+import socket
 import stat
 from pathlib import Path
 from types import SimpleNamespace
@@ -314,6 +315,74 @@ def test_descriptor_operations_list_replace_rename_and_remove(tmp_path, monkeypa
         assert not (paths.workspace_root / "project").exists()
     finally:
         roots.close()
+
+
+def test_lifecycle_cleanup_removes_generation_tree_and_special_entries(tmp_path, monkeypatch):
+    _linux(monkeypatch)
+    paths = _runtime_paths(tmp_path)
+    runtime_dir = paths.worker_runtime_dir
+    nested = runtime_dir / "nested"
+    nested.mkdir(parents=True)
+    (nested / "artifact.txt").write_text("temporary")
+    worker_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    monkeypatch.chdir(runtime_dir)
+    worker_socket.bind("worker.sock")
+    roots = controlled_roots_for(paths)
+
+    try:
+        roots.remove_tree_for_cleanup(RootKind.OWNER_WRITABLE, "runtime/workers/1")
+        roots.remove_tree_for_cleanup(RootKind.OWNER_WRITABLE, "runtime/workers/1")
+    finally:
+        roots.close()
+        worker_socket.close()
+
+    assert not runtime_dir.exists()
+
+
+@pytest.mark.parametrize("relative_path", ["", ".", "..", "runtime/../sessions", "/runtime/workers/1"])
+def test_lifecycle_cleanup_rejects_untrusted_path_forms(tmp_path, monkeypatch, relative_path):
+    _linux(monkeypatch)
+    roots = controlled_roots_for(_runtime_paths(tmp_path))
+
+    try:
+        with pytest.raises(ValueError):
+            roots.remove_tree_for_cleanup(RootKind.OWNER_WRITABLE, relative_path)
+    finally:
+        roots.close()
+
+
+@pytest.mark.parametrize("replace_tree", [False, True])
+def test_lifecycle_cleanup_unlinks_symlinks_without_following_targets(
+    tmp_path,
+    monkeypatch,
+    replace_tree,
+):
+    _linux(monkeypatch)
+    paths = _runtime_paths(tmp_path)
+    runtime_dir = paths.worker_runtime_dir
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("keep")
+    runtime_dir.parent.mkdir(parents=True)
+    if replace_tree:
+        link = runtime_dir
+    else:
+        runtime_dir.mkdir()
+        link = runtime_dir / "outside-link"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    roots = controlled_roots_for(paths)
+
+    try:
+        roots.remove_tree_for_cleanup(RootKind.OWNER_WRITABLE, "runtime/workers/1")
+    finally:
+        roots.close()
+
+    assert (outside / "keep.txt").read_text() == "keep"
+    assert not runtime_dir.exists()
+
 
 
 def test_open_relative_rejects_multiply_linked_regular_files(tmp_path, monkeypatch):

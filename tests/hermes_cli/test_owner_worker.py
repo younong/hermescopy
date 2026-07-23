@@ -821,6 +821,8 @@ def test_supervisor_reclaims_conclusively_absent_orphan_lease(tmp_path):
         startup_cooldown=0,
     )
     handle = first.get_or_start(owner)
+    orphan_runtime = handle.socket_path.parent
+    (orphan_runtime / "stale-artifact").write_text("stale")
     handle.socket_path.unlink()
     first.authority_store.transition_worker_lease(
         first._lease_for_handle(handle),
@@ -838,6 +840,8 @@ def test_supervisor_reclaims_conclusively_absent_orphan_lease(tmp_path):
     replacement = restarted.get_or_start(owner)
 
     assert replacement.worker_generation == 2
+    assert not orphan_runtime.exists()
+    assert replacement.socket_path.parent.exists()
     assert first.authority_store.read_worker_generation(owner.owner_key, 1).state is WorkerGenerationState.REVOKED
     assert restarted.authority_store.read_worker_generation(owner.owner_key, 2).state is WorkerGenerationState.ACTIVE
     assert len(spawned) == 2
@@ -1404,12 +1408,25 @@ def test_supervisor_fences_and_closes_bridges_before_terminating_exact_generatio
     )
     handle = supervisor.get_or_start(owner)
     socket_path = handle.socket_path
+    (socket_path.parent / "nested").mkdir()
+    (socket_path.parent / "nested" / "temporary.txt").write_text("temporary")
+    persistent_paths = [
+        owner.owner_home / "sessions" / "keep.txt",
+        owner.owner_home / "workspaces" / "keep.txt",
+        owner.owner_home / "runtime" / "logs" / "keep.txt",
+        owner.owner_home / "runtime" / "tmp" / "keep.txt",
+        owner.owner_home / "runtime" / "executors" / "keep.txt",
+    ]
+    for persistent in persistent_paths:
+        persistent.parent.mkdir(parents=True, exist_ok=True)
+        persistent.write_text("keep")
 
     supervisor._terminate_handle(owner.owner_key, handle)
 
     assert events == ["bridges", "terminate"]
     assert not socket_path.exists()
     assert not socket_path.parent.exists()
+    assert all(path.read_text() == "keep" for path in persistent_paths)
     assert supervisor.authority_store.read_worker_generation(owner.owner_key, 1).state is WorkerGenerationState.TERMINATED
     assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.REVOKED
 
@@ -1475,6 +1492,38 @@ def test_supervisor_does_not_mark_unconfirmed_process_exit_terminated(tmp_path):
     assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.REVOKED
 
 
+def test_supervisor_cleanup_failure_does_not_skip_lifecycle_finalization(tmp_path, monkeypatch):
+    owner = _Owner("ok1_cleanup_failure", tmp_path / "owner")
+
+    def fake_process_factory(*args, **kwargs):
+        del kwargs
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+    handle = supervisor.get_or_start(owner)
+    monkeypatch.setattr(
+        supervisor,
+        "_cleanup_generation_runtime",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("cleanup failed")),
+    )
+
+    supervisor._terminate_handle(owner.owner_key, handle)
+
+    assert handle.socket_path.exists()
+    assert supervisor._terminating_handles == {}
+    assert supervisor.authority_store.read_worker_generation(owner.owner_key, 1).state is WorkerGenerationState.TERMINATED
+    assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.REVOKED
+
+
+
 def test_supervisor_active_use_skips_idle_stop_until_released(tmp_path):
     owner = _Owner("ok1_active", tmp_path / "owner")
 
@@ -1534,6 +1583,31 @@ def test_supervisor_startup_throttle_is_per_owner(tmp_path):
     assert len(spawned) == 2
 
 
+def test_supervisor_process_launch_failure_reclaims_generation_runtime(tmp_path):
+    owner = _Owner("ok1_launch_failure", tmp_path / "owner")
+
+    def fail_process_launch(*_args, **_kwargs):
+        runtime_dir = owner.owner_home / "runtime" / "workers" / "1"
+        (runtime_dir / "launch-artifact").write_text("temporary")
+        raise OSError("spawn failed")
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fail_process_launch,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+
+    with pytest.raises(OwnerWorkerStartupError, match="process launch failed"):
+        supervisor.get_or_start(owner)
+
+    assert not (owner.owner_home / "runtime" / "workers" / "1").exists()
+    assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.REVOKED
+    assert supervisor.authority_store.read_worker_generation(owner.owner_key, 1).state is WorkerGenerationState.FAILED
+
+
+
 def test_supervisor_relay_activation_failure_revokes_active_worker(tmp_path, monkeypatch):
     from hermes_cli.deployment_image import DeploymentImagePolicy
 
@@ -1580,7 +1654,7 @@ def test_supervisor_relay_activation_failure_revokes_active_worker(tmp_path, mon
 
     assert supervisor._handles == {}
     assert process.returncode is not None
-    assert not supervisor.socket_path_for(owner, 1).exists()
+    assert not supervisor.socket_path_for(owner, 1).parent.exists()
     assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.REVOKED
     assert supervisor.authority_store.read_worker_generation(owner.owner_key, 1).state is WorkerGenerationState.FAILED
 
@@ -1608,6 +1682,7 @@ def test_supervisor_startup_exit_is_typed_and_releases_the_fence(tmp_path):
         supervisor.get_or_start(owner)
 
     assert supervisor._handles == {}
+    assert not supervisor.socket_path_for(owner, 1).parent.exists()
     assert supervisor._starting_owner_keys == set()
     assert supervisor._in_flight_starts == 0
     assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.REVOKED
@@ -1722,6 +1797,48 @@ def test_supervisor_evicts_only_idle_workers(tmp_path):
     assert not active.process.terminated
     assert idle.process.terminated
     lease.release()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="controlled roots require Linux")
+def test_supervisor_real_worker_shutdown_reclaims_only_generation_runtime(tmp_path):
+    socket_root = Path("/tmp") / f"hr{os.getpid():x}"
+    socket_root.mkdir(mode=0o700, exist_ok=True)
+    owner_home = ensure_owner_runtime_dirs(socket_root / "u")
+    control_home = socket_root / "c"
+    owner = _Owner("ok1_runtime_cleanup", owner_home)
+    persistent_paths = [
+        owner_home / "sessions" / "keep.txt",
+        owner_home / "workspaces" / "keep.txt",
+        owner_home / "runtime" / "logs" / "keep.txt",
+        owner_home / "runtime" / "tmp" / "keep.txt",
+        owner_home / "runtime" / "executors" / "keep.txt",
+    ]
+    for persistent in persistent_paths:
+        persistent.parent.mkdir(parents=True, exist_ok=True)
+        persistent.write_text("keep")
+    supervisor = OwnerWorkerSupervisor(
+        control_home=control_home,
+        global_home=socket_root / "global",
+        startup_timeout=10,
+        startup_cooldown=0,
+    )
+
+    try:
+        handle = supervisor.get_or_start(owner)
+        (handle.socket_path.parent / "temporary.txt").write_text("temporary")
+
+        supervisor.shutdown()
+
+        assert handle.process.poll() is not None
+        assert not handle.socket_path.parent.exists()
+        assert all(path.read_text() == "keep" for path in persistent_paths)
+    finally:
+        supervisor.shutdown()
+        if socket_root.exists():
+            import shutil
+
+            shutil.rmtree(socket_root)
+
 
 
 def test_worker_health_over_unix_socket_reports_owner_env(tmp_path, monkeypatch):
