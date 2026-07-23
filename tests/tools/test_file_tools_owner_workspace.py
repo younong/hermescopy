@@ -9,7 +9,13 @@ import pytest
 import tools.file_tools as file_tools
 from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
 from hermes_cli.controlled_roots import RootKind, controlled_roots_for
+from hermes_cli.dashboard_auth.authority import OwnerWorkerAuthorityLease, WorkerLeaseState
 from hermes_cli.owner_runtime import ensure_owner_runtime_dirs, owner_worker_runtime_paths
+from hermes_cli.owner_worker.executor_identity import ExecutorIdentity, ExecutorInvocation
+from hermes_cli.owner_worker.owner_tool_relay import (
+    OwnerToolRelayBroker,
+    dispatch_owner_tool_over_relay,
+)
 from tools.file_operations import ControlledWorkspaceFileOperations
 from tui_gateway.server import OwnerWorkerGatewayRuntime, _gateway_runtime
 
@@ -149,6 +155,136 @@ def test_authenticated_write_does_not_resolve_ambient_cwd(owner_a_workspace, mon
         _gateway_runtime.reset(token)
 
 
+def test_authenticated_tools_accept_exact_workspace_namespace(owner_a_workspace, monkeypatch):
+    filename = "雨崩虫草线_路上捡来的朋友02_135源格式.html"
+    workspace_path = f"/workspace/{filename}"
+    selected = owner_a_workspace.get(RootKind.WORKSPACE).canonical_path / "default"
+    owner_a_workspace.replace_bytes(
+        RootKind.WORKSPACE,
+        f"default/{filename}",
+        "初稿\n".encode(),
+    )
+    token = _bind_runtime(owner_a_workspace)
+    try:
+        monkeypatch.setattr(
+            file_tools,
+            "_resolve_base_dir",
+            lambda *_args, **_kwargs: pytest.fail("authenticated tools must not resolve a terminal cwd"),
+        )
+        monkeypatch.setattr(
+            file_tools,
+            "_resolve_path_for_task",
+            lambda *_args, **_kwargs: pytest.fail("authenticated tools must not resolve a host path"),
+        )
+        monkeypatch.setattr(
+            file_tools,
+            "ShellFileOperations",
+            lambda *_args, **_kwargs: pytest.fail("authenticated tools must not create a shell backend"),
+        )
+
+        read = json.loads(file_tools.read_file_tool(workspace_path))
+        assert read["content"] == "1|初稿\n2|"
+
+        replaced = json.loads(file_tools.patch_tool(
+            mode="replace",
+            path=workspace_path,
+            old_string="初稿",
+            new_string="定稿",
+        ))
+        assert replaced["success"] is True
+        assert (selected / filename).read_text() == "定稿\n"
+
+        written = json.loads(file_tools.write_file_tool("/workspace/目录/新文件.html", "内容\n"))
+        assert written["bytes_written"] == len("内容\n".encode())
+        assert (selected / "目录/新文件.html").read_text() == "内容\n"
+
+        searched = json.loads(file_tools.search_tool("定稿", path="/workspace"))
+        assert searched["matches"][0]["path"] == filename
+        assert "default/" not in searched["matches"][0]["path"]
+        assert str(selected) not in searched["matches"][0]["path"]
+    finally:
+        _gateway_runtime.reset(token)
+
+
+def test_authenticated_executor_file_relay_uses_descriptor_workspace(owner_a_workspace, monkeypatch):
+    filename = "雨崩虫草线_路上捡来的朋友02_135源格式.html"
+    workspace_path = f"/workspace/{filename}"
+    selected = owner_a_workspace.get(RootKind.WORKSPACE).canonical_path / "default"
+    owner_a_workspace.replace_bytes(
+        RootKind.WORKSPACE,
+        f"default/{filename}",
+        "初稿\n".encode(),
+    )
+    lease = OwnerWorkerAuthorityLease(
+        "owner-a", 1, "worker-a", WorkerLeaseState.ACTIVE, 1, 0
+    )
+    identity = ExecutorIdentity.for_task(
+        lease,
+        workspace_prefix="default",
+        task_id="task-a",
+        session_id="session-a",
+        executor_id="executor-a",
+    )
+    def require_identity(received):
+        if received != identity:
+            raise PermissionError("foreign executor identity")
+
+    broker = OwnerToolRelayBroker(
+        identity_validator=require_identity,
+        workspace_context=AuthenticatedWorkspaceContext(owner_a_workspace),
+    )
+    monkeypatch.setattr(
+        file_tools,
+        "ShellFileOperations",
+        lambda *_args, **_kwargs: pytest.fail(
+            "authenticated executor relay must not create a shell backend"
+        ),
+    )
+
+    def dispatch(tool_name, arguments, invocation_id):
+        invocation = ExecutorInvocation(
+            identity,
+            tool_name,
+            arguments,
+            f"call-{invocation_id}",
+            f"turn-{invocation_id}",
+            f"request-{invocation_id}",
+            invocation_id,
+            "tool-none",
+        )
+        relay_fd = broker.register(invocation)
+        return json.loads(dispatch_owner_tool_over_relay(relay_fd, invocation))
+
+    try:
+        read = dispatch("read_file", {"path": workspace_path}, "read")
+        assert read["content"] == "1|初稿\n2|"
+        assert "similar_files" not in read
+
+        patched = dispatch(
+            "patch",
+            {
+                "mode": "replace",
+                "path": workspace_path,
+                "old_string": "初稿",
+                "new_string": "定稿",
+            },
+            "patch",
+        )
+        assert patched["success"] is True
+        assert (selected / filename).read_text() == "定稿\n"
+
+        searched = dispatch(
+            "search_files",
+            {"pattern": "定稿", "path": "/workspace"},
+            "search",
+        )
+        assert searched["matches"][0]["path"] == filename
+        assert "default/" not in searched["matches"][0]["path"]
+        assert str(selected) not in searched["matches"][0]["path"]
+    finally:
+        broker.close()
+
+
 def test_authenticated_v4a_supports_add_update_delete_and_move(owner_a_workspace):
     token = _bind_runtime(owner_a_workspace)
     try:
@@ -156,19 +292,19 @@ def test_authenticated_v4a_supports_add_update_delete_and_move(owner_a_workspace
             mode="patch",
             patch=(
                 "*** Begin Patch\n"
-                "*** Add File: src/example.py\n"
+                "*** Add File: /workspace/src/example.py\n"
                 "+before\n"
                 "*** End Patch\n"
             ),
         ))
         assert added["success"] is True
-        assert added["files_created"] == ["src/example.py"]
+        assert added["files_created"] == ["/workspace/src/example.py"]
 
         updated = json.loads(file_tools.patch_tool(
             mode="patch",
             patch=(
                 "*** Begin Patch\n"
-                "*** Update File: src/example.py\n"
+                "*** Update File: /workspace/src/example.py\n"
                 "@@\n"
                 "-before\n"
                 "+after\n"
@@ -176,35 +312,53 @@ def test_authenticated_v4a_supports_add_update_delete_and_move(owner_a_workspace
             ),
         ))
         assert updated["success"] is True
-        assert updated["files_modified"] == ["src/example.py"]
+        assert updated["files_modified"] == ["/workspace/src/example.py"]
 
         moved = json.loads(file_tools.patch_tool(
             mode="patch",
             patch=(
                 "*** Begin Patch\n"
-                "*** Move File: src/example.py -> src/renamed.py\n"
+                "*** Move File: /workspace/src/example.py -> /workspace/src/renamed.py\n"
                 "*** End Patch\n"
             ),
         ))
         assert moved["success"] is True
-        assert moved["files_modified"] == ["src/example.py -> src/renamed.py"]
+        assert moved["files_modified"] == [
+            "/workspace/src/example.py -> /workspace/src/renamed.py"
+        ]
 
         deleted = json.loads(file_tools.patch_tool(
             mode="patch",
             patch=(
                 "*** Begin Patch\n"
-                "*** Delete File: src/renamed.py\n"
+                "*** Delete File: /workspace/src/renamed.py\n"
                 "*** End Patch\n"
             ),
         ))
         assert deleted["success"] is True
-        assert deleted["files_deleted"] == ["src/renamed.py"]
+        assert deleted["files_deleted"] == ["/workspace/src/renamed.py"]
         assert not (owner_a_workspace.get(RootKind.WORKSPACE).canonical_path / "default/src/renamed.py").exists()
     finally:
         _gateway_runtime.reset(token)
 
 
-@pytest.mark.parametrize("bad_path", ["/tmp/file", "../file", "~/.ssh/id", "dir//file", "dir/"])
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "/tmp/file",
+        "/workspace",
+        "/workspace2/file",
+        "/workspace/../file",
+        "/workspace/./file",
+        "/workspace//file",
+        "/workspace/",
+        "../file",
+        "~/.ssh/id",
+        "dir//file",
+        "dir/",
+        "bad\x00file",
+    ],
+)
 def test_authenticated_v4a_rejects_all_untrusted_paths_before_apply(owner_a_workspace, bad_path):
     token = _bind_runtime(owner_a_workspace)
     try:
@@ -224,7 +378,7 @@ def test_authenticated_v4a_rejects_all_untrusted_paths_before_apply(owner_a_work
             ),
         ))
         assert result["success"] is False
-        assert "workspace-relative" in result["error"] or "empty, dot, or parent" in result["error"]
+        assert "path must" in result["error"]
         assert original.read_text() == "keep\n"
     finally:
         _gateway_runtime.reset(token)

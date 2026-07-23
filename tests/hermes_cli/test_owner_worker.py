@@ -2293,6 +2293,8 @@ def test_worker_managed_files_are_descriptor_scoped_to_its_owner(tmp_path, monke
     default_workspace = owner_a / "workspaces" / "default"
     default_workspace.joinpath("subdir").mkdir()
     default_workspace.joinpath("report.html").write_bytes(b"<h1>owner-a</h1>")
+    chinese_filename = "雨崩虫草线_路上捡来的朋友02_135源格式.html"
+    default_workspace.joinpath(chinese_filename).write_bytes("完整内容".encode())
     default_workspace.joinpath("subdir/report.pdf").write_bytes(b"%PDF-owner-a")
     default_workspace.joinpath("directory").mkdir()
     default_workspace.joinpath("report-link.html").symlink_to("report.html")
@@ -2348,6 +2350,7 @@ def test_worker_managed_files_are_descriptor_scoped_to_its_owner(tmp_path, monke
 
     for sandbox_path, sandbox_cwd, expected, expected_type in (
         ("/workspace/report.html", None, b"<h1>owner-a</h1>", "text/html"),
+        (f"/workspace/{chinese_filename}", None, "完整内容".encode(), "text/html"),
         (
             "/workspace/subdir/report.pdf",
             None,
@@ -2393,6 +2396,9 @@ def test_worker_managed_files_are_descriptor_scoped_to_its_owner(tmp_path, monke
         ("/workspace", None),
         ("/workspace2/report.html", None),
         ("/workspace/../secret.txt", None),
+        ("/workspace/./report.html", None),
+        ("/workspace//report.html", None),
+        ("/workspace/", None),
         ("/workspace/directory", None),
         ("/workspace/report-link.html", None),
         ("/workspace/report.html", str(owner_b / "workspaces")),
@@ -2405,7 +2411,7 @@ def test_worker_managed_files_are_descriptor_scoped_to_its_owner(tmp_path, monke
             headers=request("/api/files/download"),
             params=params,
         )
-        assert response.status_code == 400
+        assert response.status_code == 400, (rejected_path, rejected_cwd, response.text)
         assert b"owner-b-only" not in response.content
 
 

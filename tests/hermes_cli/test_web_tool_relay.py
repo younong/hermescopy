@@ -93,7 +93,7 @@ def test_web_relay_dispatches_exact_search_and_extract_invocations():
 @pytest.mark.parametrize(
     "tool_name,arguments",
     [
-        ("read_file", {"path": "README.md"}),
+        ("read_file", {"path": "README.md", "unexpected": True}),
         ("web_search", {"query": "", "limit": 5}),
         ("web_search", {"query": "Hermes", "provider": "forged"}),
         ("web_extract", {"urls": ["https://example.com"] * 6}),
@@ -116,8 +116,37 @@ def test_web_relay_rejects_noncanonical_operations_and_arguments(tool_name, argu
 def test_owner_relay_allowlist_excludes_skill_manage():
     assert OWNER_RELAY_TOOL_NAMES == {
         "web_search", "web_extract", "skills_list", "skill_view", "image_generate",
+        "read_file", "write_file", "patch", "search_files",
     }
     assert "skill_manage" not in OWNER_RELAY_TOOL_NAMES
+
+
+def test_owner_relay_dispatches_canonical_file_invocations():
+    seen = []
+    broker = OwnerToolRelayBroker(
+        identity_validator=lambda _identity: None,
+        workspace_context=object(),
+        dispatcher=lambda name, args, invocation, materializer, workspace_context: (
+            seen.append((name, args, invocation.invocation_id, materializer, workspace_context))
+            or '{"success":true}'
+        ),
+    )
+    invocation = _invocation(
+        "read_file",
+        {"path": "/workspace/报告.html"},
+        invocation_id="read-file",
+    )
+    relay_fd = broker.register(invocation)
+    assert dispatch_owner_tool_over_relay(relay_fd, invocation) == '{"success":true}'
+    broker.close()
+
+    assert seen == [(
+        "read_file",
+        {"path": "/workspace/报告.html", "offset": 1, "limit": 500},
+        "read-file",
+        None,
+        broker._workspace_context,
+    )]
 
 
 def test_owner_relay_dispatches_canonical_image_generation():

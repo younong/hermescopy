@@ -499,23 +499,17 @@ class ControlledWorkspaceFileOperations(FileOperations):
     """File operations rooted at one authenticated worker's workspace FD.
 
     This deliberately implements only operations that can remain entirely
-    descriptor-relative.  It never accepts absolute paths, expands ``~``, or
-    delegates to a terminal backend.  Unsupported operations fail closed rather
-    than recovering through ambient cwd or a shell command.
+    descriptor-relative.  It accepts the sandbox's exact ``/workspace`` alias,
+    but never expands ``~`` or delegates to a terminal backend. Unsupported
+    operations fail closed rather than recovering through ambient cwd or a shell
+    command.
     """
 
     def __init__(self, context: AuthenticatedWorkspaceContext) -> None:
         self._context = context
 
     def _relative_path(self, path: str) -> str:
-        if not isinstance(path, str) or not path:
-            raise ValueError("path must be a non-empty workspace-relative path")
-        if path.startswith(("/", "~")) or "\x00" in path:
-            raise ValueError("path must be a workspace-relative path")
-        components = tuple(path.split("/"))
-        if any(component in {"", ".", ".."} for component in components):
-            raise ValueError("path must not contain empty, dot, or parent components")
-        return f"{self._context.workspace_prefix}/{path}"
+        return self._context.controlled_workspace_path(path)
 
     def diagnostic_path(self, path: str) -> str:
         """Return a display-only path after validating the relative input."""
@@ -689,7 +683,7 @@ class ControlledWorkspaceFileOperations(FileOperations):
     def _search_root(self, path: str) -> str:
         if path == ".":
             return self._context.workspace_prefix
-        return self._relative_path(path)
+        return self._context.controlled_workspace_path(path, allow_workspace_root=True)
 
     def _walk_regular_files(self, relative_directory: str) -> list[str]:
         files: list[str] = []
