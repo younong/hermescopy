@@ -29,6 +29,11 @@
     {"name": "libreoffice-pyuno", "nevra": "libreoffice-pyuno-1:7.1.8.1-15.0.1.2.al8.2.x86_64"},
     {"name": "libreoffice-ure", "nevra": "libreoffice-ure-1:7.1.8.1-15.0.1.2.al8.2.x86_64"},
     {"name": "libreoffice-x11", "nevra": "libreoffice-x11-1:7.1.8.1-15.0.1.2.al8.2.x86_64"},
-    {"name": "libreoffice-ure-common", "nevra": "libreoffice-ure-common-1:7.1.8.1-15.0.1.2.al8.2.noarch"}
+    {"name": "libreoffice-ure-common", "nevra": "libreoffice-ure-common-1:7.1.8.1-15.0.1.2.al8.2.noarch"},
+    {"name": "nss-softokn", "nevra": "nss-softokn-0:3.101.0-11.0.1.al8.x86_64"},
+    {"name": "nss-softokn-freebl", "nevra": "nss-softokn-freebl-0:3.101.0-11.0.1.al8.x86_64"},
+    {"name": "nss-sysinit", "nevra": "nss-sysinit-0:3.101.0-11.0.1.al8.x86_64"},
+    {"name": "p11-kit-trust", "nevra": "p11-kit-trust-0:0.23.22-2.al8.x86_64"},
+    {"name": "sqlite-libs", "nevra": "sqlite-libs-0:3.26.0-20.al8.x86_64"}
   ]
 }

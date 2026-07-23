@@ -962,8 +962,8 @@ if [ -z "$node_path" ]; then
 fi
 node_identity="$(printf '%s\n' "$(node --version)" "$(sha256sum "$node_path" | cut -d ' ' -f1)" | sha256sum | cut -d ' ' -f1)"
 python_version="3.11"
-runtime_inputs_hash="$(printf '%s\n' "$lock_hash" "$powerpoint_lock_hash" "$powerpoint_package_hash" "$node_identity" 'sandbox8' | sha256sum | cut -d ' ' -f1)"
-runtime_id="py311-${"${"}architecture}-${"${"}runtime_inputs_hash}-sandbox8"
+runtime_inputs_hash="$(printf '%s\n' "$lock_hash" "$powerpoint_lock_hash" "$powerpoint_package_hash" "$node_identity" 'sandbox9' | sha256sum | cut -d ' ' -f1)"
+runtime_id="py311-${"${"}architecture}-${"${"}runtime_inputs_hash}-sandbox9"
 venv="$runtimes_dir/$runtime_id"
 # One manifest drives both packaging and preflight. Keep it aligned with
 # ShellFileOperations' target-side scripts, especially atomic writes. Keep

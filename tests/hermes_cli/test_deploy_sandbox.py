@@ -18,10 +18,25 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     source = DEPLOY.read_text(encoding="utf-8")
 
     assert 'runtimes_dir="$remote_root/runtimes/python"' in source
-    assert 'runtime_id="py311-${"${"}architecture}-${"${"}runtime_inputs_hash}-sandbox8"' in source
+    assert 'runtime_id="py311-${"${"}architecture}-${"${"}runtime_inputs_hash}-sandbox9"' in source
     assert 'powerpoint_lock_hash="$(sha256sum "$release/deploy/powerpoint-runtime/package-lock.json"' in source
     assert 'powerpoint_package_hash=' in source
     assert 'node_identity=' in source
+    powerpoint_packages = {
+        package["name"]
+        for package in json.loads(
+            (ROOT / "deploy/runtime/alicloud3-powerpoint-packages.json").read_text(
+                encoding="utf-8"
+            )
+        )["packages"]
+    }
+    assert {
+        "nss-softokn",
+        "nss-softokn-freebl",
+        "nss-sysinit",
+        "p11-kit-trust",
+        "sqlite-libs",
+    } <= powerpoint_packages
     assert 'venv="$shared/venv"' not in source
     assert 'service_user="hermes"' in source
     assert 'service_group="hermes"' in source
