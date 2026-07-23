@@ -132,6 +132,7 @@ def _run_authenticated_executor(
     cleanup = "passed"
     roots = None
     supervisor = None
+    resource_controller = None
 
     try:
         from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
@@ -144,8 +145,40 @@ def _run_authenticated_executor(
             ensure_owner_runtime_dirs,
             owner_worker_runtime_paths,
         )
+        from hermes_cli.owner_worker.cgroup_v2 import CgroupV2Manager
         from hermes_cli.owner_worker.host_sandbox import host_sandbox_deployment_policy
         from hermes_cli.owner_worker.tool_executor_supervisor import ToolExecutorSupervisor
+
+        class LocalResourceController:
+            def __init__(self, manager):
+                self.manager = manager
+
+            def reserve_executor(self, identity, invocation_id):
+                scope = self.manager.admit_executor(identity, invocation_id)
+
+                class LocalScope:
+                    def attach_pids(self, pids):
+                        for pid in pids:
+                            scope.attach(pid)
+
+                    def verify_pids(self, pids):
+                        return all(scope.verify_membership(pid) for pid in pids)
+
+                    def read_events(self):
+                        return scope.read_events()
+
+                    def release(self):
+                        scope.cleanup()
+
+                return LocalScope()
+
+            def shutdown_generation(self):
+                # This one-shot smoke owns only invocation leases it returns;
+                # never sweep scopes held by the live Dashboard manager.
+                return None
+
+            def close(self):
+                self.manager.close()
 
         ensure_owner_runtime_dirs(owner_home)
         runtime_paths = owner_worker_runtime_paths(
@@ -161,11 +194,18 @@ def _run_authenticated_executor(
             1,
             0,
         )
+        deployment_policy = host_sandbox_deployment_policy(policy_path)
+        manager = CgroupV2Manager(deployment_policy.resource_policy)
+        checks["startup_recovery"] = (
+            f"passed:{manager.startup_cleanup_count}"
+        )
+        resource_controller = LocalResourceController(manager)
         supervisor = ToolExecutorSupervisor(
             owner_home=owner_home,
             workspace_context=AuthenticatedWorkspaceContext(roots),
             lease=lease,
-            deployment_policy=host_sandbox_deployment_policy(policy_path),
+            deployment_policy=deployment_policy,
+            resource_controller=resource_controller,
         )
         inside_command = " ".join(
             shlex.quote(part)
@@ -200,6 +240,53 @@ def _run_authenticated_executor(
             raise RuntimeError("authenticated_executor_result")
         checks.update({str(key): str(value) for key, value in inside_checks.items()})
         checks["authenticated_executor"] = "passed"
+
+        for function_args, check, failure_check in (
+            (
+                {
+                    "command": (
+                        "/opt/hermes/python/bin/python3 -c "
+                        + shlex.quote("import time; time.sleep(180)")
+                    ),
+                    "timeout": 180,
+                },
+                "deadline_enforced",
+                "resource_deadline_exceeded",
+            ),
+            (
+                {
+                    "command": (
+                        "/opt/hermes/python/bin/python3 -c "
+                        + shlex.quote("print('x' * 400000)")
+                    ),
+                    "timeout": timeout,
+                },
+                "output_enforced",
+                "resource_output_limit_exceeded",
+            ),
+        ):
+            try:
+                supervisor.dispatch(
+                    function_name="terminal",
+                    function_args=function_args,
+                    task_id=f"deploy-{check}",
+                    session_id=f"deploy-{check}",
+                    tool_call_id=f"deploy-{check}",
+                    turn_id=f"deploy-{check}",
+                    api_request_id=f"deploy-{check}",
+                )
+            except Exception as exc:
+                name = type(exc).__name__
+                expected = (
+                    name == "ExecutorDeadlineExceeded"
+                    if check == "deadline_enforced"
+                    else name == "ExecutorOutputExceeded"
+                )
+                if not expected:
+                    raise RuntimeError(failure_check) from exc
+            else:
+                raise RuntimeError(failure_check)
+            checks[check] = "passed"
     except Exception as exc:
         check = str(exc) if isinstance(exc, RuntimeError) else "authenticated_executor"
         failure = {"check": check, "code": type(exc).__name__}
@@ -207,6 +294,11 @@ def _run_authenticated_executor(
         if supervisor is not None:
             try:
                 supervisor.stop_generation()
+            except Exception:
+                cleanup = "failed"
+        if resource_controller is not None:
+            try:
+                resource_controller.close()
             except Exception:
                 cleanup = "failed"
         if roots is not None:

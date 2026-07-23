@@ -232,6 +232,13 @@ async def _lifespan(app: "FastAPI"):
                 await asyncio.to_thread(supervisor.shutdown)
             except Exception:
                 _log.exception("owner worker shutdown cleanup failed")
+            finally:
+                resource_manager = getattr(supervisor, "resource_manager", None)
+                if resource_manager is not None:
+                    try:
+                        resource_manager.close()
+                    except Exception:
+                        _log.exception("owner resource manager close failed")
         if cron_stop is not None:
             cron_stop.set()
 
@@ -15379,6 +15386,8 @@ def start_server(
             load_deployment_inference_policy,
         )
         from hermes_cli.owner_worker import OwnerWorkerSupervisor
+        from hermes_cli.owner_worker.cgroup_v2 import CgroupV2Manager
+        from hermes_cli.owner_worker.tool_executor_sandbox import load_sandbox_deployment_policy
 
         policy_spec = os.environ.get("HERMES_DEPLOYMENT_INFERENCE_POLICY", "")
         try:
@@ -15390,6 +15399,17 @@ def start_server(
             deployment_image_policy = load_deployment_image_policy(image_policy_spec)
         except DeploymentImagePolicyInvalid as exc:
             raise RuntimeError("deployment image policy is invalid") from exc
+        sandbox_policy_spec = os.environ.get("HERMES_SANDBOX_DEPLOYMENT_POLICY", "")
+        try:
+            sandbox_deployment_policy = load_sandbox_deployment_policy(sandbox_policy_spec)
+            if sandbox_deployment_policy.resource_policy is None:
+                raise RuntimeError("sandbox deployment resource policy is unavailable")
+            resource_manager = CgroupV2Manager(sandbox_deployment_policy.resource_policy)
+        except Exception:
+            # Authenticated chat remains available, but no resource descriptor is
+            # inherited and the Owner Worker therefore refuses all tool admission.
+            resource_manager = None
+            _log.warning("authenticated tool resource governance is unavailable")
 
         worker_scheme = "wss" if os.environ.get("HERMES_DASHBOARD_EXTERNAL_SCHEME", "").lower() == "https" else "ws"
         worker_host = os.environ.get("HERMES_DASHBOARD_EXTERNAL_HOST", "").strip() or host
@@ -15411,14 +15431,20 @@ def start_server(
             )
             future.result()
 
-        app.state.owner_worker_supervisor = OwnerWorkerSupervisor(
-            global_home=global_home,
-            control_home=global_home / "control-plane",
-            control_ws_base=f"{worker_scheme}://{worker_netloc}",
-            generation_bridge_revoker=revoke_generation_bridges,
-            deployment_inference_policy=deployment_inference_policy,
-            deployment_image_policy=deployment_image_policy,
-        )
+        try:
+            app.state.owner_worker_supervisor = OwnerWorkerSupervisor(
+                global_home=global_home,
+                control_home=global_home / "control-plane",
+                control_ws_base=f"{worker_scheme}://{worker_netloc}",
+                generation_bridge_revoker=revoke_generation_bridges,
+                deployment_inference_policy=deployment_inference_policy,
+                deployment_image_policy=deployment_image_policy,
+                resource_manager=resource_manager,
+            )
+        except Exception:
+            if resource_manager is not None:
+                resource_manager.close()
+            raise
 
     # ``--insecure`` no longer disables the auth gate (June 2026 hardening:
     # the hermes-0day MCP-persistence campaign abused unauthenticated public

@@ -20,6 +20,7 @@ from hermes_cli.owner_worker.tool_executor_sandbox import (
     SandboxVerificationRecord,
 )
 from hermes_cli.dashboard_auth.audit import AuthorityAuditEvent, AuthorityAuditReason
+from hermes_cli.owner_worker.cgroup_v2 import CgroupResourceEvents
 from hermes_cli.owner_worker.executor_identity import (
     EgressProfile,
     ExecutorIdentityInvalid,
@@ -27,13 +28,34 @@ from hermes_cli.owner_worker.executor_identity import (
     default_executor_resource_decision,
 )
 from hermes_cli.owner_worker.executor_tokens import AUD_PROCESS_REGISTRY, ExecutorCapabilityInvalid
-from hermes_cli.owner_worker.tool_executor_supervisor import ExecutorEgressPolicy, ToolExecutorSupervisor
+from hermes_cli.owner_worker.tool_executor_supervisor import (
+    ExecutorCleanupFailed,
+    ExecutorDeadlineExceeded,
+    ExecutorEgressPolicy,
+    ExecutorOutputExceeded,
+    ExecutorResourceRejected,
+    ToolExecutorSupervisor,
+)
+
+
+def _bubblewrap_argv(argv):
+    marker = argv.index("--")
+    return argv[marker + 1:]
 
 
 def _publish_fake_sandbox_info(argv, *, pid=4243):
+    launcher_argv = argv
+    launcher_gate_fd = os.dup(int(launcher_argv[launcher_argv.index("--start-fd") + 1]))
+    argv = _bubblewrap_argv(launcher_argv)
     info_fd = os.dup(int(argv[argv.index("--info-fd") + 1]))
-    os.write(info_fd, json.dumps({"child-pid": pid}).encode("utf-8"))
-    os.close(info_fd)
+
+    def publish():
+        assert os.read(launcher_gate_fd, 1) == b"1"
+        os.close(launcher_gate_fd)
+        os.write(info_fd, json.dumps({"child-pid": pid}).encode("utf-8"))
+        os.close(info_fd)
+
+    threading.Thread(target=publish, daemon=True).start()
 
 
 def test_bubblewrap_child_pid_accepts_partial_info_writes():
@@ -59,6 +81,60 @@ class _FakeProcess:
     def wait(self, timeout=None):
         del timeout
         return 0
+
+
+class _ResourceScope:
+    def __init__(self, events):
+        self.events = events
+        self.attached = []
+        self.verified = True
+        self.released = False
+        self.release_error = None
+        self.resource_events = CgroupResourceEvents(
+            populated=False,
+            frozen=False,
+            cpu={},
+            memory={},
+            pids={},
+        )
+
+    def attach_pids(self, pids):
+        self.events.append(("attach", tuple(pids)))
+        self.attached.extend(pids)
+
+    def verify_pids(self, pids):
+        self.events.append(("verify", tuple(pids)))
+        return self.verified
+
+    def read_events(self):
+        self.events.append(("read_events",))
+        return self.resource_events
+
+    def release(self):
+        self.events.append(("release",))
+        if self.release_error is not None:
+            raise self.release_error
+        self.released = True
+
+
+class _ResourceController:
+    def __init__(self, events):
+        self.events = events
+        self.scope = _ResourceScope(events)
+        self.reserve_error = None
+
+    def reserve_executor(self, identity, invocation_id):
+        del identity, invocation_id
+        self.events.append(("reserve",))
+        if self.reserve_error is not None:
+            raise self.reserve_error
+        return self.scope
+
+    def shutdown_generation(self):
+        self.events.append(("shutdown",))
+
+    def close(self):
+        pass
 
 
 def _roots(tmp_path):
@@ -126,10 +202,16 @@ def _record(binding, mount_policy, invocation, *, observed_at=90, expires_at=110
 def _supervisor(
     tmp_path, process_factory, *, sandbox_builder=_launch_spec, verification_source=_record,
     egress_policy=None, audit_reporter=None, image_dispatcher=None, clock=lambda: 100,
+    monotonic_clock=None, resource_controller=None,
 ):
     roots, locations = _roots(tmp_path)
     lease = OwnerWorkerAuthorityLease("ok1_owner", 1, "worker-a", WorkerLeaseState.ACTIVE, 1, 0)
-    return roots, ToolExecutorSupervisor(
+    if resource_controller is None:
+        resource_controller = _ResourceController([])
+    kwargs = {}
+    if monotonic_clock is not None:
+        kwargs["monotonic_clock"] = monotonic_clock
+    supervisor = ToolExecutorSupervisor(
         owner_home=locations[RootKind.OWNER_WRITABLE],
         workspace_context=AuthenticatedWorkspaceContext(roots),
         lease=lease,
@@ -141,8 +223,241 @@ def _supervisor(
         egress_policy=egress_policy,
         audit_reporter=audit_reporter,
         image_dispatcher=image_dispatcher,
+        resource_controller=resource_controller,
         clock=clock,
+        **kwargs,
     )
+    supervisor._test_resource_controller = resource_controller
+    return roots, supervisor
+
+
+def _dispatch(supervisor):
+    return supervisor.dispatch(
+        function_name="read_file", function_args={}, task_id="task-a", session_id="session-a",
+        tool_call_id="call-a", turn_id="turn-a", api_request_id="request-a",
+    )
+
+
+def _successful_factory(*, result="ok", keep_response_open=False, extra=b""):
+    def factory(*args, **kwargs):
+        _publish_fake_sandbox_info(args[0])
+        gate_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_START_GATE_FD"]))
+        request_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_BOOTSTRAP_FD"]))
+        response_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_RESPONSE_FD"]))
+
+        def respond():
+            if os.read(gate_fd, 1) != b"1":
+                os.close(gate_fd)
+                os.close(request_fd)
+                os.close(response_fd)
+                return
+            os.close(gate_fd)
+            os.read(request_fd, 1 << 20)
+            os.close(request_fd)
+            try:
+                os.write(response_fd, json.dumps({"result": result}).encode() + extra)
+            except BrokenPipeError:
+                pass
+            if not keep_response_open:
+                os.close(response_fd)
+
+        threading.Thread(target=respond, daemon=True).start()
+        return _FakeProcess()
+
+    return factory
+
+
+def test_resource_capacity_is_reserved_before_runtime_workspace_or_spawn(tmp_path):
+    events = []
+    controller = _ResourceController(events)
+    controller.reserve_error = RuntimeError("capacity")
+    spawned = []
+    roots, supervisor = _supervisor(
+        tmp_path, lambda *args, **kwargs: spawned.append((args, kwargs)),
+        resource_controller=controller,
+    )
+    workspace_calls = []
+    supervisor._workspace_fd = lambda: workspace_calls.append(True)  # type: ignore[method-assign]
+    try:
+        with pytest.raises(ExecutorResourceRejected, match="admission"):
+            _dispatch(supervisor)
+        identity = supervisor.identity_for(task_id="task-a", session_id="session-a")
+        assert not (supervisor.owner_home / "runtime" / "executors" / identity.executor_id).exists()
+    finally:
+        roots.close()
+    assert events == [("reserve",)]
+    assert workspace_calls == []
+    assert spawned == []
+
+
+def test_membership_mismatch_never_releases_sandbox_start_gate(tmp_path):
+    events = []
+    controller = _ResourceController(events)
+    controller.scope.verified = False
+    observed_gate = []
+
+    def factory(*args, **kwargs):
+        gate_fd = os.dup(int(kwargs["env"]["HERMES_EXECUTOR_START_GATE_FD"]))
+        threading.Thread(target=lambda: observed_gate.append(os.read(gate_fd, 1)), daemon=True).start()
+        return _FakeProcess()
+
+    roots, supervisor = _supervisor(tmp_path, factory, resource_controller=controller)
+    try:
+        with pytest.raises(ExecutorResourceRejected, match="membership"):
+            _dispatch(supervisor)
+    finally:
+        roots.close()
+    assert controller.scope.released
+    assert ("attach", (4242,)) in events
+    assert ("verify", (4242,)) in events
+
+
+def test_success_cleans_resource_scope_even_with_background_members(tmp_path):
+    events = []
+    controller = _ResourceController(events)
+    roots, supervisor = _supervisor(
+        tmp_path, _successful_factory(), resource_controller=controller,
+    )
+    try:
+        assert _dispatch(supervisor) == "ok"
+    finally:
+        roots.close()
+    assert controller.scope.released
+    assert ("attach", (4242, 4243)) in events
+    assert ("verify", (4242, 4243)) in events
+    assert events[-2:] == [("read_events",), ("release",)]
+
+
+def test_resource_events_are_mapped_to_deidentified_audit_results(tmp_path):
+    events = []
+    audit_events = []
+    controller = _ResourceController(events)
+    controller.scope.resource_events = CgroupResourceEvents(
+        populated=True,
+        frozen=False,
+        cpu={"nr_throttled": 2, "throttled_usec": 11},
+        memory={"oom": 1, "oom_kill": 1},
+        pids={"max": 3},
+    )
+    roots, supervisor = _supervisor(
+        tmp_path,
+        _successful_factory(),
+        resource_controller=controller,
+        audit_reporter=lambda event, reason, identity, policy_id, resource_events: audit_events.append(
+            (event, reason, policy_id, resource_events)
+        ),
+    )
+    try:
+        assert _dispatch(supervisor) == "ok"
+    finally:
+        roots.close()
+
+    assert [item[1] for item in audit_events] == [
+        AuthorityAuditReason.RESOURCE_MEMORY_OOM,
+        AuthorityAuditReason.RESOURCE_PID_LIMIT,
+        AuthorityAuditReason.RESOURCE_CPU_THROTTLED,
+    ]
+    assert all(item[0] is AuthorityAuditEvent.RESOURCE_OBSERVED for item in audit_events)
+    assert all(item[2].startswith("resource:") for item in audit_events)
+    assert all(item[3] is controller.scope.resource_events for item in audit_events)
+    assert "ok1_owner" not in repr(audit_events)
+
+
+def test_never_closing_response_pipe_expires_one_deadline_and_cleans(tmp_path):
+    events = []
+    controller = _ResourceController(events)
+    identity_clock = iter([0.0, 0.0, 0.0, 0.0, 31.0])
+    roots, supervisor = _supervisor(
+        tmp_path, _successful_factory(keep_response_open=True),
+        resource_controller=controller,
+        monotonic_clock=lambda: next(identity_clock, 31.0),
+    )
+    try:
+        with pytest.raises(ExecutorDeadlineExceeded, match="deadline"):
+            _dispatch(supervisor)
+    finally:
+        roots.close()
+    assert controller.scope.released
+
+
+def test_response_overflow_is_bounded_and_cleans(tmp_path):
+    events = []
+    controller = _ResourceController(events)
+    roots, supervisor = _supervisor(
+        tmp_path, _successful_factory(result="x" * 200_001), resource_controller=controller,
+    )
+    try:
+        with pytest.raises(ExecutorOutputExceeded, match="output"):
+            _dispatch(supervisor)
+    finally:
+        roots.close()
+    assert controller.scope.released
+
+
+def test_cleanup_failure_overrides_success_and_is_audited(tmp_path):
+    events = []
+    audit_events = []
+    controller = _ResourceController(events)
+    controller.scope.release_error = RuntimeError("proof unavailable")
+    roots, supervisor = _supervisor(
+        tmp_path, _successful_factory(), resource_controller=controller,
+        audit_reporter=lambda event, reason, identity, policy_id, resource_events: audit_events.append((event, reason)),
+    )
+    try:
+        with pytest.raises(ExecutorCleanupFailed, match="cleanup"):
+            _dispatch(supervisor)
+    finally:
+        roots.close()
+    assert controller.scope.released is False
+    assert audit_events[-1] == (
+        AuthorityAuditEvent.RESOURCE_REJECTED,
+        AuthorityAuditReason.RESOURCE_CLEANUP_FAILED,
+    )
+
+
+def test_production_policy_supplies_exact_executor_runtime_quota(tmp_path):
+    from hermes_cli.owner_worker.tool_executor_sandbox import (
+        SandboxDeploymentPolicy, SandboxReadonlyMount, SandboxResourceLimits,
+        SandboxResourcePolicy,
+    )
+
+    roots, supervisor = _supervisor(tmp_path, _successful_factory())
+    readonly_root = tmp_path / "readonly"
+    readonly_root.mkdir()
+    identity = supervisor.identity_for(task_id="task-a", session_id="session-a")
+    resource_policy = SandboxResourcePolicy(
+        cgroup_root=tmp_path / "cgroup",
+        required_controllers=("cpu", "memory", "pids"),
+        global_limits=SandboxResourceLimits(3000, 3 << 30, 512, 4, max_owner_workers=5),
+        owner_limits=SandboxResourceLimits(2000, 2 << 30, 256, 2),
+        executor_limits=SandboxResourceLimits(
+            800, 192 << 20, 32, 1, swap_bytes=0, file_descriptors=37,
+            duration_seconds=17, output_bytes=12345,
+        ),
+        cleanup_grace_seconds=1,
+        cleanup_timeout_seconds=2,
+        cgroup_kill_required=False,
+    )
+    supervisor.deployment_policy = SandboxDeploymentPolicy(
+        verification_policy=_POLICY,
+        verification_source=_record,
+        syscall_filter_source=_syscall_filter,
+        readonly_global_roots=(),
+        owner_root=supervisor.owner_home,
+        readonly_mounts=(SandboxReadonlyMount(readonly_root, Path("/opt/test")),),
+        python_executable="/opt/test/python",
+        resource_policy=resource_policy,
+    )
+    try:
+        decision = supervisor._production_resource_decision(identity)
+    finally:
+        roots.close()
+    assert decision.quota.cpu_millis == 800
+    assert decision.quota.memory_bytes == 192 << 20
+    assert decision.quota.pids == 32
+    assert decision.quota.file_descriptors == 37
+    assert decision.quota.duration_seconds == 17
+    assert decision.quota.output_bytes == 12345
 
 
 def test_executor_rejection_audit_is_pre_spawn_and_deidentified(tmp_path):
@@ -151,7 +466,7 @@ def test_executor_rejection_audit_is_pre_spawn_and_deidentified(tmp_path):
     roots, supervisor = _supervisor(
         tmp_path,
         lambda *args, **kwargs: spawned.append((args, kwargs)),
-        audit_reporter=lambda event, reason, identity: audit_events.append((event, reason)),
+        audit_reporter=lambda event, reason, identity, policy_id, resource_events: audit_events.append((event, reason)),
     )
     workspace_fd_calls = []
     try:
@@ -264,13 +579,15 @@ def test_supervisor_uses_sandbox_fd_bootstrap_and_no_preexec_cwd(tmp_path):
 
     assert json.loads(result) == {"ok": "read_file"}
     kwargs = spawned[0][1]
-    assert spawned[0][0][0][0] == "/trusted/bwrap"
+    launcher_argv = spawned[0][0][0]
+    assert launcher_argv[:3] == [os.sys.executable, "-m", "hermes_cli.owner_worker.tool_executor_launcher"]
+    assert _bubblewrap_argv(launcher_argv)[0] == "/trusted/bwrap"
     assert kwargs["close_fds"] is True
     assert kwargs["stdin"] is not None
     assert kwargs["stdout"] is not None
     assert kwargs["stderr"] is not None
-    assert len(kwargs["pass_fds"]) == 6
-    assert len(set(kwargs["pass_fds"])) == 6
+    assert len(kwargs["pass_fds"]) == 7
+    assert len(set(kwargs["pass_fds"])) == 7
     assert kwargs["env"]["HERMES_EXECUTOR_START_GATE_FD"] in {
         str(fd) for fd in kwargs["pass_fds"]
     }
@@ -344,7 +661,7 @@ def test_supervisor_passes_one_private_relay_fd_for_web_search(tmp_path):
     kwargs = spawned[0][1]
     assert kwargs["env"]["HERMES_EXECUTOR_EGRESS_PROFILE"] == "tool-none"
     assert kwargs["env"]["HERMES_EXECUTOR_OWNER_RELAY_FD"] in {str(fd) for fd in kwargs["pass_fds"]}
-    assert len(kwargs["pass_fds"]) == 7
+    assert len(kwargs["pass_fds"]) == 8
     serialized = json.dumps({"argv": spawned[0][0][0], "env": kwargs["env"]})
     assert "API_KEY" not in serialized
     assert "TOKEN" not in serialized
@@ -400,7 +717,7 @@ def test_supervisor_passes_one_private_relay_fd_for_image_generate(tmp_path, mon
     assert kwargs["env"]["HERMES_EXECUTOR_EGRESS_PROFILE"] == "tool-none"
     relay_fd = kwargs["env"]["HERMES_EXECUTOR_OWNER_RELAY_FD"]
     assert relay_fd in {str(fd) for fd in kwargs["pass_fds"]}
-    assert len(kwargs["pass_fds"]) == 7
+    assert len(kwargs["pass_fds"]) == 8
     serialized = json.dumps({"argv": args[0], "env": kwargs["env"]})
     for forbidden in (
         "ambient-control-plane-image-secret",
@@ -780,8 +1097,16 @@ def test_revoke_executor_and_generation_stop_only_terminate_matching_live_proces
         second_grant = supervisor.credential_broker.issue(
             other, audience=AUD_PROCESS_REGISTRY, operation="process.read", scope="proc-b"
         )
-        supervisor._live[(identity.stable_key, "one")] = type("Live", (), {"identity": identity, "invocation_id": "one", "process": _FakeProcess()})()
-        supervisor._live[(other.stable_key, "two")] = type("Live", (), {"identity": other, "invocation_id": "two", "process": _FakeProcess()})()
+        scope_one = _ResourceScope([])
+        scope_two = _ResourceScope([])
+        supervisor._live[(identity.stable_key, "one")] = type("Live", (), {
+            "identity": identity, "invocation_id": "one", "process": _FakeProcess(),
+            "resource_scope": scope_one,
+        })()
+        supervisor._live[(other.stable_key, "two")] = type("Live", (), {
+            "identity": other, "invocation_id": "two", "process": _FakeProcess(),
+            "resource_scope": scope_two,
+        })()
         terminated = []
         with patch.object(supervisor, "_terminate", side_effect=lambda process: terminated.append(process)), \
              patch.object(supervisor, "_reap_registry_descendants", side_effect=reaped.append):
@@ -793,6 +1118,7 @@ def test_revoke_executor_and_generation_stop_only_terminate_matching_live_proces
                 )
             assert supervisor.stop_generation() == 1
         assert len(terminated) == 2
+        assert scope_one.released and scope_two.released
         assert reaped == [identity, identity, other]
         assert supervisor.credential_broker.active_grant_count == 0
         with pytest.raises(ExecutorCapabilityInvalid, match="revoked_or_unknown"):

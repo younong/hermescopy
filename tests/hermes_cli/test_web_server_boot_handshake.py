@@ -80,6 +80,30 @@ def test_lifespan_warmup_is_nonblocking():
     )
 
 
+def test_lifespan_closes_owner_resource_manager_even_when_supervisor_shutdown_fails(monkeypatch):
+    closed = []
+
+    class _ResourceManager:
+        def close(self):
+            closed.append("closed")
+
+    class _Supervisor:
+        resource_manager = _ResourceManager()
+
+        def shutdown(self):
+            raise RuntimeError("cleanup failed")
+
+    async def _run():
+        web_server_mod.app.state.owner_worker_supervisor = _Supervisor()
+        async with web_server_mod._lifespan(web_server_mod.app):
+            pass
+
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+    asyncio.run(_run())
+
+    assert closed == ["closed"]
+
+
 # ---------------------------------------------------------------------------
 # Test 2 — get_status run_in_executor keeps event loop free for other requests
 # ---------------------------------------------------------------------------

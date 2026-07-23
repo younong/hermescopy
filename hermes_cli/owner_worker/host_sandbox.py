@@ -17,8 +17,10 @@ from hermes_cli.owner_worker.tool_executor_sandbox import (
     ExecutorIsolationUnavailable,
     SandboxDeploymentPolicy,
     SandboxLaunchBinding,
+    SandboxResourceLimits,
     SandboxMountPolicy,
     SandboxReadonlyMount,
+    SandboxResourcePolicy,
     SandboxSecurityPolicy,
     SandboxSyscallFilter,
     SandboxVerificationInvalid,
@@ -57,6 +59,7 @@ class HostSandboxConfig:
     syscall_policy_digest: str
     seccomp_artifact: Path
     image_digest: str
+    resource_policy: SandboxResourcePolicy
     require_root_owner: bool = True
     profile: str = "executor-bwrap-v1"
     security_backend: str = "host-bwrap-seccomp-v1"
@@ -107,15 +110,16 @@ def parse_host_sandbox_config(
     require_root_owner: bool = True,
     machine: str | None = None,
 ) -> HostSandboxConfig:
-    """Parse an exact v1 host policy; unknown or omitted fields fail closed."""
+    """Parse an exact v2 host policy; unknown or omitted fields fail closed."""
     required = {
         "schema_version", "architecture", "owner_root", "uid", "gid", "bwrap_binary",
         "release_root", "runtime_root", "python_executable", "readonly_mounts",
         "syscall_policy_id", "syscall_policy_digest", "seccomp_artifact", "image_digest",
         "profile", "security_backend", "network_mode", "verifier", "record_ttl_seconds",
         "root_tmpfs_bytes", "executor_tmpfs_bytes", "allowed_egress_profiles",
+        "resource_policy",
     }
-    if not isinstance(value, Mapping) or set(value) != required or value.get("schema_version") != 1:
+    if not isinstance(value, Mapping) or set(value) != required or value.get("schema_version") != 2:
         raise HostSandboxInvalid("host sandbox policy schema is invalid")
     architecture = _text(value["architecture"], "host sandbox architecture")
     if architecture != _normalized_architecture(machine or platform.machine()):
@@ -234,6 +238,7 @@ def parse_host_sandbox_config(
     egress_raw = value["allowed_egress_profiles"]
     if egress_raw != [EgressProfile.TOOL_NONE.value]:
         raise HostSandboxInvalid("bare-metal host sandbox permits only tool-none egress")
+    resource_policy = _resource_policy(value["resource_policy"], require_root_owner=require_root_owner)
     return HostSandboxConfig(
         architecture=architecture,
         owner_root=owner_root,
@@ -248,6 +253,7 @@ def parse_host_sandbox_config(
         syscall_policy_digest=syscall_digest,
         seccomp_artifact=seccomp,
         image_digest=_digest(value["image_digest"], "host sandbox image digest"),
+        resource_policy=resource_policy,
         require_root_owner=require_root_owner,
         profile=_text(value["profile"], "host sandbox profile"),
         security_backend=_text(value["security_backend"], "host sandbox security backend"),
@@ -338,14 +344,18 @@ def build_host_sandbox_deployment_policy(
         allowed_egress_profiles=config.allowed_egress_profiles,
         root_tmpfs_bytes=config.root_tmpfs_bytes,
         executor_tmpfs_bytes=config.executor_tmpfs_bytes,
+        resource_policy=config.resource_policy,
     )
 
 
 def host_sandbox_deployment_policy(
     policy_path: str | Path = _DEFAULT_POLICY_PATH,
 ) -> SandboxDeploymentPolicy:
-    """Production factory for an operator-installed bare-metal policy."""
-    return build_host_sandbox_deployment_policy(load_host_sandbox_config(policy_path))
+    """Production factory requiring an operator-installed v2 resource policy."""
+    policy = build_host_sandbox_deployment_policy(load_host_sandbox_config(policy_path))
+    if policy.resource_policy is None:
+        raise HostSandboxInvalid("host sandbox resource policy is required")
+    return policy
 
 
 def _open_nofollow(path: Path, field: str) -> int:
@@ -449,6 +459,59 @@ def _digest(value: Any, field: str) -> str:
     if not text.startswith(_DIGEST_RE) or len(text) != 71 or any(ch not in "0123456789abcdef" for ch in text[7:]):
         raise HostSandboxInvalid(f"{field} is invalid")
     return text
+
+
+def _resource_policy(value: Any, *, require_root_owner: bool) -> SandboxResourcePolicy:
+    required = {
+        "cgroup_root", "required_controllers", "global", "owner", "executor",
+        "cleanup_grace_seconds", "cleanup_timeout_seconds", "cgroup_kill_required",
+    }
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise HostSandboxInvalid("host sandbox resource policy schema is invalid")
+    cgroup_root = _canonical_directory_path(value["cgroup_root"], "host sandbox cgroup root")
+    if require_root_owner:
+        _require_protected_ancestors(cgroup_root, "host sandbox cgroup root")
+        status = cgroup_root.stat()
+        if status.st_uid != 0 or stat.S_IMODE(status.st_mode) & 0o022:
+            raise HostSandboxInvalid("host sandbox cgroup root is not protected")
+    controllers = value["required_controllers"]
+    if controllers != ["cpu", "memory", "pids"]:
+        raise HostSandboxInvalid("host sandbox required cgroup controllers are invalid")
+    try:
+        return SandboxResourcePolicy(
+            cgroup_root=cgroup_root,
+            required_controllers=tuple(controllers),
+            global_limits=_resource_limits(value["global"], layer="global"),
+            owner_limits=_resource_limits(value["owner"], layer="owner"),
+            executor_limits=_resource_limits(value["executor"], layer="executor"),
+            cleanup_grace_seconds=value["cleanup_grace_seconds"],
+            cleanup_timeout_seconds=value["cleanup_timeout_seconds"],
+            cgroup_kill_required=value["cgroup_kill_required"],
+        )
+    except SandboxVerificationInvalid as exc:
+        raise HostSandboxInvalid(str(exc)) from exc
+
+
+def _resource_limits(value: Any, *, layer: str) -> SandboxResourceLimits:
+    common = {"cpu_millis", "memory_bytes", "pids", "max_concurrent_executors"}
+    extra = {
+        "global": {"max_owner_workers"},
+        "owner": set(),
+        "executor": {"swap_bytes", "file_descriptors", "duration_seconds", "output_bytes"},
+    }[layer]
+    if not isinstance(value, Mapping) or set(value) != common | extra:
+        raise HostSandboxInvalid(f"host sandbox {layer} resource limits are invalid")
+    try:
+        return SandboxResourceLimits(**{name: value[name] for name in common | extra})
+    except SandboxVerificationInvalid as exc:
+        raise HostSandboxInvalid(str(exc)) from exc
+
+
+def _canonical_directory_path(value: Any, field: str) -> Path:
+    path = _canonical(value, field)
+    if not path.is_dir():
+        raise HostSandboxInvalid(f"{field} is not a directory")
+    return path
 
 
 def _ttl(value: Any) -> int:

@@ -189,6 +189,7 @@ def create_app(
     worker_generation: int = 1,
     worker_id: str = "direct-test-worker",
     socket_path: Path | None = None,
+    resource_controller: Any | None = None,
 ):
     if int(worker_generation) < 1 or not str(worker_id).strip():
         raise ValueError("worker_generation and worker_id are required")
@@ -262,44 +263,58 @@ def create_app(
     async def _lifespan(_: FastAPI):
         relay = None
         image_relay = None
-        relay_fd = os.environ.pop("HERMES_DEPLOYMENT_INFERENCE_RELAY_FD", "").strip()
-        if relay_fd:
-            try:
-                from hermes_cli.owner_worker.inference_relay import OwnerInferenceRelay
-
-                relay = OwnerInferenceRelay(int(relay_fd))
-                relay.start()
-                os.environ["HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL"] = relay.base_url
-            except Exception as exc:
-                raise RuntimeError("deployment inference relay startup failed") from exc
-        image_relay_fd = os.environ.pop("HERMES_DEPLOYMENT_IMAGE_RELAY_FD", "").strip()
-        if image_relay_fd:
-            try:
-                from hermes_cli.deployment_image import deployment_image_descriptor_from_environment
-                from hermes_cli.owner_worker.image_relay import OwnerImageRelayClient
-
-                descriptor = deployment_image_descriptor_from_environment()
-                if descriptor is None:
-                    raise RuntimeError("deployment image descriptor is unavailable")
-                image_relay = OwnerImageRelayClient(int(image_relay_fd), descriptor)
-                app.state.deployment_image_relay = image_relay
-            except Exception as exc:
-                raise RuntimeError("deployment image relay startup failed") from exc
         try:
+            relay_fd = os.environ.pop("HERMES_DEPLOYMENT_INFERENCE_RELAY_FD", "").strip()
+            if relay_fd:
+                try:
+                    from hermes_cli.owner_worker.inference_relay import OwnerInferenceRelay
+
+                    relay = OwnerInferenceRelay(int(relay_fd))
+                    relay.start()
+                    os.environ["HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL"] = relay.base_url
+                except Exception as exc:
+                    raise RuntimeError("deployment inference relay startup failed") from exc
+            image_relay_fd = os.environ.pop("HERMES_DEPLOYMENT_IMAGE_RELAY_FD", "").strip()
+            if image_relay_fd:
+                try:
+                    from hermes_cli.deployment_image import deployment_image_descriptor_from_environment
+                    from hermes_cli.owner_worker.image_relay import OwnerImageRelayClient
+
+                    descriptor = deployment_image_descriptor_from_environment()
+                    if descriptor is None:
+                        raise RuntimeError("deployment image descriptor is unavailable")
+                    image_relay = OwnerImageRelayClient(int(image_relay_fd), descriptor)
+                    app.state.deployment_image_relay = image_relay
+                except Exception as exc:
+                    raise RuntimeError("deployment image relay startup failed") from exc
             yield
         finally:
+            cleanup_error = None
+
+            def _cleanup(callback):
+                nonlocal cleanup_error
+                try:
+                    callback()
+                except Exception as exc:
+                    cleanup_error = cleanup_error or exc
+
             os.environ.pop("HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL", None)
             if relay is not None:
-                relay.close()
+                _cleanup(relay.close)
             if image_relay is not None:
-                image_relay.close()
+                _cleanup(image_relay.close)
             supervisor = getattr(app.state, "tool_executor_supervisor", None)
             if supervisor is not None:
-                supervisor.stop_generation()
+                _cleanup(supervisor.stop_generation)
+            controller = getattr(app.state, "executor_resource_controller", None)
+            if controller is not None:
+                _cleanup(controller.close)
             broker = getattr(app.state, "tool_executor_credential_broker", None)
             if broker is not None:
-                broker.close()
-            controlled_roots.close()
+                _cleanup(broker.close)
+            _cleanup(controlled_roots.close)
+            if cleanup_error is not None:
+                raise cleanup_error
     from hermes_constants import get_hermes_home
     from hermes_state import SessionDB, get_default_db_path
 
@@ -347,6 +362,16 @@ def create_app(
     app.state.tool_executor_credential_broker = CredentialBroker(
         audit_reporter=report_executor_authority_decision,
     )
+    active_resource_controller = resource_controller
+    resource_broker_fd = os.environ.pop("HERMES_DEPLOYMENT_RESOURCE_BROKER_FD", "").strip()
+    if active_resource_controller is None and resource_broker_fd:
+        try:
+            from hermes_cli.owner_worker.resource_broker import OwnerResourceBrokerClient
+
+            active_resource_controller = OwnerResourceBrokerClient(int(resource_broker_fd))
+        except Exception:
+            active_resource_controller = None
+    app.state.executor_resource_controller = active_resource_controller
     policy_factory = os.environ.get("HERMES_SANDBOX_DEPLOYMENT_POLICY", "")
     try:
         deployment_policy = load_sandbox_deployment_policy(policy_factory)
@@ -356,25 +381,31 @@ def create_app(
         app.state.tool_executor_supervisor = None
         app.state.tool_executor_startup_error = "sandbox deployment policy unavailable"
     else:
-        def _dispatch_image(_tool_name, arguments, _invocation, _materializer):
-            from hermes_cli.owner_worker.image_dispatch import dispatch_deployment_image
+        controller = active_resource_controller
+        if controller is None:
+            app.state.tool_executor_supervisor = None
+            app.state.tool_executor_startup_error = "resource broker unavailable"
+        else:
+            def _dispatch_image(_tool_name, arguments, _invocation, _materializer):
+                from hermes_cli.owner_worker.image_dispatch import dispatch_deployment_image
 
-            relay_client = getattr(app.state, "deployment_image_relay", None)
-            if relay_client is None:
-                raise RuntimeError("deployment image relay is unavailable")
-            return dispatch_deployment_image(
-                arguments, relay_client=relay_client, descriptor=relay_client.descriptor,
-                controlled_roots=controlled_roots, owner_home=owner_home,
-                workspace_root=runtime_paths.workspace_root,
+                relay_client = getattr(app.state, "deployment_image_relay", None)
+                if relay_client is None:
+                    raise RuntimeError("deployment image relay is unavailable")
+                return dispatch_deployment_image(
+                    arguments, relay_client=relay_client, descriptor=relay_client.descriptor,
+                    controlled_roots=controlled_roots, owner_home=owner_home,
+                    workspace_root=runtime_paths.workspace_root,
+                )
+
+            app.state.tool_executor_supervisor = ToolExecutorSupervisor(
+                owner_home=owner_home, workspace_context=workspace_context, lease=lease,
+                credential_broker=app.state.tool_executor_credential_broker,
+                image_dispatcher=_dispatch_image, deployment_policy=deployment_policy,
+                resource_controller=controller,
+                control_home=app.state.owner_worker_control_home,
+                audit_reporter=report_executor_authority_decision,
             )
-
-        app.state.tool_executor_supervisor = ToolExecutorSupervisor(
-            owner_home=owner_home, workspace_context=workspace_context, lease=lease,
-            credential_broker=app.state.tool_executor_credential_broker,
-            image_dispatcher=_dispatch_image, deployment_policy=deployment_policy,
-            control_home=app.state.owner_worker_control_home,
-            audit_reporter=report_executor_authority_decision,
-        )
     app.state.owner_worker_live_state.gateway_runtime = OwnerWorkerGatewayRuntime(
         owner_key=lease.owner_key,
         worker_generation=lease.worker_generation,

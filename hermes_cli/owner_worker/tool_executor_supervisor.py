@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import json
 import os
+import selectors
 import signal
-import select
 import stat
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -24,6 +25,7 @@ from hermes_cli.owner_worker.executor_identity import (
     ExecutorIdentityInvalid,
     ExecutorInvocation,
     ExecutorResourceDecision,
+    ExecutorResourceQuota,
     default_executor_resource_decision,
     parse_egress_profile,
 )
@@ -43,6 +45,11 @@ from hermes_cli.owner_worker.tool_executor_sandbox import (
     validate_sandbox_verification_record,
 )
 from hermes_cli.tool_executor_runtime.env import build_executor_environment
+from hermes_cli.owner_worker.cgroup_v2 import CgroupResourceEvents
+from hermes_cli.owner_worker.resource_broker import (
+    ExecutorResourceController,
+    ExecutorResourceScope,
+)
 from hermes_cli.owner_worker.owner_tool_relay import (
     OWNER_FILE_TOOL_NAMES,
     OWNER_RELAY_TOOL_NAMES,
@@ -66,8 +73,30 @@ class _LiveInvocation:
     identity: ExecutorIdentity
     invocation_id: str
     process: Any
+    resource_scope: ExecutorResourceScope
+    deadline: float
+    resource_policy_id: str
     sandbox_binding: SandboxLaunchBinding | None = None
     verification_record: SandboxVerificationRecord | None = None
+
+
+class ExecutorResourceRejected(RuntimeError):
+    """A de-identified resource admission or containment check failed."""
+
+
+class ExecutorDeadlineExceeded(TimeoutError):
+    """The invocation's single resource-policy deadline expired."""
+
+
+class ExecutorOutputExceeded(RuntimeError):
+    """The executor response exceeded its policy byte ceiling."""
+
+
+class ExecutorCleanupFailed(RuntimeError):
+    """The invocation scope could not prove descendant cleanup."""
+
+
+_JSON_FRAMING_ALLOWANCE = 256
 
 
 _NETWORK_TOOL_NAMES = frozenset({
@@ -131,8 +160,13 @@ class ToolExecutorSupervisor:
         sandbox_syscall_filter_source: Callable[[SandboxLaunchBinding, SandboxSecurityPolicy], SandboxSyscallFilter | None] | None = None,
         egress_policy: ExecutorEgressPolicy | None = None,
         resource_decision_source: Callable[[ExecutorIdentity], ExecutorResourceDecision] = default_executor_resource_decision,
-        audit_reporter: Callable[[AuthorityAuditEvent, AuthorityAuditReason, ExecutorIdentity], None] | None = None,
+        resource_controller: ExecutorResourceController | None = None,
+        audit_reporter: Callable[
+            [AuthorityAuditEvent, AuthorityAuditReason, ExecutorIdentity, str | None, CgroupResourceEvents | None],
+            None,
+        ] | None = None,
         clock: Callable[[], float] = time.time,
+        monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.owner_home = Path(owner_home).resolve()
         self.workspace_context = workspace_context
@@ -193,7 +227,12 @@ class ToolExecutorSupervisor:
         self.root_tmpfs_bytes = root_tmpfs_bytes
         self.executor_tmpfs_bytes = executor_tmpfs_bytes
         self.egress_policy = egress_policy or ExecutorEgressPolicy()
-        self.resource_decision_source = resource_decision_source
+        self.resource_decision_source = (
+            self._production_resource_decision
+            if deployment_policy is not None and resource_decision_source is default_executor_resource_decision
+            else resource_decision_source
+        )
+        self.resource_controller = resource_controller
         self.audit_reporter = audit_reporter
         if (
             not isinstance(self.egress_policy, ExecutorEgressPolicy)
@@ -202,19 +241,49 @@ class ToolExecutorSupervisor:
         ):
             raise ExecutorIdentityInvalid("executor egress policy is invalid")
         self._clock = clock
+        self._monotonic = monotonic_clock
         self._lock = threading.RLock()
         self._identities: dict[tuple[str, str], ExecutorIdentity] = {}
         self._live: dict[tuple[tuple, str], _LiveInvocation] = {}
         self._revoked: set[tuple] = set()
 
-    def _report(self, event: AuthorityAuditEvent, reason: AuthorityAuditReason, identity: ExecutorIdentity) -> None:
+    def _report(
+        self,
+        event: AuthorityAuditEvent,
+        reason: AuthorityAuditReason,
+        identity: ExecutorIdentity,
+        policy_id: str | None = None,
+        resource_events: CgroupResourceEvents | None = None,
+    ) -> None:
         if self.audit_reporter is None:
             return
         try:
-            self.audit_reporter(event, reason, identity)
+            self.audit_reporter(event, reason, identity, policy_id, resource_events)
         except Exception:
             # Audit delivery cannot relax executor admission or revocation.
             pass
+
+    def _report_resource_events(
+        self,
+        identity: ExecutorIdentity,
+        policy_id: str,
+        events: CgroupResourceEvents,
+    ) -> None:
+        reasons = []
+        if events.memory.get("oom", 0) or events.memory.get("oom_kill", 0):
+            reasons.append(AuthorityAuditReason.RESOURCE_MEMORY_OOM)
+        if events.pids.get("max", 0):
+            reasons.append(AuthorityAuditReason.RESOURCE_PID_LIMIT)
+        if events.cpu.get("nr_throttled", 0) or events.cpu.get("throttled_usec", 0):
+            reasons.append(AuthorityAuditReason.RESOURCE_CPU_THROTTLED)
+        for reason in reasons:
+            self._report(
+                AuthorityAuditEvent.RESOURCE_OBSERVED,
+                reason,
+                identity,
+                policy_id,
+                events,
+            )
 
     @property
     def egress_policy_fingerprint(self) -> tuple[Any, ...]:
@@ -296,6 +365,35 @@ class ToolExecutorSupervisor:
         )
         try:
             return self._dispatch_invocation(invocation)
+        except ExecutorResourceRejected as exc:
+            reason = (
+                AuthorityAuditReason.RESOURCE_MEMBERSHIP_REJECTED
+                if "membership" in str(exc)
+                else AuthorityAuditReason.RESOURCE_ADMISSION_REJECTED
+            )
+            self._report(AuthorityAuditEvent.RESOURCE_REJECTED, reason, identity)
+            raise
+        except ExecutorDeadlineExceeded:
+            self._report(
+                AuthorityAuditEvent.RESOURCE_REJECTED,
+                AuthorityAuditReason.RESOURCE_DEADLINE_EXCEEDED,
+                identity,
+            )
+            raise
+        except ExecutorOutputExceeded:
+            self._report(
+                AuthorityAuditEvent.RESOURCE_REJECTED,
+                AuthorityAuditReason.RESOURCE_OUTPUT_EXCEEDED,
+                identity,
+            )
+            raise
+        except ExecutorCleanupFailed:
+            self._report(
+                AuthorityAuditEvent.RESOURCE_REJECTED,
+                AuthorityAuditReason.RESOURCE_CLEANUP_FAILED,
+                identity,
+            )
+            raise
         except PermissionError:
             self._report(AuthorityAuditEvent.EXECUTOR_REJECTED, AuthorityAuditReason.EXECUTOR_LEASE_REJECTED, identity)
             raise
@@ -310,6 +408,22 @@ class ToolExecutorSupervisor:
                 identity,
             )
             raise
+
+    def _production_resource_decision(self, identity: ExecutorIdentity) -> ExecutorResourceDecision:
+        if self.deployment_policy is None or self.deployment_policy.resource_policy is None:
+            raise ExecutorIdentityInvalid("executor resource decision is unavailable")
+        limits = self.deployment_policy.resource_policy.executor_limits
+        baseline = default_executor_resource_decision(identity).quota.to_payload()
+        baseline.update({
+            "cpu_millis": limits.cpu_millis,
+            "memory_bytes": limits.memory_bytes,
+            "pids": limits.pids,
+            "file_descriptors": limits.file_descriptors,
+            "duration_seconds": limits.duration_seconds,
+            "concurrent_tools": limits.max_concurrent_executors,
+            "output_bytes": limits.output_bytes,
+        })
+        return ExecutorResourceDecision(identity, ExecutorResourceQuota(**baseline))
 
     def _resource_decision_for(self, identity: ExecutorIdentity) -> ExecutorResourceDecision:
         try:
@@ -411,31 +525,77 @@ class ToolExecutorSupervisor:
             raise SandboxVerificationInvalid("trusted sandbox syscall filter is unavailable") from exc
 
     @staticmethod
-    def _bubblewrap_child_pid(info_fd: int, *, timeout: float = 5.0) -> int:
-        """Read Bubblewrap's exact host-visible sandbox PID from ``--info-fd``."""
-        deadline = time.monotonic() + timeout
+    def _remaining(deadline: float, clock: Callable[[], float]) -> float:
+        remaining = deadline - clock()
+        if remaining <= 0:
+            raise ExecutorDeadlineExceeded("executor resource deadline exceeded")
+        return remaining
+
+    @staticmethod
+    def _read_fd_bounded(
+        fd: int,
+        *,
+        deadline: float,
+        clock: Callable[[], float],
+        limit: int,
+        timeout_message: str,
+        overflow_error: type[Exception],
+        overflow_message: str,
+    ) -> bytes:
         raw = bytearray()
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise SandboxVerificationInvalid("Bubblewrap sandbox identity timed out")
-            ready, _, _ = select.select([info_fd], [], [], remaining)
-            if not ready:
-                raise SandboxVerificationInvalid("Bubblewrap sandbox identity timed out")
-            chunk = os.read(info_fd, 4096)
-            if not chunk:
+        selector = selectors.DefaultSelector()
+        try:
+            selector.register(fd, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - clock()
+                if remaining <= 0:
+                    raise ExecutorDeadlineExceeded(timeout_message)
+                if not selector.select(remaining):
+                    raise ExecutorDeadlineExceeded(timeout_message)
+                chunk = os.read(fd, min(65536, limit + 1 - len(raw)))
+                if not chunk:
+                    return bytes(raw)
+                raw.extend(chunk)
+                if len(raw) > limit:
+                    raise overflow_error(overflow_message)
+        finally:
+            selector.close()
+
+    @classmethod
+    def _bubblewrap_child_pid(
+        cls,
+        info_fd: int,
+        *,
+        deadline: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        timeout: float = 5.0,
+    ) -> int:
+        """Read Bubblewrap's exact host-visible sandbox PID from ``--info-fd``."""
+        effective_deadline = clock() + timeout if deadline is None else deadline
+        raw = bytearray()
+        selector = selectors.DefaultSelector()
+        try:
+            selector.register(info_fd, selectors.EVENT_READ)
+            while True:
+                remaining = effective_deadline - clock()
+                if remaining <= 0 or not selector.select(max(0.0, remaining)):
+                    raise ExecutorDeadlineExceeded("executor resource deadline exceeded")
+                chunk = os.read(info_fd, 4096)
+                if not chunk:
+                    break
+                raw.extend(chunk)
+                if len(raw) > 65536:
+                    raise SandboxVerificationInvalid("Bubblewrap sandbox identity is invalid")
+                try:
+                    text = raw.decode("utf-8")
+                    value, offset = json.JSONDecoder().raw_decode(text)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if text[offset:].strip():
+                    raise SandboxVerificationInvalid("Bubblewrap sandbox identity is invalid")
                 break
-            raw.extend(chunk)
-            if len(raw) > 65536:
-                raise SandboxVerificationInvalid("Bubblewrap sandbox identity is invalid")
-            try:
-                text = raw.decode("utf-8")
-                value, offset = json.JSONDecoder().raw_decode(text)
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
-            if text[offset:].strip():
-                raise SandboxVerificationInvalid("Bubblewrap sandbox identity is invalid")
-            break
+        finally:
+            selector.close()
         try:
             text = raw.decode("utf-8")
             value, offset = json.JSONDecoder().raw_decode(text)
@@ -487,51 +647,115 @@ class ToolExecutorSupervisor:
                 raise
             return os.dup(self.workspace_context.roots.get(RootKind.WORKSPACE).directory_fd)
 
+    def _production_resource_limits(self, invocation: ExecutorInvocation) -> tuple[int, int, int]:
+        quota = invocation.resource_decision.quota
+        if self.deployment_policy is None:
+            return quota.file_descriptors, quota.duration_seconds, quota.output_bytes
+        resource_policy = self.deployment_policy.resource_policy
+        if resource_policy is None:
+            raise ExecutorResourceRejected("executor resource policy is unavailable")
+        limits = resource_policy.executor_limits
+        expected = (limits.file_descriptors, limits.duration_seconds, limits.output_bytes)
+        actual = (quota.file_descriptors, quota.duration_seconds, quota.output_bytes)
+        if expected != actual:
+            raise ExecutorResourceRejected("executor resource policy does not match")
+        return actual
+
+    @staticmethod
+    def _launcher_argv(start_fd: int, file_descriptors: int, bubblewrap_argv: tuple[str, ...]) -> list[str]:
+        return [
+            sys.executable,
+            "-m",
+            "hermes_cli.owner_worker.tool_executor_launcher",
+            "--start-fd",
+            str(start_fd),
+            "--nofile",
+            str(file_descriptors),
+            "--",
+            *bubblewrap_argv,
+        ]
+
+    @staticmethod
+    def _write_fd_bounded(
+        fd: int, payload: bytes, *, deadline: float, clock: Callable[[], float], timeout_message: str,
+    ) -> None:
+        view = memoryview(payload)
+        selector = selectors.DefaultSelector()
+        os.set_blocking(fd, False)
+        try:
+            selector.register(fd, selectors.EVENT_WRITE)
+            while view:
+                remaining = deadline - clock()
+                if remaining <= 0 or not selector.select(max(0.0, remaining)):
+                    raise ExecutorDeadlineExceeded(timeout_message)
+                try:
+                    written = os.write(fd, view)
+                except BlockingIOError:
+                    continue
+                view = view[written:]
+        finally:
+            selector.close()
+
     def _dispatch_invocation(self, invocation: ExecutorInvocation) -> str:
         identity = invocation.identity
-        binding = self._sandbox_binding(identity)
-        mount_policy = self._sandbox_mount_policy(binding)
-        verification_record = (
-            None
-            if self.sandbox_post_spawn_verification_source is not None
-            else self._require_verified_sandbox(binding, mount_policy, invocation)
-        )
-        syscall_filter = self._require_syscall_filter(binding)
-        inherited_security_fd = -1
+        self._require_active_executor_identity(identity)
+        file_descriptors, duration_seconds, output_bytes = self._production_resource_limits(invocation)
+        if self.resource_controller is None:
+            raise ExecutorResourceRejected("executor resource controller is unavailable")
         try:
-            inherited_security_fd = os.dup(syscall_filter.fd)
-            os.set_inheritable(inherited_security_fd, True)
-            os.close(syscall_filter.fd)
-            syscall_filter = SandboxSyscallFilter(
-                inherited_security_fd, syscall_filter.syscall_policy_id, syscall_filter.syscall_policy_digest
-            )
-        except OSError as exc:
-            if inherited_security_fd >= 0:
-                try:
-                    os.close(inherited_security_fd)
-                except OSError:
-                    pass
-            raise SandboxVerificationInvalid("sandbox syscall filter descriptor is unavailable") from exc
-        runtime_home = binding.runtime_home
-        runtime_home.mkdir(parents=True, exist_ok=True)
-        if os.name != "nt":
-            runtime_home.chmod(stat.S_IRWXU)
+            resource_scope = self.resource_controller.reserve_executor(identity, invocation.invocation_id)
+        except Exception as exc:
+            raise ExecutorResourceRejected("executor resource admission was rejected") from exc
+        deadline = self._monotonic() + duration_seconds
 
+        binding: SandboxLaunchBinding | None = None
+        verification_record: SandboxVerificationRecord | None = None
+        inherited_security_fd = -1
+        runtime_home: Path | None = None
         workspace_fd = inherited_workspace_fd = request_read = request_write = response_read = response_write = -1
-        gate_read = gate_write = info_read = info_write = owner_relay_fd = -1
+        sandbox_gate_read = sandbox_gate_write = info_read = info_write = -1
+        launcher_gate_read = launcher_gate_write = owner_relay_fd = -1
         process: Any | None = None
         spec: BubblewrapLaunchSpec | None = None
-        completed = False
+        result: str | None = None
+        dispatch_error: BaseException | None = None
         live_key = (identity.stable_key, invocation.invocation_id)
         try:
+            binding = self._sandbox_binding(identity)
+            mount_policy = self._sandbox_mount_policy(binding)
+            verification_record = (
+                None
+                if self.sandbox_post_spawn_verification_source is not None
+                else self._require_verified_sandbox(binding, mount_policy, invocation)
+            )
+            syscall_filter = self._require_syscall_filter(binding)
+            try:
+                inherited_security_fd = os.dup(syscall_filter.fd)
+                os.set_inheritable(inherited_security_fd, True)
+                os.close(syscall_filter.fd)
+            except OSError as exc:
+                if inherited_security_fd >= 0:
+                    os.close(inherited_security_fd)
+                    inherited_security_fd = -1
+                raise SandboxVerificationInvalid("sandbox syscall filter descriptor is unavailable") from exc
+
+            runtime_home = binding.runtime_home
+            runtime_home.mkdir(parents=True, exist_ok=True)
+            if os.name != "nt":
+                runtime_home.chmod(stat.S_IRWXU)
             workspace_fd = self._workspace_fd()
             inherited_workspace_fd = os.dup(workspace_fd)
             request_read, request_write = os.pipe()
             response_read, response_write = os.pipe()
-            gate_read, gate_write = os.pipe()
+            sandbox_gate_read, sandbox_gate_write = os.pipe()
             info_read, info_write = os.pipe()
-            for fd in (inherited_workspace_fd, request_read, response_write, gate_read, info_write):
+            launcher_gate_read, launcher_gate_write = os.pipe()
+            for fd in (
+                inherited_workspace_fd, request_read, response_write, sandbox_gate_read,
+                info_write, launcher_gate_read,
+            ):
                 os.set_inheritable(fd, True)
+
             relay_file_tool = owner_file_tool_relay_admissible(invocation)
             relay_tool = invocation.tool_name in OWNER_RELAY_TOOL_NAMES and (
                 invocation.tool_name not in OWNER_FILE_TOOL_NAMES or relay_file_tool
@@ -550,8 +774,7 @@ class ToolExecutorSupervisor:
                         )
 
                 owner_relay_fd = self.owner_tool_relay.register(
-                    invocation,
-                    skill_dir_materializer=skill_dir_materializer,
+                    invocation, skill_dir_materializer=skill_dir_materializer,
                 )
                 os.set_inheritable(owner_relay_fd, True)
             environment = build_executor_environment(
@@ -560,7 +783,7 @@ class ToolExecutorSupervisor:
                 workspace_fd=inherited_workspace_fd,
                 bootstrap_fd=request_read,
                 response_fd=response_write,
-                start_gate_fd=gate_read,
+                start_gate_fd=sandbox_gate_read,
                 egress_profile=invocation.egress_profile,
                 owner_relay_fd=(owner_relay_fd if owner_relay_fd >= 0 else None),
             )
@@ -578,30 +801,40 @@ class ToolExecutorSupervisor:
                 bubblewrap_binary=(str(self.bubblewrap_binary) if self.bubblewrap_binary else None),
                 info_fd=info_write,
             )
+            pass_fds = tuple(dict.fromkeys((
+                inherited_workspace_fd, request_read, response_write, sandbox_gate_read,
+                info_write, launcher_gate_read, inherited_security_fd,
+                *((owner_relay_fd,) if owner_relay_fd >= 0 else ()),
+                *spec.inherited_security_fds,
+            )))
             with self._lock:
                 if identity.stable_key in self._revoked:
                     raise PermissionError("executor generation is revoked")
                 process = self.process_factory(
-                    list(spec.argv),
+                    self._launcher_argv(launcher_gate_read, file_descriptors, spec.argv),
                     env=environment,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     close_fds=True,
-                    pass_fds=tuple(dict.fromkeys((
-                        inherited_workspace_fd, request_read, response_write, gate_read,
-                        info_write, inherited_security_fd,
-                        *((owner_relay_fd,) if owner_relay_fd >= 0 else ()),
-                        *spec.inherited_security_fds,
-                    ))),
+                    pass_fds=pass_fds,
                     start_new_session=True,
                 )
                 self._live[live_key] = _LiveInvocation(
-                    identity, invocation.invocation_id, process, binding, verification_record
+                    identity=identity,
+                    invocation_id=invocation.invocation_id,
+                    process=process,
+                    resource_scope=resource_scope,
+                    deadline=deadline,
+                    resource_policy_id=invocation.resource_decision.policy_id,
+                    sandbox_binding=binding,
+                    verification_record=verification_record,
                 )
-            for fd in (request_read, response_write, gate_read, info_write):
+            for fd in (
+                request_read, response_write, sandbox_gate_read, info_write, launcher_gate_read,
+            ):
                 os.close(fd)
-            request_read = response_write = gate_read = info_write = -1
+            request_read = response_write = sandbox_gate_read = info_write = launcher_gate_read = -1
             if owner_relay_fd >= 0:
                 os.close(owner_relay_fd)
                 owner_relay_fd = -1
@@ -612,12 +845,38 @@ class ToolExecutorSupervisor:
                 spec.argv, spec.bubblewrap_path, spec.runtime_home,
                 spec.binding, (inherited_security_fd,),
             )
-            sandbox_pid = self._bubblewrap_child_pid(info_read)
+
+            try:
+                resource_scope.attach_pids([process.pid])
+                if not resource_scope.verify_pids([process.pid]):
+                    raise ExecutorResourceRejected("executor resource membership was rejected")
+            except ExecutorResourceRejected:
+                raise
+            except Exception as exc:
+                raise ExecutorResourceRejected("executor resource membership was rejected") from exc
+            self._write_fd_bounded(
+                launcher_gate_write, b"1", deadline=deadline, clock=self._monotonic,
+                timeout_message="executor resource deadline exceeded",
+            )
+            os.close(launcher_gate_write)
+            launcher_gate_write = -1
+
+            sandbox_pid = self._bubblewrap_child_pid(
+                info_read, deadline=deadline, clock=self._monotonic,
+            )
             os.close(info_read)
             info_read = -1
+            try:
+                resource_scope.attach_pids([process.pid, sandbox_pid])
+                if not resource_scope.verify_pids([process.pid, sandbox_pid]):
+                    raise ExecutorResourceRejected("executor resource membership was rejected")
+            except ExecutorResourceRejected:
+                raise
+            except Exception as exc:
+                raise ExecutorResourceRejected("executor resource membership was rejected") from exc
             if self.sandbox_post_spawn_verification_source is not None:
                 verification_record = self._post_spawn_verification(
-                    binding, mount_policy, invocation, sandbox_pid
+                    binding, mount_policy, invocation, sandbox_pid,
                 )
             with self._lock:
                 if identity.stable_key in self._revoked:
@@ -626,50 +885,94 @@ class ToolExecutorSupervisor:
                 if live is None or live.process is not process:
                     raise PermissionError("executor generation is revoked")
                 live.verification_record = verification_record
-            with os.fdopen(gate_write, "wb", closefd=True) as stream:
-                stream.write(b"1")
-                stream.flush()
-            gate_write = -1
-            with os.fdopen(request_write, "wb", closefd=True) as stream:
-                stream.write(json.dumps(invocation.to_payload(), ensure_ascii=False).encode("utf-8"))
-                stream.flush()
+            self._write_fd_bounded(
+                sandbox_gate_write, b"1", deadline=deadline, clock=self._monotonic,
+                timeout_message="executor resource deadline exceeded",
+            )
+            os.close(sandbox_gate_write)
+            sandbox_gate_write = -1
+            request_payload = json.dumps(
+                invocation.to_payload(), ensure_ascii=False,
+            ).encode("utf-8")
+            self._write_fd_bounded(
+                request_write, request_payload, deadline=deadline, clock=self._monotonic,
+                timeout_message="executor resource deadline exceeded",
+            )
+            os.close(request_write)
             request_write = -1
-            with os.fdopen(response_read, "rb", closefd=True) as stream:
-                raw = stream.read()
+            raw = self._read_fd_bounded(
+                response_read,
+                deadline=deadline,
+                clock=self._monotonic,
+                limit=output_bytes + _JSON_FRAMING_ALLOWANCE,
+                timeout_message="executor resource deadline exceeded",
+                overflow_error=ExecutorOutputExceeded,
+                overflow_message="executor output limit exceeded",
+            )
+            os.close(response_read)
             response_read = -1
             try:
                 response = json.loads(raw.decode("utf-8"))
-                result = response["result"]
+                value = response["result"]
             except (UnicodeDecodeError, TypeError, KeyError, json.JSONDecodeError) as exc:
                 raise RuntimeError("executor returned an invalid response") from exc
-            if process.wait(timeout=30) != 0 and not raw:
+            result = str(value)
+            if len(result.encode("utf-8")) > output_bytes:
+                raise ExecutorOutputExceeded("executor output limit exceeded")
+            try:
+                exit_code = process.wait(timeout=self._remaining(deadline, self._monotonic))
+            except (subprocess.TimeoutExpired, TimeoutError) as exc:
+                raise ExecutorDeadlineExceeded("executor resource deadline exceeded") from exc
+            if exit_code != 0:
                 raise RuntimeError("executor process failed")
-            completed = True
-            return str(result)
+        except BaseException as exc:
+            dispatch_error = exc
         finally:
             self.owner_tool_relay.revoke_invocation(invocation)
+            cleanup_error: BaseException | None = None
+            try:
+                resource_events = resource_scope.read_events()
+            except Exception:
+                resource_events = None
+            if resource_events is not None:
+                self._report_resource_events(
+                    identity,
+                    invocation.resource_decision.policy_id,
+                    resource_events,
+                )
+            try:
+                resource_scope.release()
+            except Exception as exc:
+                cleanup_error = ExecutorCleanupFailed("executor resource cleanup failed")
+                cleanup_error.__cause__ = exc
             if process is not None:
-                if not completed:
-                    self._terminate(process)
+                self._terminate(process)
                 with self._lock:
                     self._live.pop(live_key, None)
             extra_spec_fds = (
                 () if spec is None else tuple(
-                    fd for fd in spec.inherited_security_fds
-                    if fd != inherited_security_fd
+                    fd for fd in spec.inherited_security_fds if fd != inherited_security_fd
                 )
             )
             for fd in (
                 workspace_fd, inherited_workspace_fd, request_read, request_write,
-                response_read, response_write, gate_read, gate_write,
-                info_read, info_write, owner_relay_fd,
-                inherited_security_fd, *extra_spec_fds,
+                response_read, response_write, sandbox_gate_read, sandbox_gate_write,
+                info_read, info_write, launcher_gate_read, launcher_gate_write,
+                owner_relay_fd, inherited_security_fd, *extra_spec_fds,
             ):
                 if isinstance(fd, int) and fd >= 0:
                     try:
                         os.close(fd)
                     except OSError:
                         pass
+            if cleanup_error is not None:
+                if dispatch_error is not None:
+                    raise cleanup_error from dispatch_error
+                raise cleanup_error
+        if dispatch_error is not None:
+            raise dispatch_error
+        assert result is not None
+        return result
 
     @staticmethod
     def _terminate(process: Any) -> None:
@@ -697,8 +1000,16 @@ class ToolExecutorSupervisor:
             live = [entry for entry in self._live.values() if predicate(entry.identity)]
             for entry in live:
                 self._live.pop((entry.identity.stable_key, entry.invocation_id), None)
+        first_error: Exception | None = None
         for entry in live:
-            self._terminate(entry.process)
+            try:
+                entry.resource_scope.release()
+            except Exception as exc:
+                first_error = first_error or exc
+            finally:
+                self._terminate(entry.process)
+        if first_error is not None:
+            raise ExecutorCleanupFailed("executor resource cleanup failed") from first_error
 
     @staticmethod
     def _reap_registry_descendants(identity: ExecutorIdentity) -> None:
@@ -770,4 +1081,6 @@ class ToolExecutorSupervisor:
         )
         for identity in identities:
             self._remove_runtime_generation(identity)
+        if self.resource_controller is not None:
+            self.resource_controller.shutdown_generation()
         return revoked

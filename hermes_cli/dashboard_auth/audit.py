@@ -69,6 +69,7 @@ class AuthorityAuditEvent(enum.Enum):
     CREDENTIAL_LIFECYCLE = "authority_credential_lifecycle"
     EGRESS_REJECTED = "authority_egress_rejected"
     RESOURCE_REJECTED = "authority_resource_rejected"
+    RESOURCE_OBSERVED = "authority_resource_observed"
     KEY_ROTATION_FAILURE = "authority_key_rotation_failure"
     BRIDGE_CLOSED = "authority_bridge_closed"
     PERSISTED_SCOPE_REJECTED = "persisted_scope_rejected"
@@ -98,6 +99,14 @@ class AuthorityAuditReason(enum.Enum):
     CONTROL_PLANE_FILESYSTEM_FORBIDDEN = "control_plane_filesystem_forbidden"
     RESOURCE_DECISION_UNAVAILABLE = "resource_decision_unavailable"
     RESOURCE_DECISION_INVALID = "resource_decision_invalid"
+    RESOURCE_ADMISSION_REJECTED = "resource_admission_rejected"
+    RESOURCE_MEMBERSHIP_REJECTED = "resource_membership_rejected"
+    RESOURCE_DEADLINE_EXCEEDED = "resource_deadline_exceeded"
+    RESOURCE_OUTPUT_EXCEEDED = "resource_output_exceeded"
+    RESOURCE_MEMORY_OOM = "resource_memory_oom"
+    RESOURCE_PID_LIMIT = "resource_pid_limit"
+    RESOURCE_CPU_THROTTLED = "resource_cpu_throttled"
+    RESOURCE_CLEANUP_FAILED = "resource_cleanup_failed"
     EGRESS_PROFILE_REJECTED = "egress_profile_rejected"
     EXECUTOR_LEASE_REJECTED = "executor_lease_rejected"
     SANDBOX_REJECTED = "sandbox_rejected"
@@ -161,6 +170,18 @@ _AUTHORITY_EVENT_REASONS: dict[AuthorityAuditEvent, frozenset[AuthorityAuditReas
     AuthorityAuditEvent.RESOURCE_REJECTED: frozenset({
         AuthorityAuditReason.RESOURCE_DECISION_UNAVAILABLE,
         AuthorityAuditReason.RESOURCE_DECISION_INVALID,
+        AuthorityAuditReason.RESOURCE_ADMISSION_REJECTED,
+        AuthorityAuditReason.RESOURCE_MEMBERSHIP_REJECTED,
+        AuthorityAuditReason.RESOURCE_DEADLINE_EXCEEDED,
+        AuthorityAuditReason.RESOURCE_OUTPUT_EXCEEDED,
+        AuthorityAuditReason.RESOURCE_MEMORY_OOM,
+        AuthorityAuditReason.RESOURCE_PID_LIMIT,
+        AuthorityAuditReason.RESOURCE_CLEANUP_FAILED,
+    }),
+    AuthorityAuditEvent.RESOURCE_OBSERVED: frozenset({
+        AuthorityAuditReason.RESOURCE_MEMORY_OOM,
+        AuthorityAuditReason.RESOURCE_PID_LIMIT,
+        AuthorityAuditReason.RESOURCE_CPU_THROTTLED,
     }),
     AuthorityAuditEvent.BRIDGE_CLOSED: frozenset({AuthorityAuditReason.BRIDGE_CLOSED}),
     AuthorityAuditEvent.PERSISTED_SCOPE_REJECTED: frozenset({AuthorityAuditReason.PERSISTED_SCOPE_ASSERTION_MISMATCH}),
@@ -229,6 +250,11 @@ def audit_authority(
     credential_digest: str | None = None,
     issuer_digest: str | None = None,
     policy_digest: str | None = None,
+    cpu_nr_throttled: int | None = None,
+    cpu_throttled_usec: int | None = None,
+    memory_oom: int | None = None,
+    memory_oom_kill: int | None = None,
+    pids_max: int | None = None,
 ) -> None:
     """Write one allowlisted, de-identified Control Plane authority record.
 
@@ -259,6 +285,11 @@ def audit_authority(
         ("worker_generation", worker_generation),
         ("executor_generation", executor_generation),
         ("sequence", sequence),
+        ("cpu_nr_throttled", cpu_nr_throttled),
+        ("cpu_throttled_usec", cpu_throttled_usec),
+        ("memory_oom", memory_oom),
+        ("memory_oom_kill", memory_oom_kill),
+        ("pids_max", pids_max),
     ):
         if value is not None:
             normalized = int(value)
