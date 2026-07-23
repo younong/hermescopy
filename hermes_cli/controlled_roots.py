@@ -416,6 +416,58 @@ class ControlledRoots:
         finally:
             os.close(parent_fd)
 
+    def remove_tree_for_cleanup(self, kind: RootKind, relative_path: str) -> None:
+        """Remove one lifecycle-owned tree without following filesystem links."""
+        self._require_linux()
+        root = self._require_root(kind, writable=True)
+        try:
+            parent_fd, leaf, root_device = self._open_parent(
+                root,
+                relative_path,
+                create_parents=False,
+            )
+        except FileNotFoundError:
+            return
+        try:
+            try:
+                metadata = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            if not stat.S_ISDIR(metadata.st_mode):
+                os.unlink(leaf, dir_fd=parent_fd)
+                return
+            _validate_stat(
+                metadata,
+                ExpectedType.DIRECTORY,
+                root_device=root_device,
+                enforce_no_xdev=True,
+            )
+            try:
+                child_fd = _open_child_directory(parent_fd, leaf, root_device=root_device)
+            except FileNotFoundError:
+                return
+            try:
+                opened = os.fstat(child_fd)
+                _remove_tree_for_cleanup(child_fd, root_device=root_device)
+                try:
+                    current = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    return
+                if (
+                    not stat.S_ISDIR(current.st_mode)
+                    or current.st_dev != opened.st_dev
+                    or current.st_ino != opened.st_ino
+                ):
+                    raise RuntimeError("lifecycle cleanup target changed during removal")
+            finally:
+                os.close(child_fd)
+            try:
+                os.rmdir(leaf, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        finally:
+            os.close(parent_fd)
+
     def rename(self, kind: RootKind, source: str, destination: str, *, overwrite: bool = False) -> None:
         """Rename one entry within the same controlled root using verified parents."""
         self._require_linux()
@@ -669,6 +721,49 @@ def _remove_tree(directory_fd: int, *, root_device: int) -> None:
             os.unlink(name, dir_fd=directory_fd)
         else:
             raise RuntimeError("refusing to recursively remove a special filesystem entry")
+
+
+def _remove_tree_for_cleanup(directory_fd: int, *, root_device: int) -> None:
+    for name in os.listdir(directory_fd):
+        try:
+            metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(metadata.st_mode):
+            try:
+                os.unlink(name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+            continue
+        _validate_stat(
+            metadata,
+            ExpectedType.DIRECTORY,
+            root_device=root_device,
+            enforce_no_xdev=True,
+        )
+        try:
+            child_fd = _open_child_directory(directory_fd, name, root_device=root_device)
+        except FileNotFoundError:
+            continue
+        try:
+            opened = os.fstat(child_fd)
+            _remove_tree_for_cleanup(child_fd, root_device=root_device)
+            try:
+                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or current.st_dev != opened.st_dev
+                or current.st_ino != opened.st_ino
+            ):
+                raise RuntimeError("lifecycle cleanup target changed during removal")
+        finally:
+            os.close(child_fd)
+        try:
+            os.rmdir(name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
 
 
 def _write_all(fd: int, data: bytes) -> None:

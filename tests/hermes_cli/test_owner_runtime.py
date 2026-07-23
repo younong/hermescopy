@@ -12,7 +12,9 @@ from hermes_cli.owner_runtime import (
     get_default_workspace,
     get_workspace_root,
     owner_worker_env_for,
+    owner_worker_runtime_dir,
     owner_worker_runtime_paths,
+    owner_worker_socket_path,
     propagate_owner_env,
     resolve_workspace_cwd,
     strip_owner_worker_deployment_runtime_env,
@@ -93,6 +95,26 @@ def test_ensure_owner_runtime_dirs_uses_private_modes_on_posix(tmp_path):
         assert path.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO) == 0
 
 
+def test_owner_worker_generation_runtime_path_is_canonical_and_not_precreated(tmp_path):
+    owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
+
+    runtime_dir = owner_worker_runtime_dir(owner_home, 3)
+    paths = owner_worker_runtime_paths(owner_home=owner_home, worker_generation=3)
+
+    assert runtime_dir == owner_home / "runtime" / "workers" / "3"
+    assert paths.worker_runtime_dir == runtime_dir
+    assert paths.worker_socket == runtime_dir / "worker.sock"
+    assert owner_worker_socket_path(owner_home, 3) == paths.worker_socket
+    assert not runtime_dir.exists()
+
+
+@pytest.mark.parametrize("generation", [0, -1])
+def test_owner_worker_generation_runtime_path_requires_positive_generation(tmp_path, generation):
+    with pytest.raises(ValueError, match="positive"):
+        owner_worker_runtime_dir(tmp_path / "owner", generation)
+
+
+
 def test_owner_runtime_temporary_root_is_canonical_and_ignores_tmpdir(tmp_path, monkeypatch):
     monkeypatch.setenv("TMPDIR", str(tmp_path / "shared-tmp"))
     owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
@@ -171,7 +193,8 @@ def test_owner_worker_runtime_contract_requires_exact_minimal_environment(tmp_pa
 
     assert paths.workspace_root == owner_home / "workspaces"
     assert paths.default_workspace == owner_home / "workspaces" / "default"
-    assert paths.worker_socket == owner_home / "runtime" / "workers" / "3" / "worker.sock"
+    assert paths.worker_runtime_dir == owner_home / "runtime" / "workers" / "3"
+    assert paths.worker_socket == paths.worker_runtime_dir / "worker.sock"
     assert paths.paths["channel_directory"] == owner_home / "channel_directory.json"
     assert paths.paths["mirror_sessions_index"] == owner_home / "sessions" / "sessions.json"
 

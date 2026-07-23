@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import logging
 import math
 import os
 import socket
@@ -78,6 +79,7 @@ class OwnerWorkerStartupError(OwnerWorkerUnavailableError):
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _OWNER_WORKER_SKILLS_STAMP = ".owner_worker_bundled_sync_stamp"
+_log = logging.getLogger(__name__)
 
 
 def _path_state(path: Path) -> str:
@@ -446,29 +448,27 @@ class OwnerWorkerSupervisor:
         env = self._env_for(owner, generation, claim.lease)
         relay_fd = None
         image_relay_fd = None
-        if self.deployment_inference_broker is not None:
-            relay_fd = self.deployment_inference_broker.register(claim.lease)
-            env["HERMES_DEPLOYMENT_INFERENCE_RELAY_FD"] = str(relay_fd)
-        if self.deployment_image_broker is not None:
-            image_relay_fd = self.deployment_image_broker.register(claim.lease)
-            env["HERMES_DEPLOYMENT_IMAGE_RELAY_FD"] = str(image_relay_fd)
-        runtime_paths = owner_worker_runtime_paths(
-            owner_home=owner_home,
-            worker_generation=generation.worker_generation,
-        )
-        controlled_roots = self._controlled_roots_for(runtime_paths)
+        controlled_roots = None
+        cwd_fd = None
+        stdout_handle = None
+        stderr_handle = None
+        inherited_cwd_fd = None
         try:
+            if self.deployment_inference_broker is not None:
+                relay_fd = self.deployment_inference_broker.register(claim.lease)
+                env["HERMES_DEPLOYMENT_INFERENCE_RELAY_FD"] = str(relay_fd)
+            if self.deployment_image_broker is not None:
+                image_relay_fd = self.deployment_image_broker.register(claim.lease)
+                env["HERMES_DEPLOYMENT_IMAGE_RELAY_FD"] = str(image_relay_fd)
+            runtime_paths = owner_worker_runtime_paths(
+                owner_home=owner_home,
+                worker_generation=generation.worker_generation,
+            )
+            controlled_roots = self._controlled_roots_for(runtime_paths)
             controlled_roots.mkdirs(
                 RootKind.OWNER_WRITABLE,
                 f"runtime/workers/{generation.worker_generation}",
             )
-        except BaseException:
-            controlled_roots.close()
-            raise
-        cwd_fd = None
-        stdout_handle = None
-        stderr_handle = None
-        try:
             cwd_fd = controlled_roots.open_relative(
                 RootKind.WORKSPACE,
                 "default",
@@ -491,50 +491,32 @@ class OwnerWorkerSupervisor:
                 os.fchdir(inherited_cwd_fd)
                 os.close(inherited_cwd_fd)
 
-            try:
-                process = self.process_factory(
-                    self._argv_for(owner, socket_path, generation),
-                    env=env,
-                    stdin=subprocess.DEVNULL,
-                    stdout=stdout_handle,
-                    stderr=stderr_handle,
-                    close_fds=True,
-                    preexec_fn=_set_descriptor_cwd,
-                    pass_fds=tuple(
-                        fd for fd in (inherited_cwd_fd, relay_fd, image_relay_fd) if fd is not None
-                    ),
-                )
-            finally:
-                os.close(inherited_cwd_fd)
-                if relay_fd is not None:
-                    os.close(relay_fd)
-                    relay_fd = None
-                if image_relay_fd is not None:
-                    os.close(image_relay_fd)
-                    image_relay_fd = None
+            process = self.process_factory(
+                self._argv_for(owner, socket_path, generation),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                close_fds=True,
+                preexec_fn=_set_descriptor_cwd,
+                pass_fds=tuple(
+                    fd for fd in (inherited_cwd_fd, relay_fd, image_relay_fd) if fd is not None
+                ),
+            )
         except Exception as exc:
-            if self.deployment_inference_broker is not None:
-                self.deployment_inference_broker.revoke(claim.lease)
-            if self.deployment_image_broker is not None:
-                self.deployment_image_broker.revoke(claim.lease)
-            self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, claim.lease)
-            try:
-                self.authority_store.transition_worker_lease(
-                    claim.lease,
-                    state=WorkerLeaseState.REVOKED,
-                    generation_state=WorkerGenerationState.FAILED,
-                )
-            except AuthorizationRejected:
-                pass
+            self._revoke_generation_brokers(claim.lease)
+            self._fail_generation_start(claim.lease)
+            self._try_cleanup_generation_runtime(owner_home, generation.worker_generation)
             raise OwnerWorkerStartupError(f"owner worker process launch failed: {exc}") from exc
         finally:
-            if cwd_fd is not None:
-                os.close(cwd_fd)
-            if stdout_handle is not None:
-                os.close(stdout_handle)
-            if stderr_handle is not None:
-                os.close(stderr_handle)
-            controlled_roots.close()
+            for fd in (inherited_cwd_fd, relay_fd, image_relay_fd, cwd_fd, stdout_handle, stderr_handle):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            if controlled_roots is not None:
+                controlled_roots.close()
         try:
             health = self._wait_until_healthy(
                 process=process,
@@ -554,31 +536,10 @@ class OwnerWorkerSupervisor:
                 generation_state=WorkerGenerationState.ACTIVE,
             )
         except Exception as exc:
-            if self.deployment_inference_broker is not None:
-                self.deployment_inference_broker.revoke(claim.lease)
-            if self.deployment_image_broker is not None:
-                self.deployment_image_broker.revoke(claim.lease)
-            self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, claim.lease)
-            try:
-                self.authority_store.transition_worker_lease(
-                    claim.lease,
-                    state=WorkerLeaseState.REVOKED,
-                    generation_state=WorkerGenerationState.FAILED,
-                )
-            except AuthorizationRejected:
-                pass
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    try:
-                        process.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        pass
-            else:
-                process.wait()
+            self._revoke_generation_brokers(claim.lease)
+            self._fail_generation_start(claim.lease)
+            if self._stop_process(process):
+                self._try_cleanup_generation_runtime(owner_home, generation.worker_generation)
             if isinstance(exc, (OwnerWorkerUnavailableError, TimeoutError)):
                 raise
             raise OwnerWorkerStartupError("owner worker startup failed") from exc
@@ -601,32 +562,10 @@ class OwnerWorkerSupervisor:
             if self.deployment_image_broker is not None:
                 self.deployment_image_broker.activate(active_lease)
         except Exception as exc:
-            if self.deployment_inference_broker is not None:
-                self.deployment_inference_broker.revoke(active_lease)
-            if self.deployment_image_broker is not None:
-                self.deployment_image_broker.revoke(active_lease)
-            self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, active_lease)
-            try:
-                self.authority_store.transition_worker_lease(
-                    active_lease,
-                    state=WorkerLeaseState.REVOKED,
-                    generation_state=WorkerGenerationState.FAILED,
-                )
-            except AuthorizationRejected:
-                pass
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    try:
-                        process.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        pass
-            else:
-                process.wait()
-            self._cleanup_generation_socket(handle)
+            self._revoke_generation_brokers(active_lease)
+            self._fail_generation_start(active_lease)
+            if self._stop_process(process):
+                self._try_cleanup_generation_runtime(owner_home, generation.worker_generation)
             raise OwnerWorkerStartupError("owner worker relay activation failed") from exc
         with self._lock:
             self._handles[owner_key] = handle
@@ -711,6 +650,7 @@ class OwnerWorkerSupervisor:
                 return False
         except AuthorizationRejected:
             return False
+        self._try_cleanup_generation_runtime(owner_home, lease.worker_generation)
         return True
 
     def shutdown(self) -> None:
@@ -813,6 +753,84 @@ class OwnerWorkerSupervisor:
             handle.recovery_generation,
         )
 
+    def _revoke_generation_brokers(self, lease: OwnerWorkerAuthorityLease) -> None:
+        if self.deployment_inference_broker is not None:
+            self.deployment_inference_broker.revoke(lease)
+        if self.deployment_image_broker is not None:
+            self.deployment_image_broker.revoke(lease)
+
+    def _fail_generation_start(self, lease: OwnerWorkerAuthorityLease) -> None:
+        self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, lease)
+        try:
+            self.authority_store.transition_worker_lease(
+                lease,
+                state=WorkerLeaseState.REVOKED,
+                generation_state=WorkerGenerationState.FAILED,
+            )
+        except AuthorizationRejected:
+            pass
+
+    @staticmethod
+    def _stop_process(process: subprocess.Popen[Any]) -> bool:
+        if process.poll() is not None:
+            process.wait()
+            return True
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        return process.poll() is not None
+
+    def _cleanup_generation_runtime(
+        self,
+        owner_home: Path,
+        worker_generation: int,
+        *,
+        socket_path: Path | None = None,
+    ) -> None:
+        runtime_paths = owner_worker_runtime_paths(
+            owner_home=owner_home,
+            worker_generation=worker_generation,
+        )
+        if socket_path is not None and socket_path.resolve(strict=False) != runtime_paths.worker_socket.resolve(
+            strict=False
+        ):
+            raise RuntimeError("owner worker socket does not match worker generation")
+        controlled_roots = self._controlled_roots_for(runtime_paths)
+        try:
+            relative_runtime = runtime_paths.worker_runtime_dir.relative_to(runtime_paths.owner_home)
+            controlled_roots.remove_tree_for_cleanup(
+                RootKind.OWNER_WRITABLE,
+                relative_runtime.as_posix(),
+            )
+        finally:
+            controlled_roots.close()
+
+    def _try_cleanup_generation_runtime(
+        self,
+        owner_home: Path,
+        worker_generation: int,
+        *,
+        socket_path: Path | None = None,
+    ) -> None:
+        try:
+            self._cleanup_generation_runtime(
+                owner_home,
+                worker_generation,
+                socket_path=socket_path,
+            )
+        except Exception:
+            _log.warning(
+                "Owner worker generation runtime cleanup failed",
+                extra={"worker_generation": worker_generation},
+                exc_info=True,
+            )
+
     def _mark_handle_failed(self, handle: OwnerWorkerHandle) -> None:
         try:
             self.authority_store.transition_worker_lease(
@@ -848,19 +866,6 @@ class OwnerWorkerSupervisor:
                 generation_state=generation_state,
             )
         except AuthorizationRejected:
-            pass
-
-    def _cleanup_generation_socket(self, handle: OwnerWorkerHandle) -> None:
-        expected = owner_worker_socket_path(handle.owner_home, handle.worker_generation)
-        if handle.socket_path.resolve(strict=False) != expected.resolve(strict=False):
-            raise RuntimeError("owner worker socket does not match worker generation")
-        try:
-            expected.unlink()
-        except FileNotFoundError:
-            pass
-        try:
-            expected.parent.rmdir()
-        except OSError:
             pass
 
     def _reserve_termination_locked(self, owner_key: str, handle: OwnerWorkerHandle) -> bool:
@@ -907,22 +912,13 @@ class OwnerWorkerSupervisor:
             if self.generation_bridge_revoker is not None:
                 self.generation_bridge_revoker(retired_lease)
 
-            process_exited = handle.process.poll() is not None
+            process_exited = self._stop_process(handle.process)
             if process_exited:
-                handle.process.wait()
-            else:
-                handle.process.terminate()
-                try:
-                    handle.process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    handle.process.kill()
-                    try:
-                        handle.process.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        pass
-                process_exited = handle.process.poll() is not None
-            if process_exited:
-                self._cleanup_generation_socket(handle)
+                self._try_cleanup_generation_runtime(
+                    handle.owner_home,
+                    handle.worker_generation,
+                    socket_path=handle.socket_path,
+                )
             if draining is not None:
                 terminal_state = (
                     WorkerGenerationState.TERMINATED
