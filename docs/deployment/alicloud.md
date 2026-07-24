@@ -246,6 +246,27 @@ nginx -t && systemctl reload nginx
 
 任一 unified-v2、Docker/containerd、SearXNG 或 Hermes gate 失败时回滚：从控制台选择保存的旧启动项（或恢复保存的 kernel arguments），重启回 cgroup v1，复核 Docker/SearXNG 和旧 Hermes tag。不要通过删除 Tool admission、关闭 controller 检查、改回 root 服务、放宽 cgroup 路径或让应用自动写 bootloader 来“修复”。应用版本回滚与主机 cgroup 回滚是两个独立动作；都必须记录结果。
 
+## 微信 iLink Connector
+
+`channel_connectors.weixin_ilink` 默认启用，但只有 authenticated Dashboard、deployment inference/image policy、cgroup v2 resource manager 和两套版本化 keyring 全部 ready 后才接受二维码 enrollment。前置条件缺失时 Dashboard 继续工作，Chat GUI 会显示微信入口及泛化的不可用说明；Connector 不启动 poller/dispatcher，也不会绕过 Owner Worker admission。
+
+显式关闭：
+
+```yaml
+channel_connectors:
+  weixin_ilink:
+    enabled: false
+```
+
+启用需要在权限受限的 `/opt/hermes/shared/.env` 中配置两套**彼此独立**的随机 32-byte keyring：
+
+```text
+HERMES_ILINK_LOOKUP_KEYS_JSON={"1":"<base64-32-bytes>"}
+HERMES_ILINK_ENCRYPTION_KEYS_JSON={"1":"<different-base64-32-bytes>"}
+```
+
+真实值必须在服务器本地通过 opaque generation 生成和写入；不要在命令参数、终端输出、对话、ticket、日志或仓库中读取、打印或复制，不要让两套 keyring 共用材料。轮换时递增 active version，并保留所有仍被 channel registry 引用的旧版本。配置后通过正常服务路径重启 Dashboard，再以已认证 Owner 检查 `/api/auth/me` 的 `feature_status.weixin_ilink_connect` 为 `enabled=true`、`ready=true`，最后用指定测试微信验证二维码、Owner 绑定、文本私聊、回复和 replay protection。
+
 ## Authenticated 本地工具范围
 
 当前 bare-metal policy 只允许 `tool-none`，并要求三层 cgroup v2 治理（全局 authenticated-owner 池、单 owner 聚合、单 invocation 叶节点）可用；资源层缺失时 Dashboard/聊天继续可用，但 authenticated tools 拒绝 dispatch。owner workspace 内的 `read_file`、`write_file`、`patch`、`search_files`、本地 skill 读取和无网络 terminal 可以在 Bubblewrap 中运行。terminal 提供部署时复制并绑定到 runtime 的最小命令集（`bash`、`sh`、`ls`、`pwd`、`printf`、`cat`、`grep`、`find`）以及 runtime Python，不会把宿主 `/usr` 整体暴露给 owner。每次调用使用独立 user/PID/IPC/mount/network namespace、non-root UID/GID、只读 release/runtime、私有 tmpfs、seccomp 和 post-spawn `/proc` attestation；executor 在 attestation 完成前阻塞在 start gate。

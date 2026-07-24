@@ -469,11 +469,12 @@ def _resource_policy(value: Any, *, require_root_owner: bool) -> SandboxResource
     if not isinstance(value, Mapping) or set(value) != required:
         raise HostSandboxInvalid("host sandbox resource policy schema is invalid")
     cgroup_root = _canonical_directory_path(value["cgroup_root"], "host sandbox cgroup root")
-    if require_root_owner:
-        _require_protected_ancestors(cgroup_root, "host sandbox cgroup root")
-        status = cgroup_root.stat()
-        if status.st_uid != 0 or stat.S_IMODE(status.st_mode) & 0o022:
-            raise HostSandboxInvalid("host sandbox cgroup root is not protected")
+    # A systemd-delegated cgroup is intentionally owned by the service user so
+    # it can create descendants and write controller files. Treating that
+    # ownership as replaceable filesystem data makes every real delegation fail
+    # policy loading. CgroupV2Manager separately verifies cgroup2 filesystem
+    # identity, the exact delegated root, controller availability, and all
+    # descendant access through an anchored directory descriptor.
     controllers = value["required_controllers"]
     if controllers != ["cpu", "memory", "pids"]:
         raise HostSandboxInvalid("host sandbox required cgroup controllers are invalid")

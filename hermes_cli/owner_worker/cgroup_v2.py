@@ -47,7 +47,7 @@ _OWNER_RE = re.compile(r"owner-[0-9a-f]{64}\Z")
 _WORKER_RE = re.compile(r"worker-[0-9a-f]{64}\Z")
 _EXECUTOR_RE = re.compile(r"executor-[0-9a-f]{64}\Z")
 _COMPONENT_RE = re.compile(r"[a-z]+(?:-[a-z0-9]+)*\Z")
-_CONTROL_FILE_RE = re.compile(r"[a-z]+(?:\.[a-z]+)*\Z")
+_CONTROL_FILE_RE = re.compile(r"[a-z]+(?:[._][a-z]+)*\Z")
 _CPU_PERIOD_US = 100_000
 _CGROUP2_SUPER_MAGIC = "63677270"
 

@@ -416,6 +416,47 @@ def owner_context_from_session(session: Session) -> OwnerContext:
     )
 
 
+def owner_context_from_registry(
+    *,
+    auth_provider: str,
+    tenant_id: str,
+    canonical_user_id: str,
+    expected_owner_key: str | None = None,
+    global_home: str | Path | None = None,
+) -> OwnerContext:
+    """Construct an Owner only from a verified server-side identity registry.
+
+    The caller supplies canonical registry fields, never browser/message fields.
+    When the registry already stores an owner key, recomputing and comparing it
+    prevents a corrupted or attacker-controlled row from selecting another home.
+    """
+
+    provider = _safe_component(auth_provider, fallback="unknown-provider")
+    tenant = str(tenant_id or "").strip()
+    user_id = str(canonical_user_id or "").strip()
+    if not tenant or not user_id:
+        raise ValueError("registry tenant and canonical user are required")
+    owner_key = _derive_owner_key(
+        auth_provider=provider,
+        tenant_id=_owner_key_tenant_material(tenant),
+        owner_user_id=user_id,
+    )
+    if expected_owner_key is not None and not hmac.compare_digest(
+        owner_key,
+        str(expected_owner_key or "").strip(),
+    ):
+        raise RuntimeError("registry owner key does not match canonical identity")
+    base_home = Path(global_home).expanduser().resolve() if global_home is not None else get_hermes_home()
+    return OwnerContext(
+        auth_provider=provider,
+        tenant_id=tenant,
+        owner_user_id=user_id,
+        owner_key=owner_key,
+        host_global_home=base_home,
+        host_owner_home=_host_owner_home(owner_key, host_global_home=base_home),
+    )
+
+
 def owner_context_from_owner_key(owner_key: str, *, global_home: str | Path | None = None) -> OwnerContext:
     """Reconstruct a Control Plane owner context from a signed owner key.
 

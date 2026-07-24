@@ -1163,11 +1163,9 @@ class TestWeixinApiTimeout:
                 )
             )
 
-    def test_api_post_raises_runtime_error_on_non_ok_status(self):
-        # The non-2xx branch now lives inside the wait_for-wrapped inner coro;
-        # confirm it still raises with the HTTP status and truncated body.
-        session = _StubSession(_StubResponse(status=500, body="boom"))
-        with pytest.raises(RuntimeError, match="iLink POST ep HTTP 500: boom"):
+    def test_api_post_raises_sanitized_runtime_error_on_non_ok_status(self):
+        session = _StubSession(_StubResponse(status=500, body="provider-secret"))
+        with pytest.raises(RuntimeError, match="iLink POST ep HTTP 500: request failed") as caught:
             asyncio.run(
                 weixin._api_post(
                     session,
@@ -1178,10 +1176,11 @@ class TestWeixinApiTimeout:
                     timeout_ms=5000,
                 )
             )
+        assert "provider-secret" not in str(caught.value)
 
-    def test_api_get_raises_runtime_error_on_non_ok_status(self):
-        session = _StubSession(_StubResponse(status=500, body="boom"))
-        with pytest.raises(RuntimeError, match="iLink GET ep HTTP 500: boom"):
+    def test_api_get_raises_sanitized_runtime_error_on_non_ok_status(self):
+        session = _StubSession(_StubResponse(status=500, body="provider-secret"))
+        with pytest.raises(RuntimeError, match="iLink GET ep HTTP 500: request failed") as caught:
             asyncio.run(
                 weixin._api_get(
                     session,
@@ -1190,6 +1189,7 @@ class TestWeixinApiTimeout:
                     timeout_ms=5000,
                 )
             )
+        assert "provider-secret" not in str(caught.value)
 
     def test_get_updates_returns_empty_sentinel_on_timeout(self):
         # wait_for raises asyncio.TimeoutError, which _get_updates swallows into

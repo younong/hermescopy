@@ -32,7 +32,7 @@ from hermes_cli.dashboard_auth.cookies import (
     read_sso_attempt_cookie,
     set_sso_attempt_cookie,
 )
-from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS
+from hermes_cli.dashboard_auth.public_paths import is_public_api_route
 
 _log = logging.getLogger(__name__)
 
@@ -92,7 +92,7 @@ def _path_is_allowed_during_password_change(path: str) -> bool:
     }
 
 
-def _path_is_public(path: str) -> bool:
+def _path_is_public(path: str, *, method: str = "GET") -> bool:
     """True if ``path`` bypasses the OAuth auth gate.
 
     Two sources of public-ness:
@@ -105,7 +105,7 @@ def _path_is_public(path: str) -> bool:
       mounts. Prefix-matched so ``/assets/foo.css`` lights up via
       ``/assets/``.
     """
-    if path in PUBLIC_API_PATHS:
+    if is_public_api_route(path, method=method):
         return True
     return any(
         path == prefix or path.startswith(prefix)
@@ -114,9 +114,11 @@ def _path_is_public(path: str) -> bool:
 
 
 def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
+    """Use only the ASGI-resolved peer identity.
+
+    Trusted-proxy middleware may rewrite ``request.client`` before this gate;
+    arbitrary request headers are not an identity source here.
+    """
     return request.client.host if request.client else ""
 
 
@@ -468,7 +470,7 @@ async def gated_auth_middleware(
         return await call_next(request)
 
     path = request.url.path
-    if _path_is_public(path):
+    if _path_is_public(path, method=request.method):
         return await call_next(request)
 
     at, _rt = read_session_cookies(request)

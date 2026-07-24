@@ -2354,6 +2354,86 @@ def _session(agent=None, **extra):
     }
 
 
+def test_prompt_submit_replays_completed_external_turn_without_agent(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    runtime = server.OwnerWorkerGatewayRuntime("owner-a", 1, "worker-a", 1, 0)
+    db.begin_external_turn(
+        turn_key="weixin-ilink:im_test",
+        stored_session_id="session-key",
+        worker_id=runtime.worker_id,
+        worker_generation=runtime.worker_generation,
+    )
+    db.complete_external_turn(
+        turn_key="weixin-ilink:im_test",
+        worker_id=runtime.worker_id,
+        worker_generation=runtime.worker_generation,
+        result_text="saved response",
+        result_status="complete",
+    )
+    emitted = []
+    runtime.mutable_state.sessions["sid-replay"] = _session()
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    monkeypatch.setattr(
+        server,
+        "_start_agent_build",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Agent started")),
+    )
+    try:
+        with server.owner_worker_gateway_runtime(runtime):
+            response = server._methods["prompt.submit"](
+                "rid",
+                {
+                    "session_id": "sid-replay",
+                    "text": "hello",
+                    "idempotency_key": "weixin-ilink:im_test",
+                },
+            )
+    finally:
+        runtime.mutable_state.sessions.pop("sid-replay", None)
+
+    assert response["result"] == {"status": "completed", "replayed": True}
+    assert emitted == [
+        (
+            "message.complete",
+            "sid-replay",
+            {"text": "saved response", "status": "complete", "replayed": True},
+        )
+    ]
+
+
+def test_prompt_submit_rejects_stale_external_turn_generation(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    db.begin_external_turn(
+        turn_key="weixin-ilink:im_stale",
+        stored_session_id="session-key",
+        worker_id="worker-old",
+        worker_generation=1,
+    )
+    runtime = server.OwnerWorkerGatewayRuntime("owner-a", 2, "worker-new", 1, 0)
+    runtime.mutable_state.sessions["sid-stale"] = _session()
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    try:
+        with server.owner_worker_gateway_runtime(runtime):
+            response = server._methods["prompt.submit"](
+                "rid",
+                {
+                    "session_id": "sid-stale",
+                    "text": "hello",
+                    "idempotency_key": "weixin-ilink:im_stale",
+                },
+            )
+    finally:
+        runtime.mutable_state.sessions.pop("sid-stale", None)
+
+    assert response["error"]["code"] == 4092
+    assert response["error"]["message"] == "external turn outcome is ambiguous"
+
+
 def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):
     calls = {"hooks": []}
 

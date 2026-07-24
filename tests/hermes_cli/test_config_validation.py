@@ -4,6 +4,29 @@
 from hermes_cli.config import validate_config_structure, ConfigIssue
 
 
+class TestChannelConnectorValidation:
+    def test_valid_boolean_enablement(self):
+        assert validate_config_structure({
+            "channel_connectors": {"weixin_ilink": {"enabled": True}},
+        }) == []
+
+    def test_connector_root_must_be_mapping(self):
+        issues = validate_config_structure({"channel_connectors": []})
+        assert any("channel_connectors should be a dict" in issue.message for issue in issues)
+
+    def test_ilink_config_must_be_mapping(self):
+        issues = validate_config_structure({
+            "channel_connectors": {"weixin_ilink": True},
+        })
+        assert any("weixin_ilink should be a dict" in issue.message for issue in issues)
+
+    def test_enabled_must_be_boolean(self):
+        issues = validate_config_structure({
+            "channel_connectors": {"weixin_ilink": {"enabled": "true"}},
+        })
+        assert any("enabled should be a boolean" in issue.message for issue in issues)
+
+
 class TestCustomProvidersValidation:
     """custom_providers must be a YAML list, not a dict."""
 

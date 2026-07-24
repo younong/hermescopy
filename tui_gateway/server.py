@@ -9525,6 +9525,46 @@ def _(rid, params: dict) -> dict:
         session["last_active"] = time.time()
         _start_inflight_turn(session, text, generation)
 
+    idempotency_key = str(params.get("idempotency_key") or "").strip()
+    if idempotency_key:
+        db = _get_db()
+        runtime = current_owner_worker_gateway_runtime()
+        if db is None or runtime is None:
+            with session["history_lock"]:
+                session["running"] = False
+                _clear_inflight_turn(session, generation)
+            return _err(rid, 5000, "external turn receipts require an owner worker database")
+        try:
+            receipt = db.begin_external_turn(
+                turn_key=idempotency_key,
+                stored_session_id=str(session.get("session_key") or ""),
+                worker_id=runtime.worker_id,
+                worker_generation=runtime.worker_generation,
+            )
+        except Exception:
+            with session["history_lock"]:
+                session["running"] = False
+                _clear_inflight_turn(session, generation)
+            return _err(rid, 5000, "external turn receipt unavailable")
+        if receipt.get("status") == "completed":
+            with session["history_lock"]:
+                session["running"] = False
+                _clear_inflight_turn(session, generation)
+            payload = {
+                "text": str(receipt.get("result_text") or ""),
+                "status": str(receipt.get("result_status") or "complete"),
+                "replayed": True,
+            }
+            _emit("message.complete", sid, payload)
+            return _ok(rid, {"status": "completed", "replayed": True})
+        if receipt.get("status") == "ambiguous":
+            with session["history_lock"]:
+                session["running"] = False
+                _clear_inflight_turn(session, generation)
+            return _err(rid, 4092, "external turn outcome is ambiguous")
+        session["_external_turn_key"] = idempotency_key
+        session["_external_turn_generation"] = generation
+
     # Persist the DB row lazily, now that the user has actually sent a message.
     _ensure_session_db_row(session)
     # A branch becomes real here: copy its parent's transcript into the row so it
@@ -10220,8 +10260,24 @@ def _run_prompt_submit(
             rendered = render_message(raw, cols)
             if rendered:
                 payload["rendered"] = rendered
+            external_turn_key = None
             with session["history_lock"]:
                 _clear_inflight_turn(session, generation)
+                if session.get("_external_turn_generation") == generation:
+                    external_turn_key = session.pop("_external_turn_key", None)
+                    session.pop("_external_turn_generation", None)
+            if external_turn_key:
+                db = _get_db()
+                completion_runtime = current_owner_worker_gateway_runtime()
+                if db is None or completion_runtime is None:
+                    raise RuntimeError("external turn receipt completion unavailable")
+                db.complete_external_turn(
+                    turn_key=external_turn_key,
+                    worker_id=completion_runtime.worker_id,
+                    worker_generation=completion_runtime.worker_generation,
+                    result_text=str(raw or ""),
+                    result_status=status,
+                )
             _emit("message.complete", sid, payload)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
