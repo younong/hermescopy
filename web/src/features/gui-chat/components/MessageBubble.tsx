@@ -1,4 +1,3 @@
-import { Badge } from "@nous-research/ui/ui/components/badge";
 import { useDeferredValue } from "react";
 
 import { Markdown } from "@/components/Markdown";
@@ -41,7 +40,7 @@ export function MessageBubble({
           ) : null}
 
           {message.text ? (
-            <div className="min-w-0 max-w-full rounded-3xl bg-current/[0.06] px-5 py-3 text-base leading-relaxed break-words text-text-primary shadow-sm [overflow-wrap:anywhere]">
+            <div data-message-variant="user" className="min-w-0 max-w-full rounded-[1.25rem] bg-[#f0f1f2] px-4 py-2.5 text-[0.9375rem] leading-6 break-words text-[#25282d] [overflow-wrap:anywhere]">
               <Markdown content={message.text} streaming={message.streaming} />
             </div>
           ) : null}
@@ -54,19 +53,19 @@ export function MessageBubble({
     <article className="flex w-full min-w-0 justify-start">
       <div
         className={cn(
-          "min-w-0 max-w-[min(52rem,92%)] px-1 py-1",
-          message.role === "system" ? "text-warning" : "text-text-primary",
+          "min-w-0 w-full px-1 py-1 text-[0.9375rem] leading-7",
+          message.role === "system" ? "text-[#9a6700]" : "text-[#282b30]",
         )}
       >
-        <div className="mb-2 flex items-center gap-2 text-xs uppercase tracking-[0.12em] text-text-tertiary">
-          {message.streaming ? <Badge tone="warning">streaming</Badge> : null}
-          {message.status === "error" ? <Badge tone="destructive">error</Badge> : null}
-          {message.status === "interrupted" ? <Badge tone="secondary">stopped</Badge> : null}
-        </div>
         {message.text ? (
           <AssistantMarkdown text={message.text} streaming={message.streaming} />
         ) : message.streaming ? (
-          <div className="text-sm text-text-secondary">Thinking…</div>
+          <div className="text-sm text-[#8a8f97]">Thinking…</div>
+        ) : null}
+        {message.streaming || message.status === "error" || message.status === "interrupted" ? (
+          <div className={cn("mt-3 text-xs text-[#92969d]", message.status === "error" && "text-[#b42318]")}>
+            {message.streaming ? "Writing…" : message.status === "error" ? "Response failed" : "Stopped"}
+          </div>
         ) : null}
         {message.attachments?.length ? (
           <div className="mt-3 flex flex-wrap gap-2">

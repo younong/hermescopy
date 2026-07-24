@@ -7,8 +7,7 @@ import {
   type DragEvent,
   type KeyboardEvent,
 } from "react";
-import { Button } from "@nous-research/ui/ui/components/button";
-import { Paperclip, Send, Square } from "lucide-react";
+import { ArrowUp, Plus, Square } from "lucide-react";
 
 import {
   COMPOSER_ATTACHMENT_MAX_COUNT,
@@ -202,7 +201,7 @@ export function Composer({
 
   return (
     <form
-      className="shrink-0 border-t border-current/15 bg-background-base/95 p-3"
+      className="pointer-events-none absolute inset-x-0 bottom-0 z-10 shrink-0 bg-gradient-to-t from-white via-white/95 to-transparent px-3 pb-[calc(0.75rem+env(safe-area-inset-bottom,0px))] pt-8 sm:px-6"
       onSubmit={(event) => {
         event.preventDefault();
         void submit();
@@ -218,10 +217,10 @@ export function Composer({
       />
       <div
         className={[
-          "rounded-[28px] border bg-background-base p-3 shadow-sm transition focus-within:border-blue-300 focus-within:ring-2 focus-within:ring-blue-200/50",
+          "pointer-events-auto mx-auto max-w-[50rem] rounded-[1.35rem] border bg-white px-3 pb-2.5 pt-3 shadow-[0_8px_28px_rgba(31,41,55,0.08)] transition focus-within:border-[#aebdd0] focus-within:ring-2 focus-within:ring-[#dce5ef]/70",
           isDraggingFiles
-            ? "border-blue-400 bg-blue-500/5 ring-2 ring-blue-200/70"
-            : "border-current/20",
+            ? "border-[#8ca7c5] bg-[#f8fbff] ring-2 ring-[#dce5ef]"
+            : "border-[#c8d2df]",
         ].join(" ")}
         onDragEnter={onDragEnter}
         onDragLeave={onDragLeave}
@@ -249,7 +248,7 @@ export function Composer({
 
         <textarea
           aria-label="GUI chat message"
-          className="min-h-16 max-h-40 w-full resize-none bg-transparent px-1 py-1 text-sm text-text-primary outline-none placeholder:text-text-tertiary disabled:cursor-not-allowed disabled:opacity-70"
+          className="min-h-11 max-h-40 w-full resize-none bg-transparent px-1 py-0.5 text-[0.9375rem] leading-6 text-[#26292e] outline-none placeholder:text-[#999da4] disabled:cursor-not-allowed disabled:opacity-70"
           disabled={disabled || isSubmitting}
           onChange={(event) => setText(event.target.value)}
           onKeyDown={onKeyDown}
@@ -262,35 +261,40 @@ export function Composer({
         {localError ? <div className="px-1 pb-2 text-xs text-destructive">{localError}</div> : null}
 
         <div className="flex items-center justify-between gap-2 pt-1">
-          <Button
-            type="button"
-            ghost
-            size="icon"
-            aria-label="Attach files"
-            disabled={controlsDisabled}
-            onClick={() => fileInputRef.current?.click()}
-          >
-            <Paperclip className="h-4 w-4" />
-          </Button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              aria-label="Attach files"
+              className="flex h-7 w-7 items-center justify-center rounded-full text-[#686d75] transition hover:bg-[#f0f1f3] disabled:cursor-not-allowed disabled:opacity-40"
+              disabled={controlsDisabled}
+              onClick={() => fileInputRef.current?.click()}
+            >
+              <Plus className="h-4 w-4" />
+            </button>
+            <span className="text-[0.6875rem] text-[#9a9ea5]">Enter to send · Shift+Enter for new line</span>
+          </div>
 
           <div className="flex items-center gap-2">
             {isGenerating ? (
-              <Button
+              <button
                 type="button"
-                ghost
-                className="text-destructive"
+                aria-label="Stop generating"
+                className="flex h-8 w-8 items-center justify-center rounded-full bg-[#2f3338] text-white transition hover:bg-[#191b1e] disabled:opacity-40"
                 onClick={onStop}
                 disabled={disabled}
               >
-                <Square className="h-4 w-4" />
-                Stop
-              </Button>
+                <Square className="h-3 w-3 fill-current" />
+              </button>
             ) : null}
             {!isGenerating || allowSendWhileGenerating ? (
-              <Button type="submit" disabled={!canSend}>
-                <Send className="h-4 w-4" />
-                {isSubmitting ? "Sending…" : "Send"}
-              </Button>
+              <button
+                type="submit"
+                aria-label={isSubmitting ? "Sending" : "Send message"}
+                className="flex h-8 w-8 items-center justify-center rounded-full bg-[#2f3338] text-white transition hover:bg-[#191b1e] disabled:cursor-not-allowed disabled:bg-[#d7d9dc]"
+                disabled={!canSend}
+              >
+                <ArrowUp className="h-4 w-4" />
+              </button>
             ) : null}
           </div>
         </div>

@@ -384,7 +384,8 @@ export default function App() {
   const isDocsRoute = pathname === "/docs" || pathname === "/docs/";
   const normalizedPath = pathname.replace(/\/$/, "") || "/";
   const isChatRoute = normalizedPath === "/chat";
-  const isChatSurfaceRoute = isChatRoute || normalizedPath === "/chat-gui";
+  const isGuiChatRoute = normalizedPath === "/chat-gui";
+  const isChatSurfaceRoute = isChatRoute;
   const embeddedChat = isDashboardEmbeddedChatEnabled();
 
   // `dashboard.show_token_analytics` gates the Analytics nav item.  The
@@ -486,6 +487,32 @@ export default function App() {
     mql.addEventListener("change", onChange);
     return () => mql.removeEventListener("change", onChange);
   }, []);
+
+  if (isGuiChatRoute) {
+    return (
+      <ProfileProvider>
+        <div className="relative flex h-dvh max-h-dvh min-h-0 overflow-hidden bg-white text-[#202124] antialiased">
+          <SelectionSwitcher />
+          <div aria-hidden className="pointer-events-none fixed inset-0 z-0">
+            <PluginSlot name="backdrop" />
+          </div>
+          <ProfileKeyedRoutes>
+            <Routes>
+              {routes.map(({ key, path, element }) => (
+                <Route key={key} path={path} element={element} />
+              ))}
+              <Route
+                path="*"
+                element={<UnknownRouteFallback pluginsLoading={pluginsLoading} />}
+              />
+            </Routes>
+          </ProfileKeyedRoutes>
+          <PluginSlot name="overlay" />
+        </div>
+      </ProfileProvider>
+    );
+  }
+
 
   return (
     <ProfileProvider>

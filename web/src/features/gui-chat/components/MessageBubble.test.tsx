@@ -12,6 +12,25 @@ afterEach(() => {
 });
 
 describe("MessageBubble", () => {
+  it("renders user messages as the quiet right-aligned bubble", async () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(
+        <MessageBubble
+          artifacts={[]}
+          message={{ artifactIds: [], id: "user-1", role: "user", text: "Hello" }}
+        />,
+      );
+    });
+
+    expect(container.querySelector('[data-message-variant="user"]')?.textContent).toBe("Hello");
+    expect(container.querySelector("article")?.className).toContain("justify-end");
+    await act(async () => root.unmount());
+  });
+
   it("renders assistant Markdown while streaming and catches up on completion", async () => {
     const container = document.createElement("div");
     document.body.appendChild(container);

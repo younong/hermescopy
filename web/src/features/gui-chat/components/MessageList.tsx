@@ -29,7 +29,6 @@ export function MessageList({
   onApprovalRespond,
   onClarifyRespond,
   onLoadEarlier,
-  showTerminalChatHint = true,
   state,
 }: {
   disabled?: boolean;
@@ -37,7 +36,6 @@ export function MessageList({
   onApprovalRespond: (id: string, approved: boolean) => void;
   onClarifyRespond: (id: string, answer: string) => void;
   onLoadEarlier?: () => void;
-  showTerminalChatHint?: boolean;
   state: GuiChatState;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -181,28 +179,25 @@ export function MessageList({
 
   if (rows.length === 0) {
     return (
-      <div className="flex min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5">
-        <div className="m-auto max-w-xl border border-current/15 bg-midground/5 px-6 py-5 text-center">
-          <h2 className="mb-2 font-display text-lg uppercase tracking-[0.12em] text-midground">Hermes GUI Chat beta</h2>
-          <p className="text-sm text-text-secondary">
-            {showTerminalChatHint
-              ? "Structured chat over /api/ws. Terminal Chat remains available at /chat."
-              : "Structured chat over /api/ws."}
-          </p>
+      <div className="flex min-h-0 flex-1 overflow-y-auto px-5 pb-36 pt-[18vh] sm:px-8">
+        <div className="m-auto max-w-lg text-center">
+          <div className="mx-auto mb-5 flex h-10 w-10 items-center justify-center rounded-xl bg-[#f2f3f5] text-lg font-semibold text-[#4f555d]">H</div>
+          <h2 className="mb-2 text-xl font-medium tracking-[-0.02em] text-[#25282d]">How can I help?</h2>
+          <p className="text-sm leading-6 text-[#8a8f97]">Start a conversation, attach a file, or continue one of your recent chats.</p>
         </div>
       </div>
     );
   }
 
   return (
-    <div aria-busy={state.historyLoading} className="min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5" onScroll={handleScroll} ref={containerRef}>
-      <div className="relative w-full" style={{ height: `${totalSize}px` }}>
+    <div aria-busy={state.historyLoading} className="min-h-0 flex-1 overflow-y-auto px-4 pb-36 pt-7 sm:px-8 sm:pt-10" onScroll={handleScroll} ref={containerRef}>
+      <div className="relative mx-auto w-full max-w-[50rem]" style={{ height: `${totalSize}px` }}>
         {virtualizer.getVirtualItems().map((item) => {
           const row = rows[item.index];
           if (!row) return null;
           return (
             <div
-              className="absolute left-0 top-0 w-full pb-4"
+              className="absolute left-0 top-0 w-full pb-7"
               data-index={item.index}
               key={row.id}
               ref={virtualizer.measureElement}
