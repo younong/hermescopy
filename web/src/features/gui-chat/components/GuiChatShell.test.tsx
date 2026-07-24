@@ -119,6 +119,7 @@ describe("GuiChatShell", () => {
 
     expect(document.querySelector("[data-gui-chat]")).not.toBeNull();
     expect(document.body.textContent).not.toContain("Terminal chat");
+    expect(document.querySelector<HTMLButtonElement>('button[aria-current="page"]')?.textContent).toContain("New chat");
     expect(document.querySelector('aside[aria-label="Chat workspace"]')).not.toBeNull();
     expect(document.querySelector('[aria-label="Log out"]')).not.toBeNull();
   });
