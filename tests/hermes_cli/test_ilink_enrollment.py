@@ -10,7 +10,31 @@ import pytest
 
 from gateway.weixin_ilink import ILinkCredentials, QRCode, QRCodeStatus, QRStatus
 from hermes_cli.channel_connectors.weixin_ilink.enrollment import EnrollmentManager
-from hermes_cli.channel_identity import ChannelCrypto, ChannelIdentityStore, Keyring
+from hermes_cli.channel_identity import (
+    ChannelCrypto,
+    ChannelIdentityStore,
+    Keyring,
+    ensure_owner_binding,
+    register_weixin_identity_for_owner,
+    resolve_binding,
+)
+from hermes_cli.dashboard_auth.base import Session
+from hermes_cli.dashboard_auth.owner_context import owner_context_from_session
+
+
+def _owner(user_id: str):
+    return owner_context_from_session(
+        Session(
+            user_id=user_id,
+            email=f"{user_id}@example.com",
+            display_name=user_id,
+            org_id="org-a",
+            provider="stub",
+            expires_at=9_999_999_999,
+            access_token="access",
+            refresh_token="refresh",
+        )
+    )
 
 
 @pytest.fixture
@@ -118,6 +142,122 @@ async def test_identity_stays_pending_until_owner_home_is_provisioned(store):
         await manager._tasks.copy().pop()
 
     assert manager.get(view.attempt_id).status == "confirmed"
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_authenticated_attempt_durably_targets_dashboard_owner(store):
+    manager = EnrollmentManager(store, object(), poll_interval_seconds=60)
+    owner = _owner("dashboard-user")
+    with patch(
+        "hermes_cli.channel_connectors.weixin_ilink.enrollment.WeixinILinkClient.create_qr_code",
+        new=AsyncMock(return_value=QRCode(token="qr-token", content="full")),
+    ):
+        view = await manager.create(
+            source="127.0.0.1",
+            device_id="device",
+            scene="internal",
+            target_owner=owner,
+        )
+
+    with store.read() as conn:
+        row = conn.execute(
+            """
+            SELECT a.target_canonical_user_id, o.owner_key
+            FROM enrollment_attempts a
+            JOIN owner_bindings o ON o.canonical_user_id=a.target_canonical_user_id
+            WHERE a.attempt_id=?
+            """,
+            (view.attempt_id,),
+        ).fetchone()
+    assert row["target_canonical_user_id"] != owner.owner_user_id
+    assert row["owner_key"] == owner.owner_key
+    assert manager.get(view.attempt_id) is None
+    assert manager.get(view.attempt_id, target_owner=owner).status == "waiting"
+    assert manager.get(view.attempt_id, target_owner=_owner("other-user")) is None
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_authenticated_confirmed_identity_resolves_same_dashboard_owner(store):
+    manager = EnrollmentManager(store, object(), poll_interval_seconds=0)
+    owner = _owner("dashboard-user")
+    credentials = ILinkCredentials(
+        bot_id="bot-owner",
+        bot_token="bot-token",
+        base_url="https://ilink.example",
+        user_id="peer-owner",
+    )
+    with patch(
+        "hermes_cli.channel_connectors.weixin_ilink.enrollment.WeixinILinkClient.create_qr_code",
+        new=AsyncMock(return_value=QRCode(token="qr-token", content="full")),
+    ), patch(
+        "hermes_cli.channel_connectors.weixin_ilink.enrollment.WeixinILinkClient.get_qr_status",
+        new=AsyncMock(return_value=QRStatus(status=QRCodeStatus.CONFIRMED, credentials=credentials)),
+    ), patch(
+        "hermes_cli.channel_connectors.weixin_ilink.enrollment.ensure_owner_home",
+    ):
+        view = await manager.create(
+            source="127.0.0.1",
+            device_id="device",
+            scene="internal",
+            target_owner=owner,
+        )
+        await manager._tasks.copy().pop()
+
+    with store.read() as conn:
+        binding_id = conn.execute("SELECT binding_id FROM channel_bindings").fetchone()["binding_id"]
+    resolved_owner, _ = resolve_binding(store, binding_id=binding_id)
+    assert resolved_owner == owner
+    assert manager.get(view.attempt_id, target_owner=owner).status == "confirmed"
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_authenticated_cross_owner_conflict_clears_attempt_secrets(store):
+    first_owner = _owner("owner-a")
+    second_owner = _owner("owner-b")
+    first_target = ensure_owner_binding(store, first_owner)
+    register_weixin_identity_for_owner(
+        store,
+        target_canonical_user_id=first_target,
+        subject="peer-conflict",
+        bot_id="bot-conflict",
+        bot_token="original-token",
+        base_url="https://ilink.example",
+        peer_id="peer-conflict",
+    )
+    manager = EnrollmentManager(store, object(), poll_interval_seconds=0)
+    credentials = ILinkCredentials(
+        bot_id="bot-conflict",
+        bot_token="attacker-token",
+        base_url="https://attacker.example",
+        user_id="peer-conflict",
+    )
+    with patch(
+        "hermes_cli.channel_connectors.weixin_ilink.enrollment.WeixinILinkClient.create_qr_code",
+        new=AsyncMock(return_value=QRCode(token="qr-token", content="full")),
+    ), patch(
+        "hermes_cli.channel_connectors.weixin_ilink.enrollment.WeixinILinkClient.get_qr_status",
+        new=AsyncMock(return_value=QRStatus(status=QRCodeStatus.CONFIRMED, credentials=credentials)),
+    ):
+        view = await manager.create(
+            source="127.0.0.1",
+            device_id="device",
+            scene="internal",
+            target_owner=second_owner,
+        )
+        await manager._tasks.copy().pop()
+
+    with store.read() as conn:
+        attempt = conn.execute(
+            "SELECT status, qr_ciphertext, confirmed_ciphertext FROM enrollment_attempts WHERE attempt_id=?",
+            (view.attempt_id,),
+        ).fetchone()
+    assert attempt["status"] == "conflict"
+    assert attempt["qr_ciphertext"] is None
+    assert attempt["confirmed_ciphertext"] is None
+    assert manager.get(view.attempt_id, target_owner=second_owner).next_action is None
     await manager.stop()
 
 

@@ -381,6 +381,16 @@ export const api = {
     fetchJSON<AuthMeResponse>("/api/auth/me", undefined, {
       allowUnauthorized: true,
     }),
+  createILinkEnrollment: (deviceId: string) =>
+    fetchJSON<ILinkCreatedEnrollment>("/api/auth/ilink/enrollments", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scene: "internal", device_id: deviceId }),
+    }),
+  getILinkEnrollment: (attemptId: string) =>
+    fetchJSON<ILinkEnrollmentState>(
+      `/api/auth/ilink/enrollments/${encodeURIComponent(attemptId)}`,
+    ),
   changePassword: (current_password: string, new_password: string) =>
     fetchJSON<{ ok: boolean; account: LocalAccount }>("/api/auth/password-change", {
       method: "POST",
@@ -1285,6 +1295,30 @@ export const api = {
  * see Contract Anchor C4 in the plan). The AuthWidget surfaces a
  * truncated ``user_id`` instead.
  */
+export type ILinkEnrollmentStatus =
+  | "creating"
+  | "waiting"
+  | "scanned"
+  | "registering"
+  | "confirmed"
+  | "expired"
+  | "failed"
+  | "conflict";
+
+export interface ILinkCreatedEnrollment {
+  attempt_id: string;
+  qr_content: string;
+  status: ILinkEnrollmentStatus;
+  expires_at: number;
+}
+
+export interface ILinkEnrollmentState {
+  status: ILinkEnrollmentStatus;
+  expires_at: number;
+  next_action: "continue_in_wechat" | "retry" | null;
+  detail?: string;
+}
+
 export interface AuthMeResponse {
   user_id: string;
   email: string;
@@ -1300,6 +1334,9 @@ export interface AuthMeResponse {
   isolation_mode?: string;
   legacy_sessions_imported?: boolean;
   legacy_sessions_message?: string;
+  features?: {
+    weixin_ilink_connect?: boolean;
+  };
 }
 
 export type LocalAccountRole = "admin" | "member";

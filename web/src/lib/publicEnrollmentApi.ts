@@ -1,13 +1,6 @@
-import { HERMES_BASE_PATH } from "./api";
+import { HERMES_BASE_PATH, type ILinkEnrollmentStatus } from "./api";
 
-export type EnrollmentStatus =
-  | "creating"
-  | "waiting"
-  | "scanned"
-  | "registering"
-  | "confirmed"
-  | "expired"
-  | "failed";
+export type EnrollmentStatus = ILinkEnrollmentStatus;
 
 export interface CreatedEnrollment {
   attempt_id: string;

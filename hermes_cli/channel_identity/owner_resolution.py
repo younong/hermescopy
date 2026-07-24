@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hmac
-
 from hermes_cli.dashboard_auth.owner_context import OwnerContext, owner_context_from_registry
 
 from .models import ResolvedChannelOwner
@@ -16,7 +14,8 @@ def resolve_binding(
     binding_id: str,
     allow_pending: bool = False,
 ) -> tuple[OwnerContext, ResolvedChannelOwner]:
-    required_status = "pending" if allow_pending else "active"
+    binding_status = "pending" if allow_pending else "active"
+    owner_statuses = ("pending", "active") if allow_pending else ("active", "active")
     with store.read() as conn:
         row = conn.execute(
             """
@@ -31,9 +30,9 @@ def resolve_binding(
             JOIN owner_bindings o ON o.canonical_user_id=u.canonical_user_id
             JOIN ilink_accounts a ON a.account_id=b.account_id
             WHERE b.binding_id=? AND b.status=? AND e.status='active'
-              AND u.status=? AND a.status=?
+              AND u.status IN (?, ?) AND a.status=?
             """,
-            (binding_id, required_status, required_status, required_status),
+            (binding_id, binding_status, *owner_statuses, binding_status),
         ).fetchone()
     if row is None:
         raise RuntimeError("channel binding is unavailable")
@@ -43,8 +42,6 @@ def resolve_binding(
         canonical_user_id=row["owner_user_id"],
         expected_owner_key=row["owner_key"],
     )
-    if not hmac.compare_digest(owner.owner_user_id, row["canonical_user_id"]):
-        raise RuntimeError("channel owner binding is inconsistent")
     bot_id = store.crypto.decrypt_text(
         row["bot_id_ciphertext"],
         table="ilink_accounts",

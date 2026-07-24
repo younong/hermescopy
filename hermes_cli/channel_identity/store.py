@@ -13,7 +13,7 @@ from hermes_constants import get_hermes_home
 
 from .crypto import ChannelCrypto
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _DB_RELATIVE_PATH = Path("control-plane") / "channel_identities.sqlite3"
 
 _SCHEMA = """
@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS enrollment_attempts (
     qr_key_version INTEGER,
     confirmed_ciphertext BLOB,
     confirmed_key_version INTEGER,
+    target_canonical_user_id TEXT REFERENCES canonical_users(canonical_user_id),
     expires_at REAL NOT NULL,
     next_poll_at REAL NOT NULL,
     consumed_at REAL,
@@ -204,23 +205,47 @@ class ChannelIdentityStore:
     def _initialize(self) -> None:
         with self.connect() as conn:
             conn.executescript(_SCHEMA)
-            row = conn.execute(
-                "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
-            ).fetchone()
-            if row is None:
-                conn.execute(
-                    "INSERT INTO channel_identity_meta(key, value) VALUES ('schema_version', ?)",
-                    (str(SCHEMA_VERSION),),
-                )
-            else:
-                try:
-                    version = int(row["value"])
-                except (TypeError, ValueError) as exc:
-                    raise RuntimeError("channel identity database schema is corrupt") from exc
-                if version != SCHEMA_VERSION:
-                    direction = "newer" if version > SCHEMA_VERSION else "older"
-                    raise RuntimeError(f"channel identity database schema is {direction} than supported")
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
+                ).fetchone()
+                if row is None:
+                    conn.execute(
+                        "INSERT INTO channel_identity_meta(key, value) VALUES ('schema_version', ?)",
+                        (str(SCHEMA_VERSION),),
+                    )
+                else:
+                    try:
+                        version = int(row["value"])
+                    except (TypeError, ValueError) as exc:
+                        raise RuntimeError("channel identity database schema is corrupt") from exc
+                    if version == 1:
+                        self._migrate_v1_to_v2(conn)
+                    elif version != SCHEMA_VERSION:
+                        direction = "newer" if version > SCHEMA_VERSION else "older"
+                        raise RuntimeError(
+                            f"channel identity database schema is {direction} than supported"
+                        )
+                conn.execute("COMMIT")
+            except BaseException:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
         self._validate_referenced_key_versions()
+
+    @staticmethod
+    def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            ALTER TABLE enrollment_attempts
+            ADD COLUMN target_canonical_user_id TEXT
+                REFERENCES canonical_users(canonical_user_id)
+            """
+        )
+        conn.execute(
+            "UPDATE channel_identity_meta SET value='2' WHERE key='schema_version'"
+        )
 
     def _validate_referenced_key_versions(self) -> None:
         encrypted_columns = (

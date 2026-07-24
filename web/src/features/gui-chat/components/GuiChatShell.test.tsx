@@ -16,7 +16,9 @@ import { GuiChatShell } from "./GuiChatShell";
 
 const mocks = vi.hoisted(() => ({
   connectGuiChat: vi.fn(),
+  createILinkEnrollment: vi.fn(),
   getAuthMe: vi.fn(),
+  getILinkEnrollment: vi.fn(),
   logout: vi.fn(),
 }));
 
@@ -24,7 +26,13 @@ vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
   return {
     ...actual,
-    api: { ...actual.api, getAuthMe: mocks.getAuthMe, logout: mocks.logout },
+    api: {
+      ...actual.api,
+      createILinkEnrollment: mocks.createILinkEnrollment,
+      getAuthMe: mocks.getAuthMe,
+      getILinkEnrollment: mocks.getILinkEnrollment,
+      logout: mocks.logout,
+    },
   };
 });
 
@@ -90,9 +98,22 @@ beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
     .IS_REACT_ACT_ENVIRONMENT = true;
   mocks.connectGuiChat.mockReset();
+  mocks.createILinkEnrollment.mockReset();
   mocks.getAuthMe.mockReset();
+  mocks.getILinkEnrollment.mockReset();
   mocks.logout.mockReset();
   mocks.logout.mockResolvedValue(new Response(null, { status: 200 }));
+  mocks.createILinkEnrollment.mockResolvedValue({
+    attempt_id: "enr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    qr_content: "https://example.invalid/qr",
+    status: "waiting",
+    expires_at: 123,
+  });
+  mocks.getILinkEnrollment.mockResolvedValue({
+    status: "confirmed",
+    expires_at: 123,
+    next_action: "continue_in_wechat",
+  });
   window.__HERMES_AUTH_REQUIRED__ = true;
   window.matchMedia = vi.fn().mockImplementation((query: string) => ({
     addEventListener: vi.fn(),
@@ -158,6 +179,37 @@ describe("GuiChatShell", () => {
     expect(document.querySelector("[data-files-pane]")).toBeNull();
     expect(document.querySelector("[data-composer-send]")).not.toBeNull();
     expect(connection.createOrAttach).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows the WeChat action only when the authenticated connector is ready", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue({
+      ...authIdentity(),
+      features: { weixin_ilink_connect: true },
+    });
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(<GuiChatShell />);
+
+    const connect = document.querySelector<HTMLButtonElement>('[aria-label="Connect WeChat"]');
+    expect(connect).not.toBeNull();
+    await act(async () => {
+      connect?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(mocks.createILinkEnrollment).toHaveBeenCalledOnce();
+  });
+
+  it("hides the WeChat action when the connector feature is unavailable", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(<GuiChatShell />);
+
+    expect(document.querySelector('[aria-label="Connect WeChat"]')).toBeNull();
   });
 
   it("logs out from the dedicated workspace", async () => {
@@ -459,6 +511,7 @@ interface AuthIdentity {
   display_name: string;
   email: string;
   expires_at: number;
+  features?: { weixin_ilink_connect?: boolean };
   org_id: string;
   owner_key: string;
   provider: string;

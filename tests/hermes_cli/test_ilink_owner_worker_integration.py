@@ -24,6 +24,8 @@ from hermes_cli.channel_connectors.weixin_ilink.poller import (
 from hermes_cli.channel_connectors.weixin_ilink.sender import OutboundSender, claim_outbound
 from hermes_cli.channel_dispatch import ChannelDispatcher
 from hermes_cli.channel_identity import ChannelCrypto, ChannelIdentityStore, Keyring, resolve_binding
+from hermes_cli.dashboard_auth.base import Session
+from hermes_cli.dashboard_auth.owner_context import ensure_owner_home, owner_context_from_session
 from hermes_cli.deployment_inference import DeploymentInferencePolicy
 from hermes_cli.owner_worker import OwnerWorkerSupervisor
 
@@ -150,10 +152,15 @@ def _inference_server():
         thread.join(timeout=2)
 
 
-async def _wait_for_enrollment(manager: EnrollmentManager, attempt_id: str) -> None:
+async def _wait_for_enrollment(
+    manager: EnrollmentManager,
+    attempt_id: str,
+    *,
+    target_owner=None,
+) -> None:
     deadline = asyncio.get_running_loop().time() + 10
     while asyncio.get_running_loop().time() < deadline:
-        view = manager.get(attempt_id)
+        view = manager.get(attempt_id, target_owner=target_owner)
         if view is not None and view.status == "confirmed":
             return
         if view is not None and view.status in {"failed", "expired"}:
@@ -167,6 +174,7 @@ async def _enroll(
     session: _FakeILinkSession,
     *,
     user_id: str,
+    target_owner=None,
 ) -> tuple[object, object]:
     session.qr_credentials.append(
         ILinkCredentials(
@@ -179,9 +187,14 @@ async def _enroll(
     attempt = await manager.create(
         source=f"source-{user_id}",
         device_id=f"device-{user_id}",
-        scene="join",
+        scene="internal" if target_owner is not None else "join",
+        target_owner=target_owner,
     )
-    await _wait_for_enrollment(manager, attempt.attempt_id)
+    await _wait_for_enrollment(
+        manager,
+        attempt.attempt_id,
+        target_owner=target_owner,
+    )
     with manager.store.read() as conn:
         row = conn.execute(
             """
@@ -252,18 +265,35 @@ async def test_ilink_enrollment_poll_dispatch_send_and_generation_resume(monkeyp
             dispatcher = ChannelDispatcher(store, supervisor, turn_timeout=30)
             sender = OutboundSender(store, ilink, retry_seconds=0)
 
+            dashboard_owner = owner_context_from_session(
+                Session(
+                    user_id="dashboard-user-a",
+                    email="dashboard-user-a@example.test",
+                    display_name="Dashboard User A",
+                    org_id="org-a",
+                    provider="stub",
+                    expires_at=9_999_999_999,
+                    access_token="access",
+                    refresh_token="refresh",
+                )
+            )
+            ensure_owner_home(dashboard_owner)
+            owner_homes_before = set((root / "users").iterdir())
             owner_a, channel_a = await _enroll(
                 enrollments,
                 ilink,
                 user_id="peer-a",
+                target_owner=dashboard_owner,
             )
             owner_b, channel_b = await _enroll(
                 enrollments,
                 ilink,
                 user_id="peer-b",
             )
+            assert owner_a == dashboard_owner
             assert owner_a.owner_key != owner_b.owner_key
             assert owner_a.owner_home != owner_b.owner_home
+            assert set((root / "users").iterdir()) - owner_homes_before == {owner_b.owner_home}
             assert owner_a.owner_home.is_dir()
             assert owner_b.owner_home.is_dir()
 

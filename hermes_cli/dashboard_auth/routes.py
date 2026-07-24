@@ -780,6 +780,12 @@ async def api_auth_me(request: Request):
         "isolation_mode": "owner_worker",
         "legacy_sessions_imported": False,
         "legacy_sessions_message": "Authenticated owner isolation uses a separate owner home; legacy local sessions are not imported automatically.",
+        "features": {
+            "weixin_ilink_connect": bool(
+                getattr(request.app.state, "auth_required", False)
+                and getattr(request.app.state, "weixin_ilink_service", None) is not None
+            ),
+        },
         **owner_public_summary(owner),
     }
     durable = _durable_local_basic(request)

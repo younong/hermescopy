@@ -10,11 +10,14 @@ from dataclasses import dataclass
 
 from gateway.weixin_ilink import QRCodeStatus, WeixinILinkClient
 from hermes_cli.channel_identity.registration import (
+    ChannelIdentityOwnershipConflict,
     activate_weixin_identity,
+    ensure_owner_binding,
     register_weixin_identity,
+    register_weixin_identity_for_owner,
 )
 from hermes_cli.channel_identity.store import ChannelIdentityStore
-from hermes_cli.dashboard_auth.owner_context import ensure_owner_home
+from hermes_cli.dashboard_auth.owner_context import OwnerContext, ensure_owner_home
 from hermes_cli.channel_identity.owner_resolution import resolve_binding
 
 
@@ -53,7 +56,14 @@ class EnrollmentManager:
         self._tasks: set[asyncio.Task] = set()
         self._accepting = True
 
-    async def create(self, *, source: str, device_id: str, scene: str) -> EnrollmentView:
+    async def create(
+        self,
+        *,
+        source: str,
+        device_id: str,
+        scene: str,
+        target_owner: OwnerContext | None = None,
+    ) -> EnrollmentView:
         if not self._accepting:
             raise RuntimeError("enrollment service is stopping")
         if scene not in {"join", "invite", "internal"}:
@@ -65,6 +75,11 @@ class EnrollmentManager:
         source_hash = self.store.crypto.lookup_hash("enrollment-source", source)
         device_hash = self.store.crypto.lookup_hash("enrollment-device", device_id)
         with self.store.write() as conn:
+            target_canonical_user_id = (
+                ensure_owner_binding(self.store, target_owner, conn=conn)
+                if target_owner is not None
+                else None
+            )
             conn.execute(
                 "DELETE FROM enrollment_rate_events WHERE occurred_at < ?",
                 (now - self.rate_window_seconds,),
@@ -90,14 +105,15 @@ class EnrollmentManager:
                 """
                 INSERT INTO enrollment_attempts
                   (attempt_id, status, scene, source_lookup_hash, device_lookup_hash,
-                   expires_at, next_poll_at, created_at, updated_at)
-                VALUES (?, 'creating', ?, ?, ?, ?, ?, ?, ?)
+                   target_canonical_user_id, expires_at, next_poll_at, created_at, updated_at)
+                VALUES (?, 'creating', ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     attempt_id,
                     scene,
                     source_hash,
                     device_hash,
+                    target_canonical_user_id,
                     now + self.ttl_seconds,
                     now,
                     now,
@@ -136,11 +152,39 @@ class EnrollmentManager:
             qr_content=qr.content,
         )
 
-    def get(self, attempt_id: str) -> EnrollmentView | None:
+    def get(
+        self,
+        attempt_id: str,
+        *,
+        target_owner: OwnerContext | None = None,
+    ) -> EnrollmentView | None:
+        target_canonical_user_id = None
+        if target_owner is not None:
+            with self.store.read() as conn:
+                target = conn.execute(
+                    """
+                    SELECT o.canonical_user_id, o.auth_provider, o.tenant_id,
+                           o.owner_user_id, u.status
+                    FROM owner_bindings o
+                    JOIN canonical_users u ON u.canonical_user_id=o.canonical_user_id
+                    WHERE o.owner_key=?
+                    """,
+                    (target_owner.owner_key,),
+                ).fetchone()
+            if target is None or target["status"] != "active" or (
+                target["auth_provider"] != target_owner.auth_provider
+                or target["tenant_id"] != target_owner.tenant_id
+                or target["owner_user_id"] != target_owner.owner_user_id
+            ):
+                return None
+            target_canonical_user_id = target["canonical_user_id"]
         with self.store.read() as conn:
             row = conn.execute(
-                "SELECT status, expires_at FROM enrollment_attempts WHERE attempt_id=?",
-                (attempt_id,),
+                """
+                SELECT status, expires_at FROM enrollment_attempts
+                WHERE attempt_id=? AND target_canonical_user_id IS ?
+                """,
+                (attempt_id, target_canonical_user_id),
             ).fetchone()
         if row is None:
             return None
@@ -149,6 +193,7 @@ class EnrollmentManager:
             "confirmed": "continue_in_wechat",
             "expired": "retry",
             "failed": "retry",
+            "conflict": None,
         }
         return EnrollmentView(
             attempt_id=attempt_id,
@@ -225,22 +270,50 @@ class EnrollmentManager:
         if changed != 1:
             return
         try:
-            registered = register_weixin_identity(
-                self.store,
-                subject=credentials.user_id,
-                bot_id=credentials.bot_id,
-                bot_token=credentials.bot_token,
-                base_url=credentials.base_url,
-                peer_id=credentials.user_id,
-                activate=False,
-            )
+            with self.store.read() as conn:
+                attempt = conn.execute(
+                    "SELECT target_canonical_user_id FROM enrollment_attempts WHERE attempt_id=?",
+                    (attempt_id,),
+                ).fetchone()
+            if attempt is None:
+                return
+            target_canonical_user_id = attempt["target_canonical_user_id"]
+            if target_canonical_user_id is None:
+                registered = register_weixin_identity(
+                    self.store,
+                    subject=credentials.user_id,
+                    bot_id=credentials.bot_id,
+                    bot_token=credentials.bot_token,
+                    base_url=credentials.base_url,
+                    peer_id=credentials.user_id,
+                    activate=False,
+                )
+            else:
+                registered = register_weixin_identity_for_owner(
+                    self.store,
+                    target_canonical_user_id=target_canonical_user_id,
+                    subject=credentials.user_id,
+                    bot_id=credentials.bot_id,
+                    bot_token=credentials.bot_token,
+                    base_url=credentials.base_url,
+                    peer_id=credentials.user_id,
+                    activate=False,
+                )
             owner, _ = resolve_binding(
                 self.store,
                 binding_id=registered.binding_id,
                 allow_pending=True,
             )
+            if (
+                target_canonical_user_id is not None
+                and registered.canonical_user_id != target_canonical_user_id
+            ):
+                raise RuntimeError("pending channel registration changed during provisioning")
             await asyncio.to_thread(ensure_owner_home, owner)
             activate_weixin_identity(self.store, registered=registered)
+        except ChannelIdentityOwnershipConflict:
+            self._set_terminal(attempt_id, "conflict")
+            return
         except Exception:
             self._set_terminal(attempt_id, "failed")
             raise
@@ -271,7 +344,7 @@ class EnrollmentManager:
                 """
                 UPDATE enrollment_attempts SET status=?, qr_ciphertext=NULL, qr_key_version=NULL,
                     confirmed_ciphertext=NULL, confirmed_key_version=NULL, updated_at=?
-                WHERE attempt_id=? AND status NOT IN ('confirmed','expired','failed')
+                WHERE attempt_id=? AND status NOT IN ('confirmed','expired','failed','conflict')
                 """,
                 (status, time.time(), attempt_id),
             )

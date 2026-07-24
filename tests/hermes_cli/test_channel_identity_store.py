@@ -11,15 +11,35 @@ import pytest
 
 from hermes_cli.channel_identity import (
     ChannelCrypto,
+    ChannelIdentityOwnershipConflict,
     ChannelIdentityStore,
     Keyring,
+    ensure_owner_binding,
     register_weixin_identity,
+    register_weixin_identity_for_owner,
     resolve_binding,
 )
+from hermes_cli.dashboard_auth.base import Session
+from hermes_cli.dashboard_auth.owner_context import owner_context_from_session
 
 
 def _keys(byte: int) -> dict[str, str]:
     return {"1": base64.b64encode(bytes([byte]) * 32).decode("ascii")}
+
+
+def _owner(*, user_id: str = "dashboard-user"):
+    return owner_context_from_session(
+        Session(
+            user_id=user_id,
+            email=f"{user_id}@example.com",
+            display_name=user_id,
+            org_id="org-a",
+            provider="stub",
+            expires_at=9_999_999_999,
+            access_token="access",
+            refresh_token="refresh",
+        )
+    )
 
 
 @pytest.fixture
@@ -89,6 +109,58 @@ def test_store_rejects_symlink_database(tmp_path, crypto):
         ChannelIdentityStore(crypto, path=parent / "channel_identities.sqlite3")
 
 
+def test_store_migrates_v1_attempts_to_owner_target_schema(tmp_path, crypto, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_OWNER_SECRET", "owner-secret")
+    path = tmp_path / "control-plane" / "channel_identities.sqlite3"
+    first = ChannelIdentityStore(crypto, path=path)
+    with first.write() as conn:
+        conn.execute("UPDATE channel_identity_meta SET value='1' WHERE key='schema_version'")
+        conn.execute(
+            """
+            INSERT INTO enrollment_attempts
+              (attempt_id, status, scene, source_lookup_hash, device_lookup_hash,
+               expires_at, next_poll_at, created_at, updated_at)
+            VALUES ('enr_existing', 'waiting', 'join', 'source', 'device', 10, 0, 1, 1)
+            """
+        )
+        conn.execute("ALTER TABLE enrollment_attempts RENAME TO enrollment_attempts_v2")
+        conn.execute(
+            """
+            CREATE TABLE enrollment_attempts (
+                attempt_id TEXT PRIMARY KEY, status TEXT NOT NULL, scene TEXT NOT NULL,
+                source_lookup_hash TEXT NOT NULL, device_lookup_hash TEXT NOT NULL,
+                qr_ciphertext BLOB, qr_key_version INTEGER, confirmed_ciphertext BLOB,
+                confirmed_key_version INTEGER, expires_at REAL NOT NULL,
+                next_poll_at REAL NOT NULL, consumed_at REAL, created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO enrollment_attempts
+            SELECT attempt_id, status, scene, source_lookup_hash, device_lookup_hash,
+                   qr_ciphertext, qr_key_version, confirmed_ciphertext,
+                   confirmed_key_version, expires_at, next_poll_at, consumed_at,
+                   created_at, updated_at
+            FROM enrollment_attempts_v2
+            """
+        )
+        conn.execute("DROP TABLE enrollment_attempts_v2")
+
+    migrated = ChannelIdentityStore(crypto, path=path)
+
+    with migrated.read() as conn:
+        assert conn.execute(
+            "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
+        ).fetchone()["value"] == "2"
+        row = conn.execute(
+            "SELECT target_canonical_user_id FROM enrollment_attempts WHERE attempt_id='enr_existing'"
+        ).fetchone()
+    assert row["target_canonical_user_id"] is None
+
+
 def test_store_rejects_unknown_newer_schema(tmp_path, crypto):
     path = tmp_path / "control-plane" / "channel_identities.sqlite3"
     first = ChannelIdentityStore(crypto, path=path)
@@ -99,6 +171,92 @@ def test_store_rejects_unknown_newer_schema(tmp_path, crypto):
 
     with pytest.raises(RuntimeError, match="newer"):
         ChannelIdentityStore(crypto, path=path)
+
+
+def test_dashboard_owner_binding_uses_random_registry_identity(store):
+    dashboard_owner = _owner()
+
+    canonical_user_id = ensure_owner_binding(store, dashboard_owner)
+    again = ensure_owner_binding(store, dashboard_owner)
+
+    assert canonical_user_id == again
+    assert canonical_user_id.startswith("cu_")
+    assert canonical_user_id != dashboard_owner.owner_user_id
+    with store.read() as conn:
+        row = conn.execute(
+            "SELECT * FROM owner_bindings WHERE canonical_user_id=?",
+            (canonical_user_id,),
+        ).fetchone()
+    assert row["auth_provider"] == dashboard_owner.auth_provider
+    assert row["tenant_id"] == dashboard_owner.tenant_id
+    assert row["owner_user_id"] == dashboard_owner.owner_user_id
+    assert row["owner_key"] == dashboard_owner.owner_key
+
+
+def test_owner_linked_registration_resolves_dashboard_owner_and_rotates_credentials(store):
+    dashboard_owner = _owner()
+    target = ensure_owner_binding(store, dashboard_owner)
+
+    first = register_weixin_identity_for_owner(
+        store,
+        target_canonical_user_id=target,
+        subject="subject-a",
+        bot_id="bot-a",
+        bot_token="token-one",
+        base_url="https://ilink.example/",
+        peer_id="subject-a",
+    )
+    second = register_weixin_identity_for_owner(
+        store,
+        target_canonical_user_id=target,
+        subject="subject-a",
+        bot_id="bot-a",
+        bot_token="token-two",
+        base_url="https://ilink.example/",
+        peer_id="subject-a",
+    )
+
+    assert first.created is True
+    assert second.created is False
+    assert second.canonical_user_id == target
+    assert second.owner_key == dashboard_owner.owner_key
+    owner, resolved = resolve_binding(store, binding_id=first.binding_id)
+    assert owner == dashboard_owner
+    assert resolved.bot_token == "token-two"
+    assert resolved.credential_version == 2
+
+
+def test_owner_linked_registration_conflict_does_not_rotate_credentials(store):
+    first_owner = _owner(user_id="owner-a")
+    second_owner = _owner(user_id="owner-b")
+    first_target = ensure_owner_binding(store, first_owner)
+    second_target = ensure_owner_binding(store, second_owner)
+    registered = register_weixin_identity_for_owner(
+        store,
+        target_canonical_user_id=first_target,
+        subject="subject-a",
+        bot_id="bot-a",
+        bot_token="token-one",
+        base_url="https://ilink.example/",
+        peer_id="subject-a",
+    )
+
+    with pytest.raises(ChannelIdentityOwnershipConflict):
+        register_weixin_identity_for_owner(
+            store,
+            target_canonical_user_id=second_target,
+            subject="subject-a",
+            bot_id="bot-a",
+            bot_token="token-attacker",
+            base_url="https://attacker.example/",
+            peer_id="subject-a",
+        )
+
+    owner, resolved = resolve_binding(store, binding_id=registered.binding_id)
+    assert owner.owner_key == first_owner.owner_key
+    assert resolved.bot_token == "token-one"
+    assert resolved.account_base_url == "https://ilink.example"
+    assert resolved.credential_version == 1
 
 
 def test_repeated_registration_restores_same_owner_and_rotates_credentials(store):
