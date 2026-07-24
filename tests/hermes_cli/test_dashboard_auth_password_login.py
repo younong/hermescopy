@@ -449,19 +449,57 @@ class TestPasswordOnlyLoginNavigation:
 
 
 class TestLoginPageRender:
-    def test_password_provider_renders_credential_form_and_script(self):
+    def test_password_provider_renders_accessible_toggle_and_script(self):
         clear_providers()
         register_provider(PasswordProvider())
         try:
             html = render_login_html(next_path="/sessions")
             assert '<form class="provider-form" data-provider="testpw"' in html
-            assert 'name="username"' in html
-            assert 'name="password"' in html
+            assert 'label class="field-label" for="login-username-0"' in html
+            assert 'id="login-username-0" type="text" name="username"' in html
+            assert 'label class="field-label" for="login-password-0"' in html
+            assert 'id="login-password-0" type="password" name="password"' in html
+            assert 'class="password-input-wrap"' in html
+            assert 'class="password-toggle" type="button"' in html
+            assert 'aria-label="Show password" title="Show password"' in html
+            assert 'aria-pressed="false" aria-controls="login-password-0"' in html
+            assert 'class="toggle-icon-show" aria-hidden="true" focusable="false"' in html
+            assert 'class="toggle-icon-hide" aria-hidden="true" focusable="false"' in html
             assert 'value="/sessions"' in html
+
             assert "<script>" in html
+            assert "form.querySelector('input[name=password]')" in html
+            assert "form.querySelector('.password-toggle')" in html
+            assert "passwordInput.type === 'password'" in html
+            assert "passwordInput.type = reveal ? 'text' : 'password';" in html
+            assert "var label = reveal ? 'Hide password' : 'Show password';" in html
+            assert "passwordToggle.setAttribute('aria-pressed'" in html
+            assert "showIcon.setAttribute('hidden', '')" in html
+            assert "hideIcon.removeAttribute('hidden')" in html
             assert "var loginPrefix = window.location.pathname.replace(/\\/login$/, '') || '';" in html
             assert "fetch(loginPrefix + '/auth/password-login'" in html
             assert "window.location.assign(loginPrefix + target);" in html
+        finally:
+            clear_providers()
+
+    def test_multiple_password_providers_get_distinct_control_ids(self):
+        class BackupPasswordProvider(PasswordProvider):
+            name = "backuppw"
+            display_name = "Backup Password"
+
+        clear_providers()
+        register_provider(PasswordProvider())
+        register_provider(BackupPasswordProvider())
+        try:
+            html = render_login_html()
+            assert html.count('<form class="provider-form"') == 2
+            assert html.count('id="login-username-0"') == 1
+            assert html.count('id="login-username-1"') == 1
+            assert html.count('id="login-password-0"') == 1
+            assert html.count('id="login-password-1"') == 1
+            assert html.count('aria-controls="login-password-0"') == 1
+            assert html.count('aria-controls="login-password-1"') == 1
+            assert "document.querySelectorAll('form.provider-form')" in html
         finally:
             clear_providers()
 
@@ -472,10 +510,10 @@ class TestLoginPageRender:
             html = render_login_html()
             assert "provider-btn" in html
             assert "<script>" not in html
-            # No password FORM element rendered (the .provider-form CSS
-            # rule lives in the template's <style> block unconditionally;
-            # what must be absent is an actual rendered form + its script).
+            # No password form or toggle is rendered. Their CSS rules remain in
+            # the shared template, but OAuth-only pages stay script-free.
             assert '<form class="provider-form"' not in html
+            assert '<button class="password-toggle"' not in html
             assert "/auth/password-login" not in html
         finally:
             clear_providers()
@@ -486,9 +524,11 @@ class TestLoginPageRender:
         register_provider(PasswordProvider())
         try:
             html = render_login_html()
-            # OAuth redirect button AND a password form, both present.
+            # OAuth redirect button AND a password form, both present. Provider
+            # order also makes the password form's safe numeric suffix 1.
             assert "/auth/login?provider=stub" in html
             assert 'data-provider="testpw"' in html
+            assert 'id="login-password-1"' in html
             assert "<script>" in html
         finally:
             clear_providers()
