@@ -7,12 +7,18 @@ helpers with an already-open owner/profile-local ``SessionDB``.
 """
 from __future__ import annotations
 
+import logging
 import re
 import time
 from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException
+
+from hermes_cli.latency_trace import log_latency_stage
+
+
+_log = logging.getLogger(__name__)
 
 
 def list_sessions_payload(
@@ -28,6 +34,8 @@ def list_sessions_payload(
     cwd_prefix: str | None = None,
     profile_name: str | None = None,
     recovery_scope: dict[str, Any] | None = None,
+    compact: bool = False,
+    latency_trace_id: str = "",
 ) -> dict[str, Any]:
     if archived not in ("exclude", "only", "include"):
         raise HTTPException(status_code=400, detail="archived must be one of: exclude, only, include")
@@ -37,6 +45,7 @@ def list_sessions_payload(
     min_message_count = max(0, min_messages)
     archived_only = archived == "only"
     include_archived = archived == "include"
+    stage_started_at = time.monotonic()
     sessions = db.list_sessions_rich(
         source=source or None,
         exclude_sources=exclude_list or None,
@@ -49,6 +58,14 @@ def list_sessions_payload(
         order_by_last_active=order == "recent",
         recovery_scope=recovery_scope,
     )
+    log_latency_stage(
+        _log,
+        trace_id=latency_trace_id,
+        surface="session-list",
+        stage="sessions.queried",
+        started_at=stage_started_at,
+    )
+    stage_started_at = time.monotonic()
     total = db.session_count(
         source=source or None,
         cwd_prefix=(cwd_prefix or None),
@@ -59,24 +76,40 @@ def list_sessions_payload(
         exclude_children=True,
         recovery_scope=recovery_scope,
     )
+    log_latency_stage(
+        _log,
+        trace_id=latency_trace_id,
+        surface="session-list",
+        stage="sessions.counted",
+        started_at=stage_started_at,
+    )
     now = time.time()
+    stage_started_at = time.monotonic()
     for session in sessions:
         session["is_active"] = (
             session.get("ended_at") is None
             and (now - session.get("last_active", session.get("started_at", 0))) < 300
         )
-        try:
-            session["message_count"] = db.display_message_count(
-                session["id"],
-                include_ancestors=True,
-                recovery_scope=recovery_scope,
-            )
-        except (AttributeError, TypeError):
-            pass
+        if not compact:
+            try:
+                session["message_count"] = db.display_message_count(
+                    session["id"],
+                    include_ancestors=True,
+                    recovery_scope=recovery_scope,
+                )
+            except (AttributeError, TypeError):
+                pass
         session["archived"] = bool(session.get("archived"))
         if profile_name:
             session["profile"] = profile_name
             session["is_default_profile"] = profile_name == "default"
+    log_latency_stage(
+        _log,
+        trace_id=latency_trace_id,
+        surface="session-list",
+        stage="sessions.enriched" if not compact else "sessions.compact",
+        started_at=stage_started_at,
+    )
     return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
 
 

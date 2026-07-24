@@ -79,6 +79,7 @@ describe("ChatSessionList", () => {
     expect(container.querySelector('[aria-current="true"]')?.textContent).toContain("UI exploration");
     expect(container.querySelector('[aria-current="true"]')?.className).toContain("bg-white");
     expect(onActiveSessionChange).toHaveBeenLastCalledWith({ id: "beta", label: "UI exploration" });
+    expect(mocks.getSessions).toHaveBeenCalledWith(30, 0, "", "recent", true);
   });
 
   it("opens selected sessions on an optional destination route", async () => {
@@ -137,6 +138,7 @@ describe("ChatSessionList", () => {
     expect(container.textContent).toContain("Sessions");
     expect(container.textContent).toContain("New chat");
     expect(container.textContent).toContain("3 msgs");
+    expect(mocks.getSessions).toHaveBeenCalledWith(30, 0, "", "recent", false);
   });
 });
 

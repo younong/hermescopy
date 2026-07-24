@@ -835,6 +835,7 @@ def create_app(
 
     @app.get("/api/sessions")
     def get_sessions(
+        request: Request,
         limit: int = 20,
         offset: int = 0,
         min_messages: int = 0,
@@ -844,6 +845,7 @@ def create_app(
         exclude_sources: str | None = None,
         cwd_prefix: str | None = None,
         profile: str | None = None,
+        compact: bool = False,
         _: None = Depends(_require_owner_token),
     ) -> dict[str, Any]:
         _reject_profile(profile)
@@ -863,6 +865,8 @@ def create_app(
                 exclude_sources=exclude_sources,
                 cwd_prefix=cwd_prefix,
                 recovery_scope=(scope if socket_path is not None and scope is not None else None),
+                compact=compact,
+                latency_trace_id=request.headers.get("x-request-id", ""),
             )
         finally:
             db.close()
