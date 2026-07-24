@@ -2,7 +2,6 @@
 
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -18,15 +17,14 @@ import { GuiChatShell } from "./GuiChatShell";
 const mocks = vi.hoisted(() => ({
   connectGuiChat: vi.fn(),
   getAuthMe: vi.fn(),
-  setEnd: vi.fn(),
-  setTitle: vi.fn(),
+  logout: vi.fn(),
 }));
 
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
   return {
     ...actual,
-    api: { ...actual.api, getAuthMe: mocks.getAuthMe },
+    api: { ...actual.api, getAuthMe: mocks.getAuthMe, logout: mocks.logout },
   };
 });
 
@@ -36,10 +34,6 @@ vi.mock("../api", () => ({
 
 vi.mock("../mock", () => ({
   connectMockGuiChat: vi.fn(),
-}));
-
-vi.mock("@/contexts/usePageHeader", () => ({
-  usePageHeader: () => ({ setEnd: mocks.setEnd, setTitle: mocks.setTitle }),
 }));
 
 vi.mock("@/contexts/useProfileScope", () => ({
@@ -77,7 +71,6 @@ vi.mock("./MessageList", () => ({
   MessageList: (props: Record<string, unknown>) => (
     <button
       data-clarify-answer
-      data-terminal-hint={String(props.showTerminalChatHint)}
       onClick={() =>
         (props.onClarifyRespond as (...args: unknown[]) => unknown)("clarify-1", "A")
       }
@@ -94,8 +87,8 @@ beforeEach(() => {
     .IS_REACT_ACT_ENVIRONMENT = true;
   mocks.connectGuiChat.mockReset();
   mocks.getAuthMe.mockReset();
-  mocks.setEnd.mockReset();
-  mocks.setTitle.mockReset();
+  mocks.logout.mockReset();
+  mocks.logout.mockResolvedValue(new Response(null, { status: 200 }));
   window.__HERMES_AUTH_REQUIRED__ = true;
   window.matchMedia = vi.fn().mockImplementation((query: string) => ({
     addEventListener: vi.fn(),
@@ -117,37 +110,31 @@ afterEach(async () => {
 });
 
 describe("GuiChatShell", () => {
-  it("keeps terminal chat in the default dashboard header", async () => {
+  it("renders the dedicated workspace navigation", async () => {
     const connection = createConnection();
     mocks.getAuthMe.mockResolvedValue(authIdentity());
     mocks.connectGuiChat.mockReturnValue(connection);
 
     await renderShell(<GuiChatShell />);
 
-    expect(latestHeaderMarkup()).toContain("Terminal Chat");
-    expect(document.querySelector("[data-terminal-hint]")?.getAttribute("data-terminal-hint")).toBe(
-      "true",
-    );
+    expect(document.querySelector("[data-gui-chat]")).not.toBeNull();
+    expect(document.body.textContent).toContain("Terminal chat");
+    expect(document.querySelector('aside[aria-label="Chat workspace"]')).not.toBeNull();
+    expect(document.querySelector('[aria-label="Log out"]')).not.toBeNull();
   });
 
-  it("hides terminal chat and includes custom actions in standalone mode", async () => {
+  it("logs out from the dedicated workspace", async () => {
     const connection = createConnection();
     mocks.getAuthMe.mockResolvedValue(authIdentity());
     mocks.connectGuiChat.mockReturnValue(connection);
 
-    await renderShell(
-      <GuiChatShell
-        headerActions={<button type="button">Log out</button>}
-        showTerminalChatAction={false}
-      />,
-    );
+    await renderShell(<GuiChatShell />);
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[aria-label="Log out"]')?.click();
+      await Promise.resolve();
+    });
 
-    const header = latestHeaderMarkup();
-    expect(header).not.toContain("Terminal Chat");
-    expect(header).toContain("Log out");
-    expect(document.querySelector("[data-terminal-hint]")?.getAttribute("data-terminal-hint")).toBe(
-      "false",
-    );
+    expect(mocks.logout).toHaveBeenCalledOnce();
   });
 
   it("connects automatically when the authenticated owner becomes ready", async () => {
@@ -190,6 +177,8 @@ describe("GuiChatShell", () => {
     ]);
     expect(document.querySelector("[data-ready]")?.outerHTML).toContain('data-ready="true"');
     expect(firstConnection.close).toHaveBeenCalledOnce();
+    expect(document.querySelector("[data-gui-chat]")).not.toBeNull();
+    expect(document.querySelector('aside[aria-label="Chat workspace"]')).not.toBeNull();
     expect(document.body.textContent).toContain("idle");
     expect(connection.createOrAttach).toHaveBeenCalledOnce();
     expect(connection.createOrAttach).toHaveBeenCalledWith(
@@ -367,11 +356,6 @@ async function renderShell(shell: ReactNode) {
     await Promise.resolve();
     await Promise.resolve();
   });
-}
-
-function latestHeaderMarkup(): string {
-  const calls = mocks.setEnd.mock.calls.filter(([value]) => value !== null);
-  return renderToStaticMarkup(calls.at(-1)?.[0] ?? null);
 }
 
 function ReadyProbe() {

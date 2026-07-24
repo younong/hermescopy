@@ -188,6 +188,174 @@ code { font-size: 0.875rem; }
 }
 
 
+/* Dedicated light workspace for the full-screen GUI chat route. */
+[data-gui-chat] {
+  --background-base: #ffffff;
+  --background-alt: #f5f6f7;
+  --foreground: #202124;
+  --midground: #202124;
+  --text-primary: #202124;
+  --text-secondary: #6f747c;
+  --text-tertiary: #969aa1;
+  --destructive: #b42318;
+  color-scheme: light;
+  font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+[data-gui-chat] .gui-chat-sidebar {
+  display: flex;
+  width: 15.5rem;
+  min-width: 15.5rem;
+  min-height: 0;
+  flex-direction: column;
+  border-right: 1px solid #e3e4e6;
+  background: #f4f5f6;
+  color: #3d4148;
+}
+
+[data-gui-chat] .gui-chat-search {
+  display: flex;
+  height: 2rem;
+  align-items: center;
+  gap: 0.45rem;
+  border: 1px solid #dedfe2;
+  border-radius: 0.55rem;
+  background: #fff;
+  padding: 0 0.65rem;
+  color: #969aa1;
+}
+
+[data-gui-chat] .gui-chat-search input {
+  min-width: 0;
+  width: 100%;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: #34383e;
+  font-size: 0.75rem;
+}
+
+[data-gui-chat] .gui-chat-nav-item,
+[data-gui-chat] .gui-chat-account {
+  display: flex;
+  width: 100%;
+  min-height: 2rem;
+  align-items: center;
+  gap: 0.6rem;
+  border-radius: 0.5rem;
+  padding: 0.4rem 0.625rem;
+  color: #555b64;
+  font-size: 0.75rem;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+[data-gui-chat] .gui-chat-nav-item:hover,
+[data-gui-chat] .gui-chat-account:hover {
+  background: #e9eaec;
+  color: #202124;
+}
+
+[data-gui-chat] .gui-chat-nav-item svg {
+  width: 0.875rem;
+  height: 0.875rem;
+  flex: none;
+}
+
+[data-gui-chat] .gui-chat-account-row {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+[data-gui-chat] .gui-chat-account {
+  min-width: 0;
+  min-height: 2.25rem;
+}
+
+[data-gui-chat] .gui-chat-logout {
+  display: grid;
+  width: 2rem;
+  height: 2rem;
+  flex: none;
+  place-items: center;
+  border-radius: 0.5rem;
+  color: #8a8e95;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+[data-gui-chat] .gui-chat-logout:hover {
+  background: #e9eaec;
+  color: #202124;
+}
+
+[data-gui-chat] .gui-chat-logout svg {
+  width: 0.875rem;
+  height: 0.875rem;
+}
+
+[data-gui-chat] .gui-chat-avatar {
+  display: grid;
+  width: 1.45rem;
+  height: 1.45rem;
+  flex: none;
+  place-items: center;
+  border-radius: 999px;
+  background: #dfe2e6;
+  color: #4f555d;
+  font-size: 0.6875rem;
+  font-weight: 600;
+}
+
+[data-gui-chat] .gui-chat-icon-button {
+  display: inline-flex;
+  width: 2rem;
+  height: 2rem;
+  align-items: center;
+  justify-content: center;
+  border-radius: 0.5rem;
+  color: #737880;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+[data-gui-chat] .gui-chat-icon-button:hover {
+  background: #f0f1f2;
+  color: #25282d;
+}
+
+[data-gui-chat] .gui-chat-notice {
+  display: flex;
+  flex: none;
+  align-items: flex-start;
+  gap: 0.5rem;
+  border-bottom: 1px solid #e5e7ea;
+  background: #f8f9fa;
+  padding: 0.5rem 1rem;
+  color: #676c74;
+  font-size: 0.75rem;
+}
+
+[data-gui-chat] .gui-chat-notice svg {
+  width: 0.875rem;
+  height: 0.875rem;
+  flex: none;
+  margin-top: 0.1rem;
+}
+
+[data-gui-chat] .gui-chat-notice-error {
+  background: #fff6f5;
+  color: #b42318;
+}
+
+[data-gui-chat] .markdown-body,
+[data-gui-chat] [data-streamdown] {
+  color: #282b30;
+  line-height: 1.75;
+}
+
+[data-gui-chat] pre {
+  border-radius: 0.75rem;
+}
+
 /* Collapsed sidebar tooltip entrance — skipped when moving between items. */
 @keyframes sidebar-tooltip-in {
   from { opacity: 0; transform: translateY(-50%) translateX(-4px); }

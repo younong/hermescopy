@@ -120,15 +120,15 @@ describe("Composer attachment transfers", () => {
       valueSetter?.call(textarea, "Use the default");
       textarea.dispatchEvent(new Event("input", { bubbles: true }));
     });
-    const sendButton = Array.from(container.querySelectorAll("button")).find(
-      (button) => button.textContent?.includes("Send"),
+    const sendButton = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Send message"]',
     );
-    expect(sendButton).toBeDefined();
+    expect(sendButton).not.toBeNull();
     await dispatch(sendButton ?? null, new MouseEvent("click", { bubbles: true, cancelable: true }));
 
     expect(onSend).toHaveBeenCalledOnce();
     expect(onSend.mock.calls[0]?.[0]).toBe("Use the default");
-    expect(container.textContent).toContain("Stop");
+    expect(container.querySelector('button[aria-label="Stop generating"]')).not.toBeNull();
   });
 
   it("does not accept new drops while a message is submitting", async () => {
@@ -146,10 +146,10 @@ describe("Composer attachment transfers", () => {
       transferEvent("drop", transfer([new File(["first"], "first.txt", { type: "text/plain" })])),
     );
 
-    const sendButton = Array.from(container.querySelectorAll("button")).find((button) =>
-      button.textContent?.includes("Send"),
+    const sendButton = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Send message"]',
     );
-    await dispatch(sendButton ?? null, new MouseEvent("click", { bubbles: true, cancelable: true }));
+    await dispatch(sendButton, new MouseEvent("click", { bubbles: true, cancelable: true }));
     expect(onSend).toHaveBeenCalledOnce();
 
     const blockedDrop = transferEvent(

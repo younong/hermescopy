@@ -1,21 +1,25 @@
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useReducer,
-  useRef,
-  useState,
-  type ReactNode,
-} from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Button } from "@nous-research/ui/ui/components/button";
-import { AlertCircle, PanelRight, RefreshCw, Terminal, X } from "lucide-react";
+import {
+  AlertCircle,
+  CircleHelp,
+  FolderOpen,
+  LogOut,
+  Menu,
+  MessageSquarePlus,
+  RefreshCw,
+  Search,
+  Settings2,
+  Sparkles,
+  Terminal,
+  X,
+} from "lucide-react";
 import { ChatSessionList } from "@/components/ChatSessionList";
-import { usePageHeader } from "@/contexts/usePageHeader";
 import { useProfileScope } from "@/contexts/useProfileScope";
 import { useI18n } from "@/i18n";
+import { api } from "@/lib/api";
 import { JsonRpcGatewayError, type GatewayEvent } from "@/lib/gatewayClient";
 import { emitChatDiagnostic } from "@/lib/chatDiagnostics";
 import { dashboardAuthTransition } from "@/lib/dashboardAuthTransition";
@@ -37,18 +41,9 @@ import {
 import { Composer } from "./Composer";
 import { MessageList } from "./MessageList";
 
-interface GuiChatShellProps {
-  headerActions?: ReactNode;
-  showTerminalChatAction?: boolean;
-}
-
-export function GuiChatShell({
-  headerActions,
-  showTerminalChatAction = true,
-}: GuiChatShellProps = {}) {
+export function GuiChatShell() {
   const { t } = useI18n();
   const navigate = useNavigate();
-  const { setEnd, setTitle } = usePageHeader();
   const { profile } = useProfileScope();
   const [searchParams, setSearchParams] = useSearchParams();
   const resumeSessionId = searchParams.get("resume");
@@ -78,7 +73,9 @@ export function GuiChatShell({
   const [resumeNotice, setResumeNotice] = useState<string | null>(null);
   const [sendScrollNonce, setSendScrollNonce] = useState(0);
   const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false);
-  const { ownerKey, ready: authIdentityReady } = useDashboardAuthIdentity();
+  const [sessionQuery, setSessionQuery] = useState("");
+  const [activeSessionTitle, setActiveSessionTitle] = useState<string | null>(null);
+  const { authMe, authRequired, ownerKey, ready: authIdentityReady } = useDashboardAuthIdentity();
   const stateRef = useRef(state);
   const resumeSessionIdRef = useRef(resumeSessionId);
   const setSearchParamsRef = useRef(setSearchParams);
@@ -105,6 +102,11 @@ export function GuiChatShell({
   const terminalResumeId = state.storedSessionId ?? resumeSessionId;
   const forceBottomKey = `${activeSessionId ?? "new"}:${sendScrollNonce}`;
   const closeMobilePanel = useCallback(() => setMobilePanelOpenRaw(false), []);
+  const handleActiveSessionChange = useCallback(
+    (session: { id: string; label: string } | null) =>
+      setActiveSessionTitle(session?.label ?? null),
+    [],
+  );
   const startSessionSwitchTrace = useCallback((_sessionId: string) => {
     reconnectLifecycleRef.current?.cancelRecovery();
     latencyTraceRef.current?.mark("switch.superseded", "cancelled");
@@ -340,67 +342,10 @@ export function GuiChatShell({
     return () => mql.removeEventListener("change", onChange);
   }, []);
 
-  useEffect(() => {
-    setTitle("Chat GUI (beta)");
-    setEnd(
-      <div className="flex items-center gap-2">
-        {narrow ? (
-          <Button
-            ghost
-            size="sm"
-            onClick={() => setMobilePanelOpenRaw(true)}
-            aria-expanded={mobilePanelOpen}
-            aria-controls="gui-chat-session-panel"
-          >
-            <PanelRight className="h-4 w-4" />
-            Sessions
-          </Button>
-        ) : null}
-        {showTerminalChatAction ? (
-          <Button
-            ghost
-            size="sm"
-            onClick={() =>
-              navigate(
-                terminalResumeId
-                  ? `/chat?resume=${encodeURIComponent(terminalResumeId)}`
-                  : "/chat",
-              )
-            }
-          >
-            <Terminal className="h-4 w-4" />
-            Terminal Chat
-          </Button>
-        ) : null}
-        {headerActions}
-      </div>,
-    );
-    return () => {
-      setTitle(null);
-      setEnd(null);
-    };
-  }, [
-    headerActions,
-    mobilePanelOpen,
-    narrow,
-    navigate,
-    setEnd,
-    setTitle,
-    showTerminalChatAction,
-    terminalResumeId,
-  ]);
-
   const disabled = state.connection !== "open" || !state.sessionId;
   const hasPendingClarification = state.clarificationOrder.some((id) =>
     ["pending", "submitting"].includes(state.clarifications[id]?.status ?? ""),
   );
-  const statusTone = useMemo(() => {
-    if (state.connection === "open") return "success";
-    if (state.connection === "error") return "destructive";
-    if (state.connection === "connecting") return "warning";
-    return "secondary";
-  }, [state.connection]);
-
   const send = useCallback(
     async (
       text: string,
@@ -582,11 +527,86 @@ export function GuiChatShell({
   const sessionPanel = (
     <ChatSessionList
       activeSessionId={activeSessionId}
-      profile={profile}
+      onActiveSessionChange={handleActiveSessionChange}
+      onNewChat={startNewGuiChat}
       onPicked={closeMobilePanel}
       onSessionPick={startSessionSwitchTrace}
-      onNewChat={startNewGuiChat}
+      profile={profile}
+      query={sessionQuery}
+      variant="compact"
     />
+  );
+  const conversationTitle = activeSessionTitle ?? (activeSessionId ? "Conversation" : "New chat");
+  const accountLabel = authMe?.display_name || authMe?.email || "Hermes workspace";
+  const handleLogout = () => {
+    dashboardAuthTransition.reset();
+    void api.logout();
+  };
+  const goToTerminal = () =>
+    navigate(
+      terminalResumeId
+        ? `/chat?resume=${encodeURIComponent(terminalResumeId)}`
+        : "/chat",
+    );
+  const sidebar = (
+    <>
+      <div className="px-3 pb-2 pt-3">
+        <div className="gui-chat-search">
+          <Search aria-hidden className="h-3.5 w-3.5 shrink-0" />
+          <input
+            aria-label="Search conversations"
+            onChange={(event) => setSessionQuery(event.target.value)}
+            placeholder="Search"
+            value={sessionQuery}
+          />
+        </div>
+      </div>
+      <nav aria-label="Chat navigation" className="space-y-0.5 px-2">
+        <button className="gui-chat-nav-item" onClick={startNewGuiChat} type="button">
+          <MessageSquarePlus />
+          <span>New chat</span>
+        </button>
+        <button className="gui-chat-nav-item" onClick={goToTerminal} type="button">
+          <Terminal />
+          <span>Terminal chat</span>
+        </button>
+        <button className="gui-chat-nav-item" onClick={() => navigate("/files")} type="button">
+          <FolderOpen />
+          <span>Files</span>
+        </button>
+        <button className="gui-chat-nav-item" onClick={() => navigate("/skills")} type="button">
+          <Sparkles />
+          <span>Skills</span>
+        </button>
+      </nav>
+      <div className="mt-3 flex min-h-0 flex-1 flex-col px-2">
+        <div className="flex items-center justify-between px-2 pb-1.5 text-[0.6875rem] font-medium text-[#82868d]">
+          <span>Recent chats</span>
+          <button aria-label={t.common.refresh} className="gui-chat-icon-button" onClick={retryConnection} type="button">
+            <RefreshCw className={cn("h-3.5 w-3.5", state.connection === "connecting" && "animate-spin")} />
+          </button>
+        </div>
+        <div className="min-h-0 flex-1 overflow-hidden">{sessionPanel}</div>
+      </div>
+      <div className="border-t border-[#e2e3e5] px-2 py-2">
+        <div className="gui-chat-account-row">
+          <button className="gui-chat-account" onClick={() => navigate("/system")} type="button">
+            <span className="gui-chat-avatar">{accountLabel.trim().charAt(0).toUpperCase() || "H"}</span>
+            <span className="min-w-0 flex-1 truncate text-left">{accountLabel}</span>
+            <Settings2 className="h-3.5 w-3.5 text-[#8a8e95]" />
+          </button>
+          {authRequired && authMe ? (
+            <button aria-label="Log out" className="gui-chat-logout" onClick={handleLogout} title="Log out" type="button">
+              <LogOut />
+            </button>
+          ) : null}
+        </div>
+        <button className="gui-chat-nav-item mt-0.5" onClick={() => navigate("/docs")} type="button">
+          <CircleHelp />
+          <span>Help</span>
+        </button>
+      </div>
+    </>
   );
 
   const mobileSessionPortal =
@@ -597,95 +617,95 @@ export function GuiChatShell({
         {mobilePanelOpen && (
           <Button
             ghost
-            aria-label="Close sessions"
+            aria-label="Dismiss session drawer"
             onClick={closeMobilePanel}
             className="fixed inset-0 z-[55] block bg-black/60 p-0"
           />
         )}
 
-        <div
+        <aside
+          data-gui-chat
           id="gui-chat-session-panel"
-          role="complementary"
-          aria-label={t.sessions.title}
+          aria-label="Chat workspace"
           className={cn(
-            "font-mondwest fixed top-0 right-0 z-[60] flex h-dvh max-h-dvh w-72 min-w-0 flex-col antialiased",
-            "border-l border-current/20 text-midground",
-            "bg-background-base/95",
+            "fixed left-0 top-0 z-[60] flex h-dvh max-h-dvh w-[15.5rem] min-w-0 flex-col bg-[#f4f5f6] text-[#3d4148] shadow-2xl",
             "transition-transform duration-200 ease-out",
-            "[background:var(--component-sidebar-background)]",
-            "[clip-path:var(--component-sidebar-clip-path)]",
-            "[border-image:var(--component-sidebar-border-image)]",
             mobilePanelOpen
               ? "translate-x-0"
-              : "pointer-events-none translate-x-full",
+              : "pointer-events-none -translate-x-full",
           )}
         >
-          <div className="flex h-14 shrink-0 items-center justify-between gap-2 border-b border-current/20 px-5">
-            <div className="text-display text-sm font-bold tracking-wider text-midground">
-              {t.sessions.title}
-            </div>
-            <Button
-              ghost
-              size="icon"
-              onClick={closeMobilePanel}
-              aria-label="Close sessions"
-              className="text-text-secondary hover:text-midground"
-            >
-              <X />
-            </Button>
+          <div className="flex h-11 shrink-0 items-center justify-between px-3">
+            <span className="text-sm font-semibold">Hermes</span>
+            <button aria-label="Close sessions" className="gui-chat-icon-button" onClick={closeMobilePanel} type="button">
+              <X className="h-4 w-4" />
+            </button>
           </div>
-
-          <div className="min-h-0 flex-1 overflow-hidden px-1 py-2">
-            {sessionPanel}
-          </div>
-        </div>
+          {sidebar}
+        </aside>
       </>,
       portalRoot,
     );
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-2">
+    <div data-gui-chat className="relative z-1 flex h-dvh min-h-0 w-full overflow-hidden bg-white text-[#202124]">
       {mobileSessionPortal}
-      <div className="flex min-h-0 flex-1 flex-col gap-2 lg:flex-row lg:gap-3">
-        <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden border border-current/15 bg-background-base">
-          <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-current/15 px-3 py-2 text-xs text-text-secondary sm:px-5">
-            <Badge tone={statusTone}>{mockMode ? "mock" : state.connection}</Badge>
-            {state.model ? <span className="truncate">Model: {state.model}</span> : null}
-            {state.storedSessionId ? <span className="truncate">Session: {state.storedSessionId}</span> : null}
-            <span className="ml-auto text-text-tertiary">
-              {mockMode ? "mock structured events" : "/api/ws structured beta"}
-            </span>
-            <Button
-              ghost
-              size="sm"
-              className="h-7 px-2 text-xs"
-              onClick={retryConnection}
+      {!narrow ? (
+        <aside aria-label="Chat workspace" className="gui-chat-sidebar">
+          {sidebar}
+        </aside>
+      ) : null}
+
+      <main className="flex min-h-0 min-w-0 flex-1 flex-col bg-white">
+        <header className="relative flex h-12 shrink-0 items-center border-b border-[#ebecef] px-3 sm:px-4">
+          {narrow ? (
+            <button
+              aria-controls="gui-chat-session-panel"
+              aria-expanded={mobilePanelOpen}
+              aria-label="Open sessions"
+              className="gui-chat-icon-button"
+              onClick={() => setMobilePanelOpenRaw(true)}
+              type="button"
             >
-              <RefreshCw className="h-3.5 w-3.5" />
-              {mockMode ? "Replay" : t.common.retry}
-            </Button>
+              <Menu className="h-4 w-4" />
+            </button>
+          ) : <div className="w-8" />}
+          <div className="pointer-events-none absolute inset-x-20 top-1/2 min-w-0 -translate-y-1/2 text-center">
+            <h1 className="truncate text-[0.8125rem] font-medium text-[#25282d]">{conversationTitle}</h1>
+            <p className="truncate text-[0.625rem] text-[#969aa1]">
+              {state.model ?? "Hermes"} · {mockMode ? "mock" : state.connection}
+            </p>
           </div>
+          <div className="ml-auto flex items-center gap-1">
+            <button aria-label={mockMode ? "Replay" : t.common.retry} className="gui-chat-icon-button" onClick={retryConnection} type="button">
+              <RefreshCw className={cn("h-3.5 w-3.5", state.connection === "connecting" && "animate-spin")} />
+            </button>
+            <button aria-label="Open Terminal Chat" className="gui-chat-icon-button" onClick={goToTerminal} type="button">
+              <Terminal className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        </header>
 
-          {resumeNotice ? (
-            <div className="flex shrink-0 items-start gap-2 border-b border-current/20 bg-background-alt px-3 py-2 text-sm text-text-secondary sm:px-5">
-              <AlertCircle className="mt-0.5 h-4 w-4" />
-              <span className="min-w-0 flex-1 whitespace-pre-wrap">{resumeNotice}</span>
-            </div>
-          ) : null}
-          {state.error ? (
-            <div className="flex shrink-0 items-start gap-2 border-b border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive sm:px-5">
-              <AlertCircle className="mt-0.5 h-4 w-4" />
-              <span className="min-w-0 flex-1 whitespace-pre-wrap">{state.error}</span>
-            </div>
-          ) : null}
+        {resumeNotice ? (
+          <div className="gui-chat-notice">
+            <AlertCircle />
+            <span>{resumeNotice}</span>
+          </div>
+        ) : null}
+        {state.error ? (
+          <div className="gui-chat-notice gui-chat-notice-error">
+            <AlertCircle />
+            <span>{state.error}</span>
+          </div>
+        ) : null}
 
+        <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
           <MessageList
             disabled={disabled}
             forceBottomKey={forceBottomKey}
             onApprovalRespond={respondToApproval}
             onClarifyRespond={respondToClarify}
             onLoadEarlier={loadEarlier}
-            showTerminalChatHint={showTerminalChatAction}
             state={state}
           />
           <Composer
@@ -696,18 +716,7 @@ export function GuiChatShell({
             onStop={stop}
           />
         </div>
-
-        {!narrow && (
-          <div
-            id="gui-chat-session-panel"
-            role="complementary"
-            aria-label={t.sessions.title}
-            className="flex min-h-0 shrink-0 flex-col overflow-hidden lg:h-full lg:w-60"
-          >
-            {sessionPanel}
-          </div>
-        )}
-      </div>
+      </main>
     </div>
   );
 }

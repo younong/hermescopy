@@ -36,6 +36,12 @@ interface ChatSessionListProps {
   /** Management profile from the dashboard switcher — scopes the listing. */
   profile?: string;
   className?: string;
+  /** Optional local title/preview filter used by compact chat sidebars. */
+  query?: string;
+  /** Keep the original rich panel by default; compact is a single-line list. */
+  variant?: "default" | "compact";
+  /** Reports the loaded active row so a chat shell can mirror its title. */
+  onActiveSessionChange?: (session: { id: string; label: string } | null) => void;
   /** Optional callback fired after a row is picked (e.g. close mobile sheet). */
   onPicked?: () => void;
   /** Called before navigation so the owning surface can start an end-to-end trace. */
@@ -61,6 +67,9 @@ export function ChatSessionList({
   activeSessionId,
   profile,
   className,
+  query = "",
+  variant = "default",
+  onActiveSessionChange,
   onPicked,
   onSessionPick,
   onNewChat,
@@ -112,6 +121,26 @@ export function ChatSessionList({
   }, [load, reloadNonce]);
 
   const reload = useCallback(() => setReloadNonce((n) => n + 1), []);
+  const filteredSessions = useMemo(() => {
+    if (!sessions) return sessions;
+    const normalizedQuery = query.trim().toLocaleLowerCase();
+    if (!normalizedQuery) return sessions;
+    return sessions.filter((session) =>
+      `${session.title ?? ""}\n${session.preview ?? ""}`
+        .toLocaleLowerCase()
+        .includes(normalizedQuery),
+    );
+  }, [query, sessions]);
+
+  useEffect(() => {
+    if (!onActiveSessionChange) return;
+    const active = sessions?.find((session) => session.id === activeSessionId);
+    onActiveSessionChange(
+      active
+        ? { id: active.id, label: rowLabel(active, t.sessions.untitledSession) }
+        : null,
+    );
+  }, [activeSessionId, onActiveSessionChange, sessions, t.sessions.untitledSession]);
 
   // Picking a row sets the current route's `?resume=<id>`. Re-picking the row
   // already shown by the chat surface is a no-op (avoids a needless reconnect).
@@ -181,9 +210,16 @@ export function ChatSessionList({
         </div>
       );
     }
+    if (!filteredSessions || filteredSessions.length === 0) {
+      return (
+        <div className="px-2 py-6 text-center text-xs text-text-secondary">
+          {t.sessions.noMatch}
+        </div>
+      );
+    }
     return (
       <div className="flex flex-col gap-0.5">
-        {sessions.map((s) => {
+        {filteredSessions.map((s) => {
           const isActive = s.id === activeSessionId;
           return (
             <ListItem
@@ -191,37 +227,45 @@ export function ChatSessionList({
               onClick={() => pick(s.id)}
               aria-current={isActive ? "true" : undefined}
               className={cn(
-                "flex-col items-start gap-0.5 rounded px-2 py-1.5",
-                "normal-case tracking-normal",
-                isActive
-                  ? "bg-primary/10 text-foreground border-l-2 border-primary"
-                  : "text-text-secondary hover:bg-midground/5 hover:text-foreground",
+                "flex-col items-start normal-case tracking-normal",
+                variant === "compact"
+                  ? "min-h-8 gap-0 rounded-lg px-2.5 py-1.5 text-[#555b64]"
+                  : "gap-0.5 rounded px-2 py-1.5",
+                variant === "compact"
+                  ? isActive
+                    ? "bg-[#e9eaec] text-[#202124]"
+                    : "hover:bg-[#eceef0] hover:text-[#202124]"
+                  : isActive
+                    ? "border-l-2 border-primary bg-primary/10 text-foreground"
+                    : "text-text-secondary hover:bg-midground/5 hover:text-foreground",
               )}
             >
-              <span className="w-full truncate text-sm font-medium">
+              <span className={cn("w-full truncate", variant === "compact" ? "text-[0.8125rem] font-normal" : "text-sm font-medium")}>
                 {rowLabel(s, t.sessions.untitledSession)}
               </span>
-              <span className="flex w-full items-center gap-1.5 text-[0.6875rem] text-text-tertiary">
-                <span>{timeAgo(s.last_active)}</span>
-                {s.message_count > 0 && (
-                  <>
-                    <span aria-hidden>·</span>
-                    <span>{s.message_count} msgs</span>
-                  </>
-                )}
-                {s.source && s.source !== "cli" && (
-                  <>
-                    <span aria-hidden>·</span>
-                    <span className="truncate">{s.source}</span>
-                  </>
-                )}
-              </span>
+              {variant === "default" ? (
+                <span className="flex w-full items-center gap-1.5 text-[0.6875rem] text-text-tertiary">
+                  <span>{timeAgo(s.last_active)}</span>
+                  {s.message_count > 0 && (
+                    <>
+                      <span aria-hidden>·</span>
+                      <span>{s.message_count} msgs</span>
+                    </>
+                  )}
+                  {s.source && s.source !== "cli" && (
+                    <>
+                      <span aria-hidden>·</span>
+                      <span className="truncate">{s.source}</span>
+                    </>
+                  )}
+                </span>
+              ) : null}
             </ListItem>
           );
         })}
       </div>
     );
-  }, [activeSessionId, error, loading, pick, reload, sessions, t]);
+  }, [activeSessionId, error, filteredSessions, loading, pick, reload, sessions, t, variant]);
 
   return (
     <aside
@@ -230,33 +274,37 @@ export function ChatSessionList({
         className,
       )}
     >
-      <div className="flex items-center justify-between gap-2 px-2 pb-2">
-        <span className="text-display text-xs tracking-wider text-text-tertiary">
-          {t.sessions.title}
-        </span>
-        <Button
-          ghost
-          size="icon"
-          onClick={reload}
-          aria-label={t.common.refresh}
-          title={t.common.refresh}
-          className="text-text-secondary hover:text-foreground"
-        >
-          <RefreshCw className={cn(loading && "animate-spin")} />
-        </Button>
-      </div>
+      {variant === "default" ? (
+        <>
+          <div className="flex items-center justify-between gap-2 px-2 pb-2">
+            <span className="text-display text-xs tracking-wider text-text-tertiary">
+              {t.sessions.title}
+            </span>
+            <Button
+              ghost
+              size="icon"
+              onClick={reload}
+              aria-label={t.common.refresh}
+              title={t.common.refresh}
+              className="text-text-secondary hover:text-foreground"
+            >
+              <RefreshCw className={cn(loading && "animate-spin")} />
+            </Button>
+          </div>
 
-      <Button
-        outlined
-        size="sm"
-        onClick={startNew}
-        prefix={<MessageSquarePlus />}
-        className="mx-2 mb-2 justify-center"
-      >
-        {t.sessions.newChat}
-      </Button>
+          <Button
+            outlined
+            size="sm"
+            onClick={startNew}
+            prefix={<MessageSquarePlus />}
+            className="mx-2 mb-2 justify-center"
+          >
+            {t.sessions.newChat}
+          </Button>
+        </>
+      ) : null}
 
-      <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-1 pb-1">
+      <div className={cn("min-h-0 flex-1 overflow-y-auto overflow-x-hidden pb-1", variant === "default" ? "px-1" : "px-0.5")}>
         {content}
       </div>
     </aside>
