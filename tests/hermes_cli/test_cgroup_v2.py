@@ -10,12 +10,30 @@ from hermes_cli.owner_worker.cgroup_v2 import (
     CgroupCleanupFailed,
     CgroupV2Manager,
     CgroupV2Unavailable,
+    _validate_control_file,
 )
 from hermes_cli.owner_worker.executor_identity import ExecutorIdentity
 from hermes_cli.owner_worker.tool_executor_sandbox import (
     SandboxResourceLimits,
     SandboxResourcePolicy,
 )
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["cgroup.subtree_control", "memory.swap.max", "memory.oom.group"],
+)
+def test_control_file_validation_accepts_kernel_control_names(name):
+    _validate_control_file(name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["", "../cpu.max", "cpu/max", "cpu max", "cpu-max", "CPU.max"],
+)
+def test_control_file_validation_rejects_unsafe_names(name):
+    with pytest.raises(CgroupV2Unavailable, match="control file name"):
+        _validate_control_file(name)
 
 
 class FakeCgroupV2IO:
