@@ -3,7 +3,8 @@
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { SessionMessageList } from "./SessionsPage";
+import { api } from "@/lib/api";
+import { fetchSessionsOverview, SessionMessageList } from "./SessionsPage";
 
 beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
@@ -12,7 +13,23 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   document.body.innerHTML = "";
+});
+
+describe("fetchSessionsOverview", () => {
+  it("requests compact recent session metadata", async () => {
+    const getSessions = vi.spyOn(api, "getSessions").mockResolvedValue({
+      limit: 30,
+      offset: 0,
+      sessions: [],
+      total: 0,
+    });
+
+    await fetchSessionsOverview();
+
+    expect(getSessions).toHaveBeenCalledWith(30, 0, undefined, "recent", true);
+  });
 });
 
 function scroll(element: HTMLElement, scrollTop: number) {
