@@ -13,7 +13,7 @@ export default function AuthenticatedApp() {
     return (
       <div
         aria-busy="true"
-        className="flex min-h-dvh items-center justify-center bg-background-base text-text-primary"
+        className="flex min-h-dvh items-center justify-center bg-white text-[#202124]"
       >
         <Spinner className="text-2xl text-primary" />
       </div>

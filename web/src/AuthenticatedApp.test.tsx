@@ -70,7 +70,9 @@ describe("AuthenticatedApp", () => {
 
     expect(document.querySelector("[data-admin-app]")).toBeNull();
     expect(document.querySelector("[data-member-chat]")).toBeNull();
-    expect(document.querySelector('[aria-busy="true"]')).not.toBeNull();
+    const loadingShell = document.querySelector('[aria-busy="true"]');
+    expect(loadingShell).not.toBeNull();
+    expect(loadingShell?.classList.contains("bg-white")).toBe(true);
   });
 
   it("shows authentication failures before selecting an application", () => {
