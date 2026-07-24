@@ -65,6 +65,7 @@ def authenticated_client():
     previous_service = getattr(web_server.app.state, "weixin_ilink_service", None)
     previous_required = getattr(web_server.app.state, "auth_required", None)
     previous_host = getattr(web_server.app.state, "bound_host", None)
+    previous_status = getattr(web_server.app.state, "weixin_ilink_status", None)
     web_server.app.state.auth_required = True
     web_server.app.state.bound_host = "testserver"
     enrollments = SimpleNamespace(
@@ -86,9 +87,16 @@ def authenticated_client():
     service = SimpleNamespace(enrollments=enrollments, stop=AsyncMock())
     with TestClient(web_server.app, base_url="http://testserver") as test_client:
         web_server.app.state.weixin_ilink_service = service
+        web_server.app.state.weixin_ilink_status = SimpleNamespace(
+            enabled=True,
+            ready=True,
+            state="ready",
+            message="WeChat connection is ready.",
+        )
         _login(test_client)
         yield test_client, enrollments
     web_server.app.state.weixin_ilink_service = previous_service
+    web_server.app.state.weixin_ilink_status = previous_status
     web_server.app.state.auth_required = previous_required
     web_server.app.state.bound_host = previous_host
     clear_providers()
@@ -220,10 +228,28 @@ def test_auth_me_advertises_running_connector(authenticated_client):
 
     assert response.status_code == 200
     assert response.json()["features"]["weixin_ilink_connect"] is True
+    assert response.json()["feature_status"]["weixin_ilink_connect"] == {
+        "enabled": True,
+        "ready": True,
+        "state": "ready",
+        "message": "WeChat connection is ready.",
+    }
     web_server.app.state.weixin_ilink_service = None
+    web_server.app.state.weixin_ilink_status = SimpleNamespace(
+        enabled=True,
+        ready=False,
+        state="resource_governance_unavailable",
+        message="WeChat connection is not available on this server yet.",
+    )
     unavailable = test_client.get("/api/auth/me")
     assert unavailable.status_code == 200
     assert unavailable.json()["features"]["weixin_ilink_connect"] is False
+    assert unavailable.json()["feature_status"]["weixin_ilink_connect"] == {
+        "enabled": True,
+        "ready": False,
+        "state": "resource_governance_unavailable",
+        "message": "WeChat connection is not available on this server yet.",
+    }
 
 
 def test_service_unavailable_is_generic_503(client):

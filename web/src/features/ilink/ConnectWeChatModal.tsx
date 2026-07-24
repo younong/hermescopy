@@ -9,6 +9,7 @@ import { useILinkEnrollment } from "./useILinkEnrollment";
 
 interface Props {
   onClose: () => void;
+  unavailableMessage?: string;
 }
 
 function enrollmentDeviceId(): string {
@@ -20,8 +21,7 @@ function enrollmentDeviceId(): string {
   return id;
 }
 
-export function ConnectWeChatModal({ onClose }: Props) {
-  const dialogRef = useRef<HTMLDivElement>(null);
+function ReadyEnrollment() {
   const operations = useMemo(
     () => ({
       create: () => api.createILinkEnrollment(enrollmentDeviceId()),
@@ -30,7 +30,11 @@ export function ConnectWeChatModal({ onClose }: Props) {
     [],
   );
   const enrollment = useILinkEnrollment(operations);
+  return <ILinkEnrollmentPanel {...enrollment} ownerLinked />;
+}
 
+export function ConnectWeChatModal({ onClose, unavailableMessage }: Props) {
+  const dialogRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
     dialogRef.current?.querySelector<HTMLButtonElement>("[data-close]")?.focus();
@@ -74,7 +78,14 @@ export function ConnectWeChatModal({ onClose }: Props) {
         <h2 className="mb-4 pr-8 text-lg font-semibold" id="connect-wechat-title">
           Connect WeChat
         </h2>
-        <ILinkEnrollmentPanel {...enrollment} ownerLinked />
+        {unavailableMessage ? (
+          <div className="space-y-3 text-sm text-muted-foreground">
+            <p>{unavailableMessage}</p>
+            <p>The server administrator must finish the secure connector setup before a QR code can be created.</p>
+          </div>
+        ) : (
+          <ReadyEnrollment />
+        )}
       </div>
     </div>,
     document.body,

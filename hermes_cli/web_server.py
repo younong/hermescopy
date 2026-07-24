@@ -189,50 +189,21 @@ async def _lifespan(app: "FastAPI"):
     # On app.state (not a module global) so the Lock binds to the running
     # event loop during lifespan startup — see _get_event_state's docstring.
     app.state.chat_argv_lock = asyncio.Lock()
+    from hermes_cli.channel_connectors.weixin_ilink.bootstrap import bootstrap_weixin_ilink
+
     app.state.weixin_ilink_service = None
-    app.state.weixin_ilink_session = None
-
-    connector_config = (load_config().get("channel_connectors") or {}).get("weixin_ilink") or {}
-    if connector_config.get("enabled"):
-        supervisor = getattr(app.state, "owner_worker_supervisor", None)
-        if not getattr(app.state, "auth_required", False) or supervisor is None:
-            raise RuntimeError(
-                "iLink connector requires authenticated mode and an Owner Worker supervisor"
-            )
-        if (
-            getattr(supervisor, "deployment_inference_policy", None) is None
-            or getattr(supervisor, "deployment_image_policy", None) is None
-            or getattr(supervisor, "resource_manager", None) is None
-        ):
-            raise RuntimeError(
-                "iLink connector requires deployment inference, image, and resource policies"
-            )
-        import aiohttp
-
-        from hermes_cli.channel_connectors.weixin_ilink.service import WeixinILinkService
-        from hermes_cli.channel_identity.crypto import ChannelCrypto
-        from hermes_cli.channel_identity.store import ChannelIdentityStore
-
-        crypto = ChannelCrypto.from_env(
-            lookup_version=int(connector_config.get("active_lookup_key_version", 1)),
-            encryption_version=int(connector_config.get("active_encryption_key_version", 1)),
-        )
-        connector_session = aiohttp.ClientSession(trust_env=True)
-        app.state.weixin_ilink_session = connector_session
-        try:
-            connector_store = ChannelIdentityStore(crypto)
-            connector_service = WeixinILinkService(
-                connector_store,
-                connector_session,
-                supervisor,
-                config=connector_config,
-            )
-            await connector_service.start()
-        except BaseException:
-            await connector_session.close()
-            app.state.weixin_ilink_session = None
-            raise
-        app.state.weixin_ilink_service = connector_service
+    app.state.weixin_ilink_runtime = None
+    app.state.weixin_ilink_status = None
+    connectors = load_config().get("channel_connectors") or {}
+    connector_config = connectors.get("weixin_ilink") or {}
+    connector_runtime = await bootstrap_weixin_ilink(
+        connector_config,
+        auth_required=bool(getattr(app.state, "auth_required", False)),
+        supervisor=getattr(app.state, "owner_worker_supervisor", None),
+    )
+    app.state.weixin_ilink_runtime = connector_runtime
+    app.state.weixin_ilink_status = connector_runtime.status
+    app.state.weixin_ilink_service = connector_runtime.service
 
     # Fire hermes_cli.gateway import into a background thread so the event
     # loop is not blocked and HERMES_DASHBOARD_READY fires without delay.
@@ -260,12 +231,9 @@ async def _lifespan(app: "FastAPI"):
     try:
         yield
     finally:
-        connector_service = getattr(app.state, "weixin_ilink_service", None)
-        if connector_service is not None:
-            await connector_service.stop()
-        connector_session = getattr(app.state, "weixin_ilink_session", None)
-        if connector_session is not None:
-            await connector_session.close()
+        connector_runtime = getattr(app.state, "weixin_ilink_runtime", None)
+        if connector_runtime is not None:
+            await connector_runtime.close()
         authority_change_stop = getattr(app.state, "authority_change_stop", None)
         authority_change_task = getattr(app.state, "authority_change_task", None)
         if authority_change_stop is not None:

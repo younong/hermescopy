@@ -81,9 +81,14 @@ export function GuiChatShell() {
   const [activeSessionTitle, setActiveSessionTitle] = useState<string | null>(null);
   const [connectWeChatOpen, setConnectWeChatOpen] = useState(false);
   const { authMe, authRequired, ownerKey, ready: authIdentityReady } = useDashboardAuthIdentity();
+  const weChatStatus = authMe?.feature_status?.weixin_ilink_connect;
+  const weChatReady = Boolean(authMe?.features?.weixin_ilink_connect);
   const canConnectWeChat = Boolean(
-    authRequired && authIdentityReady && authMe?.features?.weixin_ilink_connect,
+    authRequired && authIdentityReady && (weChatStatus?.enabled ?? weChatReady),
   );
+  const weChatUnavailableMessage = weChatReady
+    ? undefined
+    : weChatStatus?.message ?? "WeChat connection is not available on this server yet.";
   const stateRef = useRef(state);
   const filesOpenRef = useRef(filesOpen);
   const navigateRef = useRef(navigate);
@@ -670,7 +675,10 @@ export function GuiChatShell() {
     <div data-gui-chat className="relative z-1 flex h-dvh min-h-0 w-full overflow-hidden bg-white text-[#202124]">
       {mobileSessionPortal}
       {connectWeChatOpen ? (
-        <ConnectWeChatModal onClose={() => setConnectWeChatOpen(false)} />
+        <ConnectWeChatModal
+          onClose={() => setConnectWeChatOpen(false)}
+          unavailableMessage={weChatUnavailableMessage}
+        />
       ) : null}
       {!narrow ? (
         <aside aria-label="Chat workspace" className="gui-chat-sidebar">

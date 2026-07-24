@@ -1337,6 +1337,14 @@ export interface AuthMeResponse {
   features?: {
     weixin_ilink_connect?: boolean;
   };
+  feature_status?: {
+    weixin_ilink_connect?: {
+      enabled: boolean;
+      ready: boolean;
+      state: string;
+      message: string;
+    };
+  };
 }
 
 export type LocalAccountRole = "admin" | "member";

@@ -917,7 +917,7 @@ DEFAULT_CONFIG = {
     "max_live_sessions": 16,
     "channel_connectors": {
         "weixin_ilink": {
-            "enabled": False,
+            "enabled": True,
             "bot_type": "3",
             "enrollment_ttl_seconds": 480,
             "enrollment_poll_interval_seconds": 1,
@@ -5011,7 +5011,7 @@ _KNOWN_ROOT_KEYS = {
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
     "auxiliary", "moa", "custom_providers", "context", "memory", "gateway",
-    "sessions", "streaming", "updates", "mcp_servers",
+    "sessions", "streaming", "updates", "mcp_servers", "channel_connectors",
 }
 
 # Valid fields inside a custom_providers list entry
@@ -5052,6 +5052,31 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             return [ConfigIssue("error", "Could not load config.yaml", "Run 'hermes setup' to create a valid config")]
 
     issues: List[ConfigIssue] = []
+
+    # ── channel_connectors must preserve boolean enablement semantics ────
+    channel_connectors = config.get("channel_connectors")
+    if channel_connectors is not None and not isinstance(channel_connectors, dict):
+        issues.append(ConfigIssue(
+            "error",
+            f"channel_connectors should be a dict, got {type(channel_connectors).__name__}",
+            "Configure connector settings under channel_connectors: mapping entries",
+        ))
+    elif isinstance(channel_connectors, dict):
+        weixin_ilink = channel_connectors.get("weixin_ilink")
+        if weixin_ilink is not None and not isinstance(weixin_ilink, dict):
+            issues.append(ConfigIssue(
+                "error",
+                f"channel_connectors.weixin_ilink should be a dict, got {type(weixin_ilink).__name__}",
+                "Configure enabled and related settings under weixin_ilink:",
+            ))
+        elif isinstance(weixin_ilink, dict):
+            enabled = weixin_ilink.get("enabled")
+            if enabled is not None and not isinstance(enabled, bool):
+                issues.append(ConfigIssue(
+                    "error",
+                    "channel_connectors.weixin_ilink.enabled should be a boolean",
+                    "Use enabled: true or enabled: false without quotes",
+                ))
 
     # ── custom_providers must be a list, not a dict ──────────────────────
     cp = config.get("custom_providers")

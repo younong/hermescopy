@@ -80,18 +80,24 @@ def test_lifespan_warmup_is_nonblocking():
     )
 
 
-def test_lifespan_rejects_enabled_ilink_without_deployment_policies(monkeypatch):
+def test_lifespan_isolates_enabled_ilink_without_deployment_policies(monkeypatch):
     class _Supervisor:
         deployment_inference_policy = None
         deployment_image_policy = None
         resource_manager = None
 
+        def shutdown(self):
+            pass
+
     async def _run():
         web_server_mod.app.state.auth_required = True
         web_server_mod.app.state.owner_worker_supervisor = _Supervisor()
-        with pytest.raises(RuntimeError, match="deployment inference, image, and resource policies"):
-            async with web_server_mod._lifespan(web_server_mod.app):
-                pass
+        async with web_server_mod._lifespan(web_server_mod.app):
+            assert web_server_mod.app.state.weixin_ilink_service is None
+            status = web_server_mod.app.state.weixin_ilink_status
+            assert status.enabled is True
+            assert status.ready is False
+            assert status.state == "deployment_policy_unavailable"
 
     monkeypatch.setattr(
         web_server_mod,

@@ -770,6 +770,23 @@ async def api_auth_me(request: Request):
     if sess is None:
         raise HTTPException(status_code=401, detail="Unauthorized")
     owner = owner_context_from_session(sess)
+    ilink_service = getattr(request.app.state, "weixin_ilink_service", None)
+    ilink_status = getattr(request.app.state, "weixin_ilink_status", None)
+    ilink_ready = bool(
+        getattr(request.app.state, "auth_required", False)
+        and ilink_service is not None
+    )
+    ilink_enabled = bool(getattr(ilink_status, "enabled", ilink_ready))
+    ilink_state = "ready" if ilink_ready else getattr(ilink_status, "state", "disabled")
+    ilink_message = (
+        "WeChat connection is ready."
+        if ilink_ready
+        else getattr(
+            ilink_status,
+            "message",
+            "WeChat connection is disabled on this server.",
+        )
+    )
     response: dict[str, object] = {
         "user_id": sess.user_id,
         "email": sess.email,
@@ -781,10 +798,15 @@ async def api_auth_me(request: Request):
         "legacy_sessions_imported": False,
         "legacy_sessions_message": "Authenticated owner isolation uses a separate owner home; legacy local sessions are not imported automatically.",
         "features": {
-            "weixin_ilink_connect": bool(
-                getattr(request.app.state, "auth_required", False)
-                and getattr(request.app.state, "weixin_ilink_service", None) is not None
-            ),
+            "weixin_ilink_connect": ilink_ready,
+        },
+        "feature_status": {
+            "weixin_ilink_connect": {
+                "enabled": ilink_enabled,
+                "ready": ilink_ready,
+                "state": ilink_state,
+                "message": ilink_message,
+            },
         },
         **owner_public_summary(owner),
     }

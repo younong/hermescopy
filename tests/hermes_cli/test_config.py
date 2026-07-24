@@ -29,6 +29,17 @@ from hermes_cli.config import (
 )
 
 
+def test_ilink_connector_is_enabled_by_default_and_can_be_disabled(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    assert load_config()["channel_connectors"]["weixin_ilink"]["enabled"] is True
+
+    (tmp_path / "config.yaml").write_text(
+        "channel_connectors:\n  weixin_ilink:\n    enabled: false\n",
+        encoding="utf-8",
+    )
+    assert load_config()["channel_connectors"]["weixin_ilink"]["enabled"] is False
+
+
 class TestGetHermesHome:
     def test_default_path(self):
         with patch.dict(os.environ, {}, clear=False):

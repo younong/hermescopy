@@ -202,9 +202,50 @@ describe("GuiChatShell", () => {
     expect(mocks.createILinkEnrollment).toHaveBeenCalledOnce();
   });
 
-  it("hides the WeChat action when the connector feature is unavailable", async () => {
+  it("shows a safe explanation without enrolling when the enabled connector is unavailable", async () => {
     const connection = createConnection();
-    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.getAuthMe.mockResolvedValue({
+      ...authIdentity(),
+      features: { weixin_ilink_connect: false },
+      feature_status: {
+        weixin_ilink_connect: {
+          enabled: true,
+          ready: false,
+          state: "resource_governance_unavailable",
+          message: "WeChat connection is not available on this server yet.",
+        },
+      },
+    });
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(<GuiChatShell />);
+
+    const connect = document.querySelector<HTMLButtonElement>('[aria-label="Connect WeChat"]');
+    expect(connect).not.toBeNull();
+    await act(async () => {
+      connect?.click();
+      await Promise.resolve();
+    });
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain(
+      "WeChat connection is not available on this server yet.",
+    );
+    expect(mocks.createILinkEnrollment).not.toHaveBeenCalled();
+  });
+
+  it("hides the WeChat action when the connector is explicitly disabled", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue({
+      ...authIdentity(),
+      features: { weixin_ilink_connect: false },
+      feature_status: {
+        weixin_ilink_connect: {
+          enabled: false,
+          ready: false,
+          state: "disabled",
+          message: "WeChat connection is disabled on this server.",
+        },
+      },
+    });
     mocks.connectGuiChat.mockReturnValue(connection);
 
     await renderShell(<GuiChatShell />);
@@ -512,6 +553,14 @@ interface AuthIdentity {
   email: string;
   expires_at: number;
   features?: { weixin_ilink_connect?: boolean };
+  feature_status?: {
+    weixin_ilink_connect?: {
+      enabled: boolean;
+      ready: boolean;
+      state: string;
+      message: string;
+    };
+  };
   org_id: string;
   owner_key: string;
   provider: string;
