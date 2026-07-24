@@ -13,6 +13,7 @@ from hermes_cli.owner_worker.executor_identity import EgressProfile, ExecutorIde
 from hermes_cli.owner_worker.host_sandbox import (
     HostSandboxInvalid,
     HostSandboxUnavailable,
+    _resource_policy,
     build_host_sandbox_deployment_policy,
     load_host_sandbox_config,
 )
@@ -229,6 +230,26 @@ def test_host_policy_rejects_unknown_schema_wrong_arch_root_ids_and_egress(tmp_p
             load_host_sandbox_config(
                 policy_path, require_root_owner=False, platform_name="Linux", machine="x86_64"
             )
+
+
+def test_host_policy_accepts_service_owned_delegated_cgroup_root(tmp_path, monkeypatch):
+    document, _policy_path = _document(tmp_path)
+    cgroup_root = Path(document["resource_policy"]["cgroup_root"])
+    original_stat = Path.stat
+
+    def fake_stat(path, *args, **kwargs):
+        value = original_stat(path, *args, **kwargs)
+        if path in {cgroup_root, cgroup_root.parent}:
+            return SimpleNamespace(
+                st_mode=value.st_mode, st_uid=987, st_gid=987,
+            )
+        return value
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+
+    policy = _resource_policy(document["resource_policy"], require_root_owner=True)
+
+    assert policy.cgroup_root == cgroup_root
 
 
 def test_host_policy_rejects_missing_unknown_or_incoherent_resource_governance(tmp_path):
