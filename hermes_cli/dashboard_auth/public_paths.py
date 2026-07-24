@@ -30,6 +30,8 @@ the SPA should bootstrap it after login instead.
 """
 from __future__ import annotations
 
+import re
+
 PUBLIC_API_PATHS: frozenset[str] = frozenset({
     # Liveness probe target. Returns version, gateway state, active
     # session count, and the dashboard auth-gate shape. No bodies, no
@@ -51,3 +53,15 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     # 401 no_cookie. The JWT — not this allowlist — is the security boundary.
     "/api/cron/fire",
 })
+
+_ENROLLMENT_ITEM_RE = re.compile(r"^/api/public/ilink/enrollments/enr_[0-9a-f]{32}$")
+
+
+def is_public_api_route(path: str, *, method: str = "GET") -> bool:
+    """Return whether this exact method/path may bypass dashboard auth."""
+    method = str(method or "GET").upper()
+    if path in PUBLIC_API_PATHS:
+        return True
+    if method == "POST" and path == "/api/public/ilink/enrollments":
+        return True
+    return method == "GET" and bool(_ENROLLMENT_ITEM_RE.fullmatch(path))

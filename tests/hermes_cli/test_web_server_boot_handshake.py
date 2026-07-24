@@ -80,6 +80,28 @@ def test_lifespan_warmup_is_nonblocking():
     )
 
 
+def test_lifespan_rejects_enabled_ilink_without_deployment_policies(monkeypatch):
+    class _Supervisor:
+        deployment_inference_policy = None
+        deployment_image_policy = None
+        resource_manager = None
+
+    async def _run():
+        web_server_mod.app.state.auth_required = True
+        web_server_mod.app.state.owner_worker_supervisor = _Supervisor()
+        with pytest.raises(RuntimeError, match="deployment inference, image, and resource policies"):
+            async with web_server_mod._lifespan(web_server_mod.app):
+                pass
+
+    monkeypatch.setattr(
+        web_server_mod,
+        "load_config",
+        lambda: {"channel_connectors": {"weixin_ilink": {"enabled": True}}},
+    )
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+    asyncio.run(_run())
+
+
 def test_lifespan_closes_owner_resource_manager_even_when_supervisor_shutdown_fails(monkeypatch):
     closed = []
 
