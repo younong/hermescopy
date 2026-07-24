@@ -1,22 +1,17 @@
 """Server-rendered /login page.
 
-No React, no JavaScript dependency. Listed providers come from the
-registry; clicking a provider sends a GET to
-``/auth/login?provider=<name>``.
+No React bundle is loaded. Listed providers come from the registry;
+OAuth providers send a GET to ``/auth/login?provider=<name>`` and password
+providers submit through the inline script below.
 
-Visual styling mirrors the Nous Research design system (the
-``@nous-research/ui`` package the React dashboard uses): the same
-``Collapse`` / ``Rules Compressed`` typeface, amber-on-dark colour
-tokens (``#170d02`` / ``#ffac02`` / ``#fff``), uppercase + wide-tracking
-brand chrome, and the inset-bevel button shadow. Fonts are served
-out of the SPA's ``/fonts/`` directory which the dashboard-auth gate
-already allowlists pre-auth (see ``_GATE_PUBLIC_PREFIXES`` in
-``middleware.py``), so the page renders without needing the React
-bundle loaded.
+The standalone page mirrors the dedicated chat GUI workspace: a fixed light
+canvas, neutral borders, system sans-serif typography, rounded controls, and
+subtle shadows. It intentionally does not depend on the authenticated SPA or
+its user-selectable themes.
 
 Test-stable class names: the existing test suite extracts the
-``class="provider-btn"`` anchor href to walk the OAuth flow. That
-class name MUST NOT change without updating
+``class="provider-btn"`` anchor href to walk the OAuth flow. That exact class
+attribute MUST NOT change without updating
 ``tests/hermes_cli/test_dashboard_auth_401_reauth.py``.
 """
 from __future__ import annotations
@@ -25,13 +20,12 @@ import html
 
 from hermes_cli.dashboard_auth import list_session_providers
 
-# Inline minimal CSS. The dashboard's full skin lives in the React
-# bundle, which we deliberately do NOT load here — the login page must
-# not depend on the SPA build being present or on the injected session
-# token.
+# Inline minimal CSS. The dashboard's full skin lives in the React bundle,
+# which we deliberately do NOT load here — the login page must not depend on
+# the SPA build being present or on the injected session token.
 #
-# Single curly braces are placeholders for ``str.format``; CSS curlies
-# are doubled (``{{`` / ``}}``).
+# Single curly braces are placeholders for ``str.format``; CSS curlies are
+# doubled (``{{`` / ``}}``).
 _LOGIN_HTML_TEMPLATE = """\
 <!doctype html>
 <html lang="en">
@@ -40,279 +34,243 @@ _LOGIN_HTML_TEMPLATE = """\
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sign in — Hermes Agent</title>
 <style>
-  /* Brand fonts shipped by @nous-research/ui — same files the SPA loads. */
-  @font-face {{
-    font-family: 'Collapse';
-    font-style: normal;
-    font-weight: 400;
-    font-display: swap;
-    src: url('/fonts/Collapse-Regular.woff2') format('woff2');
-  }}
-  @font-face {{
-    font-family: 'Collapse';
-    font-style: normal;
-    font-weight: 700;
-    font-display: swap;
-    src: url('/fonts/Collapse-Bold.woff2') format('woff2');
-  }}
-  @font-face {{
-    font-family: 'Rules Compressed';
-    font-style: normal;
-    font-weight: 400;
-    font-display: swap;
-    src: url('/fonts/RulesCompressed-Regular.woff2') format('woff2');
-  }}
-  @font-face {{
-    font-family: 'Rules Compressed';
-    font-style: normal;
-    font-weight: 600;
-    font-display: swap;
-    src: url('/fonts/RulesCompressed-Medium.woff2') format('woff2');
-  }}
-
   :root {{
-    --background-base: #170d02;
-    --background: #170d02;
-    --midground: #ffac02;
-    --foreground: #ffffff;
-    --hairline: color-mix(in srgb, #ffac02 18%, transparent);
-    --hairline-strong: color-mix(in srgb, #ffac02 35%, transparent);
+    color-scheme: light;
+    --canvas: #f5f6f7;
+    --surface: #ffffff;
+    --foreground: #202124;
+    --text-secondary: #6f747c;
+    --text-tertiary: #969aa1;
+    --border: #dedfe2;
+    --border-strong: #c8d2df;
+    --focus-border: #aebdd0;
+    --focus-ring: rgba(220, 229, 239, 0.7);
+    --action: #2f3338;
+    --action-hover: #191b1e;
+    --error: #b42318;
   }}
 
   *, *::before, *::after {{ box-sizing: border-box; }}
 
   html, body {{
     margin: 0;
-    padding: 0;
     min-height: 100%;
-    background: var(--background-base);
+    background: var(--canvas);
     color: var(--foreground);
-    font-family: 'Collapse', system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont,
+      "Segoe UI", sans-serif;
     font-size: 16px;
     line-height: 1.5;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
   }}
 
-  /* Subtle dot-grid backdrop — DS idiom (see `.dither` in globals.css). */
-  body {{
-    background-image:
-      radial-gradient(
-        ellipse at top,
-        color-mix(in srgb, var(--midground) 6%, transparent) 0%,
-        transparent 55%
-      ),
-      repeating-conic-gradient(
-        color-mix(in srgb, var(--midground) 4%, transparent) 0% 25%,
-        transparent 0% 50%
-      );
-    background-size: auto, 3px 3px;
-    background-attachment: fixed;
-  }}
-
-  /* Layout: vertically center on tall screens, top-anchor on short. */
   body {{
     display: grid;
+    min-height: 100vh;
+    min-height: 100dvh;
     place-items: center;
-    padding: clamp(1.5rem, 6vh, 6rem) 1.25rem;
+    padding: clamp(1.25rem, 6vh, 5rem) 1rem;
   }}
 
   main {{
     width: 100%;
     max-width: 26rem;
-    position: relative;
-    animation: slide-up 0.6s ease-out both;
   }}
 
-  @keyframes slide-up {{
-    from {{ opacity: 0; transform: translateY(6px); }}
-    to   {{ opacity: 1; transform: translateY(0); }}
-  }}
-
-  @media (prefers-reduced-motion: reduce) {{
-    main {{ animation: none; }}
-  }}
-
-  /* Brand wordmark above the card — same uppercase + wide-tracking
-     idiom DS Buttons use. */
   .brand {{
-    text-align: center;
-    margin-bottom: 1.75rem;
-    font-family: 'Rules Compressed', 'Collapse', sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.65rem;
+    margin-bottom: 1.25rem;
+    color: #3d4148;
+    font-size: 0.9rem;
     font-weight: 600;
-    font-size: 1.05rem;
-    letter-spacing: 0.32em;
-    text-transform: uppercase;
-    color: var(--midground);
   }}
-  .brand .dot {{
-    display: inline-block;
-    width: 6px;
-    height: 6px;
-    background: var(--midground);
-    margin: 0 0.55em 0.18em;
-    vertical-align: middle;
-    border-radius: 1px;
+
+  .brand-mark {{
+    display: grid;
+    width: 2.5rem;
+    height: 2.5rem;
+    place-items: center;
+    border-radius: 0.75rem;
+    background: #f2f3f5;
+    color: #4f555d;
+    font-size: 1.125rem;
+    font-weight: 600;
   }}
 
   .card {{
-    position: relative;
-    padding: 2.25rem 2rem 2rem;
-    background: color-mix(in srgb, #ffffff 2%, var(--background-base));
-    border: 1px solid var(--hairline);
-    /* Hairline highlight + bevel shadow — matches DS Button SHADOW_DEFAULT
-       (`inset -1px -1px 0 #00000080, inset 1px 1px 0 #ffffff80`) at panel scale. */
-    box-shadow:
-      inset 1px 1px 0 0 color-mix(in srgb, #ffffff 5%, transparent),
-      inset -1px -1px 0 0 rgba(0, 0, 0, 0.4),
-      0 24px 60px -20px rgba(0, 0, 0, 0.6);
+    padding: clamp(1.5rem, 5vw, 2rem);
+    border: 1px solid var(--border);
+    border-radius: 1.35rem;
+    background: var(--surface);
+    box-shadow: 0 8px 28px rgba(31, 41, 55, 0.08);
   }}
 
   h1 {{
-    margin: 0 0 0.4rem;
-    font-family: 'Rules Compressed', 'Collapse', sans-serif;
+    margin: 0 0 0.35rem;
+    color: #25282d;
+    font-size: 1.5rem;
     font-weight: 600;
-    font-size: 1.85rem;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
-    color: var(--foreground);
+    letter-spacing: -0.02em;
   }}
 
   .subtitle {{
-    margin: 0 0 1.75rem;
-    color: color-mix(in srgb, var(--foreground) 65%, transparent);
-    font-size: 0.95rem;
+    margin: 0 0 1.5rem;
+    color: var(--text-secondary);
+    font-size: 0.9rem;
   }}
 
   .provider-list {{
     display: grid;
-    gap: 0.75rem;
+    gap: 1rem;
   }}
 
-  /* Provider button — mirrors DS Button (default variant):
-     amber surface, dark text, uppercase + wide tracking, inset bevel. */
   .provider-btn {{
     display: block;
     width: 100%;
-    box-sizing: border-box;
-    padding: 0.95rem 1rem;
-    text-align: center;
-    background: var(--midground);
-    color: var(--background-base);
-    font-family: 'Collapse', sans-serif;
-    font-weight: 700;
-    font-size: 0.78rem;
-    letter-spacing: 0.2em;
-    text-transform: uppercase;
-    text-decoration: none;
+    padding: 0.75rem 1rem;
     border: 0;
-    border-radius: 0;  /* DS Button is squared — no rounded corners. */
+    border-radius: 0.75rem;
+    background: var(--action);
+    color: #ffffff;
     cursor: pointer;
-    box-shadow:
-      inset 1px 1px 0 0 rgba(255, 255, 255, 0.5),
-      inset -1px -1px 0 0 rgba(0, 0, 0, 0.5);
-    transition: filter 0.12s ease-out;
-  }}
-  .provider-btn:hover {{
-    filter: brightness(1.08);
-  }}
-  .provider-btn:active {{
-    /* DS Button uses `active:invert` on the default surface. */
-    filter: invert(1);
-  }}
-  .provider-btn:focus-visible {{
-    outline: 2px solid var(--midground);
-    outline-offset: 3px;
+    font: inherit;
+    font-size: 0.875rem;
+    font-weight: 600;
+    text-align: center;
+    text-decoration: none;
+    transition: background-color 120ms ease, box-shadow 120ms ease,
+      opacity 120ms ease;
   }}
 
-  /* Password provider form — same visual language as the OAuth buttons:
-     squared inputs, hairline borders, amber focus ring. */
+  .provider-btn:hover {{ background: var(--action-hover); }}
+  .provider-btn:active {{ background: #0f1012; }}
+  .provider-btn:disabled {{ cursor: not-allowed; opacity: 0.45; }}
+  .provider-btn:focus-visible {{
+    outline: none;
+    box-shadow: 0 0 0 3px var(--focus-ring);
+  }}
+
   .provider-form {{
     display: grid;
-    gap: 0.75rem;
+    gap: 0.85rem;
     text-align: left;
   }}
+
   .form-title {{
-    font-family: 'Rules Compressed', 'Collapse', sans-serif;
+    color: #3d4148;
+    font-size: 0.8125rem;
     font-weight: 600;
-    font-size: 0.72rem;
-    letter-spacing: 0.18em;
-    text-transform: uppercase;
-    color: color-mix(in srgb, var(--foreground) 70%, transparent);
   }}
+
   .field {{
     display: grid;
-    gap: 0.3rem;
+    gap: 0.35rem;
   }}
+
   .field-label {{
-    font-size: 0.72rem;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    color: color-mix(in srgb, var(--foreground) 55%, transparent);
+    color: #555b64;
+    font-size: 0.75rem;
+    font-weight: 500;
   }}
+
   .field-input {{
     width: 100%;
-    box-sizing: border-box;
+    min-height: 2.75rem;
     padding: 0.7rem 0.8rem;
-    background: color-mix(in srgb, #000000 25%, var(--background-base));
-    color: var(--foreground);
-    border: 1px solid var(--hairline-strong);
-    border-radius: 0;
-    font-family: 'Collapse', sans-serif;
-    font-size: 0.95rem;
-  }}
-  .field-input:focus-visible {{
+    border: 1px solid var(--border-strong);
+    border-radius: 0.7rem;
     outline: none;
-    border-color: var(--midground);
-    box-shadow: 0 0 0 1px var(--midground);
+    background: var(--surface);
+    color: #26292e;
+    font: inherit;
+    font-size: 0.9rem;
+    transition: border-color 120ms ease, box-shadow 120ms ease;
   }}
+
+  .field-input::placeholder {{ color: var(--text-tertiary); }}
+  .field-input:hover {{ border-color: var(--focus-border); }}
+  .field-input:focus {{
+    border-color: var(--focus-border);
+    box-shadow: 0 0 0 2px var(--focus-ring);
+  }}
+
+  .password-input-wrap {{ position: relative; }}
+  .password-input-wrap .field-input {{ padding-right: 3rem; }}
+  .password-input-wrap input::-ms-reveal,
+  .password-input-wrap input::-ms-clear {{ display: none; }}
+
+  .password-toggle {{
+    position: absolute;
+    top: 50%;
+    right: 0.4rem;
+    display: inline-flex;
+    width: 2rem;
+    height: 2rem;
+    padding: 0;
+    transform: translateY(-50%);
+    align-items: center;
+    justify-content: center;
+    border: 0;
+    border-radius: 0.5rem;
+    background: transparent;
+    color: #737880;
+    cursor: pointer;
+    transition: background-color 120ms ease, color 120ms ease,
+      box-shadow 120ms ease;
+  }}
+
+  .password-toggle:hover {{
+    background: #f0f1f2;
+    color: #25282d;
+  }}
+
+  .password-toggle:focus-visible {{
+    outline: none;
+    box-shadow: 0 0 0 2px var(--focus-ring);
+  }}
+
+  .password-toggle svg {{ width: 1rem; height: 1rem; }}
+  .password-toggle svg[hidden] {{ display: none; }}
+
   .form-error {{
-    color: #ff6b6b;
-    font-size: 0.82rem;
-    letter-spacing: 0.02em;
+    padding: 0.55rem 0.7rem;
+    border-radius: 0.55rem;
+    background: #fff6f5;
+    color: var(--error);
+    font-size: 0.8rem;
   }}
-  .provider-form .provider-btn {{
-    margin-top: 0.25rem;
-  }}
+
+  .provider-form .provider-btn {{ margin-top: 0.15rem; }}
 
   footer {{
-    margin-top: 1.75rem;
-    text-align: center;
-    color: color-mix(in srgb, var(--foreground) 45%, transparent);
+    margin-top: 1rem;
+    color: var(--text-tertiary);
     font-size: 0.75rem;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    line-height: 1.7;
-  }}
-  footer .sep {{
-    display: inline-block;
-    width: 1.5rem;
-    height: 1px;
-    background: var(--hairline-strong);
-    vertical-align: middle;
-    margin: 0 0.6em 0.2em;
+    text-align: center;
   }}
 
-  /* Selection — DS uses midground bg + background text. */
-  ::selection {{
-    background: var(--midground);
-    color: var(--background-base);
+  ::selection {{ background: #dce5ef; color: var(--foreground); }}
+
+  @media (max-height: 34rem) {{
+    body {{ place-items: start center; }}
   }}
 </style>
 </head>
 <body>
 <main>
-  <div class="brand">Nous<span class="dot"></span>Research</div>
+  <div class="brand"><span class="brand-mark" aria-hidden="true">H</span>Hermes</div>
   <div class="card">
-    <h1>Sign in</h1>
-    <p class="subtitle">Choose a sign-in method to continue to the Hermes Agent dashboard.</p>
+    <h1>Welcome back</h1>
+    <p class="subtitle">Sign in to continue to your Hermes workspace.</p>
     <div class="provider-list">
 {provider_buttons}
     </div>
   </div>
-  <footer>
-    <span class="sep"></span>Public bind &middot; Auth required<span class="sep"></span>
-  </footer>
+  <footer>Hermes secure workspace</footer>
 </main>
 {password_script}
 </body>
@@ -327,68 +285,76 @@ _EMPTY_HTML = """\
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sign-in unavailable — Hermes Agent</title>
 <style>
-  @font-face {
-    font-family: 'Collapse';
-    font-style: normal;
-    font-weight: 400;
-    font-display: swap;
-    src: url('/fonts/Collapse-Regular.woff2') format('woff2');
-  }
-  @font-face {
-    font-family: 'Rules Compressed';
-    font-style: normal;
-    font-weight: 600;
-    font-display: swap;
-    src: url('/fonts/RulesCompressed-Medium.woff2') format('woff2');
-  }
   :root {
-    --background-base: #170d02;
-    --midground: #ffac02;
-    --foreground: #ffffff;
-    --hairline: color-mix(in srgb, #ffac02 18%, transparent);
+    color-scheme: light;
+    --canvas: #f5f6f7;
+    --surface: #ffffff;
+    --foreground: #202124;
+    --text-secondary: #6f747c;
+    --border: #dedfe2;
   }
   *, *::before, *::after { box-sizing: border-box; }
   html, body {
-    margin: 0; padding: 0; min-height: 100%;
-    background: var(--background-base);
+    margin: 0;
+    min-height: 100%;
+    background: var(--canvas);
     color: var(--foreground);
-    font-family: 'Collapse', system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    font-size: 16px; line-height: 1.5;
+    font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont,
+      "Segoe UI", sans-serif;
+    font-size: 16px;
+    line-height: 1.5;
     -webkit-font-smoothing: antialiased;
   }
   body {
-    display: grid; place-items: center;
-    padding: clamp(1.5rem, 6vh, 6rem) 1.25rem;
+    display: grid;
+    min-height: 100vh;
+    min-height: 100dvh;
+    place-items: center;
+    padding: clamp(1.25rem, 6vh, 5rem) 1rem;
   }
   main {
-    width: 100%; max-width: 32rem;
-    padding: 2.25rem 2rem;
-    background: color-mix(in srgb, #ffffff 2%, var(--background-base));
-    border: 1px solid var(--hairline);
-    box-shadow:
-      inset 1px 1px 0 0 color-mix(in srgb, #ffffff 5%, transparent),
-      inset -1px -1px 0 0 rgba(0, 0, 0, 0.4),
-      0 24px 60px -20px rgba(0, 0, 0, 0.6);
+    width: 100%;
+    max-width: 32rem;
+    padding: clamp(1.5rem, 5vw, 2rem);
+    border: 1px solid var(--border);
+    border-radius: 1.35rem;
+    background: var(--surface);
+    box-shadow: 0 8px 28px rgba(31, 41, 55, 0.08);
+  }
+  .brand-mark {
+    display: grid;
+    width: 2.5rem;
+    height: 2.5rem;
+    margin-bottom: 1.25rem;
+    place-items: center;
+    border-radius: 0.75rem;
+    background: #f2f3f5;
+    color: #4f555d;
+    font-size: 1.125rem;
+    font-weight: 600;
   }
   h1 {
-    margin: 0 0 1rem;
-    font-family: 'Rules Compressed', 'Collapse', sans-serif;
-    font-weight: 600; font-size: 1.5rem;
-    letter-spacing: 0.05em; text-transform: uppercase;
-    color: var(--midground);
+    margin: 0 0 0.75rem;
+    color: #25282d;
+    font-size: 1.5rem;
+    font-weight: 600;
+    letter-spacing: -0.02em;
   }
-  p { margin: 0 0 1rem; }
+  p { margin: 0 0 1rem; color: var(--text-secondary); }
+  p:last-child { margin-bottom: 0; }
   code {
-    background: var(--midground);
-    color: var(--background-base);
-    padding: 0.1em 0.35em;
-    font-family: 'Courier New', monospace;
+    border-radius: 0.3rem;
+    background: #f2f3f5;
+    color: #3d4148;
+    padding: 0.12em 0.35em;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     font-size: 0.9em;
   }
 </style>
 </head>
 <body>
 <main>
+<div class="brand-mark" aria-hidden="true">H</div>
 <h1>Sign-in unavailable</h1>
 <p>This dashboard is bound to a non-loopback host but no authentication
 providers are installed.</p>
@@ -401,14 +367,13 @@ auth gate (not recommended on untrusted networks).</p>
 """
 
 
-# Inline script that wires every password provider form to POST JSON to
-# ``/auth/password-login`` and navigate on success. Emitted ONLY when at
-# least one ``supports_password`` provider is listed (OAuth-only login
-# pages stay script-free, preserving the no-JS contract for that case).
+# Inline script that wires every password provider form to toggle password
+# visibility, POST JSON to ``/auth/password-login``, and navigate on success.
+# Emitted ONLY when at least one ``supports_password`` provider is listed
+# (OAuth-only login pages stay script-free, preserving that no-JS contract).
 #
-# Plain string (NOT run through ``str.format``), so braces are literal —
-# do not double them. A single delegated submit handler covers all forms;
-# the provider name is read from the form's ``data-provider`` attribute.
+# Plain string (NOT run through ``str.format``), so braces are literal — do not
+# double them. Each handler scopes its controls and credentials to one form.
 _PASSWORD_FORM_SCRIPT = """\
 <script>
 (function () {
@@ -419,6 +384,29 @@ _PASSWORD_FORM_SCRIPT = """\
   var loginPrefix = window.location.pathname.replace(/\\/login$/, '') || '';
 
   function handle(form) {
+    var passwordInput = form.querySelector('input[name=password]');
+    var passwordToggle = form.querySelector('.password-toggle');
+    if (passwordInput && passwordToggle) {
+      passwordToggle.addEventListener('click', function () {
+        var reveal = passwordInput.type === 'password';
+        var label = reveal ? 'Hide password' : 'Show password';
+        passwordInput.type = reveal ? 'text' : 'password';
+        passwordToggle.setAttribute('aria-label', label);
+        passwordToggle.setAttribute('title', label);
+        passwordToggle.setAttribute('aria-pressed', reveal ? 'true' : 'false');
+        var showIcon = passwordToggle.querySelector('.toggle-icon-show');
+        var hideIcon = passwordToggle.querySelector('.toggle-icon-hide');
+        if (showIcon) {
+          if (reveal) { showIcon.setAttribute('hidden', ''); }
+          else { showIcon.removeAttribute('hidden'); }
+        }
+        if (hideIcon) {
+          if (reveal) { hideIcon.removeAttribute('hidden'); }
+          else { hideIcon.setAttribute('hidden', ''); }
+        }
+      });
+    }
+
     form.addEventListener('submit', function (ev) {
       ev.preventDefault();
       var err = form.querySelector('.form-error');
@@ -465,38 +453,41 @@ _PASSWORD_FORM_SCRIPT = """\
 def render_login_html(*, next_path: str = "") -> str:
     """Return the full HTML for ``GET /login``.
 
-    ``next_path`` — when set, the post-login landing path the user
-    originally requested. Threaded into each provider button's ``href``
-    as a ``next=`` query parameter so the OAuth round trip carries it
-    end-to-end. The caller (``routes.login_page``) is responsible for
-    validating ``next_path`` against the same-origin rules before we
-    emit it; we still HTML-escape it as defence in depth.
+    ``next_path`` — when set, the post-login landing path the user originally
+    requested. Threaded into each provider button's ``href`` as a ``next=``
+    query parameter so the OAuth round trip carries it end-to-end. The caller
+    (``routes.login_page``) is responsible for validating ``next_path`` against
+    the same-origin rules before we emit it; we still HTML-escape it as defence
+    in depth.
     """
     providers = list_session_providers()
     if not providers:
         return _EMPTY_HTML
 
     if next_path:
-        # URL-encode then HTML-escape. The URL-encode step matches the
-        # gate's ``_safe_next_target`` output shape (also URL-encoded),
-        # so a value that round-tripped from /login?next=... back into
-        # the button href is byte-identical.
+        # URL-encode then HTML-escape. The URL-encode step matches the gate's
+        # ``_safe_next_target`` output shape (also URL-encoded), so a value that
+        # round-tripped from /login?next=... back into the button href is
+        # byte-identical.
         from urllib.parse import quote
+
         next_qs = f"&next={html.escape(quote(next_path, safe=''), quote=True)}"
     else:
         next_qs = ""
 
     buttons = []
     needs_password_script = False
-    for p in providers:
-        if getattr(p, "supports_password", False):
+    for provider_index, provider in enumerate(providers):
+        if getattr(provider, "supports_password", False):
             needs_password_script = True
-            buttons.append(_render_password_form(p, next_path))
+            buttons.append(
+                _render_password_form(provider, next_path, provider_index)
+            )
         else:
             buttons.append(
                 f'      <a class="provider-btn" '
-                f'href="/auth/login?provider={html.escape(p.name, quote=True)}{next_qs}">'
-                f'Sign in with {html.escape(p.display_name)}</a>'
+                f'href="/auth/login?provider={html.escape(provider.name, quote=True)}{next_qs}">'
+                f"Sign in with {html.escape(provider.display_name)}</a>"
             )
     script = _PASSWORD_FORM_SCRIPT if needs_password_script else ""
     return _LOGIN_HTML_TEMPLATE.format(
@@ -505,36 +496,52 @@ def render_login_html(*, next_path: str = "") -> str:
     )
 
 
-def _render_password_form(provider, next_path: str) -> str:
-    """Render a username/password form for a ``supports_password`` provider.
+def _render_password_form(provider, next_path: str, provider_index: int) -> str:
+    """Render a username/password form for one password provider.
 
-    The form is wired by :data:`_PASSWORD_FORM_SCRIPT` (a single delegated
-    submit handler) to POST JSON to ``/auth/password-login`` and navigate
-    on success. ``next_path`` is carried in a hidden field; it has already
-    been validated same-origin by the caller and is HTML-escaped here as
-    defence in depth. The provider ``name`` is emitted in a ``data-``
-    attribute (not a hidden input) so the script reads it without trusting
-    form-field ordering.
+    Numeric input IDs avoid trusting provider names as DOM identifiers and
+    remain unique when more than one password provider is installed. The
+    provider name and validated landing path are still escaped before being
+    emitted.
     """
     pname = html.escape(provider.name, quote=True)
     plabel = html.escape(provider.display_name)
     safe_next = html.escape(next_path, quote=True) if next_path else ""
+    username_id = f"login-username-{provider_index}"
+    password_id = f"login-password-{provider_index}"
     return (
         f'      <form class="provider-form" data-provider="{pname}" '
         f'autocomplete="on">\n'
         f'        <div class="form-title">Sign in with {plabel}</div>\n'
         f'        <input type="hidden" name="next" value="{safe_next}">\n'
-        f'        <label class="field">\n'
-        f'          <span class="field-label">Username</span>\n'
-        f'          <input class="field-input" type="text" name="username" '
-        f'autocomplete="username" autocapitalize="none" '
+        f'        <div class="field">\n'
+        f'          <label class="field-label" for="{username_id}">Username</label>\n'
+        f'          <input class="field-input" id="{username_id}" type="text" '
+        f'name="username" autocomplete="username" autocapitalize="none" '
         f'autocorrect="off" spellcheck="false" required>\n'
-        f'        </label>\n'
-        f'        <label class="field">\n'
-        f'          <span class="field-label">Password</span>\n'
-        f'          <input class="field-input" type="password" name="password" '
-        f'autocomplete="current-password" required>\n'
-        f'        </label>\n'
+        f'        </div>\n'
+        f'        <div class="field">\n'
+        f'          <label class="field-label" for="{password_id}">Password</label>\n'
+        f'          <div class="password-input-wrap">\n'
+        f'            <input class="field-input" id="{password_id}" type="password" '
+        f'name="password" autocomplete="current-password" required>\n'
+        f'            <button class="password-toggle" type="button" '
+        f'aria-label="Show password" title="Show password" aria-pressed="false" '
+        f'aria-controls="{password_id}">\n'
+        f'              <svg class="toggle-icon-show" aria-hidden="true" focusable="false" '
+        f'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+        f'stroke-linecap="round" stroke-linejoin="round">'
+        f'<path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/>'
+        f'<circle cx="12" cy="12" r="3"/></svg>\n'
+        f'              <svg class="toggle-icon-hide" aria-hidden="true" focusable="false" '
+        f'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+        f'stroke-linecap="round" stroke-linejoin="round" hidden>'
+        f'<path d="m2 2 20 20"/><path d="M6.71 6.71C4.89 8.03 3.5 9.76 2.66 11.67a1 1 0 0 0 0 .66C4.35 16.23 7.93 19 12 19c1.5 0 2.91-.38 4.15-1.05"/>'
+        f'<path d="M10.73 5.08A9.8 9.8 0 0 1 12 5c4.07 0 7.65 2.77 9.34 6.67a1 1 0 0 1 0 .66 11 11 0 0 1-1.04 1.84"/>'
+        f'<path d="M14.12 14.12A3 3 0 0 1 9.88 9.88"/></svg>\n'
+        f'            </button>\n'
+        f'          </div>\n'
+        f'        </div>\n'
         f'        <div class="form-error" role="alert" hidden></div>\n'
         f'        <button class="provider-btn" type="submit">Sign in</button>\n'
         f'      </form>'
