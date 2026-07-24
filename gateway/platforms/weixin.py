@@ -57,6 +57,7 @@ except ImportError:  # pragma: no cover - dependency gate
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
+from gateway.weixin_ilink.client import WeixinILinkClient
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -376,18 +377,12 @@ async def _api_post(
     token: Optional[str],
     timeout_ms: int,
 ) -> Dict[str, Any]:
-    body = _json_dumps({**payload, "base_info": _base_info()})
-    url = f"{base_url.rstrip('/')}/{endpoint}"
-    # Use asyncio.wait_for() instead of aiohttp ClientTimeout to avoid
-    # "Timeout context manager should be used inside a task" errors when
-    # invoked via asyncio.run_coroutine_threadsafe() from cron jobs.
-    async def _do() -> Dict[str, Any]:
-        async with session.post(url, data=body, headers=_headers(token, body)) as response:
-            raw = await response.text()
-            if not response.ok:
-                raise RuntimeError(f"iLink POST {endpoint} HTTP {response.status}: {raw[:200]}")
-            return json.loads(raw)
-    return await asyncio.wait_for(_do(), timeout=timeout_ms / 1000)
+    """Compatibility wrapper around the shared iLink transport."""
+    return await WeixinILinkClient(
+        session,
+        base_url=base_url,
+        token=token or "",
+    ).post_json(endpoint=endpoint, payload=payload, timeout_ms=timeout_ms)
 
 
 async def _api_get(
@@ -397,21 +392,11 @@ async def _api_get(
     endpoint: str,
     timeout_ms: int,
 ) -> Dict[str, Any]:
-    url = f"{base_url.rstrip('/')}/{endpoint}"
-    headers = {
-        "iLink-App-Id": ILINK_APP_ID,
-        "iLink-App-ClientVersion": str(ILINK_APP_CLIENT_VERSION),
-    }
-    # Use asyncio.wait_for() instead of aiohttp ClientTimeout to avoid
-    # "Timeout context manager should be used inside a task" errors when
-    # invoked via asyncio.run_coroutine_threadsafe() from cron jobs.
-    async def _do() -> Dict[str, Any]:
-        async with session.get(url, headers=headers) as response:
-            raw = await response.text()
-            if not response.ok:
-                raise RuntimeError(f"iLink GET {endpoint} HTTP {response.status}: {raw[:200]}")
-            return json.loads(raw)
-    return await asyncio.wait_for(_do(), timeout=timeout_ms / 1000)
+    """Compatibility wrapper around the shared iLink transport."""
+    return await WeixinILinkClient(session, base_url=base_url).get_json(
+        endpoint=endpoint,
+        timeout_ms=timeout_ms,
+    )
 
 
 async def _get_updates(
@@ -422,17 +407,18 @@ async def _get_updates(
     sync_buf: str,
     timeout_ms: int,
 ) -> Dict[str, Any]:
-    try:
-        return await _api_post(
-            session,
-            base_url=base_url,
-            endpoint=EP_GET_UPDATES,
-            payload={"get_updates_buf": sync_buf},
-            token=token,
-            timeout_ms=timeout_ms,
-        )
-    except asyncio.TimeoutError:
-        return {"ret": 0, "msgs": [], "get_updates_buf": sync_buf}
+    batch = await WeixinILinkClient(session, base_url=base_url, token=token).get_updates(
+        sync_buf,
+        timeout_ms=timeout_ms,
+    )
+    result: Dict[str, Any] = {
+        "ret": 0,
+        "msgs": list(batch.messages),
+        "get_updates_buf": batch.cursor,
+    }
+    if batch.long_poll_timeout_ms is not None:
+        result["longpolling_timeout_ms"] = batch.long_poll_timeout_ms
+    return result
 
 
 async def _send_message(
@@ -445,31 +431,18 @@ async def _send_message(
     context_token: Optional[str],
     client_id: str,
 ) -> Dict[str, Any]:
-    """Send a text message via iLink sendmessage API.
-
-    Returns the raw API response dict (may contain error codes like
-    ``errcode: -14`` for session expiry that the caller can inspect).
-    """
-    if not text or not text.strip():
-        raise ValueError("_send_message: text must not be empty")
-    message: Dict[str, Any] = {
-        "from_user_id": "",
-        "to_user_id": to,
-        "client_id": client_id,
-        "message_type": MSG_TYPE_BOT,
-        "message_state": MSG_STATE_FINISH,
-        "item_list": [{"type": ITEM_TEXT, "text_item": {"text": text}}],
-    }
-    if context_token:
-        message["context_token"] = context_token
-    return await _api_post(
-        session,
-        base_url=base_url,
-        endpoint=EP_SEND_MESSAGE,
-        payload={"msg": message},
-        token=token,
-        timeout_ms=API_TIMEOUT_MS,
-    )
+    """Send a text message via the shared iLink transport."""
+    try:
+        return await WeixinILinkClient(session, base_url=base_url, token=token).send_message(
+            to=to,
+            text=text,
+            context_token=context_token,
+            client_id=client_id,
+        )
+    except ValueError as exc:
+        if not text or not text.strip():
+            raise ValueError("_send_message: text must not be empty") from exc
+        raise
 
 
 async def _send_typing(
@@ -481,17 +454,10 @@ async def _send_typing(
     typing_ticket: str,
     status: int,
 ) -> None:
-    await _api_post(
-        session,
-        base_url=base_url,
-        endpoint=EP_SEND_TYPING,
-        payload={
-            "ilink_user_id": to_user_id,
-            "typing_ticket": typing_ticket,
-            "status": status,
-        },
-        token=token,
-        timeout_ms=CONFIG_TIMEOUT_MS,
+    await WeixinILinkClient(session, base_url=base_url, token=token).send_typing(
+        to_user_id=to_user_id,
+        typing_ticket=typing_ticket,
+        status=status,
     )
 
 

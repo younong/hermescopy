@@ -11,11 +11,13 @@ import {
   MessageSquarePlus,
   RefreshCw,
   Search,
+  QrCode,
   Settings2,
   Sparkles,
   X,
 } from "lucide-react";
 import { ChatSessionList } from "@/components/ChatSessionList";
+import { ConnectWeChatModal } from "@/features/ilink/ConnectWeChatModal";
 import { useProfileScope } from "@/contexts/useProfileScope";
 import { GuiChatFilesPane } from "@/features/files/components/GuiChatFilesPane";
 import { useI18n } from "@/i18n";
@@ -77,7 +79,16 @@ export function GuiChatShell() {
   const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false);
   const [sessionQuery, setSessionQuery] = useState("");
   const [activeSessionTitle, setActiveSessionTitle] = useState<string | null>(null);
+  const [connectWeChatOpen, setConnectWeChatOpen] = useState(false);
   const { authMe, authRequired, ownerKey, ready: authIdentityReady } = useDashboardAuthIdentity();
+  const weChatStatus = authMe?.feature_status?.weixin_ilink_connect;
+  const weChatReady = Boolean(authMe?.features?.weixin_ilink_connect);
+  const canConnectWeChat = Boolean(
+    authRequired && authIdentityReady && (weChatStatus?.enabled ?? weChatReady),
+  );
+  const weChatUnavailableMessage = weChatReady
+    ? undefined
+    : weChatStatus?.message ?? "WeChat connection is not available on this server yet.";
   const stateRef = useRef(state);
   const filesOpenRef = useRef(filesOpen);
   const navigateRef = useRef(navigate);
@@ -663,6 +674,12 @@ export function GuiChatShell() {
   return (
     <div data-gui-chat className="relative z-1 flex h-dvh min-h-0 w-full overflow-hidden bg-white text-[#202124]">
       {mobileSessionPortal}
+      {connectWeChatOpen ? (
+        <ConnectWeChatModal
+          onClose={() => setConnectWeChatOpen(false)}
+          unavailableMessage={weChatUnavailableMessage}
+        />
+      ) : null}
       {!narrow ? (
         <aside aria-label="Chat workspace" className="gui-chat-sidebar">
           {sidebar}
@@ -693,6 +710,17 @@ export function GuiChatShell() {
           </div>
           {!filesOpen ? (
             <div className="ml-auto flex items-center gap-1">
+              {canConnectWeChat ? (
+                <button
+                  aria-label="Connect WeChat"
+                  className="gui-chat-icon-button"
+                  onClick={() => setConnectWeChatOpen(true)}
+                  title="Connect WeChat"
+                  type="button"
+                >
+                  <QrCode className="h-3.5 w-3.5" />
+                </button>
+              ) : null}
               <button aria-label={mockMode ? "Replay" : t.common.retry} className="gui-chat-icon-button" onClick={retryConnection} type="button">
                 <RefreshCw className={cn("h-3.5 w-3.5", state.connection === "connecting" && "animate-spin")} />
               </button>

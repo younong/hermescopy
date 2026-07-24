@@ -189,6 +189,21 @@ async def _lifespan(app: "FastAPI"):
     # On app.state (not a module global) so the Lock binds to the running
     # event loop during lifespan startup — see _get_event_state's docstring.
     app.state.chat_argv_lock = asyncio.Lock()
+    from hermes_cli.channel_connectors.weixin_ilink.bootstrap import bootstrap_weixin_ilink
+
+    app.state.weixin_ilink_service = None
+    app.state.weixin_ilink_runtime = None
+    app.state.weixin_ilink_status = None
+    connectors = load_config().get("channel_connectors") or {}
+    connector_config = connectors.get("weixin_ilink") or {}
+    connector_runtime = await bootstrap_weixin_ilink(
+        connector_config,
+        auth_required=bool(getattr(app.state, "auth_required", False)),
+        supervisor=getattr(app.state, "owner_worker_supervisor", None),
+    )
+    app.state.weixin_ilink_runtime = connector_runtime
+    app.state.weixin_ilink_status = connector_runtime.status
+    app.state.weixin_ilink_service = connector_runtime.service
 
     # Fire hermes_cli.gateway import into a background thread so the event
     # loop is not blocked and HERMES_DASHBOARD_READY fires without delay.
@@ -216,6 +231,9 @@ async def _lifespan(app: "FastAPI"):
     try:
         yield
     finally:
+        connector_runtime = getattr(app.state, "weixin_ilink_runtime", None)
+        if connector_runtime is not None:
+            await connector_runtime.close()
         authority_change_stop = getattr(app.state, "authority_change_stop", None)
         authority_change_task = getattr(app.state, "authority_change_task", None)
         if authority_change_stop is not None:
@@ -303,6 +321,10 @@ from hermes_cli.memory_oauth import router as _memory_oauth_router  # noqa: E402
 
 app.include_router(_memory_oauth_router)
 
+from hermes_cli.channel_connectors.weixin_ilink.api import router as _ilink_enrollment_router  # noqa: E402
+
+app.include_router(_ilink_enrollment_router)
+
 # ---------------------------------------------------------------------------
 # Session token for protecting sensitive endpoints (reveal).
 # The desktop shell mints the token and injects it via
@@ -355,9 +377,7 @@ from hermes_cli.dashboard_auth.api_availability import (
     authenticated_control_plane_api_allowed,
     authenticated_owner_worker_api_allowed,
 )
-from hermes_cli.dashboard_auth.public_paths import (
-    PUBLIC_API_PATHS as _PUBLIC_API_PATHS,
-)
+from hermes_cli.dashboard_auth.public_paths import is_public_api_route
 
 
 def _has_valid_session_token(request: Request) -> bool:
@@ -943,7 +963,7 @@ async def auth_middleware(request: Request, call_next):
     if getattr(request.app.state, "auth_required", False):
         return await call_next(request)
     path = request.url.path
-    if path.startswith("/api/") and path not in _PUBLIC_API_PATHS:
+    if path.startswith("/api/") and not is_public_api_route(path, method=request.method):
         if not _has_valid_session_token(request) and not _has_valid_query_token(request, path):
             return JSONResponse(
                 status_code=401,
@@ -12614,27 +12634,15 @@ async def _relay_send(peer: Any, value: Any) -> None:
 
 
 async def _connect_owner_worker_ws(socket_path: Path, uri: str, *, open_timeout: float = _OWNER_WORKER_WS_CONNECT_TIMEOUT) -> Any:
-    """Open a websocket client over a Unix-domain socket.
+    """Open a websocket client through the shared exact-worker transport."""
+    from hermes_cli.owner_worker.gateway_client import connect_owner_worker_ws
 
-    ``websockets`` is a project dependency but isn't present in some system
-    interpreters used only for lint/compile checks, so import lazily. The
-    top-level ``unix_connect`` call signature differs between websockets
-    legacy/new asyncio APIs; try both supported shapes.
-    """
-    try:
-        import websockets
-    except Exception as exc:  # pragma: no cover - depends on runtime extras
-        raise RuntimeError("websockets package is required for owner worker WS bridge") from exc
-
-    unix_connect = getattr(websockets, "unix_connect", None)
-    if unix_connect is None:  # pragma: no cover - old/stripped installations
-        raise RuntimeError("websockets.unix_connect is unavailable")
-
-    kwargs = {"open_timeout": open_timeout, "max_queue": _OWNER_WORKER_WS_RELAY_QUEUE_SIZE}
-    try:
-        return await unix_connect(uri=uri, path=str(socket_path), **kwargs)
-    except TypeError:
-        return await unix_connect(str(socket_path), uri=uri, **kwargs)
+    return await connect_owner_worker_ws(
+        socket_path,
+        uri,
+        open_timeout=open_timeout,
+        max_queue=_OWNER_WORKER_WS_RELAY_QUEUE_SIZE,
+    )
 
 
 def _worker_bridge_identity(lease: Any) -> tuple[str, int, str, int, int]:
