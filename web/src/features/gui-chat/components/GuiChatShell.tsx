@@ -13,7 +13,6 @@ import {
   Search,
   Settings2,
   Sparkles,
-  Terminal,
   X,
 } from "lucide-react";
 import { ChatSessionList } from "@/components/ChatSessionList";
@@ -99,7 +98,6 @@ export function GuiChatShell() {
   );
   const mobilePanelOpen = mobilePanelOpenRaw;
   const activeSessionId = state.storedSessionId ?? resumeSessionId;
-  const terminalResumeId = state.storedSessionId ?? resumeSessionId;
   const forceBottomKey = `${activeSessionId ?? "new"}:${sendScrollNonce}`;
   const closeMobilePanel = useCallback(() => setMobilePanelOpenRaw(false), []);
   const handleActiveSessionChange = useCallback(
@@ -542,12 +540,6 @@ export function GuiChatShell() {
     dashboardAuthTransition.reset();
     void api.logout();
   };
-  const goToTerminal = () =>
-    navigate(
-      terminalResumeId
-        ? `/chat?resume=${encodeURIComponent(terminalResumeId)}`
-        : "/chat",
-    );
   const sidebar = (
     <>
       <div className="px-3 pb-2 pt-3">
@@ -565,10 +557,6 @@ export function GuiChatShell() {
         <button className="gui-chat-nav-item" onClick={startNewGuiChat} type="button">
           <MessageSquarePlus />
           <span>New chat</span>
-        </button>
-        <button className="gui-chat-nav-item" onClick={goToTerminal} type="button">
-          <Terminal />
-          <span>Terminal chat</span>
         </button>
         <button className="gui-chat-nav-item" onClick={() => navigate("/files")} type="button">
           <FolderOpen />
@@ -679,9 +667,6 @@ export function GuiChatShell() {
           <div className="ml-auto flex items-center gap-1">
             <button aria-label={mockMode ? "Replay" : t.common.retry} className="gui-chat-icon-button" onClick={retryConnection} type="button">
               <RefreshCw className={cn("h-3.5 w-3.5", state.connection === "connecting" && "animate-spin")} />
-            </button>
-            <button aria-label="Open Terminal Chat" className="gui-chat-icon-button" onClick={goToTerminal} type="button">
-              <Terminal className="h-3.5 w-3.5" />
             </button>
           </div>
         </header>

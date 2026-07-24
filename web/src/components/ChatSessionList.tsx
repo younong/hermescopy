@@ -240,7 +240,7 @@ export function ChatSessionList({
                     : "text-text-secondary hover:bg-midground/5 hover:text-foreground",
               )}
             >
-              <span className={cn("w-full truncate", variant === "compact" ? "text-[0.8125rem] font-normal" : "text-sm font-medium")}>
+              <span className={cn("w-full truncate", variant === "compact" ? "text-sm font-normal" : "text-sm font-medium")}>
                 {rowLabel(s, t.sessions.untitledSession)}
               </span>
               {variant === "default" ? (
