@@ -915,6 +915,24 @@ DEFAULT_CONFIG = {
     # sessions (no live client) so accumulated agents don't pile up under memory
     # pressure. Reopening one re-resumes it from disk. 0/null disables.
     "max_live_sessions": 16,
+    "channel_connectors": {
+        "weixin_ilink": {
+            "enabled": False,
+            "bot_type": "3",
+            "enrollment_ttl_seconds": 480,
+            "enrollment_poll_interval_seconds": 1,
+            "max_pending_enrollments": 100,
+            "rate_limit_per_source": 5,
+            "rate_limit_window_seconds": 300,
+            "provider_poll_timeout_ms": 35000,
+            "provider_retry_seconds": 2,
+            "dispatch_concurrency": 4,
+            "dispatch_claim_timeout_seconds": 1800,
+            "outbound_retry_seconds": 2,
+            "active_lookup_key_version": 1,
+            "active_encryption_key_version": 1,
+        },
+    },
     "agent": {
         "max_turns": 90,
         # Inactivity timeout for gateway agent execution (seconds).

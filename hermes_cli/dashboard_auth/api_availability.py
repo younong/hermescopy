@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS
+from hermes_cli.dashboard_auth.public_paths import is_public_api_route
 
 
 class AuthenticatedApiBucket(str, Enum):
@@ -111,7 +111,7 @@ def classify_authenticated_api(
             True,
             "non-api route",
         )
-    if path in PUBLIC_API_PATHS:
+    if is_public_api_route(path, method=method):
         bucket = AuthenticatedApiBucket.TOKEN_AUTH_ONLY if path in TOKEN_AUTH_ONLY_PATHS else AuthenticatedApiBucket.PUBLIC_BOOTSTRAP
         return AuthenticatedApiDecision(bucket, True, bucket.value)
     if path in CONTROL_PLANE_AUTH_PATHS or any(path.startswith(prefix) for prefix in CONTROL_PLANE_AUTH_PREFIXES):

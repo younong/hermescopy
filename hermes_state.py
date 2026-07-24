@@ -788,6 +788,18 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS external_turn_receipts (
+    turn_key TEXT PRIMARY KEY,
+    stored_session_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('processing', 'completed', 'ambiguous')),
+    worker_id TEXT NOT NULL,
+    worker_generation INTEGER NOT NULL,
+    result_text TEXT,
+    result_status TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -1197,6 +1209,86 @@ class SessionDB:
         raise last_err or sqlite3.OperationalError(
             "database is locked after max retries"
         )
+
+    def begin_external_turn(
+        self,
+        *,
+        turn_key: str,
+        stored_session_id: str,
+        worker_id: str,
+        worker_generation: int,
+    ) -> dict[str, Any]:
+        """Claim an external turn or return its durable terminal state.
+
+        A receipt left processing by another Worker generation is ambiguous:
+        tools may already have run, so callers must not silently execute again.
+        """
+        now = time.time()
+
+        def _write(conn: sqlite3.Connection) -> dict[str, Any]:
+            row = conn.execute(
+                "SELECT * FROM external_turn_receipts WHERE turn_key=?",
+                (turn_key,),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO external_turn_receipts
+                      (turn_key, stored_session_id, status, worker_id,
+                       worker_generation, created_at, updated_at)
+                    VALUES (?, ?, 'processing', ?, ?, ?, ?)
+                    """,
+                    (turn_key, stored_session_id, worker_id, worker_generation, now, now),
+                )
+                return {"status": "claimed"}
+            result = dict(row)
+            if result["stored_session_id"] != stored_session_id:
+                raise RuntimeError("external turn receipt session mismatch")
+            if result["status"] == "processing" and (
+                result["worker_id"] != worker_id
+                or int(result["worker_generation"]) != int(worker_generation)
+            ):
+                conn.execute(
+                    "UPDATE external_turn_receipts SET status='ambiguous', updated_at=? WHERE turn_key=? AND status='processing'",
+                    (now, turn_key),
+                )
+                result["status"] = "ambiguous"
+            return result
+
+        return self._execute_write(_write)
+
+    def complete_external_turn(
+        self,
+        *,
+        turn_key: str,
+        worker_id: str,
+        worker_generation: int,
+        result_text: str,
+        result_status: str,
+    ) -> None:
+        now = time.time()
+
+        def _write(conn: sqlite3.Connection) -> None:
+            changed = conn.execute(
+                """
+                UPDATE external_turn_receipts
+                SET status='completed', result_text=?, result_status=?, updated_at=?
+                WHERE turn_key=? AND status='processing' AND worker_id=?
+                  AND worker_generation=?
+                """,
+                (
+                    result_text,
+                    result_status,
+                    now,
+                    turn_key,
+                    worker_id,
+                    worker_generation,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("external turn receipt claim is no longer valid")
+
+        self._execute_write(_write)
 
     def _try_wal_checkpoint(self) -> None:
         """Best-effort TRUNCATE WAL checkpoint.  Never raises.
