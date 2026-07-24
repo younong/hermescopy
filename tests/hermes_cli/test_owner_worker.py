@@ -2474,7 +2474,10 @@ def test_worker_session_routes_require_owner_token(tmp_path, monkeypatch):
     assert client.get("/api/sessions").status_code == 401
 
     token = _capability_for(app, audience=AUD_OWNER_WORKER_HTTP, path="/api/sessions", control_home=tmp_path / "control")
-    response = client.get("/api/sessions", headers={"Authorization": f"Bearer {token}"})
+    response = client.get(
+        "/api/sessions?compact=true",
+        headers={"Authorization": f"Bearer {token}"},
+    )
     assert response.status_code == 200
     assert response.json()["sessions"] == []
 

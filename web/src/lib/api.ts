@@ -425,10 +425,11 @@ export const api = {
     offset = 0,
     profile = getManagementProfile(),
     order: "created" | "recent" = "created",
+    compact = false,
   ) =>
     fetchJSON<PaginatedSessions>(
       appendProfileParam(
-        `/api/sessions?limit=${limit}&offset=${offset}&order=${order}`,
+        `/api/sessions?limit=${limit}&offset=${offset}&order=${order}${compact ? "&compact=true" : ""}`,
         profile,
       ),
     ),

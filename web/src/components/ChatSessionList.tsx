@@ -101,7 +101,7 @@ export function ChatSessionList({
     setLoading(true);
     setError(null);
     api
-      .getSessions(SESSION_LIMIT, 0, scopeKey, "recent")
+      .getSessions(SESSION_LIMIT, 0, scopeKey, "recent", variant === "compact")
       .then((res) => {
         if (reqRef.current !== myReq) return;
         setSessions(res.sessions);
@@ -113,7 +113,7 @@ export function ChatSessionList({
       .finally(() => {
         if (reqRef.current === myReq) setLoading(false);
       });
-  }, [scopeKey]);
+  }, [scopeKey, variant]);
 
   useEffect(() => {
     // Dashboard data surfaces fetch from an effect on mount + scope change;

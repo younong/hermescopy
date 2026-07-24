@@ -5392,7 +5392,10 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
     @pytest.mark.parametrize(
         ("request_path", "worker_path"),
         [
-            ("/api/sessions?limit=5&profile=default", "/api/sessions?limit=5"),
+            (
+                "/api/sessions?limit=5&profile=default&compact=true",
+                "/api/sessions?limit=5&compact=true",
+            ),
             ("/api/sessions/search?q=needle&profile=default", "/api/sessions/search?q=needle"),
             ("/api/sessions/session-1?profile=default", "/api/sessions/session-1"),
             ("/api/sessions/session-1/messages?profile=default", "/api/sessions/session-1/messages"),
@@ -5695,6 +5698,13 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
 
         assert response.status_code == 400
         assert not self.supervisor.owners
+
+    def test_auth_me_prewarms_the_exact_authenticated_owner(self):
+        response = self.client.get("/api/auth/me")
+
+        assert response.status_code == 200
+        assert len(self.supervisor.owners) == 1
+        assert self.supervisor.owners[0].owner_key == response.json()["owner_key"]
 
     def test_authenticated_sessions_route_a_and_b_to_independent_trusted_owner_handles(self, monkeypatch):
         import httpx

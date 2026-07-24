@@ -547,24 +547,20 @@ async def _proxy_authenticated_owner_http(request: Request) -> Response:
     if not _authenticated_owner_request(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    from hermes_cli.dashboard_auth.owner_context import ensure_owner_home, owner_context_from_session
     from hermes_cli.owner_worker import (
         OwnerWorkerClient,
         OwnerWorkerHealthError,
         OwnerWorkerUnavailableError,
     )
+    from hermes_cli.owner_worker.readiness import ensure_owner_worker_ready
 
     _reject_authenticated_profile_query_params(request)
-    owner = owner_context_from_session(request.state.session)
-    ensure_owner_home(owner)
     supervisor = getattr(request.app.state, "owner_worker_supervisor", None)
-    if supervisor is None:
-        raise HTTPException(status_code=503, detail="Owner worker supervisor is unavailable")
 
     lease: Any | None = None
     try:
         stage_started_at = time.monotonic()
-        handle = await asyncio.to_thread(supervisor.get_or_start, owner)
+        _owner, handle = await ensure_owner_worker_ready(request)
         log_latency_stage(
             _log,
             trace_id=latency_trace_id,
@@ -572,14 +568,6 @@ async def _proxy_authenticated_owner_http(request: Request) -> Response:
             stage="owner_worker.ready",
             started_at=stage_started_at,
         )
-        if str(handle.owner_key) != str(owner.owner_key):
-            _log.error(
-                "owner worker returned a mismatched handle method=%s path=%s request_id=%s",
-                request.method,
-                request.url.path,
-                request.headers.get("x-request-id", ""),
-            )
-            raise HTTPException(status_code=502, detail="Owner worker request failed")
         lease = _acquire_owner_worker_use(supervisor, handle)
         content = await request.body()
         worker_path = request.url.path
@@ -3978,6 +3966,7 @@ async def get_sessions(
     exclude_sources: str = None,
     cwd_prefix: str = None,
     profile: Optional[str] = None,
+    compact: bool = False,
 ):
     """List sessions.
 
@@ -3991,16 +3980,6 @@ async def get_sessions(
     chain). ``recent`` keeps a long-running conversation on the first page
     after it auto-compresses into a fresh continuation id.
     """
-    if archived not in ("exclude", "only", "include"):
-        raise HTTPException(
-            status_code=400,
-            detail="archived must be one of: exclude, only, include",
-        )
-    if order not in ("created", "recent"):
-        raise HTTPException(
-            status_code=400,
-            detail="order must be one of: created, recent",
-        )
     if _authenticated_owner_request(request):
         _reject_authenticated_profile_param(profile)
         return await _proxy_authenticated_owner_http(request)
@@ -4010,46 +3989,20 @@ async def get_sessions(
     try:
         db = _open_session_db_for_profile(profile)
         try:
-            min_message_count = max(0, min_messages)
-            archived_only = archived == "only"
-            include_archived = archived == "include"
-            # Optional source scoping: ``source`` includes a single class,
-            # ``exclude_sources`` (comma-separated) drops classes. The desktop
-            # uses these to split recents (exclude=cron) from the cron-jobs
-            # section (source=cron) into two independent lists.
-            exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
-            sessions = db.list_sessions_rich(
-                source=source or None,
-                exclude_sources=exclude_list or None,
-                cwd_prefix=(cwd_prefix or None),
+            return session_api.list_sessions_payload(
+                db,
                 limit=limit,
                 offset=offset,
-                min_message_count=min_message_count,
-                include_archived=include_archived,
-                archived_only=archived_only,
-                order_by_last_active=order == "recent",
+                min_messages=min_messages,
+                archived=archived,
+                order=order,
+                source=source,
+                exclude_sources=exclude_sources,
+                cwd_prefix=cwd_prefix,
+                profile_name=profile_name,
+                compact=compact,
+                latency_trace_id=request.headers.get("x-request-id", ""),
             )
-            total = db.session_count(
-                source=source or None,
-                cwd_prefix=(cwd_prefix or None),
-                exclude_sources=exclude_list or None,
-                min_message_count=min_message_count,
-                include_archived=include_archived,
-                archived_only=archived_only,
-                exclude_children=True,
-            )
-            now = time.time()
-            for s in sessions:
-                s["is_active"] = (
-                    s.get("ended_at") is None
-                    and (now - s.get("last_active", s.get("started_at", 0))) < 300
-                )
-                if profile_name:
-                    s["profile"] = profile_name
-                    s["is_default_profile"] = profile_name == "default"
-                # SQLite stores the flag as 0/1; expose a real JSON boolean.
-                s["archived"] = bool(s.get("archived"))
-            return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
         finally:
             db.close()
     except HTTPException:
