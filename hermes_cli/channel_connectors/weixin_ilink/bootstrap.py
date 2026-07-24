@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+import ssl
 from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
+import certifi
 
 from hermes_cli.channel_identity.crypto import ChannelCrypto
 from hermes_cli.channel_identity.store import ChannelIdentityStore
@@ -106,7 +108,11 @@ async def bootstrap_weixin_ilink(
         return WeixinILinkRuntime(WeixinILinkStatus.create("keyrings_unavailable"))
 
     runtime = WeixinILinkRuntime(WeixinILinkStatus.create("startup_failed"))
-    runtime.session = aiohttp.ClientSession(trust_env=True)
+    ssl_context = ssl.create_default_context(cafile=certifi.where())
+    runtime.session = aiohttp.ClientSession(
+        connector=aiohttp.TCPConnector(ssl=ssl_context),
+        trust_env=True,
+    )
     try:
         store = ChannelIdentityStore(crypto)
         runtime.service = WeixinILinkService(
