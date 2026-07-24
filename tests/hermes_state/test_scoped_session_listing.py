@@ -57,7 +57,13 @@ def test_historical_scope_lists_only_resumable_owner_history(tmp_path):
 def test_compact_listing_skips_exact_display_counts(tmp_path, monkeypatch):
     db = SessionDB(tmp_path / "state.db")
     try:
-        db.create_session("compact", source="gui")
+        db.create_session(
+            "compact",
+            source="gui",
+            model="test-model",
+            model_config={"large": "x" * 10_000},
+            system_prompt="secret prompt material",
+        )
         db.append_message("compact", "user", "hello")
 
         def fail_display_count(*args, **kwargs):
@@ -68,7 +74,11 @@ def test_compact_listing_skips_exact_display_counts(tmp_path, monkeypatch):
         payload = list_sessions_payload(db, order="recent", compact=True)
 
         assert [session["id"] for session in payload["sessions"]] == ["compact"]
-        assert payload["sessions"][0]["message_count"] == 1
+        session = payload["sessions"][0]
+        assert session["message_count"] == 1
+        assert session["model"] == "test-model"
+        assert "system_prompt" not in session
+        assert "model_config" not in session
     finally:
         db.close()
 

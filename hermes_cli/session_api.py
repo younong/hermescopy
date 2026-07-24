@@ -20,6 +20,25 @@ from hermes_cli.latency_trace import log_latency_stage
 
 _log = logging.getLogger(__name__)
 
+_COMPACT_SESSION_FIELDS = (
+    "id",
+    "source",
+    "model",
+    "title",
+    "started_at",
+    "ended_at",
+    "last_active",
+    "is_active",
+    "message_count",
+    "tool_call_count",
+    "input_tokens",
+    "output_tokens",
+    "preview",
+    "parent_session_id",
+    "archived",
+    "_lineage_root_id",
+)
+
 
 def list_sessions_payload(
     db: Any,
@@ -103,6 +122,11 @@ def list_sessions_payload(
         if profile_name:
             session["profile"] = profile_name
             session["is_default_profile"] = profile_name == "default"
+    if compact:
+        sessions = [
+            {key: session[key] for key in _COMPACT_SESSION_FIELDS if key in session}
+            for session in sessions
+        ]
     log_latency_stage(
         _log,
         trace_id=latency_trace_id,
