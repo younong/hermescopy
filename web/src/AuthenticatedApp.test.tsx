@@ -112,6 +112,16 @@ describe("AuthenticatedApp", () => {
     },
   );
 
+  it("allows members to open the Chat GUI files route", async () => {
+    mocks.identity.mockReturnValue(identity({ authMe: authMe("member") }));
+
+    renderApp("/chat-gui/files");
+    await flush();
+
+    expect(document.querySelector("[data-member-chat]")?.getAttribute("data-pathname"))
+      .toBe("/chat-gui/files");
+  });
+
   it("preserves a member chat resume deep link", async () => {
     mocks.identity.mockReturnValue(identity({ authMe: authMe("member") }));
 

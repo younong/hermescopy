@@ -1,5 +1,4 @@
 import {
-  useCallback,
   useEffect,
   useRef,
   useState,
@@ -33,8 +32,8 @@ import { Toast } from "@nous-research/ui/ui/components/toast";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
 import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
 import { usePageHeader } from "@/contexts/usePageHeader";
-import { api } from "@/lib/api";
-import type { ManagedFileEntry, ManagedFilesResponse } from "@/lib/api";
+import { useManagedFiles } from "@/features/files/useManagedFiles";
+import type { ManagedFileEntry } from "@/lib/api";
 import { PluginSlot } from "@/plugins";
 
 const DATE_FORMAT = new Intl.DateTimeFormat(undefined, {
@@ -42,29 +41,12 @@ const DATE_FORMAT = new Intl.DateTimeFormat(undefined, {
   timeStyle: "short",
 });
 
-function joinPath(base: string, name: string): string {
-  const cleanName = name.trim().replace(/^[\\/]+/, "");
-  if (!cleanName) return base;
-  const separator = base.includes("\\") && !base.includes("/") ? "\\" : "/";
-  if (!base || base.endsWith("/") || base.endsWith("\\")) return `${base}${cleanName}`;
-  return `${base}${separator}${cleanName}`;
-}
-
 function formatBytes(size: number | null): string {
   if (size === null) return "-";
   if (size < 1024) return `${size} B`;
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
   if (size < 1024 * 1024 * 1024) return `${(size / (1024 * 1024)).toFixed(1)} MB`;
   return `${(size / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-}
-
-function downloadDataUrl(dataUrl: string, name: string) {
-  const link = document.createElement("a");
-  link.href = dataUrl;
-  link.download = name || "download";
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
 }
 
 function displayPath(path: string | null | undefined): string {
@@ -80,48 +62,29 @@ export default function FilesPage() {
   const { setAfterTitle, setEnd } = usePageHeader();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const dragDepthRef = useRef(0);
-  const [currentPath, setCurrentPath] = useState<string | undefined>(undefined);
   const [pathInput, setPathInput] = useState("");
-  const [listing, setListing] = useState<ManagedFilesResponse | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [uploading, setUploading] = useState(false);
   const [draggingFiles, setDraggingFiles] = useState(false);
-  const [creating, setCreating] = useState(false);
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
-  const [deleting, setDeleting] = useState(false);
   const [folderName, setFolderName] = useState("");
   const [pendingDelete, setPendingDelete] = useState<ManagedFileEntry | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  const activePath = listing?.path ?? currentPath ?? "";
-  const canChangePath = listing?.can_change_path ?? false;
-  const canUpload = Boolean(activePath) && !uploading;
-  const headerPath = displayPath(listing?.locked_root ?? listing?.path ?? currentPath);
-
-  const load = useCallback(
-    async (path = currentPath) => {
-      setLoading(true);
-      setError(null);
-      try {
-        const result = await api.listFiles(path);
-        setListing(result);
-        setCurrentPath(result.path);
-        setPathInput(result.path);
-      } catch (e) {
-        setError(String(e));
-      } finally {
-        setLoading(false);
-      }
-    },
-    [currentPath],
-  );
-
-  useEffect(() => {
-    // Existing dashboard data pages fetch from effects; keep this local and explicit
-    // until the shared lint profile is updated for async page loaders.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    void load(currentPath);
-  }, [currentPath]); // eslint-disable-line react-hooks/exhaustive-deps
+  const {
+    activePath,
+    canChangePath,
+    canUpload,
+    createDirectory,
+    creating,
+    deleteFile,
+    deleting,
+    downloadFile,
+    error,
+    listing,
+    load,
+    loading,
+    setCurrentPath,
+    uploading,
+    uploadFiles,
+  } = useManagedFiles();
+  const headerPath = displayPath(listing?.locked_root ?? listing?.path);
 
   useEffect(() => {
     setAfterTitle(
@@ -156,51 +119,34 @@ export default function FilesPage() {
   };
 
   const goToPath = async () => {
-    const nextPath = pathInput.trim();
+    const nextPath = pathInput.trim() || activePath;
     if (!nextPath) {
       showToast("Path required", "error");
       return;
     }
     await load(nextPath);
+    setPathInput("");
   };
 
-  const createDirectory = async () => {
-    const name = folderName.trim();
-    if (!activePath) {
-      showToast("Directory unavailable", "error");
-      return;
-    }
-    if (!name) {
-      showToast("Folder name required", "error");
-      return;
-    }
-    setCreating(true);
+  const submitCreateDirectory = async () => {
     try {
-      await api.createDirectory(joinPath(activePath, name));
+      await createDirectory(folderName, activePath);
       setFolderName("");
       setCreateDialogOpen(false);
       showToast("Folder created", "success");
-      await load();
     } catch (e) {
       showToast(`Create failed: ${e}`, "error");
-    } finally {
-      setCreating(false);
     }
   };
 
-  const uploadFiles = async (files: FileList | null) => {
+  const submitUploadFiles = async (files: FileList | null) => {
     if (!files?.length) return;
-    setUploading(true);
     try {
-      for (const file of Array.from(files)) {
-        await api.uploadFile(joinPath(activePath, file.name), file, true);
-      }
+      await uploadFiles(Array.from(files), activePath);
       showToast(`${files.length} file${files.length === 1 ? "" : "s"} uploaded`, "success");
-      await load();
     } catch (e) {
       showToast(`Upload failed: ${e}`, "error");
     } finally {
-      setUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
     }
   };
@@ -232,14 +178,12 @@ export default function FilesPage() {
     event.preventDefault();
     dragDepthRef.current = 0;
     setDraggingFiles(false);
-    void uploadFiles(event.dataTransfer.files);
+    void submitUploadFiles(event.dataTransfer.files);
   };
 
-  const downloadFile = async (entry: ManagedFileEntry) => {
-    if (entry.is_directory) return;
+  const submitDownloadFile = async (entry: ManagedFileEntry) => {
     try {
-      const file = await api.readFile(entry.path);
-      downloadDataUrl(file.data_url, file.name);
+      await downloadFile(entry);
     } catch (e) {
       showToast(`Download failed: ${e}`, "error");
     }
@@ -247,16 +191,12 @@ export default function FilesPage() {
 
   const confirmDelete = async () => {
     if (!pendingDelete) return;
-    setDeleting(true);
     try {
-      await api.deleteFile(pendingDelete.path, pendingDelete.is_directory);
+      await deleteFile(pendingDelete, activePath);
       showToast("Deleted", "success");
       setPendingDelete(null);
-      await load();
     } catch (e) {
       showToast(`Delete failed: ${e}`, "error");
-    } finally {
-      setDeleting(false);
     }
   };
 
@@ -269,7 +209,7 @@ export default function FilesPage() {
         type="file"
         multiple
         className="hidden"
-        onChange={(event) => void uploadFiles(event.currentTarget.files)}
+        onChange={(event) => void submitUploadFiles(event.currentTarget.files)}
       />
 
       <div className="flex min-w-0 flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
@@ -282,7 +222,7 @@ export default function FilesPage() {
             }}
           >
             <Input
-              value={pathInput}
+              value={pathInput || activePath}
               onChange={(event) => setPathInput(event.target.value)}
               aria-label="Path"
               placeholder="Path"
@@ -402,7 +342,7 @@ export default function FilesPage() {
               >
                 <button
                   type="button"
-                  onClick={() => (entry.is_directory ? openDirectory(entry) : void downloadFile(entry))}
+                  onClick={() => (entry.is_directory ? openDirectory(entry) : void submitDownloadFile(entry))}
                   className="flex min-w-0 items-center gap-2 text-left font-mono text-foreground"
                 >
                   {entry.is_directory ? (
@@ -432,7 +372,7 @@ export default function FilesPage() {
                       ghost
                       size="icon"
                       type="button"
-                      onClick={() => void downloadFile(entry)}
+                      onClick={() => void submitDownloadFile(entry)}
                       aria-label={`Download ${entry.name}`}
                     >
                       <Download />
@@ -478,7 +418,7 @@ export default function FilesPage() {
               value={folderName}
               onChange={(event) => setFolderName(event.target.value)}
               onKeyDown={(event) => {
-                if (event.key === "Enter") void createDirectory();
+                if (event.key === "Enter") void submitCreateDirectory();
               }}
               placeholder="Folder name"
               disabled={creating}
@@ -498,7 +438,7 @@ export default function FilesPage() {
             </Button>
             <Button
               type="button"
-              onClick={() => void createDirectory()}
+              onClick={() => void submitCreateDirectory()}
               disabled={creating}
               prefix={creating ? <Spinner /> : <FolderPlus />}
             >
