@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 
-import { act } from "react";
+import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -17,6 +18,8 @@ import { GuiChatShell } from "./GuiChatShell";
 const mocks = vi.hoisted(() => ({
   connectGuiChat: vi.fn(),
   getAuthMe: vi.fn(),
+  setEnd: vi.fn(),
+  setTitle: vi.fn(),
 }));
 
 vi.mock("@/lib/api", async (importOriginal) => {
@@ -36,7 +39,7 @@ vi.mock("../mock", () => ({
 }));
 
 vi.mock("@/contexts/usePageHeader", () => ({
-  usePageHeader: () => ({ setEnd: vi.fn(), setTitle: vi.fn() }),
+  usePageHeader: () => ({ setEnd: mocks.setEnd, setTitle: mocks.setTitle }),
 }));
 
 vi.mock("@/contexts/useProfileScope", () => ({
@@ -55,7 +58,16 @@ vi.mock("@/components/ChatSessionList", () => ({
 
 vi.mock("./Composer", () => ({
   Composer: (props: Record<string, unknown>) => (
-    <button data-composer-send onClick={() => void (props.onSend as Function)("new message", [], () => undefined)}>
+    <button
+      data-composer-send
+      onClick={() =>
+        void (props.onSend as (...args: unknown[]) => unknown)(
+          "new message",
+          [],
+          () => undefined,
+        )
+      }
+    >
       Composer send
     </button>
   ),
@@ -63,7 +75,13 @@ vi.mock("./Composer", () => ({
 
 vi.mock("./MessageList", () => ({
   MessageList: (props: Record<string, unknown>) => (
-    <button data-clarify-answer onClick={() => (props.onClarifyRespond as Function)("clarify-1", "A")}>
+    <button
+      data-clarify-answer
+      data-terminal-hint={String(props.showTerminalChatHint)}
+      onClick={() =>
+        (props.onClarifyRespond as (...args: unknown[]) => unknown)("clarify-1", "A")
+      }
+    >
       Clarify answer
     </button>
   ),
@@ -76,6 +94,8 @@ beforeEach(() => {
     .IS_REACT_ACT_ENVIRONMENT = true;
   mocks.connectGuiChat.mockReset();
   mocks.getAuthMe.mockReset();
+  mocks.setEnd.mockReset();
+  mocks.setTitle.mockReset();
   window.__HERMES_AUTH_REQUIRED__ = true;
   window.matchMedia = vi.fn().mockImplementation((query: string) => ({
     addEventListener: vi.fn(),
@@ -97,6 +117,39 @@ afterEach(async () => {
 });
 
 describe("GuiChatShell", () => {
+  it("keeps terminal chat in the default dashboard header", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(<GuiChatShell />);
+
+    expect(latestHeaderMarkup()).toContain("Terminal Chat");
+    expect(document.querySelector("[data-terminal-hint]")?.getAttribute("data-terminal-hint")).toBe(
+      "true",
+    );
+  });
+
+  it("hides terminal chat and includes custom actions in standalone mode", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(
+      <GuiChatShell
+        headerActions={<button type="button">Log out</button>}
+        showTerminalChatAction={false}
+      />,
+    );
+
+    const header = latestHeaderMarkup();
+    expect(header).not.toContain("Terminal Chat");
+    expect(header).toContain("Log out");
+    expect(document.querySelector("[data-terminal-hint]")?.getAttribute("data-terminal-hint")).toBe(
+      "false",
+    );
+  });
+
   it("connects automatically when the authenticated owner becomes ready", async () => {
     const identity = deferred<AuthIdentity>();
     const firstConnection = createConnection();
@@ -300,6 +353,26 @@ describe("GuiChatShell", () => {
     expect(connection.close).toHaveBeenCalledOnce();
   });
 });
+
+async function renderShell(shell: ReactNode) {
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  root = createRoot(container);
+  await act(async () => {
+    root?.render(
+      <MemoryRouter initialEntries={["/chat-gui"]}>
+        <DashboardAuthIdentityProvider>{shell}</DashboardAuthIdentityProvider>
+      </MemoryRouter>,
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
+function latestHeaderMarkup(): string {
+  const calls = mocks.setEnd.mock.calls.filter(([value]) => value !== null);
+  return renderToStaticMarkup(calls.at(-1)?.[0] ?? null);
+}
 
 function ReadyProbe() {
   const { ready } = useDashboardAuthIdentity();

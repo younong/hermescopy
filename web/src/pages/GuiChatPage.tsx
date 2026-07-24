@@ -1,5 +1,11 @@
+import type { ReactNode } from "react";
 import { GuiChatShell } from "@/features/gui-chat/components/GuiChatShell";
 
-export default function GuiChatPage() {
-  return <GuiChatShell />;
+interface GuiChatPageProps {
+  headerActions?: ReactNode;
+  showTerminalChatAction?: boolean;
+}
+
+export default function GuiChatPage(props: GuiChatPageProps) {
+  return <GuiChatShell {...props} />;
 }

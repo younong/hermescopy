@@ -31,6 +31,7 @@ import { LogOut } from "lucide-react";
 
 interface AuthWidgetProps {
   className?: string;
+  variant?: "sidebar" | "header";
 }
 
 /** Truncate ``user_id`` to fit a small UI without revealing the full
@@ -41,8 +42,9 @@ function truncateUserId(id: string): string {
   return `${id.slice(0, 14)}…`;
 }
 
-export function AuthWidget({ className }: AuthWidgetProps) {
+export function AuthWidget({ className, variant = "sidebar" }: AuthWidgetProps) {
   const { authMe: me, authRequired, error, loading } = useDashboardAuthIdentity();
+  const header = variant === "header";
 
   if (!authRequired || error?.startsWith("401:") || error?.startsWith("403:")) {
     return null;
@@ -52,7 +54,9 @@ export function AuthWidget({ className }: AuthWidgetProps) {
     return (
       <div
         className={cn(
-          "px-5 py-2 text-[0.65rem] tracking-[0.05em] text-muted-foreground/70",
+          header
+            ? "text-xs text-muted-foreground/70"
+            : "px-5 py-2 text-[0.65rem] tracking-[0.05em] text-muted-foreground/70",
           className,
         )}
       >
@@ -67,7 +71,9 @@ export function AuthWidget({ className }: AuthWidgetProps) {
     return (
       <div
         className={cn(
-          "h-9 px-5 py-2 text-[0.65rem] text-muted-foreground/40",
+          header
+            ? "text-xs text-muted-foreground/40"
+            : "h-9 px-5 py-2 text-[0.65rem] text-muted-foreground/40",
           className,
         )}
         aria-busy="true"
@@ -91,9 +97,9 @@ export function AuthWidget({ className }: AuthWidgetProps) {
     <div
       className={cn(
         "flex shrink-0 items-center justify-between gap-2",
-        "px-5 py-2",
-        "border-t border-current/10",
-        "text-[0.65rem] tracking-[0.05em]",
+        header
+          ? "text-xs"
+          : "border-t border-current/10 px-5 py-2 text-[0.65rem] tracking-[0.05em]",
         className,
       )}
       role="status"
@@ -103,9 +109,11 @@ export function AuthWidget({ className }: AuthWidgetProps) {
         <span className="truncate font-mono text-foreground/90" title={me.user_id}>
           {label}
         </span>
-        <span className="truncate text-muted-foreground/70">
-          via {me.provider}{me.isolation_mode === "owner_worker" ? " · isolated" : ""}
-        </span>
+        {!header ? (
+          <span className="truncate text-muted-foreground/70">
+            via {me.provider}{me.isolation_mode === "owner_worker" ? " · isolated" : ""}
+          </span>
+        ) : null}
         {me.legacy_sessions_message ? (
           <span className="sr-only">{me.legacy_sessions_message}</span>
         ) : null}

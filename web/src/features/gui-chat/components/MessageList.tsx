@@ -29,6 +29,7 @@ export function MessageList({
   onApprovalRespond,
   onClarifyRespond,
   onLoadEarlier,
+  showTerminalChatHint = true,
   state,
 }: {
   disabled?: boolean;
@@ -36,6 +37,7 @@ export function MessageList({
   onApprovalRespond: (id: string, approved: boolean) => void;
   onClarifyRespond: (id: string, answer: string) => void;
   onLoadEarlier?: () => void;
+  showTerminalChatHint?: boolean;
   state: GuiChatState;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -182,7 +184,11 @@ export function MessageList({
       <div className="flex min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5">
         <div className="m-auto max-w-xl border border-current/15 bg-midground/5 px-6 py-5 text-center">
           <h2 className="mb-2 font-display text-lg uppercase tracking-[0.12em] text-midground">Hermes GUI Chat beta</h2>
-          <p className="text-sm text-text-secondary">Structured chat over /api/ws. Terminal Chat remains available at /chat.</p>
+          <p className="text-sm text-text-secondary">
+            {showTerminalChatHint
+              ? "Structured chat over /api/ws. Terminal Chat remains available at /chat."
+              : "Structured chat over /api/ws."}
+          </p>
         </div>
       </div>
     );

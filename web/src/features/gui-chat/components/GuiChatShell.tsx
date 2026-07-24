@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { createPortal } from "react-dom";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { Badge } from "@nous-research/ui/ui/components/badge";
@@ -29,7 +37,15 @@ import {
 import { Composer } from "./Composer";
 import { MessageList } from "./MessageList";
 
-export function GuiChatShell() {
+interface GuiChatShellProps {
+  headerActions?: ReactNode;
+  showTerminalChatAction?: boolean;
+}
+
+export function GuiChatShell({
+  headerActions,
+  showTerminalChatAction = true,
+}: GuiChatShellProps = {}) {
   const { t } = useI18n();
   const navigate = useNavigate();
   const { setEnd, setTitle } = usePageHeader();
@@ -340,27 +356,39 @@ export function GuiChatShell() {
             Sessions
           </Button>
         ) : null}
-        <Button
-          ghost
-          size="sm"
-          onClick={() =>
-            navigate(
-              terminalResumeId
-                ? `/chat?resume=${encodeURIComponent(terminalResumeId)}`
-                : "/chat",
-            )
-          }
-        >
-          <Terminal className="h-4 w-4" />
-          Terminal Chat
-        </Button>
+        {showTerminalChatAction ? (
+          <Button
+            ghost
+            size="sm"
+            onClick={() =>
+              navigate(
+                terminalResumeId
+                  ? `/chat?resume=${encodeURIComponent(terminalResumeId)}`
+                  : "/chat",
+              )
+            }
+          >
+            <Terminal className="h-4 w-4" />
+            Terminal Chat
+          </Button>
+        ) : null}
+        {headerActions}
       </div>,
     );
     return () => {
       setTitle(null);
       setEnd(null);
     };
-  }, [mobilePanelOpen, narrow, navigate, setEnd, setTitle, terminalResumeId]);
+  }, [
+    headerActions,
+    mobilePanelOpen,
+    narrow,
+    navigate,
+    setEnd,
+    setTitle,
+    showTerminalChatAction,
+    terminalResumeId,
+  ]);
 
   const disabled = state.connection !== "open" || !state.sessionId;
   const hasPendingClarification = state.clarificationOrder.some((id) =>
@@ -657,6 +685,7 @@ export function GuiChatShell() {
             onApprovalRespond={respondToApproval}
             onClarifyRespond={respondToClarify}
             onLoadEarlier={loadEarlier}
+            showTerminalChatHint={showTerminalChatAction}
             state={state}
           />
           <Composer
