@@ -261,7 +261,7 @@ export function GuiChatFilesPane() {
             <span aria-label="Actions" role="columnheader" />
           </div>
 
-          {listing?.parent ? (
+          {listing && listing.parent !== null ? (
             <button
               className="gui-chat-files-row gui-chat-files-parent-row"
               onClick={() => setCurrentPath(listing.parent ?? undefined)}

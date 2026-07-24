@@ -143,6 +143,16 @@ describe("GuiChatFilesPane", () => {
     expect(mocks.deleteFile).toHaveBeenCalledWith(listing.entries[1], "/workspace");
   });
 
+  it("navigates to an empty-string workspace parent", async () => {
+    listing.path = "default";
+    listing.parent = "";
+    const container = await renderPane();
+
+    await act(async () => container.querySelector<HTMLButtonElement>(".gui-chat-files-parent-row")?.click());
+
+    expect(mocks.setCurrentPath).toHaveBeenCalledWith("");
+  });
+
   it("hides arbitrary path entry when the backend restricts navigation", async () => {
     canChangePath = false;
     const container = await renderPane();

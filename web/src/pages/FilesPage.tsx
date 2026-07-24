@@ -311,7 +311,7 @@ export default function FilesPage() {
             <span className="text-right">Actions</span>
           </div>
 
-          {listing?.parent && (
+          {listing && listing.parent !== null && (
             <button
               type="button"
               onClick={() => setCurrentPath(listing.parent ?? undefined)}
