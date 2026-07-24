@@ -761,6 +761,11 @@ function SessionRow({
 type SessionsView = "list" | "overview";
 
 const PAGE_SIZE = 20;
+const OVERVIEW_SESSION_LIMIT = 30;
+
+export function fetchSessionsOverview() {
+  return api.getSessions(OVERVIEW_SESSION_LIMIT, 0, undefined, "recent", true);
+}
 
 function SessionsPagination({
   className,
@@ -952,17 +957,16 @@ export default function SessionsPage() {
         .getStatus()
         .then(setStatus)
         .catch(() => {});
-      api
-        .getSessions(50)
+      fetchSessionsOverview()
         .then((r) => {
           setOverviewSessions(r.sessions);
           // The dashboard server and a terminal CLI are separate
           // processes sharing one session DB — there is no push channel,
           // so we detect sessions created in another process here. The
-          // overview poll already fetches the 50 newest sessions, so we
-          // reuse its head id as a cheap change signal: when it changes,
-          // silently refresh the paginated list so the new session shows
-          // up in real time without a visible loading flicker.
+          // overview poll fetches compact metadata for the 30 most recently
+          // active sessions, so we reuse its head id as a cheap change signal:
+          // when it changes, silently refresh the paginated list so the new
+          // session shows up in real time without a visible loading flicker.
           const newest = r.sessions[0]?.id ?? null;
           if (shouldRefreshSessions(newestSeenRef.current, newest)) {
             loadSessions(pageRef.current, true);
