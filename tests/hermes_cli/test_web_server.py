@@ -5352,6 +5352,8 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
 
         original_auth_required = getattr(app.state, "auth_required", False)
         original_supervisor = getattr(app.state, "owner_worker_supervisor", None)
+        original_warmup_tasks = getattr(app.state, "owner_worker_warmup_tasks", None)
+        original_warmup_accepting = getattr(app.state, "owner_worker_warmup_accepting", None)
         app.state.auth_required = True
 
         class _Handle:
@@ -5369,25 +5371,49 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
 
             def __init__(self):
                 self.owners = []
+                self.start_count = 0
+                self.start_entered = threading.Event()
+                self.start_completed = threading.Event()
+                self.release_start = threading.Event()
+                self.release_start.set()
+                self.start_error = None
+
+            def shutdown(self):
+                pass
 
             def get_or_start(self, owner):
+                self.start_count += 1
+                self.start_entered.set()
+                if not self.release_start.wait(timeout=5):
+                    raise TimeoutError("test worker start remained blocked")
+                if self.start_error is not None:
+                    self.start_completed.set()
+                    raise self.start_error
                 self.owners.append(owner)
+                self.start_completed.set()
                 return _Handle(owner.owner_key)
 
         self.supervisor = _Supervisor()
         app.state.owner_worker_supervisor = self.supervisor
+        app.state.owner_worker_warmup_tasks = {}
+        app.state.owner_worker_warmup_accepting = True
 
         async def fake_gate(request, call_next):
             request.state.session = self.session
             return await call_next(request)
 
         monkeypatch.setattr(auth_middleware, "gated_auth_middleware", fake_gate)
-        self.client = TestClient(app)
+        client_context = TestClient(app)
+        self.client = client_context.__enter__()
 
         yield
 
+        self.supervisor.release_start.set()
+        client_context.__exit__(None, None, None)
         app.state.auth_required = original_auth_required
         app.state.owner_worker_supervisor = original_supervisor
+        app.state.owner_worker_warmup_tasks = original_warmup_tasks
+        app.state.owner_worker_warmup_accepting = original_warmup_accepting
 
     @pytest.mark.parametrize(
         ("request_path", "worker_path"),
@@ -5699,12 +5725,52 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         assert response.status_code == 400
         assert not self.supervisor.owners
 
-    def test_auth_me_prewarms_the_exact_authenticated_owner(self):
+    def test_auth_me_returns_identity_while_exact_owner_warms_in_background(self):
+        self.supervisor.release_start.clear()
+
         response = self.client.get("/api/auth/me")
 
         assert response.status_code == 200
-        assert len(self.supervisor.owners) == 1
+        assert self.supervisor.start_entered.wait(timeout=2)
+        assert not self.supervisor.start_completed.is_set()
+        assert not self.supervisor.owners
+        self.supervisor.release_start.set()
+        assert self.supervisor.start_completed.wait(timeout=2)
+        for _ in range(100):
+            if not self.app.state.owner_worker_warmup_tasks:
+                break
+            threading.Event().wait(0.01)
         assert self.supervisor.owners[0].owner_key == response.json()["owner_key"]
+        assert not self.app.state.owner_worker_warmup_tasks
+
+    def test_auth_me_ignores_background_owner_worker_timeout(self, caplog):
+        self.supervisor.start_error = TimeoutError("private startup details")
+
+        with caplog.at_level("WARNING", logger="hermes_cli.owner_worker.readiness"):
+            response = self.client.get("/api/auth/me")
+            assert self.supervisor.start_completed.wait(timeout=2)
+            for _ in range(100):
+                if "reason=startup_timeout" in caplog.text:
+                    break
+                threading.Event().wait(0.01)
+
+        assert response.status_code == 200
+        assert response.json()["owner_key"]
+        assert "reason=startup_timeout" in caplog.text
+        assert "private startup details" not in caplog.text
+
+    def test_auth_me_coalesces_overlapping_owner_worker_warmups(self):
+        self.supervisor.release_start.clear()
+
+        first = self.client.get("/api/auth/me")
+        assert self.supervisor.start_entered.wait(timeout=2)
+        second = self.client.get("/api/auth/me")
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert self.supervisor.start_count == 1
+        self.supervisor.release_start.set()
+        assert self.supervisor.start_completed.wait(timeout=2)
 
     def test_authenticated_sessions_route_a_and_b_to_independent_trusted_owner_handles(self, monkeypatch):
         import httpx

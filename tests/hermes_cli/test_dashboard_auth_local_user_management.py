@@ -118,8 +118,22 @@ def test_forced_change_blocks_regular_api_and_ws_ticket_but_allows_recovery(loca
     )
     assert _login(client, "resetuser", "temporary-password").status_code == 200
 
-    me = client.get("/api/auth/me")
+    previous_supervisor = getattr(web_server.app.state, "owner_worker_supervisor", None)
+    warmup_started = False
+
+    class _Supervisor:
+        def get_or_start(self, owner):
+            nonlocal warmup_started
+            del owner
+            warmup_started = True
+
+    web_server.app.state.owner_worker_supervisor = _Supervisor()
+    try:
+        me = client.get("/api/auth/me")
+    finally:
+        web_server.app.state.owner_worker_supervisor = previous_supervisor
     assert me.status_code == 200
+    assert not warmup_started
     assert me.json()["must_change_password"] is True
     assert me.json()["local_user_management"] == {"enabled": True, "is_admin": False}
     assert me.json()["capabilities"] == ["auth.me", "auth.password.change", "auth.logout"]
