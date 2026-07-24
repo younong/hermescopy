@@ -81,6 +81,9 @@ describe("AuthenticatedApp", () => {
     renderApp("/");
 
     expect(document.body.textContent).toContain("Authentication unavailable");
+    const errorShell = document.body.firstElementChild?.firstElementChild;
+    expect(errorShell?.classList.contains("bg-white")).toBe(true);
+    expect(errorShell?.classList.contains("bg-background-base")).toBe(false);
     expect(document.querySelector("[data-admin-app]")).toBeNull();
     expect(document.querySelector("[data-member-chat]")).toBeNull();
   });

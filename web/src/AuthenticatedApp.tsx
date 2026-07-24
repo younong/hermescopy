@@ -22,7 +22,7 @@ export default function AuthenticatedApp() {
 
   if (authIdentity.authRequired && authIdentity.error) {
     return (
-      <div className="flex min-h-dvh items-center justify-center bg-background-base px-4 text-text-primary">
+      <div className="flex min-h-dvh items-center justify-center bg-white px-4 text-[#202124]">
         <div className="max-w-md text-center">
           <h1 className="text-lg font-semibold">Authentication unavailable</h1>
           <p className="mt-2 text-sm text-muted-foreground">

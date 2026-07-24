@@ -108,6 +108,51 @@ def test_lifespan_isolates_enabled_ilink_without_deployment_policies(monkeypatch
     asyncio.run(_run())
 
 
+def test_lifespan_drains_owner_warmup_before_supervisor_shutdown(monkeypatch):
+    from hermes_cli.owner_worker.readiness import schedule_owner_worker_warmup
+
+    startup_entered = threading.Event()
+    release_startup = threading.Event()
+    events = []
+
+    class _Handle:
+        owner_key = "ok1_warmup"
+
+    class _Owner:
+        owner_key = "ok1_warmup"
+        owner_home = None
+
+    class _Supervisor:
+        resource_manager = None
+
+        def get_or_start(self, owner):
+            del owner
+            events.append("warmup-started")
+            startup_entered.set()
+            assert release_startup.wait(timeout=5)
+            events.append("warmup-finished")
+            return _Handle()
+
+        def shutdown(self):
+            events.append("shutdown")
+
+    async def _run():
+        supervisor = _Supervisor()
+        web_server_mod.app.state.owner_worker_supervisor = supervisor
+        async with web_server_mod._lifespan(web_server_mod.app):
+            with patch("hermes_cli.owner_worker.readiness.ensure_owner_home"):
+                schedule_owner_worker_warmup(
+                    web_server_mod.app, owner=_Owner(), supervisor=supervisor
+                )
+                assert await asyncio.to_thread(startup_entered.wait, 2)
+                release_startup.set()
+
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+    asyncio.run(_run())
+
+    assert events == ["warmup-started", "warmup-finished", "shutdown"]
+
+
 def test_lifespan_closes_owner_resource_manager_even_when_supervisor_shutdown_fails(monkeypatch):
     closed = []
 

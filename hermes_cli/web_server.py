@@ -189,6 +189,10 @@ async def _lifespan(app: "FastAPI"):
     # On app.state (not a module global) so the Lock binds to the running
     # event loop during lifespan startup — see _get_event_state's docstring.
     app.state.chat_argv_lock = asyncio.Lock()
+    from hermes_cli.owner_worker.readiness import initialize_owner_worker_warmups
+
+    initialize_owner_worker_warmups(app)
+
     from hermes_cli.channel_connectors.weixin_ilink.bootstrap import bootstrap_weixin_ilink
 
     app.state.weixin_ilink_service = None
@@ -244,6 +248,9 @@ async def _lifespan(app: "FastAPI"):
                 await authority_change_task
             except asyncio.CancelledError:
                 pass
+        from hermes_cli.owner_worker.readiness import drain_owner_worker_warmups
+
+        await drain_owner_worker_warmups(app)
         supervisor = getattr(app.state, "owner_worker_supervisor", None)
         if supervisor is not None:
             try:
