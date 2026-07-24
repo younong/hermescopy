@@ -151,7 +151,7 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/channels": ChannelsPage,
   "/webhooks": WebhooksPage,
   "/system": SystemPage,
-  "/chat-gui": GuiChatPage,
+  "/chat-gui/*": GuiChatPage,
   "/profiles": ProfilesPage,
   "/profiles/new": ProfileBuilderPage,
   "/config": ConfigPage,
@@ -384,7 +384,7 @@ export default function App() {
   const isDocsRoute = pathname === "/docs" || pathname === "/docs/";
   const normalizedPath = pathname.replace(/\/$/, "") || "/";
   const isChatRoute = normalizedPath === "/chat";
-  const isGuiChatRoute = normalizedPath === "/chat-gui";
+  const isGuiChatRoute = normalizedPath === "/chat-gui" || normalizedPath.startsWith("/chat-gui/");
   const isChatSurfaceRoute = isChatRoute;
   const embeddedChat = isDashboardEmbeddedChatEnabled();
 

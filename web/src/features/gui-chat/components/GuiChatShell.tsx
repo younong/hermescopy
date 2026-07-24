@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { Button } from "@nous-research/ui/ui/components/button";
 import {
   AlertCircle,
@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import { ChatSessionList } from "@/components/ChatSessionList";
 import { useProfileScope } from "@/contexts/useProfileScope";
+import { GuiChatFilesPane } from "@/features/files/components/GuiChatFilesPane";
 import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
 import { JsonRpcGatewayError, type GatewayEvent } from "@/lib/gatewayClient";
@@ -42,11 +43,13 @@ import { MessageList } from "./MessageList";
 
 export function GuiChatShell() {
   const { t } = useI18n();
+  const location = useLocation();
   const navigate = useNavigate();
   const { profile } = useProfileScope();
   const [searchParams, setSearchParams] = useSearchParams();
   const resumeSessionId = searchParams.get("resume");
   const mockMode = searchParams.get("mock") === "1";
+  const filesOpen = location.pathname.replace(/\/$/, "") === "/chat-gui/files";
   const [state, dispatch] = useReducer(guiChatReducer, initialGuiChatState);
   const connectionRef = useRef<GuiChatConnection | null>(null);
   const historyAbortRef = useRef<AbortController | null>(null);
@@ -76,9 +79,13 @@ export function GuiChatShell() {
   const [activeSessionTitle, setActiveSessionTitle] = useState<string | null>(null);
   const { authMe, authRequired, ownerKey, ready: authIdentityReady } = useDashboardAuthIdentity();
   const stateRef = useRef(state);
+  const filesOpenRef = useRef(filesOpen);
+  const navigateRef = useRef(navigate);
   const resumeSessionIdRef = useRef(resumeSessionId);
   const setSearchParamsRef = useRef(setSearchParams);
   stateRef.current = state;
+  filesOpenRef.current = filesOpen;
+  navigateRef.current = navigate;
   resumeSessionIdRef.current = resumeSessionId;
   setSearchParamsRef.current = setSearchParams;
   const updateSearchParams = useCallback(
@@ -133,14 +140,18 @@ export function GuiChatShell() {
     reconnectLifecycleRef.current?.cancelRecovery();
     setResumeNotice(null);
     skipClearedRouteRef.current = true;
-    updateSearchParams(
-      (prev) => {
-        const next = new URLSearchParams(prev);
-        next.delete("resume");
-        return next;
-      },
-      { replace: true },
-    );
+    if (filesOpenRef.current) {
+      navigateRef.current("/chat-gui", { replace: true });
+    } else {
+      updateSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          next.delete("resume");
+          return next;
+        },
+        { replace: true },
+      );
+    }
     switchCoordinatorRef.current?.start(null);
   }, [updateSearchParams]);
 
@@ -531,6 +542,7 @@ export function GuiChatShell() {
       onSessionPick={startSessionSwitchTrace}
       profile={profile}
       query={sessionQuery}
+      sessionPath="/chat-gui"
       variant="compact"
     />
   );
@@ -555,7 +567,7 @@ export function GuiChatShell() {
       </div>
       <nav aria-label="Chat navigation" className="space-y-[3px] px-3">
         <button
-          aria-current={resumeSessionId ? undefined : "page"}
+          aria-current={!filesOpen && !resumeSessionId ? "page" : undefined}
           className="gui-chat-nav-item"
           onClick={startNewGuiChat}
           type="button"
@@ -563,7 +575,15 @@ export function GuiChatShell() {
           <MessageSquarePlus />
           <span>New chat</span>
         </button>
-        <button className="gui-chat-nav-item" onClick={() => navigate("/files")} type="button">
+        <button
+          aria-current={filesOpen ? "page" : undefined}
+          className="gui-chat-nav-item"
+          onClick={() => {
+            closeMobilePanel();
+            navigate("/chat-gui/files");
+          }}
+          type="button"
+        >
           <FolderOpen />
           <span>Files</span>
         </button>
@@ -664,48 +684,58 @@ export function GuiChatShell() {
             </button>
           ) : <div className="w-8" />}
           <div className="pointer-events-none absolute inset-x-20 top-1/2 min-w-0 -translate-y-1/2 text-center">
-            <h1 className="truncate text-[0.8125rem] font-medium text-[#25282d]">{conversationTitle}</h1>
+            <h1 className="truncate text-[0.8125rem] font-medium text-[#25282d]">
+              {filesOpen ? "Files" : conversationTitle}
+            </h1>
             <p className="truncate text-[0.625rem] text-[#969aa1]">
-              {state.model ?? "Hermes"} · {mockMode ? "mock" : state.connection}
+              {filesOpen ? "Workspace" : `${state.model ?? "Hermes"} · ${mockMode ? "mock" : state.connection}`}
             </p>
           </div>
-          <div className="ml-auto flex items-center gap-1">
-            <button aria-label={mockMode ? "Replay" : t.common.retry} className="gui-chat-icon-button" onClick={retryConnection} type="button">
-              <RefreshCw className={cn("h-3.5 w-3.5", state.connection === "connecting" && "animate-spin")} />
-            </button>
-          </div>
+          {!filesOpen ? (
+            <div className="ml-auto flex items-center gap-1">
+              <button aria-label={mockMode ? "Replay" : t.common.retry} className="gui-chat-icon-button" onClick={retryConnection} type="button">
+                <RefreshCw className={cn("h-3.5 w-3.5", state.connection === "connecting" && "animate-spin")} />
+              </button>
+            </div>
+          ) : null}
         </header>
 
-        {resumeNotice ? (
-          <div className="gui-chat-notice">
-            <AlertCircle />
-            <span>{resumeNotice}</span>
-          </div>
-        ) : null}
-        {state.error ? (
-          <div className="gui-chat-notice gui-chat-notice-error">
-            <AlertCircle />
-            <span>{state.error}</span>
-          </div>
-        ) : null}
+        {filesOpen ? (
+          <GuiChatFilesPane />
+        ) : (
+          <>
+            {resumeNotice ? (
+              <div className="gui-chat-notice">
+                <AlertCircle />
+                <span>{resumeNotice}</span>
+              </div>
+            ) : null}
+            {state.error ? (
+              <div className="gui-chat-notice gui-chat-notice-error">
+                <AlertCircle />
+                <span>{state.error}</span>
+              </div>
+            ) : null}
 
-        <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
-          <MessageList
-            disabled={disabled}
-            forceBottomKey={forceBottomKey}
-            onApprovalRespond={respondToApproval}
-            onClarifyRespond={respondToClarify}
-            onLoadEarlier={loadEarlier}
-            state={state}
-          />
-          <Composer
-            allowSendWhileGenerating={hasPendingClarification}
-            disabled={disabled}
-            isGenerating={state.isGenerating}
-            onSend={send}
-            onStop={stop}
-          />
-        </div>
+            <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
+              <MessageList
+                disabled={disabled}
+                forceBottomKey={forceBottomKey}
+                onApprovalRespond={respondToApproval}
+                onClarifyRespond={respondToClarify}
+                onLoadEarlier={loadEarlier}
+                state={state}
+              />
+              <Composer
+                allowSendWhileGenerating={hasPendingClarification}
+                disabled={disabled}
+                isGenerating={state.isGenerating}
+                onSend={send}
+                onStop={stop}
+              />
+            </div>
+          </>
+        )}
       </main>
     </div>
   );

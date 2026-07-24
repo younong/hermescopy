@@ -80,6 +80,10 @@ vi.mock("./MessageList", () => ({
   ),
 }));
 
+vi.mock("@/features/files/components/GuiChatFilesPane", () => ({
+  GuiChatFilesPane: () => <section data-files-pane>Files pane</section>,
+}));
+
 let root: Root | null = null;
 
 beforeEach(() => {
@@ -122,6 +126,38 @@ describe("GuiChatShell", () => {
     expect(document.querySelector<HTMLButtonElement>('button[aria-current="page"]')?.textContent).toContain("New chat");
     expect(document.querySelector('aside[aria-label="Chat workspace"]')).not.toBeNull();
     expect(document.querySelector('[aria-label="Log out"]')).not.toBeNull();
+  });
+
+  it("opens files inside the dedicated workspace and returns to chat", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(<GuiChatShell />);
+    await act(async () => {
+      Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
+        .find((button) => button.textContent?.includes("Files"))
+        ?.click();
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector('aside[aria-label="Chat workspace"]')).not.toBeNull();
+    expect(document.querySelector("[data-files-pane]")).not.toBeNull();
+    expect(document.querySelector("[data-composer-send]")).toBeNull();
+    expect(Array.from(document.querySelectorAll<HTMLButtonElement>('button[aria-current="page"]'))
+      .some((button) => button.textContent?.includes("Files"))).toBe(true);
+    expect(connection.createOrAttach).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
+        .find((button) => button.textContent?.includes("New chat"))
+        ?.click();
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector("[data-files-pane]")).toBeNull();
+    expect(document.querySelector("[data-composer-send]")).not.toBeNull();
+    expect(connection.createOrAttach).toHaveBeenCalledTimes(2);
   });
 
   it("logs out from the dedicated workspace", async () => {

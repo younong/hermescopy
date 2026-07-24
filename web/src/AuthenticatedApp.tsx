@@ -40,7 +40,7 @@ export default function AuthenticatedApp() {
   if (authIdentity.authRequired && authIdentity.authMe?.role === "member") {
     return (
       <Routes>
-        <Route path="/chat-gui" element={<StandaloneGuiChatPage />} />
+        <Route path="/chat-gui/*" element={<StandaloneGuiChatPage />} />
         <Route path="*" element={<Navigate to="/chat-gui" replace />} />
       </Routes>
     );

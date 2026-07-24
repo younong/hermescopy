@@ -23,7 +23,7 @@ import { ListItem } from "@nous-research/ui/ui/components/list-item";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { AlertCircle, MessageSquarePlus, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 
 import { useI18n } from "@/i18n";
 import { api, type SessionInfo } from "@/lib/api";
@@ -44,6 +44,8 @@ interface ChatSessionListProps {
   onActiveSessionChange?: (session: { id: string; label: string } | null) => void;
   /** Optional callback fired after a row is picked (e.g. close mobile sheet). */
   onPicked?: () => void;
+  /** Route to open before applying a selected session's resume query. */
+  sessionPath?: string;
   /** Called before navigation so the owning surface can start an end-to-end trace. */
   onSessionPick?: (id: string) => void;
   /**
@@ -73,8 +75,10 @@ export function ChatSessionList({
   onPicked,
   onSessionPick,
   onNewChat,
+  sessionPath,
 }: ChatSessionListProps) {
   const { t } = useI18n();
+  const navigate = useNavigate();
   const [, setSearchParams] = useSearchParams();
   const [sessions, setSessions] = useState<SessionInfo[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -149,6 +153,12 @@ export function ChatSessionList({
       onPicked?.();
       if (id === activeSessionId) return;
       onSessionPick?.(id);
+      if (sessionPath) {
+        const next = new URLSearchParams();
+        next.set("resume", id);
+        navigate(`${sessionPath}?${next.toString()}`);
+        return;
+      }
       setSearchParams(
         (prev) => {
           const next = new URLSearchParams(prev);
@@ -158,7 +168,7 @@ export function ChatSessionList({
         { replace: false },
       );
     },
-    [activeSessionId, onPicked, onSessionPick, setSearchParams],
+    [activeSessionId, navigate, onPicked, onSessionPick, sessionPath, setSearchParams],
   );
 
   // "New chat" prefers the owning chat surface's robust handler (clears resume

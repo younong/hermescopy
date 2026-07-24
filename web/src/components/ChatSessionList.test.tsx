@@ -2,7 +2,7 @@
 
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { SessionInfo } from "@/lib/api";
@@ -81,6 +81,38 @@ describe("ChatSessionList", () => {
     expect(onActiveSessionChange).toHaveBeenLastCalledWith({ id: "beta", label: "UI exploration" });
   });
 
+  it("opens selected sessions on an optional destination route", async () => {
+    mocks.getSessions.mockResolvedValue({
+      limit: 30,
+      offset: 0,
+      sessions: [session("alpha", "Release notes", "Published")],
+      total: 1,
+    });
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+
+    await act(async () => {
+      root?.render(
+        <MemoryRouter initialEntries={["/chat-gui/files"]}>
+          <ChatSessionList activeSessionId={null} sessionPath="/chat-gui" variant="compact" />
+          <LocationProbe />
+        </MemoryRouter>,
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
+        .find((button) => button.textContent?.includes("Release notes"))
+        ?.click();
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector("[data-location]")?.getAttribute("data-location"))
+      .toBe("/chat-gui?resume=alpha");
+  });
+
   it("keeps the default panel chrome and metadata", async () => {
     mocks.getSessions.mockResolvedValue({
       limit: 30,
@@ -107,6 +139,11 @@ describe("ChatSessionList", () => {
     expect(container.textContent).toContain("3 msgs");
   });
 });
+
+function LocationProbe() {
+  const location = useLocation();
+  return <span data-location={`${location.pathname}${location.search}`} />;
+}
 
 function session(id: string, title: string | null, preview: string | null): SessionInfo {
   return {
