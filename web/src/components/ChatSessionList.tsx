@@ -218,7 +218,7 @@ export function ChatSessionList({
       );
     }
     return (
-      <div className="flex flex-col gap-0.5">
+      <div className={cn("flex flex-col", variant === "compact" ? "gap-[3px]" : "gap-0.5")}>
         {filteredSessions.map((s) => {
           const isActive = s.id === activeSessionId;
           return (
@@ -229,18 +229,18 @@ export function ChatSessionList({
               className={cn(
                 "flex-col items-start normal-case tracking-normal",
                 variant === "compact"
-                  ? "min-h-8 gap-0 rounded-lg px-2.5 py-1.5 text-[#555b64]"
+                  ? "min-h-9 gap-0 rounded-[10px] px-2 py-[7px] text-[#1f1f1f]"
                   : "gap-0.5 rounded px-2 py-1.5",
                 variant === "compact"
                   ? isActive
-                    ? "bg-[#e9eaec] text-[#202124]"
-                    : "hover:bg-[#eceef0] hover:text-[#202124]"
+                    ? "bg-white text-black"
+                    : "hover:bg-black/[0.04] hover:text-black"
                   : isActive
                     ? "border-l-2 border-primary bg-primary/10 text-foreground"
                     : "text-text-secondary hover:bg-midground/5 hover:text-foreground",
               )}
             >
-              <span className={cn("w-full truncate", variant === "compact" ? "text-[0.8125rem] font-normal" : "text-sm font-medium")}>
+              <span className={cn("w-full truncate", variant === "compact" ? "text-sm font-normal leading-[22px]" : "text-sm font-medium")}>
                 {rowLabel(s, t.sessions.untitledSession)}
               </span>
               {variant === "default" ? (

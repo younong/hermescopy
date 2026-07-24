@@ -77,6 +77,7 @@ describe("ChatSessionList", () => {
     expect(container.textContent).toContain("UI exploration");
     expect(container.textContent).not.toContain("New chat");
     expect(container.querySelector('[aria-current="true"]')?.textContent).toContain("UI exploration");
+    expect(container.querySelector('[aria-current="true"]')?.className).toContain("bg-white");
     expect(onActiveSessionChange).toHaveBeenLastCalledWith({ id: "beta", label: "UI exploration" });
   });
 

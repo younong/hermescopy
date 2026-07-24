@@ -13,7 +13,6 @@ import {
   Search,
   Settings2,
   Sparkles,
-  Terminal,
   X,
 } from "lucide-react";
 import { ChatSessionList } from "@/components/ChatSessionList";
@@ -99,7 +98,6 @@ export function GuiChatShell() {
   );
   const mobilePanelOpen = mobilePanelOpenRaw;
   const activeSessionId = state.storedSessionId ?? resumeSessionId;
-  const terminalResumeId = state.storedSessionId ?? resumeSessionId;
   const forceBottomKey = `${activeSessionId ?? "new"}:${sendScrollNonce}`;
   const closeMobilePanel = useCallback(() => setMobilePanelOpenRaw(false), []);
   const handleActiveSessionChange = useCallback(
@@ -542,12 +540,6 @@ export function GuiChatShell() {
     dashboardAuthTransition.reset();
     void api.logout();
   };
-  const goToTerminal = () =>
-    navigate(
-      terminalResumeId
-        ? `/chat?resume=${encodeURIComponent(terminalResumeId)}`
-        : "/chat",
-    );
   const sidebar = (
     <>
       <div className="px-3 pb-2 pt-3">
@@ -561,14 +553,15 @@ export function GuiChatShell() {
           />
         </div>
       </div>
-      <nav aria-label="Chat navigation" className="space-y-0.5 px-2">
-        <button className="gui-chat-nav-item" onClick={startNewGuiChat} type="button">
+      <nav aria-label="Chat navigation" className="space-y-[3px] px-3">
+        <button
+          aria-current={resumeSessionId ? undefined : "page"}
+          className="gui-chat-nav-item"
+          onClick={startNewGuiChat}
+          type="button"
+        >
           <MessageSquarePlus />
           <span>New chat</span>
-        </button>
-        <button className="gui-chat-nav-item" onClick={goToTerminal} type="button">
-          <Terminal />
-          <span>Terminal chat</span>
         </button>
         <button className="gui-chat-nav-item" onClick={() => navigate("/files")} type="button">
           <FolderOpen />
@@ -579,8 +572,8 @@ export function GuiChatShell() {
           <span>Skills</span>
         </button>
       </nav>
-      <div className="mt-3 flex min-h-0 flex-1 flex-col px-2">
-        <div className="flex items-center justify-between px-2 pb-1.5 text-[0.6875rem] font-medium text-[#82868d]">
+      <div className="mt-4 flex min-h-0 flex-1 flex-col px-3">
+        <div className="gui-chat-section-heading">
           <span>Recent chats</span>
           <button aria-label={t.common.refresh} className="gui-chat-icon-button" onClick={retryConnection} type="button">
             <RefreshCw className={cn("h-3.5 w-3.5", state.connection === "connecting" && "animate-spin")} />
@@ -588,7 +581,7 @@ export function GuiChatShell() {
         </div>
         <div className="min-h-0 flex-1 overflow-hidden">{sessionPanel}</div>
       </div>
-      <div className="border-t border-[#e2e3e5] px-2 py-2">
+      <div className="mx-3 border-t border-black/[0.06] py-1.5">
         <div className="gui-chat-account-row">
           <button className="gui-chat-account" onClick={() => navigate("/system")} type="button">
             <span className="gui-chat-avatar">{accountLabel.trim().charAt(0).toUpperCase() || "H"}</span>
@@ -628,7 +621,7 @@ export function GuiChatShell() {
           id="gui-chat-session-panel"
           aria-label="Chat workspace"
           className={cn(
-            "fixed left-0 top-0 z-[60] flex h-dvh max-h-dvh w-[15.5rem] min-w-0 flex-col bg-[#f4f5f6] text-[#3d4148] shadow-2xl",
+            "gui-chat-mobile-sidebar fixed left-0 top-0 z-[60] flex h-dvh max-h-dvh min-w-0 flex-col shadow-2xl",
             "transition-transform duration-200 ease-out",
             mobilePanelOpen
               ? "translate-x-0"
@@ -679,9 +672,6 @@ export function GuiChatShell() {
           <div className="ml-auto flex items-center gap-1">
             <button aria-label={mockMode ? "Replay" : t.common.retry} className="gui-chat-icon-button" onClick={retryConnection} type="button">
               <RefreshCw className={cn("h-3.5 w-3.5", state.connection === "connecting" && "animate-spin")} />
-            </button>
-            <button aria-label="Open Terminal Chat" className="gui-chat-icon-button" onClick={goToTerminal} type="button">
-              <Terminal className="h-3.5 w-3.5" />
             </button>
           </div>
         </header>
