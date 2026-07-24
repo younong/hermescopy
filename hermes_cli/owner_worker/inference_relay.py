@@ -364,9 +364,10 @@ class DeploymentInferenceBroker:
                         "status": response.status_code,
                         "headers": safe_headers,
                     })
-                    # Preserve provider chunks (including SSE event framing) rather
-                    # than collecting the response before the worker can consume it.
-                    for chunk in response.iter_raw(chunk_size=48 * 1024):
+                    # Forward each transport chunk as soon as httpx yields it. A
+                    # fixed chunk_size makes ByteChunker buffer small SSE events
+                    # until the threshold or EOF, defeating streaming semantics.
+                    for chunk in response.iter_raw(chunk_size=None):
                         if chunk:
                             if diag["first_chunk_at"] is None:
                                 diag["first_chunk_at"] = time.time()

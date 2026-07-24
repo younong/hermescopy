@@ -436,11 +436,11 @@ def test_broker_logs_midstream_failure_with_counts(tmp_path, caplog):
                 broker._stream_request(active, _request_for_model(), lambda _frame: None)
         assert "outcome=midstream_failure" in caplog.text
         assert "http_status=200" in caplog.text
-        # The transport can detect an incomplete chunk before yielding it to
-        # iter_raw; counters report bytes delivered to the worker, not bytes read
-        # internally by httpcore.
-        assert "bytes=0" in caplog.text
-        assert "chunks=0" in caplog.text
+        # Native transport chunks are forwarded before httpcore detects that the
+        # terminating chunk is missing, so diagnostics include bytes that already
+        # reached the worker.
+        assert "bytes=7" in caplog.text
+        assert "chunks=1" in caplog.text
         assert "x-openrouter-id=openrouter-safe" in caplog.text
         assert "partial" not in caplog.text
     finally:
@@ -503,6 +503,103 @@ def test_owner_relay_does_not_send_second_error_after_headers(monkeypatch, caplo
     assert handler.error_calls == []
     assert handler.close_connection is True
     assert "phase=midstream" in caplog.text
+
+
+def test_owner_relay_forwards_small_sse_event_before_upstream_completes(tmp_path):
+    first_event = b"data: first\n\n"
+    second_event = b"data: second\n\n"
+    first_upstream_event_sent = threading.Event()
+    release_second_event = threading.Event()
+    upstream_completed = threading.Event()
+    first_worker_event_received = threading.Event()
+    worker_completed = threading.Event()
+    received: list[dict[str, object]] = []
+    worker_bytes = bytearray()
+    worker_errors: list[BaseException] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            length = int(self.headers["Content-Length"])
+            received.append({
+                "path": self.path,
+                "headers": dict(self.headers.items()),
+                "body": self.rfile.read(length),
+            })
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(first_event)
+            self.wfile.flush()
+            first_upstream_event_sent.set()
+            if not release_second_event.wait(timeout=10):
+                return
+            self.wfile.write(second_event)
+            self.wfile.flush()
+            upstream_completed.set()
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    policy = DeploymentInferencePolicy(
+        provider="custom:deployment",
+        model="gpt-safe",
+        api_mode="chat_completions",
+        runtime_resolver=lambda: {
+            "provider": "custom:deployment",
+            "api_mode": "chat_completions",
+            "base_url": f"http://127.0.0.1:{server.server_port}",
+            "api_key": "control-plane-secret",
+        },
+    )
+    broker, active, relay = _activate_relay(AuthorityStore(tmp_path / "control"), policy)
+
+    def consume_worker_stream() -> None:
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                with client.stream(
+                    "POST",
+                    f"{relay.base_url}/chat/completions",
+                    headers={"Authorization": "Bearer worker-marker"},
+                    json={"model": "gpt-safe", "stream": True, "messages": []},
+                ) as response:
+                    assert response.status_code == 200
+                    assert response.headers["content-type"] == "text/event-stream"
+                    for chunk in response.iter_raw():
+                        worker_bytes.extend(chunk)
+                        if first_event in worker_bytes:
+                            first_worker_event_received.set()
+        except BaseException as exc:
+            worker_errors.append(exc)
+        finally:
+            worker_completed.set()
+
+    worker_thread = threading.Thread(target=consume_worker_stream, daemon=True)
+    worker_thread.start()
+    try:
+        assert first_upstream_event_sent.wait(timeout=5)
+        assert first_worker_event_received.wait(timeout=5)
+        assert upstream_completed.is_set() is False
+        assert bytes(worker_bytes) == first_event
+
+        release_second_event.set()
+        assert worker_completed.wait(timeout=5)
+        assert worker_errors == []
+        assert bytes(worker_bytes) == first_event + second_event
+        upstream = received[0]
+        assert upstream["path"] == "/v1/chat/completions"
+        assert upstream["headers"]["Authorization"] == "Bearer control-plane-secret"
+        assert "worker-marker" not in str(upstream["headers"])
+    finally:
+        release_second_event.set()
+        worker_thread.join(timeout=2)
+        broker.revoke(active)
+        relay.close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
 
 
 @pytest.mark.parametrize("base_path", ["", "/v1"])
