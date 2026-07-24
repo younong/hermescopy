@@ -17,13 +17,14 @@ import { GuiChatShell } from "./GuiChatShell";
 const mocks = vi.hoisted(() => ({
   connectGuiChat: vi.fn(),
   getAuthMe: vi.fn(),
+  logout: vi.fn(),
 }));
 
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
   return {
     ...actual,
-    api: { ...actual.api, getAuthMe: mocks.getAuthMe },
+    api: { ...actual.api, getAuthMe: mocks.getAuthMe, logout: mocks.logout },
   };
 });
 
@@ -86,6 +87,8 @@ beforeEach(() => {
     .IS_REACT_ACT_ENVIRONMENT = true;
   mocks.connectGuiChat.mockReset();
   mocks.getAuthMe.mockReset();
+  mocks.logout.mockReset();
+  mocks.logout.mockResolvedValue(new Response(null, { status: 200 }));
   window.__HERMES_AUTH_REQUIRED__ = true;
   window.matchMedia = vi.fn().mockImplementation((query: string) => ({
     addEventListener: vi.fn(),
@@ -117,6 +120,21 @@ describe("GuiChatShell", () => {
     expect(document.querySelector("[data-gui-chat]")).not.toBeNull();
     expect(document.body.textContent).toContain("Terminal chat");
     expect(document.querySelector('aside[aria-label="Chat workspace"]')).not.toBeNull();
+    expect(document.querySelector('[aria-label="Log out"]')).not.toBeNull();
+  });
+
+  it("logs out from the dedicated workspace", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(<GuiChatShell />);
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[aria-label="Log out"]')?.click();
+      await Promise.resolve();
+    });
+
+    expect(mocks.logout).toHaveBeenCalledOnce();
   });
 
   it("connects automatically when the authenticated owner becomes ready", async () => {

@@ -261,8 +261,36 @@ code { font-size: 0.875rem; }
   flex: none;
 }
 
+[data-gui-chat] .gui-chat-account-row {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
 [data-gui-chat] .gui-chat-account {
+  min-width: 0;
   min-height: 2.25rem;
+}
+
+[data-gui-chat] .gui-chat-logout {
+  display: grid;
+  width: 2rem;
+  height: 2rem;
+  flex: none;
+  place-items: center;
+  border-radius: 0.5rem;
+  color: #8a8e95;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+[data-gui-chat] .gui-chat-logout:hover {
+  background: #e9eaec;
+  color: #202124;
+}
+
+[data-gui-chat] .gui-chat-logout svg {
+  width: 0.875rem;
+  height: 0.875rem;
 }
 
 [data-gui-chat] .gui-chat-avatar {

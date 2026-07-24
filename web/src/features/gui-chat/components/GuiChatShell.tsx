@@ -6,6 +6,7 @@ import {
   AlertCircle,
   CircleHelp,
   FolderOpen,
+  LogOut,
   Menu,
   MessageSquarePlus,
   RefreshCw,
@@ -18,6 +19,7 @@ import {
 import { ChatSessionList } from "@/components/ChatSessionList";
 import { useProfileScope } from "@/contexts/useProfileScope";
 import { useI18n } from "@/i18n";
+import { api } from "@/lib/api";
 import { JsonRpcGatewayError, type GatewayEvent } from "@/lib/gatewayClient";
 import { emitChatDiagnostic } from "@/lib/chatDiagnostics";
 import { dashboardAuthTransition } from "@/lib/dashboardAuthTransition";
@@ -73,7 +75,7 @@ export function GuiChatShell() {
   const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false);
   const [sessionQuery, setSessionQuery] = useState("");
   const [activeSessionTitle, setActiveSessionTitle] = useState<string | null>(null);
-  const { authMe, ownerKey, ready: authIdentityReady } = useDashboardAuthIdentity();
+  const { authMe, authRequired, ownerKey, ready: authIdentityReady } = useDashboardAuthIdentity();
   const stateRef = useRef(state);
   const resumeSessionIdRef = useRef(resumeSessionId);
   const setSearchParamsRef = useRef(setSearchParams);
@@ -536,6 +538,10 @@ export function GuiChatShell() {
   );
   const conversationTitle = activeSessionTitle ?? (activeSessionId ? "Conversation" : "New chat");
   const accountLabel = authMe?.display_name || authMe?.email || "Hermes workspace";
+  const handleLogout = () => {
+    dashboardAuthTransition.reset();
+    void api.logout();
+  };
   const goToTerminal = () =>
     navigate(
       terminalResumeId
@@ -583,11 +589,18 @@ export function GuiChatShell() {
         <div className="min-h-0 flex-1 overflow-hidden">{sessionPanel}</div>
       </div>
       <div className="border-t border-[#e2e3e5] px-2 py-2">
-        <button className="gui-chat-account" onClick={() => navigate("/system")} type="button">
-          <span className="gui-chat-avatar">{accountLabel.trim().charAt(0).toUpperCase() || "H"}</span>
-          <span className="min-w-0 flex-1 truncate text-left">{accountLabel}</span>
-          <Settings2 className="h-3.5 w-3.5 text-[#8a8e95]" />
-        </button>
+        <div className="gui-chat-account-row">
+          <button className="gui-chat-account" onClick={() => navigate("/system")} type="button">
+            <span className="gui-chat-avatar">{accountLabel.trim().charAt(0).toUpperCase() || "H"}</span>
+            <span className="min-w-0 flex-1 truncate text-left">{accountLabel}</span>
+            <Settings2 className="h-3.5 w-3.5 text-[#8a8e95]" />
+          </button>
+          {authRequired && authMe ? (
+            <button aria-label="Log out" className="gui-chat-logout" onClick={handleLogout} title="Log out" type="button">
+              <LogOut />
+            </button>
+          ) : null}
+        </div>
         <button className="gui-chat-nav-item mt-0.5" onClick={() => navigate("/docs")} type="button">
           <CircleHelp />
           <span>Help</span>
