@@ -1,5 +1,6 @@
 """Tests for config.yaml structure validation (validate_config_structure)."""
 
+import pytest
 
 from hermes_cli.config import validate_config_structure, ConfigIssue
 
@@ -25,6 +26,32 @@ class TestChannelConnectorValidation:
             "channel_connectors": {"weixin_ilink": {"enabled": "true"}},
         })
         assert any("enabled should be a boolean" in issue.message for issue in issues)
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("outbound_retry_seconds", -1),
+            ("outbound_retry_max_seconds", -1),
+            ("outbound_max_attempts", 0),
+            ("outbound_chunk_delay_seconds", -1),
+        ],
+    )
+    def test_delivery_settings_reject_values_below_minimum(self, key, value):
+        issues = validate_config_structure({
+            "channel_connectors": {"weixin_ilink": {key: value}},
+        })
+        assert any(key in issue.message for issue in issues)
+
+    def test_delivery_delay_settings_allow_zero(self):
+        issues = validate_config_structure({
+            "channel_connectors": {
+                "weixin_ilink": {
+                    "outbound_retry_seconds": 0,
+                    "outbound_chunk_delay_seconds": 0,
+                }
+            },
+        })
+        assert not any("outbound_" in issue.message for issue in issues)
 
 
 class TestCustomProvidersValidation:

@@ -154,11 +154,70 @@ def test_store_migrates_v1_attempts_to_owner_target_schema(tmp_path, crypto, mon
     with migrated.read() as conn:
         assert conn.execute(
             "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
-        ).fetchone()["value"] == "2"
+        ).fetchone()["value"] == "3"
         row = conn.execute(
             "SELECT target_canonical_user_id FROM enrollment_attempts WHERE attempt_id='enr_existing'"
         ).fetchone()
     assert row["target_canonical_user_id"] is None
+
+
+def test_store_migrates_v2_outbound_with_fresh_chunk_attempts(tmp_path, crypto):
+    path = tmp_path / "control-plane" / "channel_identities.sqlite3"
+    first = ChannelIdentityStore(crypto, path=path)
+    registered = register_weixin_identity(
+        first,
+        subject="subject-a",
+        bot_id="bot-a",
+        bot_token="token-a",
+        base_url="https://ilink.example",
+        peer_id="subject-a",
+    )
+    with first.write() as conn:
+        now = 1.0
+        conn.execute(
+            """
+            INSERT INTO inbound_messages
+              (inbound_id, account_id, binding_id, provider_message_id, status,
+               created_at, updated_at)
+            VALUES ('inbound-existing', ?, ?, 'provider-existing', 'outbound_pending', ?, ?)
+            """,
+            (registered.account_id, registered.binding_id, now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO outbound_messages
+              (outbound_id, inbound_id, account_id, binding_id, client_message_id,
+               status, attempts, next_attempt_at, created_at, updated_at)
+            VALUES ('outbound-existing', 'inbound-existing', ?, ?, 'client-existing',
+                    'queued', 20700, 0, ?, ?)
+            """,
+            (registered.account_id, registered.binding_id, now, now),
+        )
+        conn.execute("UPDATE channel_identity_meta SET value='2' WHERE key='schema_version'")
+        conn.execute("ALTER TABLE outbound_messages RENAME TO outbound_messages_v3")
+        conn.execute(
+            """
+            CREATE TABLE outbound_messages AS
+            SELECT outbound_id, inbound_id, account_id, binding_id, client_message_id,
+                   payload_ciphertext, payload_key_version, context_ciphertext,
+                   context_key_version, status, attempts, next_attempt_at, claimed_by,
+                   claimed_at, last_error, created_at, updated_at
+            FROM outbound_messages_v3
+            """
+        )
+        conn.execute("DROP TABLE outbound_messages_v3")
+
+    migrated = ChannelIdentityStore(crypto, path=path)
+
+    with migrated.read() as conn:
+        row = conn.execute(
+            """
+            SELECT attempts, chunk_count, next_chunk_index, chunk_attempts,
+                   failed_chunk_index FROM outbound_messages
+            WHERE outbound_id='outbound-existing'
+            """
+        ).fetchone()
+    assert tuple(row) == (20700, None, 0, 0, None)
 
 
 def test_store_rejects_unknown_newer_schema(tmp_path, crypto):

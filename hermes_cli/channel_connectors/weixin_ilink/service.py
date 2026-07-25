@@ -48,6 +48,9 @@ class WeixinILinkService:
             store,
             session,
             retry_seconds=float(config.get("outbound_retry_seconds", 2)),
+            retry_max_seconds=float(config.get("outbound_retry_max_seconds", 300)),
+            max_attempts=int(config.get("outbound_max_attempts", 8)),
+            chunk_delay_seconds=float(config.get("outbound_chunk_delay_seconds", 0.2)),
         )
         self._running = False
         self._tasks: set[asyncio.Task] = set()

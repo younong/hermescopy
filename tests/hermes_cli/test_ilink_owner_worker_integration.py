@@ -85,6 +85,9 @@ class _FakeILinkSession:
             return _Response(self.update_batches.pop(0))
         if "sendmessage" in url:
             self.sent_messages.append(payload["msg"])
+            text = payload["msg"]["item_list"][0]["text_item"]["text"]
+            if len(text) > 2000:
+                return _Response({"ret": 413}, status=413)
             if self.fail_next_send:
                 self.fail_next_send = False
                 return _Response({"error": "temporary"}, status=503)
@@ -101,7 +104,11 @@ def _inference_server():
             length = int(self.headers.get("Content-Length", "0"))
             request = json.loads(self.rfile.read(length))
             requests.append(request)
-            reply = f"integration reply {len(requests)}"
+            reply = (
+                "long integration reply " + "word " * 900
+                if len(requests) == 1
+                else f"integration reply {len(requests)}"
+            )
             chunks = (
                 {
                     "id": "ilink-integration",
@@ -263,7 +270,12 @@ async def test_ilink_enrollment_poll_dispatch_send_and_generation_resume(monkeyp
                 deployment_inference_policy=policy,
             )
             dispatcher = ChannelDispatcher(store, supervisor, turn_timeout=30)
-            sender = OutboundSender(store, ilink, retry_seconds=0)
+            sender = OutboundSender(
+                store,
+                ilink,
+                retry_seconds=0,
+                chunk_delay_seconds=0,
+            )
 
             dashboard_owner = owner_context_from_session(
                 Session(
@@ -336,19 +348,33 @@ async def test_ilink_enrollment_poll_dispatch_send_and_generation_resume(monkeyp
                     assert retry is not None
                     assert retry.outbound_id == outbound.outbound_id
                     assert retry.client_message_id == outbound.client_message_id
-                    assert await sender.send_claim(retry, holder="integration-send") is True
-                else:
+                    assert retry.chunk_client_id == outbound.chunk_client_id
+                    outbound = retry
+                while outbound is not None:
                     assert await sender.send_claim(outbound, holder="integration-send") is True
+                    outbound = claim_outbound(store, holder="integration-send")
 
             assert len(model_requests) == 2
+            assert len(ilink.sent_messages) >= 4
+            assert all(
+                len(message["item_list"][0]["text_item"]["text"]) <= 2000
+                for message in ilink.sent_messages
+            )
+            assert ilink.sent_messages[0]["client_id"] == ilink.sent_messages[1]["client_id"]
             assert {message["to_user_id"] for message in ilink.sent_messages} == {
                 "peer-a",
                 "peer-b",
             }
-            assert [message["context_token"] for message in ilink.sent_messages[-2:]] == [
-                "context-a",
-                "context-b",
-            ]
+            assert all(
+                message["context_token"] == "context-a"
+                for message in ilink.sent_messages
+                if message["to_user_id"] == "peer-a"
+            )
+            assert all(
+                message["context_token"] == "context-b"
+                for message in ilink.sent_messages
+                if message["to_user_id"] == "peer-b"
+            )
             assert (owner_a.owner_home / "state.db").is_file()
             assert (owner_b.owner_home / "state.db").is_file()
             with store.read() as conn:

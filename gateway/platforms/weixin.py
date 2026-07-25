@@ -23,7 +23,6 @@ import re
 import secrets
 import struct
 import tempfile
-import textwrap
 import time
 import uuid
 from datetime import datetime
@@ -32,8 +31,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlparse
 
 logger = logging.getLogger(__name__)
-
-WEIXIN_COPY_LINE_WIDTH = 120
 
 try:
     import aiohttp
@@ -58,6 +55,12 @@ except ImportError:  # pragma: no cover - dependency gate
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.weixin_ilink.client import WeixinILinkClient
+from gateway.weixin_ilink.text import (
+    ILINK_TEXT_MESSAGE_LIMIT,
+    WEIXIN_COPY_LINE_WIDTH,
+    format_weixin_text,
+    split_weixin_text,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -148,9 +151,6 @@ MSG_STATE_FINISH = 2
 TYPING_START = 1
 TYPING_STOP = 2
 
-_HEADER_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
-_TABLE_RULE_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$")
-_FENCE_RE = re.compile(r"^```([^\n`]*)\s*$")
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 
 
@@ -438,6 +438,7 @@ async def _send_message(
             text=text,
             context_token=context_token,
             client_id=client_id,
+            raise_provider_errors=False,
         )
     except ValueError as exc:
         if not text or not text.strip():
@@ -630,260 +631,6 @@ def _split_table_row(line: str) -> List[str]:
     if row.endswith("|"):
         row = row[:-1]
     return [cell.strip() for cell in row.split("|")]
-
-
-def _normalize_markdown_blocks(content: str) -> str:
-    lines = content.splitlines()
-    result: List[str] = []
-    in_code_block = False
-    blank_run = 0
-
-    for raw_line in lines:
-        line = raw_line.rstrip()
-        if _FENCE_RE.match(line.strip()):
-            in_code_block = not in_code_block
-            result.append(line)
-            blank_run = 0
-            continue
-
-        if in_code_block:
-            result.append(line)
-            continue
-
-        if not line.strip():
-            blank_run += 1
-            if blank_run <= 1:
-                result.append("")
-            continue
-
-        blank_run = 0
-        result.append(line)
-
-    return "\n".join(result).strip()
-
-
-def _wrap_copy_friendly_lines_for_weixin(content: str) -> str:
-    """Wrap long display lines that are hard to copy in WeChat clients."""
-    if not content:
-        return content
-
-    wrapped: List[str] = []
-    in_code_block = False
-
-    for raw_line in content.splitlines():
-        line = raw_line.rstrip()
-        stripped = line.strip()
-
-        if _FENCE_RE.match(stripped):
-            in_code_block = not in_code_block
-            wrapped.append(line)
-            continue
-
-        if (
-            in_code_block
-            or len(line) <= WEIXIN_COPY_LINE_WIDTH
-            or not stripped
-            or stripped.startswith("|")
-            or _TABLE_RULE_RE.match(stripped)
-        ):
-            wrapped.append(line)
-            continue
-
-        wrapped_lines = textwrap.wrap(
-            line,
-            width=WEIXIN_COPY_LINE_WIDTH,
-            break_long_words=False,
-            break_on_hyphens=False,
-            replace_whitespace=False,
-            drop_whitespace=True,
-        )
-        wrapped.extend(wrapped_lines or [line])
-
-    return "\n".join(wrapped).strip()
-
-
-def _split_markdown_blocks(content: str) -> List[str]:
-    if not content:
-        return []
-
-    blocks: List[str] = []
-    lines = content.splitlines()
-    current: List[str] = []
-    in_code_block = False
-
-    for raw_line in lines:
-        line = raw_line.rstrip()
-        if _FENCE_RE.match(line.strip()):
-            if not in_code_block and current:
-                blocks.append("\n".join(current).strip())
-                current = []
-            current.append(line)
-            in_code_block = not in_code_block
-            if not in_code_block:
-                blocks.append("\n".join(current).strip())
-                current = []
-            continue
-
-        if in_code_block:
-            current.append(line)
-            continue
-
-        if not line.strip():
-            if current:
-                blocks.append("\n".join(current).strip())
-                current = []
-            continue
-        current.append(line)
-
-    if current:
-        blocks.append("\n".join(current).strip())
-    return [block for block in blocks if block]
-
-
-def _split_delivery_units_for_weixin(content: str) -> List[str]:
-    """Split formatted content into chat-friendly delivery units.
-
-    Weixin can render Markdown, but chat readability is better when top-level
-    line breaks become separate messages. Keep fenced code blocks intact and
-    attach indented continuation lines to the previous top-level line so nested
-    list items do not get torn apart.
-    """
-    units: List[str] = []
-
-    for block in _split_markdown_blocks(content):
-        if _FENCE_RE.match(block.splitlines()[0].strip()):
-            units.append(block)
-            continue
-
-        current: List[str] = []
-        for raw_line in block.splitlines():
-            line = raw_line.rstrip()
-            if not line.strip():
-                if current:
-                    units.append("\n".join(current).strip())
-                    current = []
-                continue
-
-            is_continuation = bool(current) and raw_line.startswith((" ", "\t"))
-            if is_continuation:
-                current.append(line)
-                continue
-
-            if current:
-                units.append("\n".join(current).strip())
-            current = [line]
-
-        if current:
-            units.append("\n".join(current).strip())
-
-    return [unit for unit in units if unit]
-
-
-def _looks_like_chatty_line_for_weixin(line: str) -> bool:
-    """Return True when a line looks like a standalone chat utterance."""
-    stripped = line.strip()
-    if not stripped:
-        return False
-    if len(stripped) > 48:
-        return False
-    if line.startswith((" ", "\t")):
-        return False
-    if stripped.startswith((">", "-", "*", "【", "#", "|")):
-        return False
-    if _TABLE_RULE_RE.match(stripped):
-        return False
-    if re.match(r"^\*\*[^*]+\*\*$", stripped):
-        return False
-    if re.match(r"^\d+\.\s", stripped):
-        return False
-    return True
-
-
-def _looks_like_heading_line_for_weixin(line: str) -> bool:
-    """Return True when a short line behaves like a heading."""
-    stripped = line.strip()
-    if not stripped:
-        return False
-    if _HEADER_RE.match(stripped):
-        return True
-    return len(stripped) <= 24 and stripped.endswith((":", "："))
-
-
-def _should_split_short_chat_block_for_weixin(block: str) -> bool:
-    """Split only chat-like multiline blocks into separate bubbles."""
-    lines = [line for line in block.splitlines() if line.strip()]
-    if not 2 <= len(lines) <= 6:
-        return False
-    if _looks_like_heading_line_for_weixin(lines[0]):
-        return False
-    return all(_looks_like_chatty_line_for_weixin(line) for line in lines)
-
-
-def _pack_markdown_blocks_for_weixin(content: str, max_length: int) -> List[str]:
-    if len(content) <= max_length:
-        return [content]
-
-    packed: List[str] = []
-    current = ""
-    for block in _split_markdown_blocks(content):
-        candidate = block if not current else f"{current}\n\n{block}"
-        if len(candidate) <= max_length:
-            current = candidate
-            continue
-        if current:
-            packed.append(current)
-            current = ""
-        if len(block) <= max_length:
-            current = block
-            continue
-        packed.extend(BasePlatformAdapter.truncate_message(block, max_length))
-    if current:
-        packed.append(current)
-    return packed
-
-
-def _split_text_for_weixin_delivery(
-    content: str, max_length: int, split_per_line: bool = False,
-) -> List[str]:
-    """Split content into sequential Weixin messages.
-
-    *compact* (default): Keep everything in a single message whenever it fits
-    within the platform limit, even when the author used explicit line breaks.
-    Only fall back to block-aware packing when the payload exceeds
-    ``max_length``.
-
-    *per_line* (``split_per_line=True``): Legacy behavior — top-level line
-    breaks become separate chat messages; oversized units still use
-    block-aware packing.
-
-    The active mode is controlled via ``config.yaml`` ->
-    ``platforms.weixin.extra.split_multiline_messages`` (``true`` / ``false``)
-    or the env var ``WEIXIN_SPLIT_MULTILINE_MESSAGES``.
-    """
-    if not content:
-        return []
-    if split_per_line:
-        # Legacy: one message per top-level delivery unit.
-        if len(content) <= max_length and "\n" not in content:
-            return [content]
-        chunks: List[str] = []
-        for unit in _split_delivery_units_for_weixin(content):
-            if len(unit) <= max_length:
-                chunks.append(unit)
-                continue
-            chunks.extend(_pack_markdown_blocks_for_weixin(unit, max_length))
-        return [c for c in chunks if c] or [content]
-
-    # Compact (default): single message when under the limit — unless the
-    # content looks like a short chatty exchange, in which case split into
-    # separate bubbles for a more natural chat feel.
-    if len(content) <= max_length:
-        return (
-            [u for u in _split_delivery_units_for_weixin(content) if u]
-            if _should_split_short_chat_block_for_weixin(content)
-            else [content]
-        )
-    return _pack_markdown_blocks_for_weixin(content, max_length) or [content]
 
 
 def _coerce_bool(value: Any, default: bool = True) -> bool:
@@ -1107,7 +854,7 @@ class WeixinAdapter(BasePlatformAdapter):
     supports_code_blocks = True  # Weixin renders fenced code blocks
     splits_long_messages = True  # send() chunks via _split_text()
 
-    MAX_MESSAGE_LENGTH = 2000
+    MAX_MESSAGE_LENGTH = ILINK_TEXT_MESSAGE_LIMIT
 
     # WeChat does not support editing sent messages — streaming must use the
     # fallback "send-final-only" path so the cursor (▉) is never left visible.
@@ -1648,8 +1395,10 @@ class WeixinAdapter(BasePlatformAdapter):
             logger.debug("[%s] getConfig failed for %s: %s", self.name, _safe_id(user_id), exc)
 
     def _split_text(self, content: str) -> List[str]:
-        return _split_text_for_weixin_delivery(
-            content, self.MAX_MESSAGE_LENGTH, self._split_multiline_messages,
+        return split_weixin_text(
+            content,
+            self.MAX_MESSAGE_LENGTH,
+            split_per_line=self._split_multiline_messages,
         )
 
     def _rate_limit_cooldown_remaining(self) -> float:
@@ -2241,7 +1990,7 @@ class WeixinAdapter(BasePlatformAdapter):
     def format_message(self, content: Optional[str]) -> str:
         if content is None:
             return ""
-        return _wrap_copy_friendly_lines_for_weixin(_normalize_markdown_blocks(content))
+        return format_weixin_text(content)
 
 
 async def send_weixin_direct(
