@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -19,6 +21,7 @@ from hermes_cli.owner_worker.executor_identity import (
 from hermes_cli.tool_executor_runtime.entrypoint import (
     ExecutorRuntimeInvalid,
     _admit_workspace_mount,
+    _apply_file_descriptor_limit,
     _await_start_gate,
     _require_matching_egress_profile,
     invocation_from_payload,
@@ -287,6 +290,35 @@ def test_workspace_admission_accepts_descriptor_consumed_by_bubblewrap(tmp_path,
     _admit_workspace_mount(descriptor)
 
     assert seen == ["/workspace"]
+
+
+def test_file_descriptor_limit_is_applied_to_descendants():
+    limit = 37
+    program = (
+        "import resource,subprocess,sys;"
+        "resource.setrlimit(resource.RLIMIT_NOFILE,(int(sys.argv[1]),int(sys.argv[1])));"
+        "subprocess.run([sys.executable,'-c',"
+        "'import json,resource;print(json.dumps(resource.getrlimit(resource.RLIMIT_NOFILE)))'],check=True)"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", program, str(limit)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.stdout.strip() == f"[{limit}, {limit}]"
+
+
+def test_file_descriptor_limit_fails_closed(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.tool_executor_runtime.entrypoint.resource.setrlimit",
+        lambda *_args: (_ for _ in ()).throw(OSError("denied")),
+    )
+
+    with pytest.raises(ExecutorRuntimeInvalid, match="descriptor limit"):
+        _apply_file_descriptor_limit(64)
 
 
 def test_executor_environment_keeps_tmp_internal_without_host_tmp_input(tmp_path):
