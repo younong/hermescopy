@@ -78,10 +78,16 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert 'path.join(buildDir, "deploy/powerpoint-runtime/node_modules")' in source
     assert 'path.join(buildDir, "deploy/powerpoint-runtime/runtime-modules")' in source
     assert 'test -d "$release/deploy/powerpoint-runtime/runtime-modules/pptxgenjs"' in source
-    archive_block = source[source.index('"-czf"') : source.index('return { tmp, archivePath }')]
+    archive_block = source[source.index('"-czf"') : source.index("export function createArchive")]
     assert '"--exclude=./node_modules"' in archive_block
     assert '"--exclude=./deploy/powerpoint-runtime/runtime-modules/.package-lock.json"' in archive_block
+    for omitted_tree in ("tests", "website", "apps", ".github", "docs"):
+        assert f'"--exclude=./{omitted_tree}"' in archive_block
     assert '"--exclude=./deploy/powerpoint-runtime/runtime-modules"' not in archive_block
+    build_call = source.index("buildArtifact(buildDir, { dryRun });")
+    powerpoint_move = source.index('path.join(buildDir, "deploy/powerpoint-runtime/runtime-modules")')
+    archive_call = source.index("createReleaseArchive(buildDir, archivePath, { dryRun });")
+    assert build_call < powerpoint_move < archive_call
     assert "maxBuffer: 64 * 1024 * 1024" in source
     assert '"--no-xattrs"' in source
     assert 'executor_commands="bash sh /bin/sh ls pwd printf cat chmod grep find head mktemp mv rm stat awk basename dirname sed uname which node soffice"' in source
