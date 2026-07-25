@@ -1360,6 +1360,34 @@ if ! systemctl restart hermes-gateway.service || ! systemctl start hermes-dashbo
 fi
 systemctl --no-pager --full status hermes-gateway.service hermes-dashboard.service || true
 
+# systemd reports active as soon as the Dashboard process starts, before app
+# construction has initialized the managed cgroup hierarchy. Wait for Uvicorn's
+# exact unauthenticated contract so resource smoke cannot race CgroupV2Manager.
+login_status="000"
+api_status="000"
+for _ in $(seq 1 30); do
+  login_status="$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "Host: $dashboard_public_host" \
+    -H "X-Forwarded-Host: $dashboard_public_host" \
+    -H 'X-Forwarded-Proto: https' \
+    -H 'X-Forwarded-Prefix: /hermes' \
+    http://127.0.0.1:9119/ || true)"
+  api_status="$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "Host: $dashboard_public_host" \
+    -H "X-Forwarded-Host: $dashboard_public_host" \
+    -H 'X-Forwarded-Proto: https' \
+    -H 'X-Forwarded-Prefix: /hermes' \
+    http://127.0.0.1:9119/api/sessions || true)"
+  if [ "$login_status" = "302" ] && [ "$api_status" = "401" ]; then
+    break
+  fi
+  sleep 1
+done
+if [ "$login_status" != "302" ] || [ "$api_status" != "401" ]; then
+  echo "Hermes internal auth preflight failed (html=$login_status api=$api_status)" >&2
+  exit 1
+fi
+
 if "$venv/bin/python" "$release/deploy/check-executor-cgroup-host.py" \
   --managed-root "$cgroup_root" \
   --service hermes-dashboard.service \
@@ -1390,34 +1418,6 @@ if "$venv/bin/python" "$release/deploy/check-executor-cgroup-host.py" \
 else
   echo "HERMES_DEPLOY_STAGE executor_resource_preflight=unavailable"
   echo "Authenticated tools remain fail closed until the documented cgroup v2 migration is complete"
-fi
-
-# Prove Hermes' own gate is active before touching the legacy outer Nginx gate.
-# systemd can report active before Uvicorn has opened its socket, so retry the
-# exact fail-closed contract for up to 30 seconds rather than racing startup.
-login_status="000"
-api_status="000"
-for _ in $(seq 1 30); do
-  login_status="$(curl -sS -o /dev/null -w '%{http_code}' \
-    -H "Host: $dashboard_public_host" \
-    -H "X-Forwarded-Host: $dashboard_public_host" \
-    -H 'X-Forwarded-Proto: https' \
-    -H 'X-Forwarded-Prefix: /hermes' \
-    http://127.0.0.1:9119/ || true)"
-  api_status="$(curl -sS -o /dev/null -w '%{http_code}' \
-    -H "Host: $dashboard_public_host" \
-    -H "X-Forwarded-Host: $dashboard_public_host" \
-    -H 'X-Forwarded-Proto: https' \
-    -H 'X-Forwarded-Prefix: /hermes' \
-    http://127.0.0.1:9119/api/sessions || true)"
-  if [ "$login_status" = "302" ] && [ "$api_status" = "401" ]; then
-    break
-  fi
-  sleep 1
-done
-if [ "$login_status" != "302" ] || [ "$api_status" != "401" ]; then
-  echo "Hermes internal auth preflight failed (html=$login_status api=$api_status)" >&2
-  exit 1
 fi
 
 # Gate the transaction with a real gateway conversation while the previous

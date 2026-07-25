@@ -110,10 +110,16 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert 'chown -R root:root "$release_tmp"' in source
     assert 'find "$release_tmp" -type d -exec chmod go-w {} +' in source
     service_start = source.index("systemctl start hermes-dashboard.service")
-    resource_preflight = source.index("check-executor-cgroup-host.py", service_start)
+    dashboard_ready = source.index("# systemd reports active", service_start)
+    resource_preflight = source.index("check-executor-cgroup-host.py", dashboard_ready)
     resource_smoke = source.index("smoke-executor-resources.py", resource_preflight)
     powerpoint_smoke = source.index("smoke-powerpoint-runtime.py", resource_smoke)
-    assert service_start < resource_preflight < resource_smoke < powerpoint_smoke
+    assert service_start < dashboard_ready < resource_preflight < resource_smoke < powerpoint_smoke
+    ready_block = source[dashboard_ready:resource_preflight]
+    assert "for _ in $(seq 1 30); do" in ready_block
+    assert 'if [ "$login_status" = "302" ] && [ "$api_status" = "401" ]' in ready_block
+    assert "Hermes internal auth preflight failed" in ready_block
+    assert source.count("Hermes internal auth preflight failed") == 1
     assert '"schema_version":2' in source
     assert '"cpu_millis":1500' in source
     assert '"memory_bytes":2415919104' in source
