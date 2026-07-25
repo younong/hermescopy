@@ -143,6 +143,7 @@ class WeixinILinkClient:
         text: str,
         context_token: str | None,
         client_id: str,
+        raise_provider_errors: bool = True,
     ) -> dict[str, Any]:
         if not text or not text.strip():
             raise ValueError("text must not be empty")
@@ -158,12 +159,15 @@ class WeixinILinkClient:
         }
         if context_token:
             message["context_token"] = context_token
-        return await self.post_json(
+        response = await self.post_json(
             endpoint=EP_SEND_MESSAGE,
             payload={"msg": message},
             timeout_ms=API_TIMEOUT_MS,
             operation="send message",
         )
+        if raise_provider_errors:
+            _raise_provider_error(response, "send message")
+        return response
 
     async def send_typing(
         self,
@@ -199,7 +203,12 @@ class WeixinILinkClient:
             async with self._session.post(url, data=body, headers=_headers(self._token, body)) as response:
                 raw = await response.text()
                 if not response.ok:
-                    raise ILinkTransportError(label, "request failed", http_status=response.status)
+                    raise ILinkTransportError(
+                        label,
+                        "request failed",
+                        http_status=response.status,
+                        transient=response.status == 429 or response.status >= 500,
+                    )
                 return _decode_json(raw, label)
 
         return await asyncio.wait_for(_do(), timeout=timeout_ms / 1000)
@@ -222,7 +231,12 @@ class WeixinILinkClient:
             async with self._session.get(url, headers=headers) as response:
                 raw = await response.text()
                 if not response.ok:
-                    raise ILinkTransportError(label, "request failed", http_status=response.status)
+                    raise ILinkTransportError(
+                        label,
+                        "request failed",
+                        http_status=response.status,
+                        transient=response.status == 429 or response.status >= 500,
+                    )
                 return _decode_json(raw, label)
 
         return await asyncio.wait_for(_do(), timeout=timeout_ms / 1000)
@@ -243,6 +257,41 @@ def _required_string(payload: Mapping[str, Any], key: str, operation: str) -> st
     if not isinstance(value, str) or not value:
         raise ILinkTransportError(operation, "incomplete response")
     return value
+
+
+def _raise_provider_error(payload: Mapping[str, Any], operation: str) -> None:
+    raw_ret = payload.get("ret")
+    raw_errcode = payload.get("errcode")
+    ret = _provider_code(raw_ret)
+    errcode = _provider_code(raw_errcode)
+    if _provider_success(raw_ret) and _provider_success(raw_errcode):
+        return
+    code = ret if ret not in {None, 0} else errcode
+    message = payload.get("errmsg") or payload.get("msg")
+    stale_session = code == -14 or (code == -2 and str(message).lower() == "unknown error")
+    if stale_session:
+        reason = "stale_session"
+        transient = False
+    elif code == -2:
+        reason = "rate_limited"
+        transient = True
+    else:
+        reason = "provider_rejected"
+        transient = False
+    raise ILinkTransportError(
+        operation,
+        reason,
+        provider_code=code,
+        transient=transient,
+    )
+
+
+def _provider_success(value: Any) -> bool:
+    return value is None or (isinstance(value, int) and not isinstance(value, bool) and value == 0)
+
+
+def _provider_code(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _json_dumps(payload: Mapping[str, Any]) -> str:

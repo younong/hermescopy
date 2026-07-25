@@ -103,6 +103,45 @@ async def test_dispatch_creates_session_submits_idempotent_turn_and_writes_outbo
     assert outbound["client_message_id"].startswith("hermes-ilink-")
 
 
+def test_failed_outbound_unblocks_next_inbound_but_active_outbound_does_not(queued):
+    store, registered = queued
+    dispatcher = ChannelDispatcher(store, object())
+    now = 1.0
+    with store.write() as conn:
+        first = conn.execute("SELECT inbound_id FROM inbound_messages").fetchone()["inbound_id"]
+        conn.execute(
+            "UPDATE inbound_messages SET status='outbound_pending', created_at=? WHERE inbound_id=?",
+            (now, first),
+        )
+        conn.execute(
+            """
+            INSERT INTO outbound_messages
+              (outbound_id, inbound_id, account_id, binding_id, client_message_id,
+               status, next_attempt_at, created_at, updated_at)
+            VALUES ('outbound-first', ?, ?, ?, 'client-first', 'queued', 0, ?, ?)
+            """,
+            (first, registered.account_id, registered.binding_id, now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO inbound_messages
+              (inbound_id, account_id, binding_id, provider_message_id, status,
+               created_at, updated_at)
+            VALUES ('inbound-next', ?, ?, 'provider-next', 'queued', ?, ?)
+            """,
+            (registered.account_id, registered.binding_id, now + 1, now + 1),
+        )
+
+    assert dispatcher.claim_next(holder="dispatcher") is None
+    with store.write() as conn:
+        conn.execute("UPDATE outbound_messages SET status='failed'")
+        conn.execute("UPDATE inbound_messages SET status='failed' WHERE inbound_id=?", (first,))
+
+    claim = dispatcher.claim_next(holder="dispatcher")
+    assert claim is not None
+    assert claim["inbound_id"] == "inbound-next"
+
+
 @pytest.mark.asyncio
 async def test_failed_agent_turn_does_not_create_outbox(queued):
     store, registered = queued

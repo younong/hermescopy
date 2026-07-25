@@ -56,9 +56,14 @@ class ILinkTransportError(RuntimeError):
         reason: str,
         *,
         http_status: int | None = None,
+        provider_code: int | None = None,
+        transient: bool = False,
     ) -> None:
         self.operation = operation
         self.reason = reason
         self.http_status = http_status
+        self.provider_code = provider_code
+        self.transient = transient
         status = f" HTTP {http_status}" if http_status is not None else ""
-        super().__init__(f"iLink {operation}{status}: {reason}")
+        provider = f" provider {provider_code}" if provider_code is not None else ""
+        super().__init__(f"iLink {operation}{status}{provider}: {reason}")
