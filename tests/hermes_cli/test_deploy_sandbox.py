@@ -124,7 +124,7 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert '"cpu_millis":1500' in source
     assert '"memory_bytes":2415919104' in source
     assert '"max_owner_workers":5' in source
-    assert '"reader":{"cpu_millis":250,"memory_bytes":134217728,"pids":16' in source
+    assert '"reader":{"cpu_millis":1000,"memory_bytes":134217728,"pids":16' in source
     assert '"cpu_millis":750' in source
     assert '"memory_bytes":536870912' in source
     assert "Delegate=cpu memory pids" in source
