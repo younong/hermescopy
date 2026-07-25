@@ -308,7 +308,7 @@ def test_authenticated_api_availability_requires_explicit_owner_worker_routes(pa
         ("PUT", "/api/dashboard/font"),
         ("GET", "/api/dashboard/plugins/rescan"),
         ("POST", "/api/dashboard/plugins/example/visibility"),
-        ("DELETE", "/api/skills"),
+        ("PATCH", "/api/skills"),
         ("GET", "/api/skills/toggle"),
         ("POST", "/api/skills/content"),
         ("GET", "/api/skills/export"),
@@ -329,6 +329,7 @@ def test_authenticated_owner_worker_routes_are_method_and_path_exact(method, pat
     [
         ("GET", "/api/skills"),
         ("POST", "/api/skills"),
+        ("DELETE", "/api/skills"),
         ("GET", "/api/skills/content"),
         ("PUT", "/api/skills/content"),
         ("PUT", "/api/skills/toggle"),

@@ -1,0 +1,328 @@
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
+import { Plus, RefreshCw, Search, Sparkles, Trash2, X } from "lucide-react";
+import { api, type SkillInfo } from "@/lib/api";
+
+const CREATE_TEMPLATE = `---
+name: my-skill
+description: One-line description of when to use this skill.
+---
+
+# My Skill
+
+Numbered steps, exact commands, and pitfalls go here.
+`;
+
+export function GuiChatSkillsPane({ profile }: { profile?: string }) {
+  const scopedProfile = profile || undefined;
+  const [skills, setSkills] = useState<SkillInfo[] | null>(null);
+  const [query, setQuery] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [savingSkill, setSavingSkill] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<SkillInfo | null>(null);
+  const [createOpen, setCreateOpen] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const rows = await api.getSkills(scopedProfile);
+      setSkills([...rows].sort((a, b) => a.name.localeCompare(b.name)));
+    } catch (cause) {
+      setError(errorMessage(cause));
+      setSkills((current) => current ?? []);
+    } finally {
+      setLoading(false);
+    }
+  }, [scopedProfile]);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getSkills(scopedProfile)
+      .then((rows) => {
+        if (!cancelled) setSkills([...rows].sort((a, b) => a.name.localeCompare(b.name)));
+      })
+      .catch((cause) => {
+        if (!cancelled) {
+          setError(errorMessage(cause));
+          setSkills([]);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [scopedProfile]);
+
+  const visibleSkills = useMemo(() => {
+    const normalized = query.trim().toLowerCase();
+    if (!normalized) return skills ?? [];
+    return (skills ?? []).filter((skill) =>
+      [skill.name, skill.description, skill.category].some((value) =>
+        String(value || "").toLowerCase().includes(normalized),
+      ),
+    );
+  }, [query, skills]);
+
+  const toggleSkill = async (skill: SkillInfo, enabled: boolean) => {
+    setSavingSkill(skill.name);
+    setError(null);
+    try {
+      await api.toggleSkill(skill.name, enabled, scopedProfile);
+      setSkills((current) =>
+        current?.map((row) => row.name === skill.name ? { ...row, enabled } : row) ?? current,
+      );
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setSavingSkill(null);
+    }
+  };
+
+  const deleteSkill = async () => {
+    if (!pendingDelete) return;
+    const name = pendingDelete.name;
+    setSavingSkill(name);
+    setError(null);
+    try {
+      await api.deleteSkill(name, scopedProfile);
+      setSkills((current) => current?.filter((skill) => skill.name !== name) ?? current);
+      setPendingDelete(null);
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setSavingSkill(null);
+    }
+  };
+
+  return (
+    <section aria-label="Skills" className="gui-chat-skills-pane" data-skills-pane>
+      <header className="gui-chat-skills-toolbar">
+        <button className="gui-chat-skills-primary-button" onClick={() => setCreateOpen(true)} type="button">
+          <Plus aria-hidden />
+          New skill
+        </button>
+        <button
+          aria-label="Refresh skills"
+          className="gui-chat-skills-icon-button"
+          disabled={loading}
+          onClick={() => void load()}
+          type="button"
+        >
+          <RefreshCw aria-hidden className={loading ? "animate-spin" : ""} />
+        </button>
+      </header>
+
+      <div className="gui-chat-skills-heading">
+        <div>
+          <h1>Skills</h1>
+          <p>Reusable instructions available to new conversations in this workspace.</p>
+        </div>
+        <label className="gui-chat-skills-search">
+          <Search aria-hidden />
+          <input
+            aria-label="Search skills"
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Search skills"
+            value={query}
+          />
+        </label>
+      </div>
+
+      {error ? <div className="gui-chat-skills-feedback is-error" role="alert">{error}</div> : null}
+
+      <div className="gui-chat-skills-list">
+        {skills === null && loading ? (
+          <div className="gui-chat-skills-empty" role="status">Loading skills…</div>
+        ) : visibleSkills.length === 0 ? (
+          <div className="gui-chat-skills-empty">
+            <Sparkles aria-hidden />
+            <strong>{query.trim() ? "No matching skills" : "No skills yet"}</strong>
+            <span>{query.trim() ? "Try a different search." : "Create a skill to add reusable guidance."}</span>
+          </div>
+        ) : (
+          visibleSkills.map((skill) => (
+            <article className="gui-chat-skill-row" key={skill.name}>
+              <div className="gui-chat-skill-copy">
+                <div className="gui-chat-skill-title">
+                  <span>{skill.name}</span>
+                  {skill.category ? <span className="gui-chat-skill-category">{skill.category}</span> : null}
+                </div>
+                <p>{skill.description || "No description"}</p>
+              </div>
+              <div className="gui-chat-skill-actions">
+                <button
+                  aria-checked={skill.enabled}
+                  aria-label={`${skill.enabled ? "Disable" : "Enable"} ${skill.name}`}
+                  className="gui-chat-skill-switch"
+                  disabled={savingSkill === skill.name}
+                  onClick={() => void toggleSkill(skill, !skill.enabled)}
+                  role="switch"
+                  type="button"
+                >
+                  <span />
+                </button>
+                <button
+                  aria-label={`Delete ${skill.name}`}
+                  className="gui-chat-skills-icon-button is-destructive"
+                  disabled={savingSkill === skill.name}
+                  onClick={() => setPendingDelete(skill)}
+                  type="button"
+                >
+                  <Trash2 aria-hidden />
+                </button>
+              </div>
+            </article>
+          ))
+        )}
+      </div>
+
+      {createOpen ? (
+        <CreateSkillDialog
+          busy={savingSkill === "__create__"}
+          onClose={() => setCreateOpen(false)}
+          onCreate={async (name, category, content) => {
+            setSavingSkill("__create__");
+            setError(null);
+            try {
+              await api.createSkill({ name, category: category || undefined, content }, scopedProfile);
+              await load();
+              setCreateOpen(false);
+            } catch (cause) {
+              throw new Error(errorMessage(cause));
+            } finally {
+              setSavingSkill(null);
+            }
+          }}
+        />
+      ) : null}
+
+      {pendingDelete ? (
+        <GuiChatSkillsDialog
+          busy={savingSkill === pendingDelete.name}
+          description="This permanently removes the skill and its supporting files. This action cannot be undone."
+          onClose={() => setPendingDelete(null)}
+          title={`Delete ${pendingDelete.name}?`}
+        >
+          <div className="gui-chat-skills-dialog-actions">
+            <button disabled={savingSkill === pendingDelete.name} onClick={() => setPendingDelete(null)} type="button">Cancel</button>
+            <button className="is-destructive" disabled={savingSkill === pendingDelete.name} onClick={() => void deleteSkill()} type="button">
+              {savingSkill === pendingDelete.name ? "Deleting…" : "Delete"}
+            </button>
+          </div>
+        </GuiChatSkillsDialog>
+      ) : null}
+    </section>
+  );
+}
+
+function CreateSkillDialog({
+  busy,
+  onClose,
+  onCreate,
+}: {
+  busy: boolean;
+  onClose: () => void;
+  onCreate: (name: string, category: string, content: string) => Promise<void>;
+}) {
+  const [name, setName] = useState("");
+  const [category, setCategory] = useState("");
+  const [content, setContent] = useState(CREATE_TEMPLATE);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async () => {
+    const trimmedName = name.trim();
+    if (!trimmedName) {
+      setError("Skill name is required.");
+      return;
+    }
+    if (!content.trim()) {
+      setError("SKILL.md content is required.");
+      return;
+    }
+    setError(null);
+    try {
+      await onCreate(trimmedName, category.trim(), content);
+    } catch (cause) {
+      setError(errorMessage(cause));
+    }
+  };
+
+  return (
+    <GuiChatSkillsDialog
+      busy={busy}
+      description="Add YAML frontmatter and markdown instructions. The skill becomes available to new conversations."
+      onClose={onClose}
+      title="New skill"
+      wide
+    >
+      <div className="gui-chat-skills-editor-grid">
+        <label>
+          <span>Name</span>
+          <input aria-label="Skill name" autoFocus disabled={busy} onChange={(event) => setName(event.target.value)} placeholder="my-skill" value={name} />
+        </label>
+        <label>
+          <span>Category (optional)</span>
+          <input aria-label="Skill category" disabled={busy} onChange={(event) => setCategory(event.target.value)} placeholder="productivity" value={category} />
+        </label>
+      </div>
+      <label className="gui-chat-skills-editor-content">
+        <span>SKILL.md</span>
+        <textarea aria-label="SKILL.md" disabled={busy} onChange={(event) => setContent(event.target.value)} spellCheck={false} value={content} />
+      </label>
+      {error ? <div className="gui-chat-skills-editor-error" role="alert">{error}</div> : null}
+      <div className="gui-chat-skills-dialog-actions">
+        <button disabled={busy} onClick={onClose} type="button">Cancel</button>
+        <button className="is-primary" disabled={busy} onClick={() => void submit()} type="button">
+          {busy ? "Creating…" : "Create skill"}
+        </button>
+      </div>
+    </GuiChatSkillsDialog>
+  );
+}
+
+function GuiChatSkillsDialog({
+  busy,
+  children,
+  description,
+  onClose,
+  title,
+  wide = false,
+}: {
+  busy: boolean;
+  children: ReactNode;
+  description: string;
+  onClose: () => void;
+  title: string;
+  wide?: boolean;
+}) {
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !busy) onClose();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [busy, onClose]);
+
+  return createPortal(
+    <div className="gui-chat-skills-dialog-backdrop" data-gui-chat role="presentation">
+      <div aria-labelledby="gui-chat-skills-dialog-title" aria-modal="true" className={`gui-chat-skills-dialog${wide ? " is-wide" : ""}`} role="dialog">
+        <button aria-label="Close" className="gui-chat-skills-dialog-close" disabled={busy} onClick={onClose} type="button">
+          <X aria-hidden />
+        </button>
+        <h2 id="gui-chat-skills-dialog-title">{title}</h2>
+        <p>{description}</p>
+        {children}
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+function errorMessage(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
+}

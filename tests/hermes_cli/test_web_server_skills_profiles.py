@@ -114,6 +114,20 @@ class TestProfileScopedSkills:
         resp = client.get("/api/skills", params={"profile": "Bad Name!"})
         assert resp.status_code == 400
 
+    def test_delete_removes_only_target_profile_skill(self, client, isolated_profiles):
+        _write_skill(isolated_profiles["default"] / "skills", "shared-skill")
+        _write_skill(isolated_profiles["worker_alpha"] / "skills", "shared-skill")
+
+        resp = client.request(
+            "DELETE",
+            "/api/skills",
+            json={"name": "shared-skill", "profile": "worker_alpha"},
+        )
+
+        assert resp.status_code == 200
+        assert not (isolated_profiles["worker_alpha"] / "skills" / "shared-skill").exists()
+        assert (isolated_profiles["default"] / "skills" / "shared-skill").exists()
+
     def test_scope_restores_module_globals(self, client, isolated_profiles):
         """The SKILLS_DIR swap is per-request; the module global must be
         restored even after a scoped call (cron-style locked swap)."""

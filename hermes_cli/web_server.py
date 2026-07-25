@@ -11601,6 +11601,11 @@ class SkillContentUpdate(BaseModel):
     profile: Optional[str] = None
 
 
+class SkillDelete(BaseModel):
+    name: str
+    profile: Optional[str] = None
+
+
 def _clear_skills_prompt_cache() -> None:
     """Best-effort: invalidate the skills system-prompt snapshot after a write.
 
@@ -11654,6 +11659,27 @@ async def create_skill(request: Request, body: SkillCreate):
         result = _create_skill(body.name, body.content, body.category or None)
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error", "Failed to create skill."))
+    _clear_skills_prompt_cache()
+    return result
+
+
+@app.delete("/api/skills")
+async def delete_skill(request: Request, body: SkillDelete):
+    """Permanently delete a skill selected by the authenticated dashboard user."""
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(body.profile)
+        return await _proxy_authenticated_owner_http(request)
+    from tools.skill_manager_tool import _delete_skill
+    from tools.skill_usage import forget
+
+    with _profile_scope(body.profile):
+        result = _delete_skill(body.name, absorbed_into="")
+        if result.get("success") and not result.get("_archived"):
+            forget(body.name)
+    if not result.get("success"):
+        err = result.get("error", "Failed to delete skill.")
+        status = 404 if "not found" in str(err).lower() else 400
+        raise HTTPException(status_code=status, detail=err)
     _clear_skills_prompt_cache()
     return result
 

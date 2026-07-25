@@ -2623,6 +2623,19 @@ def test_worker_skill_writes_mutate_only_owner_home(tmp_path, monkeypatch):
     assert updated.status_code == 200, updated.text
     assert existing.joinpath("SKILL.md").read_text() == updated_content
 
+    deleted = request("DELETE", "/api/skills", {"name": "new-skill"})
+    assert deleted.status_code == 200, deleted.text
+    assert not owner_home.joinpath("skills/new-skill").exists()
+    assert not other_home.joinpath("skills/new-skill").exists()
+
+    rejected_delete = request(
+        "DELETE",
+        "/api/skills",
+        {"name": "owner-skill", "profile": "other"},
+    )
+    assert rejected_delete.status_code == 400
+    assert existing.exists()
+
     rejected = request(
         "POST",
         "/api/skills",
