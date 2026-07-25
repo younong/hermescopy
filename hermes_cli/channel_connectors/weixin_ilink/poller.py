@@ -11,6 +11,17 @@ from typing import Any, Mapping
 from gateway.weixin_ilink import WeixinILinkClient
 from hermes_cli.channel_identity.store import ChannelIdentityStore
 
+ITEM_TEXT = 1
+ITEM_VOICE = 3
+_MAX_VOICE_DESCRIPTOR_BYTES = 16 * 1024
+_MAX_MEDIA_FIELD_CHARS = 8 * 1024
+
+
+@dataclass(frozen=True)
+class InboundPayload:
+    kind: str
+    value: str
+
 
 class StalePollLeaseError(RuntimeError):
     """The account lease was replaced or its credentials changed."""
@@ -160,7 +171,7 @@ def _commit_message(store, conn, account_id: str, message: Mapping[str, Any], no
     ).fetchone() if peer_hash else None
     status = "queued"
     reason = None
-    text = _extract_text(message.get("item_list"))
+    payload = _extract_payload(message.get("item_list"))
     if not provider_message_id:
         provider_message_id = f"rejected-{uuid.uuid4().hex}"
         status, reason = "rejected", "missing_provider_message_id"
@@ -168,12 +179,15 @@ def _commit_message(store, conn, account_id: str, message: Mapping[str, Any], no
         status, reason = "rejected", "unknown_peer"
     elif message.get("room_id") or message.get("chat_room_id"):
         status, reason = "rejected", "group_not_supported"
-    elif text is None:
+    elif payload is None:
         status, reason = "rejected", "non_text_not_supported"
+    elif payload.kind == "voice_invalid":
+        status, reason = "rejected", "voice_media_invalid"
     payload_ciphertext = payload_version = None
     if status == "queued":
+        assert payload is not None
         payload_ciphertext, payload_version = store.crypto.encrypt_text(
-            text,
+            payload.value,
             table="inbound_messages",
             record_id=provider_message_id,
             field="payload",
@@ -210,8 +224,9 @@ def _commit_message(store, conn, account_id: str, message: Mapping[str, Any], no
             INSERT INTO inbound_messages
               (inbound_id, account_id, binding_id, provider_message_id,
                payload_ciphertext, payload_key_version, context_ciphertext,
-               context_key_version, status, rejection_reason, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               context_key_version, status, rejection_reason, payload_kind,
+               next_attempt_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 inbound_id,
@@ -224,6 +239,8 @@ def _commit_message(store, conn, account_id: str, message: Mapping[str, Any], no
                 context_version,
                 status,
                 reason,
+                payload.kind if status == "queued" and payload is not None else "text",
+                now,
                 now,
                 now,
             ),
@@ -236,18 +253,57 @@ def _commit_message(store, conn, account_id: str, message: Mapping[str, Any], no
     return 1
 
 
-def _extract_text(items: Any) -> str | None:
-    if not isinstance(items, list) or not items:
+def _extract_payload(items: Any) -> InboundPayload | None:
+    if not isinstance(items, list) or len(items) != 1:
         return None
-    for item in items:
-        if not isinstance(item, Mapping):
-            return None
-        if item.get("type") != 1:
-            return None
+    item = items[0]
+    if not isinstance(item, Mapping):
+        return None
+    if item.get("type") == ITEM_TEXT:
         text = (item.get("text_item") or {}).get("text")
         if isinstance(text, str) and text.strip():
-            return text
-    return None
+            return InboundPayload("text", text)
+        return None
+    if item.get("type") != ITEM_VOICE:
+        return None
+    voice = item.get("voice_item")
+    if not isinstance(voice, Mapping):
+        return InboundPayload("voice_invalid", "")
+    transcript = voice.get("text")
+    if isinstance(transcript, str) and transcript.strip():
+        return InboundPayload("voice_transcript", transcript.strip())
+    media = voice.get("media")
+    if not isinstance(media, Mapping):
+        return InboundPayload("voice_invalid", "")
+    descriptor: dict[str, Any] = {"v": 1, "media": {}}
+    for key in ("encrypt_query_param", "aes_key", "full_url"):
+        value = media.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value or len(value) > _MAX_MEDIA_FIELD_CHARS:
+            return InboundPayload("voice_invalid", "")
+        descriptor["media"][key] = value
+    if not (
+        descriptor["media"].get("encrypt_query_param")
+        or descriptor["media"].get("full_url")
+    ):
+        return InboundPayload("voice_invalid", "")
+    for key in ("playtime", "sample_rate", "encode_type", "bits_per_sample"):
+        value = voice.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return InboundPayload("voice_invalid", "")
+        descriptor[key] = value
+    serialized = json.dumps(descriptor, ensure_ascii=False, separators=(",", ":"))
+    if len(serialized.encode("utf-8")) > _MAX_VOICE_DESCRIPTOR_BYTES:
+        return InboundPayload("voice_invalid", "")
+    return InboundPayload("voice_media", serialized)
+
+
+def _extract_text(items: Any) -> str | None:
+    payload = _extract_payload(items)
+    return payload.value if payload and payload.kind in {"text", "voice_transcript"} else None
 
 
 class AccountPoller:

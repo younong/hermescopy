@@ -1014,7 +1014,7 @@ if [ ! -x "$venv/bin/python3" ]; then
   UV_PYTHON_DOWNLOADS=never uv venv --relocatable --python "$base_python" "$runtime_tmp/venv"
   cd "$release"
   UV_PROJECT_ENVIRONMENT="$runtime_tmp/venv" UV_DEFAULT_INDEX="$python_package_index" \
-    uv sync --extra all --extra ddgs --locked --no-editable --link-mode copy
+    uv sync --extra all --extra ddgs --extra voice --locked --no-editable --link-mode copy
   cp -a "$runtime_tmp/venv/." "$runtime_tmp/"
   rm -rf -- "$runtime_tmp/venv"
   python_target="$(readlink "$runtime_tmp/bin/python3" || true)"
@@ -1176,7 +1176,7 @@ for command in $executor_commands; do
     *) PATH="$venv/toolchain/usr/bin:$venv/toolchain/bin" command -v "$command" >/dev/null ;;
   esac
 done
-PYTHONPATH="$release" "$venv/bin/python" -c 'import hermes_cli.tool_executor_runtime.entrypoint, tools.registry'
+PYTHONPATH="$release" "$venv/bin/python" -c 'import faster_whisper, hermes_cli.tool_executor_runtime.entrypoint, pilk, tools.registry, tools.silk_decoder'
 
 ln -sfnT "$release" "$current"
 release_target="$(resolved_path "$release")"

@@ -109,6 +109,48 @@ def test_store_rejects_symlink_database(tmp_path, crypto):
         ChannelIdentityStore(crypto, path=parent / "channel_identities.sqlite3")
 
 
+def _downgrade_inbound_messages_to_v3(conn: sqlite3.Connection) -> None:
+    conn.execute("DROP INDEX idx_inbound_due")
+    conn.execute("DROP INDEX idx_inbound_binding_status")
+    conn.execute("ALTER TABLE inbound_messages RENAME TO inbound_messages_v3")
+    conn.execute(
+        """
+        CREATE TABLE inbound_messages (
+            inbound_id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL REFERENCES ilink_accounts(account_id),
+            binding_id TEXT REFERENCES channel_bindings(binding_id),
+            provider_message_id TEXT NOT NULL,
+            payload_ciphertext BLOB,
+            payload_key_version INTEGER,
+            context_ciphertext BLOB,
+            context_key_version INTEGER,
+            status TEXT NOT NULL,
+            claimed_by TEXT,
+            claimed_at REAL,
+            rejection_reason TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(account_id, provider_message_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO inbound_messages
+        SELECT inbound_id, account_id, binding_id, provider_message_id,
+               payload_ciphertext, payload_key_version, context_ciphertext,
+               context_key_version, status, claimed_by, claimed_at,
+               rejection_reason, created_at, updated_at
+        FROM inbound_messages_v3
+        """
+    )
+    conn.execute("DROP TABLE inbound_messages_v3")
+    conn.execute(
+        "CREATE INDEX idx_inbound_binding_status "
+        "ON inbound_messages(binding_id, status, created_at)"
+    )
+
+
 def test_store_migrates_v1_attempts_to_owner_target_schema(tmp_path, crypto, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_OWNER_SECRET", "owner-secret")
@@ -116,6 +158,7 @@ def test_store_migrates_v1_attempts_to_owner_target_schema(tmp_path, crypto, mon
     first = ChannelIdentityStore(crypto, path=path)
     with first.write() as conn:
         conn.execute("UPDATE channel_identity_meta SET value='1' WHERE key='schema_version'")
+        _downgrade_inbound_messages_to_v3(conn)
         conn.execute(
             """
             INSERT INTO enrollment_attempts
@@ -154,11 +197,67 @@ def test_store_migrates_v1_attempts_to_owner_target_schema(tmp_path, crypto, mon
     with migrated.read() as conn:
         assert conn.execute(
             "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
-        ).fetchone()["value"] == "3"
+        ).fetchone()["value"] == "4"
         row = conn.execute(
             "SELECT target_canonical_user_id FROM enrollment_attempts WHERE attempt_id='enr_existing'"
         ).fetchone()
+        inbound_columns = {
+            column["name"]
+            for column in conn.execute("PRAGMA table_info(inbound_messages)").fetchall()
+        }
     assert row["target_canonical_user_id"] is None
+    assert {"payload_kind", "attempts", "next_attempt_at", "last_error"} <= inbound_columns
+
+
+def test_store_migrates_v3_inbound_rows_with_retry_defaults(tmp_path, crypto):
+    path = tmp_path / "control-plane" / "channel_identities.sqlite3"
+    first = ChannelIdentityStore(crypto, path=path)
+    with first.write() as conn:
+        conn.execute(
+            "INSERT INTO canonical_users VALUES ('cu', 'active', 1, 1)"
+        )
+        conn.execute(
+            """
+            INSERT INTO external_identities
+            VALUES ('ei', 'weixin-ilink', 'subject', X'00', 1, 'cu', 'active', 1, 1)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO ilink_accounts
+              (account_id, external_identity_id, bot_id_lookup_hash,
+               bot_id_ciphertext, bot_id_key_version, bot_token_ciphertext,
+               bot_token_key_version, base_url, credential_version, status,
+               created_at, updated_at)
+            VALUES ('account', 'ei', 'bot', X'00', 1, X'00', 1,
+                    'https://ilink.example', 1, 'active', 1, 1)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO inbound_messages
+              (inbound_id, account_id, provider_message_id, status,
+               created_at, updated_at)
+            VALUES ('im_existing', 'account', 'msg', 'queued', 1, 1)
+            """
+        )
+        _downgrade_inbound_messages_to_v3(conn)
+        conn.execute("UPDATE channel_identity_meta SET value='3' WHERE key='schema_version'")
+
+    migrated = ChannelIdentityStore(crypto, path=path)
+
+    with migrated.read() as conn:
+        row = conn.execute(
+            """
+            SELECT payload_kind, attempts, next_attempt_at, last_error
+            FROM inbound_messages WHERE inbound_id='im_existing'
+            """
+        ).fetchone()
+        version = conn.execute(
+            "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
+        ).fetchone()["value"]
+    assert tuple(row) == ("text", 0, 0, None)
+    assert version == "4"
 
 
 def test_store_migrates_v2_outbound_with_fresh_chunk_attempts(tmp_path, crypto):

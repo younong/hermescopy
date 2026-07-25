@@ -6,6 +6,7 @@ dispatch.  All external dependencies (faster_whisper, openai) are mocked.
 
 import os
 import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -27,6 +28,70 @@ pytestmark = pytest.mark.usefixtures("disable_lazy_stt_install")
 @pytest.fixture(autouse=True)
 def _clear_openai_env(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+
+class TestSilkNormalization:
+    def test_rejects_non_silk_input(self, tmp_path):
+        from tools.transcription_tools import normalize_silk_to_wav
+
+        source = tmp_path / "voice.silk"
+        source.write_bytes(b"not silk")
+        with pytest.raises(ValueError, match="header"):
+            normalize_silk_to_wav(str(source))
+
+    def test_real_pilk_decoder_runs_in_isolated_process(self, tmp_path):
+        import math
+        import struct
+
+        pilk = pytest.importorskip("pilk")
+        from tools.transcription_tools import normalize_silk_to_wav
+
+        pcm = tmp_path / "voice.pcm"
+        pcm.write_bytes(b"".join(
+            struct.pack("<h", int(3000 * math.sin(2 * math.pi * 440 * sample / 16000)))
+            for sample in range(1600)
+        ))
+        source = tmp_path / "voice.silk"
+        pilk.encode(str(pcm), str(source), pcm_rate=16000, tencent=True)
+
+        output = normalize_silk_to_wav(
+            str(source), timeout_seconds=10, max_duration_seconds=1
+        )
+        try:
+            assert Path(output).read_bytes().startswith(b"RIFF")
+        finally:
+            Path(output).unlink()
+
+    def test_validates_decoder_wav_and_returns_private_file(self, tmp_path, monkeypatch):
+        import wave
+        from tools import transcription_tools
+
+        source = tmp_path / "voice.silk"
+        source.write_bytes(b"#!SILK_V3 fake")
+
+        class Process:
+            def __init__(self, command, **_kwargs):
+                output = command[-1]
+                with wave.open(output, "wb") as wav:
+                    wav.setnchannels(1)
+                    wav.setsampwidth(2)
+                    wav.setframerate(16000)
+                    wav.writeframes(b"\x00\x00" * 1600)
+
+            def wait(self, timeout):
+                assert timeout == 10
+                return 0
+
+        monkeypatch.setattr(transcription_tools.subprocess, "Popen", Process)
+        output = transcription_tools.normalize_silk_to_wav(
+            str(source), timeout_seconds=10, max_duration_seconds=1
+        )
+        try:
+            assert Path(output).read_bytes().startswith(b"RIFF")
+            if os.name != "nt":
+                assert Path(output).stat().st_mode & 0o777 == 0o600
+        finally:
+            Path(output).unlink()
 
 
 class TestGetProvider:

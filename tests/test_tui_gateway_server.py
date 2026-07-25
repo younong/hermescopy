@@ -2354,6 +2354,103 @@ def _session(agent=None, **extra):
     }
 
 
+def test_channel_voice_rpc_is_owner_scoped_chunked_and_cleans_files(monkeypatch, tmp_path):
+    import base64
+    import hashlib
+
+    home = tmp_path / "owner"
+    token = set_hermes_home_override(home)
+    runtime = server.OwnerWorkerGatewayRuntime("owner-a", 1, "worker-a", 1, 0)
+    sid = "voice-session"
+    voice = b"#!SILK_V3 voice-bytes"
+    wav = tmp_path / "decoded.wav"
+    runtime.mutable_state.sessions[sid] = _session(source="weixin-ilink")
+    monkeypatch.setenv("HERMES_OWNER_KEY", "owner-a")
+
+    def normalize(path, **_kwargs):
+        assert Path(path).read_bytes() == voice
+        wav.write_bytes(b"RIFF decoded")
+        return str(wav)
+
+    monkeypatch.setattr("tools.transcription_tools.normalize_silk_to_wav", normalize)
+    monkeypatch.setattr(
+        "tools.transcription_tools.transcribe_audio",
+        lambda path: {"success": True, "transcript": "你好", "provider": "local"},
+    )
+    try:
+        with server.owner_worker_gateway_runtime(runtime):
+            begin = server._methods["channel.voice.begin"](
+                "1",
+                {
+                    "session_id": sid,
+                    "request_key": "weixin-ilink:im_voice",
+                    "size": len(voice),
+                    "sha256": hashlib.sha256(voice).hexdigest(),
+                },
+            )
+            chunk = server._methods["channel.voice.chunk"](
+                "2",
+                {
+                    "session_id": sid,
+                    "request_key": "weixin-ilink:im_voice",
+                    "offset": 0,
+                    "data": base64.b64encode(voice).decode("ascii"),
+                },
+            )
+            finish = server._methods["channel.voice.finish"](
+                "3",
+                {"session_id": sid, "request_key": "weixin-ilink:im_voice"},
+            )
+        assert begin["result"]["accepted"] is True
+        assert chunk["result"]["offset"] == len(voice)
+        assert finish["result"] == {
+            "success": True,
+            "transcript": "你好",
+            "provider": "local",
+            "code": "",
+            "retryable": False,
+        }
+        assert runtime.mutable_state.voice_uploads == {}
+        assert list((home / "runtime" / "tmp" / "weixin-voice").iterdir()) == []
+        assert not wav.exists()
+    finally:
+        runtime.mutable_state.sessions.pop(sid, None)
+        reset_hermes_home_override(token)
+
+
+def test_channel_voice_rpc_rejects_wrong_source_and_chunk_offset(monkeypatch, tmp_path):
+    token = set_hermes_home_override(tmp_path / "owner")
+    runtime = server.OwnerWorkerGatewayRuntime("owner-a", 1, "worker-a", 1, 0)
+    monkeypatch.setenv("HERMES_OWNER_KEY", "owner-a")
+    try:
+        runtime.mutable_state.sessions["dashboard"] = _session(source="dashboard-gui")
+        with server.owner_worker_gateway_runtime(runtime):
+            denied = server._methods["channel.voice.begin"](
+                "1",
+                {"session_id": "dashboard", "request_key": "voice", "size": 1, "sha256": "0" * 64},
+            )
+        assert denied["error"]["code"] == 4031
+
+        runtime.mutable_state.sessions["voice"] = _session(source="weixin-ilink")
+        with server.owner_worker_gateway_runtime(runtime):
+            server._methods["channel.voice.begin"](
+                "2",
+                {"session_id": "voice", "request_key": "voice", "size": 1, "sha256": "0" * 64},
+            )
+            bad_offset = server._methods["channel.voice.chunk"](
+                "3",
+                {"session_id": "voice", "request_key": "voice", "offset": 1, "data": "YQ=="},
+            )
+            server._methods["channel.voice.abort"](
+                "4", {"session_id": "voice", "request_key": "voice"}
+            )
+        assert bad_offset["error"]["message"] == "invalid voice chunk offset"
+    finally:
+        runtime.mutable_state.sessions.pop("dashboard", None)
+        runtime.mutable_state.sessions.pop("voice", None)
+        reset_hermes_home_override(token)
+
+
 def test_prompt_submit_replays_completed_external_turn_without_agent(monkeypatch, tmp_path):
     from hermes_state import SessionDB
 

@@ -150,6 +150,7 @@ class _GatewayMutableState:
     answers: dict[str, Any] = field(default_factory=dict)
     child_mirrors: dict[str, dict] = field(default_factory=dict)
     active_child_runs: dict[str, float] = field(default_factory=dict)
+    voice_uploads: dict[str, Any] = field(default_factory=dict)
     sessions_lock: threading.RLock = field(default_factory=threading.RLock)
     prompt_lock: threading.Lock = field(default_factory=threading.Lock)
     session_resume_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -288,6 +289,10 @@ _DASHBOARD_MUTATION_METHODS = frozenset(
     {
         "approval.respond",
         "file.attach",
+        "channel.voice.abort",
+        "channel.voice.begin",
+        "channel.voice.chunk",
+        "channel.voice.finish",
         "image.attach_bytes",
         "pdf.attach",
         "prompt.submit",
@@ -310,6 +315,7 @@ _LONG_HANDLERS = frozenset(
         # responsive; completion is read-only and write_json is lock-guarded.
         "complete.path",
         "complete.slash",
+        "channel.voice.finish",
         "llm.oneshot",
         # Pet RPCs hit the network (manifest fetch / spritesheet download) or do
         # per-frame PNG decode/encode (pet.cells): inline they serialize on the
@@ -1899,6 +1905,86 @@ def _sess(params, rid):
         return (None, err)
     _start_agent_build(params.get("session_id") or "", s)
     return (s, _wait_agent(s, rid))
+
+
+@dataclass
+class _VoiceUpload:
+    session_id: str
+    path: Path
+    expected_size: int
+    expected_sha256: str
+    offset: int
+    created_at: float
+
+
+_VOICE_CHUNK_BYTES = 256 * 1024
+_VOICE_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+_VOICE_TEMP_TTL_SECONDS = 3600
+
+
+def _voice_uploads() -> dict[str, _VoiceUpload]:
+    return _gateway_state().voice_uploads
+
+
+def _voice_rpc_session(rid, params: dict) -> tuple[dict | None, dict | None]:
+    runtime = current_owner_worker_gateway_runtime()
+    if runtime is None or not _owner_worker_mode():
+        return None, _err(rid, 4031, "voice transcription requires an authenticated owner worker")
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return None, err
+    if _session_source(session).lower() != "weixin-ilink":
+        return None, _err(rid, 4031, "voice transcription requires a weixin-ilink session")
+    return session, None
+
+
+def _voice_temp_dir() -> Path:
+    directory = get_hermes_home() / "runtime" / "tmp" / "weixin-voice"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name != "nt":
+        directory.chmod(0o700)
+    return directory
+
+
+def _cleanup_voice_uploads(*, ttl_seconds: int = _VOICE_TEMP_TTL_SECONDS) -> None:
+    cutoff = time.time() - max(60, ttl_seconds)
+    uploads = _voice_uploads()
+    for request_key, upload in list(uploads.items()):
+        if upload.created_at >= cutoff:
+            continue
+        uploads.pop(request_key, None)
+        try:
+            upload.path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    directory = _voice_temp_dir()
+    scanned = 0
+    for candidate in directory.iterdir():
+        if scanned >= 100:
+            break
+        scanned += 1
+        try:
+            if candidate.is_file() and not candidate.is_symlink() and candidate.stat().st_mtime < cutoff:
+                candidate.unlink(missing_ok=True)
+        except OSError:
+            continue
+
+
+def _voice_request_key(params: dict) -> str:
+    key = str(params.get("request_key") or "").strip()
+    if not key or len(key) > 200 or not all(ch.isalnum() or ch in "-_:" for ch in key):
+        raise ValueError("invalid request_key")
+    return key
+
+
+def _voice_unlink_upload(request_key: str) -> _VoiceUpload | None:
+    upload = _voice_uploads().pop(request_key, None)
+    if upload is not None:
+        try:
+            upload.path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return upload
 
 
 def _normalize_completion_path(path_part: str) -> str:
@@ -11071,6 +11157,172 @@ def _stage_session_file_attachment(
     target = _unique_attachment_path(upload_dir, _sanitize_attachment_name(filename))
     target.write_bytes(payload)
     return target.resolve(), True
+
+
+@method("channel.voice.begin")
+def _channel_voice_begin(rid, params: dict) -> dict:
+    _session, err = _voice_rpc_session(rid, params)
+    if err:
+        return err
+    try:
+        request_key = _voice_request_key(params)
+        size = params.get("size")
+        sha256 = str(params.get("sha256") or "").lower()
+        ttl_seconds = int(params.get("temp_ttl_seconds") or _VOICE_TEMP_TTL_SECONDS)
+        if isinstance(size, bool) or not isinstance(size, int) or not 1 <= size <= _VOICE_MAX_UPLOAD_BYTES:
+            raise ValueError("invalid voice size")
+        if len(sha256) != 64 or any(ch not in "0123456789abcdef" for ch in sha256):
+            raise ValueError("invalid voice sha256")
+        _cleanup_voice_uploads(ttl_seconds=ttl_seconds)
+        if request_key in _voice_uploads():
+            raise ValueError("voice request already exists")
+        path = _voice_temp_dir() / f"{uuid.uuid4().hex}.silk"
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+        _voice_uploads()[request_key] = _VoiceUpload(
+            session_id=str(params.get("session_id") or ""),
+            path=path,
+            expected_size=size,
+            expected_sha256=sha256,
+            offset=0,
+            created_at=time.time(),
+        )
+        return _ok(rid, {"accepted": True, "offset": 0, "chunk_bytes": _VOICE_CHUNK_BYTES})
+    except ValueError as exc:
+        return _err(rid, 4015, str(exc))
+    except OSError:
+        return _err(rid, 5028, "voice upload unavailable")
+
+
+@method("channel.voice.chunk")
+def _channel_voice_chunk(rid, params: dict) -> dict:
+    _session, err = _voice_rpc_session(rid, params)
+    if err:
+        return err
+    try:
+        import base64 as _base64
+        import binascii as _binascii
+
+        request_key = _voice_request_key(params)
+        upload = _voice_uploads().get(request_key)
+        if upload is None or upload.session_id != str(params.get("session_id") or ""):
+            raise ValueError("voice request not found")
+        offset = params.get("offset")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset != upload.offset:
+            raise ValueError("invalid voice chunk offset")
+        encoded = str(params.get("data") or "")
+        if not encoded or len(encoded) > ((_VOICE_CHUNK_BYTES + 2) // 3) * 4:
+            raise ValueError("invalid voice chunk size")
+        try:
+            chunk = _base64.b64decode(encoded, validate=True)
+        except (ValueError, _binascii.Error) as exc:
+            raise ValueError("invalid voice chunk encoding") from exc
+        if not chunk or len(chunk) > _VOICE_CHUNK_BYTES or upload.offset + len(chunk) > upload.expected_size:
+            raise ValueError("invalid voice chunk size")
+        with upload.path.open("ab") as stream:
+            stream.write(chunk)
+        upload.offset += len(chunk)
+        return _ok(rid, {"accepted": True, "offset": upload.offset})
+    except ValueError as exc:
+        return _err(rid, 4015, str(exc))
+    except OSError:
+        return _err(rid, 5028, "voice upload unavailable")
+
+
+@method("channel.voice.abort")
+def _channel_voice_abort(rid, params: dict) -> dict:
+    _session, err = _voice_rpc_session(rid, params)
+    if err:
+        return err
+    try:
+        request_key = _voice_request_key(params)
+    except ValueError as exc:
+        return _err(rid, 4015, str(exc))
+    upload = _voice_uploads().get(request_key)
+    if upload is not None and upload.session_id != str(params.get("session_id") or ""):
+        return _err(rid, 4015, "voice request not found")
+    return _ok(rid, {"aborted": _voice_unlink_upload(request_key) is not None})
+
+
+@method("channel.voice.finish")
+def _channel_voice_finish(rid, params: dict) -> dict:
+    _session, err = _voice_rpc_session(rid, params)
+    if err:
+        return err
+    upload = None
+    wav_path = None
+    try:
+        import hashlib
+        from tools.transcription_tools import normalize_silk_to_wav, transcribe_audio
+
+        request_key = _voice_request_key(params)
+        upload = _voice_uploads().pop(request_key, None)
+        if upload is None or upload.session_id != str(params.get("session_id") or ""):
+            raise ValueError("voice request not found")
+        if upload.offset != upload.expected_size or upload.path.stat().st_size != upload.expected_size:
+            raise ValueError("voice upload incomplete")
+        digest = hashlib.sha256()
+        with upload.path.open("rb") as stream:
+            header = stream.read(9)
+            digest.update(header)
+            for chunk in iter(lambda: stream.read(256 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != upload.expected_sha256:
+            raise ValueError("voice sha256 mismatch")
+        if not header.startswith((b"#!SILK", b"\x02#!SILK")):
+            raise ValueError("invalid SILK header")
+        timeout = float(params.get("timeout_seconds") or 600)
+        max_duration = float(params.get("max_duration_seconds") or 300)
+        wav_path = normalize_silk_to_wav(
+            str(upload.path),
+            timeout_seconds=min(max(timeout, 1), 3600),
+            max_duration_seconds=min(max(max_duration, 1), 1800),
+        )
+        result = transcribe_audio(wav_path)
+        transcript = str(result.get("transcript") or "").strip()
+        if not result.get("success") or not transcript:
+            return _ok(rid, {
+                "success": False,
+                "transcript": "",
+                "provider": str(result.get("provider") or ""),
+                "code": "stt_unavailable" if not result.get("provider") else "stt_failed",
+                "retryable": bool(result.get("provider")),
+            })
+        return _ok(rid, {
+            "success": True,
+            "transcript": transcript,
+            "provider": str(result.get("provider") or ""),
+            "code": "",
+            "retryable": False,
+        })
+    except (ValueError, OSError) as exc:
+        return _ok(rid, {
+            "success": False,
+            "transcript": "",
+            "provider": "",
+            "code": str(exc),
+            "retryable": False,
+        })
+    except Exception:
+        logger.warning("owner voice transcription failed", exc_info=True)
+        return _ok(rid, {
+            "success": False,
+            "transcript": "",
+            "provider": "",
+            "code": "voice_transcription_failed",
+            "retryable": True,
+        })
+    finally:
+        if upload is not None:
+            try:
+                upload.path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if wav_path:
+            try:
+                Path(wav_path).unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 @method("file.attach")

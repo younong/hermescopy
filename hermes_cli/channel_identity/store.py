@@ -13,7 +13,7 @@ from hermes_constants import get_hermes_home
 
 from .crypto import ChannelCrypto
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _DB_RELATIVE_PATH = Path("control-plane") / "channel_identities.sqlite3"
 
 _SCHEMA = """
@@ -136,6 +136,10 @@ CREATE TABLE IF NOT EXISTS inbound_messages (
     claimed_by TEXT,
     claimed_at REAL,
     rejection_reason TEXT,
+    payload_kind TEXT NOT NULL DEFAULT 'text',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at REAL NOT NULL DEFAULT 0,
+    last_error TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     UNIQUE(account_id, provider_message_id)
@@ -224,17 +228,28 @@ class ChannelIdentityStore:
                         version = int(row["value"])
                     except (TypeError, ValueError) as exc:
                         raise RuntimeError("channel identity database schema is corrupt") from exc
-                    if version == 1:
-                        self._migrate_v1_to_v2(conn)
-                        version = 2
-                    if version == 2:
-                        self._migrate_v2_to_v3(conn)
-                        version = 3
-                    if version != SCHEMA_VERSION:
-                        direction = "newer" if version > SCHEMA_VERSION else "older"
+                    if version > SCHEMA_VERSION:
                         raise RuntimeError(
-                            f"channel identity database schema is {direction} than supported"
+                            "channel identity database schema is newer than supported"
                         )
+                    while version < SCHEMA_VERSION:
+                        if version == 1:
+                            self._migrate_v1_to_v2(conn)
+                            version = 2
+                        elif version == 2:
+                            self._migrate_v2_to_v3(conn)
+                            version = 3
+                        elif version == 3:
+                            self._migrate_v3_to_v4(conn)
+                            version = 4
+                        else:
+                            raise RuntimeError(
+                                "channel identity database schema is older than supported"
+                            )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_inbound_due "
+                    "ON inbound_messages(status, next_attempt_at, binding_id, created_at)"
+                )
                 conn.execute("COMMIT")
             except BaseException:
                 if conn.in_transaction:
@@ -273,6 +288,30 @@ class ChannelIdentityStore:
                 )
         conn.execute(
             "UPDATE channel_identity_meta SET value='3' WHERE key='schema_version'"
+        )
+
+    @staticmethod
+    def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
+        existing = {
+            row["name"] for row in conn.execute("PRAGMA table_info(inbound_messages)")
+        }
+        additions = (
+            ("payload_kind", "TEXT NOT NULL DEFAULT 'text'"),
+            ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("next_attempt_at", "REAL NOT NULL DEFAULT 0"),
+            ("last_error", "TEXT"),
+        )
+        for column, declaration in additions:
+            if column not in existing:
+                conn.execute(
+                    f"ALTER TABLE inbound_messages ADD COLUMN {column} {declaration}"
+                )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inbound_due "
+            "ON inbound_messages(status, next_attempt_at, binding_id, created_at)"
+        )
+        conn.execute(
+            "UPDATE channel_identity_meta SET value='4' WHERE key='schema_version'"
         )
 
     def _validate_referenced_key_versions(self) -> None:

@@ -10,6 +10,7 @@ from typing import Any
 import aiohttp
 import certifi
 
+from gateway.weixin_ilink.media import PublicAddressResolver
 from hermes_cli.channel_identity.crypto import ChannelCrypto
 from hermes_cli.channel_identity.store import ChannelIdentityStore
 
@@ -110,8 +111,12 @@ async def bootstrap_weixin_ilink(
     runtime = WeixinILinkRuntime(WeixinILinkStatus.create("startup_failed"))
     ssl_context = ssl.create_default_context(cafile=certifi.where())
     runtime.session = aiohttp.ClientSession(
-        connector=aiohttp.TCPConnector(ssl=ssl_context),
-        trust_env=True,
+        connector=aiohttp.TCPConnector(
+            ssl=ssl_context,
+            resolver=PublicAddressResolver(),
+            use_dns_cache=False,
+        ),
+        trust_env=False,
     )
     try:
         store = ChannelIdentityStore(crypto)

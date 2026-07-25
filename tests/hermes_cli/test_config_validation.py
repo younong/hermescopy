@@ -53,6 +53,41 @@ class TestChannelConnectorValidation:
         })
         assert not any("outbound_" in issue.message for issue in issues)
 
+    def test_voice_limits_are_bounded(self):
+        issues = validate_config_structure({
+            "channel_connectors": {
+                "weixin_ilink": {
+                    "voice_enabled": "yes",
+                    "voice_max_download_bytes": 100,
+                    "voice_max_duration_seconds": 9999,
+                    "voice_retry_base_seconds": 30,
+                    "voice_retry_max_seconds": 5,
+                },
+            },
+        })
+        messages = [issue.message for issue in issues]
+        assert any("voice_enabled should be a boolean" in message for message in messages)
+        assert any("voice_max_download_bytes" in message for message in messages)
+        assert any("voice_max_duration_seconds" in message for message in messages)
+        assert any("should not exceed" in message for message in messages)
+
+    def test_valid_voice_limits(self):
+        assert validate_config_structure({
+            "channel_connectors": {
+                "weixin_ilink": {
+                    "voice_enabled": True,
+                    "voice_max_download_bytes": 1024,
+                    "voice_max_duration_seconds": 30,
+                    "voice_download_timeout_seconds": 10,
+                    "voice_stt_timeout_seconds": 60,
+                    "voice_max_retries": 2,
+                    "voice_retry_base_seconds": 5,
+                    "voice_retry_max_seconds": 20,
+                    "voice_temp_ttl_seconds": 60,
+                },
+            },
+        }) == []
+
 
 class TestCustomProvidersValidation:
     """custom_providers must be a YAML list, not a dict."""
