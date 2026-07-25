@@ -25,6 +25,8 @@ class WeixinILinkService:
             store,
             supervisor,
             turn_timeout=self.claim_timeout,
+            media_session=session,
+            voice_config=config,
         )
         self.dispatch_concurrency = max(1, int(config.get("dispatch_concurrency", 4)))
         self.enrollments = EnrollmentManager(
@@ -87,7 +89,8 @@ class WeixinILinkService:
         except asyncio.CancelledError:
             raise
         except Exception:
-            self.dispatcher.fail_claim(claim["inbound_id"], self.holder, "dispatch_failed")
+            if claim.get("payload_kind") != "voice_media":
+                self.dispatcher.fail_claim(claim["inbound_id"], self.holder, "dispatch_failed")
 
     async def _sender_loop(self) -> None:
         while self._running:

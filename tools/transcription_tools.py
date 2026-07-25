@@ -32,7 +32,9 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
+import wave
 from pathlib import Path
 from typing import Optional, Dict, Any
 from urllib.parse import urljoin
@@ -1614,6 +1616,84 @@ def _transcribe_elevenlabs(file_path: str, model_name: str) -> Dict[str, Any]:
     except Exception as e:
         logger.error("ElevenLabs STT transcription failed: %s", e, exc_info=True)
         return {"success": False, "transcript": "", "error": f"ElevenLabs STT transcription failed: {e}"}
+
+
+# ---------------------------------------------------------------------------
+# SILK normalization
+# ---------------------------------------------------------------------------
+
+
+def normalize_silk_to_wav(
+    file_path: str,
+    *,
+    timeout_seconds: float = 60,
+    max_duration_seconds: float = 300,
+) -> str:
+    """Decode a bounded SILK input in an isolated helper process."""
+    source = Path(file_path)
+    if source.is_symlink() or not source.is_file():
+        raise ValueError("invalid SILK input")
+    size = source.stat().st_size
+    if not 1 <= size <= MAX_FILE_SIZE:
+        raise ValueError("invalid SILK size")
+    with source.open("rb") as stream:
+        magic = stream.read(9)
+    if not (magic.startswith(b"#!SILK") or magic.startswith(b"\x02#!SILK")):
+        raise ValueError("invalid SILK header")
+
+    fd, raw_output = tempfile.mkstemp(prefix="hermes-silk-", suffix=".wav")
+    os.close(fd)
+    output = Path(raw_output)
+    helper = Path(__file__).with_name("silk_decoder.py").resolve()
+    command = [sys.executable, "-I", str(helper), str(source), str(output)]
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONNOUSERSITE": "1",
+    }
+    popen_kwargs: Dict[str, Any] = {
+        "env": env,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "stdin": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | windows_hide_flags()
+    else:
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen(command, **popen_kwargs)
+    try:
+        try:
+            returncode = proc.wait(timeout=min(max(float(timeout_seconds), 1), 3600))
+        except subprocess.TimeoutExpired as exc:
+            _terminate_command_stt_process_tree(proc)
+            raise ValueError("SILK decoder timeout") from exc
+        if returncode != 0:
+            raise ValueError("SILK decoder failed")
+        if output.is_symlink() or not output.is_file():
+            raise ValueError("SILK decoder output missing")
+        with wave.open(str(output), "rb") as wav:
+            channels = wav.getnchannels()
+            width = wav.getsampwidth()
+            rate = wav.getframerate()
+            frames = wav.getnframes()
+            compression = wav.getcomptype()
+        duration = frames / rate if rate else 0
+        if (
+            channels != 1
+            or width != 2
+            or not 8000 <= rate <= 48000
+            or compression != "NONE"
+            or not 0 < duration <= max_duration_seconds
+            or output.stat().st_size > MAX_FILE_SIZE
+        ):
+            raise ValueError("invalid decoded WAV")
+        if os.name != "nt":
+            output.chmod(0o600)
+        return str(output)
+    except BaseException:
+        output.unlink(missing_ok=True)
+        raise
 
 
 # ---------------------------------------------------------------------------

@@ -54,6 +54,12 @@ except ImportError:  # pragma: no cover - dependency gate
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
+from gateway.weixin_ilink.media import (
+    WeixinMediaError,
+    cdn_download_url as _shared_cdn_download_url,
+    decrypt_aes128_ecb as _shared_aes128_ecb_decrypt,
+    parse_aes_key as _shared_parse_aes_key,
+)
 from gateway.weixin_ilink.client import WeixinILinkClient
 from gateway.weixin_ilink.text import (
     ILINK_TEXT_MESSAGE_LIMIT,
@@ -184,15 +190,12 @@ def _aes128_ecb_encrypt(plaintext: bytes, key: bytes) -> bytes:
 
 
 def _aes128_ecb_decrypt(ciphertext: bytes, key: bytes) -> bytes:
-    cipher = Cipher(algorithms.AES(key), modes.ECB(), backend=default_backend())
-    decryptor = cipher.decryptor()
-    padded = decryptor.update(ciphertext) + decryptor.finalize()
-    if not padded:
-        return padded
-    pad_len = padded[-1]
-    if 1 <= pad_len <= 16 and padded.endswith(bytes([pad_len]) * pad_len):
-        return padded[:-pad_len]
-    return padded
+    try:
+        return _shared_aes128_ecb_decrypt(ciphertext, key)
+    except WeixinMediaError:
+        cipher = Cipher(algorithms.AES(key), modes.ECB(), backend=default_backend())
+        decryptor = cipher.decryptor()
+        return decryptor.update(ciphertext) + decryptor.finalize()
 
 
 def _aes_padded_size(size: int) -> int:
@@ -337,7 +340,7 @@ class TypingTicketCache:
 
 
 def _cdn_download_url(cdn_base_url: str, encrypted_query_param: str) -> str:
-    return f"{cdn_base_url.rstrip('/')}/download?encrypted_query_param={quote(encrypted_query_param, safe='')}"
+    return _shared_cdn_download_url(cdn_base_url, encrypted_query_param)
 
 
 def _cdn_upload_url(cdn_base_url: str, upload_param: str, filekey: str) -> str:
@@ -349,14 +352,7 @@ def _cdn_upload_url(cdn_base_url: str, upload_param: str, filekey: str) -> str:
 
 
 def _parse_aes_key(aes_key_b64: str) -> bytes:
-    decoded = base64.b64decode(aes_key_b64)
-    if len(decoded) == 16:
-        return decoded
-    if len(decoded) == 32:
-        text = decoded.decode("ascii", errors="ignore")
-        if text and all(ch in "0123456789abcdefABCDEF" for ch in text):
-            return bytes.fromhex(text)
-    raise ValueError(f"unexpected aes_key format ({len(decoded)} decoded bytes)")
+    return _shared_parse_aes_key(aes_key_b64)
 
 
 def _guess_chat_type(message: Dict[str, Any], account_id: str) -> Tuple[str, str]:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from unittest.mock import AsyncMock
@@ -107,6 +108,25 @@ def _queue_outbound(store, registered, *, text: str, attempts: int = 0) -> str:
             ),
         )
     return outbound_id
+
+
+def _voice_message(message_id: str, voice_item: dict):
+    return {
+        "message_id": message_id,
+        "from_user_id": "peer-a",
+        "context_token": "ctx",
+        "item_list": [{"type": 3, "voice_item": voice_item}],
+    }
+
+
+def _decrypt_inbound_payload(identity_store, row) -> str:
+    return identity_store.crypto.decrypt_text(
+        row["payload_ciphertext"],
+        table="inbound_messages",
+        record_id=row["provider_message_id"],
+        field="payload",
+        version=row["payload_key_version"],
+    )
 
 
 @pytest.mark.asyncio
@@ -339,6 +359,68 @@ def test_batch_atomically_advances_cursor_context_and_inbound(store):
     assert token["count"] == 1
 
 
+def test_provider_voice_transcript_queues_without_media_descriptor(store):
+    identity_store, registered = store
+    lease = acquire_poll_lease(identity_store, account_id=registered.account_id, holder="holder")
+
+    commit_update_batch(
+        identity_store,
+        lease,
+        messages=(_voice_message("msg-voice-text", {"text": "  你好 Hermes  "}),),
+        cursor="cursor",
+    )
+
+    with identity_store.read() as conn:
+        row = conn.execute("SELECT * FROM inbound_messages").fetchone()
+    assert row["status"] == "queued"
+    assert row["payload_kind"] == "voice_transcript"
+    assert _decrypt_inbound_payload(identity_store, row) == "你好 Hermes"
+
+
+def test_raw_voice_queues_minimal_encrypted_descriptor(store):
+    identity_store, registered = store
+    lease = acquire_poll_lease(identity_store, account_id=registered.account_id, holder="holder")
+
+    commit_update_batch(
+        identity_store,
+        lease,
+        messages=(
+            _voice_message(
+                "msg-voice-media",
+                {
+                    "media": {
+                        "encrypt_query_param": "signed-query",
+                        "aes_key": "encrypted-key",
+                        "ignored": "must-not-persist",
+                    },
+                    "playtime": 1200,
+                    "sample_rate": 24000,
+                    "ignored": "must-not-persist",
+                },
+            ),
+        ),
+        cursor="cursor",
+    )
+
+    with identity_store.read() as conn:
+        row = conn.execute("SELECT * FROM inbound_messages").fetchone()
+        raw_database = identity_store.path.read_bytes()
+    descriptor = json.loads(_decrypt_inbound_payload(identity_store, row))
+    assert row["status"] == "queued"
+    assert row["payload_kind"] == "voice_media"
+    assert descriptor == {
+        "v": 1,
+        "media": {
+            "encrypt_query_param": "signed-query",
+            "aes_key": "encrypted-key",
+        },
+        "playtime": 1200,
+        "sample_rate": 24000,
+    }
+    assert b"signed-query" not in raw_database
+    assert b"encrypted-key" not in raw_database
+
+
 def test_provider_replay_is_idempotent_but_same_text_new_id_is_distinct(store):
     identity_store, registered = store
     lease = acquire_poll_lease(identity_store, account_id=registered.account_id, holder="holder")
@@ -376,6 +458,7 @@ def test_provider_replay_is_idempotent_but_same_text_new_id_is_distinct(store):
             },
             "non_text_not_supported",
         ),
+        (_voice_message("msg-invalid-voice", {"media": {}}), "voice_media_invalid"),
     ],
 )
 def test_unsupported_inbound_is_explicitly_rejected(store, message, reason):

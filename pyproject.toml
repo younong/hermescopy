@@ -175,6 +175,7 @@ voice = [
   # Local STT pulls in wheel-only transitive deps (ctranslate2, onnxruntime),
   # so keep it out of the base install for source-build packagers like Homebrew.
   "faster-whisper==1.2.1",
+  "pilk==0.2.4",
   "sounddevice==0.5.5",
   "numpy==2.4.3",
 ]

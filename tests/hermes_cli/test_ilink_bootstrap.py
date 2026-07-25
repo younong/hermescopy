@@ -126,11 +126,14 @@ async def test_connector_uses_certifi_tls_context(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     ssl_context = object()
     connector = object()
+    resolver = object()
     monkeypatch.setattr(bootstrap.certifi, "where", lambda: "/trusted/cacert.pem")
     create_context = Mock(return_value=ssl_context)
     monkeypatch.setattr(bootstrap.ssl, "create_default_context", create_context)
     tcp_connector = Mock(return_value=connector)
     monkeypatch.setattr(bootstrap.aiohttp, "TCPConnector", tcp_connector)
+    public_resolver = Mock(return_value=resolver)
+    monkeypatch.setattr(bootstrap, "PublicAddressResolver", public_resolver)
     session = SimpleNamespace(closed=False, close=AsyncMock())
     client_session = Mock(return_value=session)
     monkeypatch.setattr(bootstrap.aiohttp, "ClientSession", client_session)
@@ -143,8 +146,13 @@ async def test_connector_uses_certifi_tls_context(monkeypatch, tmp_path):
 
     assert runtime.status.state == "ready"
     create_context.assert_called_once_with(cafile="/trusted/cacert.pem")
-    tcp_connector.assert_called_once_with(ssl=ssl_context)
-    client_session.assert_called_once_with(connector=connector, trust_env=True)
+    public_resolver.assert_called_once_with()
+    tcp_connector.assert_called_once_with(
+        ssl=ssl_context,
+        resolver=resolver,
+        use_dns_cache=False,
+    )
+    client_session.assert_called_once_with(connector=connector, trust_env=False)
     await runtime.close()
 
 

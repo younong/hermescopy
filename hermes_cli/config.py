@@ -928,6 +928,15 @@ DEFAULT_CONFIG = {
             "provider_retry_seconds": 2,
             "dispatch_concurrency": 4,
             "dispatch_claim_timeout_seconds": 1800,
+            "voice_enabled": True,
+            "voice_max_download_bytes": 6291456,
+            "voice_max_duration_seconds": 300,
+            "voice_download_timeout_seconds": 60,
+            "voice_stt_timeout_seconds": 600,
+            "voice_max_retries": 3,
+            "voice_retry_base_seconds": 5,
+            "voice_retry_max_seconds": 120,
+            "voice_temp_ttl_seconds": 3600,
             "outbound_retry_seconds": 2,
             "outbound_retry_max_seconds": 300,
             "outbound_max_attempts": 8,
@@ -5073,12 +5082,47 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                 "Configure enabled and related settings under weixin_ilink:",
             ))
         elif isinstance(weixin_ilink, dict):
-            enabled = weixin_ilink.get("enabled")
-            if enabled is not None and not isinstance(enabled, bool):
+            for key in ("enabled", "voice_enabled"):
+                value = weixin_ilink.get(key)
+                if value is not None and not isinstance(value, bool):
+                    issues.append(ConfigIssue(
+                        "error",
+                        f"channel_connectors.weixin_ilink.{key} should be a boolean",
+                        f"Use {key}: true or {key}: false without quotes",
+                    ))
+            voice_ranges = {
+                "voice_max_download_bytes": (1024, 25 * 1024 * 1024),
+                "voice_max_duration_seconds": (1, 1800),
+                "voice_download_timeout_seconds": (1, 300),
+                "voice_stt_timeout_seconds": (1, 3600),
+                "voice_max_retries": (0, 10),
+                "voice_retry_base_seconds": (1, 3600),
+                "voice_retry_max_seconds": (1, 86400),
+                "voice_temp_ttl_seconds": (60, 86400),
+            }
+            for key, (minimum, maximum) in voice_ranges.items():
+                value = weixin_ilink.get(key)
+                if value is None:
+                    continue
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not minimum <= value <= maximum:
+                    issues.append(ConfigIssue(
+                        "error",
+                        f"channel_connectors.weixin_ilink.{key} should be between {minimum} and {maximum}",
+                        f"Set {key} to a numeric value in the supported safety range",
+                    ))
+            retry_base = weixin_ilink.get("voice_retry_base_seconds")
+            retry_max = weixin_ilink.get("voice_retry_max_seconds")
+            if (
+                isinstance(retry_base, (int, float))
+                and not isinstance(retry_base, bool)
+                and isinstance(retry_max, (int, float))
+                and not isinstance(retry_max, bool)
+                and retry_base > retry_max
+            ):
                 issues.append(ConfigIssue(
                     "error",
-                    "channel_connectors.weixin_ilink.enabled should be a boolean",
-                    "Use enabled: true or enabled: false without quotes",
+                    "channel_connectors.weixin_ilink.voice_retry_base_seconds should not exceed voice_retry_max_seconds",
+                    "Increase voice_retry_max_seconds or reduce voice_retry_base_seconds",
                 ))
             numeric_settings = {
                 "outbound_retry_seconds": ((int, float), 0),
