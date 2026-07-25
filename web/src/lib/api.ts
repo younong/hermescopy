@@ -788,6 +788,12 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ...skill, profile: profile || undefined }),
     }),
+  deleteSkill: (name: string, profile?: string) =>
+    fetchJSON<SkillWriteResult>("/api/skills", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, profile: profile || undefined }),
+    }),
   updateSkillContent: (name: string, content: string, profile?: string) =>
     fetchJSON<SkillWriteResult>("/api/skills/content", {
       method: "PUT",

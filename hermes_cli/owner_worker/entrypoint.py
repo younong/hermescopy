@@ -80,6 +80,11 @@ class SkillContentUpdate(BaseModel):
     profile: str | None = None
 
 
+class SkillDelete(BaseModel):
+    name: str
+    profile: str | None = None
+
+
 from hermes_cli.dashboard_auth.authority import (
     AuthorityStore,
     OwnerWorkerAuthorityLease,
@@ -1026,6 +1031,25 @@ def create_app(
         result = _create_skill(body.name, body.content, body.category or None)
         if not result.get("success"):
             raise HTTPException(status_code=400, detail=result.get("error", "Failed to create skill."))
+        _clear_skills_prompt_cache()
+        return result
+
+    @app.delete("/api/skills")
+    def delete_skill(
+        body: SkillDelete,
+        _: None = Depends(_require_owner_token),
+    ) -> dict[str, Any]:
+        _reject_profile(body.profile)
+        from tools.skill_manager_tool import _delete_skill
+        from tools.skill_usage import forget
+
+        result = _delete_skill(body.name, absorbed_into="")
+        if not result.get("success"):
+            error = result.get("error", "Failed to delete skill.")
+            status = 404 if "not found" in str(error).lower() else 400
+            raise HTTPException(status_code=status, detail=error)
+        if not result.get("_archived"):
+            forget(body.name)
         _clear_skills_prompt_cache()
         return result
 

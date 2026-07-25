@@ -92,6 +92,10 @@ vi.mock("@/features/files/components/GuiChatFilesPane", () => ({
   GuiChatFilesPane: () => <section data-files-pane>Files pane</section>,
 }));
 
+vi.mock("./GuiChatSkillsPane", () => ({
+  GuiChatSkillsPane: () => <section data-skills-pane>Skills pane</section>,
+}));
+
 let root: Root | null = null;
 
 beforeEach(() => {
@@ -177,6 +181,38 @@ describe("GuiChatShell", () => {
     });
 
     expect(document.querySelector("[data-files-pane]")).toBeNull();
+    expect(document.querySelector("[data-composer-send]")).not.toBeNull();
+    expect(connection.createOrAttach).toHaveBeenCalledTimes(2);
+  });
+
+  it("opens skills inside the dedicated workspace and returns to chat", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(<GuiChatShell />);
+    await act(async () => {
+      Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
+        .find((button) => button.textContent?.includes("Skills"))
+        ?.click();
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector('aside[aria-label="Chat workspace"]')).not.toBeNull();
+    expect(document.querySelector("[data-skills-pane]")).not.toBeNull();
+    expect(document.querySelector("[data-composer-send]")).toBeNull();
+    expect(Array.from(document.querySelectorAll<HTMLButtonElement>('button[aria-current="page"]'))
+      .some((button) => button.textContent?.includes("Skills"))).toBe(true);
+    expect(connection.createOrAttach).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
+        .find((button) => button.textContent?.includes("New chat"))
+        ?.click();
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector("[data-skills-pane]")).toBeNull();
     expect(document.querySelector("[data-composer-send]")).not.toBeNull();
     expect(connection.createOrAttach).toHaveBeenCalledTimes(2);
   });

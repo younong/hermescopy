@@ -8,6 +8,7 @@ gap for headless/VPS users. These tests pin:
 - POST /api/skills creates a skill through the same validated write path
   as the agent's ``skill_manage`` tool (frontmatter validation enforced).
 - PUT /api/skills/content rewrites an existing SKILL.md (404 on unknown).
+- DELETE /api/skills removes an existing skill through the guarded delete path.
 - POST /api/cron/jobs accepts ``skills`` and persists it on the job;
   PUT /api/cron/jobs/{id} can update the list.
 """
@@ -195,6 +196,47 @@ class TestSkillUpdate:
         assert resp.status_code == 400
 
 
+class TestSkillDelete:
+    def test_delete_removes_skill_and_forgets_usage(self, client, isolated_profiles, monkeypatch):
+        from hermes_cli import web_server
+        from tools import skill_usage
+
+        forgotten = []
+        cache_clears = []
+        monkeypatch.setattr(skill_usage, "forget", forgotten.append)
+        monkeypatch.setattr(web_server, "_clear_skills_prompt_cache", lambda: cache_clears.append(True))
+
+        resp = client.request(
+            "DELETE",
+            "/api/skills",
+            json={"name": "dashboard-skill"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+        assert not (isolated_profiles["default"] / "skills" / "dashboard-skill").exists()
+        assert forgotten == ["dashboard-skill"]
+        assert cache_clears == [True]
+
+    def test_delete_unknown_skill_404(self, client, isolated_profiles):
+        resp = client.request("DELETE", "/api/skills", json={"name": "nope"})
+        assert resp.status_code == 404
+
+    def test_delete_pinned_skill_is_refused(self, client, isolated_profiles, monkeypatch):
+        from tools import skill_usage
+
+        monkeypatch.setattr(skill_usage, "get_record", lambda _name: {"pinned": True})
+        resp = client.request(
+            "DELETE",
+            "/api/skills",
+            json={"name": "dashboard-skill"},
+        )
+
+        assert resp.status_code == 400
+        assert "pinned" in resp.json()["detail"].lower()
+        assert (isolated_profiles["default"] / "skills" / "dashboard-skill").exists()
+
+
 class TestEditorEndpointsAuth:
     @pytest.mark.parametrize(
         "method,path,kwargs",
@@ -202,6 +244,7 @@ class TestEditorEndpointsAuth:
             ("get", "/api/skills/content?name=dashboard-skill", {}),
             ("post", "/api/skills", {"json": {"name": "x", "content": "y"}}),
             ("put", "/api/skills/content", {"json": {"name": "x", "content": "y"}}),
+            ("delete", "/api/skills", {"json": {"name": "dashboard-skill"}}),
         ],
     )
     def test_endpoints_401_without_token(
@@ -210,7 +253,7 @@ class TestEditorEndpointsAuth:
         from hermes_cli.web_server import _SESSION_HEADER_NAME
 
         client.headers.pop(_SESSION_HEADER_NAME, None)
-        resp = getattr(client, method)(path, **kwargs)
+        resp = client.request(method.upper(), path, **kwargs)
         assert resp.status_code == 401
 
 
