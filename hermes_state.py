@@ -31,6 +31,15 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
 
+
+def __getattr__(name: str):
+    if name == "asyncio":
+        import asyncio
+
+        return asyncio
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 def _delegate_from_json(col: str = "model_config") -> str:
     return f"json_extract(COALESCE({col}, '{{}}'), '$._delegate_from')"
 
