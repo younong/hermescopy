@@ -14,6 +14,7 @@ from gateway.weixin_ilink.media import (
     WeixinMediaLimits,
     download_and_decrypt_voice,
 )
+from hermes_cli.channel_connectors.weixin_ilink.media import download_file, sanitize_filename
 from hermes_cli.channel_identity.owner_resolution import resolve_binding
 from hermes_cli.channel_identity.store import ChannelIdentityStore
 from hermes_cli.owner_worker.gateway_client import OwnerWorkerGatewayClient
@@ -37,11 +38,12 @@ class ChannelDispatcher:
         turn_timeout: float = 1800,
         media_session=None,
         voice_config: dict | None = None,
+        session=None,
     ) -> None:
         self.store = store
         self.supervisor = supervisor
         self.turn_timeout = turn_timeout
-        self.media_session = media_session
+        self.media_session = media_session if media_session is not None else session
         config = voice_config or {}
         self.voice_enabled = bool(config.get("voice_enabled", True))
         self.voice_limits = WeixinMediaLimits(
@@ -97,6 +99,20 @@ class ChannelDispatcher:
             field="payload",
             version=claim["payload_key_version"],
         )
+        files = []
+        if claim.get("payload_kind") == "file":
+            try:
+                decoded_payload = json.loads(text)
+            except json.JSONDecodeError:
+                decoded_payload = None
+            if not (
+                isinstance(decoded_payload, dict)
+                and decoded_payload.get("kind") == "weixin_ilink_message"
+                and isinstance(decoded_payload.get("files"), list)
+            ):
+                raise RuntimeError("iLink file payload is invalid")
+            text = str(decoded_payload.get("text") or "")
+            files = decoded_payload["files"]
         if claim.get("payload_kind") == "voice_media" and (
             not self.voice_enabled or self.media_session is None
         ):
@@ -131,11 +147,44 @@ class ChannelDispatcher:
                 except VoiceDispatchError as exc:
                     self.fail_voice_claim(claim, holder, exc.code, retryable=exc.retryable)
                     raise
+            file_references: list[str] = []
+            if files:
+                if self.media_session is None:
+                    raise RuntimeError("iLink file download session is unavailable")
+                attachment_root = (
+                    owner.owner_home
+                    / "workspaces"
+                    / "default"
+                    / ".hermes"
+                    / "weixin-attachments"
+                    / claim["inbound_id"]
+                )
+                for index, descriptor in enumerate(files, start=1):
+                    if not isinstance(descriptor, dict):
+                        raise RuntimeError("iLink file descriptor is invalid")
+                    name = sanitize_filename(str(descriptor.get("file_name") or "document.bin"))
+                    destination = attachment_root / f"{index}-{name}"
+                    await download_file(self.media_session, descriptor, destination=destination)
+                    result = await client.call(
+                        "file.attach",
+                        {
+                            "session_id": live_session_id,
+                            "path": str(destination),
+                            "name": name,
+                        },
+                    )
+                    file_references.append(str((result or {}).get("ref_text") or ""))
+            prompt_text = text.strip()
+            if file_references:
+                reference_text = "\n".join(
+                    reference for reference in file_references if reference
+                )
+                prompt_text = f"{prompt_text}\n\n{reference_text}".strip()
             await client.call(
                 "prompt.submit",
                 {
                     "session_id": live_session_id,
-                    "text": text,
+                    "text": prompt_text,
                     "idempotency_key": turn_key,
                 },
             )

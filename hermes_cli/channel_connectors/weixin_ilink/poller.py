@@ -11,8 +11,11 @@ from typing import Any, Mapping
 from gateway.weixin_ilink import WeixinILinkClient
 from hermes_cli.channel_identity.store import ChannelIdentityStore
 
+from .media import extract_file_descriptors
+
 ITEM_TEXT = 1
 ITEM_VOICE = 3
+ITEM_FILE = 4
 _MAX_VOICE_DESCRIPTOR_BYTES = 16 * 1024
 _MAX_MEDIA_FIELD_CHARS = 8 * 1024
 
@@ -254,6 +257,21 @@ def _commit_message(store, conn, account_id: str, message: Mapping[str, Any], no
 
 
 def _extract_payload(items: Any) -> InboundPayload | None:
+    if isinstance(items, list) and any(
+        isinstance(item, Mapping) and item.get("type") == ITEM_FILE for item in items
+    ):
+        content = extract_file_descriptors(items)
+        if content is None:
+            return None
+        text, files = content
+        return InboundPayload(
+            "file",
+            json.dumps(
+                {"kind": "weixin_ilink_message", "text": text, "files": files},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
     if not isinstance(items, list) or len(items) != 1:
         return None
     item = items[0]

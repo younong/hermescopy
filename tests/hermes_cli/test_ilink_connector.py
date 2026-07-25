@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import sqlite3
 import time
@@ -419,6 +420,55 @@ def test_raw_voice_queues_minimal_encrypted_descriptor(store):
     }
     assert b"signed-query" not in raw_database
     assert b"encrypted-key" not in raw_database
+
+
+def test_file_message_is_queued_with_encrypted_download_descriptor(store):
+    identity_store, registered = store
+    lease = acquire_poll_lease(identity_store, account_id=registered.account_id, holder="holder")
+    aes_key = base64.b64encode(b"a" * 16).decode()
+
+    inserted = commit_update_batch(
+        identity_store,
+        lease,
+        messages=(
+            {
+                "message_id": "msg-file",
+                "from_user_id": "peer-a",
+                "item_list": [
+                    {
+                        "type": 4,
+                        "file_item": {
+                            "file_name": "report.txt",
+                            "len": "12",
+                            "media": {
+                                "encrypt_query_param": "download-token",
+                                "aes_key": aes_key,
+                            },
+                        },
+                    }
+                ],
+            },
+        ),
+        cursor="cursor-file",
+    )
+
+    assert inserted == 1
+    with identity_store.read() as conn:
+        row = conn.execute("SELECT * FROM inbound_messages").fetchone()
+    assert row["status"] == "queued"
+    assert row["payload_kind"] == "file"
+    assert json.loads(_decrypt_inbound_payload(identity_store, row)) == {
+        "kind": "weixin_ilink_message",
+        "text": "",
+        "files": [
+            {
+                "file_name": "report.txt",
+                "encrypt_query_param": "download-token",
+                "full_url": "",
+                "aes_key": aes_key,
+            }
+        ],
+    }
 
 
 def test_provider_replay_is_idempotent_but_same_text_new_id_is_distinct(store):
