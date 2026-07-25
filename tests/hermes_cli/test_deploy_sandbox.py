@@ -134,7 +134,10 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert "session_reader_pids=" in source
     assert "[h]ermes_cli.session_reader.entrypoint" in source
     assert "hermes-log-format.conf" in source
-    assert 'nginx_log_format="/etc/nginx/conf.d/hermes-log-format.conf"' in source
+    assert 'nginx_log_format="/etc/nginx/conf.d/00-hermes-log-format.conf"' in source
+    assert 'legacy_nginx_log_format="/etc/nginx/conf.d/hermes-log-format.conf"' in source
+    assert 'rm -f -- "$legacy_nginx_log_format"' in source
+    assert source.count('"$legacy_nginx_log_format"; do') == 2
     assert "HERMES_DEPLOY_STAGE executor_resource_preflight=passed" in source
     assert "HERMES_DEPLOY_STAGE executor_resource_smoke=passed" in source
     assert "HERMES_DEPLOY_STAGE powerpoint_runtime_smoke=passed" in source

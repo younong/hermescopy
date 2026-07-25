@@ -702,11 +702,12 @@ powerpoint_smoke_owner=""
 
 gateway_unit="/etc/systemd/system/hermes-gateway.service"
 dashboard_unit="/etc/systemd/system/hermes-dashboard.service"
-nginx_log_format="/etc/nginx/conf.d/hermes-log-format.conf"
+nginx_log_format="/etc/nginx/conf.d/00-hermes-log-format.conf"
+legacy_nginx_log_format="/etc/nginx/conf.d/hermes-log-format.conf"
 
 backup_deployment_state() {
   rollback_dir="$(mktemp -d "$tmp_dir/hermes-rollback.XXXXXX")"
-  for path in "$gateway_unit" "$dashboard_unit" "$runner" "$sandbox_policy" "$sandbox_seccomp" "$nginx_log_format"; do
+  for path in "$gateway_unit" "$dashboard_unit" "$runner" "$sandbox_policy" "$sandbox_seccomp" "$nginx_log_format" "$legacy_nginx_log_format"; do
     if [ -e "$path" ]; then
       cp -a -- "$path" "$rollback_dir/$(printf '%s' "$path" | sed 's#/#_#g')"
     fi
@@ -715,7 +716,7 @@ backup_deployment_state() {
 
 restore_deployment_state() {
   local path backup
-  for path in "$gateway_unit" "$dashboard_unit" "$runner" "$sandbox_policy" "$sandbox_seccomp" "$nginx_log_format"; do
+  for path in "$gateway_unit" "$dashboard_unit" "$runner" "$sandbox_policy" "$sandbox_seccomp" "$nginx_log_format" "$legacy_nginx_log_format"; do
     backup="$rollback_dir/$(printf '%s' "$path" | sed 's#/#_#g')"
     if [ -e "$backup" ]; then
       cp -a -- "$backup" "$path"
@@ -1456,6 +1457,7 @@ smoke_root=""
 install -o root -g root -m 0644 \
   "$release/deploy/nginx/hermes-log-format.conf" \
   "$nginx_log_format"
+rm -f -- "$legacy_nginx_log_format"
 action="reconcile"
 [ "$migrate_nginx_hermes" = "1" ] && action="migrate"
 "$venv/bin/python" "$release/deploy/nginx/manage_hermes_proxy.py" \
