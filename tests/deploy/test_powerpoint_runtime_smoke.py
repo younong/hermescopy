@@ -127,6 +127,8 @@ def test_authenticated_smoke_dispatches_terminal_through_supervisor_source():
     source = SMOKE.read_text(encoding="utf-8")
 
     assert "host_sandbox_deployment_policy(policy_path)" in source
+    assert "os.chdir(runtime_paths.default_workspace)" in source
+    assert "os.chdir(original_cwd)" in source
     assert 'function_name="terminal"' in source
     assert '"/opt/hermes/release/deploy/smoke-powerpoint-runtime.py"' in source
     assert '"--inside"' in source

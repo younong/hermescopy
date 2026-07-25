@@ -207,6 +207,7 @@ def _run_authenticated_executor(
     network_server = None
     network_thread = None
     pressure_fds: list[int] = []
+    original_cwd: Path | None = None
 
     try:
         from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
@@ -260,6 +261,8 @@ def _run_authenticated_executor(
             owner_home=owner_home,
             worker_generation=1,
         )
+        original_cwd = Path.cwd()
+        os.chdir(runtime_paths.default_workspace)
         roots = controlled_roots_for(runtime_paths)
         lease = OwnerWorkerAuthorityLease(
             "ok1_deploy_powerpoint_smoke",
@@ -449,6 +452,11 @@ def _run_authenticated_executor(
             try:
                 roots.close()
             except Exception:
+                cleanup = "failed"
+        if original_cwd is not None:
+            try:
+                os.chdir(original_cwd)
+            except OSError:
                 cleanup = "failed"
         try:
             shutil.rmtree(owner_home)

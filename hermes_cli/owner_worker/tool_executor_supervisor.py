@@ -667,10 +667,11 @@ class ToolExecutorSupervisor:
 
     @staticmethod
     def _launcher_argv(start_fd: int, bubblewrap_argv: tuple[str, ...]) -> list[str]:
+        launcher = Path(__file__).with_name("tool_executor_launcher.py").resolve(strict=True)
         return [
             sys.executable,
-            "-m",
-            "hermes_cli.owner_worker.tool_executor_launcher",
+            "-I",
+            str(launcher),
             "--start-fd",
             str(start_fd),
             "--",
