@@ -273,10 +273,11 @@ def _run_authenticated_executor(
             0,
         )
         deployment_policy = host_sandbox_deployment_policy(policy_path)
-        manager = CgroupV2Manager(deployment_policy.resource_policy)
-        checks["startup_recovery"] = (
-            f"passed:{manager.startup_cleanup_count}"
+        manager = CgroupV2Manager(
+            deployment_policy.resource_policy,
+            recover_stale_scopes=False,
         )
+        checks["non_destructive_cgroup_attach"] = "passed"
         resource_controller = LocalResourceController(manager)
         network_server = HTTPServer(("127.0.0.1", 0), _NetworkSmokeHandler)
         network_thread = threading.Thread(

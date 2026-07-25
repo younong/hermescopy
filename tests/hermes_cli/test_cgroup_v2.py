@@ -429,6 +429,37 @@ def test_startup_cleans_managed_stale_scopes_before_admission(tmp_path):
     )
 
 
+def test_concurrent_manager_does_not_recover_live_scopes(tmp_path):
+    policy = _policy(tmp_path)
+    io = FakeCgroupV2IO(policy.cgroup_root)
+    primary = CgroupV2Manager(policy, io=io)
+    active = primary.admit_executor(_identity(executor="active"), "active")
+    active.attach(808)
+
+    diagnostic = CgroupV2Manager(
+        policy,
+        io=io,
+        recover_stale_scopes=False,
+    )
+
+    assert active._relative in io.nodes
+    assert io.nodes[active._relative]["cgroup.procs"] == "808"
+    assert diagnostic.startup_cleanup_count == 0
+    diagnostic_scope = diagnostic.admit_executor(
+        _identity(executor="diagnostic"), "diagnostic"
+    )
+    diagnostic_scope.cleanup()
+    assert active._relative in io.nodes
+
+
+def test_recovery_mode_must_be_boolean(tmp_path):
+    policy = _policy(tmp_path)
+    io = FakeCgroupV2IO(policy.cgroup_root)
+
+    with pytest.raises(CgroupV2Unavailable, match="recovery mode"):
+        CgroupV2Manager(policy, io=io, recover_stale_scopes=1)
+
+
 def test_startup_rejects_unmanaged_stale_scope_names(tmp_path):
     policy = _policy(tmp_path)
     io = FakeCgroupV2IO(policy.cgroup_root)
