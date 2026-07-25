@@ -463,7 +463,7 @@ def _digest(value: Any, field: str) -> str:
 
 def _resource_policy(value: Any, *, require_root_owner: bool) -> SandboxResourcePolicy:
     required = {
-        "cgroup_root", "required_controllers", "global", "owner", "executor",
+        "cgroup_root", "required_controllers", "global", "owner", "reader", "executor",
         "cleanup_grace_seconds", "cleanup_timeout_seconds", "cgroup_kill_required",
     }
     if not isinstance(value, Mapping) or set(value) != required:
@@ -484,6 +484,7 @@ def _resource_policy(value: Any, *, require_root_owner: bool) -> SandboxResource
             required_controllers=tuple(controllers),
             global_limits=_resource_limits(value["global"], layer="global"),
             owner_limits=_resource_limits(value["owner"], layer="owner"),
+            reader_limits=_resource_limits(value["reader"], layer="reader"),
             executor_limits=_resource_limits(value["executor"], layer="executor"),
             cleanup_grace_seconds=value["cleanup_grace_seconds"],
             cleanup_timeout_seconds=value["cleanup_timeout_seconds"],
@@ -498,6 +499,7 @@ def _resource_limits(value: Any, *, layer: str) -> SandboxResourceLimits:
     extra = {
         "global": {"max_owner_workers"},
         "owner": set(),
+        "reader": set(),
         "executor": {"swap_bytes", "file_descriptors", "duration_seconds", "output_bytes"},
     }[layer]
     if not isinstance(value, Mapping) or set(value) != common | extra:

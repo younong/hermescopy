@@ -190,8 +190,10 @@ async def _lifespan(app: "FastAPI"):
     # event loop during lifespan startup — see _get_event_state's docstring.
     app.state.chat_argv_lock = asyncio.Lock()
     from hermes_cli.owner_worker.readiness import initialize_owner_worker_warmups
+    from hermes_cli.session_reader.readiness import initialize_session_reader_warmups
 
     initialize_owner_worker_warmups(app)
+    initialize_session_reader_warmups(app)
 
     from hermes_cli.channel_connectors.weixin_ilink.bootstrap import bootstrap_weixin_ilink
 
@@ -249,7 +251,15 @@ async def _lifespan(app: "FastAPI"):
             except asyncio.CancelledError:
                 pass
         from hermes_cli.owner_worker.readiness import drain_owner_worker_warmups
+        from hermes_cli.session_reader.readiness import drain_session_reader_warmups
 
+        await drain_session_reader_warmups(app)
+        reader_supervisor = getattr(app.state, "session_reader_supervisor", None)
+        if reader_supervisor is not None:
+            try:
+                await asyncio.to_thread(reader_supervisor.shutdown)
+            except Exception:
+                _log.exception("session reader shutdown cleanup failed")
         await drain_owner_worker_warmups(app)
         supervisor = getattr(app.state, "owner_worker_supervisor", None)
         if supervisor is not None:
@@ -383,6 +393,7 @@ app.add_middleware(
 from hermes_cli.dashboard_auth.api_availability import (
     authenticated_control_plane_api_allowed,
     authenticated_owner_worker_api_allowed,
+    authenticated_session_reader_api_allowed,
 )
 from hermes_cli.dashboard_auth.public_paths import is_public_api_route
 
@@ -559,6 +570,122 @@ def _release_owner_worker_iter(iterator: Any, lease: Any):
         yield from iterator
     finally:
         lease.release()
+
+
+def _session_reader_authority_lease(handle: Any):
+    from hermes_cli.dashboard_auth.authority import ReaderLeaseState, SessionReaderAuthorityLease
+
+    return SessionReaderAuthorityLease(
+        owner_key=str(handle.owner_key),
+        reader_generation=int(handle.reader_generation),
+        reader_id=str(handle.reader_id),
+        state=ReaderLeaseState.ACTIVE,
+        lease_version=int(handle.lease_version),
+        recovery_generation=int(handle.recovery_generation),
+    )
+
+
+async def _proxy_authenticated_session_reader_http(request: Request) -> Response:
+    """Forward authenticated session-list traffic to the owner Reader only."""
+    latency_started_at = time.monotonic()
+    trace_id = request.headers.get("x-request-id", "")
+    log_latency_stage(_log, trace_id=trace_id, surface="session-reader-proxy", stage="request.received")
+    if not _authenticated_owner_request(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    from hermes_cli.session_reader import (
+        SessionReaderClient,
+        SessionReaderHealthError,
+        SessionReaderUnavailableError,
+    )
+    from hermes_cli.session_reader.readiness import ensure_session_reader_ready
+
+    _reject_authenticated_profile_query_params(request)
+    supervisor = getattr(request.app.state, "session_reader_supervisor", None)
+    use: Any | None = None
+    try:
+        stage_started_at = time.monotonic()
+        _owner, handle = await ensure_session_reader_ready(request)
+        log_latency_stage(
+            _log,
+            trace_id=trace_id,
+            surface="session-reader-proxy",
+            stage="session_reader.ready",
+            started_at=stage_started_at,
+        )
+        use = _acquire_owner_worker_use(supervisor, handle)
+        reader_path = request.url.path
+        query = _owner_worker_query_string(request.url.query)
+        if query:
+            reader_path = f"{reader_path}?{query}"
+        forwarded_headers = {
+            name: value
+            for name, value in request.headers.items()
+            if name.lower() in {"accept", "accept-encoding", "user-agent", "x-request-id"}
+        }
+        stage_started_at = time.monotonic()
+        response = await asyncio.to_thread(
+            SessionReaderClient(
+                handle.socket_path,
+                control_home=getattr(supervisor, "control_home", None),
+                signing_record=getattr(supervisor, "signing_record", None),
+            ).request,
+            request.method,
+            reader_path,
+            lease=_session_reader_authority_lease(handle),
+            headers=forwarded_headers,
+        )
+        log_latency_stage(
+            _log,
+            trace_id=trace_id,
+            surface="session-reader-proxy",
+            stage="reader_http.response",
+            started_at=stage_started_at,
+            outcome="ok" if response.status_code < 500 else "error",
+        )
+    except HTTPException:
+        if use is not None:
+            use.release()
+        raise
+    except TimeoutError as exc:
+        if use is not None:
+            use.release()
+        raise HTTPException(status_code=503, detail="Session reader startup timed out") from exc
+    except SessionReaderUnavailableError as exc:
+        if use is not None:
+            use.release()
+        raise HTTPException(status_code=503, detail="Session reader is unavailable") from exc
+    except SessionReaderHealthError as exc:
+        if use is not None:
+            use.release()
+        raise HTTPException(status_code=502, detail="Session reader request failed") from exc
+    except Exception as exc:
+        if use is not None:
+            use.release()
+        _log.exception("session reader proxy internal failure path=%s", request.url.path)
+        raise HTTPException(status_code=500, detail="Internal server error") from exc
+
+    if use is not None:
+        use.release()
+    log_latency_stage(
+        _log,
+        trace_id=trace_id,
+        surface="session-reader-proxy",
+        stage="request.complete",
+        started_at=latency_started_at,
+        outcome="ok" if response.status_code < 500 else "error",
+    )
+    response_headers = {
+        name: value
+        for name, value in response.headers.items()
+        if name.lower() not in _HOP_BY_HOP_HEADERS and name.lower() != "content-length"
+    }
+    return Response(
+        content=response.content,
+        status_code=response.status_code,
+        headers=response_headers,
+        media_type=response.headers.get("content-type"),
+    )
 
 
 async def _proxy_authenticated_owner_http(request: Request) -> Response:
@@ -851,6 +978,7 @@ def _authenticated_owner_control_plane_gate_response(request: Request) -> Option
         and not getattr(request.state, "token_authenticated", False)
         and not authenticated_control_plane_api_allowed(path, method=method)
         and not authenticated_owner_worker_api_allowed(path, method=method)
+        and not authenticated_session_reader_api_allowed(path, method=method)
     ):
         _log.warning(
             "authenticated API denied method=%s path=%s request_id=%s",
@@ -4009,7 +4137,7 @@ async def get_sessions(
     """
     if _authenticated_owner_request(request):
         _reject_authenticated_profile_param(profile)
-        return await _proxy_authenticated_owner_http(request)
+        return await _proxy_authenticated_session_reader_http(request)
     profile_name: Optional[str] = None
     if profile:
         profile_name, _ = _cron_profile_home(profile)
@@ -4032,7 +4160,7 @@ async def get_sessions(
             )
         finally:
             db.close()
-    except HTTPException:
+    except (HTTPException, session_api.HTTPException):
         raise
     except Exception:
         _log.exception("GET /api/sessions failed")
@@ -8307,7 +8435,7 @@ def _open_session_db_for_profile(profile: Optional[str], *, request: Request | N
         _log.error("authenticated Control Plane attempted to open SessionDB directly")
         raise HTTPException(
             status_code=500,
-            detail="Owner-scoped sessions must be served by the Owner Worker",
+            detail="Owner-scoped sessions must be served by an owner-scoped session service",
         )
     from hermes_state import SessionDB
     if not profile:
@@ -15370,6 +15498,7 @@ def start_server(
             f"{parsed_public_url.scheme}://{parsed_public_url.netloc}"
         )
     app.state.owner_worker_supervisor = None
+    app.state.session_reader_supervisor = None
     if app.state.auth_required:
         from hermes_cli.deployment_image import (
             DeploymentImagePolicyInvalid,
@@ -15382,6 +15511,7 @@ def start_server(
         from hermes_cli.owner_worker import OwnerWorkerSupervisor
         from hermes_cli.owner_worker.cgroup_v2 import CgroupV2Manager
         from hermes_cli.owner_worker.tool_executor_sandbox import load_sandbox_deployment_policy
+        from hermes_cli.session_reader import SessionReaderSupervisor
 
         policy_spec = os.environ.get("HERMES_DEPLOYMENT_INFERENCE_POLICY", "")
         try:
@@ -15425,6 +15555,11 @@ def start_server(
             )
             future.result()
 
+        app.state.session_reader_supervisor = SessionReaderSupervisor(
+            global_home=global_home,
+            control_home=global_home / "control-plane",
+            resource_manager=resource_manager,
+        )
         try:
             app.state.owner_worker_supervisor = OwnerWorkerSupervisor(
                 global_home=global_home,
@@ -15436,6 +15571,8 @@ def start_server(
                 resource_manager=resource_manager,
             )
         except Exception:
+            app.state.session_reader_supervisor.shutdown()
+            app.state.session_reader_supervisor = None
             if resource_manager is not None:
                 resource_manager.close()
             raise

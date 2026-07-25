@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import HTTPException
+from starlette.exceptions import HTTPException
 
 from hermes_cli.latency_trace import log_latency_stage
 

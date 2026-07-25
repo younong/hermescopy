@@ -210,6 +210,7 @@ def _policy(tmp_path, *, global_workers=2, global_executors=3, owner_executors=2
             3000, 3 << 30, 512, global_executors, max_owner_workers=global_workers,
         ),
         owner_limits=SandboxResourceLimits(2000, 2 << 30, 256, owner_executors),
+        reader_limits=SandboxResourceLimits(250, 128 << 20, 16, 1),
         executor_limits=SandboxResourceLimits(
             1000, 1 << 30, 64, 1, swap_bytes=0, file_descriptors=64,
             duration_seconds=120, output_bytes=200_000,
@@ -229,6 +230,12 @@ def _manager(tmp_path, **policy_args):
 
 def _lease(owner="ok1_owner", worker="worker-a", generation=1):
     return OwnerWorkerAuthorityLease(owner, generation, worker, WorkerLeaseState.ACTIVE, 1, 0)
+
+
+def _reader_lease(owner="ok1_owner", reader="reader-a", generation=1):
+    from hermes_cli.dashboard_auth.authority import ReaderLeaseState, SessionReaderAuthorityLease
+
+    return SessionReaderAuthorityLease(owner, generation, reader, ReaderLeaseState.ACTIVE, 1, 0)
 
 
 def _identity(owner="ok1_owner", worker="worker-a", generation=1, executor="executor-a"):
@@ -285,6 +292,19 @@ def test_admits_generated_owner_worker_and_per_invocation_executor_leaves(tmp_pa
     assert "raw" not in str(worker.path) and ".." not in str(worker.path)
     assert io.nodes[worker._relative]["memory.oom.group"] == "1"
     assert executor.read_limits().memory_swap_max == 0
+
+
+def test_reader_has_independent_small_scope_without_consuming_worker_capacity(tmp_path):
+    manager, io = _manager(tmp_path, global_workers=1)
+    reader = manager.admit_reader(_reader_lease(owner="owner-a"))
+    worker = manager.admit_worker(_lease(owner="owner-b", worker="worker-b"))
+
+    assert reader.path.name.startswith("reader-")
+    assert worker.path.name.startswith("worker-")
+    assert reader.read_limits().memory_max == 128 << 20
+    assert io.nodes[reader._relative]["pids.max"] == "16"
+    with pytest.raises(CgroupAdmissionRejected, match="worker"):
+        manager.admit_worker(_lease(owner="owner-c", worker="worker-c"))
 
 
 def test_enforces_exact_global_worker_and_global_owner_executor_admission(tmp_path):
