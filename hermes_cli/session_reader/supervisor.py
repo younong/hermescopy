@@ -20,13 +20,13 @@ from hermes_cli.dashboard_auth.authority import (
     ReaderLeaseState,
     SessionReaderAuthorityLease,
 )
-from hermes_cli.owner_runtime import (
-    ensure_owner_runtime_dirs,
+from hermes_cli.owner_runtime import ensure_owner_runtime_dirs
+from .client import SessionReaderClient, SessionReaderHealthError, warm_http_transport
+from .runtime import (
     session_reader_env_for,
     session_reader_runtime_dir,
     session_reader_socket_path,
 )
-from .client import SessionReaderClient, SessionReaderHealthError, warm_http_transport
 from .tokens import session_reader_capability_public_config
 from hermes_cli.owner_worker.tokens import _signing_record
 

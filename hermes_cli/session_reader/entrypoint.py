@@ -7,12 +7,11 @@ import logging
 import os
 import socket
 import threading
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from hermes_cli.owner_runtime import (
+from .runtime import (
     FORBIDDEN_OWNER_WORKER_ENV_KEYS,
     session_reader_socket_path,
     validate_session_reader_runtime_environment,
@@ -32,14 +31,32 @@ _STATUS_TEXT = {
 _log = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
 class _ReaderLease:
-    owner_key: str
-    reader_generation: int
-    reader_id: str
-    state: str
-    lease_version: int
-    recovery_generation: int
+    __slots__ = (
+        "owner_key",
+        "reader_generation",
+        "reader_id",
+        "state",
+        "lease_version",
+        "recovery_generation",
+    )
+
+    def __init__(
+        self,
+        *,
+        owner_key: str,
+        reader_generation: int,
+        reader_id: str,
+        state: str,
+        lease_version: int,
+        recovery_generation: int,
+    ) -> None:
+        self.owner_key = owner_key
+        self.reader_generation = reader_generation
+        self.reader_id = reader_id
+        self.state = state
+        self.lease_version = lease_version
+        self.recovery_generation = recovery_generation
 
 
 def _parse_args() -> argparse.Namespace:
@@ -133,7 +150,7 @@ def _create_handler(
     socket_path: Path,
 ):
     from hermes_cli import session_api
-    from hermes_state import SessionDB
+    from .db import ReadOnlySessionDB
     from .tokens import SessionReaderCapabilityInvalid, verify_session_reader_capability
 
     paths = validate_session_reader_runtime_environment(
@@ -209,7 +226,7 @@ def _create_handler(
             return 422, {"detail": str(exc)}
         if not paths.state_db.exists():
             return 200, {"sessions": [], "total": 0, "limit": limit, "offset": offset}
-        db = SessionDB(db_path=paths.state_db, read_only=True)
+        db = ReadOnlySessionDB(paths.state_db)
         try:
             return 200, session_api.list_sessions_payload(
                 db,

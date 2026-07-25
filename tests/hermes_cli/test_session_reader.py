@@ -405,6 +405,64 @@ def test_reader_real_process_reads_owner_db_without_creating_missing_db(tmp_path
         shutil.rmtree(short_root, ignore_errors=True)
 
 
+def test_reader_read_only_adapter_matches_session_db_payloads(tmp_path):
+    from hermes_cli.session_api import list_sessions_payload
+    from hermes_cli.session_reader.db import ReadOnlySessionDB
+    from hermes_state import SessionDB
+
+    owner_home = tmp_path / "owner"
+    db = SessionDB(owner_home / "state.db")
+    scope = {
+        "owner_key": "ok1_parity",
+        "workspace_root": str((owner_home / "workspaces").resolve()),
+        "worker_generation": 1,
+        "historical_resume": True,
+    }
+    try:
+        db.create_session(
+            "root",
+            source="gui",
+            owner_key=scope["owner_key"],
+            workspace_root=scope["workspace_root"],
+            worker_generation=1,
+        )
+        db.append_message("root", "user", "before compression")
+        db.end_session("root", "compression")
+        db.create_session(
+            "tip",
+            source="gui",
+            parent_session_id="root",
+            owner_key=scope["owner_key"],
+            workspace_root=scope["workspace_root"],
+            worker_generation=2,
+        )
+        db.append_message("tip", "assistant", "after compression")
+        db.create_session(
+            "archived",
+            source="cli",
+            owner_key=scope["owner_key"],
+            workspace_root=scope["workspace_root"],
+            worker_generation=1,
+        )
+        db.set_session_archived("archived", True)
+
+        reader_db = ReadOnlySessionDB(owner_home / "state.db")
+        try:
+            for options in (
+                {"order": "recent", "compact": True},
+                {"order": "recent", "compact": False},
+                {"order": "created", "archived": "include", "compact": True},
+                {"source": "gui", "order": "recent", "compact": True},
+            ):
+                expected = list_sessions_payload(db, recovery_scope=scope, **options)
+                actual = list_sessions_payload(reader_db, recovery_scope=scope, **options)
+                assert actual == expected
+        finally:
+            reader_db.close()
+    finally:
+        db.close()
+
+
 def test_reader_rejects_worker_capability_and_stale_reader_lease(tmp_path):
     from hermes_cli.dashboard_auth.authority import WorkerGenerationState, WorkerLeaseState
     from hermes_cli.owner_worker.tokens import (
