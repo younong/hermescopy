@@ -978,8 +978,8 @@ if [ -z "$node_path" ]; then
 fi
 node_identity="$(printf '%s\n' "$(node --version)" "$(sha256sum "$node_path" | cut -d ' ' -f1)" | sha256sum | cut -d ' ' -f1)"
 python_version="3.11"
-runtime_inputs_hash="$(printf '%s\n' "$lock_hash" "$powerpoint_lock_hash" "$powerpoint_package_hash" "$node_identity" 'sandbox9' | sha256sum | cut -d ' ' -f1)"
-runtime_id="py311-${"${"}architecture}-${"${"}runtime_inputs_hash}-sandbox9"
+runtime_inputs_hash="$(printf '%s\n' "$lock_hash" "$powerpoint_lock_hash" "$powerpoint_package_hash" "$node_identity" 'sandbox10' | sha256sum | cut -d ' ' -f1)"
+runtime_id="py311-${"${"}architecture}-${"${"}runtime_inputs_hash}-sandbox10"
 venv="$runtimes_dir/$runtime_id"
 # One manifest drives both packaging and preflight. Keep it aligned with
 # ShellFileOperations' target-side scripts, especially atomic writes. Keep
@@ -989,6 +989,7 @@ executor_commands="bash sh /bin/sh ls pwd printf cat chmod grep find head mktemp
 
 if [ ! -x "$venv/bin/python3" ]; then
   echo "Bootstrapping immutable Python runtime $runtime_id"
+  runtime_build_started=$SECONDS
   if ! command -v uv >/dev/null 2>&1; then
     if ! command -v curl >/dev/null 2>&1; then
       echo "Missing required command: curl (needed to install uv)" >&2
@@ -1029,19 +1030,51 @@ if [ ! -x "$venv/bin/python3" ]; then
     *) echo "Sandbox Python resolves outside the runtime" >&2; exit 1 ;;
   esac
   resolved_python="$(readlink -f "$runtime_tmp/bin/python3")"
-  while read -r library; do
-    [ -n "$library" ] || continue
+  dependency_reference_count=0
+  dependency_unique_count=0
+  dependency_duplicate_count=0
+  dependency_copied_count=0
+  dependency_existing_count=0
+  libreoffice_candidate_count=0
+  declare -A runtime_dependency_seen=()
+
+  copy_runtime_dependency() {
+    local library="$1"
+    local library_target
+    dependency_reference_count=$((dependency_reference_count + 1))
+    if [ -n "${"${"}runtime_dependency_seen[$library]+x}" ]; then
+      dependency_duplicate_count=$((dependency_duplicate_count + 1))
+      return
+    fi
+    runtime_dependency_seen["$library"]=1
+    dependency_unique_count=$((dependency_unique_count + 1))
     library_target="$runtime_tmp/toolchain$library"
+    if [ -e "$library_target" ] || [ -L "$library_target" ]; then
+      if [ ! -f "$library_target" ] || [ -L "$library_target" ]; then
+        echo "Runtime dependency target is not a regular file: $library_target" >&2
+        exit 1
+      fi
+      dependency_existing_count=$((dependency_existing_count + 1))
+      return
+    fi
     mkdir -p "$(dirname "$library_target")"
     cp -aL -- "$library" "$library_target"
-  done < <(ldd "$resolved_python" | sed -nE 's#.*=> (/[^ ]+).*#\1#p; s#^[[:space:]]*(/[^ ]+).*#\1#p')
-  while IFS= read -r -d '' extension; do
-    while read -r library; do
+    dependency_copied_count=$((dependency_copied_count + 1))
+  }
+
+  collect_runtime_dependencies() {
+    local dependency_source="$1"
+    local library
+    while IFS= read -r library; do
       [ -n "$library" ] || continue
-      library_target="$runtime_tmp/toolchain$library"
-      mkdir -p "$(dirname "$library_target")"
-      cp -aL -- "$library" "$library_target"
-    done < <(ldd "$extension" | sed -nE 's#.*=> (/[^ ]+).*#\1#p; s#^[[:space:]]*(/[^ ]+).*#\1#p')
+      copy_runtime_dependency "$library"
+    done < <(ldd "$dependency_source" 2>/dev/null | sed -nE 's#.*=> (/[^ ]+).*#\1#p; s#^[[:space:]]*(/[^ ]+).*#\1#p')
+  }
+
+  pre_rpm_started=$SECONDS
+  collect_runtime_dependencies "$resolved_python"
+  while IFS= read -r -d '' extension; do
+    collect_runtime_dependencies "$extension"
   done < <(find "$runtime_tmp/lib/python3.11/site-packages" -type f -name '*.so' -print0)
   for command in $executor_commands; do
     [ "$command" != "soffice" ] || continue
@@ -1056,13 +1089,10 @@ if [ ! -x "$venv/bin/python3" ]; then
     command_target="$runtime_tmp/toolchain$command_path"
     mkdir -p "$(dirname "$command_target")"
     cp -aL -- "$command_path" "$command_target"
-    while read -r library; do
-      [ -n "$library" ] || continue
-      library_target="$runtime_tmp/toolchain$library"
-      mkdir -p "$(dirname "$library_target")"
-      cp -aL -- "$library" "$library_target"
-    done < <(ldd "$command_path" | sed -nE 's#.*=> (/[^ ]+).*#\1#p; s#^[[:space:]]*(/[^ ]+).*#\1#p')
+    collect_runtime_dependencies "$command_path"
   done
+  pre_rpm_seconds=$((SECONDS - pre_rpm_started))
+  rpm_copy_started=$SECONDS
   while IFS= read -r package; do
     [ -n "$package" ] || continue
     while IFS= read -r packaged_path; do
@@ -1095,6 +1125,7 @@ if [ ! -x "$venv/bin/python3" ]; then
       esac
     done < <(rpm -ql "$package")
   done < <(printf '%s\n' "$powerpoint_package_entries" | cut -d'|' -f1)
+  rpm_copy_seconds=$((SECONDS - rpm_copy_started))
   soffice_source="$(type -P soffice || true)"
   if [ "$soffice_source" != "/usr/bin/soffice" ] || [ ! -L "$soffice_source" ]; then
     echo "Host soffice launcher is not the reviewed /usr/bin/soffice symlink" >&2
@@ -1113,14 +1144,22 @@ if [ ! -x "$venv/bin/python3" ]; then
   fi
   rm -f -- "$soffice_target"
   ln -s ../lib64/libreoffice/program/soffice "$soffice_target"
+  libreoffice_started=$SECONDS
   while IFS= read -r -d '' executable; do
-    while read -r library; do
-      [ -n "$library" ] || continue
-      library_target="$runtime_tmp/toolchain$library"
-      mkdir -p "$(dirname "$library_target")"
-      cp -aL -- "$library" "$library_target"
-    done < <(ldd "$executable" 2>/dev/null | sed -nE 's#.*=> (/[^ ]+).*#\1#p; s#^[[:space:]]*(/[^ ]+).*#\1#p')
-  done < <(find "$runtime_tmp/toolchain/usr/lib64/libreoffice" -type f -print0 2>/dev/null)
+    libreoffice_candidate_count=$((libreoffice_candidate_count + 1))
+    collect_runtime_dependencies "$executable"
+  done < <(
+    find "$runtime_tmp/toolchain/usr/lib64/libreoffice" \
+      -type f \( -name '*.so*' -o -perm /111 \) -print0 2>/dev/null
+  )
+  libreoffice_seconds=$((SECONDS - libreoffice_started))
+  runtime_build_seconds=$((SECONDS - runtime_build_started))
+  if [ "$dependency_reference_count" -ne $((dependency_unique_count + dependency_duplicate_count)) ] || \
+     [ "$dependency_unique_count" -ne $((dependency_copied_count + dependency_existing_count)) ]; then
+    echo "Runtime dependency collection counters are inconsistent" >&2
+    exit 1
+  fi
+  echo "HERMES_DEPLOY_RUNTIME_BUILD runtime_id=$runtime_id pre_rpm_seconds=$pre_rpm_seconds rpm_seconds=$rpm_copy_seconds libreoffice_seconds=$libreoffice_seconds libreoffice_candidates=$libreoffice_candidate_count dependency_references=$dependency_reference_count dependency_unique=$dependency_unique_count dependency_duplicates=$dependency_duplicate_count dependency_copied=$dependency_copied_count dependency_existing=$dependency_existing_count total_seconds=$runtime_build_seconds"
   chown -R root:root "$runtime_tmp"
   find "$runtime_tmp" -type d -exec chmod 0755 {} +
   find "$runtime_tmp" -type f -exec chmod go-w {} +

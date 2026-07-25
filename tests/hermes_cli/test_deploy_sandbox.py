@@ -18,7 +18,7 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     source = DEPLOY.read_text(encoding="utf-8")
 
     assert 'runtimes_dir="$remote_root/runtimes/python"' in source
-    assert 'runtime_id="py311-${"${"}architecture}-${"${"}runtime_inputs_hash}-sandbox9"' in source
+    assert 'runtime_id="py311-${"${"}architecture}-${"${"}runtime_inputs_hash}-sandbox10"' in source
     assert 'powerpoint_lock_hash="$(sha256sum "$release/deploy/powerpoint-runtime/package-lock.json"' in source
     assert 'powerpoint_package_hash=' in source
     assert 'node_identity=' in source
@@ -66,9 +66,9 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert 'resolved_python="$(readlink -f "$runtime_tmp/bin/python3")"' in source
     assert 'final_python_relative="$(realpath --relative-to="$venv/bin" "$final_python")"' in source
     assert 'ln -sfn "$final_python_relative" "$venv/bin/python"' in source
-    assert 'ldd "$resolved_python"' in source
+    assert 'collect_runtime_dependencies "$resolved_python"' in source
     assert 'find "$runtime_tmp/lib/python3.11/site-packages" -type f -name \'*.so\' -print0' in source
-    assert 'ldd "$extension"' in source
+    assert 'collect_runtime_dependencies "$extension"' in source
     assert 'for destination in /bin /usr/bin /lib /lib64 /usr/lib /usr/lib64 /usr/share /etc/fonts; do' in source
     assert '/etc/X11/fontpath.d/*)' in source
     assert 'if [ ! -L "$packaged_path" ]; then' in source
@@ -156,6 +156,60 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert "restoring previous deployment state" in source
     assert "restore_deployment_state" in source
     assert "HERMES_EXECUTOR_START_GATE_FD" not in source
+
+
+def test_deploy_filters_and_deduplicates_runtime_dependencies():
+    source = DEPLOY.read_text(encoding="utf-8")
+    build_start = source.index('if [ ! -x "$venv/bin/python3" ]; then')
+    build_end = source.index('else\n  echo "Reusing immutable Python runtime $venv"', build_start)
+    build = source[build_start:build_end]
+
+    assert "'sandbox10'" in source
+    assert 'declare -A runtime_dependency_seen=()' in build
+    assert 'copy_runtime_dependency() {' in build
+    assert 'collect_runtime_dependencies() {' in build
+    assert 'runtime_dependency_seen["$library"]=1' in build
+    assert 'cp -aL -- "$library" "$library_target"' in build
+    assert 'if [ -e "$library_target" ] || [ -L "$library_target" ]; then' in build
+    assert 'if [ ! -f "$library_target" ] || [ -L "$library_target" ]; then' in build
+    assert 'Runtime dependency target is not a regular file' in build
+    assert 'collect_runtime_dependencies "$resolved_python"' in build
+    assert 'collect_runtime_dependencies "$extension"' in build
+    assert 'collect_runtime_dependencies "$command_path"' in build
+    assert 'collect_runtime_dependencies "$executable"' in build
+    assert "-type f \\( -name '*.so*' -o -perm /111 \\) -print0" in build
+    assert 'find "$runtime_tmp/toolchain/usr/lib64/libreoffice" -type f -print0' not in build
+    assert 'libreoffice_candidate_count=$((libreoffice_candidate_count + 1))' in build
+    assert 'dependency_reference_count=$((dependency_reference_count + 1))' in build
+    assert 'dependency_duplicate_count=$((dependency_duplicate_count + 1))' in build
+    assert 'dependency_existing_count=$((dependency_existing_count + 1))' in build
+    assert 'dependency_copied_count=$((dependency_copied_count + 1))' in build
+    assert 'dependency_unique_count + dependency_duplicate_count' in build
+    assert 'dependency_copied_count + dependency_existing_count' in build
+    summary = next(line for line in build.splitlines() if "HERMES_DEPLOY_RUNTIME_BUILD" in line)
+    for field in (
+        "runtime_id=",
+        "pre_rpm_seconds=",
+        "rpm_seconds=",
+        "libreoffice_seconds=",
+        "libreoffice_candidates=",
+        "dependency_references=",
+        "dependency_unique=",
+        "dependency_duplicates=",
+        "dependency_copied=",
+        "dependency_existing=",
+        "total_seconds=",
+    ):
+        assert field in summary
+    required_commands = source[source.index("for required in ") : source.index("done", source.index("for required in "))]
+    for extra_command in ("file", "od", "readelf"):
+        assert extra_command not in required_commands.split()
+    rpm = build.index('while IFS= read -r package; do')
+    soffice = build.index('soffice_source="$(type -P soffice || true)"')
+    libreoffice = build.index('libreoffice_started=$SECONDS')
+    normalize = build.index('chown -R root:root "$runtime_tmp"')
+    publish = build.index('mv -- "$runtime_tmp" "$venv"')
+    assert rpm < soffice < libreoffice < normalize < publish
 
 
 def test_deploy_gates_commit_on_isolated_conversation_smoke():
