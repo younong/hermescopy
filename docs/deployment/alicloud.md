@@ -164,7 +164,7 @@ npm run deploy -- --create-tag v2026.7.4-test --allow-non-main
 6. 校验 Bubblewrap 能力，安装 root-owned seccomp artifact 和 `/etc/hermes/executor-sandbox.json`，执行 policy preflight。
 7. 切换 `/opt/hermes/current`，写入带 cgroup delegation/bootstrap 的 systemd unit，并以稳定的非 root `hermes` user/group 重启 gateway 和 dashboard。
 8. 对 delegated subtree 执行 `check-executor-cgroup-host.py --require-ready`。已迁移主机必须通过 controller、accounting、swap/freeze 和 topology 检查；未迁移主机明确保持 Tool fail closed，部署脚本不会修改 grub 或重启。
-9. 资源层 ready 时执行 `smoke-executor-resources.py` 的真实 kernel limit/event/cleanup 检查，再通过同一 cgroup manager 启动真实 authenticated executor，完成 PptxGenJS、MarkItDown 与单次 LibreOffice PowerPoint runtime smoke。
+9. 资源层 ready 时执行 `smoke-executor-resources.py` 的真实 kernel limit/event/cleanup 检查，再通过同一 cgroup manager 启动真实 authenticated executor：在高编号 FD 压力下验证 Bubblewrap 可启动、executor 内 `RLIMIT_NOFILE` 与 policy 一致，并完成 PptxGenJS、MarkItDown、单次 LibreOffice PowerPoint runtime 以及确定性的 loopback owner-relay 网络 smoke。
 10. 从 loopback 带生产代理头验证 Hermes 自己的登录 gate 已生效。
 11. 在部署事务内以 `hermes` 用户和干净环境运行确定性核心对话冒烟；它只连接 loopback 假模型，不读取生产 `.env`，并覆盖附件、tool/approval、流、持久化和 cold resume。
 12. 首次迁移时显式替换旧 Nginx 外层认证；后续发布只同步已托管 snippet，并在 `nginx -t` 成功后 reload；随后写入远端 deployment commit marker。
@@ -273,7 +273,7 @@ HERMES_ILINK_ENCRYPTION_KEYS_JSON={"1":"<different-base64-32-bytes>"}
 
 `tool-public` 与 `protected-target` 继续在 spawn 前明确拒绝：`authenticated network egress is not configured`。Authenticated 会话会按当前 executor policy 过滤模型可见工具，因此只允许 `tool-none` 的生产环境不会向模型展示必然失败的 browser/media 直连工具；该过滤不替代 spawn 前的最终拒绝。不要通过关闭 `--unshare-net` 或回退到进程全局 tool registry 来恢复联网工具。
 
-Authenticated 会话中的 `web_search` 与 `web_extract` 使用独立的 one-shot web relay：Tool Executor 保持 `tool-none` 和私有 network namespace，只继承绑定 exact executor identity/invocation 的 socketpair descriptor；owner worker 校验绑定后，以 owner-scoped `config.yaml`、`.env` 和 `auth.json` 执行现有 web provider。API key/token 不进入 executor env、argv、mount 或 bootstrap。该 relay 不接受任意 tool name、provider、header 或通用 HTTP 请求，也不会给 browser、terminal、code execution、plugin 或 MCP 工具增加网络权限。
+Authenticated 会话中的 `web_search` 与 `web_extract` 使用独立的 one-shot web relay：Tool Executor 保持 `tool-none` 和私有 network namespace，只继承绑定 exact executor identity/invocation 的 socketpair descriptor；owner worker 校验绑定后，以 owner-scoped `config.yaml`、`.env` 和 `auth.json` 执行现有 web provider。API key/token 不进入 executor env、argv、mount 或 bootstrap。该 relay 不接受任意 tool name、provider、header 或通用 HTTP 请求，也不会给 browser、terminal、code execution、plugin 或 MCP 工具增加网络权限。部署事务内的 authenticated runtime smoke 使用无凭据的 loopback HTTP endpoint，通过真实 Bubblewrap/executor/socket framing 验证 owner relay 可执行网络 I/O；它不访问公网 provider，且 post-spawn attestation 仍要求 executor 的 network namespace 隔离。
 
 生产 immutable runtime 通过单独的 locked `ddgs` extra 提供无密钥的 `web_search` 基线；已配置的付费/自托管 provider 仍按既有优先级覆盖它。工具可见性按能力判断：DDGS 只支持 search，因此没有 Firecrawl、Tavily、Exa 或 Parallel 等 extract provider 时，`web_extract` 不会向模型暴露，也不会因为 DDGS 已安装而错误显示为可用。
 

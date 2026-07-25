@@ -137,6 +137,11 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert "CgroupV2Manager(deployment_policy.resource_policy)" in powerpoint_source
     assert 'checks["startup_recovery"]' in powerpoint_source
     assert "resource_controller=resource_controller" in powerpoint_source
+    assert 'checks["executor_nofile_limit"]' in powerpoint_source
+    assert 'checks["high_fd_launch_pressure"]' in powerpoint_source
+    assert 'checks["owner_relay_network"]' in powerpoint_source
+    assert "_open_fd_pressure(nofile_limit + 8)" in powerpoint_source
+    assert "owner_tool_relay=relay" in powerpoint_source
     assert '--policy "$sandbox_policy"' in source
     assert "NODE_PATH=\"$venv/powerpoint/node_modules\"" not in source
     assert "npm ci" not in source[source.index("function remoteDeployScript"):]

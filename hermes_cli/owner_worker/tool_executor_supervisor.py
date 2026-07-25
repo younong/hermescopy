@@ -596,6 +596,10 @@ class ToolExecutorSupervisor:
                 break
         finally:
             selector.close()
+        if not raw:
+            raise SandboxVerificationInvalid(
+                "Bubblewrap exited before publishing sandbox identity"
+            )
         try:
             text = raw.decode("utf-8")
             value, offset = json.JSONDecoder().raw_decode(text)
@@ -662,15 +666,13 @@ class ToolExecutorSupervisor:
         return actual
 
     @staticmethod
-    def _launcher_argv(start_fd: int, file_descriptors: int, bubblewrap_argv: tuple[str, ...]) -> list[str]:
+    def _launcher_argv(start_fd: int, bubblewrap_argv: tuple[str, ...]) -> list[str]:
         return [
             sys.executable,
             "-m",
             "hermes_cli.owner_worker.tool_executor_launcher",
             "--start-fd",
             str(start_fd),
-            "--nofile",
-            str(file_descriptors),
             "--",
             *bubblewrap_argv,
         ]
@@ -811,7 +813,7 @@ class ToolExecutorSupervisor:
                 if identity.stable_key in self._revoked:
                     raise PermissionError("executor generation is revoked")
                 process = self.process_factory(
-                    self._launcher_argv(launcher_gate_read, file_descriptors, spec.argv),
+                    self._launcher_argv(launcher_gate_read, spec.argv),
                     env=environment,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
