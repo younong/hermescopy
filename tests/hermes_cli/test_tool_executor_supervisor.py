@@ -16,6 +16,7 @@ from hermes_cli.owner_worker.tool_executor_sandbox import (
     ExecutorIsolationUnavailable,
     SandboxSecurityPolicy,
     SandboxSyscallFilter,
+    SandboxVerificationInvalid,
     SandboxVerificationPolicy,
     SandboxVerificationRecord,
 )
@@ -56,6 +57,30 @@ def _publish_fake_sandbox_info(argv, *, pid=4243):
         os.close(info_fd)
 
     threading.Thread(target=publish, daemon=True).start()
+
+
+def test_bubblewrap_child_pid_distinguishes_empty_info_from_malformed_identity():
+    read_fd, write_fd = os.pipe()
+    os.close(write_fd)
+    try:
+        with pytest.raises(
+            SandboxVerificationInvalid,
+            match="exited before publishing sandbox identity",
+        ):
+            ToolExecutorSupervisor._bubblewrap_child_pid(read_fd)
+    finally:
+        os.close(read_fd)
+
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, b"not-json")
+    os.close(write_fd)
+    try:
+        with pytest.raises(
+            SandboxVerificationInvalid, match="sandbox identity is invalid"
+        ):
+            ToolExecutorSupervisor._bubblewrap_child_pid(read_fd)
+    finally:
+        os.close(read_fd)
 
 
 def test_bubblewrap_child_pid_accepts_partial_info_writes():
@@ -581,6 +606,7 @@ def test_supervisor_uses_sandbox_fd_bootstrap_and_no_preexec_cwd(tmp_path):
     kwargs = spawned[0][1]
     launcher_argv = spawned[0][0][0]
     assert launcher_argv[:3] == [os.sys.executable, "-m", "hermes_cli.owner_worker.tool_executor_launcher"]
+    assert "--nofile" not in launcher_argv
     assert _bubblewrap_argv(launcher_argv)[0] == "/trusted/bwrap"
     assert kwargs["close_fds"] is True
     assert kwargs["stdin"] is not None

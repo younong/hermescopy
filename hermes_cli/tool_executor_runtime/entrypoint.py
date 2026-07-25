@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import resource
 import stat
 import sys
 from typing import Any
@@ -97,6 +98,16 @@ def _require_matching_egress_profile(invocation: ExecutorInvocation, environment
         raise ExecutorRuntimeInvalid("executor egress profile does not match bootstrap")
 
 
+def _apply_file_descriptor_limit(limit: int) -> None:
+    """Apply the identity-bound descriptor quota after sandbox admission."""
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (limit, limit))
+    except (OSError, ValueError) as exc:
+        raise ExecutorRuntimeInvalid(
+            "executor file descriptor limit could not be applied"
+        ) from exc
+
+
 def invocation_from_payload(payload: dict[str, Any]) -> ExecutorInvocation:
     try:
         identity = ExecutorIdentity.from_payload(payload["identity"])
@@ -132,6 +143,9 @@ def run_once(environment: dict[str, str] | None = None) -> int:
         _admit_workspace_mount(workspace_fd)
         invocation = invocation_from_payload(_read_bootstrap(bootstrap_fd))
         _require_matching_egress_profile(invocation, env)
+        _apply_file_descriptor_limit(
+            invocation.resource_decision.quota.file_descriptors
+        )
         relay_fd_text = str(env.get(EXECUTOR_OWNER_RELAY_FD, "") or "").strip()
         from hermes_cli.owner_worker.owner_tool_relay import OWNER_RELAY_TOOL_NAMES
 
