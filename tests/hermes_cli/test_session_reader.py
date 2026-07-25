@@ -140,7 +140,14 @@ def test_reader_runtime_contract_is_minimal_and_separate_from_worker(tmp_path):
         source=env,
     )
     assert paths == session_reader_runtime_paths(owner_home=owner_home, reader_generation=3)
-    assert paths.reader_socket == owner_home / "runtime/session-readers/3/reader.sock"
+    assert paths.reader_socket == owner_home / "runtime/r/3/s"
+    production_home = Path(
+        "/opt/hermes/shared/.hermes/users/"
+        "ok1_54b69cda14d5ddfbed684f1ca4a7e270f8ce"
+    )
+    production_socket = session_reader_socket_path(production_home, 999_999)
+    assert len(os.fsencode(production_socket)) < 104
+    assert production_socket.is_relative_to(production_home)
     assert not any(key.startswith("HERMES_WORKER_") for key in env)
     assert "HERMES_WORKSPACE_ROOT" not in env
     polluted = {**env, "HERMES_DEPLOYMENT_INFERENCE_RELAY_FD": "7"}

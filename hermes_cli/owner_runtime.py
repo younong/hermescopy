@@ -188,12 +188,14 @@ def session_reader_runtime_dir(owner_home: str | Path, reader_generation: int) -
     generation = int(reader_generation)
     if generation < 1:
         raise ValueError("reader_generation must be positive")
-    return home / "runtime" / "session-readers" / str(generation)
+    # Keep the authenticated owner-local socket below AF_UNIX's 104-byte
+    # portable limit even for the production owner-home shape.
+    return home / "runtime" / "r" / str(generation)
 
 
 def session_reader_socket_path(owner_home: str | Path, reader_generation: int) -> Path:
     """Return the sole authenticated Reader socket for a generation."""
-    return session_reader_runtime_dir(owner_home, reader_generation) / "reader.sock"
+    return session_reader_runtime_dir(owner_home, reader_generation) / "s"
 
 
 def owner_worker_runtime_dir(owner_home: str | Path, worker_generation: int) -> Path:
@@ -427,7 +429,7 @@ def session_reader_runtime_paths(
     return SessionReaderRuntimePaths(
         owner_home=home,
         reader_runtime_dir=runtime_dir,
-        reader_socket=runtime_dir / "reader.sock",
+        reader_socket=session_reader_socket_path(home, generation),
         state_db=(home / "state.db").resolve(),
     )
 
