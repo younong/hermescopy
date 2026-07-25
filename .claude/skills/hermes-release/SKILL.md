@@ -46,6 +46,10 @@ allowed-tools:
    - 远端 commit 后自动运行 authenticated 公开真实 AI smoke；失败必须报告 `deployment committed but public smoke failed`、返回非零，且不得自动回滚已提交版本。
    - `--dry-run` 只确认两层 smoke 均为 `planned`，不得登录或调用模型。
 
+6. **不等待 GitHub 远程测试**
+   - 发布前不得查询、等待或要求 GitHub 分片测试、GitHub Actions、PR checks 或其他远程 CI 通过。
+   - 发布只由当前改动规定的本地验证、下方发布前检查和发布工具自身检查决定；这些本地与内置检查不得省略。
+
 ## 常用命令
 
 ### 查看帮助
