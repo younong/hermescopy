@@ -74,8 +74,6 @@ function buildTerminalTheme(background: string, foreground: string) {
     foreground,
     cursor: foreground,
     cursorAccent: background,
-    selectionBackground:
-      foreground.length === 7 ? `${foreground}44` : foreground,
   };
 }
 
