@@ -267,14 +267,16 @@ def _raise_provider_error(payload: Mapping[str, Any], operation: str) -> None:
     if _provider_success(raw_ret) and _provider_success(raw_errcode):
         return
     code = ret if ret not in {None, 0} else errcode
-    message = payload.get("errmsg") or payload.get("msg")
-    stale_session = code == -14 or (code == -2 and str(message).lower() == "unknown error")
-    if stale_session:
+    message = _provider_message(payload)
+    if code == -14:
         reason = "stale_session"
         transient = False
-    elif code == -2:
+    elif code == -2 and _is_explicit_rate_limit(message):
         reason = "rate_limited"
         transient = True
+    elif code == -2 and _is_stale_context(message):
+        reason = "stale_context"
+        transient = False
     else:
         reason = "provider_rejected"
         transient = False
@@ -283,6 +285,37 @@ def _raise_provider_error(payload: Mapping[str, Any], operation: str) -> None:
         reason,
         provider_code=code,
         transient=transient,
+    )
+
+
+def _provider_message(payload: Mapping[str, Any]) -> str:
+    message = payload.get("errmsg") or payload.get("msg")
+    return " ".join(str(message or "").lower().split())
+
+
+def _is_explicit_rate_limit(message: str) -> bool:
+    return any(
+        marker in message
+        for marker in (
+            "too frequent",
+            "freq limit",
+            "frequency limit",
+            "rate limit",
+            "too many requests",
+            "操作频繁",
+            "请求频繁",
+            "频率限制",
+        )
+    )
+
+
+def _is_stale_context(message: str) -> bool:
+    if not message or message == "unknown error":
+        return True
+    context_markers = ("context", "context_token", "context token")
+    stale_markers = ("expired", "invalid", "missing", "stale")
+    return any(marker in message for marker in context_markers) and any(
+        marker in message for marker in stale_markers
     )
 
 

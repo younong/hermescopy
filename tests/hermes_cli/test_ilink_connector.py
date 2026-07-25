@@ -268,6 +268,47 @@ async def test_outbound_sender_retries_same_chunk_id_then_terminally_fails(store
     assert tuple(inbound) == ("failed", "outbound_failed")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["stale_context", "provider_rejected"])
+async def test_outbound_sender_terminally_fails_ambiguous_provider_rejection(
+    store, monkeypatch, reason
+):
+    identity_store, registered = store
+    _queue_outbound(identity_store, registered, text="reply")
+
+    async def send_message(_client, **_kwargs):
+        raise ILinkTransportError("send message", reason, provider_code=-2)
+
+    monkeypatch.setattr(
+        "hermes_cli.channel_connectors.weixin_ilink.sender.WeixinILinkClient.send_message",
+        send_message,
+    )
+    sender = OutboundSender(identity_store, object(), retry_seconds=0, max_attempts=3)
+
+    claim = claim_outbound(identity_store, holder="sender")
+    assert claim is not None
+    assert claim.chunk_attempts == 1
+    assert await sender.send_claim(claim, holder="sender") is False
+
+    assert claim_outbound(identity_store, holder="sender") is None
+    with identity_store.read() as conn:
+        outbound = conn.execute(
+            "SELECT status, attempts, chunk_attempts, last_error, failed_chunk_index "
+            "FROM outbound_messages"
+        ).fetchone()
+        inbound = conn.execute(
+            "SELECT status, rejection_reason FROM inbound_messages"
+        ).fetchone()
+    assert tuple(outbound) == (
+        "failed",
+        1,
+        1,
+        f"{reason}:provider=-2",
+        0,
+    )
+    assert tuple(inbound) == ("failed", "outbound_failed")
+
+
 def test_new_poll_generation_fences_old_poller(store):
     identity_store, registered = store
     old = acquire_poll_lease(identity_store, account_id=registered.account_id, holder="old")

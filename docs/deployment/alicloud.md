@@ -267,7 +267,7 @@ HERMES_ILINK_ENCRYPTION_KEYS_JSON={"1":"<different-base64-32-bytes>"}
 
 真实值必须在服务器本地通过 opaque generation 生成和写入；不要在命令参数、终端输出、对话、ticket、日志或仓库中读取、打印或复制，不要让两套 keyring 共用材料。轮换时递增 active version，并保留所有仍被 channel registry 引用的旧版本。配置后通过正常服务路径重启 Dashboard，再以已认证 Owner 检查 `/api/auth/me` 的 `feature_status.weixin_ilink_connect` 为 `enabled=true`、`ready=true`，最后用指定测试微信验证二维码、Owner 绑定、文本私聊、回复和 replay protection。
 
-中央 Connector 会按 2,000 字符上限顺序分片回复，并为每个 chunk 使用稳定幂等 ID、持久化已确认进度。临时网络、HTTP 429/5xx 和 provider 限流默认最多尝试 8 次，以 2 秒为基数指数退避并封顶 300 秒；失效 session/context、其他 HTTP 4xx、未知 provider 拒绝或重试耗尽会把 outbound/inbound 标记为 `failed`，停止热重试并解除同 binding 后续消息的顺序阻塞。可在 `channel_connectors.weixin_ilink` 下调整 `outbound_retry_seconds`、`outbound_retry_max_seconds`、`outbound_max_attempts` 和 `outbound_chunk_delay_seconds`。
+中央 Connector 会按 2,000 字符上限顺序分片回复，并为每个 chunk 使用稳定幂等 ID、持久化已确认进度。临时网络、HTTP 429/5xx 和 provider 明确返回的频率限制默认最多尝试 8 次，以 2 秒为基数指数退避并封顶 300 秒；`ret=-2` 本身是歧义 code，只有明确的频率限制 message 才会重试，空/`unknown error` 或 context-token 失效信号会记为 `stale_context`，其他 `-2` 会记为 `provider_rejected`。失效 session/context、其他 HTTP 4xx、未知 provider 拒绝或重试耗尽会把 outbound/inbound 标记为 `failed`，停止热重试并解除同 binding 后续消息的顺序阻塞；`stale_context` 需要新的 inbound 刷新 context，持续 session 问题则需要重新 enrollment。可在 `channel_connectors.weixin_ilink` 下调整 `outbound_retry_seconds`、`outbound_retry_max_seconds`、`outbound_max_attempts` 和 `outbound_chunk_delay_seconds`。
 
 ## Authenticated 本地工具范围
 
