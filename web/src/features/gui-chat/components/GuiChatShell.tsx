@@ -41,6 +41,7 @@ import {
   type MessageAttachmentState,
 } from "../types";
 import { Composer } from "./Composer";
+import { GuiChatSkillsPane } from "./GuiChatSkillsPane";
 import { MessageList } from "./MessageList";
 
 export function GuiChatShell() {
@@ -51,7 +52,10 @@ export function GuiChatShell() {
   const [searchParams, setSearchParams] = useSearchParams();
   const resumeSessionId = searchParams.get("resume");
   const mockMode = searchParams.get("mock") === "1";
-  const filesOpen = location.pathname.replace(/\/$/, "") === "/chat-gui/files";
+  const workspacePath = location.pathname.replace(/\/$/, "");
+  const filesOpen = workspacePath === "/chat-gui/files";
+  const skillsOpen = workspacePath === "/chat-gui/skills";
+  const workspacePaneOpen = filesOpen || skillsOpen;
   const [state, dispatch] = useReducer(guiChatReducer, initialGuiChatState);
   const connectionRef = useRef<GuiChatConnection | null>(null);
   const historyAbortRef = useRef<AbortController | null>(null);
@@ -90,12 +94,12 @@ export function GuiChatShell() {
     ? undefined
     : weChatStatus?.message ?? "WeChat connection is not available on this server yet.";
   const stateRef = useRef(state);
-  const filesOpenRef = useRef(filesOpen);
+  const workspacePaneOpenRef = useRef(workspacePaneOpen);
   const navigateRef = useRef(navigate);
   const resumeSessionIdRef = useRef(resumeSessionId);
   const setSearchParamsRef = useRef(setSearchParams);
   stateRef.current = state;
-  filesOpenRef.current = filesOpen;
+  workspacePaneOpenRef.current = workspacePaneOpen;
   navigateRef.current = navigate;
   resumeSessionIdRef.current = resumeSessionId;
   setSearchParamsRef.current = setSearchParams;
@@ -151,7 +155,7 @@ export function GuiChatShell() {
     reconnectLifecycleRef.current?.cancelRecovery();
     setResumeNotice(null);
     skipClearedRouteRef.current = true;
-    if (filesOpenRef.current) {
+    if (workspacePaneOpenRef.current) {
       navigateRef.current("/chat-gui", { replace: true });
     } else {
       updateSearchParams(
@@ -578,7 +582,7 @@ export function GuiChatShell() {
       </div>
       <nav aria-label="Chat navigation" className="space-y-[3px] px-3">
         <button
-          aria-current={!filesOpen && !resumeSessionId ? "page" : undefined}
+          aria-current={!workspacePaneOpen && !resumeSessionId ? "page" : undefined}
           className="gui-chat-nav-item"
           onClick={startNewGuiChat}
           type="button"
@@ -598,7 +602,15 @@ export function GuiChatShell() {
           <FolderOpen />
           <span>Files</span>
         </button>
-        <button className="gui-chat-nav-item" onClick={() => navigate("/skills")} type="button">
+        <button
+          aria-current={skillsOpen ? "page" : undefined}
+          className="gui-chat-nav-item"
+          onClick={() => {
+            closeMobilePanel();
+            navigate("/chat-gui/skills");
+          }}
+          type="button"
+        >
           <Sparkles />
           <span>Skills</span>
         </button>
@@ -702,13 +714,13 @@ export function GuiChatShell() {
           ) : <div className="w-8" />}
           <div className="pointer-events-none absolute inset-x-20 top-1/2 min-w-0 -translate-y-1/2 text-center">
             <h1 className="truncate text-[0.8125rem] font-medium text-[#25282d]">
-              {filesOpen ? "Files" : conversationTitle}
+              {filesOpen ? "Files" : skillsOpen ? "Skills" : conversationTitle}
             </h1>
             <p className="truncate text-[0.625rem] text-[#969aa1]">
-              {filesOpen ? "Workspace" : `${state.model ?? "Hermes"} · ${mockMode ? "mock" : state.connection}`}
+              {workspacePaneOpen ? "Workspace" : `${state.model ?? "Hermes"} · ${mockMode ? "mock" : state.connection}`}
             </p>
           </div>
-          {!filesOpen ? (
+          {!workspacePaneOpen ? (
             <div className="ml-auto flex items-center gap-1">
               {canConnectWeChat ? (
                 <button
@@ -730,6 +742,8 @@ export function GuiChatShell() {
 
         {filesOpen ? (
           <GuiChatFilesPane />
+        ) : skillsOpen ? (
+          <GuiChatSkillsPane profile={profile} />
         ) : (
           <>
             {resumeNotice ? (
