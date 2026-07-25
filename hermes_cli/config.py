@@ -929,6 +929,9 @@ DEFAULT_CONFIG = {
             "dispatch_concurrency": 4,
             "dispatch_claim_timeout_seconds": 1800,
             "outbound_retry_seconds": 2,
+            "outbound_retry_max_seconds": 300,
+            "outbound_max_attempts": 8,
+            "outbound_chunk_delay_seconds": 0.2,
             "active_lookup_key_version": 1,
             "active_encryption_key_version": 1,
         },
@@ -5077,6 +5080,25 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                     "channel_connectors.weixin_ilink.enabled should be a boolean",
                     "Use enabled: true or enabled: false without quotes",
                 ))
+            numeric_settings = {
+                "outbound_retry_seconds": ((int, float), 0),
+                "outbound_retry_max_seconds": ((int, float), 0),
+                "outbound_max_attempts": ((int,), 1),
+                "outbound_chunk_delay_seconds": ((int, float), 0),
+            }
+            for key, (expected_types, minimum) in numeric_settings.items():
+                value = weixin_ilink.get(key)
+                if value is not None and (
+                    isinstance(value, bool)
+                    or not isinstance(value, expected_types)
+                    or value < minimum
+                ):
+                    qualifier = "a positive integer" if minimum else "a non-negative number"
+                    issues.append(ConfigIssue(
+                        "error",
+                        f"channel_connectors.weixin_ilink.{key} should be {qualifier}",
+                        f"Set {key} to {minimum} or greater",
+                    ))
 
     # ── custom_providers must be a list, not a dict ──────────────────────
     cp = config.get("custom_providers")

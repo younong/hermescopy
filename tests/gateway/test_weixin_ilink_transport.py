@@ -164,6 +164,61 @@ async def test_send_reuses_caller_supplied_client_id():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "reason", "code", "transient"),
+    [
+        ({"ret": -2, "errmsg": "too frequent"}, "rate_limited", -2, True),
+        ({"errcode": -14, "errmsg": "secret detail"}, "stale_session", -14, False),
+        ({"ret": -2, "errmsg": "unknown error"}, "stale_session", -2, False),
+        ({"ret": 123, "errmsg": "secret detail"}, "provider_rejected", 123, False),
+        ({"ret": "unexpected"}, "provider_rejected", None, False),
+    ],
+)
+async def test_send_classifies_provider_errors_without_exposing_messages(
+    payload, reason, code, transient
+):
+    client = WeixinILinkClient(_Session(_json_response(payload)), token="bot-secret")
+
+    with pytest.raises(ILinkTransportError) as caught:
+        await client.send_message(
+            to="peer-id",
+            text="reply-secret",
+            context_token="context-secret",
+            client_id="stable-id",
+        )
+
+    error = caught.value
+    assert error.reason == reason
+    assert error.provider_code == code
+    assert error.transient is transient
+    rendered = f"{error!r} {error}"
+    assert "secret detail" not in rendered
+    assert "reply-secret" not in rendered
+    assert "context-secret" not in rendered
+    assert "bot-secret" not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "transient"),
+    [(400, False), (429, True), (500, True)],
+)
+async def test_http_error_classification(status, transient):
+    client = WeixinILinkClient(_Session(_Response(status=status)))
+
+    with pytest.raises(ILinkTransportError) as caught:
+        await client.send_message(
+            to="peer-id",
+            text="hello",
+            context_token=None,
+            client_id="stable-id",
+        )
+
+    assert caught.value.http_status == status
+    assert caught.value.transient is transient
+
+
+@pytest.mark.asyncio
 async def test_http_errors_do_not_expose_response_or_credentials():
     secret_values = ["bot-secret", "qr-secret", "context-secret", "provider-secret"]
     session = _Session(_Response(status=500, body="provider-secret"))

@@ -13,7 +13,7 @@ from hermes_constants import get_hermes_home
 
 from .crypto import ChannelCrypto
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _DB_RELATIVE_PATH = Path("control-plane") / "channel_identities.sqlite3"
 
 _SCHEMA = """
@@ -153,10 +153,14 @@ CREATE TABLE IF NOT EXISTS outbound_messages (
     context_key_version INTEGER,
     status TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
+    chunk_count INTEGER,
+    next_chunk_index INTEGER NOT NULL DEFAULT 0,
+    chunk_attempts INTEGER NOT NULL DEFAULT 0,
     next_attempt_at REAL NOT NULL,
     claimed_by TEXT,
     claimed_at REAL,
     last_error TEXT,
+    failed_chunk_index INTEGER,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -222,7 +226,11 @@ class ChannelIdentityStore:
                         raise RuntimeError("channel identity database schema is corrupt") from exc
                     if version == 1:
                         self._migrate_v1_to_v2(conn)
-                    elif version != SCHEMA_VERSION:
+                        version = 2
+                    if version == 2:
+                        self._migrate_v2_to_v3(conn)
+                        version = 3
+                    if version != SCHEMA_VERSION:
                         direction = "newer" if version > SCHEMA_VERSION else "older"
                         raise RuntimeError(
                             f"channel identity database schema is {direction} than supported"
@@ -245,6 +253,26 @@ class ChannelIdentityStore:
         )
         conn.execute(
             "UPDATE channel_identity_meta SET value='2' WHERE key='schema_version'"
+        )
+
+    @staticmethod
+    def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+        existing = {
+            row["name"] for row in conn.execute("PRAGMA table_info(outbound_messages)")
+        }
+        additions = (
+            ("chunk_count", "INTEGER"),
+            ("next_chunk_index", "INTEGER NOT NULL DEFAULT 0"),
+            ("chunk_attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("failed_chunk_index", "INTEGER"),
+        )
+        for column, declaration in additions:
+            if column not in existing:
+                conn.execute(
+                    f"ALTER TABLE outbound_messages ADD COLUMN {column} {declaration}"
+                )
+        conn.execute(
+            "UPDATE channel_identity_meta SET value='3' WHERE key='schema_version'"
         )
 
     def _validate_referenced_key_versions(self) -> None:
