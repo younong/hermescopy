@@ -4,14 +4,20 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import json
+import os
+import resource
 import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 
 def _run(command: list[str], *, cwd: Path, timeout: int) -> subprocess.CompletedProcess[str]:
@@ -42,7 +48,9 @@ def _result(
     }
 
 
-def _run_checks(*, wrapper: str, timeout: int) -> dict[str, object]:
+def _run_checks(
+    *, wrapper: str, timeout: int, expected_nofile: int
+) -> dict[str, object]:
     started = time.monotonic()
     checks: dict[str, str] = {}
     failure: dict[str, str] | None = None
@@ -50,6 +58,13 @@ def _run_checks(*, wrapper: str, timeout: int) -> dict[str, object]:
     work = Path(tempfile.mkdtemp(prefix="hermes-powerpoint-smoke-"))
 
     try:
+        if resource.getrlimit(resource.RLIMIT_NOFILE) != (
+            expected_nofile,
+            expected_nofile,
+        ):
+            raise RuntimeError("executor_nofile_limit")
+        checks["executor_nofile_limit"] = f"passed:{expected_nofile}"
+
         generator = work / "generate.js"
         deck = work / "runtime-smoke.pptx"
         generator.write_text(
@@ -120,6 +135,61 @@ pptx.writeFile({ fileName: process.argv[2] }).catch(error => { console.error(err
     )
 
 
+_NETWORK_SMOKE_QUERY = "hermes-owner-relay-loopback-smoke"
+_NETWORK_SMOKE_MARKER = "HERMES_OWNER_RELAY_NETWORK_OK"
+
+
+class _NetworkSmokeHandler(BaseHTTPRequestHandler):
+    marker = _NETWORK_SMOKE_MARKER
+
+    def do_GET(self) -> None:
+        if self.path != "/network-smoke":
+            self.send_error(404)
+            return
+        payload = json.dumps({"marker": self.marker}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, _format: str, *args: Any) -> None:
+        del args
+
+
+def _dispatch_network_smoke(
+    base_url: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+    _invocation: Any,
+    _materializer: Any,
+) -> str:
+    if tool_name != "web_search" or arguments != {
+        "query": _NETWORK_SMOKE_QUERY,
+        "limit": 1,
+    }:
+        raise RuntimeError("owner_relay_network_invocation")
+    with urllib.request.urlopen(
+        f"{base_url}/network-smoke", timeout=5
+    ) as response:
+        result = json.loads(response.read(4096))
+    if result != {"marker": _NETWORK_SMOKE_MARKER}:
+        raise RuntimeError("owner_relay_network_response")
+    return json.dumps({"success": True, "marker": _NETWORK_SMOKE_MARKER})
+
+
+def _open_fd_pressure(target_fd: int) -> list[int]:
+    descriptors: list[int] = []
+    try:
+        while not descriptors or descriptors[-1] <= target_fd:
+            descriptors.append(os.open(os.devnull, os.O_RDONLY))
+    except Exception:
+        for descriptor in descriptors:
+            os.close(descriptor)
+        raise
+    return descriptors
+
+
 def _run_authenticated_executor(
     *,
     owner_home: Path,
@@ -133,6 +203,11 @@ def _run_authenticated_executor(
     roots = None
     supervisor = None
     resource_controller = None
+    relay = None
+    network_server = None
+    network_thread = None
+    pressure_fds: list[int] = []
+    original_cwd: Path | None = None
 
     try:
         from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
@@ -147,6 +222,7 @@ def _run_authenticated_executor(
         )
         from hermes_cli.owner_worker.cgroup_v2 import CgroupV2Manager
         from hermes_cli.owner_worker.host_sandbox import host_sandbox_deployment_policy
+        from hermes_cli.owner_worker.owner_tool_relay import OwnerToolRelayBroker
         from hermes_cli.owner_worker.tool_executor_supervisor import ToolExecutorSupervisor
 
         class LocalResourceController:
@@ -185,6 +261,8 @@ def _run_authenticated_executor(
             owner_home=owner_home,
             worker_generation=1,
         )
+        original_cwd = Path.cwd()
+        os.chdir(runtime_paths.default_workspace)
         roots = controlled_roots_for(runtime_paths)
         lease = OwnerWorkerAuthorityLease(
             "ok1_deploy_powerpoint_smoke",
@@ -200,12 +278,30 @@ def _run_authenticated_executor(
             f"passed:{manager.startup_cleanup_count}"
         )
         resource_controller = LocalResourceController(manager)
+        network_server = HTTPServer(("127.0.0.1", 0), _NetworkSmokeHandler)
+        network_thread = threading.Thread(
+            target=network_server.serve_forever,
+            daemon=True,
+            name="owner-relay-network-smoke",
+        )
+        network_thread.start()
+        relay = OwnerToolRelayBroker(
+            identity_validator=lambda identity: (
+                supervisor._require_active_executor_identity(identity)
+            ),
+            dispatcher=functools.partial(
+                _dispatch_network_smoke,
+                f"http://127.0.0.1:{network_server.server_port}",
+            ),
+            workspace_context=AuthenticatedWorkspaceContext(roots),
+        )
         supervisor = ToolExecutorSupervisor(
             owner_home=owner_home,
             workspace_context=AuthenticatedWorkspaceContext(roots),
             lease=lease,
             deployment_policy=deployment_policy,
             resource_controller=resource_controller,
+            owner_tool_relay=relay,
         )
         inside_command = " ".join(
             shlex.quote(part)
@@ -217,8 +313,18 @@ def _run_authenticated_executor(
                 "/opt/hermes/release/skills/productivity/powerpoint/scripts/office/soffice.py",
                 "--timeout",
                 str(timeout),
+                "--expected-nofile",
+                str(
+                    deployment_policy.resource_policy.executor_limits.file_descriptors
+                ),
             )
         )
+        nofile_limit = (
+            deployment_policy.resource_policy.executor_limits.file_descriptors
+        )
+        pressure_fds = _open_fd_pressure(nofile_limit + 8)
+        if pressure_fds[-1] <= nofile_limit:
+            raise RuntimeError("high_fd_launch_pressure")
         raw = supervisor.dispatch(
             function_name="terminal",
             function_args={"command": inside_command, "timeout": timeout},
@@ -240,6 +346,27 @@ def _run_authenticated_executor(
             raise RuntimeError("authenticated_executor_result")
         checks.update({str(key): str(value) for key, value in inside_checks.items()})
         checks["authenticated_executor"] = "passed"
+        checks["high_fd_launch_pressure"] = f"passed:{pressure_fds[-1]}"
+        for descriptor in pressure_fds:
+            os.close(descriptor)
+        pressure_fds = []
+
+        network_raw = supervisor.dispatch(
+            function_name="web_search",
+            function_args={"query": _NETWORK_SMOKE_QUERY, "limit": 1},
+            task_id="deploy-owner-relay-network",
+            session_id="deploy-owner-relay-network",
+            tool_call_id="deploy-owner-relay-network",
+            turn_id="deploy-owner-relay-network",
+            api_request_id="deploy-owner-relay-network",
+        )
+        network_result = json.loads(network_raw)
+        if network_result != {
+            "success": True,
+            "marker": _NETWORK_SMOKE_MARKER,
+        }:
+            raise RuntimeError("owner_relay_network_response")
+        checks["owner_relay_network"] = "passed"
 
         for function_args, check, failure_check in (
             (
@@ -291,9 +418,29 @@ def _run_authenticated_executor(
         check = str(exc) if isinstance(exc, RuntimeError) else "authenticated_executor"
         failure = {"check": check, "code": type(exc).__name__}
     finally:
+        for descriptor in pressure_fds:
+            try:
+                os.close(descriptor)
+            except OSError:
+                cleanup = "failed"
+        if network_server is not None:
+            try:
+                network_server.shutdown()
+                network_server.server_close()
+            except Exception:
+                cleanup = "failed"
+        if network_thread is not None:
+            network_thread.join(timeout=5)
+            if network_thread.is_alive():
+                cleanup = "failed"
         if supervisor is not None:
             try:
                 supervisor.stop_generation()
+            except Exception:
+                cleanup = "failed"
+        if relay is not None:
+            try:
+                relay.close()
             except Exception:
                 cleanup = "failed"
         if resource_controller is not None:
@@ -305,6 +452,11 @@ def _run_authenticated_executor(
             try:
                 roots.close()
             except Exception:
+                cleanup = "failed"
+        if original_cwd is not None:
+            try:
+                os.chdir(original_cwd)
+            except OSError:
                 cleanup = "failed"
         try:
             shutil.rmtree(owner_home)
@@ -330,12 +482,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--owner-home")
     parser.add_argument("--policy", default="/etc/hermes/executor-sandbox.json")
     parser.add_argument("--timeout", type=int, default=45)
+    parser.add_argument("--expected-nofile", type=int)
     args = parser.parse_args(argv)
 
     if args.inside:
-        if not args.wrapper:
-            parser.error("--inside requires --wrapper")
-        result = _run_checks(wrapper=args.wrapper, timeout=args.timeout)
+        if not args.wrapper or not args.expected_nofile:
+            parser.error("--inside requires --wrapper and --expected-nofile")
+        result = _run_checks(
+            wrapper=args.wrapper,
+            timeout=args.timeout,
+            expected_nofile=args.expected_nofile,
+        )
     else:
         if not args.owner_home:
             parser.error("authenticated smoke requires --owner-home")

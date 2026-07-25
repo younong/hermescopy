@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import threading
 from pathlib import Path
 from unittest.mock import patch
@@ -16,6 +17,7 @@ from hermes_cli.owner_worker.tool_executor_sandbox import (
     ExecutorIsolationUnavailable,
     SandboxSecurityPolicy,
     SandboxSyscallFilter,
+    SandboxVerificationInvalid,
     SandboxVerificationPolicy,
     SandboxVerificationRecord,
 )
@@ -56,6 +58,30 @@ def _publish_fake_sandbox_info(argv, *, pid=4243):
         os.close(info_fd)
 
     threading.Thread(target=publish, daemon=True).start()
+
+
+def test_bubblewrap_child_pid_distinguishes_empty_info_from_malformed_identity():
+    read_fd, write_fd = os.pipe()
+    os.close(write_fd)
+    try:
+        with pytest.raises(
+            SandboxVerificationInvalid,
+            match="exited before publishing sandbox identity",
+        ):
+            ToolExecutorSupervisor._bubblewrap_child_pid(read_fd)
+    finally:
+        os.close(read_fd)
+
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, b"not-json")
+    os.close(write_fd)
+    try:
+        with pytest.raises(
+            SandboxVerificationInvalid, match="sandbox identity is invalid"
+        ):
+            ToolExecutorSupervisor._bubblewrap_child_pid(read_fd)
+    finally:
+        os.close(read_fd)
 
 
 def test_bubblewrap_child_pid_accepts_partial_info_writes():
@@ -580,7 +606,10 @@ def test_supervisor_uses_sandbox_fd_bootstrap_and_no_preexec_cwd(tmp_path):
     assert json.loads(result) == {"ok": "read_file"}
     kwargs = spawned[0][1]
     launcher_argv = spawned[0][0][0]
-    assert launcher_argv[:3] == [os.sys.executable, "-m", "hermes_cli.owner_worker.tool_executor_launcher"]
+    assert launcher_argv[:2] == [os.sys.executable, "-I"]
+    assert Path(launcher_argv[2]).name == "tool_executor_launcher.py"
+    assert Path(launcher_argv[2]).is_absolute()
+    assert "--nofile" not in launcher_argv
     assert _bubblewrap_argv(launcher_argv)[0] == "/trusted/bwrap"
     assert kwargs["close_fds"] is True
     assert kwargs["stdin"] is not None
@@ -603,6 +632,41 @@ def test_supervisor_uses_sandbox_fd_bootstrap_and_no_preexec_cwd(tmp_path):
     assert "task-only-sentinel" not in spawn_text
     assert received[0]["arguments"] == {"path": "/host/owner-a/secret.txt", "token": "task-only-sentinel"}
     assert supervisor._live == {}
+
+
+def test_launcher_argv_runs_from_unrelated_cwd_with_executor_environment(tmp_path):
+    read_fd, write_fd = os.pipe()
+    try:
+        launcher_argv = ToolExecutorSupervisor._launcher_argv(
+            read_fd, (os.sys.executable, "-I", "-c", "pass")
+        )
+        os.write(write_fd, b"1")
+        os.close(write_fd)
+        write_fd = -1
+        completed = subprocess.run(
+            launcher_argv,
+            cwd=tmp_path,
+            env={
+                "HOME": "/executor",
+                "PATH": "/usr/bin:/bin",
+                "PWD": "/workspace",
+                "PYTHONPATH": "/opt/hermes/release",
+                "TMPDIR": "/executor/tmp",
+            },
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            pass_fds=(read_fd,),
+            close_fds=True,
+            check=False,
+        )
+    finally:
+        os.close(read_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
+
+    assert completed.returncode == 0
+    assert completed.stderr == b""
 
 
 def test_web_relay_identity_validation_rejects_revoked_executor(tmp_path):

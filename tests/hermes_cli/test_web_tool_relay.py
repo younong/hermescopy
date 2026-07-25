@@ -380,13 +380,27 @@ def test_executor_runtime_dispatches_web_tool_through_real_socketpair(tmp_path, 
     os.close(gate_write)
     os.write(bootstrap_write, json.dumps(invocation.to_payload()).encode())
     os.close(bootstrap_write)
+    events = []
     monkeypatch.setattr(entrypoint, "_workspace_mount_status", workspace.stat)
     monkeypatch.setattr(entrypoint.os, "chdir", lambda _path: None)
+    monkeypatch.setattr(
+        entrypoint,
+        "_apply_file_descriptor_limit",
+        lambda limit: events.append(("limit", limit)),
+    )
+    broker._dispatcher = lambda name, arguments, _invocation, _materializer: (
+        events.append(("dispatch", name))
+        or json.dumps({"tool": name, "query": arguments["query"]})
+    )
 
     try:
         assert entrypoint.run_once(environment) == 0
         response = json.loads(os.read(response_read, 1 << 20))
         assert json.loads(response["result"]) == {"tool": "web_search", "query": "Hermes"}
+        assert events == [
+            ("limit", invocation.resource_decision.quota.file_descriptors),
+            ("dispatch", "web_search"),
+        ]
     finally:
         os.close(response_read)
         broker.close()
