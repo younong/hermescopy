@@ -920,6 +920,7 @@ test -f "$release/deploy/runtime/alicloud3-powerpoint-packages.json"
 test -f "$release/deploy/smoke-powerpoint-runtime.py"
 test -f "$release/deploy/check-executor-cgroup-host.py"
 test -f "$release/deploy/smoke-executor-resources.py"
+test -f "$release/deploy/run-cgroup-smoke.py"
 test -f "$release/skills/productivity/powerpoint/scripts/office/soffice.py"
 
 powerpoint_manifest="$release/deploy/runtime/alicloud3-powerpoint-packages.json"
@@ -1399,11 +1400,16 @@ if "$venv/bin/python" "$release/deploy/check-executor-cgroup-host.py" \
     --timeout 10
   echo "HERMES_DEPLOY_STAGE executor_resource_smoke=passed"
   powerpoint_smoke_owner="$owner_root/.deploy-powerpoint-smoke.$$"
-  if ! runuser -u "$service_user" -- env -i \
+  if ! env -i \
     HOME="$shared" \
     PATH="$venv/bin:/usr/bin:/bin" \
     PYTHONPATH="$release" \
     PYTHONNOUSERSITE=1 \
+    "$venv/bin/python" "$release/deploy/run-cgroup-smoke.py" \
+    --managed-root "$cgroup_root" \
+    --service hermes-dashboard.service \
+    --user "$service_user" \
+    -- \
     "$venv/bin/python" "$release/deploy/smoke-powerpoint-runtime.py" \
     --owner-home "$powerpoint_smoke_owner" \
     --policy "$sandbox_policy" \

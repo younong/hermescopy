@@ -138,6 +138,13 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert "HERMES_DEPLOY_STAGE executor_resource_preflight=passed" in source
     assert "HERMES_DEPLOY_STAGE executor_resource_smoke=passed" in source
     assert "HERMES_DEPLOY_STAGE powerpoint_runtime_smoke=passed" in source
+    assert 'test -f "$release/deploy/run-cgroup-smoke.py"' in source
+    powerpoint_launch = source[source.index('powerpoint_smoke_owner='):source.index('echo "HERMES_DEPLOY_STAGE powerpoint_runtime_smoke=passed"')]
+    assert '"$release/deploy/run-cgroup-smoke.py"' in powerpoint_launch
+    assert '--managed-root "$cgroup_root"' in powerpoint_launch
+    assert '--service hermes-dashboard.service' in powerpoint_launch
+    assert '--user "$service_user"' in powerpoint_launch
+    assert 'runuser -u "$service_user"' not in powerpoint_launch
     preflight_source = (ROOT / "deploy" / "check-executor-cgroup-host.py").read_text(encoding="utf-8")
     assert "service_processes == 0" in preflight_source
     assert "managed_processes == 0" in preflight_source
@@ -152,6 +159,9 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert 'checks[check] = "passed"' in powerpoint_source
     assert '"deadline_enforced"' in powerpoint_source
     assert '"output_enforced"' in powerpoint_source
+    assert 'output_config_home / "config.yaml"' in powerpoint_source
+    assert '"tool_output:\\n  max_bytes: 400000\\n"' in powerpoint_source
+    assert "manager.cleanup_owner(self.owner_lease)" in powerpoint_source
     assert "recover_stale_scopes=False" in powerpoint_source
     assert 'checks["non_destructive_cgroup_attach"]' in powerpoint_source
     assert "resource_controller=resource_controller" in powerpoint_source
