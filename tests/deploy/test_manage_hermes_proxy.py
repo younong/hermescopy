@@ -210,6 +210,12 @@ def test_repository_snippet_has_single_auth_layer_contract():
     assert "auth_request off;" in snippet
     assert "auth_request /" not in snippet
     assert "proxy_pass http://127.0.0.1:9119/;" in snippet
+    assert "access_log /var/log/nginx/hermes-access.log hermes_timing;" in snippet
+    log_format = (
+        Path(__file__).parents[2] / "deploy" / "nginx" / "hermes-log-format.conf"
+    ).read_text()
+    assert "$request_time" in log_format
+    assert "$upstream_response_time" in log_format
     assert "proxy_set_header Host $host;" in snippet
     assert "proxy_set_header X-Forwarded-Prefix /hermes;" in snippet
     assert 'proxy_set_header Upgrade $http_upgrade;' in snippet

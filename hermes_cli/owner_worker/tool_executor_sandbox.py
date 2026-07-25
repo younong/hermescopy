@@ -228,6 +228,7 @@ class SandboxResourcePolicy:
     required_controllers: tuple[str, ...]
     global_limits: SandboxResourceLimits
     owner_limits: SandboxResourceLimits
+    reader_limits: SandboxResourceLimits
     executor_limits: SandboxResourceLimits
     cleanup_grace_seconds: int
     cleanup_timeout_seconds: int
@@ -244,12 +245,20 @@ class SandboxResourcePolicy:
             raise SandboxVerificationInvalid("sandbox required cgroup controllers are invalid")
         if not all(
             isinstance(value, SandboxResourceLimits)
-            for value in (self.global_limits, self.owner_limits, self.executor_limits)
+            for value in (
+                self.global_limits,
+                self.owner_limits,
+                self.reader_limits,
+                self.executor_limits,
+            )
         ):
             raise SandboxVerificationInvalid("sandbox resource limits are invalid")
         if self.global_limits.max_owner_workers is None:
             raise SandboxVerificationInvalid("sandbox global owner worker limit is required")
-        if self.owner_limits.max_owner_workers is not None or self.executor_limits.max_owner_workers is not None:
+        if any(
+            limits.max_owner_workers is not None
+            for limits in (self.owner_limits, self.reader_limits, self.executor_limits)
+        ):
             raise SandboxVerificationInvalid("sandbox owner worker limit is only valid globally")
         if any(
             getattr(self.executor_limits, field_name) is None
@@ -259,8 +268,12 @@ class SandboxResourcePolicy:
         for field_name in ("cpu_millis", "memory_bytes", "pids", "max_concurrent_executors"):
             global_value = getattr(self.global_limits, field_name)
             owner_value = getattr(self.owner_limits, field_name)
+            reader_value = getattr(self.reader_limits, field_name)
             executor_value = getattr(self.executor_limits, field_name)
-            if not executor_value <= owner_value <= global_value:
+            if not (
+                executor_value <= owner_value <= global_value
+                and reader_value <= owner_value
+            ):
                 raise SandboxVerificationInvalid("sandbox resource limit hierarchy is invalid")
         if (
             _invalid_positive_integer(self.cleanup_grace_seconds)

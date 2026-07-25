@@ -5352,14 +5352,27 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
 
         original_auth_required = getattr(app.state, "auth_required", False)
         original_supervisor = getattr(app.state, "owner_worker_supervisor", None)
+        original_reader_supervisor = getattr(app.state, "session_reader_supervisor", None)
         original_warmup_tasks = getattr(app.state, "owner_worker_warmup_tasks", None)
         original_warmup_accepting = getattr(app.state, "owner_worker_warmup_accepting", None)
+        original_reader_warmup_tasks = getattr(app.state, "session_reader_warmup_tasks", None)
+        original_reader_warmup_accepting = getattr(app.state, "session_reader_warmup_accepting", None)
         app.state.auth_required = True
 
         class _Handle:
             socket_path = "unused.sock"
             worker_generation = 1
             worker_id = "worker-test"
+            lease_version = 1
+            recovery_generation = 0
+
+            def __init__(self, owner_key):
+                self.owner_key = owner_key
+
+        class _ReaderHandle:
+            socket_path = "unused-reader.sock"
+            reader_generation = 1
+            reader_id = "reader-test"
             lease_version = 1
             recovery_generation = 0
 
@@ -5393,10 +5406,41 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
                 self.start_completed.set()
                 return _Handle(owner.owner_key)
 
+        class _ReaderSupervisor(_Supervisor):
+            def __init__(self):
+                super().__init__()
+                self.active_uses = 0
+
+            def get_or_start(self, owner):
+                self.start_count += 1
+                self.start_entered.set()
+                if not self.release_start.wait(timeout=5):
+                    raise TimeoutError("test reader start remained blocked")
+                if self.start_error is not None:
+                    self.start_completed.set()
+                    raise self.start_error
+                self.owners.append(owner)
+                self.start_completed.set()
+                return _ReaderHandle(owner.owner_key)
+
+            def acquire_use(self, handle):
+                self.active_uses += 1
+                supervisor = self
+
+                class _Use:
+                    def release(self):
+                        supervisor.active_uses -= 1
+
+                return _Use()
+
         self.supervisor = _Supervisor()
+        self.reader_supervisor = _ReaderSupervisor()
         app.state.owner_worker_supervisor = self.supervisor
+        app.state.session_reader_supervisor = self.reader_supervisor
         app.state.owner_worker_warmup_tasks = {}
         app.state.owner_worker_warmup_accepting = True
+        app.state.session_reader_warmup_tasks = {}
+        app.state.session_reader_warmup_accepting = True
 
         async def fake_gate(request, call_next):
             request.state.session = self.session
@@ -5409,19 +5453,19 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         yield
 
         self.supervisor.release_start.set()
+        self.reader_supervisor.release_start.set()
         client_context.__exit__(None, None, None)
         app.state.auth_required = original_auth_required
         app.state.owner_worker_supervisor = original_supervisor
+        app.state.session_reader_supervisor = original_reader_supervisor
         app.state.owner_worker_warmup_tasks = original_warmup_tasks
         app.state.owner_worker_warmup_accepting = original_warmup_accepting
+        app.state.session_reader_warmup_tasks = original_reader_warmup_tasks
+        app.state.session_reader_warmup_accepting = original_reader_warmup_accepting
 
     @pytest.mark.parametrize(
         ("request_path", "worker_path"),
         [
-            (
-                "/api/sessions?limit=5&profile=default&compact=true",
-                "/api/sessions?limit=5&compact=true",
-            ),
             ("/api/sessions/search?q=needle&profile=default", "/api/sessions/search?q=needle"),
             ("/api/sessions/session-1?profile=default", "/api/sessions/session-1"),
             ("/api/sessions/session-1/messages?profile=default", "/api/sessions/session-1/messages"),
@@ -5461,6 +5505,49 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         assert captured["method"] == "GET"
         assert captured["path"] == worker_path
         assert captured["owner_key"] == self.supervisor.owners[0].owner_key
+
+    def test_authenticated_session_list_uses_reader_without_worker_or_control_plane_db(
+        self, monkeypatch
+    ):
+        import hermes_cli.owner_worker.client as owner_client
+        import hermes_cli.session_reader.client as reader_client
+        import hermes_cli.web_server as web_server
+
+        captured = {}
+
+        def fail_reach(*args, **kwargs):
+            raise AssertionError("authenticated session list must use only the Session Reader")
+
+        def fake_request(self, method, path, *, lease, headers=None, content=None):
+            import httpx
+
+            captured.update({
+                "method": method,
+                "path": path,
+                "owner_key": lease.owner_key,
+                "reader_generation": lease.reader_generation,
+            })
+            return httpx.Response(200, json={"sessions": [], "total": 0, "limit": 5, "offset": 0})
+
+        monkeypatch.setattr(web_server, "_open_session_db_for_profile", fail_reach)
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fail_reach)
+        monkeypatch.setattr(reader_client.SessionReaderClient, "request", fake_request)
+        self.supervisor.get_or_start = fail_reach
+
+        response = self.client.get(
+            "/api/sessions?limit=5&profile=default&order=recent&compact=true"
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"sessions": [], "total": 0, "limit": 5, "offset": 0}
+        assert captured == {
+            "method": "GET",
+            "path": "/api/sessions?limit=5&order=recent&compact=true",
+            "owner_key": self.reader_supervisor.owners[0].owner_key,
+            "reader_generation": 1,
+        }
+        assert not self.supervisor.owners
+        assert self.reader_supervisor.active_uses == 0
 
     @pytest.mark.parametrize(
         ("method", "request_path", "payload", "worker_path"),
@@ -5677,7 +5764,6 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
     @pytest.mark.parametrize(
         "path",
         [
-            "/api/sessions?profile=default",
             "/api/sessions/session-1?profile=default",
             "/api/analytics/usage?profile=default",
             "/api/model/info?profile=default",
@@ -5709,6 +5795,32 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         assert response.status_code == 502
         assert len(self.supervisor.owners) == 1
 
+    def test_authenticated_reader_failure_never_falls_back_to_worker_or_local_state(
+        self, monkeypatch
+    ):
+        import hermes_cli.owner_worker.client as owner_client
+        import hermes_cli.session_reader.client as reader_client
+        import hermes_cli.web_server as web_server
+        from hermes_cli.session_reader import SessionReaderHealthError
+
+        def fail_local_or_worker(*args, **kwargs):
+            raise AssertionError("reader failure must not reach local state or Owner Worker")
+
+        def fail_reader_request(*args, **kwargs):
+            raise SessionReaderHealthError("reader unavailable")
+
+        monkeypatch.setattr(web_server, "_open_session_db_for_profile", fail_local_or_worker)
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fail_local_or_worker)
+        monkeypatch.setattr(reader_client.SessionReaderClient, "request", fail_reader_request)
+        self.supervisor.get_or_start = fail_local_or_worker
+
+        response = self.client.get("/api/sessions?profile=default")
+
+        assert response.status_code == 502
+        assert not self.supervisor.owners
+        assert len(self.reader_supervisor.owners) == 1
+        assert self.reader_supervisor.active_uses == 0
+
     @pytest.mark.parametrize("selector", ["owner=other", "owner_home=/tmp/other", "owner_key=ok1_other"])
     def test_authenticated_owner_selectors_are_rejected_before_any_fallback_or_proxy(self, monkeypatch, selector):
         import hermes_cli.owner_worker.client as owner_client
@@ -5725,56 +5837,60 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         assert response.status_code == 400
         assert not self.supervisor.owners
 
-    def test_auth_me_returns_identity_while_exact_owner_warms_in_background(self):
-        self.supervisor.release_start.clear()
+    def test_auth_me_returns_identity_while_exact_reader_warms_in_background(self):
+        self.reader_supervisor.release_start.clear()
 
         response = self.client.get("/api/auth/me")
 
         assert response.status_code == 200
-        assert self.supervisor.start_entered.wait(timeout=2)
-        assert not self.supervisor.start_completed.is_set()
+        assert self.reader_supervisor.start_entered.wait(timeout=2)
+        assert not self.reader_supervisor.start_completed.is_set()
+        assert not self.reader_supervisor.owners
         assert not self.supervisor.owners
-        self.supervisor.release_start.set()
-        assert self.supervisor.start_completed.wait(timeout=2)
+        self.reader_supervisor.release_start.set()
+        assert self.reader_supervisor.start_completed.wait(timeout=2)
         for _ in range(100):
-            if not self.app.state.owner_worker_warmup_tasks:
+            if not self.app.state.session_reader_warmup_tasks:
                 break
             threading.Event().wait(0.01)
-        assert self.supervisor.owners[0].owner_key == response.json()["owner_key"]
-        assert not self.app.state.owner_worker_warmup_tasks
+        assert self.reader_supervisor.owners[0].owner_key == response.json()["owner_key"]
+        assert not self.app.state.session_reader_warmup_tasks
+        assert not self.supervisor.owners
 
-    def test_auth_me_ignores_background_owner_worker_timeout(self, caplog):
-        self.supervisor.start_error = TimeoutError("private startup details")
+    def test_auth_me_ignores_background_reader_timeout(self, caplog):
+        self.reader_supervisor.start_error = TimeoutError("private startup details")
 
-        with caplog.at_level("WARNING", logger="hermes_cli.owner_worker.readiness"):
+        with caplog.at_level("WARNING", logger="hermes_cli.session_reader.readiness"):
             response = self.client.get("/api/auth/me")
-            assert self.supervisor.start_completed.wait(timeout=2)
+            assert self.reader_supervisor.start_completed.wait(timeout=2)
             for _ in range(100):
-                if "reason=startup_timeout" in caplog.text:
+                if "session reader background warmup failed" in caplog.text:
                     break
                 threading.Event().wait(0.01)
 
         assert response.status_code == 200
         assert response.json()["owner_key"]
-        assert "reason=startup_timeout" in caplog.text
+        assert "session reader background warmup failed" in caplog.text
         assert "private startup details" not in caplog.text
+        assert not self.supervisor.owners
 
-    def test_auth_me_coalesces_overlapping_owner_worker_warmups(self):
-        self.supervisor.release_start.clear()
+    def test_auth_me_coalesces_overlapping_reader_warmups(self):
+        self.reader_supervisor.release_start.clear()
 
         first = self.client.get("/api/auth/me")
-        assert self.supervisor.start_entered.wait(timeout=2)
+        assert self.reader_supervisor.start_entered.wait(timeout=2)
         second = self.client.get("/api/auth/me")
 
         assert first.status_code == 200
         assert second.status_code == 200
-        assert self.supervisor.start_count == 1
-        self.supervisor.release_start.set()
-        assert self.supervisor.start_completed.wait(timeout=2)
+        assert self.reader_supervisor.start_count == 1
+        assert not self.supervisor.owners
+        self.reader_supervisor.release_start.set()
+        assert self.reader_supervisor.start_completed.wait(timeout=2)
 
-    def test_authenticated_sessions_route_a_and_b_to_independent_trusted_owner_handles(self, monkeypatch):
+    def test_authenticated_sessions_route_a_and_b_to_independent_trusted_reader_handles(self, monkeypatch):
         import httpx
-        import hermes_cli.owner_worker.client as owner_client
+        import hermes_cli.session_reader.client as reader_client
 
         captured = []
 
@@ -5783,7 +5899,7 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
             captured.append((method, path, lease.owner_key))
             return httpx.Response(200, json={"owner_key": lease.owner_key})
 
-        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fake_request)
+        monkeypatch.setattr(reader_client.SessionReaderClient, "request", fake_request)
 
         response_a = self.client.get("/api/sessions?profile=default")
         session_a = self.session
@@ -5807,9 +5923,10 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         assert captured[0][2] != captured[1][2]
         assert response_a.json()["owner_key"] == captured[0][2]
         assert response_b.json()["owner_key"] == captured[1][2]
-        assert [owner.owner_key for owner in self.supervisor.owners] == [
+        assert [owner.owner_key for owner in self.reader_supervisor.owners] == [
             captured[0][2], captured[1][2]
         ]
+        assert not self.supervisor.owners
 
     def test_authenticated_image_preview_proxies_to_owner_worker(self, monkeypatch):
         import base64
@@ -5846,8 +5963,8 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
             "path": "/api/fs/read-data-url?path=%2Fopt%2Fhermes%2Fshared%2F.hermes%2Fusers%2Fowner%2Fimages%2Fupload.png",
         }
 
-    def test_authenticated_session_proxy_rejects_mismatched_owner_handle_before_request(self, monkeypatch):
-        import hermes_cli.owner_worker.client as owner_client
+    def test_authenticated_session_proxy_rejects_mismatched_reader_handle_before_request(self, monkeypatch):
+        import hermes_cli.session_reader.client as reader_client
 
         captured = {}
         handle = type(
@@ -5856,15 +5973,15 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
             {
                 "owner_key": "ok1_wrong_owner",
                 "socket_path": "unused.sock",
-                "worker_generation": 9,
-                "worker_id": "worker-generation-9",
+                "reader_generation": 9,
+                "reader_id": "reader-generation-9",
                 "lease_version": 7,
                 "recovery_generation": 3,
             },
         )()
 
         class _Supervisor:
-            control_home = self.supervisor.control_home
+            control_home = self.reader_supervisor.control_home
 
             def get_or_start(self, owner):
                 captured["derived_owner"] = owner
@@ -5876,16 +5993,16 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         def fail_request(*args, **kwargs):
             raise AssertionError("owner-mismatched handle must not receive a request")
 
-        self.app.state.owner_worker_supervisor = _Supervisor()
-        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fail_request)
+        self.app.state.session_reader_supervisor = _Supervisor()
+        monkeypatch.setattr(reader_client.SessionReaderClient, "request", fail_request)
 
         response = self.client.get("/api/sessions")
 
         assert response.status_code == 502
         assert captured["derived_owner"].owner_key != handle.owner_key
 
-    def test_authenticated_session_proxy_uses_exact_active_lease_and_releases_it(self, monkeypatch):
-        import hermes_cli.owner_worker.client as owner_client
+    def test_authenticated_session_proxy_uses_exact_active_reader_lease_and_releases_it(self, monkeypatch):
+        import hermes_cli.session_reader.client as reader_client
         from hermes_cli.dashboard_auth.owner_context import owner_context_from_session
 
         owner = owner_context_from_session(self.session)
@@ -5904,15 +6021,15 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
             {
                 "owner_key": owner.owner_key,
                 "socket_path": "unused.sock",
-                "worker_generation": 9,
-                "worker_id": "worker-generation-9",
+                "reader_generation": 9,
+                "reader_id": "reader-generation-9",
                 "lease_version": 7,
                 "recovery_generation": 3,
             },
         )()
 
         class _Supervisor:
-            control_home = self.supervisor.control_home
+            control_home = self.reader_supervisor.control_home
 
             def get_or_start(self, owner):
                 captured["derived_owner"] = owner
@@ -5928,8 +6045,8 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
             captured["capability_lease"] = lease
             return httpx.Response(200, json={"ok": True})
 
-        self.app.state.owner_worker_supervisor = _Supervisor()
-        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fake_request)
+        self.app.state.session_reader_supervisor = _Supervisor()
+        monkeypatch.setattr(reader_client.SessionReaderClient, "request", fake_request)
 
         response = self.client.get("/api/sessions")
 
@@ -5937,24 +6054,27 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         assert captured["derived_owner"].owner_key == handle.owner_key
         capability_lease = captured["capability_lease"]
         assert capability_lease.owner_key == handle.owner_key
-        assert capability_lease.worker_generation == 9
-        assert capability_lease.worker_id == "worker-generation-9"
+        assert capability_lease.reader_generation == 9
+        assert capability_lease.reader_id == "reader-generation-9"
         assert capability_lease.lease_version == 7
         assert capability_lease.recovery_generation == 3
         assert lease.released is True
 
     def test_authenticated_owner_key_query_cannot_select_another_owner(self, monkeypatch):
         import hermes_cli.owner_worker.client as owner_client
+        import hermes_cli.session_reader.client as reader_client
 
         def fail_request(*args, **kwargs):
             raise AssertionError("must not proxy an external owner selector")
 
         monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fail_request)
+        monkeypatch.setattr(reader_client.SessionReaderClient, "request", fail_request)
 
         response = self.client.get("/api/sessions?owner_key=ok1_other")
 
         assert response.status_code == 400
         assert not self.supervisor.owners
+        assert not self.reader_supervisor.owners
 
     @pytest.mark.parametrize(
         "path",
@@ -6058,8 +6178,9 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
             web_server._open_session_db_for_profile(None)
 
         assert exc_info.value.status_code == 500
-        assert "Owner Worker" in str(exc_info.value.detail)
+        assert "owner-scoped session service" in str(exc_info.value.detail)
         assert not self.supervisor.owners
+        assert not self.reader_supervisor.owners
 
     @pytest.mark.parametrize(
         "path",
@@ -6195,69 +6316,67 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         assert response.status_code == 400
         assert not self.supervisor.owners
 
-    def test_authenticated_worker_startup_timeout_returns_503_without_acquiring_lease(self, monkeypatch):
-        import hermes_cli.web_server as web_server
-
+    def test_authenticated_reader_startup_timeout_returns_503_without_acquiring_lease(self, monkeypatch):
         acquired = False
         startup_entered = threading.Event()
 
         class _Supervisor:
-            control_home = self.supervisor.control_home
+            control_home = self.reader_supervisor.control_home
             startup_timeout = 0
 
             def get_or_start(self, owner):
                 startup_entered.set()
-                raise TimeoutError("worker socket did not become healthy")
+                raise TimeoutError("reader socket did not become healthy")
 
             def acquire_use(self, handle):
                 nonlocal acquired
                 acquired = True
                 raise AssertionError("a startup timeout must not acquire a use lease")
 
-        def fail_worker_request(*args, **kwargs):
+        def fail_reader_request(*args, **kwargs):
             raise AssertionError("a startup timeout must not proxy a request")
 
-        self.app.state.owner_worker_supervisor = _Supervisor()
-        monkeypatch.setattr("hermes_cli.owner_worker.client.OwnerWorkerClient.request", fail_worker_request)
+        self.app.state.session_reader_supervisor = _Supervisor()
+        monkeypatch.setattr("hermes_cli.session_reader.client.SessionReaderClient.request", fail_reader_request)
 
         response = self.client.get("/api/sessions")
 
         assert startup_entered.is_set()
         assert response.status_code == 503
-        assert response.json()["detail"] == "Owner worker startup timed out"
+        assert response.json()["detail"] == "Session reader startup timed out"
         assert acquired is False
 
-    def test_authenticated_worker_unavailable_returns_503_without_acquiring_lease(self, monkeypatch):
-        from hermes_cli.owner_worker import OwnerWorkerUnavailableError
+    def test_authenticated_reader_unavailable_returns_503_without_acquiring_lease(self, monkeypatch):
+        from hermes_cli.session_reader import SessionReaderUnavailableError
 
         acquired = False
 
         class _Supervisor:
-            control_home = self.supervisor.control_home
+            control_home = self.reader_supervisor.control_home
 
             def get_or_start(self, owner):
-                raise OwnerWorkerUnavailableError("worker bootstrap failed")
+                raise SessionReaderUnavailableError("reader bootstrap failed")
 
             def acquire_use(self, handle):
                 nonlocal acquired
                 acquired = True
                 raise AssertionError("a failed startup must not acquire a use lease")
 
-        def fail_worker_request(*args, **kwargs):
+        def fail_reader_request(*args, **kwargs):
             raise AssertionError("a failed startup must not proxy a request")
 
-        self.app.state.owner_worker_supervisor = _Supervisor()
-        monkeypatch.setattr("hermes_cli.owner_worker.client.OwnerWorkerClient.request", fail_worker_request)
+        self.app.state.session_reader_supervisor = _Supervisor()
+        monkeypatch.setattr("hermes_cli.session_reader.client.SessionReaderClient.request", fail_reader_request)
 
         response = self.client.get("/api/sessions")
 
         assert response.status_code == 503
-        assert response.json()["detail"] == "Owner worker is unavailable"
+        assert response.json()["detail"] == "Session reader is unavailable"
         assert acquired is False
 
-    def test_authenticated_worker_response_status_is_preserved_and_releases_lease(self, monkeypatch):
+    def test_authenticated_reader_response_status_is_preserved_and_releases_lease(self, monkeypatch):
         import httpx
-        import hermes_cli.owner_worker.client as owner_client
+        import hermes_cli.session_reader.client as reader_client
         from hermes_cli.dashboard_auth.owner_context import owner_context_from_session
 
         owner = owner_context_from_session(self.session)
@@ -6268,8 +6387,8 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
             {
                 "owner_key": owner.owner_key,
                 "socket_path": "unused.sock",
-                "worker_generation": 9,
-                "worker_id": "worker-generation-9",
+                "reader_generation": 9,
+                "reader_id": "reader-generation-9",
                 "lease_version": 7,
                 "recovery_generation": 3,
             },
@@ -6281,7 +6400,7 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
                 released = True
 
         class _Supervisor:
-            control_home = self.supervisor.control_home
+            control_home = self.reader_supervisor.control_home
 
             def get_or_start(self, requested_owner):
                 assert requested_owner.owner_key == owner.owner_key
@@ -6291,13 +6410,13 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
                 assert requested_handle is handle
                 return _Lease()
 
-        def worker_error(self, method, path, *, lease, headers=None, content=None):
+        def reader_error(self, method, path, *, lease, headers=None, content=None):
             assert method == "GET"
             assert path == "/api/sessions?limit=30&offset=0&order=recent"
             return httpx.Response(500, json={"detail": "owner database failure"})
 
-        self.app.state.owner_worker_supervisor = _Supervisor()
-        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", worker_error)
+        self.app.state.session_reader_supervisor = _Supervisor()
+        monkeypatch.setattr(reader_client.SessionReaderClient, "request", reader_error)
 
         response = self.client.get("/api/sessions?limit=30&offset=0&order=recent")
 
@@ -6305,13 +6424,13 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         assert response.json() == {"detail": "owner database failure"}
         assert released is True
 
-    def test_authenticated_proxy_internal_error_is_500(self, monkeypatch):
-        import hermes_cli.owner_worker.client as owner_client
+    def test_authenticated_reader_proxy_internal_error_is_500(self, monkeypatch):
+        import hermes_cli.session_reader.client as reader_client
 
         def unexpected_failure(*args, **kwargs):
             raise RuntimeError("control-plane defect")
 
-        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", unexpected_failure)
+        monkeypatch.setattr(reader_client.SessionReaderClient, "request", unexpected_failure)
 
         response = self.client.get("/api/sessions")
 

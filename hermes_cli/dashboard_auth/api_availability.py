@@ -16,6 +16,7 @@ class AuthenticatedApiBucket(str, Enum):
     PUBLIC_BOOTSTRAP = "public_bootstrap"
     CONTROL_PLANE_AUTH = "control_plane_auth"
     OWNER_WORKER = "owner_worker"
+    SESSION_READER = "session_reader"
     LOCAL_ONLY_OR_UNAVAILABLE = "local_only_or_unavailable"
     TOKEN_AUTH_ONLY = "token_auth_only"
 
@@ -43,7 +44,6 @@ OWNER_WORKER_ROUTES: frozenset[tuple[str, str]] = frozenset({
     ("GET", "/api/logs"),
     ("GET", "/api/analytics/usage"),
     ("GET", "/api/analytics/models"),
-    ("GET", "/api/sessions"),
     ("GET", "/api/sessions/search"),
     ("POST", "/api/sessions/bulk-delete"),
     ("GET", "/api/sessions/empty/count"),
@@ -61,6 +61,7 @@ OWNER_WORKER_ROUTES: frozenset[tuple[str, str]] = frozenset({
 })
 # Compatibility export for callers that only need the known path inventory.
 OWNER_WORKER_PATHS: frozenset[str] = frozenset(path for _method, path in OWNER_WORKER_ROUTES)
+SESSION_READER_ROUTES: frozenset[tuple[str, str]] = frozenset({("GET", "/api/sessions")})
 _SESSION_ITEM_SUFFIXES: frozenset[str] = frozenset({
     "latest-descendant",
     "messages",
@@ -117,6 +118,8 @@ def classify_authenticated_api(
         return AuthenticatedApiDecision(bucket, True, bucket.value)
     if path in CONTROL_PLANE_AUTH_PATHS or any(path.startswith(prefix) for prefix in CONTROL_PLANE_AUTH_PREFIXES):
         return AuthenticatedApiDecision(AuthenticatedApiBucket.CONTROL_PLANE_AUTH, True, "control-plane auth")
+    if (method, path) in SESSION_READER_ROUTES:
+        return AuthenticatedApiDecision(AuthenticatedApiBucket.SESSION_READER, True, "session-reader routed")
     if (method, path) in OWNER_WORKER_ROUTES or (
         _session_item_path(path)
         and method in {"GET", "PATCH", "DELETE"}
@@ -148,3 +151,8 @@ def authenticated_control_plane_api_allowed(path: str, *, method: str = "GET") -
 def authenticated_owner_worker_api_allowed(path: str, *, method: str = "GET") -> bool:
     decision = classify_authenticated_api(path, method=method)
     return decision.allowed and decision.bucket == AuthenticatedApiBucket.OWNER_WORKER
+
+
+def authenticated_session_reader_api_allowed(path: str, *, method: str = "GET") -> bool:
+    decision = classify_authenticated_api(path, method=method)
+    return decision.allowed and decision.bucket == AuthenticatedApiBucket.SESSION_READER

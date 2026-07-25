@@ -277,7 +277,7 @@ def test_gated_require_token_routes_reject_cookie_session_in_owner_mode(
         ("/api/skills/content", True),
         ("/api/skills/hub/search", False),
         ("/api/tools/toolsets", True),
-        ("/api/sessions", True),
+        ("/api/sessions", False),
         ("/api/sessions/abc123/messages", True),
         ("/api/sessions/abc123/export", True),
         ("/api/analytics/usage", True),
@@ -322,6 +322,22 @@ def test_authenticated_owner_worker_routes_are_method_and_path_exact(method, pat
     from hermes_cli.dashboard_auth.api_availability import authenticated_owner_worker_api_allowed
 
     assert authenticated_owner_worker_api_allowed(path, method=method) is False
+
+
+def test_authenticated_session_list_has_dedicated_reader_bucket():
+    from hermes_cli.dashboard_auth.api_availability import (
+        AuthenticatedApiBucket,
+        authenticated_owner_worker_api_allowed,
+        authenticated_session_reader_api_allowed,
+        classify_authenticated_api,
+    )
+
+    decision = classify_authenticated_api("/api/sessions", method="GET")
+    assert decision.allowed is True
+    assert decision.bucket == AuthenticatedApiBucket.SESSION_READER
+    assert authenticated_session_reader_api_allowed("/api/sessions") is True
+    assert authenticated_owner_worker_api_allowed("/api/sessions") is False
+    assert authenticated_session_reader_api_allowed("/api/sessions", method="POST") is False
 
 
 @pytest.mark.parametrize(
