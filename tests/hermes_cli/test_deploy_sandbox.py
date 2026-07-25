@@ -152,8 +152,8 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert 'checks[check] = "passed"' in powerpoint_source
     assert '"deadline_enforced"' in powerpoint_source
     assert '"output_enforced"' in powerpoint_source
-    assert "CgroupV2Manager(deployment_policy.resource_policy)" in powerpoint_source
-    assert 'checks["startup_recovery"]' in powerpoint_source
+    assert "recover_stale_scopes=False" in powerpoint_source
+    assert 'checks["non_destructive_cgroup_attach"]' in powerpoint_source
     assert "resource_controller=resource_controller" in powerpoint_source
     assert 'checks["executor_nofile_limit"]' in powerpoint_source
     assert 'checks["high_fd_launch_pressure"]' in powerpoint_source

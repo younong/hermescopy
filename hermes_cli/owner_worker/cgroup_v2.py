@@ -336,11 +336,14 @@ class CgroupV2Manager:
         io: CgroupV2IO | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
+        recover_stale_scopes: bool = True,
     ) -> None:
         if not isinstance(policy, SandboxResourcePolicy):
             raise CgroupV2Unavailable("sandbox resource policy is required")
         if policy.required_controllers != _REQUIRED_CONTROLLERS:
             raise CgroupV2Unavailable("exact cpu, memory, and pids controllers are required")
+        if not isinstance(recover_stale_scopes, bool):
+            raise CgroupV2Unavailable("stale scope recovery mode must be boolean")
         self.policy = policy
         self._io = io or DirectoryFdCgroupV2IO(policy.cgroup_root)
         if Path(self._io.root) != policy.cgroup_root:
@@ -351,6 +354,7 @@ class CgroupV2Manager:
         self._active: dict[tuple[str, ...], CgroupScopeLease] = {}
         self._pool = (_POOL_NAME,)
         self._startup_cleanup_count = 0
+        self._recover_stale_scopes = recover_stale_scopes
         self._initialize_pool()
 
     @property
@@ -498,8 +502,10 @@ class CgroupV2Manager:
                 # The service unit's control-group kill normally empties this
                 # subtree, but a manager restart must deterministically recover
                 # any managed scopes that survived an abrupt predecessor exit.
-                # Unknown names still fail closed inside cleanup_stale_scopes.
-                self._startup_cleanup_count = self.cleanup_stale_scopes()
+                # Concurrent diagnostic managers disable recovery so they cannot
+                # terminate scopes owned by the live Dashboard manager.
+                if self._recover_stale_scopes:
+                    self._startup_cleanup_count = self.cleanup_stale_scopes()
                 self._inspect_hierarchy()
             except (CgroupV2Unavailable, CgroupCleanupFailed):
                 raise

@@ -127,6 +127,8 @@ def test_authenticated_smoke_dispatches_terminal_through_supervisor_source():
     source = SMOKE.read_text(encoding="utf-8")
 
     assert "host_sandbox_deployment_policy(policy_path)" in source
+    assert "recover_stale_scopes=False" in source
+    assert 'checks["non_destructive_cgroup_attach"] = "passed"' in source
     assert "os.chdir(runtime_paths.default_workspace)" in source
     assert "os.chdir(original_cwd)" in source
     assert 'function_name="terminal"' in source
