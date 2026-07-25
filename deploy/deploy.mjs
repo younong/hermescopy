@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
@@ -494,7 +494,38 @@ export function prepareCreateTag(tag, { allowNonMain = false, dryRun = false, cw
   return { branch, sourceCommit: preparedCommit };
 }
 
-function createArchive(args, { dryRun }) {
+export function createReleaseArchive(buildDir, archivePath, { dryRun = false } = {}) {
+  run(
+    "tar",
+    [
+      "-czf",
+      archivePath,
+      "--no-xattrs",
+      "--exclude=._*",
+      "--exclude=*/._*",
+      "--exclude=./node_modules",
+      "--exclude=./web/node_modules",
+      "--exclude=./ui-tui/node_modules",
+      "--exclude=./apps/*/node_modules",
+      "--exclude=./deploy/powerpoint-runtime/runtime-modules/.package-lock.json",
+      "--exclude=./tests",
+      "--exclude=./website",
+      "--exclude=./apps",
+      "--exclude=./.github",
+      "--exclude=./docs",
+      "-C",
+      buildDir,
+      ".",
+    ],
+    { dryRun, env: { COPYFILE_DISABLE: "1" } },
+  );
+  if (!dryRun) {
+    const archiveBytes = statSync(archivePath).size;
+    console.log(`Release archive: ${archiveBytes} bytes (${(archiveBytes / 1024 / 1024).toFixed(2)} MiB)`);
+  }
+}
+
+export function createArchive(args, { dryRun }) {
   const { releaseId, sourceCommit, sourceKind, sourceTag } = args;
   const tmp = dryRun ? null : mkdtempSync(path.join(tmpdir(), "hermes-deploy-"));
   const buildDir = dryRun ? path.join(tmpdir(), `hermes-${releaseId}-artifact`) : path.join(tmp, "artifact");
@@ -524,25 +555,7 @@ function createArchive(args, { dryRun }) {
     ],
     { dryRun },
   );
-  run(
-    "tar",
-    [
-      "-czf",
-      archivePath,
-      "--no-xattrs",
-      "--exclude=._*",
-      "--exclude=*/._*",
-      "--exclude=./node_modules",
-      "--exclude=./web/node_modules",
-      "--exclude=./ui-tui/node_modules",
-      "--exclude=./apps/*/node_modules",
-      "--exclude=./deploy/powerpoint-runtime/runtime-modules/.package-lock.json",
-      "-C",
-      buildDir,
-      ".",
-    ],
-    { dryRun, env: archiveEnv },
-  );
+  createReleaseArchive(buildDir, archivePath, { dryRun });
   return { tmp, archivePath };
 }
 

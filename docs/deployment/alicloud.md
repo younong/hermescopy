@@ -1,6 +1,6 @@
 # 阿里云部署
 
-Hermes 的阿里云生产部署使用 `deploy/` 目录里的 Node.js 工具。常规发布先确定一个 Git tag，再在本机基于该 tag 构建 web/ui-tui 和 locked PptxGenJS 产物，最后把源码 + 构建产物上传到服务器。无 tag 的受限例外是 `--ref <40-hex-commit-sha>`：它只接受已推送到 `origin` 的不可变完整 commit SHA，绝不会发布当前工作区或可移动分支。服务器只负责解包、创建按 locked Python/PowerPoint 输入与架构标识的不可变 runtime、配置 authenticated Tool Executor 沙箱、切换 current symlink，并通过 systemd 直接运行 Hermes gateway 和 dashboard。
+Hermes 的阿里云生产部署使用 `deploy/` 目录里的 Node.js 工具。常规发布先确定一个 Git tag，再在本机基于该 tag 构建 web/ui-tui 和 locked PptxGenJS 产物，最后把生产运行源码 + 本机预构建产物上传到服务器；测试、官网/桌面应用源码、GitHub 元数据和文档等非运行目录会在构建完成后从归档中省略。无 tag 的受限例外是 `--ref <40-hex-commit-sha>`：它只接受已推送到 `origin` 的不可变完整 commit SHA，绝不会发布当前工作区或可移动分支。服务器只负责解包、创建按 locked Python/PowerPoint 输入与架构标识的不可变 runtime、配置 authenticated Tool Executor 沙箱、切换 current symlink，并通过 systemd 直接运行 Hermes gateway 和 dashboard。
 
 服务器默认配置：
 
@@ -158,7 +158,7 @@ npm run deploy -- --create-tag v2026.7.4-test --allow-non-main
 
 1. 在本机基于 tag 解出干净源码。
 2. 在本机安装 Node workspace 依赖并构建 web dashboard 和 TUI。
-3. 把源码 + 构建产物打包上传到服务器临时目录，再解包到 `/opt/hermes/releases/<tag>`。
+3. 把生产运行源码 + 本机预构建产物打包上传到服务器临时目录；归档省略 `tests/`、`website/`、`apps/`、`.github/` 和 `docs/`，再解包到 `/opt/hermes/releases/<tag>`。
 4. 成功解包后删除本次上传的 `/opt/hermes/tmp/hermes-<tag>.tar.gz`。
 5. 在服务器上按 locked Python/PowerPoint 输入与架构创建或复用不可变 runtime。
 6. 校验 Bubblewrap 能力，安装 root-owned seccomp artifact 和 `/etc/hermes/executor-sandbox.json`，执行 policy preflight。
