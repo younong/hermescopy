@@ -4,7 +4,11 @@ import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "@/lib/api";
-import { fetchSessionsOverview, SessionMessageList } from "./SessionsPage";
+import {
+  fetchSessionsOverview,
+  scheduleSessionsOverviewPoll,
+  SessionMessageList,
+} from "./SessionsPage";
 
 beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
@@ -29,6 +33,35 @@ describe("fetchSessionsOverview", () => {
     await fetchSessionsOverview();
 
     expect(getSessions).toHaveBeenCalledWith(30, 0, undefined, "recent", true);
+  });
+});
+
+describe("scheduleSessionsOverviewPoll", () => {
+  it("does not overlap polls when one request is still pending", async () => {
+    vi.useFakeTimers();
+    let resolveFirst: (() => void) | undefined;
+    const poll = vi
+      .fn<() => Promise<void>>()
+      .mockImplementationOnce(
+        () => new Promise<void>((resolve) => {
+          resolveFirst = resolve;
+        }),
+      )
+      .mockResolvedValue(undefined);
+
+    const stop = scheduleSessionsOverviewPoll(poll);
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(poll).toHaveBeenCalledTimes(1);
+
+    resolveFirst?.();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(poll).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(poll).toHaveBeenCalledTimes(2);
+
+    stop();
+    vi.useRealTimers();
   });
 });
 

@@ -1,106 +1,199 @@
-"""Authenticated Session Reader readiness and warmup boundary."""
+"""Background lifecycle coordination for authenticated Session Readers."""
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from dataclasses import dataclass
 from typing import Any
 
-from fastapi import HTTPException, Request
-
-from hermes_cli.dashboard_auth.owner_context import ensure_owner_home, owner_context_from_session
+from hermes_cli.dashboard_auth.owner_context import owner_context_from_session
 from .client import SessionReaderHealthError
 from .supervisor import SessionReaderStartupError, SessionReaderUnavailableError
 
 _log = logging.getLogger(__name__)
-_TASKS_ATTR = "session_reader_warmup_tasks"
-_ACCEPTING_ATTR = "session_reader_warmup_accepting"
+_LIFECYCLE_ATTR = "session_reader_lifecycle"
 
 
-def initialize_session_reader_warmups(app: Any) -> None:
-    setattr(app.state, _TASKS_ATTR, {})
-    setattr(app.state, _ACCEPTING_ATTR, True)
+@dataclass
+class _ObservedOwner:
+    owner: Any
+    last_observed_at: float
+    failures: int = 0
+    retry_at: float = 0.0
 
 
-def _state(app: Any) -> tuple[dict[str, asyncio.Task[None]], bool]:
-    tasks = getattr(app.state, _TASKS_ATTR, None)
-    if tasks is None:
-        tasks = {}
-        setattr(app.state, _TASKS_ATTR, tasks)
-        setattr(app.state, _ACCEPTING_ATTR, True)
-    return tasks, bool(getattr(app.state, _ACCEPTING_ATTR, True))
+class SessionReaderLifecycle:
+    """Own Reader startup and maintenance outside the business request path."""
 
+    def __init__(
+        self,
+        supervisor: Any,
+        *,
+        maintenance_interval: float = 1.0,
+        initial_backoff: float = 0.1,
+        max_backoff: float = 5.0,
+    ) -> None:
+        self.supervisor = supervisor
+        self.maintenance_interval = max(0.05, float(maintenance_interval))
+        self.initial_backoff = max(0.01, float(initial_backoff))
+        self.max_backoff = max(self.initial_backoff, float(max_backoff))
+        self._owners: dict[str, _ObservedOwner] = {}
+        self._startups: dict[str, asyncio.Task[None]] = {}
+        self._accepting = True
+        self._wake = asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
 
-def _start(supervisor: Any, owner: Any) -> Any:
-    ensure_owner_home(owner)
-    handle = supervisor.get_or_start(owner)
-    if str(handle.owner_key) != str(owner.owner_key):
-        raise SessionReaderHealthError("session reader returned a mismatched handle")
-    return handle
+    def start(self) -> None:
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(
+                self._run(),
+                name="session-reader-lifecycle",
+            )
 
+    def observe_verified_owner(self, owner: Any) -> None:
+        if not self._accepting:
+            return
+        owner_key = str(owner.owner_key)
+        now = time.monotonic()
+        observed = self._owners.get(owner_key)
+        if observed is None:
+            self._owners[owner_key] = _ObservedOwner(owner=owner, last_observed_at=now)
+        else:
+            observed.owner = owner
+            observed.last_observed_at = now
+        self._wake.set()
+        self._schedule_start(owner_key)
 
-async def start_session_reader(supervisor: Any, owner: Any) -> Any:
-    return await asyncio.to_thread(_start, supervisor, owner)
+    def report_request_failure(self, lease: Any, reason: str) -> None:
+        """Wake maintenance only when the failed fence is still locally current."""
+        if not self._accepting:
+            return
+        owner_key = str(lease.owner_key)
+        if not self.supervisor.report_request_failure(lease):
+            return
+        _log.warning(
+            "session reader request failure owner=%s generation=%s reason=%s",
+            owner_key,
+            lease.reader_generation,
+            reason,
+        )
+        self._wake.set()
 
+    def _schedule_start(self, owner_key: str) -> None:
+        observed = self._owners.get(owner_key)
+        if observed is None or observed.retry_at > time.monotonic():
+            return
+        existing = self._startups.get(owner_key)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(
+            self._ensure_started(owner_key, observed),
+            name=f"session-reader-start:{owner_key}",
+        )
+        self._startups[owner_key] = task
 
-def schedule_session_reader_warmup(
-    app: Any, *, owner: Any, supervisor: Any | None = None
-) -> asyncio.Task[None] | None:
-    tasks, accepting = _state(app)
-    if not accepting:
-        return None
-    supervisor = supervisor or getattr(app.state, "session_reader_supervisor", None)
-    if supervisor is None:
-        return None
-    owner_key = str(owner.owner_key)
-    existing = tasks.get(owner_key)
-    if existing is not None and not existing.done():
-        return existing
+        def discard(completed: asyncio.Task[None]) -> None:
+            if self._startups.get(owner_key) is completed:
+                self._startups.pop(owner_key, None)
 
-    async def warm() -> None:
+        task.add_done_callback(discard)
+
+    async def _ensure_started(self, owner_key: str, observed: _ObservedOwner) -> None:
         try:
-            await start_session_reader(supervisor, owner)
-        except (TimeoutError, SessionReaderUnavailableError, SessionReaderStartupError, SessionReaderHealthError):
-            _log.warning("session reader background warmup failed owner=%s", owner_key)
+            handle = await asyncio.to_thread(
+                self.supervisor.ensure_started,
+                observed.owner,
+            )
+            if str(handle.owner_key) != owner_key:
+                raise SessionReaderHealthError("session reader returned a mismatched handle")
+            observed.failures = 0
+            observed.retry_at = 0.0
+        except asyncio.CancelledError:
+            raise
+        except (
+            TimeoutError,
+            SessionReaderUnavailableError,
+            SessionReaderStartupError,
+            SessionReaderHealthError,
+        ):
+            observed.failures += 1
+            delay = min(
+                self.max_backoff,
+                self.initial_backoff * (2 ** min(observed.failures - 1, 8)),
+            )
+            observed.retry_at = time.monotonic() + delay
+            _log.warning("session reader background startup failed owner=%s", owner_key)
         except Exception as exc:
+            observed.failures += 1
+            observed.retry_at = time.monotonic() + self.max_backoff
             _log.warning(
-                "session reader background warmup failed owner=%s error_type=%s",
+                "session reader background startup failed owner=%s error_type=%s",
                 owner_key,
                 type(exc).__name__,
             )
 
-    task = asyncio.create_task(warm(), name=f"session-reader-warmup:{owner_key}")
-    tasks[owner_key] = task
+    async def _run(self) -> None:
+        while self._accepting:
+            try:
+                await asyncio.wait_for(
+                    self._wake.wait(),
+                    timeout=self.maintenance_interval,
+                )
+            except asyncio.TimeoutError:
+                pass
+            self._wake.clear()
+            try:
+                await asyncio.to_thread(self.supervisor.maintenance_tick)
+            except Exception:
+                _log.exception("session reader lifecycle maintenance failed")
+            now = time.monotonic()
+            desired_ttl = max(
+                self.maintenance_interval,
+                float(getattr(self.supervisor, "idle_timeout", 1800.0)),
+            )
+            for owner_key, observed in tuple(self._owners.items()):
+                if now - observed.last_observed_at >= desired_ttl:
+                    self._owners.pop(owner_key, None)
+                    continue
+                self._schedule_start(owner_key)
 
-    def discard(completed: asyncio.Task[None]) -> None:
-        if tasks.get(owner_key) is completed:
-            tasks.pop(owner_key, None)
+    async def close(self) -> None:
+        self._accepting = False
+        self._wake.set()
+        if self._task is not None:
+            self._task.cancel()
+        for task in tuple(self._startups.values()):
+            task.cancel()
+        tasks = tuple(self._startups.values())
+        if self._task is not None:
+            tasks = (self._task, *tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._startups.clear()
+        self._owners.clear()
 
-    task.add_done_callback(discard)
-    return task
+
+def initialize_session_reader_warmups(app: Any) -> None:
+    supervisor = getattr(app.state, "session_reader_supervisor", None)
+    lifecycle = SessionReaderLifecycle(supervisor) if supervisor is not None else None
+    setattr(app.state, _LIFECYCLE_ATTR, lifecycle)
+    if lifecycle is not None:
+        lifecycle.start()
+
+
+def observe_verified_session(app: Any, session: Any) -> None:
+    lifecycle = getattr(app.state, _LIFECYCLE_ATTR, None)
+    if lifecycle is None:
+        return
+    try:
+        lifecycle.observe_verified_owner(owner_context_from_session(session))
+    except Exception:
+        _log.exception("session reader owner observation failed")
 
 
 async def drain_session_reader_warmups(app: Any) -> None:
-    tasks, _accepting = _state(app)
-    setattr(app.state, _ACCEPTING_ATTR, False)
-    if tasks:
-        await asyncio.gather(*tuple(tasks.values()), return_exceptions=True)
-    tasks.clear()
-
-
-async def ensure_session_reader_ready(request: Request) -> tuple[Any, Any]:
-    session = getattr(request.state, "session", None)
-    if session is None:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    owner = owner_context_from_session(session)
-    supervisor = getattr(request.app.state, "session_reader_supervisor", None)
-    if supervisor is None:
-        raise HTTPException(status_code=503, detail="Session reader supervisor is unavailable")
-    try:
-        handle = await start_session_reader(supervisor, owner)
-    except TimeoutError as exc:
-        raise HTTPException(status_code=503, detail="Session reader startup timed out") from exc
-    except (SessionReaderUnavailableError, SessionReaderStartupError) as exc:
-        raise HTTPException(status_code=503, detail="Session reader is unavailable") from exc
-    except SessionReaderHealthError as exc:
-        raise HTTPException(status_code=502, detail="Session reader request failed") from exc
-    return owner, handle
+    lifecycle = getattr(app.state, _LIFECYCLE_ATTR, None)
+    if lifecycle is not None:
+        await lifecycle.close()
+    setattr(app.state, _LIFECYCLE_ATTR, None)

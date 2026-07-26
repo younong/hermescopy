@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +53,61 @@ def session_reader_runtime_dir(owner_home: str | Path, reader_generation: int) -
 def session_reader_socket_path(owner_home: str | Path, reader_generation: int) -> Path:
     """Return the sole authenticated Reader socket for a generation."""
     return session_reader_runtime_dir(owner_home, reader_generation) / "s"
+
+
+def _prepare_private_directory(path: Path, *, parent_device: int) -> os.stat_result:
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        path.mkdir(mode=0o700)
+        before = path.lstat()
+    if not stat.S_ISDIR(before.st_mode):
+        raise RuntimeError(f"session reader path must be a directory: {path}")
+    if os.name != "nt" and before.st_mode & 0o077:
+        raise RuntimeError(f"session reader path has unsafe permissions: {path}")
+    if hasattr(os, "getuid") and before.st_uid != os.getuid():
+        raise RuntimeError(f"session reader path has unexpected ownership: {path}")
+    if before.st_dev != parent_device:
+        raise RuntimeError(f"session reader path is on an unexpected mount: {path}")
+    after = path.lstat()
+    if (before.st_dev, before.st_ino, stat.S_IFMT(before.st_mode)) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode & 0o170000,
+    ):
+        raise RuntimeError(f"session reader path changed during preparation: {path}")
+    return after
+
+
+def prepare_session_reader_runtime(
+    owner_home: str | Path,
+    reader_generation: int,
+) -> SessionReaderRuntimePaths:
+    """Create only the owner-local directories required by one Reader."""
+    home = Path(owner_home).expanduser().resolve()
+    home_info = home.lstat()
+    if not stat.S_ISDIR(home_info.st_mode):
+        raise RuntimeError("session reader owner home must be a directory")
+    paths = session_reader_runtime_paths(
+        owner_home=home,
+        reader_generation=reader_generation,
+    )
+    runtime = home / "runtime"
+    runtime_info = _prepare_private_directory(runtime, parent_device=home_info.st_dev)
+    _prepare_private_directory(runtime / "logs", parent_device=runtime_info.st_dev)
+    readers = runtime / "r"
+    readers_info = _prepare_private_directory(readers, parent_device=runtime_info.st_dev)
+    _prepare_private_directory(
+        paths.reader_runtime_dir,
+        parent_device=readers_info.st_dev,
+    )
+    for label, path in (
+        ("runtime", runtime),
+        ("runtime_logs", runtime / "logs"),
+        ("reader_runtime", paths.reader_runtime_dir),
+    ):
+        _require_under(path, home, label)
+    return paths
 
 
 def session_reader_env_for(

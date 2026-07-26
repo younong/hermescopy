@@ -572,21 +572,19 @@ def _release_owner_worker_iter(iterator: Any, lease: Any):
         lease.release()
 
 
-def _session_reader_authority_lease(handle: Any):
-    from hermes_cli.dashboard_auth.authority import ReaderLeaseState, SessionReaderAuthorityLease
-
-    return SessionReaderAuthorityLease(
-        owner_key=str(handle.owner_key),
-        reader_generation=int(handle.reader_generation),
-        reader_id=str(handle.reader_id),
-        state=ReaderLeaseState.ACTIVE,
-        lease_version=int(handle.lease_version),
-        recovery_generation=int(handle.recovery_generation),
+def _session_reader_unavailable_response() -> Response:
+    return JSONResponse(
+        {
+            "error": "session_reader_unavailable",
+            "detail": "Session reader is unavailable",
+        },
+        status_code=503,
+        headers={"Retry-After": "1"},
     )
 
 
 async def _proxy_authenticated_session_reader_http(request: Request) -> Response:
-    """Forward authenticated session-list traffic to the owner Reader only."""
+    """Forward authenticated read-only session traffic to the owner Reader."""
     latency_started_at = time.monotonic()
     trace_id = request.headers.get("x-request-id", "")
     log_latency_stage(_log, trace_id=trace_id, surface="session-reader-proxy", stage="request.received")
@@ -598,22 +596,26 @@ async def _proxy_authenticated_session_reader_http(request: Request) -> Response
         SessionReaderHealthError,
         SessionReaderUnavailableError,
     )
-    from hermes_cli.session_reader.readiness import ensure_session_reader_ready
+    from hermes_cli.dashboard_auth.owner_context import owner_context_from_session
 
     _reject_authenticated_profile_query_params(request)
     supervisor = getattr(request.app.state, "session_reader_supervisor", None)
+    lifecycle = getattr(request.app.state, "session_reader_lifecycle", None)
     use: Any | None = None
     try:
+        if supervisor is None:
+            return _session_reader_unavailable_response()
+        owner = owner_context_from_session(request.state.session)
         stage_started_at = time.monotonic()
-        _owner, handle = await ensure_session_reader_ready(request)
+        use = supervisor.acquire_active(owner)
+        handle = use.handle
         log_latency_stage(
             _log,
             trace_id=trace_id,
             surface="session-reader-proxy",
-            stage="session_reader.ready",
+            stage="session_reader.acquired",
             started_at=stage_started_at,
         )
-        use = _acquire_owner_worker_use(supervisor, handle)
         reader_path = request.url.path
         query = _owner_worker_query_string(request.url.query)
         if query:
@@ -632,9 +634,11 @@ async def _proxy_authenticated_session_reader_http(request: Request) -> Response
             ).request,
             request.method,
             reader_path,
-            lease=_session_reader_authority_lease(handle),
+            lease=use.lease,
             headers=forwarded_headers,
         )
+        if response.status_code == 401:
+            raise SessionReaderHealthError("session reader rejected its exact capability")
         log_latency_stage(
             _log,
             trace_id=trace_id,
@@ -647,18 +651,16 @@ async def _proxy_authenticated_session_reader_http(request: Request) -> Response
         if use is not None:
             use.release()
         raise
-    except TimeoutError as exc:
+    except SessionReaderUnavailableError:
         if use is not None:
             use.release()
-        raise HTTPException(status_code=503, detail="Session reader startup timed out") from exc
-    except SessionReaderUnavailableError as exc:
+        return _session_reader_unavailable_response()
+    except SessionReaderHealthError:
         if use is not None:
+            if lifecycle is not None:
+                lifecycle.report_request_failure(use.lease, "transport")
             use.release()
-        raise HTTPException(status_code=503, detail="Session reader is unavailable") from exc
-    except SessionReaderHealthError as exc:
-        if use is not None:
-            use.release()
-        raise HTTPException(status_code=502, detail="Session reader request failed") from exc
+        return _session_reader_unavailable_response()
     except Exception as exc:
         if use is not None:
             use.release()
@@ -4303,7 +4305,7 @@ async def search_sessions(request: Request, q: str = "", limit: int = 20, profil
     """
     if _authenticated_owner_request(request):
         _reject_authenticated_profile_param(profile)
-        return await _proxy_authenticated_owner_http(request)
+        return await _proxy_authenticated_session_reader_http(request)
     if not q or not q.strip():
         return {"results": []}
     try:
@@ -8346,7 +8348,7 @@ async def count_empty_sessions_endpoint(request: Request, profile: Optional[str]
     """
     if _authenticated_owner_request(request):
         _reject_authenticated_profile_param(profile)
-        return await _proxy_authenticated_owner_http(request)
+        return await _proxy_authenticated_session_reader_http(request)
     db = _open_session_db_for_profile(profile)
     try:
         return {"count": db.count_empty_sessions()}
@@ -8394,7 +8396,7 @@ async def get_session_stats(request: Request, profile: Optional[str] = None):
     """
     if _authenticated_owner_request(request):
         _reject_authenticated_profile_param(profile)
-        return await _proxy_authenticated_owner_http(request)
+        return await _proxy_authenticated_session_reader_http(request)
     db = _open_session_db_for_profile(profile)
     try:
         total = db.session_count(include_archived=True)
@@ -8448,7 +8450,7 @@ def _open_session_db_for_profile(profile: Optional[str], *, request: Request | N
 async def get_session_detail(request: Request, session_id: str, profile: Optional[str] = None):
     if _authenticated_owner_request(request):
         _reject_authenticated_profile_param(profile)
-        return await _proxy_authenticated_owner_http(request)
+        return await _proxy_authenticated_session_reader_http(request)
     db = _open_session_db_for_profile(profile)
     try:
         sid = db.resolve_session_id(session_id)
@@ -8466,7 +8468,7 @@ async def get_session_detail(request: Request, session_id: str, profile: Optiona
 @app.get("/api/sessions/{session_id}/latest-descendant")
 async def get_session_latest_descendant(request: Request, session_id: str):
     if _authenticated_owner_request(request):
-        return await _proxy_authenticated_owner_http(request)
+        return await _proxy_authenticated_session_reader_http(request)
     latency_started_at = time.monotonic()
     latency_trace_id = request.headers.get("x-request-id", "")
     log_latency_stage(
@@ -8503,7 +8505,7 @@ async def get_session_messages(
 ):
     if _authenticated_owner_request(request):
         _reject_authenticated_profile_param(profile)
-        return await _proxy_authenticated_owner_http(request)
+        return await _proxy_authenticated_session_reader_http(request)
     db = _open_session_db_for_profile(profile)
     try:
         return session_api.session_messages_payload(
@@ -8594,7 +8596,7 @@ async def export_session_endpoint(request: Request, session_id: str, profile: Op
     """Export a single session (metadata + messages) as JSON."""
     if _authenticated_owner_request(request):
         _reject_authenticated_profile_param(profile)
-        return await _proxy_authenticated_owner_http(request)
+        return await _proxy_authenticated_session_reader_http(request)
     db = _open_session_db_for_profile(profile)
     try:
         sid = db.resolve_session_id(session_id)

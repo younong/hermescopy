@@ -525,7 +525,7 @@ def owner_public_summary(owner: OwnerContext) -> dict[str, str]:
     }
 
 
-def _admit_host_owner_home(owner: OwnerContext) -> Path:
+def admit_host_owner_home(owner: OwnerContext) -> Path:
     """Create and verify the Control Plane's trusted owner-home path.
 
     The path is derived solely from the canonical owner key. This is a host-root
@@ -581,7 +581,7 @@ def _admit_host_owner_home(owner: OwnerContext) -> Path:
 def ensure_owner_home(owner: OwnerContext) -> Path:
     """Create the admitted host owner home and runtime/data subdirectories."""
 
-    return ensure_owner_runtime_dirs(_admit_host_owner_home(owner))
+    return ensure_owner_runtime_dirs(admit_host_owner_home(owner))
 
 
 def owner_worker_env(owner: OwnerContext) -> dict[str, str]:

@@ -205,10 +205,6 @@ def test_reader_supervisor_attaches_resource_scope_before_accepting_health(tmp_p
         def attach(self, pid):
             operations.append(("attach", pid))
 
-        def verify_membership(self, pid):
-            operations.append(("verify", pid))
-            return True
-
         def cleanup(self):
             self.cleaned = True
             operations.append(("cleanup",))
@@ -239,7 +235,8 @@ def test_reader_supervisor_attaches_resource_scope_before_accepting_health(tmp_p
         {"owner_key": "ok1_resource", "owner_home": tmp_path / "owner"}
     )
 
-    assert operations[:3] == [("admit", 1), ("attach", handle.pid), ("verify", handle.pid)]
+    assert operations[:2] == [("admit", 1), ("attach", handle.pid)]
+    assert not any(operation[0] == "verify" for operation in operations)
     assert handle.resource_scope is manager.scope
     supervisor.shutdown()
     assert manager.scope.cleaned
@@ -256,10 +253,9 @@ def test_reader_supervisor_membership_failure_revokes_lease_and_cleans_scope(tmp
         cleaned = False
 
         def attach(self, _pid):
-            return None
-
-        def verify_membership(self, _pid):
-            return False
+            raise SessionReaderStartupError(
+                "session reader cgroup membership verification failed"
+            )
 
         def cleanup(self):
             self.cleaned = True
@@ -335,9 +331,17 @@ def test_reader_supervisor_idle_and_capacity_retirement_respect_active_uses(tmp_
     supervisor._handles[newer_idle.owner_key] = newer_idle
     started = handle("ok1_started", now)
     monkeypatch.setattr(supervisor, "_start", lambda *_args, **_kwargs: started)
-    assert supervisor.get_or_start(
-        {"owner_key": started.owner_key, "owner_home": started.owner_home}
-    ) is started
+    with pytest.raises(SessionReaderUnavailableError, match="limit reached"):
+        supervisor.ensure_started(
+            {"owner_key": started.owner_key, "owner_home": started.owner_home}
+        )
+    assert retired == [idle]
+    assert supervisor._handles == {
+        active.owner_key: active,
+        newer_idle.owner_key: newer_idle,
+    }
+
+    supervisor.maintenance_tick(now=now + 20)
     assert retired == [idle, newer_idle]
     assert supervisor._handles == {active.owner_key: active}
 
@@ -406,7 +410,16 @@ def test_reader_real_process_reads_owner_db_without_creating_missing_db(tmp_path
 
 
 def test_reader_read_only_adapter_matches_session_db_payloads(tmp_path):
-    from hermes_cli.session_api import list_sessions_payload
+    from hermes_cli.session_api import (
+        empty_count_payload,
+        export_session_payload,
+        latest_descendant_payload,
+        list_sessions_payload,
+        search_sessions_payload,
+        session_detail_payload,
+        session_messages_payload,
+        stats_payload,
+    )
     from hermes_cli.session_reader.db import ReadOnlySessionDB
     from hermes_state import SessionDB
 
@@ -448,6 +461,11 @@ def test_reader_read_only_adapter_matches_session_db_payloads(tmp_path):
 
         reader_db = ReadOnlySessionDB(owner_home / "state.db")
         try:
+            reader_scope = {
+                "owner_key": scope["owner_key"],
+                "workspace_root": scope["workspace_root"],
+                "historical_resume": True,
+            }
             for options in (
                 {"order": "recent", "compact": True},
                 {"order": "recent", "compact": False},
@@ -455,8 +473,166 @@ def test_reader_read_only_adapter_matches_session_db_payloads(tmp_path):
                 {"source": "gui", "order": "recent", "compact": True},
             ):
                 expected = list_sessions_payload(db, recovery_scope=scope, **options)
-                actual = list_sessions_payload(reader_db, recovery_scope=scope, **options)
+                actual = list_sessions_payload(reader_db, recovery_scope=reader_scope, **options)
                 assert actual == expected
+
+            assert search_sessions_payload(
+                reader_db,
+                q="compression",
+                recovery_scope=reader_scope,
+            ) == search_sessions_payload(
+                db,
+                q="compression",
+            )
+            assert session_detail_payload(
+                reader_db,
+                "root",
+                recovery_scope=reader_scope,
+            ) == session_detail_payload(
+                db,
+                "root",
+                recovery_scope=scope,
+            )
+            assert latest_descendant_payload(
+                reader_db,
+                "root",
+                recovery_scope=reader_scope,
+            ) == latest_descendant_payload(db, "root", recovery_scope=scope)
+            assert session_messages_payload(
+                reader_db,
+                "root",
+                recovery_scope=reader_scope,
+            ) == session_messages_payload(db, "root", recovery_scope=scope)
+            assert export_session_payload(
+                reader_db,
+                "root",
+                recovery_scope=reader_scope,
+            ) == export_session_payload(db, "root")
+            assert empty_count_payload(
+                reader_db,
+                recovery_scope=reader_scope,
+            ) == empty_count_payload(db)
+            assert stats_payload(
+                reader_db,
+                recovery_scope=reader_scope,
+            ) == stats_payload(db)
+        finally:
+            reader_db.close()
+    finally:
+        db.close()
+
+
+def test_reader_route_parser_rejects_ambiguous_or_encoded_session_paths():
+    from hermes_cli.session_reader.entrypoint import _session_route
+
+    assert _session_route("/api/sessions/session-1") == (
+        "/api/sessions/session-1",
+        "session-1",
+    )
+    assert _session_route("/api/sessions/session-1/messages") == (
+        "/api/sessions/session-1/messages",
+        "session-1",
+    )
+    for path in (
+        "/api/sessions/%",
+        "/api/sessions/%2",
+        "/api/sessions/%GG",
+        "/api/sessions/%2F",
+        "/api/sessions/%5C",
+        "/api/sessions/%2E",
+        "/api/sessions/%2e%2e",
+        "/api/sessions/session-1/unknown",
+        "/api/sessions/session-1/messages/extra",
+        "/api/sessions//messages",
+    ):
+        assert _session_route(path) is None
+
+
+def test_reader_payloads_exclude_rows_outside_authenticated_owner_scope(tmp_path):
+    from starlette.exceptions import HTTPException
+
+    from hermes_cli.session_api import (
+        empty_count_payload,
+        export_session_payload,
+        latest_descendant_payload,
+        search_sessions_payload,
+        session_detail_payload,
+        session_messages_payload,
+        stats_payload,
+    )
+    from hermes_cli.session_reader.db import ReadOnlySessionDB
+    from hermes_state import SessionDB
+
+    owner_home = tmp_path / "owner"
+    workspace_root = str((owner_home / "workspaces").resolve())
+    db = SessionDB(owner_home / "state.db")
+    try:
+        db.create_session(
+            "owned",
+            source="gui",
+            owner_key="ok1_owned",
+            workspace_root=workspace_root,
+            worker_generation=1,
+        )
+        db.append_message("owned", "user", "visible owner content")
+        db.create_session(
+            "owned-empty",
+            source="cli",
+            owner_key="ok1_owned",
+            workspace_root=workspace_root,
+            worker_generation=1,
+        )
+        db.end_session("owned-empty", "completed")
+        for session_id, owner_key, workspace, marker in (
+            ("foreign-owner", "ok1_foreign", workspace_root, "foreignownermarker"),
+            (
+                "foreign-workspace",
+                "ok1_owned",
+                str((owner_home / "other-workspace").resolve()),
+                "foreignworkspacemarker",
+            ),
+        ):
+            db.create_session(
+                session_id,
+                source="gateway",
+                owner_key=owner_key,
+                workspace_root=workspace,
+                worker_generation=2,
+            )
+            db.append_message(session_id, "user", marker)
+
+        reader_db = ReadOnlySessionDB(owner_home / "state.db")
+        try:
+            scope = {
+                "owner_key": "ok1_owned",
+                "workspace_root": workspace_root,
+                "historical_resume": True,
+            }
+            for marker in ("foreignownermarker", "foreignworkspacemarker"):
+                assert search_sessions_payload(
+                    reader_db,
+                    q=marker,
+                    recovery_scope=scope,
+                ) == {"results": []}
+            for session_id in ("foreign-owner", "foreign-workspace"):
+                for payload in (
+                    session_detail_payload,
+                    latest_descendant_payload,
+                    session_messages_payload,
+                    export_session_payload,
+                ):
+                    with pytest.raises(HTTPException) as exc_info:
+                        payload(reader_db, session_id, recovery_scope=scope)
+                    assert exc_info.value.status_code == 404
+
+            assert empty_count_payload(reader_db, recovery_scope=scope) == {"count": 1}
+            assert stats_payload(reader_db, recovery_scope=scope) == {
+                "total": 2,
+                "active_store": 2,
+                "archived": 0,
+                "messages": 1,
+                "by_source": {"gui": 1, "cli": 1},
+            }
         finally:
             reader_db.close()
     finally:
@@ -509,59 +685,23 @@ def test_reader_rejects_worker_capability_and_stale_reader_lease(tmp_path):
         verify_session_reader_capability(reader_token, **kwargs)
 
 
-@pytest.mark.skipif(os.name == "nt", reason="Unix-domain Session Reader subprocess")
-def test_reader_concurrent_cold_start_coalesces_and_stays_below_300ms(tmp_path):
-    from hermes_cli.session_reader.client import SessionReaderClient
-    from hermes_cli.session_reader.supervisor import SessionReaderSupervisor
-
-    short_root = Path("/tmp") / f"hermes-reader-cold-{os.getpid()}-{time.time_ns()}"
-    control = short_root / "control"
-    owner_home = short_root / "owner"
-    owner = {"owner_key": "ok1_cold", "owner_home": owner_home}
-    supervisor = SessionReaderSupervisor(
-        control_home=control,
-        global_home=tmp_path,
-        startup_timeout=3,
-        poll_interval=0.001,
+def test_reader_acquire_active_never_waits_for_concurrent_startup(tmp_path):
+    from hermes_cli.session_reader.supervisor import (
+        SessionReaderSupervisor,
+        SessionReaderUnavailableError,
     )
-    barrier = threading.Barrier(3)
-    results = []
-    errors = []
 
-    def request() -> None:
-        try:
-            barrier.wait(timeout=2)
-            started = time.perf_counter()
-            handle = supervisor.get_or_start(owner)
-            lease = supervisor._lease_for_handle(handle)
-            response = SessionReaderClient(
-                handle.socket_path,
-                control_home=control,
-                signing_record=supervisor.signing_record,
-            ).request(
-                "GET",
-                "/api/sessions?limit=30&offset=0&order=recent&compact=true",
-                lease=lease,
-            )
-            results.append((handle.pid, time.perf_counter() - started, response.json()))
-        except Exception as exc:
-            errors.append(exc)
+    supervisor = SessionReaderSupervisor(
+        control_home=tmp_path / "control",
+        global_home=tmp_path,
+    )
+    owner = {"owner_key": "ok1_cold", "owner_home": tmp_path / "owner"}
+    supervisor._starting.add(owner["owner_key"])
 
-    threads = [threading.Thread(target=request) for _ in range(2)]
-    try:
-        for thread in threads:
-            thread.start()
-        barrier.wait(timeout=2)
-        for thread in threads:
-            thread.join(timeout=5)
-        assert not errors
-        assert len(results) == 2
-        assert len({pid for pid, _elapsed, _payload in results}) == 1
-        assert all(payload["total"] == 0 for _pid, _elapsed, payload in results)
-        assert max(elapsed for _pid, elapsed, _payload in results) < 0.3
-    finally:
-        supervisor.shutdown()
-        shutil.rmtree(short_root, ignore_errors=True)
+    started = time.perf_counter()
+    with pytest.raises(SessionReaderUnavailableError, match="not active"):
+        supervisor.acquire_active(owner)
+    assert time.perf_counter() - started < 0.05
 
 
 def _populate_large_scoped_session_history(db, owner_key: str, owner_home: Path) -> None:
@@ -644,11 +784,14 @@ def test_reader_real_path_large_history_stays_below_300ms(tmp_path):
         poll_interval=0.001,
     )
     try:
-        # Include lazy process startup in the first request budget. The second
-        # request pins the same real UDS/capability/query path with a warm Reader.
+        # Lifecycle startup is measured separately. The business budget starts
+        # only once the exact ACTIVE Reader can be pinned without waiting.
+        startup_started = time.perf_counter()
+        handle = supervisor.ensure_started({"owner_key": owner_key, "owner_home": owner_home})
+        startup_elapsed = time.perf_counter() - startup_started
         cold_started = time.perf_counter()
-        handle = supervisor.get_or_start({"owner_key": owner_key, "owner_home": owner_home})
-        lease = supervisor._lease_for_handle(handle)
+        use = supervisor.acquire_active({"owner_key": owner_key, "owner_home": owner_home})
+        lease = use.lease
         client = SessionReaderClient(
             handle.socket_path,
             control_home=control,
@@ -662,6 +805,7 @@ def test_reader_real_path_large_history_stays_below_300ms(tmp_path):
             )
         ]
         cold_elapsed = time.perf_counter() - cold_started
+        use.release()
         warm_started = time.perf_counter()
         responses.append(
             client.request(
@@ -677,7 +821,8 @@ def test_reader_real_path_large_history_stays_below_300ms(tmp_path):
         assert payload["total"] == 3_000
         assert len(payload["sessions"]) == 30
         assert payload["sessions"][0]["id"] == "session-2999-root"
-        assert cold_elapsed < 0.3, f"cold Reader request took {cold_elapsed:.3f}s"
+        assert startup_elapsed < 3
+        assert cold_elapsed < 0.3, f"ACTIVE Reader request took {cold_elapsed:.3f}s"
         assert warm_elapsed < 0.3, f"warm Reader request took {warm_elapsed:.3f}s"
     finally:
         db.close()

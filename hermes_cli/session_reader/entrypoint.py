@@ -5,11 +5,12 @@ import argparse
 import json
 import logging
 import os
+import re
 import socket
 import threading
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from .runtime import (
     FORBIDDEN_OWNER_WORKER_ENV_KEYS,
@@ -19,6 +20,18 @@ from .runtime import (
 
 _MAX_HEADER_BYTES = 32 * 1024
 _MAX_REQUEST_LINE_BYTES = 8 * 1024
+_LITERAL_SESSION_PATHS = frozenset({
+    "/api/sessions",
+    "/api/sessions/search",
+    "/api/sessions/empty/count",
+    "/api/sessions/stats",
+})
+_SESSION_ITEM_SUFFIXES = frozenset({
+    "latest-descendant",
+    "messages",
+    "export",
+})
+_STRICT_PERCENT_ESCAPE_RE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _STATUS_TEXT = {
     200: "OK",
     400: "Bad Request",
@@ -27,6 +40,7 @@ _STATUS_TEXT = {
     405: "Method Not Allowed",
     422: "Unprocessable Entity",
     500: "Internal Server Error",
+    503: "Service Unavailable",
 }
 _log = logging.getLogger(__name__)
 
@@ -130,6 +144,35 @@ def _bool_query(query: dict[str, list[str]], name: str, default: bool) -> bool:
     raise ValueError(f"{name} must be a boolean")
 
 
+def _session_route(path: str) -> tuple[str, str | None] | None:
+    if path in _LITERAL_SESSION_PATHS:
+        return path, None
+    parts = path.split("/")
+    if len(parts) not in {4, 5} or parts[:3] != ["", "api", "sessions"]:
+        return None
+    encoded_id = parts[3]
+    if (
+        not encoded_id
+        or _STRICT_PERCENT_ESCAPE_RE.search(encoded_id)
+        or any(ord(char) < 32 or ord(char) == 127 for char in encoded_id)
+    ):
+        return None
+    try:
+        session_id = unquote(encoded_id, errors="strict")
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if (
+        session_id in {".", ".."}
+        or "/" in session_id
+        or "\\" in session_id
+        or any(ord(char) < 32 or ord(char) == 127 for char in session_id)
+    ):
+        return None
+    if len(parts) == 5 and parts[4] not in _SESSION_ITEM_SUFFIXES:
+        return None
+    return path, session_id
+
+
 def _response(status: int, payload: dict[str, Any]) -> bytes:
     body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     reason = _STATUS_TEXT.get(status, "Error")
@@ -173,7 +216,8 @@ def _create_handler(
         path = parsed.path or "/"
         if method != "GET":
             return 405, {"detail": "Method not allowed"}
-        if path not in {"/internal/health", "/api/sessions"}:
+        route = (path, None) if path == "/internal/health" else _session_route(path)
+        if route is None:
             return 404, {"detail": "Not found"}
         authorization = headers.get("authorization", "")
         token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
@@ -209,9 +253,10 @@ def _create_handler(
         query = parse_qs(parsed.query, keep_blank_values=True)
         if any(any(str(value).strip() for value in query.get(key, [])) for key in ("owner", "owner_home", "owner_key")):
             return 400, {"detail": "owner selection is not available in authenticated mode"}
+        route_path, session_id = route
         try:
             profile = str(_single_query_value(query, "profile", "")).strip().lower()
-            if profile and profile != "default":
+            if profile and profile not in {"current", "default"}:
                 return 400, {"detail": "profile selection is not available in authenticated mode"}
             limit = _int_query(query, "limit", 20)
             offset = _int_query(query, "offset", 0)
@@ -222,31 +267,90 @@ def _create_handler(
             exclude_sources = str(_single_query_value(query, "exclude_sources", "")) or None
             cwd_prefix = str(_single_query_value(query, "cwd_prefix", "")) or None
             compact = _bool_query(query, "compact", False)
+            search_query = str(_single_query_value(query, "q", ""))
+            before = str(_single_query_value(query, "before", "")) or None
         except ValueError as exc:
             return 422, {"detail": str(exc)}
         if not paths.state_db.exists():
-            return 200, {"sessions": [], "total": 0, "limit": limit, "offset": offset}
+            if route_path == "/api/sessions":
+                return 200, {"sessions": [], "total": 0, "limit": limit, "offset": offset}
+            if route_path == "/api/sessions/search":
+                return 200, {"results": []}
+            if route_path == "/api/sessions/empty/count":
+                return 200, {"count": 0}
+            if route_path == "/api/sessions/stats":
+                return 200, {
+                    "total": 0,
+                    "active_store": 0,
+                    "archived": 0,
+                    "messages": 0,
+                    "by_source": {},
+                }
+            return 404, {"detail": "Session not found"}
+        recovery_scope = {
+            "owner_key": owner_key,
+            "workspace_root": str((paths.owner_home / "workspaces").resolve()),
+            "historical_resume": True,
+        }
         db = ReadOnlySessionDB(paths.state_db)
         try:
-            return 200, session_api.list_sessions_payload(
-                db,
-                limit=limit,
-                offset=offset,
-                min_messages=min_messages,
-                archived=archived,
-                order=order,
-                source=source,
-                exclude_sources=exclude_sources,
-                cwd_prefix=cwd_prefix,
-                recovery_scope={
-                    "owner_key": owner_key,
-                    "workspace_root": str((paths.owner_home / "workspaces").resolve()),
-                    "worker_generation": 1,
-                    "historical_resume": True,
-                },
-                compact=compact,
-                latency_trace_id=headers.get("x-request-id", ""),
-            )
+            if route_path == "/api/sessions":
+                payload = session_api.list_sessions_payload(
+                    db,
+                    limit=limit,
+                    offset=offset,
+                    min_messages=min_messages,
+                    archived=archived,
+                    order=order,
+                    source=source,
+                    exclude_sources=exclude_sources,
+                    cwd_prefix=cwd_prefix,
+                    recovery_scope=recovery_scope,
+                    compact=compact,
+                    latency_trace_id=headers.get("x-request-id", ""),
+                )
+            elif route_path == "/api/sessions/search":
+                payload = session_api.search_sessions_payload(
+                    db,
+                    q=search_query,
+                    limit=limit,
+                    recovery_scope=recovery_scope,
+                )
+            elif route_path == "/api/sessions/empty/count":
+                payload = session_api.empty_count_payload(
+                    db, recovery_scope=recovery_scope
+                )
+            elif route_path == "/api/sessions/stats":
+                payload = session_api.stats_payload(
+                    db, recovery_scope=recovery_scope
+                )
+            elif route_path.endswith("/latest-descendant"):
+                payload = session_api.latest_descendant_payload(
+                    db,
+                    str(session_id),
+                    recovery_scope=recovery_scope,
+                )
+            elif route_path.endswith("/messages"):
+                payload = session_api.session_messages_payload(
+                    db,
+                    str(session_id),
+                    limit=limit if "limit" in query else None,
+                    before=before,
+                    recovery_scope=recovery_scope,
+                )
+            elif route_path.endswith("/export"):
+                payload = session_api.export_session_payload(
+                    db,
+                    str(session_id),
+                    recovery_scope=recovery_scope,
+                )
+            else:
+                payload = session_api.session_detail_payload(
+                    db,
+                    str(session_id),
+                    recovery_scope=recovery_scope,
+                )
+            return 200, payload
         except Exception as exc:
             status = int(getattr(exc, "status_code", 500))
             detail = getattr(exc, "detail", None) or "Internal server error"

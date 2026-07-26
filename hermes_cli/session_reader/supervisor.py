@@ -20,9 +20,10 @@ from hermes_cli.dashboard_auth.authority import (
     ReaderLeaseState,
     SessionReaderAuthorityLease,
 )
-from hermes_cli.owner_runtime import ensure_owner_runtime_dirs
+from hermes_cli.dashboard_auth.owner_context import admit_host_owner_home
 from .client import SessionReaderClient, SessionReaderHealthError, warm_http_transport
 from .runtime import (
+    prepare_session_reader_runtime,
     session_reader_env_for,
     session_reader_runtime_dir,
     session_reader_socket_path,
@@ -54,13 +55,21 @@ class SessionReaderHandle:
     last_used_at: float = field(default_factory=time.time)
     last_health: dict[str, Any] = field(default_factory=dict)
     active_uses: int = 0
+    accepting: bool = True
+    retire_pending: bool = False
     resource_scope: Any | None = field(default=None, repr=False)
 
 
 class SessionReaderUse:
-    def __init__(self, supervisor: "SessionReaderSupervisor", handle: SessionReaderHandle) -> None:
+    def __init__(
+        self,
+        supervisor: "SessionReaderSupervisor",
+        handle: SessionReaderHandle,
+        lease: SessionReaderAuthorityLease,
+    ) -> None:
         self.supervisor = supervisor
         self.handle = handle
+        self.lease = lease
         self.released = False
 
     def release(self) -> None:
@@ -118,12 +127,19 @@ class SessionReaderSupervisor:
         self._condition = threading.Condition(self._lock)
 
     def get_or_start(self, owner: Any, *, timeout: float | None = None) -> SessionReaderHandle:
+        """Compatibility alias for lifecycle callers; requests use acquire_active."""
+        return self.ensure_started(owner, timeout=timeout)
+
+    def ensure_started(
+        self,
+        owner: Any,
+        *,
+        timeout: float | None = None,
+    ) -> SessionReaderHandle:
         owner_key = self._owner_key(owner)
         owner_home = self._owner_home(owner)
         startup_timeout = self.startup_timeout if timeout is None else float(timeout)
         deadline = time.monotonic() + startup_timeout
-        self._reap_exited()
-        self._stop_idle(now=time.time())
         with self._condition:
             while owner_key in self._starting:
                 remaining = deadline - time.monotonic()
@@ -133,51 +149,72 @@ class SessionReaderSupervisor:
             if existing is not None:
                 if existing.owner_home != owner_home:
                     raise RuntimeError("session reader exact owner_home mismatch")
-                if existing.process.poll() is None:
-                    lease = self._lease_for_handle(existing)
+                if (
+                    existing.accepting
+                    and existing.process.poll() is None
+                ):
                     self.authority_store.assert_reader_lease(
-                        lease, states=frozenset({ReaderLeaseState.ACTIVE})
+                        self._lease_for_handle(existing),
+                        states=frozenset({ReaderLeaseState.ACTIVE}),
                     )
-                    health = self.client_cls(
-                        existing.socket_path,
-                        control_home=self.control_home,
-                        signing_record=self.signing_record,
-                    ).verify_health(
-                        lease=lease, owner_home=owner_home,
-                    )
-                    if int(health["pid"]) == existing.pid:
-                        existing.last_used_at = time.time()
-                        existing.last_health = health
-                        return existing
-                self._handles.pop(owner_key, None)
-                self._retire(existing)
-            eviction = None
-            if len(self._handles) >= self.max_readers:
-                eviction = min(
-                    (
-                        (candidate.last_used_at, candidate_key, candidate)
-                        for candidate_key, candidate in self._handles.items()
-                        if candidate.active_uses <= 0
-                    ),
-                    default=None,
+                    return existing
+                raise SessionReaderUnavailableError(
+                    "session reader is not accepting requests"
                 )
-                if eviction is None:
-                    raise SessionReaderUnavailableError("session reader limit reached")
-                self._handles.pop(eviction[1], None)
+            if len(self._handles) >= self.max_readers:
+                raise SessionReaderUnavailableError("session reader limit reached")
             self._starting.add(owner_key)
-        if eviction is not None:
-            self._retire(eviction[2])
         try:
-            return self._start(owner_key, owner_home, deadline=deadline)
+            return self._start(owner, owner_key, owner_home, deadline=deadline)
         finally:
             with self._condition:
                 self._starting.discard(owner_key)
                 self._condition.notify_all()
 
-    def _start(self, owner_key: str, owner_home: Path, *, deadline: float) -> SessionReaderHandle:
-        ensure_owner_runtime_dirs(owner_home)
+    def acquire_active(self, owner: Any) -> SessionReaderUse:
+        """Pin one already ACTIVE Reader without performing lifecycle work."""
+        owner_key = self._owner_key(owner)
+        owner_home = self._owner_home(owner)
+        with self._lock:
+            handle = self._handles.get(owner_key)
+            if handle is None or not handle.accepting:
+                raise SessionReaderUnavailableError("session reader is not active")
+            if handle.owner_home != owner_home:
+                raise SessionReaderUnavailableError("session reader owner mismatch")
+            if handle.process.poll() is not None:
+                raise SessionReaderUnavailableError("session reader process exited")
+            try:
+                lease = self.authority_store.assert_reader_lease(
+                    self._lease_for_handle(handle),
+                    states=frozenset({ReaderLeaseState.ACTIVE}),
+                )
+            except AuthorizationRejected as exc:
+                raise SessionReaderUnavailableError("session reader lease is unavailable") from exc
+            handle.active_uses += 1
+            handle.last_used_at = time.time()
+            return SessionReaderUse(self, handle, lease)
+
+    def _start(
+        self,
+        owner: Any,
+        owner_key: str,
+        owner_home: Path,
+        *,
+        deadline: float,
+    ) -> SessionReaderHandle:
+        if not isinstance(owner, dict):
+            admitted = admit_host_owner_home(owner)
+            if admitted != owner_home:
+                raise RuntimeError("session reader admitted owner_home mismatch")
+        else:
+            owner_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if os.name != "nt":
+                owner_home.chmod(0o700)
         try:
-            claim = self.authority_store.claim_reader_start(owner_key, reader_id=uuid.uuid4().hex)
+            claim = self.authority_store.claim_reader_start(
+                owner_key,
+                reader_id=uuid.uuid4().hex,
+            )
         except AuthorizationRejected as exc:
             raise SessionReaderUnavailableError(f"session reader is already owned: {exc}") from exc
         lease = claim.lease
@@ -190,12 +227,20 @@ class SessionReaderSupervisor:
                 raise SessionReaderUnavailableError(
                     f"session reader resource admission failed: {exc}"
                 ) from exc
-        socket_path = session_reader_socket_path(owner_home, lease.reader_generation)
-        runtime_dir = session_reader_runtime_dir(owner_home, lease.reader_generation)
-        runtime_dir.mkdir(parents=True, exist_ok=True)
-        socket_path.with_name("reader.ready.json").unlink(missing_ok=True)
-        if os.name != "nt":
-            runtime_dir.chmod(0o700)
+        try:
+            paths = prepare_session_reader_runtime(
+                owner_home,
+                lease.reader_generation,
+            )
+            socket_path = paths.reader_socket
+            runtime_dir = paths.reader_runtime_dir
+            socket_path.with_name("reader.ready.json").unlink(missing_ok=True)
+        except Exception:
+            self._fail_start(lease)
+            if resource_scope is not None:
+                resource_scope.cleanup()
+            self._cleanup_runtime(owner_home, lease.reader_generation)
+            raise
         verifier = session_reader_capability_public_config(self.control_home)
         env = {key: value for key, value in os.environ.items() if key in _ENV_ALLOW}
         env.update(session_reader_env_for(
@@ -243,10 +288,6 @@ class SessionReaderSupervisor:
         try:
             if resource_scope is not None:
                 resource_scope.attach(process.pid)
-                if not resource_scope.verify_membership(process.pid):
-                    raise SessionReaderStartupError(
-                        "session reader cgroup membership verification failed"
-                    )
             health = self._wait_healthy(process, socket_path, lease, owner_home, deadline)
             if os.name != "nt":
                 socket_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
@@ -318,55 +359,98 @@ class SessionReaderSupervisor:
         raise TimeoutError("timed out waiting for session reader socket")
 
     def acquire_use(self, handle: SessionReaderHandle) -> SessionReaderUse:
-        with self._lock:
-            if self._handles.get(handle.owner_key) is not handle:
-                raise RuntimeError("session reader handle is no longer active")
-            self.authority_store.assert_reader_lease(
-                self._lease_for_handle(handle), states=frozenset({ReaderLeaseState.ACTIVE})
-            )
-            handle.active_uses += 1
-            handle.last_used_at = time.time()
-        return SessionReaderUse(self, handle)
+        """Compatibility helper for non-request callers holding an exact handle."""
+        return self.acquire_active({
+            "owner_key": handle.owner_key,
+            "owner_home": handle.owner_home,
+        })
 
     def release_use(self, handle: SessionReaderHandle) -> None:
+        retire = False
         with self._lock:
             if handle.active_uses > 0:
                 handle.active_uses -= 1
             handle.last_used_at = time.time()
+            retire = handle.active_uses == 0 and handle.retire_pending
+        if retire:
+            self._retire(handle)
+
+    def report_request_failure(
+        self,
+        lease: SessionReaderAuthorityLease,
+    ) -> bool:
+        """Fence a failed Reader generation for lifecycle-only retirement."""
+        with self._lock:
+            handle = self._handles.get(str(lease.owner_key))
+            if handle is None or self._lease_for_handle(handle) != lease:
+                return False
+            handle.accepting = False
+            handle.retire_pending = True
+            handle.last_used_at = 0.0
+            return True
 
     def shutdown(self) -> None:
         with self._lock:
             handles = tuple(self._handles.values())
             self._handles.clear()
+            for handle in handles:
+                handle.accepting = False
+                handle.retire_pending = handle.active_uses > 0
         for handle in handles:
-            self._retire(handle)
+            if not handle.retire_pending:
+                self._retire(handle)
 
-    def _reap_exited(self) -> None:
+    def maintenance_tick(self, *, now: float | None = None) -> None:
+        """Perform lifecycle-only reaping, idle retirement, and capacity cleanup."""
+        observed_at = time.time() if now is None else float(now)
         with self._lock:
-            exited = [
+            candidates = [
                 (owner_key, handle)
                 for owner_key, handle in self._handles.items()
                 if handle.process.poll() is not None
+                or (
+                    handle.active_uses <= 0
+                    and observed_at - handle.last_used_at >= self.idle_timeout
+                )
             ]
-            for owner_key, _handle in exited:
+            excess = max(0, len(self._handles) - self.max_readers)
+            if excess:
+                selected = {owner_key for owner_key, _handle in candidates}
+                additional = sorted(
+                    (
+                        (handle.last_used_at, owner_key, handle)
+                        for owner_key, handle in self._handles.items()
+                        if owner_key not in selected
+                        and handle.active_uses <= 0
+                    ),
+                    key=lambda item: item[0],
+                )[:excess]
+                candidates.extend((owner_key, handle) for _at, owner_key, handle in additional)
+            retire: list[SessionReaderHandle] = []
+            for owner_key, handle in candidates:
+                if self._handles.get(owner_key) is not handle:
+                    continue
+                handle.accepting = False
+                handle.retire_pending = handle.active_uses > 0
                 self._handles.pop(owner_key, None)
-        for _owner_key, handle in exited:
+                if not handle.retire_pending:
+                    retire.append(handle)
+        for handle in retire:
             self._retire(handle)
+
+    def _reap_exited(self) -> None:
+        self.maintenance_tick(now=time.time())
 
     def _stop_idle(self, *, now: float) -> None:
-        with self._lock:
-            idle = [
-                (owner_key, handle)
-                for owner_key, handle in self._handles.items()
-                if handle.active_uses <= 0
-                and now - handle.last_used_at >= self.idle_timeout
-            ]
-            for owner_key, _handle in idle:
-                self._handles.pop(owner_key, None)
-        for _owner_key, handle in idle:
-            self._retire(handle)
+        self.maintenance_tick(now=now)
 
     def _retire(self, handle: SessionReaderHandle) -> None:
+        with self._lock:
+            handle.accepting = False
+            if handle.active_uses > 0:
+                handle.retire_pending = True
+                return
+            handle.retire_pending = False
         lease = self._lease_for_handle(handle)
         draining: SessionReaderAuthorityLease | None = None
         try:
