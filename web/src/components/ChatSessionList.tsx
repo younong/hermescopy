@@ -12,16 +12,16 @@
  * Best-effort, like ChatSidebar: a failed fetch surfaces a small inline
  * error with a retry affordance and the active chat pane keeps working.
  *
- * This is a navigation surface, NOT a session-management one — delete,
- * rename, export, and bulk actions live on the Sessions page. Keeping this
- * panel read-only (plus select / new) avoids duplicating that machinery and
- * keeps the chat context focused on switching conversations quickly.
+ * This stays a focused navigation surface: users can select, create, and
+ * rename conversations here, while delete, export, and bulk actions remain on
+ * the Sessions page.
  */
 
 import { Button } from "@nous-research/ui/ui/components/button";
+import { Input } from "@nous-research/ui/ui/components/input";
 import { ListItem } from "@nous-research/ui/ui/components/list-item";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
-import { AlertCircle, MessageSquarePlus, RefreshCw } from "lucide-react";
+import { AlertCircle, Check, MessageSquarePlus, Pencil, RefreshCw, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 
@@ -30,6 +30,19 @@ import { api, type SessionInfo } from "@/lib/api";
 import { cn, timeAgo } from "@/lib/utils";
 
 const SESSION_LIMIT = 30;
+interface RenameState {
+  error: string | null;
+  id: string | null;
+  saving: boolean;
+  value: string;
+}
+const EMPTY_RENAME: RenameState = {
+  error: null,
+  id: null,
+  saving: false,
+  value: "",
+};
+
 interface ChatSessionListProps {
   /** Active resume target (the session currently shown by the chat surface). */
   activeSessionId: string | null;
@@ -83,6 +96,7 @@ export function ChatSessionList({
   const [sessions, setSessions] = useState<SessionInfo[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [rename, setRename] = useState<RenameState>(EMPTY_RENAME);
   // Bumped to force a refetch (after switching, on Refresh, on mount).
   const [reloadNonce, setReloadNonce] = useState(0);
 
@@ -91,10 +105,20 @@ export function ChatSessionList({
   // stable when no profile is selected (default profile).
   const scopeKey = profile ?? "";
 
-  // Monotonic request token: only the most recent fetch is allowed to
-  // commit state, so a fast profile switch (or Refresh spam) can't land a
-  // stale list out of order.
+  // Monotonic request tokens keep both list loads and title updates scoped to
+  // the profile that started them.
   const reqRef = useRef(0);
+  const renameReqRef = useRef(0);
+
+  useEffect(() => {
+    renameReqRef.current += 1;
+    // A profile change replaces the rows beneath the editor, so discard the
+    // previous scope's draft and ignore its outstanding save response.
+    setRename(EMPTY_RENAME);
+    return () => {
+      renameReqRef.current += 1;
+    };
+  }, [scopeKey]);
 
   const load = useCallback(() => {
     const myReq = ++reqRef.current;
@@ -117,9 +141,7 @@ export function ChatSessionList({
 
   useEffect(() => {
     // Dashboard data surfaces fetch from an effect on mount + scope change;
-    // keep this local and explicit until the shared lint profile is updated
-    // for async loaders (matches FilesPage).
-    // eslint-disable-next-line react-hooks/set-state-in-effect
+    // keep this local and explicit (matches FilesPage).
     load();
     // `reloadNonce` is a manual refetch trigger (Refresh button / row pick).
   }, [load, reloadNonce]);
@@ -171,11 +193,62 @@ export function ChatSessionList({
     [activeSessionId, navigate, onPicked, onSessionPick, sessionPath, setSearchParams],
   );
 
+  const cancelRename = useCallback(() => setRename(EMPTY_RENAME), []);
+
+  const beginRename = useCallback((session: SessionInfo) => {
+    const title = session.title?.trim();
+    setRename({
+      error: null,
+      id: session.id,
+      saving: false,
+      value: title && title !== "Untitled" ? title : "",
+    });
+  }, []);
+
+  const submitRename = useCallback(
+    async (session: SessionInfo) => {
+      if (rename.saving) return;
+      const title = rename.value.trim();
+      const currentTitle = session.title?.trim() ?? "";
+      if (!title || title === currentTitle) {
+        cancelRename();
+        return;
+      }
+
+      const myReq = ++renameReqRef.current;
+      setRename((current) => ({ ...current, error: null, saving: true }));
+      try {
+        const result = await api.renameSession(session.id, title, scopeKey);
+        if (renameReqRef.current !== myReq) return;
+        reqRef.current += 1;
+        setSessions((current) =>
+          current?.map((item) =>
+            item.id === session.id ? { ...item, title: result.title } : item,
+          ) ?? null,
+        );
+        setRename(EMPTY_RENAME);
+      } catch (cause) {
+        if (renameReqRef.current !== myReq) return;
+        setRename((current) => ({
+          ...current,
+          error:
+            cause instanceof Error && cause.message
+              ? cause.message
+              : (t.sessions.failedToRename ?? "Failed to rename session"),
+        }));
+      } finally {
+        if (renameReqRef.current === myReq) {
+          setRename((current) => ({ ...current, saving: false }));
+        }
+      }
+    },
+    [cancelRename, rename.saving, rename.value, scopeKey, t.sessions.failedToRename],
+  );
+
   // "New chat" prefers the owning chat surface's robust handler (clears resume
   // + forces a fresh connection even from an already-fresh session). Fallback:
   // clear the resume param ourselves, which starts a fresh session whenever one
-  // was being resumed. Session management (delete/rename/export) lives on the
-  // Sessions page; this panel only switches and starts conversations.
+  // was being resumed. Delete/export/bulk management remains on Sessions.
   const startNew = useCallback(() => {
     onPicked?.();
     if (onNewChat) {
@@ -231,51 +304,169 @@ export function ChatSessionList({
       <div className={cn("flex flex-col", variant === "compact" ? "gap-[3px]" : "gap-0.5")}>
         {filteredSessions.map((s) => {
           const isActive = s.id === activeSessionId;
+          const isRenaming = s.id === rename.id;
+          const label = rowLabel(s, t.sessions.untitledSession);
+          const renameLabel = t.sessions.renameSession ?? "Rename session";
+          const titlePlaceholder =
+            t.sessions.sessionTitlePlaceholder ?? "Session title";
+
+          if (isRenaming) {
+            return (
+              <div
+                key={s.id}
+                aria-busy={rename.saving}
+                aria-current={isActive ? "true" : undefined}
+                className={cn(
+                  "rounded",
+                  variant === "compact"
+                    ? "bg-white px-1 py-1 text-black"
+                    : isActive
+                      ? "border-l-2 border-primary bg-primary/10 px-1 py-1"
+                      : "px-1 py-1",
+                )}
+              >
+                <div className="flex min-w-0 items-center gap-1">
+                  <Input
+                    autoFocus
+                    value={rename.value}
+                    onChange={(event) =>
+                      setRename((current) => ({
+                        ...current,
+                        value: event.target.value,
+                      }))
+                    }
+                    onKeyDown={(event) => {
+                      event.stopPropagation();
+                      if (event.nativeEvent.isComposing) return;
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        void submitRename(s);
+                      } else if (event.key === "Escape") {
+                        event.preventDefault();
+                        cancelRename();
+                      }
+                    }}
+                    onClick={(event) => event.stopPropagation()}
+                    placeholder={titlePlaceholder}
+                    aria-label={titlePlaceholder}
+                    className="h-8 min-w-0 flex-1 py-0 text-sm"
+                    disabled={rename.saving}
+                  />
+                  <Button
+                    ghost
+                    size="icon"
+                    className="shrink-0 text-text-secondary hover:text-success"
+                    aria-label={t.common.save}
+                    title={t.common.save}
+                    disabled={rename.saving}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void submitRename(s);
+                    }}
+                  >
+                    {rename.saving ? <Spinner className="text-sm" /> : <Check />}
+                  </Button>
+                  <Button
+                    ghost
+                    size="icon"
+                    className="shrink-0 text-text-secondary hover:text-foreground"
+                    aria-label={t.common.cancel}
+                    title={t.common.cancel}
+                    disabled={rename.saving}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      cancelRename();
+                    }}
+                  >
+                    <X />
+                  </Button>
+                </div>
+                {rename.error ? (
+                  <div role="alert" className="px-1 pt-1 text-xs text-destructive">
+                    {rename.error}
+                  </div>
+                ) : null}
+              </div>
+            );
+          }
+
           return (
-            <ListItem
-              key={s.id}
-              onClick={() => pick(s.id)}
-              aria-current={isActive ? "true" : undefined}
-              className={cn(
-                "flex-col items-start normal-case tracking-normal",
-                variant === "compact"
-                  ? "min-h-9 gap-0 rounded-[10px] px-2 py-[7px] text-[#1f1f1f]"
-                  : "gap-0.5 rounded px-2 py-1.5",
-                variant === "compact"
-                  ? isActive
-                    ? "bg-white text-black"
-                    : "hover:bg-black/[0.04] hover:text-black"
-                  : isActive
-                    ? "border-l-2 border-primary bg-primary/10 text-foreground"
-                    : "text-text-secondary hover:bg-midground/5 hover:text-foreground",
-              )}
-            >
-              <span className={cn("w-full truncate", variant === "compact" ? "text-sm font-normal leading-[22px]" : "text-sm font-medium")}>
-                {rowLabel(s, t.sessions.untitledSession)}
-              </span>
-              {variant === "default" ? (
-                <span className="flex w-full items-center gap-1.5 text-[0.6875rem] text-text-tertiary">
-                  <span>{timeAgo(s.last_active)}</span>
-                  {s.message_count > 0 && (
-                    <>
-                      <span aria-hidden>·</span>
-                      <span>{s.message_count} msgs</span>
-                    </>
-                  )}
-                  {s.source && s.source !== "cli" && (
-                    <>
-                      <span aria-hidden>·</span>
-                      <span className="truncate">{s.source}</span>
-                    </>
-                  )}
+            <div key={s.id} className="group relative min-w-0">
+              <ListItem
+                onClick={() => pick(s.id)}
+                aria-current={isActive ? "true" : undefined}
+                className={cn(
+                  "flex-col items-start pr-10 normal-case tracking-normal",
+                  variant === "compact"
+                    ? "min-h-9 gap-0 rounded-[10px] px-2 py-[7px] pr-10 text-[#1f1f1f]"
+                    : "gap-0.5 rounded px-2 py-1.5 pr-10",
+                  variant === "compact"
+                    ? isActive
+                      ? "bg-white text-black"
+                      : "hover:bg-black/[0.04] hover:text-black"
+                    : isActive
+                      ? "border-l-2 border-primary bg-primary/10 text-foreground"
+                      : "text-text-secondary hover:bg-midground/5 hover:text-foreground",
+                )}
+              >
+                <span className={cn("w-full truncate", variant === "compact" ? "text-sm font-normal leading-[22px]" : "text-sm font-medium")}>
+                  {label}
                 </span>
-              ) : null}
-            </ListItem>
+                {variant === "default" ? (
+                  <span className="flex w-full items-center gap-1.5 text-[0.6875rem] text-text-tertiary">
+                    <span>{timeAgo(s.last_active)}</span>
+                    {s.message_count > 0 && (
+                      <>
+                        <span aria-hidden>·</span>
+                        <span>{s.message_count} msgs</span>
+                      </>
+                    )}
+                    {s.source && s.source !== "cli" && (
+                      <>
+                        <span aria-hidden>·</span>
+                        <span className="truncate">{s.source}</span>
+                      </>
+                    )}
+                  </span>
+                ) : null}
+              </ListItem>
+              <Button
+                ghost
+                size="icon"
+                className={cn(
+                  "absolute right-1 top-1/2 h-7 w-7 -translate-y-1/2 opacity-0 transition-opacity",
+                  "text-text-secondary hover:text-foreground focus:opacity-100 group-hover:opacity-100",
+                  isActive && "opacity-100",
+                )}
+                aria-label={`${renameLabel}: ${label}`}
+                title={renameLabel}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  beginRename(s);
+                }}
+              >
+                <Pencil />
+              </Button>
+            </div>
           );
         })}
       </div>
     );
-  }, [activeSessionId, error, filteredSessions, loading, pick, reload, sessions, t, variant]);
+  }, [
+    activeSessionId,
+    beginRename,
+    cancelRename,
+    error,
+    filteredSessions,
+    loading,
+    pick,
+    reload,
+    rename,
+    sessions,
+    submitRename,
+    t,
+    variant,
+  ]);
 
   return (
     <aside

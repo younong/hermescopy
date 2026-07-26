@@ -177,6 +177,9 @@ export const en: Translations = {
     failedToDeleteSelected: "Failed to delete selected sessions",
     resumeInChat: "Resume in Chat",
     newChat: "New chat",
+    renameSession: "Rename session",
+    sessionTitlePlaceholder: "Session title",
+    failedToRename: "Failed to rename session",
     previousPage: "Previous page",
     nextPage: "Next page",
     roles: {
