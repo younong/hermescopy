@@ -119,7 +119,7 @@ export function GuiChatShell() {
       : false,
   );
   const mobilePanelOpen = mobilePanelOpenRaw;
-  const activeSessionId = state.storedSessionId ?? resumeSessionId;
+  const activeSessionId = state.historySessionId ?? resumeSessionId;
   const forceBottomKey = `${activeSessionId ?? "new"}:${sendScrollNonce}`;
   const closeMobilePanel = useCallback(() => setMobilePanelOpenRaw(false), []);
   const handleActiveSessionChange = useCallback(
@@ -167,7 +167,11 @@ export function GuiChatShell() {
         { replace: true },
       );
     }
-    switchCoordinatorRef.current?.start(null);
+    const coordinator = switchCoordinatorRef.current;
+    if (coordinator) {
+      const generation = coordinator.start(null);
+      dispatch({ type: "session.selected", generation, sessionId: null });
+    }
   }, [updateSearchParams]);
 
   const switchScope = useMemo(() => {
@@ -177,36 +181,11 @@ export function GuiChatShell() {
     connectionRef.current = connection;
     let coordinator: GuiChatSessionSwitchCoordinator;
     coordinator = new GuiChatSessionSwitchCoordinator(connection, {
-      onCommit: (_connection, response, requestedSessionId, generation) => {
-        historyAbortRef.current?.abort();
+      onCommit: (_connection, response, _requestedSessionId, generation) => {
         const trace = switchTraceByGenerationRef.current.get(generation);
         switchTraceByGenerationRef.current.delete(generation);
         dispatch({ type: "session.created", response });
-        emitChatDiagnostic({
-          event: "initial_page",
-          loadedCount: response.messages?.length ?? 0,
-          outcome: "ok",
-          renderedCount: response.messages?.length ?? 0,
-          surface: "gui_history",
-        });
         reconnectLifecycleRef.current?.onSwitchSettled(generation, true);
-
-        if (requestedSessionId && "resumed" in response) {
-          const canonicalSessionId = response.resumed ?? response.session_key ?? requestedSessionId;
-          if (canonicalSessionId !== requestedSessionId) {
-            trace?.mark("session.canonicalized", "ok");
-            canonicalRouteRef.current = canonicalSessionId;
-            updateSearchParams(
-              (prev) => {
-                if (prev.get("resume") !== requestedSessionId) return prev;
-                const next = new URLSearchParams(prev);
-                next.set("resume", canonicalSessionId);
-                return next;
-              },
-              { replace: true },
-            );
-          }
-        }
 
         requestAnimationFrame(() => {
           if (!switchCoordinatorRef.current?.isGenerationCurrent(generation)) return;
@@ -280,10 +259,65 @@ export function GuiChatShell() {
   const connectRoute = useCallback(() => {
     reconnectLifecycleRef.current?.cancelRecovery();
     setResumeNotice(null);
+    historyAbortRef.current?.abort();
     const trace = latencyTraceRef.current;
     trace?.mark("connection.start");
     const nextGeneration = switchCoordinator.currentGeneration + 1;
     if (trace) switchTraceByGenerationRef.current.set(nextGeneration, trace);
+    dispatch({ type: "session.selected", generation: nextGeneration, sessionId: resumeSessionId });
+    if (resumeSessionId && !mockMode) {
+      const controller = new AbortController();
+      historyAbortRef.current = controller;
+      const requestedSessionId = resumeSessionId;
+      const startedAt = performance.now();
+      void api.getSessionMessages(
+        requestedSessionId,
+        { limit: 100, signal: controller.signal },
+        profile,
+      ).then((response) => {
+        if (controller.signal.aborted || !switchCoordinator.isGenerationCurrent(nextGeneration)) return;
+        dispatch({
+          type: "history.initial.succeeded",
+          generation: nextGeneration,
+          requestedSessionId,
+          response,
+        });
+        emitChatDiagnostic({
+          durationMs: Math.round(performance.now() - startedAt),
+          event: "initial_page",
+          loadedCount: response.messages.length,
+          outcome: "ok",
+          renderedCount: response.messages.length,
+          surface: "gui_history",
+        });
+        if (response.session_id !== requestedSessionId) {
+          trace?.mark("session.canonicalized", "ok");
+          canonicalRouteRef.current = response.session_id;
+          updateSearchParams((prev) => {
+            if (prev.get("resume") !== requestedSessionId) return prev;
+            const next = new URLSearchParams(prev);
+            next.set("resume", response.session_id);
+            return next;
+          }, { replace: true });
+        }
+      }).catch((error: unknown) => {
+        if (controller.signal.aborted || !switchCoordinator.isGenerationCurrent(nextGeneration)) return;
+        dispatch({
+          type: "history.initial.failed",
+          generation: nextGeneration,
+          message: error instanceof Error ? error.message : String(error),
+          requestedSessionId,
+        });
+        emitChatDiagnostic({
+          durationMs: Math.round(performance.now() - startedAt),
+          event: "initial_page",
+          outcome: "error",
+          surface: "gui_history",
+        });
+      }).finally(() => {
+        if (historyAbortRef.current === controller) historyAbortRef.current = null;
+      });
+    }
     switchCoordinator.start(
       resumeSessionId,
       trace
@@ -294,7 +328,7 @@ export function GuiChatShell() {
           }
         : undefined,
     );
-  }, [resumeSessionId, switchCoordinator]);
+  }, [mockMode, profile, resumeSessionId, switchCoordinator, updateSearchParams]);
 
   const retryConnection = useCallback(() => {
     setResumeNotice(null);
@@ -477,19 +511,23 @@ export function GuiChatShell() {
   }, [state.sessionId]);
 
   const loadEarlier = useCallback(async () => {
-    const connection = connectionRef.current;
-    const sessionId = state.sessionId;
+    const sessionId = state.historySessionId;
     const cursor = state.historyCursor;
-    if (!connection || !sessionId || !cursor || state.historyLoading) return;
+    const generation = state.switchGeneration;
+    if (!sessionId || !cursor || state.historyLoading) return;
     historyAbortRef.current?.abort();
     const controller = new AbortController();
     historyAbortRef.current = controller;
-    dispatch({ type: "history.prepend.started" });
+    dispatch({ type: "history.prepend.started", generation, sessionId });
     const startedAt = performance.now();
     try {
-      const response = await connection.loadEarlier(sessionId, cursor, controller.signal);
+      const response = await api.getSessionMessages(
+        sessionId,
+        { before: cursor, limit: 100, signal: controller.signal },
+        profile,
+      );
       if (controller.signal.aborted) return;
-      dispatch({ type: "history.prepend.succeeded", response });
+      dispatch({ type: "history.prepend.succeeded", generation, response });
       emitChatDiagnostic({
         durationMs: Math.round(performance.now() - startedAt),
         event: "page_loaded",
@@ -505,18 +543,16 @@ export function GuiChatShell() {
         outcome: "error",
         surface: "gui_history",
       });
-      if (error instanceof JsonRpcGatewayError && error.code === -32601) {
-        dispatch({ type: "history.prepend.failed", message: "Earlier history is unavailable on this server version." });
-        return;
-      }
       dispatch({
         type: "history.prepend.failed",
+        generation,
         message: error instanceof Error ? error.message : String(error),
+        sessionId,
       });
     } finally {
       if (historyAbortRef.current === controller) historyAbortRef.current = null;
     }
-  }, [state.historyCursor, state.historyLoading, state.sessionId]);
+  }, [profile, state.historyCursor, state.historyLoading, state.historySessionId, state.switchGeneration]);
 
   const respondToClarify = useCallback(
     (id: string, answer: string) => {

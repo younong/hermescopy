@@ -59,6 +59,7 @@ export class GuiChatSessionSwitchCoordinator {
   start(targetSessionId: string | null, timing?: GuiChatSwitchTiming): number {
     const generation = ++this.generation;
     this.cancelPending();
+    this.committedRuntimeSessionId = null;
 
     const pending: PendingSwitch = {
       abortController: new AbortController(),
@@ -106,10 +107,6 @@ export class GuiChatSessionSwitchCoordinator {
     const pending = this.pending;
     if (pending) {
       this.callbacks.onEventObserved?.(event, pending.generation);
-      if (event.session_id === this.committedRuntimeSessionId) {
-        this.callbacks.onEvent(event, pending.generation);
-        return;
-      }
       if (event.session_id) pending.pendingEvents.push(event);
       return;
     }
@@ -147,6 +144,7 @@ export class GuiChatSessionSwitchCoordinator {
     if (!this.isCurrent(pending)) return;
     this.pending = null;
     pending.pendingEvents = [];
+    this.committedTargetSessionId = pending.targetSessionId;
     if (!isAbortError(error)) {
       this.callbacks.onError(
         error,

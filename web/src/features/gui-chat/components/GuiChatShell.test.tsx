@@ -19,6 +19,7 @@ const mocks = vi.hoisted(() => ({
   createILinkEnrollment: vi.fn(),
   getAuthMe: vi.fn(),
   getILinkEnrollment: vi.fn(),
+  getSessionMessages: vi.fn(),
   logout: vi.fn(),
 }));
 
@@ -31,6 +32,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
       createILinkEnrollment: mocks.createILinkEnrollment,
       getAuthMe: mocks.getAuthMe,
       getILinkEnrollment: mocks.getILinkEnrollment,
+      getSessionMessages: mocks.getSessionMessages,
       logout: mocks.logout,
     },
   };
@@ -77,14 +79,21 @@ vi.mock("./Composer", () => ({
 
 vi.mock("./MessageList", () => ({
   MessageList: (props: Record<string, unknown>) => (
-    <button
-      data-clarify-answer
-      onClick={() =>
-        (props.onClarifyRespond as (...args: unknown[]) => unknown)("clarify-1", "A")
-      }
-    >
-      Clarify answer
-    </button>
+    <div>
+      <div data-message-text>
+        {(props.state as { messages?: Array<{ text: string }> }).messages
+          ?.map((message) => message.text)
+          .join("|")}
+      </div>
+      <button
+        data-clarify-answer
+        onClick={() =>
+          (props.onClarifyRespond as (...args: unknown[]) => unknown)("clarify-1", "A")
+        }
+      >
+        Clarify answer
+      </button>
+    </div>
   ),
 }));
 
@@ -105,6 +114,12 @@ beforeEach(() => {
   mocks.createILinkEnrollment.mockReset();
   mocks.getAuthMe.mockReset();
   mocks.getILinkEnrollment.mockReset();
+  mocks.getSessionMessages.mockReset();
+  mocks.getSessionMessages.mockResolvedValue({
+    history_page: { cursor: null, has_more: false, returned_count: 0 },
+    messages: [],
+    session_id: "stored-a",
+  });
   mocks.logout.mockReset();
   mocks.logout.mockResolvedValue(new Response(null, { status: 200 }));
   mocks.createILinkEnrollment.mockResolvedValue({
@@ -431,6 +446,61 @@ describe("GuiChatShell", () => {
     vi.useRealTimers();
   });
 
+  it("loads durable history without waiting for runtime attach", async () => {
+    const connection = createConnection();
+    const attach = deferred<Awaited<ReturnType<GuiChatConnection["createOrAttach"]>>>();
+    const history = deferred<{
+      history_page: { cursor: null; has_more: false; returned_count: number };
+      messages: Array<{ id: string; role: "assistant"; text: string }>;
+      session_id: string;
+    }>();
+    connection.createOrAttachMock.mockReturnValue(attach.promise);
+    mocks.getSessionMessages.mockReturnValue(history.promise);
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => {
+      root?.render(
+        <MemoryRouter initialEntries={["/chat-gui?resume=requested"]}>
+          <DashboardAuthIdentityProvider>
+            <GuiChatShell />
+          </DashboardAuthIdentityProvider>
+        </MemoryRouter>,
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      history.resolve({
+        history_page: { cursor: null, has_more: false, returned_count: 1 },
+        messages: [{ id: "db-requested-1", role: "assistant", text: "saved answer" }],
+        session_id: "requested",
+      });
+      await history.promise;
+    });
+
+    expect(mocks.getSessionMessages).toHaveBeenCalledWith(
+      "requested",
+      expect.objectContaining({ limit: 100, signal: expect.any(AbortSignal) }),
+      "",
+    );
+    expect(connection.createOrAttach).toHaveBeenCalledOnce();
+    expect(container.textContent).toContain("saved answer");
+
+    await act(async () => {
+      attach.resolve({ session_id: "runtime-requested" });
+      await attach.promise;
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("saved answer");
+    expect(mocks.getSessionMessages.mock.calls[0]?.[1]?.signal.aborted).toBe(false);
+  });
+
   it("connects once when loading a resumed route", async () => {
     const connection = createConnection();
     mocks.getAuthMe.mockResolvedValue(authIdentity());
@@ -573,7 +643,6 @@ function createConnection(): TestGuiChatConnection {
     emitState: (state: ConnectionState) => {
       for (const handler of stateHandlers) handler(state);
     },
-    loadEarlier: vi.fn(),
     ping: vi.fn(),
     reportFrameQueueDiagnostic: vi.fn(),
     respondToApproval: vi.fn().mockResolvedValue(undefined),

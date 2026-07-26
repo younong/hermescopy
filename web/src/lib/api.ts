@@ -517,7 +517,7 @@ export const api = {
     ),
   getSessionMessages: (
     id: string,
-    options: { before?: string; limit?: number } = {},
+    options: { before?: string; limit?: number; signal?: AbortSignal } = {},
     profile = getManagementProfile(),
   ) => {
     const params = new URLSearchParams();
@@ -528,6 +528,7 @@ export const api = {
         `/api/sessions/${encodeURIComponent(id)}/messages?${params.toString()}`,
         profile,
       ),
+      { signal: options.signal },
     );
   },
   getSessionDetail: (id: string, profile = getManagementProfile()) =>
@@ -1999,14 +2000,24 @@ export interface TelegramOnboardingApplyResponse {
 }
 
 export interface SessionMessage {
+  id?: string;
   role: "user" | "assistant" | "system" | "tool";
-  content: string | null;
-  tool_calls?: Array<{
-    id: string;
-    function: { name: string; arguments: string };
+  text?: string;
+  content?: unknown;
+  attachments?: Array<{
+    kind?: unknown;
+    mime_type?: unknown;
+    name?: unknown;
+    pages_attached?: unknown;
+    path?: unknown;
+    ref_text?: unknown;
+    size_bytes?: unknown;
+    source_paths?: unknown;
+    width?: unknown;
+    height?: unknown;
   }>;
-  tool_name?: string;
-  tool_call_id?: string;
+  name?: string;
+  context?: string;
   timestamp?: number;
 }
 

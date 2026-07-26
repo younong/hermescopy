@@ -7956,7 +7956,7 @@ def test_session_attach_uses_persistent_id_and_commits_live_runtime(monkeypatch)
     assert session["source"] == "dashboard-gui"
 
 
-def test_session_attach_live_returns_cursor_capable_display_page(monkeypatch):
+def test_session_attach_live_omits_display_history(monkeypatch):
     transport = _DashboardAttachTransport()
     previous_transport = object()
     session = _session(
@@ -7977,24 +7977,8 @@ def test_session_attach_live_returns_cursor_capable_display_page(monkeypatch):
         def resolve_resume_session_id(self, target):
             return target
 
-        def get_conversation_page(self, target, **kwargs):
-            assert target == "canonical-tip"
-            assert kwargs["limit"] == 2
-            assert kwargs["before_cursor"] is None
-            return {
-                "messages": [
-                    {
-                        "_row_id": 7,
-                        "_session_id": target,
-                        "role": "assistant",
-                        "content": "latest durable history",
-                    }
-                ],
-                "next_cursor": "older-cursor",
-                "has_more": True,
-                "returned_count": 1,
-                "filtered_count": 0,
-            }
+        def get_conversation_page(self, _target, **_kwargs):
+            raise AssertionError("dashboard attach must not read display history")
 
     fake_db = _DB()
     monkeypatch.setattr(server, "_get_db", lambda: fake_db)
@@ -8019,19 +8003,10 @@ def test_session_attach_live_returns_cursor_capable_display_page(monkeypatch):
         server.reset_transport(token)
         server._sessions.pop("runtime-tip", None)
 
-    assert resp["result"]["messages"] == [
-        {
-            "id": "db-canonical-tip-7",
-            "role": "assistant",
-            "text": "latest durable history",
-        }
-    ]
-    assert resp["result"]["history_page"] == {
-        "cursor": "older-cursor",
-        "has_more": True,
-        "returned_count": 1,
-        "truncated_count": 0,
-    }
+    assert "messages" not in resp["result"]
+    assert "message_count" not in resp["result"]
+    assert "history_page" not in resp["result"]
+    assert resp["result"]["info"]["model"] == "model-live"
 
 
 def test_session_attach_cold_resume_commits_deferred_runtime(monkeypatch):
@@ -8073,7 +8048,10 @@ def test_session_attach_cold_resume_commits_deferred_runtime(monkeypatch):
         sid = resp["result"]["session_id"]
         session = server._sessions[sid]
         assert resp["result"]["resume_kind"] == "cold"
-        assert resp["result"]["messages"] == [{"role": "user", "text": "cold history"}]
+        assert "messages" not in resp["result"]
+        assert "message_count" not in resp["result"]
+        assert "history_page" not in resp["result"]
+        assert session["history"] == [{"role": "user", "content": "cold history"}]
         assert transport.active_session_id == sid
         assert session["transport"] is transport
         assert session["agent"] is None
