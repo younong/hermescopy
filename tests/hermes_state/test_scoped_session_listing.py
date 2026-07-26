@@ -83,6 +83,26 @@ def test_compact_listing_skips_exact_display_counts(tmp_path, monkeypatch):
         db.close()
 
 
+def test_listing_uses_bounded_sql_for_page_and_display_counts(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        for index in range(30):
+            session_id = f"session-{index}"
+            db.create_session(session_id, source="gui")
+            db.append_message(session_id, "user", f"message {index}")
+
+        statements = []
+        db._conn.set_trace_callback(statements.append)
+        payload = list_sessions_payload(db, limit=20, order="recent")
+        db._conn.set_trace_callback(None)
+
+        assert len(payload["sessions"]) == 20
+        selects = [sql for sql in statements if sql.lstrip().upper().startswith(("SELECT", "WITH"))]
+        assert len(selects) <= 6
+    finally:
+        db.close()
+
+
 def test_rich_listing_keeps_lineage_aware_display_count(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     try:
@@ -155,6 +175,18 @@ def test_compact_recent_listing_stays_below_300ms_with_compression_chains(tmp_pa
             messages,
         )
         db._conn.commit()
+
+        query_plan = [
+            row[3]
+            for row in db._conn.execute(
+                "EXPLAIN QUERY PLAN "
+                "SELECT child.id FROM sessions parent "
+                "JOIN sessions child INDEXED BY idx_sessions_parent "
+                "ON child.parent_session_id = parent.id "
+                "WHERE parent.end_reason = 'compression'"
+            ).fetchall()
+        ]
+        assert any("idx_sessions_parent" in detail for detail in query_plan)
 
         started = time.perf_counter()
         payload = list_sessions_payload(

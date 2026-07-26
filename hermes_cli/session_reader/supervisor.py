@@ -1,6 +1,7 @@
 """Supervisor for lightweight per-owner Session Reader processes."""
 from __future__ import annotations
 
+import asyncio
 import os
 import stat
 import subprocess
@@ -21,7 +22,7 @@ from hermes_cli.dashboard_auth.authority import (
     SessionReaderAuthorityLease,
 )
 from hermes_cli.dashboard_auth.owner_context import admit_host_owner_home
-from .client import SessionReaderClient, SessionReaderHealthError, warm_http_transport
+from .client import SessionReaderClient, SessionReaderHealthError
 from .runtime import (
     prepare_session_reader_runtime,
     session_reader_env_for,
@@ -38,6 +39,13 @@ class SessionReaderUnavailableError(RuntimeError):
 
 class SessionReaderStartupError(SessionReaderUnavailableError):
     """A Reader process exited or failed health verification during startup."""
+
+
+@dataclass(frozen=True)
+class _ClientBinding:
+    client: SessionReaderClient
+    loop: asyncio.AbstractEventLoop
+    thread_id: int
 
 
 @dataclass
@@ -120,15 +128,24 @@ class SessionReaderSupervisor:
         self.resource_manager = resource_manager
         self.authority_store = AuthorityStore(self.control_home)
         self.signing_record = _signing_record(self.control_home)
-        warm_http_transport()
         self._handles: dict[str, SessionReaderHandle] = {}
+        self._clients: dict[tuple[str, int, str, int, int], _ClientBinding] = {}
         self._starting: set[str] = set()
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
 
-    def get_or_start(self, owner: Any, *, timeout: float | None = None) -> SessionReaderHandle:
-        """Compatibility alias for lifecycle callers; requests use acquire_active."""
-        return self.ensure_started(owner, timeout=timeout)
+    def needs_start(self, owner: Any) -> bool:
+        """Return whether the exact owner lacks a healthy accepting Reader."""
+        owner_key = self._owner_key(owner)
+        owner_home = self._owner_home(owner)
+        with self._lock:
+            handle = self._handles.get(owner_key)
+            return not (
+                handle is not None
+                and handle.owner_home == owner_home
+                and handle.accepting
+                and handle.process.poll() is None
+            )
 
     def ensure_started(
         self,
@@ -358,12 +375,81 @@ class SessionReaderSupervisor:
             raise SessionReaderStartupError(f"session reader failed health verification: {last_error}")
         raise TimeoutError("timed out waiting for session reader socket")
 
-    def acquire_use(self, handle: SessionReaderHandle) -> SessionReaderUse:
-        """Compatibility helper for non-request callers holding an exact handle."""
-        return self.acquire_active({
-            "owner_key": handle.owner_key,
-            "owner_home": handle.owner_home,
-        })
+    @staticmethod
+    def _client_key(handle: SessionReaderHandle) -> tuple[str, int, str, int, int]:
+        return (
+            handle.owner_key,
+            handle.reader_generation,
+            handle.reader_id,
+            handle.lease_version,
+            handle.recovery_generation,
+        )
+
+    def client_for(self, handle: SessionReaderHandle) -> SessionReaderClient:
+        key = self._client_key(handle)
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            current = self._handles.get(handle.owner_key)
+            if current is not handle or not handle.accepting:
+                raise SessionReaderUnavailableError("session reader client is unavailable")
+            binding = self._clients.get(key)
+            if binding is None:
+                binding = _ClientBinding(
+                    client=self.client_cls(
+                        handle.socket_path,
+                        control_home=self.control_home,
+                        signing_record=self.signing_record,
+                    ),
+                    loop=loop,
+                    thread_id=threading.get_ident(),
+                )
+                self._clients[key] = binding
+            elif binding.loop is not loop:
+                raise SessionReaderUnavailableError(
+                    "session reader client belongs to another event loop"
+                )
+            return binding.client
+
+    @staticmethod
+    async def _close_bindings(bindings: tuple[_ClientBinding, ...]) -> None:
+        current_loop = asyncio.get_running_loop()
+        awaitables = []
+        for binding in bindings:
+            if binding.loop is current_loop:
+                awaitables.append(binding.client.aclose())
+            elif binding.loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(
+                    binding.client.aclose(), binding.loop
+                )
+                awaitables.append(asyncio.wrap_future(future))
+        if awaitables:
+            await asyncio.gather(*awaitables, return_exceptions=True)
+
+    def _pop_client(self, handle: SessionReaderHandle) -> tuple[_ClientBinding, ...]:
+        with self._lock:
+            binding = self._clients.pop(self._client_key(handle), None)
+        return () if binding is None else (binding,)
+
+    async def close_client(self, handle: SessionReaderHandle) -> None:
+        await self._close_bindings(self._pop_client(handle))
+
+    async def close_clients(self) -> None:
+        with self._lock:
+            bindings = tuple(self._clients.values())
+            self._clients.clear()
+        await self._close_bindings(bindings)
+
+    def _close_client_from_worker(self, handle: SessionReaderHandle) -> None:
+        for binding in self._pop_client(handle):
+            if binding.loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(
+                    binding.client.aclose(), binding.loop
+                )
+                if threading.get_ident() != binding.thread_id:
+                    try:
+                        future.result(timeout=2.0)
+                    except Exception:
+                        pass
 
     def release_use(self, handle: SessionReaderHandle) -> None:
         retire = False
@@ -438,11 +524,17 @@ class SessionReaderSupervisor:
         for handle in retire:
             self._retire(handle)
 
-    def _reap_exited(self) -> None:
-        self.maintenance_tick(now=time.time())
-
-    def _stop_idle(self, *, now: float) -> None:
-        self.maintenance_tick(now=now)
+    def next_maintenance_delay(self, *, now: float | None = None) -> float:
+        observed_at = time.time() if now is None else float(now)
+        with self._lock:
+            if not self._handles:
+                return self.idle_timeout
+            deadlines = [
+                max(0.0, handle.last_used_at + self.idle_timeout - observed_at)
+                for handle in self._handles.values()
+                if handle.active_uses <= 0
+            ]
+        return min(deadlines, default=self.idle_timeout)
 
     def _retire(self, handle: SessionReaderHandle) -> None:
         with self._lock:
@@ -451,6 +543,7 @@ class SessionReaderSupervisor:
                 handle.retire_pending = True
                 return
             handle.retire_pending = False
+        self._close_client_from_worker(handle)
         lease = self._lease_for_handle(handle)
         draining: SessionReaderAuthorityLease | None = None
         try:

@@ -65,7 +65,7 @@ def list_sessions_payload(
     archived_only = archived == "only"
     include_archived = archived == "include"
     stage_started_at = time.monotonic()
-    sessions = db.list_sessions_rich(
+    sessions, total = db.list_sessions_page(
         source=source or None,
         exclude_sources=exclude_list or None,
         cwd_prefix=(cwd_prefix or None),
@@ -76,6 +76,7 @@ def list_sessions_payload(
         archived_only=archived_only,
         order_by_last_active=order == "recent",
         recovery_scope=recovery_scope,
+        include_display_counts=not compact,
     )
     log_latency_stage(
         _log,
@@ -85,16 +86,6 @@ def list_sessions_payload(
         started_at=stage_started_at,
     )
     stage_started_at = time.monotonic()
-    total = db.session_count(
-        source=source or None,
-        cwd_prefix=(cwd_prefix or None),
-        exclude_sources=exclude_list or None,
-        min_message_count=min_message_count,
-        include_archived=include_archived,
-        archived_only=archived_only,
-        exclude_children=True,
-        recovery_scope=recovery_scope,
-    )
     log_latency_stage(
         _log,
         trace_id=latency_trace_id,
@@ -109,15 +100,6 @@ def list_sessions_payload(
             session.get("ended_at") is None
             and (now - session.get("last_active", session.get("started_at", 0))) < 300
         )
-        if not compact:
-            try:
-                session["message_count"] = db.display_message_count(
-                    session["id"],
-                    include_ancestors=True,
-                    recovery_scope=recovery_scope,
-                )
-            except (AttributeError, TypeError):
-                pass
         session["archived"] = bool(session.get("archived"))
         if profile_name:
             session["profile"] = profile_name
@@ -142,103 +124,7 @@ def _resolve_session_id(
     session_id: str,
     recovery_scope: dict[str, Any] | None = None,
 ) -> str | None:
-    if recovery_scope is None:
-        return db.resolve_session_id(session_id)
-    try:
-        return db.resolve_session_id(
-            session_id, recovery_scope=recovery_scope
-        )
-    except TypeError:
-        sid = db.resolve_session_id(session_id)
-        if not sid or not db.get_session_for_recovery(
-            sid, recovery_scope=recovery_scope
-        ):
-            return None
-        return sid
-
-
-def _compression_root(
-    db: Any,
-    session_id: str,
-    root_cache: dict[str, str],
-    recovery_scope: dict[str, Any] | None = None,
-) -> str:
-    if not session_id:
-        return session_id
-    if session_id in root_cache:
-        return root_cache[session_id]
-    chain: list[str] = []
-    cur = session_id
-    visited: set[str] = set()
-    root = session_id
-    while cur and cur not in visited:
-        visited.add(cur)
-        chain.append(cur)
-        if cur in root_cache:
-            root = root_cache[cur]
-            break
-        try:
-            session = (
-                db.get_session(cur)
-                if recovery_scope is None
-                else db.get_session_for_recovery(cur, recovery_scope=recovery_scope)
-            )
-        except Exception:
-            session = None
-        if not session:
-            root = cur
-            break
-        parent = session.get("parent_session_id") if isinstance(session, dict) else None
-        if not parent:
-            root = cur
-            break
-        try:
-            parent_session = (
-                db.get_session(parent)
-                if recovery_scope is None
-                else db.get_session_for_recovery(parent, recovery_scope=recovery_scope)
-            )
-        except Exception:
-            parent_session = None
-        if not parent_session:
-            root = cur
-            break
-        parent_ended_at = parent_session.get("ended_at")
-        started_at = session.get("started_at")
-        is_compression_edge = (
-            parent_session.get("end_reason") == "compression"
-            and parent_ended_at is not None
-            and started_at is not None
-            and started_at >= parent_ended_at
-        )
-        if not is_compression_edge:
-            root = cur
-            break
-        cur = parent
-    for node in chain:
-        root_cache[node] = root
-    return root
-
-
-def _lineage_tip(
-    db: Any,
-    root_id: str,
-    tip_cache: dict[str, str],
-    recovery_scope: dict[str, Any] | None = None,
-) -> str:
-    if root_id in tip_cache:
-        return tip_cache[root_id]
-    tip = root_id
-    try:
-        resolved = db.get_compression_tip(
-            root_id, recovery_scope=recovery_scope
-        )
-        if resolved:
-            tip = resolved
-    except Exception:
-        pass
-    tip_cache[root_id] = tip
-    return tip
+    return db.resolve_session_id(session_id, recovery_scope=recovery_scope)
 
 
 def search_sessions_payload(
@@ -251,57 +137,42 @@ def search_sessions_payload(
     if not q or not q.strip():
         return {"results": []}
     safe_limit = max(1, min(int(limit or 20), 100))
-    root_cache: dict[str, str] = {}
-    tip_cache: dict[str, str] = {}
     seen: dict[str, dict[str, Any]] = {}
-
-    def add_lineage_result(raw_sid: str, payload: dict[str, Any]) -> None:
-        if not raw_sid:
-            return
-        root = _compression_root(
-            db, raw_sid, root_cache, recovery_scope=recovery_scope
-        )
-        if root in seen or len(seen) >= safe_limit:
-            return
-        payload = dict(payload)
-        payload["session_id"] = _lineage_tip(
-            db, root, tip_cache, recovery_scope=recovery_scope
-        )
-        payload["lineage_root"] = root
-        seen[root] = payload
 
     search_scope = (
         {"recovery_scope": recovery_scope} if recovery_scope is not None else {}
     )
-    for row in db.search_sessions_by_id(
+    id_rows = db.search_sessions_by_id(
         q,
         limit=safe_limit,
         include_archived=True,
         **search_scope,
-    ):
-        sid = row.get("id")
-        preview = (row.get("preview") or "").strip()
-        add_lineage_result(
-            sid,
-            {
-                "snippet": preview or f"Session ID: {sid}",
-                "role": None,
-                "source": row.get("source"),
-                "model": row.get("model"),
-                "session_started": row.get("started_at"),
-            },
-        )
-
+    )
     terms = [token if token.startswith('"') or token.endswith("*") else token + "*" for token in re.findall(r'"[^"]*"|\S+', q.strip())]
-    for match in db.search_messages(
+    message_rows = db.search_messages(
         query=" ".join(terms),
         limit=max(safe_limit * 5, 50),
         **search_scope,
-    ):
-        if len(seen) >= safe_limit:
-            break
-        add_lineage_result(
-            match["session_id"],
+    )
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    for row in id_rows:
+        sid = str(row.get("id") or "")
+        preview = (row.get("preview") or "").strip()
+        candidates.append(
+            (
+                sid,
+                {
+                    "snippet": preview or f"Session ID: {sid}",
+                    "role": None,
+                    "source": row.get("source"),
+                    "model": row.get("model"),
+                    "session_started": row.get("started_at"),
+                },
+            )
+        )
+    candidates.extend(
+        (
+            str(match.get("session_id") or ""),
             {
                 "snippet": match.get("snippet", ""),
                 "role": match.get("role"),
@@ -310,6 +181,20 @@ def search_sessions_payload(
                 "session_started": match.get("session_started"),
             },
         )
+        for match in message_rows
+    )
+    lineage = db.compression_lineage(
+        [sid for sid, _payload in candidates], recovery_scope=recovery_scope
+    )
+    for sid, payload in candidates:
+        item = lineage.get(sid, {"root": sid, "tip": sid})
+        root = item["root"]
+        if not sid or root in seen or len(seen) >= safe_limit:
+            continue
+        result = dict(payload)
+        result["session_id"] = item["tip"]
+        result["lineage_root"] = root
+        seen[root] = result
     return {"results": list(seen.values())}
 
 
@@ -334,15 +219,9 @@ def session_latest_descendant(
         return None, []
     if not row:
         return None, []
-    try:
-        if recovery_scope is None:
-            latest = db.resolve_resume_session_id(sid)
-        else:
-            latest = db.resolve_resume_session_id(sid, recovery_scope=recovery_scope)
-    except TypeError:
-        if recovery_scope is not None:
-            return None, []
-        return None, []
+    latest = db.resolve_resume_session_id(
+        sid, recovery_scope=recovery_scope
+    )
     if not latest:
         return None, []
     return latest, [sid] if latest == sid else [sid, latest]
@@ -407,12 +286,7 @@ def session_messages_payload(
         sid, recovery_scope=recovery_scope
     ):
         raise HTTPException(status_code=404, detail="Session not found")
-    try:
-        sid = db.resolve_resume_session_id(sid, recovery_scope=recovery_scope)
-    except TypeError:
-        if recovery_scope is not None:
-            raise HTTPException(status_code=404, detail="Session not found")
-        sid = db.resolve_resume_session_id(sid)
+    sid = db.resolve_resume_session_id(sid, recovery_scope=recovery_scope)
     if limit is None and before is None:
         return {
             "session_id": sid,
@@ -519,25 +393,7 @@ def stats_payload(
     *,
     recovery_scope: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    scope_kwargs = {"recovery_scope": recovery_scope} if recovery_scope is not None else {}
-    by_source: dict[str, int] = {}
-    try:
-        for session in db.list_sessions_rich(
-            limit=10000,
-            include_archived=True,
-            **scope_kwargs,
-        ):
-            source = str(session.get("source") or "cli")
-            by_source[source] = by_source.get(source, 0) + 1
-    except Exception:
-        pass
-    return {
-        "total": db.session_count(include_archived=True, **scope_kwargs),
-        "active_store": db.session_count(include_archived=False, **scope_kwargs),
-        "archived": db.session_count(archived_only=True, **scope_kwargs),
-        "messages": db.message_count(**scope_kwargs),
-        "by_source": by_source,
-    }
+    return db.session_stats(recovery_scope=recovery_scope)
 
 
 def prune_sessions_payload(
