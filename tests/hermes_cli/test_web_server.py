@@ -716,13 +716,12 @@ class TestWebServerEndpoints:
             def __init__(self, *args, **kwargs):
                 pass
 
-            def list_sessions_rich(self, limit, offset, min_message_count=0, **kwargs):
+            def list_sessions_page(
+                self, limit, offset, min_message_count=0, **kwargs
+            ):
                 captured["list"] = min_message_count
-                return []
-
-            def session_count(self, min_message_count=0, **kwargs):
                 captured["count"] = min_message_count
-                return 0
+                return [], 0
 
             def close(self):
                 pass
@@ -5411,6 +5410,7 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
                 super().__init__()
                 self.active_uses = 0
                 self.handles = {}
+                self.clients = {}
 
             def ensure_started(self, owner):
                 self.start_count += 1
@@ -5428,7 +5428,8 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
                 self.start_completed.set()
                 return handle
 
-            get_or_start = ensure_started
+            def needs_start(self, owner):
+                return owner.owner_key not in self.handles
 
             def acquire_active(self, owner):
                 from hermes_cli.dashboard_auth.authority import (
@@ -5460,6 +5461,29 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
                         supervisor.active_uses -= 1
 
                 return _Use()
+
+            def client_for(self, handle):
+                from hermes_cli.session_reader.client import SessionReaderClient
+
+                client = self.clients.get(handle.owner_key)
+                if client is None:
+                    client = SessionReaderClient(
+                        handle.socket_path,
+                        control_home=self.control_home,
+                    )
+                    self.clients[handle.owner_key] = client
+                return client
+
+            async def close_client(self, handle):
+                client = self.clients.pop(handle.owner_key, None)
+                if client is not None:
+                    await client.aclose()
+
+            async def close_clients(self):
+                clients = tuple(self.clients.values())
+                self.clients.clear()
+                for client in clients:
+                    await client.aclose()
 
             def report_request_failure(self, lease):
                 handle = self.handles.get(lease.owner_key)
@@ -5522,7 +5546,7 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         def fail_reach(*args, **kwargs):
             raise AssertionError("authenticated session reads must use only the Session Reader")
 
-        def fake_request(self, method, path, *, lease, headers=None, content=None):
+        async def fake_request(self, method, path, *, lease, headers=None, content=None):
             import httpx
 
             captured.update({"method": method, "path": path, "owner_key": lease.owner_key, "content": content})
@@ -5556,7 +5580,7 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         def fail_reach(*args, **kwargs):
             raise AssertionError("authenticated session list must use only the Session Reader")
 
-        def fake_request(self, method, path, *, lease, headers=None, content=None):
+        async def fake_request(self, method, path, *, lease, headers=None, content=None):
             import httpx
 
             captured.update({
@@ -5762,11 +5786,8 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         opened_profiles = []
 
         class _LocalSessionDB:
-            def list_sessions_rich(self, **kwargs):
-                return []
-
-            def session_count(self, **kwargs):
-                return 0
+            def list_sessions_page(self, **kwargs):
+                return [], 0
 
             def resolve_session_id(self, session_id):
                 return session_id
@@ -5843,7 +5864,7 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         def fail_local_or_worker(*args, **kwargs):
             raise AssertionError("reader failure must not reach local state or Owner Worker")
 
-        def fail_reader_request(*args, **kwargs):
+        async def fail_reader_request(*args, **kwargs):
             raise SessionReaderHealthError("reader unavailable")
 
         monkeypatch.setattr(web_server, "_open_session_db_for_profile", fail_local_or_worker)
@@ -5932,7 +5953,7 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
 
         captured = []
 
-        def fake_request(self, method, path, *, lease, headers=None, content=None):
+        async def fake_request(self, method, path, *, lease, headers=None, content=None):
             del self, headers, content
             captured.append((method, path, lease.owner_key))
             return httpx.Response(200, json={"owner_key": lease.owner_key})
@@ -6014,6 +6035,9 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
                 captured["derived_owner"] = owner
                 raise SessionReaderUnavailableError("reader owner mismatch")
 
+            async def close_clients(self):
+                return None
+
             def shutdown(self):
                 return None
 
@@ -6079,10 +6103,20 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
                 captured["derived_owner"] = requested_owner
                 return use
 
+            def client_for(self, requested_handle):
+                assert requested_handle is handle
+                return reader_client.SessionReaderClient(
+                    requested_handle.socket_path,
+                    control_home=self.control_home,
+                )
+
+            async def close_clients(self):
+                return None
+
             def shutdown(self):
                 return None
 
-        def fake_request(self, method, path, *, lease, headers=None, content=None):
+        async def fake_request(self, method, path, *, lease, headers=None, content=None):
             import httpx
 
             captured["capability_lease"] = lease
@@ -6460,10 +6494,20 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
                 assert requested_owner.owner_key == owner.owner_key
                 return _Use()
 
+            def client_for(self, requested_handle):
+                assert requested_handle is handle
+                return reader_client.SessionReaderClient(
+                    requested_handle.socket_path,
+                    control_home=self.control_home,
+                )
+
+            async def close_clients(self):
+                return None
+
             def shutdown(self):
                 return None
 
-        def reader_error(self, method, path, *, lease, headers=None, content=None):
+        async def reader_error(self, method, path, *, lease, headers=None, content=None):
             assert method == "GET"
             assert path == "/api/sessions?limit=30&offset=0&order=recent"
             return httpx.Response(500, json={"detail": "owner database failure"})
@@ -6480,7 +6524,7 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
     def test_authenticated_reader_proxy_internal_error_is_500(self, monkeypatch):
         import hermes_cli.session_reader.client as reader_client
 
-        def unexpected_failure(*args, **kwargs):
+        async def unexpected_failure(*args, **kwargs):
             raise RuntimeError("control-plane defect")
 
         monkeypatch.setattr(reader_client.SessionReaderClient, "request", unexpected_failure)

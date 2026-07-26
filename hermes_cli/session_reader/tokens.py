@@ -29,6 +29,11 @@ class SessionReaderCapabilityInvalid(ValueError):
 
 
 @dataclass(frozen=True)
+class SessionReaderCapabilityVerifier:
+    keys: Mapping[str, Ed25519PublicKey]
+
+
+@dataclass(frozen=True)
 class SessionReaderCapabilityClaims:
     issuer_key_version: str
     owner_key: str
@@ -150,6 +155,21 @@ def _verifiers(
         raise SessionReaderCapabilityInvalid("capability_verifier_unavailable") from exc
 
 
+def prepare_session_reader_capability_verifier(
+    *,
+    public_key: str | bytes | None = None,
+    issuer_key_version: str | None = None,
+    retained_public_keys: str | Mapping[str, str] | None = None,
+) -> SessionReaderCapabilityVerifier:
+    return SessionReaderCapabilityVerifier(
+        keys=_verifiers(
+            public_key=public_key,
+            issuer_key_version=issuer_key_version,
+            retained_public_keys=retained_public_keys,
+        )
+    )
+
+
 def verify_session_reader_capability(
     token: str,
     *,
@@ -159,6 +179,7 @@ def verify_session_reader_capability(
     public_key: str | bytes | None = None,
     issuer_key_version: str | None = None,
     retained_public_keys: str | Mapping[str, str] | None = None,
+    verifier: SessionReaderCapabilityVerifier | None = None,
     now: int | None = None,
 ) -> SessionReaderCapabilityClaims:
     """Verify signature, service identity, exact binding, and optional durable fence."""
@@ -169,10 +190,14 @@ def verify_session_reader_capability(
         signature = _b64url_decode(encoded_signature)
     except Exception as exc:
         raise SessionReaderCapabilityInvalid("capability_malformed") from exc
-    verifiers = _verifiers(
-        public_key=public_key,
-        issuer_key_version=issuer_key_version,
-        retained_public_keys=retained_public_keys,
+    verifiers = (
+        verifier.keys
+        if verifier is not None
+        else _verifiers(
+            public_key=public_key,
+            issuer_key_version=issuer_key_version,
+            retained_public_keys=retained_public_keys,
+        )
     )
     key_version = str(header.get("kid") or "") if isinstance(header, dict) else ""
     if (

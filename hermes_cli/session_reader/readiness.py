@@ -87,6 +87,11 @@ class SessionReaderLifecycle:
         existing = self._startups.get(owner_key)
         if existing is not None and not existing.done():
             return
+        needs_start = getattr(self.supervisor, "needs_start", None)
+        if callable(needs_start) and not needs_start(observed.owner):
+            observed.failures = 0
+            observed.retry_at = 0.0
+            return
         task = asyncio.create_task(
             self._ensure_started(owner_key, observed),
             name=f"session-reader-start:{owner_key}",
@@ -149,13 +154,37 @@ class SessionReaderLifecycle:
                 observed.failures,
                 self.max_backoff,
             )
+        finally:
+            self._wake.set()
+
+    def _next_wake_delay(self, now: float) -> float:
+        idle_timeout = float(getattr(self.supervisor, "idle_timeout", 1800.0))
+        desired_ttl = max(self.maintenance_interval, idle_timeout)
+        deadlines = [
+            observed.last_observed_at + desired_ttl
+            for observed in self._owners.values()
+        ]
+        deadlines.extend(
+            observed.retry_at
+            for observed in self._owners.values()
+            if observed.retry_at > now
+        )
+        next_maintenance = getattr(self.supervisor, "next_maintenance_delay", None)
+        if callable(next_maintenance):
+            deadlines.append(now + max(0.0, float(next_maintenance())))
+        elif self._owners:
+            deadlines.append(now + self.maintenance_interval)
+        if not deadlines:
+            return idle_timeout
+        return max(0.01, min(deadlines) - now)
 
     async def _run(self) -> None:
         while self._accepting:
+            now = time.monotonic()
             try:
                 await asyncio.wait_for(
                     self._wake.wait(),
-                    timeout=self.maintenance_interval,
+                    timeout=self._next_wake_delay(now),
                 )
             except asyncio.TimeoutError:
                 pass

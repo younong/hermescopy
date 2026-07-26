@@ -8,8 +8,11 @@ import os
 import re
 import socket
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from queue import Empty, Queue
+from typing import Any, Iterator
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .runtime import (
@@ -20,6 +23,10 @@ from .runtime import (
 
 _MAX_HEADER_BYTES = 32 * 1024
 _MAX_REQUEST_LINE_BYTES = 8 * 1024
+_MAX_WORKERS = 8
+_MAX_IN_FLIGHT = 16
+_DB_POOL_SIZE = 4
+_SOCKET_READ_TIMEOUT = 5.0
 _LITERAL_SESSION_PATHS = frozenset({
     "/api/sessions",
     "/api/sessions/search",
@@ -184,6 +191,54 @@ def _response(status: int, payload: dict[str, Any]) -> bytes:
     ).encode("ascii") + body
 
 
+class SessionReaderQueryRuntime:
+    """Lazily reuse a bounded set of owner-local read-only connections."""
+
+    def __init__(self, state_db: Path, *, pool_size: int = _DB_POOL_SIZE) -> None:
+        self.state_db = Path(state_db)
+        self.pool_size = max(1, int(pool_size))
+        self._available: Queue[Any] = Queue(maxsize=self.pool_size)
+        self._opened = 0
+        self._lock = threading.Lock()
+        self._closed = False
+
+    @contextmanager
+    def borrow(self) -> Iterator[Any]:
+        from .db import ReadOnlySessionDB
+
+        if self._closed:
+            raise RuntimeError("session reader query runtime is closed")
+        try:
+            db = self._available.get_nowait()
+        except Empty:
+            with self._lock:
+                if self._opened < self.pool_size:
+                    db = ReadOnlySessionDB(self.state_db)
+                    self._opened += 1
+                else:
+                    db = None
+            if db is None:
+                db = self._available.get()
+        try:
+            yield db
+        finally:
+            if self._closed:
+                db.close()
+            else:
+                self._available.put(db)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        while True:
+            try:
+                self._available.get_nowait().close()
+            except Empty:
+                return
+
+
 def _create_handler(
     owner_key: str,
     owner_home: Path,
@@ -193,8 +248,11 @@ def _create_handler(
     socket_path: Path,
 ):
     from hermes_cli import session_api
-    from .db import ReadOnlySessionDB
-    from .tokens import SessionReaderCapabilityInvalid, verify_session_reader_capability
+    from .tokens import (
+        SessionReaderCapabilityInvalid,
+        prepare_session_reader_capability_verifier,
+        verify_session_reader_capability,
+    )
 
     paths = validate_session_reader_runtime_environment(
         owner_home=owner_home,
@@ -205,11 +263,14 @@ def _create_handler(
     )
     lease = _lease_from_env(owner_key)
     Path(os.environ["HERMES_CONTROL_HOME"]).resolve()
-    verifier = {
-        "public_key": os.environ["HERMES_SESSION_READER_CAPABILITY_PUBLIC_KEY"],
-        "issuer_key_version": os.environ["HERMES_SESSION_READER_CAPABILITY_ISSUER"],
-        "retained_public_keys": os.environ["HERMES_SESSION_READER_CAPABILITY_RETAINED_PUBLIC_KEYS"],
-    }
+    verifier = prepare_session_reader_capability_verifier(
+        public_key=os.environ["HERMES_SESSION_READER_CAPABILITY_PUBLIC_KEY"],
+        issuer_key_version=os.environ["HERMES_SESSION_READER_CAPABILITY_ISSUER"],
+        retained_public_keys=os.environ[
+            "HERMES_SESSION_READER_CAPABILITY_RETAINED_PUBLIC_KEYS"
+        ],
+    )
+    queries = SessionReaderQueryRuntime(paths.state_db)
 
     def handle(method: str, target: str, headers: dict[str, str]) -> tuple[int, dict[str, Any]]:
         parsed = urlsplit(target)
@@ -231,7 +292,7 @@ def _create_handler(
                 # keeping the subprocess off authority.db avoids a second shared
                 # database trust boundary on the latency-critical read path.
                 authority_store=None,
-                **verifier,
+                verifier=verifier,
             )
         except (SessionReaderCapabilityInvalid, RuntimeError):
             return 401, {"detail": "invalid session reader capability"}
@@ -292,64 +353,64 @@ def _create_handler(
             "workspace_root": str((paths.owner_home / "workspaces").resolve()),
             "historical_resume": True,
         }
-        db = ReadOnlySessionDB(paths.state_db)
         try:
-            if route_path == "/api/sessions":
-                payload = session_api.list_sessions_payload(
-                    db,
-                    limit=limit,
-                    offset=offset,
-                    min_messages=min_messages,
-                    archived=archived,
-                    order=order,
-                    source=source,
-                    exclude_sources=exclude_sources,
-                    cwd_prefix=cwd_prefix,
-                    recovery_scope=recovery_scope,
-                    compact=compact,
-                    latency_trace_id=headers.get("x-request-id", ""),
-                )
-            elif route_path == "/api/sessions/search":
-                payload = session_api.search_sessions_payload(
-                    db,
-                    q=search_query,
-                    limit=limit,
-                    recovery_scope=recovery_scope,
-                )
-            elif route_path == "/api/sessions/empty/count":
-                payload = session_api.empty_count_payload(
-                    db, recovery_scope=recovery_scope
-                )
-            elif route_path == "/api/sessions/stats":
-                payload = session_api.stats_payload(
-                    db, recovery_scope=recovery_scope
-                )
-            elif route_path.endswith("/latest-descendant"):
-                payload = session_api.latest_descendant_payload(
-                    db,
-                    str(session_id),
-                    recovery_scope=recovery_scope,
-                )
-            elif route_path.endswith("/messages"):
-                payload = session_api.session_messages_payload(
-                    db,
-                    str(session_id),
-                    limit=limit if "limit" in query else None,
-                    before=before,
-                    recovery_scope=recovery_scope,
-                )
-            elif route_path.endswith("/export"):
-                payload = session_api.export_session_payload(
-                    db,
-                    str(session_id),
-                    recovery_scope=recovery_scope,
-                )
-            else:
-                payload = session_api.session_detail_payload(
-                    db,
-                    str(session_id),
-                    recovery_scope=recovery_scope,
-                )
+            with queries.borrow() as db:
+                if route_path == "/api/sessions":
+                    payload = session_api.list_sessions_payload(
+                        db,
+                        limit=limit,
+                        offset=offset,
+                        min_messages=min_messages,
+                        archived=archived,
+                        order=order,
+                        source=source,
+                        exclude_sources=exclude_sources,
+                        cwd_prefix=cwd_prefix,
+                        recovery_scope=recovery_scope,
+                        compact=compact,
+                        latency_trace_id=headers.get("x-request-id", ""),
+                    )
+                elif route_path == "/api/sessions/search":
+                    payload = session_api.search_sessions_payload(
+                        db,
+                        q=search_query,
+                        limit=limit,
+                        recovery_scope=recovery_scope,
+                    )
+                elif route_path == "/api/sessions/empty/count":
+                    payload = session_api.empty_count_payload(
+                        db, recovery_scope=recovery_scope
+                    )
+                elif route_path == "/api/sessions/stats":
+                    payload = session_api.stats_payload(
+                        db, recovery_scope=recovery_scope
+                    )
+                elif route_path.endswith("/latest-descendant"):
+                    payload = session_api.latest_descendant_payload(
+                        db,
+                        str(session_id),
+                        recovery_scope=recovery_scope,
+                    )
+                elif route_path.endswith("/messages"):
+                    payload = session_api.session_messages_payload(
+                        db,
+                        str(session_id),
+                        limit=limit if "limit" in query else None,
+                        before=before,
+                        recovery_scope=recovery_scope,
+                    )
+                elif route_path.endswith("/export"):
+                    payload = session_api.export_session_payload(
+                        db,
+                        str(session_id),
+                        recovery_scope=recovery_scope,
+                    )
+                else:
+                    payload = session_api.session_detail_payload(
+                        db,
+                        str(session_id),
+                        recovery_scope=recovery_scope,
+                    )
             return 200, payload
         except Exception as exc:
             status = int(getattr(exc, "status_code", 500))
@@ -357,43 +418,18 @@ def _create_handler(
             if status >= 500:
                 _log.exception("session reader request failed")
             return status, {"detail": detail}
-        finally:
-            db.close()
 
+    handle.close = queries.close
     return handle
 
 
-def create_app(
-    owner_key: str,
-    owner_home: Path,
-    *,
-    reader_generation: int,
-    reader_id: str,
-    socket_path: Path,
-):
-    """Compatibility ASGI app for focused in-process tests; subprocesses use the lean server."""
-    from fastapi import FastAPI, Request
-    from fastapi.responses import JSONResponse
-
-    handler = _create_handler(
-        owner_key,
-        owner_home,
-        reader_generation=reader_generation,
-        reader_id=reader_id,
-        socket_path=socket_path,
-    )
-    app = FastAPI(title="Hermes Session Reader")
-
-    @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
-    async def dispatch(request: Request, path: str):
-        status, payload = handler(request.method, request.url.path + (f"?{request.url.query}" if request.url.query else ""), dict(request.headers))
-        return JSONResponse(status_code=status, content=payload)
-
-    return app
-
-
-def _handle_connection(connection: socket.socket, handler: Any) -> None:
+def _handle_connection(
+    connection: socket.socket,
+    handler: Any,
+    admission: threading.BoundedSemaphore | None = None,
+) -> None:
     with connection:
+        connection.settimeout(_SOCKET_READ_TIMEOUT)
         status, payload = 400, {"detail": "Bad request"}
         try:
             chunks = bytearray()
@@ -420,7 +456,11 @@ def _handle_connection(connection: socket.socket, handler: Any) -> None:
         except Exception:
             _log.exception("session reader connection failed")
             status, payload = 500, {"detail": "Internal server error"}
-        connection.sendall(_response(status, payload))
+        try:
+            connection.sendall(_response(status, payload))
+        finally:
+            if admission is not None:
+                admission.release()
 
 
 def _serve(
@@ -439,16 +479,32 @@ def _serve(
         encoding="utf-8",
     )
     os.replace(temporary_ready, ready_path)
+    admission = threading.BoundedSemaphore(_MAX_IN_FLIGHT)
+    executor = ThreadPoolExecutor(
+        max_workers=_MAX_WORKERS,
+        thread_name_prefix="session-reader",
+    )
     try:
         while True:
             connection, _address = server.accept()
-            threading.Thread(
-                target=_handle_connection,
-                args=(connection, handler),
-                daemon=True,
-            ).start()
+            if not admission.acquire(blocking=False):
+                with connection:
+                    connection.sendall(
+                        _response(503, {"detail": "Session reader is busy"})
+                    )
+                continue
+            try:
+                executor.submit(_handle_connection, connection, handler, admission)
+            except Exception:
+                admission.release()
+                connection.close()
+                raise
     finally:
         server.close()
+        executor.shutdown(wait=True, cancel_futures=True)
+        close_handler = getattr(handler, "close", None)
+        if close_handler is not None:
+            close_handler()
 
 
 def main() -> None:
