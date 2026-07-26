@@ -29,6 +29,24 @@ follow the implementation and its closest focused tests.
    deploy, tag, rollback, or production-status operation, first invoke the
    project `hermes-release` skill.
 
+## Replacement and Cleanup Policy
+
+- Prefer modifying or reusing existing implementations over adding parallel
+  ones. Before adding a function, state field, configuration key, abstraction,
+  or execution path, search for the implementation it replaces or can extend.
+- When a new implementation supersedes an old one, remove the old code, callers,
+  compatibility branches, imports, configuration, comments, and test fixtures
+  in the same change unless an explicit compatibility requirement exists.
+- Do not introduce `v2`, wrapper, fallback, or temporary compatibility paths
+  without documenting why callers cannot migrate directly and what will remove
+  the compatibility path.
+- After implementation and focused validation, run a dedicated simplification
+  pass (use `/simplify` when available), rerun affected validation after any
+  cleanup edits, and review the final diff for duplication and unreachable code.
+- In the completion report, identify obsolete code removed. If none was removed,
+  explain why all affected existing code remains necessary. Do not optimize for
+  a negative line count; optimize for the smallest complete implementation.
+
 ## Bounded Code Reviews
 
 - Code reviews in this repository have a global Claude Code `Agent` budget of
