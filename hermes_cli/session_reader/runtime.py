@@ -39,6 +39,17 @@ class SessionReaderRuntimePaths:
     state_db: Path
 
 
+class SessionReaderRuntimePreparationError(RuntimeError):
+    """Safe, fixed classification for one rejected Reader runtime component."""
+
+    stage = "runtime_prepare"
+
+    def __init__(self, code: str, component: str) -> None:
+        self.code = str(code)
+        self.component = str(component)
+        super().__init__(f"session reader runtime preparation failed: {self.code}")
+
+
 def session_reader_runtime_dir(owner_home: str | Path, reader_generation: int) -> Path:
     """Return the canonical runtime directory for one Session Reader generation."""
     home = Path(owner_home).expanduser().resolve()
@@ -55,27 +66,71 @@ def session_reader_socket_path(owner_home: str | Path, reader_generation: int) -
     return session_reader_runtime_dir(owner_home, reader_generation) / "s"
 
 
-def _prepare_private_directory(path: Path, *, parent_device: int) -> os.stat_result:
+def _directory_identity(info: os.stat_result) -> tuple[int, int, int]:
+    return info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)
+
+
+def _preparation_error(code: str, component: str) -> SessionReaderRuntimePreparationError:
+    return SessionReaderRuntimePreparationError(code, component)
+
+
+def _prepare_private_directory(
+    path: Path,
+    *,
+    parent_device: int,
+    component: str,
+) -> os.stat_result:
     try:
         before = path.lstat()
     except FileNotFoundError:
-        path.mkdir(mode=0o700)
+        try:
+            path.mkdir(mode=0o700)
+        except OSError as exc:
+            raise _preparation_error("create_failed", component) from exc
         before = path.lstat()
+    if stat.S_ISLNK(before.st_mode):
+        raise _preparation_error("symlink", component)
     if not stat.S_ISDIR(before.st_mode):
-        raise RuntimeError(f"session reader path must be a directory: {path}")
-    if os.name != "nt" and before.st_mode & 0o077:
-        raise RuntimeError(f"session reader path has unsafe permissions: {path}")
+        raise _preparation_error("not_directory", component)
     if hasattr(os, "getuid") and before.st_uid != os.getuid():
-        raise RuntimeError(f"session reader path has unexpected ownership: {path}")
+        raise _preparation_error("wrong_owner", component)
     if before.st_dev != parent_device:
-        raise RuntimeError(f"session reader path is on an unexpected mount: {path}")
+        raise _preparation_error("wrong_device", component)
+
+    if os.name == "nt":
+        after = path.lstat()
+        if _directory_identity(before) != _directory_identity(after):
+            raise _preparation_error("identity_changed", component)
+        return after
+
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise _preparation_error("open_failed", component) from exc
+    try:
+        opened = os.fstat(descriptor)
+        if _directory_identity(before) != _directory_identity(opened):
+            raise _preparation_error("identity_changed", component)
+        if opened.st_uid != os.getuid():
+            raise _preparation_error("wrong_owner", component)
+        try:
+            os.fchmod(descriptor, 0o700)
+        except OSError as exc:
+            raise _preparation_error("harden_failed", component) from exc
+        hardened = os.fstat(descriptor)
+        if stat.S_IMODE(hardened.st_mode) != 0o700:
+            raise _preparation_error("harden_failed", component)
+    finally:
+        os.close(descriptor)
+
     after = path.lstat()
-    if (before.st_dev, before.st_ino, stat.S_IFMT(before.st_mode)) != (
-        after.st_dev,
-        after.st_ino,
-        after.st_mode & 0o170000,
-    ):
-        raise RuntimeError(f"session reader path changed during preparation: {path}")
+    if _directory_identity(before) != _directory_identity(after):
+        raise _preparation_error("identity_changed", component)
+    if stat.S_IMODE(after.st_mode) != 0o700:
+        raise _preparation_error("harden_failed", component)
     return after
 
 
@@ -93,13 +148,26 @@ def prepare_session_reader_runtime(
         reader_generation=reader_generation,
     )
     runtime = home / "runtime"
-    runtime_info = _prepare_private_directory(runtime, parent_device=home_info.st_dev)
-    _prepare_private_directory(runtime / "logs", parent_device=runtime_info.st_dev)
+    runtime_info = _prepare_private_directory(
+        runtime,
+        parent_device=home_info.st_dev,
+        component="runtime",
+    )
+    _prepare_private_directory(
+        runtime / "logs",
+        parent_device=runtime_info.st_dev,
+        component="runtime_logs",
+    )
     readers = runtime / "r"
-    readers_info = _prepare_private_directory(readers, parent_device=runtime_info.st_dev)
+    readers_info = _prepare_private_directory(
+        readers,
+        parent_device=runtime_info.st_dev,
+        component="readers_root",
+    )
     _prepare_private_directory(
         paths.reader_runtime_dir,
         parent_device=readers_info.st_dev,
+        component="generation",
     )
     for label, path in (
         ("runtime", runtime),

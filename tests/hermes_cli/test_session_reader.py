@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import threading
 import time
 from pathlib import Path
@@ -113,6 +114,114 @@ def test_reader_capability_is_exact_owner_generation_lease_and_path_bound(tmp_pa
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory hardening")
+def test_reader_runtime_preparation_hardens_owned_legacy_directory(tmp_path):
+    from hermes_cli.session_reader.runtime import prepare_session_reader_runtime
+
+    owner_home = tmp_path / "owner"
+    readers = owner_home / "runtime" / "r"
+    readers.mkdir(parents=True, mode=0o755)
+    readers.chmod(0o755)
+    before = readers.lstat()
+
+    paths = prepare_session_reader_runtime(owner_home, 3)
+
+    after = readers.lstat()
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    assert stat.S_IMODE(after.st_mode) == 0o700
+    assert stat.S_IMODE(paths.reader_runtime_dir.lstat().st_mode) == 0o700
+    for worker_only in ("workspaces", "skills", "sessions", "checkpoints"):
+        assert not (owner_home / worker_only).exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory hardening")
+@pytest.mark.parametrize(
+    ("kind", "code"),
+    [("symlink", "symlink"), ("file", "not_directory")],
+)
+def test_reader_runtime_preparation_rejects_non_directory_components(
+    tmp_path, kind, code
+):
+    from hermes_cli.session_reader.runtime import (
+        SessionReaderRuntimePreparationError,
+        prepare_session_reader_runtime,
+    )
+
+    owner_home = tmp_path / "owner"
+    runtime = owner_home / "runtime"
+    runtime.mkdir(parents=True, mode=0o700)
+    logs = runtime / "logs"
+    if kind == "symlink":
+        target = tmp_path / "outside"
+        target.mkdir(mode=0o700)
+        try:
+            logs.symlink_to(target, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks unavailable")
+    else:
+        logs.write_text("not a directory")
+
+    with pytest.raises(SessionReaderRuntimePreparationError) as caught:
+        prepare_session_reader_runtime(owner_home, 1)
+
+    assert caught.value.code == code
+    assert caught.value.component == "runtime_logs"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory ownership")
+def test_reader_runtime_preparation_rejects_wrong_owner_before_chmod(
+    tmp_path, monkeypatch
+):
+    import hermes_cli.session_reader.runtime as reader_runtime
+
+    owner_home = tmp_path / "owner"
+    runtime = owner_home / "runtime"
+    runtime.mkdir(parents=True, mode=0o755)
+    runtime.chmod(0o755)
+    actual_uid = os.getuid()
+    monkeypatch.setattr(reader_runtime.os, "getuid", lambda: actual_uid + 1)
+
+    with pytest.raises(reader_runtime.SessionReaderRuntimePreparationError) as caught:
+        reader_runtime.prepare_session_reader_runtime(owner_home, 1)
+
+    assert caught.value.code == "wrong_owner"
+    assert caught.value.component == "runtime"
+    assert stat.S_IMODE(runtime.lstat().st_mode) == 0o755
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor identity")
+def test_reader_runtime_preparation_rejects_replaced_inode_before_chmod(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    import hermes_cli.session_reader.runtime as reader_runtime
+
+    owner_home = tmp_path / "owner"
+    runtime = owner_home / "runtime"
+    runtime.mkdir(parents=True, mode=0o755)
+    runtime.chmod(0o755)
+    actual_fstat = reader_runtime.os.fstat
+
+    def changed_fstat(descriptor):
+        info = actual_fstat(descriptor)
+        return SimpleNamespace(
+            st_dev=info.st_dev,
+            st_ino=info.st_ino + 1,
+            st_mode=info.st_mode,
+            st_uid=info.st_uid,
+        )
+
+    monkeypatch.setattr(reader_runtime.os, "fstat", changed_fstat)
+
+    with pytest.raises(reader_runtime.SessionReaderRuntimePreparationError) as caught:
+        reader_runtime.prepare_session_reader_runtime(owner_home, 1)
+
+    assert caught.value.code == "identity_changed"
+    assert caught.value.component == "runtime"
+    assert stat.S_IMODE(runtime.lstat().st_mode) == 0o755
+
+
 def test_reader_runtime_contract_is_minimal_and_separate_from_worker(tmp_path):
     owner_home = tmp_path / "owner"
     control_home = tmp_path / "control"
@@ -193,6 +302,58 @@ def _write_reader_ready(argv, env, process) -> None:
     socket_path.with_name("reader.ready.json").write_text(json.dumps(health))
 
 
+def test_reader_lifecycle_logs_safe_runtime_preparation_metadata(
+    tmp_path, caplog
+):
+    import asyncio
+    from types import SimpleNamespace
+
+    from hermes_cli.session_reader.readiness import SessionReaderLifecycle
+    from hermes_cli.session_reader.runtime import SessionReaderRuntimePreparationError
+
+    private_path = tmp_path / "private-owner-path"
+
+    class _Supervisor:
+        idle_timeout = 1800
+
+        def ensure_started(self, _owner):
+            try:
+                private_path.write_text("private")
+            except OSError:
+                pass
+            raise SessionReaderRuntimePreparationError(
+                "wrong_owner", "readers_root"
+            )
+
+        def maintenance_tick(self):
+            return None
+
+    async def run() -> None:
+        lifecycle = SessionReaderLifecycle(
+            _Supervisor(), initial_backoff=0.1, max_backoff=5
+        )
+        observed = SimpleNamespace(
+            owner=SimpleNamespace(owner_key="ok1_safe_log"),
+            last_observed_at=0.0,
+            failures=0,
+            retry_at=0.0,
+        )
+        await lifecycle._ensure_started("ok1_safe_log", observed)
+
+    with caplog.at_level(
+        "WARNING", logger="hermes_cli.session_reader.readiness"
+    ):
+        asyncio.run(run())
+
+    assert "error_type=SessionReaderRuntimePreparationError" in caplog.text
+    assert "failure_stage=runtime_prepare" in caplog.text
+    assert "failure_code=wrong_owner" in caplog.text
+    assert "component=readers_root" in caplog.text
+    assert "attempt=1" in caplog.text
+    assert "retry_delay=5.000" in caplog.text
+    assert str(private_path) not in caplog.text
+
+
 def test_reader_supervisor_attaches_resource_scope_before_accepting_health(tmp_path):
     from hermes_cli.session_reader.supervisor import SessionReaderSupervisor
 
@@ -241,6 +402,42 @@ def test_reader_supervisor_attaches_resource_scope_before_accepting_health(tmp_p
     supervisor.shutdown()
     assert manager.scope.cleaned
     assert operations[-1] == ("cleanup",)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory ownership")
+def test_reader_runtime_preparation_failure_revokes_lease_without_launch(tmp_path):
+    from hermes_cli.session_reader.runtime import SessionReaderRuntimePreparationError
+    from hermes_cli.session_reader.supervisor import SessionReaderSupervisor
+
+    owner_home = tmp_path / "owner"
+    runtime = owner_home / "runtime"
+    runtime.mkdir(parents=True, mode=0o700)
+    (runtime / "logs").write_text("not a directory")
+    launched = False
+
+    def process_factory(*_args, **_kwargs):
+        nonlocal launched
+        launched = True
+        raise AssertionError("runtime rejection must precede process launch")
+
+    supervisor = SessionReaderSupervisor(
+        control_home=tmp_path / "control",
+        global_home=tmp_path,
+        process_factory=process_factory,
+        startup_timeout=0.1,
+    )
+
+    with pytest.raises(SessionReaderRuntimePreparationError) as caught:
+        supervisor.ensure_started(
+            {"owner_key": "ok1_runtime_rejected", "owner_home": owner_home}
+        )
+
+    assert caught.value.code == "not_directory"
+    assert not launched
+    lease = supervisor.authority_store.read_session_reader_lease(
+        "ok1_runtime_rejected"
+    )
+    assert lease is not None and lease.state is ReaderLeaseState.REVOKED
 
 
 def test_reader_supervisor_membership_failure_revokes_lease_and_cleans_scope(tmp_path):
@@ -362,6 +559,10 @@ def test_reader_real_process_reads_owner_db_without_creating_missing_db(tmp_path
     short_root = Path("/tmp") / f"hermes-reader-{os.getpid()}-{time.time_ns()}"
     control = short_root / "control"
     owner_home = short_root / "owner"
+    readers = owner_home / "runtime" / "r"
+    readers.mkdir(parents=True, mode=0o755)
+    if os.name != "nt":
+        readers.chmod(0o755)
     owner = {"owner_key": "ok1_a", "owner_home": owner_home}
     supervisor = SessionReaderSupervisor(
         control_home=control,
@@ -373,6 +574,7 @@ def test_reader_real_process_reads_owner_db_without_creating_missing_db(tmp_path
         started = time.perf_counter()
         handle = supervisor.get_or_start(owner)
         assert time.perf_counter() - started < 3
+        assert stat.S_IMODE(readers.lstat().st_mode) == 0o700
         lease = supervisor._lease_for_handle(handle)
         client = SessionReaderClient(handle.socket_path, control_home=control)
         response = client.request(

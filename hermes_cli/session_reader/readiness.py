@@ -116,21 +116,38 @@ class SessionReaderLifecycle:
             SessionReaderUnavailableError,
             SessionReaderStartupError,
             SessionReaderHealthError,
-        ):
+        ) as exc:
             observed.failures += 1
             delay = min(
                 self.max_backoff,
                 self.initial_backoff * (2 ** min(observed.failures - 1, 8)),
             )
             observed.retry_at = time.monotonic() + delay
-            _log.warning("session reader background startup failed owner=%s", owner_key)
+            _log.warning(
+                "session reader background startup failed owner=%s error_type=%s "
+                "failure_stage=%s failure_code=%s component=%s attempt=%s retry_delay=%.3f",
+                owner_key,
+                type(exc).__name__,
+                getattr(exc, "stage", "startup"),
+                getattr(exc, "code", "unavailable"),
+                getattr(exc, "component", "reader"),
+                observed.failures,
+                delay,
+            )
         except Exception as exc:
             observed.failures += 1
             observed.retry_at = time.monotonic() + self.max_backoff
             _log.warning(
-                "session reader background startup failed owner=%s error_type=%s",
+                "session reader background startup failed owner=%s error_type=%s "
+                "failure_stage=%s failure_code=%s component=%s "
+                "attempt=%s retry_delay=%.3f",
                 owner_key,
                 type(exc).__name__,
+                getattr(exc, "stage", "unexpected"),
+                getattr(exc, "code", "unexpected"),
+                getattr(exc, "component", "reader"),
+                observed.failures,
+                self.max_backoff,
             )
 
     async def _run(self) -> None:

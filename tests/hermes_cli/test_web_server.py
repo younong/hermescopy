@@ -5904,6 +5904,11 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         assert response.status_code == 200
         assert response.json()["owner_key"]
         assert "session reader background startup failed" in caplog.text
+        assert "error_type=TimeoutError" in caplog.text
+        assert "failure_stage=startup" in caplog.text
+        assert "failure_code=unavailable" in caplog.text
+        assert "attempt=1" in caplog.text
+        assert "retry_delay=0.100" in caplog.text
         assert "private startup details" not in caplog.text
         assert not self.supervisor.owners
 
