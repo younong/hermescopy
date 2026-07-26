@@ -127,6 +127,8 @@ def test_authenticated_smoke_dispatches_terminal_through_supervisor_source():
     source = SMOKE.read_text(encoding="utf-8")
 
     assert "host_sandbox_deployment_policy(policy_path)" in source
+    assert "recover_stale_scopes=False" in source
+    assert 'checks["non_destructive_cgroup_attach"] = "passed"' in source
     assert "os.chdir(runtime_paths.default_workspace)" in source
     assert "os.chdir(original_cwd)" in source
     assert 'function_name="terminal"' in source
@@ -136,6 +138,10 @@ def test_authenticated_smoke_dispatches_terminal_through_supervisor_source():
     assert '"/opt/hermes/release/skills/productivity/powerpoint/scripts/office/soffice.py"' in source
     assert "_open_fd_pressure(nofile_limit + 8)" in source
     assert 'function_name="web_search"' in source
+    assert 'output_config_home / "config.yaml"' in source
+    assert '"tool_output:\\n  max_bytes: 400000\\n"' in source
+    assert 'type(exc).__name__ != "ExecutorOutputExceeded"' in source
+    assert "manager.cleanup_owner(self.owner_lease)" in source
     assert "owner_tool_relay=relay" in source
     assert "supervisor.stop_generation()" in source
     assert "network_server.shutdown()" in source

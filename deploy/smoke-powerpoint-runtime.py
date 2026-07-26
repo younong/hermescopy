@@ -199,7 +199,7 @@ def _run_authenticated_executor(
     started = time.monotonic()
     checks: dict[str, str] = {}
     failure: dict[str, str] | None = None
-    cleanup = "passed"
+    cleanup_failures: list[str] = []
     roots = None
     supervisor = None
     resource_controller = None
@@ -226,8 +226,9 @@ def _run_authenticated_executor(
         from hermes_cli.owner_worker.tool_executor_supervisor import ToolExecutorSupervisor
 
         class LocalResourceController:
-            def __init__(self, manager):
+            def __init__(self, manager, owner_lease):
                 self.manager = manager
+                self.owner_lease = owner_lease
 
             def reserve_executor(self, identity, invocation_id):
                 scope = self.manager.admit_executor(identity, invocation_id)
@@ -249,9 +250,9 @@ def _run_authenticated_executor(
                 return LocalScope()
 
             def shutdown_generation(self):
-                # This one-shot smoke owns only invocation leases it returns;
-                # never sweep scopes held by the live Dashboard manager.
-                return None
+                # This one-shot smoke owns this exact synthetic owner only. Never
+                # sweep scopes held by the live Dashboard manager.
+                self.manager.cleanup_owner(self.owner_lease)
 
             def close(self):
                 self.manager.close()
@@ -273,11 +274,12 @@ def _run_authenticated_executor(
             0,
         )
         deployment_policy = host_sandbox_deployment_policy(policy_path)
-        manager = CgroupV2Manager(deployment_policy.resource_policy)
-        checks["startup_recovery"] = (
-            f"passed:{manager.startup_cleanup_count}"
+        manager = CgroupV2Manager(
+            deployment_policy.resource_policy,
+            recover_stale_scopes=False,
         )
-        resource_controller = LocalResourceController(manager)
+        checks["non_destructive_cgroup_attach"] = "passed"
+        resource_controller = LocalResourceController(manager, lease)
         network_server = HTTPServer(("127.0.0.1", 0), _NetworkSmokeHandler)
         network_thread = threading.Thread(
             target=network_server.serve_forever,
@@ -380,17 +382,6 @@ def _run_authenticated_executor(
                 "deadline_enforced",
                 "resource_deadline_exceeded",
             ),
-            (
-                {
-                    "command": (
-                        "/opt/hermes/python/bin/python3 -c "
-                        + shlex.quote("print('x' * 400000)")
-                    ),
-                    "timeout": timeout,
-                },
-                "output_enforced",
-                "resource_output_limit_exceeded",
-            ),
         ):
             try:
                 supervisor.dispatch(
@@ -403,17 +394,53 @@ def _run_authenticated_executor(
                     api_request_id=f"deploy-{check}",
                 )
             except Exception as exc:
-                name = type(exc).__name__
-                expected = (
-                    name == "ExecutorDeadlineExceeded"
-                    if check == "deadline_enforced"
-                    else name == "ExecutorOutputExceeded"
-                )
-                if not expected:
+                if type(exc).__name__ != "ExecutorDeadlineExceeded":
                     raise RuntimeError(failure_check) from exc
             else:
                 raise RuntimeError(failure_check)
             checks[check] = "passed"
+
+        output_identity = supervisor.identity_for(
+            task_id="deploy-output-enforced",
+            session_id="deploy-output-enforced",
+        )
+        output_runtime = (
+            owner_home
+            / "runtime"
+            / "executors"
+            / output_identity.executor_id
+            / f"gen-{output_identity.executor_generation}"
+        )
+        output_runtime.mkdir(parents=True, exist_ok=False)
+        output_runtime.chmod(0o700)
+        output_config_home = output_runtime / ".hermes"
+        output_config_home.mkdir(mode=0o700)
+        (output_config_home / "config.yaml").write_text(
+            "tool_output:\n  max_bytes: 400000\n",
+            encoding="utf-8",
+        )
+        try:
+            supervisor.dispatch(
+                function_name="terminal",
+                function_args={
+                    "command": (
+                        "/opt/hermes/python/bin/python3 -c "
+                        + shlex.quote("print('x' * 400000)")
+                    ),
+                    "timeout": timeout,
+                },
+                task_id="deploy-output-enforced",
+                session_id="deploy-output-enforced",
+                tool_call_id="deploy-output-enforced",
+                turn_id="deploy-output-enforced",
+                api_request_id="deploy-output-enforced",
+            )
+        except Exception as exc:
+            if type(exc).__name__ != "ExecutorOutputExceeded":
+                raise RuntimeError("resource_output_limit_exceeded") from exc
+        else:
+            raise RuntimeError("resource_output_limit_exceeded")
+        checks["output_enforced"] = "passed"
     except Exception as exc:
         check = str(exc) if isinstance(exc, RuntimeError) else "authenticated_executor"
         failure = {"check": check, "code": type(exc).__name__}
@@ -422,50 +449,51 @@ def _run_authenticated_executor(
             try:
                 os.close(descriptor)
             except OSError:
-                cleanup = "failed"
+                cleanup_failures.append("pressure_fds")
         if network_server is not None:
             try:
                 network_server.shutdown()
                 network_server.server_close()
             except Exception:
-                cleanup = "failed"
+                cleanup_failures.append("network_server")
         if network_thread is not None:
             network_thread.join(timeout=5)
             if network_thread.is_alive():
-                cleanup = "failed"
+                cleanup_failures.append("network_thread")
         if supervisor is not None:
             try:
                 supervisor.stop_generation()
             except Exception:
-                cleanup = "failed"
+                cleanup_failures.append("supervisor")
         if relay is not None:
             try:
                 relay.close()
             except Exception:
-                cleanup = "failed"
+                cleanup_failures.append("relay")
         if resource_controller is not None:
             try:
                 resource_controller.close()
             except Exception:
-                cleanup = "failed"
+                cleanup_failures.append("resource_controller")
         if roots is not None:
             try:
                 roots.close()
             except Exception:
-                cleanup = "failed"
+                cleanup_failures.append("roots")
         if original_cwd is not None:
             try:
                 os.chdir(original_cwd)
             except OSError:
-                cleanup = "failed"
+                cleanup_failures.append("cwd")
         try:
             shutil.rmtree(owner_home)
         except FileNotFoundError:
             pass
         except OSError:
-            cleanup = "failed"
-        if cleanup != "passed" and failure is None:
-            failure = {"check": "owner_cleanup", "code": "OSError"}
+            cleanup_failures.append("owner_home")
+        cleanup = "passed" if not cleanup_failures else "failed:" + ",".join(cleanup_failures)
+        if cleanup_failures and failure is None:
+            failure = {"check": "owner_cleanup", "code": "RuntimeError"}
 
     return _result(
         started=started,

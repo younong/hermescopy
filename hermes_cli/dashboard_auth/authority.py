@@ -22,8 +22,59 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 _DB_NAME = "authority.sqlite3"
+
+
+class ReaderLeaseState(StrEnum):
+    """Fenced admission state for one Session Reader per owner."""
+
+    STARTING = "starting"
+    ACTIVE = "active"
+    DRAINING = "draining"
+    REVOKED = "revoked"
+
+
+class ReaderGenerationState(StrEnum):
+    """Durable lifecycle states for a Session Reader generation."""
+
+    STARTING = "starting"
+    ACTIVE = "active"
+    DRAINING = "draining"
+    REVOKED = "revoked"
+    TERMINATED = "terminated"
+    FAILED = "failed"
+
+
+_READER_GENERATION_TRANSITIONS: dict[ReaderGenerationState, frozenset[ReaderGenerationState]] = {
+    ReaderGenerationState.STARTING: frozenset({ReaderGenerationState.ACTIVE, ReaderGenerationState.REVOKED, ReaderGenerationState.FAILED}),
+    ReaderGenerationState.ACTIVE: frozenset({ReaderGenerationState.DRAINING, ReaderGenerationState.REVOKED, ReaderGenerationState.FAILED}),
+    ReaderGenerationState.DRAINING: frozenset({ReaderGenerationState.REVOKED, ReaderGenerationState.TERMINATED, ReaderGenerationState.FAILED}),
+    ReaderGenerationState.REVOKED: frozenset({ReaderGenerationState.TERMINATED}),
+    ReaderGenerationState.TERMINATED: frozenset(),
+    ReaderGenerationState.FAILED: frozenset(),
+}
+
+_READER_LEASE_TRANSITIONS: dict[
+    ReaderLeaseState, frozenset[tuple[ReaderLeaseState, ReaderGenerationState]]
+] = {
+    ReaderLeaseState.STARTING: frozenset({
+        (ReaderLeaseState.ACTIVE, ReaderGenerationState.ACTIVE),
+        (ReaderLeaseState.REVOKED, ReaderGenerationState.REVOKED),
+        (ReaderLeaseState.REVOKED, ReaderGenerationState.FAILED),
+    }),
+    ReaderLeaseState.ACTIVE: frozenset({
+        (ReaderLeaseState.DRAINING, ReaderGenerationState.DRAINING),
+        (ReaderLeaseState.REVOKED, ReaderGenerationState.REVOKED),
+        (ReaderLeaseState.REVOKED, ReaderGenerationState.FAILED),
+    }),
+    ReaderLeaseState.DRAINING: frozenset({
+        (ReaderLeaseState.REVOKED, ReaderGenerationState.TERMINATED),
+        (ReaderLeaseState.REVOKED, ReaderGenerationState.REVOKED),
+        (ReaderLeaseState.REVOKED, ReaderGenerationState.FAILED),
+    }),
+    ReaderLeaseState.REVOKED: frozenset(),
+}
 
 
 class WorkerLeaseState(StrEnum):
@@ -186,6 +237,35 @@ class ReplayContinuity:
     authority_id: str
     recovery_generation: int
     ready: bool
+
+
+@dataclass(frozen=True)
+class ReaderGeneration:
+    """A durable owner-scoped Session Reader identity."""
+
+    owner_key: str
+    reader_generation: int
+    reader_id: str
+    state: ReaderGenerationState
+    recovery_generation: int
+
+
+@dataclass(frozen=True)
+class SessionReaderAuthorityLease:
+    """Durable fencing identity for the admitted owner Session Reader."""
+
+    owner_key: str
+    reader_generation: int
+    reader_id: str
+    state: ReaderLeaseState
+    lease_version: int
+    recovery_generation: int
+
+
+@dataclass(frozen=True)
+class ReaderStartClaim:
+    generation: ReaderGeneration
+    lease: SessionReaderAuthorityLease
 
 
 @dataclass(frozen=True)
@@ -365,6 +445,20 @@ class AuthorityStore:
             )
             version = 5
             conn.execute("UPDATE authority_meta SET value=? WHERE key='schema_version'", (version,))
+        if version == 5:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS session_reader_generations ("
+                "owner_key TEXT NOT NULL, reader_generation INTEGER NOT NULL, reader_id TEXT NOT NULL UNIQUE, "
+                "state TEXT NOT NULL, recovery_generation INTEGER NOT NULL, "
+                "PRIMARY KEY(owner_key, reader_generation))"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS session_reader_leases ("
+                "owner_key TEXT PRIMARY KEY, reader_generation INTEGER NOT NULL, reader_id TEXT NOT NULL, "
+                "state TEXT NOT NULL, lease_version INTEGER NOT NULL, recovery_generation INTEGER NOT NULL)"
+            )
+            version = 6
+            conn.execute("UPDATE authority_meta SET value=? WHERE key='schema_version'", (version,))
         if version == _SCHEMA_VERSION:
             generations = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='owner_worker_generations'"
@@ -378,7 +472,15 @@ class AuthorityStore:
             worker_changes = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='owner_worker_changes'"
             ).fetchone()
-            if generations is None or leases is None or bootstraps is None or worker_changes is None:
+            reader_generations = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='session_reader_generations'"
+            ).fetchone()
+            reader_leases = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='session_reader_leases'"
+            ).fetchone()
+            if any(record is None for record in (
+                generations, leases, bootstraps, worker_changes, reader_generations, reader_leases,
+            )):
                 raise AuthorityUnavailable("authority store schema is incomplete")
 
     def _validate_path(self) -> None:
@@ -414,6 +516,33 @@ class AuthorityStore:
         return int(row[0])
 
     @staticmethod
+    def _reader_generation_from_row(row: tuple[object, ...]) -> ReaderGeneration:
+        try:
+            return ReaderGeneration(
+                owner_key=str(row[0]),
+                reader_generation=int(row[1]),
+                reader_id=str(row[2]),
+                state=ReaderGenerationState(str(row[3])),
+                recovery_generation=int(row[4]),
+            )
+        except (IndexError, TypeError, ValueError) as exc:
+            raise AuthorityUnavailable("session reader generation record is invalid") from exc
+
+    @staticmethod
+    def _reader_lease_from_row(row: tuple[object, ...]) -> SessionReaderAuthorityLease:
+        try:
+            return SessionReaderAuthorityLease(
+                owner_key=str(row[0]),
+                reader_generation=int(row[1]),
+                reader_id=str(row[2]),
+                state=ReaderLeaseState(str(row[3])),
+                lease_version=int(row[4]),
+                recovery_generation=int(row[5]),
+            )
+        except (IndexError, TypeError, ValueError) as exc:
+            raise AuthorityUnavailable("session reader lease record is invalid") from exc
+
+    @staticmethod
     def _worker_generation_from_row(row: tuple[object, ...]) -> WorkerGeneration:
         try:
             return WorkerGeneration(
@@ -446,6 +575,158 @@ class AuthorityStore:
         if not value:
             raise ValueError("owner_key is required")
         return value
+
+    def claim_reader_start(self, owner_key: str, *, reader_id: str | None = None) -> ReaderStartClaim:
+        """Atomically allocate the sole Session Reader generation for an owner."""
+        owner_key = self._require_worker_owner_key(owner_key)
+        instance_id = str(reader_id or secrets.token_urlsafe(18)).strip()
+        if not instance_id:
+            raise ValueError("reader_id is required")
+        self._ensure_ready()
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                recovery_generation = self._recovery_generation(conn)
+                existing_row = conn.execute(
+                    "SELECT owner_key, reader_generation, reader_id, state, lease_version, recovery_generation "
+                    "FROM session_reader_leases WHERE owner_key=?",
+                    (owner_key,),
+                ).fetchone()
+                if existing_row is not None:
+                    existing = self._reader_lease_from_row(existing_row)
+                    if existing.recovery_generation == recovery_generation and existing.state in {
+                        ReaderLeaseState.STARTING, ReaderLeaseState.ACTIVE, ReaderLeaseState.DRAINING,
+                    }:
+                        raise AuthorizationRejected("reader_lease_already_owned")
+                    next_lease_version = existing.lease_version + 1
+                else:
+                    next_lease_version = 1
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(reader_generation), 0) FROM session_reader_generations WHERE owner_key=?",
+                    (owner_key,),
+                ).fetchone()
+                generation = int(row[0]) + 1 if row is not None else 1
+                conn.execute(
+                    "INSERT INTO session_reader_generations("
+                    "owner_key, reader_generation, reader_id, state, recovery_generation) VALUES (?, ?, ?, ?, ?)",
+                    (owner_key, generation, instance_id, ReaderGenerationState.STARTING.value, recovery_generation),
+                )
+                conn.execute(
+                    "INSERT INTO session_reader_leases("
+                    "owner_key, reader_generation, reader_id, state, lease_version, recovery_generation) "
+                    "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(owner_key) DO UPDATE SET "
+                    "reader_generation=excluded.reader_generation, reader_id=excluded.reader_id, "
+                    "state=excluded.state, lease_version=excluded.lease_version, "
+                    "recovery_generation=excluded.recovery_generation",
+                    (owner_key, generation, instance_id, ReaderLeaseState.STARTING.value, next_lease_version, recovery_generation),
+                )
+                conn.commit()
+                return ReaderStartClaim(
+                    ReaderGeneration(owner_key, generation, instance_id, ReaderGenerationState.STARTING, recovery_generation),
+                    SessionReaderAuthorityLease(
+                        owner_key, generation, instance_id, ReaderLeaseState.STARTING,
+                        next_lease_version, recovery_generation,
+                    ),
+                )
+        except AuthorizationRejected:
+            raise
+        except sqlite3.IntegrityError as exc:
+            raise AuthorizationRejected("reader_generation_conflict") from exc
+        except (sqlite3.Error, OSError) as exc:
+            raise AuthorityUnavailable("authority transaction failed") from exc
+
+    def read_session_reader_lease(self, owner_key: str) -> SessionReaderAuthorityLease | None:
+        """Return the current Session Reader fence without granting admission."""
+        owner_key = self._require_worker_owner_key(owner_key)
+        self._ensure_ready()
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT owner_key, reader_generation, reader_id, state, lease_version, recovery_generation "
+                    "FROM session_reader_leases WHERE owner_key=?", (owner_key,),
+                ).fetchone()
+                return None if row is None else self._reader_lease_from_row(row)
+        except (sqlite3.Error, OSError) as exc:
+            raise AuthorityUnavailable("authority transaction failed") from exc
+
+    def assert_reader_lease(
+        self, lease: SessionReaderAuthorityLease, *, states: frozenset[ReaderLeaseState] | None = None
+    ) -> SessionReaderAuthorityLease:
+        """Require the exact durable Session Reader fence before using a handle."""
+        self._ensure_ready()
+        try:
+            with self._connect() as conn:
+                current = self._recovery_generation(conn)
+                row = conn.execute(
+                    "SELECT owner_key, reader_generation, reader_id, state, lease_version, recovery_generation "
+                    "FROM session_reader_leases WHERE owner_key=?", (lease.owner_key,),
+                ).fetchone()
+                if row is None:
+                    raise AuthorizationRejected("reader_lease_not_found")
+                actual = self._reader_lease_from_row(row)
+                if actual != lease or actual.recovery_generation != current:
+                    raise AuthorizationRejected("reader_lease_stale")
+                if states is not None and actual.state not in states:
+                    raise AuthorizationRejected("reader_lease_state_mismatch")
+                return actual
+        except AuthorizationRejected:
+            raise
+        except (sqlite3.Error, OSError) as exc:
+            raise AuthorityUnavailable("authority transaction failed") from exc
+
+    def transition_reader_lease(
+        self,
+        lease: SessionReaderAuthorityLease,
+        *,
+        state: ReaderLeaseState,
+        generation_state: ReaderGenerationState,
+    ) -> SessionReaderAuthorityLease:
+        """CAS one Reader fence and its independent generation record."""
+        self._ensure_ready()
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                current_recovery = self._recovery_generation(conn)
+                row = conn.execute(
+                    "SELECT owner_key, reader_generation, reader_id, state, lease_version, recovery_generation "
+                    "FROM session_reader_leases WHERE owner_key=?", (lease.owner_key,),
+                ).fetchone()
+                if row is None:
+                    raise AuthorizationRejected("reader_lease_not_found")
+                actual = self._reader_lease_from_row(row)
+                if actual != lease or actual.recovery_generation != current_recovery:
+                    raise AuthorizationRejected("reader_lease_stale")
+                generation_row = conn.execute(
+                    "SELECT owner_key, reader_generation, reader_id, state, recovery_generation "
+                    "FROM session_reader_generations WHERE owner_key=? AND reader_generation=?",
+                    (lease.owner_key, lease.reader_generation),
+                ).fetchone()
+                if generation_row is None:
+                    raise AuthorizationRejected("reader_generation_not_found")
+                generation = self._reader_generation_from_row(generation_row)
+                if generation.reader_id != lease.reader_id or generation.recovery_generation != current_recovery:
+                    raise AuthorizationRejected("reader_lease_identity_mismatch")
+                if (state, generation_state) not in _READER_LEASE_TRANSITIONS[actual.state]:
+                    raise AuthorizationRejected("reader_lease_invalid_transition")
+                if generation_state not in _READER_GENERATION_TRANSITIONS[generation.state]:
+                    raise AuthorizationRejected("reader_generation_invalid_transition")
+                conn.execute(
+                    "UPDATE session_reader_generations SET state=? WHERE owner_key=? AND reader_generation=?",
+                    (generation_state.value, lease.owner_key, lease.reader_generation),
+                )
+                conn.execute(
+                    "UPDATE session_reader_leases SET state=? WHERE owner_key=? AND lease_version=?",
+                    (state.value, lease.owner_key, lease.lease_version),
+                )
+                conn.commit()
+                return SessionReaderAuthorityLease(
+                    lease.owner_key, lease.reader_generation, lease.reader_id, state,
+                    lease.lease_version, current_recovery,
+                )
+        except AuthorizationRejected:
+            raise
+        except (sqlite3.Error, OSError) as exc:
+            raise AuthorityUnavailable("authority transaction failed") from exc
 
     def claim_worker_start(self, owner_key: str, *, worker_id: str | None = None) -> WorkerStartClaim:
         """Atomically fence an owner and allocate its sole starting generation."""

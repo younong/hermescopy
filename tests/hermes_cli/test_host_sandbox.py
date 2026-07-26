@@ -83,6 +83,10 @@ def _document(tmp_path: Path):
                 "cpu_millis": 2000, "memory_bytes": 2 << 30, "pids": 256,
                 "max_concurrent_executors": 2,
             },
+            "reader": {
+                "cpu_millis": 250, "memory_bytes": 128 << 20, "pids": 16,
+                "max_concurrent_executors": 1,
+            },
             "executor": {
                 "cpu_millis": 1000, "memory_bytes": 1 << 30, "swap_bytes": 0,
                 "pids": 64, "file_descriptors": 64, "duration_seconds": 120,

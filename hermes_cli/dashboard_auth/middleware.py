@@ -600,6 +600,10 @@ async def gated_auth_middleware(
                     prefix=prefix_from_request(request),
                 )
                 return response
+            if not requires_password_change:
+                from hermes_cli.session_reader.readiness import observe_verified_session
+
+                observe_verified_session(request.app, new_session)
             from hermes_cli.web_server import _authenticated_owner_control_plane_gate_response
 
             gated = _authenticated_owner_control_plane_gate_response(request)
@@ -671,6 +675,10 @@ async def gated_auth_middleware(
         )
     if requires_password_change and not _path_is_allowed_during_password_change(path):
         return _password_change_required_response(request)
+    if not requires_password_change:
+        from hermes_cli.session_reader.readiness import observe_verified_session
+
+        observe_verified_session(request.app, session)
     from hermes_cli.web_server import _authenticated_owner_control_plane_gate_response
 
     gated = _authenticated_owner_control_plane_gate_response(request)

@@ -702,10 +702,12 @@ powerpoint_smoke_owner=""
 
 gateway_unit="/etc/systemd/system/hermes-gateway.service"
 dashboard_unit="/etc/systemd/system/hermes-dashboard.service"
+nginx_log_format="/etc/nginx/conf.d/00-hermes-log-format.conf"
+legacy_nginx_log_format="/etc/nginx/conf.d/hermes-log-format.conf"
 
 backup_deployment_state() {
   rollback_dir="$(mktemp -d "$tmp_dir/hermes-rollback.XXXXXX")"
-  for path in "$gateway_unit" "$dashboard_unit" "$runner" "$sandbox_policy" "$sandbox_seccomp"; do
+  for path in "$gateway_unit" "$dashboard_unit" "$runner" "$sandbox_policy" "$sandbox_seccomp" "$nginx_log_format" "$legacy_nginx_log_format"; do
     if [ -e "$path" ]; then
       cp -a -- "$path" "$rollback_dir/$(printf '%s' "$path" | sed 's#/#_#g')"
     fi
@@ -714,7 +716,7 @@ backup_deployment_state() {
 
 restore_deployment_state() {
   local path backup
-  for path in "$gateway_unit" "$dashboard_unit" "$runner" "$sandbox_policy" "$sandbox_seccomp"; do
+  for path in "$gateway_unit" "$dashboard_unit" "$runner" "$sandbox_policy" "$sandbox_seccomp" "$nginx_log_format" "$legacy_nginx_log_format"; do
     backup="$rollback_dir/$(printf '%s' "$path" | sed 's#/#_#g')"
     if [ -e "$backup" ]; then
       cp -a -- "$backup" "$path"
@@ -919,6 +921,7 @@ test -f "$release/deploy/runtime/alicloud3-powerpoint-packages.json"
 test -f "$release/deploy/smoke-powerpoint-runtime.py"
 test -f "$release/deploy/check-executor-cgroup-host.py"
 test -f "$release/deploy/smoke-executor-resources.py"
+test -f "$release/deploy/run-cgroup-smoke.py"
 test -f "$release/skills/productivity/powerpoint/scripts/office/soffice.py"
 
 powerpoint_manifest="$release/deploy/runtime/alicloud3-powerpoint-packages.json"
@@ -1203,7 +1206,7 @@ done
 # delegated cgroup v2 directory only after systemd has created its service scope.
 policy_tmp="$sandbox_policy.tmp.$$"
 cat > "$policy_tmp" <<POLICY
-{"schema_version":2,"architecture":"$architecture","owner_root":"$owner_root","uid":$(id -u "$service_user"),"gid":$(getent group "$service_group" | cut -d: -f3),"bwrap_binary":"/usr/bin/bwrap","release_root":"$release","runtime_root":"$venv","python_executable":"/opt/hermes/python/bin/python3","readonly_mounts":[{"source":"$release","destination":"/opt/hermes/release"},{"source":"$venv","destination":"/opt/hermes/python"}$readonly_mounts],"syscall_policy_id":"executor-local-v1","syscall_policy_digest":"sha256:$seccomp_digest","seccomp_artifact":"$sandbox_seccomp","image_digest":"sha256:$image_digest","profile":"executor-bwrap-v1","security_backend":"host-bwrap-seccomp-v1","network_mode":"isolated-tool-network","verifier":"host-sandbox-policy-v1","record_ttl_seconds":30,"root_tmpfs_bytes":67108864,"executor_tmpfs_bytes":33554432,"allowed_egress_profiles":["tool-none"],"resource_policy":{"cgroup_root":"$cgroup_root","required_controllers":["cpu","memory","pids"],"global":{"cpu_millis":1500,"memory_bytes":2415919104,"pids":512,"max_concurrent_executors":2,"max_owner_workers":5},"owner":{"cpu_millis":1000,"memory_bytes":939524096,"pids":128,"max_concurrent_executors":1},"executor":{"cpu_millis":750,"memory_bytes":536870912,"pids":64,"max_concurrent_executors":1,"swap_bytes":0,"file_descriptors":64,"duration_seconds":120,"output_bytes":200000},"cleanup_grace_seconds":2,"cleanup_timeout_seconds":10,"cgroup_kill_required":false}}
+{"schema_version":2,"architecture":"$architecture","owner_root":"$owner_root","uid":$(id -u "$service_user"),"gid":$(getent group "$service_group" | cut -d: -f3),"bwrap_binary":"/usr/bin/bwrap","release_root":"$release","runtime_root":"$venv","python_executable":"/opt/hermes/python/bin/python3","readonly_mounts":[{"source":"$release","destination":"/opt/hermes/release"},{"source":"$venv","destination":"/opt/hermes/python"}$readonly_mounts],"syscall_policy_id":"executor-local-v1","syscall_policy_digest":"sha256:$seccomp_digest","seccomp_artifact":"$sandbox_seccomp","image_digest":"sha256:$image_digest","profile":"executor-bwrap-v1","security_backend":"host-bwrap-seccomp-v1","network_mode":"isolated-tool-network","verifier":"host-sandbox-policy-v1","record_ttl_seconds":30,"root_tmpfs_bytes":67108864,"executor_tmpfs_bytes":33554432,"allowed_egress_profiles":["tool-none"],"resource_policy":{"cgroup_root":"$cgroup_root","required_controllers":["cpu","memory","pids"],"global":{"cpu_millis":1500,"memory_bytes":2415919104,"pids":512,"max_concurrent_executors":2,"max_owner_workers":5},"owner":{"cpu_millis":1000,"memory_bytes":939524096,"pids":128,"max_concurrent_executors":1},"reader":{"cpu_millis":1000,"memory_bytes":134217728,"pids":16,"max_concurrent_executors":1},"executor":{"cpu_millis":750,"memory_bytes":536870912,"pids":64,"max_concurrent_executors":1,"swap_bytes":0,"file_descriptors":64,"duration_seconds":120,"output_bytes":200000},"cleanup_grace_seconds":2,"cleanup_timeout_seconds":10,"cgroup_kill_required":false}}
 POLICY
 chown root:root "$policy_tmp"
 chmod 0644 "$policy_tmp"
@@ -1328,7 +1331,9 @@ services_touched="1"
 # cold start after the new dashboard comes up.
 systemctl stop hermes-dashboard.service
 owner_worker_pids="$(pgrep -f '[h]ermes_cli.owner_worker.entrypoint' || true)"
-if [ -n "$owner_worker_pids" ]; then
+session_reader_pids="$(pgrep -f '[h]ermes_cli.session_reader.entrypoint' || true)"
+owner_worker_pids="$owner_worker_pids $session_reader_pids"
+if [ -n "$(printf '%s' "$owner_worker_pids" | tr -d '[:space:]')" ]; then
   kill -TERM $owner_worker_pids || true
   for _ in $(seq 1 50); do
     live_owner_workers=""
@@ -1357,41 +1362,9 @@ if ! systemctl restart hermes-gateway.service || ! systemctl start hermes-dashbo
 fi
 systemctl --no-pager --full status hermes-gateway.service hermes-dashboard.service || true
 
-if "$venv/bin/python" "$release/deploy/check-executor-cgroup-host.py" \
-  --managed-root "$cgroup_root" \
-  --service hermes-dashboard.service \
-  --require-ready; then
-  echo "HERMES_DEPLOY_STAGE executor_resource_preflight=passed"
-  PYTHONPATH="$release" "$venv/bin/python" -c 'from hermes_cli.owner_worker.host_sandbox import host_sandbox_deployment_policy; host_sandbox_deployment_policy()'
-  "$venv/bin/python" "$release/deploy/smoke-executor-resources.py" \
-    --managed-root "$cgroup_root" \
-    --timeout 10
-  echo "HERMES_DEPLOY_STAGE executor_resource_smoke=passed"
-  powerpoint_smoke_owner="$owner_root/.deploy-powerpoint-smoke.$$"
-  if ! runuser -u "$service_user" -- env -i \
-    HOME="$shared" \
-    PATH="$venv/bin:/usr/bin:/bin" \
-    PYTHONPATH="$release" \
-    PYTHONNOUSERSITE=1 \
-    "$venv/bin/python" "$release/deploy/smoke-powerpoint-runtime.py" \
-    --owner-home "$powerpoint_smoke_owner" \
-    --policy "$sandbox_policy" \
-    --timeout 45; then
-    echo "PowerPoint runtime smoke failed" >&2
-    rm -rf -- "$powerpoint_smoke_owner"
-    exit 1
-  fi
-  rm -rf -- "$powerpoint_smoke_owner"
-  powerpoint_smoke_owner=""
-  echo "HERMES_DEPLOY_STAGE powerpoint_runtime_smoke=passed"
-else
-  echo "HERMES_DEPLOY_STAGE executor_resource_preflight=unavailable"
-  echo "Authenticated tools remain fail closed until the documented cgroup v2 migration is complete"
-fi
-
-# Prove Hermes' own gate is active before touching the legacy outer Nginx gate.
-# systemd can report active before Uvicorn has opened its socket, so retry the
-# exact fail-closed contract for up to 30 seconds rather than racing startup.
+# systemd reports active as soon as the Dashboard process starts, before app
+# construction has initialized the managed cgroup hierarchy. Wait for Uvicorn's
+# exact unauthenticated contract so resource smoke cannot race CgroupV2Manager.
 login_status="000"
 api_status="000"
 for _ in $(seq 1 30); do
@@ -1415,6 +1388,43 @@ done
 if [ "$login_status" != "302" ] || [ "$api_status" != "401" ]; then
   echo "Hermes internal auth preflight failed (html=$login_status api=$api_status)" >&2
   exit 1
+fi
+
+if "$venv/bin/python" "$release/deploy/check-executor-cgroup-host.py" \
+  --managed-root "$cgroup_root" \
+  --service hermes-dashboard.service \
+  --require-ready; then
+  echo "HERMES_DEPLOY_STAGE executor_resource_preflight=passed"
+  PYTHONPATH="$release" "$venv/bin/python" -c 'from hermes_cli.owner_worker.host_sandbox import host_sandbox_deployment_policy; host_sandbox_deployment_policy()'
+  "$venv/bin/python" "$release/deploy/smoke-executor-resources.py" \
+    --managed-root "$cgroup_root" \
+    --timeout 10
+  echo "HERMES_DEPLOY_STAGE executor_resource_smoke=passed"
+  powerpoint_smoke_owner="$owner_root/.deploy-powerpoint-smoke.$$"
+  if ! env -i \
+    HOME="$shared" \
+    PATH="$venv/bin:/usr/bin:/bin" \
+    PYTHONPATH="$release" \
+    PYTHONNOUSERSITE=1 \
+    "$venv/bin/python" "$release/deploy/run-cgroup-smoke.py" \
+    --managed-root "$cgroup_root" \
+    --service hermes-dashboard.service \
+    --user "$service_user" \
+    -- \
+    "$venv/bin/python" "$release/deploy/smoke-powerpoint-runtime.py" \
+    --owner-home "$powerpoint_smoke_owner" \
+    --policy "$sandbox_policy" \
+    --timeout 45; then
+    echo "PowerPoint runtime smoke failed" >&2
+    rm -rf -- "$powerpoint_smoke_owner"
+    exit 1
+  fi
+  rm -rf -- "$powerpoint_smoke_owner"
+  powerpoint_smoke_owner=""
+  echo "HERMES_DEPLOY_STAGE powerpoint_runtime_smoke=passed"
+else
+  echo "HERMES_DEPLOY_STAGE executor_resource_preflight=unavailable"
+  echo "Authenticated tools remain fail closed until the documented cgroup v2 migration is complete"
 fi
 
 # Gate the transaction with a real gateway conversation while the previous
@@ -1444,6 +1454,10 @@ echo "HERMES_DEPLOY_STAGE deterministic_smoke=passed"
 rm -rf -- "$smoke_root"
 smoke_root=""
 
+install -o root -g root -m 0644 \
+  "$release/deploy/nginx/hermes-log-format.conf" \
+  "$nginx_log_format"
+rm -f -- "$legacy_nginx_log_format"
 action="reconcile"
 [ "$migrate_nginx_hermes" = "1" ] && action="migrate"
 "$venv/bin/python" "$release/deploy/nginx/manage_hermes_proxy.py" \

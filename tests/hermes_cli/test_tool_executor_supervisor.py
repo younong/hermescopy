@@ -456,6 +456,7 @@ def test_production_policy_supplies_exact_executor_runtime_quota(tmp_path):
         required_controllers=("cpu", "memory", "pids"),
         global_limits=SandboxResourceLimits(3000, 3 << 30, 512, 4, max_owner_workers=5),
         owner_limits=SandboxResourceLimits(2000, 2 << 30, 256, 2),
+        reader_limits=SandboxResourceLimits(250, 128 << 20, 16, 1),
         executor_limits=SandboxResourceLimits(
             800, 192 << 20, 32, 1, swap_bytes=0, file_descriptors=37,
             duration_seconds=17, output_bytes=12345,

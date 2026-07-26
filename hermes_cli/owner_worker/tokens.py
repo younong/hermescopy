@@ -244,10 +244,22 @@ def _write_keyring(path: Path, payload: Mapping[str, Any]) -> None:
         raise OwnerWorkerCapabilityInvalid("capability_keyring_unavailable") from exc
 
 
+_SIGNING_RECORD_CACHE: dict[Path, tuple[int, int, dict[str, Any]]] = {}
+
+
 def _signing_record(control_home: str | Path | None) -> dict[str, Any]:
     """Read/create a Control-Plane private signer; never call from workers."""
     path = _keyring_path(control_home)
     _validate_keyring_path(path)
+    try:
+        status = path.stat()
+    except FileNotFoundError:
+        status = None
+    if status is not None:
+        cached = _SIGNING_RECORD_CACHE.get(path)
+        stamp = (status.st_mtime_ns, status.st_size)
+        if cached is not None and cached[:2] == stamp:
+            return cached[2]
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -256,7 +268,13 @@ def _signing_record(control_home: str | Path | None) -> dict[str, Any]:
         raw = payload
     except (OSError, json.JSONDecodeError) as exc:
         raise OwnerWorkerCapabilityInvalid("capability_keyring_unavailable") from exc
-    return _parse_keyring(raw)
+    record = _parse_keyring(raw)
+    try:
+        status = path.stat()
+        _SIGNING_RECORD_CACHE[path] = (status.st_mtime_ns, status.st_size, record)
+    except OSError:
+        pass
+    return record
 
 
 def owner_worker_capability_public_config(control_home: str | Path | None = None) -> dict[str, str]:

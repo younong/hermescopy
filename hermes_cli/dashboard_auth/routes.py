@@ -835,11 +835,6 @@ async def api_auth_me(request: Request):
                 ]
             ),
         })
-    supervisor = getattr(request.app.state, "owner_worker_supervisor", None)
-    if supervisor is not None and response.get("must_change_password") is not True:
-        from hermes_cli.owner_worker.readiness import schedule_owner_worker_warmup
-
-        schedule_owner_worker_warmup(request.app, owner=owner, supervisor=supervisor)
     return response
 
 

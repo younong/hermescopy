@@ -218,6 +218,78 @@ export async function fetchJSON<T>(
   return res.json();
 }
 
+const SESSION_READER_RETRY_MIN_MS = 100;
+const SESSION_READER_RETRY_MAX_MS = 1000;
+
+function sessionReaderRetryDelay(res: Response): number {
+  const raw = res.headers.get("Retry-After");
+  const seconds = raw === null ? NaN : Number(raw);
+  const delay = Number.isFinite(seconds) ? seconds * 1000 : SESSION_READER_RETRY_MIN_MS;
+  return Math.max(
+    SESSION_READER_RETRY_MIN_MS,
+    Math.min(delay, SESSION_READER_RETRY_MAX_MS),
+  );
+}
+
+async function isSessionReaderUnavailable(res: Response): Promise<boolean> {
+  if (res.status !== 503) return false;
+  try {
+    const body = (await res.clone().json()) as { error?: string };
+    return body.error === "session_reader_unavailable";
+  } catch {
+    return false;
+  }
+}
+
+function waitForSessionReaderRetry(delay: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    return Promise.reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+  }
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(resolve, delay);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        window.clearTimeout(timer);
+        reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+      },
+      { once: true },
+    );
+  });
+}
+
+/** Fetch an idempotent Session Reader JSON route with one bounded warmup retry. */
+export async function fetchSessionReaderJSON<T>(
+  url: string,
+  init?: RequestInit,
+): Promise<T> {
+  url = withManagementProfile(url);
+  const headers = new Headers(init?.headers);
+  const token = window.__HERMES_SESSION_TOKEN__;
+  if (token) setSessionHeader(headers, token);
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const res = await fetch(`${BASE}${url}`, {
+      ...init,
+      method: "GET",
+      headers,
+      credentials: init?.credentials ?? "include",
+    });
+    await applyFetchAuthRecovery(res);
+    if (res.ok) return res.json();
+    if (attempt === 0 && (await isSessionReaderUnavailable(res))) {
+      await waitForSessionReaderRetry(
+        sessionReaderRetryDelay(res),
+        init?.signal ?? undefined,
+      );
+      continue;
+    }
+    const text = await res.text().catch(() => res.statusText);
+    throw new FetchJSONError(res.status, `${res.status}: ${text}`);
+  }
+  throw new FetchJSONError(503, "503: Session reader is unavailable");
+}
+
 /** Encode a plugin registry key for URL paths (preserves `/` segment separators). */
 function pluginPath(name: string): string {
   return name.split("/").map(encodeURIComponent).join("/");
@@ -437,7 +509,7 @@ export const api = {
     order: "created" | "recent" = "created",
     compact = false,
   ) =>
-    fetchJSON<PaginatedSessions>(
+    fetchSessionReaderJSON<PaginatedSessions>(
       appendProfileParam(
         `/api/sessions?limit=${limit}&offset=${offset}&order=${order}${compact ? "&compact=true" : ""}`,
         profile,
@@ -451,7 +523,7 @@ export const api = {
     const params = new URLSearchParams();
     params.set("limit", String(Math.max(1, Math.min(options.limit ?? 100, 200))));
     if (options.before) params.set("before", options.before);
-    return fetchJSON<SessionMessagesResponse>(
+    return fetchSessionReaderJSON<SessionMessagesResponse>(
       appendProfileParam(
         `/api/sessions/${encodeURIComponent(id)}/messages?${params.toString()}`,
         profile,
@@ -459,11 +531,11 @@ export const api = {
     );
   },
   getSessionDetail: (id: string, profile = getManagementProfile()) =>
-    fetchJSON<SessionInfo>(
+    fetchSessionReaderJSON<SessionInfo>(
       appendProfileParam(`/api/sessions/${encodeURIComponent(id)}`, profile),
     ),
   getSessionLatestDescendant: (id: string, traceId?: string) =>
-    fetchJSON<SessionLatestDescendantResponse>(
+    fetchSessionReaderJSON<SessionLatestDescendantResponse>(
       `/api/sessions/${encodeURIComponent(id)}/latest-descendant`,
       traceId ? { headers: { "X-Request-ID": traceId } } : undefined,
     ),
@@ -475,7 +547,7 @@ export const api = {
       },
     ),
   getEmptySessionsCount: (profile = getManagementProfile()) =>
-    fetchJSON<{ count: number }>(
+    fetchSessionReaderJSON<{ count: number }>(
       appendProfileParam("/api/sessions/empty/count", profile),
     ),
   deleteEmptySessions: (profile = getManagementProfile()) =>
@@ -501,7 +573,9 @@ export const api = {
       },
     ),
   getSessionStats: (profile = getManagementProfile()) =>
-    fetchJSON<SessionStoreStats>(appendProfileParam("/api/sessions/stats", profile)),
+    fetchSessionReaderJSON<SessionStoreStats>(
+      appendProfileParam("/api/sessions/stats", profile),
+    ),
   exportSessionUrl: (id: string, profile = getManagementProfile()) =>
     appendProfileParam(`/api/sessions/${encodeURIComponent(id)}/export`, profile),
   pruneSessions: (
@@ -844,9 +918,14 @@ export const api = {
     ),
 
   // Session search (FTS5)
-  searchSessions: (q: string, profile = getManagementProfile()) =>
-    fetchJSON<SessionSearchResponse>(
+  searchSessions: (
+    q: string,
+    profile = getManagementProfile(),
+    signal?: AbortSignal,
+  ) =>
+    fetchSessionReaderJSON<SessionSearchResponse>(
       appendProfileParam(`/api/sessions/search?q=${encodeURIComponent(q)}`, profile),
+      { signal },
     ),
 
   // OAuth provider management

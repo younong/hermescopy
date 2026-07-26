@@ -14,7 +14,6 @@ Key design decisions:
 - Session source tagging ('cli', 'telegram', 'discord', etc.) for filtering
 """
 
-import asyncio
 import base64
 import hashlib
 import json
@@ -27,11 +26,19 @@ import threading
 import time
 from pathlib import Path
 
-from agent.memory_manager import sanitize_context
 from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
+
+
+def __getattr__(name: str):
+    if name == "asyncio":
+        import asyncio
+
+        return asyncio
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 def _delegate_from_json(col: str = "model_config") -> str:
     return f"json_extract(COALESCE({col}, '{{}}'), '$._delegate_from')"
@@ -3149,7 +3156,8 @@ class SessionDB:
                     SELECT c.root_id, child.id
                     FROM chain c
                     JOIN sessions parent ON parent.id = c.cur_id
-                    JOIN sessions child ON child.parent_session_id = c.cur_id
+                    JOIN sessions child INDEXED BY idx_sessions_parent
+                      ON child.parent_session_id = c.cur_id
                     WHERE parent.end_reason = 'compression'
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
@@ -4141,6 +4149,8 @@ class SessionDB:
     ) -> Dict[str, Any]:
         content = cls._decode_content(row["content"])
         if row["role"] in {"user", "assistant"} and isinstance(content, str):
+            from agent.memory_manager import sanitize_context
+
             content = sanitize_context(content).strip()
         msg: Dict[str, Any] = {"role": row["role"], "content": content}
         if include_row_identity:
@@ -4502,6 +4512,8 @@ class SessionDB:
         for row in rows:
             content = self._decode_content(row["content"])
             if row["role"] in {"user", "assistant"} and isinstance(content, str):
+                from agent.memory_manager import sanitize_context
+
                 content = sanitize_context(content).strip()
             msg = {"role": row["role"], "content": content}
             if row["attachments"]:
@@ -6556,6 +6568,8 @@ class AsyncSessionDB:
             return attr
 
         async def _offloaded(*args, **kwargs):
+            import asyncio
+
             return await asyncio.to_thread(attr, *args, **kwargs)
 
         return _offloaded

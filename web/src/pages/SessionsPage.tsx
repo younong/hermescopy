@@ -767,6 +767,23 @@ export function fetchSessionsOverview() {
   return api.getSessions(OVERVIEW_SESSION_LIMIT, 0, undefined, "recent", true);
 }
 
+export function scheduleSessionsOverviewPoll(
+  poll: () => Promise<unknown>,
+  delay = 5000,
+): () => void {
+  let cancelled = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const run = async () => {
+    await poll();
+    if (!cancelled) timer = setTimeout(run, delay);
+  };
+  void run();
+  return () => {
+    cancelled = true;
+    if (timer) clearTimeout(timer);
+  };
+}
+
 function SessionsPagination({
   className,
   compact = false,
@@ -820,6 +837,7 @@ export default function SessionsPage() {
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [readerUnavailable, setReaderUnavailable] = useState(false);
   const [search, setSearch] = useState("");
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [searchResults, setSearchResults] = useState<
@@ -827,6 +845,7 @@ export default function SessionsPage() {
   >(null);
   const [searching, setSearching] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout>>(null);
+  const searchAbortRef = useRef<AbortController | null>(null);
   const logScrollRef = useRef<HTMLPreElement | null>(null);
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [overviewSessions, setOverviewSessions] = useState<SessionInfo[]>([]);
@@ -919,8 +938,9 @@ export default function SessionsPage() {
       .then((resp) => {
         setSessions(resp.sessions);
         setTotal(resp.total);
+        setReaderUnavailable(false);
       })
-      .catch(() => {})
+      .catch(() => setReaderUnavailable(true))
       .finally(() => {
         if (!silent) setLoading(false);
       });
@@ -952,14 +972,16 @@ export default function SessionsPage() {
   }, [loadSessions, page, refreshEmptyCount]);
 
   useEffect(() => {
-    const loadOverview = () => {
-      api
-        .getStatus()
-        .then(setStatus)
-        .catch(() => {});
-      fetchSessionsOverview()
-        .then((r) => {
+    let cancelled = false;
+    const loadOverview = async () => {
+      await Promise.allSettled([
+        api.getStatus().then((nextStatus) => {
+          if (!cancelled) setStatus(nextStatus);
+        }),
+        fetchSessionsOverview().then((r) => {
+          if (cancelled) return;
           setOverviewSessions(r.sessions);
+          setReaderUnavailable(false);
           // The dashboard server and a terminal CLI are separate
           // processes sharing one session DB — there is no push channel,
           // so we detect sessions created in another process here. The
@@ -972,12 +994,16 @@ export default function SessionsPage() {
             loadSessions(pageRef.current, true);
           }
           newestSeenRef.current = newest;
-        })
-        .catch(() => {});
+        }).catch(() => {
+          if (!cancelled) setReaderUnavailable(true);
+        }),
+      ]);
     };
-    loadOverview();
-    const id = setInterval(loadOverview, 5000);
-    return () => clearInterval(id);
+    const stopPolling = scheduleSessionsOverviewPoll(loadOverview);
+    return () => {
+      cancelled = true;
+      stopPolling();
+    };
   }, [loadSessions]);
 
   useEffect(() => {
@@ -1018,6 +1044,7 @@ export default function SessionsPage() {
   // Debounced FTS search
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
+    searchAbortRef.current?.abort();
 
     if (!search.trim()) {
       setSearchResults(null);
@@ -1026,16 +1053,28 @@ export default function SessionsPage() {
     }
 
     setSearching(true);
+    const controller = new AbortController();
+    searchAbortRef.current = controller;
     debounceRef.current = setTimeout(() => {
       api
-        .searchSessions(search.trim())
-        .then((resp) => setSearchResults(resp.results))
-        .catch(() => setSearchResults(null))
-        .finally(() => setSearching(false));
+        .searchSessions(search.trim(), undefined, controller.signal)
+        .then((resp) => {
+          if (!controller.signal.aborted) {
+            setSearchResults(resp.results);
+            setReaderUnavailable(false);
+          }
+        })
+        .catch(() => {
+          if (!controller.signal.aborted) setReaderUnavailable(true);
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setSearching(false);
+        });
     }, 300);
 
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
+      controller.abort();
     };
   }, [search]);
 
@@ -1444,6 +1483,33 @@ export default function SessionsPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {readerUnavailable && (
+        <div
+          className="flex items-center justify-between gap-3 border border-warning/30 bg-warning/[0.06] px-4 py-3"
+          role="alert"
+        >
+          <div>
+            <p className="text-sm font-medium text-warning">
+              Session history is temporarily unavailable
+            </p>
+            <p className="text-xs text-muted-foreground">
+              The last loaded session data is preserved while the Reader recovers.
+            </p>
+          </div>
+          <Button
+            outlined
+            size="sm"
+            onClick={() => {
+              loadSessions(page);
+              loadStats();
+              refreshEmptyCount();
+            }}
+          >
+            Retry
+          </Button>
+        </div>
+      )}
 
       {stats && (
         <div className="flex flex-wrap items-center gap-x-6 gap-y-2 border border-border bg-background-base/40 px-4 py-3">

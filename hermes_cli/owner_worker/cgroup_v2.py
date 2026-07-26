@@ -21,7 +21,12 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Mapping, Protocol, Sequence
 
-from hermes_cli.dashboard_auth.authority import OwnerWorkerAuthorityLease, WorkerLeaseState
+from hermes_cli.dashboard_auth.authority import (
+    OwnerWorkerAuthorityLease,
+    ReaderLeaseState,
+    SessionReaderAuthorityLease,
+    WorkerLeaseState,
+)
 from hermes_cli.owner_worker.executor_identity import ExecutorIdentity
 from hermes_cli.owner_worker.tool_executor_sandbox import (
     SandboxResourceLimits,
@@ -45,6 +50,7 @@ _REQUIRED_CONTROLLERS = ("cpu", "memory", "pids")
 _POOL_NAME = "pool-v1"
 _OWNER_RE = re.compile(r"owner-[0-9a-f]{64}\Z")
 _WORKER_RE = re.compile(r"worker-[0-9a-f]{64}\Z")
+_READER_RE = re.compile(r"reader-[0-9a-f]{64}\Z")
 _EXECUTOR_RE = re.compile(r"executor-[0-9a-f]{64}\Z")
 _COMPONENT_RE = re.compile(r"[a-z]+(?:-[a-z0-9]+)*\Z")
 _CONTROL_FILE_RE = re.compile(r"[a-z]+(?:[._][a-z]+)*\Z")
@@ -330,11 +336,14 @@ class CgroupV2Manager:
         io: CgroupV2IO | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
+        recover_stale_scopes: bool = True,
     ) -> None:
         if not isinstance(policy, SandboxResourcePolicy):
             raise CgroupV2Unavailable("sandbox resource policy is required")
         if policy.required_controllers != _REQUIRED_CONTROLLERS:
             raise CgroupV2Unavailable("exact cpu, memory, and pids controllers are required")
+        if not isinstance(recover_stale_scopes, bool):
+            raise CgroupV2Unavailable("stale scope recovery mode must be boolean")
         self.policy = policy
         self._io = io or DirectoryFdCgroupV2IO(policy.cgroup_root)
         if Path(self._io.root) != policy.cgroup_root:
@@ -345,6 +354,7 @@ class CgroupV2Manager:
         self._active: dict[tuple[str, ...], CgroupScopeLease] = {}
         self._pool = (_POOL_NAME,)
         self._startup_cleanup_count = 0
+        self._recover_stale_scopes = recover_stale_scopes
         self._initialize_pool()
 
     @property
@@ -375,6 +385,23 @@ class CgroupV2Manager:
                 raise CgroupAdmissionRejected("global owner worker admission limit reached")
             self._ensure_owner(owner)
             return self._reserve_leaf(worker, "worker", self.policy.owner_limits)
+
+    def admit_reader(self, lease: SessionReaderAuthorityLease) -> CgroupScopeLease:
+        if not isinstance(lease, SessionReaderAuthorityLease) or lease.state not in {
+            ReaderLeaseState.STARTING, ReaderLeaseState.ACTIVE,
+        }:
+            raise CgroupAdmissionRejected("active session reader authority is required")
+        owner_digest = _owner_digest(lease.owner_key)
+        reader_digest = _digest_fields(
+            "reader-v1", owner_digest, lease.reader_id, lease.reader_generation,
+            lease.lease_version, lease.recovery_generation,
+        )
+        owner = self._pool + (f"owner-{owner_digest}",)
+        reader = owner + (f"reader-{reader_digest}",)
+        with self._lock:
+            self._inspect_hierarchy()
+            self._ensure_owner(owner)
+            return self._reserve_leaf(reader, "reader", self.policy.reader_limits)
 
     def admit_executor(self, identity: ExecutorIdentity, invocation_id: str) -> CgroupScopeLease:
         if not isinstance(identity, ExecutorIdentity):
@@ -475,8 +502,10 @@ class CgroupV2Manager:
                 # The service unit's control-group kill normally empties this
                 # subtree, but a manager restart must deterministically recover
                 # any managed scopes that survived an abrupt predecessor exit.
-                # Unknown names still fail closed inside cleanup_stale_scopes.
-                self._startup_cleanup_count = self.cleanup_stale_scopes()
+                # Concurrent diagnostic managers disable recovery so they cannot
+                # terminate scopes owned by the live Dashboard manager.
+                if self._recover_stale_scopes:
+                    self._startup_cleanup_count = self.cleanup_stale_scopes()
                 self._inspect_hierarchy()
             except (CgroupV2Unavailable, CgroupCleanupFailed):
                 raise
@@ -672,17 +701,28 @@ class CgroupV2Manager:
             if self._read_pids(owner):
                 raise CgroupV2Unavailable("owner aggregate cgroup contains a process")
             leaves = self._io.list_dirs(owner)
-            if any(not (_WORKER_RE.fullmatch(name) or _EXECUTOR_RE.fullmatch(name)) for name in leaves):
+            if any(
+                not (
+                    _WORKER_RE.fullmatch(name)
+                    or _READER_RE.fullmatch(name)
+                    or _EXECUTOR_RE.fullmatch(name)
+                )
+                for name in leaves
+            ):
                 raise CgroupV2Unavailable("authenticated owner scope contains an unmanaged cgroup")
             self._verify_limits(owner, self.policy.owner_limits)
             for leaf_name in leaves:
                 leaf = owner + (leaf_name,)
                 if self._io.list_dirs(leaf):
                     raise CgroupV2Unavailable("process-bearing cgroup leaf contains a child")
-                self._verify_limits(
-                    leaf,
-                    self.policy.owner_limits if _WORKER_RE.fullmatch(leaf_name) else self.policy.executor_limits,
+                limits = (
+                    self.policy.owner_limits
+                    if _WORKER_RE.fullmatch(leaf_name)
+                    else self.policy.reader_limits
+                    if _READER_RE.fullmatch(leaf_name)
+                    else self.policy.executor_limits
                 )
+                self._verify_limits(leaf, limits)
 
     def _require_only_managed(
         self, relative: tuple[str, ...], names: Sequence[str], *, allow_unmanaged: bool,

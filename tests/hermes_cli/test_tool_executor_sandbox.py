@@ -269,6 +269,7 @@ def _resource_policy(tmp_path):
         required_controllers=("cpu", "memory", "pids"),
         global_limits=SandboxResourceLimits(3000, 3 << 30, 512, 4, max_owner_workers=5),
         owner_limits=SandboxResourceLimits(2000, 2 << 30, 256, 2),
+        reader_limits=SandboxResourceLimits(250, 128 << 20, 16, 1),
         executor_limits=SandboxResourceLimits(
             1000, 1 << 30, 64, 1, swap_bytes=0, file_descriptors=64,
             duration_seconds=120, output_bytes=200_000,

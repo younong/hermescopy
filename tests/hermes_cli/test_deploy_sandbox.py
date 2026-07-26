@@ -110,23 +110,44 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert 'chown -R root:root "$release_tmp"' in source
     assert 'find "$release_tmp" -type d -exec chmod go-w {} +' in source
     service_start = source.index("systemctl start hermes-dashboard.service")
-    resource_preflight = source.index("check-executor-cgroup-host.py", service_start)
+    dashboard_ready = source.index("# systemd reports active", service_start)
+    resource_preflight = source.index("check-executor-cgroup-host.py", dashboard_ready)
     resource_smoke = source.index("smoke-executor-resources.py", resource_preflight)
     powerpoint_smoke = source.index("smoke-powerpoint-runtime.py", resource_smoke)
-    assert service_start < resource_preflight < resource_smoke < powerpoint_smoke
+    assert service_start < dashboard_ready < resource_preflight < resource_smoke < powerpoint_smoke
+    ready_block = source[dashboard_ready:resource_preflight]
+    assert "for _ in $(seq 1 30); do" in ready_block
+    assert 'if [ "$login_status" = "302" ] && [ "$api_status" = "401" ]' in ready_block
+    assert "Hermes internal auth preflight failed" in ready_block
+    assert source.count("Hermes internal auth preflight failed") == 1
     assert '"schema_version":2' in source
     assert '"cpu_millis":1500' in source
     assert '"memory_bytes":2415919104' in source
     assert '"max_owner_workers":5' in source
+    assert '"reader":{"cpu_millis":1000,"memory_bytes":134217728,"pids":16' in source
     assert '"cpu_millis":750' in source
     assert '"memory_bytes":536870912' in source
     assert "Delegate=cpu memory pids" in source
     assert "CPUAccounting=yes" in source
     assert "MemoryAccounting=yes" in source
     assert "TasksAccounting=yes" in source
+    assert "session_reader_pids=" in source
+    assert "[h]ermes_cli.session_reader.entrypoint" in source
+    assert "hermes-log-format.conf" in source
+    assert 'nginx_log_format="/etc/nginx/conf.d/00-hermes-log-format.conf"' in source
+    assert 'legacy_nginx_log_format="/etc/nginx/conf.d/hermes-log-format.conf"' in source
+    assert 'rm -f -- "$legacy_nginx_log_format"' in source
+    assert source.count('"$legacy_nginx_log_format"; do') == 2
     assert "HERMES_DEPLOY_STAGE executor_resource_preflight=passed" in source
     assert "HERMES_DEPLOY_STAGE executor_resource_smoke=passed" in source
     assert "HERMES_DEPLOY_STAGE powerpoint_runtime_smoke=passed" in source
+    assert 'test -f "$release/deploy/run-cgroup-smoke.py"' in source
+    powerpoint_launch = source[source.index('powerpoint_smoke_owner='):source.index('echo "HERMES_DEPLOY_STAGE powerpoint_runtime_smoke=passed"')]
+    assert '"$release/deploy/run-cgroup-smoke.py"' in powerpoint_launch
+    assert '--managed-root "$cgroup_root"' in powerpoint_launch
+    assert '--service hermes-dashboard.service' in powerpoint_launch
+    assert '--user "$service_user"' in powerpoint_launch
+    assert 'runuser -u "$service_user"' not in powerpoint_launch
     preflight_source = (ROOT / "deploy" / "check-executor-cgroup-host.py").read_text(encoding="utf-8")
     assert "service_processes == 0" in preflight_source
     assert "managed_processes == 0" in preflight_source
@@ -141,8 +162,11 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert 'checks[check] = "passed"' in powerpoint_source
     assert '"deadline_enforced"' in powerpoint_source
     assert '"output_enforced"' in powerpoint_source
-    assert "CgroupV2Manager(deployment_policy.resource_policy)" in powerpoint_source
-    assert 'checks["startup_recovery"]' in powerpoint_source
+    assert 'output_config_home / "config.yaml"' in powerpoint_source
+    assert '"tool_output:\\n  max_bytes: 400000\\n"' in powerpoint_source
+    assert "manager.cleanup_owner(self.owner_lease)" in powerpoint_source
+    assert "recover_stale_scopes=False" in powerpoint_source
+    assert 'checks["non_destructive_cgroup_attach"]' in powerpoint_source
     assert "resource_controller=resource_controller" in powerpoint_source
     assert 'checks["executor_nofile_limit"]' in powerpoint_source
     assert 'checks["high_fd_launch_pressure"]' in powerpoint_source

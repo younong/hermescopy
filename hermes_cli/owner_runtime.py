@@ -12,7 +12,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, MutableMapping
 
-from hermes_constants import get_hermes_home
+from hermes_cli.session_reader.runtime import (
+    FORBIDDEN_OWNER_WORKER_ENV_KEYS,
+    SessionReaderRuntimePaths,
+    session_reader_env_for,
+    session_reader_runtime_dir,
+    session_reader_runtime_paths,
+    session_reader_socket_path,
+    validate_session_reader_runtime_environment,
+)
 
 REQUIRED_OWNER_DIRS: tuple[Path, ...] = (
     Path("runtime"),
@@ -64,17 +72,16 @@ OWNER_ENV_KEYS: tuple[str, ...] = (
     "HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY",
     "HERMES_OWNER_WORKER_CAPABILITY_RETAINED_PUBLIC_KEYS",
     "HERMES_OWNER_WORKER_CONTROL_WS_BASE",
+    "HERMES_READER_GENERATION",
+    "HERMES_READER_ID",
+    "HERMES_READER_LEASE_VERSION",
+    "HERMES_READER_RECOVERY_GENERATION",
+    "HERMES_SESSION_READER_CAPABILITY_ISSUER",
+    "HERMES_SESSION_READER_CAPABILITY_PUBLIC_KEY",
+    "HERMES_SESSION_READER_CAPABILITY_RETAINED_PUBLIC_KEYS",
     "HERMES_SANDBOX_DEPLOYMENT_POLICY",
     "HERMES_DISABLE_LAZY_INSTALLS",
     *OWNER_WORKER_DEPLOYMENT_RUNTIME_ENV_KEYS,
-)
-
-FORBIDDEN_OWNER_WORKER_ENV_KEYS: tuple[str, ...] = (
-    "HERMES_PROFILE",
-    "HERMES_SESSION_PROFILE",
-    "HERMES_CONFIG",
-    "HERMES_ENV",
-    "TERMINAL_CWD",
 )
 
 _REQUIRED_OWNER_WORKER_ENV_KEYS: tuple[str, ...] = (
@@ -265,6 +272,11 @@ def get_runtime_owner_home() -> Path:
     host owner path in a local-process deployment, but callers must not use that
     equality as proof of the authenticated owner identity.
     """
+
+    raw = os.environ.get("HERMES_HOME", "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    from hermes_constants import get_hermes_home
 
     return get_hermes_home().expanduser().resolve()
 
