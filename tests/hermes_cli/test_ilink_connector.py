@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import sqlite3
 import time
@@ -218,17 +219,17 @@ async def test_outbound_sender_delivers_long_reply_with_stable_chunk_progress(st
     first = claim_outbound(identity_store, holder="sender")
     assert first is not None
     assert first.outbound_id == outbound_id
-    assert first.chunk_attempts == 1
-    assert len(first.chunks) > 1
-    first_client_id = first.chunk_client_id
-    assert first.chunk_attempts == 1
+    assert first.part_attempts == 1
+    assert len(first.parts) > 1
+    first_client_id = first.part_client_id
+    assert first.part_attempts == 1
     assert await sender.send_claim(first, holder="sender") is True
 
     second = claim_outbound(identity_store, holder="sender")
     assert second is not None
-    assert second.next_chunk_index == 1
-    assert second.chunk_attempts == 1
-    assert second.chunk_client_id != first_client_id
+    assert second.next_part_index == 1
+    assert second.part_attempts == 1
+    assert second.part_client_id != first_client_id
     while second is not None:
         assert await sender.send_claim(second, holder="sender") is True
         second = claim_outbound(identity_store, holder="sender")
@@ -271,11 +272,11 @@ async def test_outbound_sender_retries_same_chunk_id_then_terminally_fails(store
     assert await sender.send_claim(first, holder="sender") is False
     retry = claim_outbound(identity_store, holder="sender")
     assert retry is not None
-    assert retry.chunk_attempts == 2
-    assert retry.chunk_client_id == first.chunk_client_id
+    assert retry.part_attempts == 2
+    assert retry.part_client_id == first.part_client_id
     assert await sender.send_claim(retry, holder="sender") is False
 
-    assert ids == [first.chunk_client_id, first.chunk_client_id]
+    assert ids == [first.part_client_id, first.part_client_id]
     assert claim_outbound(identity_store, holder="sender") is None
     with identity_store.read() as conn:
         outbound = conn.execute(
@@ -286,6 +287,71 @@ async def test_outbound_sender_retries_same_chunk_id_then_terminally_fails(store
         ).fetchone()
     assert tuple(outbound) == ("failed", "stale_session:provider=-14", 0)
     assert tuple(inbound) == ("failed", "outbound_failed")
+
+
+@pytest.mark.asyncio
+async def test_outbound_sender_delivers_text_then_media_parts(store, monkeypatch, tmp_path):
+    identity_store, registered = store
+    image = tmp_path / "reply.png"
+    audio = tmp_path / "reply.mp3"
+    image.write_bytes(b"png")
+    audio.write_bytes(b"mp3")
+    payload = json.dumps(
+        {
+            "v": 1,
+            "text": "reply",
+            "media": [
+                {"path": str(image), "voice": False},
+                {"path": str(audio), "voice": True},
+            ],
+        }
+    )
+    _queue_outbound(identity_store, registered, text=payload)
+    sent: list[tuple] = []
+
+    async def send_message(_client, *, text, client_id, **_kwargs):
+        sent.append(("text", text, client_id))
+        return {"ret": 0}
+
+    async def upload_media(_session, _client, *, path, force_file, **_kwargs):
+        sent.append(("upload", path, force_file))
+        return {"type": 2 if path.endswith(".png") else 4}
+
+    async def send_item(_client, *, item, client_id, **_kwargs):
+        sent.append(("item", item["type"], client_id))
+        return {"ret": 0}
+
+    monkeypatch.setattr(
+        "hermes_cli.channel_connectors.weixin_ilink.sender.WeixinILinkClient.send_message",
+        send_message,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.channel_connectors.weixin_ilink.sender.upload_media_item",
+        upload_media,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.channel_connectors.weixin_ilink.sender.WeixinILinkClient.send_item",
+        send_item,
+    )
+    sender = OutboundSender(identity_store, object(), chunk_delay_seconds=0)
+
+    claim = claim_outbound(identity_store, holder="sender")
+    assert claim is not None
+    assert [part.kind for part in claim.parts] == ["text", "media", "media"]
+    client_ids = []
+    while claim is not None:
+        client_ids.append(claim.part_client_id)
+        assert await sender.send_claim(claim, holder="sender") is True
+        claim = claim_outbound(identity_store, holder="sender")
+
+    assert len(set(client_ids)) == 3
+    assert sent == [
+        ("text", "reply", client_ids[0]),
+        ("upload", str(image), False),
+        ("item", 2, client_ids[1]),
+        ("upload", str(audio), True),
+        ("item", 4, client_ids[2]),
+    ]
 
 
 @pytest.mark.asyncio
@@ -307,7 +373,7 @@ async def test_outbound_sender_terminally_fails_ambiguous_provider_rejection(
 
     claim = claim_outbound(identity_store, holder="sender")
     assert claim is not None
-    assert claim.chunk_attempts == 1
+    assert claim.part_attempts == 1
     assert await sender.send_claim(claim, holder="sender") is False
 
     assert claim_outbound(identity_store, holder="sender") is None
@@ -421,6 +487,119 @@ def test_raw_voice_queues_minimal_encrypted_descriptor(store):
     assert b"encrypted-key" not in raw_database
 
 
+def test_file_message_is_queued_with_encrypted_download_descriptor(store):
+    identity_store, registered = store
+    lease = acquire_poll_lease(identity_store, account_id=registered.account_id, holder="holder")
+    aes_key = base64.b64encode(b"a" * 16).decode()
+
+    inserted = commit_update_batch(
+        identity_store,
+        lease,
+        messages=(
+            {
+                "message_id": "msg-file",
+                "from_user_id": "peer-a",
+                "item_list": [
+                    {
+                        "type": 4,
+                        "file_item": {
+                            "file_name": "report.txt",
+                            "len": "12",
+                            "media": {
+                                "encrypt_query_param": "download-token",
+                                "aes_key": aes_key,
+                            },
+                        },
+                    }
+                ],
+            },
+        ),
+        cursor="cursor-file",
+    )
+
+    assert inserted == 1
+    with identity_store.read() as conn:
+        row = conn.execute("SELECT * FROM inbound_messages").fetchone()
+    assert row["status"] == "queued"
+    assert row["payload_kind"] == "media"
+    assert json.loads(_decrypt_inbound_payload(identity_store, row)) == {
+        "v": 1,
+        "text": "",
+        "attachments": [
+            {
+                "kind": "file",
+                "file_name": "report.txt",
+                "media": {
+                    "encrypt_query_param": "download-token",
+                    "aes_key": aes_key,
+                },
+                "size": 12,
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    ("item", "kind", "file_name"),
+    [
+        (
+            {
+                "type": 2,
+                "image_item": {
+                    "file_name": "photo.png",
+                    "media": {"encrypt_query_param": "image-token"},
+                },
+            },
+            "image",
+            "photo.png",
+        ),
+        (
+            {
+                "type": 5,
+                "video_item": {
+                    "file_name": "clip.mp4",
+                    "media": {"encrypt_query_param": "video-token"},
+                },
+            },
+            "video",
+            "clip.mp4",
+        ),
+    ],
+)
+def test_known_visual_media_is_queued_with_text(store, item, kind, file_name):
+    identity_store, registered = store
+    lease = acquire_poll_lease(identity_store, account_id=registered.account_id, holder="holder")
+
+    commit_update_batch(
+        identity_store,
+        lease,
+        messages=(
+            {
+                "message_id": f"msg-{kind}",
+                "from_user_id": "peer-a",
+                "item_list": [
+                    {"type": 1, "text_item": {"text": "caption"}},
+                    item,
+                ],
+            },
+        ),
+        cursor=f"cursor-{kind}",
+    )
+
+    with identity_store.read() as conn:
+        row = conn.execute("SELECT * FROM inbound_messages").fetchone()
+    payload = json.loads(_decrypt_inbound_payload(identity_store, row))
+    assert row["payload_kind"] == "media"
+    assert payload["text"] == "caption"
+    assert payload["attachments"] == [
+        {
+            "kind": kind,
+            "file_name": file_name,
+            "media": item[f"{kind}_item"]["media"],
+        }
+    ]
+
+
 def test_provider_replay_is_idempotent_but_same_text_new_id_is_distinct(store):
     identity_store, registered = store
     lease = acquire_poll_lease(identity_store, account_id=registered.account_id, holder="holder")
@@ -456,7 +635,7 @@ def test_provider_replay_is_idempotent_but_same_text_new_id_is_distinct(store):
                 "from_user_id": "peer-a",
                 "item_list": [{"type": 2, "image_item": {}}],
             },
-            "non_text_not_supported",
+            "media_descriptor_invalid",
         ),
         (_voice_message("msg-invalid-voice", {"media": {}}), "voice_media_invalid"),
     ],

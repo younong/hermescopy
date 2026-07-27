@@ -30,11 +30,29 @@ from hermes_cli.deployment_inference import DeploymentInferencePolicy
 from hermes_cli.owner_worker import OwnerWorkerSupervisor
 
 
+class _Content:
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+
+    async def iter_chunked(self, _size: int):
+        yield self.data
+
+
 class _Response:
-    def __init__(self, payload: dict, *, status: int = 200) -> None:
-        self._payload = payload
+    def __init__(
+        self,
+        payload: dict | None = None,
+        *,
+        status: int = 200,
+        data: bytes = b"",
+        headers: dict | None = None,
+    ) -> None:
+        self._payload = payload or {}
+        self._data = data
         self.status = status
         self.ok = 200 <= status < 300
+        self.headers = headers or {}
+        self.content = _Content(data)
 
     async def __aenter__(self):
         return self
@@ -45,6 +63,9 @@ class _Response:
     async def text(self) -> str:
         return json.dumps(self._payload)
 
+    async def read(self) -> bytes:
+        return self._data
+
 
 class _FakeILinkSession:
     def __init__(self) -> None:
@@ -52,6 +73,8 @@ class _FakeILinkSession:
         self.qr_by_token: dict[str, ILinkCredentials] = {}
         self.update_batches: list[dict] = []
         self.sent_messages: list[dict] = []
+        self.downloads: dict[str, bytes] = {}
+        self.uploaded_media: list[bytes] = []
         self.fail_next_send = False
 
     def get(self, url: str, **_kwargs):
@@ -77,15 +100,24 @@ class _FakeILinkSession:
                     "ilink_user_id": credentials.user_id,
                 }
             )
+        if "novac2c.cdn.weixin.qq.com" in url:
+            token = url.split("encrypted_query_param=", 1)[-1].split("&", 1)[0]
+            return _Response(data=self.downloads[token])
         raise AssertionError(f"unexpected iLink GET endpoint: {url}")
 
-    def post(self, url: str, *, data: str, **_kwargs):
+    def post(self, url: str, *, data, **_kwargs):
+        if "novac2c.cdn.weixin.qq.com" in url:
+            self.uploaded_media.append(bytes(data))
+            return _Response(headers={"x-encrypted-param": f"uploaded-{len(self.uploaded_media)}"})
         payload = json.loads(data)
         if "getupdates" in url:
             return _Response(self.update_batches.pop(0))
+        if "getuploadurl" in url:
+            return _Response({"upload_param": f"upload-{len(self.uploaded_media) + 1}"})
         if "sendmessage" in url:
             self.sent_messages.append(payload["msg"])
-            text = payload["msg"]["item_list"][0]["text_item"]["text"]
+            item = payload["msg"]["item_list"][0]
+            text = (item.get("text_item") or {}).get("text", "")
             if len(text) > 2000:
                 return _Response({"ret": 413}, status=413)
             if self.fail_next_send:
@@ -104,11 +136,15 @@ def _inference_server():
             length = int(self.headers.get("Content-Length", "0"))
             request = json.loads(self.rfile.read(length))
             requests.append(request)
-            reply = (
-                "long integration reply " + "word " * 900
-                if len(requests) == 1
-                else f"integration reply {len(requests)}"
-            )
+            if len(requests) == 1:
+                reply = "long integration reply " + "word " * 900
+            elif len(requests) == 4:
+                media_path = Path(os.environ["HERMES_HOME"]) / "media" / "outbound.png"
+                media_path.parent.mkdir(parents=True, exist_ok=True)
+                media_path.write_bytes(b"outbound image")
+                reply = f"media reply\nMEDIA:{media_path}"
+            else:
+                reply = f"integration reply {len(requests)}"
             chunks = (
                 {
                     "id": "ilink-integration",
@@ -269,7 +305,12 @@ async def test_ilink_enrollment_poll_dispatch_send_and_generation_resume(monkeyp
                 startup_cooldown=0,
                 deployment_inference_policy=policy,
             )
-            dispatcher = ChannelDispatcher(store, supervisor, turn_timeout=30)
+            dispatcher = ChannelDispatcher(
+                store,
+                supervisor,
+                turn_timeout=30,
+                media_session=ilink,
+            )
             sender = OutboundSender(
                 store,
                 ilink,
@@ -348,7 +389,7 @@ async def test_ilink_enrollment_poll_dispatch_send_and_generation_resume(monkeyp
                     assert retry is not None
                     assert retry.outbound_id == outbound.outbound_id
                     assert retry.client_message_id == outbound.client_message_id
-                    assert retry.chunk_client_id == outbound.chunk_client_id
+                    assert retry.part_client_id == outbound.part_client_id
                     outbound = retry
                 while outbound is not None:
                     assert await sender.send_claim(outbound, holder="integration-send") is True
@@ -449,6 +490,48 @@ async def test_ilink_enrollment_poll_dispatch_send_and_generation_resume(monkeyp
             assert resumed["worker_generation"] > first_generation
             assert resumed["worker_generation"] == active_lease.worker_generation
             assert len(model_requests) == 3
+
+            media_token = "integration-file"
+            ilink.downloads[media_token] = b"integration attachment"
+            assert commit_update_batch(
+                store,
+                lease_a,
+                messages=(
+                    {
+                        "message_id": "message-a-media",
+                        "from_user_id": "peer-a",
+                        "context_token": "context-a-media",
+                        "item_list": [
+                            {"type": 1, "text_item": {"text": "inspect attachment"}},
+                            {
+                                "type": 4,
+                                "file_item": {
+                                    "file_name": "integration.txt",
+                                    "len": "22",
+                                    "media": {"encrypt_query_param": media_token},
+                                },
+                            },
+                        ],
+                    },
+                ),
+                cursor="cursor-a-media",
+            ) == 1
+            media_claim = dispatcher.claim_next(holder="integration-dispatch")
+            assert media_claim is not None
+            await dispatcher.dispatch_claim(media_claim, holder="integration-dispatch")
+            assert "@file:" in json.dumps(model_requests[-1])
+
+            media_outbound = claim_outbound(store, holder="integration-send")
+            assert media_outbound is not None
+            while media_outbound is not None:
+                assert await sender.send_claim(media_outbound, holder="integration-send") is True
+                media_outbound = claim_outbound(store, holder="integration-send")
+            assert len(model_requests) == 4
+            assert ilink.uploaded_media
+            assert any(
+                message["item_list"][0].get("type") == 2
+                for message in ilink.sent_messages
+            )
     finally:
         await enrollments.stop()
         if supervisor is not None:

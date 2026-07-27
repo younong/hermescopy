@@ -15,7 +15,7 @@ from gateway.weixin_ilink.media import (
     WeixinMediaLimits,
     cdn_download_url,
     decrypt_aes128_ecb,
-    download_and_decrypt_voice,
+    download_and_decrypt_media,
     parse_aes_key,
     validate_media_url,
 )
@@ -99,7 +99,7 @@ async def test_download_decrypts_without_redirects():
     key = b"k" * 16
     session = _Session(_Response([_encrypt(b"#!SILK_V3 test", key)]))
 
-    result = await download_and_decrypt_voice(
+    result = await download_and_decrypt_media(
         session,
         descriptor={
             "v": 1,
@@ -118,11 +118,11 @@ async def test_download_decrypts_without_redirects():
 async def test_download_rejects_redirect_and_streamed_oversize():
     descriptor = {"v": 1, "media": {"full_url": "https://novac2c.cdn.weixin.qq.com/file"}}
     with pytest.raises(WeixinMediaError, match="media_redirected"):
-        await download_and_decrypt_voice(_Session(_Response([], status=302)), descriptor=descriptor)
+        await download_and_decrypt_media(_Session(_Response([], status=302)), descriptor=descriptor)
 
     session = _Session(_Response([b"123", b"456"]))
     with pytest.raises(WeixinMediaError, match="media_too_large"):
-        await download_and_decrypt_voice(
+        await download_and_decrypt_media(
             session,
             descriptor=descriptor,
             limits=WeixinMediaLimits(max_download_bytes=5),

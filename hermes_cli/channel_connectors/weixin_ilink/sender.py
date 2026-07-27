@@ -4,12 +4,26 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import time
 from dataclasses import dataclass
 
-from gateway.weixin_ilink import ILinkTransportError, WeixinILinkClient
+from gateway.platforms.base import BasePlatformAdapter
+from gateway.weixin_ilink import (
+    ILinkTransportError,
+    WeixinILinkClient,
+    WeixinMediaError,
+    upload_media_item,
+)
 from gateway.weixin_ilink.text import format_weixin_text, split_weixin_text
 from hermes_cli.channel_identity.store import ChannelIdentityStore
+
+
+@dataclass(frozen=True)
+class OutboundPart:
+    kind: str
+    value: str
+    force_file: bool = False
 
 
 @dataclass(frozen=True)
@@ -18,26 +32,64 @@ class OutboundClaim:
     account_id: str
     binding_id: str
     client_message_id: str
-    chunks: tuple[str, ...]
-    next_chunk_index: int
-    chunk_attempts: int
+    parts: tuple[OutboundPart, ...]
+    next_part_index: int
+    part_attempts: int
     context_token: str | None
     base_url: str
     bot_token: str
     peer_id: str
 
     @property
-    def chunk(self) -> str:
-        return self.chunks[self.next_chunk_index]
+    def part(self) -> OutboundPart:
+        return self.parts[self.next_part_index]
 
     @property
-    def chunk_client_id(self) -> str:
-        if len(self.chunks) == 1:
+    def part_client_id(self) -> str:
+        if len(self.parts) == 1:
             return self.client_message_id
         digest = hashlib.sha256(
-            f"{self.client_message_id}:{self.next_chunk_index}".encode("utf-8")
+            f"{self.client_message_id}:{self.next_part_index}".encode("utf-8")
         ).hexdigest()[:32]
         return f"hermes-ilink-{digest}"
+
+
+def _outbound_parts(payload: str) -> tuple[OutboundPart, ...]:
+    text = payload
+    media: list[dict] = []
+    try:
+        envelope = json.loads(payload)
+    except (TypeError, json.JSONDecodeError):
+        envelope = None
+    if isinstance(envelope, dict) and envelope.get("v") == 1 and "media" in envelope:
+        if not isinstance(envelope.get("text"), str) or not isinstance(envelope["media"], list):
+            raise RuntimeError("outbound media payload is invalid")
+        text = envelope["text"]
+        media = envelope["media"]
+        if not media or len(media) > 16:
+            raise RuntimeError("outbound media payload is invalid")
+
+    parts = [OutboundPart("text", chunk) for chunk in split_weixin_text(format_weixin_text(text))]
+    seen: set[str] = set()
+    for entry in media:
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("path"), str)
+            or not entry["path"]
+            or not isinstance(entry.get("voice", False), bool)
+        ):
+            raise RuntimeError("outbound media payload is invalid")
+        path = entry["path"]
+        validated = BasePlatformAdapter.filter_media_delivery_paths([(path, entry.get("voice", False))])
+        if len(validated) != 1 or validated[0][0] != path:
+            raise RuntimeError("outbound media path is invalid")
+        if path in seen:
+            continue
+        seen.add(path)
+        parts.append(OutboundPart("media", path, force_file=bool(entry.get("voice"))))
+    if not parts:
+        raise RuntimeError("outbound payload is empty")
+    return tuple(parts)
 
 
 def claim_outbound(store: ChannelIdentityStore, *, holder: str) -> OutboundClaim | None:
@@ -67,21 +119,19 @@ def claim_outbound(store: ChannelIdentityStore, *, holder: str) -> OutboundClaim
         ).rowcount
         if changed != 1:
             return None
-    text = store.crypto.decrypt_text(
+    payload = store.crypto.decrypt_text(
         row["payload_ciphertext"],
         table="outbound_messages",
         record_id=row["outbound_id"],
         field="payload",
         version=row["payload_key_version"],
     )
-    chunks = tuple(split_weixin_text(format_weixin_text(text)))
-    if not chunks:
-        raise RuntimeError("outbound payload is empty")
-    next_chunk_index = int(row["next_chunk_index"])
-    if next_chunk_index < 0 or next_chunk_index >= len(chunks):
-        raise RuntimeError("outbound chunk progress is invalid")
-    if row["chunk_count"] is not None and int(row["chunk_count"]) != len(chunks):
-        raise RuntimeError("outbound chunk count changed")
+    parts = _outbound_parts(payload)
+    next_part_index = int(row["next_chunk_index"])
+    if next_part_index < 0 or next_part_index >= len(parts):
+        raise RuntimeError("outbound part progress is invalid")
+    if row["chunk_count"] is not None and int(row["chunk_count"]) != len(parts):
+        raise RuntimeError("outbound part count changed")
     with store.write() as conn:
         changed = conn.execute(
             """
@@ -89,7 +139,7 @@ def claim_outbound(store: ChannelIdentityStore, *, holder: str) -> OutboundClaim
             WHERE outbound_id=? AND status='sending' AND claimed_by=?
               AND (chunk_count IS NULL OR chunk_count=?)
             """,
-            (len(chunks), time.time(), row["outbound_id"], holder, len(chunks)),
+            (len(parts), time.time(), row["outbound_id"], holder, len(parts)),
         ).rowcount
         if changed != 1:
             raise RuntimeError("outbound send claim is stale")
@@ -121,9 +171,9 @@ def claim_outbound(store: ChannelIdentityStore, *, holder: str) -> OutboundClaim
         account_id=row["account_id"],
         binding_id=row["binding_id"],
         client_message_id=row["client_message_id"],
-        chunks=chunks,
-        next_chunk_index=next_chunk_index,
-        chunk_attempts=int(row["chunk_attempts"]) + 1,
+        parts=parts,
+        next_part_index=next_part_index,
+        part_attempts=int(row["chunk_attempts"]) + 1,
         context_token=context,
         base_url=row["base_url"],
         bot_token=bot_token,
@@ -151,21 +201,37 @@ class OutboundSender:
 
     async def send_claim(self, claim: OutboundClaim, *, holder: str) -> bool:
         try:
-            await WeixinILinkClient(
+            client = WeixinILinkClient(
                 self.session,
                 base_url=claim.base_url,
                 token=claim.bot_token,
-            ).send_message(
-                to=claim.peer_id,
-                text=claim.chunk,
-                context_token=claim.context_token,
-                client_id=claim.chunk_client_id,
             )
+            if claim.part.kind == "text":
+                await client.send_message(
+                    to=claim.peer_id,
+                    text=claim.part.value,
+                    context_token=claim.context_token,
+                    client_id=claim.part_client_id,
+                )
+            else:
+                item = await upload_media_item(
+                    self.session,
+                    client,
+                    to_user_id=claim.peer_id,
+                    path=claim.part.value,
+                    force_file=claim.part.force_file,
+                )
+                await client.send_item(
+                    to=claim.peer_id,
+                    item=item,
+                    context_token=claim.context_token,
+                    client_id=claim.part_client_id,
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             error, transient = _classify_error(exc)
-            if transient and claim.chunk_attempts < self.max_attempts:
+            if transient and claim.part_attempts < self.max_attempts:
                 self._retry(claim, holder=holder, error=error)
             else:
                 if transient:
@@ -175,7 +241,7 @@ class OutboundSender:
         return self._advance(claim, holder=holder)
 
     def _retry(self, claim: OutboundClaim, *, holder: str, error: str) -> None:
-        exponent = max(0, claim.chunk_attempts - 1)
+        exponent = max(0, claim.part_attempts - 1)
         delay = min(self.retry_max_seconds, self.retry_seconds * (2**exponent))
         now = time.time()
         with self.store.write() as conn:
@@ -197,7 +263,7 @@ class OutboundSender:
                     last_error=?, failed_chunk_index=?, updated_at=?
                 WHERE outbound_id=? AND status='sending' AND claimed_by=?
                 """,
-                (error, claim.next_chunk_index, now, claim.outbound_id, holder),
+                (error, claim.next_part_index, now, claim.outbound_id, holder),
             ).rowcount
             if changed == 1:
                 conn.execute(
@@ -212,9 +278,9 @@ class OutboundSender:
 
     def _advance(self, claim: OutboundClaim, *, holder: str) -> bool:
         now = time.time()
-        next_index = claim.next_chunk_index + 1
+        next_index = claim.next_part_index + 1
         with self.store.write() as conn:
-            if next_index < len(claim.chunks):
+            if next_index < len(claim.parts):
                 changed = conn.execute(
                     """
                     UPDATE outbound_messages SET status='queued', next_chunk_index=?,
@@ -229,7 +295,7 @@ class OutboundSender:
                         now,
                         claim.outbound_id,
                         holder,
-                        claim.next_chunk_index,
+                        claim.next_part_index,
                     ),
                 ).rowcount
                 return changed == 1
@@ -243,7 +309,7 @@ class OutboundSender:
                 WHERE outbound_id=? AND status='sending' AND claimed_by=?
                   AND next_chunk_index=?
                 """,
-                (next_index, now, claim.outbound_id, holder, claim.next_chunk_index),
+                (next_index, now, claim.outbound_id, holder, claim.next_part_index),
             ).rowcount
             if changed == 1:
                 conn.execute(
@@ -266,6 +332,8 @@ def _classify_error(exc: Exception) -> tuple[str, bool]:
         if exc.provider_code is not None:
             parts.append(f"provider={exc.provider_code}")
         return ":".join(parts), exc.transient
+    if isinstance(exc, WeixinMediaError):
+        return exc.code, exc.retryable
     if isinstance(exc, (TimeoutError, OSError)):
         return "network_error", True
     return f"internal_error:{type(exc).__name__}", False

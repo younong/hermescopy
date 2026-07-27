@@ -28,7 +28,6 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -41,24 +40,23 @@ except ImportError:  # pragma: no cover - dependency gate
     AIOHTTP_AVAILABLE = False
 
 try:
-    from cryptography.hazmat.backends import default_backend
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    import cryptography  # noqa: F401
 
     CRYPTO_AVAILABLE = True
 except ImportError:  # pragma: no cover - dependency gate
-    default_backend = None  # type: ignore[assignment]
-    Cipher = None  # type: ignore[assignment]
-    algorithms = None  # type: ignore[assignment]
-    modes = None  # type: ignore[assignment]
     CRYPTO_AVAILABLE = False
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.weixin_ilink.media import (
-    WeixinMediaError,
-    cdn_download_url as _shared_cdn_download_url,
-    decrypt_aes128_ecb as _shared_aes128_ecb_decrypt,
-    parse_aes_key as _shared_parse_aes_key,
+    ITEM_FILE,
+    ITEM_IMAGE,
+    ITEM_TEXT,
+    ITEM_VIDEO,
+    ITEM_VOICE,
+    WeixinMediaLimits,
+    download_and_decrypt_media as _shared_download_and_decrypt_media,
+    upload_media_item,
 )
 from gateway.weixin_ilink.client import WeixinILinkClient
 from gateway.weixin_ilink.text import (
@@ -89,7 +87,6 @@ EP_GET_UPDATES = "ilink/bot/getupdates"
 EP_SEND_MESSAGE = "ilink/bot/sendmessage"
 EP_SEND_TYPING = "ilink/bot/sendtyping"
 EP_GET_CONFIG = "ilink/bot/getconfig"
-EP_GET_UPLOAD_URL = "ilink/bot/getuploadurl"
 EP_GET_BOT_QR = "ilink/bot/get_bot_qrcode"
 EP_GET_QR_STATUS = "ilink/bot/get_qrcode_status"
 
@@ -117,11 +114,6 @@ def _is_stale_session_ret(
     return (errmsg or "").lower() == "unknown error"
 
 
-MEDIA_IMAGE = 1
-MEDIA_VIDEO = 2
-MEDIA_FILE = 3
-MEDIA_VOICE = 4
-
 _LIVE_ADAPTERS: Dict[str, Any] = {}
 
 
@@ -143,12 +135,6 @@ def _make_ssl_connector() -> Optional["aiohttp.TCPConnector"]:
         return None
     ssl_ctx = ssl.create_default_context(cafile=certifi.where())
     return aiohttp.TCPConnector(ssl=ssl_ctx)
-
-ITEM_TEXT = 1
-ITEM_IMAGE = 2
-ITEM_VOICE = 3
-ITEM_FILE = 4
-ITEM_VIDEO = 5
 
 MSG_TYPE_USER = 1
 MSG_TYPE_BOT = 2
@@ -176,30 +162,6 @@ def _safe_id(value: Optional[str], keep: int = 8) -> str:
 
 def _json_dumps(payload: Dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-
-
-def _pkcs7_pad(data: bytes, block_size: int = 16) -> bytes:
-    pad_len = block_size - (len(data) % block_size)
-    return data + bytes([pad_len] * pad_len)
-
-
-def _aes128_ecb_encrypt(plaintext: bytes, key: bytes) -> bytes:
-    cipher = Cipher(algorithms.AES(key), modes.ECB(), backend=default_backend())
-    encryptor = cipher.encryptor()
-    return encryptor.update(_pkcs7_pad(plaintext)) + encryptor.finalize()
-
-
-def _aes128_ecb_decrypt(ciphertext: bytes, key: bytes) -> bytes:
-    try:
-        return _shared_aes128_ecb_decrypt(ciphertext, key)
-    except WeixinMediaError:
-        cipher = Cipher(algorithms.AES(key), modes.ECB(), backend=default_backend())
-        decryptor = cipher.decryptor()
-        return decryptor.update(ciphertext) + decryptor.finalize()
-
-
-def _aes_padded_size(size: int) -> int:
-    return ((size + 1 + 15) // 16) * 16
 
 
 def _random_wechat_uin() -> str:
@@ -339,22 +301,6 @@ class TypingTicketCache:
         self._cache[user_id] = (ticket, time.time())
 
 
-def _cdn_download_url(cdn_base_url: str, encrypted_query_param: str) -> str:
-    return _shared_cdn_download_url(cdn_base_url, encrypted_query_param)
-
-
-def _cdn_upload_url(cdn_base_url: str, upload_param: str, filekey: str) -> str:
-    return (
-        f"{cdn_base_url.rstrip('/')}/upload"
-        f"?encrypted_query_param={quote(upload_param, safe='')}"
-        f"&filekey={quote(filekey, safe='')}"
-    )
-
-
-def _parse_aes_key(aes_key_b64: str) -> bytes:
-    return _shared_parse_aes_key(aes_key_b64)
-
-
 def _guess_chat_type(message: Dict[str, Any], account_id: str) -> Tuple[str, str]:
     room_id = str(message.get("room_id") or message.get("chat_room_id") or "").strip()
     to_user_id = str(message.get("to_user_id") or "").strip()
@@ -479,141 +425,8 @@ async def _get_config(
     )
 
 
-async def _get_upload_url(
-    session: "aiohttp.ClientSession",
-    *,
-    base_url: str,
-    token: str,
-    to_user_id: str,
-    media_type: int,
-    filekey: str,
-    rawsize: int,
-    rawfilemd5: str,
-    filesize: int,
-    aeskey_hex: str,
-) -> Dict[str, Any]:
-    return await _api_post(
-        session,
-        base_url=base_url,
-        endpoint=EP_GET_UPLOAD_URL,
-        payload={
-            "filekey": filekey,
-            "media_type": media_type,
-            "to_user_id": to_user_id,
-            "rawsize": rawsize,
-            "rawfilemd5": rawfilemd5,
-            "filesize": filesize,
-            "no_need_thumb": True,
-            "aeskey": aeskey_hex,
-        },
-        token=token,
-        timeout_ms=API_TIMEOUT_MS,
-    )
-
-
-async def _upload_ciphertext(
-    session: "aiohttp.ClientSession",
-    *,
-    ciphertext: bytes,
-    upload_url: str,
-) -> str:
-    """Upload encrypted media to the CDN.
-
-    Accepts either a constructed CDN URL (from upload_param) or a direct
-    upload_full_url — both use POST with the raw ciphertext as the body.
-    """
-    # Use asyncio.wait_for() instead of aiohttp ClientTimeout to avoid
-    # "Timeout context manager should be used inside a task" errors when
-    # invoked via asyncio.run_coroutine_threadsafe() from cron jobs.
-    async def _do_upload() -> str:
-        async with session.post(upload_url, data=ciphertext, headers={"Content-Type": "application/octet-stream"}) as response:
-            if response.status == 200:
-                encrypted_param = response.headers.get("x-encrypted-param")
-                if encrypted_param:
-                    await response.read()
-                    return encrypted_param
-                raw = await response.text()
-                raise RuntimeError(f"CDN upload missing x-encrypted-param header: {raw[:200]}")
-            raw = await response.text()
-            raise RuntimeError(f"CDN upload HTTP {response.status}: {raw[:200]}")
-    return await asyncio.wait_for(_do_upload(), timeout=120)
-
-
-async def _download_bytes(
-    session: "aiohttp.ClientSession",
-    *,
-    url: str,
-    timeout_seconds: float = 60.0,
-) -> bytes:
-    # Use asyncio.wait_for() instead of aiohttp ClientTimeout to avoid
-    # "Timeout context manager should be used inside a task" errors.
-    async def _do_download() -> bytes:
-        async with session.get(url) as response:
-            response.raise_for_status()
-            return await response.read()
-    return await asyncio.wait_for(_do_download(), timeout=timeout_seconds)
-
-
-_WEIXIN_CDN_ALLOWLIST: frozenset[str] = frozenset(
-    {
-        "novac2c.cdn.weixin.qq.com",
-        "ilinkai.weixin.qq.com",
-        "wx.qlogo.cn",
-        "thirdwx.qlogo.cn",
-        "res.wx.qq.com",
-        "mmbiz.qpic.cn",
-        "mmbiz.qlogo.cn",
-    }
-)
-
-
-def _assert_weixin_cdn_url(url: str) -> None:
-    """Raise ValueError if *url* does not point at a known WeChat CDN host."""
-    try:
-        parsed = urlparse(url)
-        scheme = parsed.scheme.lower()
-        host = parsed.hostname or ""
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError(f"Unparseable media URL: {url!r}") from exc
-
-    if scheme not in {"http", "https"}:
-        raise ValueError(
-            f"Media URL has disallowed scheme {scheme!r}; only http/https are permitted."
-        )
-    if host not in _WEIXIN_CDN_ALLOWLIST:
-        raise ValueError(
-            f"Media URL host {host!r} is not in the WeChat CDN allowlist. "
-            "Refusing to fetch to prevent SSRF."
-        )
-
-
 def _media_reference(item: Dict[str, Any], key: str) -> Dict[str, Any]:
     return (item.get(key) or {}).get("media") or {}
-
-
-async def _download_and_decrypt_media(
-    session: "aiohttp.ClientSession",
-    *,
-    cdn_base_url: str,
-    encrypted_query_param: Optional[str],
-    aes_key_b64: Optional[str],
-    full_url: Optional[str],
-    timeout_seconds: float,
-) -> bytes:
-    if encrypted_query_param:
-        raw = await _download_bytes(
-            session,
-            url=_cdn_download_url(cdn_base_url, encrypted_query_param),
-            timeout_seconds=timeout_seconds,
-        )
-    elif full_url:
-        _assert_weixin_cdn_url(full_url)
-        raw = await _download_bytes(session, url=full_url, timeout_seconds=timeout_seconds)
-    else:
-        raise RuntimeError("media item had neither encrypt_query_param nor full_url")
-    if aes_key_b64:
-        raw = _aes128_ecb_decrypt(raw, _parse_aes_key(aes_key_b64))
-    return raw
 
 
 def _mime_from_filename(filename: str) -> str:
@@ -676,13 +489,17 @@ def _extract_text(item_list: List[Dict[str, Any]]) -> str:
     return ""
 
 
-def _message_type_from_media(media_types: List[str], text: str) -> MessageType:
+def _message_type_from_media(
+    media_types: List[str], text: str, *, native_voice: bool = False
+) -> MessageType:
     if any(m.startswith("image/") for m in media_types):
         return MessageType.PHOTO
     if any(m.startswith("video/") for m in media_types):
         return MessageType.VIDEO
-    if any(m.startswith("audio/") for m in media_types):
+    if native_voice:
         return MessageType.VOICE
+    if any(m.startswith("audio/") for m in media_types):
+        return MessageType.AUDIO
     if media_types:
         return MessageType.DOCUMENT
     if text.startswith("/"):
@@ -1148,12 +965,15 @@ class WeixinAdapter(BasePlatformAdapter):
 
         media_paths: List[str] = []
         media_types: List[str] = []
+        native_voice = False
 
         for item in item_list:
+            native_voice = native_voice or item.get("type") == ITEM_VOICE
             await self._collect_media(item, media_paths, media_types)
             ref_message = item.get("ref_msg") or {}
             ref_item = ref_message.get("message_item")
             if isinstance(ref_item, dict):
+                native_voice = native_voice or ref_item.get("type") == ITEM_VOICE
                 await self._collect_media(ref_item, media_paths, media_types)
 
         if not text and not media_paths:
@@ -1167,7 +987,7 @@ class WeixinAdapter(BasePlatformAdapter):
         )
         event = MessageEvent(
             text=text,
-            message_type=_message_type_from_media(media_types, text),
+            message_type=_message_type_from_media(media_types, text, native_voice=native_voice),
             source=source,
             raw_message=message,
             message_id=message_id or None,
@@ -1302,15 +1122,15 @@ class WeixinAdapter(BasePlatformAdapter):
     async def _download_image(self, item: Dict[str, Any]) -> Optional[str]:
         media = _media_reference(item, "image_item")
         try:
-            data = await _download_and_decrypt_media(
+            aes_key = media.get("aes_key")
+            raw_aes_key = (item.get("image_item") or {}).get("aeskey")
+            if raw_aes_key:
+                aes_key = base64.b64encode(bytes.fromhex(str(raw_aes_key))).decode("ascii")
+            data = await _shared_download_and_decrypt_media(
                 self._poll_session,
+                descriptor={"v": 1, "media": {**media, "aes_key": aes_key}},
                 cdn_base_url=self._cdn_base_url,
-                encrypted_query_param=media.get("encrypt_query_param"),
-                aes_key_b64=(item.get("image_item") or {}).get("aeskey")
-                and base64.b64encode(bytes.fromhex(str((item.get("image_item") or {}).get("aeskey")))).decode("ascii")
-                or media.get("aes_key"),
-                full_url=media.get("full_url"),
-                timeout_seconds=30.0,
+                limits=WeixinMediaLimits(timeout_seconds=30.0),
             )
             return cache_image_from_bytes(data, ".jpg")
         except Exception as exc:
@@ -1320,13 +1140,11 @@ class WeixinAdapter(BasePlatformAdapter):
     async def _download_video(self, item: Dict[str, Any]) -> Optional[str]:
         media = _media_reference(item, "video_item")
         try:
-            data = await _download_and_decrypt_media(
+            data = await _shared_download_and_decrypt_media(
                 self._poll_session,
+                descriptor={"v": 1, "media": media},
                 cdn_base_url=self._cdn_base_url,
-                encrypted_query_param=media.get("encrypt_query_param"),
-                aes_key_b64=media.get("aes_key"),
-                full_url=media.get("full_url"),
-                timeout_seconds=120.0,
+                limits=WeixinMediaLimits(timeout_seconds=120.0),
             )
             return cache_document_from_bytes(data, "video.mp4")
         except Exception as exc:
@@ -1339,13 +1157,11 @@ class WeixinAdapter(BasePlatformAdapter):
         filename = str(file_item.get("file_name") or "document.bin")
         mime = _mime_from_filename(filename)
         try:
-            data = await _download_and_decrypt_media(
+            data = await _shared_download_and_decrypt_media(
                 self._poll_session,
+                descriptor={"v": 1, "media": media},
                 cdn_base_url=self._cdn_base_url,
-                encrypted_query_param=media.get("encrypt_query_param"),
-                aes_key_b64=media.get("aes_key"),
-                full_url=media.get("full_url"),
-                timeout_seconds=60.0,
+                limits=WeixinMediaLimits(timeout_seconds=60.0),
             )
             return cache_document_from_bytes(data, filename), mime
         except Exception as exc:
@@ -1358,13 +1174,11 @@ class WeixinAdapter(BasePlatformAdapter):
         if voice_item.get("text"):
             return None
         try:
-            data = await _download_and_decrypt_media(
+            data = await _shared_download_and_decrypt_media(
                 self._poll_session,
+                descriptor={"v": 1, "media": media},
                 cdn_base_url=self._cdn_base_url,
-                encrypted_query_param=media.get("encrypt_query_param"),
-                aes_key_b64=media.get("aes_key"),
-                full_url=media.get("full_url"),
-                timeout_seconds=60.0,
+                limits=WeixinMediaLimits(timeout_seconds=60.0),
             )
             return cache_audio_from_bytes(data, ".silk")
         except Exception as exc:
@@ -1820,61 +1634,20 @@ class WeixinAdapter(BasePlatformAdapter):
         force_file_attachment: bool = False,
     ) -> str:
         assert self._send_session is not None and self._token is not None
-        plaintext = Path(path).read_bytes()
-        media_type, item_builder = self._outbound_media_builder(path, force_file_attachment=force_file_attachment)
-        filekey = secrets.token_hex(16)
-        aes_key = secrets.token_bytes(16)
-        rawsize = len(plaintext)
-        rawfilemd5 = hashlib.md5(plaintext).hexdigest()
-        upload_response = await _get_upload_url(
+        client = WeixinILinkClient(
             self._send_session,
             base_url=self._base_url,
             token=self._token,
-            to_user_id=chat_id,
-            media_type=media_type,
-            filekey=filekey,
-            rawsize=rawsize,
-            rawfilemd5=rawfilemd5,
-            filesize=_aes_padded_size(rawsize),
-            aeskey_hex=aes_key.hex(),
         )
-        upload_param = str(upload_response.get("upload_param") or "")
-        upload_full_url = str(upload_response.get("upload_full_url") or "")
-        ciphertext = _aes128_ecb_encrypt(plaintext, aes_key)
-
-        # Prefer upload_full_url (direct CDN), fall back to constructed CDN URL
-        # from upload_param.  Both paths use POST — the old PUT for
-        # upload_full_url caused 404s on the WeChat CDN.
-        if upload_full_url:
-            upload_url = upload_full_url
-        elif upload_param:
-            upload_url = _cdn_upload_url(self._cdn_base_url, upload_param, filekey)
-        else:
-            raise RuntimeError(f"getUploadUrl returned neither upload_param nor upload_full_url: {upload_response}")
-
-        encrypted_query_param = await _upload_ciphertext(
+        media_item = await upload_media_item(
             self._send_session,
-            ciphertext=ciphertext,
-            upload_url=upload_url,
+            client,
+            to_user_id=chat_id,
+            path=path,
+            cdn_base_url=self._cdn_base_url,
+            force_file=force_file_attachment,
         )
         context_token = self._token_store.get(self._account_id, chat_id)
-        # The iLink API expects aes_key as base64(hex_string), not base64(raw_bytes).
-        # Sending base64(raw_bytes) causes images to show as grey boxes on the
-        # receiver side because the decryption key doesn't match.
-        aes_key_for_api = base64.b64encode(aes_key.hex().encode("ascii")).decode("ascii")
-        item_kwargs = {
-            "encrypt_query_param": encrypted_query_param,
-            "aes_key_for_api": aes_key_for_api,
-            "ciphertext_size": len(ciphertext),
-            "plaintext_size": rawsize,
-            "filename": Path(path).name,
-            "rawfilemd5": rawfilemd5,
-        }
-        if media_type == MEDIA_VOICE and path.endswith(".silk"):
-            item_kwargs["encode_type"] = 6
-            item_kwargs["sample_rate"] = 24000
-            item_kwargs["bits_per_sample"] = 16
-        media_item = item_builder(**item_kwargs)
 
         last_message_id = None
         if caption:
@@ -1890,94 +1663,14 @@ class WeixinAdapter(BasePlatformAdapter):
             )
 
         last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
-        await _api_post(
-            self._send_session,
-            base_url=self._base_url,
-            endpoint=EP_SEND_MESSAGE,
-            payload={
-                "msg": {
-                    "from_user_id": "",
-                    "to_user_id": chat_id,
-                    "client_id": last_message_id,
-                    "message_type": MSG_TYPE_BOT,
-                    "message_state": MSG_STATE_FINISH,
-                    "item_list": [media_item],
-                    **({"context_token": context_token} if context_token else {}),
-                }
-            },
-            token=self._token,
-            timeout_ms=API_TIMEOUT_MS,
+        await client.send_item(
+            to=chat_id,
+            item=media_item,
+            context_token=context_token,
+            client_id=last_message_id,
+            raise_provider_errors=False,
         )
         return last_message_id
-
-    def _outbound_media_builder(self, path: str, force_file_attachment: bool = False):
-        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
-        if mime.startswith("image/"):
-            return MEDIA_IMAGE, lambda **kw: {
-                "type": ITEM_IMAGE,
-                "image_item": {
-                    "media": {
-                        "encrypt_query_param": kw["encrypt_query_param"],
-                        "aes_key": kw["aes_key_for_api"],
-                        "encrypt_type": 1,
-                    },
-                    "mid_size": kw["ciphertext_size"],
-                },
-            }
-        if mime.startswith("video/"):
-            return MEDIA_VIDEO, lambda **kw: {
-                "type": ITEM_VIDEO,
-                "video_item": {
-                    "media": {
-                        "encrypt_query_param": kw["encrypt_query_param"],
-                        "aes_key": kw["aes_key_for_api"],
-                        "encrypt_type": 1,
-                    },
-                    "video_size": kw["ciphertext_size"],
-                    "play_length": kw.get("play_length", 0),
-                    "video_md5": kw.get("rawfilemd5", ""),
-                },
-            }
-        if path.endswith(".silk") and not force_file_attachment:
-            return MEDIA_VOICE, lambda **kw: {
-                "type": ITEM_VOICE,
-                "voice_item": {
-                    "media": {
-                        "encrypt_query_param": kw["encrypt_query_param"],
-                        "aes_key": kw["aes_key_for_api"],
-                        "encrypt_type": 1,
-                    },
-                    "encode_type": kw.get("encode_type"),
-                    "bits_per_sample": kw.get("bits_per_sample"),
-                    "sample_rate": kw.get("sample_rate"),
-                    "playtime": kw.get("playtime", 0),
-                },
-            }
-        if mime.startswith("audio/"):
-            return MEDIA_FILE, lambda **kw: {
-                "type": ITEM_FILE,
-                "file_item": {
-                    "media": {
-                        "encrypt_query_param": kw["encrypt_query_param"],
-                        "aes_key": kw["aes_key_for_api"],
-                        "encrypt_type": 1,
-                    },
-                    "file_name": kw["filename"],
-                    "len": str(kw["plaintext_size"]),
-                },
-            }
-        return MEDIA_FILE, lambda **kw: {
-            "type": ITEM_FILE,
-            "file_item": {
-                "media": {
-                    "encrypt_query_param": kw["encrypt_query_param"],
-                    "aes_key": kw["aes_key_for_api"],
-                    "encrypt_type": 1,
-                },
-                "file_name": kw["filename"],
-                "len": str(kw["plaintext_size"]),
-            },
-        }
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         chat_type = "group" if chat_id.endswith("@chatroom") else "dm"
@@ -1987,6 +1680,22 @@ class WeixinAdapter(BasePlatformAdapter):
         if content is None:
             return ""
         return format_weixin_text(content)
+
+
+async def _send_direct_media(
+    adapter: "WeixinAdapter",
+    chat_id: str,
+    media_path: str,
+    is_voice: bool,
+) -> SendResult:
+    mime = _mime_from_filename(media_path)
+    if is_voice or mime.startswith("audio/"):
+        return await adapter.send_voice(chat_id, media_path)
+    if mime.startswith("video/"):
+        return await adapter.send_video(chat_id, media_path)
+    if mime.startswith("image/"):
+        return await adapter.send_image_file(chat_id, media_path)
+    return await adapter.send_document(chat_id, media_path)
 
 
 async def send_weixin_direct(
@@ -2027,12 +1736,8 @@ async def send_weixin_direct(
             if not last_result.success:
                 return {"error": f"Weixin send failed: {last_result.error}"}
 
-        for media_path, _is_voice in media_files or []:
-            ext = Path(media_path).suffix.lower()
-            if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
-                last_result = await live_adapter.send_image_file(chat_id, media_path)
-            else:
-                last_result = await live_adapter.send_document(chat_id, media_path)
+        for media_path, is_voice in media_files or []:
+            last_result = await _send_direct_media(live_adapter, chat_id, media_path, is_voice)
             if not last_result.success:
                 return {"error": f"Weixin media send failed: {last_result.error}"}
 
@@ -2072,12 +1777,8 @@ async def send_weixin_direct(
             if not last_result.success:
                 return {"error": f"Weixin send failed: {last_result.error}"}
 
-        for media_path, _is_voice in media_files or []:
-            ext = Path(media_path).suffix.lower()
-            if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
-                last_result = await adapter.send_image_file(chat_id, media_path)
-            else:
-                last_result = await adapter.send_document(chat_id, media_path)
+        for media_path, is_voice in media_files or []:
+            last_result = await _send_direct_media(adapter, chat_id, media_path, is_voice)
             if not last_result.success:
                 return {"error": f"Weixin media send failed: {last_result.error}"}
 
