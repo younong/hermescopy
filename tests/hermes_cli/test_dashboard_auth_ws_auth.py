@@ -1213,80 +1213,21 @@ class TestWsAuthOkGated:
         assert identity in browser.app.state.revoked_ws_bridge_worker_fences
         assert identity not in browser.app.state.authorized_ws_bridges_by_worker
 
-    def test_bridge_passes_sanitized_trace_to_owner_worker_start(
-        self, gated_app, monkeypatch, tmp_path
+    def test_bridge_start_timeout_closes_before_browser_accept(
+        self, gated_app, monkeypatch, tmp_path, caplog
     ):
         import asyncio
+        import logging
 
         class _Browser:
             def __init__(self):
                 self.app = web_server.app
                 self.query_params = SimpleNamespace(
                     get=lambda key, default="": (
-                        "trace-bridge-123" if key == "ws_trace" else default
+                        "trace-ws-owner-123" if key == "ws_trace" else default
                     )
                 )
-                self.url = SimpleNamespace(query="ws_trace=trace-bridge-123")
-                self.accepted = False
-                self.closed = []
-
-            async def accept(self):
-                self.accepted = True
-
-            async def close(self, *, code=1000, reason=""):
-                self.closed.append((code, reason))
-
-        received = []
-
-        class _Supervisor:
-            control_home = tmp_path / "control"
-
-            def get_or_start(self, _owner, *, latency_trace_id=""):
-                received.append(latency_trace_id)
-                raise TimeoutError("owner worker startup timed out")
-
-        browser = _Browser()
-        browser.app.state.owner_worker_supervisor = _Supervisor()
-        monkeypatch.setattr(
-            web_server,
-            "_owner_context_from_ws_auth_result",
-            lambda _result: SimpleNamespace(owner_key="ok1_owner"),
-        )
-        monkeypatch.setattr(
-            "hermes_cli.dashboard_auth.owner_context.ensure_owner_home",
-            lambda _owner: None,
-        )
-        auth_result = web_server._WsAuthResult(
-            None,
-            "ticket",
-            {
-                "provider": "stub",
-                "tenant_id": "tenant-a",
-                "user_id": "user-a",
-                "session_id": "session-a",
-                "membership_revision": "v1",
-                "epoch": 0,
-            },
-        )
-
-        asyncio.run(
-            web_server._bridge_websocket_to_owner_worker(
-                browser, path="/api/pty", auth_result=auth_result
-            )
-        )
-
-        assert received == ["trace-bridge-123"]
-        assert browser.accepted is False
-        assert browser.closed == [(1013, "owner worker unavailable")]
-
-    def test_bridge_start_timeout_closes_before_browser_accept(self, gated_app, monkeypatch, tmp_path):
-        import asyncio
-
-        class _Browser:
-            def __init__(self):
-                self.app = web_server.app
-                self.query_params = SimpleNamespace(get=lambda *_args: "")
-                self.url = SimpleNamespace(query="")
+                self.url = SimpleNamespace(query="ws_trace=trace-ws-owner-123")
                 self.accepted = False
                 self.closed = []
 
@@ -1300,6 +1241,13 @@ class TestWsAuthOkGated:
             control_home = tmp_path / "control"
 
             def get_or_start(self, _owner):
+                from hermes_cli.latency_trace import observe_latency_stage
+
+                observe_latency_stage(
+                    stage="owner_worker.ready",
+                    outcome="error",
+                    path="wait_existing_start",
+                )
                 raise TimeoutError("owner worker startup timed out")
 
             def acquire_use(self, _handle):
@@ -1316,10 +1264,21 @@ class TestWsAuthOkGated:
         monkeypatch.setattr(web_server, "_connect_owner_worker_ws", fail_connect)
         auth_result = web_server._WsAuthResult(None, "ticket", {"provider": "stub", "tenant_id": "tenant-a", "user_id": "user-a", "session_id": "session-a", "membership_revision": "v1", "epoch": 0})
 
-        asyncio.run(web_server._bridge_websocket_to_owner_worker(browser, path="/api/pty", auth_result=auth_result))
+        with caplog.at_level(logging.INFO, logger="hermes_cli.web_server"):
+            asyncio.run(
+                web_server._bridge_websocket_to_owner_worker(
+                    browser, path="/api/pty", auth_result=auth_result
+                )
+            )
 
         assert browser.accepted is False
         assert browser.closed == [(1013, "owner worker unavailable")]
+        ready = [message for message in caplog.messages if "stage=owner_worker.ready " in message]
+        assert len(ready) == 1
+        assert "trace_id=trace-ws-owner-123" in ready[0]
+        assert "surface=owner-ws-bridge" in ready[0]
+        assert "outcome=error" in ready[0]
+        assert "path=wait_existing_start" in ready[0]
 
     def test_bridge_connect_failure_releases_lease_before_browser_accept(self, gated_app, monkeypatch, tmp_path):
         import asyncio

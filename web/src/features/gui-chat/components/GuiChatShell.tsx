@@ -30,7 +30,11 @@ import { cn } from "@/lib/utils";
 import { connectGuiChat, type GuiChatConnection } from "../api";
 import { buildSessionFileDownloadUrl } from "../files";
 import { createGatewayEventFrameQueue } from "../gatewayEventFrameQueue";
-import { startGuiChatLatencyTrace, type GuiChatLatencyTrace } from "../latencyTrace";
+import {
+  navigationStartedAt,
+  startGuiChatLatencyTrace,
+  type GuiChatLatencyTrace,
+} from "../latencyTrace";
 import { connectMockGuiChat } from "../mock";
 import { guiChatReducer } from "../reducer";
 import { WebSocketReconnectLifecycle } from "../reconnectLifecycle";
@@ -261,7 +265,11 @@ export function GuiChatShell() {
     setResumeNotice(null);
     historyAbortRef.current?.abort();
     const existingTrace = latencyTraceRef.current;
-    const trace = existingTrace ?? startGuiChatLatencyTrace("connection.start");
+    const navigationStart = navigationStartedAt();
+    const trace = existingTrace ?? startGuiChatLatencyTrace(
+      "connection.start",
+      navigationStart === undefined ? undefined : { startedAt: navigationStart },
+    );
     latencyTraceRef.current = trace;
     if (existingTrace) trace.mark("connection.start");
     const nextGeneration = switchCoordinator.currentGeneration + 1;

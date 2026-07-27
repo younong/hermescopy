@@ -75,7 +75,11 @@ from hermes_cli.memory_providers import (
     ProviderField,
     get_memory_provider,
 )
-from hermes_cli.latency_trace import clean_latency_trace_id, log_latency_stage
+from hermes_cli.latency_trace import (
+    clean_latency_trace_id,
+    latency_trace_scope,
+    log_latency_stage,
+)
 from gateway.status import (
     derive_gateway_busy,
     derive_gateway_drainable,
@@ -701,15 +705,12 @@ async def _proxy_authenticated_owner_http(request: Request) -> Response:
 
     lease: Any | None = None
     try:
-        stage_started_at = time.monotonic()
-        _owner, handle = await ensure_owner_worker_ready(request)
-        log_latency_stage(
+        with latency_trace_scope(
             _log,
             trace_id=latency_trace_id,
             surface="owner-http-proxy",
-            stage="owner_worker.ready",
-            started_at=stage_started_at,
-        )
+        ):
+            _owner, handle = await ensure_owner_worker_ready(request)
         lease = _acquire_owner_worker_use(supervisor, handle)
         content = await request.body()
         worker_path = request.url.path
@@ -13075,23 +13076,13 @@ async def _bridge_websocket_to_owner_worker(
 
     lease: Any | None = None
     try:
-        stage_started_at = time.monotonic()
-        if latency_trace_id:
-            handle = await asyncio.to_thread(
-                supervisor.get_or_start,
-                owner,
-                latency_trace_id=latency_trace_id,
-            )
-        else:
-            handle = await asyncio.to_thread(supervisor.get_or_start, owner)
-        lease = _acquire_owner_worker_use(supervisor, handle)
-        log_latency_stage(
+        with latency_trace_scope(
             _log,
             trace_id=latency_trace_id,
             surface="owner-ws-bridge",
-            stage="owner_worker.ready",
-            started_at=stage_started_at,
-        )
+        ):
+            handle = await asyncio.to_thread(supervisor.get_or_start, owner)
+        lease = _acquire_owner_worker_use(supervisor, handle)
     except Exception as exc:
         if lease is not None:
             lease.release()
@@ -15504,6 +15495,7 @@ def start_server(
             DeploymentInferencePolicyInvalid,
             load_deployment_inference_policy,
         )
+        from hermes_cli.dashboard_auth.authority import AuthorityStore
         from hermes_cli.owner_worker import OwnerWorkerSupervisor
         from hermes_cli.owner_worker.cgroup_v2 import CgroupV2Manager
         from hermes_cli.owner_worker.tool_executor_sandbox import load_sandbox_deployment_policy
@@ -15560,15 +15552,20 @@ def start_server(
             )
             future.result()
 
+        control_home = global_home / "control-plane"
+        authority_store = AuthorityStore(control_home)
+        authority_store.ensure_ready()
         app.state.session_reader_supervisor = SessionReaderSupervisor(
             global_home=global_home,
-            control_home=global_home / "control-plane",
+            control_home=control_home,
             resource_manager=resource_manager,
+            authority_store=authority_store,
         )
         try:
             app.state.owner_worker_supervisor = OwnerWorkerSupervisor(
                 global_home=global_home,
-                control_home=global_home / "control-plane",
+                control_home=control_home,
+                authority_store=authority_store,
                 control_ws_base=f"{worker_scheme}://{worker_netloc}",
                 generation_bridge_revoker=revoke_generation_bridges,
                 deployment_inference_policy=deployment_inference_policy,

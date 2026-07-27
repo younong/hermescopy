@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => ({
   getILinkEnrollment: vi.fn(),
   getSessionMessages: vi.fn(),
   logout: vi.fn(),
+  navigationStartedAt: vi.fn(),
   startGuiChatLatencyTrace: vi.fn(),
 }));
 
@@ -48,6 +49,7 @@ vi.mock("../mock", () => ({
 }));
 
 vi.mock("../latencyTrace", () => ({
+  navigationStartedAt: mocks.navigationStartedAt,
   startGuiChatLatencyTrace: mocks.startGuiChatLatencyTrace,
 }));
 
@@ -126,6 +128,8 @@ beforeEach(() => {
     session_id: "stored-a",
   });
   mocks.logout.mockReset();
+  mocks.navigationStartedAt.mockReset();
+  mocks.navigationStartedAt.mockReturnValue(undefined);
   mocks.startGuiChatLatencyTrace.mockReset();
   mocks.startGuiChatLatencyTrace.mockImplementation(() => ({
     id: "trace-initial-123",
@@ -328,15 +332,19 @@ describe("GuiChatShell", () => {
     expect(mocks.logout).toHaveBeenCalledOnce();
   });
 
-  it("traces the initial physical connection", async () => {
+  it("traces the initial physical connection from navigation", async () => {
     const connection = createConnection();
     mocks.getAuthMe.mockResolvedValue(authIdentity());
     mocks.connectGuiChat.mockReturnValue(connection);
+    mocks.navigationStartedAt.mockReturnValue(0);
 
     await renderShell(<GuiChatShell />);
 
     expect(mocks.startGuiChatLatencyTrace).toHaveBeenCalledOnce();
-    expect(mocks.startGuiChatLatencyTrace).toHaveBeenCalledWith("connection.start");
+    expect(mocks.startGuiChatLatencyTrace).toHaveBeenCalledWith(
+      "connection.start",
+      { startedAt: 0 },
+    );
     expect(connection.createOrAttach).toHaveBeenCalledWith(
       null,
       expect.any(Number),

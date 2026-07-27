@@ -17,7 +17,9 @@ import time
 import traceback
 
 from tui_gateway import server
-from tui_gateway.server import _CRASH_LOG, dispatch, resolve_skin, write_json
+from tui_gateway.server import _CRASH_LOG, dispatch, initialize_gateway_runtime, resolve_skin, write_json
+
+initialize_gateway_runtime()
 from tui_gateway.transport import TeeTransport
 
 logger = logging.getLogger(__name__)

@@ -5394,6 +5394,8 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
                 pass
 
             def get_or_start(self, owner):
+                from hermes_cli.latency_trace import observe_latency_stage
+
                 self.start_count += 1
                 self.start_entered.set()
                 if not self.release_start.wait(timeout=5):
@@ -5403,6 +5405,10 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
                     raise self.start_error
                 self.owners.append(owner)
                 self.start_completed.set()
+                observe_latency_stage(
+                    stage="owner_worker.ready",
+                    path="cold_start",
+                )
                 return _Handle(owner.owner_key)
 
         class _ReaderSupervisor(_Supervisor):
@@ -5522,6 +5528,36 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         app.state.owner_worker_warmup_accepting = original_warmup_accepting
         app.state.session_reader_warmup_tasks = original_reader_warmup_tasks
         app.state.session_reader_warmup_accepting = original_reader_warmup_accepting
+
+    def test_authenticated_owner_proxy_binds_http_latency_surface(
+        self, monkeypatch, caplog
+    ):
+        import logging
+
+        import httpx
+        import hermes_cli.owner_worker.client as owner_client
+
+        monkeypatch.setattr(
+            owner_client.OwnerWorkerClient,
+            "request",
+            lambda *_args, **_kwargs: httpx.Response(200, json={"ok": True}),
+        )
+
+        with caplog.at_level(logging.INFO, logger="hermes_cli.web_server"):
+            response = self.client.post(
+                "/api/sessions/prune",
+                headers={"X-Request-ID": "trace-http-owner-123"},
+                json={"older_than_days": 7},
+            )
+
+        assert response.status_code == 200
+        ready = [message for message in caplog.messages if "stage=owner_worker.ready " in message]
+        assert len(ready) == 1
+        assert "trace_id=trace-http-owner-123" in ready[0]
+        assert "surface=owner-http-proxy" in ready[0]
+        assert "path=cold_start" in ready[0]
+        assert "a@example.test" not in ready[0]
+        assert "owner_home" not in ready[0]
 
     @pytest.mark.parametrize(
         ("request_path", "reader_path"),
@@ -7537,7 +7573,7 @@ class TestPtyWebSocket:
         assert url.startswith("ws://127.0.0.1:9119/api/pub?")
         assert "channel=abc-123" in url
         assert "token=" in url
-        assert captured["active_session_file"]
+        assert captured["active_session_file"] is None
         assert captured["browser_id"] is None
         assert captured["app_obj"] is self.ws_module.app
 

@@ -219,6 +219,29 @@ def test_gui_chat_warmup_requires_successful_session_authorization(gated_app, mo
     assert scheduled == []
 
 
+def test_gui_chat_warmup_scheduling_failure_does_not_change_document_response(
+    gated_app, monkeypatch, caplog
+):
+    from hermes_cli.owner_worker import readiness
+
+    _complete_stub_login(gated_app)
+
+    def fail_schedule(*_args, **_kwargs):
+        raise RuntimeError("warmup unavailable")
+
+    monkeypatch.setattr(readiness, "schedule_owner_worker_warmup", fail_schedule)
+
+    with caplog.at_level("WARNING", logger="hermes_cli.dashboard_auth.middleware"):
+        response = gated_app.get(
+            "/chat-gui",
+            headers={"Accept": "text/html", "Sec-Fetch-Dest": "document"},
+        )
+
+    assert response.status_code in (200, 404)
+    assert "warmup scheduling failed error_type=RuntimeError" in caplog.text
+    assert "warmup unavailable" not in caplog.text
+
+
 def test_full_login_round_trip_unlocks_gated_api(gated_app):
     # 1) Click "Sign in with Stub IdP" — /auth/login redirects to the stub
     #    with a PKCE cookie on the response.

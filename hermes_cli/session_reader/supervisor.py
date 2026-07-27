@@ -117,6 +117,7 @@ class SessionReaderSupervisor:
         max_readers: int = 64,
         idle_timeout: float = 1800,
         resource_manager: Any | None = None,
+        authority_store: AuthorityStore | None = None,
     ) -> None:
         self.global_home = Path(global_home).resolve() if global_home else get_hermes_home().resolve()
         self.control_home = Path(control_home).resolve() if control_home else self.global_home / "control-plane"
@@ -127,7 +128,7 @@ class SessionReaderSupervisor:
         self.max_readers = max(1, int(max_readers))
         self.idle_timeout = max(1.0, float(idle_timeout))
         self.resource_manager = resource_manager
-        self.authority_store = AuthorityStore(self.control_home)
+        self.authority_store = authority_store or AuthorityStore(self.control_home)
         self.signing_record = _signing_record(self.control_home)
         warm_http_transport()
         self._handles: dict[str, SessionReaderHandle] = {}

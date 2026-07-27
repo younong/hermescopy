@@ -328,6 +328,10 @@ class AuthorityStore:
         self._init_lock = threading.Lock()
         self._initialized = False
 
+    def ensure_ready(self) -> None:
+        """Initialize and validate the durable authority store."""
+        self._ensure_ready()
+
     def _ensure_ready(self) -> None:
         if self._initialized:
             self._validate_path()

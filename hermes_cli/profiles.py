@@ -1160,10 +1160,16 @@ def create_profile(
     return profile_dir
 
 
-def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict]:
-    """Seed bundled skills into a profile via subprocess.
+def seed_profile_skills(
+    profile_dir: Path,
+    quiet: bool = False,
+    *,
+    bundled_snapshot=None,
+) -> Optional[dict]:
+    """Seed bundled skills into an exact profile home.
 
-    Uses subprocess because sync_skills() caches HERMES_HOME at module level.
+    ``sync_skills()`` resolves its profile paths at call time, so callers do not
+    need a fresh interpreter merely to isolate ``HERMES_HOME``.
     Returns the sync result dict, or None on failure.
 
     Profiles that opted out of bundled skills (via ``hermes profile create
@@ -1178,31 +1184,21 @@ def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict
             "user_modified": [],
             "skipped_opt_out": True,
         }
-    project_root = Path(__file__).parent.parent.resolve()
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.skills_sync import sync_skills
+
+    token = set_hermes_home_override(profile_dir)
     try:
-        result = subprocess.run(
-            [sys.executable, "-c",
-             "import json; from tools.skills_sync import sync_skills; "
-             "r = sync_skills(quiet=True); print(json.dumps(r))"],
-            env={**os.environ, "HERMES_HOME": str(profile_dir)},
-            cwd=str(project_root),
-            capture_output=True, text=True, timeout=60,
+        return sync_skills(
+            quiet=True,
+            bundled_snapshot=bundled_snapshot,
         )
-        if result.returncode == 0 and result.stdout.strip():
-            return json.loads(result.stdout.strip())
+    except Exception as exc:
         if not quiet:
-            print(f"⚠ Skill seeding returned exit code {result.returncode}")
-            if result.stderr.strip():
-                print(f"  {result.stderr.strip()[:200]}")
+            print(f"⚠ Skill seeding failed: {exc}")
         return None
-    except subprocess.TimeoutExpired:
-        if not quiet:
-            print("⚠ Skill seeding timed out (60s)")
-        return None
-    except Exception as e:
-        if not quiet:
-            print(f"⚠ Skill seeding failed: {e}")
-        return None
+    finally:
+        reset_hermes_home_override(token)
 
 
 def backfill_profile_envs(quiet: bool = False) -> List[str]:
