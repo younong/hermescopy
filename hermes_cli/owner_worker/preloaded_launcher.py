@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import array
+import ctypes
+import errno
 import json
 import os
+import platform
 import selectors
 import signal
 import socket
@@ -20,10 +23,83 @@ _MAX_PACKET_BYTES = 128 * 1024
 _MAX_FDS = 8
 _RESPONSE_TIMEOUT = 10.0
 _FD_NAMES = ("cwd", "stdout", "stderr", "start", "inference", "image", "resource")
+_PIDFD_SYSCALLS = {
+    "aarch64": (434, 424),
+    "ppc64le": (434, 424),
+    "riscv64": (434, 424),
+    "s390x": (434, 424),
+    "x86_64": (434, 424),
+}
 
 
 class OwnerWorkerLauncherError(RuntimeError):
     """Raised when the resident launcher cannot safely start a worker."""
+
+
+def _pidfd_syscall_numbers() -> tuple[int, int]:
+    if not sys.platform.startswith("linux"):
+        raise OwnerWorkerLauncherError("owner worker launcher requires Linux pidfds")
+    numbers = _PIDFD_SYSCALLS.get(platform.machine().lower())
+    if numbers is None:
+        raise OwnerWorkerLauncherError("owner worker launcher requires supported Linux pidfds")
+    return numbers
+
+
+def _pidfd_syscall(number: int, *arguments: Any) -> int:
+    try:
+        syscall = ctypes.CDLL(None, use_errno=True).syscall
+    except (AttributeError, OSError) as exc:
+        raise OwnerWorkerLauncherError(
+            "owner worker launcher cannot access Linux pidfds"
+        ) from exc
+    syscall.restype = ctypes.c_long
+    result = syscall(ctypes.c_long(number), *arguments)
+    if result >= 0:
+        return int(result)
+    error = ctypes.get_errno()
+    raise OSError(error, os.strerror(error))
+
+
+def _pidfd_open(pid: int) -> int:
+    native = getattr(os, "pidfd_open", None)
+    if native is not None:
+        return native(pid, 0)
+    open_number, _send_signal_number = _pidfd_syscall_numbers()
+    return _pidfd_syscall(open_number, ctypes.c_int(pid), ctypes.c_uint(0))
+
+
+def _pidfd_send_signal(pidfd: int, sig: int | signal.Signals) -> None:
+    native = getattr(signal, "pidfd_send_signal", None)
+    if native is not None:
+        native(pidfd, sig, None, 0)
+        return
+    _open_number, send_signal_number = _pidfd_syscall_numbers()
+    _pidfd_syscall(
+        send_signal_number,
+        ctypes.c_int(pidfd),
+        ctypes.c_int(int(sig)),
+        ctypes.c_void_p(),
+        ctypes.c_uint(0),
+    )
+
+
+def _require_pidfd_support() -> None:
+    try:
+        pidfd = _pidfd_open(os.getpid())
+        try:
+            _pidfd_send_signal(pidfd, 0)
+        finally:
+            os.close(pidfd)
+    except OwnerWorkerLauncherError:
+        raise
+    except OSError as exc:
+        if exc.errno == errno.ENOSYS:
+            raise OwnerWorkerLauncherError(
+                "owner worker launcher requires Linux pidfds"
+            ) from exc
+        raise OwnerWorkerLauncherError(
+            "owner worker launcher cannot use Linux pidfds"
+        ) from exc
 
 
 def _packet(payload: dict[str, Any]) -> bytes:
@@ -333,11 +409,9 @@ class LauncherProcessHandle:
     """pidfd-backed process facade used by OwnerWorkerSupervisor."""
 
     def __init__(self, pid: int, launcher: "OwnerWorkerLauncher") -> None:
-        if not sys.platform.startswith("linux") or not hasattr(os, "pidfd_open"):
-            raise OwnerWorkerLauncherError("owner worker launcher requires Linux pidfds")
         self.pid = pid
         self._launcher = launcher
-        self._pidfd = os.pidfd_open(pid)
+        self._pidfd = _pidfd_open(pid)
         self.returncode: int | None = None
 
     def poll(self) -> int | None:
@@ -374,10 +448,7 @@ class LauncherProcessHandle:
     def _signal(self, sig: signal.Signals) -> None:
         if self.poll() is not None:
             return
-        if hasattr(signal, "pidfd_send_signal"):
-            signal.pidfd_send_signal(self._pidfd, sig)
-            return
-        os.kill(self.pid, sig)
+        _pidfd_send_signal(self._pidfd, sig)
 
     def close(self) -> None:
         fd = getattr(self, "_pidfd", -1)
@@ -390,8 +461,7 @@ class OwnerWorkerLauncher:
     """Own the preload process and synchronously request exact child forks."""
 
     def __init__(self, *, process_factory: Any = subprocess.Popen) -> None:
-        if not sys.platform.startswith("linux") or not hasattr(os, "pidfd_open"):
-            raise OwnerWorkerLauncherError("owner worker launcher requires Linux pidfds")
+        _require_pidfd_support()
         parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         child.set_inheritable(True)
         try:

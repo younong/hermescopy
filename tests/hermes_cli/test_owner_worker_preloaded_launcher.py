@@ -1,17 +1,25 @@
 from __future__ import annotations
 
 import array
+import errno
 import os
+import signal
 import socket
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from hermes_cli.owner_worker.preloaded_launcher import (
+    LauncherProcessHandle,
+    OwnerWorkerLauncher,
     OwnerWorkerLauncherError,
     _MAX_FDS,
     _PROTOCOL_VERSION,
+    _pidfd_open,
+    _pidfd_send_signal,
     _recv_packet,
+    _require_pidfd_support,
     _run_child,
     _send_packet,
     _validate_launch,
@@ -26,6 +34,22 @@ def _fd_is_open(fd: int) -> bool:
     return True
 
 
+class _FakeSyscall:
+    def __init__(self, results):
+        self.results = iter(results)
+        self.calls = []
+        self.restype = None
+
+    def __call__(self, *args):
+        self.calls.append(args)
+        return next(self.results)
+
+
+class _FakeLibc:
+    def __init__(self, results):
+        self.syscall = _FakeSyscall(results)
+
+
 def _launch_payload(**overrides):
     payload = {
         "version": _PROTOCOL_VERSION,
@@ -37,6 +61,176 @@ def _launch_payload(**overrides):
     }
     payload.update(overrides)
     return payload
+
+
+def test_pidfd_helpers_prefer_native_wrappers(monkeypatch):
+    opened = []
+    signaled = []
+    monkeypatch.setattr(
+        os,
+        "pidfd_open",
+        lambda pid, flags=0: opened.append((pid, flags)) or 17,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        signal,
+        "pidfd_send_signal",
+        lambda pidfd, sig, siginfo=None, flags=0: signaled.append(
+            (pidfd, sig, siginfo, flags)
+        ),
+        raising=False,
+    )
+
+    assert _pidfd_open(42) == 17
+    _pidfd_send_signal(17, signal.SIGTERM)
+
+    assert opened == [(42, 0)]
+    assert signaled == [(17, signal.SIGTERM, None, 0)]
+
+
+def test_pidfd_helpers_use_exact_x86_64_syscalls_without_native_wrappers(monkeypatch):
+    import hermes_cli.owner_worker.preloaded_launcher as launcher_module
+
+    libc = _FakeLibc([23, 0])
+    monkeypatch.delattr(os, "pidfd_open", raising=False)
+    monkeypatch.delattr(signal, "pidfd_send_signal", raising=False)
+    monkeypatch.setattr(launcher_module.sys, "platform", "linux")
+    monkeypatch.setattr(launcher_module.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(launcher_module.ctypes, "CDLL", lambda *_args, **_kwargs: libc)
+
+    assert _pidfd_open(1234) == 23
+    _pidfd_send_signal(23, signal.SIGKILL)
+
+    open_call, signal_call = libc.syscall.calls
+    assert open_call[0].value == 434
+    assert open_call[1].value == 1234
+    assert open_call[2].value == 0
+    assert signal_call[0].value == 424
+    assert signal_call[1].value == 23
+    assert signal_call[2].value == signal.SIGKILL
+    assert signal_call[3].value is None
+    assert signal_call[4].value == 0
+
+
+@pytest.mark.parametrize("error", [errno.EINVAL, errno.EPERM, errno.ESRCH])
+def test_pidfd_syscall_preserves_errno(monkeypatch, error):
+    import hermes_cli.owner_worker.preloaded_launcher as launcher_module
+
+    libc = _FakeLibc([-1])
+    monkeypatch.delattr(os, "pidfd_open", raising=False)
+    monkeypatch.setattr(launcher_module.sys, "platform", "linux")
+    monkeypatch.setattr(launcher_module.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(launcher_module.ctypes, "CDLL", lambda *_args, **_kwargs: libc)
+    monkeypatch.setattr(launcher_module.ctypes, "get_errno", lambda: error)
+
+    with pytest.raises(OSError) as captured:
+        _pidfd_open(1234)
+    assert captured.value.errno == error
+
+
+def test_pidfd_support_probe_closes_descriptor(monkeypatch):
+    import hermes_cli.owner_worker.preloaded_launcher as launcher_module
+
+    signaled = []
+    closed = []
+    monkeypatch.setattr(launcher_module, "_pidfd_open", lambda _pid: 31)
+    monkeypatch.setattr(
+        launcher_module,
+        "_pidfd_send_signal",
+        lambda pidfd, sig: signaled.append((pidfd, sig)),
+    )
+    monkeypatch.setattr(launcher_module.os, "close", closed.append)
+
+    _require_pidfd_support()
+
+    assert signaled == [(31, 0)]
+    assert closed == [31]
+
+
+def test_pidfd_support_probe_closes_descriptor_and_fails_closed(monkeypatch):
+    import hermes_cli.owner_worker.preloaded_launcher as launcher_module
+
+    closed = []
+    monkeypatch.setattr(launcher_module, "_pidfd_open", lambda _pid: 31)
+    monkeypatch.setattr(
+        launcher_module,
+        "_pidfd_send_signal",
+        lambda _pidfd, _sig: (_ for _ in ()).throw(OSError(errno.ENOSYS, "unsupported")),
+    )
+    monkeypatch.setattr(launcher_module.os, "close", closed.append)
+
+    with pytest.raises(OwnerWorkerLauncherError, match="requires Linux pidfds"):
+        _require_pidfd_support()
+    assert closed == [31]
+
+
+@pytest.mark.parametrize(
+    "load_libc",
+    [
+        lambda: (_ for _ in ()).throw(OSError("unavailable")),
+        lambda: SimpleNamespace(),
+    ],
+)
+def test_pidfd_support_rejects_unavailable_libc_before_process_start(
+    monkeypatch, load_libc
+):
+    import hermes_cli.owner_worker.preloaded_launcher as launcher_module
+
+    started = []
+    monkeypatch.delattr(os, "pidfd_open", raising=False)
+    monkeypatch.setattr(launcher_module.sys, "platform", "linux")
+    monkeypatch.setattr(launcher_module.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(
+        launcher_module.ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: load_libc(),
+    )
+
+    with pytest.raises(OwnerWorkerLauncherError, match="cannot access Linux pidfds"):
+        OwnerWorkerLauncher(process_factory=lambda *_args, **_kwargs: started.append(True))
+    assert started == []
+
+
+def test_pidfd_support_rejects_unknown_arch_before_process_start(monkeypatch):
+    import hermes_cli.owner_worker.preloaded_launcher as launcher_module
+
+    started = []
+    monkeypatch.delattr(os, "pidfd_open", raising=False)
+    monkeypatch.setattr(launcher_module.sys, "platform", "linux")
+    monkeypatch.setattr(launcher_module.platform, "machine", lambda: "unknown")
+
+    with pytest.raises(OwnerWorkerLauncherError, match="supported Linux pidfds"):
+        OwnerWorkerLauncher(process_factory=lambda *_args, **_kwargs: started.append(True))
+    assert started == []
+
+
+def test_launcher_process_handle_signals_only_by_pidfd(monkeypatch):
+    import hermes_cli.owner_worker.preloaded_launcher as launcher_module
+
+    signaled = []
+    closed = []
+    monkeypatch.setattr(launcher_module, "_pidfd_open", lambda _pid: 41)
+    monkeypatch.setattr(
+        launcher_module,
+        "_pidfd_send_signal",
+        lambda pidfd, sig: signaled.append((pidfd, sig)),
+    )
+    monkeypatch.setattr(
+        launcher_module.os,
+        "kill",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("pid signaling used")),
+    )
+    monkeypatch.setattr(launcher_module.os, "close", closed.append)
+    handle = LauncherProcessHandle(1234, SimpleNamespace())
+    monkeypatch.setattr(handle, "poll", lambda: None)
+
+    handle.terminate()
+    handle.kill()
+    handle.close()
+    handle.close()
+
+    assert signaled == [(41, signal.SIGTERM), (41, signal.SIGKILL)]
+    assert closed == [41]
 
 
 def test_validate_launch_requires_exact_version_and_core_descriptor_order():
