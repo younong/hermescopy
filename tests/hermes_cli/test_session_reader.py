@@ -898,9 +898,9 @@ def test_reader_real_process_reads_owner_db_without_creating_missing_db(tmp_path
         assert response.status_code == 200
         assert response.json()["total"] == 1
         assert response.json()["sessions"][0]["id"] == "reader-session"
-        messages = client.request(
+        messages = loop.run_until_complete(client.request(
             "GET", "/api/sessions/reader-session/messages?limit=100", lease=lease,
-        )
+        ))
         assert messages.status_code == 200
         assert messages.json()["session_id"] == "reader-session"
         assert messages.json()["messages"][0]["text"] == "owner-only history"
@@ -1452,16 +1452,17 @@ def test_reader_real_process_recovers_orphaned_fence_and_serves_history(tmp_path
             control_home=control,
             signing_record=supervisor.signing_record,
         )
-        sessions = client.request(
+        loop = asyncio.new_event_loop()
+        sessions = loop.run_until_complete(client.request(
             "GET",
             "/api/sessions?limit=30&offset=0&order=recent&compact=true",
             lease=lease,
-        )
-        messages = client.request(
+        ))
+        messages = loop.run_until_complete(client.request(
             "GET",
             "/api/sessions/known-session/messages?limit=100",
             lease=lease,
-        )
+        ))
 
         assert sessions.status_code == 200
         assert sessions.json()["sessions"][0]["id"] == "known-session"
@@ -1473,6 +1474,9 @@ def test_reader_real_process_recovers_orphaned_fence_and_serves_history(tmp_path
         ).reader_runtime_dir.exists()
     finally:
         db.close()
+        if "client" in locals():
+            loop.run_until_complete(client.aclose())
+            loop.close()
         supervisor.shutdown()
         shutil.rmtree(short_root, ignore_errors=True)
 
