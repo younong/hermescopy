@@ -1133,6 +1133,16 @@ def test_reader_query_runtime_reuses_bounded_connections_and_closes(tmp_path):
     ReadOnlySessionDB.__init__ = tracked_init
     runtime = entrypoint.SessionReaderQueryRuntime(state_path, pool_size=2)
     try:
+        assert len(created) == 1
+
+        missing_runtime = entrypoint.SessionReaderQueryRuntime(
+            tmp_path / "missing.db", pool_size=2
+        )
+        try:
+            assert len(created) == 1
+        finally:
+            missing_runtime.close()
+
         def use_runtime(_index):
             with runtime.borrow() as db:
                 return db.session_count(include_archived=True)

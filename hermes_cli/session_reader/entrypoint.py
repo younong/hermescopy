@@ -192,13 +192,18 @@ def _response(status: int, payload: dict[str, Any]) -> bytes:
 
 
 class SessionReaderQueryRuntime:
-    """Lazily reuse a bounded set of owner-local read-only connections."""
+    """Reuse a bounded set of owner-local read-only connections."""
 
     def __init__(self, state_db: Path, *, pool_size: int = _DB_POOL_SIZE) -> None:
+        from .db import ReadOnlySessionDB
+
         self.state_db = Path(state_db)
         self.pool_size = max(1, int(pool_size))
         self._available: Queue[Any] = Queue(maxsize=self.pool_size)
         self._opened = 0
+        if self.state_db.exists():
+            self._available.put(ReadOnlySessionDB(self.state_db))
+            self._opened = 1
         self._lock = threading.Lock()
         self._closed = False
 
