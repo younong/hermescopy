@@ -89,8 +89,7 @@ class WeixinILinkService:
         except asyncio.CancelledError:
             raise
         except Exception:
-            if claim.get("payload_kind") != "voice_media":
-                self.dispatcher.fail_claim(claim["inbound_id"], self.holder, "dispatch_failed")
+            self.dispatcher.fail_claim(claim["inbound_id"], self.holder, "dispatch_failed")
 
     async def _sender_loop(self) -> None:
         while self._running:

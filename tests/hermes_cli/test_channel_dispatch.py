@@ -209,7 +209,7 @@ async def test_voice_media_transcribes_checkpoints_and_submits_raw_transcript(qu
         "hermes_cli.channel_dispatch.dispatcher.OwnerWorkerGatewayClient",
         return_value=_client_context(client),
     ), patch(
-        "hermes_cli.channel_dispatch.dispatcher.download_and_decrypt_voice",
+        "hermes_cli.channel_dispatch.dispatcher.download_and_decrypt_media",
         new=AsyncMock(return_value=b"#!SILK_V3 test"),
     ):
         await dispatcher.dispatch_claim(claim, holder="dispatcher")
@@ -247,7 +247,7 @@ async def test_voice_transient_failure_requeues_with_backoff_and_checkpoint_skip
         "hermes_cli.channel_dispatch.dispatcher.OwnerWorkerGatewayClient",
         return_value=_client_context(client),
     ), patch(
-        "hermes_cli.channel_dispatch.dispatcher.download_and_decrypt_voice",
+        "hermes_cli.channel_dispatch.dispatcher.download_and_decrypt_media",
         new=AsyncMock(side_effect=WeixinMediaError("media_download_timeout", retryable=True)),
     ):
         with pytest.raises(RuntimeError, match="media_download_timeout"):
@@ -291,7 +291,7 @@ async def test_voice_checkpoint_restart_skips_media_download(queued):
         "hermes_cli.channel_dispatch.dispatcher.OwnerWorkerGatewayClient",
         return_value=_client_context(client),
     ), patch(
-        "hermes_cli.channel_dispatch.dispatcher.download_and_decrypt_voice",
+        "hermes_cli.channel_dispatch.dispatcher.download_and_decrypt_media",
         new=AsyncMock(),
     ) as download:
         await dispatcher.dispatch_claim(claim, holder="dispatcher")
@@ -337,7 +337,7 @@ async def test_voice_terminal_failure_clears_sensitive_payload_and_unblocks_fifo
         "hermes_cli.channel_dispatch.dispatcher.OwnerWorkerGatewayClient",
         return_value=_client_context(client),
     ), patch(
-        "hermes_cli.channel_dispatch.dispatcher.download_and_decrypt_voice",
+        "hermes_cli.channel_dispatch.dispatcher.download_and_decrypt_media",
         new=AsyncMock(side_effect=WeixinMediaError("unsafe_media_url")),
     ):
         with pytest.raises(RuntimeError, match="unsafe_media_url"):
@@ -414,12 +414,17 @@ async def test_dispatch_downloads_and_attaches_file_before_prompt(queued, tmp_pa
     owner.host_owner_home.mkdir(parents=True, exist_ok=True)
     staged = owner.owner_home / "workspaces" / "default" / ".hermes" / "weixin-attachments"
 
-    async def fake_download(observed_session, descriptor, *, destination):
+    async def fake_download(observed_session, *, descriptor, limits):
         assert observed_session is session
-        assert descriptor["file_name"] == "report.txt"
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text("report", encoding="utf-8")
-        return destination
+        assert descriptor == {
+            "v": 1,
+            "media": {
+                "full_url": "https://novac2c.cdn.weixin.qq.com/report",
+                "aes_key": base64.b64encode(b"a" * 16).decode(),
+            },
+        }
+        assert limits.max_download_bytes == 32 * 1024 * 1024
+        return b"report"
 
     with (
         patch(
@@ -427,7 +432,7 @@ async def test_dispatch_downloads_and_attaches_file_before_prompt(queued, tmp_pa
             return_value=_Context(),
         ),
         patch(
-            "hermes_cli.channel_dispatch.dispatcher.download_file",
+            "hermes_cli.channel_dispatch.dispatcher.download_and_decrypt_media",
             side_effect=fake_download,
         ),
     ):

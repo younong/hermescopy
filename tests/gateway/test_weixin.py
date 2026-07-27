@@ -550,69 +550,40 @@ class TestWeixinOutboundMedia:
         assert result.message_id == "msg-2"
         adapter._send_file.assert_awaited_once_with("wxid_test123", "/tmp/report.pdf", "报告请看")
 
-    def test_send_file_uses_post_for_upload_full_url_and_hex_encoded_aes_key(self, tmp_path):
-        class _UploadResponse:
-            def __init__(self):
-                self.status = 200
-                self.headers = {"x-encrypted-param": "enc-param"}
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, exc_type, exc, tb):
-                return False
-
-            async def read(self):
-                return b""
-
-            async def text(self):
-                return ""
-
-        class _RecordingSession:
-            def __init__(self):
-                self.post_calls = []
-
-            def post(self, url, **kwargs):
-                self.post_calls.append((url, kwargs))
-                return _UploadResponse()
-
-            def put(self, *_args, **_kwargs):
-                raise AssertionError("upload_full_url branch should use POST")
-
+    def test_send_file_uses_shared_upload_and_item_sender(self, tmp_path):
         image_path = tmp_path / "demo.png"
         image_path.write_bytes(b"fake-png-bytes")
 
         adapter = _make_adapter()
-        session = _RecordingSession()
-        adapter._session = session
-        adapter._send_session = session
+        adapter._session = object()
+        adapter._send_session = adapter._session
         adapter._token = "test-token"
         adapter._base_url = "https://weixin.example.com"
-        adapter._cdn_base_url = "https://cdn.example.com/c2c"
-        adapter._token_store.get = lambda account_id, chat_id: None
+        adapter._cdn_base_url = "https://novac2c.cdn.weixin.qq.com/c2c"
+        adapter._token_store.get = lambda account_id, chat_id: "context"
+        item = {"type": weixin.ITEM_IMAGE, "image_item": {"media": {}}}
 
-        aes_key = bytes(range(16))
-        expected_aes_key = base64.b64encode(aes_key.hex().encode("ascii")).decode("ascii")
-
-        with patch("gateway.platforms.weixin._get_upload_url", new=AsyncMock(return_value={"upload_full_url": "https://upload.example.com/media"})), \
-             patch("gateway.platforms.weixin._api_post", new_callable=AsyncMock) as api_post_mock, \
-             patch("gateway.platforms.weixin.secrets.token_hex", return_value="filekey-123"), \
-             patch("gateway.platforms.weixin.secrets.token_bytes", return_value=aes_key):
+        with patch(
+            "gateway.platforms.weixin.upload_media_item",
+            new=AsyncMock(return_value=item),
+        ) as upload_mock, patch.object(
+            weixin.WeixinILinkClient,
+            "send_item",
+            new=AsyncMock(return_value={"ret": 0}),
+        ) as send_item_mock:
             message_id = asyncio.run(adapter._send_file("wxid_test123", str(image_path), ""))
 
         assert message_id.startswith("hermes-weixin-")
-        assert len(session.post_calls) == 1
-        upload_url, upload_kwargs = session.post_calls[0]
-        assert upload_url == "https://upload.example.com/media"
-        assert upload_kwargs["headers"] == {"Content-Type": "application/octet-stream"}
-        assert upload_kwargs["data"]
-        # Timeout is now enforced externally via asyncio.wait_for() rather than
-        # aiohttp.ClientTimeout, so it no longer appears as a post() kwarg.
-        assert "timeout" not in upload_kwargs
-        payload = api_post_mock.await_args.kwargs["payload"]
-        media = payload["msg"]["item_list"][0]["image_item"]["media"]
-        assert media["encrypt_query_param"] == "enc-param"
-        assert media["aes_key"] == expected_aes_key
+        upload_mock.assert_awaited_once()
+        assert upload_mock.await_args.kwargs["path"] == str(image_path)
+        assert upload_mock.await_args.kwargs["force_file"] is False
+        send_item_mock.assert_awaited_once_with(
+            to="wxid_test123",
+            item=item,
+            context_token="context",
+            client_id=message_id,
+            raise_provider_errors=False,
+        )
 
 
 class TestWeixinRemoteMediaSafety:
@@ -706,70 +677,24 @@ class TestWeixinBlankMessagePrevention:
             )
 
 
+class TestWeixinInboundMediaTypes:
+    def test_native_voice_remains_voice(self):
+        assert weixin._message_type_from_media(
+            ["audio/silk"], "", native_voice=True
+        ) == weixin.MessageType.VOICE
+
+    def test_audio_file_is_audio(self):
+        assert weixin._message_type_from_media(
+            ["audio/mpeg"], "", native_voice=False
+        ) == weixin.MessageType.AUDIO
+
+
 class TestWeixinStreamingCursorSuppression:
     """WeChat doesn't support message editing — cursor must be suppressed."""
 
     def test_supports_message_editing_is_false(self):
         adapter = _make_adapter()
         assert adapter.SUPPORTS_MESSAGE_EDITING is False
-
-
-class TestWeixinMediaBuilder:
-    """Media builder uses base64(hex_key), not base64(raw_bytes) for aes_key."""
-
-    def test_image_builder_aes_key_is_base64_of_hex(self):
-        import base64
-        adapter = _make_adapter()
-        media_type, builder = adapter._outbound_media_builder("photo.jpg")
-        assert media_type == weixin.MEDIA_IMAGE
-
-        fake_hex_key = "0123456789abcdef0123456789abcdef"
-        expected_aes = base64.b64encode(fake_hex_key.encode("ascii")).decode("ascii")
-        item = builder(
-            encrypt_query_param="eq",
-            aes_key_for_api=expected_aes,
-            ciphertext_size=1024,
-            plaintext_size=1000,
-            filename="photo.jpg",
-            rawfilemd5="abc123",
-        )
-        assert item["image_item"]["media"]["aes_key"] == expected_aes
-
-    def test_video_builder_includes_md5(self):
-        adapter = _make_adapter()
-        media_type, builder = adapter._outbound_media_builder("clip.mp4")
-        assert media_type == weixin.MEDIA_VIDEO
-
-        item = builder(
-            encrypt_query_param="eq",
-            aes_key_for_api="fakekey",
-            ciphertext_size=2048,
-            plaintext_size=2000,
-            filename="clip.mp4",
-            rawfilemd5="deadbeef",
-        )
-        assert item["video_item"]["video_md5"] == "deadbeef"
-
-    def test_voice_builder_for_audio_files_uses_file_attachment_type(self):
-        adapter = _make_adapter()
-        media_type, builder = adapter._outbound_media_builder("note.mp3")
-        assert media_type == weixin.MEDIA_FILE
-
-        item = builder(
-            encrypt_query_param="eq",
-            aes_key_for_api="fakekey",
-            ciphertext_size=512,
-            plaintext_size=500,
-            filename="note.mp3",
-            rawfilemd5="abc",
-        )
-        assert item["type"] == weixin.ITEM_FILE
-        assert item["file_item"]["file_name"] == "note.mp3"
-
-    def test_voice_builder_for_silk_files(self):
-        adapter = _make_adapter()
-        media_type, builder = adapter._outbound_media_builder("recording.silk")
-        assert media_type == weixin.MEDIA_VOICE
 
 
 class TestWeixinSendImageFileParameterName:
@@ -861,50 +786,32 @@ class TestWeixinVoiceSending:
             force_file_attachment=True,
         )
 
-    def test_voice_builder_for_silk_files_can_be_forced_to_file_attachment(self):
-        adapter = _make_adapter()
-        media_type, builder = adapter._outbound_media_builder(
-            "recording.silk",
-            force_file_attachment=True,
-        )
-        assert media_type == weixin.MEDIA_FILE
-
-        item = builder(
-            encrypt_query_param="eq",
-            aes_key_for_api="fakekey",
-            ciphertext_size=512,
-            plaintext_size=500,
-            filename="recording.silk",
-            rawfilemd5="abc",
-        )
-        assert item["type"] == weixin.ITEM_FILE
-        assert item["file_item"]["file_name"] == "recording.silk"
-
-    @patch.object(weixin, "_api_post", new_callable=AsyncMock)
-    @patch.object(weixin, "_upload_ciphertext", new_callable=AsyncMock)
-    @patch.object(weixin, "_get_upload_url", new_callable=AsyncMock)
-    def test_send_file_sets_voice_metadata_for_silk_payload(
-        self,
-        get_upload_url_mock,
-        upload_ciphertext_mock,
-        api_post_mock,
-        tmp_path,
-    ):
+    def test_send_file_uses_native_voice_item_for_silk_payload(self, tmp_path):
         adapter = self._connected_adapter()
         silk = tmp_path / "voice.silk"
         silk.write_bytes(b"\x02#!SILK_V3\x01\x00")
-        get_upload_url_mock.return_value = {"upload_full_url": "https://cdn.example.com/upload"}
-        upload_ciphertext_mock.return_value = "enc-q"
-        api_post_mock.return_value = {"success": True}
+        item = {
+            "type": weixin.ITEM_VOICE,
+            "voice_item": {
+                "playtime": 0,
+                "encode_type": 6,
+                "sample_rate": 24000,
+                "bits_per_sample": 16,
+            },
+        }
 
-        asyncio.run(adapter._send_file("wxid_test123", str(silk), ""))
+        with patch(
+            "gateway.platforms.weixin.upload_media_item",
+            new=AsyncMock(return_value=item),
+        ) as upload_mock, patch.object(
+            weixin.WeixinILinkClient,
+            "send_item",
+            new=AsyncMock(return_value={"ret": 0}),
+        ) as send_item_mock:
+            asyncio.run(adapter._send_file("wxid_test123", str(silk), ""))
 
-        payload = api_post_mock.await_args.kwargs["payload"]
-        voice_item = payload["msg"]["item_list"][0]["voice_item"]
-        assert voice_item.get("playtime", 0) == 0
-        assert voice_item["encode_type"] == 6
-        assert voice_item["sample_rate"] == 24000
-        assert voice_item["bits_per_sample"] == 16
+        assert upload_mock.await_args.kwargs["force_file"] is False
+        assert send_item_mock.await_args.kwargs["item"] == item
 
 
 class TestIsStaleSessionRet:
