@@ -10,6 +10,7 @@ import os
 import pytest
 from unittest.mock import patch
 
+from agent.chat_completion_helpers import _uses_local_inference_timeout_exemption
 from agent.model_metadata import is_local_endpoint
 
 
@@ -71,6 +72,24 @@ class TestLocalStreamReadTimeout:
             if _stream_read_timeout == 120.0 and base_url and is_local_endpoint(base_url):
                 _stream_read_timeout = _base_timeout
             assert _stream_read_timeout == 120.0
+
+
+def test_deployment_relay_does_not_use_local_timeout_exemption():
+    agent = type("Agent", (), {
+        "base_url": "http://127.0.0.1:39123/v1",
+        "api_key": "deployment-inference-relay",
+    })()
+
+    assert _uses_local_inference_timeout_exemption(agent) is False
+
+
+def test_direct_local_provider_uses_local_timeout_exemption():
+    agent = type("Agent", (), {
+        "base_url": "http://127.0.0.1:11434/v1",
+        "api_key": "local-placeholder",
+    })()
+
+    assert _uses_local_inference_timeout_exemption(agent) is True
 
 
 class TestIsLocalEndpoint:
