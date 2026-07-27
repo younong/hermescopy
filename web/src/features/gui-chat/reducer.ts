@@ -18,7 +18,10 @@ import type {
   ToolCompletePayload,
   ToolStartPayload,
 } from "./protocol";
-import { buildSessionFileDownloadUrl } from "./files";
+import {
+  buildSessionFileDownloadUrl,
+  normalizeSessionFileReference,
+} from "./files";
 import { textFromTranscriptMessage } from "./protocol";
 import {
   initialGuiChatState,
@@ -213,7 +216,7 @@ function applySessionResponse(
     );
   }
 
-  return {
+  const next = {
     ...state,
     artifacts: history && !state.historySessionId ? history.artifacts : state.artifacts,
     ...clarificationsFromSnapshot(response.pending_prompts),
@@ -231,6 +234,7 @@ function applySessionResponse(
       ("resumed" in response ? response.resumed : undefined) ??
       state.storedSessionId,
   };
+  return cwd && cwd !== state.cwd ? refreshFileDownloadContext(next, cwd) : next;
 }
 
 function prependHistoryPage(
@@ -750,7 +754,7 @@ function extractGeneratedFileReferences(text: string): ExtractedFileReference[] 
   const refs: ExtractedFileReference[] = [];
   for (const candidate of candidates) {
     if (isIndexInRanges(candidate.index, codeRanges)) continue;
-    const path = normalizeGeneratedFilePath(candidate.path);
+    const path = normalizeSessionFileReference(candidate.path);
     if (!path || seen.has(path)) continue;
     const name = filenameFromPath(path);
     if (!name) continue;
@@ -758,23 +762,6 @@ function extractGeneratedFileReferences(text: string): ExtractedFileReference[] 
     refs.push({ name, path });
   }
   return refs;
-}
-
-function normalizeGeneratedFilePath(value: string): string | null {
-  let path = value.trim().replace(/[.,;:!?。，、；：！？]+$/g, "");
-  const sandbox = path.match(/^sandbox:\/{0,2}(\/.*)$/i);
-  if (sandbox?.[1]) path = sandbox[1];
-  if (/^[a-z][a-z0-9+.-]*:/i.test(path) && !/^file:/i.test(path)) return null;
-  if (/^file:/i.test(path)) {
-    try {
-      const parsed = new URL(path);
-      if (parsed.hostname && parsed.hostname !== "localhost") return null;
-      path = decodeURIComponent(parsed.pathname);
-    } catch {
-      return null;
-    }
-  }
-  return path && !path.includes("\0") ? path : null;
 }
 
 function filenameFromPath(path: string): string {
@@ -1027,7 +1014,42 @@ function applySessionInfo(
   payload: SessionInfoPayload | undefined,
 ): GuiChatState {
   if (!payload) return state;
-  return { ...state, cwd: payload.cwd ?? state.cwd, model: payload.model ?? state.model };
+  const cwd = payload.cwd ?? state.cwd;
+  const next = { ...state, cwd, model: payload.model ?? state.model };
+  return cwd && cwd !== state.cwd ? refreshFileDownloadContext(next, cwd) : next;
+}
+
+function refreshFileDownloadContext(state: GuiChatState, cwd: string): GuiChatState {
+  const artifacts = Object.fromEntries(
+    Object.entries(state.artifacts).map(([id, artifact]) => [
+      id,
+      artifact.kind === "file"
+        ? {
+            ...artifact,
+            downloadUrl: buildSessionFileDownloadUrl(artifact.sourcePath, cwd, artifact.name),
+          }
+        : artifact,
+    ]),
+  );
+  const messages = state.messages.map((message) => {
+    if (!message.attachments?.some((attachment) => attachment.sourcePath)) return message;
+    return {
+      ...message,
+      attachments: message.attachments.map((attachment) =>
+        attachment.sourcePath
+          ? {
+              ...attachment,
+              downloadUrl: buildSessionFileDownloadUrl(
+                attachment.sourcePath,
+                cwd,
+                attachment.name,
+              ),
+            }
+          : attachment,
+      ),
+    };
+  });
+  return { ...state, artifacts, messages };
 }
 
 function startAssistantMessage(state: GuiChatState): GuiChatState {

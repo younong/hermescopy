@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { buildSessionFileDownloadUrl } from "./files";
 import { guiChatReducer } from "./reducer";
 import { initialGuiChatState, type GuiChatState, type ImageArtifactState } from "./types";
 
@@ -475,6 +476,87 @@ describe("guiChatReducer history image restoration", () => {
     expect(state.toolCalls["tool-1"].input).toBe(
       "[… non-rendered tool result omitted in Chat GUI to keep the browser responsive …]",
     );
+  });
+
+  it("refreshes historical relative file downloads when attach supplies cwd", () => {
+    const selected = guiChatReducer(initialGuiChatState, {
+      type: "session.selected",
+      generation: 1,
+      sessionId: "stored",
+    });
+    const history = guiChatReducer(selected, {
+      type: "history.initial.succeeded",
+      generation: 1,
+      requestedSessionId: "stored",
+      response: {
+        history_page: { cursor: null, has_more: false, returned_count: 1 },
+        messages: [{
+          attachments: [{
+            kind: "file",
+            name: "使用说明.txt",
+            path: "使用说明.txt",
+            size_bytes: 12,
+          }],
+          id: "db-s-1",
+          role: "assistant",
+          text: "[下载](公众号数据自动清洗_可直接使用.zip)",
+        }],
+        session_id: "stored",
+      },
+    });
+    const artifactId = history.messages[0].artifactIds[0];
+
+    expect(history.artifacts[artifactId]).toMatchObject({
+      downloadUrl: buildSessionFileDownloadUrl(
+        "公众号数据自动清洗_可直接使用.zip",
+        undefined,
+        "公众号数据自动清洗_可直接使用.zip",
+      ),
+    });
+    expect(history.messages[0].attachments?.[0].downloadUrl).toBe(
+      buildSessionFileDownloadUrl("使用说明.txt", undefined, "使用说明.txt"),
+    );
+
+    const state = guiChatReducer(history, {
+      type: "session.created",
+      response: {
+        info: { cwd: "/workspace" },
+        messages: [],
+        session_id: "runtime",
+        session_key: "stored",
+      },
+    });
+
+    expect(state.messages[0].artifactIds).toEqual([artifactId]);
+    expect(state.artifacts[artifactId]).toMatchObject({
+      downloadUrl: buildSessionFileDownloadUrl(
+        "公众号数据自动清洗_可直接使用.zip",
+        "/workspace",
+        "公众号数据自动清洗_可直接使用.zip",
+      ),
+    });
+    expect(state.messages[0].attachments?.[0].downloadUrl).toBe(
+      buildSessionFileDownloadUrl("使用说明.txt", "/workspace", "使用说明.txt"),
+    );
+  });
+
+  it("refreshes existing file downloads when a later session info event supplies cwd", () => {
+    const restored = restoreWithMessage(
+      "[下载](公众号数据自动清洗_可直接使用.zip)",
+    );
+    const artifactId = restored.messages[0].artifactIds[0];
+    const state = guiChatReducer(restored, {
+      event: { payload: { cwd: "/workspace" }, type: "session.info" },
+      type: "event",
+    });
+
+    expect(state.artifacts[artifactId]).toMatchObject({
+      downloadUrl: buildSessionFileDownloadUrl(
+        "公众号数据自动清洗_可直接使用.zip",
+        "/workspace",
+        "公众号数据自动清洗_可直接使用.zip",
+      ),
+    });
   });
 
   it("prepends an earlier display page with stable IDs and deduplicates overlap", () => {

@@ -200,7 +200,7 @@ const complete = true;
 
   it("does not activate unsafe links, images, or raw HTML", async () => {
     const container = await renderMarkdown(`
-[危险](javascript:alert(1)) [相对](/admin) [安全](mailto:test@example.com)
+[危险](javascript:alert(1)) [相对](/admin) [本地文件](report.zip) [安全](mailto:test@example.com)
 
 ![远程图片](https://example.com/tracker.png)
 
@@ -214,6 +214,7 @@ const complete = true;
     expect(container.innerHTML).not.toContain("onerror");
     expect(container.textContent).toContain("危险");
     expect(container.textContent).toContain("相对");
+    expect(container.textContent).toContain("本地文件");
     expect(container.textContent).toContain("远程图片");
   });
 

@@ -1,8 +1,8 @@
 import {
-  Archive,
   Braces,
   Code2,
   File,
+  FileArchive,
   FileAudio,
   FileImage,
   FileJson,
@@ -33,7 +33,7 @@ export function FileTypeIcon({
     case "image":
       return <FileImage {...props} data-file-type="image" />;
     case "archive":
-      return <Archive {...props} data-file-type="archive" />;
+      return <FileArchive {...props} data-file-type="archive" />;
     case "spreadsheet":
       return <FileSpreadsheet {...props} data-file-type="spreadsheet" />;
     case "document":

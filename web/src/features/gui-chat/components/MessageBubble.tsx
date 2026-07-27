@@ -1,9 +1,11 @@
-import { useDeferredValue } from "react";
+import { useDeferredValue, useMemo } from "react";
 
-import { Markdown } from "@/components/Markdown";
+import { Markdown, type MarkdownFileLink } from "@/components/Markdown";
 import { cn } from "@/lib/utils";
+import { normalizeSessionFileReference } from "../files";
 import type { ArtifactState, ChatMessage } from "../types";
 import { ArtifactCard } from "./ArtifactCard";
+import { InlineFileLink } from "./InlineFileLink";
 import { MessageAttachmentCard } from "./MessageAttachmentCard";
 
 export function MessageBubble({
@@ -58,7 +60,11 @@ export function MessageBubble({
         )}
       >
         {message.text ? (
-          <AssistantMarkdown text={message.text} streaming={message.streaming} />
+          <AssistantMarkdown
+            artifacts={artifacts}
+            text={message.text}
+            streaming={message.streaming}
+          />
         ) : message.streaming ? (
           <div className="text-sm text-[#8a8f97]">Thinking…</div>
         ) : null}
@@ -82,8 +88,36 @@ export function MessageBubble({
   );
 }
 
-function AssistantMarkdown({ text, streaming }: { text: string; streaming?: boolean }) {
+function AssistantMarkdown({
+  artifacts,
+  text,
+  streaming,
+}: {
+  artifacts: ArtifactState[];
+  text: string;
+  streaming?: boolean;
+}) {
   const deferredText = useDeferredValue(text);
+  const fileLinks = useMemo(
+    () => artifacts.flatMap((artifact): MarkdownFileLink[] => {
+      if (artifact.kind !== "file") return [];
+      const sourcePath = normalizeSessionFileReference(artifact.sourcePath);
+      if (!sourcePath) return [];
+      return [{
+        matches: (href) => normalizeSessionFileReference(href) === sourcePath,
+        render: (children) => (
+          <InlineFileLink artifact={artifact}>{children}</InlineFileLink>
+        ),
+      }];
+    }),
+    [artifacts],
+  );
 
-  return <Markdown content={streaming ? deferredText : text} streaming={streaming} />;
+  return (
+    <Markdown
+      content={streaming ? deferredText : text}
+      fileLinks={fileLinks}
+      streaming={streaming}
+    />
+  );
 }
