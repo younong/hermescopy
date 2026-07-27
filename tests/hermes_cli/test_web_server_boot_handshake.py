@@ -153,7 +153,6 @@ def test_owner_warmup_is_nonblocking_and_deduplicated_per_owner(monkeypatch):
     assert starts == ["ok1_warmup"]
 
 
-
 def test_lifespan_drains_owner_warmup_before_supervisor_shutdown(monkeypatch):
     from hermes_cli.owner_worker.readiness import schedule_owner_worker_warmup
 

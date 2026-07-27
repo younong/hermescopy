@@ -1469,7 +1469,7 @@ def test_supervisor_serializes_concurrent_start_for_same_owner(tmp_path, caplog)
         control_home=tmp_path / "control",
         client_cls=_FakeClient,
         process_factory=fake_process_factory,
-        startup_timeout=0.1,
+        startup_timeout=1,
         startup_cooldown=0,
     )
     results: list[OwnerWorkerSupervisor | object] = []

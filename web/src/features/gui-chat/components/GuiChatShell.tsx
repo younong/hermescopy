@@ -30,10 +30,14 @@ import { cn } from "@/lib/utils";
 import { connectGuiChat, type GuiChatConnection } from "../api";
 import { buildSessionFileDownloadUrl } from "../files";
 import { createGatewayEventFrameQueue } from "../gatewayEventFrameQueue";
-import { startGuiChatLatencyTrace, type GuiChatLatencyTrace } from "../latencyTrace";
+import {
+  navigationStartedAt,
+  startGuiChatLatencyTrace,
+  type GuiChatLatencyTrace,
+} from "../latencyTrace";
 import { connectMockGuiChat } from "../mock";
 import { guiChatReducer } from "../reducer";
-import { WebSocketReconnectLifecycle } from "../reconnectLifecycle";
+import { GuiChatReconnectLifecycle } from "../reconnectLifecycle";
 import { GuiChatSessionSwitchCoordinator } from "../sessionSwitch";
 import {
   initialGuiChatState,
@@ -59,7 +63,7 @@ export function GuiChatShell() {
   const [state, dispatch] = useReducer(guiChatReducer, initialGuiChatState);
   const connectionRef = useRef<GuiChatConnection | null>(null);
   const historyAbortRef = useRef<AbortController | null>(null);
-  const reconnectLifecycleRef = useRef<WebSocketReconnectLifecycle | null>(null);
+  const reconnectLifecycleRef = useRef<GuiChatReconnectLifecycle | null>(null);
   const eventFrameQueue = useMemo(
     () => createGatewayEventFrameQueue(
       (event) => dispatch({ type: "event", event }),
@@ -185,7 +189,7 @@ export function GuiChatShell() {
         const trace = switchTraceByGenerationRef.current.get(generation);
         switchTraceByGenerationRef.current.delete(generation);
         dispatch({ type: "session.created", response });
-        reconnectLifecycleRef.current?.onReconnectSettled(generation, true);
+        reconnectLifecycleRef.current?.onSwitchSettled(generation, true);
 
         requestAnimationFrame(() => {
           if (!switchCoordinatorRef.current?.isGenerationCurrent(generation)) return;
@@ -196,7 +200,7 @@ export function GuiChatShell() {
       onError: (error, requestedSessionId, generation, committedSessionId) => {
         const trace = switchTraceByGenerationRef.current.get(generation);
         switchTraceByGenerationRef.current.delete(generation);
-        reconnectLifecycleRef.current?.onReconnectSettled(generation, false);
+        reconnectLifecycleRef.current?.onSwitchSettled(generation, false);
         trace?.mark(requestedSessionId ? "session.attach.end" : "session.create.end", "error");
         if (latencyTraceRef.current === trace) latencyTraceRef.current = null;
 
@@ -240,7 +244,7 @@ export function GuiChatShell() {
     });
     const reconnectLifecycle = mockMode
       ? null
-      : new WebSocketReconnectLifecycle({
+      : new GuiChatReconnectLifecycle({
           close: () => connection.close(),
           ping: () => connection.ping(),
           reconnect: () =>
@@ -261,7 +265,11 @@ export function GuiChatShell() {
     setResumeNotice(null);
     historyAbortRef.current?.abort();
     const existingTrace = latencyTraceRef.current;
-    const trace = existingTrace ?? startGuiChatLatencyTrace("connection.start");
+    const navigationStart = navigationStartedAt();
+    const trace = existingTrace ?? startGuiChatLatencyTrace(
+      "connection.start",
+      navigationStart === undefined ? undefined : { startedAt: navigationStart },
+    );
     latencyTraceRef.current = trace;
     if (existingTrace) trace.mark("connection.start");
     const nextGeneration = switchCoordinator.currentGeneration + 1;

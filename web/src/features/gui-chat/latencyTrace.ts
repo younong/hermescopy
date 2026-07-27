@@ -12,6 +12,10 @@ export interface GuiChatLatencyTrace {
   mark(stage: string, outcome?: GuiChatLatencyOutcome): void;
 }
 
+interface GuiChatLatencyTraceOptions {
+  startedAt?: number;
+}
+
 function createTraceId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
@@ -20,7 +24,14 @@ function createTraceId(): string {
 }
 
 function elapsedSince(startedAt: number): number {
-  return Math.round((performance.now() - startedAt) * 10) / 10;
+  return Math.round(Math.max(0, performance.now() - startedAt) * 10) / 10;
+}
+
+export function navigationStartedAt(): number | undefined {
+  if (typeof performance === "undefined") return undefined;
+  const navigation = performance.getEntriesByType("navigation")[0];
+  if (!navigation) return undefined;
+  return navigation.startTime;
 }
 
 /**
@@ -28,9 +39,12 @@ function elapsedSince(startedAt: number): number {
  * logs. Records contain timings and opaque identifiers only; session titles,
  * message content, auth credentials, and owner identity are never included.
  */
-export function startGuiChatLatencyTrace(initialStage: string): GuiChatLatencyTrace {
+export function startGuiChatLatencyTrace(
+  initialStage: string,
+  options: GuiChatLatencyTraceOptions = {},
+): GuiChatLatencyTrace {
   const id = createTraceId();
-  const startedAt = performance.now();
+  const startedAt = options.startedAt ?? performance.now();
   const mark = (stage: string, outcome?: GuiChatLatencyOutcome) => {
     const entry: GuiChatLatencyEntry = {
       elapsed_ms: elapsedSince(startedAt),
