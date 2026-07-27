@@ -1244,12 +1244,21 @@ def write_json(obj: dict) -> bool:
     return (current_transport() or _stdio_transport).write(obj)
 
 
-def _emit(event: str, sid: str, payload: dict | None = None):
+def _emit(
+    event: str,
+    sid: str,
+    payload: dict | None = None,
+    *,
+    transport=None,
+):
     params = {"type": event, "session_id": sid}
     payload = _compact_gui_payload_for_emit(event, sid, payload)
     if payload is not None:
         params["payload"] = payload
-    write_json({"jsonrpc": "2.0", "method": "event", "params": params})
+    frame = {"jsonrpc": "2.0", "method": "event", "params": params}
+    if transport is not None:
+        return transport.write(frame)
+    return write_json(frame)
 
 
 def _emit_approval_request(sid: str, data: dict | None) -> None:
@@ -9536,6 +9545,7 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 4092, "external turn outcome is ambiguous")
         session["_external_turn_key"] = idempotency_key
         session["_external_turn_generation"] = generation
+        session["_external_turn_transport"] = t or session.get("transport")
 
     # Persist the DB row lazily, now that the user has actually sent a message.
     _ensure_session_db_row(session)
@@ -10233,10 +10243,12 @@ def _run_prompt_submit(
             if rendered:
                 payload["rendered"] = rendered
             external_turn_key = None
+            external_turn_transport = None
             with session["history_lock"]:
                 _clear_inflight_turn(session, generation)
                 if session.get("_external_turn_generation") == generation:
                     external_turn_key = session.pop("_external_turn_key", None)
+                    external_turn_transport = session.pop("_external_turn_transport", None)
                     session.pop("_external_turn_generation", None)
             if external_turn_key:
                 db = _get_db()
@@ -10250,7 +10262,19 @@ def _run_prompt_submit(
                     result_text=str(raw or ""),
                     result_status=status,
                 )
-            _emit("message.complete", sid, payload)
+            if external_turn_key and external_turn_transport is not None:
+                # The external caller owns this completion. A dashboard session
+                # attach may have rebound session["transport"] while the turn was
+                # running; route to the request transport so the channel dispatcher
+                # cannot lose the terminal event and stall its ordered queue.
+                _emit(
+                    "message.complete",
+                    sid,
+                    payload,
+                    transport=external_turn_transport,
+                )
+            else:
+                _emit("message.complete", sid, payload)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
