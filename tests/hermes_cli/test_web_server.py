@@ -7573,7 +7573,7 @@ class TestPtyWebSocket:
         assert url.startswith("ws://127.0.0.1:9119/api/pub?")
         assert "channel=abc-123" in url
         assert "token=" in url
-        assert captured["active_session_file"]
+        assert captured["active_session_file"] is None
         assert captured["browser_id"] is None
         assert captured["app_obj"] is self.ws_module.app
 

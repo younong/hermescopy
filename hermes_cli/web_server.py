@@ -176,7 +176,6 @@ def _resolve_restart_drain_timeout() -> float:
 async def _lifespan(app: "FastAPI"):
     app.state.event_channels = {}  # dict[str, set]
     app.state.event_lock = asyncio.Lock()
-    app.state.pty_active_session_files = {}  # dict[str, Path]
     app.state.pty_browser_sessions = {}  # browser_id -> active /api/pty owner
     app.state.pty_browser_lock = asyncio.Lock()
     app.state.authorized_ws_bridges = {}  # scope digest -> {(websocket, epoch)}
@@ -325,15 +324,6 @@ def _get_pty_browser_state(app: "FastAPI") -> tuple[dict[str, dict], asyncio.Loc
         sessions = app.state.pty_browser_sessions
         lock = app.state.pty_browser_lock
     return sessions, lock
-
-
-def _get_pty_active_session_files(app: "FastAPI") -> dict[str, Path]:
-    """Return channel -> active-session-file state for dashboard PTYs."""
-    try:
-        return app.state.pty_active_session_files
-    except AttributeError:
-        app.state.pty_active_session_files = {}
-        return app.state.pty_active_session_files
 
 
 app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
@@ -12926,6 +12916,7 @@ async def close_authorized_bridges_by_worker_change(
     *,
     reason: str,
     close_active: bool = False,
+    planned_restart: bool = False,
 ) -> None:
     """Close only bridges bound to a non-admissible exact Worker fence."""
     if not changes:
@@ -12949,7 +12940,10 @@ async def close_authorized_bridges_by_worker_change(
                 else:
                     bridges.pop(digest, None)
     await _close_authorized_bridge_targets(
-        app_obj, tuple(targets), reason=reason, code=1011
+        app_obj,
+        tuple(targets),
+        reason=reason,
+        code=1012 if planned_restart else 1011,
     )
 
 
@@ -13079,6 +13073,7 @@ async def _bridge_websocket_to_owner_worker(
     if supervisor is None:
         await ws.close(code=1013, reason=_ws_close_reason("owner worker supervisor unavailable"))
         return
+
     lease: Any | None = None
     try:
         with latency_trace_scope(
@@ -13616,17 +13611,12 @@ def _channel_or_close_code(ws: WebSocket) -> Optional[str]:
     return channel if _VALID_CHANNEL_RE.match(channel) else None
 
 
-def _active_session_file_for_channel(app: "FastAPI", channel: str) -> Path:
-    """Return the per-channel file where a dashboard TUI writes its active sid."""
-    files = _get_pty_active_session_files(app)
-    existing = files.get(channel)
-    if existing is not None:
-        return existing
+def _active_session_file_for_browser(browser_id: str) -> Path:
+    """Return the durable owner-local active session record for one browser."""
+    from hermes_cli.owner_runtime import dashboard_current_session_relative_path
 
-    fd, raw_path = tempfile.mkstemp(prefix="hermes-pty-active-", suffix=".json")
-    os.close(fd)
-    path = Path(raw_path)
-    files[channel] = path
+    path = get_hermes_home() / dashboard_current_session_relative_path(browser_id)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     return path
 
 
@@ -13634,6 +13624,8 @@ def _read_active_session_file(path: Path) -> Optional[str]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        return None
+    if data.get("schema_version") != 1:
         return None
 
     session_id = str(data.get("session_id") or "").strip()
@@ -13838,8 +13830,8 @@ async def pty_ws(ws: WebSocket) -> None:
             )
             await _close_replaced_browser_pty(replaced_owner)
 
-    if channel:
-        active_session_file = _active_session_file_for_channel(ws.app, channel)
+    if browser_id:
+        active_session_file = _active_session_file_for_browser(browser_id)
         if force_fresh:
             resume = None
             _forget_active_session_file(active_session_file)
@@ -15536,7 +15528,11 @@ def start_server(
         worker_netloc = f"[{worker_host}]:{port}" if ":" in worker_host and not worker_host.startswith("[") else f"{worker_host}:{port}"
         global_home = get_hermes_home()
 
-        def revoke_generation_bridges(lease: Any) -> None:
+        def revoke_generation_bridges(
+            lease: Any,
+            *,
+            planned_restart: bool = False,
+        ) -> None:
             loop = getattr(app.state, "server_event_loop", None)
             if loop is None or loop.is_closed():
                 return
@@ -15544,8 +15540,13 @@ def start_server(
                 close_authorized_bridges_by_worker_change(
                     app,
                     (lease,),
-                    reason="worker_generation_revoked",
+                    reason=(
+                        "service_restart"
+                        if planned_restart
+                        else "worker_generation_revoked"
+                    ),
                     close_active=True,
+                    planned_restart=planned_restart,
                 ),
                 loop,
             )

@@ -69,6 +69,18 @@ class _FakeClient:
             "hermes_home": str(Path(owner_home).resolve()),
         }
 
+    def begin_drain(self, *, lease):
+        del lease
+        return {"active_turns": 0}
+
+    def drain_status(self, *, lease):
+        del lease
+        return {"active_turns": 0}
+
+    def force_drain(self, *, lease):
+        del lease
+        return {"active_turns": 0}
+
 
 @pytest.fixture(autouse=True)
 def _simulate_linux_controlled_roots(monkeypatch):
