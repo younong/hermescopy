@@ -50,15 +50,18 @@ follow the implementation and its closest focused tests.
 ## Bounded Code Reviews
 
 - Code reviews in this repository have a global Claude Code `Agent` budget of
-  **0**. Review and verify findings serially in the main conversation.
-- Do not call `Agent` or `Workflow`, delegate review work, or spawn finder,
-  verifier, Explore, general-purpose, or candidate-specific subagents.
-- Never invoke `code-review` or another review skill from inside a subagent, and
-  never ask a delegated agent to invoke a review skill or create more agents.
+  **at most 5 calls per user review request**. Use fewer when focused review in
+  the main conversation is sufficient.
+- Call review agents only from the main conversation. Do not call `Workflow`,
+  and do not ask a delegated agent to invoke a review skill or create agents.
+- Count finder, verifier, Explore, general-purpose, and candidate-specific
+  review agents against the same five-call budget; verification agents do not
+  receive a separate allowance.
 - Prefer the project `/bounded-code-review` skill for explicit reviews. Use
-  focused searches, direct reads, relevant history, and applicable tests.
-- If the scope is too large for the main conversation, identify what remains
-  unreviewed instead of fanning out or implying complete coverage.
+  focused searches, direct reads, relevant history, and applicable tests, then
+  verify and synthesize all agent output in the main conversation.
+- If the scope is too large for the five-call budget, identify what remains
+  unreviewed instead of exceeding the budget or implying complete coverage.
 
 Examples:
 
