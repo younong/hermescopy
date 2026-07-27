@@ -25,6 +25,7 @@ import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
+from hermes_cli.deployment_inference import is_deployment_inference_relay
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
@@ -114,6 +115,16 @@ def estimate_request_context_tokens(api_payload: Any) -> int:
         return sum(_chars(value) for value in api_payload.values()) // 4
 
     return _chars(api_payload) // 4
+
+
+def _uses_local_inference_timeout_exemption(agent) -> bool:
+    """Return whether the runtime directly serves a local inference model."""
+    base_url = getattr(agent, "base_url", None)
+    return bool(
+        base_url
+        and is_local_endpoint(base_url)
+        and not is_deployment_inference_relay(getattr(agent, "api_key", None))
+    )
 
 
 def _is_openai_codex_backend(agent) -> bool:
@@ -1992,7 +2003,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # prefill on large contexts before producing the first token.
             # Auto-increase the httpx read timeout unless the user explicitly
             # overrode HERMES_STREAM_READ_TIMEOUT.
-            if _stream_read_timeout == 120.0 and agent.base_url and is_local_endpoint(agent.base_url):
+            if (
+                _stream_read_timeout == 120.0
+                and _uses_local_inference_timeout_exemption(agent)
+            ):
                 _stream_read_timeout = _base_timeout
                 logger.debug(
                     "Local provider detected (%s) — stream read timeout raised to %.0fs",
@@ -2787,7 +2801,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # Local providers (Ollama, oMLX, llama-cpp) can take 300+ seconds
     # for prefill on large contexts.  Disable the stale detector unless
     # the user explicitly set HERMES_STREAM_STALE_TIMEOUT.
-    if _stream_stale_timeout_base == 180.0 and agent.base_url and is_local_endpoint(agent.base_url):
+    if (
+        _stream_stale_timeout_base == 180.0
+        and _uses_local_inference_timeout_exemption(agent)
+    ):
         _stream_stale_timeout = float("inf")
         logger.debug("Local provider detected (%s) — stale stream timeout disabled", agent.base_url)
     else:

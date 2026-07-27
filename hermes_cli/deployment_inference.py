@@ -17,6 +17,12 @@ from urllib.parse import urlparse
 
 _SUPPORTED_API_MODES = frozenset({"chat_completions", "anthropic_messages"})
 _SUPPORTS_VISION_ENV = "HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION"
+DEPLOYMENT_INFERENCE_RELAY_MARKER = "deployment-inference-relay"
+
+
+def is_deployment_inference_relay(api_key: object) -> bool:
+    """Return whether runtime credentials target the owner-local cloud relay."""
+    return api_key == DEPLOYMENT_INFERENCE_RELAY_MARKER
 
 
 def _parse_optional_bool(raw: object, *, field: str) -> bool | None:
@@ -72,7 +78,7 @@ class DeploymentInferenceDescriptor:
         return {
             "provider": self.provider,
             "api_mode": self.api_mode,
-            "api_key": "deployment-inference-relay",
+            "api_key": DEPLOYMENT_INFERENCE_RELAY_MARKER,
             "source": "deployment-relay",
             "selection_source": "deployment",
             "policy_id": self.policy_id,

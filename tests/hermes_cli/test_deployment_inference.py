@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import logging
 import socket
 import threading
@@ -327,6 +328,57 @@ def test_broker_logs_upstream_http_error(tmp_path, caplog):
         thread.join(timeout=2)
 
 
+def test_broker_uses_bounded_cloud_timeout(tmp_path, monkeypatch):
+    import httpx
+
+    captured = {}
+
+    class FailingClient:
+        def __init__(self, *, timeout):
+            captured["timeout"] = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def stream(self, *_args, **_kwargs):
+            raise httpx.ReadTimeout("silent upstream")
+
+    monkeypatch.setattr(httpx, "Client", FailingClient)
+    policy = DeploymentInferencePolicy(
+        provider="custom:deployment",
+        model="gpt-safe",
+        api_mode="chat_completions",
+        runtime_resolver=lambda: {
+            "provider": "custom:deployment",
+            "api_mode": "chat_completions",
+            "base_url": "https://provider.example.test/v1",
+            "api_key": "control-plane-secret",
+        },
+    )
+    store = AuthorityStore(tmp_path / "control")
+    claim = store.claim_worker_start("ok1_owner", worker_id="worker-1")
+    broker = DeploymentInferenceBroker(policy=policy, authority_store=store)
+    active = store.transition_worker_lease(
+        claim.lease,
+        state=WorkerLeaseState.ACTIVE,
+        generation_state=WorkerGenerationState.ACTIVE,
+    )
+    try:
+        with pytest.raises(DeploymentInferenceRelayError, match="unavailable"):
+            broker._stream_request(active, _request_for_model(), lambda _frame: None)
+    finally:
+        broker.close()
+
+    timeout = captured["timeout"]
+    assert timeout.connect == 30.0
+    assert timeout.read == 120.0
+    assert timeout.write == 120.0
+    assert timeout.pool == 30.0
+
+
 def test_broker_logs_pre_header_failure_without_secret_or_url(
     tmp_path, caplog, monkeypatch
 ):
@@ -503,6 +555,114 @@ def test_owner_relay_does_not_send_second_error_after_headers(monkeypatch, caplo
     assert handler.error_calls == []
     assert handler.close_connection is True
     assert "phase=midstream" in caplog.text
+
+
+def test_owner_relay_drains_abandoned_response_before_next_request(caplog):
+    import hermes_cli.owner_worker.inference_relay as relay_module
+
+    broker_side, worker_side = socket.socketpair()
+    relay = OwnerInferenceRelay(worker_side.detach())
+    broker_errors: list[BaseException] = []
+
+    def serve_two_responses() -> None:
+        try:
+            relay_module._recv_frame(broker_side)
+            for frame in (
+                {"type": "response_start", "status": 200, "headers": {}},
+                {
+                    "type": "response_chunk",
+                    "body": base64.b64encode(b"abandoned-first").decode("ascii"),
+                },
+                {
+                    "type": "response_chunk",
+                    "body": base64.b64encode(b"abandoned-second").decode("ascii"),
+                },
+                {"type": "response_end"},
+            ):
+                relay_module._send_frame(broker_side, frame)
+
+            relay_module._recv_frame(broker_side)
+            for frame in (
+                {"type": "response_start", "status": 200, "headers": {}},
+                {
+                    "type": "response_chunk",
+                    "body": base64.b64encode(b"fresh-response").decode("ascii"),
+                },
+                {"type": "response_end"},
+            ):
+                relay_module._send_frame(broker_side, frame)
+        except BaseException as exc:
+            broker_errors.append(exc)
+
+    broker_thread = threading.Thread(target=serve_two_responses, daemon=True)
+    broker_thread.start()
+
+    class Handler:
+        path = "/v1/chat/completions"
+        command = "POST"
+        headers = {"Content-Length": "0"}
+        rfile = type("Reader", (), {"read": staticmethod(lambda _length: b"")})()
+        close_connection = False
+
+        def __init__(self, writer):
+            self.wfile = writer
+            self.error_calls = []
+
+        def send_response(self, _status):
+            pass
+
+        def send_header(self, _name, _value):
+            pass
+
+        def end_headers(self):
+            pass
+
+        def send_error(self, status, message):
+            self.error_calls.append((status, message))
+
+    class DisconnectedWriter:
+        @staticmethod
+        def write(_body):
+            raise BrokenPipeError("worker SDK disconnected")
+
+        @staticmethod
+        def flush():
+            pass
+
+    class RecordingWriter:
+        def __init__(self):
+            self.body = bytearray()
+
+        def write(self, body):
+            self.body.extend(body)
+
+        def flush(self):
+            pass
+
+    first_handler = Handler(DisconnectedWriter())
+    second_writer = RecordingWriter()
+    second_handler = Handler(second_writer)
+    try:
+        with caplog.at_level(
+            logging.WARNING,
+            logger="hermes_cli.owner_worker.inference_relay",
+        ):
+            relay._handle_http(first_handler)
+        relay._handle_http(second_handler)
+
+        assert first_handler.close_connection is True
+        assert first_handler.error_calls == []
+        assert bytes(second_writer.body) == b"fresh-response"
+        assert second_handler.error_calls == []
+        assert "abandoned-first" not in caplog.text
+        assert "abandoned-second" not in caplog.text
+    finally:
+        relay.close()
+        broker_side.close()
+        broker_thread.join(timeout=2)
+
+    assert broker_errors == []
+    assert broker_thread.is_alive() is False
 
 
 def test_owner_relay_forwards_small_sse_event_before_upstream_completes(tmp_path):

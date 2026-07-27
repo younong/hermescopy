@@ -288,6 +288,26 @@ def test_default_non_stream_stale_timeout_auto_disables_for_local_endpoints(monk
     assert agent._compute_non_stream_stale_timeout([]) == float("inf")
 
 
+def test_deployment_relay_keeps_cloud_non_stream_stale_timeout(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+
+    from run_agent import AIAgent
+    agent = AIAgent(
+        model="gpt-safe",
+        provider="custom:deployment",
+        api_key="deployment-inference-relay",
+        base_url="http://127.0.0.1:39123/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        platform="cli",
+    )
+
+    assert agent._compute_non_stream_stale_timeout([]) == 90.0
+
+
 def test_explicit_non_stream_stale_timeout_is_honored_for_local_endpoints(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / ".env").write_text("", encoding="utf-8")

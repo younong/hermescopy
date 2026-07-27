@@ -27,6 +27,8 @@ from hermes_cli.dashboard_auth.authority import AuthorityStore, AuthorizationRej
 from hermes_cli.deployment_inference import DeploymentInferencePolicy
 
 _MAX_FRAME_BYTES = 64 * 1024 * 1024
+_RELAY_CONNECT_TIMEOUT_SECONDS = 30.0
+_RELAY_READ_TIMEOUT_SECONDS = 120.0
 _ALLOWED_PATHS = frozenset({"/v1/chat/completions", "/v1/messages"})
 _HOP_BY_HOP_HEADERS = frozenset({
     "authorization",
@@ -350,7 +352,13 @@ class DeploymentInferenceBroker:
         try:
             import httpx
 
-            with httpx.Client(timeout=900.0) as client:
+            timeout = httpx.Timeout(
+                connect=_RELAY_CONNECT_TIMEOUT_SECONDS,
+                read=_RELAY_READ_TIMEOUT_SECONDS,
+                write=_RELAY_READ_TIMEOUT_SECONDS,
+                pool=_RELAY_CONNECT_TIMEOUT_SECONDS,
+            )
+            with httpx.Client(timeout=timeout) as client:
                 with client.stream("POST", upstream, content=body, headers=headers) as response:
                     response_started = True
                     _capture_relay_response_diag(diag, response)
@@ -474,15 +482,20 @@ class OwnerInferenceRelay:
                 headers = response.get("headers")
                 if not isinstance(headers, dict):
                     raise DeploymentInferenceRelayError("relay response is invalid")
-                handler.send_response(status)
-                for name, value in headers.items():
-                    if str(name).lower() not in _HOP_BY_HOP_HEADERS:
-                        handler.send_header(str(name), str(value))
-                # Framing is intentionally delegated to the HTTP server.  Do not
-                # add Content-Length: provider SSE responses are streamed as they
-                # arrive over the private broker connection.
-                handler.end_headers()
+                downstream_error: BaseException | None = None
                 headers_sent = True
+                try:
+                    handler.send_response(status)
+                    for name, value in headers.items():
+                        if str(name).lower() not in _HOP_BY_HOP_HEADERS:
+                            handler.send_header(str(name), str(value))
+                    # Framing is intentionally delegated to the HTTP server.  Do
+                    # not add Content-Length: provider SSE responses are streamed
+                    # as they arrive over the private broker connection.
+                    handler.end_headers()
+                except (BrokenPipeError, ConnectionError, OSError) as exc:
+                    downstream_error = exc
+                    handler.close_connection = True
                 while True:
                     response = _recv_frame(self._connection)
                     response_type = response.get("type")
@@ -493,9 +506,19 @@ class OwnerInferenceRelay:
                     if response_type != "response_chunk":
                         raise DeploymentInferenceRelayError("relay response is invalid")
                     body = base64.b64decode(str(response.get("body") or ""), validate=True)
-                    if body:
-                        handler.wfile.write(body)
-                        handler.wfile.flush()
+                    if body and downstream_error is None:
+                        try:
+                            handler.wfile.write(body)
+                            handler.wfile.flush()
+                        except (BrokenPipeError, ConnectionError, OSError) as exc:
+                            # The broker protocol is sequential and has no request
+                            # IDs. Keep consuming the abandoned response while the
+                            # lock is held so its remaining frames cannot be
+                            # mistaken for the next request's response.
+                            downstream_error = exc
+                            handler.close_connection = True
+                if downstream_error is not None:
+                    raise downstream_error
         except Exception as exc:
             logger.warning(
                 "owner inference relay response failed phase=%s error_chain=%s",

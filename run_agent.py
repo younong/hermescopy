@@ -121,6 +121,7 @@ from hermes_cli.timeouts import (
     get_provider_request_timeout,
     get_provider_stale_timeout,
 )
+from hermes_cli.deployment_inference import is_deployment_inference_relay
 
 _hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
@@ -1166,7 +1167,7 @@ class AIAgent:
     def _current_main_runtime(self) -> Dict[str, str]:
         """Return the live main runtime for session-scoped auxiliary routing."""
         api_key = getattr(self, "api_key", "") or ""
-        if api_key == "deployment-inference-relay":
+        if is_deployment_inference_relay(api_key):
             # This marker only authorizes the owner-local relay and is not a
             # credential.  Do not serialize it into session or auxiliary state.
             api_key = ""
@@ -1297,7 +1298,12 @@ class AIAgent:
         """
         stale_base, uses_implicit_default = self._resolved_api_call_stale_timeout_base()
         base_url = getattr(self, "_base_url", None) or self.base_url or ""
-        if uses_implicit_default and base_url and is_local_endpoint(base_url):
+        if (
+            uses_implicit_default
+            and base_url
+            and is_local_endpoint(base_url)
+            and not is_deployment_inference_relay(getattr(self, "api_key", None))
+        ):
             return float("inf")
 
         from agent.chat_completion_helpers import estimate_request_context_tokens
