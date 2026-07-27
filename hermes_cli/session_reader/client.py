@@ -10,6 +10,10 @@ from hermes_cli.dashboard_auth.authority import SessionReaderAuthorityLease
 from .tokens import mint_session_reader_capability
 
 
+_MAX_CONNECTIONS = 8
+_MAX_KEEPALIVE_CONNECTIONS = 4
+
+
 class SessionReaderHealthError(RuntimeError):
     """Raised when a Session Reader request or identity check fails."""
 
@@ -31,7 +35,10 @@ class SessionReaderClient:
             transport=httpx.AsyncHTTPTransport(uds=str(self.socket_path)),
             base_url="http://session-reader",
             timeout=self.timeout,
-            limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
+            limits=httpx.Limits(
+                max_connections=_MAX_CONNECTIONS,
+                max_keepalive_connections=_MAX_KEEPALIVE_CONNECTIONS,
+            ),
         )
         self._closed = False
 

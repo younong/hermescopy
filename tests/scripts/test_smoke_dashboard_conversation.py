@@ -85,8 +85,8 @@ def test_public_smoke_returns_redacted_success_and_always_closes_browser(
             {"name": "public_session_create", "status": "passed"},
             {"name": "public_model_response", "status": "passed", "deltaCount": 2},
             {"name": "public_cold_resume", "status": "passed"},
-            {"name": "public_session_reader_list", "status": "passed"},
-            {"name": "public_session_reader_messages", "status": "passed"},
+            {"name": "public_session_reader_list", "status": "passed", "durationMs": 109},
+            {"name": "public_session_reader_messages", "status": "passed", "durationMs": 147},
             {"name": "public_cleanup", "status": "passed"},
         ],
         "cleanup": {"sessionClosed": True, "sessionDeleted": True, "socketClosed": True},
@@ -124,6 +124,9 @@ def test_public_smoke_returns_redacted_success_and_always_closes_browser(
         "public_session_reader_messages",
         "public_cleanup",
     }
+    checks = {item["name"]: item for item in result["checks"]}
+    assert checks["public_session_reader_list"]["durationMs"] == 109
+    assert checks["public_session_reader_messages"]["durationMs"] == 147
     assert result["cleanup"] == {
         "sessionClosed": True,
         "sessionDeleted": True,

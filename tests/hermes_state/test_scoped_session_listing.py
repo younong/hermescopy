@@ -121,61 +121,15 @@ def test_rich_listing_keeps_lineage_aware_display_count(tmp_path):
 
 
 def test_compact_recent_listing_stays_below_300ms_with_compression_chains(tmp_path):
+    from hermes_cli.session_reader.performance_contract import (
+        STANDARDS,
+        expected_latest_session_id,
+        populate_large_session_history,
+    )
+
     db = SessionDB(tmp_path / "state.db")
     try:
-        base = 1_700_000_000.0
-        sessions = []
-        messages = []
-        message_id = 1
-        for index in range(3_000):
-            chain_length = 3 if index % 10 == 0 else 1
-            parent_id = None
-            for chain_index in range(chain_length):
-                session_id = (
-                    f"session-{index}-root"
-                    if chain_index == 0
-                    else f"session-{index}-tip-{chain_index}"
-                )
-                started_at = base + index * 10 + chain_index
-                compressed = chain_index < chain_length - 1
-                sessions.append(
-                    (
-                        session_id,
-                        "gui",
-                        parent_id,
-                        started_at,
-                        started_at + 0.5 if compressed else None,
-                        "compression" if compressed else None,
-                        3,
-                        0,
-                    )
-                )
-                for message_index in range(3):
-                    messages.append(
-                        (
-                            message_id,
-                            session_id,
-                            "user" if message_index == 0 else "assistant",
-                            f"message {index} {chain_index} {message_index}",
-                            started_at + message_index / 10,
-                        )
-                    )
-                    message_id += 1
-                parent_id = session_id
-        db._conn.executemany(
-            """INSERT INTO sessions (
-                   id, source, parent_session_id, started_at, ended_at,
-                   end_reason, message_count, archived
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            sessions,
-        )
-        db._conn.executemany(
-            """INSERT INTO messages (id, session_id, role, content, timestamp)
-               VALUES (?, ?, ?, ?, ?)""",
-            messages,
-        )
-        db._conn.commit()
-
+        populate_large_session_history(db)
         query_plan = [
             row[3]
             for row in db._conn.execute(
@@ -197,10 +151,10 @@ def test_compact_recent_listing_stays_below_300ms_with_compression_chains(tmp_pa
         )
         elapsed = time.perf_counter() - started
 
-        assert payload["total"] == 3_000
-        assert len(payload["sessions"]) == 30
-        assert payload["sessions"][0]["id"] == "session-2999-root"
-        assert elapsed < 0.3
+        assert payload["total"] == STANDARDS.visible_sessions
+        assert len(payload["sessions"]) == STANDARDS.page_size
+        assert payload["sessions"][0]["id"] == expected_latest_session_id()
+        assert elapsed * 1000 < STANDARDS.local_list_max_ms
     finally:
         db.close()
 

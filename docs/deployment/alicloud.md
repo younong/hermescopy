@@ -365,13 +365,15 @@ HERMES_DASHBOARD_BROWSER_PASSWORD=...
 
 不要读取、打印、手工复制、`source` 或提交 `.env.local`。登录 helper 只在进程内加载凭据，用 mode-`0600` 临时 JavaScript 驱动浏览器，并对异常做脱敏；凭据、cookie、WebSocket ticket、模型回复均不写入 argv 或最终总结。公开 smoke 有总 timeout，且无论成功失败都会 best-effort close/delete session、关闭 WebSocket/Playwright 并删除临时脚本。事务内 smoke 使用独立临时 `HOME`/workspace，完成后由 runner 和部署 EXIT trap 双重清理。
 
-两个 smoke runner 输出独立的 machine-readable JSON，部署脚本再输出 aggregate release summary。只接受以下结果语义：
+部署提交前还会运行确定性的 Session Reader 性能 smoke。它只使用候选 release、隔离的合成 3,000 会话历史和本机 UDS，不读取生产状态或凭据，也不访问公网；固定检查 SQL 数量、压缩链查询计划、本地与真实 Reader 冷/热延迟、连接池及并发资源上限。标准由 `hermes_cli/session_reader/performance_contract.py` 统一定义。任一回归或清理失败都会在 commit 前终止并恢复旧部署。公开 smoke 中的 Reader list/messages 延迟会写入总结，但仅作线上观测，不作为阈值，避免把 TLS、认证、网络和共享主机抖动变成 post-commit 性能误报。
 
-- `rolled back before commit`：远端事务未提交；旧部署已由 trap 恢复。排查 deterministic smoke 的 failure `code/check` 后重试。
+三个 smoke runner 输出独立的 machine-readable JSON，部署脚本再输出 aggregate release summary。只接受以下结果语义：
+
+- `rolled back before commit`：远端事务未提交；旧部署已由 trap 恢复。排查 Session Reader performance 或 deterministic smoke 的 failure `code/check` 后重试。
 - `deployment committed and all smoke passed`：部署与发布验证均成功。
 - `deployment committed but public smoke failed`：线上版本已提交，但公开路径/真实模型验证失败；命令返回非零，且不会自动回滚。立即检查 auth、ticket、WebSocket、Owner Worker、模型配置和日志，再人工决定修复重试或发布上一稳定 tag。
 
-`--dry-run` 只展示两层 smoke 命令和 `planned` 总结，不读取本机凭据、不打开浏览器、不调用模型。
+`--dry-run` 只展示各层 smoke 命令和 `planned` 总结，不运行性能基准、不读取本机凭据、不打开浏览器、不调用模型。
 
 ## 服务器状态检查
 

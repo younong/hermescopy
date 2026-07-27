@@ -1065,9 +1065,11 @@ def test_reader_queries_are_batched_and_read_only_fts_is_available(tmp_path):
                 not sql.lstrip().startswith("--") for sql in statements
             )
 
-            assert list_count <= 6
-            assert stats_count == 3
-            assert search_count <= 7
+            from hermes_cli.session_reader.performance_contract import STANDARDS
+
+            assert list_count <= STANDARDS.list_sql_max
+            assert stats_count == STANDARDS.stats_sql_exact
+            assert search_count <= STANDARDS.search_sql_max
         finally:
             profile_reader.close()
             reader.close()
@@ -1347,66 +1349,6 @@ def test_reader_acquire_active_never_waits_for_concurrent_startup(tmp_path):
     assert time.perf_counter() - started < 0.05
 
 
-def _populate_large_scoped_session_history(db, owner_key: str, owner_home: Path) -> None:
-    base = 1_700_000_000.0
-    workspace_root = str((owner_home / "workspaces").resolve())
-    sessions = []
-    messages = []
-    message_id = 1
-    for index in range(3_000):
-        chain_length = 3 if index % 10 == 0 else 1
-        parent_id = None
-        for chain_index in range(chain_length):
-            session_id = (
-                f"session-{index}-root"
-                if chain_index == 0
-                else f"session-{index}-tip-{chain_index}"
-            )
-            started_at = base + index * 10 + chain_index
-            compressed = chain_index < chain_length - 1
-            sessions.append(
-                (
-                    session_id,
-                    "gui",
-                    parent_id,
-                    started_at,
-                    started_at + 0.5 if compressed else None,
-                    "compression" if compressed else None,
-                    3,
-                    0,
-                    owner_key,
-                    workspace_root,
-                    1,
-                )
-            )
-            for message_index in range(3):
-                messages.append(
-                    (
-                        message_id,
-                        session_id,
-                        "user" if message_index == 0 else "assistant",
-                        f"message {index} {chain_index} {message_index}",
-                        started_at + message_index / 10,
-                    )
-                )
-                message_id += 1
-            parent_id = session_id
-    db._conn.executemany(
-        """INSERT INTO sessions (
-               id, source, parent_session_id, started_at, ended_at,
-               end_reason, message_count, archived, owner_key,
-               workspace_root, worker_generation
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        sessions,
-    )
-    db._conn.executemany(
-        """INSERT INTO messages (id, session_id, role, content, timestamp)
-           VALUES (?, ?, ?, ?, ?)""",
-        messages,
-    )
-    db._conn.commit()
-
-
 @pytest.mark.skipif(os.name == "nt", reason="Unix-domain Session Reader subprocess")
 def test_reader_real_process_recovers_orphaned_fence_and_serves_history(tmp_path):
     from hermes_state import SessionDB
@@ -1485,6 +1427,11 @@ def test_reader_real_process_recovers_orphaned_fence_and_serves_history(tmp_path
 def test_reader_real_path_large_history_stays_below_300ms(tmp_path):
     from hermes_state import SessionDB
     from hermes_cli.session_reader.client import SessionReaderClient
+    from hermes_cli.session_reader.performance_contract import (
+        STANDARDS,
+        expected_latest_session_id,
+        populate_large_session_history,
+    )
     from hermes_cli.session_reader.supervisor import SessionReaderSupervisor
 
     short_root = Path("/tmp") / f"hermes-reader-large-{os.getpid()}-{time.time_ns()}"
@@ -1493,7 +1440,11 @@ def test_reader_real_path_large_history_stays_below_300ms(tmp_path):
     owner_home.mkdir(parents=True)
     owner_key = "ok1_large"
     db = SessionDB(db_path=owner_home / "state.db")
-    _populate_large_scoped_session_history(db, owner_key, owner_home)
+    populate_large_session_history(
+        db,
+        owner_key=owner_key,
+        owner_home=owner_home,
+    )
     supervisor = SessionReaderSupervisor(
         control_home=control,
         global_home=tmp_path,
@@ -1536,12 +1487,12 @@ def test_reader_real_path_large_history_stays_below_300ms(tmp_path):
 
         assert all(response.status_code == 200 for response in responses)
         payload = responses[-1].json()
-        assert payload["total"] == 3_000
-        assert len(payload["sessions"]) == 30
-        assert payload["sessions"][0]["id"] == "session-2999-root"
+        assert payload["total"] == STANDARDS.visible_sessions
+        assert len(payload["sessions"]) == STANDARDS.page_size
+        assert payload["sessions"][0]["id"] == expected_latest_session_id()
         assert startup_elapsed < 3
-        assert cold_elapsed < 0.3, f"ACTIVE Reader request took {cold_elapsed:.3f}s"
-        assert warm_elapsed < 0.3, f"warm Reader request took {warm_elapsed:.3f}s"
+        assert cold_elapsed * 1000 < STANDARDS.reader_cold_max_ms
+        assert warm_elapsed * 1000 < STANDARDS.reader_warm_max_ms
     finally:
         db.close()
         if "client" in locals():
