@@ -213,7 +213,7 @@ function applySessionResponse(
     );
   }
 
-  return {
+  const next = {
     ...state,
     artifacts: history && !state.historySessionId ? history.artifacts : state.artifacts,
     ...clarificationsFromSnapshot(response.pending_prompts),
@@ -231,6 +231,7 @@ function applySessionResponse(
       ("resumed" in response ? response.resumed : undefined) ??
       state.storedSessionId,
   };
+  return cwd && cwd !== state.cwd ? refreshFileDownloadContext(next, cwd) : next;
 }
 
 function prependHistoryPage(
@@ -1027,7 +1028,42 @@ function applySessionInfo(
   payload: SessionInfoPayload | undefined,
 ): GuiChatState {
   if (!payload) return state;
-  return { ...state, cwd: payload.cwd ?? state.cwd, model: payload.model ?? state.model };
+  const cwd = payload.cwd ?? state.cwd;
+  const next = { ...state, cwd, model: payload.model ?? state.model };
+  return cwd && cwd !== state.cwd ? refreshFileDownloadContext(next, cwd) : next;
+}
+
+function refreshFileDownloadContext(state: GuiChatState, cwd: string): GuiChatState {
+  const artifacts = Object.fromEntries(
+    Object.entries(state.artifacts).map(([id, artifact]) => [
+      id,
+      artifact.kind === "file"
+        ? {
+            ...artifact,
+            downloadUrl: buildSessionFileDownloadUrl(artifact.sourcePath, cwd, artifact.name),
+          }
+        : artifact,
+    ]),
+  );
+  const messages = state.messages.map((message) => {
+    if (!message.attachments?.some((attachment) => attachment.sourcePath)) return message;
+    return {
+      ...message,
+      attachments: message.attachments.map((attachment) =>
+        attachment.sourcePath
+          ? {
+              ...attachment,
+              downloadUrl: buildSessionFileDownloadUrl(
+                attachment.sourcePath,
+                cwd,
+                attachment.name,
+              ),
+            }
+          : attachment,
+      ),
+    };
+  });
+  return { ...state, artifacts, messages };
 }
 
 function startAssistantMessage(state: GuiChatState): GuiChatState {
