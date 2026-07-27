@@ -68,6 +68,98 @@ def test_generated_smoke_uses_public_ticket_and_full_session_lifecycle(smoke_mod
     assert "release-marker" in javascript
 
 
+def test_generated_continuity_smoke_holds_then_reconnects_same_session(smoke_module):
+    prepare = smoke_module._continuity_javascript(
+        base="https://example.com/hermes/",
+        path_prefix="/hermes/",
+        marker="continuity-marker",
+        timeout_ms=30_000,
+        phase="prepare",
+    )
+    verify = smoke_module._continuity_javascript(
+        base="https://example.com/hermes/",
+        path_prefix="/hermes/",
+        marker="unused-verify-marker",
+        timeout_ms=30_000,
+        phase="verify",
+    )
+
+    assert smoke_module.CONTINUITY_STATE_KEY in prepare
+    assert "state.socket = ws" in prepare
+    assert "state.closeCode = event.code" in prepare
+    assert "oldSocket.addEventListener('close'" in verify
+    assert "state.closeCode !== 1012" in verify
+    assert "while (now() < deadline)" in verify
+    assert "api/auth/ws-ticket" in verify
+    assert "session_id: state.storedSessionId" in verify
+    assert "continuity resume did not restore the prepared transcript" in verify
+    assert "continuity cold resume did not restore the prepared transcript" in verify
+    assert "session.delete" in verify
+    assert "response.text()" not in prepare + verify
+
+
+def test_continuity_phases_keep_browser_open_until_verify(smoke_module, monkeypatch, tmp_path):
+    credentials = smoke_module.Credentials("member@example.com", "secret value")
+    close_calls: list[list[str]] = []
+    phases: list[str] = []
+    monkeypatch.setattr(smoke_module, "load_credentials", lambda _root: credentials)
+    monkeypatch.setattr(smoke_module, "login_dashboard", lambda **_kwargs: {"ok": True})
+
+    def fake_secure(**kwargs):
+        javascript = kwargs["javascript"]
+        phase = "prepare" if '"phase": "prepare"' in javascript else "verify"
+        phases.append(phase)
+        return json.dumps(
+            {
+                "ok": True,
+                "checks": [{"name": f"continuity_{phase}", "status": "passed"}],
+                "cleanup": {
+                    "sessionClosed": phase == "verify",
+                    "sessionDeleted": phase == "verify",
+                    "socketClosed": phase == "verify",
+                },
+            }
+        )
+
+    monkeypatch.setattr(smoke_module, "run_secure_playwright_code", fake_secure)
+    monkeypatch.setattr(
+        smoke_module.subprocess,
+        "run",
+        lambda args, **_kwargs: (
+            close_calls.append([str(value) for value in args])
+            or subprocess.CompletedProcess(args, 0, "", "")
+        ),
+    )
+
+    prepared, prepare_status = smoke_module.run_continuity_smoke(
+        repo_root=tmp_path,
+        raw_url="https://example.com/hermes/",
+        session="release-continuity",
+        playwright_cli="playwright-cli",
+        timeout=30,
+        phase="prepare",
+    )
+    verified, verify_status = smoke_module.run_continuity_smoke(
+        repo_root=tmp_path,
+        raw_url="https://example.com/hermes/",
+        session="release-continuity",
+        playwright_cli="playwright-cli",
+        timeout=30,
+        phase="verify",
+    )
+
+    assert prepare_status == verify_status == 0
+    assert prepared["kind"] == smoke_module.CONTINUITY_KIND
+    assert prepared["phase"] == "prepare"
+    assert prepared["cleanup"]["browserClosed"] is False
+    assert verified["phase"] == "verify"
+    assert verified["cleanup"]["browserClosed"] is True
+    assert phases == ["prepare", "verify"]
+    assert close_calls == [["playwright-cli", "-s=release-continuity", "close"]]
+    assert credentials.username not in json.dumps([prepared, verified])
+    assert credentials.password not in json.dumps([prepared, verified])
+
+
 def test_public_smoke_returns_redacted_success_and_always_closes_browser(
     smoke_module, monkeypatch, tmp_path
 ):

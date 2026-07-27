@@ -2,9 +2,9 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { GuiChatReconnectLifecycle } from "./reconnectLifecycle";
+import { WebSocketReconnectLifecycle } from "./reconnectLifecycle";
 
-let lifecycle: GuiChatReconnectLifecycle | null;
+let lifecycle: WebSocketReconnectLifecycle | null;
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -21,7 +21,7 @@ function createLifecycle(ping = vi.fn().mockResolvedValue(undefined)) {
   const close = vi.fn();
   let generation = 0;
   const reconnect = vi.fn(() => ++generation);
-  lifecycle = new GuiChatReconnectLifecycle({
+  lifecycle = new WebSocketReconnectLifecycle({
     close,
     ping,
     random: () => 0.5,
@@ -30,7 +30,7 @@ function createLifecycle(ping = vi.fn().mockResolvedValue(undefined)) {
   return { close, ping, reconnect };
 }
 
-describe("GuiChatReconnectLifecycle", () => {
+describe("WebSocketReconnectLifecycle", () => {
   it("retries with capped exponential backoff and one attempt at a time", () => {
     const { reconnect } = createLifecycle();
     lifecycle?.onConnectionState("closed");
@@ -39,23 +39,42 @@ describe("GuiChatReconnectLifecycle", () => {
     vi.advanceTimersByTime(1);
     expect(reconnect).toHaveBeenCalledTimes(1);
 
-    lifecycle?.onSwitchSettled(1, false);
+    lifecycle?.onReconnectSettled(1, false);
     vi.advanceTimersByTime(1_999);
     expect(reconnect).toHaveBeenCalledTimes(1);
     vi.advanceTimersByTime(1);
     expect(reconnect).toHaveBeenCalledTimes(2);
 
-    lifecycle?.onSwitchSettled(2, false);
+    lifecycle?.onReconnectSettled(2, false);
     vi.advanceTimersByTime(4_000);
-    lifecycle?.onSwitchSettled(3, false);
+    lifecycle?.onReconnectSettled(3, false);
     vi.advanceTimersByTime(8_000);
-    lifecycle?.onSwitchSettled(4, false);
+    lifecycle?.onReconnectSettled(4, false);
     vi.advanceTimersByTime(15_000);
-    lifecycle?.onSwitchSettled(5, false);
+    lifecycle?.onReconnectSettled(5, false);
     vi.advanceTimersByTime(14_999);
     expect(reconnect).toHaveBeenCalledTimes(5);
     vi.advanceTimersByTime(1);
     expect(reconnect).toHaveBeenCalledTimes(6);
+  });
+
+  it("retries when an asynchronous reconnect attempt rejects", async () => {
+    const close = vi.fn();
+    const reconnect = vi.fn().mockRejectedValue(new Error("ticket unavailable"));
+    lifecycle = new WebSocketReconnectLifecycle({
+      close,
+      ping: vi.fn().mockResolvedValue(undefined),
+      random: () => 0.5,
+      reconnect,
+    });
+    lifecycle.onConnectionState("closed");
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(reconnect).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(reconnect).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(reconnect).toHaveBeenCalledTimes(2);
   });
 
   it("recovers immediately on online and pageshow without duplicate attempts", () => {

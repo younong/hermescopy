@@ -30,7 +30,7 @@ describe('writeActiveSessionFile', () => {
 
     writeActiveSessionFile('actual_session', path)
 
-    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ session_id: 'actual_session' })
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ schema_version: 1, session_id: 'actual_session' })
   })
 })
 

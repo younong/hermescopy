@@ -407,9 +407,11 @@ export async function authedFetch(
 export async function buildWsUrl(
   path: string,
   params?: Record<string, string>,
+  traceId?: string,
+  signal?: AbortSignal,
 ): Promise<string> {
   return buildHermesWebSocketUrl({
-    authParam: await buildWsAuthParam(path),
+    authParam: await buildWsAuthParam(path, traceId, signal),
     basePath: BASE,
     params,
     path,

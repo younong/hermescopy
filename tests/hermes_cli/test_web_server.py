@@ -7153,7 +7153,6 @@ class TestPtyWebSocket:
         # its own fake argv via ``ws._resolve_chat_argv``.
         self.ws_module = ws
         monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
-        ws.app.state.pty_active_session_files = {}
         self.token = ws._SESSION_TOKEN
         self.client = TestClient(ws.app)
 

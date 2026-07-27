@@ -56,7 +56,6 @@ def pty_client(monkeypatch, _isolate_hermes_home):
 
     monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
     monkeypatch.setattr(ws.PtyBridge, "spawn", _OneFrameBridge.spawn)
-    ws.app.state.pty_active_session_files = {}
     ws.app.state.pty_browser_sessions = {}
     ws.app.state.pty_browser_lock = asyncio.Lock()
 
@@ -93,8 +92,8 @@ def test_resolve_chat_argv_sets_active_session_file_env(monkeypatch):
     assert env["HERMES_TUI_ACTIVE_SESSION_FILE"] == "/tmp/hermes-active-session.json"
 
 
-def test_channel_reconnect_resumes_active_session_file(pty_client, monkeypatch):
-    """A new /api/pty socket on the same channel resumes the last TUI sid."""
+def test_browser_reconnect_resumes_active_session_file(pty_client, monkeypatch):
+    """A new /api/pty socket for the same browser resumes the last TUI sid."""
     ws, client, token = pty_client
     captured = []
 
@@ -108,17 +107,17 @@ def test_channel_reconnect_resumes_active_session_file(pty_client, monkeypatch):
         )
         if active_session_file and not resume:
             Path(active_session_file).write_text(
-                json.dumps({"session_id": "sess-live"}),
+                json.dumps({"schema_version": 1, "session_id": "sess-live"}),
                 encoding="utf-8",
             )
         return (["fake-hermes-tui"], None, None)
 
     monkeypatch.setattr(ws, "_resolve_chat_argv", fake_resolve)
 
-    with client.websocket_connect(_url(token, channel="reconnect-chan")) as conn:
+    with client.websocket_connect(_url(token, browser_id="browser-reconnect", channel="reconnect-chan")) as conn:
         assert conn.receive_bytes() == b"ready"
 
-    with client.websocket_connect(_url(token, channel="reconnect-chan")) as conn:
+    with client.websocket_connect(_url(token, browser_id="browser-reconnect", channel="reconnect-chan")) as conn:
         assert conn.receive_bytes() == b"ready"
 
     assert captured[0]["resume"] is None
@@ -127,12 +126,16 @@ def test_channel_reconnect_resumes_active_session_file(pty_client, monkeypatch):
     assert captured[1]["active_session_file"] == captured[0]["active_session_file"]
 
 
-def test_fresh_param_ignores_channel_active_session_file(pty_client, monkeypatch):
-    """Explicit fresh starts must not resurrect the prior channel session."""
+def test_fresh_param_ignores_browser_active_session_file(pty_client, monkeypatch):
+    """Explicit fresh starts must not resurrect the prior browser session."""
     ws, client, token = pty_client
     channel = "fresh-chan"
-    active_file = ws._active_session_file_for_channel(ws.app, channel)
-    active_file.write_text(json.dumps({"session_id": "sess-old"}), encoding="utf-8")
+    browser_id = "browser-fresh"
+    active_file = ws._active_session_file_for_browser(browser_id)
+    active_file.write_text(
+        json.dumps({"schema_version": 1, "session_id": "sess-old"}),
+        encoding="utf-8",
+    )
     captured = {}
 
     def fake_resolve(resume=None, sidecar_url=None, profile=None, active_session_file=None, **_kwargs):
@@ -142,7 +145,9 @@ def test_fresh_param_ignores_channel_active_session_file(pty_client, monkeypatch
 
     monkeypatch.setattr(ws, "_resolve_chat_argv", fake_resolve)
 
-    with client.websocket_connect(_url(token, channel=channel, fresh="1")) as conn:
+    with client.websocket_connect(
+        _url(token, browser_id=browser_id, channel=channel, fresh="1")
+    ) as conn:
         assert conn.receive_bytes() == b"ready"
 
     assert captured["resume"] is None

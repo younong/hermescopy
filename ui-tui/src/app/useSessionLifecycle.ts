@@ -46,7 +46,7 @@ export const writeActiveSessionFile = (sessionId: null | string, file = process.
   }
 
   try {
-    writeFileSync(file, JSON.stringify({ session_id: sessionId }), { mode: 0o600 })
+    writeFileSync(file, JSON.stringify({ schema_version: 1, session_id: sessionId }), { mode: 0o600 })
   } catch {
     // Best-effort shell epilogue hint only; never break live session changes.
   }

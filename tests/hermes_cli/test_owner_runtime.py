@@ -8,6 +8,7 @@ from hermes_cli.owner_runtime import (
     OWNER_WORKER_DEPLOYMENT_RUNTIME_ENV_KEYS,
     REQUIRED_OWNER_DIRS,
     assert_owner_runtime_paths,
+    dashboard_current_session_relative_path,
     ensure_owner_runtime_dirs,
     get_default_workspace,
     get_workspace_root,
@@ -20,6 +21,22 @@ from hermes_cli.owner_runtime import (
     strip_owner_worker_deployment_runtime_env,
     validate_owner_worker_runtime_environment,
 )
+
+
+def test_dashboard_current_session_path_hashes_valid_browser_id():
+    relative_path = dashboard_current_session_relative_path("browser:stable-id")
+
+    assert relative_path.startswith("sessions/dashboard-current/")
+    assert relative_path.endswith(".json")
+    assert "browser" not in relative_path
+    assert relative_path == dashboard_current_session_relative_path("browser:stable-id")
+    assert relative_path != dashboard_current_session_relative_path("browser:other-id")
+
+
+@pytest.mark.parametrize("browser_id", ["", "../escape", "/absolute", "space id", "x" * 161])
+def test_dashboard_current_session_path_rejects_invalid_browser_id(browser_id):
+    with pytest.raises(ValueError, match="browser_id is invalid"):
+        dashboard_current_session_relative_path(browser_id)
 
 
 def test_runtime_owner_home_is_derived_only_from_worker_environment(tmp_path, monkeypatch):

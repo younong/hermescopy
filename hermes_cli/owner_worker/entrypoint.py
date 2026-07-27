@@ -303,6 +303,15 @@ def create_app(
                 except Exception as exc:
                     cleanup_error = cleanup_error or exc
 
+            runtime = getattr(
+                getattr(app.state, "owner_worker_live_state", None),
+                "gateway_runtime",
+                None,
+            )
+            if runtime is not None:
+                from tui_gateway.server import force_owner_worker_gateway_drain
+
+                _cleanup(lambda: force_owner_worker_gateway_drain(runtime))
             os.environ.pop("HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL", None)
             if relay is not None:
                 _cleanup(relay.close)
@@ -602,6 +611,30 @@ def create_app(
             "control_home": str(app.state.owner_worker_control_home or ""),
             "forbidden_env_present": [key for key in FORBIDDEN_OWNER_WORKER_ENV_KEYS if os.environ.get(key, "").strip()],
         }
+
+    @app.post("/internal/drain")
+    def begin_drain(_: None = Depends(_require_owner_token)) -> dict[str, Any]:
+        from tui_gateway.server import begin_owner_worker_gateway_drain
+
+        return begin_owner_worker_gateway_drain(
+            app.state.owner_worker_live_state.gateway_runtime
+        )
+
+    @app.get("/internal/drain")
+    def drain_status(_: None = Depends(_require_owner_token)) -> dict[str, Any]:
+        from tui_gateway.server import owner_worker_gateway_drain_status
+
+        return owner_worker_gateway_drain_status(
+            app.state.owner_worker_live_state.gateway_runtime
+        )
+
+    @app.post("/internal/drain/force")
+    def force_drain(_: None = Depends(_require_owner_token)) -> dict[str, Any]:
+        from tui_gateway.server import force_owner_worker_gateway_drain
+
+        return force_owner_worker_gateway_drain(
+            app.state.owner_worker_live_state.gateway_runtime
+        )
 
     @app.get("/api/files")
     def list_files(path: str = "", _: None = Depends(_require_owner_token)) -> dict[str, Any]:

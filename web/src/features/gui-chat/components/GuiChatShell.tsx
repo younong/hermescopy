@@ -33,7 +33,7 @@ import { createGatewayEventFrameQueue } from "../gatewayEventFrameQueue";
 import { startGuiChatLatencyTrace, type GuiChatLatencyTrace } from "../latencyTrace";
 import { connectMockGuiChat } from "../mock";
 import { guiChatReducer } from "../reducer";
-import { GuiChatReconnectLifecycle } from "../reconnectLifecycle";
+import { WebSocketReconnectLifecycle } from "../reconnectLifecycle";
 import { GuiChatSessionSwitchCoordinator } from "../sessionSwitch";
 import {
   initialGuiChatState,
@@ -59,7 +59,7 @@ export function GuiChatShell() {
   const [state, dispatch] = useReducer(guiChatReducer, initialGuiChatState);
   const connectionRef = useRef<GuiChatConnection | null>(null);
   const historyAbortRef = useRef<AbortController | null>(null);
-  const reconnectLifecycleRef = useRef<GuiChatReconnectLifecycle | null>(null);
+  const reconnectLifecycleRef = useRef<WebSocketReconnectLifecycle | null>(null);
   const eventFrameQueue = useMemo(
     () => createGatewayEventFrameQueue(
       (event) => dispatch({ type: "event", event }),
@@ -185,7 +185,7 @@ export function GuiChatShell() {
         const trace = switchTraceByGenerationRef.current.get(generation);
         switchTraceByGenerationRef.current.delete(generation);
         dispatch({ type: "session.created", response });
-        reconnectLifecycleRef.current?.onSwitchSettled(generation, true);
+        reconnectLifecycleRef.current?.onReconnectSettled(generation, true);
 
         requestAnimationFrame(() => {
           if (!switchCoordinatorRef.current?.isGenerationCurrent(generation)) return;
@@ -196,7 +196,7 @@ export function GuiChatShell() {
       onError: (error, requestedSessionId, generation, committedSessionId) => {
         const trace = switchTraceByGenerationRef.current.get(generation);
         switchTraceByGenerationRef.current.delete(generation);
-        reconnectLifecycleRef.current?.onSwitchSettled(generation, false);
+        reconnectLifecycleRef.current?.onReconnectSettled(generation, false);
         trace?.mark(requestedSessionId ? "session.attach.end" : "session.create.end", "error");
         if (latencyTraceRef.current === trace) latencyTraceRef.current = null;
 
@@ -240,7 +240,7 @@ export function GuiChatShell() {
     });
     const reconnectLifecycle = mockMode
       ? null
-      : new GuiChatReconnectLifecycle({
+      : new WebSocketReconnectLifecycle({
           close: () => connection.close(),
           ping: () => connection.ping(),
           reconnect: () =>

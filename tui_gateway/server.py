@@ -156,6 +156,8 @@ class _GatewayMutableState:
     prompt_lock: threading.Lock = field(default_factory=threading.Lock)
     session_resume_lock: threading.Lock = field(default_factory=threading.Lock)
     child_mirrors_lock: threading.Lock = field(default_factory=threading.Lock)
+    drain_lock: threading.Lock = field(default_factory=threading.Lock)
+    draining: bool = False
 
 
 @dataclass(frozen=True)
@@ -5483,6 +5485,80 @@ def _inflight_text(value: Any) -> str:
     return _content_display_text(value).strip()
 
 
+def begin_owner_worker_gateway_drain(runtime: OwnerWorkerGatewayRuntime) -> dict[str, int | bool]:
+    """Close turn admission for one exact owner runtime and report active turns."""
+    state = runtime.mutable_state
+    with state.drain_lock:
+        state.draining = True
+    return owner_worker_gateway_drain_status(runtime)
+
+
+def owner_worker_gateway_drain_status(runtime: OwnerWorkerGatewayRuntime) -> dict[str, int | bool]:
+    state = runtime.mutable_state
+    with state.sessions_lock:
+        active_turns = sum(bool(session.get("running")) for session in state.sessions.values())
+    with state.drain_lock:
+        draining = state.draining
+    return {"draining": draining, "active_turns": active_turns}
+
+
+def force_owner_worker_gateway_drain(runtime: OwnerWorkerGatewayRuntime) -> dict[str, int | bool]:
+    """Persist and interrupt every still-running turn without ending sessions."""
+    state = runtime.mutable_state
+    with state.drain_lock:
+        state.draining = True
+    with state.sessions_lock:
+        sessions = list(state.sessions.values())
+    for session in sessions:
+        with session["history_lock"]:
+            if not session.get("running"):
+                continue
+            session["queued_prompt"] = None
+            agent = session.get("agent")
+            history = list(session.get("history", []))
+            if agent is not None and hasattr(agent, "_persist_session"):
+                snapshot = getattr(agent, "_session_messages", None) or history
+                if snapshot:
+                    try:
+                        agent._persist_session(snapshot, conversation_history=history)
+                    except Exception:
+                        pass
+            if agent is not None and hasattr(agent, "interrupt"):
+                try:
+                    agent.interrupt()
+                except Exception:
+                    pass
+            for sid, event in list(state.pending.values()):
+                if sid == session.get("session_key"):
+                    event.set()
+    return owner_worker_gateway_drain_status(runtime)
+
+
+def _runtime_accepts_turns() -> bool:
+    state = _gateway_state()
+    with state.drain_lock:
+        return not state.draining
+
+
+def _claim_turn_locked(session: dict, text: Any) -> int | None:
+    """Claim a new turn while atomically excluding drain admission closure.
+
+    Callers hold ``session["history_lock"]``. The shared drain lock serializes
+    the final admission decision with ``begin_owner_worker_gateway_drain``.
+    """
+    state = _gateway_state()
+    with state.drain_lock:
+        if state.draining or session.get("running"):
+            return None
+        session["running"] = True
+        generation = _next_turn_generation(session)
+        session["_turn_cancel_requested"] = False
+        session["_turn_cancel_generation"] = None
+        session["last_active"] = time.time()
+        _start_inflight_turn(session, text, generation)
+        return generation
+
+
 def _next_turn_generation(session: dict) -> int:
     generation = int(session.get("_turn_generation", 0)) + 1
     session["_turn_generation"] = generation
@@ -5613,15 +5689,14 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     """
     with session["history_lock"]:
         queued = session.get("queued_prompt")
-        if not queued or session.get("running"):
+        if not queued:
+            return False
+        generation = _claim_turn_locked(session, queued["text"])
+        if generation is None:
             return False
         session["queued_prompt"] = None
-        session["running"] = True
-        generation = _next_turn_generation(session)
-        session["_turn_cancel_requested"] = False
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
-        _start_inflight_turn(session, queued["text"], generation)
     try:
         _run_prompt_submit(
             rid, sid, session, queued["text"], generation=generation
@@ -9418,12 +9493,9 @@ def _(rid, params: dict) -> dict:
                     db.replace_messages(session["session_key"], truncated)
                 except Exception as exc:
                     print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
-        session["running"] = True
-        generation = _next_turn_generation(session)
-        session["_turn_cancel_requested"] = False
-        session["_turn_cancel_generation"] = None
-        session["last_active"] = time.time()
-        _start_inflight_turn(session, text, generation)
+        generation = _claim_turn_locked(session, text)
+        if generation is None:
+            return _err(rid, 4012, "service restart in progress")
 
     idempotency_key = str(params.get("idempotency_key") or "").strip()
     if idempotency_key:
@@ -10354,15 +10426,11 @@ def _run_prompt_submit(
         # we check that guard before re-firing.
         if goal_followup:
             with session["history_lock"]:
-                if session.get("running"):
-                    # User already sent something — their turn wins,
-                    # the judge will re-run on the next turn anyway.
+                followup_generation = _claim_turn_locked(session, goal_followup)
+                if followup_generation is None:
+                    # A user turn or drain already owns admission. The goal judge
+                    # will run again after the next admitted user turn.
                     return
-                session["running"] = True
-                followup_generation = _next_turn_generation(session)
-                session["_turn_cancel_requested"] = False
-                session["_turn_cancel_generation"] = None
-                _start_inflight_turn(session, goal_followup, followup_generation)
             try:
                 _emit("message.start", sid)
                 _run_prompt_submit(
@@ -10394,16 +10462,10 @@ def _run_prompt_submit(
 
             for _evt, synth in process_registry.drain_notifications():
                 with session["history_lock"]:
-                    if session.get("running"):
+                    notification_generation = _claim_turn_locked(session, synth)
+                    if notification_generation is None:
                         process_registry.completion_queue.put(_evt)
                         break
-                    session["running"] = True
-                    notification_generation = _next_turn_generation(session)
-                    session["_turn_cancel_requested"] = False
-                    session["_turn_cancel_generation"] = None
-                    _start_inflight_turn(
-                        session, synth, notification_generation
-                    )
                 try:
                     _emit("message.start", sid)
                     _run_prompt_submit(
