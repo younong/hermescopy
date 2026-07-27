@@ -5659,6 +5659,43 @@ def _clear_inflight_turn(
     session["inflight_turn"] = None
 
 
+def _complete_prompt_turn_receipt(
+    session: dict,
+    generation: int | None,
+    *,
+    result_text: str,
+    result_status: str,
+    strict: bool = True,
+) -> None:
+    external_turn_key = None
+    with session["history_lock"]:
+        _clear_inflight_turn(session, generation)
+        if session.get("_external_turn_generation") == generation:
+            external_turn_key = session.pop("_external_turn_key", None)
+            session.pop("_external_turn_generation", None)
+    if not external_turn_key:
+        return
+    db = _get_db()
+    completion_runtime = current_owner_worker_gateway_runtime()
+    if db is None or completion_runtime is None:
+        if strict:
+            raise RuntimeError("external turn receipt completion unavailable")
+        logger.warning("External turn receipt completion unavailable")
+        return
+    try:
+        db.complete_external_turn(
+            turn_key=external_turn_key,
+            worker_id=completion_runtime.worker_id,
+            worker_generation=completion_runtime.worker_generation,
+            result_text=result_text,
+            result_status=result_status,
+        )
+    except RuntimeError as exc:
+        if strict:
+            raise
+        logger.warning("External turn receipt completion rejected: %s", exc)
+
+
 def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -10270,24 +10307,12 @@ def _run_prompt_submit(
             rendered = render_message(raw, cols)
             if rendered:
                 payload["rendered"] = rendered
-            external_turn_key = None
-            with session["history_lock"]:
-                _clear_inflight_turn(session, generation)
-                if session.get("_external_turn_generation") == generation:
-                    external_turn_key = session.pop("_external_turn_key", None)
-                    session.pop("_external_turn_generation", None)
-            if external_turn_key:
-                db = _get_db()
-                completion_runtime = current_owner_worker_gateway_runtime()
-                if db is None or completion_runtime is None:
-                    raise RuntimeError("external turn receipt completion unavailable")
-                db.complete_external_turn(
-                    turn_key=external_turn_key,
-                    worker_id=completion_runtime.worker_id,
-                    worker_generation=completion_runtime.worker_generation,
-                    result_text=str(raw or ""),
-                    result_status=status,
-                )
+            _complete_prompt_turn_receipt(
+                session,
+                generation,
+                result_text=str(raw or ""),
+                result_status=status,
+            )
             _emit("message.complete", sid, payload)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
@@ -10428,7 +10453,19 @@ def _run_prompt_submit(
             print(
                 f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True
             )
-            _emit("error", sid, {"message": str(e)})
+            raw = "Agent turn was interrupted before completion. Please retry."
+            _complete_prompt_turn_receipt(
+                session,
+                generation,
+                result_text=raw,
+                result_status="error",
+                strict=False,
+            )
+            _emit(
+                "message.complete",
+                sid,
+                {"text": raw, "usage": _get_usage(agent), "status": "error"},
+            )
         finally:
             try:
                 if approval_token is not None:

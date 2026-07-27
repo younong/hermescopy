@@ -2222,6 +2222,7 @@ def test_worker_health_over_unix_socket_reports_owner_env(tmp_path, monkeypatch)
             raise AssertionError(f"worker did not become healthy: {last_error}")
 
         assert health["ready"] is True
+        assert health["active_turns"] == 0
         assert health["owner_key"] == "ok1_worker"
         assert Path(health["owner_home"]).resolve() == owner_home.resolve()
         assert Path(health["hermes_home"]).resolve() == owner_home.resolve()

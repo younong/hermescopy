@@ -7,6 +7,7 @@ never cgroup paths or raw owner identifiers.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import secrets
@@ -387,6 +388,18 @@ def _deidentified_identity(identity: ExecutorIdentity) -> dict[str, Any]:
     }
 
 
+def _resource_broker_peer_closed(exc: ResourceBrokerError) -> bool:
+    """Return whether a teardown request found an already-closed private peer."""
+    if str(exc) == "resource broker peer closed":
+        return True
+    cause = exc.__cause__
+    return isinstance(cause, OSError) and cause.errno in {
+        errno.EPIPE,
+        errno.ECONNRESET,
+        errno.ENOTCONN,
+    }
+
+
 class OwnerResourceBrokerClient:
     """Owner-worker controller backed only by one inherited private endpoint."""
 
@@ -430,8 +443,13 @@ class OwnerResourceBrokerClient:
         return OwnerResourceScopeClient(self, token)
 
     def shutdown_generation(self) -> None:
+        if self._closed:
+            return
         try:
             self._request({"operation": "shutdown_generation"})
+        except ResourceBrokerError as exc:
+            if not _resource_broker_peer_closed(exc):
+                raise
         finally:
             self.close()
 

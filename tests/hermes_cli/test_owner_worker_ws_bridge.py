@@ -58,6 +58,81 @@ def test_owner_worker_bridge_close_closes_both_halves_and_releases_once() -> Non
     assert lease.release_count == 1
 
 
+def test_owner_worker_bridge_can_transfer_lease_to_active_turn_guard(monkeypatch) -> None:
+    class _Handle:
+        socket_path = "/unused"
+        owner_key = "ok1_owner"
+        owner_home = "/owner"
+        worker_generation = 3
+        worker_id = "worker-a"
+        lease_version = 4
+        recovery_generation = 0
+
+    class _Client:
+        calls = 0
+
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def verify_health(self, **_kwargs):
+            type(self).calls += 1
+            return {"active_turns": 1 if type(self).calls == 1 else 0}
+
+    async def exercise() -> tuple[_Peer, _Peer, _Lease]:
+        browser, worker, lease = _Peer(), _Peer(), _Lease()
+        bridge = web_server._OwnerWorkerWsBridge(browser, worker, lease)
+        transferred = await bridge.close(release_lease=False)
+        assert transferred is lease
+        assert lease.release_count == 0
+        monkeypatch.setattr(
+            "hermes_cli.owner_worker.client.OwnerWorkerClient", _Client
+        )
+        old_interval = web_server._OWNER_WORKER_TURN_LEASE_POLL_INTERVAL
+        web_server._OWNER_WORKER_TURN_LEASE_POLL_INTERVAL = 0
+        try:
+            await web_server._guard_owner_worker_turn_lease(
+                _Handle(), object(), transferred
+            )
+        finally:
+            web_server._OWNER_WORKER_TURN_LEASE_POLL_INTERVAL = old_interval
+        return browser, worker, lease
+
+    browser, worker, lease = asyncio.run(exercise())
+
+    assert browser.closed and worker.closed
+    assert _Client.calls == 2
+    assert lease.release_count == 1
+
+
+def test_owner_worker_turn_lease_guard_releases_on_exact_health_failure(monkeypatch) -> None:
+    from hermes_cli.owner_worker.client import OwnerWorkerHealthError
+
+    class _Handle:
+        socket_path = "/unused"
+        owner_key = "ok1_owner"
+        owner_home = "/owner"
+        worker_generation = 3
+        worker_id = "worker-a"
+        lease_version = 4
+        recovery_generation = 0
+
+    class _Client:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def verify_health(self, **_kwargs):
+            raise OwnerWorkerHealthError("generation revoked")
+
+    lease = _Lease()
+    monkeypatch.setattr("hermes_cli.owner_worker.client.OwnerWorkerClient", _Client)
+
+    asyncio.run(
+        web_server._guard_owner_worker_turn_lease(_Handle(), object(), lease)
+    )
+
+    assert lease.release_count == 1
+
+
 def test_owner_worker_bridge_lifecycle_audit_is_terminal_and_exactly_once(monkeypatch) -> None:
     events = []
     monkeypatch.setattr(web_server, "_report_bridge_lifecycle", lambda lease, reason: events.append((lease, reason)))
