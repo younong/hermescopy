@@ -9,6 +9,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ComponentProps,
@@ -49,6 +50,17 @@ const TAG_CLASSES = {
 
 const HighlightTermsContext = createContext<readonly string[]>([]);
 
+export interface MarkdownFileLink {
+  matches: (href: string) => boolean;
+  render: (children: ReactNode) => ReactNode;
+}
+
+interface RenderableFileLink extends MarkdownFileLink {
+  renderHref: string;
+}
+
+const FileLinksContext = createContext<readonly RenderableFileLink[]>([]);
+
 type MarkdownElementProps<T extends keyof React.JSX.IntrinsicElements> =
   ComponentProps<T> & { node?: unknown };
 
@@ -80,7 +92,11 @@ function MarkdownAnchor({
   node,
   ...rest
 }: MarkdownElementProps<"a">) {
+  const fileLink = useContext(FileLinksContext).find(
+    (link) => href === link.renderHref,
+  );
   void node;
+  if (fileLink) return fileLink.render(children);
   if (!href || !/^(https?:|mailto:)/i.test(href)) {
     return (
       <span className={className}>
@@ -290,6 +306,25 @@ const safeUrlTransform: UrlTransform = (url, key) => {
   return /^(https?:|mailto:)/i.test(url.trim()) ? url : null;
 };
 
+function replaceFileLinkHrefs(
+  fileLinks: readonly RenderableFileLink[],
+) {
+  return () => (tree: MarkdownAstNode) => {
+    visitFileLinks(tree, fileLinks);
+  };
+}
+
+function visitFileLinks(
+  node: MarkdownAstNode,
+  fileLinks: readonly RenderableFileLink[],
+) {
+  if (node.type === "link" && node.url) {
+    const fileLink = fileLinks.find((link) => link.matches(node.url ?? ""));
+    if (fileLink) node.url = fileLink.renderHref;
+  }
+  node.children?.forEach((child) => visitFileLinks(child, fileLinks));
+}
+
 const bareUrlParser = new Autolinker({
   email: false,
   phone: false,
@@ -304,7 +339,12 @@ function linkifyBareUrls() {
 }
 
 function visitMarkdownText(node: MarkdownAstNode) {
-  if (!node.children || node.type === "code" || node.type === "inlineCode") return;
+  if (
+    !node.children ||
+    node.type === "code" ||
+    node.type === "inlineCode" ||
+    node.type === "link"
+  ) return;
 
   const children: MarkdownAstNode[] = [];
   for (const child of node.children) {
@@ -361,43 +401,60 @@ type MarkdownAstNode = {
   value?: string;
 };
 
-const REMARK_PLUGINS = [
+const DEFAULT_REMARK_PLUGINS = [
   linkifyBareUrls,
   ...Object.values(defaultRemarkPlugins),
 ];
 
 export const Markdown = memo(function Markdown({
   content,
+  fileLinks,
   highlightTerms,
   streaming,
 }: {
   content: string;
+  fileLinks?: readonly MarkdownFileLink[];
   highlightTerms?: string[];
   streaming?: boolean;
 }) {
   const terms = highlightTerms ?? [];
+  const renderableFileLinks = useMemo(
+    () => fileLinks?.map((link, index) => ({
+      ...link,
+      renderHref: `https://hermes.local/file/${index}`,
+    })) ?? [],
+    [fileLinks],
+  );
+  const remarkPlugins = useMemo(
+    () => renderableFileLinks.length > 0
+      ? [replaceFileLinkHrefs(renderableFileLinks), ...DEFAULT_REMARK_PLUGINS]
+      : DEFAULT_REMARK_PLUGINS,
+    [renderableFileLinks],
+  );
 
   return (
     <HighlightTermsContext.Provider value={terms}>
-      <div
-        className="min-w-0 break-words text-sm leading-relaxed text-foreground [overflow-wrap:anywhere]"
-        data-markdown-streaming={streaming ? "true" : undefined}
-      >
-        <Streamdown
-          caret="block"
-          components={COMPONENTS}
-          controls={false}
-          isAnimating={Boolean(streaming)}
-          lineNumbers={false}
-          mode={streaming ? "streaming" : "static"}
-          parseIncompleteMarkdown={Boolean(streaming)}
-          remarkPlugins={REMARK_PLUGINS}
-          skipHtml
-          urlTransform={safeUrlTransform}
+      <FileLinksContext.Provider value={renderableFileLinks}>
+        <div
+          className="min-w-0 break-words text-sm leading-relaxed text-foreground [overflow-wrap:anywhere]"
+          data-markdown-streaming={streaming ? "true" : undefined}
         >
-          {content}
-        </Streamdown>
-      </div>
+          <Streamdown
+            caret="block"
+            components={COMPONENTS}
+            controls={false}
+            isAnimating={Boolean(streaming)}
+            lineNumbers={false}
+            mode={streaming ? "streaming" : "static"}
+            parseIncompleteMarkdown={Boolean(streaming)}
+            remarkPlugins={remarkPlugins}
+            skipHtml
+            urlTransform={safeUrlTransform}
+          >
+            {content}
+          </Streamdown>
+        </div>
+      </FileLinksContext.Provider>
     </HighlightTermsContext.Provider>
   );
 });

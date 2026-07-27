@@ -26,6 +26,28 @@ export function buildSessionFileDownloadUrl(
   return `/api/files/download?${params.toString()}`;
 }
 
+export function normalizeSessionFileReference(value: string): string | null {
+  let path = value.trim().replace(/[.,;:!?。，、；：！？]+$/g, "");
+  const sandbox = path.match(/^sandbox:\/{0,2}(\/.*)$/i);
+  if (sandbox?.[1]) path = sandbox[1];
+  if (/^[a-z][a-z0-9+.-]*:/i.test(path) && !/^file:/i.test(path)) return null;
+  if (/^file:/i.test(path)) {
+    try {
+      const parsed = new URL(path);
+      if (parsed.hostname && parsed.hostname !== "localhost") return null;
+      path = parsed.pathname;
+    } catch {
+      return null;
+    }
+  }
+  try {
+    path = decodeURIComponent(path);
+  } catch {
+    return null;
+  }
+  return path && !path.includes("\0") ? path : null;
+}
+
 export function sessionFileType(name: string, mimeType?: string): SessionFileType {
   const mime = (mimeType ?? "").toLowerCase().split(";", 1)[0];
   const extension = name.split(/[?#]/, 1)[0]?.match(/\.([^.\/\\]+)$/)?.[1]?.toLowerCase() ?? "";

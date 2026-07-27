@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildSessionFileDownloadUrl,
   downloadSessionFile,
+  normalizeSessionFileReference,
   sessionFileType,
 } from "./files";
 
@@ -21,6 +22,14 @@ describe("session files", () => {
     expect(buildSessionFileDownloadUrl("outputs/report.html", "/tmp/my project", "report final.html")).toBe(
       "/api/files/download?path=outputs%2Freport.html&cwd=%2Ftmp%2Fmy+project&filename=report+final.html",
     );
+  });
+
+  it("normalizes only supported local file references", () => {
+    expect(normalizeSessionFileReference("sandbox:/workspace/report.zip")).toBe("/workspace/report.zip");
+    expect(normalizeSessionFileReference("file:///workspace/report.zip")).toBe("/workspace/report.zip");
+    expect(normalizeSessionFileReference("%E6%8A%A5%E5%91%8A.zip")).toBe("报告.zip");
+    expect(normalizeSessionFileReference("https://example.com/report.zip")).toBeNull();
+    expect(normalizeSessionFileReference("javascript:alert(1)")).toBeNull();
   });
 
   it.each([
