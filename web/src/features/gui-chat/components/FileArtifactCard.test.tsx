@@ -12,6 +12,31 @@ afterEach(() => {
 });
 
 describe("FileArtifactCard", () => {
+  it("shows a file archive icon for ZIP downloads", async () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(
+        <FileArtifactCard
+          artifact={{
+            downloadUrl: "/api/files/download?path=export.zip",
+            id: "generated-zip",
+            kind: "file",
+            mimeType: "application/zip",
+            name: "export.zip",
+            sourcePath: "export.zip",
+          }}
+        />,
+      );
+    });
+
+    expect(container.querySelector('[data-file-type="archive"].lucide-file-archive')).not.toBeNull();
+
+    await act(async () => root.unmount());
+  });
+
   it("downloads a generated file when its card is clicked", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response("generated-bytes", { status: 200 }),
