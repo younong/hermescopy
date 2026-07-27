@@ -312,6 +312,31 @@ class TestTransparentRefreshOnAccessTokenEviction:
         )
         return provider, valid_rt
 
+    def test_rt_only_gui_chat_document_refreshes_and_schedules_warmup(
+        self, gated_app, monkeypatch
+    ):
+        from hermes_cli.owner_worker import readiness
+
+        _provider, valid_rt = self._build_rt_only_app()
+        gated_app.cookies.clear()
+        gated_app.cookies.set(SESSION_RT_COOKIE, valid_rt)
+        scheduled = []
+        monkeypatch.setattr(
+            readiness,
+            "schedule_owner_worker_warmup",
+            lambda app, *, owner, supervisor=None: scheduled.append(owner.owner_key),
+        )
+
+        response = gated_app.get(
+            "/chat-gui",
+            headers={"Accept": "text/html", "Sec-Fetch-Dest": "document"},
+            follow_redirects=False,
+        )
+
+        assert response.status_code in (200, 404)
+        assert len(scheduled) == 1
+        assert scheduled[0].startswith("ok1_")
+
     def test_at_evicted_rt_present_refreshes_transparently(self, gated_app):
         provider, valid_rt = self._build_rt_only_app()
         # Browser sends ONLY the RT cookie — the AT cookie has aged out.

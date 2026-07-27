@@ -13082,7 +13082,14 @@ async def _bridge_websocket_to_owner_worker(
     lease: Any | None = None
     try:
         stage_started_at = time.monotonic()
-        handle = await asyncio.to_thread(supervisor.get_or_start, owner)
+        if latency_trace_id:
+            handle = await asyncio.to_thread(
+                supervisor.get_or_start,
+                owner,
+                latency_trace_id=latency_trace_id,
+            )
+        else:
+            handle = await asyncio.to_thread(supervisor.get_or_start, owner)
         lease = _acquire_owner_worker_use(supervisor, handle)
         log_latency_stage(
             _log,

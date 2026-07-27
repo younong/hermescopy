@@ -260,8 +260,10 @@ export function GuiChatShell() {
     reconnectLifecycleRef.current?.cancelRecovery();
     setResumeNotice(null);
     historyAbortRef.current?.abort();
-    const trace = latencyTraceRef.current;
-    trace?.mark("connection.start");
+    const existingTrace = latencyTraceRef.current;
+    const trace = existingTrace ?? startGuiChatLatencyTrace("connection.start");
+    latencyTraceRef.current = trace;
+    if (existingTrace) trace.mark("connection.start");
     const nextGeneration = switchCoordinator.currentGeneration + 1;
     if (trace) switchTraceByGenerationRef.current.set(nextGeneration, trace);
     dispatch({ type: "session.selected", generation: nextGeneration, sessionId: resumeSessionId });

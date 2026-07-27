@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => ({
   getILinkEnrollment: vi.fn(),
   getSessionMessages: vi.fn(),
   logout: vi.fn(),
+  startGuiChatLatencyTrace: vi.fn(),
 }));
 
 vi.mock("@/lib/api", async (importOriginal) => {
@@ -44,6 +45,10 @@ vi.mock("../api", () => ({
 
 vi.mock("../mock", () => ({
   connectMockGuiChat: vi.fn(),
+}));
+
+vi.mock("../latencyTrace", () => ({
+  startGuiChatLatencyTrace: mocks.startGuiChatLatencyTrace,
 }));
 
 vi.mock("@/contexts/useProfileScope", () => ({
@@ -121,6 +126,11 @@ beforeEach(() => {
     session_id: "stored-a",
   });
   mocks.logout.mockReset();
+  mocks.startGuiChatLatencyTrace.mockReset();
+  mocks.startGuiChatLatencyTrace.mockImplementation(() => ({
+    id: "trace-initial-123",
+    mark: vi.fn(),
+  }));
   mocks.logout.mockResolvedValue(new Response(null, { status: 200 }));
   mocks.createILinkEnrollment.mockResolvedValue({
     attempt_id: "enr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -318,6 +328,23 @@ describe("GuiChatShell", () => {
     expect(mocks.logout).toHaveBeenCalledOnce();
   });
 
+  it("traces the initial physical connection", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(<GuiChatShell />);
+
+    expect(mocks.startGuiChatLatencyTrace).toHaveBeenCalledOnce();
+    expect(mocks.startGuiChatLatencyTrace).toHaveBeenCalledWith("connection.start");
+    expect(connection.createOrAttach).toHaveBeenCalledWith(
+      null,
+      expect.any(Number),
+      expect.any(AbortSignal),
+      expect.objectContaining({ traceId: "trace-initial-123" }),
+    );
+  });
+
   it("connects automatically when the authenticated owner becomes ready", async () => {
     const identity = deferred<AuthIdentity>();
     const firstConnection = createConnection();
@@ -366,7 +393,7 @@ describe("GuiChatShell", () => {
       null,
       expect.any(Number),
       expect.any(AbortSignal),
-      undefined,
+      expect.objectContaining({ traceId: "trace-initial-123" }),
     );
   });
 

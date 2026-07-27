@@ -108,6 +108,52 @@ def test_lifespan_isolates_enabled_ilink_without_deployment_policies(monkeypatch
     asyncio.run(_run())
 
 
+def test_owner_warmup_is_nonblocking_and_deduplicated_per_owner(monkeypatch):
+    from hermes_cli.owner_worker.readiness import (
+        initialize_owner_worker_warmups,
+        schedule_owner_worker_warmup,
+    )
+
+    startup_entered = threading.Event()
+    release_startup = threading.Event()
+    starts = []
+
+    class _Handle:
+        owner_key = "ok1_warmup"
+
+    class _Owner:
+        owner_key = "ok1_warmup"
+        owner_home = None
+
+    class _Supervisor:
+        def get_or_start(self, owner):
+            starts.append(owner.owner_key)
+            startup_entered.set()
+            assert release_startup.wait(timeout=5)
+            return _Handle()
+
+    async def _run():
+        initialize_owner_worker_warmups(web_server_mod.app)
+        supervisor = _Supervisor()
+        with patch("hermes_cli.owner_worker.readiness.ensure_owner_home"):
+            first = schedule_owner_worker_warmup(
+                web_server_mod.app, owner=_Owner(), supervisor=supervisor
+            )
+            second = schedule_owner_worker_warmup(
+                web_server_mod.app, owner=_Owner(), supervisor=supervisor
+            )
+            assert first is second
+            assert await asyncio.to_thread(startup_entered.wait, 2)
+            assert first is not None and not first.done()
+            release_startup.set()
+            await first
+
+    asyncio.run(_run())
+
+    assert starts == ["ok1_warmup"]
+
+
+
 def test_lifespan_drains_owner_warmup_before_supervisor_shutdown(monkeypatch):
     from hermes_cli.owner_worker.readiness import schedule_owner_worker_warmup
 

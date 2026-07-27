@@ -413,6 +413,38 @@ def _authority_unavailable_response() -> Response:
     )
 
 
+def _is_gui_chat_document_request(request: Request) -> bool:
+    """Return whether this authenticated request is loading GUI Chat HTML."""
+    path = request.url.path
+    if request.method not in {"GET", "HEAD"} or not (
+        path == "/chat-gui" or path.startswith("/chat-gui/")
+    ):
+        return False
+    fetch_destination = request.headers.get("sec-fetch-dest", "").lower()
+    if fetch_destination:
+        return fetch_destination == "document"
+    return "text/html" in request.headers.get("accept", "").lower()
+
+
+def _schedule_gui_chat_owner_warmup(request: Request, session) -> None:
+    """Best-effort prewarm after GUI Chat document authorization succeeds."""
+    if not _is_gui_chat_document_request(request):
+        return
+    try:
+        from hermes_cli.dashboard_auth.owner_context import owner_context_from_session
+        from hermes_cli.owner_worker.readiness import schedule_owner_worker_warmup
+
+        schedule_owner_worker_warmup(
+            request.app,
+            owner=owner_context_from_session(session),
+        )
+    except Exception as exc:  # noqa: BLE001 - warmup cannot alter authentication
+        _log.warning(
+            "owner worker GUI Chat warmup scheduling failed error_type=%s",
+            type(exc).__name__,
+        )
+
+
 def _safe_next_target(request: Request) -> str:
     """Build the URL-encoded ``next`` query value, or empty string.
 
@@ -610,6 +642,7 @@ async def gated_auth_middleware(
             if gated is not None:
                 response = gated
             else:
+                _schedule_gui_chat_owner_warmup(request, new_session)
                 response = await call_next(request)
             # Persist the ROTATED tokens. Portal rotates the refresh token on
             # every refresh and runs reuse-detection, so writing the new RT
@@ -684,6 +717,7 @@ async def gated_auth_middleware(
     gated = _authenticated_owner_control_plane_gate_response(request)
     if gated is not None:
         return gated
+    _schedule_gui_chat_owner_warmup(request, session)
     return await call_next(request)
 
 
