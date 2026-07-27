@@ -53,10 +53,49 @@ from tui_gateway.transport import (
 
 logger = logging.getLogger(__name__)
 
-_hermes_home = get_hermes_home()
-load_hermes_dotenv(
-    hermes_home=_hermes_home, project_env=Path(__file__).parent.parent / ".env"
-)
+_PROJECT_ENV = Path(__file__).parent.parent / ".env"
+_gateway_runtime_initialized = False
+_gateway_runtime_init_lock = threading.Lock()
+_real_stdout = sys.stdout
+
+
+def _gateway_home() -> Path:
+    """Resolve the active Gateway home after owner/profile scope is installed."""
+    return get_hermes_home()
+
+
+def _crash_log_path() -> str:
+    return os.path.join(_gateway_home(), "logs", "tui_gateway_crash.log")
+
+
+# Kept for the standalone entrypoint's signal logging API. Owner-worker code
+# resolves the path at call time through ``_crash_log_path()``.
+_CRASH_LOG = _crash_log_path()
+
+
+def initialize_gateway_runtime() -> None:
+    """Apply process-local Gateway side effects once, after fork when applicable."""
+    global _gateway_runtime_initialized, _real_stdout
+    if _gateway_runtime_initialized:
+        return
+    with _gateway_runtime_init_lock:
+        if _gateway_runtime_initialized:
+            return
+        home = _gateway_home()
+        load_hermes_dotenv(hermes_home=home, project_env=_PROJECT_ENV)
+        sys.excepthook = _panic_hook
+        threading.excepthook = _thread_panic_hook
+        if not _owner_worker_mode():
+            try:
+                from hermes_cli.banner import prefetch_update_check
+
+                prefetch_update_check()
+            except Exception:
+                pass
+            _start_idle_reaper()
+        _real_stdout = sys.stdout
+        sys.stdout = sys.stderr
+        _gateway_runtime_initialized = True
 
 
 # ── Panic logger ─────────────────────────────────────────────────────
@@ -68,7 +107,6 @@ load_hermes_dotenv(
 # AND re-emits a one-line summary to stderr so the TUI can surface it in
 # Activity — exactly what was missing when the voice-mode turns started
 # exiting the gateway mid-TTS.
-_CRASH_LOG = os.path.join(_hermes_home, "logs", "tui_gateway_crash.log")
 
 
 def _panic_hook(exc_type, exc_value, exc_tb):
@@ -76,8 +114,8 @@ def _panic_hook(exc_type, exc_value, exc_tb):
 
     trace = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
     try:
-        os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
-        with open(_CRASH_LOG, "a", encoding="utf-8") as f:
+        os.makedirs(os.path.dirname(_crash_log_path()), exist_ok=True)
+        with open(_crash_log_path(), "a", encoding="utf-8") as f:
             f.write(
                 f"\n=== unhandled exception · {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
             )
@@ -97,9 +135,6 @@ def _panic_hook(exc_type, exc_value, exc_tb):
     sys.__excepthook__(exc_type, exc_value, exc_tb)
 
 
-sys.excepthook = _panic_hook
-
-
 def _thread_panic_hook(args):
     # threading.excepthook signature: SimpleNamespace(exc_type, exc_value, exc_traceback, thread)
     import traceback
@@ -108,8 +143,8 @@ def _thread_panic_hook(args):
         traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)
     )
     try:
-        os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
-        with open(_CRASH_LOG, "a", encoding="utf-8") as f:
+        os.makedirs(os.path.dirname(_crash_log_path()), exist_ok=True)
+        with open(_crash_log_path(), "a", encoding="utf-8") as f:
             f.write(
                 f"\n=== thread exception · {time.strftime('%Y-%m-%d %H:%M:%S')} "
                 f"· thread={args.thread.name} ===\n"
@@ -128,15 +163,6 @@ def _thread_panic_hook(args):
         flush=True,
     )
 
-
-threading.excepthook = _thread_panic_hook
-
-try:
-    from hermes_cli.banner import prefetch_update_check
-
-    prefetch_update_check()
-except Exception:
-    pass
 
 from tui_gateway.render import make_stream_renderer, render_diff, render_message
 
@@ -368,17 +394,30 @@ try:
     )
 except (ValueError, TypeError):
     _rpc_pool_workers = 4
-_pool = concurrent.futures.ThreadPoolExecutor(
-    max_workers=_rpc_pool_workers,
-    thread_name_prefix="tui-rpc",
-)
-atexit.register(lambda: _pool.shutdown(wait=False, cancel_futures=True))
+_pool: concurrent.futures.ThreadPoolExecutor | None = None
+_pool_lock = threading.Lock()
 
-# Reserve real stdout for JSON-RPC only; redirect Python's stdout to stderr
-# so stray print() from libraries/tools becomes harmless gateway.stderr instead
-# of corrupting the JSON protocol.
-_real_stdout = sys.stdout
-sys.stdout = sys.stderr
+
+def _rpc_pool() -> concurrent.futures.ThreadPoolExecutor:
+    """Create the process-local RPC pool on first asynchronous dispatch."""
+    global _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:
+                _pool = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=_rpc_pool_workers,
+                    thread_name_prefix="tui-rpc",
+                )
+    return _pool
+
+
+def _shutdown_rpc_pool() -> None:
+    pool = _pool
+    if pool is not None:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+atexit.register(_shutdown_rpc_pool)
 
 
 class _DropTransport:
@@ -1026,7 +1065,6 @@ def _start_idle_reaper() -> None:
 
 
 atexit.register(_shutdown_sessions)
-_start_idle_reaper()
 
 
 # ── Plumbing ──────────────────────────────────────────────────────────
@@ -1161,7 +1199,7 @@ def _profile_home(profile: str | None) -> Path | None:
     except Exception:
         return None
     # Already the launch profile? No override needed.
-    if home.resolve() == Path(_hermes_home).resolve():
+    if home.resolve() == Path(_gateway_home()).resolve():
         return None
     return home if (home / "state.db").exists() or home.exists() else None
 
@@ -1671,7 +1709,7 @@ def dispatch(
                 t.write(resp)
 
         try:
-            _pool.submit(lambda: ctx.run(run))
+            _rpc_pool().submit(lambda: ctx.run(run))
         except Exception:
             if attach_generation is not None:
                 abort_attach = getattr(t, "abort_dashboard_attach", None)
@@ -2496,7 +2534,7 @@ def _active_config_home() -> Path:
         return Path(override)
     if _owner_worker_mode():
         return get_hermes_home()
-    return _hermes_home
+    return _gateway_home()
 
 
 def _load_cfg() -> dict:
@@ -2506,7 +2544,7 @@ def _load_cfg() -> dict:
 
         # Honor a per-session profile override (see session.resume) so a resumed
         # remote profile loads ITS config (model, skills, prompt); otherwise the
-        # launch profile's _hermes_home. In owner-worker mode, HERMES_HOME is the
+        # launch profile's _gateway_home(). In owner-worker mode, HERMES_HOME is the
         # immutable owner home and must win over any import-time Control Plane home.
         # Cache is keyed on the resolved path, so profiles/owners don't clobber each other.
         p = _active_config_home() / "config.yaml"
@@ -10378,8 +10416,8 @@ def _run_prompt_submit(
 
             trace = traceback.format_exc()
             try:
-                os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
-                with open(_CRASH_LOG, "a", encoding="utf-8") as f:
+                os.makedirs(os.path.dirname(_crash_log_path()), exist_ok=True)
+                with open(_crash_log_path(), "a", encoding="utf-8") as f:
                     f.write(
                         f"\n=== turn-dispatcher exception · "
                         f"{time.strftime('%Y-%m-%d %H:%M:%S')} · sid={sid} ===\n"
@@ -10513,7 +10551,7 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5027, f"clipboard unavailable: {e}")
 
     session["image_counter"] = session.get("image_counter", 0) + 1
-    img_dir = _hermes_home / "images"
+    img_dir = _gateway_home() / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
     img_path = (
         img_dir
@@ -10663,7 +10701,7 @@ def _queue_attached_image(session: dict, img_bytes: bytes, ext: str, *, prefix: 
     the existing native-image-attach pipeline. Returns the written path.
     """
     session["image_counter"] = session.get("image_counter", 0) + 1
-    img_dir = _hermes_home / "images"
+    img_dir = _gateway_home() / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     img_path = img_dir / f"{prefix}_{ts}_{session['image_counter']}{ext}"
@@ -12569,7 +12607,7 @@ def _(rid, params: dict) -> dict:
     if key == "profile":
         from hermes_constants import display_hermes_home
 
-        return _ok(rid, {"home": str(_hermes_home), "display": display_hermes_home()})
+        return _ok(rid, {"home": str(_gateway_home()), "display": display_hermes_home()})
     if key == "project":
         cfg_terminal = _load_cfg().get("terminal") or {}
         raw = str(params.get("cwd", "") or cfg_terminal.get("cwd", "") or "").strip()
@@ -12689,7 +12727,7 @@ def _(rid, params: dict) -> dict:
         display = _load_cfg().get("display")
         return _ok(rid, {"value": _display_mouse_tracking(display)})
     if key == "mtime":
-        cfg_path = _hermes_home / "config.yaml"
+        cfg_path = _gateway_home() / "config.yaml"
         try:
             return _ok(
                 rid, {"mtime": cfg_path.stat().st_mtime if cfg_path.exists() else 0}
@@ -13590,7 +13628,7 @@ def _(rid, params: dict) -> dict:
 
     _paste_counter += 1
     line_count = text.count("\n") + 1
-    paste_dir = _hermes_home / "pastes"
+    paste_dir = _gateway_home() / "pastes"
     paste_dir.mkdir(parents=True, exist_ok=True)
 
     from datetime import datetime
@@ -15126,7 +15164,7 @@ def _(rid, params: dict) -> dict:
                 "title": "Environment",
                 "rows": [
                     ["Working Dir", os.getcwd()],
-                    ["Config File", str(_hermes_home / "config.yaml")],
+                    ["Config File", str(_gateway_home() / "config.yaml")],
                 ],
             },
         ]

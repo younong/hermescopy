@@ -14,6 +14,7 @@ from tools.skills_sync import (
     _discover_bundled_skills,
     _compute_relative_dest,
     _dir_hash,
+    prepare_bundled_skill_snapshot,
     sync_skills,
     reset_bundled_skill,
     restore_official_optional_skill,
@@ -23,8 +24,8 @@ from tools.skills_sync import (
 class TestReadWriteManifest:
     def test_read_missing_manifest(self, tmp_path):
         with patch(
-            "tools.skills_sync.MANIFEST_FILE",
-            tmp_path / "nonexistent",
+            "tools.skills_sync._manifest_file",
+            return_value=tmp_path / "nonexistent",
         ):
             result = _read_manifest()
         assert result == {}
@@ -33,7 +34,7 @@ class TestReadWriteManifest:
         manifest_file = tmp_path / ".bundled_manifest"
         entries = {"skill-a": "abc123", "skill-b": "def456", "skill-c": "789012"}
 
-        with patch("tools.skills_sync.MANIFEST_FILE", manifest_file):
+        with patch("tools.skills_sync._manifest_file", return_value=manifest_file):
             _write_manifest(entries)
             result = _read_manifest()
 
@@ -43,7 +44,7 @@ class TestReadWriteManifest:
         manifest_file = tmp_path / ".bundled_manifest"
         entries = {"zebra": "hash1", "alpha": "hash2", "middle": "hash3"}
 
-        with patch("tools.skills_sync.MANIFEST_FILE", manifest_file):
+        with patch("tools.skills_sync._manifest_file", return_value=manifest_file):
             _write_manifest(entries)
 
         lines = manifest_file.read_text().strip().splitlines()
@@ -55,7 +56,7 @@ class TestReadWriteManifest:
         manifest_file = tmp_path / ".bundled_manifest"
         manifest_file.write_text("skill-a\nskill-b\n")
 
-        with patch("tools.skills_sync.MANIFEST_FILE", manifest_file):
+        with patch("tools.skills_sync._manifest_file", return_value=manifest_file):
             result = _read_manifest()
 
         assert result == {"skill-a": "", "skill-b": ""}
@@ -64,7 +65,7 @@ class TestReadWriteManifest:
         manifest_file = tmp_path / ".bundled_manifest"
         manifest_file.write_text("skill-a:hash1\n\n  \nskill-b:hash2\n")
 
-        with patch("tools.skills_sync.MANIFEST_FILE", manifest_file):
+        with patch("tools.skills_sync._manifest_file", return_value=manifest_file):
             result = _read_manifest()
 
         assert result == {"skill-a": "hash1", "skill-b": "hash2"}
@@ -74,7 +75,7 @@ class TestReadWriteManifest:
         manifest_file = tmp_path / ".bundled_manifest"
         manifest_file.write_text("old-skill\nnew-skill:abc123\n")
 
-        with patch("tools.skills_sync.MANIFEST_FILE", manifest_file):
+        with patch("tools.skills_sync._manifest_file", return_value=manifest_file):
             result = _read_manifest()
 
         assert result == {"old-skill": "", "new-skill": "abc123"}
@@ -202,11 +203,11 @@ class TestRmtreeWritableScopeGuard:
 
     def test_refuses_root_path(self, tmp_path):
         """``Path('/')`` is the entire filesystem — must always be rejected."""
-        from tools.skills_sync import _rmtree_writable, SKILLS_DIR
+        from tools.skills_sync import _rmtree_writable
 
         skills = tmp_path / "skills"
         skills.mkdir()
-        with patch("tools.skills_sync.SKILLS_DIR", skills):
+        with patch("tools.skills_sync._skills_dir", return_value=skills):
             with pytest.raises(ValueError, match="refusing to rmtree"):
                 _rmtree_writable(Path("/"))
 
@@ -217,7 +218,7 @@ class TestRmtreeWritableScopeGuard:
         hermes = tmp_path / "home"
         hermes.mkdir()
         (hermes / "skills").mkdir()
-        with patch("tools.skills_sync.SKILLS_DIR", hermes / "skills"):
+        with patch("tools.skills_sync._skills_dir", return_value=hermes / "skills"):
             with pytest.raises(ValueError, match="refusing to rmtree"):
                 _rmtree_writable(hermes)
 
@@ -233,7 +234,7 @@ class TestRmtreeWritableScopeGuard:
         skills.mkdir()
         not_skills = hermes / "kanban.db"  # any non-skills path
         not_skills.mkdir()
-        with patch("tools.skills_sync.SKILLS_DIR", skills):
+        with patch("tools.skills_sync._skills_dir", return_value=skills):
             with pytest.raises(ValueError, match="refusing to rmtree"):
                 _rmtree_writable(not_skills)
 
@@ -250,7 +251,7 @@ class TestRmtreeWritableScopeGuard:
 
         skills = tmp_path / "skills"
         (skills / "keep").mkdir(parents=True)
-        with patch("tools.skills_sync.SKILLS_DIR", skills):
+        with patch("tools.skills_sync._skills_dir", return_value=skills):
             with pytest.raises(ValueError, match="refusing to rmtree"):
                 _rmtree_writable(skills)
         assert (skills / "keep").exists()  # nothing was wiped
@@ -265,7 +266,7 @@ class TestRmtreeWritableScopeGuard:
         sub.mkdir(parents=True)
         (sub / "SKILL.md").write_text("# old")
 
-        with patch("tools.skills_sync.SKILLS_DIR", skills):
+        with patch("tools.skills_sync._skills_dir", return_value=skills):
             _rmtree_writable(sub)
 
         assert skills.exists()
@@ -297,8 +298,8 @@ class TestExternalDirsIndexing:
         stack = ExitStack()
         stack.enter_context(patch("tools.skills_sync._get_bundled_dir", return_value=bundled))
         stack.enter_context(patch("tools.skills_sync._get_optional_dir", return_value=bundled.parent / "optional-skills"))
-        stack.enter_context(patch("tools.skills_sync.SKILLS_DIR", skills_dir))
-        stack.enter_context(patch("tools.skills_sync.MANIFEST_FILE", manifest_file))
+        stack.enter_context(patch("tools.skills_sync._skills_dir", return_value=skills_dir))
+        stack.enter_context(patch("tools.skills_sync._manifest_file", return_value=manifest_file))
         return stack
 
     def test_shadowed_skill_skipped_and_deferred(self, tmp_path):
@@ -413,8 +414,8 @@ class TestSyncSkills:
         stack = ExitStack()
         stack.enter_context(patch("tools.skills_sync._get_bundled_dir", return_value=bundled))
         stack.enter_context(patch("tools.skills_sync._get_optional_dir", return_value=bundled.parent / "optional-skills"))
-        stack.enter_context(patch("tools.skills_sync.SKILLS_DIR", skills_dir))
-        stack.enter_context(patch("tools.skills_sync.MANIFEST_FILE", manifest_file))
+        stack.enter_context(patch("tools.skills_sync._skills_dir", return_value=skills_dir))
+        stack.enter_context(patch("tools.skills_sync._manifest_file", return_value=manifest_file))
         return stack
 
     def test_suppressed_builtin_not_reseeded(self, tmp_path):
@@ -453,6 +454,79 @@ class TestSyncSkills:
         assert (skills_dir / "category" / "new-skill" / "SKILL.md").exists()
         assert (skills_dir / "old-skill" / "SKILL.md").exists()
         assert (skills_dir / "category" / "DESCRIPTION.md").exists()
+
+    def test_snapshot_seeds_empty_profile_with_lock_and_modes(self, tmp_path):
+        bundled = self._setup_bundled(tmp_path)
+        executable = bundled / "category" / "new-skill" / "main.py"
+        executable.chmod(0o755)
+        skills_dir = tmp_path / "user_skills"
+        skills_dir.mkdir()
+        (skills_dir / ".bundled_sync.lock").touch()
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        with self._patches(bundled, skills_dir, manifest_file), patch.dict(
+            "tools.skills_sync._BUNDLED_SKILL_SNAPSHOT_CACHE", {}, clear=True
+        ):
+            snapshot = prepare_bundled_skill_snapshot()
+            result = sync_skills(quiet=True, bundled_snapshot=snapshot)
+            manifest = _read_manifest()
+
+        assert set(result["copied"]) == {"new-skill", "old-skill"}
+        assert manifest == {name: origin_hash for name, _path, origin_hash in snapshot.skills}
+        assert (skills_dir / "category" / "DESCRIPTION.md").read_text() == "Category desc"
+        assert (skills_dir / "category" / "new-skill" / "main.py").stat().st_mode & 0o111
+
+    def test_snapshot_falls_back_without_overwriting_nonempty_profile(self, tmp_path):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        user_skill = skills_dir / "category" / "new-skill" / "SKILL.md"
+        user_skill.parent.mkdir(parents=True)
+        user_skill.write_text("# User copy")
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        with self._patches(bundled, skills_dir, manifest_file), patch.dict(
+            "tools.skills_sync._BUNDLED_SKILL_SNAPSHOT_CACHE", {}, clear=True
+        ):
+            snapshot = prepare_bundled_skill_snapshot()
+            result = sync_skills(quiet=True, bundled_snapshot=snapshot)
+
+        assert user_skill.read_text() == "# User copy"
+        assert "new-skill" not in result["copied"]
+        assert "old-skill" in result["copied"]
+
+    def test_snapshot_partial_write_rolls_back_only_created_files(self, tmp_path):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        skills_dir.mkdir()
+        lock_file = skills_dir / ".bundled_sync.lock"
+        lock_file.write_text("keep")
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        with self._patches(bundled, skills_dir, manifest_file), patch.dict(
+            "tools.skills_sync._BUNDLED_SKILL_SNAPSHOT_CACHE", {}, clear=True
+        ):
+            snapshot = prepare_bundled_skill_snapshot()
+            original_open = Path.open
+            writes = 0
+
+            def fail_second_snapshot_write(path, *args, **kwargs):
+                nonlocal writes
+                if args[:1] == ("xb",):
+                    writes += 1
+                    if writes == 2:
+                        raise OSError("simulated snapshot write failure")
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(Path, "open", fail_second_snapshot_write):
+                with pytest.raises(OSError, match="simulated snapshot write failure"):
+                    sync_skills(quiet=True, bundled_snapshot=snapshot)
+
+        assert lock_file.read_text() == "keep"
+        assert not any(
+            path.is_file() and path.name != ".bundled_sync.lock"
+            for path in skills_dir.rglob("*")
+        )
+        assert not manifest_file.exists()
 
     def test_fresh_install_records_origin_hashes(self, tmp_path):
         """After fresh install, manifest should have v2 format with hashes."""
@@ -620,7 +694,7 @@ class TestSyncSkills:
             result = sync_skills(quiet=True)
 
         assert "removed-skill" in result["cleaned"]
-        with patch("tools.skills_sync.MANIFEST_FILE", manifest_file):
+        with patch("tools.skills_sync._manifest_file", return_value=manifest_file):
             manifest = _read_manifest()
         assert "removed-skill" not in manifest
 
@@ -665,7 +739,7 @@ class TestSyncSkills:
         )
 
         # Manifest must NOT contain the skill — it was never synced from bundled.
-        with patch("tools.skills_sync.MANIFEST_FILE", manifest_file):
+        with patch("tools.skills_sync._manifest_file", return_value=manifest_file):
             manifest = _read_manifest()
         assert "new-skill" not in manifest, (
             "Collision path wrote bundled_hash to the manifest even though "
@@ -969,8 +1043,8 @@ class TestResetBundledSkill:
         stack = ExitStack()
         stack.enter_context(patch("tools.skills_sync._get_bundled_dir", return_value=bundled))
         stack.enter_context(patch("tools.skills_sync._get_optional_dir", return_value=bundled.parent / "optional-skills"))
-        stack.enter_context(patch("tools.skills_sync.SKILLS_DIR", skills_dir))
-        stack.enter_context(patch("tools.skills_sync.MANIFEST_FILE", manifest_file))
+        stack.enter_context(patch("tools.skills_sync._skills_dir", return_value=skills_dir))
+        stack.enter_context(patch("tools.skills_sync._manifest_file", return_value=manifest_file))
         return stack
 
     def test_reset_clears_stuck_user_modified_flag(self, tmp_path):
@@ -1189,15 +1263,34 @@ class TestNoBundledSkillsOptOut:
         (hermes_home / ".no-bundled-skills").write_text("opted out\n")
 
         with patch("tools.skills_sync._get_bundled_dir", return_value=bundled), \
-             patch("tools.skills_sync.SKILLS_DIR", skills_dir), \
-             patch("tools.skills_sync.MANIFEST_FILE", manifest_file), \
-             patch("tools.skills_sync.HERMES_HOME", hermes_home):
+             patch("tools.skills_sync._skills_dir", return_value=skills_dir), \
+             patch("tools.skills_sync._manifest_file", return_value=manifest_file), \
+             patch("tools.skills_sync._skills_home", return_value=hermes_home):
             result = sync_skills(quiet=True)
 
         # Opt-out signalled, nothing copied, nothing written to disk.
         assert result["skipped_opt_out"] is True
         assert result["copied"] == []
         assert result["total_bundled"] == 0
+        assert not skills_dir.exists()
+
+    def test_marker_skips_preloaded_snapshot(self, tmp_path):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        hermes_home = tmp_path / "home"
+        hermes_home.mkdir()
+        (hermes_home / ".no-bundled-skills").write_text("opted out\n")
+
+        with patch("tools.skills_sync._get_bundled_dir", return_value=bundled), \
+             patch("tools.skills_sync._skills_dir", return_value=skills_dir), \
+             patch("tools.skills_sync._manifest_file", return_value=manifest_file), \
+             patch("tools.skills_sync._skills_home", return_value=hermes_home), \
+             patch.dict("tools.skills_sync._BUNDLED_SKILL_SNAPSHOT_CACHE", {}, clear=True):
+            snapshot = prepare_bundled_skill_snapshot()
+            result = sync_skills(quiet=True, bundled_snapshot=snapshot)
+
+        assert result["skipped_opt_out"] is True
         assert not skills_dir.exists()
 
     def test_no_marker_seeds_normally(self, tmp_path):
@@ -1210,9 +1303,9 @@ class TestNoBundledSkillsOptOut:
 
         with patch("tools.skills_sync._get_bundled_dir", return_value=bundled), \
              patch("tools.skills_sync._get_optional_dir", return_value=bundled.parent / "optional-skills"), \
-             patch("tools.skills_sync.SKILLS_DIR", skills_dir), \
-             patch("tools.skills_sync.MANIFEST_FILE", manifest_file), \
-             patch("tools.skills_sync.HERMES_HOME", hermes_home):
+             patch("tools.skills_sync._skills_dir", return_value=skills_dir), \
+             patch("tools.skills_sync._manifest_file", return_value=manifest_file), \
+             patch("tools.skills_sync._skills_home", return_value=hermes_home):
             result = sync_skills(quiet=True)
 
         assert result.get("skipped_opt_out") is not True
@@ -1237,7 +1330,7 @@ class TestOptOutToggleAndRemove:
         )
         home = tmp_path / "home"
         home.mkdir()
-        with patch("tools.skills_sync.HERMES_HOME", home):
+        with patch("tools.skills_sync._skills_home", return_value=home):
             assert is_bundled_skills_opt_out() is False
             r = set_bundled_skills_opt_out(True)
             assert r["ok"] and r["changed"]
@@ -1261,9 +1354,9 @@ class TestOptOutToggleAndRemove:
         home.mkdir()
         with patch("tools.skills_sync._get_bundled_dir", return_value=bundled), \
              patch("tools.skills_sync._get_optional_dir", return_value=bundled.parent / "optional-skills"), \
-             patch("tools.skills_sync.SKILLS_DIR", skills_dir), \
-             patch("tools.skills_sync.MANIFEST_FILE", manifest_file), \
-             patch("tools.skills_sync.HERMES_HOME", home):
+             patch("tools.skills_sync._skills_dir", return_value=skills_dir), \
+             patch("tools.skills_sync._manifest_file", return_value=manifest_file), \
+             patch("tools.skills_sync._skills_home", return_value=home):
             sync_skills(quiet=True)
             # User edits 'beta'
             (skills_dir / "beta" / "SKILL.md").write_text("---\nname: beta\n---\nEDITED\n")
@@ -1309,8 +1402,8 @@ class TestUpdateBackupRecovery:
         stack = ExitStack()
         stack.enter_context(patch("tools.skills_sync._get_bundled_dir", return_value=bundled))
         stack.enter_context(patch("tools.skills_sync._get_optional_dir", return_value=bundled.parent / "optional-skills"))
-        stack.enter_context(patch("tools.skills_sync.SKILLS_DIR", skills_dir))
-        stack.enter_context(patch("tools.skills_sync.MANIFEST_FILE", manifest_file))
+        stack.enter_context(patch("tools.skills_sync._skills_dir", return_value=skills_dir))
+        stack.enter_context(patch("tools.skills_sync._manifest_file", return_value=manifest_file))
         return stack
 
     def _seed_synced_copy(self, skills_dir, manifest_file, text="# Old v1"):
@@ -1318,7 +1411,7 @@ class TestUpdateBackupRecovery:
         dest = skills_dir / "old-skill"
         dest.mkdir(parents=True)
         (dest / "SKILL.md").write_text(text)
-        with patch("tools.skills_sync.MANIFEST_FILE", manifest_file):
+        with patch("tools.skills_sync._manifest_file", return_value=manifest_file):
             _write_manifest({"old-skill": _dir_hash(dest)})
         return dest
 

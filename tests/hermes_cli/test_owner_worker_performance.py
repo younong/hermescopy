@@ -11,7 +11,7 @@ import pytest
 from hermes_cli.latency_trace import latency_trace_scope
 from hermes_cli.owner_worker.performance_contract import (
     OwnerWorkerPerformanceError,
-    require_request_ready_latency,
+    require_ready_latency,
 )
 from hermes_cli.owner_worker.supervisor import OwnerWorkerSupervisor
 
@@ -124,16 +124,22 @@ def _trace_ready(supervisor, owner, caplog, trace_id: str):
             return supervisor.get_or_start(owner)
 
 
-def test_request_ready_latency_contract_is_strictly_below_500ms():
-    require_request_ready_latency("gui", "hot_active", 499.999)
+def test_ready_latency_contract_is_strictly_below_one_second():
+    for path in (
+        "hot_active",
+        "hot_health_probe",
+        "wait_existing_start",
+        "cold_start",
+        "replace_unhealthy",
+    ):
+        require_ready_latency(path, path, 999.999)
+        with pytest.raises(OwnerWorkerPerformanceError, match="required < 1000.0 ms"):
+            require_ready_latency(path, path, 1000.0)
 
-    with pytest.raises(OwnerWorkerPerformanceError, match="required < 500.0 ms"):
-        require_request_ready_latency("gui", "hot_active", 500.0)
 
-
-def test_request_ready_latency_contract_rejects_cold_path():
-    with pytest.raises(ValueError, match="not a request-facing readiness path"):
-        require_request_ready_latency("gui", "cold_start", 1.0)
+def test_ready_latency_contract_rejects_unknown_path():
+    with pytest.raises(ValueError, match="not an owner-worker readiness path"):
+        require_ready_latency("gui", "unknown", 1.0)
 
 
 def test_hot_active_and_health_probe_meet_request_budget(tmp_path, caplog):
@@ -144,13 +150,13 @@ def test_hot_active_and_health_probe_meet_request_budget(tmp_path, caplog):
     assert _trace_ready(supervisor, owner, caplog, "trace-hot-active-123") is handle
     path, elapsed_ms = _ready_sample(caplog)
     assert path == "hot_active"
-    require_request_ready_latency("hot active", path, elapsed_ms)
+    require_ready_latency("hot active", path, elapsed_ms)
     lease.release()
 
     assert _trace_ready(supervisor, owner, caplog, "trace-hot-probe-123") is handle
     path, elapsed_ms = _ready_sample(caplog)
     assert path == "hot_health_probe"
-    require_request_ready_latency("hot health probe", path, elapsed_ms)
+    require_ready_latency("hot health probe", path, elapsed_ms)
 
     supervisor.shutdown()
 
@@ -210,6 +216,6 @@ def test_warmup_follower_meets_request_budget(tmp_path, caplog):
     assert len(result) == 1
     path, elapsed_ms = _ready_sample(caplog)
     assert path == "wait_existing_start"
-    require_request_ready_latency("warmup follower", path, elapsed_ms)
+    require_ready_latency("warmup follower", path, elapsed_ms)
 
     supervisor.shutdown()

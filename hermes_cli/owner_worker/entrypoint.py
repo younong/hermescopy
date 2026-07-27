@@ -11,6 +11,7 @@ import binascii
 import logging
 import mimetypes
 import os
+import sys
 import time
 import urllib.parse
 from contextlib import asynccontextmanager
@@ -361,8 +362,9 @@ def create_app(
     # Long-lived browser/PTY/event records are allocated once per worker app,
     # never in the Control Plane or a module-level singleton.
     from hermes_cli.owner_worker.ws_routes import OwnerWorkerLiveState
-    from tui_gateway.server import OwnerWorkerGatewayRuntime
+    from tui_gateway.server import OwnerWorkerGatewayRuntime, initialize_gateway_runtime
 
+    initialize_gateway_runtime()
     app.state.owner_worker_live_state = OwnerWorkerLiveState()
     lease = app.state.owner_worker_lease
     from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
@@ -1273,8 +1275,17 @@ def create_app(
     return app
 
 
-def main() -> None:
-    args = _parse_args()
+def run_worker(argv: list[str] | None = None) -> None:
+    """Build and serve one exact worker after its process has been admitted."""
+    previous = None
+    if argv is not None:
+        previous = sys.argv
+        sys.argv = [previous[0], *argv]
+    try:
+        args = _parse_args()
+    finally:
+        if previous is not None:
+            sys.argv = previous
     owner_key, owner_home, socket_path = _prepare_owner_env(args)
 
     import uvicorn
@@ -1291,7 +1302,16 @@ def main() -> None:
         socket_path=socket_path,
     )
     os.umask(0o077)
-    uvicorn.run(app, uds=str(socket_path), log_level="warning", access_log=False)
+    uvicorn.run(
+        app,
+        uds=str(socket_path),
+        log_level="warning",
+        access_log=False,
+    )
+
+
+def main() -> None:
+    run_worker()
 
 
 if __name__ == "__main__":  # pragma: no cover

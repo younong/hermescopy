@@ -22,7 +22,7 @@ from hermes_cli.latency_trace import latency_trace_scope
 from hermes_cli.owner_runtime import ensure_owner_runtime_dirs
 from hermes_cli.owner_worker.performance_contract import (
     STANDARDS,
-    require_request_ready_latency,
+    require_ready_latency,
 )
 from hermes_cli.owner_worker.supervisor import OwnerWorkerSupervisor
 
@@ -137,6 +137,9 @@ def run_measurement() -> tuple[dict[str, Any], int]:
             scenario="cold_start",
         )
         samples.append(cold_sample)
+        require_ready_latency(
+            cold_sample["scenario"], cold_sample["path"], cold_sample["elapsedMs"]
+        )
         cold_handle.process.terminate()
         cold_handle.process.wait(timeout=5)
         _replacement, replacement_sample = _traced_ready(
@@ -147,6 +150,11 @@ def run_measurement() -> tuple[dict[str, Any], int]:
             scenario="replace_unhealthy",
         )
         samples.append(replacement_sample)
+        require_ready_latency(
+            replacement_sample["scenario"],
+            replacement_sample["path"],
+            replacement_sample["elapsedMs"],
+        )
 
         warm_owner = _Owner(
             "ok1_readiness_measurement_warm",
@@ -181,7 +189,7 @@ def run_measurement() -> tuple[dict[str, Any], int]:
         if warmup_thread.is_alive() or warmup_errors:
             raise RuntimeError("warmup did not finish cleanly")
         samples.append(follower_sample)
-        require_request_ready_latency(
+        require_ready_latency(
             follower_sample["scenario"],
             follower_sample["path"],
             follower_sample["elapsedMs"],
@@ -199,7 +207,7 @@ def run_measurement() -> tuple[dict[str, Any], int]:
         finally:
             use.release()
         samples.append(active_sample)
-        require_request_ready_latency(
+        require_ready_latency(
             active_sample["scenario"], active_sample["path"], active_sample["elapsedMs"]
         )
 
@@ -211,7 +219,7 @@ def run_measurement() -> tuple[dict[str, Any], int]:
             scenario="hot_health_probe",
         )
         samples.append(probe_sample)
-        require_request_ready_latency(
+        require_ready_latency(
             probe_sample["scenario"], probe_sample["path"], probe_sample["elapsedMs"]
         )
     except Exception as exc:

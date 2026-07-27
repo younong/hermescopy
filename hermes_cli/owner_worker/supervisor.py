@@ -40,6 +40,7 @@ from hermes_cli.local_socket import canonical_unix_peer_is_absent
 from hermes_cli.owner_worker.cgroup_v2 import CgroupScopeLease
 from hermes_cli.owner_worker.image_relay import DeploymentImageBroker
 from hermes_cli.owner_worker.inference_relay import DeploymentInferenceBroker
+from hermes_cli.owner_worker.preloaded_launcher import OwnerWorkerLauncher
 from hermes_cli.owner_worker.resource_broker import DeploymentResourceBroker
 from hermes_cli.owner_runtime import (
     OwnerWorkerRuntimePaths,
@@ -149,7 +150,11 @@ def _mark_owner_worker_skills_synced(owner_home: Path, fingerprint: str) -> None
                 pass
 
 
-def _seed_owner_worker_skills(owner_home: Path) -> dict[str, Any]:
+def _seed_owner_worker_skills(
+    owner_home: Path,
+    *,
+    bundled_snapshot: Any | None = None,
+) -> dict[str, Any]:
     """Synchronize changed bundled skills before the worker imports skill state."""
     fingerprint = _owner_worker_skills_fingerprint(owner_home)
     try:
@@ -162,7 +167,14 @@ def _seed_owner_worker_skills(owner_home: Path) -> dict[str, Any]:
 
     from hermes_cli.profiles import seed_profile_skills
 
-    result = seed_profile_skills(owner_home, quiet=True)
+    if bundled_snapshot is None:
+        result = seed_profile_skills(owner_home, quiet=True)
+    else:
+        result = seed_profile_skills(
+            owner_home,
+            quiet=True,
+            bundled_snapshot=bundled_snapshot,
+        )
     if result is None:
         raise RuntimeError("owner bundled skill synchronization failed")
     _mark_owner_worker_skills_synced(owner_home, fingerprint)
@@ -246,25 +258,36 @@ class OwnerWorkerSupervisor:
         client_cls: type[OwnerWorkerClient] = OwnerWorkerClient,
         process_factory: Callable[..., subprocess.Popen[Any]] = subprocess.Popen,
         startup_timeout: float = 5.0,
-        poll_interval: float = 0.05,
+        poll_interval: float = 0.01,
         max_workers: int | None = None,
         startup_cooldown: float | None = None,
         idle_timeout: float | None = None,
         max_owner_concurrency: int | None = None,
         control_ws_base: str | None = None,
         authority_store_factory: Callable[[Path], AuthorityStore] = AuthorityStore,
+        authority_store: AuthorityStore | None = None,
         generation_bridge_revoker: Callable[[OwnerWorkerAuthorityLease], None] | None = None,
         deployment_inference_policy: DeploymentInferencePolicy | None = None,
         deployment_image_policy: DeploymentImagePolicy | None = None,
         resource_manager: Any | None = None,
+        launcher: Any | None = None,
     ) -> None:
         self.global_home = Path(global_home).resolve() if global_home else get_hermes_home().resolve()
         self.control_home = Path(control_home).resolve() if control_home else self.global_home / "control-plane"
         self.client_cls = client_cls
         self.process_factory = process_factory
-        # Real launches always use the exec gate. Injected factories retain the
-        # legacy callable shape so direct unit construction can use light doubles.
-        self._use_launch_gate = process_factory is subprocess.Popen
+        # Injected factories retain the direct callable path for isolated unit
+        # doubles. Production starts only through the preload-ready launcher.
+        self._use_preloaded_launcher = process_factory is subprocess.Popen
+        self.launcher = None
+        self._bundled_skill_snapshot = None
+        if self._use_preloaded_launcher:
+            from tools.skills_sync import prepare_bundled_skill_snapshot
+
+            self.launcher = launcher or OwnerWorkerLauncher()
+            self._bundled_skill_snapshot = prepare_bundled_skill_snapshot()
+        elif launcher is not None:
+            raise ValueError("owner worker launcher requires the production process factory")
         self.startup_timeout = startup_timeout
         self.poll_interval = poll_interval
         self.resource_manager = resource_manager
@@ -299,7 +322,10 @@ class OwnerWorkerSupervisor:
         if self.max_owner_concurrency < 1:
             raise ValueError("owner worker concurrency limit is invalid")
         self.control_ws_base = (control_ws_base or os.environ.get("HERMES_OWNER_WORKER_CONTROL_WS_BASE", "")).strip()
-        self.authority_store = authority_store_factory(self.control_home)
+        self.authority_store = authority_store or authority_store_factory(self.control_home)
+        if self._use_preloaded_launcher:
+            self.authority_store.ensure_ready()
+            owner_worker_capability_public_config(self.control_home)
         self.generation_bridge_revoker = generation_bridge_revoker
         self.deployment_inference_policy = deployment_inference_policy
         self.deployment_inference_broker = (
@@ -479,7 +505,13 @@ class OwnerWorkerSupervisor:
                 stage="owner_worker.ready.skills_sync", path=trace_state[0]
             ):
                 try:
-                    _seed_owner_worker_skills(owner_home)
+                    if self._bundled_skill_snapshot is None:
+                        _seed_owner_worker_skills(owner_home)
+                    else:
+                        _seed_owner_worker_skills(
+                            owner_home,
+                            bundled_snapshot=self._bundled_skill_snapshot,
+                        )
                 except Exception as exc:
                     raise OwnerWorkerStartupError(
                         f"owner bundled skill synchronization failed: {exc}"
@@ -659,7 +691,37 @@ class OwnerWorkerSupervisor:
                 "close_fds": True,
             }
             try:
-                if worker_resource_scope is not None or self._use_launch_gate:
+                if self._use_preloaded_launcher:
+                    if self.launcher is None:
+                        raise OwnerWorkerStartupError("owner worker launcher is unavailable")
+                    relay_fds = {
+                        name: fd
+                        for name, fd in (
+                            ("inference", relay_fd),
+                            ("image", image_relay_fd),
+                            ("resource", resource_broker_fd),
+                        )
+                        if fd is not None
+                    }
+                    process = self.launcher.spawn(
+                        worker_argv[3:],
+                        env=env,
+                        cwd_fd=inherited_cwd_fd,
+                        stdout_fd=stdout_handle,
+                        stderr_fd=stderr_handle,
+                        start_fd=start_read,
+                        relay_fds=relay_fds,
+                    )
+                    os.close(start_read)
+                    start_read = None
+                    if worker_resource_scope is not None:
+                        worker_resource_scope.attach(process.pid)
+                        if not worker_resource_scope.verify_membership(process.pid):
+                            raise OwnerWorkerStartupError("owner worker resource membership verification failed")
+                    os.write(start_write, b"1")
+                    os.close(start_write)
+                    start_write = None
+                elif worker_resource_scope is not None:
                     launcher_argv = [
                         sys.executable, "-m", "hermes_cli.owner_worker.launch_gate",
                         "--cwd-fd", str(inherited_cwd_fd), "--start-fd", str(start_read),
@@ -669,18 +731,22 @@ class OwnerWorkerSupervisor:
                         launcher_argv,
                         **process_kwargs,
                         pass_fds=tuple(
-                            fd for fd in (
-                                inherited_cwd_fd, start_read, relay_fd, image_relay_fd,
+                            fd
+                            for fd in (
+                                inherited_cwd_fd,
+                                start_read,
+                                relay_fd,
+                                image_relay_fd,
                                 resource_broker_fd,
-                            ) if fd is not None
+                            )
+                            if fd is not None
                         ),
                     )
                     os.close(start_read)
                     start_read = None
-                    if worker_resource_scope is not None:
-                        worker_resource_scope.attach(process.pid)
-                        if not worker_resource_scope.verify_membership(process.pid):
-                            raise OwnerWorkerStartupError("owner worker resource membership verification failed")
+                    worker_resource_scope.attach(process.pid)
+                    if not worker_resource_scope.verify_membership(process.pid):
+                        raise OwnerWorkerStartupError("owner worker resource membership verification failed")
                     os.write(start_write, b"1")
                     os.close(start_write)
                     start_write = None
@@ -988,6 +1054,11 @@ class OwnerWorkerSupervisor:
                 self._teardown_terminated_handle(owner_key, handle)
             except Exception as exc:
                 first_error = first_error or exc
+        if self.launcher is not None:
+            try:
+                self.launcher.close()
+            except Exception as exc:
+                first_error = first_error or exc
         for broker in (
             self.deployment_inference_broker,
             self.deployment_image_broker,
@@ -1251,6 +1322,9 @@ class OwnerWorkerSupervisor:
                     handle.worker_generation,
                     socket_path=handle.socket_path,
                 )
+                close_process = getattr(handle.process, "close", None)
+                if callable(close_process):
+                    _cleanup(close_process)
             if draining is not None:
                 terminal_state = (
                     WorkerGenerationState.TERMINATED

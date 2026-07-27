@@ -448,57 +448,46 @@ class TestNoSkillsOptOut:
         assert list((profile_dir / "skills").iterdir()) == []
 
     def test_default_profile_gets_skills_seeded(self, profile_env, monkeypatch):
-        """Sanity: without --no-skills, seed_profile_skills() runs the real
-        subprocess path. Mock the subprocess so the test is hermetic, and
-        just confirm the marker is NOT checked in the non-opt-out case."""
-        import subprocess as _sp
-
+        """Without --no-skills, seed skills in the exact profile context."""
         profile_dir = create_profile("coder", no_alias=True)
-        # No marker — not opted out
         assert not (profile_dir / NO_BUNDLED_SKILLS_MARKER).exists()
         assert has_bundled_skills_opt_out(profile_dir) is False
 
-        # Mock subprocess.run to avoid actually running skill sync in tests
         calls = []
 
-        def fake_run(*args, **kwargs):
-            calls.append(args)
-            return _sp.CompletedProcess(
-                args=args, returncode=0, stdout='{"copied": ["x"]}', stderr=""
-            )
+        def fake_sync_skills(*, quiet, bundled_snapshot=None):
+            from hermes_constants import get_hermes_home
 
-        monkeypatch.setattr("subprocess.run", fake_run)
+            calls.append((quiet, get_hermes_home()))
+            return {"copied": ["x"]}
+
+        monkeypatch.setattr("tools.skills_sync.sync_skills", fake_sync_skills)
         result = seed_profile_skills(profile_dir, quiet=True)
 
-        # Subprocess was invoked (the opt-out branch did NOT short-circuit)
-        assert len(calls) == 1
+        assert calls == [(True, profile_dir)]
         assert result == {"copied": ["x"]}
 
     def test_delete_marker_re_enables_seeding(self, profile_env, monkeypatch):
         """Deleting .no-bundled-skills opts the profile back in."""
-        import subprocess as _sp
-
         profile_dir = create_profile("orchestrator", no_alias=True, no_skills=True)
         assert has_bundled_skills_opt_out(profile_dir) is True
 
-        # First call: opted out, returns skipped dict without touching subprocess
-        called = []
-        monkeypatch.setattr(
-            "subprocess.run",
-            lambda *a, **kw: (called.append(a), _sp.CompletedProcess(
-                args=a, returncode=0, stdout='{"copied": []}', stderr=""
-            ))[1],
-        )
+        calls = []
+
+        def fake_sync_skills(*, quiet, bundled_snapshot=None):
+            calls.append(quiet)
+            return {"copied": []}
+
+        monkeypatch.setattr("tools.skills_sync.sync_skills", fake_sync_skills)
         r1 = seed_profile_skills(profile_dir, quiet=True)
         assert r1.get("skipped_opt_out") is True
-        assert called == []
+        assert calls == []
 
-        # Delete marker → next call runs the real path
         (profile_dir / NO_BUNDLED_SKILLS_MARKER).unlink()
         assert has_bundled_skills_opt_out(profile_dir) is False
         r2 = seed_profile_skills(profile_dir, quiet=True)
         assert r2 == {"copied": []}
-        assert len(called) == 1
+        assert calls == [True]
 
 
 # ===================================================================

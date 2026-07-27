@@ -33,13 +33,13 @@ def test_non_linux_measurement_reports_unsupported(measurement_module, monkeypat
 
     assert status == 0
     assert result == {
-        "schemaVersion": 1,
+        "schemaVersion": 3,
         "kind": "hermes.owner-worker-readiness-measurement",
         "status": "unsupported",
         "reason": "controlled roots require Linux",
         "standards": {
-            "schema_version": 1,
-            "request_ready_max_ms": 500.0,
+            "schema_version": 3,
+            "ready_max_ms": 1000.0,
         },
         "samples": [],
     }

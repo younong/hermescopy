@@ -13079,7 +13079,6 @@ async def _bridge_websocket_to_owner_worker(
     if supervisor is None:
         await ws.close(code=1013, reason=_ws_close_reason("owner worker supervisor unavailable"))
         return
-
     lease: Any | None = None
     try:
         with latency_trace_scope(
@@ -15504,6 +15503,7 @@ def start_server(
             DeploymentInferencePolicyInvalid,
             load_deployment_inference_policy,
         )
+        from hermes_cli.dashboard_auth.authority import AuthorityStore
         from hermes_cli.owner_worker import OwnerWorkerSupervisor
         from hermes_cli.owner_worker.cgroup_v2 import CgroupV2Manager
         from hermes_cli.owner_worker.tool_executor_sandbox import load_sandbox_deployment_policy
@@ -15551,15 +15551,20 @@ def start_server(
             )
             future.result()
 
+        control_home = global_home / "control-plane"
+        authority_store = AuthorityStore(control_home)
+        authority_store.ensure_ready()
         app.state.session_reader_supervisor = SessionReaderSupervisor(
             global_home=global_home,
-            control_home=global_home / "control-plane",
+            control_home=control_home,
             resource_manager=resource_manager,
+            authority_store=authority_store,
         )
         try:
             app.state.owner_worker_supervisor = OwnerWorkerSupervisor(
                 global_home=global_home,
-                control_home=global_home / "control-plane",
+                control_home=control_home,
+                authority_store=authority_store,
                 control_ws_base=f"{worker_scheme}://{worker_netloc}",
                 generation_bridge_revoker=revoke_generation_bridges,
                 deployment_inference_policy=deployment_inference_policy,
