@@ -375,7 +375,7 @@ deterministic、continuity 和 public smoke runner 输出独立的 machine-reada
 
 `--dry-run` 只展示各层 smoke 命令和 `planned` 总结，不运行性能基准、不读取本机凭据、不打开浏览器、不调用模型。
 
-从 pre-continuity release 首次安装此协议时，已经运行的旧 frontend/Worker 无法被 candidate 反向赋予 `1012`、canonical browser pointer 或 exact Worker drain；首次交接按计划维护窗口处理。该版本成为基线后，后续向前发布和部署旧 immutable tag 的回滚都使用相同 drain-before-switch 与 continuity watcher 路径。
+从 pre-continuity release 首次安装此协议时，已经运行的旧 frontend/Worker 无法被 candidate 反向赋予 `1012`、canonical browser pointer 或 exact Worker drain；首次交接按计划维护窗口处理并显式传 `--initial-continuity-transition`。该 flag 只豁免旧版本无法完成的跨切换 watcher，candidate 启动后的公开真实 AI smoke 仍必须通过。该版本成为基线后不得继续使用该 flag；后续向前发布和部署旧 immutable tag 的回滚都使用相同 drain-before-switch 与 continuity watcher 路径。
 
 ## 服务器状态检查
 

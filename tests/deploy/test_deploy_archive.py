@@ -30,7 +30,10 @@ def test_remote_cutover_stops_before_atomic_current_switch():
     drain = script.index("write_drain_request(principal=", cutover - 10_000)
     assert drain < stop_dashboard
     assert 'gateway_drain_status" = "draining:0"' in script
+    assert 'print("{}:{}".format(s.get("gateway_state", ""), s.get("active_agents", 0)))' in script
     assert "is_gateway_runtime_lock_active() or get_running_pid()" in script
+    assert 'case "--initial-continuity-transition"' in script
+    assert "args.initialContinuityTransition || continuitySmoke.status" in script
     assert "clear_drain_request; clear_drain_request()" in script
 
 

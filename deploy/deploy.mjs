@@ -61,6 +61,9 @@ Options:
   --provision-powerpoint-deps
                            Add reviewed LibreOffice/font host prerequisites before
                            building the immutable PowerPoint executor runtime.
+  --initial-continuity-transition
+                           Allow the one-time upgrade from a release that cannot yet
+                           emit planned-restart 1012 or participate in continuity smoke.
   --dry-run                Print commands without changing local or remote state.
   -h, --help               Show this help.
 
@@ -91,6 +94,7 @@ function parseArgs(argv) {
       process.env.HERMES_DEPLOY_DASHBOARD_PUBLIC_URL || DEFAULT_DASHBOARD_PUBLIC_URL,
     migrateNginxHermes: false,
     provisionPowerpointDeps: false,
+    initialContinuityTransition: false,
     dryRun: false,
   };
 
@@ -153,6 +157,9 @@ function parseArgs(argv) {
         break;
       case "--provision-powerpoint-deps":
         args.provisionPowerpointDeps = true;
+        break;
+      case "--initial-continuity-transition":
+        args.initialContinuityTransition = true;
         break;
       case "--dry-run":
         args.dryRun = true;
@@ -1354,7 +1361,7 @@ while :; do
     runuser -u "$service_user" -- env -i \
       HOME="$shared" HERMES_HOME="$hermes_home" PYTHONPATH="$old_current_target" \
       "$venv/bin/python" -c \
-      'from gateway.status import read_runtime_status; s=read_runtime_status() or {}; print(f"{s.get(\"gateway_state\", \"\")}:{s.get(\"active_agents\", 0)}")'
+      'from gateway.status import read_runtime_status; s=read_runtime_status() or {}; print("{}:{}".format(s.get("gateway_state", ""), s.get("active_agents", 0)))'
   )"
   [ "$gateway_drain_status" = "draining:0" ] && break
   [ "$(date +%s)" -ge "$gateway_drain_deadline" ] && break
@@ -1803,7 +1810,9 @@ function main() {
   let readerPerformanceResult = null;
   let continuityPrepare = null;
   try {
-    continuityPrepare = runContinuityConversationSmoke(args, "prepare");
+    continuityPrepare = args.initialContinuityTransition
+      ? { status: args.dryRun ? "planned (initial transition)" : "not supported by old release", result: null }
+      : runContinuityConversationSmoke(args, "prepare");
     if (!args.dryRun && continuityPrepare.status === "failed") {
       throw new Error("cross-release continuity preparation failed before remote deployment");
     }
@@ -1835,7 +1844,7 @@ function main() {
         readerPerformanceResult,
         deterministicSmoke: "failed or not reached",
         continuitySmoke:
-          args.dryRun || continuityPrepare?.status !== "passed"
+          args.initialContinuityTransition || args.dryRun || continuityPrepare?.status !== "passed"
             ? continuityPrepare?.status || "not run"
             : runContinuityConversationSmoke(args, "verify").status,
         publicSmoke: "not run",
@@ -1845,11 +1854,14 @@ function main() {
       throw error;
     }
 
-    const continuitySmoke = runContinuityConversationSmoke(args, "verify");
+    const continuitySmoke = args.initialContinuityTransition
+      ? { status: args.dryRun ? "planned (initial transition)" : "not supported by old release", result: null }
+      : runContinuityConversationSmoke(args, "verify");
     const publicSmoke = runPublicConversationSmoke(args);
     const allPublicSmokePassed =
       args.dryRun ||
-      (continuitySmoke.status === "passed" && publicSmoke.status === "passed");
+      ((args.initialContinuityTransition || continuitySmoke.status === "passed") &&
+        publicSmoke.status === "passed");
     const outcome = args.dryRun
       ? "dry-run: deployment and all smoke layers planned"
       : allPublicSmokePassed

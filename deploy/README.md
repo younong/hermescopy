@@ -189,7 +189,7 @@ HERMES_DASHBOARD_BROWSER_PASSWORD=...
 
 任一层失败均返回非零。连续性 prepare 在远端变更前失败时不会开始部署；pre-commit 事务失败会先恢复旧版本，再由 watcher 验证旧版本连续性，结果仍为 `rolled back before commit`。部署提交后的连续性或公开冒烟失败**不会自动回滚已提交版本**；此时先查看公开认证、ticket、WebSocket `1012`、Owner Worker drain、canonical session 和模型日志，决定修复后重试还是经人工判断发布上一个稳定 tag。runner 会输出可机器解析且已脱敏的 JSON（schema、状态、named checks、duration、cleanup、稳定 failure code/check）。`--dry-run` 只打印三层计划，不登录 Dashboard、不连接真实模型，也不修改远端。
 
-从不含本连续性协议的旧版本首次升级时，正在运行的旧 frontend/Worker 无法被新 release 反向赋予 `1012` 和 exact Worker drain；该首次交接仍应按计划维护窗口处理。完成首次升级后，后续向前发布和不可变 tag 回滚都使用完整连续性路径。
+从不含本连续性协议的旧版本首次升级时，正在运行的旧 frontend/Worker 无法被新 release 反向赋予 `1012` 和 exact Worker drain；该首次交接仍应按计划维护窗口处理，并显式传 `--initial-continuity-transition`。此 flag 只跳过旧版本无法满足的跨切换 watcher，candidate 启动后的独立公开真实 AI smoke 仍是提交后 gate。完成首次升级后不得继续使用该 flag；后续向前发布和不可变 tag 回滚都使用完整连续性路径。
 
 ## Release 保留与清理
 
