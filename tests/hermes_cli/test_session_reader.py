@@ -513,7 +513,14 @@ def test_reader_supervisor_membership_failure_revokes_lease_and_cleans_scope(tmp
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Unix-domain Session Reader recovery")
-@pytest.mark.parametrize("state", [ReaderLeaseState.ACTIVE, ReaderLeaseState.DRAINING])
+@pytest.mark.parametrize(
+    "state",
+    [
+        ReaderLeaseState.STARTING,
+        ReaderLeaseState.ACTIVE,
+        ReaderLeaseState.DRAINING,
+    ],
+)
 @pytest.mark.parametrize("socket_state", ["missing", "refused"])
 def test_reader_supervisor_replaces_absent_canonical_socket_fence(
     tmp_path, state, socket_state
@@ -524,7 +531,13 @@ def test_reader_supervisor_replaces_absent_canonical_socket_fence(
     owner_home = tmp_path / "owner"
     owner_key = "ok1_orphaned"
     store = AuthorityStore(control)
-    stale = _active_reader(store, owner_key)
+    stale = store.claim_reader_start(owner_key, reader_id="reader-stale").lease
+    if state is not ReaderLeaseState.STARTING:
+        stale = store.transition_reader_lease(
+            stale,
+            state=ReaderLeaseState.ACTIVE,
+            generation_state=ReaderGenerationState.ACTIVE,
+        )
     if state is ReaderLeaseState.DRAINING:
         stale = store.transition_reader_lease(
             stale,
@@ -616,7 +629,8 @@ def test_reader_supervisor_keeps_ambiguous_owned_fence(tmp_path, state):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Unix-domain Session Reader recovery")
-def test_reader_supervisor_keeps_live_canonical_socket_fence(tmp_path):
+@pytest.mark.parametrize("state", [ReaderLeaseState.STARTING, ReaderLeaseState.ACTIVE])
+def test_reader_supervisor_keeps_live_canonical_socket_fence(tmp_path, state):
     from hermes_cli.session_reader.supervisor import (
         SessionReaderSupervisor,
         SessionReaderUnavailableError,
@@ -626,7 +640,13 @@ def test_reader_supervisor_keeps_live_canonical_socket_fence(tmp_path):
     owner_home = tmp_path / "owner"
     owner_key = "ok1_live_reader"
     store = AuthorityStore(control)
-    lease = _active_reader(store, owner_key)
+    lease = store.claim_reader_start(owner_key, reader_id="reader-live").lease
+    if state is ReaderLeaseState.ACTIVE:
+        lease = store.transition_reader_lease(
+            lease,
+            state=ReaderLeaseState.ACTIVE,
+            generation_state=ReaderGenerationState.ACTIVE,
+        )
     socket_path = session_reader_socket_path(owner_home, lease.reader_generation)
     socket_path.parent.mkdir(parents=True)
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -678,7 +698,10 @@ def test_reader_supervisor_retries_reconciled_claim_only_once(tmp_path, monkeypa
     assert claims == 2
 
 
-def test_reader_supervisor_exact_fence_race_does_not_clean_replacement(tmp_path, monkeypatch):
+@pytest.mark.parametrize("state", [ReaderLeaseState.STARTING, ReaderLeaseState.ACTIVE])
+def test_reader_supervisor_exact_fence_race_does_not_clean_replacement(
+    tmp_path, monkeypatch, state
+):
     from hermes_cli.session_reader.supervisor import (
         SessionReaderSupervisor,
         SessionReaderUnavailableError,
@@ -688,7 +711,13 @@ def test_reader_supervisor_exact_fence_race_does_not_clean_replacement(tmp_path,
     owner_home = tmp_path / "owner"
     owner_key = "ok1_reader_race"
     store = AuthorityStore(control)
-    stale = _active_reader(store, owner_key)
+    stale = store.claim_reader_start(owner_key, reader_id="reader-stale").lease
+    if state is ReaderLeaseState.ACTIVE:
+        stale = store.transition_reader_lease(
+            stale,
+            state=ReaderLeaseState.ACTIVE,
+            generation_state=ReaderGenerationState.ACTIVE,
+        )
     stale_socket = session_reader_socket_path(owner_home, stale.reader_generation)
     stale_socket.parent.mkdir(parents=True)
     sentinel = stale_socket.with_name("sentinel")
@@ -703,16 +732,23 @@ def test_reader_supervisor_exact_fence_race_does_not_clean_replacement(tmp_path,
 
     def race_assert(lease, *, states=None):
         nonlocal replacement
-        draining = supervisor.authority_store.transition_reader_lease(
-            lease,
-            state=ReaderLeaseState.DRAINING,
-            generation_state=ReaderGenerationState.DRAINING,
-        )
-        supervisor.authority_store.transition_reader_lease(
-            draining,
-            state=ReaderLeaseState.REVOKED,
-            generation_state=ReaderGenerationState.REVOKED,
-        )
+        if lease.state is ReaderLeaseState.STARTING:
+            supervisor.authority_store.transition_reader_lease(
+                lease,
+                state=ReaderLeaseState.REVOKED,
+                generation_state=ReaderGenerationState.FAILED,
+            )
+        else:
+            draining = supervisor.authority_store.transition_reader_lease(
+                lease,
+                state=ReaderLeaseState.DRAINING,
+                generation_state=ReaderGenerationState.DRAINING,
+            )
+            supervisor.authority_store.transition_reader_lease(
+                draining,
+                state=ReaderLeaseState.REVOKED,
+                generation_state=ReaderGenerationState.REVOKED,
+            )
         replacement = supervisor.authority_store.claim_reader_start(
             owner_key,
             reader_id="reader-replacement",
@@ -1371,7 +1407,7 @@ def test_reader_real_process_recovers_orphaned_fence_and_serves_history(tmp_path
     )
     db.append_message("known-session", "user", "known persisted message")
     store = AuthorityStore(control)
-    stale = _active_reader(store, owner_key)
+    stale = store.claim_reader_start(owner_key, reader_id="reader-stale").lease
     stale_socket = session_reader_socket_path(owner_home, stale.reader_generation)
     stale_socket.parent.mkdir(parents=True)
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

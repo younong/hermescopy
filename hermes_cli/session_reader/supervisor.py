@@ -499,6 +499,7 @@ class SessionReaderSupervisor:
         """Release one conclusively absent local Reader fence, if safe."""
         lease = self.authority_store.read_session_reader_lease(owner_key)
         if lease is None or lease.state not in {
+            ReaderLeaseState.STARTING,
             ReaderLeaseState.ACTIVE,
             ReaderLeaseState.DRAINING,
         }:
@@ -511,7 +512,10 @@ class SessionReaderSupervisor:
             return False
         try:
             lease = self.authority_store.assert_reader_lease(lease)
-            if lease.state is ReaderLeaseState.ACTIVE:
+            generation_state = ReaderGenerationState.REVOKED
+            if lease.state is ReaderLeaseState.STARTING:
+                generation_state = ReaderGenerationState.FAILED
+            elif lease.state is ReaderLeaseState.ACTIVE:
                 lease = self.authority_store.transition_reader_lease(
                     lease,
                     state=ReaderLeaseState.DRAINING,
@@ -520,7 +524,7 @@ class SessionReaderSupervisor:
             self.authority_store.transition_reader_lease(
                 lease,
                 state=ReaderLeaseState.REVOKED,
-                generation_state=ReaderGenerationState.REVOKED,
+                generation_state=generation_state,
             )
         except AuthorizationRejected:
             return False
