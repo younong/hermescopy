@@ -14,7 +14,6 @@ class FakeConnection implements GuiChatConnection {
   readonly attachImage = vi.fn();
   readonly attachPdf = vi.fn();
   readonly attachFile = vi.fn();
-  readonly loadEarlier = vi.fn();
   readonly send = vi.fn();
   readonly stop = vi.fn();
   readonly respondToApproval = vi.fn();
@@ -121,7 +120,7 @@ describe("GuiChatSessionSwitchCoordinator", () => {
     expect(connection.close).not.toHaveBeenCalled();
   });
 
-  it("keeps committed connection and transcript events when replacement fails", async () => {
+  it("keeps the socket but stops routing the old runtime when replacement fails", async () => {
     const { connection, coordinator, errors, events } = createHarness();
     const first = connection.nextResult();
     coordinator.start("session-a");
@@ -137,12 +136,12 @@ describe("GuiChatSessionSwitchCoordinator", () => {
     expect(connection.close).not.toHaveBeenCalled();
     expect(errors).toEqual([
       {
-        committedTarget: "session-a",
+        committedTarget: "session-b",
         error: expect.objectContaining({ message: "replacement failed" }),
         target: "session-b",
       },
     ]);
-    expect(events).toEqual([{ type: "message.delta", session_id: "runtime-a" }]);
+    expect(events).toEqual([]);
   });
 
   it("aborts superseded switches without closing the reusable socket", async () => {
@@ -191,7 +190,6 @@ describe("GuiChatSessionSwitchCoordinator", () => {
 
     expect(events).toEqual([
       { type: "message.start", session_id: "runtime-a" },
-      { type: "message.delta", session_id: "runtime-a" },
       { type: "message.start", session_id: "runtime-b" },
     ]);
   });

@@ -83,6 +83,28 @@ describe("fetchSessionReaderJSON", () => {
     await rejection;
   });
 
+  it("forwards getSessionMessages cancellation through a pending Reader retry", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      response(503, { error: "session_reader_unavailable" }, "1"),
+    );
+    const controller = new AbortController();
+    const pending = api.getSessionMessages(
+      "session-1",
+      { limit: 42, signal: controller.signal },
+      "worker",
+    );
+    const rejection = expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    await vi.advanceTimersByTimeAsync(1);
+    controller.abort();
+
+    await rejection;
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0]?.[0]).toContain(
+      "/api/sessions/session-1/messages?limit=42&profile=worker",
+    );
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ signal: controller.signal });
+  });
+
   it("keeps session mutations on the non-retrying JSON path", async () => {
     const fetchMock = vi
       .spyOn(globalThis, "fetch")

@@ -1,3 +1,4 @@
+import type { SessionMessagesResponse } from "@/lib/api";
 import type { GatewayEvent } from "@/lib/gatewayClient";
 import type {
   ApprovalPayload,
@@ -43,10 +44,13 @@ const MAX_DISPLAY_ARTIFACTS = 500;
 
 export type GuiChatAction =
   | { type: "connection"; state: GuiChatConnectionState }
+  | { type: "session.selected"; generation: number; sessionId: string | null }
   | { type: "session.created"; response: SessionCreateResponse | SessionResumeResponse }
-  | { type: "history.prepend.started" }
-  | { type: "history.prepend.succeeded"; response: SessionResumeResponse }
-  | { type: "history.prepend.failed"; message: string }
+  | { type: "history.initial.succeeded"; generation: number; requestedSessionId: string; response: SessionMessagesResponse }
+  | { type: "history.initial.failed"; generation: number; message: string; requestedSessionId: string }
+  | { type: "history.prepend.started"; generation: number; sessionId: string }
+  | { type: "history.prepend.succeeded"; generation: number; response: SessionMessagesResponse }
+  | { type: "history.prepend.failed"; generation: number; message: string; sessionId: string }
   | { type: "event"; event: GatewayEvent }
   | { type: "user.sent"; attachments?: MessageAttachmentState[]; id: string; text: string }
   | { type: "error"; message: string }
@@ -61,14 +65,29 @@ export function guiChatReducer(
   switch (action.type) {
     case "connection":
       return { ...state, connection: action.state };
+    case "session.selected":
+      return selectSession(state, action.sessionId, action.generation);
     case "session.created":
       return applySessionResponse(state, action.response);
+    case "history.initial.succeeded":
+      return applyInitialHistory(state, action);
+    case "history.initial.failed":
+      return action.generation === state.switchGeneration &&
+        action.requestedSessionId === state.historySessionId
+        ? { ...state, historyError: action.message, historyLoading: false }
+        : state;
     case "history.prepend.started":
-      return { ...state, historyError: undefined, historyLoading: true };
+      return action.generation === state.switchGeneration && action.sessionId === state.historySessionId
+        ? { ...state, historyError: undefined, historyLoading: true }
+        : state;
     case "history.prepend.succeeded":
-      return prependHistoryPage(state, action.response);
+      return action.generation === state.switchGeneration
+        ? prependHistoryPage(state, action.response)
+        : state;
     case "history.prepend.failed":
-      return { ...state, historyError: action.message, historyLoading: false };
+      return action.generation === state.switchGeneration && action.sessionId === state.historySessionId
+        ? { ...state, historyError: action.message, historyLoading: false }
+        : state;
     case "event":
       return applyGatewayEvent(state, action.event);
     case "user.sent":
@@ -92,6 +111,65 @@ export function guiChatReducer(
   }
 }
 
+function selectSession(
+  state: GuiChatState,
+  sessionId: string | null,
+  generation: number,
+): GuiChatState {
+  if (!sessionId) {
+    return { ...initialGuiChatState, connection: state.connection, switchGeneration: generation };
+  }
+  return {
+    ...initialGuiChatState,
+    connection: state.connection,
+    historyLoading: true,
+    historySessionId: sessionId,
+    storedSessionId: sessionId,
+    switchGeneration: generation,
+  };
+}
+
+function applyInitialHistory(
+  state: GuiChatState,
+  action: Extract<GuiChatAction, { type: "history.initial.succeeded" }>,
+): GuiChatState {
+  if (
+    action.generation !== state.switchGeneration ||
+    action.requestedSessionId !== state.historySessionId
+  ) {
+    return state;
+  }
+  const history = transcriptToHistoryState(action.response.messages, state.cwd);
+  const tail = state.messages.filter((message) => !history.messages.some((item) => item.id === message.id));
+  const messages = mergeHistoryWithLiveTail(history.messages, tail);
+  return {
+    ...state,
+    artifacts: { ...history.artifacts, ...state.artifacts },
+    historyCursor: action.response.history_page?.cursor ?? undefined,
+    historyError: undefined,
+    historyHasMore: !!action.response.history_page?.has_more,
+    historyLoading: false,
+    historySessionId: action.response.session_id,
+    loadedTextChars: estimateMessageChars(messages),
+    messages,
+    safeguardReached: false,
+    storedSessionId: action.response.session_id,
+  };
+}
+
+function mergeHistoryWithLiveTail(history: ChatMessage[], tail: ChatMessage[]): ChatMessage[] {
+  const messages = [...history];
+  for (const message of tail) {
+    const last = messages.at(-1);
+    if (last?.role === message.role && last.text === message.text) {
+      if (message.streaming) messages[messages.length - 1] = { ...last, streaming: true };
+      continue;
+    }
+    messages.push(message);
+  }
+  return messages;
+}
+
 function applySessionResponse(
   state: GuiChatState,
   response: SessionCreateResponse | SessionResumeResponse,
@@ -101,7 +179,7 @@ function applySessionResponse(
     ? transcriptToHistoryState(response.messages, cwd)
     : null;
   const inflight = "inflight" in response ? response.inflight : null;
-  let messages = history ? history.messages : state.messages;
+  let messages = history && !state.historySessionId ? history.messages : state.messages;
   const inflightUser = String(inflight?.user ?? "").trim();
   const inflightAssistant = String(inflight?.assistant ?? "");
   const lastMessage = messages.at(-1);
@@ -137,15 +215,11 @@ function applySessionResponse(
 
   return {
     ...state,
-    artifacts: history ? history.artifacts : state.artifacts,
+    artifacts: history && !state.historySessionId ? history.artifacts : state.artifacts,
     ...clarificationsFromSnapshot(response.pending_prompts),
     cwd,
     error: undefined,
-    historyCursor: response.history_page?.cursor ?? undefined,
-    historyHasMore: !!response.history_page?.has_more,
-    historyLoading: false,
     loadedTextChars: estimateMessageChars(messages),
-    safeguardReached: false,
     isGenerating:
       !!("running" in response && response.running) || Boolean(inflight?.streaming),
     messages,
@@ -161,9 +235,9 @@ function applySessionResponse(
 
 function prependHistoryPage(
   state: GuiChatState,
-  response: SessionResumeResponse,
+  response: SessionMessagesResponse,
 ): GuiChatState {
-  if (response.session_id !== state.sessionId || !Array.isArray(response.messages)) {
+  if (response.session_id !== state.historySessionId || !Array.isArray(response.messages)) {
     return { ...state, historyLoading: false };
   }
   const history = transcriptToHistoryState(response.messages, state.cwd);

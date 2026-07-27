@@ -81,7 +81,7 @@ describe("SessionMessageList", () => {
       <SessionMessageList
         canLoadEarlier
         historyLoading={false}
-        messages={[{ content: "Current message", role: "user" }]}
+        messages={[{ text: "Current message", role: "user" }]}
         onLoadEarlier={onLoadEarlier}
         sessionId="session-1"
       />,
@@ -104,7 +104,7 @@ describe("SessionMessageList", () => {
     document.body.appendChild(container);
     const root = createRoot(container);
     const onLoadEarlier = vi.fn();
-    const messages = [{ content: "Current message", role: "assistant" as const }];
+    const messages = [{ text: "Current message", role: "assistant" as const }];
 
     await act(async () => root.render(
       <SessionMessageList
@@ -149,7 +149,7 @@ describe("SessionMessageList", () => {
       <SessionMessageList
         canLoadEarlier
         historyLoading={false}
-        messages={[{ content: "Current message", role: "user" }]}
+        messages={[{ text: "Current message", role: "user" }]}
         onLoadEarlier={onLoadEarlier}
         sessionId="session-1"
       />,
@@ -168,7 +168,7 @@ describe("SessionMessageList", () => {
       <SessionMessageList
         canLoadEarlier
         historyLoading
-        messages={[{ content: "Current message", role: "user" }]}
+        messages={[{ text: "Current message", role: "user" }]}
         onLoadEarlier={onLoadEarlier}
         sessionId="session-1"
       />,
@@ -179,8 +179,8 @@ describe("SessionMessageList", () => {
         canLoadEarlier
         historyLoading={false}
         messages={[
-          { content: "Earlier message", role: "assistant" },
-          { content: "Current message", role: "user" },
+          { text: "Earlier message", role: "assistant" },
+          { text: "Current message", role: "user" },
         ]}
         onLoadEarlier={onLoadEarlier}
         sessionId="session-1"

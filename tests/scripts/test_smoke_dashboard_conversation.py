@@ -57,6 +57,14 @@ def test_generated_smoke_uses_public_ticket_and_full_session_lifecycle(smoke_mod
     assert "message.delta" in javascript
     assert "message.complete" in javascript
     assert "cold resume did not restore the smoke transcript" in javascript
+    assert "api/sessions?limit=30&offset=0&order=recent&compact=true" in javascript
+    assert "api/sessions/${encodeURIComponent(storedSessionId)}/messages?limit=100" in javascript
+    assert "public_session_reader_list" in javascript
+    assert "public_session_reader_messages" in javascript
+    assert "response.status !== 503" in javascript
+    assert "Math.min(config.timeoutMs, 10_000)" in javascript
+    assert "response.headers.get('Retry-After')" in javascript
+    assert "response.text()" not in javascript
     assert "release-marker" in javascript
 
 
@@ -77,6 +85,8 @@ def test_public_smoke_returns_redacted_success_and_always_closes_browser(
             {"name": "public_session_create", "status": "passed"},
             {"name": "public_model_response", "status": "passed", "deltaCount": 2},
             {"name": "public_cold_resume", "status": "passed"},
+            {"name": "public_session_reader_list", "status": "passed"},
+            {"name": "public_session_reader_messages", "status": "passed"},
             {"name": "public_cleanup", "status": "passed"},
         ],
         "cleanup": {"sessionClosed": True, "sessionDeleted": True, "socketClosed": True},
@@ -110,6 +120,8 @@ def test_public_smoke_returns_redacted_success_and_always_closes_browser(
         "public_session_create",
         "public_model_response",
         "public_cold_resume",
+        "public_session_reader_list",
+        "public_session_reader_messages",
         "public_cleanup",
     }
     assert result["cleanup"] == {

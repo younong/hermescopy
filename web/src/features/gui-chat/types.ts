@@ -114,6 +114,8 @@ export interface GuiChatState {
   connection: GuiChatConnectionState;
   sessionId?: string;
   storedSessionId?: string;
+  historySessionId?: string;
+  switchGeneration: number;
   cwd?: string;
   model?: string;
   messages: ChatMessage[];
@@ -149,6 +151,7 @@ export const initialGuiChatState: GuiChatState = {
   messages: [],
   safeguardReached: false,
   statusLines: [],
+  switchGeneration: 0,
   toolCalls: {},
   toolOrder: [],
 };

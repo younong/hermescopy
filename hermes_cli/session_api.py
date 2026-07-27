@@ -15,6 +15,7 @@ from typing import Any
 
 from starlette.exceptions import HTTPException
 
+from hermes_cli.display_transcript import format_display_transcript
 from hermes_cli.latency_trace import log_latency_stage
 
 
@@ -414,13 +415,14 @@ def session_messages_payload(
             raise HTTPException(status_code=404, detail="Session not found")
         sid = db.resolve_resume_session_id(sid)
     if limit is None and before is None:
+        history = db.get_display_messages(
+            sid,
+            include_ancestors=True,
+            recovery_scope=recovery_scope,
+        )
         return {
             "session_id": sid,
-            "messages": db.get_display_messages(
-                sid,
-                include_ancestors=True,
-                recovery_scope=recovery_scope,
-            ),
+            "messages": format_display_transcript(history),
         }
     try:
         page = db.get_conversation_page(
@@ -434,7 +436,7 @@ def session_messages_payload(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
         "session_id": sid,
-        "messages": page["messages"],
+        "messages": format_display_transcript(page["messages"]),
         "history_page": {
             "cursor": page["next_cursor"],
             "has_more": page["has_more"],

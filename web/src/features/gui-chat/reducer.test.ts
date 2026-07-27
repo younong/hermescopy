@@ -478,27 +478,39 @@ describe("guiChatReducer history image restoration", () => {
   });
 
   it("prepends an earlier display page with stable IDs and deduplicates overlap", () => {
-    const current = guiChatReducer(initialGuiChatState, {
-      type: "session.created",
+    const selected = guiChatReducer(initialGuiChatState, {
+      type: "session.selected",
+      generation: 1,
+      sessionId: "stored",
+    });
+    const current = guiChatReducer(selected, {
+      type: "history.initial.succeeded",
+      generation: 1,
+      requestedSessionId: "stored",
       response: {
         history_page: { cursor: "cursor-2", has_more: true, returned_count: 2 },
         messages: [
           { id: "db-s-2", role: "user", text: "second" },
           { id: "db-s-3", role: "assistant", text: "third" },
         ],
-        session_id: "runtime",
+        session_id: "stored",
       },
     });
-    const loading = guiChatReducer(current, { type: "history.prepend.started" });
+    const loading = guiChatReducer(current, {
+      type: "history.prepend.started",
+      generation: 1,
+      sessionId: "stored",
+    });
     const state = guiChatReducer(loading, {
       type: "history.prepend.succeeded",
+      generation: 1,
       response: {
         history_page: { cursor: null, has_more: false, returned_count: 2 },
         messages: [
           { id: "db-s-1", role: "assistant", text: "first" },
           { id: "db-s-2", role: "user", text: "second" },
         ],
-        session_id: "runtime",
+        session_id: "stored",
       },
     });
 
@@ -512,23 +524,35 @@ describe("guiChatReducer history image restoration", () => {
     expect(state.historyLoading).toBe(false);
   });
 
-  it("ignores a stale earlier-history response for another runtime", () => {
-    const current = guiChatReducer(initialGuiChatState, {
-      type: "session.created",
+  it("ignores a stale earlier-history response for another durable session", () => {
+    const selected = guiChatReducer(initialGuiChatState, {
+      type: "session.selected",
+      generation: 3,
+      sessionId: "stored-current",
+    });
+    const current = guiChatReducer(selected, {
+      type: "history.initial.succeeded",
+      generation: 3,
+      requestedSessionId: "stored-current",
       response: {
         history_page: { cursor: "cursor-2", has_more: true, returned_count: 1 },
         messages: [{ id: "db-s-2", role: "assistant", text: "current" }],
-        session_id: "runtime-current",
+        session_id: "stored-current",
       },
     });
     const state = guiChatReducer(
-      guiChatReducer(current, { type: "history.prepend.started" }),
+      guiChatReducer(current, {
+        type: "history.prepend.started",
+        generation: 3,
+        sessionId: "stored-current",
+      }),
       {
         type: "history.prepend.succeeded",
+        generation: 3,
         response: {
           history_page: { cursor: null, has_more: false, returned_count: 1 },
           messages: [{ id: "db-other-1", role: "assistant", text: "stale" }],
-          session_id: "runtime-stale",
+          session_id: "stored-stale",
         },
       },
     );
@@ -1191,17 +1215,33 @@ describe("guiChatReducer history image restoration", () => {
   });
 
   it("retains pagination state after a failed page and clears the error on retry", () => {
-    const current = guiChatReducer(initialGuiChatState, {
-      type: "session.created",
+    const selected = guiChatReducer(initialGuiChatState, {
+      type: "session.selected",
+      generation: 2,
+      sessionId: "stored",
+    });
+    const current = guiChatReducer(selected, {
+      type: "history.initial.succeeded",
+      generation: 2,
+      requestedSessionId: "stored",
       response: {
         history_page: { cursor: "cursor-2", has_more: true, returned_count: 1 },
         messages: [{ id: "db-s-2", role: "assistant", text: "current" }],
-        session_id: "runtime",
+        session_id: "stored",
       },
     });
     const failed = guiChatReducer(
-      guiChatReducer(current, { type: "history.prepend.started" }),
-      { type: "history.prepend.failed", message: "Network unavailable" },
+      guiChatReducer(current, {
+        type: "history.prepend.started",
+        generation: 2,
+        sessionId: "stored",
+      }),
+      {
+        type: "history.prepend.failed",
+        generation: 2,
+        message: "Network unavailable",
+        sessionId: "stored",
+      },
     );
 
     expect(failed.historyCursor).toBe("cursor-2");
@@ -1209,7 +1249,11 @@ describe("guiChatReducer history image restoration", () => {
     expect(failed.historyLoading).toBe(false);
     expect(failed.historyError).toBe("Network unavailable");
 
-    const retrying = guiChatReducer(failed, { type: "history.prepend.started" });
+    const retrying = guiChatReducer(failed, {
+      type: "history.prepend.started",
+      generation: 2,
+      sessionId: "stored",
+    });
     expect(retrying.historyCursor).toBe("cursor-2");
     expect(retrying.historyHasMore).toBe(true);
     expect(retrying.historyLoading).toBe(true);

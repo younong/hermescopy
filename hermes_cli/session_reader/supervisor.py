@@ -21,6 +21,7 @@ from hermes_cli.dashboard_auth.authority import (
     SessionReaderAuthorityLease,
 )
 from hermes_cli.dashboard_auth.owner_context import admit_host_owner_home
+from hermes_cli.local_socket import canonical_unix_peer_is_absent
 from .client import SessionReaderClient, SessionReaderHealthError, warm_http_transport
 from .runtime import (
     prepare_session_reader_runtime,
@@ -216,7 +217,22 @@ class SessionReaderSupervisor:
                 reader_id=uuid.uuid4().hex,
             )
         except AuthorizationRejected as exc:
-            raise SessionReaderUnavailableError(f"session reader is already owned: {exc}") from exc
+            if (
+                str(exc) != "reader_lease_already_owned"
+                or not self._reconcile_missing_local_reader(owner_key, owner_home)
+            ):
+                raise SessionReaderUnavailableError(
+                    f"session reader is already owned: {exc}"
+                ) from exc
+            try:
+                claim = self.authority_store.claim_reader_start(
+                    owner_key,
+                    reader_id=uuid.uuid4().hex,
+                )
+            except AuthorizationRejected as retry_exc:
+                raise SessionReaderUnavailableError(
+                    f"session reader is already owned: {retry_exc}"
+                ) from retry_exc
         lease = claim.lease
         resource_scope = None
         if self.resource_manager is not None:
@@ -388,6 +404,42 @@ class SessionReaderSupervisor:
             handle.retire_pending = True
             handle.last_used_at = 0.0
             return True
+
+    def _reconcile_missing_local_reader(
+        self,
+        owner_key: str,
+        owner_home: Path,
+    ) -> bool:
+        """Release one conclusively absent local Reader fence, if safe."""
+        lease = self.authority_store.read_session_reader_lease(owner_key)
+        if lease is None or lease.state not in {
+            ReaderLeaseState.ACTIVE,
+            ReaderLeaseState.DRAINING,
+        }:
+            return False
+        socket_path = session_reader_socket_path(
+            owner_home,
+            lease.reader_generation,
+        )
+        if not canonical_unix_peer_is_absent(socket_path):
+            return False
+        try:
+            lease = self.authority_store.assert_reader_lease(lease)
+            if lease.state is ReaderLeaseState.ACTIVE:
+                lease = self.authority_store.transition_reader_lease(
+                    lease,
+                    state=ReaderLeaseState.DRAINING,
+                    generation_state=ReaderGenerationState.DRAINING,
+                )
+            self.authority_store.transition_reader_lease(
+                lease,
+                state=ReaderLeaseState.REVOKED,
+                generation_state=ReaderGenerationState.REVOKED,
+            )
+        except AuthorizationRejected:
+            return False
+        self._cleanup_runtime(owner_home, lease.reader_generation)
+        return True
 
     def shutdown(self) -> None:
         with self._lock:

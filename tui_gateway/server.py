@@ -26,6 +26,7 @@ from hermes_constants import (
     reset_hermes_home_override,
     set_hermes_home_override,
 )
+from hermes_cli.display_transcript import format_display_transcript
 from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_cli.latency_trace import clean_latency_trace_id, log_latency_stage
 from hermes_cli.owner_runtime import (
@@ -1428,31 +1429,6 @@ def _history_image_dimensions(
     except OSError:
         return None
     return _read_image_dimensions(resolved)
-
-
-def _valid_history_attachments(value: Any, *, session: dict | None = None) -> list[dict]:
-    """Return the persisted attachment subset safe to expose to clients."""
-    if not isinstance(value, list):
-        return []
-    valid = []
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        kind = item.get("kind")
-        name = item.get("name")
-        if kind not in {"image", "pdf", "file"} or not isinstance(name, str) or not name:
-            continue
-        attachment = dict(item)
-        dimensions = _positive_image_dimensions(attachment)
-        attachment.pop("width", None)
-        attachment.pop("height", None)
-        if kind == "image":
-            if dimensions is None:
-                dimensions = _history_image_dimensions(attachment.get("path"), session)
-            if dimensions is not None:
-                attachment["width"], attachment["height"] = dimensions
-        valid.append(attachment)
-    return valid
 
 
 def _ok(rid, result: dict) -> dict:
@@ -5439,203 +5415,14 @@ def _content_display_text(content: Any) -> str:
     return str(content)
 
 
-def _coerce_message_text(content: Any) -> str:
-    """Render ``message['content']`` as a plain string for transport.
-
-    Provider-side, ``content`` may be a string (most common), a list of
-    multimodal parts (e.g. ``[{"type": "text", "text": "..."},
-    {"type": "image_url", "image_url": {...}}]``), or a single structured
-    dict. Calling ``.strip()`` on a list raises ``'list' object has no
-    attribute 'strip'`` and breaks session resume entirely.
-
-    Image parts (``image_url``) are preserved by appending the underlying
-    URL (data: or http:) into the text. The desktop renderer pulls these
-    back out via ``extractEmbeddedImages`` so the user sees the image
-    instead of the URL — and it stops the resume payload from disagreeing
-    with the cached message (which would otherwise cause the inline image
-    to flash, then disappear when the resume payload overwrites the cache).
-
-    Other structured dict shapes (audio, unknown types) fall back to a
-    bracketed placeholder so resume doesn't drop the message entirely.
-    """
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, (int, float)):
-        return str(content)
-    if isinstance(content, list):
-        chunks: list[str] = []
-        for part in content:
-            if isinstance(part, str):
-                chunks.append(part)
-                continue
-            if not isinstance(part, dict):
-                continue
-            text = part.get("text")
-            if isinstance(text, str):
-                chunks.append(text)
-                continue
-            kind = part.get("type")
-            if kind in {"text", "input_text", "output_text"}:
-                t = part.get("text") or part.get("content") or ""
-                if t:
-                    chunks.append(str(t))
-                continue
-            if kind in {"image_url", "input_image", "image"}:
-                image_url = part.get("image_url")
-                url = ""
-                if isinstance(image_url, dict):
-                    candidate = image_url.get("url")
-                    if isinstance(candidate, str):
-                        url = candidate
-                elif isinstance(image_url, str):
-                    url = image_url
-                if url:
-                    chunks.append(f"\n{url}")
-                else:
-                    chunks.append("\n[image]")
-                continue
-            if kind in {"input_audio", "audio"}:
-                chunks.append("\n[audio]")
-                continue
-            if kind:
-                chunks.append(f"\n[{kind}]")
-        return "".join(chunks)
-    if isinstance(content, dict):
-        kind = content.get("type")
-        if kind in {"text", "input_text", "output_text"}:
-            return str(content.get("text") or content.get("content") or "")
-        if kind in {"image_url", "input_image", "image"}:
-            image_url = content.get("image_url")
-            url = ""
-            if isinstance(image_url, dict):
-                candidate = image_url.get("url")
-                if isinstance(candidate, str):
-                    url = candidate
-            elif isinstance(image_url, str):
-                url = image_url
-            return url or "[image]"
-        if kind in {"input_audio", "audio"}:
-            return "[audio]"
-        if kind:
-            return f"[{kind}]"
-        if "text" in content:
-            return str(content.get("text") or "")
-        return "[structured content]"
-    return str(content)
-
-
 def _history_to_messages(
     history: list[dict], *, session: dict | None = None
 ) -> list[dict]:
-    messages = []
-    tool_call_args = {}
-    pending_image_artifacts: list[dict] = []
-
-    for m in history:
-        if not isinstance(m, dict):
-            continue
-        role = m.get("role")
-        if role not in {"user", "assistant", "tool", "system"}:
-            continue
-        content_text = _coerce_message_text(m.get("content"))
-        if role == "assistant" and m.get("tool_calls"):
-            for tc in m["tool_calls"]:
-                fn = tc.get("function", {})
-                tc_id = tc.get("id", "")
-                if tc_id and fn.get("name"):
-                    try:
-                        args = json.loads(fn.get("arguments", "{}"))
-                    except (json.JSONDecodeError, TypeError):
-                        args = {}
-                    tool_call_args[tc_id] = (fn["name"], args)
-            if not content_text.strip():
-                continue
-        if role == "tool":
-            tc_id = m.get("tool_call_id", "")
-            tc_info = tool_call_args.get(tc_id) if tc_id else None
-            name = (
-                (tc_info[0] if tc_info else None)
-                or m.get("_display_tool_name")
-                or m.get("tool_name")
-                or "tool"
-            )
-            args = (
-                (tc_info[1] if tc_info else None)
-                or m.get("_display_tool_args")
-                or {}
-            )
-            if name in {"image_generate", "image_generation"}:
-                try:
-                    result = json.loads(m.get("content") or "")
-                except (json.JSONDecodeError, TypeError):
-                    result = None
-                if isinstance(result, dict) and result.get("success") is not False:
-                    source = next(
-                        (
-                            result.get(key)
-                            for key in ("host_image", "image", "url")
-                            if isinstance(result.get(key), str) and result.get(key).strip()
-                        ),
-                        None,
-                    )
-                    if source:
-                        artifact = {
-                            "type": "artifact.image",
-                            "url": source,
-                            "title": "Generated image",
-                            "tool_call_id": tc_id or None,
-                        }
-                        dimensions = _positive_image_dimensions(result)
-                        if dimensions is None:
-                            dimensions = _history_image_dimensions(source, session)
-                        if dimensions is not None:
-                            artifact["width"], artifact["height"] = dimensions
-                        pending_image_artifacts.append(artifact)
-                continue
-            message = {"role": "tool", "name": name, "context": _tool_ctx(name, args)}
-            row_id = m.get("_row_id")
-            if row_id is not None:
-                message["id"] = f"db-{m.get('_session_id') or 'session'}-{row_id}"
-            messages.append(message)
-            continue
-        # An assistant turn may carry only reasoning/thinking content with no
-        # visible text (extended-thinking turns, thinking-only recovery
-        # responses). Such a turn is persisted with its reasoning fields and is
-        # recallable from the transcript, but dropping it here as "empty" makes
-        # it vanish from the resumed/reloaded session view while the desktop's
-        # reasoning disclosure has nothing to render. Keep it when it carries
-        # reasoning so the "Thinking…" block still shows. (#44022)
-        reasoning_keys = (
-            "reasoning",
-            "reasoning_content",
-            "reasoning_details",
-            "codex_reasoning_items",
-        )
-        has_reasoning = role == "assistant" and any(
-            m.get(key) for key in reasoning_keys
-        )
-        attachments = _valid_history_attachments(m.get("attachments"), session=session)
-        image_artifacts = pending_image_artifacts if role == "assistant" else []
-        if not content_text.strip() and not has_reasoning and not attachments and not image_artifacts:
-            continue
-        msg = {"role": role, "text": content_text}
-        if image_artifacts:
-            msg["content"] = list(image_artifacts)
-            pending_image_artifacts.clear()
-        row_id = m.get("_row_id")
-        if row_id is not None:
-            msg["id"] = f"db-{m.get('_session_id') or 'session'}-{row_id}"
-        if attachments:
-            msg["attachments"] = attachments
-        if role == "assistant":
-            for key in reasoning_keys:
-                if key in m and m.get(key) is not None:
-                    msg[key] = m.get(key)
-        messages.append(msg)
-
-    return messages
+    return format_display_transcript(
+        history,
+        image_dimensions=lambda path: _history_image_dimensions(path, session),
+        tool_context=_tool_ctx,
+    )
 
 
 def _coerce_seed_history(value: Any) -> list[dict]:
@@ -6555,6 +6342,8 @@ def _session_resume(rid, params: dict) -> dict:
 
     dashboard_attach = is_truthy_value(params.get("_dashboard_attach", False))
     paged_display, display_limit = _display_history_request(params)
+    if dashboard_attach:
+        paged_display = False
 
     def _reuse_live_payload(sid: str, session: dict) -> dict:
         source = str(params.get("source") or "").strip()
@@ -6567,6 +6356,7 @@ def _session_resume(rid, params: dict) -> dict:
             touch=not dashboard_attach,
             transport=None if dashboard_attach else current_transport() or _stdio_transport,
             display_limit=display_limit if paged_display else None,
+            include_display_history=not dashboard_attach,
         )
         payload["resumed"] = target
         if dashboard_attach:
@@ -6692,27 +6482,29 @@ def _session_resume(rid, params: dict) -> dict:
                 stage="history.model_loaded",
                 started_at=stage_started_at,
             )
-            stage_started_at = time.monotonic()
             display_page = None
-            if paged_display:
-                display_page = _display_history_page(
-                    db,
-                    target,
-                    limit=display_limit,
-                    recovery_scope=recovery_scope,
+            display_history = raw_history
+            if not dashboard_attach:
+                stage_started_at = time.monotonic()
+                if paged_display:
+                    display_page = _display_history_page(
+                        db,
+                        target,
+                        limit=display_limit,
+                        recovery_scope=recovery_scope,
+                    )
+                    display_history = display_page["messages"]
+                else:
+                    display_history = _resume_history(
+                        db, target, include_ancestors=True, recovery_scope=recovery_scope
+                    )
+                log_latency_stage(
+                    logger,
+                    trace_id=latency_trace_id,
+                    surface="session-resume",
+                    stage="history.display_loaded",
+                    started_at=stage_started_at,
                 )
-                display_history = display_page["messages"]
-            else:
-                display_history = _resume_history(
-                    db, target, include_ancestors=True, recovery_scope=recovery_scope
-                )
-            log_latency_stage(
-                logger,
-                trace_id=latency_trace_id,
-                surface="session-resume",
-                stage="history.display_loaded",
-                started_at=stage_started_at,
-            )
         except Exception as e:
             if lease is not None:
                 lease.release()
@@ -6722,7 +6514,7 @@ def _session_resume(rid, params: dict) -> dict:
         # not replay the unanswered call forever (#29086).
         prefix = (
             []
-            if paged_display
+            if dashboard_attach or paged_display
             else display_history[: max(0, len(display_history) - len(raw_history))]
         )
         history = sanitize_replay_history(raw_history)
@@ -6758,13 +6550,10 @@ def _session_resume(rid, params: dict) -> dict:
             _schedule_agent_build(sid)
             _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
 
-        messages = _history_to_messages(display_history, session=record)
-        response = _ok(
-            rid,
-            {
-                "session_id": sid,
-                "resumed": target,
-                **({"_attach_candidate": True} if dashboard_attach else {}),
+        display_payload = {}
+        if not dashboard_attach:
+            messages = _history_to_messages(display_history, session=record)
+            display_payload = {
                 "message_count": len(messages),
                 "messages": messages,
                 **(
@@ -6772,6 +6561,14 @@ def _session_resume(rid, params: dict) -> dict:
                     if display_page is not None
                     else {}
                 ),
+            }
+        response = _ok(
+            rid,
+            {
+                "session_id": sid,
+                "resumed": target,
+                **({"_attach_candidate": True} if dashboard_attach else {}),
+                **display_payload,
                 "info": _lazy_resume_info(
                     cwd,
                     model=model_override.get("model") or "",
@@ -6811,18 +6608,20 @@ def _session_resume(rid, params: dict) -> dict:
             db, target, include_ancestors=False, recovery_scope=recovery_scope
         )
         display_page = None
-        if paged_display:
-            display_page = _display_history_page(
-                db,
-                target,
-                limit=display_limit,
-                recovery_scope=recovery_scope,
-            )
-            display_history = display_page["messages"]
-        else:
-            display_history = _resume_history(
-                db, target, include_ancestors=True, recovery_scope=recovery_scope
-            )
+        display_history = raw_history
+        if not dashboard_attach:
+            if paged_display:
+                display_page = _display_history_page(
+                    db,
+                    target,
+                    limit=display_limit,
+                    recovery_scope=recovery_scope,
+                )
+                display_history = display_page["messages"]
+            else:
+                display_history = _resume_history(
+                    db, target, include_ancestors=True, recovery_scope=recovery_scope
+                )
         # The display transcript keeps every row so the user still sees their
         # full history.  The model-fed history is sanitized: a session whose
         # last turn died mid-tool-loop persists a dangling assistant(tool_calls)
@@ -6832,13 +6631,17 @@ def _session_resume(rid, params: dict) -> dict:
         # the WebUI/TUI resume path picking up the same cleanup.
         display_history_prefix = (
             []
-            if paged_display
+            if dashboard_attach or paged_display
             else display_history[: max(0, len(display_history) - len(raw_history))]
         )
         history = sanitize_replay_history(raw_history)
-        messages = _history_to_messages(
-            display_history,
-            session={"cwd": _resume_fallback_cwd(), "session_key": target},
+        messages = (
+            []
+            if dashboard_attach
+            else _history_to_messages(
+                display_history,
+                session={"cwd": _resume_fallback_cwd(), "session_key": target},
+            )
         )
         tokens = _set_session_context(target)
         try:
@@ -6882,9 +6685,10 @@ def _session_resume(rid, params: dict) -> dict:
             payload = _live_session_payload(
                 other_sid,
                 other_session,
-                cols=cols,
-                touch=True,
-                transport=current_transport() or _stdio_transport,
+                cols=None if dashboard_attach else cols,
+                touch=not dashboard_attach,
+                transport=None if dashboard_attach else current_transport() or _stdio_transport,
+                include_display_history=not dashboard_attach,
             )
             payload["resumed"] = target
             return _ok(rid, payload)
@@ -6924,11 +6728,9 @@ def _session_resume(rid, params: dict) -> dict:
                 lease.release()
             return _err(rid, 5000, f"resume failed: {e}")
         session = _sessions.get(sid) or {}
-    return _ok(
-        rid,
-        {
-            "session_id": sid,
-            "resumed": target,
+    display_payload = {}
+    if not dashboard_attach:
+        display_payload = {
             "message_count": len(messages),
             "messages": messages,
             **(
@@ -6936,6 +6738,13 @@ def _session_resume(rid, params: dict) -> dict:
                 if display_page is not None
                 else {}
             ),
+        }
+    return _ok(
+        rid,
+        {
+            "session_id": sid,
+            "resumed": target,
+            **display_payload,
             "info": _session_info(agent, session),
             "inflight": None,
             "running": False,
@@ -7098,6 +6907,7 @@ def _live_session_payload(
     touch: bool = False,
     transport: Transport | None = None,
     display_limit: int | None = None,
+    include_display_history: bool = True,
 ) -> dict:
     with session["history_lock"]:
         if cols is not None:
@@ -7106,14 +6916,17 @@ def _live_session_payload(
             session["transport"] = transport
         if touch:
             session["last_active"] = time.time()
-        history = list(session.get("display_history_prefix") or []) + list(
-            session.get("history") or []
+        history = (
+            list(session.get("display_history_prefix") or [])
+            + list(session.get("history") or [])
+            if include_display_history
+            else []
         )
         inflight = _inflight_snapshot(session)
         running = bool(session.get("running"))
     session_key = _session_lookup_key(session, fallback=sid)
     display_page = None
-    if display_limit is not None:
+    if include_display_history and display_limit is not None:
         recovery_scope = current_historical_resume_scope()
         try:
             with _session_db(session) as db:
@@ -7144,8 +6957,6 @@ def _live_session_payload(
             history = history[-display_limit:]
     payload = {
         "info": _fallback_session_info(session),
-        "message_count": len(history),
-        "messages": _history_to_messages(history, session=session),
         "pending_prompts": _pending_clarifications(sid),
         "running": running,
         "session_id": sid,
@@ -7153,7 +6964,10 @@ def _live_session_payload(
         "started_at": float(session.get("created_at") or time.time()),
         "status": _session_live_status(sid, session),
     }
-    if display_limit is not None:
+    if include_display_history:
+        payload["message_count"] = len(history)
+        payload["messages"] = _history_to_messages(history, session=session)
+    if include_display_history and display_limit is not None:
         if display_page is not None:
             payload["history_page"] = _history_page_payload(display_page)
         else:

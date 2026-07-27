@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import stat
 import threading
 import time
@@ -485,6 +486,225 @@ def test_reader_supervisor_membership_failure_revokes_lease_and_cleans_scope(tmp
     assert lease is not None and lease.state is ReaderLeaseState.REVOKED
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Unix-domain Session Reader recovery")
+@pytest.mark.parametrize("state", [ReaderLeaseState.ACTIVE, ReaderLeaseState.DRAINING])
+@pytest.mark.parametrize("socket_state", ["missing", "refused"])
+def test_reader_supervisor_replaces_absent_canonical_socket_fence(
+    tmp_path, state, socket_state
+):
+    from hermes_cli.session_reader.supervisor import SessionReaderSupervisor
+
+    control = tmp_path / "control"
+    owner_home = tmp_path / "owner"
+    owner_key = "ok1_orphaned"
+    store = AuthorityStore(control)
+    stale = _active_reader(store, owner_key)
+    if state is ReaderLeaseState.DRAINING:
+        stale = store.transition_reader_lease(
+            stale,
+            state=ReaderLeaseState.DRAINING,
+            generation_state=ReaderGenerationState.DRAINING,
+        )
+    stale_socket = session_reader_socket_path(owner_home, stale.reader_generation)
+    stale_socket.parent.mkdir(parents=True)
+    if socket_state == "refused":
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(stale_socket))
+        listener.close()
+    ready_path = stale_socket.with_name("reader.ready.json")
+    ready_path.write_text("stale")
+    claims = 0
+
+    def process_factory(argv, **kwargs):
+        nonlocal claims
+        claims += 1
+        process = _FakeReaderProcess()
+        _write_reader_ready(argv, kwargs["env"], process)
+        return process
+
+    supervisor = SessionReaderSupervisor(
+        control_home=control,
+        global_home=tmp_path,
+        process_factory=process_factory,
+        startup_timeout=0.1,
+    )
+    try:
+        handle = supervisor.ensure_started(
+            {"owner_key": owner_key, "owner_home": owner_home}
+        )
+
+        assert claims == 1
+        assert handle.reader_generation == stale.reader_generation + 1
+        assert not stale_socket.exists()
+        assert not ready_path.exists()
+        replacement = supervisor.authority_store.read_session_reader_lease(owner_key)
+        assert replacement == supervisor._lease_for_handle(handle)
+    finally:
+        supervisor.shutdown()
+
+
+@pytest.mark.parametrize("state", [ReaderLeaseState.STARTING, ReaderLeaseState.ACTIVE])
+def test_reader_supervisor_keeps_ambiguous_owned_fence(tmp_path, state):
+    from hermes_cli.session_reader.supervisor import (
+        SessionReaderSupervisor,
+        SessionReaderUnavailableError,
+    )
+
+    control = tmp_path / "control"
+    owner_home = tmp_path / "owner"
+    owner_key = f"ok1_ambiguous_{state.value}"
+    store = AuthorityStore(control)
+    claim = store.claim_reader_start(owner_key, reader_id="reader-stale")
+    lease = claim.lease
+    if state is ReaderLeaseState.ACTIVE:
+        lease = store.transition_reader_lease(
+            lease,
+            state=ReaderLeaseState.ACTIVE,
+            generation_state=ReaderGenerationState.ACTIVE,
+        )
+    stale_socket = session_reader_socket_path(owner_home, lease.reader_generation)
+    stale_socket.parent.mkdir(parents=True)
+    stale_socket.write_text("not a socket")
+    launched = False
+
+    def process_factory(*_args, **_kwargs):
+        nonlocal launched
+        launched = True
+        return _FakeReaderProcess()
+
+    supervisor = SessionReaderSupervisor(
+        control_home=control,
+        global_home=tmp_path,
+        process_factory=process_factory,
+        startup_timeout=0.1,
+    )
+
+    with pytest.raises(SessionReaderUnavailableError, match="already owned"):
+        supervisor.ensure_started(
+            {"owner_key": owner_key, "owner_home": owner_home}
+        )
+
+    assert not launched
+    assert supervisor.authority_store.read_session_reader_lease(owner_key) == lease
+    assert stale_socket.read_text() == "not a socket"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix-domain Session Reader recovery")
+def test_reader_supervisor_keeps_live_canonical_socket_fence(tmp_path):
+    from hermes_cli.session_reader.supervisor import (
+        SessionReaderSupervisor,
+        SessionReaderUnavailableError,
+    )
+
+    control = tmp_path / "control"
+    owner_home = tmp_path / "owner"
+    owner_key = "ok1_live_reader"
+    store = AuthorityStore(control)
+    lease = _active_reader(store, owner_key)
+    socket_path = session_reader_socket_path(owner_home, lease.reader_generation)
+    socket_path.parent.mkdir(parents=True)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen()
+    supervisor = SessionReaderSupervisor(
+        control_home=control,
+        global_home=tmp_path,
+        startup_timeout=0.1,
+    )
+    try:
+        with pytest.raises(SessionReaderUnavailableError, match="already owned"):
+            supervisor.ensure_started(
+                {"owner_key": owner_key, "owner_home": owner_home}
+            )
+
+        assert supervisor.authority_store.read_session_reader_lease(owner_key) == lease
+        assert socket_path.exists()
+    finally:
+        listener.close()
+
+
+def test_reader_supervisor_retries_reconciled_claim_only_once(tmp_path, monkeypatch):
+    from hermes_cli.session_reader.supervisor import (
+        SessionReaderSupervisor,
+        SessionReaderUnavailableError,
+    )
+
+    supervisor = SessionReaderSupervisor(
+        control_home=tmp_path / "control",
+        global_home=tmp_path,
+        startup_timeout=0.1,
+    )
+    claims = 0
+
+    def reject_claim(*_args, **_kwargs):
+        nonlocal claims
+        claims += 1
+        raise AuthorizationRejected("reader_lease_already_owned")
+
+    monkeypatch.setattr(supervisor.authority_store, "claim_reader_start", reject_claim)
+    monkeypatch.setattr(supervisor, "_reconcile_missing_local_reader", lambda *_args: True)
+
+    with pytest.raises(SessionReaderUnavailableError, match="already owned"):
+        supervisor.ensure_started(
+            {"owner_key": "ok1_retry", "owner_home": tmp_path / "owner"}
+        )
+
+    assert claims == 2
+
+
+def test_reader_supervisor_exact_fence_race_does_not_clean_replacement(tmp_path, monkeypatch):
+    from hermes_cli.session_reader.supervisor import (
+        SessionReaderSupervisor,
+        SessionReaderUnavailableError,
+    )
+
+    control = tmp_path / "control"
+    owner_home = tmp_path / "owner"
+    owner_key = "ok1_reader_race"
+    store = AuthorityStore(control)
+    stale = _active_reader(store, owner_key)
+    stale_socket = session_reader_socket_path(owner_home, stale.reader_generation)
+    stale_socket.parent.mkdir(parents=True)
+    sentinel = stale_socket.with_name("sentinel")
+    sentinel.write_text("keep")
+    supervisor = SessionReaderSupervisor(
+        control_home=control,
+        global_home=tmp_path,
+        startup_timeout=0.1,
+    )
+    original_assert = supervisor.authority_store.assert_reader_lease
+    replacement = None
+
+    def race_assert(lease, *, states=None):
+        nonlocal replacement
+        draining = supervisor.authority_store.transition_reader_lease(
+            lease,
+            state=ReaderLeaseState.DRAINING,
+            generation_state=ReaderGenerationState.DRAINING,
+        )
+        supervisor.authority_store.transition_reader_lease(
+            draining,
+            state=ReaderLeaseState.REVOKED,
+            generation_state=ReaderGenerationState.REVOKED,
+        )
+        replacement = supervisor.authority_store.claim_reader_start(
+            owner_key,
+            reader_id="reader-replacement",
+        ).lease
+        return original_assert(lease, states=states)
+
+    monkeypatch.setattr(supervisor.authority_store, "assert_reader_lease", race_assert)
+
+    with pytest.raises(SessionReaderUnavailableError, match="already owned"):
+        supervisor.ensure_started(
+            {"owner_key": owner_key, "owner_home": owner_home}
+        )
+
+    assert replacement is not None
+    assert supervisor.authority_store.read_session_reader_lease(owner_key) == replacement
+    assert sentinel.read_text() == "keep"
+
+
 def test_reader_supervisor_idle_and_capacity_retirement_respect_active_uses(tmp_path, monkeypatch):
     from hermes_cli.session_reader.supervisor import (
         SessionReaderHandle,
@@ -586,6 +806,7 @@ def test_reader_real_process_reads_owner_db_without_creating_missing_db(tmp_path
 
         db = SessionDB(db_path=owner_home / "state.db")
         db.create_session("reader-session", source="cli", model="test")
+        db.append_message("reader-session", "user", "owner-only history")
         db.record_gateway_session_peer(
             "reader-session",
             source="cli",
@@ -603,6 +824,12 @@ def test_reader_real_process_reads_owner_db_without_creating_missing_db(tmp_path
         assert response.status_code == 200
         assert response.json()["total"] == 1
         assert response.json()["sessions"][0]["id"] == "reader-session"
+        messages = client.request(
+            "GET", "/api/sessions/reader-session/messages?limit=100", lease=lease,
+        )
+        assert messages.status_code == 200
+        assert messages.json()["session_id"] == "reader-session"
+        assert messages.json()["messages"][0]["text"] == "owner-only history"
         db.close()
     finally:
         if "db" in locals():
@@ -964,6 +1191,76 @@ def _populate_large_scoped_session_history(db, owner_key: str, owner_home: Path)
         messages,
     )
     db._conn.commit()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix-domain Session Reader subprocess")
+def test_reader_real_process_recovers_orphaned_fence_and_serves_history(tmp_path):
+    from hermes_state import SessionDB
+    from hermes_cli.session_reader.client import SessionReaderClient
+    from hermes_cli.session_reader.supervisor import SessionReaderSupervisor
+
+    short_root = Path("/tmp") / f"hermes-reader-recovery-{os.getpid()}-{time.time_ns()}"
+    control = short_root / "control"
+    owner_home = short_root / "owner"
+    owner_home.mkdir(parents=True)
+    owner_key = "ok1_recovery"
+    db = SessionDB(db_path=owner_home / "state.db")
+    db.create_session(
+        "known-session",
+        source="dashboard-gui",
+        model="test",
+        owner_key=owner_key,
+        workspace_root=str((owner_home / "workspaces").resolve()),
+        worker_generation=1,
+    )
+    db.append_message("known-session", "user", "known persisted message")
+    store = AuthorityStore(control)
+    stale = _active_reader(store, owner_key)
+    stale_socket = session_reader_socket_path(owner_home, stale.reader_generation)
+    stale_socket.parent.mkdir(parents=True)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(stale_socket))
+    listener.close()
+    supervisor = SessionReaderSupervisor(
+        control_home=control,
+        global_home=short_root,
+        startup_timeout=3,
+        poll_interval=0.001,
+    )
+    try:
+        handle = supervisor.ensure_started(
+            {"owner_key": owner_key, "owner_home": owner_home}
+        )
+        assert handle.reader_generation == stale.reader_generation + 1
+        lease = supervisor._lease_for_handle(handle)
+        client = SessionReaderClient(
+            handle.socket_path,
+            control_home=control,
+            signing_record=supervisor.signing_record,
+        )
+        sessions = client.request(
+            "GET",
+            "/api/sessions?limit=30&offset=0&order=recent&compact=true",
+            lease=lease,
+        )
+        messages = client.request(
+            "GET",
+            "/api/sessions/known-session/messages?limit=100",
+            lease=lease,
+        )
+
+        assert sessions.status_code == 200
+        assert sessions.json()["sessions"][0]["id"] == "known-session"
+        assert messages.status_code == 200
+        assert messages.json()["messages"][0]["text"] == "known persisted message"
+        assert not session_reader_runtime_paths(
+            owner_home=owner_home,
+            reader_generation=stale.reader_generation,
+        ).reader_runtime_dir.exists()
+    finally:
+        db.close()
+        supervisor.shutdown()
+        shutil.rmtree(short_root, ignore_errors=True)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Unix-domain Session Reader subprocess")

@@ -880,7 +880,7 @@ class TestWebServerEndpoints:
         assert stats["messages"] == 1
 
         messages = self.client.get("/api/sessions/worker-only/messages?profile=worker").json()
-        assert [m["content"] for m in messages["messages"]] == ["worker"]
+        assert [m["text"] for m in messages["messages"]] == ["worker"]
 
     def test_analytics_endpoints_read_requested_profile(self):
         from hermes_state import SessionDB
@@ -1071,7 +1071,7 @@ class TestWebServerEndpoints:
         assert resp.status_code == 200
         payload = resp.json()
         assert payload["session_id"] == "desktop-tip"
-        assert [m["content"] for m in payload["messages"]] == ["after compression"]
+        assert [m["text"] for m in payload["messages"]] == ["after compression"]
 
     def test_get_session_messages_shows_full_in_place_compaction_history(self):
         from hermes_state import SessionDB
@@ -1097,7 +1097,7 @@ class TestWebServerEndpoints:
 
         resp = self.client.get("/api/sessions/desktop-in-place/messages")
         assert resp.status_code == 200
-        assert [message["content"] for message in resp.json()["messages"]] == [
+        assert [message["text"] for message in resp.json()["messages"]] == [
             "original question",
             "original answer",
         ]
@@ -1120,7 +1120,7 @@ class TestWebServerEndpoints:
         newest = self.client.get("/api/sessions/paged-history/messages?limit=2")
         assert newest.status_code == 200
         payload = newest.json()
-        assert [m["content"] for m in payload["messages"]] == ["message-3", "message-4"]
+        assert [m["text"] for m in payload["messages"]] == ["message-3", "message-4"]
         assert payload["history_page"]["has_more"] is True
 
         older = self.client.get(
@@ -1128,7 +1128,7 @@ class TestWebServerEndpoints:
             params={"limit": 2, "before": payload["history_page"]["cursor"]},
         )
         assert older.status_code == 200
-        assert [m["content"] for m in older.json()["messages"]] == [
+        assert [m["text"] for m in older.json()["messages"]] == [
             "message-1",
             "message-2",
         ]

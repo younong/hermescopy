@@ -1,12 +1,10 @@
 """Supervisor for per-owner Hermes worker processes."""
 from __future__ import annotations
 
-import errno
 import hashlib
 import logging
 import math
 import os
-import socket
 import stat
 import subprocess
 import sys
@@ -37,6 +35,7 @@ from hermes_cli.dashboard_auth.authority import (
 from hermes_cli.controlled_roots import ControlledRoots, ExpectedType, RootKind, controlled_roots_for
 from hermes_cli.deployment_image import DeploymentImagePolicy
 from hermes_cli.deployment_inference import DeploymentInferencePolicy
+from hermes_cli.local_socket import canonical_unix_peer_is_absent
 from hermes_cli.owner_worker.cgroup_v2 import CgroupScopeLease
 from hermes_cli.owner_worker.image_relay import DeploymentImageBroker
 from hermes_cli.owner_worker.inference_relay import DeploymentInferenceBroker
@@ -800,33 +799,6 @@ class OwnerWorkerSupervisor:
         self._audit_generation(AuthorityAuditReason.GENERATION_ACTIVE, active_lease)
         return handle
 
-    @staticmethod
-    def _canonical_socket_is_absent(socket_path: Path) -> bool:
-        """Return true only for an unambiguous absent/refused local UDS peer."""
-        if not socket_path.exists():
-            return True
-        try:
-            if not stat.S_ISSOCK(socket_path.stat().st_mode):
-                return False
-        except OSError:
-            return False
-        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            client.settimeout(0.25)
-            client.connect(str(socket_path))
-        except FileNotFoundError:
-            return True
-        except ConnectionRefusedError:
-            return True
-        except OSError as exc:
-            # Do not reclaim when permission, timeout, or any unexpected local
-            # condition leaves peer liveness uncertain.
-            return exc.errno in {errno.ENOENT, errno.ECONNREFUSED}
-        else:
-            return False
-        finally:
-            client.close()
-
     def _reconcile_missing_local_worker(self, owner_key: str, owner_home: Path) -> bool:
         """Release one conclusively absent local Worker fence, if safe.
 
@@ -845,7 +817,7 @@ class OwnerWorkerSupervisor:
         }:
             return False
         socket_path = owner_worker_socket_path(owner_home, lease.worker_generation)
-        if not self._canonical_socket_is_absent(socket_path):
+        if not canonical_unix_peer_is_absent(socket_path):
             return False
         try:
             # Re-read the exact fence after observing socket absence. This

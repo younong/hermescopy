@@ -9,7 +9,6 @@ import { useNavigate } from "react-router-dom";
 import {
   AlertTriangle,
   CheckCircle2,
-  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Database,
@@ -44,7 +43,6 @@ import { PlatformsCard } from "@/components/PlatformsCard";
 import { Toast } from "@nous-research/ui/ui/components/toast";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Checkbox } from "@nous-research/ui/ui/components/checkbox";
-import { ListItem } from "@nous-research/ui/ui/components/list-item";
 import { Segmented } from "@nous-research/ui/ui/components/segmented";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { Badge } from "@nous-research/ui/ui/components/badge";
@@ -104,48 +102,6 @@ function SnippetHighlight({ snippet }: { snippet: string }) {
     <p className="font-mondwest normal-case mt-0.5 min-w-0 max-w-full truncate text-xs text-text-secondary">
       {parts}
     </p>
-  );
-}
-
-function ToolCallBlock({
-  toolCall,
-}: {
-  toolCall: { id: string; function: { name: string; arguments: string } };
-}) {
-  const [open, setOpen] = useState(false);
-  const { t } = useI18n();
-
-  let args = toolCall.function.arguments;
-  try {
-    args = JSON.stringify(JSON.parse(args), null, 2);
-  } catch {
-    // keep as-is
-  }
-
-  return (
-    <div className="mt-2 border border-warning/20 bg-warning/5">
-      <ListItem
-        onClick={() => setOpen(!open)}
-        aria-label={`${open ? t.common.collapse : t.common.expand} tool call ${toolCall.function.name}`}
-        aria-expanded={open}
-        className="px-3 py-2 text-xs text-warning hover:bg-warning/10 hover:text-warning"
-      >
-        {open ? (
-          <ChevronDown className="h-3 w-3" />
-        ) : (
-          <ChevronRight className="h-3 w-3" />
-        )}
-        <span className="font-mono-ui font-medium">
-          {toolCall.function.name}
-        </span>
-        <span className="text-warning/50 ml-auto">{toolCall.id}</span>
-      </ListItem>
-      {open && (
-        <pre className="border-t border-warning/20 px-3 py-2 text-xs text-warning/80 overflow-x-auto whitespace-pre-wrap font-mono">
-          {args}
-        </pre>
-      )}
-    </div>
   );
 }
 
@@ -254,21 +210,21 @@ function MessageBubble({
   // rows here so the operator's actual answer survives as a readable
   // bubble next to the (clearly-labelled) handoff metadata (#29824).
   const compactionSplit =
-    typeof msg.content === "string"
-      ? splitCompactionContent(msg.content)
+    typeof msg.text === "string"
+      ? splitCompactionContent(msg.text)
       : null;
 
   if (compactionSplit && compactionSplit.remainder) {
     return (
       <>
         <MessageBubble
-          msg={{ ...msg, content: compactionSplit.summary }}
+          msg={{ ...msg, text: compactionSplit.summary }}
           highlight={highlight}
         />
         <MessageBubble
           msg={{
             ...msg,
-            content: compactionSplit.remainder,
+            text: compactionSplit.remainder,
             // The remainder is the original assistant reply that the
             // compressor pre-pended the summary to — render with the
             // normal assistant styling, NOT the muted handoff style.
@@ -287,14 +243,14 @@ function MessageBubble({
     : ROLE_STYLES[msg.role] ?? ROLE_STYLES.system;
   const label = isCompaction
     ? ROLE_STYLES.compaction.label
-    : msg.tool_name
-      ? `${t.sessions.roles.tool}: ${msg.tool_name}`
+    : msg.name
+      ? `${t.sessions.roles.tool}: ${msg.name}`
       : style.label;
 
   // Check if any search term appears as a prefix of any word in content
   const isHit = (() => {
-    if (!highlight || !msg.content) return false;
-    const content = msg.content.toLowerCase();
+    if (!highlight || !msg.text) return false;
+    const content = msg.text.toLowerCase();
     const terms = highlight.toLowerCase().split(/\s+/).filter(Boolean);
     return terms.some((term) => content.includes(term));
   })();
@@ -321,19 +277,17 @@ function MessageBubble({
           </span>
         )}
       </div>
-      {msg.content &&
+      {msg.text &&
         (msg.role === "system" ? (
           <div className="text-sm text-foreground whitespace-pre-wrap leading-relaxed">
-            {msg.content}
+            {msg.text}
           </div>
         ) : (
-          <Markdown content={msg.content} highlightTerms={highlightTerms} />
+          <Markdown content={msg.text} highlightTerms={highlightTerms} />
         ))}
-      {msg.tool_calls && msg.tool_calls.length > 0 && (
-        <div className="mt-1">
-          {msg.tool_calls.map((tc) => (
-            <ToolCallBlock key={tc.id} toolCall={tc} />
-          ))}
+      {msg.role === "tool" && msg.context && (
+        <div className="text-sm text-muted-foreground whitespace-pre-wrap">
+          {msg.context}
         </div>
       )}
     </div>

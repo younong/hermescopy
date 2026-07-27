@@ -99,6 +99,8 @@ describe("connectGuiChat", () => {
       undefined,
       undefined,
     );
+    expect(client.request.mock.calls[0]?.[1]).not.toHaveProperty("display_history");
+    expect(client.request.mock.calls.map((call) => call[0])).not.toContain("session.history");
     expect(firstStages).not.toContain("connection.reused");
     expect(secondStages).toEqual([
       "connection.reused",

@@ -67,6 +67,25 @@ def _smoke_javascript(*, base: str, path_prefix: str, marker: str, timeout_ms: i
     setTimeout(() => reject(new Error(`${{label}} timed out`)), ms));
   const withTimeout = (promise, label, ms = config.timeoutMs) =>
     Promise.race([promise, timeout(label, ms)]);
+  const readerJSON = async (path, label) => {{
+    const deadline = now() + Math.min(config.timeoutMs, 10_000);
+    while (true) {{
+      const response = await fetch(new URL(path, config.base), {{
+        credentials: 'include',
+        cache: 'no-store',
+      }});
+      if (response.status !== 503 || now() >= deadline) {{
+        if (!response.ok) throw new Error(`${{label}} HTTP ${{response.status}}`);
+        try {{ return await response.json(); }}
+        catch (_) {{ throw new Error(`${{label}} returned invalid JSON`); }}
+      }}
+      const retrySeconds = Number(response.headers.get('Retry-After') || '1');
+      const retryMs = Number.isFinite(retrySeconds)
+        ? Math.min(1000, Math.max(100, retrySeconds * 1000))
+        : 1000;
+      await new Promise((resolve) => setTimeout(resolve, retryMs));
+    }}
+  }};
 
   const baseParams = (generation) => ({{
     browser_id: config.browserId,
@@ -225,6 +244,25 @@ def _smoke_javascript(*, base: str, path_prefix: str, marker: str, timeout_ms: i
       throw new Error('cold resume did not restore the smoke transcript');
     }}
     pass('public_cold_resume', started);
+
+    started = now();
+    activeCheck = 'public_session_reader_list';
+    const listPath = `${{config.pathPrefix}}api/sessions?limit=30&offset=0&order=recent&compact=true`;
+    const listed = await readerJSON(listPath, activeCheck);
+    if (!Array.isArray(listed.sessions) ||
+        !listed.sessions.some((session) => String(session && session.id || '') === storedSessionId)) {{
+      throw new Error('session reader list omitted the smoke session');
+    }}
+    pass('public_session_reader_list', started);
+
+    started = now();
+    activeCheck = 'public_session_reader_messages';
+    const messagesPath = `${{config.pathPrefix}}api/sessions/${{encodeURIComponent(storedSessionId)}}/messages?limit=100`;
+    const history = await readerJSON(messagesPath, activeCheck);
+    if (!Array.isArray(history.messages) || !JSON.stringify(history.messages).includes(config.marker)) {{
+      throw new Error('session reader messages omitted the smoke marker');
+    }}
+    pass('public_session_reader_messages', started);
 
     started = now();
     activeCheck = 'public_cleanup';
