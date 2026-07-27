@@ -145,6 +145,80 @@ def test_gated_static_asset_path_is_public(gated_app):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("path", ["/chat-gui", "/chat-gui/files"])
+def test_authenticated_gui_chat_document_schedules_owner_warmup(
+    gated_app, monkeypatch, path
+):
+    from hermes_cli.owner_worker import readiness
+
+    _complete_stub_login(gated_app)
+    scheduled = []
+    monkeypatch.setattr(
+        readiness,
+        "schedule_owner_worker_warmup",
+        lambda app, *, owner, supervisor=None: scheduled.append((app, owner, supervisor)),
+    )
+
+    response = gated_app.get(
+        path,
+        headers={"Accept": "text/html", "Sec-Fetch-Dest": "document"},
+    )
+
+    assert response.status_code in (200, 404)
+    assert len(scheduled) == 1
+    app, owner, supervisor = scheduled[0]
+    assert app is web_server.app
+    assert owner.owner_key.startswith("ok1_")
+    assert supervisor is None
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "headers"),
+    [
+        ("GET", "/api/auth/me", {"Accept": "application/json"}),
+        ("GET", "/sessions", {"Accept": "text/html", "Sec-Fetch-Dest": "document"}),
+        ("GET", "/chat-gui", {"Accept": "application/json", "Sec-Fetch-Dest": "empty"}),
+        ("POST", "/chat-gui", {"Accept": "text/html", "Sec-Fetch-Dest": "document"}),
+    ],
+)
+def test_non_gui_chat_documents_do_not_schedule_owner_warmup(
+    gated_app, monkeypatch, method, path, headers
+):
+    from hermes_cli.owner_worker import readiness
+
+    _complete_stub_login(gated_app)
+    scheduled = []
+    monkeypatch.setattr(
+        readiness,
+        "schedule_owner_worker_warmup",
+        lambda *args, **kwargs: scheduled.append((args, kwargs)),
+    )
+
+    gated_app.request(method, path, headers=headers)
+
+    assert scheduled == []
+
+
+def test_gui_chat_warmup_requires_successful_session_authorization(gated_app, monkeypatch):
+    from hermes_cli.owner_worker import readiness
+
+    scheduled = []
+    monkeypatch.setattr(
+        readiness,
+        "schedule_owner_worker_warmup",
+        lambda *args, **kwargs: scheduled.append((args, kwargs)),
+    )
+
+    response = gated_app.get(
+        "/chat-gui",
+        headers={"Accept": "text/html", "Sec-Fetch-Dest": "document"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 302
+    assert scheduled == []
+
+
 def test_full_login_round_trip_unlocks_gated_api(gated_app):
     # 1) Click "Sign in with Stub IdP" — /auth/login redirects to the stub
     #    with a PKCE cookie on the response.

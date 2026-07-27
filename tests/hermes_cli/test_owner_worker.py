@@ -628,7 +628,9 @@ def test_supervisor_syncs_owner_skills_before_process_launch(tmp_path, monkeypat
     supervisor.shutdown()
 
 
-def test_supervisor_skill_sync_failure_prevents_generation_claim(tmp_path, monkeypatch):
+def test_supervisor_skill_sync_failure_prevents_generation_claim(
+    tmp_path, monkeypatch, caplog
+):
     import hermes_cli.owner_worker.supervisor as supervisor_module
 
     owner = _Owner("ok1_skill_sync_failure", tmp_path / "owner")
@@ -650,11 +652,18 @@ def test_supervisor_skill_sync_failure_prevents_generation_claim(tmp_path, monke
         startup_timeout=0.1,
     )
 
-    with pytest.raises(OwnerWorkerStartupError, match="skill synchronization failed"):
-        supervisor.get_or_start(owner)
+    with caplog.at_level("INFO", logger="hermes_cli.owner_worker.supervisor"):
+        with pytest.raises(OwnerWorkerStartupError, match="skill synchronization failed"):
+            supervisor.get_or_start(owner, latency_trace_id="trace-skill-failure")
 
     assert spawned is False
     assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key) is None
+    assert any(
+        "trace_id=trace-skill-failure" in message
+        and "stage=skill_sync" in message
+        and "outcome=failed" in message
+        for message in caplog.messages
+    )
 
 
 def test_supervisor_spawns_the_canonical_session_owner_context(tmp_path, monkeypatch):
@@ -1346,7 +1355,7 @@ def test_supervisor_rejects_same_key_different_owner_home(tmp_path, monkeypatch)
     assert handle.process.wait_calls >= 1
 
 
-def test_supervisor_closes_log_handles_when_spawn_fails(tmp_path):
+def test_supervisor_closes_log_handles_when_spawn_fails(tmp_path, caplog):
     owner = _Owner("ok1_spawn_fail", tmp_path / "owner")
     captured: dict[str, object] = {}
 
@@ -1362,13 +1371,70 @@ def test_supervisor_closes_log_handles_when_spawn_fails(tmp_path):
         startup_cooldown=0,
     )
 
-    with pytest.raises(RuntimeError, match="spawn failed"):
-        supervisor.get_or_start(owner)
+    with caplog.at_level("INFO", logger="hermes_cli.owner_worker.supervisor"):
+        with pytest.raises(RuntimeError, match="spawn failed"):
+            supervisor.get_or_start(owner, latency_trace_id="trace-spawn-failure")
 
     with pytest.raises(OSError):
         os.fstat(captured["stdout"])
     with pytest.raises(OSError):
         os.fstat(captured["stderr"])
+    assert any(
+        "trace_id=trace-spawn-failure" in message
+        and "stage=process_spawn" in message
+        and "outcome=failed" in message
+        for message in caplog.messages
+    )
+
+
+def test_supervisor_emits_content_free_cold_and_warm_start_stages(tmp_path, caplog):
+    owner = _Owner("ok1_latency", tmp_path / "owner")
+
+    def fake_process_factory(*args, **_kwargs):
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+
+    with caplog.at_level("INFO", logger="hermes_cli.owner_worker.supervisor"):
+        first = supervisor.get_or_start(owner, latency_trace_id="trace-id-123")
+        assert supervisor.get_or_start(owner, latency_trace_id="trace-id-123") is first
+
+    messages = [message for message in caplog.messages if "trace_id=trace-id-123" in message]
+    assert any("stage=skill_sync" in message for message in messages)
+    assert any("stage=process_spawn" in message for message in messages)
+    assert sum("stage=health_readiness" in message for message in messages) == 2
+    assert all(owner.owner_key not in message for message in messages)
+    assert all(str(owner.owner_home) not in message for message in messages)
+
+
+def test_supervisor_rejects_unsafe_latency_trace_id(tmp_path, caplog):
+    owner = _Owner("ok1_latency_invalid", tmp_path / "owner")
+
+    def fake_process_factory(*args, **_kwargs):
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+
+    with caplog.at_level("INFO", logger="hermes_cli.owner_worker.supervisor"):
+        supervisor.get_or_start(owner, latency_trace_id="valid-prefix\nforged-log-line")
+
+    assert not any("latency trace_id=" in message for message in caplog.messages)
 
 
 def test_supervisor_serializes_concurrent_start_for_same_owner(tmp_path):
@@ -1388,7 +1454,7 @@ def test_supervisor_serializes_concurrent_start_for_same_owner(tmp_path):
         control_home=tmp_path / "control",
         client_cls=_FakeClient,
         process_factory=fake_process_factory,
-        startup_timeout=0.1,
+        startup_timeout=1,
         startup_cooldown=0,
     )
     results: list[OwnerWorkerSupervisor | object] = []
@@ -1413,7 +1479,54 @@ def test_supervisor_serializes_concurrent_start_for_same_owner(tmp_path):
     assert len({id(result) for result in results}) == 1
 
 
-def test_supervisor_waiting_same_owner_start_times_out_without_releasing_leader(tmp_path):
+def test_supervisor_traces_same_owner_concurrent_wait(tmp_path, caplog):
+    owner = _Owner("ok1_concurrent_trace", tmp_path / "owner")
+    startup_entered = threading.Event()
+    release_startup = threading.Event()
+
+    def fake_process_factory(*args, **_kwargs):
+        startup_entered.set()
+        assert release_startup.wait(timeout=2)
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=1,
+        startup_cooldown=0,
+    )
+    leader = threading.Thread(target=supervisor.get_or_start, args=(owner,))
+    leader.start()
+    assert startup_entered.wait(timeout=2)
+
+    result = []
+    follower = threading.Thread(
+        target=lambda: result.append(
+            supervisor.get_or_start(owner, latency_trace_id="trace-wait-123")
+        )
+    )
+    with caplog.at_level("INFO", logger="hermes_cli.owner_worker.supervisor"):
+        follower.start()
+        time.sleep(0.02)
+        release_startup.set()
+        leader.join(timeout=2)
+        follower.join(timeout=2)
+
+    assert not leader.is_alive()
+    assert not follower.is_alive()
+    assert len(result) == 1
+    assert any(
+        "trace_id=trace-wait-123" in message and "stage=concurrent_wait" in message
+        for message in caplog.messages
+    )
+
+
+def test_supervisor_waiting_same_owner_start_times_out_without_releasing_leader(
+    tmp_path, caplog
+):
     owner = _Owner("ok1_stalled", tmp_path / "owner")
     startup_entered = threading.Event()
     release_startup = threading.Event()
@@ -1447,9 +1560,18 @@ def test_supervisor_waiting_same_owner_start_times_out_without_releasing_leader(
     leader.start()
     assert startup_entered.wait(timeout=2)
 
-    with pytest.raises(TimeoutError, match="timed out waiting for owner worker startup"):
-        supervisor.get_or_start(owner, timeout=0.01)
+    with caplog.at_level("INFO", logger="hermes_cli.owner_worker.supervisor"):
+        with pytest.raises(TimeoutError, match="timed out waiting for owner worker startup"):
+            supervisor.get_or_start(
+                owner, timeout=0.01, latency_trace_id="trace-wait-timeout"
+            )
 
+    assert any(
+        "trace_id=trace-wait-timeout" in message
+        and "stage=concurrent_wait" in message
+        and "outcome=timeout" in message
+        for message in caplog.messages
+    )
     assert len(spawned) == 1
     assert owner.owner_key in supervisor._starting_owner_keys
     assert supervisor._in_flight_starts == 1
