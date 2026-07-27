@@ -191,6 +191,10 @@ export interface Translations {
     failedToDeleteSelected: string;
     resumeInChat: string;
     newChat: string;
+    /** Optional — untranslated locales use English literals in the component. */
+    renameSession?: string;
+    sessionTitlePlaceholder?: string;
+    failedToRename?: string;
     previousPage: string;
     nextPage: string;
     roles: {
