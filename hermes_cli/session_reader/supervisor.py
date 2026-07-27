@@ -23,7 +23,7 @@ from hermes_cli.dashboard_auth.authority import (
 )
 from hermes_cli.dashboard_auth.owner_context import admit_host_owner_home
 from hermes_cli.local_socket import canonical_unix_peer_is_absent
-from .client import SessionReaderClient, SessionReaderHealthError
+from .client import SessionReaderClient, SessionReaderHealthError, warm_http_transport
 from .runtime import (
     prepare_session_reader_runtime,
     session_reader_env_for,
@@ -129,6 +129,7 @@ class SessionReaderSupervisor:
         self.resource_manager = resource_manager
         self.authority_store = AuthorityStore(self.control_home)
         self.signing_record = _signing_record(self.control_home)
+        warm_http_transport()
         self._handles: dict[str, SessionReaderHandle] = {}
         self._clients: dict[tuple[str, int, str, int, int], _ClientBinding] = {}
         self._starting: set[str] = set()
@@ -499,6 +500,7 @@ class SessionReaderSupervisor:
         """Release one conclusively absent local Reader fence, if safe."""
         lease = self.authority_store.read_session_reader_lease(owner_key)
         if lease is None or lease.state not in {
+            ReaderLeaseState.STARTING,
             ReaderLeaseState.ACTIVE,
             ReaderLeaseState.DRAINING,
         }:
@@ -511,7 +513,10 @@ class SessionReaderSupervisor:
             return False
         try:
             lease = self.authority_store.assert_reader_lease(lease)
-            if lease.state is ReaderLeaseState.ACTIVE:
+            generation_state = ReaderGenerationState.REVOKED
+            if lease.state is ReaderLeaseState.STARTING:
+                generation_state = ReaderGenerationState.FAILED
+            elif lease.state is ReaderLeaseState.ACTIVE:
                 lease = self.authority_store.transition_reader_lease(
                     lease,
                     state=ReaderLeaseState.DRAINING,
@@ -520,7 +525,7 @@ class SessionReaderSupervisor:
             self.authority_store.transition_reader_lease(
                 lease,
                 state=ReaderLeaseState.REVOKED,
-                generation_state=ReaderGenerationState.REVOKED,
+                generation_state=generation_state,
             )
         except AuthorizationRejected:
             return False

@@ -12,6 +12,17 @@ from .tokens import mint_session_reader_capability
 
 _MAX_CONNECTIONS = 8
 _MAX_KEEPALIVE_CONNECTIONS = 4
+_HTTPX_WARMED = False
+
+
+def warm_http_transport() -> None:
+    """Pay httpcore's lazy async backend setup before a request is timed."""
+    global _HTTPX_WARMED
+    if _HTTPX_WARMED:
+        return
+    # Construction loads the async network backend but does not open a socket.
+    httpx.AsyncHTTPTransport(uds="/nonexistent/hermes-session-reader.sock")
+    _HTTPX_WARMED = True
 
 
 class SessionReaderHealthError(RuntimeError):
