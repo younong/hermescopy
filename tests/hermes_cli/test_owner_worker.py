@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import subprocess
 import sys
@@ -21,6 +22,7 @@ from hermes_cli.dashboard_auth.authority import (
 from hermes_cli.dashboard_auth.base import Session
 from hermes_cli.dashboard_auth.owner_context import owner_context_from_session
 from hermes_cli.controlled_roots import RootKind, controlled_roots_for
+from hermes_cli.latency_trace import latency_trace_scope
 from hermes_cli.owner_runtime import REQUIRED_OWNER_DIRS, ensure_owner_runtime_dirs, owner_worker_socket_path
 from hermes_cli.owner_worker import (
     OwnerWorkerClient,
@@ -96,19 +98,24 @@ def _simulate_linux_controlled_roots(monkeypatch, request):
         )
 
 
+def _traced_get_or_start(
+    supervisor: OwnerWorkerSupervisor,
+    owner: _Owner,
+    caplog,
+    *,
+    trace_id: str = "trace-owner-worker-123",
+    timeout: float | None = None,
+):
+    logger = logging.getLogger("tests.owner-worker-latency")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        with latency_trace_scope(logger, trace_id=trace_id, surface="owner-http-proxy"):
+            return supervisor.get_or_start(owner, timeout=timeout)
+
+
 class _FakeClient:
     def __init__(self, socket_path, *, control_home=None, timeout=2.0) -> None:
         self.socket_path = Path(socket_path)
         self.control_home = control_home
-
-    def begin_drain(self, *, lease):
-        return {"draining": True, "active_turns": 0}
-
-    def drain_status(self, *, lease):
-        return {"draining": True, "active_turns": 0}
-
-    def force_drain(self, *, lease):
-        return {"draining": True, "active_turns": 0}
 
     def verify_health(self, *, owner_key: str, owner_home, worker_generation=None, worker_id=None, **_kwargs):
         return {
@@ -583,6 +590,38 @@ def test_owner_worker_skill_sync_cache_does_not_stamp_failed_sync(tmp_path, monk
     assert not supervisor_module._owner_worker_skills_stamp_path(owner_home).exists()
 
 
+def test_supervisor_cold_start_emits_ready_phases(tmp_path, caplog):
+    owner = _Owner("ok1_cold_latency", tmp_path / "owner")
+
+    def fake_process_factory(*args, **_kwargs):
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+    )
+
+    _traced_get_or_start(supervisor, owner, caplog)
+
+    stages = [message.split("stage=", 1)[1].split(" ", 1)[0] for message in caplog.messages]
+    assert stages == [
+        "owner_worker.ready.runtime_dirs",
+        "owner_worker.ready.skills_sync",
+        "owner_worker.ready.authority_claim",
+        "owner_worker.ready.resource_admission",
+        "owner_worker.ready.process_spawn",
+        "owner_worker.ready.health_wait",
+        "owner_worker.ready.lease_activate",
+        "owner_worker.ready",
+    ]
+    assert all("outcome=ok" in message for message in caplog.messages)
+    assert all("path=cold_start" in message for message in caplog.messages)
+
+
 def test_supervisor_syncs_owner_skills_before_process_launch(tmp_path, monkeypatch):
     import hermes_cli.owner_worker.supervisor as supervisor_module
 
@@ -637,9 +676,7 @@ def test_supervisor_syncs_owner_skills_before_process_launch(tmp_path, monkeypat
     supervisor.shutdown()
 
 
-def test_supervisor_skill_sync_failure_prevents_generation_claim(
-    tmp_path, monkeypatch, caplog
-):
+def test_supervisor_skill_sync_failure_prevents_generation_claim(tmp_path, monkeypatch, caplog):
     import hermes_cli.owner_worker.supervisor as supervisor_module
 
     owner = _Owner("ok1_skill_sync_failure", tmp_path / "owner")
@@ -661,18 +698,18 @@ def test_supervisor_skill_sync_failure_prevents_generation_claim(
         startup_timeout=0.1,
     )
 
-    with caplog.at_level("INFO", logger="hermes_cli.owner_worker.supervisor"):
-        with pytest.raises(OwnerWorkerStartupError, match="skill synchronization failed"):
-            supervisor.get_or_start(owner, latency_trace_id="trace-skill-failure")
+    with pytest.raises(OwnerWorkerStartupError, match="skill synchronization failed"):
+        _traced_get_or_start(supervisor, owner, caplog)
 
+    assert [message.split("stage=", 1)[1].split(" ", 1)[0] for message in caplog.messages] == [
+        "owner_worker.ready.runtime_dirs",
+        "owner_worker.ready.skills_sync",
+        "owner_worker.ready",
+    ]
+    assert "outcome=error" in caplog.messages[-2]
+    assert "outcome=error" in caplog.messages[-1]
     assert spawned is False
     assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key) is None
-    assert any(
-        "trace_id=trace-skill-failure" in message
-        and "stage=skill_sync" in message
-        and "outcome=failed" in message
-        for message in caplog.messages
-    )
 
 
 def test_supervisor_spawns_the_canonical_session_owner_context(tmp_path, monkeypatch):
@@ -1097,7 +1134,7 @@ def test_supervisor_shutdown_drains_all_local_workers_in_order(tmp_path):
         process_factory=fake_process_factory,
         startup_timeout=0.1,
         startup_cooldown=0,
-        generation_bridge_revoker=lambda _lease, **_kwargs: events.append("bridges"),
+        generation_bridge_revoker=lambda _lease: events.append("bridges"),
     )
     handle = supervisor.get_or_start(owner)
 
@@ -1117,7 +1154,7 @@ def test_supervisor_shutdown_failure_still_releases_resource_scope(tmp_path):
             Path(args[0][args[0].index("--socket") + 1]).touch() or _FakeProcess()
         ),
         startup_timeout=0.1,
-        generation_bridge_revoker=lambda _lease, **_kwargs: (_ for _ in ()).throw(RuntimeError("bridge cleanup failed")),
+        generation_bridge_revoker=lambda _lease: (_ for _ in ()).throw(RuntimeError("bridge cleanup failed")),
     )
     handle = supervisor.get_or_start(owner)
 
@@ -1174,7 +1211,7 @@ def test_supervisor_shutdown_revoker_can_release_active_use_from_event_loop(tmp_
         use_lease.release()
         events.append("lease_released")
 
-    def revoke_bridges(lease, **_kwargs):
+    def revoke_bridges(lease):
         assert lease.state is WorkerLeaseState.DRAINING
         future = asyncio.run_coroutine_threadsafe(close_bridge(), loop)
         future.result(timeout=1)
@@ -1195,7 +1232,7 @@ def test_supervisor_shutdown_revoker_can_release_active_use_from_event_loop(tmp_
     assert supervisor._terminating_handles == {}
 
 
-def test_supervisor_get_or_start_skips_health_probe_while_generation_is_in_use(tmp_path):
+def test_supervisor_get_or_start_skips_health_probe_while_generation_is_in_use(tmp_path, caplog):
     """A concurrent request must not retire a generation with a live bridge."""
     owner = _Owner("ok1_health_in_use", tmp_path / "owner")
 
@@ -1223,17 +1260,20 @@ def test_supervisor_get_or_start_skips_health_probe_while_generation_is_in_use(t
     first = supervisor.get_or_start(owner)
     use_lease = supervisor.acquire_use(first)
     try:
-        reused = supervisor.get_or_start(owner)
+        reused = _traced_get_or_start(supervisor, owner, caplog)
     finally:
         use_lease.release()
 
     assert reused is first
+    assert len(caplog.messages) == 1
+    assert "stage=owner_worker.ready " in caplog.messages[0]
+    assert "path=hot_active" in caplog.messages[0]
     assert _FailsAfterStartupClient.health_calls == 1
     assert not first.process.terminated
     assert supervisor._handles[owner.owner_key] is first
 
 
-def test_supervisor_get_or_start_failed_health_retires_idle_generation(tmp_path):
+def test_supervisor_get_or_start_failed_health_retires_idle_generation(tmp_path, caplog):
     """A failed health check still retires a generation without active uses."""
     owner = _Owner("ok1_health_idle", tmp_path / "owner")
 
@@ -1259,12 +1299,35 @@ def test_supervisor_get_or_start_failed_health_retires_idle_generation(tmp_path)
         startup_cooldown=0,
     )
     first = supervisor.get_or_start(owner)
-    replacement = supervisor.get_or_start(owner)
+    replacement = _traced_get_or_start(supervisor, owner, caplog)
 
     assert replacement is not first
+    assert caplog.messages[-1].endswith("outcome=ok path=replace_unhealthy")
+    assert all("path=replace_unhealthy" in message for message in caplog.messages)
     assert first.process.terminated
     assert supervisor._handles[owner.owner_key] is replacement
     assert supervisor._terminating_handles == {}
+
+
+def test_supervisor_idle_reuse_emits_health_probe_path(tmp_path, caplog):
+    owner = _Owner("ok1_health_probe", tmp_path / "owner")
+
+    def fake_process_factory(*args, **_kwargs):
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+    )
+    first = supervisor.get_or_start(owner)
+
+    assert _traced_get_or_start(supervisor, owner, caplog) is first
+    assert len(caplog.messages) == 1
+    assert "path=hot_health_probe" in caplog.messages[0]
 
 
 def test_supervisor_restart_uses_new_generation_and_socket_with_reused_pid(tmp_path):
@@ -1364,7 +1427,7 @@ def test_supervisor_rejects_same_key_different_owner_home(tmp_path, monkeypatch)
     assert handle.process.wait_calls >= 1
 
 
-def test_supervisor_closes_log_handles_when_spawn_fails(tmp_path, caplog):
+def test_supervisor_closes_log_handles_when_spawn_fails(tmp_path):
     owner = _Owner("ok1_spawn_fail", tmp_path / "owner")
     captured: dict[str, object] = {}
 
@@ -1380,73 +1443,16 @@ def test_supervisor_closes_log_handles_when_spawn_fails(tmp_path, caplog):
         startup_cooldown=0,
     )
 
-    with caplog.at_level("INFO", logger="hermes_cli.owner_worker.supervisor"):
-        with pytest.raises(RuntimeError, match="spawn failed"):
-            supervisor.get_or_start(owner, latency_trace_id="trace-spawn-failure")
+    with pytest.raises(RuntimeError, match="spawn failed"):
+        supervisor.get_or_start(owner)
 
     with pytest.raises(OSError):
         os.fstat(captured["stdout"])
     with pytest.raises(OSError):
         os.fstat(captured["stderr"])
-    assert any(
-        "trace_id=trace-spawn-failure" in message
-        and "stage=process_spawn" in message
-        and "outcome=failed" in message
-        for message in caplog.messages
-    )
 
 
-def test_supervisor_emits_content_free_cold_and_warm_start_stages(tmp_path, caplog):
-    owner = _Owner("ok1_latency", tmp_path / "owner")
-
-    def fake_process_factory(*args, **_kwargs):
-        argv = args[0]
-        Path(argv[argv.index("--socket") + 1]).touch()
-        return _FakeProcess()
-
-    supervisor = OwnerWorkerSupervisor(
-        control_home=tmp_path / "control",
-        client_cls=_FakeClient,
-        process_factory=fake_process_factory,
-        startup_timeout=0.1,
-        startup_cooldown=0,
-    )
-
-    with caplog.at_level("INFO", logger="hermes_cli.owner_worker.supervisor"):
-        first = supervisor.get_or_start(owner, latency_trace_id="trace-id-123")
-        assert supervisor.get_or_start(owner, latency_trace_id="trace-id-123") is first
-
-    messages = [message for message in caplog.messages if "trace_id=trace-id-123" in message]
-    assert any("stage=skill_sync" in message for message in messages)
-    assert any("stage=process_spawn" in message for message in messages)
-    assert sum("stage=health_readiness" in message for message in messages) == 2
-    assert all(owner.owner_key not in message for message in messages)
-    assert all(str(owner.owner_home) not in message for message in messages)
-
-
-def test_supervisor_rejects_unsafe_latency_trace_id(tmp_path, caplog):
-    owner = _Owner("ok1_latency_invalid", tmp_path / "owner")
-
-    def fake_process_factory(*args, **_kwargs):
-        argv = args[0]
-        Path(argv[argv.index("--socket") + 1]).touch()
-        return _FakeProcess()
-
-    supervisor = OwnerWorkerSupervisor(
-        control_home=tmp_path / "control",
-        client_cls=_FakeClient,
-        process_factory=fake_process_factory,
-        startup_timeout=0.1,
-        startup_cooldown=0,
-    )
-
-    with caplog.at_level("INFO", logger="hermes_cli.owner_worker.supervisor"):
-        supervisor.get_or_start(owner, latency_trace_id="valid-prefix\nforged-log-line")
-
-    assert not any("latency trace_id=" in message for message in caplog.messages)
-
-
-def test_supervisor_serializes_concurrent_start_for_same_owner(tmp_path):
+def test_supervisor_serializes_concurrent_start_for_same_owner(tmp_path, caplog):
     owner = _Owner("ok1_concurrent", tmp_path / "owner")
     spawned: list[dict] = []
     barrier = threading.Barrier(3)
@@ -1463,79 +1469,45 @@ def test_supervisor_serializes_concurrent_start_for_same_owner(tmp_path):
         control_home=tmp_path / "control",
         client_cls=_FakeClient,
         process_factory=fake_process_factory,
-        startup_timeout=1,
+        startup_timeout=0.1,
         startup_cooldown=0,
     )
     results: list[OwnerWorkerSupervisor | object] = []
     errors: list[BaseException] = []
 
+    logger = logging.getLogger("tests.owner-worker-concurrent-latency")
+
     def worker():
         try:
             barrier.wait(timeout=5)
-            results.append(supervisor.get_or_start(owner))
+            trace_id = f"trace-concurrent-{threading.get_ident()}"
+            with latency_trace_scope(
+                logger, trace_id=trace_id, surface="owner-http-proxy"
+            ):
+                results.append(supervisor.get_or_start(owner))
         except BaseException as exc:  # pragma: no cover - makes thread errors visible
             errors.append(exc)
 
     threads = [threading.Thread(target=worker) for _ in range(3)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=5)
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
 
     assert errors == []
     assert len(results) == 3
     assert len(spawned) == 1
     assert len({id(result) for result in results}) == 1
+    aggregates = [
+        message for message in caplog.messages if "stage=owner_worker.ready " in message
+    ]
+    assert len(aggregates) == 3
+    assert sum("path=cold_start" in message for message in aggregates) == 1
+    assert sum("path=wait_existing_start" in message for message in aggregates) == 2
 
 
-def test_supervisor_traces_same_owner_concurrent_wait(tmp_path, caplog):
-    owner = _Owner("ok1_concurrent_trace", tmp_path / "owner")
-    startup_entered = threading.Event()
-    release_startup = threading.Event()
-
-    def fake_process_factory(*args, **_kwargs):
-        startup_entered.set()
-        assert release_startup.wait(timeout=2)
-        argv = args[0]
-        Path(argv[argv.index("--socket") + 1]).touch()
-        return _FakeProcess()
-
-    supervisor = OwnerWorkerSupervisor(
-        control_home=tmp_path / "control",
-        client_cls=_FakeClient,
-        process_factory=fake_process_factory,
-        startup_timeout=1,
-        startup_cooldown=0,
-    )
-    leader = threading.Thread(target=supervisor.get_or_start, args=(owner,))
-    leader.start()
-    assert startup_entered.wait(timeout=2)
-
-    result = []
-    follower = threading.Thread(
-        target=lambda: result.append(
-            supervisor.get_or_start(owner, latency_trace_id="trace-wait-123")
-        )
-    )
-    with caplog.at_level("INFO", logger="hermes_cli.owner_worker.supervisor"):
-        follower.start()
-        time.sleep(0.02)
-        release_startup.set()
-        leader.join(timeout=2)
-        follower.join(timeout=2)
-
-    assert not leader.is_alive()
-    assert not follower.is_alive()
-    assert len(result) == 1
-    assert any(
-        "trace_id=trace-wait-123" in message and "stage=concurrent_wait" in message
-        for message in caplog.messages
-    )
-
-
-def test_supervisor_waiting_same_owner_start_times_out_without_releasing_leader(
-    tmp_path, caplog
-):
+def test_supervisor_waiting_same_owner_start_times_out_without_releasing_leader(tmp_path, caplog):
     owner = _Owner("ok1_stalled", tmp_path / "owner")
     startup_entered = threading.Event()
     release_startup = threading.Event()
@@ -1569,18 +1541,12 @@ def test_supervisor_waiting_same_owner_start_times_out_without_releasing_leader(
     leader.start()
     assert startup_entered.wait(timeout=2)
 
-    with caplog.at_level("INFO", logger="hermes_cli.owner_worker.supervisor"):
-        with pytest.raises(TimeoutError, match="timed out waiting for owner worker startup"):
-            supervisor.get_or_start(
-                owner, timeout=0.01, latency_trace_id="trace-wait-timeout"
-            )
+    with pytest.raises(TimeoutError, match="timed out waiting for owner worker startup"):
+        _traced_get_or_start(supervisor, owner, caplog, timeout=0.01)
 
-    assert any(
-        "trace_id=trace-wait-timeout" in message
-        and "stage=concurrent_wait" in message
-        and "outcome=timeout" in message
-        for message in caplog.messages
-    )
+    assert len(caplog.messages) == 1
+    assert "outcome=error" in caplog.messages[0]
+    assert "path=wait_existing_start" in caplog.messages[0]
     assert len(spawned) == 1
     assert owner.owner_key in supervisor._starting_owner_keys
     assert supervisor._in_flight_starts == 1
@@ -1732,7 +1698,7 @@ def test_supervisor_fences_and_closes_bridges_before_terminating_exact_generatio
         Path(argv[argv.index("--socket") + 1]).touch()
         return _OrderedProcess()
 
-    def revoke_bridges(lease, **_kwargs):
+    def revoke_bridges(lease):
         events.append("bridges")
         assert lease.state is WorkerLeaseState.DRAINING
         with pytest.raises(Exception):
@@ -3006,31 +2972,6 @@ def test_worker_http_token_validation_uses_stored_control_home(tmp_path, monkeyp
     assert client.get("/internal/health", headers={"Authorization": f"Bearer {wrong_secret}"}).status_code == 401
 
 
-def test_worker_drain_endpoint_requires_exact_path_capability(tmp_path, monkeypatch):
-    from fastapi.testclient import TestClient
-
-    control_home = tmp_path / "control"
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "owner"))
-    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_worker_drain")
-    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
-    from hermes_cli.owner_worker.entrypoint import create_app
-
-    owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
-    app = create_app("ok1_worker_drain", owner_home)
-    client = TestClient(app)
-    token = _capability_for(app, path="/internal/drain", control_home=control_home)
-    wrong = _capability_for(app, path="/internal/health", control_home=control_home)
-
-    assert client.post(
-        "/internal/drain",
-        headers={"Authorization": f"Bearer {token}"},
-    ).json() == {"draining": True, "active_turns": 0}
-    assert client.post(
-        "/internal/drain",
-        headers={"Authorization": f"Bearer {wrong}"},
-    ).status_code == 401
-
-
 def test_worker_http_token_rejects_wrong_path(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 
@@ -3668,27 +3609,30 @@ def test_worker_active_session_records_are_descriptor_scoped_to_its_owner(tmp_pa
     app_b = SimpleNamespace(state=SimpleNamespace(owner_worker_controlled_roots=roots_b, owner_worker_live_state=OwnerWorkerLiveState()))
 
     try:
-        relative_path, active_path = ws_routes._active_session_file_for_browser(app_a, "browser-a")
-        relative_path_b, active_path_b = ws_routes._active_session_file_for_browser(app_b, "browser-a")
-        assert relative_path == relative_path_b
-        assert active_path != active_path_b
+        active_path = ws_routes._active_session_file_for_channel(app_a, "browser-a")
+        active_path_b = ws_routes._active_session_file_for_channel(app_b, "browser-a")
+        assert Path(active_path).is_file()
+        assert Path(active_path_b).is_file()
         roots_a.replace_bytes(
-            RootKind.OWNER_WRITABLE,
-            relative_path,
-            b'{"schema_version":1,"session_id":"owner-a-session"}',
+            RootKind.TEMPORARY,
+            ws_routes._active_session_relative_path(app_a, active_path),
+            b'{"session_id":"owner-a-session"}',
         )
         roots_b.replace_bytes(
-            RootKind.OWNER_WRITABLE,
-            relative_path_b,
-            b'{"schema_version":1,"session_id":"owner-b-session"}',
+            RootKind.TEMPORARY,
+            ws_routes._active_session_relative_path(app_b, active_path_b),
+            b'{"session_id":"owner-b-session"}',
         )
-        assert ws_routes._read_active_session_file(app_a, relative_path) == "owner-a-session"
-        assert ws_routes._read_active_session_file(app_b, relative_path_b) == "owner-b-session"
+        assert ws_routes._read_active_session_file(app_a, active_path) == "owner-a-session"
+        assert ws_routes._read_active_session_file(app_b, active_path) is None
+        assert ws_routes._read_active_session_file(app_b, active_path_b) == "owner-b-session"
+        with pytest.raises(RuntimeError, match="not owned"):
+            ws_routes._active_session_relative_path(app_a, "/tmp/untrusted-session.json")
 
-        ws_routes._forget_active_session_file(app_a, relative_path)
+        ws_routes._forget_active_session_file(app_a, active_path)
         assert not Path(active_path).exists()
         assert Path(active_path_b).is_file()
-        assert ws_routes._read_active_session_file(app_b, relative_path_b) == "owner-b-session"
+        assert ws_routes._read_active_session_file(app_b, active_path_b) == "owner-b-session"
     finally:
         roots_a.close()
         roots_b.close()

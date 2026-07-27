@@ -35,7 +35,7 @@ from hermes_cli.dashboard_auth.authority import (
 from hermes_cli.controlled_roots import ControlledRoots, ExpectedType, RootKind, controlled_roots_for
 from hermes_cli.deployment_image import DeploymentImagePolicy
 from hermes_cli.deployment_inference import DeploymentInferencePolicy
-from hermes_cli.latency_trace import clean_latency_trace_id, log_latency_stage
+from hermes_cli.latency_trace import observe_latency_stage, observed_latency_stage
 from hermes_cli.local_socket import canonical_unix_peer_is_absent
 from hermes_cli.owner_worker.cgroup_v2 import CgroupScopeLease
 from hermes_cli.owner_worker.image_relay import DeploymentImageBroker
@@ -55,7 +55,6 @@ from .tokens import owner_worker_capability_public_config
 
 
 _log = logging.getLogger(__name__)
-_LATENCY_SURFACE = "owner-worker-supervisor"
 
 
 @dataclass
@@ -251,11 +250,10 @@ class OwnerWorkerSupervisor:
         max_workers: int | None = None,
         startup_cooldown: float | None = None,
         idle_timeout: float | None = None,
-        drain_timeout: float | None = None,
         max_owner_concurrency: int | None = None,
         control_ws_base: str | None = None,
         authority_store_factory: Callable[[Path], AuthorityStore] = AuthorityStore,
-        generation_bridge_revoker: Callable[..., None] | None = None,
+        generation_bridge_revoker: Callable[[OwnerWorkerAuthorityLease], None] | None = None,
         deployment_inference_policy: DeploymentInferencePolicy | None = None,
         deployment_image_policy: DeploymentImagePolicy | None = None,
         resource_manager: Any | None = None,
@@ -269,14 +267,6 @@ class OwnerWorkerSupervisor:
         self._use_launch_gate = process_factory is subprocess.Popen
         self.startup_timeout = startup_timeout
         self.poll_interval = poll_interval
-        self.drain_timeout = max(
-            0.0,
-            float(
-                drain_timeout
-                if drain_timeout is not None
-                else os.environ.get("HERMES_OWNER_WORKER_DRAIN_TIMEOUT", "60") or 60
-            ),
-        )
         self.resource_manager = resource_manager
         policy_max_workers = (
             resource_manager.policy.global_limits.max_owner_workers
@@ -355,22 +345,50 @@ class OwnerWorkerSupervisor:
             # Observability cannot alter worker fencing or cleanup behavior.
             pass
 
-    def get_or_start(
+    def get_or_start(self, owner: Any, *, timeout: float | None = None) -> OwnerWorkerHandle:
+        started_at = time.monotonic()
+        trace_state = ["cold_start"]
+        try:
+            handle = self._get_or_start(owner, timeout=timeout, trace_state=trace_state)
+        except BaseException:
+            observe_latency_stage(
+                stage="owner_worker.ready",
+                started_at=started_at,
+                outcome="error",
+                path=trace_state[0],
+            )
+            raise
+        observe_latency_stage(
+            stage="owner_worker.ready",
+            started_at=started_at,
+            path=trace_state[0],
+        )
+        return handle
+
+    def _get_or_start(
         self,
         owner: Any,
         *,
-        timeout: float | None = None,
-        latency_trace_id: Any = "",
+        timeout: float | None,
+        trace_state: list[str],
     ) -> OwnerWorkerHandle:
         startup_timeout = self._startup_deadline_timeout(timeout)
         deadline: float | None = None
         owner_key = self._owner_key(owner)
         owner_home = self._owner_home(owner)
-        trace_id = clean_latency_trace_id(latency_trace_id)
+        waited = False
         while True:
             # These methods only select handles while locked; their synchronous
             # revoker/process work runs after releasing the supervisor lock.
-            self._reap_exited()
+            with self._lock:
+                requested = self._handles.get(owner_key)
+                requested_exited = (
+                    requested is not None and requested.process.poll() is not None
+                )
+            if requested_exited:
+                trace_state[0] = "replace_unhealthy"
+            if owner_key in self._reap_exited():
+                trace_state[0] = "replace_unhealthy"
             self._stop_idle(now=time.time())
 
             with self._start_finished:
@@ -380,27 +398,13 @@ class OwnerWorkerSupervisor:
                         raise RuntimeError("owner worker exact owner_home mismatch for owner_key")
                     existing.last_used_at = time.time()
                 elif owner_key in self._starting_owner_keys or owner_key in self._terminating_handles:
+                    waited = True
+                    trace_state[0] = "wait_existing_start"
                     if deadline is None:
                         deadline = time.monotonic() + startup_timeout
                     remaining = deadline - time.monotonic()
-                    stage_started_at = time.monotonic()
                     if remaining <= 0 or not self._start_finished.wait(timeout=remaining):
-                        log_latency_stage(
-                            _log,
-                            trace_id=trace_id,
-                            surface=_LATENCY_SURFACE,
-                            stage="concurrent_wait",
-                            started_at=stage_started_at,
-                            outcome="timeout",
-                        )
                         raise TimeoutError("timed out waiting for owner worker startup")
-                    log_latency_stage(
-                        _log,
-                        trace_id=trace_id,
-                        surface=_LATENCY_SURFACE,
-                        stage="concurrent_wait",
-                        started_at=stage_started_at,
-                    )
                     continue
                 else:
                     eviction = self._admit_start(owner_key, owner_home, now=time.time())
@@ -408,13 +412,15 @@ class OwnerWorkerSupervisor:
                         self._starting_owner_keys.add(owner_key)
                         self._in_flight_starts += 1
                         deadline = time.monotonic() + startup_timeout
+                        if trace_state[0] != "replace_unhealthy":
+                            trace_state[0] = "cold_start"
                         break
 
             if existing is not None:
                 if existing.process.poll() is not None:
+                    trace_state[0] = "replace_unhealthy"
                     self._terminate_handle(owner_key, existing)
                     continue
-                health_readiness_started_at = time.monotonic()
                 try:
                     self.authority_store.assert_worker_lease(
                         self._lease_for_handle(existing), states=frozenset({WorkerLeaseState.ACTIVE})
@@ -428,13 +434,10 @@ class OwnerWorkerSupervisor:
                             self._handles.get(owner_key) is existing
                             and existing.active_uses > 0
                         ):
-                            log_latency_stage(
-                                _log,
-                                trace_id=trace_id,
-                                surface=_LATENCY_SURFACE,
-                                stage="health_readiness",
-                                started_at=health_readiness_started_at,
-                            )
+                            if trace_state[0] != "replace_unhealthy":
+                                trace_state[0] = (
+                                    "wait_existing_start" if waited else "hot_active"
+                                )
                             return existing
                     health = self.client_cls(existing.socket_path, control_home=self.control_home).verify_health(
                         owner_key=owner_key,
@@ -448,66 +451,46 @@ class OwnerWorkerSupervisor:
                     if int(health["pid"]) != existing.pid:
                         raise RuntimeError("owner worker pid mismatch")
                 except (AuthorizationRejected, OwnerWorkerHealthError, RuntimeError):
-                    log_latency_stage(
-                        _log,
-                        trace_id=trace_id,
-                        surface=_LATENCY_SURFACE,
-                        stage="health_readiness",
-                        started_at=health_readiness_started_at,
-                        outcome="failed",
-                    )
                     # A local cache never grants authority. Revoke and close the
                     # exact local generation; a stale CAS cannot affect a replacement.
+                    trace_state[0] = "replace_unhealthy"
                     self._terminate_handle(owner_key, existing)
                     continue
                 with self._lock:
                     if self._handles.get(owner_key) is existing:
                         existing.last_health = health
-                        log_latency_stage(
-                            _log,
-                            trace_id=trace_id,
-                            surface=_LATENCY_SURFACE,
-                            stage="health_readiness",
-                            started_at=health_readiness_started_at,
-                        )
+                        if trace_state[0] != "replace_unhealthy":
+                            trace_state[0] = (
+                                "wait_existing_start" if waited else "hot_health_probe"
+                            )
                         return existing
                 continue
 
             # Capacity eviction was reserved while locked. Complete its strict
             # bridge-revoke/process teardown outside the lock, then retry admission.
-            self._drain_and_teardown_reserved_handle(eviction[0], eviction[1])
+            self._teardown_terminated_handle(eviction[0], eviction[1])
 
         try:
-            stage_started_at = time.monotonic()
-            try:
+            with observed_latency_stage(
+                stage="owner_worker.ready.runtime_dirs", path=trace_state[0]
+            ):
                 ensure_owner_runtime_dirs(owner_home)
-                _seed_owner_worker_skills(owner_home)
-            except Exception as exc:
-                log_latency_stage(
-                    _log,
-                    trace_id=trace_id,
-                    surface=_LATENCY_SURFACE,
-                    stage="skill_sync",
-                    started_at=stage_started_at,
-                    outcome="failed",
-                )
-                raise OwnerWorkerStartupError(
-                    f"owner bundled skill synchronization failed: {exc}"
-                ) from exc
-            log_latency_stage(
-                _log,
-                trace_id=trace_id,
-                surface=_LATENCY_SURFACE,
-                stage="skill_sync",
-                started_at=stage_started_at,
-            )
+            with observed_latency_stage(
+                stage="owner_worker.ready.skills_sync", path=trace_state[0]
+            ):
+                try:
+                    _seed_owner_worker_skills(owner_home)
+                except Exception as exc:
+                    raise OwnerWorkerStartupError(
+                        f"owner bundled skill synchronization failed: {exc}"
+                    ) from exc
             process_deadline = time.monotonic() + startup_timeout
             return self._start_owner_worker(
                 owner,
                 owner_key,
                 owner_home,
                 deadline=process_deadline,
-                latency_trace_id=trace_id,
+                readiness_path=trace_state[0],
             )
         finally:
             with self._start_finished:
@@ -532,19 +515,20 @@ class OwnerWorkerSupervisor:
         owner_home: Path,
         *,
         deadline: float,
-        latency_trace_id: str = "",
+        readiness_path: str,
     ) -> OwnerWorkerHandle:
-        trace_id = latency_trace_id
-        process_spawn_started_at = time.monotonic()
-        try:
-            claim = self.authority_store.claim_worker_start(owner_key, worker_id=uuid.uuid4().hex)
-        except AuthorizationRejected as exc:
-            if (
-                str(exc) != "worker_lease_already_owned"
-                or not self._reconcile_missing_local_worker(owner_key, owner_home)
-            ):
-                raise OwnerWorkerUnavailableError(f"owner worker is already owned: {exc}") from exc
-            claim = self.authority_store.claim_worker_start(owner_key, worker_id=uuid.uuid4().hex)
+        with observed_latency_stage(
+            stage="owner_worker.ready.authority_claim", path=readiness_path
+        ):
+            try:
+                claim = self.authority_store.claim_worker_start(owner_key, worker_id=uuid.uuid4().hex)
+            except AuthorizationRejected as exc:
+                if (
+                    str(exc) != "worker_lease_already_owned"
+                    or not self._reconcile_missing_local_worker(owner_key, owner_home)
+                ):
+                    raise OwnerWorkerUnavailableError(f"owner worker is already owned: {exc}") from exc
+                claim = self.authority_store.claim_worker_start(owner_key, worker_id=uuid.uuid4().hex)
         generation = claim.generation
         socket_path = self.socket_path_for(owner, generation.worker_generation)
         env = self._env_for(owner, generation, claim.lease)
@@ -552,6 +536,7 @@ class OwnerWorkerSupervisor:
         image_relay_fd = None
         resource_broker_fd = None
         worker_resource_scope = None
+        resource_started_at = time.monotonic()
         try:
             if self.resource_manager is not None:
                 worker_resource_scope = self.resource_manager.admit_worker(claim.lease)
@@ -570,6 +555,12 @@ class OwnerWorkerSupervisor:
             )
             controlled_roots = self._controlled_roots_for(runtime_paths)
         except Exception as exc:
+            observe_latency_stage(
+                stage="owner_worker.ready.resource_admission",
+                started_at=resource_started_at,
+                outcome="error",
+                path=readiness_path,
+            )
             for fd in (relay_fd, image_relay_fd, resource_broker_fd):
                 if fd is not None:
                     try:
@@ -591,21 +582,25 @@ class OwnerWorkerSupervisor:
                 )
             except AuthorizationRejected:
                 pass
-            log_latency_stage(
-                _log,
-                trace_id=trace_id,
-                surface=_LATENCY_SURFACE,
-                stage="process_spawn",
-                started_at=process_spawn_started_at,
-                outcome="failed",
-            )
             raise OwnerWorkerStartupError("owner worker resource admission failed") from exc
+        observe_latency_stage(
+            stage="owner_worker.ready.resource_admission",
+            started_at=resource_started_at,
+            path=readiness_path,
+        )
+        process_started_at = time.monotonic()
         try:
             controlled_roots.mkdirs(
                 RootKind.OWNER_WRITABLE,
                 f"runtime/workers/{generation.worker_generation}",
             )
         except BaseException:
+            observe_latency_stage(
+                stage="owner_worker.ready.process_spawn",
+                started_at=process_started_at,
+                outcome="error",
+                path=readiness_path,
+            )
             controlled_roots.close()
             for fd in (relay_fd, image_relay_fd, resource_broker_fd):
                 if fd is not None:
@@ -719,6 +714,12 @@ class OwnerWorkerSupervisor:
                     os.close(resource_broker_fd)
                     resource_broker_fd = None
         except Exception as exc:
+            observe_latency_stage(
+                stage="owner_worker.ready.process_spawn",
+                started_at=process_started_at,
+                outcome="error",
+                path=readiness_path,
+            )
             for fd in (start_read, start_write):
                 if fd is not None:
                     try:
@@ -754,14 +755,6 @@ class OwnerWorkerSupervisor:
                 )
             except AuthorizationRejected:
                 pass
-            log_latency_stage(
-                _log,
-                trace_id=trace_id,
-                surface=_LATENCY_SURFACE,
-                stage="process_spawn",
-                started_at=process_spawn_started_at,
-                outcome="failed",
-            )
             raise OwnerWorkerStartupError(f"owner worker process launch failed: {exc}") from exc
         finally:
             if cwd_fd is not None:
@@ -771,14 +764,13 @@ class OwnerWorkerSupervisor:
             if stderr_handle is not None:
                 os.close(stderr_handle)
             controlled_roots.close()
-        log_latency_stage(
-            _log,
-            trace_id=trace_id,
-            surface=_LATENCY_SURFACE,
-            stage="process_spawn",
-            started_at=process_spawn_started_at,
+        observe_latency_stage(
+            stage="owner_worker.ready.process_spawn",
+            started_at=process_started_at,
+            path=readiness_path,
         )
-        health_readiness_started_at = time.monotonic()
+        health_started_at = time.monotonic()
+        activation_started_at: float | None = None
         try:
             health = self._wait_until_healthy(
                 process=process,
@@ -792,12 +784,28 @@ class OwnerWorkerSupervisor:
             )
             self._chmod_private_file(socket_path)
             self._verify_socket_path(socket_path, owner_home, generation.worker_generation)
+            observe_latency_stage(
+                stage="owner_worker.ready.health_wait",
+                started_at=health_started_at,
+                path=readiness_path,
+            )
+            activation_started_at = time.monotonic()
             active_lease = self.authority_store.transition_worker_lease(
                 claim.lease,
                 state=WorkerLeaseState.ACTIVE,
                 generation_state=WorkerGenerationState.ACTIVE,
             )
         except Exception as exc:
+            observe_latency_stage(
+                stage=(
+                    "owner_worker.ready.lease_activate"
+                    if activation_started_at is not None
+                    else "owner_worker.ready.health_wait"
+                ),
+                started_at=activation_started_at or health_started_at,
+                outcome="error",
+                path=readiness_path,
+            )
             if self.deployment_inference_broker is not None:
                 self.deployment_inference_broker.revoke(claim.lease)
             if self.deployment_image_broker is not None:
@@ -834,24 +842,9 @@ class OwnerWorkerSupervisor:
                     generation.worker_generation,
                     socket_path=socket_path,
                 )
-            log_latency_stage(
-                _log,
-                trace_id=trace_id,
-                surface=_LATENCY_SURFACE,
-                stage="health_readiness",
-                started_at=health_readiness_started_at,
-                outcome=("timeout" if isinstance(exc, TimeoutError) else "failed"),
-            )
             if isinstance(exc, (OwnerWorkerUnavailableError, TimeoutError)):
                 raise
             raise OwnerWorkerStartupError("owner worker startup failed") from exc
-        log_latency_stage(
-            _log,
-            trace_id=trace_id,
-            surface=_LATENCY_SURFACE,
-            stage="health_readiness",
-            started_at=health_readiness_started_at,
-        )
 
         handle = OwnerWorkerHandle(
             owner_key=owner_key,
@@ -874,6 +867,12 @@ class OwnerWorkerSupervisor:
             if self.deployment_resource_broker is not None:
                 self.deployment_resource_broker.activate(active_lease)
         except Exception as exc:
+            observe_latency_stage(
+                stage="owner_worker.ready.lease_activate",
+                started_at=activation_started_at,
+                outcome="error",
+                path=readiness_path,
+            )
             if self.deployment_inference_broker is not None:
                 self.deployment_inference_broker.revoke(active_lease)
             if self.deployment_image_broker is not None:
@@ -913,6 +912,11 @@ class OwnerWorkerSupervisor:
         with self._lock:
             self._handles[owner_key] = handle
         self._audit_generation(AuthorityAuditReason.GENERATION_ACTIVE, active_lease)
+        observe_latency_stage(
+            stage="owner_worker.ready.lease_activate",
+            started_at=activation_started_at,
+            path=readiness_path,
+        )
         return handle
 
     def _reconcile_missing_local_worker(self, owner_key: str, owner_home: Path) -> bool:
@@ -979,47 +983,9 @@ class OwnerWorkerSupervisor:
                 if self._reserve_termination_locked(owner_key, handle)
             ]
         first_error = None
-        draining: list[tuple[str, OwnerWorkerHandle, OwnerWorkerAuthorityLease, OwnerWorkerClient]] = []
-        for owner_key, handle in reserved:
-            if handle.process.poll() is not None:
-                continue
-            lease = self._lease_for_handle(handle)
-            client = self.client_cls(
-                handle.socket_path,
-                timeout=max(2.0, self.poll_interval * 2),
-                control_home=self.control_home,
-            )
-            try:
-                client.begin_drain(lease=lease)
-                draining.append((owner_key, handle, lease, client))
-            except Exception as exc:
-                first_error = first_error or exc
-        deadline = time.monotonic() + self.drain_timeout
-        pending = list(draining)
-        while pending and time.monotonic() < deadline:
-            still_pending = []
-            for item in pending:
-                try:
-                    if item[3].drain_status(lease=item[2]).get("active_turns", 0) > 0:
-                        still_pending.append(item)
-                except Exception as exc:
-                    first_error = first_error or exc
-                    still_pending.append(item)
-            pending = still_pending
-            if pending:
-                time.sleep(self.poll_interval)
-        for _owner_key, _handle, lease, client in pending:
-            try:
-                client.force_drain(lease=lease)
-            except Exception as exc:
-                first_error = first_error or exc
         for owner_key, handle in reserved:
             try:
-                self._teardown_terminated_handle(
-                    owner_key,
-                    handle,
-                    planned_restart=True,
-                )
+                self._teardown_terminated_handle(owner_key, handle)
             except Exception as exc:
                 first_error = first_error or exc
         for broker in (
@@ -1222,48 +1188,9 @@ class OwnerWorkerSupervisor:
         with self._lock:
             if not self._reserve_termination_locked(owner_key, handle):
                 return
-        self._drain_and_teardown_reserved_handle(owner_key, handle)
+        self._teardown_terminated_handle(owner_key, handle)
 
-    def _drain_and_teardown_reserved_handle(
-        self,
-        owner_key: str,
-        handle: OwnerWorkerHandle,
-        *,
-        planned_restart: bool = False,
-    ) -> None:
-        """Drain one reserved live Worker before ordered generation teardown."""
-        if handle.process.poll() is None:
-            lease = self._lease_for_handle(handle)
-            client = self.client_cls(
-                handle.socket_path,
-                timeout=max(2.0, self.poll_interval * 2),
-                control_home=self.control_home,
-            )
-            try:
-                status = client.begin_drain(lease=lease)
-                deadline = time.monotonic() + self.drain_timeout
-                while status.get("active_turns", 0) > 0 and time.monotonic() < deadline:
-                    time.sleep(self.poll_interval)
-                    status = client.drain_status(lease=lease)
-                if status.get("active_turns", 0) > 0:
-                    client.force_drain(lease=lease)
-            except Exception:
-                # Ordered teardown still fences exact capability and process state.
-                # Worker lifespan performs a final resumable force-drain on exit.
-                pass
-        self._teardown_terminated_handle(
-            owner_key,
-            handle,
-            planned_restart=planned_restart,
-        )
-
-    def _teardown_terminated_handle(
-        self,
-        owner_key: str,
-        handle: OwnerWorkerHandle,
-        *,
-        planned_restart: bool = False,
-    ) -> None:
+    def _teardown_terminated_handle(self, owner_key: str, handle: OwnerWorkerHandle) -> None:
         """Run ordered external teardown for a previously reserved handle.
 
         This method deliberately never holds ``_lock`` while calling the bridge
@@ -1295,12 +1222,7 @@ class OwnerWorkerSupervisor:
                 if broker is not None:
                     _cleanup(lambda broker=broker: broker.revoke(retired_lease))
             if self.generation_bridge_revoker is not None:
-                _cleanup(
-                    lambda: self.generation_bridge_revoker(
-                        retired_lease,
-                        planned_restart=planned_restart,
-                    )
-                )
+                _cleanup(lambda: self.generation_bridge_revoker(retired_lease))
 
             process_exited = handle.process.poll() is not None
             if process_exited:
@@ -1352,7 +1274,7 @@ class OwnerWorkerSupervisor:
                     self._terminating_handles.pop(owner_key, None)
                 self._start_finished.notify_all()
 
-    def _reap_exited(self) -> None:
+    def _reap_exited(self) -> set[str]:
         with self._lock:
             reserved = [
                 (owner_key, handle)
@@ -1360,7 +1282,8 @@ class OwnerWorkerSupervisor:
                 if handle.process.poll() is not None and self._reserve_termination_locked(owner_key, handle)
             ]
         for owner_key, handle in reserved:
-            self._drain_and_teardown_reserved_handle(owner_key, handle)
+            self._teardown_terminated_handle(owner_key, handle)
+        return {owner_key for owner_key, _handle in reserved}
 
     def _stop_idle(self, *, now: float) -> None:
         with self._lock:
@@ -1374,7 +1297,7 @@ class OwnerWorkerSupervisor:
                     if self._reserve_termination_locked(owner_key, handle):
                         reserved.append((owner_key, handle))
         for owner_key, handle in reserved:
-            self._drain_and_teardown_reserved_handle(owner_key, handle)
+            self._teardown_terminated_handle(owner_key, handle)
 
     def _reserve_oldest_idle_locked(self) -> tuple[str, OwnerWorkerHandle] | None:
         live = [
@@ -1394,7 +1317,7 @@ class OwnerWorkerSupervisor:
         with self._lock:
             reserved = self._reserve_oldest_idle_locked()
         if reserved is not None:
-            self._drain_and_teardown_reserved_handle(*reserved)
+            self._teardown_terminated_handle(*reserved)
 
     def socket_path_for(self, owner: Any, worker_generation: int | None = None) -> Path:
         if worker_generation is None:
