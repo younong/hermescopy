@@ -10,10 +10,16 @@ import mimetypes
 import os
 import re
 import secrets
+import shutil
+import signal
 import socket
+import subprocess
+import sys
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping, Sequence
 from urllib.parse import quote, urlparse
 
 from aiohttp.abc import AbstractResolver, ResolveResult
@@ -53,6 +59,164 @@ class WeixinMediaError(RuntimeError):
 class WeixinMediaLimits:
     max_download_bytes: int = 32 * 1024 * 1024
     timeout_seconds: float = 60.0
+
+
+@dataclass(frozen=True)
+class WeixinVoiceLimits:
+    max_source_bytes: int = 32 * 1024 * 1024
+    max_silk_bytes: int = 6 * 1024 * 1024
+    max_duration_seconds: float = 300.0
+    timeout_seconds: float = 60.0
+
+
+@dataclass(frozen=True)
+class PreparedWeixinVoice:
+    path: Path
+    playtime_ms: int
+
+
+def _terminate_media_process(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            proc.kill()
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        proc.kill()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _run_media_command(command: Sequence[str], *, timeout_seconds: float) -> None:
+    environment = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONNOUSERSITE": "1",
+    }
+    popen_kwargs: dict[str, Any] = {
+        "env": environment,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_kwargs["start_new_session"] = True
+    try:
+        proc = subprocess.Popen(command, **popen_kwargs)
+    except OSError as exc:
+        raise WeixinMediaError("voice_codec_unavailable") from exc
+    try:
+        returncode = proc.wait(timeout=min(max(float(timeout_seconds), 1.0), 3600.0))
+    except subprocess.TimeoutExpired as exc:
+        _terminate_media_process(proc)
+        raise WeixinMediaError("voice_encoding_timeout", retryable=True) from exc
+    if returncode != 0:
+        raise WeixinMediaError("voice_encoding_failed")
+
+
+@contextmanager
+def prepare_weixin_voice(
+    path: str,
+    *,
+    limits: WeixinVoiceLimits = WeixinVoiceLimits(),
+) -> Iterator[PreparedWeixinVoice]:
+    """Convert one bounded MP3/WAV/OGG source to 24 kHz Tencent SILK."""
+    source = Path(path)
+    if source.suffix.lower() not in {".mp3", ".wav", ".ogg"}:
+        raise WeixinMediaError("voice_format_unsupported")
+    try:
+        if source.is_symlink() or not source.is_file():
+            raise WeixinMediaError("media_file_unavailable")
+        source_size = source.stat().st_size
+    except OSError as exc:
+        raise WeixinMediaError("media_file_unavailable") from exc
+    if not 1 <= source_size <= limits.max_source_bytes:
+        raise WeixinMediaError("voice_source_too_large" if source_size else "voice_source_empty")
+    if (
+        not 0 < limits.max_duration_seconds <= 3600
+        or not limits.max_silk_bytes > 0
+        or not 0 < limits.timeout_seconds <= 3600
+    ):
+        raise WeixinMediaError("voice_limits_invalid")
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise WeixinMediaError("voice_codec_unavailable")
+    temporary_root = Path(tempfile.mkdtemp(prefix="hermes-weixin-voice-"))
+    if os.name != "nt":
+        temporary_root.chmod(0o700)
+    pcm_path = temporary_root / "voice.pcm"
+    silk_path = temporary_root / "voice.silk"
+    try:
+        _run_media_command(
+            [
+                ffmpeg,
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(source),
+                "-map_metadata",
+                "-1",
+                "-vn",
+                "-sn",
+                "-dn",
+                "-ac",
+                "1",
+                "-ar",
+                "24000",
+                "-acodec",
+                "pcm_s16le",
+                "-f",
+                "s16le",
+                "-t",
+                str(float(limits.max_duration_seconds) + 1.0),
+                str(pcm_path),
+            ],
+            timeout_seconds=limits.timeout_seconds,
+        )
+        try:
+            pcm_size = pcm_path.stat().st_size
+        except OSError as exc:
+            raise WeixinMediaError("voice_encoding_failed") from exc
+        if pcm_size <= 0 or pcm_size % 2:
+            raise WeixinMediaError("voice_pcm_invalid")
+        pcm_frames = pcm_size // 2
+        source_playtime_ms = (pcm_frames * 1000 + 12_000) // 24_000
+        if source_playtime_ms <= 0:
+            raise WeixinMediaError("voice_pcm_invalid")
+        if source_playtime_ms > limits.max_duration_seconds * 1000:
+            raise WeixinMediaError("voice_too_long")
+
+        helper = Path(__file__).resolve().parents[2] / "tools" / "silk_encoder.py"
+        _run_media_command(
+            [sys.executable, "-I", str(helper), str(pcm_path), str(silk_path)],
+            timeout_seconds=limits.timeout_seconds,
+        )
+        try:
+            silk_data = silk_path.read_bytes()
+        except OSError as exc:
+            raise WeixinMediaError("voice_encoding_failed") from exc
+        if not 1 <= len(silk_data) <= limits.max_silk_bytes:
+            raise WeixinMediaError(
+                "voice_silk_too_large" if silk_data else "voice_encoding_failed"
+            )
+        playtime_ms = silk_playtime_ms(silk_data)
+        if abs(playtime_ms - source_playtime_ms) > 20:
+            raise WeixinMediaError("voice_playtime_mismatch")
+        if os.name != "nt":
+            silk_path.chmod(0o600)
+        yield PreparedWeixinVoice(path=silk_path, playtime_ms=playtime_ms)
+    finally:
+        shutil.rmtree(temporary_root, ignore_errors=True)
 
 
 def sanitize_filename(value: str, *, default: str = "document.bin") -> str:
@@ -280,6 +444,29 @@ def media_kind_for_path(path: str, *, force_file: bool = False) -> tuple[str, in
     return "file", ITEM_FILE, MEDIA_FILE
 
 
+def silk_playtime_ms(data: bytes) -> int:
+    """Return duration from a bounded SILK packet stream without decoding it."""
+    if data.startswith(b"\x02#!SILK_V3"):
+        offset = 10
+    elif data.startswith(b"#!SILK_V3"):
+        offset = 9
+    else:
+        raise WeixinMediaError("voice_silk_invalid")
+    packets = 0
+    while offset < len(data):
+        if offset + 2 > len(data):
+            raise WeixinMediaError("voice_silk_invalid")
+        packet_size = int.from_bytes(data[offset:offset + 2], "little", signed=True)
+        offset += 2
+        if packet_size <= 0 or offset + packet_size > len(data):
+            raise WeixinMediaError("voice_silk_invalid")
+        offset += packet_size
+        packets += 1
+    if packets == 0:
+        raise WeixinMediaError("voice_silk_invalid")
+    return packets * 20
+
+
 def build_media_item(
     *,
     kind: str,
@@ -289,6 +476,7 @@ def build_media_item(
     plaintext_size: int,
     filename: str,
     rawfilemd5: str,
+    voice_playtime_ms: int | None = None,
 ) -> dict[str, Any]:
     media = {
         "encrypt_query_param": encrypted_query_param,
@@ -308,6 +496,8 @@ def build_media_item(
             },
         }
     if kind == "voice":
+        if not isinstance(voice_playtime_ms, int) or voice_playtime_ms <= 0:
+            raise WeixinMediaError("voice_playtime_invalid")
         return {
             "type": ITEM_VOICE,
             "voice_item": {
@@ -315,7 +505,7 @@ def build_media_item(
                 "encode_type": 6,
                 "bits_per_sample": 16,
                 "sample_rate": 24000,
-                "playtime": 0,
+                "playtime": voice_playtime_ms,
             },
         }
     return {
@@ -336,6 +526,7 @@ async def upload_media_item(
     path: str,
     cdn_base_url: str = WEIXIN_CDN_BASE_URL,
     force_file: bool = False,
+    voice_playtime_ms: int | None = None,
 ) -> dict[str, Any]:
     """Encrypt, upload, and construct one native iLink media item."""
     try:
@@ -343,6 +534,12 @@ async def upload_media_item(
     except OSError as exc:
         raise WeixinMediaError("media_file_unavailable") from exc
     kind, _item_type, media_type = media_kind_for_path(path, force_file=force_file)
+    if kind == "voice":
+        parsed_playtime = silk_playtime_ms(plaintext)
+        if voice_playtime_ms is None:
+            voice_playtime_ms = parsed_playtime
+        elif voice_playtime_ms != parsed_playtime:
+            raise WeixinMediaError("voice_playtime_mismatch")
     filekey = secrets.token_hex(16)
     aes_key = secrets.token_bytes(16)
     rawfilemd5 = hashlib.md5(plaintext).hexdigest()
@@ -406,4 +603,5 @@ async def upload_media_item(
         plaintext_size=len(plaintext),
         filename=Path(path).name,
         rawfilemd5=rawfilemd5,
+        voice_playtime_ms=voice_playtime_ms,
     )
