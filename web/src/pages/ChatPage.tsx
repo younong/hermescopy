@@ -46,6 +46,7 @@ import {
 import { PluginSlot } from "@/plugins";
 import { useTheme } from "@/themes";
 import { useProfileScope } from "@/contexts/useProfileScope";
+import { WebSocketReconnectLifecycle } from "@/features/gui-chat/reconnectLifecycle";
 
 // Channel id ties this chat tab's PTY child (publisher) to its sidebar
 // (subscriber).  Generated once per mount so a tab refresh starts a fresh
@@ -147,8 +148,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   );
   const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const reconnectAttemptRef = useRef(0);
+  const reconnectLifecycleRef = useRef<WebSocketReconnectLifecycle | null>(null);
   const forceFreshPtyRef = useRef(false);
   // NS-504: when the agent process exits cleanly (the user typed `/exit`, or
   // started a new session that ended the current PTY child), the PTY socket
@@ -159,32 +159,41 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // is a dependency of the connect effect, so a fresh PTY spawns in place.
   const [sessionEnded, setSessionEnded] = useState(false);
   const [reconnectNonce, setReconnectNonce] = useState(0);
-  const clearReconnectTimer = useCallback(() => {
-    if (reconnectTimerRef.current) {
-      clearTimeout(reconnectTimerRef.current);
-      reconnectTimerRef.current = null;
-    }
+  const reconnectGenerationRef = useRef(0);
+
+  useEffect(() => {
+    const lifecycle = new WebSocketReconnectLifecycle({
+      reconnect: () => {
+        const generation = ++reconnectGenerationRef.current;
+        setReconnectNonce(generation);
+        return generation;
+      },
+    });
+    reconnectLifecycleRef.current = lifecycle;
+    return () => {
+      lifecycle.dispose();
+      if (reconnectLifecycleRef.current === lifecycle) reconnectLifecycleRef.current = null;
+    };
   }, []);
+
   const reconnect = useCallback(() => {
     forceFreshPtyRef.current = true;
-    reconnectAttemptRef.current = 0;
-    clearReconnectTimer();
+    reconnectLifecycleRef.current?.cancelRecovery();
     setSessionEnded(false);
     setBanner(null);
-    setReconnectNonce((n) => n + 1);
-  }, [clearReconnectTimer]);
+    setReconnectNonce(++reconnectGenerationRef.current);
+  }, []);
   const startFreshDashboardChat = useCallback(() => {
     const next = new URLSearchParams(searchParams);
 
     next.delete("resume");
     forceFreshPtyRef.current = true;
-    reconnectAttemptRef.current = 0;
-    clearReconnectTimer();
+    reconnectLifecycleRef.current?.cancelRecovery();
     setSearchParams(next, { replace: true });
     setSessionEnded(false);
     setBanner(null);
-    setReconnectNonce((n) => n + 1);
-  }, [clearReconnectTimer, searchParams, setSearchParams]);
+    setReconnectNonce(++reconnectGenerationRef.current);
+  }, [searchParams, setSearchParams]);
 
   const markTerminalSelectionGuard = useCallback((ms = DASHBOARD_SELECTION_GUARD_MS) => {
     terminalSelectionGuardUntilRef.current = Math.max(
@@ -283,14 +292,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const { browserId, ownerKey, ready: authIdentityReady } = useDashboardBrowserIdentity();
 
   useEffect(() => dashboardAuthTransition.register(() => {
-    clearReconnectTimer();
-    reconnectAttemptRef.current = 0;
+    reconnectLifecycleRef.current?.cancelRecovery();
     forceFreshPtyRef.current = true;
     wsRef.current?.close(4401, "owner changed");
     wsRef.current = null;
     setBanner(null);
     setSessionEnded(false);
-  }), [clearReconnectTimer]);
+  }), []);
 
   const channel = useMemo(
     () => generateChannelId(`${resumeParam ?? ""}\0${scopedProfile}`),
@@ -860,26 +868,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     const forceFresh = forceFreshPtyRef.current;
     forceFreshPtyRef.current = false;
     const connectionId = diagnosticId("pty");
+    const connectController = new AbortController();
     let socketOpened = false;
-    const scheduleReconnect = (code: number) => {
-      if (reconnectTimerRef.current) {
-        return;
-      }
-      const attempt = Math.min(reconnectAttemptRef.current + 1, 5);
-      reconnectAttemptRef.current = attempt;
-      const delayMs = Math.min(250 * 2 ** (attempt - 1), 3000);
-      emitChatDiagnostic({ closeCode: code, connectionId, event: "retry", outcome: "scheduled", retryAttempt: attempt, surface: "terminal_pty" });
-      setSessionEnded(false);
-      setBanner(
-        `Chat connection interrupted (code ${code}). Reconnecting…`,
-      );
-      reconnectTimerRef.current = setTimeout(() => {
-        reconnectTimerRef.current = null;
-        setReconnectNonce((n) => n + 1);
-      }, delayMs);
-    };
+    reconnectLifecycleRef.current?.onConnectionState("connecting");
     void (async () => {
-      if (unmounting) return;
       const params: Record<string, string> = { browser_id: browserId, channel };
       if (resumeParam) params.resume = resumeParam;
       if (forceFresh) params.fresh = "1";
@@ -887,16 +879,22 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // selected profile, so the conversation runs with that profile's model,
       // skills, memory, and sessions (see web_server._resolve_chat_argv).
       if (scopedProfile) params.profile = scopedProfile;
-      const url = await api.buildWsUrl("/api/pty", params);
+      const url = await api.buildWsUrl(
+        "/api/pty",
+        params,
+        connectionId,
+        connectController.signal,
+      );
+      if (unmounting || connectController.signal.aborted) return;
       const ws = new WebSocket(url);
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
 
     ws.onopen = () => {
       socketOpened = true;
-      emitChatDiagnostic({ connectionId, event: "opened", opened: true, outcome: "ok", retryAttempt: reconnectAttemptRef.current, surface: "terminal_pty" });
-      clearReconnectTimer();
-      reconnectAttemptRef.current = 0;
+      reconnectLifecycleRef.current?.onConnectionState("open");
+      reconnectLifecycleRef.current?.onReconnectSettled(reconnectNonce, true);
+      emitChatDiagnostic({ connectionId, event: "opened", opened: true, outcome: "ok", surface: "terminal_pty" });
       setBanner(null);
       setSessionEnded(false);
       // Send the initial RESIZE immediately so Ink has *a* size to lay
@@ -996,8 +994,15 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         // Server already wrote an ANSI error frame.
         return;
       }
-      if (!ev.wasClean || ev.code === 1001 || ev.code === 1006) {
-        scheduleReconnect(ev.code);
+      if (!ev.wasClean || ev.code === 1001 || ev.code === 1006 || ev.code === 1012) {
+        reconnectLifecycleRef.current?.onConnectionState("closed");
+        emitChatDiagnostic({ closeCode: ev.code, connectionId, event: "retry", outcome: "scheduled", surface: "terminal_pty" });
+        setSessionEnded(false);
+        setBanner(
+          ev.code === 1012
+            ? "Chat is reconnecting after a service update…"
+            : `Chat connection interrupted (code ${ev.code}). Reconnecting…`,
+        );
         return;
       }
       // Normal/clean exit: the agent process ended (e.g. the user typed
@@ -1038,7 +1043,21 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           ws.send(`\x1b[RESIZE:${cols};${rows}]`);
         }
       });
-    })();
+    })().catch((error: unknown) => {
+      if (unmounting || connectController.signal.aborted) return;
+      reconnectLifecycleRef.current?.onConnectionState("error");
+      setSessionEnded(false);
+      setBanner("Chat service is temporarily unavailable. Reconnecting…");
+      emitChatDiagnostic({
+        connectionId,
+        event: "retry",
+        outcome: "scheduled",
+        surface: "terminal_pty",
+      });
+      if (error instanceof Error && error.name !== "AbortError") {
+        console.warn("[dashboard chat] websocket connection attempt failed", error);
+      }
+    });
 
     term.focus();
 
@@ -1059,7 +1078,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       if (refreshRaf) cancelAnimationFrame(refreshRaf);
       if (settleRaf1) cancelAnimationFrame(settleRaf1);
       if (settleRaf2) cancelAnimationFrame(settleRaf2);
-      clearReconnectTimer();
+      connectController.abort();
       // Phase 5.3: ``ws`` is local to the IIFE that opens it (the gated-mode
       // ticket fetch makes the open async). The cleanup runs at the outer
       // effect's top level so it can't reach into that scope — close via
@@ -1075,7 +1094,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         copyResetRef.current = null;
       }
     };
-  }, [authIdentityReady, browserId, channel, clearReconnectTimer, isActive, resumeParam, scopedProfile, reconnectNonce]);
+  }, [authIdentityReady, browserId, channel, isActive, resumeParam, scopedProfile, reconnectNonce]);
 
   // When the user returns to the chat tab (isActive: false → true), the
   // terminal host just transitioned from display:none to display:flex.

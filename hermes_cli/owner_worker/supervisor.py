@@ -251,10 +251,11 @@ class OwnerWorkerSupervisor:
         max_workers: int | None = None,
         startup_cooldown: float | None = None,
         idle_timeout: float | None = None,
+        drain_timeout: float | None = None,
         max_owner_concurrency: int | None = None,
         control_ws_base: str | None = None,
         authority_store_factory: Callable[[Path], AuthorityStore] = AuthorityStore,
-        generation_bridge_revoker: Callable[[OwnerWorkerAuthorityLease], None] | None = None,
+        generation_bridge_revoker: Callable[..., None] | None = None,
         deployment_inference_policy: DeploymentInferencePolicy | None = None,
         deployment_image_policy: DeploymentImagePolicy | None = None,
         resource_manager: Any | None = None,
@@ -268,6 +269,14 @@ class OwnerWorkerSupervisor:
         self._use_launch_gate = process_factory is subprocess.Popen
         self.startup_timeout = startup_timeout
         self.poll_interval = poll_interval
+        self.drain_timeout = max(
+            0.0,
+            float(
+                drain_timeout
+                if drain_timeout is not None
+                else os.environ.get("HERMES_OWNER_WORKER_DRAIN_TIMEOUT", "60") or 60
+            ),
+        )
         self.resource_manager = resource_manager
         policy_max_workers = (
             resource_manager.policy.global_limits.max_owner_workers
@@ -466,7 +475,7 @@ class OwnerWorkerSupervisor:
 
             # Capacity eviction was reserved while locked. Complete its strict
             # bridge-revoke/process teardown outside the lock, then retry admission.
-            self._teardown_terminated_handle(eviction[0], eviction[1])
+            self._drain_and_teardown_reserved_handle(eviction[0], eviction[1])
 
         try:
             stage_started_at = time.monotonic()
@@ -970,9 +979,47 @@ class OwnerWorkerSupervisor:
                 if self._reserve_termination_locked(owner_key, handle)
             ]
         first_error = None
+        draining: list[tuple[str, OwnerWorkerHandle, OwnerWorkerAuthorityLease, OwnerWorkerClient]] = []
+        for owner_key, handle in reserved:
+            if handle.process.poll() is not None:
+                continue
+            lease = self._lease_for_handle(handle)
+            client = self.client_cls(
+                handle.socket_path,
+                timeout=max(2.0, self.poll_interval * 2),
+                control_home=self.control_home,
+            )
+            try:
+                client.begin_drain(lease=lease)
+                draining.append((owner_key, handle, lease, client))
+            except Exception as exc:
+                first_error = first_error or exc
+        deadline = time.monotonic() + self.drain_timeout
+        pending = list(draining)
+        while pending and time.monotonic() < deadline:
+            still_pending = []
+            for item in pending:
+                try:
+                    if item[3].drain_status(lease=item[2]).get("active_turns", 0) > 0:
+                        still_pending.append(item)
+                except Exception as exc:
+                    first_error = first_error or exc
+                    still_pending.append(item)
+            pending = still_pending
+            if pending:
+                time.sleep(self.poll_interval)
+        for _owner_key, _handle, lease, client in pending:
+            try:
+                client.force_drain(lease=lease)
+            except Exception as exc:
+                first_error = first_error or exc
         for owner_key, handle in reserved:
             try:
-                self._teardown_terminated_handle(owner_key, handle)
+                self._teardown_terminated_handle(
+                    owner_key,
+                    handle,
+                    planned_restart=True,
+                )
             except Exception as exc:
                 first_error = first_error or exc
         for broker in (
@@ -1175,9 +1222,48 @@ class OwnerWorkerSupervisor:
         with self._lock:
             if not self._reserve_termination_locked(owner_key, handle):
                 return
-        self._teardown_terminated_handle(owner_key, handle)
+        self._drain_and_teardown_reserved_handle(owner_key, handle)
 
-    def _teardown_terminated_handle(self, owner_key: str, handle: OwnerWorkerHandle) -> None:
+    def _drain_and_teardown_reserved_handle(
+        self,
+        owner_key: str,
+        handle: OwnerWorkerHandle,
+        *,
+        planned_restart: bool = False,
+    ) -> None:
+        """Drain one reserved live Worker before ordered generation teardown."""
+        if handle.process.poll() is None:
+            lease = self._lease_for_handle(handle)
+            client = self.client_cls(
+                handle.socket_path,
+                timeout=max(2.0, self.poll_interval * 2),
+                control_home=self.control_home,
+            )
+            try:
+                status = client.begin_drain(lease=lease)
+                deadline = time.monotonic() + self.drain_timeout
+                while status.get("active_turns", 0) > 0 and time.monotonic() < deadline:
+                    time.sleep(self.poll_interval)
+                    status = client.drain_status(lease=lease)
+                if status.get("active_turns", 0) > 0:
+                    client.force_drain(lease=lease)
+            except Exception:
+                # Ordered teardown still fences exact capability and process state.
+                # Worker lifespan performs a final resumable force-drain on exit.
+                pass
+        self._teardown_terminated_handle(
+            owner_key,
+            handle,
+            planned_restart=planned_restart,
+        )
+
+    def _teardown_terminated_handle(
+        self,
+        owner_key: str,
+        handle: OwnerWorkerHandle,
+        *,
+        planned_restart: bool = False,
+    ) -> None:
         """Run ordered external teardown for a previously reserved handle.
 
         This method deliberately never holds ``_lock`` while calling the bridge
@@ -1209,7 +1295,12 @@ class OwnerWorkerSupervisor:
                 if broker is not None:
                     _cleanup(lambda broker=broker: broker.revoke(retired_lease))
             if self.generation_bridge_revoker is not None:
-                _cleanup(lambda: self.generation_bridge_revoker(retired_lease))
+                _cleanup(
+                    lambda: self.generation_bridge_revoker(
+                        retired_lease,
+                        planned_restart=planned_restart,
+                    )
+                )
 
             process_exited = handle.process.poll() is not None
             if process_exited:
@@ -1269,7 +1360,7 @@ class OwnerWorkerSupervisor:
                 if handle.process.poll() is not None and self._reserve_termination_locked(owner_key, handle)
             ]
         for owner_key, handle in reserved:
-            self._teardown_terminated_handle(owner_key, handle)
+            self._drain_and_teardown_reserved_handle(owner_key, handle)
 
     def _stop_idle(self, *, now: float) -> None:
         with self._lock:
@@ -1283,7 +1374,7 @@ class OwnerWorkerSupervisor:
                     if self._reserve_termination_locked(owner_key, handle):
                         reserved.append((owner_key, handle))
         for owner_key, handle in reserved:
-            self._teardown_terminated_handle(owner_key, handle)
+            self._drain_and_teardown_reserved_handle(owner_key, handle)
 
     def _reserve_oldest_idle_locked(self) -> tuple[str, OwnerWorkerHandle] | None:
         live = [
@@ -1303,7 +1394,7 @@ class OwnerWorkerSupervisor:
         with self._lock:
             reserved = self._reserve_oldest_idle_locked()
         if reserved is not None:
-            self._teardown_terminated_handle(*reserved)
+            self._drain_and_teardown_reserved_handle(*reserved)
 
     def socket_path_for(self, owner: Any, worker_generation: int | None = None) -> Path:
         if worker_generation is None:

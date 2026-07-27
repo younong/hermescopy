@@ -162,14 +162,14 @@ npm run deploy -- --create-tag v2026.7.4-test --allow-non-main
 4. 成功解包后删除本次上传的 `/opt/hermes/tmp/hermes-<tag>.tar.gz`。
 5. 在服务器上按 locked Python/PowerPoint 输入与架构创建或复用不可变 runtime。
 6. 校验 Bubblewrap 能力，安装 root-owned seccomp artifact 和 `/etc/hermes/executor-sandbox.json`，执行 policy preflight。
-7. 切换 `/opt/hermes/current`，写入带 cgroup delegation/bootstrap 的 systemd unit，并以稳定的非 root `hermes` user/group 重启 gateway 和 dashboard。
+7. 将 candidate runner/unit/policy/seccomp 留在事务 staging；旧 Dashboard 先关闭新 turn admission，等待或持久化 Owner Worker 在途 turn，并以 `1012 Service Restart` 关闭浏览器桥。依次停止旧 Dashboard、旧 Gateway并确认退出后，才原子安装 staged artifacts 和切换 `/opt/hermes/current`，再以稳定的非 root `hermes` user/group 启动 gateway、dashboard。
 8. 对 delegated subtree 执行 `check-executor-cgroup-host.py --require-ready`。已迁移主机必须通过 controller、accounting、swap/freeze 和 topology 检查；未迁移主机明确保持 Tool fail closed，部署脚本不会修改 grub 或重启。
 9. 资源层 ready 时执行 `smoke-executor-resources.py` 的真实 kernel limit/event/cleanup 检查，再通过同一 cgroup manager 启动真实 authenticated executor：在高编号 FD 压力下验证 Bubblewrap 可启动、executor 内 `RLIMIT_NOFILE` 与 policy 一致，并完成 PptxGenJS、MarkItDown、单次 LibreOffice PowerPoint runtime 以及确定性的 loopback owner-relay 网络 smoke。
 10. 从 loopback 带生产代理头验证 Hermes 自己的登录 gate 已生效。
 11. 在部署事务内以 `hermes` 用户和干净环境运行确定性核心对话冒烟；它只连接 loopback 假模型，不读取生产 `.env`，并覆盖附件、tool/approval、流、持久化和 cold resume。
 12. 首次迁移时显式替换旧 Nginx 外层认证；后续发布只同步已托管 snippet，并在 `nginx -t` 成功后 reload；随后写入远端 deployment commit marker。
-13. 远端提交成功后，本机通过 authenticated 公开 Dashboard、单次 WebSocket ticket、prefixed `/api/ws` 和真实模型运行第二层对话冒烟。
-14. 资源 smoke、PowerPoint smoke、服务、认证、确定性冒烟或 Nginx 检查失败时恢复部署前的 current symlink、runner、systemd units、sandbox policy 和 seccomp artifact，再重启旧版本；公开冒烟失败发生在 commit 之后，返回非零并报告验证失败，但不会自动回滚已提交版本。
+13. 远端事务开始前，本机先建立 authenticated 真实模型连续性会话并保持连接；candidate 成功或 pre-commit 回滚完成后，要求观察到 `1012`、使用新单次 ticket 重连、恢复同一 canonical session lineage、继续对话并 cold resume/delete。远端提交成功后，再通过公开 Dashboard、prefixed `/api/ws` 和真实模型运行独立公开冒烟。
+14. 资源 smoke、PowerPoint smoke、服务、认证、确定性冒烟或 Nginx 检查失败时恢复部署前的 current symlink、runner、systemd units、sandbox policy 和 seccomp artifact，再启动旧版本并完成连续性验证；提交后的连续性/公开冒烟失败返回非零并报告验证失败，但不会自动回滚已提交版本。
 
 ## 首次移除 Nginx 外层认证
 
@@ -367,13 +367,15 @@ HERMES_DASHBOARD_BROWSER_PASSWORD=...
 
 部署提交前还会运行确定性的 Session Reader 性能 smoke。它只使用候选 release、隔离的合成 3,000 会话历史和本机 UDS，不读取生产状态或凭据，也不访问公网；固定检查 SQL 数量、压缩链查询计划、本地与真实 Reader 冷/热延迟、连接池及并发资源上限。标准由 `hermes_cli/session_reader/performance_contract.py` 统一定义。任一回归或清理失败都会在 commit 前终止并恢复旧部署。公开 smoke 中的 Reader list/messages 延迟会写入总结，但仅作线上观测，不作为阈值，避免把 TLS、认证、网络和共享主机抖动变成 post-commit 性能误报。
 
-三个 smoke runner 输出独立的 machine-readable JSON，部署脚本再输出 aggregate release summary。只接受以下结果语义：
+deterministic、continuity 和 public smoke runner 输出独立的 machine-readable JSON，部署脚本再输出 aggregate release summary。continuity JSON 只报告 phase、named checks、`1012` close code 和 cleanup 布尔值，不包含 ticket、cookie、owner/session ID、prompt 或模型内容。只接受以下结果语义：
 
 - `rolled back before commit`：远端事务未提交；旧部署已由 trap 恢复。排查 Session Reader performance 或 deterministic smoke 的 failure `code/check` 后重试。
 - `deployment committed and all smoke passed`：部署与发布验证均成功。
 - `deployment committed but public smoke failed`：线上版本已提交，但公开路径/真实模型验证失败；命令返回非零，且不会自动回滚。立即检查 auth、ticket、WebSocket、Owner Worker、模型配置和日志，再人工决定修复重试或发布上一稳定 tag。
 
 `--dry-run` 只展示各层 smoke 命令和 `planned` 总结，不运行性能基准、不读取本机凭据、不打开浏览器、不调用模型。
+
+从 pre-continuity release 首次安装此协议时，已经运行的旧 frontend/Worker 无法被 candidate 反向赋予 `1012`、canonical browser pointer 或 exact Worker drain；首次交接按计划维护窗口处理并显式传 `--initial-continuity-transition`。该 flag 只豁免旧版本无法完成的跨切换 watcher，candidate 启动后的公开真实 AI smoke 仍必须通过。该版本成为基线后不得继续使用该 flag；后续向前发布和部署旧 immutable tag 的回滚都使用相同 drain-before-switch 与 continuity watcher 路径。
 
 ## 服务器状态检查
 

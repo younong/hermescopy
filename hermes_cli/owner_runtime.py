@@ -7,7 +7,9 @@ fresh worker process can set HERMES_HOME before importing owner-sensitive code.
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, MutableMapping
@@ -21,6 +23,8 @@ from hermes_cli.session_reader.runtime import (
     session_reader_socket_path,
     validate_session_reader_runtime_environment,
 )
+
+_VALID_BROWSER_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
 
 REQUIRED_OWNER_DIRS: tuple[Path, ...] = (
     Path("runtime"),
@@ -157,6 +161,15 @@ def ensure_owner_runtime_dirs(owner_home: str | Path | None = None) -> Path:
             _chmod_private(current)
             current = current.parent
     return home
+
+
+def dashboard_current_session_relative_path(browser_id: str) -> str:
+    """Return the owner-local active-session pointer for a validated browser."""
+    value = str(browser_id)
+    if _VALID_BROWSER_ID_RE.fullmatch(value) is None:
+        raise ValueError("browser_id is invalid")
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"sessions/dashboard-current/{digest}.json"
 
 
 def owner_worker_runtime_dir(owner_home: str | Path, worker_generation: int) -> Path:

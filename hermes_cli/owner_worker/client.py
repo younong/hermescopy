@@ -75,6 +75,32 @@ class OwnerWorkerClient:
         except Exception as exc:  # pragma: no cover - exact httpx types vary by transport
             raise OwnerWorkerHealthError(f"owner worker request failed: {exc}") from exc
 
+    def _drain_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        lease: OwnerWorkerAuthorityLease,
+    ) -> dict[str, Any]:
+        response = self.request(method, path, lease=lease)
+        try:
+            response.raise_for_status()
+            data = response.json()
+        except Exception as exc:
+            raise OwnerWorkerHealthError(f"owner worker drain request failed: {exc}") from exc
+        if not isinstance(data, dict) or not isinstance(data.get("active_turns"), int):
+            raise OwnerWorkerHealthError("owner worker drain response was invalid")
+        return data
+
+    def begin_drain(self, *, lease: OwnerWorkerAuthorityLease) -> dict[str, Any]:
+        return self._drain_request("POST", "/internal/drain", lease=lease)
+
+    def drain_status(self, *, lease: OwnerWorkerAuthorityLease) -> dict[str, Any]:
+        return self._drain_request("GET", "/internal/drain", lease=lease)
+
+    def force_drain(self, *, lease: OwnerWorkerAuthorityLease) -> dict[str, Any]:
+        return self._drain_request("POST", "/internal/drain/force", lease=lease)
+
     def verify_health(
         self,
         *,

@@ -101,6 +101,15 @@ class _FakeClient:
         self.socket_path = Path(socket_path)
         self.control_home = control_home
 
+    def begin_drain(self, *, lease):
+        return {"draining": True, "active_turns": 0}
+
+    def drain_status(self, *, lease):
+        return {"draining": True, "active_turns": 0}
+
+    def force_drain(self, *, lease):
+        return {"draining": True, "active_turns": 0}
+
     def verify_health(self, *, owner_key: str, owner_home, worker_generation=None, worker_id=None, **_kwargs):
         return {
             "ready": True,
@@ -1088,7 +1097,7 @@ def test_supervisor_shutdown_drains_all_local_workers_in_order(tmp_path):
         process_factory=fake_process_factory,
         startup_timeout=0.1,
         startup_cooldown=0,
-        generation_bridge_revoker=lambda _lease: events.append("bridges"),
+        generation_bridge_revoker=lambda _lease, **_kwargs: events.append("bridges"),
     )
     handle = supervisor.get_or_start(owner)
 
@@ -1108,7 +1117,7 @@ def test_supervisor_shutdown_failure_still_releases_resource_scope(tmp_path):
             Path(args[0][args[0].index("--socket") + 1]).touch() or _FakeProcess()
         ),
         startup_timeout=0.1,
-        generation_bridge_revoker=lambda _lease: (_ for _ in ()).throw(RuntimeError("bridge cleanup failed")),
+        generation_bridge_revoker=lambda _lease, **_kwargs: (_ for _ in ()).throw(RuntimeError("bridge cleanup failed")),
     )
     handle = supervisor.get_or_start(owner)
 
@@ -1165,7 +1174,7 @@ def test_supervisor_shutdown_revoker_can_release_active_use_from_event_loop(tmp_
         use_lease.release()
         events.append("lease_released")
 
-    def revoke_bridges(lease):
+    def revoke_bridges(lease, **_kwargs):
         assert lease.state is WorkerLeaseState.DRAINING
         future = asyncio.run_coroutine_threadsafe(close_bridge(), loop)
         future.result(timeout=1)
@@ -1723,7 +1732,7 @@ def test_supervisor_fences_and_closes_bridges_before_terminating_exact_generatio
         Path(argv[argv.index("--socket") + 1]).touch()
         return _OrderedProcess()
 
-    def revoke_bridges(lease):
+    def revoke_bridges(lease, **_kwargs):
         events.append("bridges")
         assert lease.state is WorkerLeaseState.DRAINING
         with pytest.raises(Exception):
@@ -2997,6 +3006,31 @@ def test_worker_http_token_validation_uses_stored_control_home(tmp_path, monkeyp
     assert client.get("/internal/health", headers={"Authorization": f"Bearer {wrong_secret}"}).status_code == 401
 
 
+def test_worker_drain_endpoint_requires_exact_path_capability(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    control_home = tmp_path / "control"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "owner"))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_worker_drain")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+    from hermes_cli.owner_worker.entrypoint import create_app
+
+    owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
+    app = create_app("ok1_worker_drain", owner_home)
+    client = TestClient(app)
+    token = _capability_for(app, path="/internal/drain", control_home=control_home)
+    wrong = _capability_for(app, path="/internal/health", control_home=control_home)
+
+    assert client.post(
+        "/internal/drain",
+        headers={"Authorization": f"Bearer {token}"},
+    ).json() == {"draining": True, "active_turns": 0}
+    assert client.post(
+        "/internal/drain",
+        headers={"Authorization": f"Bearer {wrong}"},
+    ).status_code == 401
+
+
 def test_worker_http_token_rejects_wrong_path(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 
@@ -3634,30 +3668,27 @@ def test_worker_active_session_records_are_descriptor_scoped_to_its_owner(tmp_pa
     app_b = SimpleNamespace(state=SimpleNamespace(owner_worker_controlled_roots=roots_b, owner_worker_live_state=OwnerWorkerLiveState()))
 
     try:
-        active_path = ws_routes._active_session_file_for_channel(app_a, "browser-a")
-        active_path_b = ws_routes._active_session_file_for_channel(app_b, "browser-a")
-        assert Path(active_path).is_file()
-        assert Path(active_path_b).is_file()
+        relative_path, active_path = ws_routes._active_session_file_for_browser(app_a, "browser-a")
+        relative_path_b, active_path_b = ws_routes._active_session_file_for_browser(app_b, "browser-a")
+        assert relative_path == relative_path_b
+        assert active_path != active_path_b
         roots_a.replace_bytes(
-            RootKind.TEMPORARY,
-            ws_routes._active_session_relative_path(app_a, active_path),
-            b'{"session_id":"owner-a-session"}',
+            RootKind.OWNER_WRITABLE,
+            relative_path,
+            b'{"schema_version":1,"session_id":"owner-a-session"}',
         )
         roots_b.replace_bytes(
-            RootKind.TEMPORARY,
-            ws_routes._active_session_relative_path(app_b, active_path_b),
-            b'{"session_id":"owner-b-session"}',
+            RootKind.OWNER_WRITABLE,
+            relative_path_b,
+            b'{"schema_version":1,"session_id":"owner-b-session"}',
         )
-        assert ws_routes._read_active_session_file(app_a, active_path) == "owner-a-session"
-        assert ws_routes._read_active_session_file(app_b, active_path) is None
-        assert ws_routes._read_active_session_file(app_b, active_path_b) == "owner-b-session"
-        with pytest.raises(RuntimeError, match="not owned"):
-            ws_routes._active_session_relative_path(app_a, "/tmp/untrusted-session.json")
+        assert ws_routes._read_active_session_file(app_a, relative_path) == "owner-a-session"
+        assert ws_routes._read_active_session_file(app_b, relative_path_b) == "owner-b-session"
 
-        ws_routes._forget_active_session_file(app_a, active_path)
+        ws_routes._forget_active_session_file(app_a, relative_path)
         assert not Path(active_path).exists()
         assert Path(active_path_b).is_file()
-        assert ws_routes._read_active_session_file(app_b, active_path_b) == "owner-b-session"
+        assert ws_routes._read_active_session_file(app_b, relative_path_b) == "owner-b-session"
     finally:
         roots_a.close()
         roots_b.close()

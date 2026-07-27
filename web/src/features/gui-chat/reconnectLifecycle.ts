@@ -5,20 +5,21 @@ const MAX_RECONNECT_DELAY_MS = 15_000;
 const RECONNECT_JITTER = 0.2;
 
 interface ReconnectLifecycleOptions {
-  close(): void;
+  close?(): void;
   heartbeatIntervalMs?: number;
-  ping(): Promise<void>;
+  ping?(): Promise<void>;
   random?: () => number;
-  reconnect(): number;
+  reconnect(): number | Promise<number>;
 }
 
-export class GuiChatReconnectLifecycle {
+export class WebSocketReconnectLifecycle {
   private connectionState: ConnectionState = "idle";
   private disposed = false;
   private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
   private pingInFlight = false;
   private reconnectAttempt = 0;
   private reconnectGeneration: number | null = null;
+  private reconnectInFlight = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly options: Required<Pick<ReconnectLifecycleOptions, "heartbeatIntervalMs" | "random">> &
     Omit<ReconnectLifecycleOptions, "heartbeatIntervalMs" | "random">;
@@ -47,7 +48,7 @@ export class GuiChatReconnectLifecycle {
     if (state === "closed" || state === "error") this.scheduleReconnect();
   }
 
-  onSwitchSettled(generation: number, committed: boolean): void {
+  onReconnectSettled(generation: number, committed: boolean): void {
     if (this.disposed) return;
     if (committed) {
       this.reconnectGeneration = null;
@@ -70,7 +71,7 @@ export class GuiChatReconnectLifecycle {
   }
 
   retryNow(): void {
-    if (this.disposed || this.reconnectGeneration !== null || this.connectionState === "connecting") {
+    if (this.disposed || (this.reconnectGeneration !== null || this.reconnectInFlight) || this.connectionState === "connecting") {
       return;
     }
     this.clearReconnectTimer();
@@ -108,7 +109,7 @@ export class GuiChatReconnectLifecycle {
     if (
       this.disposed ||
       this.reconnectTimer !== null ||
-      this.reconnectGeneration !== null ||
+      (this.reconnectGeneration !== null || this.reconnectInFlight) ||
       (this.connectionState !== "closed" && this.connectionState !== "error")
     ) {
       return;
@@ -129,6 +130,7 @@ export class GuiChatReconnectLifecycle {
     if (
       this.disposed ||
       this.reconnectGeneration !== null ||
+      this.reconnectInFlight ||
       this.connectionState === "connecting" ||
       (!force && this.connectionState !== "closed" && this.connectionState !== "error")
     ) {
@@ -137,16 +139,29 @@ export class GuiChatReconnectLifecycle {
 
     this.reconnectAttempt += 1;
     try {
-      this.reconnectGeneration = this.options.reconnect();
+      const reconnect = this.options.reconnect();
+      if (typeof reconnect === "number") {
+        this.reconnectGeneration = reconnect;
+        return;
+      }
+      this.reconnectInFlight = true;
+      let failed = false;
+      void reconnect.then((generation) => {
+        if (!this.disposed) this.reconnectGeneration = generation;
+      }).catch(() => {
+        failed = true;
+      }).finally(() => {
+        this.reconnectInFlight = false;
+        if (failed && !this.disposed) this.scheduleReconnect();
+      });
     } catch {
-      this.reconnectGeneration = null;
       this.scheduleReconnect();
     }
   }
 
   private scheduleHeartbeat(): void {
     this.clearHeartbeatTimer();
-    if (this.disposed || this.connectionState !== "open") return;
+    if (this.disposed || this.connectionState !== "open" || !this.options.ping) return;
     this.heartbeatTimer = setTimeout(() => {
       this.heartbeatTimer = null;
       void this.runPing();
@@ -154,13 +169,14 @@ export class GuiChatReconnectLifecycle {
   }
 
   private async runPing(): Promise<void> {
-    if (this.disposed || this.connectionState !== "open" || this.pingInFlight) return;
+    const ping = this.options.ping;
+    if (this.disposed || this.connectionState !== "open" || this.pingInFlight || !ping) return;
     this.pingInFlight = true;
     try {
-      await this.options.ping();
+      await ping();
       if (!this.disposed && this.connectionState === "open") this.scheduleHeartbeat();
     } catch {
-      if (!this.disposed) this.options.close();
+      if (!this.disposed) this.options.close?.();
     } finally {
       this.pingInFlight = false;
     }

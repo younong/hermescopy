@@ -9,6 +9,34 @@ import tarfile
 DEPLOY_SCRIPT = Path(__file__).parents[2] / "deploy" / "deploy.mjs"
 
 
+def test_remote_cutover_stops_before_atomic_current_switch():
+    script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+
+    cutover = script.index("# Stop the old release before changing any active artifact")
+    stop_dashboard = script.index("systemctl stop hermes-dashboard.service", cutover)
+    stop_gateway = script.index("systemctl stop hermes-gateway.service", stop_dashboard)
+    switch_current = script.index('mv -Tf "$next_current" "$current"')
+    start_gateway = script.index("systemctl start hermes-gateway.service", switch_current)
+    assert stop_dashboard < stop_gateway < switch_current < start_gateway
+    assert "pgrep -f '[h]ermes_cli.owner_worker.entrypoint'" not in script
+    assert "systemctl restart hermes-gateway.service" not in script
+    assert 'ln -sfnT "$release" "$current"' not in script
+    prepare = script.index('runContinuityConversationSmoke(args, "prepare")')
+    deploy = script.index("deployArchive(args, archivePath)", prepare)
+    verify = script.index('runContinuityConversationSmoke(args, "verify")', deploy)
+    assert prepare < deploy < verify
+    assert '"hermes.public-continuity-smoke"' in script
+    assert "cross-release continuity preparation failed before remote deployment" in script
+    drain = script.index("write_drain_request(principal=", cutover - 10_000)
+    assert drain < stop_dashboard
+    assert 'gateway_drain_status" = "draining:0"' in script
+    assert 'print("{}:{}".format(s.get("gateway_state", ""), s.get("active_agents", 0)))' in script
+    assert "is_gateway_runtime_lock_active() or get_running_pid()" in script
+    assert 'case "--initial-continuity-transition"' in script
+    assert "args.initialContinuityTransition || continuitySmoke.status" in script
+    assert "clear_drain_request; clear_drain_request()" in script
+
+
 def _write(root: Path, relative: str, content: str = "fixture\n") -> None:
     target = root / relative
     target.parent.mkdir(parents=True, exist_ok=True)

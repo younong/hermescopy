@@ -61,6 +61,9 @@ Options:
   --provision-powerpoint-deps
                            Add reviewed LibreOffice/font host prerequisites before
                            building the immutable PowerPoint executor runtime.
+  --initial-continuity-transition
+                           Allow the one-time upgrade from a release that cannot yet
+                           emit planned-restart 1012 or participate in continuity smoke.
   --dry-run                Print commands without changing local or remote state.
   -h, --help               Show this help.
 
@@ -91,6 +94,7 @@ function parseArgs(argv) {
       process.env.HERMES_DEPLOY_DASHBOARD_PUBLIC_URL || DEFAULT_DASHBOARD_PUBLIC_URL,
     migrateNginxHermes: false,
     provisionPowerpointDeps: false,
+    initialContinuityTransition: false,
     dryRun: false,
   };
 
@@ -153,6 +157,9 @@ function parseArgs(argv) {
         break;
       case "--provision-powerpoint-deps":
         args.provisionPowerpointDeps = true;
+        break;
+      case "--initial-continuity-transition":
+        args.initialContinuityTransition = true;
         break;
       case "--dry-run":
         args.dryRun = true;
@@ -687,6 +694,11 @@ runtimes_dir="$remote_root/runtimes/python"
 sandbox_dir="/etc/hermes"
 sandbox_policy="$sandbox_dir/executor-sandbox.json"
 sandbox_seccomp="$sandbox_dir/executor-x86_64.bpf"
+staged_runner="$tmp_dir/hermes-service-runner.$$.sh"
+staged_gateway_unit="$tmp_dir/hermes-gateway.$$.service"
+staged_dashboard_unit="$tmp_dir/hermes-dashboard.$$.service"
+staged_sandbox_policy="$tmp_dir/executor-sandbox.$$.json"
+staged_sandbox_seccomp="$tmp_dir/executor-x86_64.$$.bpf"
 cgroup_root="/sys/fs/cgroup/system.slice/hermes-dashboard.service/authenticated-owners"
 owner_root="$hermes_home/users"
 service_user="hermes"
@@ -727,7 +739,9 @@ restore_deployment_state() {
     fi
   done
   if [ -n "$old_current_target" ]; then
-    ln -sfnT "$old_current_target" "$current"
+    rollback_link="$current.rollback.$$"
+    ln -sT "$old_current_target" "$rollback_link"
+    mv -Tf "$rollback_link" "$current"
   else
     rm -f -- "$current"
   fi
@@ -739,14 +753,19 @@ cleanup_release_tmp() {
     restore_deployment_state || true
     systemctl daemon-reload || true
     if [ "$services_touched" = "1" ] && [ -n "$old_current_target" ]; then
-      systemctl restart hermes-gateway.service || true
-      systemctl restart hermes-dashboard.service || true
+      systemctl stop hermes-dashboard.service hermes-gateway.service || true
+      runuser -u "$service_user" -- env -i \
+        HOME="$shared" HERMES_HOME="$hermes_home" PYTHONPATH="$old_current_target" \
+        "$venv/bin/python" -c 'from gateway.drain_control import clear_drain_request; clear_drain_request()' || true
+      systemctl start hermes-gateway.service || true
+      systemctl start hermes-dashboard.service || true
     fi
   fi
   rm -rf -- "$release_tmp"
   [ -z "$smoke_root" ] || rm -rf -- "$smoke_root"
   [ -z "$reader_smoke_root" ] || rm -rf -- "$reader_smoke_root"
   [ -z "$powerpoint_smoke_owner" ] || rm -rf -- "$powerpoint_smoke_owner"
+  rm -f -- "$staged_runner" "$staged_gateway_unit" "$staged_dashboard_unit" "$staged_sandbox_policy" "$staged_sandbox_seccomp" "$current.next.$$" "$current.rollback.$$"
   [ -z "$rollback_dir" ] || rm -rf -- "$rollback_dir"
   rm -f -- "$archive"
   rmdir -- "$release_lock" 2>/dev/null || true
@@ -1196,7 +1215,7 @@ done
 
 test -f "$release/deploy/sandbox/executor-x86_64.bpf"
 seccomp_digest="$(sha256sum "$release/deploy/sandbox/executor-x86_64.bpf" | cut -d ' ' -f1)"
-install -o root -g root -m 0444 "$release/deploy/sandbox/executor-x86_64.bpf" "$sandbox_seccomp"
+install -o root -g root -m 0444 "$release/deploy/sandbox/executor-x86_64.bpf" "$staged_sandbox_seccomp"
 image_digest="$(printf '%s:%s' "$source_commit" "$runtime_id" | sha256sum | cut -d ' ' -f1)"
 readonly_mounts=''
 for destination in /bin /usr/bin /lib /lib64 /usr/lib /usr/lib64 /usr/share /etc/fonts; do
@@ -1207,13 +1226,12 @@ done
 # Policy loading stays available before the host migration so chat can start and
 # tools can fail closed. The trusted Dashboard bootstrap creates the exact
 # delegated cgroup v2 directory only after systemd has created its service scope.
-policy_tmp="$sandbox_policy.tmp.$$"
+policy_tmp="$staged_sandbox_policy"
 cat > "$policy_tmp" <<POLICY
 {"schema_version":2,"architecture":"$architecture","owner_root":"$owner_root","uid":$(id -u "$service_user"),"gid":$(getent group "$service_group" | cut -d: -f3),"bwrap_binary":"/usr/bin/bwrap","release_root":"$release","runtime_root":"$venv","python_executable":"/opt/hermes/python/bin/python3","readonly_mounts":[{"source":"$release","destination":"/opt/hermes/release"},{"source":"$venv","destination":"/opt/hermes/python"}$readonly_mounts],"syscall_policy_id":"executor-local-v1","syscall_policy_digest":"sha256:$seccomp_digest","seccomp_artifact":"$sandbox_seccomp","image_digest":"sha256:$image_digest","profile":"executor-bwrap-v1","security_backend":"host-bwrap-seccomp-v1","network_mode":"isolated-tool-network","verifier":"host-sandbox-policy-v1","record_ttl_seconds":30,"root_tmpfs_bytes":67108864,"executor_tmpfs_bytes":33554432,"allowed_egress_profiles":["tool-none"],"resource_policy":{"cgroup_root":"$cgroup_root","required_controllers":["cpu","memory","pids"],"global":{"cpu_millis":1500,"memory_bytes":2415919104,"pids":512,"max_concurrent_executors":2,"max_owner_workers":5},"owner":{"cpu_millis":1000,"memory_bytes":939524096,"pids":128,"max_concurrent_executors":1},"reader":{"cpu_millis":1000,"memory_bytes":134217728,"pids":16,"max_concurrent_executors":1},"executor":{"cpu_millis":750,"memory_bytes":536870912,"pids":64,"max_concurrent_executors":1,"swap_bytes":0,"file_descriptors":64,"duration_seconds":120,"output_bytes":200000},"cleanup_grace_seconds":2,"cleanup_timeout_seconds":10,"cgroup_kill_required":false}}
 POLICY
 chown root:root "$policy_tmp"
 chmod 0644 "$policy_tmp"
-mv -- "$policy_tmp" "$sandbox_policy"
 
 for command in $executor_commands; do
   case "$command" in
@@ -1223,11 +1241,10 @@ for command in $executor_commands; do
 done
 PYTHONPATH="$release" "$venv/bin/python" -c 'import faster_whisper, hermes_cli.tool_executor_runtime.entrypoint, pilk, tools.registry, tools.silk_decoder'
 
-ln -sfnT "$release" "$current"
 release_target="$(resolved_path "$release")"
-new_current_target="$(resolved_path "$current")"
+new_current_target="$release_target"
 
-cat > "$runner" <<'RUNNER'
+cat > "$staged_runner" <<'RUNNER'
 #!/usr/bin/env bash
 set -euo pipefail
 remote_root="${"${"}HERMES_REMOTE_ROOT:-/opt/hermes}"
@@ -1251,9 +1268,9 @@ fi
 cd "$current"
 exec "$venv/bin/python" -m hermes_cli.main "$@"
 RUNNER
-chmod 0755 "$runner"
+chmod 0755 "$staged_runner"
 
-cat > "$gateway_unit" <<UNIT
+cat > "$staged_gateway_unit" <<UNIT
 [Unit]
 Description=Hermes Gateway
 After=network-online.target
@@ -1287,7 +1304,7 @@ StandardError=journal
 WantedBy=multi-user.target
 UNIT
 
-cat > "$dashboard_unit" <<UNIT
+cat > "$staged_dashboard_unit" <<UNIT
 [Unit]
 Description=Hermes Dashboard
 After=network-online.target hermes-gateway.service
@@ -1317,7 +1334,7 @@ TasksAccounting=yes
 # revoke their authority fence before systemd reaps any remaining children.
 KillMode=control-group
 KillSignal=SIGTERM
-TimeoutStopSec=60
+TimeoutStopSec=90
 StandardOutput=journal
 StandardError=journal
 
@@ -1325,32 +1342,62 @@ StandardError=journal
 WantedBy=multi-user.target
 UNIT
 
+# Close Gateway turn admission through its established marker/status contract.
+# The marker writer and status reader run as the service user against the active
+# release and durable HERMES_HOME; no deployment secret or new control channel.
+runuser -u "$service_user" -- env -i \
+  HOME="$shared" HERMES_HOME="$hermes_home" PYTHONPATH="$old_current_target" \
+  "$venv/bin/python" -c \
+  'from gateway.drain_control import write_drain_request; write_drain_request(principal="release", suppress_notification=True)'
+gateway_drain_timeout="$(
+  runuser -u "$service_user" -- env -i \
+    HOME="$shared" HERMES_HOME="$hermes_home" PYTHONPATH="$old_current_target" \
+    "$venv/bin/python" -c \
+    'from hermes_cli.config import load_config; from gateway.restart import parse_restart_drain_timeout; cfg=load_config() or {}; raw=((cfg.get("agent") or {}).get("restart_drain_timeout")); print(parse_restart_drain_timeout(raw))'
+)"
+gateway_drain_deadline="$(( $(date +%s) + ${"${"}gateway_drain_timeout%.*} ))"
+while :; do
+  gateway_drain_status="$(
+    runuser -u "$service_user" -- env -i \
+      HOME="$shared" HERMES_HOME="$hermes_home" PYTHONPATH="$old_current_target" \
+      "$venv/bin/python" -c \
+      'from gateway.status import read_runtime_status; s=read_runtime_status() or {}; print("{}:{}".format(s.get("gateway_state", ""), s.get("active_agents", 0)))'
+  )"
+  [ "$gateway_drain_status" = "draining:0" ] && break
+  [ "$(date +%s)" -ge "$gateway_drain_deadline" ] && break
+  sleep 1
+done
+
+# Stop the old release before changing any active artifact. Dashboard shutdown
+# drains its Owner Workers; Gateway SIGTERM reuses its resume/flush shutdown.
+services_touched="1"
+systemctl stop hermes-dashboard.service
+systemctl stop hermes-gateway.service
+if systemctl is-active --quiet hermes-dashboard.service || systemctl is-active --quiet hermes-gateway.service; then
+  echo "Old services did not stop before release switch" >&2
+  exit 1
+fi
+if ! runuser -u "$service_user" -- env -i \
+  HOME="$shared" HERMES_HOME="$hermes_home" PYTHONPATH="$old_current_target" \
+  "$venv/bin/python" -c \
+  'from gateway.status import get_running_pid, is_gateway_runtime_lock_active; raise SystemExit(1 if is_gateway_runtime_lock_active() or get_running_pid() else 0)'; then
+  echo "Old Gateway runtime lock or PID remained after service stop" >&2
+  exit 1
+fi
+install -o root -g root -m 0755 "$staged_runner" "$runner"
+install -o root -g root -m 0644 "$staged_gateway_unit" "$gateway_unit"
+install -o root -g root -m 0644 "$staged_dashboard_unit" "$dashboard_unit"
+install -o root -g root -m 0644 "$staged_sandbox_policy" "$sandbox_policy"
+install -o root -g root -m 0444 "$staged_sandbox_seccomp" "$sandbox_seccomp"
+next_current="$current.next.$$"
+ln -sT "$release" "$next_current"
+mv -Tf "$next_current" "$current"
+runuser -u "$service_user" -- env -i \
+  HOME="$shared" HERMES_HOME="$hermes_home" PYTHONPATH="$release" \
+  "$venv/bin/python" -c 'from gateway.drain_control import clear_drain_request; clear_drain_request()'
 systemctl daemon-reload
 systemctl enable hermes-gateway.service hermes-dashboard.service
-services_touched="1"
-# Stop the control plane before rotating a release, then terminate any worker
-# that survived an older dashboard unit. Older KillMode=mixed releases could
-# leave those children orphaned with an ACTIVE durable lease, blocking every
-# cold start after the new dashboard comes up.
-systemctl stop hermes-dashboard.service
-owner_worker_pids="$(pgrep -f '[h]ermes_cli.owner_worker.entrypoint' || true)"
-session_reader_pids="$(pgrep -f '[h]ermes_cli.session_reader.entrypoint' || true)"
-owner_worker_pids="$owner_worker_pids $session_reader_pids"
-if [ -n "$(printf '%s' "$owner_worker_pids" | tr -d '[:space:]')" ]; then
-  kill -TERM $owner_worker_pids || true
-  for _ in $(seq 1 50); do
-    live_owner_workers=""
-    for pid in $owner_worker_pids; do
-      if kill -0 "$pid" 2>/dev/null; then
-        live_owner_workers="$live_owner_workers $pid"
-      fi
-    done
-    [ -z "$live_owner_workers" ] && break
-    sleep 0.1
-  done
-  [ -z "${"${"}live_owner_workers:-}" ] || kill -KILL $live_owner_workers || true
-fi
-if ! systemctl restart hermes-gateway.service || ! systemctl start hermes-dashboard.service || \
+if ! systemctl start hermes-gateway.service || ! systemctl start hermes-dashboard.service || \
    ! systemctl is-active --quiet hermes-gateway.service || \
    ! systemctl is-active --quiet hermes-dashboard.service; then
   echo "New services failed; restoring previous deployment state" >&2
@@ -1358,8 +1405,9 @@ if ! systemctl restart hermes-gateway.service || ! systemctl start hermes-dashbo
   deployment_committed="1"
   systemctl daemon-reload
   if [ -n "$old_current_target" ]; then
-    systemctl restart hermes-gateway.service || true
-    systemctl restart hermes-dashboard.service || true
+    systemctl stop hermes-dashboard.service hermes-gateway.service || true
+    systemctl start hermes-gateway.service || true
+    systemctl start hermes-dashboard.service || true
   fi
   exit 1
 fi
@@ -1580,6 +1628,35 @@ function parseSmokeResult(output, kind) {
   return null;
 }
 
+function runContinuityConversationSmoke(args, phase) {
+  const commandArgs = [
+    path.join(repoRoot, "scripts", "smoke_dashboard_conversation.py"),
+    "--url",
+    args.dashboardPublicUrl,
+    "--timeout",
+    "240",
+    "--session",
+    "hermes-release-continuity",
+    "--continuity-phase",
+    phase,
+  ];
+  try {
+    const commandResult = run("python3", commandArgs, { dryRun: args.dryRun });
+    return {
+      status: args.dryRun ? "planned" : "passed",
+      result: args.dryRun
+        ? null
+        : parseSmokeResult(commandResult.stdout, "hermes.public-continuity-smoke"),
+    };
+  } catch (error) {
+    console.error(`Public dashboard continuity ${phase} failed: ${error.message}`);
+    return {
+      status: "failed",
+      result: parseSmokeResult(error?.commandResult?.stdout, "hermes.public-continuity-smoke"),
+    };
+  }
+}
+
 function runPublicConversationSmoke(args) {
   const commandArgs = [
     path.join(repoRoot, "scripts", "smoke_dashboard_conversation.py"),
@@ -1671,6 +1748,7 @@ function printSummary(args, result) {
     }
   }
   console.log(`Deterministic conversation smoke: ${result.deterministicSmoke}`);
+  console.log(`Cross-release conversation continuity: ${result.continuitySmoke}`);
   console.log(`Public real-AI conversation smoke: ${result.publicSmoke}`);
   const publicLatency = publicReaderLatency(result.publicSmokeResult);
   if (publicLatency) {
@@ -1730,7 +1808,14 @@ function main() {
   const { tmp, archivePath } = createArchive(args, { dryRun: args.dryRun });
   let deploymentCommitted = false;
   let readerPerformanceResult = null;
+  let continuityPrepare = null;
   try {
+    continuityPrepare = args.initialContinuityTransition
+      ? { status: args.dryRun ? "planned (initial transition)" : "not supported by old release", result: null }
+      : runContinuityConversationSmoke(args, "prepare");
+    if (!args.dryRun && continuityPrepare.status === "failed") {
+      throw new Error("cross-release continuity preparation failed before remote deployment");
+    }
     try {
       const remoteResult = deployArchive(args, archivePath);
       readerPerformanceResult = args.dryRun
@@ -1758,6 +1843,10 @@ function main() {
             : "failed or not reached",
         readerPerformanceResult,
         deterministicSmoke: "failed or not reached",
+        continuitySmoke:
+          args.initialContinuityTransition || args.dryRun || continuityPrepare?.status !== "passed"
+            ? continuityPrepare?.status || "not run"
+            : runContinuityConversationSmoke(args, "verify").status,
         publicSmoke: "not run",
         publicSmokeResult: null,
         outcome: "rolled back before commit",
@@ -1765,10 +1854,17 @@ function main() {
       throw error;
     }
 
+    const continuitySmoke = args.initialContinuityTransition
+      ? { status: args.dryRun ? "planned (initial transition)" : "not supported by old release", result: null }
+      : runContinuityConversationSmoke(args, "verify");
     const publicSmoke = runPublicConversationSmoke(args);
+    const allPublicSmokePassed =
+      args.dryRun ||
+      ((args.initialContinuityTransition || continuitySmoke.status === "passed") &&
+        publicSmoke.status === "passed");
     const outcome = args.dryRun
       ? "dry-run: deployment and all smoke layers planned"
-      : publicSmoke.status === "passed"
+      : allPublicSmokePassed
         ? "deployment committed and all smoke passed"
         : "deployment committed but public smoke failed";
     printSummary(args, {
@@ -1776,11 +1872,12 @@ function main() {
       readerPerformanceSmoke: args.dryRun ? "planned" : "passed",
       readerPerformanceResult,
       deterministicSmoke: args.dryRun ? "planned" : "passed",
+      continuitySmoke: continuitySmoke.status,
       publicSmoke: publicSmoke.status,
       publicSmokeResult: publicSmoke.result,
       outcome,
     });
-    if (publicSmoke.status === "failed") {
+    if (!allPublicSmokePassed) {
       throw new Error("deployment committed but public smoke failed; automatic rollback was not attempted");
     }
   } finally {

@@ -24,7 +24,7 @@
 
 新发布前必须人工提交代码。`--create-tag` 要求具名分支和干净工作区，fetch 最新 `origin/main`，以 `--no-autostash` rebase 当前分支，再用绑定 rebase 前远端分支精确 SHA 的 `--force-with-lease=<完整分支 ref>:<observed SHA>` 更新远端同名 PR/源分支，然后只创建并 atomic push 指定的 annotated tag。默认只允许 `main`；`--allow-non-main` 保留，但同样必须 rebase 最新 `origin/main`，且不允许 detached HEAD。远端分支在快照后发生任何变化时 lease 会失效，发布会在 tag 创建/发布前 fail closed。工具不会自动 commit/stash，也禁止无守卫的 `--force`、裸/隐式 lease、`+` refspec、覆盖 tag、tag-only 降级或用 `--tags` 推送无关 tag。
 
-工具使用 `git archive <tag>` 生成干净源码，在本机临时源码目录中安装 Node 依赖、构建 web/ui-tui，并用独立 lockfile 生成只含 PptxGenJS 的 PowerPoint payload，然后把生产运行源码 + 本机预构建产物打包上传到服务器。构建完成后，归档会省略 `tests/`、`website/`、`apps/`、`.github/` 和 `docs/` 等非运行目录。服务器只解包到 `/opt/hermes/releases/<tag>`、按 locked Python/PowerPoint 输入和架构创建或复用 root-owned immutable runtime、验证 host sandbox policy、切换 `/opt/hermes/current`，最后以稳定的非 root `hermes` user/group 重启 systemd 服务。切换前会通过真实 authenticated Bubblewrap executor 生成两页 PPTX、用 MarkItDown 校验顺序，并用 LibreOffice 转换一次 PDF。提交部署事务前还会自动运行无 secret、仅 loopback 的确定性对话冒烟；远端提交后，本机再通过公开 Dashboard 运行一次 authenticated 真实模型冒烟。发布成功后会清理本次上传的远端 tarball 和临时冒烟数据，并按保留策略回收旧 release。
+工具使用 `git archive <tag>` 生成干净源码，在本机临时源码目录中安装 Node 依赖、构建 web/ui-tui，并用独立 lockfile 生成只含 PptxGenJS 的 PowerPoint payload，然后把生产运行源码 + 本机预构建产物打包上传到服务器。构建完成后，归档会省略 `tests/`、`website/`、`apps/`、`.github/` 和 `docs/` 等非运行目录。服务器只解包到 `/opt/hermes/releases/<tag>`、按 locked Python/PowerPoint 输入和架构创建或复用 root-owned immutable runtime、验证 host sandbox policy，并把 runner/unit/policy/seccomp 先写入事务 staging。切换时先让旧 Dashboard/Owner Workers 停止接收新 turn、等待或持久化在途 turn，以 `1012 Service Restart` 关闭浏览器桥，再依次停止旧 Dashboard 和 Gateway；确认旧服务退出后才原子替换 `/opt/hermes/current` 和 staged artifacts，随后启动 Gateway、Dashboard。切换前会通过真实 authenticated Bubblewrap executor 生成两页 PPTX、用 MarkItDown 校验顺序，并用 LibreOffice 转换一次 PDF。发布工具还会在远端事务前建立 authenticated 连续性会话，在候选成功或 pre-commit 回滚后用新单次 ticket 恢复同一 canonical session，再执行提交后公开真实模型冒烟。发布成功后会清理本次上传的远端 tarball 和临时冒烟数据，并按保留策略回收旧 release。
 
 ## 服务器运行方式
 
@@ -164,12 +164,13 @@ APIYI_GEMINI_BASE_URL=https://api.apiyi.com/v1beta
 
 部署脚本生成的 systemd runner 会读取 `/opt/hermes/shared/.env`，但不会打印其中内容。
 
-## 自动两层对话冒烟
+## 自动对话冒烟与跨版本连续性
 
-每次非 dry-run 发布都自动执行两层检查：
+每次非 dry-run 发布都自动执行三层检查：
 
-1. **事务内确定性冒烟**：systemd 和 Hermes 内部认证 readiness 通过后、Nginx reconcile 和 `deployment_committed` 之前，在服务器上以 `hermes` 用户、`env -i`、独立 `HOME`/`TMPDIR` 运行 `deploy/smoke-conversation.py`。它使用 loopback 假模型且禁止非 loopback 网络，不读取 `/opt/hermes/shared/.env`，覆盖 session create、provider/model 传播、附件、terminal、危险命令拒绝、流式输出、持久化、第二 gateway 进程 cold resume、继续对话和清理。失败会退出当前事务，由 EXIT trap 恢复旧 symlink/unit/policy 并重启旧版本。
-2. **提交后公开真实 AI 冒烟**：远端 Nginx 校验成功并写入 commit marker 后，本机自动运行 `scripts/smoke_dashboard_conversation.py`。它通过安全登录 helper 读取 Git 忽略且权限为 `0600` 的 `.env.local`，申请单次 WebSocket ticket，连接带 path prefix 的公开 `/api/ws`，创建会话、验证真实模型 delta/completion、关闭后 cold resume、确认持久化并删除会话。
+1. **跨版本连续性 watcher**：远端事务开始前，本机通过安全登录 helper 建立真实模型会话并保持浏览器连接。切换或 pre-commit 回滚时必须收到 `1012 Service Restart`；watcher 在服务不可用期间持续申请新的单次 WebSocket ticket，恢复后以稳定 `browser_id` 和 owner-scoped canonical pointer 继续同一 session lineage，再做一次 cold resume 和删除。它不会复用 ticket，也不会把 owner/session ID、prompt 或模型输出写入总结。
+2. **事务内确定性冒烟**：systemd 和 Hermes 内部认证 readiness 通过后、Nginx reconcile 和 `deployment_committed` 之前，在服务器上以 `hermes` 用户、`env -i`、独立 `HOME`/`TMPDIR` 运行 `deploy/smoke-conversation.py`。它使用 loopback 假模型且禁止非 loopback 网络，不读取 `/opt/hermes/shared/.env`，覆盖 session create、provider/model 传播、附件、terminal、危险命令拒绝、流式输出、持久化、第二 gateway 进程 cold resume、继续对话和清理。失败会退出当前事务，由 EXIT trap 恢复旧 symlink/unit/policy 并启动旧版本；连续性 watcher 随后验证恢复路径。
+3. **提交后公开真实 AI 冒烟**：远端 Nginx 校验成功并写入 commit marker 后，本机再次运行 `scripts/smoke_dashboard_conversation.py`。它申请单次 WebSocket ticket，连接带 path prefix 的公开 `/api/ws`，创建会话、验证真实模型 delta/completion、关闭后 cold resume、确认持久化并删除会话。
 
 本机需要安装 `playwright-cli`，且仓库根目录 `.env.local` 只包含：
 
@@ -186,7 +187,9 @@ HERMES_DASHBOARD_BROWSER_PASSWORD=...
 - `deployment committed and all smoke passed`
 - `deployment committed but public smoke failed`
 
-两层任一失败均返回非零。公开冒烟发生在部署提交之后，因此其失败**不会自动回滚已提交版本**；此时先查看公开认证/WebSocket/Owner Worker/模型日志，决定修复后重试还是经人工判断发布上一个稳定 tag。两个 runner 也会分别输出可机器解析且已脱敏的 JSON（schema、状态、named checks、duration、cleanup、稳定 failure code/check）。`--dry-run` 只打印两层计划，不登录 Dashboard、不连接真实模型，也不修改远端。
+任一层失败均返回非零。连续性 prepare 在远端变更前失败时不会开始部署；pre-commit 事务失败会先恢复旧版本，再由 watcher 验证旧版本连续性，结果仍为 `rolled back before commit`。部署提交后的连续性或公开冒烟失败**不会自动回滚已提交版本**；此时先查看公开认证、ticket、WebSocket `1012`、Owner Worker drain、canonical session 和模型日志，决定修复后重试还是经人工判断发布上一个稳定 tag。runner 会输出可机器解析且已脱敏的 JSON（schema、状态、named checks、duration、cleanup、稳定 failure code/check）。`--dry-run` 只打印三层计划，不登录 Dashboard、不连接真实模型，也不修改远端。
+
+从不含本连续性协议的旧版本首次升级时，正在运行的旧 frontend/Worker 无法被新 release 反向赋予 `1012` 和 exact Worker drain；该首次交接仍应按计划维护窗口处理，并显式传 `--initial-continuity-transition`。此 flag 只跳过旧版本无法满足的跨切换 watcher，candidate 启动后的独立公开真实 AI smoke 仍是提交后 gate。完成首次升级后不得继续使用该 flag；后续向前发布和不可变 tag 回滚都使用完整连续性路径。
 
 ## Release 保留与清理
 

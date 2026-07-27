@@ -521,6 +521,19 @@ def test_owner_gateway_runtimes_keep_live_maps_and_prompt_state_isolated():
         }
 
 
+def test_owner_gateway_drain_counts_turns_and_closes_admission():
+    runtime = server.OwnerWorkerGatewayRuntime("owner-a", 1, "worker-a", 1, 0)
+    runtime.mutable_state.sessions["idle"] = {"running": False}
+    runtime.mutable_state.sessions["active"] = {"running": True}
+
+    assert server.begin_owner_worker_gateway_drain(runtime) == {
+        "draining": True,
+        "active_turns": 1,
+    }
+    with server.owner_worker_gateway_runtime(runtime):
+        assert server._runtime_accepts_turns() is False
+
+
 def test_owner_runtime_propagates_to_deferred_agent_build(monkeypatch):
     runtime = server.OwnerWorkerGatewayRuntime("owner-a", 1, "worker-a", 1, 0)
     seen = threading.Event()
