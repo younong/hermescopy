@@ -698,6 +698,8 @@ rollback_dir=""
 deployment_committed="0"
 services_touched="0"
 smoke_root=""
+reader_smoke_root=""
+reader_smoke_result=""
 powerpoint_smoke_owner=""
 
 gateway_unit="/etc/systemd/system/hermes-gateway.service"
@@ -743,6 +745,7 @@ cleanup_release_tmp() {
   fi
   rm -rf -- "$release_tmp"
   [ -z "$smoke_root" ] || rm -rf -- "$smoke_root"
+  [ -z "$reader_smoke_root" ] || rm -rf -- "$reader_smoke_root"
   [ -z "$powerpoint_smoke_owner" ] || rm -rf -- "$powerpoint_smoke_owner"
   [ -z "$rollback_dir" ] || rm -rf -- "$rollback_dir"
   rm -f -- "$archive"
@@ -1427,6 +1430,54 @@ else
   echo "Authenticated tools remain fail closed until the documented cgroup v2 migration is complete"
 fi
 
+# Gate Reader performance before commit using only isolated synthetic state.
+reader_smoke_root="$(mktemp -d /tmp/hermes-reader-release-smoke.XXXXXX)"
+chown "$service_user:$service_group" "$reader_smoke_root"
+chmod 0700 "$reader_smoke_root"
+echo "Running deterministic Session Reader performance smoke before deployment commit"
+if ! reader_smoke_result="$(
+  cd "$reader_smoke_root"
+  exec runuser -u "$service_user" -- env -i \
+    HOME="$reader_smoke_root" \
+    TMPDIR="$reader_smoke_root" \
+    PATH="$venv/bin:/usr/local/bin:/usr/bin:/bin" \
+    PYTHONPATH="$release" \
+    PYTHONUNBUFFERED=1 \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    "$venv/bin/python" "$release/deploy/smoke-session-reader.py" \
+    --root "$reader_smoke_root/work"
+)"; then
+  printf '%s\n' "$reader_smoke_result"
+  echo "HERMES_DEPLOY_STAGE session_reader_performance_smoke=failed" >&2
+  echo "Session Reader performance smoke failed; deployment remains uncommitted and will be rolled back" >&2
+  exit 1
+fi
+printf '%s\n' "$reader_smoke_result"
+printf '%s' "$reader_smoke_result" | "$venv/bin/python" -c '
+import json, sys
+result = json.load(sys.stdin)
+required = {
+    "reader_resource_contract", "reader_fixture", "reader_query_plan",
+    "list_sql_budget", "stats_sql_budget", "search_sql_budget",
+    "local_compact_listing", "reader_startup", "reader_uds_cold",
+    "reader_uds_warm",
+}
+checks = {item.get("name") for item in result.get("checks", []) if isinstance(item, dict)}
+cleanup = result.get("cleanup") or {}
+if result.get("schemaVersion") != 1:
+    raise SystemExit("unsupported Session Reader smoke schema")
+if result.get("kind") != "hermes.session-reader-performance-smoke":
+    raise SystemExit("unexpected Session Reader smoke kind")
+if result.get("status") != "passed" or not required.issubset(checks):
+    raise SystemExit("Session Reader smoke did not pass all required checks")
+if not all(bool(value) for value in cleanup.values()):
+    raise SystemExit("Session Reader smoke cleanup was incomplete")
+'
+echo "HERMES_DEPLOY_STAGE session_reader_performance_smoke=passed"
+rm -rf -- "$reader_smoke_root"
+reader_smoke_root=""
+
 # Gate the transaction with a real gateway conversation while the previous
 # deployment is still restorable. The runner receives no production env file or
 # model credentials and enforces loopback-only network access itself.
@@ -1511,6 +1562,24 @@ function deployArchive(args, archivePath) {
   );
 }
 
+function parseSmokeResult(output, kind) {
+  const lines = String(output || "").split(/\r?\n/).reverse();
+  for (const line of lines) {
+    if (!line.includes(`\"kind\":\"${kind}\"`) && !line.includes(`\"kind\": \"${kind}\"`)) {
+      continue;
+    }
+    try {
+      const result = JSON.parse(line);
+      if (result?.kind === kind) {
+        return result;
+      }
+    } catch {
+      // The remote stage validates its JSON; continue past unrelated output.
+    }
+  }
+  return null;
+}
+
 function runPublicConversationSmoke(args) {
   const commandArgs = [
     path.join(repoRoot, "scripts", "smoke_dashboard_conversation.py"),
@@ -1520,11 +1589,19 @@ function runPublicConversationSmoke(args) {
     "180",
   ];
   try {
-    run("python3", commandArgs, { dryRun: args.dryRun });
-    return args.dryRun ? "planned" : "passed";
+    const commandResult = run("python3", commandArgs, { dryRun: args.dryRun });
+    return {
+      status: args.dryRun ? "planned" : "passed",
+      result: args.dryRun
+        ? null
+        : parseSmokeResult(commandResult.stdout, "hermes.public-conversation-smoke"),
+    };
   } catch (error) {
     console.error(`Public dashboard conversation smoke failed: ${error.message}`);
-    return "failed";
+    return {
+      status: "failed",
+      result: parseSmokeResult(error?.commandResult?.stdout, "hermes.public-conversation-smoke"),
+    };
   }
 }
 
@@ -1533,6 +1610,37 @@ function remoteStagePassed(error, stage) {
     .filter(Boolean)
     .join("\n");
   return output.includes(`HERMES_DEPLOY_STAGE ${stage}=passed`);
+}
+
+function readerPerformanceSummary(smoke) {
+  if (!smoke) {
+    return null;
+  }
+  const observations = smoke.observations || {};
+  const sql = observations.sql || {};
+  const checks = new Map((smoke.checks || []).map((check) => [check.name, check]));
+  return {
+    sql: `list=${sql.list ?? "?"} stats=${sql.stats ?? "?"} search=${sql.search ?? "?"}`,
+    latency: [
+      `local=${observations.localListMs ?? "?"}ms`,
+      `cold=${checks.get("reader_uds_cold")?.observedMs ?? "?"}ms`,
+      `warm=${checks.get("reader_uds_warm")?.observedMs ?? "?"}ms`,
+    ].join(" "),
+    resources: Object.entries(observations.resources || {})
+      .map(([key, value]) => `${key}=${value}`)
+      .join(" "),
+    cleanup: Object.values(smoke.cleanup || {}).every(Boolean) ? "passed" : "failed",
+    failure: smoke.failure || null,
+  };
+}
+
+function publicReaderLatency(smoke) {
+  const checks = new Map((smoke?.checks || []).map((check) => [check.name, check]));
+  const list = checks.get("public_session_reader_list")?.durationMs;
+  const messages = checks.get("public_session_reader_messages")?.durationMs;
+  return list === undefined || messages === undefined
+    ? null
+    : `list=${list}ms messages=${messages}ms`;
 }
 
 function printSummary(args, result) {
@@ -1551,8 +1659,23 @@ function printSummary(args, result) {
   );
   console.log(`PowerPoint runtime smoke: ${result.powerpointSmoke}`);
   console.log(`PowerPoint host provisioning: ${args.provisionPowerpointDeps ? "enabled" : "preflight only"}`);
+  console.log(`Session Reader performance smoke: ${result.readerPerformanceSmoke}`);
+  const readerSummary = readerPerformanceSummary(result.readerPerformanceResult);
+  if (readerSummary) {
+    console.log(`Session Reader SQL: ${readerSummary.sql}`);
+    console.log(`Session Reader latency: ${readerSummary.latency}`);
+    console.log(`Session Reader resources: ${readerSummary.resources}`);
+    console.log(`Session Reader cleanup: ${readerSummary.cleanup}`);
+    if (readerSummary.failure) {
+      console.log(`Session Reader failure: ${readerSummary.failure.code}/${readerSummary.failure.check}`);
+    }
+  }
   console.log(`Deterministic conversation smoke: ${result.deterministicSmoke}`);
   console.log(`Public real-AI conversation smoke: ${result.publicSmoke}`);
+  const publicLatency = publicReaderLatency(result.publicSmokeResult);
+  if (publicLatency) {
+    console.log(`Public Session Reader latency (informational): ${publicLatency}`);
+  }
   console.log(`Release outcome: ${result.outcome}`);
   console.log("Remote staging archive and deterministic smoke state are removed after use.");
   console.log(
@@ -1606,22 +1729,37 @@ function main() {
   args.releaseId = releaseIdFor(args);
   const { tmp, archivePath } = createArchive(args, { dryRun: args.dryRun });
   let deploymentCommitted = false;
+  let readerPerformanceResult = null;
   try {
     try {
       const remoteResult = deployArchive(args, archivePath);
+      readerPerformanceResult = args.dryRun
+        ? null
+        : parseSmokeResult(remoteResult.stdout, "hermes.session-reader-performance-smoke");
       deploymentCommitted = args.dryRun || remoteResult.stdout.includes("HERMES_DEPLOY_STAGE deployment=committed");
       if (!deploymentCommitted) {
         throw new Error("remote deployment completed without a commit marker");
       }
     } catch (error) {
+      readerPerformanceResult = parseSmokeResult(
+        error?.commandResult?.stdout,
+        "hermes.session-reader-performance-smoke",
+      );
       printSummary(args, {
         powerpointSmoke: args.dryRun
           ? "planned"
           : remoteStagePassed(error, "powerpoint_runtime_smoke")
             ? "passed"
             : "failed or not reached",
+        readerPerformanceSmoke: args.dryRun
+          ? "planned"
+          : remoteStagePassed(error, "session_reader_performance_smoke")
+            ? "passed"
+            : "failed or not reached",
+        readerPerformanceResult,
         deterministicSmoke: "failed or not reached",
         publicSmoke: "not run",
+        publicSmokeResult: null,
         outcome: "rolled back before commit",
       });
       throw error;
@@ -1629,17 +1767,20 @@ function main() {
 
     const publicSmoke = runPublicConversationSmoke(args);
     const outcome = args.dryRun
-      ? "dry-run: deployment and both smoke layers planned"
-      : publicSmoke === "passed"
+      ? "dry-run: deployment and all smoke layers planned"
+      : publicSmoke.status === "passed"
         ? "deployment committed and all smoke passed"
         : "deployment committed but public smoke failed";
     printSummary(args, {
       powerpointSmoke: args.dryRun ? "planned" : "passed",
+      readerPerformanceSmoke: args.dryRun ? "planned" : "passed",
+      readerPerformanceResult,
       deterministicSmoke: args.dryRun ? "planned" : "passed",
-      publicSmoke,
+      publicSmoke: publicSmoke.status,
+      publicSmokeResult: publicSmoke.result,
       outcome,
     });
-    if (publicSmoke === "failed") {
+    if (publicSmoke.status === "failed") {
       throw new Error("deployment committed but public smoke failed; automatic rollback was not attempted");
     }
   } finally {

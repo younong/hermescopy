@@ -1,4 +1,4 @@
-"""HTTP client for an owner Session Reader Unix-domain socket."""
+"""Asynchronous HTTP client for an owner Session Reader Unix socket."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -10,28 +10,12 @@ from hermes_cli.dashboard_auth.authority import SessionReaderAuthorityLease
 from .tokens import mint_session_reader_capability
 
 
+_MAX_CONNECTIONS = 8
+_MAX_KEEPALIVE_CONNECTIONS = 4
+
+
 class SessionReaderHealthError(RuntimeError):
     """Raised when a Session Reader request or identity check fails."""
-
-
-_HTTPX_WARMED = False
-
-
-def warm_http_transport() -> None:
-    """Pay httpcore's lazy import/setup cost during Control Plane startup."""
-    global _HTTPX_WARMED
-    if _HTTPX_WARMED:
-        return
-    transport = httpx.HTTPTransport(uds="/nonexistent/hermes-session-reader.sock")
-    try:
-        with httpx.Client(transport=transport, base_url="http://session-reader") as client:
-            try:
-                client.get("/internal/health", timeout=0.01)
-            except Exception:
-                pass
-    finally:
-        transport.close()
-    _HTTPX_WARMED = True
 
 
 class SessionReaderClient:
@@ -47,10 +31,16 @@ class SessionReaderClient:
         self.timeout = timeout
         self.control_home = Path(control_home).resolve() if control_home else None
         self.signing_record = signing_record
-
-    def _client(self) -> httpx.Client:
-        transport = httpx.HTTPTransport(uds=str(self.socket_path))
-        return httpx.Client(transport=transport, base_url="http://session-reader", timeout=self.timeout)
+        self._client = httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(uds=str(self.socket_path)),
+            base_url="http://session-reader",
+            timeout=self.timeout,
+            limits=httpx.Limits(
+                max_connections=_MAX_CONNECTIONS,
+                max_keepalive_connections=_MAX_KEEPALIVE_CONNECTIONS,
+            ),
+        )
+        self._closed = False
 
     def _headers(self, lease: SessionReaderAuthorityLease, path: str) -> dict[str, str]:
         token = mint_session_reader_capability(
@@ -61,7 +51,7 @@ class SessionReaderClient:
         )
         return {"Authorization": f"Bearer {token}"}
 
-    def request(
+    async def request(
         self,
         method: str,
         path: str,
@@ -70,29 +60,25 @@ class SessionReaderClient:
         headers: dict[str, str] | None = None,
         content: bytes | None = None,
     ) -> httpx.Response:
+        if self._closed:
+            raise SessionReaderHealthError("session reader client is closed")
         token_path = str(path or "").split("?", 1)[0] or "/"
         request_headers = dict(headers or {})
         request_headers.update(self._headers(lease, token_path))
         try:
-            with self._client() as client:
-                return client.request(method, path, headers=request_headers, content=content)
+            return await self._client.request(
+                method,
+                path,
+                headers=request_headers,
+                content=content,
+            )
         except Exception as exc:
             raise SessionReaderHealthError(f"session reader request failed: {exc}") from exc
 
-    def verify_health(
-        self,
-        *,
-        lease: SessionReaderAuthorityLease,
-        owner_home: str | Path,
-    ) -> dict[str, Any]:
-        response = self.request("GET", "/internal/health", lease=lease)
-        try:
-            response.raise_for_status()
-            data = response.json()
-        except Exception as exc:
-            raise SessionReaderHealthError(f"session reader health request failed: {exc}") from exc
-        self.verify_health_payload(data, lease=lease, owner_home=owner_home)
-        return data
+    async def aclose(self) -> None:
+        if not self._closed:
+            self._closed = True
+            await self._client.aclose()
 
     @staticmethod
     def verify_health_payload(

@@ -257,6 +257,7 @@ async def _lifespan(app: "FastAPI"):
         reader_supervisor = getattr(app.state, "session_reader_supervisor", None)
         if reader_supervisor is not None:
             try:
+                await reader_supervisor.close_clients()
                 await asyncio.to_thread(reader_supervisor.shutdown)
             except Exception:
                 _log.exception("session reader shutdown cleanup failed")
@@ -592,7 +593,6 @@ async def _proxy_authenticated_session_reader_http(request: Request) -> Response
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     from hermes_cli.session_reader import (
-        SessionReaderClient,
         SessionReaderHealthError,
         SessionReaderUnavailableError,
     )
@@ -626,12 +626,7 @@ async def _proxy_authenticated_session_reader_http(request: Request) -> Response
             if name.lower() in {"accept", "accept-encoding", "user-agent", "x-request-id"}
         }
         stage_started_at = time.monotonic()
-        response = await asyncio.to_thread(
-            SessionReaderClient(
-                handle.socket_path,
-                control_home=getattr(supervisor, "control_home", None),
-                signing_record=getattr(supervisor, "signing_record", None),
-            ).request,
+        response = await supervisor.client_for(handle).request(
             request.method,
             reader_path,
             lease=use.lease,
@@ -659,6 +654,7 @@ async def _proxy_authenticated_session_reader_http(request: Request) -> Response
         if use is not None:
             if lifecycle is not None:
                 lifecycle.report_request_failure(use.lease, "transport")
+            await supervisor.close_client(use.handle)
             use.release()
         return _session_reader_unavailable_response()
     except Exception as exc:
