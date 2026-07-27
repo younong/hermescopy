@@ -10,6 +10,7 @@ import struct
 from typing import Any, Mapping
 from urllib.parse import quote
 
+from .media import ITEM_TEXT
 from .models import (
     ILinkCredentials,
     ILinkTransportError,
@@ -34,7 +35,6 @@ API_TIMEOUT_MS = 15_000
 CONFIG_TIMEOUT_MS = 10_000
 QR_TIMEOUT_MS = 35_000
 
-ITEM_TEXT = 1
 MSG_TYPE_BOT = 2
 MSG_STATE_FINISH = 2
 
@@ -147,15 +147,34 @@ class WeixinILinkClient:
     ) -> dict[str, Any]:
         if not text or not text.strip():
             raise ValueError("text must not be empty")
+        return await self.send_item(
+            to=to,
+            item={"type": ITEM_TEXT, "text_item": {"text": text}},
+            context_token=context_token,
+            client_id=client_id,
+            raise_provider_errors=raise_provider_errors,
+        )
+
+    async def send_item(
+        self,
+        *,
+        to: str,
+        item: Mapping[str, Any],
+        context_token: str | None,
+        client_id: str,
+        raise_provider_errors: bool = True,
+    ) -> dict[str, Any]:
         if not client_id:
             raise ValueError("client_id must not be empty")
+        if not isinstance(item.get("type"), int):
+            raise ValueError("item type must be an integer")
         message: dict[str, Any] = {
             "from_user_id": "",
             "to_user_id": to,
             "client_id": client_id,
             "message_type": MSG_TYPE_BOT,
             "message_state": MSG_STATE_FINISH,
-            "item_list": [{"type": ITEM_TEXT, "text_item": {"text": text}}],
+            "item_list": [dict(item)],
         }
         if context_token:
             message["context_token"] = context_token
