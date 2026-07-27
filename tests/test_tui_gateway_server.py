@@ -2514,6 +2514,34 @@ def test_prompt_submit_replays_completed_external_turn_without_agent(monkeypatch
     ]
 
 
+def test_external_turn_completion_uses_submit_transport_after_session_rebind():
+    class Transport:
+        def __init__(self):
+            self.frames = []
+
+        def write(self, frame):
+            self.frames.append(frame)
+            return True
+
+    external = Transport()
+    dashboard = Transport()
+    payload = {"text": "saved response", "status": "complete"}
+    session = {"transport": dashboard}
+
+    session["_external_turn_transport"] = external
+    session["transport"] = dashboard
+
+    server._emit(
+        "message.complete",
+        "sid-external",
+        payload,
+        transport=session.pop("_external_turn_transport"),
+    )
+
+    assert external.frames[0]["params"]["payload"] == payload
+    assert dashboard.frames == []
+
+
 def test_prompt_submit_rejects_stale_external_turn_generation(monkeypatch, tmp_path):
     from hermes_state import SessionDB
 
