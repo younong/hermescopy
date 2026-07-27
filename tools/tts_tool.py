@@ -23,6 +23,7 @@ Custom command providers:
 
 Output formats:
 - Opus (.ogg) for Telegram voice bubbles (requires ffmpeg for Edge TTS)
+- MP3/WAV/OGG source audio for Weixin iLink delivery
 - MP3 (.mp3) for everything else (CLI, Discord, WhatsApp)
 
 Configuration is loaded from ~/.hermes/config.yaml under the 'tts:' key.
@@ -2173,13 +2174,17 @@ def text_to_speech_tool(
         )
         text = text[:max_len]
 
-    # Detect platform from gateway env var to choose the best output format.
+    # Detect platform from gateway context to choose the best output format.
     # Telegram voice bubbles require Opus (.ogg); OpenAI and ElevenLabs can
-    # produce Opus natively (no ffmpeg needed).  Edge TTS always outputs MP3
-    # and needs ffmpeg for conversion.
+    # produce Opus natively (no ffmpeg needed). Edge TTS always outputs MP3
+    # and needs ffmpeg for conversion. Weixin iLink accepts the source format
+    # through its outbox, which currently delivers requested voice as a regular
+    # audio attachment until native voice bubbles pass the real-device gate.
     from gateway.session_context import get_session_env
     platform = get_session_env("HERMES_SESSION_PLATFORM", "").lower()
-    want_opus = (platform == "telegram")
+    source = get_session_env("HERMES_SESSION_SOURCE", "").lower()
+    want_opus = platform == "telegram"
+    want_weixin_voice = source == "weixin-ilink"
 
     # Determine output path
     if output_path:
@@ -2408,6 +2413,9 @@ def text_to_speech_tool(
                 voice_compatible = True
         elif provider in {"elevenlabs", "openai", "mistral", "gemini"}:
             voice_compatible = want_opus and file_str.endswith(".ogg")
+
+        if want_weixin_voice and Path(file_str).suffix.lower() in {".mp3", ".wav", ".ogg"}:
+            voice_compatible = True
 
         file_size = os.path.getsize(file_str)
         logger.info("TTS audio saved: %s (%s bytes, provider: %s)", file_str, f"{file_size:,}", provider)
@@ -2817,7 +2825,7 @@ from tools.registry import registry, tool_error
 
 TTS_SCHEMA = {
     "name": "text_to_speech",
-    "description": "Convert text to speech audio. Returns a MEDIA: path that the platform delivers as native audio. Compatible providers render as a voice bubble on Telegram; otherwise audio is sent as a regular attachment. In CLI mode, saves to ~/voice-memos/. Voice and provider are user-configured (built-in providers like edge/openai or custom command providers under tts.providers.<name>), not model-selected.",
+    "description": "Convert text to speech audio. Returns a MEDIA: path for platform delivery. Compatible providers render as a voice bubble on Telegram. Weixin iLink sessions can send generated MP3/WAV/OGG audio; until native Weixin voice bubbles pass real-device validation, Hermes delivers it as a regular audio attachment. Other platforms use their supported audio or attachment route. In CLI mode, saves to ~/voice-memos/. Voice and provider are user-configured (built-in providers like edge/openai or custom command providers under tts.providers.<name>), not model-selected.",
     "parameters": {
         "type": "object",
         "properties": {
