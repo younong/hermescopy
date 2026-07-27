@@ -598,9 +598,14 @@ def create_app(
     @app.get("/internal/health")
     def health(_: None = Depends(_require_owner_token)) -> dict[str, Any]:
         from hermes_cli.owner_runtime import FORBIDDEN_OWNER_WORKER_ENV_KEYS, get_workspace_root
+        from tui_gateway.server import owner_worker_gateway_drain_status
 
+        turn_status = owner_worker_gateway_drain_status(
+            app.state.owner_worker_live_state.gateway_runtime
+        )
         return {
             "ready": True,
+            "active_turns": turn_status["active_turns"],
             "owner_key": owner_key,
             "owner_home": str(owner_home),
             "worker_generation": worker_generation,

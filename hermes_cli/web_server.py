@@ -182,6 +182,7 @@ async def _lifespan(app: "FastAPI"):
     app.state.authorized_ws_bridges_by_worker = {}  # exact worker fence -> {websocket}
     app.state.revoked_ws_bridge_worker_fences = set()  # exact durable fences
     app.state.authorized_ws_bridge_lock = asyncio.Lock()
+    app.state.owner_worker_turn_lease_guards = set()
     app.state.authority_change_sequence = 0
     app.state.worker_change_sequence = 0
     app.state.server_event_loop = asyncio.get_running_loop()
@@ -265,6 +266,7 @@ async def _lifespan(app: "FastAPI"):
             except Exception:
                 _log.exception("session reader shutdown cleanup failed")
         await drain_owner_worker_warmups(app)
+        await _drain_owner_worker_turn_lease_guards(app)
         supervisor = getattr(app.state, "owner_worker_supervisor", None)
         if supervisor is not None:
             try:
@@ -12688,6 +12690,88 @@ _OWNER_WORKER_WS_CONNECT_TIMEOUT = 10.0
 _OWNER_WORKER_WS_HANDSHAKE_TIMEOUT = 5.0
 _OWNER_WORKER_WS_RELAY_QUEUE_SIZE = 16
 _OWNER_WORKER_WS_RELAY_OPERATION_TIMEOUT = 10.0
+_OWNER_WORKER_TURN_LEASE_POLL_INTERVAL = 0.1
+
+
+def _owner_worker_turn_lease_guard_state(app_obj: Any) -> set[asyncio.Task[Any]]:
+    try:
+        return app_obj.state.owner_worker_turn_lease_guards
+    except AttributeError:
+        tasks: set[asyncio.Task[Any]] = set()
+        app_obj.state.owner_worker_turn_lease_guards = tasks
+        return tasks
+
+
+async def _guard_owner_worker_turn_lease(
+    handle: Any,
+    supervisor: Any,
+    lease: Any,
+) -> None:
+    """Hold one exact Worker use lease until its admitted turns finish."""
+    from hermes_cli.owner_worker.client import OwnerWorkerClient, OwnerWorkerHealthError
+
+    authority_lease = _owner_worker_authority_lease(handle)
+    client = OwnerWorkerClient(
+        handle.socket_path,
+        control_home=getattr(supervisor, "control_home", None),
+    )
+    try:
+        while True:
+            health = await asyncio.to_thread(
+                client.verify_health,
+                owner_key=handle.owner_key,
+                owner_home=handle.owner_home,
+                worker_generation=handle.worker_generation,
+                worker_id=handle.worker_id,
+                lease_version=handle.lease_version,
+                recovery_generation=handle.recovery_generation,
+                lease=authority_lease,
+            )
+            active_turns = health.get("active_turns")
+            if (
+                isinstance(active_turns, bool)
+                or not isinstance(active_turns, int)
+                or active_turns < 0
+            ):
+                raise OwnerWorkerHealthError(
+                    "owner worker active turn status was invalid"
+                )
+            if active_turns == 0:
+                return
+            await asyncio.sleep(_OWNER_WORKER_TURN_LEASE_POLL_INTERVAL)
+    except Exception:
+        # An exited or revoked exact generation no longer needs protection. Health
+        # remains fail-closed; only the already-detached use lease is released.
+        return
+    finally:
+        lease.release()
+
+
+def _schedule_owner_worker_turn_lease_guard(
+    app_obj: Any,
+    *,
+    handle: Any,
+    supervisor: Any,
+    lease: Any,
+) -> None:
+    tasks = _owner_worker_turn_lease_guard_state(app_obj)
+    try:
+        task = asyncio.create_task(
+            _guard_owner_worker_turn_lease(handle, supervisor, lease)
+        )
+    except Exception:
+        lease.release()
+        raise
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+
+
+async def _drain_owner_worker_turn_lease_guards(app_obj: Any) -> None:
+    tasks = tuple(_owner_worker_turn_lease_guard_state(app_obj))
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _report_bridge_lifecycle(lease: Any, reason: "AuthorityAuditReason") -> None:
@@ -12715,7 +12799,7 @@ class _OwnerWorkerWsRelayClosed(Exception):
 
 
 class _OwnerWorkerWsBridge:
-    """Own the two relay halves and release the exact use lease once."""
+    """Own the two relay halves and transfer or release the use lease once."""
 
     def __init__(self, browser_ws: Any, worker_ws: Any, lease: Any) -> None:
         self.browser_ws = browser_ws
@@ -12733,11 +12817,17 @@ class _OwnerWorkerWsBridge:
     def closing(self) -> bool:
         return self._closing
 
-    async def close(self, *, code: int = 1011, reason: str = "") -> None:
-        """Cancel relay work, close both halves, and release the use lease."""
+    async def close(
+        self,
+        *,
+        code: int = 1011,
+        reason: str = "",
+        release_lease: bool = True,
+    ) -> Any | None:
+        """Cancel relay work and either release or transfer the use lease."""
         async with self._lock:
             if self._closing:
-                return
+                return None
             self._closing = True
             current = asyncio.current_task()
             tasks = tuple(task for task in self._tasks if task is not current and not task.done())
@@ -12752,13 +12842,18 @@ class _OwnerWorkerWsBridge:
                     await peer.close(code=close_code, reason=close_reason)
                 except Exception:
                     pass
+            transferred_lease = None
             if not self._released and self.lease is not None:
                 self._released = True
-                self.lease.release()
+                if release_lease:
+                    self.lease.release()
+                else:
+                    transferred_lease = self.lease
             if self.lease is not None:
                 from hermes_cli.dashboard_auth.audit import AuthorityAuditReason
 
                 _report_bridge_lifecycle(self.lease, AuthorityAuditReason.BRIDGE_CLOSED)
+            return transferred_lease
 
 
 async def _relay_queue_put(queue: asyncio.Queue[Any], value: Any) -> None:
@@ -13290,6 +13385,7 @@ async def _bridge_websocket_to_owner_worker(
     # task can race into its normal disconnect path.
     await asyncio.sleep(0)
     close_code, close_reason = 1011, "owner worker relay ended"
+    browser_transport_ended = False
     try:
         wait_targets = (*relay_tasks, *((expiry_task,) if expiry_task is not None else ()))
         done, _pending = await asyncio.wait(wait_targets, return_when=asyncio.FIRST_COMPLETED)
@@ -13309,15 +13405,18 @@ async def _bridge_websocket_to_owner_worker(
         # masking the browser's explicit close frame.
         await asyncio.sleep(0)
         done = {task for task in relay_tasks if task.done()}
-        for task in done:
+        ordered_done = tuple(task for task in relay_tasks if task in done)
+        for task in ordered_done:
             if task.cancelled():
                 continue
             try:
                 task.result()
             except _OwnerWorkerWsRelayClosed as exc:
                 close_code, close_reason = exc.code, exc.reason
+                browser_transport_ended = task in {relay_tasks[0], relay_tasks[3]}
                 break
             except Exception:
+                browser_transport_ended = task in {relay_tasks[0], relay_tasks[3]}
                 _log.debug("owner websocket relay ended", exc_info=True)
                 break
     finally:
@@ -13349,7 +13448,19 @@ async def _bridge_websocket_to_owner_worker(
                             bridge_worker_identity, None
                         )
         if not bridge.closing:
-            await bridge.close(code=close_code, reason=close_reason)
+            defer_turn_lease = path == "/api/ws" and browser_transport_ended
+            guarded_lease = await bridge.close(
+                code=close_code,
+                reason=close_reason,
+                release_lease=not defer_turn_lease,
+            )
+            if guarded_lease is not None:
+                _schedule_owner_worker_turn_lease_guard(
+                    ws.app,
+                    handle=handle,
+                    supervisor=supervisor,
+                    lease=guarded_lease,
+                )
 
 
 # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)

@@ -7331,6 +7331,106 @@ def test_prompt_submit_skips_auto_title_when_response_empty(monkeypatch):
     mock_title.assert_not_called()
 
 
+def test_prompt_submit_dispatcher_exception_completes_with_retryable_error(monkeypatch):
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            raise RuntimeError("private backend detail")
+
+    session = _session(agent=_Agent())
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    emitted: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, sid, payload or {})),
+    )
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    server.handle_request(
+        {
+            "id": "1",
+            "method": "prompt.submit",
+            "params": {"session_id": "sid", "text": "hello"},
+        }
+    )
+
+    complete_events = [event for event in emitted if event[0] == "message.complete"]
+    assert len(complete_events) == 1
+    assert complete_events[0][2]["status"] == "error"
+    assert complete_events[0][2]["text"] == (
+        "Agent turn was interrupted before completion. Please retry."
+    )
+    assert "private backend detail" not in complete_events[0][2]["text"]
+    assert not [
+        event
+        for event in emitted
+        if event[0] == "error" and "private backend detail" in event[2].get("message", "")
+    ]
+    assert session["running"] is False
+    assert session["inflight_turn"] is None
+
+
+def test_prompt_submit_dispatcher_exception_persists_external_receipt(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            raise RuntimeError("backend disconnected")
+
+    db = SessionDB(tmp_path / "state.db")
+    runtime = server.OwnerWorkerGatewayRuntime("owner-a", 1, "worker-a", 1, 0)
+    runtime.mutable_state.sessions["sid"] = _session(agent=_Agent())
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda _agent, _session: {"session_id": "sid"},
+    )
+    monkeypatch.setattr(server, "_session_cwd", lambda _session: str(tmp_path))
+    monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
+
+    with server.owner_worker_gateway_runtime(runtime):
+        response = server._methods["prompt.submit"](
+            "rid",
+            {
+                "session_id": "sid",
+                "text": "hello",
+                "idempotency_key": "weixin-ilink:failed",
+            },
+        )
+        replay = server._methods["prompt.submit"](
+            "rid-replay",
+            {
+                "session_id": "sid",
+                "text": "hello",
+                "idempotency_key": "weixin-ilink:failed",
+            },
+        )
+
+    assert response["result"] == {"status": "streaming"}
+    assert replay["result"] == {"status": "completed", "replayed": True}
+    receipt = db.begin_external_turn(
+        turn_key="weixin-ilink:failed",
+        stored_session_id=runtime.mutable_state.sessions["sid"]["session_key"],
+        worker_id=runtime.worker_id,
+        worker_generation=runtime.worker_generation,
+    )
+    assert receipt["status"] == "completed"
+    assert receipt["result_status"] == "error"
+    assert receipt["result_text"] == (
+        "Agent turn was interrupted before completion. Please retry."
+    )
+
+
 def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):
     """When the backend fails with no visible response (e.g. invalid model slug
     → provider 4xx), the TUI must surface result['error'] as visible text

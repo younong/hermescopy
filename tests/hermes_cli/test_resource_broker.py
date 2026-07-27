@@ -116,6 +116,46 @@ def test_resource_broker_rejects_requests_after_durable_lease_revocation(tmp_pat
     broker.close()
 
 
+def test_resource_broker_generation_shutdown_is_idempotent_after_peer_disconnect(tmp_path):
+    store, starting = _starting_lease(tmp_path)
+    manager = _Manager()
+    broker = DeploymentResourceBroker(manager=manager, authority_store=store)
+    client = OwnerResourceBrokerClient(broker.register(starting))
+    active = _activate(store, starting)
+    broker.activate(active)
+    client.reserve_executor(_identity(active), "invocation-a")
+    scope = manager.admissions[-1][2]
+
+    broker.revoke(active)
+    deadline = time.monotonic() + 1
+    while not scope.released and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert scope.released
+    client.shutdown_generation()
+    client.shutdown_generation()
+    with pytest.raises(ResourceBrokerError, match="unavailable"):
+        client.reserve_executor(_identity(active), "invocation-b")
+    broker.close()
+
+
+def test_resource_broker_generation_shutdown_preserves_protocol_rejection(tmp_path):
+    store, starting = _starting_lease(tmp_path)
+    broker = DeploymentResourceBroker(manager=_Manager(), authority_store=store)
+    client = OwnerResourceBrokerClient(broker.register(starting))
+    active = _activate(store, starting)
+    broker.activate(active)
+    store.transition_worker_lease(
+        active,
+        state=WorkerLeaseState.DRAINING,
+        generation_state=WorkerGenerationState.DRAINING,
+    )
+
+    with pytest.raises(ResourceBrokerError, match="rejected"):
+        client.shutdown_generation()
+    broker.close()
+
+
 def test_resource_broker_generation_shutdown_and_disconnect_cleanup_reservations(tmp_path):
     store, starting = _starting_lease(tmp_path)
     manager = _Manager()
