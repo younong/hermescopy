@@ -13,6 +13,7 @@ import {
   Search,
   QrCode,
   Settings2,
+  SlidersHorizontal,
   Sparkles,
   X,
 } from "lucide-react";
@@ -47,6 +48,7 @@ import {
 import { Composer } from "./Composer";
 import { GuiChatSkillsPane } from "./GuiChatSkillsPane";
 import { MessageList } from "./MessageList";
+import { RegisteredModelPickerDialog } from "./RegisteredModelPickerDialog";
 
 export function GuiChatShell() {
   const { t } = useI18n();
@@ -88,6 +90,7 @@ export function GuiChatShell() {
   const [sessionQuery, setSessionQuery] = useState("");
   const [activeSessionTitle, setActiveSessionTitle] = useState<string | null>(null);
   const [connectWeChatOpen, setConnectWeChatOpen] = useState(false);
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const { authMe, authRequired, ownerKey, ready: authIdentityReady } = useDashboardAuthIdentity();
   const weChatStatus = authMe?.feature_status?.weixin_ilink_connect;
   const weChatReady = Boolean(authMe?.features?.weixin_ilink_connect);
@@ -520,6 +523,29 @@ export function GuiChatShell() {
       .catch((error: Error) => dispatch({ type: "error", message: error.message }));
   }, [state.sessionId]);
 
+  const switchChatModel = useCallback(
+    async (
+      registration: { model: string; provider: string },
+      confirmExpensiveModel = false,
+      persistGlobally = false,
+    ) => {
+      const sessionId = state.sessionId;
+      const connection = connectionRef.current;
+      if (!sessionId || !connection) throw new Error("No active conversation");
+      if (state.isGenerating) {
+        throw new Error("Stop the current response before switching chat models.");
+      }
+      return connection.switchModel(
+        sessionId,
+        registration.provider,
+        registration.model,
+        confirmExpensiveModel,
+        persistGlobally,
+      );
+    },
+    [state.isGenerating, state.sessionId],
+  );
+
   const loadEarlier = useCallback(async () => {
     const sessionId = state.historySessionId;
     const cursor = state.historyCursor;
@@ -738,6 +764,16 @@ export function GuiChatShell() {
           unavailableMessage={weChatUnavailableMessage}
         />
       ) : null}
+      {modelPickerOpen && state.sessionId ? (
+        <RegisteredModelPickerDialog
+          busy={state.isGenerating}
+          currentModel={state.model}
+          currentProvider={state.provider}
+          onClose={() => setModelPickerOpen(false)}
+          onSwitchChat={switchChatModel}
+          profile={profile}
+        />
+      ) : null}
       {!narrow ? (
         <aside aria-label="Chat workspace" className="gui-chat-sidebar">
           {sidebar}
@@ -763,11 +799,23 @@ export function GuiChatShell() {
               {filesOpen ? "Files" : skillsOpen ? "Skills" : conversationTitle}
             </h1>
             <p className="truncate text-[0.625rem] text-[#969aa1]">
-              {workspacePaneOpen ? "Workspace" : `${state.model ?? "Hermes"} · ${mockMode ? "mock" : state.connection}`}
+              {workspacePaneOpen
+                ? "Workspace"
+                : `${state.model ?? "Hermes"}${state.provider ? ` · ${state.provider}` : ""} · ${mockMode ? "mock" : state.connection}`}
             </p>
           </div>
           {!workspacePaneOpen ? (
             <div className="ml-auto flex items-center gap-1">
+              <button
+                aria-label="Switch registered model"
+                className="gui-chat-icon-button"
+                disabled={!state.sessionId || state.connection !== "open"}
+                onClick={() => setModelPickerOpen(true)}
+                title="Switch registered model"
+                type="button"
+              >
+                <SlidersHorizontal className="h-3.5 w-3.5" />
+              </button>
               {canConnectWeChat ? (
                 <button
                   aria-label="Connect WeChat"

@@ -86,6 +86,26 @@ class SkillDelete(BaseModel):
     profile: str | None = None
 
 
+class ModelRegistrationPayload(BaseModel):
+    id: str = ""
+    name: str
+    kind: str
+    provider: str = ""
+    model: str
+    source: str = "catalog"
+    base_url: str = ""
+    api_mode: str = "openai"
+    api_key: str = ""
+    context_length: int | None = None
+    use_gateway: bool = False
+    profile: str | None = None
+
+
+class ModelRegistrationMutation(BaseModel):
+    id: str
+    profile: str | None = None
+
+
 from hermes_cli.dashboard_auth.authority import (
     AuthorityStore,
     OwnerWorkerAuthorityLease,
@@ -1130,6 +1150,85 @@ def create_app(
             load_config(),
             deployment_descriptor=deployment_descriptor_from_environment(),
         )
+
+    def _registration_error(exc: Exception) -> HTTPException:
+        from hermes_cli.model_registrations import (
+            ModelRegistrationConflict,
+            ModelRegistrationNotFound,
+        )
+
+        if isinstance(exc, ModelRegistrationNotFound):
+            return HTTPException(status_code=404, detail=str(exc))
+        if isinstance(exc, ModelRegistrationConflict):
+            return HTTPException(status_code=409, detail=str(exc))
+        if isinstance(exc, ValueError):
+            return HTTPException(status_code=400, detail=str(exc))
+        return HTTPException(status_code=500, detail="Internal server error")
+
+    @app.get("/api/model/registrations")
+    def get_model_registrations(
+        profile: str | None = None,
+        _: None = Depends(_require_owner_token),
+    ) -> dict[str, Any]:
+        _reject_profile(profile)
+        from hermes_cli.model_registrations import get_model_registrations_payload
+
+        try:
+            return get_model_registrations_payload()
+        except Exception as exc:
+            raise _registration_error(exc) from exc
+
+    @app.post("/api/model/registrations")
+    def create_model_registration(
+        body: ModelRegistrationPayload,
+        _: None = Depends(_require_owner_token),
+    ) -> dict[str, Any]:
+        _reject_profile(body.profile)
+        from hermes_cli.model_registrations import create_model_registration as create
+
+        try:
+            return create(body.dict(exclude={"id", "profile"}))
+        except Exception as exc:
+            raise _registration_error(exc) from exc
+
+    @app.put("/api/model/registrations")
+    def update_model_registration(
+        body: ModelRegistrationPayload,
+        _: None = Depends(_require_owner_token),
+    ) -> dict[str, Any]:
+        _reject_profile(body.profile)
+        from hermes_cli.model_registrations import update_model_registration as update
+
+        try:
+            return update(body.id, body.dict(exclude={"id", "profile"}))
+        except Exception as exc:
+            raise _registration_error(exc) from exc
+
+    @app.delete("/api/model/registrations")
+    def delete_model_registration(
+        body: ModelRegistrationMutation,
+        _: None = Depends(_require_owner_token),
+    ) -> dict[str, Any]:
+        _reject_profile(body.profile)
+        from hermes_cli.model_registrations import delete_model_registration as delete
+
+        try:
+            return delete(body.id)
+        except Exception as exc:
+            raise _registration_error(exc) from exc
+
+    @app.put("/api/model/registrations/active")
+    def activate_model_registration(
+        body: ModelRegistrationMutation,
+        _: None = Depends(_require_owner_token),
+    ) -> dict[str, Any]:
+        _reject_profile(body.profile)
+        from hermes_cli.model_registrations import activate_model_registration as activate
+
+        try:
+            return activate(body.id)
+        except Exception as exc:
+            raise _registration_error(exc) from exc
 
     @app.get("/api/logs")
     def get_logs(

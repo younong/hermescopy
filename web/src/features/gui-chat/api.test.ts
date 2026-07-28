@@ -137,6 +137,32 @@ describe("connectGuiChat", () => {
     expect(client.connect).toHaveBeenCalledOnce();
   });
 
+  it("switches the current session model through config.set", async () => {
+    const connection = connectGuiChat({ ownerKey: "owner-a" });
+
+    await connection.switchModel("runtime-a", "provider-a", "model-a", true);
+
+    expect(mocks.gatewayInstances[0].request).toHaveBeenCalledWith("config.set", {
+      confirm_expensive_model: true,
+      key: "model",
+      session_id: "runtime-a",
+      value: "model-a --provider provider-a --session",
+    });
+  });
+
+  it("can persist a model switch for new sessions", async () => {
+    const connection = connectGuiChat({ ownerKey: "owner-a" });
+
+    await connection.switchModel("runtime-a", "provider-a", "model-a", false, true);
+
+    expect(mocks.gatewayInstances[0].request).toHaveBeenCalledWith("config.set", {
+      confirm_expensive_model: false,
+      key: "model",
+      session_id: "runtime-a",
+      value: "model-a --provider provider-a --global",
+    });
+  });
+
   it("sends a sessionless heartbeat over the open connection", async () => {
     const connection = connectGuiChat({ ownerKey: "owner-a" });
     await connection.createOrAttach("stored-a", 1);

@@ -3343,6 +3343,7 @@ def test_worker_analytics_and_model_info_routes_require_owner_token(tmp_path, mo
     assert client.get("/api/analytics/usage").status_code == 401
     assert client.get("/api/analytics/models").status_code == 401
     assert client.get("/api/model/info").status_code == 401
+    assert client.get("/api/model/registrations").status_code == 401
     assert client.get("/api/logs").status_code == 401
     assert client.get("/api/profiles").status_code == 401
     assert client.get("/api/config").status_code == 401
@@ -3503,6 +3504,55 @@ def test_worker_model_info_returns_owner_local_config(tmp_path, monkeypatch):
     assert body["model"] == "claude-test-owner"
     assert body["provider"] == "anthropic"
     assert body["config_context_length"] == 12345
+
+
+def test_worker_model_registration_routes_use_owner_home_and_reject_selectors(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    owner_home = tmp_path / "owner"
+    control_home = tmp_path / "control"
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_registration_routes")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+    from hermes_cli import model_registrations
+    from hermes_cli.owner_worker.entrypoint import create_app
+
+    ensure_owner_runtime_dirs(owner_home)
+    monkeypatch.setattr(model_registrations, "_chat_catalog", lambda: [{
+        "slug": "anthropic",
+        "name": "Anthropic",
+        "models": ["claude-owner"],
+        "authenticated": True,
+    }])
+    app = create_app("ok1_registration_routes", owner_home)
+    client = TestClient(app)
+
+    def token(path):
+        return _capability_for(
+            app,
+            audience=AUD_OWNER_WORKER_HTTP,
+            path=path,
+            control_home=control_home,
+        )
+
+    path = "/api/model/registrations"
+    headers = {"Authorization": f"Bearer {token(path)}"}
+    created = client.post(path, headers=headers, json={
+        "name": "Owner chat",
+        "kind": "chat",
+        "provider": "anthropic",
+        "model": "claude-owner",
+    })
+    assert created.status_code == 200
+    registration_id = created.json()["id"]
+    assert (owner_home / "config.yaml").exists()
+    assert not (control_home / "config.yaml").exists()
+
+    listed = client.get(path, headers=headers)
+    assert listed.status_code == 200
+    assert listed.json()["registrations"][0]["id"] == registration_id
+    assert client.get(f"{path}?profile=other", headers=headers).status_code == 400
+    assert client.get(f"{path}?owner=other", headers=headers).status_code == 400
 
 
 def test_worker_analytics_routes_reject_legacy_profile_selection(tmp_path, monkeypatch):
