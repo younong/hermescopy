@@ -47,6 +47,12 @@ follow the implementation and its closest focused tests.
   explain why all affected existing code remains necessary. Do not optimize for
   a negative line count; optimize for the smallest complete implementation.
 
+## Bounded Feature Development
+
+- At most **2 feature-development subagents** may be active concurrently,
+  regardless of how they are launched.
+- This limits concurrency, not total calls. A completed subagent frees its slot.
+
 ## Bounded Code Reviews
 
 - Code reviews in this repository have a global Claude Code `Agent` budget of
