@@ -42,7 +42,7 @@ export function MessageBubble({
           ) : null}
 
           {message.text ? (
-            <div data-message-variant="user" className="min-w-0 max-w-full rounded-[1.25rem] bg-[#f0f1f2] px-4 py-2.5 text-[0.9375rem] leading-6 break-words text-[#25282d] [overflow-wrap:anywhere]">
+            <div data-message-variant="user" className="min-w-0 max-w-full rounded-[1.25rem] bg-[#f0f1f2] px-4 py-2.5 break-words text-[#25282d] [overflow-wrap:anywhere]">
               <Markdown content={message.text} streaming={message.streaming} />
             </div>
           ) : null}
@@ -54,8 +54,9 @@ export function MessageBubble({
   return (
     <article className="flex w-full min-w-0 justify-start">
       <div
+        data-message-variant="assistant"
         className={cn(
-          "min-w-0 w-full px-1 py-1 text-[0.9375rem] leading-7",
+          "min-w-0 w-full px-1 py-1",
           message.role === "system" ? "text-[#9a6700]" : "text-[#282b30]",
         )}
       >
@@ -66,7 +67,7 @@ export function MessageBubble({
             streaming={message.streaming}
           />
         ) : message.streaming ? (
-          <div className="text-sm text-[#8a8f97]">Thinking…</div>
+          <div className="text-[#8a8f97]">Thinking…</div>
         ) : null}
         {message.streaming || message.status === "error" || message.status === "interrupted" ? (
           <div className={cn("mt-3 text-xs text-[#92969d]", message.status === "error" && "text-[#b42318]")}>

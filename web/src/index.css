@@ -262,7 +262,7 @@ code { font-size: 0.875rem; }
   padding: 7px 8px;
   color: #1f1f1f;
   font-size: 14px;
-  font-weight: 400;
+  font-weight: 500;
   line-height: 22px;
   transition: background-color 120ms ease, color 120ms ease;
 }
@@ -1320,10 +1320,16 @@ code { font-size: 0.875rem; }
   }
 }
 
+[data-gui-chat] [data-message-variant],
+[data-gui-chat] .markdown-body,
+[data-gui-chat] [data-streamdown] {
+  font-size: 14px;
+  line-height: 1.7;
+}
+
 [data-gui-chat] .markdown-body,
 [data-gui-chat] [data-streamdown] {
   color: #282b30;
-  line-height: 1.75;
 }
 
 [data-gui-chat] pre {
