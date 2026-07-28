@@ -172,7 +172,7 @@ def test_duplicate_type_and_catalog_validation(monkeypatch):
         })
 
 
-def test_payload_catalog_is_safe_and_chat_activation_is_rejected(monkeypatch):
+def test_payload_is_lightweight_and_catalog_is_safe(monkeypatch):
     monkeypatch.setattr(model_registrations, "_chat_catalog", _chat_catalog)
     chat = model_registrations.create_model_registration({
         "name": "Chat",
@@ -181,11 +181,26 @@ def test_payload_catalog_is_safe_and_chat_activation_is_rejected(monkeypatch):
         "model": "claude-test",
     })
 
+    media_catalog = model_registrations._media_catalog
+    monkeypatch.setattr(
+        model_registrations,
+        "_media_catalog",
+        lambda kind: pytest.fail(f"unexpected {kind} catalog load"),
+    )
     payload = model_registrations.get_model_registrations_payload()
-    image = payload["catalogs"]["image"][0]
+    assert "catalogs" not in payload
+    assert payload["registrations"][0]["id"] == chat["id"]
+
+    image = media_catalog("image")[0]
     assert image["available"] is False
     assert image["capabilities"] == {"modalities": ["text", "image"]}
     assert image["setup"]["env_vars"] == [{"key": "IMAGE_TEST_API_KEY", "prompt": "Secret"}]
     assert "value" not in repr(image)
+    assert model_registrations.get_model_registration_catalog("chat") == {
+        "kind": "chat",
+        "providers": _chat_catalog(),
+    }
+    with pytest.raises(model_registrations.ModelRegistrationError, match="kind must be"):
+        model_registrations.get_model_registration_catalog("audio")
     with pytest.raises(model_registrations.ModelRegistrationError, match="session gateway"):
         model_registrations.activate_model_registration(chat["id"])

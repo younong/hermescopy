@@ -297,10 +297,7 @@ def _active(config: dict[str, Any], registrations: dict[str, dict[str, Any]]) ->
 
 
 def get_model_registrations_payload() -> dict[str, Any]:
-    """Return public registrations, selectable catalogs, and active selections."""
-    chat = _chat_catalog()
-    image = _media_catalog("image")
-    video = _media_catalog("video")
+    """Return public registrations and active selections without loading catalogs."""
     with _LOCK:
         config = load_config()
         registrations = dict(_registrations(config))
@@ -311,9 +308,17 @@ def get_model_registrations_payload() -> dict[str, Any]:
             for rid, item in registrations.items()
             if isinstance(item, dict)
         ],
-        "catalogs": {"chat": chat, "image": image, "video": video},
         "active": _active(config, registrations),
     }
+
+
+def get_model_registration_catalog(kind: str) -> dict[str, Any]:
+    """Return the selectable catalog for one registration kind."""
+    normalized = str(kind or "").strip().lower()
+    if normalized not in _KINDS:
+        raise ModelRegistrationError("kind must be chat, image, or video")
+    providers = _chat_catalog() if normalized == "chat" else _media_catalog(normalized)
+    return {"kind": normalized, "providers": providers}
 
 
 def create_model_registration(data: dict[str, Any]) -> dict[str, Any]:

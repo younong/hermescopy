@@ -3344,6 +3344,7 @@ def test_worker_analytics_and_model_info_routes_require_owner_token(tmp_path, mo
     assert client.get("/api/analytics/models").status_code == 401
     assert client.get("/api/model/info").status_code == 401
     assert client.get("/api/model/registrations").status_code == 401
+    assert client.get("/api/model/registrations/catalog?kind=chat").status_code == 401
     assert client.get("/api/logs").status_code == 401
     assert client.get("/api/profiles").status_code == 401
     assert client.get("/api/config").status_code == 401
@@ -3551,6 +3552,17 @@ def test_worker_model_registration_routes_use_owner_home_and_reject_selectors(tm
     listed = client.get(path, headers=headers)
     assert listed.status_code == 200
     assert listed.json()["registrations"][0]["id"] == registration_id
+
+    catalog_path = f"{path}/catalog"
+    catalog_headers = {"Authorization": f"Bearer {token(catalog_path)}"}
+    catalog = client.get(f"{catalog_path}?kind=chat", headers=catalog_headers)
+    assert catalog.status_code == 200
+    assert catalog.json()["providers"][0]["models"] == ["claude-owner"]
+    assert client.get(
+        f"{catalog_path}?kind=chat&profile=other",
+        headers=catalog_headers,
+    ).status_code == 400
+
     assert client.get(f"{path}?profile=other", headers=headers).status_code == 400
     assert client.get(f"{path}?owner=other", headers=headers).status_code == 400
 

@@ -40,32 +40,33 @@ describe("model registration API", () => {
       Promise.resolve(
         response({
           registrations: [],
-          catalogs: { chat: [], image: [], video: [] },
           active: {},
         }),
       ),
     );
 
     await api.getModelRegistrations();
+    await api.getModelRegistrationCatalog("image");
     await api.createModelRegistration(request);
     await api.updateModelRegistration("registration/a", request);
     await api.deleteModelRegistration("registration/a");
 
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
       "/api/model/registrations?profile=managed-profile",
+      "/api/model/registrations/catalog?kind=image&profile=managed-profile",
       "/api/model/registrations?profile=managed-profile",
       "/api/model/registrations?profile=managed-profile",
       "/api/model/registrations?profile=managed-profile",
     ]);
-    expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({
+    expect(fetchMock.mock.calls[2]?.[1]).toMatchObject({
       method: "POST",
       body: JSON.stringify(request),
     });
-    expect(fetchMock.mock.calls[2]?.[1]).toMatchObject({
+    expect(fetchMock.mock.calls[3]?.[1]).toMatchObject({
       method: "PUT",
       body: JSON.stringify({ ...request, id: "registration/a" }),
     });
-    expect(fetchMock.mock.calls[3]?.[1]).toMatchObject({
+    expect(fetchMock.mock.calls[4]?.[1]).toMatchObject({
       method: "DELETE",
       body: JSON.stringify({ id: "registration/a" }),
     });
