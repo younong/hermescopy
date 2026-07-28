@@ -33,12 +33,12 @@ def test_non_linux_measurement_reports_unsupported(measurement_module, monkeypat
 
     assert status == 0
     assert result == {
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "kind": "hermes.owner-worker-readiness-measurement",
         "status": "unsupported",
         "reason": "controlled roots require Linux",
         "standards": {
-            "schema_version": 3,
+            "schema_version": 4,
             "ready_max_ms": 1000.0,
         },
         "samples": [],
@@ -57,7 +57,7 @@ def test_ready_handler_keeps_only_bounded_timing_fields(measurement_module):
         (
             "latency trace_id=opaque surface=owner-ws-bridge "
             "stage=owner_worker.ready elapsed_ms=23.4 outcome=ok "
-            "path=hot_health_probe"
+            "path=hot_cached"
         ),
         (),
         None,
@@ -66,5 +66,5 @@ def test_ready_handler_keeps_only_bounded_timing_fields(measurement_module):
     handler.emit(record)
 
     assert handler.samples == [
-        {"elapsedMs": 23.4, "outcome": "ok", "path": "hot_health_probe"}
+        {"elapsedMs": 23.4, "outcome": "ok", "path": "hot_cached"}
     ]

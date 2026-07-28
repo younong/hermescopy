@@ -126,15 +126,27 @@ def test_owner_warmup_is_nonblocking_and_deduplicated_per_owner(monkeypatch):
         owner_home = None
 
     class _Supervisor:
+        started = False
+
+        def needs_start(self, _owner):
+            return not self.started
+
         def get_or_start(self, owner):
             starts.append(owner.owner_key)
             startup_entered.set()
             assert release_startup.wait(timeout=5)
+            self.started = True
             return _Handle()
 
+        def maintenance_tick(self):
+            return None
+
     async def _run():
-        initialize_owner_worker_warmups(web_server_mod.app)
         supervisor = _Supervisor()
+        initialize_owner_worker_warmups(
+            web_server_mod.app,
+            supervisor=supervisor,
+        )
         with patch("hermes_cli.owner_worker.readiness.ensure_owner_home"):
             first = schedule_owner_worker_warmup(
                 web_server_mod.app, owner=_Owner(), supervisor=supervisor
@@ -147,6 +159,9 @@ def test_owner_warmup_is_nonblocking_and_deduplicated_per_owner(monkeypatch):
             assert first is not None and not first.done()
             release_startup.set()
             await first
+            assert schedule_owner_worker_warmup(
+                web_server_mod.app, owner=_Owner(), supervisor=supervisor
+            ) is None
 
     asyncio.run(_run())
 
@@ -170,6 +185,9 @@ def test_lifespan_drains_owner_warmup_before_supervisor_shutdown(monkeypatch):
     class _Supervisor:
         resource_manager = None
 
+        def needs_start(self, _owner):
+            return True
+
         def get_or_start(self, owner):
             del owner
             events.append("warmup-started")
@@ -177,6 +195,9 @@ def test_lifespan_drains_owner_warmup_before_supervisor_shutdown(monkeypatch):
             assert release_startup.wait(timeout=5)
             events.append("warmup-finished")
             return _Handle()
+
+        def maintenance_tick(self):
+            return None
 
         def shutdown(self):
             events.append("shutdown")

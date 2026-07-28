@@ -1238,8 +1238,8 @@ def test_supervisor_shutdown_revoker_can_release_active_use_from_event_loop(tmp_
     assert supervisor._terminating_handles == {}
 
 
-def test_supervisor_get_or_start_skips_health_probe_while_generation_is_in_use(tmp_path):
-    """A concurrent request must not retire a generation with a live bridge."""
+def test_supervisor_get_or_start_reuses_cached_generation_without_health_probe(tmp_path):
+    """Real downstream operations, not preflight probes, establish liveness."""
     owner = _Owner("ok1_health_in_use", tmp_path / "owner")
 
     class _FailsAfterStartupClient(_FakeClient):
@@ -1264,11 +1264,7 @@ def test_supervisor_get_or_start_skips_health_probe_while_generation_is_in_use(t
         startup_cooldown=0,
     )
     first = supervisor.get_or_start(owner)
-    use_lease = supervisor.acquire_use(first)
-    try:
-        reused = supervisor.get_or_start(owner)
-    finally:
-        use_lease.release()
+    reused = supervisor.get_or_start(owner)
 
     assert reused is first
     assert _FailsAfterStartupClient.health_calls == 1
@@ -1276,68 +1272,38 @@ def test_supervisor_get_or_start_skips_health_probe_while_generation_is_in_use(t
     assert supervisor._handles[owner.owner_key] is first
 
 
-def test_supervisor_get_or_start_failed_health_retires_idle_generation(tmp_path, caplog):
-    """A failed health check still retires a generation without active uses."""
-    owner = _Owner("ok1_health_idle", tmp_path / "owner")
+def test_supervisor_reported_failure_retires_idle_generation(tmp_path):
+    owner = _Owner("ok1_transport_failure", tmp_path / "owner")
 
-    class _FailsAfterStartupClient(_FakeClient):
-        health_calls = 0
-        control_timeouts: list[float] = []
-
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            type(self).control_timeouts.append(self.timeout)
-
-        def verify_health(self, **kwargs):
-            type(self).health_calls += 1
-            if type(self).health_calls == 2:
-                raise OwnerWorkerHealthError("worker unavailable")
-            return super().verify_health(**kwargs)
-
-    def fake_process_factory(*args, **kwargs):
+    def fake_process_factory(*args, **_kwargs):
         argv = args[0]
         Path(argv[argv.index("--socket") + 1]).touch()
-        return _FakeProcess(pid=4300 + _FailsAfterStartupClient.health_calls)
+        return _FakeProcess()
 
     supervisor = OwnerWorkerSupervisor(
         control_home=tmp_path / "control",
-        client_cls=_FailsAfterStartupClient,
+        client_cls=_FakeClient,
         process_factory=fake_process_factory,
         startup_timeout=0.1,
         startup_cooldown=0,
     )
     first = supervisor.get_or_start(owner)
-    replacement = _traced_get_or_start(supervisor, owner, caplog)
+
+    assert supervisor.report_request_failure(first) is True
+    with pytest.raises(OwnerWorkerUnavailableError, match="retiring"):
+        supervisor.get_or_start(owner)
+
+    assert supervisor.maintenance_tick() == {owner.owner_key}
+    replacement = supervisor.get_or_start(owner)
 
     assert replacement is not first
-    assert caplog.messages[-1].endswith("outcome=ok path=replace_unhealthy")
-    assert any(
-        "stage=owner_worker.ready.health_probe" in message
-        and "outcome=error path=hot_health_probe" in message
-        for message in caplog.messages
-    )
-    assert any(
-        "stage=owner_worker.ready.replacement_drain" in message
-        and "outcome=ok path=replace_unhealthy" in message
-        for message in caplog.messages
-    )
-    assert any(
-        "stage=owner_worker.ready.replacement_teardown" in message
-        and "outcome=ok path=replace_unhealthy" in message
-        for message in caplog.messages
-    )
     assert first.process.terminated
-    assert [
-        timeout
-        for timeout in _FailsAfterStartupClient.control_timeouts
-        if timeout < 2.0
-    ] == [0.1, 0.1]
     assert supervisor._handles[owner.owner_key] is replacement
     assert supervisor._terminating_handles == {}
 
 
-def test_supervisor_idle_reuse_emits_health_probe_path(tmp_path, caplog):
-    owner = _Owner("ok1_health_probe", tmp_path / "owner")
+def test_supervisor_idle_reuse_emits_cached_path(tmp_path, caplog):
+    owner = _Owner("ok1_cached", tmp_path / "owner")
 
     def fake_process_factory(*args, **_kwargs):
         argv = args[0]
@@ -1358,11 +1324,63 @@ def test_supervisor_idle_reuse_emits_health_probe_path(tmp_path, caplog):
         for message in caplog.messages
     ] == [
         "owner_worker.ready.maintenance",
-        "owner_worker.ready.health_probe",
         "owner_worker.ready",
     ]
-    assert "path=hot_health_probe" in caplog.messages[-1]
+    assert "path=hot_cached" in caplog.messages[-1]
 
+
+
+def test_supervisor_stale_failure_report_does_not_fence_replacement(tmp_path):
+    owner = _Owner("ok1_stale_transport_failure", tmp_path / "owner")
+
+    def fake_process_factory(*args, **_kwargs):
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+    stale = supervisor.get_or_start(owner)
+    supervisor._terminate_handle(owner.owner_key, stale)
+    replacement = supervisor.get_or_start(owner)
+
+    assert supervisor.report_request_failure(stale) is False
+    assert replacement.accepting is True
+    assert supervisor._handles[owner.owner_key] is replacement
+
+
+def test_supervisor_reported_failure_waits_for_active_use_release(tmp_path):
+    owner = _Owner("ok1_failure_active_use", tmp_path / "owner")
+
+    def fake_process_factory(*args, **_kwargs):
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+    handle = supervisor.get_or_start(owner)
+    use = supervisor.acquire_use(handle)
+
+    assert supervisor.report_request_failure(handle) is True
+    assert supervisor.maintenance_tick() == set()
+    assert handle.process.terminated is False
+    with pytest.raises(OwnerWorkerUnavailableError, match="no longer active"):
+        supervisor.acquire_use(handle)
+
+    use.release()
+    assert supervisor.maintenance_tick() == {owner.owner_key}
+    assert handle.process.terminated is True
 
 
 def test_supervisor_restart_uses_new_generation_and_socket_with_reused_pid(tmp_path):
@@ -1803,7 +1821,7 @@ def test_supervisor_reaps_already_exited_process_with_wait(tmp_path):
     handle = supervisor.get_or_start(owner)
     handle.process.returncode = 0
 
-    supervisor._reap_exited()
+    supervisor.maintenance_tick()
 
     assert handle.process.wait_calls == 1
     assert not handle.process.terminated
@@ -1899,14 +1917,14 @@ def test_supervisor_active_use_skips_idle_stop_until_released(tmp_path):
     lease = supervisor.acquire_use(handle)
     handle.last_used_at = 0
 
-    supervisor._stop_idle(now=10)
+    supervisor.maintenance_tick(now=10)
 
     assert not handle.process.terminated
     assert handle.active_uses == 1
 
     lease.release()
     handle.last_used_at = 0
-    supervisor._stop_idle(now=10)
+    supervisor.maintenance_tick(now=10)
 
     assert handle.process.terminated
     assert supervisor.authority_store.read_worker_generation(owner.owner_key, 1).state.value == "terminated"

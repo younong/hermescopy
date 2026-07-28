@@ -5431,6 +5431,8 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
                 self.release_start = threading.Event()
                 self.release_start.set()
                 self.start_error = None
+                self.handles = {}
+                self.failed_handles = []
 
             def shutdown(self):
                 pass
@@ -5451,7 +5453,23 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
                     stage="owner_worker.ready",
                     path="cold_start",
                 )
-                return _Handle(owner.owner_key)
+                handle = self.handles.get(owner.owner_key)
+                if handle is None:
+                    handle = _Handle(owner.owner_key)
+                    self.handles[owner.owner_key] = handle
+                return handle
+
+            def needs_start(self, owner):
+                return owner.owner_key not in self.handles
+
+            def report_request_failure(self, handle):
+                if self.handles.get(handle.owner_key) is not handle:
+                    return False
+                self.failed_handles.append(handle)
+                return True
+
+            def maintenance_tick(self):
+                return None
 
         class _ReaderSupervisor(_Supervisor):
             def __init__(self):
@@ -5930,6 +5948,9 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
 
         assert response.status_code == 502
         assert len(self.supervisor.owners) == 1
+        assert self.supervisor.failed_handles == [
+            self.supervisor.handles[self.supervisor.owners[0].owner_key]
+        ]
 
     def test_authenticated_reader_failure_never_falls_back_to_worker_or_local_state(
         self, monkeypatch

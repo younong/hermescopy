@@ -140,7 +140,7 @@ def _trace_ready(supervisor, owner, caplog, trace_id: str):
 def test_ready_latency_contract_is_strictly_below_one_second():
     for path in (
         "hot_active",
-        "hot_health_probe",
+        "hot_cached",
         "wait_existing_start",
         "cold_start",
         "replace_unhealthy",
@@ -155,7 +155,7 @@ def test_ready_latency_contract_rejects_unknown_path():
         require_ready_latency("gui", "unknown", 1.0)
 
 
-def test_hot_active_and_health_probe_meet_request_budget(tmp_path, caplog):
+def test_hot_active_and_cached_reuse_meet_request_budget(tmp_path, caplog):
     supervisor, owner = _supervisor(tmp_path)
     handle = supervisor.get_or_start(owner)
 
@@ -166,49 +166,31 @@ def test_hot_active_and_health_probe_meet_request_budget(tmp_path, caplog):
     require_ready_latency("hot active", path, elapsed_ms)
     lease.release()
 
-    assert _trace_ready(supervisor, owner, caplog, "trace-hot-probe-123") is handle
+    assert _trace_ready(supervisor, owner, caplog, "trace-hot-cached-123") is handle
     path, elapsed_ms = _ready_sample(caplog)
-    assert path == "hot_health_probe"
-    require_ready_latency("hot health probe", path, elapsed_ms)
+    assert path == "hot_cached"
+    require_ready_latency("hot cached", path, elapsed_ms)
 
     supervisor.shutdown()
 
 
-def test_unhealthy_replacement_meets_request_budget(tmp_path, caplog):
-    class _FailsAfterStartupClient(_FakeClient):
-        health_calls = 0
-        control_timeouts: list[float] = []
-
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            type(self).control_timeouts.append(self.timeout)
-
-        def verify_health(self, **kwargs):
-            type(self).health_calls += 1
-            if type(self).health_calls == 2:
-                raise RuntimeError("worker unavailable")
-            return super().verify_health(**kwargs)
-
+def test_reported_failure_replacement_meets_request_budget(tmp_path, caplog):
     supervisor, owner = _supervisor(tmp_path)
-    supervisor.client_cls = _FailsAfterStartupClient
     first = supervisor.get_or_start(owner)
 
+    assert supervisor.report_request_failure(first) is True
+    supervisor.maintenance_tick()
     replacement = _trace_ready(
         supervisor,
         owner,
         caplog,
-        "trace-replace-unhealthy-123",
+        "trace-replace-reported-failure-123",
     )
 
     assert replacement is not first
     path, elapsed_ms = _ready_sample(caplog)
-    assert path == "replace_unhealthy"
-    require_ready_latency("unhealthy replacement", path, elapsed_ms)
-    assert [
-        timeout
-        for timeout in _FailsAfterStartupClient.control_timeouts
-        if timeout < 2.0
-    ] == [0.2, 0.2]
+    assert path == "cold_start"
+    require_ready_latency("reported failure replacement", path, elapsed_ms)
     assert supervisor._terminating_handles == {}
 
     supervisor.shutdown()

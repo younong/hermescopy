@@ -47,10 +47,13 @@ follow the implementation and its closest focused tests.
   explain why all affected existing code remains necessary. Do not optimize for
   a negative line count; optimize for the smallest complete implementation.
 
-## Bounded Feature Development
+## Bounded Subagent Concurrency
 
-- At most **2 feature-development subagents** may be active concurrently,
-  regardless of how they are launched.
+- At most **2 subagents total** may be active concurrently across the main
+  conversation and every nested delegation level, regardless of task type or
+  how they are launched.
+- Delegated agents must not launch descendants unless the main conversation has
+  explicitly reserved one of those two global slots for that descendant.
 - This limits concurrency, not total calls. A completed subagent frees its slot.
 
 ## Bounded Code Reviews

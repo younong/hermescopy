@@ -1306,7 +1306,12 @@ class TestWsAuthOkGated:
 
         browser, lease = _Browser(), _Lease()
         handle = SimpleNamespace(socket_path="/unused", owner_key="ok1_owner", worker_generation=1, worker_id="worker-a", lease_version=1, recovery_generation=0)
+        failures = []
         browser.app.state.owner_worker_supervisor = SimpleNamespace(get_or_start=lambda _owner: handle, control_home=tmp_path / "control")
+        browser.app.state.owner_worker_lifecycle = SimpleNamespace(
+            observe_verified_owner=lambda *_args, **_kwargs: None,
+            report_request_failure=lambda failed, reason: failures.append((failed, reason)),
+        )
         monkeypatch.setattr(web_server, "_owner_context_from_ws_auth_result", lambda _result: SimpleNamespace(owner_key="ok1_owner"))
         monkeypatch.setattr(web_server, "_acquire_owner_worker_use", lambda *_args: lease)
         monkeypatch.setattr("hermes_cli.dashboard_auth.owner_context.ensure_owner_home", lambda _owner: None)
@@ -1322,6 +1327,7 @@ class TestWsAuthOkGated:
 
         assert browser.accepted is False
         assert browser.closed and browser.closed[-1][0] == 1013
+        assert failures == [(handle, "transport")]
         assert lease.release_count == 1
 
     def test_ws_close_reason_redacts_auth_query_values(self):

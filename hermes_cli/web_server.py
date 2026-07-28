@@ -704,6 +704,7 @@ async def _proxy_authenticated_owner_http(request: Request) -> Response:
 
     _reject_authenticated_profile_query_params(request)
     supervisor = getattr(request.app.state, "owner_worker_supervisor", None)
+    lifecycle = getattr(request.app.state, "owner_worker_lifecycle", None)
 
     lease: Any | None = None
     try:
@@ -735,6 +736,10 @@ async def _proxy_authenticated_owner_http(request: Request) -> Response:
             headers=forwarded_headers,
             content=content,
         )
+        if response.status_code == 401:
+            raise OwnerWorkerHealthError(
+                "owner worker rejected its exact capability"
+            )
         log_latency_stage(
             _log,
             trace_id=latency_trace_id,
@@ -765,6 +770,8 @@ async def _proxy_authenticated_owner_http(request: Request) -> Response:
         raise HTTPException(status_code=503, detail="Owner worker is unavailable") from exc
     except OwnerWorkerHealthError as exc:
         if lease is not None:
+            if lifecycle is not None:
+                lifecycle.report_request_failure(handle, "transport")
             lease.release()
         _log.warning(
             "owner worker proxy transport failed method=%s path=%s request_id=%s: %s",
@@ -13195,6 +13202,7 @@ async def _bridge_websocket_to_owner_worker(
         return
 
     supervisor = getattr(ws.app.state, "owner_worker_supervisor", None)
+    lifecycle = getattr(ws.app.state, "owner_worker_lifecycle", None)
     if supervisor is None:
         await ws.close(code=1013, reason=_ws_close_reason("owner worker supervisor unavailable"))
         return
@@ -13208,6 +13216,8 @@ async def _bridge_websocket_to_owner_worker(
         ):
             handle = await asyncio.to_thread(supervisor.get_or_start, owner)
         lease = _acquire_owner_worker_use(supervisor, handle)
+        if lifecycle is not None:
+            lifecycle.observe_verified_owner(owner, schedule_start=False)
     except Exception as exc:
         if lease is not None:
             lease.release()
@@ -13269,6 +13279,8 @@ async def _bridge_websocket_to_owner_worker(
             except Exception:
                 pass
         if lease is not None:
+            if lifecycle is not None:
+                lifecycle.report_request_failure(handle, "transport")
             lease.release()
         _log.warning("owner worker websocket connect failed path=%s owner=%s: %s", path, owner.owner_key, _redact_auth_secrets(exc))
         await ws.close(code=1013, reason=_ws_close_reason("owner worker websocket unavailable"))
