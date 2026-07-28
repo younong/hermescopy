@@ -243,8 +243,8 @@ code { font-size: 0.875rem; }
   outline: 0;
   background: transparent;
   color: #1f1f1f;
-  font-size: 14px;
-  line-height: 22px;
+  font-size: 13px;
+  line-height: 20px;
 }
 
 [data-gui-chat] .gui-chat-search input::placeholder {
@@ -261,9 +261,9 @@ code { font-size: 0.875rem; }
   border-radius: 10px;
   padding: 7px 8px;
   color: #1f1f1f;
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 400;
-  line-height: 22px;
+  line-height: 20px;
   transition: background-color 120ms ease, color 120ms ease;
 }
 
@@ -291,9 +291,9 @@ code { font-size: 0.875rem; }
   justify-content: space-between;
   padding: 8px 10px;
   color: rgb(0 0 0 / 35%);
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 500;
-  line-height: 18px;
+  line-height: 16px;
 }
 
 [data-gui-chat] .gui-chat-section-heading .gui-chat-icon-button {
@@ -1320,10 +1320,16 @@ code { font-size: 0.875rem; }
   }
 }
 
+[data-gui-chat] [data-message-variant],
+[data-gui-chat] .markdown-body,
+[data-gui-chat] [data-streamdown] {
+  font-size: 13px;
+  line-height: 1.65;
+}
+
 [data-gui-chat] .markdown-body,
 [data-gui-chat] [data-streamdown] {
   color: #282b30;
-  line-height: 1.75;
 }
 
 [data-gui-chat] pre {

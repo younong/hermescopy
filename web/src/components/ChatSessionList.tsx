@@ -349,7 +349,10 @@ export function ChatSessionList({
                     onClick={(event) => event.stopPropagation()}
                     placeholder={titlePlaceholder}
                     aria-label={titlePlaceholder}
-                    className="h-8 min-w-0 flex-1 py-0 text-sm"
+                    className={cn(
+                      "h-8 min-w-0 flex-1 py-0",
+                      variant === "compact" ? "text-[13px] leading-5" : "text-sm",
+                    )}
                     disabled={rename.saving}
                   />
                   <Button
@@ -409,7 +412,7 @@ export function ChatSessionList({
                       : "text-text-secondary hover:bg-midground/5 hover:text-foreground",
                 )}
               >
-                <span className={cn("w-full truncate", variant === "compact" ? "text-sm font-normal leading-[22px]" : "text-sm font-medium")}>
+                <span className={cn("w-full truncate", variant === "compact" ? "text-[13px] font-normal leading-5" : "text-sm font-medium")}>
                   {label}
                 </span>
                 {variant === "default" ? (

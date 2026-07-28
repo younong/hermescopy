@@ -248,7 +248,7 @@ export function Composer({
 
         <textarea
           aria-label="GUI chat message"
-          className="min-h-11 max-h-40 w-full resize-none bg-transparent px-1 py-0.5 text-[0.9375rem] leading-6 text-[#26292e] outline-none placeholder:text-[#999da4] disabled:cursor-not-allowed disabled:opacity-70"
+          className="min-h-11 max-h-40 w-full resize-none bg-transparent px-1 py-0.5 text-[14px] leading-[22px] text-[#26292e] outline-none placeholder:text-[#999da4] disabled:cursor-not-allowed disabled:opacity-70"
           disabled={disabled || isSubmitting}
           onChange={(event) => setText(event.target.value)}
           onKeyDown={onKeyDown}
