@@ -211,16 +211,18 @@ def run_measurement() -> tuple[dict[str, Any], int]:
             active_sample["scenario"], active_sample["path"], active_sample["elapsedMs"]
         )
 
-        _probe, probe_sample = _traced_ready(
+        _cached, cached_sample = _traced_ready(
             warm_supervisor,
             warm_owner,
             logger,
             handler,
-            scenario="hot_health_probe",
+            scenario="hot_cached",
         )
-        samples.append(probe_sample)
+        samples.append(cached_sample)
         require_ready_latency(
-            probe_sample["scenario"], probe_sample["path"], probe_sample["elapsedMs"]
+            cached_sample["scenario"],
+            cached_sample["path"],
+            cached_sample["elapsedMs"],
         )
     except Exception as exc:
         status = 1

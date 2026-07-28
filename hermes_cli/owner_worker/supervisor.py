@@ -74,6 +74,7 @@ class OwnerWorkerHandle:
     last_used_at: float = field(default_factory=time.time)
     last_health: dict[str, Any] = field(default_factory=dict)
     active_uses: int = 0
+    accepting: bool = True
     resource_scope: CgroupScopeLease | None = field(default=None, repr=False)
 
 
@@ -416,7 +417,6 @@ class OwnerWorkerSupervisor:
         owner_key = self._owner_key(owner)
         owner_home = self._owner_home(owner)
         waited = False
-        control_timeout = max(0.001, min(_LOCAL_CONTROL_TIMEOUT, startup_timeout))
         while True:
             # These methods only select handles while locked; their synchronous
             # revoker/process work runs after releasing the supervisor lock.
@@ -434,17 +434,15 @@ class OwnerWorkerSupervisor:
                         owner_key,
                         requested,
                         readiness_path=trace_state[0],
-                        control_timeout=control_timeout,
                     )
-                self._reap_exited()
-                self._stop_idle(now=time.time())
 
             with self._start_finished:
                 existing = self._handles.get(owner_key)
                 if existing is not None:
                     if existing.owner_home.resolve() != owner_home.resolve():
                         raise RuntimeError("owner worker exact owner_home mismatch for owner_key")
-                    existing.last_used_at = time.time()
+                    if existing.accepting:
+                        existing.last_used_at = time.time()
                 elif owner_key in self._starting_owner_keys or owner_key in self._terminating_handles:
                     waited = True
                     trace_state[0] = "wait_existing_start"
@@ -474,65 +472,35 @@ class OwnerWorkerSupervisor:
                         owner_key,
                         existing,
                         readiness_path=trace_state[0],
-                        control_timeout=control_timeout,
                     )
                     continue
                 try:
                     self.authority_store.assert_worker_lease(
-                        self._lease_for_handle(existing), states=frozenset({WorkerLeaseState.ACTIVE})
+                        self._lease_for_handle(existing),
+                        states=frozenset({WorkerLeaseState.ACTIVE}),
                     )
-                    # An active use lease means an admitted HTTP stream or WebSocket
-                    # bridge still owns this exact generation. Do not let a new
-                    # request's best-effort health probe fence those live clients
-                    # when the worker event loop is temporarily busy.
-                    with self._lock:
-                        if (
-                            self._handles.get(owner_key) is existing
-                            and existing.active_uses > 0
-                        ):
-                            if trace_state[0] != "replace_unhealthy":
-                                trace_state[0] = (
-                                    "wait_existing_start" if waited else "hot_active"
-                                )
-                            return existing
-                    health_path = (
-                        "wait_existing_start" if waited else "hot_health_probe"
-                    )
-                    with observed_latency_stage(
-                        stage="owner_worker.ready.health_probe",
-                        path=health_path,
-                    ):
-                        health = self.client_cls(
-                            existing.socket_path,
-                            timeout=control_timeout,
-                            control_home=self.control_home,
-                        ).verify_health(
-                            owner_key=owner_key,
-                            owner_home=owner_home,
-                            worker_generation=existing.worker_generation,
-                            worker_id=existing.worker_id,
-                            lease_version=existing.lease_version,
-                            recovery_generation=existing.recovery_generation,
-                            lease=self._lease_for_handle(existing),
-                        )
-                        if int(health["pid"]) != existing.pid:
-                            raise RuntimeError("owner worker pid mismatch")
-                except (AuthorizationRejected, OwnerWorkerHealthError, RuntimeError):
-                    # A local cache never grants authority. Revoke and close the
-                    # exact local generation; a stale CAS cannot affect a replacement.
+                except AuthorizationRejected:
                     trace_state[0] = "replace_unhealthy"
                     self._terminate_handle(
                         owner_key,
                         existing,
                         readiness_path=trace_state[0],
-                        control_timeout=control_timeout,
                     )
                     continue
                 with self._lock:
                     if self._handles.get(owner_key) is existing:
-                        existing.last_health = health
+                        if not existing.accepting:
+                            raise OwnerWorkerUnavailableError(
+                                "owner worker is retiring"
+                            )
                         if trace_state[0] != "replace_unhealthy":
-                            trace_state[0] = health_path
+                            trace_state[0] = (
+                                "wait_existing_start"
+                                if waited
+                                else "hot_active"
+                                if existing.active_uses > 0
+                                else "hot_cached"
+                            )
                         return existing
                 continue
 
@@ -542,7 +510,6 @@ class OwnerWorkerSupervisor:
                 eviction[0],
                 eviction[1],
                 readiness_path=trace_state[0],
-                control_timeout=control_timeout,
             )
 
         try:
@@ -1184,12 +1151,27 @@ class OwnerWorkerSupervisor:
         self._last_start_attempt[owner_key] = now
         return None
 
+    def needs_start(self, owner: Any) -> bool:
+        """Return whether the exact owner lacks a live accepting Worker."""
+        owner_key = self._owner_key(owner)
+        owner_home = self._owner_home(owner)
+        with self._lock:
+            handle = self._handles.get(owner_key)
+            return not (
+                handle is not None
+                and handle.owner_home.resolve() == owner_home.resolve()
+                and handle.accepting
+                and handle.process.poll() is None
+            )
+
     def acquire_use(self, handle: OwnerWorkerHandle) -> OwnerWorkerLease:
         """Mark a worker as actively serving an HTTP stream or WS bridge."""
         with self._lock:
             current = self._handles.get(handle.owner_key)
-            if current is not handle:
-                raise RuntimeError("owner worker handle is no longer active")
+            if current is not handle or not handle.accepting:
+                raise OwnerWorkerUnavailableError(
+                    "owner worker handle is no longer active"
+                )
             self.authority_store.assert_worker_lease(
                 self._lease_for_handle(handle), states=frozenset({WorkerLeaseState.ACTIVE})
             )
@@ -1201,10 +1183,65 @@ class OwnerWorkerSupervisor:
 
     def release_use(self, handle: OwnerWorkerHandle) -> None:
         """Release an active-use lease acquired by :meth:`acquire_use`."""
-        with self._lock:
+        with self._start_finished:
             if handle.active_uses > 0:
                 handle.active_uses -= 1
             handle.last_used_at = time.time()
+            if handle.active_uses == 0 and not handle.accepting:
+                self._start_finished.notify_all()
+
+    def report_request_failure(self, handle: OwnerWorkerHandle) -> bool:
+        """Fence an exact failed handle for lifecycle-only retirement."""
+        with self._start_finished:
+            if self._handles.get(handle.owner_key) is not handle:
+                return False
+            if handle.process.poll() is None:
+                try:
+                    self.authority_store.assert_worker_lease(
+                        self._lease_for_handle(handle),
+                        states=frozenset({WorkerLeaseState.ACTIVE}),
+                    )
+                except AuthorizationRejected:
+                    return False
+            handle.accepting = False
+            self._start_finished.notify_all()
+            return True
+
+    def maintenance_tick(self, *, now: float | None = None) -> set[str]:
+        """Perform lifecycle-only reaping, retirement, and idle cleanup."""
+        observed_at = time.time() if now is None else float(now)
+        reserved: list[tuple[str, OwnerWorkerHandle]] = []
+        with self._lock:
+            for owner_key, handle in tuple(self._handles.items()):
+                should_retire = (
+                    handle.process.poll() is not None
+                    or not handle.accepting
+                    or (
+                        handle.active_uses <= 0
+                        and observed_at - handle.last_used_at >= self.idle_timeout
+                    )
+                )
+                if (
+                    should_retire
+                    and handle.active_uses <= 0
+                    and self._reserve_termination_locked(owner_key, handle)
+                ):
+                    reserved.append((owner_key, handle))
+        for owner_key, handle in reserved:
+            self._drain_and_teardown_reserved_handle(owner_key, handle)
+        return {owner_key for owner_key, _handle in reserved}
+
+    def next_maintenance_delay(self, *, now: float | None = None) -> float:
+        observed_at = time.time() if now is None else float(now)
+        with self._lock:
+            if any(not handle.accepting for handle in self._handles.values()):
+                return max(0.01, self.poll_interval)
+            deadlines = [
+                max(0.0, handle.last_used_at + self.idle_timeout - observed_at)
+                for handle in self._handles.values()
+                if handle.active_uses <= 0
+            ]
+        return min(deadlines, default=self.idle_timeout)
 
     @staticmethod
     def _controlled_roots_for(runtime_paths: OwnerWorkerRuntimePaths) -> ControlledRoots:
@@ -1511,31 +1548,6 @@ class OwnerWorkerSupervisor:
                 if self._terminating_handles.get(owner_key) is handle:
                     self._terminating_handles.pop(owner_key, None)
                 self._start_finished.notify_all()
-
-    def _reap_exited(self) -> set[str]:
-        with self._lock:
-            reserved = [
-                (owner_key, handle)
-                for owner_key, handle in tuple(self._handles.items())
-                if handle.process.poll() is not None and self._reserve_termination_locked(owner_key, handle)
-            ]
-        for owner_key, handle in reserved:
-            self._drain_and_teardown_reserved_handle(owner_key, handle)
-        return {owner_key for owner_key, _handle in reserved}
-
-    def _stop_idle(self, *, now: float) -> None:
-        with self._lock:
-            reserved = []
-            for owner_key, handle in tuple(self._handles.items()):
-                if handle.process.poll() is not None:
-                    if self._reserve_termination_locked(owner_key, handle):
-                        reserved.append((owner_key, handle))
-                    continue
-                if handle.active_uses <= 0 and now - handle.last_used_at >= self.idle_timeout:
-                    if self._reserve_termination_locked(owner_key, handle):
-                        reserved.append((owner_key, handle))
-        for owner_key, handle in reserved:
-            self._drain_and_teardown_reserved_handle(owner_key, handle)
 
     def _reserve_oldest_idle_locked(self) -> tuple[str, OwnerWorkerHandle] | None:
         live = [

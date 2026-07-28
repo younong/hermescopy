@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 
 @dataclass(frozen=True)
 class OwnerWorkerPerformanceStandards:
-    schema_version: int = 3
+    schema_version: int = 4
     ready_max_ms: float = 1000.0
 
     def payload(self) -> dict[str, int | float]:
@@ -16,7 +16,7 @@ class OwnerWorkerPerformanceStandards:
 STANDARDS = OwnerWorkerPerformanceStandards()
 READINESS_PATHS = frozenset({
     "hot_active",
-    "hot_health_probe",
+    "hot_cached",
     "wait_existing_start",
     "cold_start",
     "replace_unhealthy",
