@@ -117,6 +117,7 @@ class _FakeClient:
     def __init__(self, socket_path, *, control_home=None, timeout=2.0) -> None:
         self.socket_path = Path(socket_path)
         self.control_home = control_home
+        self.timeout = timeout
 
     def begin_drain(self, *, lease):
         return {"draining": True, "active_turns": 0}
@@ -619,6 +620,7 @@ def test_supervisor_cold_start_emits_ready_phases(tmp_path, caplog):
 
     stages = [message.split("stage=", 1)[1].split(" ", 1)[0] for message in caplog.messages]
     assert stages == [
+        "owner_worker.ready.maintenance",
         "owner_worker.ready.runtime_dirs",
         "owner_worker.ready.skills_sync",
         "owner_worker.ready.authority_claim",
@@ -1280,6 +1282,11 @@ def test_supervisor_get_or_start_failed_health_retires_idle_generation(tmp_path,
 
     class _FailsAfterStartupClient(_FakeClient):
         health_calls = 0
+        control_timeouts: list[float] = []
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            type(self).control_timeouts.append(self.timeout)
 
         def verify_health(self, **kwargs):
             type(self).health_calls += 1
@@ -1304,8 +1311,27 @@ def test_supervisor_get_or_start_failed_health_retires_idle_generation(tmp_path,
 
     assert replacement is not first
     assert caplog.messages[-1].endswith("outcome=ok path=replace_unhealthy")
-    assert all("path=replace_unhealthy" in message for message in caplog.messages)
+    assert any(
+        "stage=owner_worker.ready.health_probe" in message
+        and "outcome=error path=hot_health_probe" in message
+        for message in caplog.messages
+    )
+    assert any(
+        "stage=owner_worker.ready.replacement_drain" in message
+        and "outcome=ok path=replace_unhealthy" in message
+        for message in caplog.messages
+    )
+    assert any(
+        "stage=owner_worker.ready.replacement_teardown" in message
+        and "outcome=ok path=replace_unhealthy" in message
+        for message in caplog.messages
+    )
     assert first.process.terminated
+    assert [
+        timeout
+        for timeout in _FailsAfterStartupClient.control_timeouts
+        if timeout < 2.0
+    ] == [0.1, 0.1]
     assert supervisor._handles[owner.owner_key] is replacement
     assert supervisor._terminating_handles == {}
 
@@ -1327,8 +1353,15 @@ def test_supervisor_idle_reuse_emits_health_probe_path(tmp_path, caplog):
     first = supervisor.get_or_start(owner)
 
     assert _traced_get_or_start(supervisor, owner, caplog) is first
-    assert len(caplog.messages) == 1
-    assert "path=hot_health_probe" in caplog.messages[0]
+    assert [
+        message.split("stage=", 1)[1].split(" ", 1)[0]
+        for message in caplog.messages
+    ] == [
+        "owner_worker.ready.maintenance",
+        "owner_worker.ready.health_probe",
+        "owner_worker.ready",
+    ]
+    assert "path=hot_health_probe" in caplog.messages[-1]
 
 
 
@@ -1507,9 +1540,16 @@ def test_supervisor_serializes_concurrent_start_for_same_owner(tmp_path, caplog)
     assert len(aggregates) == 3
     assert sum("path=cold_start" in message for message in aggregates) == 1
     assert sum("path=wait_existing_start" in message for message in aggregates) == 2
+    waits = [
+        message
+        for message in caplog.messages
+        if "stage=owner_worker.ready.start_wait" in message
+    ]
+    assert len(waits) == 2
+    assert all("outcome=ok path=wait_existing_start" in message for message in waits)
 
 
-def test_supervisor_waiting_same_owner_start_times_out_without_releasing_leader(tmp_path):
+def test_supervisor_waiting_same_owner_start_times_out_without_releasing_leader(tmp_path, caplog):
     owner = _Owner("ok1_stalled", tmp_path / "owner")
     startup_entered = threading.Event()
     release_startup = threading.Event()
@@ -1544,8 +1584,14 @@ def test_supervisor_waiting_same_owner_start_times_out_without_releasing_leader(
     assert startup_entered.wait(timeout=2)
 
     with pytest.raises(TimeoutError, match="timed out waiting for owner worker startup"):
-        supervisor.get_or_start(owner, timeout=0.01)
+        _traced_get_or_start(supervisor, owner, caplog, timeout=0.01)
 
+    assert any(
+        "stage=owner_worker.ready.start_wait" in message
+        and "outcome=error path=wait_existing_start" in message
+        for message in caplog.messages
+    )
+    assert caplog.messages[-1].endswith("outcome=error path=wait_existing_start")
     assert len(spawned) == 1
     assert owner.owner_key in supervisor._starting_owner_keys
     assert supervisor._in_flight_starts == 1

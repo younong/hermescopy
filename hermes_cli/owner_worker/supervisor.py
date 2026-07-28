@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -247,6 +248,9 @@ def _configured_env_allowlist() -> set[str]:
     return {key.strip() for key in raw.split(",") if key.strip()}
 
 
+_LOCAL_CONTROL_TIMEOUT = 0.2
+
+
 class OwnerWorkerSupervisor:
     """Start and track one OS process per authenticated owner key."""
 
@@ -412,19 +416,28 @@ class OwnerWorkerSupervisor:
         owner_key = self._owner_key(owner)
         owner_home = self._owner_home(owner)
         waited = False
+        control_timeout = max(0.001, min(_LOCAL_CONTROL_TIMEOUT, startup_timeout))
         while True:
             # These methods only select handles while locked; their synchronous
             # revoker/process work runs after releasing the supervisor lock.
-            with self._lock:
-                requested = self._handles.get(owner_key)
-                requested_exited = (
-                    requested is not None and requested.process.poll() is not None
-                )
-            if requested_exited:
-                trace_state[0] = "replace_unhealthy"
-            if owner_key in self._reap_exited():
-                trace_state[0] = "replace_unhealthy"
-            self._stop_idle(now=time.time())
+            with observed_latency_stage(
+                stage="owner_worker.ready.maintenance", path=trace_state[0]
+            ):
+                with self._lock:
+                    requested = self._handles.get(owner_key)
+                    requested_exited = (
+                        requested is not None and requested.process.poll() is not None
+                    )
+                if requested_exited:
+                    trace_state[0] = "replace_unhealthy"
+                    self._terminate_handle(
+                        owner_key,
+                        requested,
+                        readiness_path=trace_state[0],
+                        control_timeout=control_timeout,
+                    )
+                self._reap_exited()
+                self._stop_idle(now=time.time())
 
             with self._start_finished:
                 existing = self._handles.get(owner_key)
@@ -438,8 +451,11 @@ class OwnerWorkerSupervisor:
                     if deadline is None:
                         deadline = time.monotonic() + startup_timeout
                     remaining = deadline - time.monotonic()
-                    if remaining <= 0 or not self._start_finished.wait(timeout=remaining):
-                        raise TimeoutError("timed out waiting for owner worker startup")
+                    with observed_latency_stage(
+                        stage="owner_worker.ready.start_wait", path=trace_state[0]
+                    ):
+                        if remaining <= 0 or not self._start_finished.wait(timeout=remaining):
+                            raise TimeoutError("timed out waiting for owner worker startup")
                     continue
                 else:
                     eviction = self._admit_start(owner_key, owner_home, now=time.time())
@@ -454,7 +470,12 @@ class OwnerWorkerSupervisor:
             if existing is not None:
                 if existing.process.poll() is not None:
                     trace_state[0] = "replace_unhealthy"
-                    self._terminate_handle(owner_key, existing)
+                    self._terminate_handle(
+                        owner_key,
+                        existing,
+                        readiness_path=trace_state[0],
+                        control_timeout=control_timeout,
+                    )
                     continue
                 try:
                     self.authority_store.assert_worker_lease(
@@ -474,36 +495,55 @@ class OwnerWorkerSupervisor:
                                     "wait_existing_start" if waited else "hot_active"
                                 )
                             return existing
-                    health = self.client_cls(existing.socket_path, control_home=self.control_home).verify_health(
-                        owner_key=owner_key,
-                        owner_home=owner_home,
-                        worker_generation=existing.worker_generation,
-                        worker_id=existing.worker_id,
-                        lease_version=existing.lease_version,
-                        recovery_generation=existing.recovery_generation,
-                        lease=self._lease_for_handle(existing),
+                    health_path = (
+                        "wait_existing_start" if waited else "hot_health_probe"
                     )
-                    if int(health["pid"]) != existing.pid:
-                        raise RuntimeError("owner worker pid mismatch")
+                    with observed_latency_stage(
+                        stage="owner_worker.ready.health_probe",
+                        path=health_path,
+                    ):
+                        health = self.client_cls(
+                            existing.socket_path,
+                            timeout=control_timeout,
+                            control_home=self.control_home,
+                        ).verify_health(
+                            owner_key=owner_key,
+                            owner_home=owner_home,
+                            worker_generation=existing.worker_generation,
+                            worker_id=existing.worker_id,
+                            lease_version=existing.lease_version,
+                            recovery_generation=existing.recovery_generation,
+                            lease=self._lease_for_handle(existing),
+                        )
+                        if int(health["pid"]) != existing.pid:
+                            raise RuntimeError("owner worker pid mismatch")
                 except (AuthorizationRejected, OwnerWorkerHealthError, RuntimeError):
                     # A local cache never grants authority. Revoke and close the
                     # exact local generation; a stale CAS cannot affect a replacement.
                     trace_state[0] = "replace_unhealthy"
-                    self._terminate_handle(owner_key, existing)
+                    self._terminate_handle(
+                        owner_key,
+                        existing,
+                        readiness_path=trace_state[0],
+                        control_timeout=control_timeout,
+                    )
                     continue
                 with self._lock:
                     if self._handles.get(owner_key) is existing:
                         existing.last_health = health
                         if trace_state[0] != "replace_unhealthy":
-                            trace_state[0] = (
-                                "wait_existing_start" if waited else "hot_health_probe"
-                            )
+                            trace_state[0] = health_path
                         return existing
                 continue
 
             # Capacity eviction was reserved while locked. Drain its admitted
             # work before strict bridge-revoke/process teardown, then retry.
-            self._drain_and_teardown_reserved_handle(eviction[0], eviction[1])
+            self._drain_and_teardown_reserved_handle(
+                eviction[0],
+                eviction[1],
+                readiness_path=trace_state[0],
+                control_timeout=control_timeout,
+            )
 
         try:
             with observed_latency_stage(
@@ -1301,12 +1341,24 @@ class OwnerWorkerSupervisor:
         self._terminating_handles[owner_key] = handle
         return True
 
-    def _terminate_handle(self, owner_key: str, handle: OwnerWorkerHandle) -> None:
+    def _terminate_handle(
+        self,
+        owner_key: str,
+        handle: OwnerWorkerHandle,
+        *,
+        readiness_path: str | None = None,
+        control_timeout: float | None = None,
+    ) -> None:
         """Retire one exact local handle without holding the supervisor lock."""
         with self._lock:
             if not self._reserve_termination_locked(owner_key, handle):
                 return
-        self._drain_and_teardown_reserved_handle(owner_key, handle)
+        self._drain_and_teardown_reserved_handle(
+            owner_key,
+            handle,
+            readiness_path=readiness_path,
+            control_timeout=control_timeout,
+        )
 
     def _drain_and_teardown_reserved_handle(
         self,
@@ -1314,32 +1366,56 @@ class OwnerWorkerSupervisor:
         handle: OwnerWorkerHandle,
         *,
         planned_restart: bool = False,
+        readiness_path: str | None = None,
+        control_timeout: float | None = None,
     ) -> None:
         """Drain one reserved live Worker before ordered generation teardown."""
-        if handle.process.poll() is None:
-            lease = self._lease_for_handle(handle)
-            client = self.client_cls(
-                handle.socket_path,
-                timeout=max(2.0, self.poll_interval * 2),
-                control_home=self.control_home,
+        drain_stage = (
+            observed_latency_stage(
+                stage="owner_worker.ready.replacement_drain",
+                path=readiness_path,
             )
-            try:
-                status = client.begin_drain(lease=lease)
-                deadline = time.monotonic() + self.drain_timeout
-                while status.get("active_turns", 0) > 0 and time.monotonic() < deadline:
-                    time.sleep(self.poll_interval)
-                    status = client.drain_status(lease=lease)
-                if status.get("active_turns", 0) > 0:
-                    client.force_drain(lease=lease)
-            except Exception:
-                # Ordered teardown still fences exact capability and process state.
-                # Worker lifespan performs a final resumable force-drain on exit.
-                pass
-        self._teardown_terminated_handle(
-            owner_key,
-            handle,
-            planned_restart=planned_restart,
+            if readiness_path is not None
+            else nullcontext()
         )
+        try:
+            with drain_stage:
+                if handle.process.poll() is None:
+                    lease = self._lease_for_handle(handle)
+                    client = self.client_cls(
+                        handle.socket_path,
+                        timeout=(
+                            _LOCAL_CONTROL_TIMEOUT
+                            if control_timeout is None
+                            else control_timeout
+                        ),
+                        control_home=self.control_home,
+                    )
+                    status = client.begin_drain(lease=lease)
+                    deadline = time.monotonic() + self.drain_timeout
+                    while status.get("active_turns", 0) > 0 and time.monotonic() < deadline:
+                        time.sleep(self.poll_interval)
+                        status = client.drain_status(lease=lease)
+                    if status.get("active_turns", 0) > 0:
+                        client.force_drain(lease=lease)
+        except Exception:
+            # Ordered teardown still fences exact capability and process state.
+            # Worker lifespan performs a final resumable force-drain on exit.
+            pass
+        teardown_stage = (
+            observed_latency_stage(
+                stage="owner_worker.ready.replacement_teardown",
+                path=readiness_path,
+            )
+            if readiness_path is not None
+            else nullcontext()
+        )
+        with teardown_stage:
+            self._teardown_terminated_handle(
+                owner_key,
+                handle,
+                planned_restart=planned_restart,
+            )
 
     def _teardown_terminated_handle(
         self,
