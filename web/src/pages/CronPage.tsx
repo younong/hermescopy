@@ -10,7 +10,6 @@ import type {
   CronJob,
   CronDeliveryTarget,
   ModelOptionsResponse,
-  ProfileInfo,
   SkillInfo,
   ToolsetInfo,
 } from "@/lib/api";
@@ -21,6 +20,7 @@ import {
   type CronJobFormState,
 } from "@/lib/cron-job";
 import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
+import { useProfileScope } from "@/contexts/useProfileScope";
 import {
   DEFAULT_SCHEDULE_STATE,
   ScheduleBuilder,
@@ -496,10 +496,6 @@ function splitJobKey(key: string): { profile: string; id: string } {
   return { profile: key.slice(0, idx) || "default", id: key.slice(idx + 1) };
 }
 
-function profileLabel(profile: string): string {
-  return profile === "default" ? "default" : profile;
-}
-
 const STATUS_TONE: Record<string, "success" | "warning" | "destructive"> = {
   enabled: "success",
   scheduled: "success",
@@ -510,7 +506,7 @@ const STATUS_TONE: Record<string, "success" | "warning" | "destructive"> = {
 
 export default function CronPage() {
   const [jobs, setJobs] = useState<CronJob[]>([]);
-  const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
+  const { profiles } = useProfileScope();
   const [selectedProfile, setSelectedProfile] = useState("all");
   const [view, setView] = useState<"jobs" | "blueprints">("jobs");
   const [loading, setLoading] = useState(true);
@@ -583,13 +579,6 @@ export default function CronPage() {
       .catch(() => showToast(t.common.loading, "error"))
       .finally(() => setLoading(false));
   }, [selectedProfile, showToast, t.common.loading]);
-
-  useEffect(() => {
-    api
-      .getProfiles()
-      .then((res) => setProfiles(res.profiles))
-      .catch(() => setProfiles([]));
-  }, []);
 
   useEffect(() => {
     api
@@ -849,8 +838,8 @@ export default function CronPage() {
                   onValueChange={(v) => setCreateProfile(v)}
                 >
                   {profiles.map((profile) => (
-                    <SelectOption key={profile.name} value={profile.name}>
-                      {profileLabel(profile.name)}
+                    <SelectOption key={profile} value={profile}>
+                      {profile}
                     </SelectOption>
                   ))}
                 </Select>
@@ -968,8 +957,8 @@ export default function CronPage() {
             >
               <SelectOption value="all">All profiles</SelectOption>
               {profiles.map((profile) => (
-                <SelectOption key={profile.name} value={profile.name}>
-                  {profileLabel(profile.name)}
+                <SelectOption key={profile} value={profile}>
+                  {profile}
                 </SelectOption>
               ))}
             </Select>
@@ -1009,7 +998,7 @@ export default function CronPage() {
                     <Badge tone={STATUS_TONE[state] ?? "secondary"}>
                       {state}
                     </Badge>
-                    <Badge tone="outline">{profileLabel(profile)}</Badge>
+                    <Badge tone="outline">{profile}</Badge>
                     {deliver && deliver !== "local" && (
                       <Badge tone="outline">{deliver}</Badge>
                     )}

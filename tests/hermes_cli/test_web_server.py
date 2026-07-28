@@ -3407,6 +3407,48 @@ class TestNewEndpoints:
         names = [p["name"] for p in resp.json()["profiles"]]
         assert "default" in names
 
+    def test_profile_summary_uses_lightweight_profile_scan(self, monkeypatch):
+        import hermes_cli.profiles as profiles_mod
+
+        monkeypatch.setattr(
+            profiles_mod,
+            "profiles_to_serve",
+            lambda multiplex: [
+                ("default", Path("/ignored/default")),
+                ("coder", Path("/ignored/coder")),
+            ] if multiplex else pytest.fail("summary must request multiplex names"),
+        )
+        monkeypatch.setattr(profiles_mod, "get_active_profile_name", lambda: "default")
+        monkeypatch.setattr(profiles_mod, "get_active_profile", lambda: "coder")
+        monkeypatch.setattr(
+            profiles_mod,
+            "list_profiles",
+            lambda: pytest.fail("summary must not load rich profile data"),
+        )
+        response = self.client.get("/api/profiles/summary")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "management_mode": "legacy_multi_profile",
+            "profiles": ["default", "coder"],
+            "current": "default",
+            "active": "coder",
+        }
+
+    def test_profile_summary_falls_back_to_default_names(self, monkeypatch):
+        import hermes_cli.profiles as profiles_mod
+
+        monkeypatch.setattr(
+            profiles_mod,
+            "profiles_to_serve",
+            lambda multiplex: (_ for _ in ()).throw(OSError("unavailable")),
+        )
+
+        response = self.client.get("/api/profiles/summary")
+
+        assert response.status_code == 200
+        assert response.json()["profiles"] == ["default"]
+
     def test_profiles_list_falls_back_when_profile_listing_fails(self, monkeypatch):
         from hermes_constants import get_hermes_home
         import hermes_cli.profiles as profiles_mod

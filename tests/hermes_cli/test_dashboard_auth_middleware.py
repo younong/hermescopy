@@ -396,6 +396,58 @@ def test_authenticated_api_availability_requires_explicit_owner_worker_routes(pa
     assert authenticated_owner_worker_api_allowed(path) is allowed
 
 
+def test_authenticated_profile_summary_is_exact_control_plane_route():
+    from hermes_cli.dashboard_auth.api_availability import (
+        AuthenticatedApiBucket,
+        classify_authenticated_api,
+    )
+
+    decision = classify_authenticated_api("/api/profiles/summary", method="GET")
+    assert decision.allowed is True
+    assert decision.bucket == AuthenticatedApiBucket.CONTROL_PLANE_AUTH
+
+    for method, path in (
+        ("POST", "/api/profiles/summary"),
+        ("GET", "/api/profiles/summary/private"),
+    ):
+        denied = classify_authenticated_api(path, method=method)
+        assert denied.allowed is False
+        assert denied.bucket == AuthenticatedApiBucket.LOCAL_ONLY_OR_UNAVAILABLE
+
+
+def test_authenticated_profile_summary_is_static_and_owner_insensitive(
+    gated_app, monkeypatch
+):
+    import hermes_cli.profiles as profiles_mod
+
+    _complete_stub_login(gated_app)
+    monkeypatch.setattr(
+        profiles_mod,
+        "profiles_to_serve",
+        lambda *_args, **_kwargs: pytest.fail("must not scan host profiles"),
+    )
+    class FailSupervisor:
+        def get_or_start(self, *_args, **_kwargs):
+            pytest.fail("must not start an owner worker")
+
+    monkeypatch.setattr(
+        web_server.app.state,
+        "owner_worker_supervisor",
+        FailSupervisor(),
+        raising=False,
+    )
+    response = gated_app.get("/api/profiles/summary")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "management_mode": "owner_singleton",
+        "profiles": ["default"],
+        "current": "default",
+        "active": "default",
+    }
+    assert "hermes" not in response.text.lower()
+
+
 @pytest.mark.parametrize(
     ("method", "path"),
     [

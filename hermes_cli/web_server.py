@@ -11197,6 +11197,44 @@ def _disable_unselected_skills(profile_dir: Path, keep: List[str]) -> int:
     return disabled_count
 
 
+def _active_profile_info(profiles_mod: Any) -> Dict[str, str]:
+    try:
+        active = profiles_mod.get_active_profile() or "default"
+    except Exception:
+        active = "default"
+    try:
+        current = profiles_mod.get_active_profile_name() or "default"
+    except Exception:
+        current = "default"
+    return {"active": active, "current": current}
+
+
+@app.get("/api/profiles/summary")
+def profile_summary_endpoint(request: Request):
+    if getattr(request.app.state, "auth_required", False):
+        return {
+            "management_mode": "owner_singleton",
+            "profiles": ["default"],
+            "current": "default",
+            "active": "default",
+        }
+
+    from hermes_cli import profiles as profiles_mod
+
+    try:
+        profile_names = [
+            name for name, _home in profiles_mod.profiles_to_serve(multiplex=True)
+        ]
+    except Exception:
+        _log.exception("GET /api/profiles/summary failed to enumerate profiles")
+        profile_names = ["default"]
+    return {
+        "management_mode": "legacy_multi_profile",
+        "profiles": profile_names,
+        **_active_profile_info(profiles_mod),
+    }
+
+
 @app.get("/api/profiles")
 async def list_profiles_endpoint(request: Request):
     if _authenticated_owner_request(request):
@@ -11340,15 +11378,7 @@ async def get_active_profile_endpoint():
     the running dashboard/gateway is scoped to (derived from HERMES_HOME).
     """
     from hermes_cli import profiles as profiles_mod
-    try:
-        active = profiles_mod.get_active_profile() or "default"
-    except Exception:
-        active = "default"
-    try:
-        current = profiles_mod.get_active_profile_name() or "default"
-    except Exception:
-        current = "default"
-    return {"active": active, "current": current}
+    return _active_profile_info(profiles_mod)
 
 
 @app.post("/api/profiles/active")

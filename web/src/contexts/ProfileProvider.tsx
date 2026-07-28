@@ -86,12 +86,12 @@ export function ProfileProvider({ children }: { children: ReactNode }) {
     const urlProfile = searchParams.get("profile");
 
     api
-      .getProfiles()
-      .then(async (profilesRes) => {
+      .getProfilesSummary()
+      .then((summary) => {
         if (cancelled) return;
-        const mode = profilesRes.management_mode ?? "legacy_multi_profile";
+        const mode = summary.management_mode;
         setManagementMode(mode);
-        setProfiles(profilesRes.profiles.map((p) => p.name));
+        setProfiles(summary.profiles);
 
         if (mode === "owner_singleton") {
           setCurrentProfile("default");
@@ -108,10 +108,7 @@ export function ProfileProvider({ children }: { children: ReactNode }) {
           return;
         }
 
-        const info = await api.getActiveProfile();
-        if (cancelled) return;
-        const current = info.current || "default";
-        const active = info.active || "default";
+        const { current, active } = summary;
         setCurrentProfile(current);
         if (urlProfile === null && active !== current) {
           setManagementProfile(active);

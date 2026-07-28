@@ -25,6 +25,9 @@ CONTROL_PLANE_AUTH_PATHS: frozenset[str] = frozenset({
     "/api/auth/me",
     "/api/auth/ws-ticket",
 })
+CONTROL_PLANE_AUTH_ROUTES: frozenset[tuple[str, str]] = frozenset({
+    ("GET", "/api/profiles/summary"),
+})
 CONTROL_PLANE_AUTH_PREFIXES: tuple[str, ...] = (
     "/api/auth/",
 )
@@ -118,7 +121,11 @@ def classify_authenticated_api(
     if is_public_api_route(path, method=method):
         bucket = AuthenticatedApiBucket.TOKEN_AUTH_ONLY if path in TOKEN_AUTH_ONLY_PATHS else AuthenticatedApiBucket.PUBLIC_BOOTSTRAP
         return AuthenticatedApiDecision(bucket, True, bucket.value)
-    if path in CONTROL_PLANE_AUTH_PATHS or any(path.startswith(prefix) for prefix in CONTROL_PLANE_AUTH_PREFIXES):
+    if (
+        (method, path) in CONTROL_PLANE_AUTH_ROUTES
+        or path in CONTROL_PLANE_AUTH_PATHS
+        or any(path.startswith(prefix) for prefix in CONTROL_PLANE_AUTH_PREFIXES)
+    ):
         return AuthenticatedApiDecision(AuthenticatedApiBucket.CONTROL_PLANE_AUTH, True, "control-plane auth")
     if (method, path) in SESSION_READER_ROUTES or (
         method == "GET" and _session_item_path(path)

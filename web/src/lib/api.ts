@@ -747,6 +747,8 @@ export const api = {
     }),
 
   // Profiles
+  getProfilesSummary: () =>
+    fetchJSON<ProfileSummaryResponse>("/api/profiles/summary"),
   getProfiles: () =>
     fetchJSON<ProfileListResponse>("/api/profiles"),
   getActiveProfile: () =>
@@ -2146,6 +2148,11 @@ export interface ProfileDescribeAutoResult {
 }
 
 export type ProfileManagementMode = "legacy_multi_profile" | "owner_singleton";
+
+export interface ProfileSummaryResponse extends ActiveProfileInfo {
+  management_mode: ProfileManagementMode;
+  profiles: string[];
+}
 
 export interface ProfileListResponse {
   profiles: ProfileInfo[];
