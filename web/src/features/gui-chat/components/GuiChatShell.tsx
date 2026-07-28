@@ -759,7 +759,7 @@ export function GuiChatShell() {
             </button>
           ) : <div className="w-8" />}
           <div className="pointer-events-none absolute inset-x-20 top-1/2 min-w-0 -translate-y-1/2 text-center">
-            <h1 className="truncate text-[0.8125rem] font-medium text-[#25282d]">
+            <h1 className="truncate text-[14px] font-medium leading-[22px] text-[#25282d]">
               {filesOpen ? "Files" : skillsOpen ? "Skills" : conversationTitle}
             </h1>
             <p className="truncate text-[0.625rem] text-[#969aa1]">

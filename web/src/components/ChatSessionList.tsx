@@ -351,7 +351,7 @@ export function ChatSessionList({
                     aria-label={titlePlaceholder}
                     className={cn(
                       "h-8 min-w-0 flex-1 py-0",
-                      variant === "compact" ? "text-[13px] leading-5" : "text-sm",
+                      variant === "compact" ? "text-[14px] font-medium leading-[22px]" : "text-sm",
                     )}
                     disabled={rename.saving}
                   />
@@ -412,7 +412,7 @@ export function ChatSessionList({
                       : "text-text-secondary hover:bg-midground/5 hover:text-foreground",
                 )}
               >
-                <span className={cn("w-full truncate", variant === "compact" ? "text-[13px] font-normal leading-5" : "text-sm font-medium")}>
+                <span className={cn("w-full truncate", variant === "compact" ? "text-[14px] font-medium leading-[22px]" : "text-sm font-medium")}>
                   {label}
                 </span>
                 {variant === "default" ? (
