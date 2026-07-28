@@ -682,6 +682,14 @@ async def _proxy_authenticated_session_reader_http(request: Request) -> Response
     )
 
 
+_OWNER_WORKER_HTTP_SLOW_PATHS = frozenset({
+    ("GET", "/api/model/registrations/catalog"),
+    ("POST", "/api/model/registrations"),
+    ("PUT", "/api/model/registrations"),
+})
+_OWNER_WORKER_HTTP_SLOW_TIMEOUT = 30.0
+
+
 async def _proxy_authenticated_owner_http(request: Request) -> Response:
     """Forward an authenticated owner-scoped HTTP request to its Owner Worker."""
     latency_started_at = time.monotonic()
@@ -727,8 +735,17 @@ async def _proxy_authenticated_owner_http(request: Request) -> Response:
             if lname in {"accept", "accept-encoding", "content-type", "user-agent", "x-request-id"}:
                 forwarded_headers[name] = value
         stage_started_at = time.monotonic()
+        request_timeout = (
+            _OWNER_WORKER_HTTP_SLOW_TIMEOUT
+            if (request.method, request.url.path) in _OWNER_WORKER_HTTP_SLOW_PATHS
+            else 2.0
+        )
         response = await asyncio.to_thread(
-            OwnerWorkerClient(handle.socket_path, control_home=getattr(supervisor, "control_home", None)).request,
+            OwnerWorkerClient(
+                handle.socket_path,
+                control_home=getattr(supervisor, "control_home", None),
+                timeout=request_timeout,
+            ).request,
             request.method,
             worker_path,
             lease=_owner_worker_authority_lease(handle),
@@ -4696,6 +4713,29 @@ async def get_model_registrations(request: Request, profile: Optional[str] = Non
     def _load():
         with _profile_scope(profile):
             return get_model_registrations_payload()
+
+    try:
+        return await asyncio.to_thread(_load)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _model_registration_http_error(exc) from exc
+
+
+@app.get("/api/model/registrations/catalog")
+async def get_model_registration_catalog_route(
+    request: Request,
+    kind: str,
+    profile: Optional[str] = None,
+):
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
+    from hermes_cli.model_registrations import get_model_registration_catalog
+
+    def _load():
+        with _profile_scope(profile):
+            return get_model_registration_catalog(kind)
 
     try:
         return await asyncio.to_thread(_load)

@@ -651,6 +651,16 @@ export const api = {
     fetchJSON<ModelRegistrationsResponse>(
       `/api/model/registrations${profileQuery(profile)}`,
     ),
+  getModelRegistrationCatalog: (
+    kind: ModelRegistrationKind,
+    profile?: string,
+  ) =>
+    fetchJSON<ModelRegistrationCatalogResponse>(
+      appendProfileParam(
+        `/api/model/registrations/catalog?kind=${encodeURIComponent(kind)}`,
+        profile,
+      ),
+    ),
   createModelRegistration: (body: ModelRegistrationRequest) =>
     fetchJSON<ModelRegistration>("/api/model/registrations", {
       method: "POST",
@@ -2499,11 +2509,13 @@ export interface ActiveModelRegistration {
 export interface ModelRegistrationsResponse {
   registrations: ModelRegistration[];
   active: Record<ModelRegistrationKind, ActiveModelRegistration>;
-  catalogs: {
-    chat: ModelRegistrationChatCatalogProvider[];
-    image: ModelRegistrationMediaCatalogProvider[];
-    video: ModelRegistrationMediaCatalogProvider[];
-  };
+}
+
+export interface ModelRegistrationCatalogResponse {
+  kind: ModelRegistrationKind;
+  providers:
+    | ModelRegistrationChatCatalogProvider[]
+    | ModelRegistrationMediaCatalogProvider[];
 }
 
 export interface ModelRegistrationActivation {

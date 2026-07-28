@@ -1178,6 +1178,20 @@ def create_app(
         except Exception as exc:
             raise _registration_error(exc) from exc
 
+    @app.get("/api/model/registrations/catalog")
+    def get_model_registration_catalog(
+        kind: str,
+        profile: str | None = None,
+        _: None = Depends(_require_owner_token),
+    ) -> dict[str, Any]:
+        _reject_profile(profile)
+        from hermes_cli.model_registrations import get_model_registration_catalog as get_catalog
+
+        try:
+            return get_catalog(kind)
+        except Exception as exc:
+            raise _registration_error(exc) from exc
+
     @app.post("/api/model/registrations")
     def create_model_registration(
         body: ModelRegistrationPayload,

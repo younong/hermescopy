@@ -6411,6 +6411,63 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         )
         assert captured["owner_key"] == self.supervisor.owners[0].owner_key
 
+    @pytest.mark.parametrize(
+        ("method", "path", "payload", "expected_timeout"),
+        [
+            ("GET", "/api/model/registrations", None, 2.0),
+            ("GET", "/api/model/registrations/catalog?kind=chat", None, 30.0),
+            (
+                "POST",
+                "/api/model/registrations",
+                {
+                    "name": "Owner chat",
+                    "kind": "chat",
+                    "provider": "anthropic",
+                    "model": "claude-owner",
+                },
+                30.0,
+            ),
+            (
+                "PUT",
+                "/api/model/registrations",
+                {
+                    "id": "registration-a",
+                    "name": "Owner chat",
+                    "kind": "chat",
+                    "provider": "anthropic",
+                    "model": "claude-owner",
+                },
+                30.0,
+            ),
+        ],
+    )
+    def test_authenticated_model_registration_proxy_uses_bounded_catalog_timeout(
+        self, monkeypatch, method, path, payload, expected_timeout
+    ):
+        import httpx
+        import hermes_cli.owner_worker.client as owner_client
+
+        captured = {}
+
+        def fake_init(client, socket_path, *, timeout=2.0, control_home=None):
+            captured["timeout"] = timeout
+
+        def fake_request(client, request_method, worker_path, *, lease, headers=None, content=None):
+            captured.update({"method": request_method, "path": worker_path})
+            return httpx.Response(200, json={"ok": True})
+
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "__init__", fake_init)
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fake_request)
+
+        response = self.client.request(method, path, json=payload)
+
+        assert response.status_code == 200
+        assert captured == {
+            "method": method,
+            "path": path,
+            "timeout": expected_timeout,
+        }
+
     def test_authenticated_model_info_is_proxied_to_owner_worker(self, monkeypatch):
         import hermes_cli.owner_worker.client as owner_client
 

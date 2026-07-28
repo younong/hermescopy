@@ -107,6 +107,19 @@ export default function ModelRegistrationsPage() {
   const { setTitle } = usePageHeader();
   const { toast, showToast } = useToast();
   const [data, setData] = useState<ModelRegistrationsResponse | null>(null);
+  const [catalogs, setCatalogs] = useState<
+    Partial<
+      Record<
+        ModelRegistrationKind,
+        Array<
+          ModelRegistrationChatCatalogProvider | ModelRegistrationMediaCatalogProvider
+        >
+      >
+    >
+  >({});
+  const [catalogsLoading, setCatalogsLoading] = useState<
+    Partial<Record<ModelRegistrationKind, boolean>>
+  >({});
   const [loading, setLoading] = useState(true);
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<ModelRegistration | null>(null);
@@ -138,11 +151,25 @@ export default function ModelRegistrationsPage() {
     void load();
   }, [load]);
 
+  const loadCatalog = useCallback(async (kind: ModelRegistrationKind) => {
+    if (catalogs[kind] || catalogsLoading[kind]) return;
+    setCatalogsLoading((current) => ({ ...current, [kind]: true }));
+    try {
+      const response = await api.getModelRegistrationCatalog(kind);
+      setCatalogs((current) => ({ ...current, [kind]: response.providers }));
+    } catch (error) {
+      showToast(`${L.loadFailed}: ${errorDetail(error)}`, "error");
+    } finally {
+      setCatalogsLoading((current) => ({ ...current, [kind]: false }));
+    }
+  }, [L.loadFailed, catalogs, catalogsLoading, showToast]);
+
   const openCreate = useCallback(() => {
     setEditing(null);
     setForm(EMPTY_FORM);
     setFormOpen(true);
-  }, []);
+    void loadCatalog("chat");
+  }, [loadCatalog]);
 
   const openEdit = useCallback((registration: ModelRegistration) => {
     setEditing(registration);
@@ -156,36 +183,40 @@ export default function ModelRegistrationsPage() {
       useGateway: registration.use_gateway,
     });
     setFormOpen(true);
-  }, []);
+    if (registration.source === "catalog") {
+      void loadCatalog(registration.kind);
+    }
+  }, [loadCatalog]);
 
   useEffect(() => {
     setTitle(L.title);
     return () => setTitle(null);
   }, [L.title, setTitle]);
 
-  const providers = useMemo(() => {
-    if (!data) return [];
-    return data.catalogs[form.kind];
-  }, [data, form.kind]);
+  const providers = useMemo(
+    () => catalogs[form.kind] ?? [],
+    [catalogs, form.kind],
+  );
 
   const models = useMemo(() => {
-    if (!data || form.source === "custom") return [];
+    if (form.source === "custom") return [];
     if (form.kind === "chat") {
-      const provider = data.catalogs.chat.find(
+      const provider = (providers as ModelRegistrationChatCatalogProvider[]).find(
         (item) => item.slug === form.provider,
       );
       return provider?.models.map((id) => ({ id, label: id })) ?? [];
     }
-    const provider = data.catalogs[form.kind].find(
+    const provider = (providers as ModelRegistrationMediaCatalogProvider[]).find(
       (item) => item.provider === form.provider,
     );
     return provider?.models.map((item) => ({
       id: item.id,
       label: item.display || item.id,
     })) ?? [];
-  }, [data, form.kind, form.provider, form.source]);
+  }, [form.kind, form.provider, form.source, providers]);
 
   const updateKind = (kind: ModelRegistrationKind) => {
+    void loadCatalog(kind);
     setForm((current) => ({
       ...current,
       kind,
@@ -197,6 +228,7 @@ export default function ModelRegistrationsPage() {
   };
 
   const updateSource = (source: ModelRegistrationSource) => {
+    if (source === "catalog") void loadCatalog(form.kind);
     setForm((current) => ({
       ...current,
       source,
@@ -207,8 +239,8 @@ export default function ModelRegistrationsPage() {
 
   const updateProvider = (provider: string) => {
     let model = "";
-    if (data && form.kind !== "chat") {
-      const selected = data.catalogs[form.kind].find(
+    if (form.kind !== "chat") {
+      const selected = (providers as ModelRegistrationMediaCatalogProvider[]).find(
         (item) => item.provider === provider,
       );
       model = selected?.default_model || selected?.models[0]?.id || "";
@@ -321,7 +353,7 @@ export default function ModelRegistrationsPage() {
 
       {formOpen && (
         <RegistrationModal
-          data={data}
+          catalogLoading={Boolean(catalogsLoading[form.kind])}
           editing={editing}
           form={form}
           modalRef={modalRef}
@@ -457,7 +489,7 @@ export default function ModelRegistrationsPage() {
 type Strings = NonNullable<typeof en.modelRegistrations>;
 
 function RegistrationModal({
-  data,
+  catalogLoading,
   editing,
   form,
   modalRef,
@@ -473,7 +505,7 @@ function RegistrationModal({
   strings: L,
   commonStrings,
 }: {
-  data: ModelRegistrationsResponse | null;
+  catalogLoading: boolean;
   editing: ModelRegistration | null;
   form: RegistrationFormState;
   modalRef: React.RefObject<HTMLDivElement | null>;
@@ -492,9 +524,9 @@ function RegistrationModal({
   commonStrings: typeof en.common;
 }) {
   const selectedMediaProvider =
-    form.kind === "chat" || !data
+    form.kind === "chat"
       ? undefined
-      : data.catalogs[form.kind].find(
+      : (providers as ModelRegistrationMediaCatalogProvider[]).find(
           (item) => item.provider === form.provider,
         );
 
@@ -585,9 +617,15 @@ function RegistrationModal({
 
           {form.source === "catalog" ? (
             <>
+              {catalogLoading ? (
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <Spinner /> {commonStrings.loading}
+                </div>
+              ) : null}
               <div className="grid gap-2">
                 <Label htmlFor="registration-provider">{L.provider}</Label>
                 <Select
+                  disabled={catalogLoading}
                   id="registration-provider"
                   value={form.provider}
                   onValueChange={onProviderChange}

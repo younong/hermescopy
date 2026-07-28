@@ -686,6 +686,19 @@ export function GuiChatShell() {
           <Sparkles />
           <span>Skills</span>
         </button>
+        <button
+          aria-label="Switch registered model"
+          className="gui-chat-nav-item"
+          disabled={!state.sessionId || state.connection !== "open"}
+          onClick={() => {
+            closeMobilePanel();
+            setModelPickerOpen(true);
+          }}
+          type="button"
+        >
+          <SlidersHorizontal />
+          <span>Models</span>
+        </button>
       </nav>
       <div className="mt-4 flex min-h-0 flex-1 flex-col px-3">
         <div className="gui-chat-section-heading">
@@ -806,16 +819,6 @@ export function GuiChatShell() {
           </div>
           {!workspacePaneOpen ? (
             <div className="ml-auto flex items-center gap-1">
-              <button
-                aria-label="Switch registered model"
-                className="gui-chat-icon-button"
-                disabled={!state.sessionId || state.connection !== "open"}
-                onClick={() => setModelPickerOpen(true)}
-                title="Switch registered model"
-                type="button"
-              >
-                <SlidersHorizontal className="h-3.5 w-3.5" />
-              </button>
               {canConnectWeChat ? (
                 <button
                   aria-label="Connect WeChat"

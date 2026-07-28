@@ -142,7 +142,6 @@ beforeEach(() => {
       image: { model: "image-old", provider: "image-provider", registration_id: null },
       video: { model: "", provider: "", registration_id: null },
     },
-    catalogs: { chat: [], image: [], video: [] },
     registrations: [
       {
         credential_configured: null,
@@ -231,7 +230,10 @@ describe("GuiChatShell", () => {
     expect(document.querySelector("[data-gui-chat]")).not.toBeNull();
     expect(document.body.textContent).not.toContain("Terminal chat");
     expect(document.querySelector<HTMLButtonElement>('button[aria-current="page"]')?.textContent).toContain("New chat");
-    expect(document.querySelector('aside[aria-label="Chat workspace"]')).not.toBeNull();
+    const sidebar = document.querySelector('aside[aria-label="Chat workspace"]');
+    expect(sidebar).not.toBeNull();
+    expect(sidebar?.querySelector('[aria-label="Switch registered model"]')?.textContent).toContain("Models");
+    expect(document.querySelector('main header [aria-label="Switch registered model"]')).toBeNull();
     expect(document.querySelector('[aria-label="Log out"]')).not.toBeNull();
   });
 

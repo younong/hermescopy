@@ -34,30 +34,6 @@ const payload: ModelRegistrationsResponse = {
       credential_configured: null,
     },
   ],
-  catalogs: {
-    chat: [
-      {
-        slug: "anthropic",
-        name: "Anthropic",
-        models: ["claude-test"],
-        authenticated: true,
-        credential_configured: true,
-      },
-    ],
-    image: [
-      {
-        provider: "image-provider",
-        name: "Image Provider",
-        available: true,
-        credential_configured: true,
-        models: [{ id: "image-v1", display: "Image V1" }],
-        default_model: "image-v1",
-        capabilities: {},
-        setup: { env_vars: [] },
-      },
-    ],
-    video: [],
-  },
   active: {
     chat: { registration_id: null, provider: "", model: "" },
     image: {
@@ -76,6 +52,36 @@ beforeEach(() => {
     .IS_REACT_ACT_ENVIRONMENT = true;
   document.body.innerHTML = "";
   vi.spyOn(api, "getModelRegistrations").mockResolvedValue(payload);
+  vi.spyOn(api, "getModelRegistrationCatalog").mockImplementation(
+    async (kind) => ({
+      kind,
+      providers:
+        kind === "chat"
+          ? [
+              {
+                slug: "anthropic",
+                name: "Anthropic",
+                models: ["claude-test"],
+                authenticated: true,
+                credential_configured: true,
+              },
+            ]
+          : kind === "image"
+            ? [
+                {
+                  provider: "image-provider",
+                  name: "Image Provider",
+                  available: true,
+                  credential_configured: true,
+                  models: [{ id: "image-v1", display: "Image V1" }],
+                  default_model: "image-v1",
+                  capabilities: {},
+                  setup: { env_vars: [] },
+                },
+              ]
+            : [],
+    }),
+  );
 });
 
 afterEach(async () => {
@@ -136,6 +142,8 @@ describe("ModelRegistrationsPage", () => {
     await flush();
 
     await clickButton("Add model");
+    await flush();
+    expect(api.getModelRegistrationCatalog).toHaveBeenCalledWith("chat");
     setInput("registration-name", "New chat");
     await chooseOption("registration-provider", "Anthropic");
     await chooseOption("registration-model", "claude-test");
@@ -173,6 +181,7 @@ describe("ModelRegistrationsPage", () => {
     await flush();
 
     await clickButton("", "Edit: Private endpoint");
+    expect(api.getModelRegistrationCatalog).not.toHaveBeenCalled();
     expect(document.body.textContent).toContain(
       "Custom endpoint URLs are write-only",
     );

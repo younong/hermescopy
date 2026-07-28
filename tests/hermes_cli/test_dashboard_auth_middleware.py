@@ -544,6 +544,7 @@ def test_authenticated_skill_routes_are_explicit_owner_worker_routes(method, pat
     ("method", "path"),
     [
         ("GET", "/api/model/registrations"),
+        ("GET", "/api/model/registrations/catalog"),
         ("POST", "/api/model/registrations"),
         ("PUT", "/api/model/registrations"),
         ("DELETE", "/api/model/registrations"),
