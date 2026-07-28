@@ -172,6 +172,32 @@ def test_duplicate_type_and_catalog_validation(monkeypatch):
         })
 
 
+def test_chat_catalog_disables_network_discovery(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: object(),
+    )
+
+    def _build(context, **kwargs):
+        captured["context"] = context
+        captured.update(kwargs)
+        return {
+            "providers": [{
+                "slug": "anthropic",
+                "name": "Anthropic",
+                "models": ["claude-test"],
+                "authenticated": True,
+            }],
+        }
+
+    monkeypatch.setattr("hermes_cli.inventory.build_models_payload", _build)
+
+    assert model_registrations._chat_catalog()[0]["models"] == ["claude-test"]
+    assert captured["allow_network"] is False
+
+
 def test_payload_is_lightweight_and_catalog_is_safe(monkeypatch):
     monkeypatch.setattr(model_registrations, "_chat_catalog", _chat_catalog)
     chat = model_registrations.create_model_registration({

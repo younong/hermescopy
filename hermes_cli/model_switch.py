@@ -1427,6 +1427,7 @@ def list_authenticated_providers(
     max_models: int | None = None,
     current_model: str = "",
     refresh: bool = False,
+    allow_network: bool = True,
 ) -> List[dict]:
     """Detect which providers have credentials and list their curated models.
 
@@ -1452,17 +1453,17 @@ def list_authenticated_providers(
     (``provider_models_cache.json``) up front so every row re-fetches its
     live catalog. Use for an explicit user-triggered "refresh models" action
     (e.g. the desktop picker's refresh control); leave false for normal picker
-    opens so they stay snappy on the 1h cache.
+    opens so they stay snappy on the 1h cache. ``allow_network=False`` keeps
+    discovery cache/static-only for latency-bounded request paths.
     """
     import os
     from agent.models_dev import (
         PROVIDER_TO_MODELS_DEV,
         fetch_models_dev,
-        get_provider_info as _mdev_pinfo,
     )
     from hermes_cli.auth import PROVIDER_REGISTRY
     from hermes_cli.models import (
-        OPENROUTER_MODELS, _PROVIDER_MODELS,
+        OPENROUTER_MODELS, _PROVIDER_LABELS, _PROVIDER_MODELS,
         _MODELS_DEV_PREFERRED, _merge_with_models_dev, cached_provider_model_ids,
         clear_provider_models_cache, get_curated_nous_model_ids,
     )
@@ -1472,7 +1473,7 @@ def list_authenticated_providers(
     # a stale 1h cache can fall back to the curated static list when its live
     # fetch later fails, silently dropping live-only models (e.g. OpenCode
     # Zen's free tier) the user had seen before.
-    if refresh:
+    if refresh and allow_network:
         try:
             clear_provider_models_cache()
         except Exception:
@@ -1480,6 +1481,17 @@ def list_authenticated_providers(
 
 
     results: List[dict] = []
+    auth_store: dict = {}
+    credential_pool: dict = {}
+    try:
+        from hermes_cli.auth import _load_auth_store
+
+        auth_store = _load_auth_store() or {}
+        credential_pool = auth_store.get("credential_pool") or {}
+        if not isinstance(credential_pool, dict):
+            credential_pool = {}
+    except Exception:
+        pass
     seen_slugs: set = set()  # lowercase-normalized to catch case variants (#9545)
     seen_mdev_ids: set = set()  # prevent duplicate entries for aliases (e.g. kimi-coding + kimi-coding-cn)
     # Effective base URLs of every built-in row we emit (normalized lower+rstrip).
@@ -1545,7 +1557,7 @@ def list_authenticated_providers(
         current_norm = str(current_provider or "").strip().lower()
         if _has_fast_aws_sdk_signal():
             return True
-        if slug_norm != current_norm:
+        if not allow_network or slug_norm != current_norm:
             return False
         try:
             from agent.bedrock_adapter import has_aws_credentials
@@ -1553,19 +1565,27 @@ def list_authenticated_providers(
         except Exception:
             return False
 
-    data = fetch_models_dev()
+    data = (
+        fetch_models_dev()
+        if allow_network
+        else fetch_models_dev(allow_network=False)
+    )
 
     # Build curated model lists keyed by hermes provider ID
-    curated: dict[str, list[str]] = dict(_PROVIDER_MODELS)
+    curated: dict[str, list[str]] = {
+        provider: list(models)
+        for provider, models in _PROVIDER_MODELS.items()
+    }
     curated["openrouter"] = [mid for mid, _ in OPENROUTER_MODELS]
     # "nous" pulls from the remote model-catalog manifest published at
     # https://hermes-agent.nousresearch.com/docs/api/model-catalog.json so
     # newly added Portal models surface in the /model picker without
     # requiring a Hermes release. Falls back to the in-repo
     # _PROVIDER_MODELS["nous"] snapshot when the manifest is unreachable.
-    curated["nous"] = get_curated_nous_model_ids()
+    if allow_network:
+        curated["nous"] = get_curated_nous_model_ids()
     # Ollama Cloud uses dynamic discovery (no static curated list)
-    if "ollama-cloud" not in curated:
+    if allow_network and "ollama-cloud" not in curated:
         from hermes_cli.models import fetch_ollama_cloud_models
         curated["ollama-cloud"] = fetch_ollama_cloud_models()
     # LM Studio has no static catalog — probe its native /api/v1/models
@@ -1574,7 +1594,7 @@ def list_authenticated_providers(
     # (when current provider is lmstudio) > 127.0.0.1 default.
     # On auth rejection or unreachable server, fall back to the caller-supplied
     # current model so the picker still shows something when offline / mis-keyed.
-    if "lmstudio" not in curated and (
+    if allow_network and "lmstudio" not in curated and (
         os.environ.get("LM_API_KEY") or os.environ.get("LM_BASE_URL") or current_provider.strip().lower() == "lmstudio"
     ):
         from hermes_cli.models import fetch_lmstudio_models
@@ -1642,14 +1662,8 @@ def list_authenticated_providers(
 
         # Check if any env var is set
         has_creds = any(os.environ.get(ev) for ev in env_vars)
-        if not has_creds:
-            try:
-                from hermes_cli.auth import _load_auth_store
-                store = _load_auth_store()
-                if store and store.get("credential_pool", {}).get(hermes_id):
-                    has_creds = True
-            except Exception:
-                pass
+        if not has_creds and credential_pool.get(hermes_id):
+            has_creds = True
         if not has_creds:
             continue
 
@@ -1657,10 +1671,10 @@ def list_authenticated_providers(
         # /model picker sees the SAME list `hermes model` would build, with
         # disk caching to keep the picker open snappy. Falls back to the
         # curated static list when the live fetcher returns nothing.
-        model_ids = cached_provider_model_ids(hermes_id)
+        model_ids = cached_provider_model_ids(hermes_id, allow_network=allow_network)
         if not model_ids:
             model_ids = curated.get(hermes_id, [])
-            if hermes_id in _MODELS_DEV_PREFERRED:
+            if allow_network and hermes_id in _MODELS_DEV_PREFERRED:
                 model_ids = _merge_with_models_dev(hermes_id, model_ids)
         total = len(model_ids)
         if hermes_id in _UNCAPPED_PICKER_PROVIDERS:
@@ -1669,8 +1683,12 @@ def list_authenticated_providers(
             top = model_ids[:max_models] if max_models is not None else model_ids
 
         slug = hermes_id
-        pinfo = _mdev_pinfo(mdev_id)
-        display_name = pinfo.name if pinfo else mdev_id
+        pdata_name = pdata.get("name")
+        display_name = (
+            str(pdata_name).strip()
+            if pdata_name
+            else _PROVIDER_LABELS.get(hermes_id, mdev_id)
+        )
 
         results.append({
             "slug": slug,
@@ -1722,19 +1740,18 @@ def list_authenticated_providers(
         # support OAuth (e.g. anthropic supports both API key and Claude Code
         # OAuth via external credential files).
         if not has_creds:
-            try:
-                from hermes_cli.auth import _load_auth_store
-                store = _load_auth_store()
-                providers_store = store.get("providers", {})
-                if store and (pid in providers_store or hermes_slug in providers_store):
-                    has_creds = True
-            except Exception as exc:
-                logger.debug("Auth store check failed for %s: %s", pid, exc)
+            providers_store = auth_store.get("providers", {})
+            if isinstance(providers_store, dict) and (
+                pid in providers_store or hermes_slug in providers_store
+            ):
+                has_creds = True
         # Fallback: check the credential pool with full auto-seeding.
         # This catches credentials that exist in external stores (e.g.
         # Codex CLI ~/.codex/auth.json) which _seed_from_singletons()
         # imports on demand but aren't in the raw auth.json yet.
-        if not has_creds:
+        if not has_creds and credential_pool.get(hermes_slug):
+            has_creds = True
+        if not has_creds and allow_network:
             try:
                 from agent.credential_pool import load_pool
                 pool = load_pool(hermes_slug)
@@ -1773,12 +1790,12 @@ def list_authenticated_providers(
             # catalog. ``cached_provider_model_ids()`` falls back to the
             # curated list when the live endpoint is unreachable, so this
             # is safe for unauthenticated and offline cases too.
-            model_ids = cached_provider_model_ids(hermes_slug)
+            model_ids = cached_provider_model_ids(hermes_slug, allow_network=allow_network)
         # For aws_sdk providers (bedrock), use live discovery so the list
         # reflects the active region (eu.*, ap.*) not the static us.* list.
         elif overlay.auth_type == "aws_sdk":
             try:
-                _ids = cached_provider_model_ids(hermes_slug)
+                _ids = cached_provider_model_ids(hermes_slug, allow_network=allow_network)
                 model_ids = _ids if _ids else (curated.get(hermes_slug, []) or curated.get(pid, []))
             except Exception:
                 model_ids = curated.get(hermes_slug, []) or curated.get(pid, [])
@@ -1794,39 +1811,40 @@ def list_authenticated_providers(
             # catalog; then: curated-only, which dropped the 4 Portal
             # recommendations (e.g. stepfun/step-3.7-flash:free).
             model_ids = curated.get("nous", [])
-            try:
-                from hermes_cli.models import (
-                    get_pricing_for_provider as _nous_pricing,
-                    check_nous_free_tier as _nous_free,
-                    union_with_portal_free_recommendations as _union_free,
-                    union_with_portal_paid_recommendations as _union_paid,
-                )
-                from hermes_cli.auth import get_provider_auth_state as _nous_state
-
-                _pricing = _nous_pricing("nous") or {}
-                _portal = ""
+            if allow_network:
                 try:
-                    _st = _nous_state("nous") or {}
-                    _portal = _st.get("portal_base_url", "") or ""
-                except Exception:
+                    from hermes_cli.models import (
+                        get_pricing_for_provider as _nous_pricing,
+                        check_nous_free_tier as _nous_free,
+                        union_with_portal_free_recommendations as _union_free,
+                        union_with_portal_paid_recommendations as _union_paid,
+                    )
+                    from hermes_cli.auth import get_provider_auth_state as _nous_state
+
+                    _pricing = _nous_pricing("nous") or {}
                     _portal = ""
-                if _nous_free(force_fresh=force_fresh_nous_tier):
-                    model_ids, _ = _union_free(model_ids, _pricing, _portal)
-                else:
-                    model_ids, _ = _union_paid(model_ids, _pricing, _portal)
-            except Exception:
-                # Portal recommendation fetch failed — fall back to the
-                # curated list alone (still correct, just may lag newly
-                # launched models, exactly like an offline CLI run).
-                pass
+                    try:
+                        _st = _nous_state("nous") or {}
+                        _portal = _st.get("portal_base_url", "") or ""
+                    except Exception:
+                        _portal = ""
+                    if _nous_free(force_fresh=force_fresh_nous_tier):
+                        model_ids, _ = _union_free(model_ids, _pricing, _portal)
+                    else:
+                        model_ids, _ = _union_paid(model_ids, _pricing, _portal)
+                except Exception:
+                    # Portal recommendation fetch failed — fall back to the
+                    # curated list alone (still correct, just may lag newly
+                    # launched models, exactly like an offline CLI run).
+                    pass
         else:
             # Unified pathway — see Section 1 rationale. Fall back to the
             # curated dict (with models.dev merge for preferred providers)
             # when the live fetcher comes up empty.
-            model_ids = cached_provider_model_ids(hermes_slug)
+            model_ids = cached_provider_model_ids(hermes_slug, allow_network=allow_network)
             if not model_ids:
                 model_ids = curated.get(hermes_slug, []) or curated.get(pid, [])
-                if hermes_slug in _MODELS_DEV_PREFERRED:
+                if allow_network and hermes_slug in _MODELS_DEV_PREFERRED:
                     model_ids = _merge_with_models_dev(hermes_slug, model_ids)
         total = len(model_ids)
         if hermes_slug in _UNCAPPED_PICKER_PROVIDERS:
@@ -1836,7 +1854,11 @@ def list_authenticated_providers(
 
         results.append({
             "slug": hermes_slug,
-            "name": get_label(hermes_slug),
+            "name": (
+                _PROVIDER_LABELS.get(hermes_slug, hermes_slug)
+                if not allow_network
+                else get_label(hermes_slug)
+            ),
             "is_current": hermes_slug == current_provider or pid == current_provider,
             "is_user_defined": False,
             "models": top,
@@ -1867,15 +1889,15 @@ def list_authenticated_providers(
             _cp_has_creds = any(os.environ.get(ev) for ev in _cp_config.api_key_env_vars)
         # Also check auth store and credential pool
         if not _cp_has_creds:
-            try:
-                from hermes_cli.auth import _load_auth_store
-                _cp_store = _load_auth_store()
-                _cp_providers_store = _cp_store.get("providers", {})
-                if _cp_store and _cp.slug in _cp_providers_store:
-                    _cp_has_creds = True
-            except Exception:
-                pass
-        if not _cp_has_creds:
+            _cp_providers_store = auth_store.get("providers", {})
+            if (
+                isinstance(_cp_providers_store, dict)
+                and _cp.slug in _cp_providers_store
+            ):
+                _cp_has_creds = True
+        if not _cp_has_creds and credential_pool.get(_cp.slug):
+            _cp_has_creds = True
+        if not _cp_has_creds and allow_network:
             try:
                 from agent.credential_pool import load_pool
                 _cp_pool = load_pool(_cp.slug)
@@ -1897,13 +1919,13 @@ def list_authenticated_providers(
         # region (eu.*, us.*, ap.*) instead of the hardcoded us.* static list.
         if _cp_config and getattr(_cp_config, "auth_type", "") == "aws_sdk":
             try:
-                _ids = cached_provider_model_ids(_cp.slug)
+                _ids = cached_provider_model_ids(_cp.slug, allow_network=allow_network)
                 _cp_model_ids = _ids if _ids else curated.get(_cp.slug, [])
             except Exception:
                 _cp_model_ids = curated.get(_cp.slug, [])
         else:
             # Unified pathway — same as sections 1 and 2.
-            _cp_model_ids = cached_provider_model_ids(_cp.slug)
+            _cp_model_ids = cached_provider_model_ids(_cp.slug, allow_network=allow_network)
             if not _cp_model_ids:
                 _cp_model_ids = curated.get(_cp.slug, [])
         _cp_total = len(_cp_model_ids)
@@ -1995,7 +2017,7 @@ def list_authenticated_providers(
             if isinstance(discover, str):
                 discover = discover.lower() not in {"false", "no", "0"}
             has_explicit_models = bool(models_list)
-            should_probe = bool(api_url) and discover and (
+            should_probe = allow_network and bool(api_url) and discover and (
                 bool(api_key) or not has_explicit_models
             )
             if should_probe:
@@ -2256,7 +2278,8 @@ def list_authenticated_providers(
             #   full aggregator catalog via /models but only serve a subset
             #   (parity with section 3's user ``providers:`` behaviour).
             should_probe = (
-                bool(api_url)
+                allow_network
+                and bool(api_url)
                 and (bool(api_key) or not grp["models"])
                 and grp.get("discover_models", True)
             )

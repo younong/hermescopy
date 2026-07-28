@@ -57,6 +57,7 @@ def _chat_catalog() -> list[dict[str, Any]]:
         include_unconfigured=True,
         picker_hints=True,
         canonical_order=True,
+        allow_network=False,
     )
     result: list[dict[str, Any]] = []
     for item in payload.get("providers") or []:

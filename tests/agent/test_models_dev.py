@@ -234,6 +234,20 @@ class TestFetchModelsDev:
         assert md._models_dev_cache == SAMPLE_REGISTRY
 
     @patch("agent.models_dev.requests.get")
+    def test_network_disabled_returns_stale_disk_cache(self, mock_get):
+        import agent.models_dev as md
+        md._models_dev_cache = {}
+        md._models_dev_cache_time = 0
+
+        with patch.object(md, "_disk_cache_age_seconds",
+                          return_value=md._MODELS_DEV_CACHE_TTL + 60), \
+             patch.object(md, "_load_disk_cache", return_value=SAMPLE_REGISTRY):
+            result = fetch_models_dev(allow_network=False)
+
+        mock_get.assert_not_called()
+        assert result == SAMPLE_REGISTRY
+
+    @patch("agent.models_dev.requests.get")
     def test_stale_disk_cache_falls_through_to_network(self, mock_get):
         """When the disk cache is OLDER than TTL, we must hit the network
         (and only fall back to the stale disk data if network fails)."""
