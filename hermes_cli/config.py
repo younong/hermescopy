@@ -904,6 +904,7 @@ def _ensure_hermes_home_managed(home: Path):
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
+    "model_registrations": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],

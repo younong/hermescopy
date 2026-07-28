@@ -465,6 +465,8 @@ def test_authenticated_profile_summary_is_static_and_owner_insensitive(
         ("POST", "/api/logs"),
         ("PUT", "/api/tools/toolsets"),
         ("GET", "/api/tools/toolsets/example/config"),
+        ("PATCH", "/api/model/registrations"),
+        ("POST", "/api/model/registrations/active"),
     ],
 )
 def test_authenticated_owner_worker_routes_are_method_and_path_exact(method, path):
@@ -533,6 +535,23 @@ def test_authenticated_session_mutations_stay_owner_worker_bound(method, path):
     ],
 )
 def test_authenticated_skill_routes_are_explicit_owner_worker_routes(method, path):
+    from hermes_cli.dashboard_auth.api_availability import authenticated_owner_worker_api_allowed
+
+    assert authenticated_owner_worker_api_allowed(path, method=method) is True
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/api/model/registrations"),
+        ("GET", "/api/model/registrations/catalog"),
+        ("POST", "/api/model/registrations"),
+        ("PUT", "/api/model/registrations"),
+        ("DELETE", "/api/model/registrations"),
+        ("PUT", "/api/model/registrations/active"),
+    ],
+)
+def test_authenticated_model_registration_routes_are_explicit_owner_worker_routes(method, path):
     from hermes_cli.dashboard_auth.api_availability import authenticated_owner_worker_api_allowed
 
     assert authenticated_owner_worker_api_allowed(path, method=method) is True

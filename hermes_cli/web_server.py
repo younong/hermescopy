@@ -682,6 +682,14 @@ async def _proxy_authenticated_session_reader_http(request: Request) -> Response
     )
 
 
+_OWNER_WORKER_HTTP_SLOW_PATHS = frozenset({
+    ("GET", "/api/model/registrations/catalog"),
+    ("POST", "/api/model/registrations"),
+    ("PUT", "/api/model/registrations"),
+})
+_OWNER_WORKER_HTTP_SLOW_TIMEOUT = 30.0
+
+
 async def _proxy_authenticated_owner_http(request: Request) -> Response:
     """Forward an authenticated owner-scoped HTTP request to its Owner Worker."""
     latency_started_at = time.monotonic()
@@ -728,8 +736,17 @@ async def _proxy_authenticated_owner_http(request: Request) -> Response:
             if lname in {"accept", "accept-encoding", "content-type", "user-agent", "x-request-id"}:
                 forwarded_headers[name] = value
         stage_started_at = time.monotonic()
+        request_timeout = (
+            _OWNER_WORKER_HTTP_SLOW_TIMEOUT
+            if (request.method, request.url.path) in _OWNER_WORKER_HTTP_SLOW_PATHS
+            else 2.0
+        )
         response = await asyncio.to_thread(
-            OwnerWorkerClient(handle.socket_path, control_home=getattr(supervisor, "control_home", None)).request,
+            OwnerWorkerClient(
+                handle.socket_path,
+                control_home=getattr(supervisor, "control_home", None),
+                timeout=request_timeout,
+            ).request,
             request.method,
             worker_path,
             lease=_owner_worker_authority_lease(handle),
@@ -1425,6 +1442,26 @@ _MAX_TRANSCRIPTION_UPLOAD_BYTES = 25 * 1024 * 1024
 def _audio_extension_for_mime(mime_type: str) -> str:
     normalized = (mime_type or "").split(";", 1)[0].strip().lower()
     return _AUDIO_MIME_EXTENSIONS.get(normalized, ".webm")
+
+
+class ModelRegistrationPayload(BaseModel):
+    id: str = ""
+    name: str
+    kind: str
+    provider: str = ""
+    model: str
+    source: str = "catalog"
+    base_url: str = ""
+    api_mode: str = "openai"
+    api_key: str = ""
+    context_length: Optional[int] = None
+    use_gateway: bool = False
+    profile: Optional[str] = None
+
+
+class ModelRegistrationMutation(BaseModel):
+    id: str
+    profile: Optional[str] = None
 
 
 class ModelAssignment(BaseModel):
@@ -4656,6 +4693,162 @@ async def get_model_info(request: Request, profile: Optional[str] = None):
     except Exception:
         _log.exception("GET /api/model/info failed")
         return dict(EMPTY_MODEL_INFO)
+
+
+def _model_registration_http_error(exc: Exception) -> HTTPException:
+    from hermes_cli.model_registrations import (
+        ModelRegistrationConflict,
+        ModelRegistrationNotFound,
+    )
+
+    if isinstance(exc, ModelRegistrationNotFound):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, ModelRegistrationConflict):
+        return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=400, detail=str(exc))
+    return HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.get("/api/model/registrations")
+async def get_model_registrations(request: Request, profile: Optional[str] = None):
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
+    from hermes_cli.model_registrations import get_model_registrations_payload
+
+    def _load():
+        with _profile_scope(profile):
+            return get_model_registrations_payload()
+
+    try:
+        return await asyncio.to_thread(_load)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _model_registration_http_error(exc) from exc
+
+
+@app.get("/api/model/registrations/catalog")
+async def get_model_registration_catalog_route(
+    request: Request,
+    kind: str,
+    profile: Optional[str] = None,
+):
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
+    from hermes_cli.model_registrations import get_model_registration_catalog
+
+    def _load():
+        with _profile_scope(profile):
+            return get_model_registration_catalog(kind)
+
+    try:
+        return await asyncio.to_thread(_load)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _model_registration_http_error(exc) from exc
+
+
+@app.post("/api/model/registrations")
+async def create_model_registration_route(
+    request: Request,
+    body: ModelRegistrationPayload,
+    profile: Optional[str] = None,
+):
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(body.profile)
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
+    from hermes_cli.model_registrations import create_model_registration
+
+    def _create():
+        with _profile_scope(body.profile or profile):
+            return create_model_registration(body.dict(exclude={"id", "profile"}))
+
+    try:
+        return await asyncio.to_thread(_create)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _model_registration_http_error(exc) from exc
+
+
+@app.put("/api/model/registrations")
+async def update_model_registration_route(
+    request: Request,
+    body: ModelRegistrationPayload,
+    profile: Optional[str] = None,
+):
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(body.profile)
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
+    from hermes_cli.model_registrations import update_model_registration
+
+    def _update():
+        with _profile_scope(body.profile or profile):
+            return update_model_registration(
+                body.id,
+                body.dict(exclude={"id", "profile"}),
+            )
+
+    try:
+        return await asyncio.to_thread(_update)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _model_registration_http_error(exc) from exc
+
+
+@app.delete("/api/model/registrations")
+async def delete_model_registration_route(
+    request: Request,
+    body: ModelRegistrationMutation,
+    profile: Optional[str] = None,
+):
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(body.profile)
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
+    from hermes_cli.model_registrations import delete_model_registration
+
+    def _delete():
+        with _profile_scope(body.profile or profile):
+            return delete_model_registration(body.id)
+
+    try:
+        return await asyncio.to_thread(_delete)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _model_registration_http_error(exc) from exc
+
+
+@app.put("/api/model/registrations/active")
+async def activate_model_registration_route(
+    request: Request,
+    body: ModelRegistrationMutation,
+    profile: Optional[str] = None,
+):
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(body.profile)
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_owner_http(request)
+    from hermes_cli.model_registrations import activate_model_registration
+
+    def _activate():
+        with _profile_scope(body.profile or profile):
+            return activate_model_registration(body.id)
+
+    try:
+        return await asyncio.to_thread(_activate)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _model_registration_http_error(exc) from exc
 
 
 # ---------------------------------------------------------------------------

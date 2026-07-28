@@ -2614,11 +2614,14 @@ def cached_provider_model_ids(
     *,
     force_refresh: bool = False,
     ttl_seconds: int = _PROVIDER_MODELS_CACHE_TTL,
+    allow_network: bool = True,
 ) -> list[str]:
     """Disk-cached wrapper around :func:`provider_model_ids`.
 
     Hits the cache when fresh; otherwise calls the live function and
-    persists a non-empty result. Always returns a list (never None).
+    persists a non-empty result. When ``allow_network`` is false, a matching
+    stale cache entry is returned without refreshing it. Always returns a list
+    (never None).
     """
     normalized = normalize_provider(provider) or (provider or "")
     if not normalized:
@@ -2638,6 +2641,16 @@ def cached_provider_model_ids(
         and (now - float(entry.get("at", 0))) < ttl_seconds
     ):
         return list(entry["models"])
+
+    if not allow_network:
+        if (
+            isinstance(entry, dict)
+            and entry.get("fp") == fp
+            and isinstance(entry.get("models"), list)
+            and entry["models"]
+        ):
+            return list(entry["models"])
+        return []
 
     # Cache miss / stale / forced refresh — call the live path.
     live = provider_model_ids(normalized, force_refresh=force_refresh)

@@ -62,13 +62,13 @@ export function connectMockGuiChat(): GuiChatConnection {
       schedule(120, {
         type: "session.info",
         session_id: MOCK_SESSION_ID,
-        payload: { model: "mock-opus", title: "Mock GUI Chat" },
+        payload: { model: "mock-opus", provider: "mock", title: "Mock GUI Chat" },
       });
       await wait(180);
       emitState("open");
       replayIntro(schedule);
       return {
-        info: { model: "mock-opus", title: "Mock GUI Chat" },
+        info: { model: "mock-opus", provider: "mock", title: "Mock GUI Chat" },
         message_count: 2,
         messages: [
           { role: "user", text: "先用 mock 数据展示一下 GUI Chat。" },
@@ -130,6 +130,14 @@ export function connectMockGuiChat(): GuiChatConnection {
         session_id: MOCK_SESSION_ID,
         payload: { status: "interrupted", text: "Mock generation stopped." },
       });
+    },
+    async switchModel(_sessionId, provider, model) {
+      emitEvent({
+        type: "session.info",
+        session_id: MOCK_SESSION_ID,
+        payload: { model, provider, title: "Mock GUI Chat" },
+      });
+      return { confirm_required: false, value: model };
     },
   };
 }

@@ -118,6 +118,7 @@ export interface GuiChatState {
   switchGeneration: number;
   cwd?: string;
   model?: string;
+  provider?: string;
   messages: ChatMessage[];
   toolCalls: Record<string, ToolCallState>;
   toolOrder: string[];

@@ -756,6 +756,19 @@ def test_build_models_payload_forwards_refresh_flag():
     assert captured["refresh"] is True
 
 
+def test_build_models_payload_forwards_allow_network_flag():
+    captured: dict = {}
+
+    def _capture(*args, **kwargs):
+        captured["allow_network"] = kwargs.get("allow_network")
+        return []
+
+    with patch("hermes_cli.model_switch.list_authenticated_providers", side_effect=_capture):
+        build_models_payload(_empty_ctx(), allow_network=False)
+
+    assert captured["allow_network"] is False
+
+
 def test_list_authenticated_providers_refresh_busts_cache():
     """refresh=True clears the provider-model disk cache exactly once;
     refresh=False leaves it untouched (so normal picker opens stay snappy)."""
@@ -765,5 +778,10 @@ def test_list_authenticated_providers_refresh_busts_cache():
         model_switch.list_authenticated_providers(refresh=False)
         assert clear.call_count == 0
         model_switch.list_authenticated_providers(refresh=True)
+        assert clear.call_count == 1
+        model_switch.list_authenticated_providers(
+            refresh=True,
+            allow_network=False,
+        )
         assert clear.call_count == 1
 

@@ -24,6 +24,29 @@ function imageArtifact(state: GuiChatState, id: string): ImageArtifactState {
   return artifact;
 }
 
+describe("guiChatReducer model identity", () => {
+  it("tracks provider with model from snapshots and live session info", () => {
+    const created = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        info: { model: "model-a", provider: "provider-a" },
+        session_id: "runtime-a",
+      },
+    });
+    const updated = guiChatReducer(created, {
+      type: "event",
+      event: {
+        payload: { model: "model-b", provider: "provider-b" },
+        session_id: "runtime-a",
+        type: "session.info",
+      },
+    });
+
+    expect(created).toMatchObject({ model: "model-a", provider: "provider-a" });
+    expect(updated).toMatchObject({ model: "model-b", provider: "provider-b" });
+  });
+});
+
 describe("guiChatReducer live attach restoration", () => {
   it("restores an in-flight user prompt and partial assistant response", () => {
     const state = guiChatReducer(initialGuiChatState, {

@@ -237,7 +237,11 @@ def _save_disk_cache(data: Dict[str, Any]) -> None:
         logger.debug("Failed to save models.dev disk cache: %s", e)
 
 
-def fetch_models_dev(force_refresh: bool = False) -> Dict[str, Any]:
+def fetch_models_dev(
+    force_refresh: bool = False,
+    *,
+    allow_network: bool = True,
+) -> Dict[str, Any]:
     """Fetch models.dev registry. Cache hierarchy: in-mem → disk → network.
 
     Returns the full registry dict keyed by provider ID, or empty dict on failure.
@@ -256,6 +260,11 @@ def fetch_models_dev(force_refresh: bool = False) -> Dict[str, Any]:
     \"refresh model catalog\" code path), stages 1 and 2 are skipped. The
     function always hits the network and only falls back to disk if the
     network call fails.
+
+    When ``allow_network=False``, the network stage is skipped and any stale
+    disk cache is returned immediately. This is intended for request paths
+    with a strict latency budget that can use their in-repo curated fallback
+    when no cache exists.
     """
     global _models_dev_cache, _models_dev_cache_time
 
@@ -289,6 +298,8 @@ def fetch_models_dev(force_refresh: bool = False) -> Dict[str, Any]:
                 return _models_dev_cache
 
     # Stage 3: network fetch.
+    if not allow_network:
+        return _models_dev_cache or _load_disk_cache()
     try:
         response = requests.get(MODELS_DEV_URL, timeout=15)
         response.raise_for_status()

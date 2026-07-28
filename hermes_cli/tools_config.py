@@ -2834,14 +2834,69 @@ def _configure_xai_imagine_storage(section_name: str, config: dict) -> None:
         _print_success("  xAI stored public URLs enabled without automatic expiry")
 
 
+def media_model_catalog(kind: str, provider_name: str) -> tuple[dict, str | None]:
+    """Return one installed media provider's public model catalog."""
+    if kind == "image":
+        return _plugin_image_gen_catalog(provider_name)
+    if kind == "video":
+        return _plugin_video_gen_catalog(provider_name)
+    raise ValueError("Media kind must be 'image' or 'video'")
+
+
+def select_media_model(
+    config: dict,
+    *,
+    kind: str,
+    provider_name: str,
+    model: str,
+    use_gateway: bool = False,
+    catalog: dict | None = None,
+) -> dict:
+    """Validate and persist one plugin-backed media model selection in memory."""
+    provider_name = str(provider_name or "").strip()
+    model = str(model or "").strip()
+    if not provider_name or not model:
+        raise ValueError("Provider and model are required")
+
+    if catalog is None:
+        catalog, _default_model = media_model_catalog(kind, provider_name)
+    if not catalog:
+        raise ValueError(f"{kind.title()} provider '{provider_name}' is not installed")
+    if model not in catalog:
+        raise ValueError(f"Model '{model}' is not available from provider '{provider_name}'")
+
+    section_name = f"{kind}_gen"
+    section = config.setdefault(section_name, {})
+    if not isinstance(section, dict):
+        section = {}
+        config[section_name] = section
+    section.update({
+        "provider": provider_name,
+        "model": model,
+        "use_gateway": bool(use_gateway),
+    })
+    return section
+
+
 def _select_plugin_image_gen_provider(plugin_name: str, config: dict) -> None:
     """Persist a plugin-backed image generation provider selection."""
-    img_cfg = config.setdefault("image_gen", {})
-    if not isinstance(img_cfg, dict):
-        img_cfg = {}
-        config["image_gen"] = img_cfg
-    img_cfg["provider"] = plugin_name
-    img_cfg["use_gateway"] = False
+    catalog, default_model = _plugin_image_gen_catalog(plugin_name)
+    selected_model = default_model or next(iter(catalog), None)
+    if selected_model:
+        select_media_model(
+            config,
+            kind="image",
+            provider_name=plugin_name,
+            model=selected_model,
+            catalog=catalog,
+        )
+    else:
+        img_cfg = config.setdefault("image_gen", {})
+        if not isinstance(img_cfg, dict):
+            img_cfg = {}
+            config["image_gen"] = img_cfg
+        img_cfg["provider"] = plugin_name
+        img_cfg["use_gateway"] = False
     _print_success(f"  image_gen.provider set to: {plugin_name}")
     _configure_imagegen_model_for_plugin(plugin_name, config)
     if plugin_name == "xai":
@@ -2938,12 +2993,24 @@ def _configure_videogen_model_for_plugin(plugin_name: str, config: dict) -> None
 
 def _select_plugin_video_gen_provider(plugin_name: str, config: dict, *, use_gateway: bool = False) -> None:
     """Persist a plugin-backed video generation provider selection."""
-    vid_cfg = config.setdefault("video_gen", {})
-    if not isinstance(vid_cfg, dict):
-        vid_cfg = {}
-        config["video_gen"] = vid_cfg
-    vid_cfg["provider"] = plugin_name
-    vid_cfg["use_gateway"] = use_gateway
+    catalog, default_model = _plugin_video_gen_catalog(plugin_name)
+    selected_model = default_model or next(iter(catalog), None)
+    if selected_model:
+        select_media_model(
+            config,
+            kind="video",
+            provider_name=plugin_name,
+            model=selected_model,
+            use_gateway=use_gateway,
+            catalog=catalog,
+        )
+    else:
+        vid_cfg = config.setdefault("video_gen", {})
+        if not isinstance(vid_cfg, dict):
+            vid_cfg = {}
+            config["video_gen"] = vid_cfg
+        vid_cfg["provider"] = plugin_name
+        vid_cfg["use_gateway"] = use_gateway
     _print_success(f"  video_gen.provider set to: {plugin_name}")
     _configure_videogen_model_for_plugin(plugin_name, config)
     if plugin_name == "xai":
