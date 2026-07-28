@@ -947,8 +947,8 @@ def profiles_to_serve(multiplex: bool) -> List[Tuple[str, Path]]:
     The returned ``hermes_home`` is the path to pass to
     ``set_hermes_home_override`` when scoping a turn to that profile.
     """
-    active = get_active_profile_name() or "default"
     if not multiplex:
+        active = get_active_profile_name() or "default"
         return [(active, get_profile_dir(active))]
 
     serve: List[Tuple[str, Path]] = [("default", _get_default_hermes_home())]
