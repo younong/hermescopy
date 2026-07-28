@@ -47,8 +47,9 @@ class _FakeProcess:
 
 class _FakeClient:
     def __init__(self, socket_path, *, control_home=None, timeout=2.0) -> None:
-        del control_home, timeout
+        del control_home
         self.socket_path = Path(socket_path)
+        self.timeout = timeout
 
     def verify_health(
         self,
@@ -169,6 +170,46 @@ def test_hot_active_and_health_probe_meet_request_budget(tmp_path, caplog):
     path, elapsed_ms = _ready_sample(caplog)
     assert path == "hot_health_probe"
     require_ready_latency("hot health probe", path, elapsed_ms)
+
+    supervisor.shutdown()
+
+
+def test_unhealthy_replacement_meets_request_budget(tmp_path, caplog):
+    class _FailsAfterStartupClient(_FakeClient):
+        health_calls = 0
+        control_timeouts: list[float] = []
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            type(self).control_timeouts.append(self.timeout)
+
+        def verify_health(self, **kwargs):
+            type(self).health_calls += 1
+            if type(self).health_calls == 2:
+                raise RuntimeError("worker unavailable")
+            return super().verify_health(**kwargs)
+
+    supervisor, owner = _supervisor(tmp_path)
+    supervisor.client_cls = _FailsAfterStartupClient
+    first = supervisor.get_or_start(owner)
+
+    replacement = _trace_ready(
+        supervisor,
+        owner,
+        caplog,
+        "trace-replace-unhealthy-123",
+    )
+
+    assert replacement is not first
+    path, elapsed_ms = _ready_sample(caplog)
+    assert path == "replace_unhealthy"
+    require_ready_latency("unhealthy replacement", path, elapsed_ms)
+    assert [
+        timeout
+        for timeout in _FailsAfterStartupClient.control_timeouts
+        if timeout < 2.0
+    ] == [0.2, 0.2]
+    assert supervisor._terminating_handles == {}
 
     supervisor.shutdown()
 
