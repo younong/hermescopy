@@ -98,6 +98,7 @@ export interface Translations {
       keys: string;
       logs: string;
       models: string;
+      modelRegistrations?: string;
       profiles: string;
       plugins: string;
       sessions: string;
@@ -243,6 +244,54 @@ export interface Translations {
     toolCalls: string;
     noModelsData: string;
     startSession: string;
+  };
+
+  modelRegistrations?: {
+    title: string;
+    add: string;
+    edit: string;
+    createTitle: string;
+    editTitle: string;
+    description: string;
+    name: string;
+    namePlaceholder: string;
+    kind: string;
+    kinds: Record<"chat" | "image" | "video", string>;
+    source: string;
+    sources: Record<"catalog" | "custom", string>;
+    provider: string;
+    model: string;
+    baseUrl: string;
+    apiMode: string;
+    apiKey: string;
+    apiKeyCreateHint: string;
+    apiKeyEditHint: string;
+    contextLength: string;
+    useGateway: string;
+    useGatewayHint: string;
+    active: string;
+    credentialReady: string;
+    credentialMissing: string;
+    noRegistrations: string;
+    noRegistrationsHint: string;
+    activate: string;
+    activating: string;
+    activated: string;
+    saved: string;
+    deleted: string;
+    loadFailed: string;
+    saveFailed: string;
+    deleteFailed: string;
+    activateFailed: string;
+    nameRequired: string;
+    providerRequired: string;
+    modelRequired: string;
+    baseUrlRequired: string;
+    customChatOnly: string;
+    deleteTitle: string;
+    deleteMessage: string;
+    deleteActiveHint: string;
+    editCustomHint: string;
   };
 
   // ── Logs page ──

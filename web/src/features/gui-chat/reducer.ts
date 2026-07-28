@@ -227,6 +227,7 @@ function applySessionResponse(
       !!("running" in response && response.running) || Boolean(inflight?.streaming),
     messages,
     model: response.info?.model ?? state.model,
+    provider: response.info?.provider ?? state.provider,
     sessionId: response.session_id,
     storedSessionId:
       response.stored_session_id ??
@@ -1015,7 +1016,12 @@ function applySessionInfo(
 ): GuiChatState {
   if (!payload) return state;
   const cwd = payload.cwd ?? state.cwd;
-  const next = { ...state, cwd, model: payload.model ?? state.model };
+  const next = {
+    ...state,
+    cwd,
+    model: payload.model ?? state.model,
+    provider: payload.provider ?? state.provider,
+  };
   return cwd && cwd !== state.cwd ? refreshFileDownloadContext(next, cwd) : next;
 }
 

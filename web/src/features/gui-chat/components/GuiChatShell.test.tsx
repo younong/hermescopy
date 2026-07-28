@@ -23,6 +23,8 @@ const mocks = vi.hoisted(() => ({
   logout: vi.fn(),
   navigationStartedAt: vi.fn(),
   startGuiChatLatencyTrace: vi.fn(),
+  getModelRegistrations: vi.fn(),
+  activateModelRegistration: vi.fn(),
 }));
 
 vi.mock("@/lib/api", async (importOriginal) => {
@@ -35,6 +37,8 @@ vi.mock("@/lib/api", async (importOriginal) => {
       getAuthMe: mocks.getAuthMe,
       getILinkEnrollment: mocks.getILinkEnrollment,
       getSessionMessages: mocks.getSessionMessages,
+      getModelRegistrations: mocks.getModelRegistrations,
+      activateModelRegistration: mocks.activateModelRegistration,
       logout: mocks.logout,
     },
   };
@@ -131,6 +135,55 @@ beforeEach(() => {
   mocks.navigationStartedAt.mockReset();
   mocks.navigationStartedAt.mockReturnValue(undefined);
   mocks.startGuiChatLatencyTrace.mockReset();
+  mocks.getModelRegistrations.mockReset();
+  mocks.getModelRegistrations.mockResolvedValue({
+    active: {
+      chat: { model: "test-model", provider: "test-provider", registration_id: "chat-a" },
+      image: { model: "image-old", provider: "image-provider", registration_id: null },
+      video: { model: "", provider: "", registration_id: null },
+    },
+    catalogs: { chat: [], image: [], video: [] },
+    registrations: [
+      {
+        credential_configured: null,
+        id: "chat-a",
+        kind: "chat",
+        model: "test-model",
+        name: "Test model",
+        provider: "test-provider",
+        source: "catalog",
+        use_gateway: false,
+      },
+      {
+        credential_configured: null,
+        id: "chat-b",
+        kind: "chat",
+        model: "next-model",
+        name: "Next model",
+        provider: "next-provider",
+        source: "catalog",
+        use_gateway: false,
+      },
+      {
+        credential_configured: null,
+        id: "image-a",
+        kind: "image",
+        model: "image-new",
+        name: "Image model",
+        provider: "image-provider",
+        source: "catalog",
+        use_gateway: false,
+      },
+    ],
+  });
+  mocks.activateModelRegistration.mockReset();
+  mocks.activateModelRegistration.mockResolvedValue({
+    kind: "image",
+    model: "image-new",
+    ok: true,
+    provider: "image-provider",
+    registration_id: "image-a",
+  });
   mocks.startGuiChatLatencyTrace.mockImplementation(() => ({
     id: "trace-initial-123",
     mark: vi.fn(),
@@ -180,6 +233,203 @@ describe("GuiChatShell", () => {
     expect(document.querySelector<HTMLButtonElement>('button[aria-current="page"]')?.textContent).toContain("New chat");
     expect(document.querySelector('aside[aria-label="Chat workspace"]')).not.toBeNull();
     expect(document.querySelector('[aria-label="Log out"]')).not.toBeNull();
+  });
+
+  it("switches the conversation through the registered chat model picker", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(<GuiChatShell />);
+    await act(async () => {
+      connection.emitState("open");
+      await Promise.resolve();
+    });
+    await openModelPicker();
+
+    expect(document.body.textContent).toContain("Switch registered model");
+    await act(async () => {
+      buttonWithText("Next model")?.click();
+    });
+    await act(async () => {
+      buttonWithText("Switch", true)?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(connection.switchModel).toHaveBeenCalledWith(
+      "runtime-a",
+      "next-provider",
+      "next-model",
+      false,
+      false,
+    );
+  });
+
+  it("can make a registered chat model the default for new conversations", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(<GuiChatShell />);
+    await act(async () => {
+      connection.emitState("open");
+      await Promise.resolve();
+    });
+    await openModelPicker();
+    await act(async () => {
+      buttonWithText("Next model")?.click();
+      const checkbox = document.querySelector<HTMLInputElement>(
+        'input[type="checkbox"]',
+      );
+      checkbox?.click();
+    });
+    await act(async () => {
+      buttonWithText("Switch", true)?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(connection.switchModel).toHaveBeenCalledWith(
+      "runtime-a",
+      "next-provider",
+      "next-model",
+      false,
+      true,
+    );
+  });
+
+  it("confirms an expensive chat model before retrying the session switch", async () => {
+    const connection = createConnection();
+    connection.switchModel
+      .mockResolvedValueOnce({
+        confirm_message: "This model can cost significantly more.",
+        confirm_required: true,
+        value: "next-model",
+      })
+      .mockResolvedValueOnce({ confirm_required: false, value: "next-model" });
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(<GuiChatShell />);
+    await act(async () => {
+      connection.emitState("open");
+      await Promise.resolve();
+    });
+    await openModelPicker();
+    await act(async () => {
+      buttonWithText("Next model")?.click();
+    });
+    await act(async () => {
+      buttonWithText("Switch", true)?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(document.body.textContent).toContain("This model can cost significantly more.");
+    expect(connection.switchModel).toHaveBeenCalledWith(
+      "runtime-a",
+      "next-provider",
+      "next-model",
+      false,
+      false,
+    );
+
+    await act(async () => {
+      buttonWithText("Switch anyway", true)?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(connection.switchModel).toHaveBeenLastCalledWith(
+      "runtime-a",
+      "next-provider",
+      "next-model",
+      true,
+      false,
+    );
+    expect(document.body.textContent).not.toContain("Switch registered model");
+  });
+
+  it("blocks all registered-model switching while generation is busy", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(<GuiChatShell />);
+    await act(async () => {
+      connection.emitState("open");
+      await Promise.resolve();
+    });
+    await act(async () => {
+      connection.emitEvent({
+        payload: {},
+        session_id: "runtime-a",
+        type: "message.start",
+      });
+    });
+    await openModelPicker();
+    await act(async () => {
+      buttonWithText("Next model")?.click();
+    });
+
+    expect(buttonWithText("Switch", true)?.disabled).toBe(true);
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain(
+      "Stop the current response before switching models.",
+    );
+
+    await act(async () => {
+      buttonWithText("Image", true)?.click();
+    });
+    expect(buttonWithText("Activate", true)?.disabled).toBe(true);
+
+    expect(mocks.activateModelRegistration).not.toHaveBeenCalled();
+    expect(connection.switchModel).not.toHaveBeenCalled();
+  });
+
+  it("updates the displayed provider from session info after switching", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(<GuiChatShell />);
+    await act(async () => {
+      connection.emitState("open");
+      await Promise.resolve();
+    });
+    await act(async () => {
+      connection.emitEvent({
+        payload: { model: "next-model", provider: "next-provider" },
+        session_id: "runtime-a",
+        type: "session.info",
+      });
+    });
+
+    expect(document.body.textContent).toContain("next-model · next-provider · open");
+  });
+
+  it("activates registered image models through REST", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(<GuiChatShell />);
+    await act(async () => {
+      connection.emitState("open");
+      await Promise.resolve();
+    });
+    await openModelPicker();
+    await act(async () => {
+      buttonWithText("Image", true)?.click();
+    });
+    await act(async () => {
+      buttonWithText("Activate", true)?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(mocks.activateModelRegistration).toHaveBeenCalledWith("image-a", "");
+    expect(connection.switchModel).not.toHaveBeenCalled();
   });
 
   it("opens files inside the dedicated workspace and returns to chat", async () => {
@@ -646,14 +896,16 @@ function NavigationProbe({
 
 type TestGuiChatConnection = GuiChatConnection & {
   createOrAttachMock: ReturnType<typeof vi.fn<GuiChatConnection["createOrAttach"]>>;
+  emitEvent(event: Parameters<Parameters<GuiChatConnection["client"]["onEvent"]>[0]>[0]): void;
   emitState(state: ConnectionState): void;
+  switchModel: ReturnType<typeof vi.fn<GuiChatConnection["switchModel"]>>;
 };
 
 function createConnection(): TestGuiChatConnection {
   const eventHandlers = new Set<(event: never) => void>();
   const stateHandlers = new Set<(state: ConnectionState) => void>();
   const createOrAttachMock = vi.fn<GuiChatConnection["createOrAttach"]>().mockResolvedValue({
-    info: { cwd: "/tmp", model: "test-model" },
+    info: { cwd: "/tmp", model: "test-model", provider: "test-provider" },
     session_id: "runtime-a",
     stored_session_id: "stored-a",
   });
@@ -675,6 +927,9 @@ function createConnection(): TestGuiChatConnection {
     close: vi.fn(),
     createOrAttach: createOrAttachMock,
     createOrAttachMock,
+    emitEvent: (event: Parameters<Parameters<GuiChatConnection["client"]["onEvent"]>[0]>[0]) => {
+      for (const handler of eventHandlers) handler(event as never);
+    },
     emitState: (state: ConnectionState) => {
       for (const handler of stateHandlers) handler(state);
     },
@@ -684,6 +939,7 @@ function createConnection(): TestGuiChatConnection {
     respondToClarify: vi.fn().mockResolvedValue(undefined),
     send: vi.fn().mockResolvedValue(undefined),
     stop: vi.fn(),
+    switchModel: vi.fn().mockResolvedValue({ confirm_required: false, value: "next-model" }),
   };
   return connection;
 }
@@ -719,6 +975,20 @@ function authIdentity(): AuthIdentity {
     tenant_id: "tenant-a",
     user_id: "user-a",
   };
+}
+
+async function openModelPicker() {
+  await act(async () => {
+    document.querySelector<HTMLButtonElement>('button[aria-label="Switch registered model"]')?.click();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
+function buttonWithText(text: string, exact = false): HTMLButtonElement | undefined {
+  return Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((button) =>
+    exact ? button.textContent?.trim() === text : button.textContent?.includes(text),
+  );
 }
 
 function deferred<T>() {

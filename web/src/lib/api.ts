@@ -80,6 +80,7 @@ const PROFILE_SCOPED_PREFIXES = [
   "/api/model/auxiliary",
   "/api/model/moa",
   "/api/model/options",
+  "/api/model/registrations",
 ];
 
 function withManagementProfile(url: string): string {
@@ -646,6 +647,37 @@ export const api = {
   getDefaults: () => fetchJSON<Record<string, unknown>>("/api/config/defaults"),
   getSchema: () => fetchJSON<{ fields: Record<string, unknown>; category_order: string[] }>("/api/config/schema"),
   getModelInfo: () => fetchJSON<ModelInfoResponse>("/api/model/info"),
+  getModelRegistrations: (profile?: string) =>
+    fetchJSON<ModelRegistrationsResponse>(
+      `/api/model/registrations${profileQuery(profile)}`,
+    ),
+  createModelRegistration: (body: ModelRegistrationRequest) =>
+    fetchJSON<ModelRegistration>("/api/model/registrations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  updateModelRegistration: (id: string, body: ModelRegistrationRequest) =>
+    fetchJSON<ModelRegistration>("/api/model/registrations", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...body, id }),
+    }),
+  deleteModelRegistration: (id: string) =>
+    fetchJSON<{ ok: boolean; id: string }>("/api/model/registrations", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    }),
+  activateModelRegistration: (id: string, profile?: string) =>
+    fetchJSON<ModelRegistrationActivation>(
+      `/api/model/registrations/active${profileQuery(profile)}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id }),
+      },
+    ),
   getModelOptions: (profile?: string) =>
     fetchJSON<ModelOptionsResponse>(`/api/model/options${profileQuery(profile)}`),
   getAuxiliaryModels: () => fetchJSON<AuxiliaryModelsResponse>("/api/model/auxiliary"),
@@ -2391,6 +2423,96 @@ export interface ModelInfoResponse {
 }
 
 // ── Model options / assignment types ──────────────────────────────────
+
+export type ModelRegistrationKind = "chat" | "image" | "video";
+
+export type ModelRegistrationSource = "catalog" | "custom";
+
+export interface ModelRegistration {
+  id: string;
+  name: string;
+  kind: ModelRegistrationKind;
+  provider: string;
+  model: string;
+  source: ModelRegistrationSource;
+  use_gateway: boolean;
+  credential_configured: boolean | null;
+}
+
+export interface ModelRegistrationRequest {
+  name: string;
+  kind: ModelRegistrationKind;
+  provider?: string;
+  model: string;
+  source?: ModelRegistrationSource;
+  base_url?: string;
+  api_mode?: string;
+  api_key?: string;
+  context_length?: number;
+  use_gateway?: boolean;
+}
+
+export interface ModelRegistrationChatCatalogProvider {
+  slug: string;
+  name: string;
+  models: string[];
+  authenticated: boolean;
+  credential_configured: boolean;
+  auth_type?: string;
+  warning?: string;
+}
+
+export interface ModelRegistrationMediaCatalogModel {
+  id: string;
+  display?: string;
+  [key: string]: unknown;
+}
+
+export interface ModelRegistrationSetupField {
+  key: string;
+  prompt?: string;
+  url?: string;
+}
+
+export interface ModelRegistrationMediaCatalogProvider {
+  provider: string;
+  name: string;
+  available: boolean;
+  credential_configured: boolean;
+  models: ModelRegistrationMediaCatalogModel[];
+  default_model: string;
+  capabilities: Record<string, unknown>;
+  setup: {
+    name?: string;
+    badge?: string;
+    tag?: string;
+    env_vars: ModelRegistrationSetupField[];
+  };
+}
+
+export interface ActiveModelRegistration {
+  registration_id: string | null;
+  provider: string;
+  model: string;
+}
+
+export interface ModelRegistrationsResponse {
+  registrations: ModelRegistration[];
+  active: Record<ModelRegistrationKind, ActiveModelRegistration>;
+  catalogs: {
+    chat: ModelRegistrationChatCatalogProvider[];
+    image: ModelRegistrationMediaCatalogProvider[];
+    video: ModelRegistrationMediaCatalogProvider[];
+  };
+}
+
+export interface ModelRegistrationActivation {
+  ok: boolean;
+  registration_id: string;
+  kind: "image" | "video";
+  provider: string;
+  model: string;
+}
 
 export interface ModelOptionProvider {
   name: string;

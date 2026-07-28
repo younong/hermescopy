@@ -80,6 +80,13 @@ export interface FileAttachResponse {
   message?: string;
 }
 
+export interface GuiChatModelSwitchResponse {
+  confirm_message?: string;
+  confirm_required?: boolean;
+  value?: string;
+  warning?: string;
+}
+
 export interface GuiChatConnection {
   client: GuiChatEventSource;
   close(): void;
@@ -94,6 +101,13 @@ export interface GuiChatConnection {
   attachFile(sessionId: string, file: File): Promise<FileAttachResponse>;
   send(sessionId: string, text: string): Promise<void>;
   stop(sessionId: string): Promise<void>;
+  switchModel(
+    sessionId: string,
+    provider: string,
+    model: string,
+    confirmExpensiveModel?: boolean,
+    persistGlobally?: boolean,
+  ): Promise<GuiChatModelSwitchResponse>;
   respondToApproval(sessionId: string, request: unknown, approved: boolean): Promise<void>;
   respondToClarify(sessionId: string, requestId: string, answer: string): Promise<void>;
   ping(): Promise<void>;
@@ -249,6 +263,19 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
     stop: async (sessionId) => {
       await client.request("session.interrupt", { session_id: sessionId }, 30_000);
     },
+    switchModel: (
+      sessionId,
+      provider,
+      model,
+      confirmExpensiveModel = false,
+      persistGlobally = false,
+    ) =>
+      client.request<GuiChatModelSwitchResponse>("config.set", {
+        confirm_expensive_model: confirmExpensiveModel,
+        key: "model",
+        session_id: sessionId,
+        value: `${model} --provider ${provider} ${persistGlobally ? "--global" : "--session"}`,
+      }),
   };
 }
 
