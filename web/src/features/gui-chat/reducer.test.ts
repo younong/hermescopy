@@ -218,6 +218,57 @@ describe("guiChatReducer clarification lifecycle", () => {
   });
 });
 
+describe("guiChatReducer compression lifecycle", () => {
+  it("stores transient structured state without appending transcript status lines", () => {
+    const preparing = guiChatReducer(initialGuiChatState, {
+      type: "event",
+      event: {
+        payload: {
+          kind: "compression.preparing",
+          text: "Summarizing earlier conversation…",
+        },
+        session_id: "sid",
+        type: "status.update",
+      },
+    });
+
+    expect(preparing.compressionStatus).toEqual({
+      kind: "compression.preparing",
+      text: "Summarizing earlier conversation…",
+    });
+    expect(preparing.statusLines).toEqual([]);
+
+    const ready = guiChatReducer(preparing, {
+      type: "event",
+      event: {
+        payload: { kind: "compression.ready", text: "Summary ready" },
+        session_id: "sid",
+        type: "status.update",
+      },
+    });
+
+    expect(ready.compressionStatus).toBeUndefined();
+    expect(ready.statusLines).toEqual([]);
+  });
+
+  it("ignores compression statuses from another live session", () => {
+    const state = guiChatReducer(
+      { ...initialGuiChatState, sessionId: "session-a" },
+      {
+        type: "event",
+        event: {
+          payload: { kind: "compression.blocked", text: "Run /compress or /new" },
+          session_id: "session-b",
+          type: "status.update",
+        },
+      },
+    );
+
+    expect(state.compressionStatus).toBeUndefined();
+    expect(state.statusLines).toEqual([]);
+  });
+});
+
 describe("guiChatReducer terminal error completion", () => {
   it("clears generating state and preserves visible error text", () => {
     const streaming = guiChatReducer(

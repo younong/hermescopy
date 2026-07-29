@@ -4,7 +4,7 @@ Self-contained class with its own OpenAI client for summarization.
 Uses auxiliary model (cheap/fast) to summarize middle turns while
 protecting head and tail context.
 
-Improvements over v2:
+Key behavior:
   - Structured summary template with Resolved/Pending question tracking
   - Filter-safe summarizer preamble that treats prior turns as source material
   - Historical (reference-only) section headings replace "Next Steps"/"Remaining Work" to avoid reading as active instructions
@@ -27,16 +27,19 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from agent.auxiliary_client import (
+    AuxiliaryRouteCapacity,
     _compression_token_cap_for_route,
     _is_connection_error,
     aux_interrupt_protection,
     call_llm,
+    resolve_auxiliary_route_capacity,
 )
 from agent.context_engine import ContextEngine
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
     get_model_context_length,
     estimate_messages_tokens_rough,
+    estimate_tokens_rough,
 )
 from agent.redact import redact_sensitive_text
 
@@ -50,6 +53,9 @@ class PreparedCompression:
     compressor_state: Dict[str, Any]
     aborted: bool
     applied: bool = True
+    auxiliary_route_fingerprint: Optional[str] = None
+    auxiliary_context_length: Optional[int] = None
+    auxiliary_input_budget: Optional[int] = None
 
 
 HISTORICAL_TASK_HEADING = "## Historical Task Snapshot"
@@ -189,6 +195,9 @@ _IMAGE_TOKEN_ESTIMATE = 1600
 # for tail-cut decisions.
 _IMAGE_CHAR_EQUIVALENT = _IMAGE_TOKEN_ESTIMATE * _CHARS_PER_TOKEN
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
+_AUX_INPUT_SAFETY_RATIO = 0.70
+_AUX_INPUT_HARD_CAP_TOKENS = 48_000
+_MAX_USAGE_CALIBRATION = 4.0
 
 # Hard ceiling for the deterministic summary-failure handoff.  The fallback is
 # only meant to preserve continuity anchors from the dropped window, not to
@@ -744,6 +753,10 @@ class ContextCompressor(ContextEngine):
         self.last_compression_rough_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
         self.awaiting_real_usage_after_compression = False
+        self._usage_calibration_ratio = 1.0
+        self._usage_calibration_samples = 0
+        self._last_request_rough_tokens = 0
+        self._summary_chunk_checkpoint = 0
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         """Clear all per-session compaction state at a real session boundary.
@@ -782,14 +795,31 @@ class ContextCompressor(ContextEngine):
         self.last_compression_rough_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
         self.awaiting_real_usage_after_compression = False
+        self._usage_calibration_ratio = 1.0
+        self._usage_calibration_samples = 0
+        self._last_request_rough_tokens = 0
+        self._summary_chunk_checkpoint = 0
 
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
-        """Bind the current session row so durable cooldowns can round-trip."""
+        """Bind the current session row and restore route-scoped pressure state."""
         self._session_db = session_db
         self._session_id = session_id or ""
         self._summary_failure_cooldown_until = 0.0
         self._last_summary_error = None
+        self._usage_calibration_ratio = 1.0
+        self._usage_calibration_samples = 0
         self.get_active_compression_failure_cooldown()
+        getter = getattr(session_db, "get_context_usage_calibration", None)
+        if getter is not None and self._session_id:
+            try:
+                state = getter(self._session_id, self._usage_route_key())
+            except Exception:
+                state = None
+            if state:
+                self._usage_calibration_ratio = max(
+                    1.0, min(float(state.get("ratio") or 1.0), _MAX_USAGE_CALIBRATION)
+                )
+                self._usage_calibration_samples = max(0, int(state.get("samples") or 0))
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
         """Bind session-scoped compression state for a new or resumed session."""
@@ -813,27 +843,28 @@ class ContextCompressor(ContextEngine):
         if not session_db or not session_id:
             return None
 
-        getter = getattr(session_db, "get_compression_failure_cooldown", None)
+        getter = getattr(session_db, "get_compression_job", None)
         if getter is None:
             return None
         try:
             state = getter(session_id)
         except sqlite3.Error as exc:
-            logger.debug("compression failure cooldown lookup failed: %s", exc)
+            logger.debug("compression job cooldown lookup failed: %s", exc)
             return None
         except Exception:
             return None
-        if not state:
+        if not state or state.get("state") != "cooldown":
             return None
 
-        remaining_seconds = float(state.get("remaining_seconds") or 0.0)
+        cooldown_until = float(state.get("retry_at") or 0.0)
+        remaining_seconds = cooldown_until - time.time()
         if remaining_seconds <= 0:
             return None
 
         self._summary_failure_cooldown_until = now_mono + remaining_seconds
-        self._last_summary_error = state.get("error")
+        self._last_summary_error = state.get("failure_code")
         return {
-            "cooldown_until": float(state.get("cooldown_until") or 0.0),
+            "cooldown_until": cooldown_until,
             "remaining_seconds": remaining_seconds,
             "error": self._last_summary_error,
         }
@@ -852,15 +883,25 @@ class ContextCompressor(ContextEngine):
         if not session_db or not session_id:
             return
 
-        recorder = getattr(session_db, "record_compression_failure_cooldown", None)
-        if recorder is None:
+        getter = getattr(session_db, "get_compression_job", None)
+        marker = getattr(session_db, "mark_compression_job_cooldown", None)
+        if getter is None or marker is None:
             return
         try:
-            recorder(session_id, cooldown_until, error)
+            job = getter(session_id)
+            if job and job.get("state") == "preparing" and job.get("lease_holder"):
+                marker(
+                    session_id=session_id,
+                    job_id=job["job_id"],
+                    holder=job["lease_holder"],
+                    lease_version=job["lease_version"],
+                    retry_at=cooldown_until,
+                    failure_code="summary_failure",
+                )
         except sqlite3.Error as exc:
-            logger.debug("compression failure cooldown persist failed: %s", exc)
+            logger.debug("compression job cooldown persist failed: %s", exc)
         except Exception as exc:
-            logger.debug("compression failure cooldown persist failed (non-sqlite): %s", exc)
+            logger.debug("compression job cooldown persist failed (non-sqlite): %s", exc)
 
     def _clear_compression_failure_cooldown(self) -> None:
         self._summary_failure_cooldown_until = 0.0
@@ -871,15 +912,18 @@ class ContextCompressor(ContextEngine):
         if not session_db or not session_id:
             return
 
-        clearer = getattr(session_db, "clear_compression_failure_cooldown", None)
-        if clearer is None:
+        getter = getattr(session_db, "get_compression_job", None)
+        requeue = getattr(session_db, "requeue_due_compression_job", None)
+        if getter is None or requeue is None:
             return
         try:
-            clearer(session_id)
+            job = getter(session_id)
+            if job and job.get("state") == "cooldown":
+                requeue(session_id, job["job_id"], force=True)
         except sqlite3.Error as exc:
-            logger.debug("compression failure cooldown clear failed: %s", exc)
+            logger.debug("compression job cooldown clear failed: %s", exc)
         except Exception as exc:
-            logger.debug("compression failure cooldown clear failed (non-sqlite): %s", exc)
+            logger.debug("compression job cooldown clear failed (non-sqlite): %s", exc)
 
     def update_model(
         self,
@@ -934,6 +978,9 @@ class ContextCompressor(ContextEngine):
         self.last_rough_tokens_when_real_prompt_fit = 0
         self.last_compression_rough_tokens = 0
         self.awaiting_real_usage_after_compression = False
+        self._usage_calibration_ratio = 1.0
+        self._usage_calibration_samples = 0
+        self._last_request_rough_tokens = 0
         self._ineffective_compression_count = 0
 
     # When the MINIMUM_CONTEXT_LENGTH floor meets/exceeds a small context
@@ -1088,10 +1135,15 @@ class ContextCompressor(ContextEngine):
 
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
+        self.last_total_tokens = 0
         self.last_real_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
         self.awaiting_real_usage_after_compression = False
+        self._usage_calibration_ratio = 1.0
+        self._usage_calibration_samples = 0
+        self._last_request_rough_tokens = 0
+        self._summary_chunk_checkpoint = 0
 
         self.summary_model = summary_model_override or ""
         self._session_db: Any = None
@@ -1132,18 +1184,77 @@ class ContextCompressor(ContextEngine):
         self._last_aux_model_failure_error: Optional[str] = None
         self._last_aux_model_failure_model: Optional[str] = None
 
+    def _usage_route_key(self) -> str:
+        return "|".join(
+            (
+                str(self.provider or "auto").strip().lower(),
+                str(self.base_url or "").strip().rstrip("/").lower(),
+                str(self.model or "").strip().lower(),
+                str(self.api_mode or "").strip().lower(),
+            )
+        )
+
+    def note_request_estimate(self, rough_tokens: int) -> int:
+        """Remember one request estimate and return calibrated pressure."""
+        self._last_request_rough_tokens = max(0, int(rough_tokens or 0))
+        return self.calibrated_prompt_tokens(self._last_request_rough_tokens)
+
+    def calibrated_prompt_tokens(self, rough_tokens: int) -> int:
+        """Apply a provider-observed conservative multiplier to a rough estimate."""
+        rough = max(0, int(rough_tokens or 0))
+        ratio = max(1.0, float(self._usage_calibration_ratio or 1.0))
+        return max(rough, int(rough * ratio + 0.999))
+
+    def hard_input_limit(self) -> int:
+        """Conservative request boundary after reserving configured output."""
+        available = max(1, int(self.context_length) - int(self.max_tokens or 0))
+        return max(1, int(available * 0.95))
+
+    def would_hard_block(self, rough_tokens: int) -> bool:
+        return self.calibrated_prompt_tokens(rough_tokens) >= self.hard_input_limit()
+
     def update_from_response(self, usage: Dict[str, Any]):
-        """Update tracked token usage from API response."""
-        self.last_prompt_tokens = usage.get("prompt_tokens", 0)
-        self.last_completion_tokens = usage.get("completion_tokens", 0)
-        self.last_total_tokens = usage.get("total_tokens", self.last_prompt_tokens + self.last_completion_tokens)
+        """Update authoritative usage and conservatively calibrate rough estimates."""
+        self.last_prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+        self.last_completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+        self.last_total_tokens = int(
+            usage.get("total_tokens", self.last_prompt_tokens + self.last_completion_tokens)
+            or 0
+        )
         if self.last_prompt_tokens > 0:
             self.last_real_prompt_tokens = self.last_prompt_tokens
+            rough = int(self._last_request_rough_tokens or 0)
+            if rough > 0:
+                observed_ratio = min(
+                    _MAX_USAGE_CALIBRATION,
+                    max(1.0, self.last_prompt_tokens / rough),
+                )
+                # Never lower the durable multiplier from one observation. Rough
+                # estimation changes and route switches are handled explicitly.
+                if observed_ratio > self._usage_calibration_ratio:
+                    self._usage_calibration_ratio = observed_ratio
+                self._usage_calibration_samples += 1
+                recorder = getattr(
+                    getattr(self, "_session_db", None),
+                    "record_context_usage_calibration",
+                    None,
+                )
+                if recorder is not None and self._session_id:
+                    try:
+                        recorder(
+                            self._session_id,
+                            self._usage_route_key(),
+                            self._usage_calibration_ratio,
+                            self._usage_calibration_samples,
+                        )
+                    except Exception:
+                        logger.debug("context usage calibration persist failed", exc_info=True)
             if self.last_prompt_tokens < self.threshold_tokens:
                 if self.awaiting_real_usage_after_compression and self.last_compression_rough_tokens > 0:
                     self.last_rough_tokens_when_real_prompt_fit = self.last_compression_rough_tokens
             else:
                 self.last_rough_tokens_when_real_prompt_fit = 0
+        self._last_request_rough_tokens = 0
         self.awaiting_real_usage_after_compression = False
 
     def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
@@ -1397,16 +1508,133 @@ class ContextCompressor(ContextEngine):
     # Summarization
     # ------------------------------------------------------------------
 
-    def _compute_summary_budget(self, turns_to_summarize: List[Dict[str, Any]]) -> int:
-        """Scale summary token budget with the amount of content being compressed.
-
-        The maximum scales with the model's context window (5% of context,
-        capped at ``_SUMMARY_TOKENS_CEILING``) so large-context models get
-        richer summaries instead of being hard-capped at 8K tokens.
-        """
+    def _compute_summary_budget(
+        self,
+        turns_to_summarize: List[Dict[str, Any]],
+        *,
+        max_output_tokens: Optional[int] = None,
+    ) -> int:
+        """Scale summary output while respecting the resolved auxiliary route."""
         content_tokens = estimate_messages_tokens_rough(turns_to_summarize)
         budget = int(content_tokens * _SUMMARY_RATIO)
-        return max(_MIN_SUMMARY_TOKENS, min(budget, self.max_summary_tokens))
+        ceiling = self.max_summary_tokens
+        if max_output_tokens is not None:
+            ceiling = min(ceiling, max(1, int(max_output_tokens / 1.3)))
+        return max(1, min(max(_MIN_SUMMARY_TOKENS, budget), ceiling))
+
+    @staticmethod
+    def _atomic_summary_groups(
+        turns: List[Dict[str, Any]],
+    ) -> List[List[Dict[str, Any]]]:
+        """Group an assistant tool request with all immediately following results."""
+        groups: List[List[Dict[str, Any]]] = []
+        idx = 0
+        while idx < len(turns):
+            end = idx + 1
+            msg = turns[idx]
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                while end < len(turns) and turns[end].get("role") == "tool":
+                    end += 1
+            groups.append(turns[idx:end])
+            idx = end
+        return groups
+
+    def _summary_chunks(
+        self,
+        turns: List[Dict[str, Any]],
+        *,
+        input_budget: int,
+    ) -> List[List[Dict[str, Any]]]:
+        """Pack complete atomic groups into bounded auxiliary prompt chunks."""
+        chunks: List[List[Dict[str, Any]]] = []
+        chunk: List[Dict[str, Any]] = []
+        chunk_tokens = 0
+        for group in self._atomic_summary_groups(turns):
+            group_tokens = estimate_tokens_rough(self._serialize_for_summary(group))
+            if chunk and chunk_tokens + group_tokens > input_budget:
+                chunks.append(chunk)
+                chunk = []
+                chunk_tokens = 0
+            chunk.extend(group)
+            chunk_tokens += group_tokens
+            if chunk_tokens >= input_budget:
+                chunks.append(chunk)
+                chunk = []
+                chunk_tokens = 0
+        if chunk:
+            chunks.append(chunk)
+        return chunks
+
+    def _generate_rolling_summary(
+        self,
+        turns: List[Dict[str, Any]],
+        *,
+        focus_topic: Optional[str],
+        deadline_monotonic: Optional[float],
+        start_cursor: int = 0,
+        rolling_summary: Optional[str] = None,
+        checkpoint: Optional[Any] = None,
+    ) -> Optional[str]:
+        """Fold bounded atomic chunks into a resumable rolling summary."""
+        capacity = self._auxiliary_summary_capacity()
+        route_budget = int(getattr(capacity, "input_budget", 0) or 0)
+        output_budget = int(getattr(capacity, "max_output_tokens", 0) or 0)
+        if route_budget <= 0:
+            route_budget = min(
+                _AUX_INPUT_HARD_CAP_TOKENS,
+                max(1, self.hard_input_limit()),
+            )
+        input_budget = max(
+            1,
+            min(
+                _AUX_INPUT_HARD_CAP_TOKENS,
+                int(route_budget * _AUX_INPUT_SAFETY_RATIO),
+            ),
+        )
+        chunks = self._summary_chunks(turns, input_budget=input_budget)
+        cursor = max(0, min(int(start_cursor or 0), len(chunks)))
+        self._previous_summary = rolling_summary or self._previous_summary
+
+        for index in range(cursor, len(chunks)):
+            chunk = chunks[index]
+            if estimate_tokens_rough(self._serialize_for_summary(chunk)) > input_budget:
+                self._last_summary_error = "atomic tool group exceeds auxiliary input budget"
+                self._last_summary_transient_failure = True
+                return None
+            summary_budget = self._compute_summary_budget(
+                chunk,
+                max_output_tokens=output_budget or None,
+            )
+            summary = self._generate_summary(
+                chunk,
+                focus_topic=focus_topic,
+                deadline_monotonic=deadline_monotonic,
+                _summary_budget=summary_budget,
+            )
+            if not summary:
+                return None
+            rolling = self._strip_summary_prefix(summary) or summary
+            self._previous_summary = rolling
+            self._summary_chunk_checkpoint = index + 1
+            if checkpoint is not None:
+                checkpoint(index + 1, rolling)
+        return self._with_summary_prefix(self._previous_summary) if self._previous_summary else None
+
+    def _auxiliary_summary_capacity(self):
+        main_runtime = {
+            "model": self.model,
+            "provider": self.provider,
+            "base_url": self.base_url,
+            "api_key": self.api_key,
+            "api_mode": self.api_mode,
+        }
+        try:
+            return resolve_auxiliary_route_capacity(
+                "compression", main_runtime=main_runtime
+            )
+        except Exception:
+            logger.debug("auxiliary compression capacity resolution failed", exc_info=True)
+            return None
 
     # Truncation limits for the summarizer input.  These bound how much of
     # each message the summary model sees — the budget is the *summary*
@@ -1699,6 +1927,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         turns_to_summarize: List[Dict[str, Any]],
         focus_topic: Optional[str] = None,
         deadline_monotonic: Optional[float] = None,
+        *,
+        _summary_budget: Optional[int] = None,
     ) -> Optional[str]:
         """Generate a structured summary of conversation turns.
 
@@ -1725,7 +1955,11 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             )
             return None
 
-        summary_budget = self._compute_summary_budget(turns_to_summarize)
+        summary_budget = (
+            max(1, int(_summary_budget))
+            if _summary_budget is not None
+            else self._compute_summary_budget(turns_to_summarize)
+        )
         content_to_summarize = self._serialize_for_summary(turns_to_summarize)
 
         # Current date for temporal anchoring (see ## Temporal Anchoring below).
@@ -1889,6 +2123,11 @@ FOCUS TOPIC: "{focus_topic}"
 This compaction should PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
 
         try:
+            planned_input_tokens = estimate_tokens_rough(prompt)
+
+            def _record_route(capacity: AuxiliaryRouteCapacity) -> None:
+                self._last_auxiliary_route_capacity = capacity
+
             call_kwargs = {
                 "task": "compression",
                 "main_runtime": {
@@ -1901,6 +2140,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": int(summary_budget * 1.3),
                 "deadline_monotonic": deadline_monotonic,
+                "planned_input_tokens": planned_input_tokens,
+                "route_metadata_callback": _record_route,
                 # Per-request timeout is resolved from config and clamped to the
                 # aggregate automatic-compression deadline by call_llm.
             }
@@ -1976,10 +2217,9 @@ This compaction should PRIORITISE preserving all information related to the focu
                                 "for %d seconds.",
                                 _SUMMARY_FAILURE_COOLDOWN_SECONDS)
                 return None
-            # If the summary model is different from the main model and the
-            # error looks permanent (model not found, 503, 404), fall back to
-            # using the main model instead of entering cooldown that leaves
-            # context growing unbounded.  (#8620 sub-issue 4)
+            # Fail the durable preparation on auxiliary-route errors. Automatic
+            # compression must never recursively retry the main chat route or
+            # archive source turns with an unavailable-summary placeholder.
             _status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
             _err_str = str(e).lower()
             _is_model_not_found = (
@@ -2052,45 +2292,27 @@ This compaction should PRIORITISE preserving all information related to the focu
                     e,
                 )
             if (
-                (_is_model_not_found or _is_timeout or _is_invalid_response or _is_streaming_closed)
+                not getattr(self, "_durable_preparation", False)
                 and self.summary_model
                 and self.summary_model != self.model
                 and not getattr(self, "_summary_model_fallen_back", False)
             ):
                 if _is_json_decode:
-                    _reason = "returned invalid JSON"
+                    reason = "returned invalid JSON"
                 elif _is_model_not_found:
-                    _reason = "unavailable"
+                    reason = "unavailable"
                 elif _is_streaming_closed:
-                    _reason = "closed stream prematurely"
+                    reason = "closed stream prematurely"
+                elif _is_timeout:
+                    reason = "timed out"
                 else:
-                    _reason = "timed out"
-                self._fallback_to_main_for_compression(e, _reason)
+                    reason = "failed"
+                self._fallback_to_main_for_compression(e, reason)
                 return self._generate_summary(
                     turns_to_summarize,
                     focus_topic=focus_topic,
                     deadline_monotonic=deadline_monotonic,
-                )  # retry immediately
-
-            # Unknown-error best-effort retry on main model.  Losing N turns of
-            # context is almost always worse than one extra summary attempt, so
-            # if we haven't already fallen back and the summary model differs
-            # from the main model, try once more on main before entering
-            # cooldown.  Errors that DID match _is_model_not_found above are
-            # already handled by the fast-path retry; this branch catches
-            # everything else (400s, provider-specific "no route" strings,
-            # aggregator rejections, etc.) where auto-retry is still safer
-            # than dropping the turns.
-            if (
-                self.summary_model
-                and self.summary_model != self.model
-                and not getattr(self, "_summary_model_fallen_back", False)
-            ):
-                self._fallback_to_main_for_compression(e, "failed")
-                return self._generate_summary(
-                    turns_to_summarize,
-                    focus_topic=focus_topic,
-                    deadline_monotonic=deadline_monotonic,
+                    _summary_budget=summary_budget,
                 )
 
             # Transient errors (timeout, rate limit, network, JSON decode,
@@ -2109,7 +2331,13 @@ This compaction should PRIORITISE preserving all information related to the focu
             # placeholder marker — retrying once the network recovers is
             # strictly better than dropping context (#29559, #25585). Mirrors
             # the auth-failure carve-out; independent of abort_on_summary_failure.
-            if _is_timeout or _is_invalid_response or _is_streaming_closed:
+            if (
+                _is_auth_error
+                or _is_model_not_found
+                or _is_timeout
+                or _is_invalid_response
+                or _is_streaming_closed
+            ):
                 self._last_summary_transient_failure = True
             logger.warning(
                 "Failed to generate context summary: %s. "
@@ -2899,6 +3127,10 @@ This compaction should PRIORITISE preserving all information related to the focu
         "_last_aux_model_failure_error",
         "_last_aux_model_failure_model",
         "_summary_model_fallen_back",
+        "_summary_chunk_checkpoint",
+        "_last_auxiliary_route_capacity",
+        "_last_compression_savings_pct",
+        "_ineffective_compression_count",
         "summary_model",
     )
 
@@ -2909,6 +3141,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         current_tokens: Optional[int] = None,
         focus_topic: Optional[str] = None,
         deadline_monotonic: Optional[float] = None,
+        chunk_cursor: int = 0,
+        rolling_summary: Optional[str] = None,
+        checkpoint: Optional[Any] = None,
     ) -> PreparedCompression:
         """Build a compression projection without mutating live session state."""
         snapshot = copy.deepcopy(messages)
@@ -2918,6 +3153,12 @@ This compaction should PRIORITISE preserving all information related to the focu
         )
         detached._session_db = None
         detached._session_id = ""
+        detached._summary_chunk_checkpoint = max(0, int(chunk_cursor or 0))
+        if rolling_summary:
+            detached._previous_summary = rolling_summary
+        detached._rolling_checkpoint = checkpoint
+        detached._last_auxiliary_route_capacity = None
+        detached._durable_preparation = True
         compressed = detached.compress(
             snapshot,
             current_tokens=current_tokens,
@@ -2928,6 +3169,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             field: copy.deepcopy(getattr(detached, field, None))
             for field in self._PREPARED_STATE_FIELDS
         }
+        route_capacity = getattr(detached, "_last_auxiliary_route_capacity", None)
         return PreparedCompression(
             compressed_messages=copy.deepcopy(compressed),
             compressor_state=state,
@@ -2936,6 +3178,13 @@ This compaction should PRIORITISE preserving all information related to the focu
                 int(getattr(detached, "compression_count", 0) or 0)
                 > initial_compression_count
             ),
+            auxiliary_route_fingerprint=getattr(
+                route_capacity, "fingerprint", None
+            ),
+            auxiliary_context_length=getattr(
+                route_capacity, "context_length", None
+            ),
+            auxiliary_input_budget=getattr(route_capacity, "input_budget", None),
         )
 
     def apply_prepared_compression(
@@ -2955,22 +3204,6 @@ This compaction should PRIORITISE preserving all information related to the focu
         compressed = self._sanitize_tool_pairs(compressed)
         compressed = _strip_historical_media(compressed)
 
-        if not prepared.applied:
-            return compressed
-
-        self.compression_count += 1
-        display_tokens = current_tokens or estimate_messages_tokens_rough(compressed)
-        new_estimate = estimate_messages_tokens_rough(compressed)
-        savings_pct = (
-            (display_tokens - new_estimate) / display_tokens * 100
-            if display_tokens > 0
-            else 0.0
-        )
-        self._last_compression_savings_pct = savings_pct
-        if savings_pct < 10:
-            self._ineffective_compression_count += 1
-        else:
-            self._ineffective_compression_count = 0
         return compressed
 
     # ------------------------------------------------------------------
@@ -3140,32 +3373,21 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         # Phase 3: Generate structured summary
         summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
-        summary = self._generate_summary(
+        summary = self._generate_rolling_summary(
             turns_to_summarize,
             focus_topic=summary_focus_topic,
             deadline_monotonic=deadline_monotonic,
+            start_cursor=int(getattr(self, "_summary_chunk_checkpoint", 0) or 0),
+            rolling_summary=self._previous_summary,
+            checkpoint=getattr(self, "_rolling_checkpoint", None),
         )
 
-        # If summary generation failed, behavior splits on
-        # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):
-        #   True  → ABORT compression entirely. Return messages unchanged
-        #           and set _last_compress_aborted=True so callers can warn
-        #           the user and stop the auto-compress retry loop.
-        #   False → Fall through to the default fallback path below: insert
-        #           a deterministic "summary unavailable" handoff and drop
-        #           the middle window.  Records _last_summary_fallback_used /
-        #           _last_summary_dropped_count for gateway hygiene to
-        #           surface a warning.
-        # Default is False (historical behavior).
-        #
-        # EXCEPTION — auth AND transient provider failures always abort. A
-        # 401/403 means the credential/endpoint is broken. Timeout/deadline,
-        # 408/429/5xx, malformed/empty responses, and connection/stream closure
-        # are transient provider failures. In all of these cases, dropping the
-        # middle window is worse than preserving it for a later retry, so abort
-        # regardless of abort_on_summary_failure.
+        # Durable automatic preparation must preserve the source transcript on
+        # every failed chunk. Legacy/manual direct calls retain their explicit
+        # deterministic recovery behavior.
         if not summary and (
-            self.abort_on_summary_failure
+            getattr(self, "_durable_preparation", False)
+            or self.abort_on_summary_failure
             or self._last_summary_auth_failure
             or self._last_summary_transient_failure
         ):
@@ -3194,8 +3416,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                     )
                 else:
                     logger.warning(
-                        "Summary generation failed — aborting compression "
-                        "(compression.abort_on_summary_failure=true). "
+                        "Summary generation failed — aborting compression. "
                         "%d message(s) preserved unchanged. Conversation "
                         "continues as-is; retry with /compress or start /new.",
                         n_skipped,
@@ -3216,19 +3437,20 @@ This compaction should PRIORITISE preserving all information related to the focu
                     )
             compressed.append(msg)
 
-        # If LLM summary failed, insert a deterministic fallback so the model
-        # gets at least locally recoverable continuity anchors instead of a
-        # content-free "N messages were removed" marker.
         if not summary:
             if not self.quiet_mode:
-                logger.warning("Summary generation failed — inserting deterministic fallback context summary")
-            n_dropped = compress_end - compress_start
-            self._last_summary_dropped_count = n_dropped
+                logger.warning(
+                    "Summary generation failed — inserting deterministic fallback context summary"
+                )
+            self._last_summary_dropped_count = compress_end - compress_start
             self._last_summary_fallback_used = True
             summary = self._build_static_fallback_summary(
                 turns_to_summarize,
                 reason=self._last_summary_error,
             )
+        else:
+            self._last_summary_dropped_count = 0
+            self._last_summary_fallback_used = False
 
         _merge_summary_into_tail = False
         last_head_role = messages[compress_start - 1].get("role", "user") if compress_start > 0 else "user"

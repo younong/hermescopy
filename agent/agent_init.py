@@ -1452,9 +1452,6 @@ def init_agent(
     except Exception:
         pass
     compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
-    compression_async_prepare = str(
-        _compression_cfg.get("async_prepare", True)
-    ).lower() in {"true", "1", "yes"}
     try:
         _configured_prepare_threshold = float(
             _compression_cfg.get("prepare_threshold", compression_threshold)
@@ -1490,15 +1487,6 @@ def init_agent(
     )
     if compression_emergency_threshold >= 1:
         raise ValueError("compression emergency threshold must remain below 1")
-    try:
-        compression_emergency_wait_seconds = float(
-            _compression_cfg.get("emergency_wait_seconds", 15.0)
-        )
-    except (TypeError, ValueError):
-        compression_emergency_wait_seconds = 15.0
-    compression_emergency_wait_seconds = max(
-        10.0, min(compression_emergency_wait_seconds, 20.0)
-    )
     compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
     compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
     # protect_first_n is the number of non-system messages to protect at
@@ -1771,11 +1759,9 @@ def init_agent(
             pass
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
-    agent.compression_async_prepare = compression_async_prepare
     agent.compression_prepare_threshold = compression_prepare_threshold
     agent.compression_commit_threshold = compression_commit_threshold
     agent.compression_emergency_threshold = compression_emergency_threshold
-    agent.compression_emergency_wait_seconds = compression_emergency_wait_seconds
 
     # Reject models whose context window is below the minimum required
     # for reliable tool-calling workflows (64K tokens).

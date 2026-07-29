@@ -1368,12 +1368,10 @@ DEFAULT_CONFIG = {
 
     "compression": {
         "enabled": True,
-        "threshold": 0.50,            # legacy/synchronous trigger and prepare default
-        "async_prepare": True,        # prepare a summary in the background at threshold
-        "prepare_threshold": 0.50,    # begin speculative preparation without switching
-        "commit_threshold": 0.80,     # apply a ready preparation at a safe boundary
-        "emergency_threshold": 0.88,  # bounded wait, then synchronous fallback
-        "emergency_wait_seconds": 15, # wait on the same background task (clamped 10-20s)
+        "threshold": 0.50,            # compressor trigger and prepare default
+        "prepare_threshold": 0.50,    # enqueue durable background preparation
+        "commit_threshold": 0.80,     # apply a ready projection at a safe boundary
+        "emergency_threshold": 0.88,  # degraded-state warning threshold; never blocks
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
         "hygiene_hard_message_limit": 5000,  # gateway session-hygiene force-compress threshold by message count
@@ -1383,17 +1381,12 @@ DEFAULT_CONFIG = {
                                       # 0 for long-running rolling-compaction sessions
                                       # where you want nothing pinned except the
                                       # system prompt + rolling summary + recent tail.
-        "abort_on_summary_failure": False,  # When True, auto-compression that fails
-                                      # to generate a summary (aux LLM errored / returned
-                                      # non-JSON / timed out) aborts entirely instead of
-                                      # dropping the middle window with a static
-                                      # "summary unavailable" placeholder.  Messages are
-                                      # preserved unchanged and the conversation continues;
-                                      # /compress bypasses the failure cooldown for an
-                                      # immediate manual retry, while /new starts fresh.
-                                      # Default False matches historical behavior; set to
-                                      # True if you'd rather pause than silently lose
-                                      # context turns when your aux model is flaky.
+        "abort_on_summary_failure": False,  # Manual synchronous compression keeps
+                                      # historical fallback behavior unless this is True.
+                                      # Durable automatic preparation is always lossless:
+                                      # failed chunks enter cooldown/degraded state, archive
+                                      # nothing, and can resume from the last checkpoint.
+                                      # /compress may retry immediately; /new starts fresh.
         "codex_gpt55_autoraise": True,  # When True, gpt-5.5 on the ChatGPT Codex OAuth
                                       # route raises its compaction trigger to 85% (vs the
                                       # global `threshold` above). Codex hard-caps gpt-5.5
@@ -1418,8 +1411,7 @@ DEFAULT_CONFIG = {
                                       # turns are soft-archived under the same id
                                       # (active=0, compacted=1) — still searchable via
                                       # session_search and recoverable, not deleted.
-                                      # Default False during rollout; will flip on
-                                      # after live validation.
+                                      # Durable automatic jobs always commit in place.
     },
 
     # Kanban subsystem (orchestrator workers + dispatcher-driven child tasks).

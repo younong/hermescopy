@@ -110,6 +110,15 @@ export interface GuiComposerAttachment {
   height?: number;
 }
 
+export interface CompressionStatusState {
+  kind:
+    | "compression.blocked"
+    | "compression.cooldown"
+    | "compression.degraded"
+    | "compression.preparing";
+  text: string;
+}
+
 export interface GuiChatState {
   connection: GuiChatConnectionState;
   sessionId?: string;
@@ -127,6 +136,7 @@ export interface GuiChatState {
   approvalOrder: string[];
   clarifications: Record<string, ClarificationState>;
   clarificationOrder: string[];
+  compressionStatus?: CompressionStatusState;
   statusLines: string[];
   isGenerating: boolean;
   error?: string;

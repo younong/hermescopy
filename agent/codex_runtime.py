@@ -228,6 +228,46 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     }
 
 
+def _codex_request_pressure(agent, messages: List[Dict[str, Any]]) -> dict[str, Any] | None:
+    """Record Codex's exact request-shape estimate and enforce the hard boundary."""
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is None:
+        return None
+    from agent.model_metadata import estimate_request_tokens_rough
+
+    rough_tokens = estimate_request_tokens_rough(
+        messages,
+        tools=getattr(agent, "tools", None) or None,
+    )
+    note = getattr(compressor, "note_request_estimate", None)
+    if note is not None:
+        note(rough_tokens)
+    if (
+        getattr(agent, "compression_enabled", True)
+        and getattr(compressor, "would_hard_block", lambda _tokens: False)(
+            rough_tokens
+        )
+    ):
+        emit = getattr(agent, "_emit_status", None)
+        if emit is not None:
+            emit(
+                "Context is too full for another safe model request. "
+                "Run /compress or /new before continuing.",
+                kind="compression.blocked",
+            )
+        return {
+            "final_response": None,
+            "messages": messages,
+            "api_calls": 0,
+            "completed": False,
+            "partial": True,
+            "error": "context pressure reached the safe request boundary",
+            "turn_exit_reason": "compression_hard_blocked",
+            "agent_persisted": True,
+        }
+    return None
+
+
 def run_codex_app_server_turn(
     agent,
     *,
@@ -248,6 +288,10 @@ def run_codex_app_server_turn(
         CodexAppServerSession,
         _ServerRequestRouting,
     )
+
+    blocked = _codex_request_pressure(agent, messages)
+    if blocked is not None:
+        return blocked
 
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent

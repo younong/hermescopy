@@ -126,7 +126,14 @@ export interface ToolCompletePayload {
 }
 
 export interface StatusPayload {
-  kind?: string;
+  kind?:
+    | "compression.blocked"
+    | "compression.completed"
+    | "compression.cooldown"
+    | "compression.degraded"
+    | "compression.preparing"
+    | "compression.ready"
+    | string;
   text?: string;
 }
 

@@ -11,8 +11,8 @@ exactly as before.
 
 import os
 import tempfile
+import time
 from pathlib import Path
-from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -322,6 +322,66 @@ class TestCompactedTurnsStaySearchable:
             assert len(recovered) == 1
 
 
+class TestDurableCommitFailure:
+    def test_failed_atomic_write_does_not_emit_completion_or_mutate_compressor(self):
+        from agent.async_context_compression import PreparedSnapshot, _message_digest
+        from agent.context_compressor import PreparedCompression
+        from agent.conversation_compression import commit_prepared_context
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "state.db")
+            sid = "20260729_failed_commit"
+            _seed(db, sid, "failed-commit")
+            agent = _make_agent(db, sid, in_place=True)
+            statuses = []
+            agent._emit_status = lambda message, *, kind="lifecycle": statuses.append(
+                (kind, message)
+            )
+            messages = [
+                {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}"}
+                for i in range(8)
+            ]
+            prepared = PreparedSnapshot(
+                session_key=(str(db.db_path), sid),
+                session_id=sid,
+                model=agent.model,
+                snapshot_length=len(messages),
+                snapshot_digest=_message_digest(messages),
+                compression=PreparedCompression(
+                    compressed_messages=[
+                        {"role": "user", "content": "prepared summary"},
+                        {"role": "assistant", "content": "recent reply"},
+                    ],
+                    compressor_state={
+                        "compression_count": 7,
+                        "_last_summary_error": None,
+                    },
+                    aborted=False,
+                ),
+            )
+            before_count = agent.context_compressor.compression_count
+
+            with pytest.raises(RuntimeError, match="fence"):
+                commit_prepared_context(
+                    agent=agent,
+                    messages=messages,
+                    system_message="sys",
+                    prepared=prepared,
+                    approx_tokens=100_000,
+                    compression_job={
+                        "job_id": "missing",
+                        "fence_id": "missing",
+                    },
+                )
+
+            assert agent.context_compressor.compression_count == before_count
+            assert "compression.completed" not in {kind for kind, _ in statuses}
+            assert [m["content"] for m in db.get_messages_as_conversation(sid)] == [
+                f"msg {i}" for i in range(8)
+            ]
+
+
 class TestAsyncInPlaceCompactionRealPath:
     def test_prepared_commit_persists_projection_and_canonical_history(self):
         """Async prepare stays pure, then commits through real SQLite in place."""
@@ -332,19 +392,6 @@ class TestAsyncInPlaceCompactionRealPath:
             maybe_handle_async_compression,
         )
         from hermes_state import SessionDB
-
-        class _ControlledExecutor:
-            def __init__(self):
-                self.submissions = []
-
-            def submit(self, fn, *args, **kwargs):
-                future = Future()
-                self.submissions.append((future, fn, args, kwargs))
-                return future
-
-            def complete(self):
-                future, fn, args, kwargs = self.submissions[0]
-                future.set_result(fn(*args, **kwargs))
 
         _reset_async_compression_for_tests()
         try:
@@ -371,22 +418,34 @@ class TestAsyncInPlaceCompactionRealPath:
                 del agent.context_compressor.compress
                 agent.context_compressor.compression_count = 0
                 agent.context_compressor.tail_token_budget = 200
-                agent.compression_async_prepare = True
                 agent.compression_prepare_threshold = 0.50
                 agent.compression_commit_threshold = 0.80
                 agent.compression_emergency_threshold = 0.88
-                agent.compression_emergency_wait_seconds = 15.0
                 agent._compression_feasibility_checked = True
-                executor = _ControlledExecutor()
-                agent._async_compression_executor = executor
                 thresholds = compression_thresholds(agent)
+
+                from agent.auxiliary_client import AuxiliaryRouteCapacity
 
                 response = MagicMock()
                 response.choices = [MagicMock()]
                 response.choices[0].message.content = "deterministic async summary"
+                route_capacity = AuxiliaryRouteCapacity(
+                    fingerprint="real-path-auxiliary-route",
+                    context_length=256_000,
+                    max_output_tokens=8_000,
+                    input_budget=248_000,
+                )
+
+                def summarize(**kwargs):
+                    kwargs["route_metadata_callback"](route_capacity)
+                    return response
+
                 with patch(
+                    "agent.context_compressor.resolve_auxiliary_route_capacity",
+                    return_value=route_capacity,
+                ), patch(
                     "agent.context_compressor.call_llm",
-                    return_value=response,
+                    side_effect=summarize,
                 ):
                     preparing = maybe_handle_async_compression(
                         agent,
@@ -396,14 +455,26 @@ class TestAsyncInPlaceCompactionRealPath:
                     )
                     assert preparing.action is AsyncCompressionAction.PREPARING
                     assert preparing.messages is source
-                    assert len(executor.submissions) == 1
                     # Background preparation is pure: active SQLite context and
                     # canonical display remain byte-for-byte source history.
                     assert [
                         m["content"] for m in db.get_messages_as_conversation(sid)
                     ] == [m["content"] for m in source]
 
-                    executor.complete()
+                    deadline = time.monotonic() + 5.0
+                    while time.monotonic() < deadline:
+                        job = db.get_compression_job(sid)
+                        if job and job["state"] == "ready":
+                            break
+                        time.sleep(0.01)
+                    else:
+                        raise AssertionError("durable preparation did not become ready")
+                    assert (
+                        job["prepared_auxiliary_route_fingerprint"]
+                        == "real-path-auxiliary-route"
+                    )
+                    assert job["prepared_auxiliary_context_length"] == 256_000
+                    assert job["prepared_auxiliary_input_budget"] == 248_000
                     delta = {
                         "role": "user",
                         "content": "append-only delta after prepare",

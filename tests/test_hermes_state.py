@@ -4902,31 +4902,107 @@ def test_gateway_session_recovery_reopens_legacy_agent_close_rows(db):
     ) is None
 
 
-def test_compression_failure_cooldown_round_trips_and_clears(db):
+def test_compression_job_cooldown_preserves_safe_retry_state(db):
     db.create_session("s1", "cli")
+    job = db.enqueue_compression_job(
+        session_id="s1",
+        job_id="job-1",
+        fence_id="fence-1",
+        snapshot_message_id=None,
+        snapshot_message_count=2,
+        snapshot_digest="digest",
+        main_route_fingerprint="main",
+        auxiliary_route_fingerprint="aux",
+        snapshot_payload="[]",
+    )
+    claimed = db.claim_compression_job(
+        session_id="s1", job_id=job["job_id"], holder="worker"
+    )
+    assert claimed is not None
+    retry_at = time.time() + 60.0
+    assert db.mark_compression_job_cooldown(
+        session_id="s1",
+        job_id="job-1",
+        holder="worker",
+        lease_version=claimed["lease_version"],
+        retry_at=retry_at,
+        failure_code="provider_timeout",
+    )
 
-    cooldown_until = time.time() + 60.0
-    db.record_compression_failure_cooldown("s1", cooldown_until, "timeout")
-
-    state = db.get_compression_failure_cooldown("s1")
-    assert state is not None
-    assert state["cooldown_until"] == cooldown_until
-    assert state["error"] == "timeout"
-
-    db.clear_compression_failure_cooldown("s1")
-    assert db.get_compression_failure_cooldown("s1") is None
-
-    row = db.get_session("s1")
-    assert row["compression_failure_cooldown_until"] is None
-    assert row["compression_failure_error"] is None
+    state = db.get_compression_job("s1")
+    assert state["state"] == "cooldown"
+    assert state["retry_at"] == retry_at
+    assert state["failure_code"] == "provider_timeout"
+    assert db.requeue_due_compression_job("s1", "job-1") is False
 
 
-def test_expired_compression_failure_cooldown_is_ignored(db):
+def test_compression_job_degraded_requires_exact_preparation_lease(db):
     db.create_session("s1", "cli")
+    job = db.enqueue_compression_job(
+        session_id="s1",
+        job_id="job-1",
+        fence_id="fence-1",
+        snapshot_message_id=None,
+        snapshot_message_count=2,
+        snapshot_digest="digest",
+        main_route_fingerprint="main",
+        auxiliary_route_fingerprint="aux",
+        snapshot_payload="[]",
+    )
+    claimed = db.claim_compression_job(
+        session_id="s1", job_id=job["job_id"], holder="worker-a"
+    )
+    assert claimed is not None
 
-    db.record_compression_failure_cooldown("s1", time.time() - 60.0, "stale")
+    assert db.mark_compression_job_degraded(
+        session_id="s1",
+        job_id="job-1",
+        holder="worker-b",
+        lease_version=claimed["lease_version"],
+        failure_code="atomic_group_too_large",
+    ) is False
+    assert db.get_compression_job("s1")["state"] == "preparing"
+    assert db.mark_compression_job_degraded(
+        session_id="s1",
+        job_id="job-1",
+        holder="worker-a",
+        lease_version=claimed["lease_version"],
+        failure_code="atomic_group_too_large",
+    ) is True
+    assert db.get_compression_job("s1")["state"] == "degraded"
 
-    assert db.get_compression_failure_cooldown("s1") is None
+
+def test_expired_compression_job_cooldown_requeues(db):
+    db.create_session("s1", "cli")
+    job = db.enqueue_compression_job(
+        session_id="s1",
+        job_id="job-1",
+        fence_id="fence-1",
+        snapshot_message_id=None,
+        snapshot_message_count=2,
+        snapshot_digest="digest",
+        main_route_fingerprint="main",
+        auxiliary_route_fingerprint="aux",
+        snapshot_payload="[]",
+    )
+    claimed = db.claim_compression_job(
+        session_id="s1", job_id=job["job_id"], holder="worker"
+    )
+    assert claimed is not None
+    assert db.mark_compression_job_cooldown(
+        session_id="s1",
+        job_id="job-1",
+        holder="worker",
+        lease_version=claimed["lease_version"],
+        retry_at=time.time() - 60.0,
+        failure_code="provider_timeout",
+    )
+
+    assert db.requeue_due_compression_job("s1", "job-1") is True
+    state = db.get_compression_job("s1")
+    assert state["state"] == "queued"
+    assert state["retry_at"] is None
+    assert state["failure_code"] is None
 
 
 def test_refresh_compression_lock_requires_holder_and_preserves_reclaimability(db, monkeypatch):

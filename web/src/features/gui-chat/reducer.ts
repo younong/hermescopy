@@ -321,8 +321,9 @@ function applyGatewayEvent(state: GuiChatState, event: GatewayEvent): GuiChatSta
       );
     case "thinking.delta":
     case "reasoning.delta":
-    case "status.update":
       return appendStatusLine(state, event.payload as StatusPayload | undefined);
+    case "status.update":
+      return applyStatusUpdate(state, event.payload as StatusPayload | undefined);
     case "tool.start":
       return startToolCall(state, event.payload as ToolStartPayload | undefined);
     case "tool.progress":
@@ -1134,6 +1135,28 @@ function completeAssistantMessage(
 function normalizeMessageStatus(status: string | undefined): ChatMessage["status"] {
   if (status === "error" || status === "interrupted") return status;
   return "complete";
+}
+
+function applyStatusUpdate(
+  state: GuiChatState,
+  payload: StatusPayload | undefined,
+): GuiChatState {
+  const kind = payload?.kind;
+  if (!kind?.startsWith("compression.")) return appendStatusLine(state, payload);
+  if (kind === "compression.completed" || kind === "compression.ready") {
+    return state.compressionStatus ? { ...state, compressionStatus: undefined } : state;
+  }
+  const text = payload?.text?.trim();
+  if (!text) return state;
+  if (
+    kind !== "compression.blocked" &&
+    kind !== "compression.cooldown" &&
+    kind !== "compression.degraded" &&
+    kind !== "compression.preparing"
+  ) {
+    return state;
+  }
+  return { ...state, compressionStatus: { kind, text } };
 }
 
 function appendStatusLine(

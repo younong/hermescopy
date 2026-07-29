@@ -4066,7 +4066,6 @@ class TestRunConversation:
     ):
         self._setup_agent(agent)
         agent.compression_enabled = True
-        agent.compression_async_prepare = True
         agent._using_builtin_context_compressor = True
         agent.context_compressor.last_prompt_tokens = 128_000
 
@@ -4107,53 +4106,46 @@ class TestRunConversation:
         sent = second_request.kwargs["messages"]
         assert any(message.get("content") == "search result" for message in sent)
         assert len(sent) == len(source_messages) + 1  # includes system message
-    def test_post_tool_compression_abort_stops_current_turn(self, agent):
+    def test_post_tool_preparation_failure_does_not_create_assistant_error(self, agent):
+        """Background compression failure does not stop or pollute the active turn."""
+        from agent.async_context_compression import (
+            AsyncCompressionAction,
+            AsyncCompressionOutcome,
+        )
+
         self._setup_agent(agent)
         agent.compression_enabled = True
-        # This regression targets the terminal behavior of the existing
-        # synchronous fallback after a post-tool compression abort.
-        agent.compression_async_prepare = False
-        agent.context_compressor.should_compress = MagicMock(return_value=True)
+        agent._using_builtin_context_compressor = True
         agent.context_compressor.last_prompt_tokens = 100_000
-        agent.context_compressor._last_summary_error = "raw SSE response was malformed"
-
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
-        agent.client.chat.completions.create.return_value = _mock_response(
-            content="", finish_reason="tool_calls", tool_calls=[tc]
-        )
-        original_session_id = agent.session_id
-        original_system_prompt = agent._cached_system_prompt
-        persisted = []
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc]),
+            _mock_response(content="Done after background failure", finish_reason="stop"),
+        ]
 
-        def abort_compression(messages, system_message, **kwargs):
-            assert kwargs["emit_abort_warning"] is False
-            agent._last_compression_attempt_aborted = True
-            return messages, original_system_prompt
+        def failed(_agent, messages, system_prompt, **_kwargs):
+            return AsyncCompressionOutcome(
+                AsyncCompressionAction.FAILED, messages, system_prompt
+            )
 
         with (
             patch("run_agent.handle_function_call", return_value="search result"),
-            patch.object(agent, "_compress_context", side_effect=abort_compression),
-            patch.object(agent, "_persist_session", side_effect=lambda messages, *_: persisted.append(list(messages))),
+            patch(
+                "agent.async_context_compression.maybe_handle_async_compression",
+                side_effect=failed,
+            ) as prepare,
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
             result = agent.run_conversation("search something")
 
-        assert agent.client.chat.completions.create.call_count == 1
-        assert result["failed"] is True
-        assert result["completed"] is False
-        assert result["failure_reason"] == "compression_aborted"
-        assert result["turn_exit_reason"] == "post_tool_compression_aborted"
-        assert result.get("compression_exhausted") is not True
-        assert "No existing messages were dropped" in result["final_response"]
-        assert "/compress" in result["final_response"]
-        assert result["session_id"] == original_session_id
-        assert agent._cached_system_prompt == original_system_prompt
-        assert [message["role"] for message in result["messages"][-3:]] == [
-            "assistant", "tool", "assistant"
-        ]
-        assert result["messages"][-2]["tool_call_id"] == "c1"
-        assert persisted[-1][-1]["content"] == result["final_response"]
+        prepare.assert_called_once()
+        mock_compress.assert_not_called()
+        assert result["completed"] is True
+        assert result["final_response"] == "Done after background failure"
+        assert result["messages"][-1]["content"] == "Done after background failure"
 
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
@@ -4742,47 +4734,51 @@ class TestRunConversation:
         assert result["completed"] is True
         assert result["final_response"] == "Recovered after remint"
 
-    def test_context_compression_triggered(self, agent):
-        """The legacy synchronous post-tool path still runs when async is disabled."""
+    def test_post_tool_compression_uses_durable_coordinator(self, agent):
+        """Built-in post-tool compression never calls the synchronous path."""
+        from agent.async_context_compression import (
+            AsyncCompressionAction,
+            AsyncCompressionOutcome,
+        )
+
         self._setup_agent(agent)
         agent.compression_enabled = True
-        agent.compression_async_prepare = False
-
+        agent._using_builtin_context_compressor = True
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
-        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
-        resp2 = _mock_response(content="All done", finish_reason="stop")
-        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc]),
+            _mock_response(content="All done", finish_reason="stop"),
+        ]
+
+        def preparing(_agent, messages, system_prompt, **_kwargs):
+            return AsyncCompressionOutcome(
+                AsyncCompressionAction.PREPARING, messages, system_prompt
+            )
 
         with (
             patch("run_agent.handle_function_call", return_value="result"),
-            patch.object(
-                agent.context_compressor, "should_compress", return_value=True
-            ),
+            patch(
+                "agent.async_context_compression.maybe_handle_async_compression",
+                side_effect=preparing,
+            ) as handle,
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            # _compress_context should return (messages, system_prompt)
-            mock_compress.return_value = (
-                [{"role": "user", "content": "search something"}],
-                "compressed system prompt",
-            )
             result = agent.run_conversation("search something")
-        mock_compress.assert_called_once()
+
+        handle.assert_called_once()
+        mock_compress.assert_not_called()
         assert result["final_response"] == "All done"
         assert result["completed"] is True
 
-    def test_glm_prompt_exceeds_max_length_triggers_compression(self, agent):
-        """GLM/Z.AI uses 'Prompt exceeds max length' for context overflow."""
+    def test_glm_prompt_exceeds_max_length_blocks_losslessly(self, agent):
         self._setup_agent(agent)
-        agent.compression_enabled = True  # this test verifies overflow→compression fires
-        err_400 = Exception(
-            "Error code: 400 - {'error': {'code': '1261', 'message': 'Prompt exceeds max length'}}"
-        )
-        err_400.status_code = 400
-        ok_resp = _mock_response(content="Recovered after compression", finish_reason="stop")
-        agent.client.chat.completions.create.side_effect = [err_400, ok_resp]
+        agent.compression_enabled = True
+        error = Exception("Error code: 400 - {\'error\': {\'code\': \'1261\', \'message\': \'Prompt exceeds max length\'}}")
+        error.status_code = 400
+        agent.client.chat.completions.create.side_effect = [error]
         prefill = [
             {"role": "user", "content": "previous question"},
             {"role": "assistant", "content": "previous answer"},
@@ -4794,38 +4790,22 @@ class TestRunConversation:
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            mock_compress.return_value = (
-                [{"role": "user", "content": "hello"}],
-                "compressed system prompt",
-            )
             result = agent.run_conversation("hello", conversation_history=prefill)
 
-        mock_compress.assert_called_once()
-        assert result["final_response"] == "Recovered after compression"
-        assert result["completed"] is True
+        mock_compress.assert_not_called()
+        assert result["turn_exit_reason"] == "compression_hard_blocked"
+        assert result["final_response"] is None
 
-    def test_minimax_delta_overflow_keeps_known_context_length(self, agent):
-        """MiniMax reports overflow deltas like 'limit (2013)' without the real window.
-
-        Keep the known 204,800-token window and compress instead of probing down
-        to the generic 128K fallback tier.
-        """
+    def test_minimax_delta_overflow_preserves_known_context_length(self, agent):
         self._setup_agent(agent)
-        agent.compression_enabled = True  # this test verifies overflow→compression fires
+        agent.compression_enabled = True
         agent.provider = "minimax"
         agent.model = "MiniMax-M2.7-highspeed"
         agent.base_url = "https://api.minimax.io/anthropic"
         agent.context_compressor.context_length = 204_800
-        agent.context_compressor.threshold_tokens = int(
-            agent.context_compressor.context_length * agent.context_compressor.threshold_percent
-        )
-
-        err_400 = Exception(
-            "HTTP 400: invalid params, context window exceeds limit (2013)"
-        )
-        err_400.status_code = 400
-        ok_resp = _mock_response(content="Recovered after compression", finish_reason="stop")
-        agent.client.chat.completions.create.side_effect = [err_400, ok_resp]
+        error = Exception("HTTP 400: invalid params, context window exceeds limit (2013)")
+        error.status_code = 400
+        agent.client.chat.completions.create.side_effect = [error]
         prefill = [
             {"role": "user", "content": "previous question"},
             {"role": "assistant", "content": "previous answer"},
@@ -4837,41 +4817,24 @@ class TestRunConversation:
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            mock_compress.return_value = (
-                [{"role": "user", "content": "hello"}],
-                "compressed system prompt",
-            )
             result = agent.run_conversation("hello", conversation_history=prefill)
 
-        mock_compress.assert_called_once()
+        mock_compress.assert_not_called()
         assert agent.context_compressor.context_length == 204_800
         assert agent.context_compressor._context_probed is False
-        assert result["final_response"] == "Recovered after compression"
-        assert result["completed"] is True
+        assert result["turn_exit_reason"] == "compression_hard_blocked"
+        assert result["final_response"] is None
 
-    def test_non_minimax_overflow_without_provider_limit_keeps_context(self, agent):
-        """Generic overflow without a provider-reported max must NOT probe-step down.
-
-        Previously a 200K configured window would silently drop to the 128K probe
-        tier on a generic overflow error.  Now we keep the configured window and
-        rely on compression — see #33669 / PR #33826.
-        """
+    def test_non_minimax_overflow_without_provider_limit_preserves_context(self, agent):
         self._setup_agent(agent)
-        agent.compression_enabled = True  # this test verifies overflow→compression fires
+        agent.compression_enabled = True
         agent.provider = "openrouter"
         agent.model = "some/unknown-model"
         agent.base_url = "https://openrouter.ai/api/v1"
         agent.context_compressor.context_length = 200_000
-        agent.context_compressor.threshold_tokens = int(
-            agent.context_compressor.context_length * agent.context_compressor.threshold_percent
-        )
-
-        err_400 = Exception(
-            "HTTP 400: invalid params, context window exceeds limit (2013)"
-        )
-        err_400.status_code = 400
-        ok_resp = _mock_response(content="Recovered after compression", finish_reason="stop")
-        agent.client.chat.completions.create.side_effect = [err_400, ok_resp]
+        error = Exception("HTTP 400: invalid params, context window exceeds limit (2013)")
+        error.status_code = 400
+        agent.client.chat.completions.create.side_effect = [error]
         prefill = [
             {"role": "user", "content": "previous question"},
             {"role": "assistant", "content": "previous answer"},
@@ -4883,17 +4846,12 @@ class TestRunConversation:
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            mock_compress.return_value = (
-                [{"role": "user", "content": "hello"}],
-                "compressed system prompt",
-            )
             result = agent.run_conversation("hello", conversation_history=prefill)
 
-        mock_compress.assert_called_once()
-        # Context length preserved — no guessed probe-tier step-down.
+        mock_compress.assert_not_called()
         assert agent.context_compressor.context_length == 200_000
-        assert result["final_response"] == "Recovered after compression"
-        assert result["completed"] is True
+        assert result["turn_exit_reason"] == "compression_hard_blocked"
+        assert result["final_response"] is None
 
     def test_length_finish_reason_requests_continuation(self, agent):
         """Normal truncation (partial real content) triggers continuation."""

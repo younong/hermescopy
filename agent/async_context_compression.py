@@ -1,4 +1,4 @@
-"""Speculative background preparation for built-in context compression."""
+"""Durable background preparation for built-in context compression."""
 
 from __future__ import annotations
 
@@ -6,16 +6,21 @@ import copy
 import hashlib
 import json
 import logging
+import os
 import threading
 import time
-from concurrent.futures import Future
-from dataclasses import dataclass
+import uuid
+from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Any, Optional
 
+from agent.context_compressor import PreparedCompression
 from agent.conversation_compression import commit_prepared_context
 
 logger = logging.getLogger(__name__)
+
+_PREPARATION_DEADLINE_SECONDS = 360.0
+_PREPARATION_LEASE_SECONDS = 420.0
 
 
 class AsyncCompressionAction(Enum):
@@ -25,7 +30,6 @@ class AsyncCompressionAction(Enum):
     COMMITTED = "committed"
     FAILED = "failed"
     STALE = "stale"
-    SYNCHRONOUS_FALLBACK = "synchronous_fallback"
 
 
 @dataclass(frozen=True)
@@ -45,17 +49,6 @@ class PreparedSnapshot:
     compression: Any
 
 
-@dataclass
-class _PreparationRecord:
-    session_id: str
-    model: str
-    snapshot_length: int
-    snapshot_digest: str
-    future: Optional[Future] = None
-    stale: bool = False
-    stale_reason: str = ""
-
-
 @dataclass(frozen=True)
 class AsyncCompressionOutcome:
     action: AsyncCompressionAction
@@ -63,10 +56,8 @@ class AsyncCompressionOutcome:
     system_prompt: str
 
 
-_registry: dict[tuple[str, str], _PreparationRecord] = {}
-_registry_lock = threading.Lock()
-_executor = None
-_executor_lock = threading.Lock()
+_orchestrators: dict[str, "_CompressionOrchestrator"] = {}
+_orchestrators_lock = threading.Lock()
 
 
 def _session_key(agent: Any) -> tuple[str, str]:
@@ -85,6 +76,91 @@ def _message_digest(messages: list) -> str:
         default=str,
     ).encode("utf-8", errors="replace")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _route_fingerprint(*parts: Any) -> str:
+    """Hash a route identity without persisting provider URLs or credentials."""
+    identity = "\x1f".join(str(part or "").strip().lower() for part in parts)
+    return hashlib.sha256(identity.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _main_route_fingerprint(agent: Any) -> str:
+    compressor = agent.context_compressor
+    return _route_fingerprint(
+        getattr(agent, "provider", None) or getattr(compressor, "provider", None),
+        getattr(agent, "base_url", None) or getattr(compressor, "base_url", None),
+        getattr(agent, "model", None) or getattr(compressor, "model", None),
+        getattr(agent, "api_mode", None) or getattr(compressor, "api_mode", None),
+    )
+
+
+def _auxiliary_route(agent: Any) -> tuple[str, Optional[int]]:
+    """Return the configured auxiliary identity without provider I/O.
+
+    Automatic turn handling must remain non-blocking. The detached compressor
+    resolves authoritative capacity in its background worker before chunking.
+    """
+    compressor = agent.context_compressor
+    return (
+        _route_fingerprint(
+            getattr(compressor, "provider", None),
+            getattr(compressor, "base_url", None),
+            getattr(compressor, "summary_model", None)
+            or getattr(compressor, "model", None),
+            getattr(compressor, "api_mode", None),
+        ),
+        None,
+    )
+
+
+def _emit_compression_status(agent: Any, kind: str, message: str) -> None:
+    emit = getattr(agent, "_emit_status", None)
+    if emit is None:
+        return
+    try:
+        emit(message, kind=kind)
+    except Exception:
+        logger.debug("compression status callback failed", exc_info=True)
+
+
+def _serialize_prepared(prepared: PreparedSnapshot) -> str:
+    return json.dumps(
+        {
+            "session_key": list(prepared.session_key),
+            "session_id": prepared.session_id,
+            "model": prepared.model,
+            "snapshot_length": prepared.snapshot_length,
+            "snapshot_digest": prepared.snapshot_digest,
+            "compression": asdict(prepared.compression),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _deserialize_prepared(payload: str) -> PreparedSnapshot:
+    value = json.loads(payload)
+    compression = value["compression"]
+    return PreparedSnapshot(
+        session_key=tuple(value["session_key"]),
+        session_id=str(value["session_id"]),
+        model=str(value["model"]),
+        snapshot_length=int(value["snapshot_length"]),
+        snapshot_digest=str(value["snapshot_digest"]),
+        compression=PreparedCompression(
+            compressed_messages=compression["compressed_messages"],
+            compressor_state=compression["compressor_state"],
+            aborted=bool(compression["aborted"]),
+            applied=bool(compression.get("applied", True)),
+            auxiliary_route_fingerprint=compression.get(
+                "auxiliary_route_fingerprint"
+            ),
+            auxiliary_context_length=compression.get(
+                "auxiliary_context_length"
+            ),
+            auxiliary_input_budget=compression.get("auxiliary_input_budget"),
+        ),
+    )
 
 
 def prepared_snapshot_is_current(prepared: PreparedSnapshot, agent: Any, messages: list) -> bool:
@@ -109,66 +185,238 @@ def compression_thresholds(agent: Any) -> CompressionThresholds:
     configured_prepare = int(
         usable * float(getattr(agent, "compression_prepare_threshold", 0.50))
     )
-    # The live compressor threshold carries model/provider route overrides.
-    # A user may raise async preparation above that floor. Auxiliary-model
-    # feasibility may then impose a lower safety cap so the detached summary
-    # request never exceeds the model selected to produce it.
     prepare = max(
         int(getattr(compressor, "threshold_tokens", 0) or 0),
         configured_prepare,
     )
-    feasibility_cap = getattr(
-        agent,
-        "_compression_prepare_token_cap",
-        None,
-    )
+    feasibility_cap = getattr(agent, "_compression_prepare_token_cap", None)
     if feasibility_cap is not None:
         prepare = min(prepare, max(1, int(feasibility_cap)))
     commit = max(
         prepare,
-        int(
-            usable
-            * float(getattr(agent, "compression_commit_threshold", 0.80))
-        ),
+        int(usable * float(getattr(agent, "compression_commit_threshold", 0.80))),
     )
     emergency = max(
         commit,
-        int(
-            usable
-            * float(getattr(agent, "compression_emergency_threshold", 0.88))
-        ),
+        int(usable * float(getattr(agent, "compression_emergency_threshold", 0.88))),
     )
-    return CompressionThresholds(
-        prepare=prepare,
-        commit=commit,
-        emergency=emergency,
-    )
+    return CompressionThresholds(prepare=prepare, commit=commit, emergency=emergency)
 
 
 def async_compression_enabled(agent: Any) -> bool:
+    db = getattr(agent, "_session_db", None)
     return bool(
         getattr(agent, "compression_enabled", True)
-        and getattr(agent, "compression_async_prepare", False)
         and getattr(agent, "_using_builtin_context_compressor", False)
+        and getattr(agent, "session_id", "")
+        and db is not None
+        and hasattr(db, "enqueue_compression_job")
         and hasattr(getattr(agent, "context_compressor", None), "prepare_compression")
     )
 
 
-def _get_executor(agent: Any):
-    injected = getattr(agent, "_async_compression_executor", None)
-    if injected is not None:
-        return injected
-    global _executor
-    if _executor is None:
-        with _executor_lock:
-            if _executor is None:
-                from tools.daemon_pool import DaemonThreadPoolExecutor
+class _CompressionOrchestrator:
+    def __init__(self, db_path: str) -> None:
+        from tools.daemon_pool import DaemonThreadPoolExecutor
 
-                _executor = DaemonThreadPoolExecutor(
-                    max_workers=1,
-                    thread_name_prefix="context-prepare",
+        self.db_path = db_path
+        self.executor = DaemonThreadPoolExecutor(
+            max_workers=4,
+            thread_name_prefix="context-prepare",
+        )
+        self.active: set[tuple[str, str]] = set()
+        self.lock = threading.Lock()
+        self.holder = f"{os.getpid()}:{uuid.uuid4().hex}"
+
+    def submit(self, agent: Any, session_id: str, job_id: str) -> None:
+        key = (session_id, job_id)
+        with self.lock:
+            if key in self.active:
+                return
+            self.active.add(key)
+        self.executor.submit(self._run, agent, session_id, job_id, key)
+
+    def _run(
+        self,
+        agent: Any,
+        session_id: str,
+        job_id: str,
+        active_key: tuple[str, str],
+    ) -> None:
+        db = agent._session_db
+        try:
+            claimed = db.claim_compression_job(
+                session_id=session_id,
+                job_id=job_id,
+                holder=self.holder,
+                lease_seconds=_PREPARATION_LEASE_SECONDS,
+            )
+            if claimed is None:
+                return
+            snapshot_payload = claimed.get("snapshot_payload")
+            if not snapshot_payload:
+                db.mark_compression_job_stale(
+                    session_id,
+                    job_id,
+                    failure_code="snapshot_unavailable",
                 )
-    return _executor
+                return
+            snapshot = json.loads(snapshot_payload)
+            lease_version = int(claimed["lease_version"])
+            deadline_at = float(
+                claimed.get("deadline_at")
+                or time.time() + _PREPARATION_DEADLINE_SECONDS
+            )
+            if deadline_at <= time.time():
+                db.mark_compression_job_degraded(
+                    session_id=session_id,
+                    job_id=job_id,
+                    holder=self.holder,
+                    lease_version=lease_version,
+                    failure_code="deadline_exceeded",
+                )
+                _emit_compression_status(
+                    agent,
+                    "compression.degraded",
+                    "Context compression preparation expired without changing the session.",
+                )
+                return
+            if claimed.get("main_route_fingerprint") != _main_route_fingerprint(agent):
+                db.mark_compression_job_stale(session_id, job_id)
+                return
+            auxiliary_fingerprint, _ = _auxiliary_route(agent)
+            if claimed.get("auxiliary_route_fingerprint") != auxiliary_fingerprint:
+                db.mark_compression_job_stale(session_id, job_id)
+                return
+
+            def checkpoint(chunk_cursor: int, rolling_summary: str) -> None:
+                if not db.refresh_compression_job_lease(
+                    session_id=session_id,
+                    job_id=job_id,
+                    holder=self.holder,
+                    lease_version=lease_version,
+                    lease_seconds=_PREPARATION_LEASE_SECONDS,
+                ):
+                    raise RuntimeError("compression job lease lost during refresh")
+                if not db.checkpoint_compression_job(
+                    session_id=session_id,
+                    job_id=job_id,
+                    holder=self.holder,
+                    lease_version=lease_version,
+                    chunk_cursor=chunk_cursor,
+                    rolling_summary=rolling_summary,
+                ):
+                    raise RuntimeError("compression job lease lost during checkpoint")
+
+            prepared = _prepare(
+                agent.context_compressor,
+                snapshot,
+                int(claimed.get("main_budget_tokens") or 0),
+                _session_key(agent),
+                session_id,
+                str(getattr(agent, "model", "") or ""),
+                str(claimed["snapshot_digest"]),
+                chunk_cursor=int(claimed.get("chunk_cursor") or 0),
+                rolling_summary=claimed.get("rolling_summary"),
+                checkpoint=checkpoint,
+                deadline_at=deadline_at,
+            )
+            if prepared.compression.aborted or not prepared.compression.applied:
+                failure_code = "summary_failure"
+                error = str(
+                    prepared.compression.compressor_state.get(
+                        "_last_summary_error", ""
+                    )
+                    or ""
+                ).lower()
+                if "atomic tool group" in error:
+                    db.mark_compression_job_degraded(
+                        session_id=session_id,
+                        job_id=job_id,
+                        holder=self.holder,
+                        lease_version=lease_version,
+                        failure_code="atomic_group_too_large",
+                    )
+                    _emit_compression_status(
+                        agent,
+                        "compression.degraded",
+                        "Context compression cannot safely summarize one tool exchange. No messages were dropped.",
+                    )
+                else:
+                    db.mark_compression_job_cooldown(
+                        session_id=session_id,
+                        job_id=job_id,
+                        holder=self.holder,
+                        lease_version=lease_version,
+                        retry_at=time.time() + 60.0,
+                        failure_code=failure_code,
+                    )
+                    _emit_compression_status(
+                        agent,
+                        "compression.cooldown",
+                        "Context compression is cooling down after a temporary preparation failure.",
+                    )
+                return
+            ready = db.mark_compression_job_ready(
+                session_id=session_id,
+                job_id=job_id,
+                holder=self.holder,
+                lease_version=lease_version,
+                prepared_payload=_serialize_prepared(prepared),
+                auxiliary_route_fingerprint=(
+                    prepared.compression.auxiliary_route_fingerprint
+                ),
+                auxiliary_context_length=(
+                    prepared.compression.auxiliary_context_length
+                ),
+                auxiliary_input_budget=(
+                    prepared.compression.auxiliary_input_budget
+                ),
+            )
+            if ready:
+                _emit_compression_status(
+                    agent,
+                    "compression.ready",
+                    "Context compression is prepared and ready to apply.",
+                )
+        except Exception as exc:
+            logger.warning(
+                "durable compression preparation failed: session=%s error_type=%s",
+                session_id,
+                type(exc).__name__,
+            )
+            job = db.get_compression_job(session_id)
+            if job and job["job_id"] == job_id and job["state"] == "preparing":
+                db.mark_compression_job_cooldown(
+                    session_id=session_id,
+                    job_id=job_id,
+                    holder=self.holder,
+                    lease_version=int(job["lease_version"]),
+                    retry_at=time.time() + min(900.0, 30.0 * 2 ** min(5, int(job["attempt_count"]))),
+                    failure_code="preparation_failure",
+                )
+                _emit_compression_status(
+                    agent,
+                    "compression.cooldown",
+                    "Context compression is cooling down after a temporary preparation failure.",
+                )
+        finally:
+            with self.lock:
+                self.active.discard(active_key)
+
+    def close(self) -> None:
+        self.executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _orchestrator(agent: Any) -> _CompressionOrchestrator:
+    db = agent._session_db
+    path = str(getattr(db, "db_path", None) or getattr(db, "_db_path", None) or id(db))
+    with _orchestrators_lock:
+        orchestrator = _orchestrators.get(path)
+        if orchestrator is None:
+            orchestrator = _CompressionOrchestrator(path)
+            _orchestrators[path] = orchestrator
+        return orchestrator
 
 
 def _prepare(
@@ -179,12 +427,20 @@ def _prepare(
     session_id: str,
     model: str,
     snapshot_digest: str,
+    *,
+    chunk_cursor: int = 0,
+    rolling_summary: Optional[str] = None,
+    checkpoint: Any = None,
+    deadline_at: Optional[float] = None,
 ) -> PreparedSnapshot:
-    deadline = time.monotonic() + 360.0
+    remaining = max(0.0, float(deadline_at or time.time()) - time.time())
     compression = compressor.prepare_compression(
         snapshot,
         current_tokens=current_tokens,
-        deadline_monotonic=deadline,
+        deadline_monotonic=time.monotonic() + remaining,
+        chunk_cursor=chunk_cursor,
+        rolling_summary=rolling_summary,
+        checkpoint=checkpoint,
     )
     return PreparedSnapshot(
         session_key=session_key,
@@ -196,43 +452,7 @@ def _prepare(
     )
 
 
-def _start(agent: Any, messages: list, current_tokens: int) -> _PreparationRecord:
-    key = _session_key(agent)
-    snapshot = copy.deepcopy(messages)
-    digest = _message_digest(snapshot)
-    record = _PreparationRecord(
-        session_id=str(getattr(agent, "session_id", "") or ""),
-        model=str(getattr(agent, "model", "") or ""),
-        snapshot_length=len(snapshot),
-        snapshot_digest=digest,
-    )
-    future = _get_executor(agent).submit(
-        _prepare,
-        agent.context_compressor,
-        snapshot,
-        current_tokens,
-        key,
-        record.session_id,
-        record.model,
-        digest,
-    )
-    record.future = future
-    _registry[key] = record
-    logger.info(
-        "async compression prepare started: session=%s messages=%d tokens=~%d",
-        record.session_id or "none",
-        len(snapshot),
-        current_tokens,
-    )
-    return record
-
-
-def invalidate_compression_runtime(
-    agent: Any,
-    *,
-    reason: str = "model changed",
-) -> None:
-    """Invalidate a snapshot and force auxiliary feasibility to be re-probed."""
+def invalidate_compression_runtime(agent: Any, *, reason: str = "model changed") -> None:
     invalidate_preparation(agent, reason=reason)
     agent._compression_feasibility_checked = False
     agent._compression_prepare_token_cap = None
@@ -240,37 +460,39 @@ def invalidate_compression_runtime(
 
 
 def invalidate_preparation(agent: Any, *, reason: str = "session changed") -> None:
-    key = _session_key(agent)
-    with _registry_lock:
-        record = _registry.get(key)
-        if record is None:
-            return
-        record.stale = True
-        record.stale_reason = reason
-        if record.future is not None:
-            record.future.cancel()
+    db = getattr(agent, "_session_db", None)
+    session_id = str(getattr(agent, "session_id", "") or "")
+    if db is not None and session_id and hasattr(db, "cancel_compression_job"):
+        db.cancel_compression_job(session_id, failure_code="invalidated")
 
 
-def _sync_fallback(
-    agent: Any,
-    messages: list,
-    system_message: str,
-    current_tokens: int,
-    task_id: str,
-    emit_abort_warning: bool,
-) -> AsyncCompressionOutcome:
-    compressed, prompt = agent._compress_context(
-        messages,
-        system_message,
-        approx_tokens=current_tokens,
-        task_id=task_id,
-        emit_abort_warning=emit_abort_warning,
+def _enqueue(agent: Any, messages: list, current_tokens: int) -> dict[str, Any]:
+    db = agent._session_db
+    session_id = str(agent.session_id)
+    snapshot = copy.deepcopy(messages)
+    digest = _message_digest(snapshot)
+    auxiliary_fingerprint, auxiliary_budget = _auxiliary_route(agent)
+    job = db.enqueue_compression_job(
+        session_id=session_id,
+        job_id=uuid.uuid4().hex,
+        fence_id=uuid.uuid4().hex,
+        snapshot_message_id=None,
+        snapshot_message_count=len(snapshot),
+        snapshot_digest=digest,
+        snapshot_payload=json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), default=str),
+        main_route_fingerprint=_main_route_fingerprint(agent),
+        auxiliary_route_fingerprint=auxiliary_fingerprint,
+        main_budget_tokens=current_tokens,
+        auxiliary_budget_tokens=auxiliary_budget,
+        deadline_at=time.time() + _PREPARATION_DEADLINE_SECONDS,
     )
-    return AsyncCompressionOutcome(
-        AsyncCompressionAction.SYNCHRONOUS_FALLBACK,
-        compressed,
-        prompt,
+    _emit_compression_status(
+        agent,
+        "compression.preparing",
+        "Preparing context compression in the background.",
     )
+    _orchestrator(agent).submit(agent, session_id, str(job["job_id"]))
+    return job
 
 
 def maybe_handle_async_compression(
@@ -282,22 +504,16 @@ def maybe_handle_async_compression(
     task_id: str = "default",
     emit_abort_warning: bool = True,
 ) -> AsyncCompressionOutcome:
-    """Advance prepare/commit state at a caller-provided safe boundary."""
+    """Enqueue or observe durable preparation without blocking the turn."""
     if not async_compression_enabled(agent):
         return AsyncCompressionOutcome(AsyncCompressionAction.NONE, messages, system_message)
 
     thresholds = compression_thresholds(agent)
-    # Probe once the transcript reaches the lowest auxiliary context Hermes
-    # supports. Waiting until the configured prepare threshold would discover a
-    # smaller auxiliary window too late; probing earlier would add startup cost
-    # to short sessions that never approach compression pressure.
     if not getattr(agent, "_compression_feasibility_checked", False):
         from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
 
         if current_tokens >= min(thresholds.prepare, MINIMUM_CONTEXT_LENGTH):
-            from agent.conversation_compression import (
-                check_compression_model_feasibility,
-            )
+            from agent.conversation_compression import check_compression_model_feasibility
 
             check_compression_model_feasibility(agent)
             agent._compression_feasibility_checked = True
@@ -308,135 +524,80 @@ def maybe_handle_async_compression(
     if not agent.context_compressor.should_compress(current_tokens):
         return AsyncCompressionOutcome(AsyncCompressionAction.NONE, messages, system_message)
 
-    key = _session_key(agent)
-    with _registry_lock:
-        record = _registry.get(key)
-        stale_record = record is not None and record.stale
-        if stale_record:
-            _registry.pop(key, None)
-    if stale_record:
-        if current_tokens >= thresholds.emergency:
-            return _sync_fallback(
-                agent,
-                messages,
-                system_message,
-                current_tokens,
-                task_id,
-                emit_abort_warning,
-            )
-        return AsyncCompressionOutcome(
-            AsyncCompressionAction.STALE,
-            messages,
-            system_message,
-        )
-
-    if record is None:
-        with _registry_lock:
-            record = _registry.get(key)
-            stale_record = record is not None and record.stale
-            if record is None:
-                record = _start(agent, messages, current_tokens)
-            elif stale_record:
-                _registry.pop(key, None)
-        if stale_record:
-            if current_tokens >= thresholds.emergency:
-                return _sync_fallback(
-                    agent,
-                    messages,
-                    system_message,
-                    current_tokens,
-                    task_id,
-                    emit_abort_warning,
-                )
-            return AsyncCompressionOutcome(
-                AsyncCompressionAction.STALE,
-                messages,
-                system_message,
-            )
-
-    if record.future is None:
-        with _registry_lock:
-            _registry.pop(key, None)
-        return _sync_fallback(
-            agent, messages, system_message, current_tokens, task_id, emit_abort_warning
-        )
-
-    prepared: Optional[PreparedSnapshot] = None
-    if current_tokens >= thresholds.emergency:
-        try:
-            prepared = record.future.result(
-                timeout=float(getattr(agent, "compression_emergency_wait_seconds", 15.0))
-            )
-        except Exception as exc:
-            logger.warning("async compression emergency wait failed: %s", exc)
-            with _registry_lock:
-                _registry.pop(key, None)
-            return _sync_fallback(
-                agent, messages, system_message, current_tokens, task_id, emit_abort_warning
-            )
-    elif record.future.done():
-        try:
-            prepared = record.future.result()
-        except Exception as exc:
-            logger.warning("async compression preparation failed: %s", exc)
-            with _registry_lock:
-                _registry.pop(key, None)
+    db = agent._session_db
+    session_id = str(agent.session_id)
+    job = db.get_compression_job(session_id)
+    if job is None or job["state"] in {"completed", "cancelled", "stale", "degraded"}:
+        job = _enqueue(agent, messages, current_tokens)
+    elif job["state"] == "cooldown":
+        if float(job.get("retry_at") or 0) > time.time():
             return AsyncCompressionOutcome(AsyncCompressionAction.FAILED, messages, system_message)
-    else:
-        return AsyncCompressionOutcome(AsyncCompressionAction.PREPARING, messages, system_message)
+        if db.requeue_due_compression_job(session_id, str(job["job_id"])):
+            job = db.get_compression_job(session_id)
+        _orchestrator(agent).submit(agent, session_id, str(job["job_id"]))
+    elif job["state"] in {"queued", "preparing"}:
+        _orchestrator(agent).submit(agent, session_id, str(job["job_id"]))
 
-    if prepared is None:
-        return AsyncCompressionOutcome(AsyncCompressionAction.PREPARING, messages, system_message)
-    if not prepared_snapshot_is_current(prepared, agent, messages):
-        with _registry_lock:
-            _registry.pop(key, None)
-        if current_tokens >= thresholds.emergency:
-            return _sync_fallback(
-                agent, messages, system_message, current_tokens, task_id, emit_abort_warning
-            )
-        return AsyncCompressionOutcome(AsyncCompressionAction.STALE, messages, system_message)
-    if prepared.compression.aborted or not prepared.compression.applied:
-        with _registry_lock:
-            _registry.pop(key, None)
-        if current_tokens >= thresholds.emergency:
-            return _sync_fallback(
-                agent, messages, system_message, current_tokens, task_id, emit_abort_warning
-            )
-        return AsyncCompressionOutcome(AsyncCompressionAction.FAILED, messages, system_message)
-    if current_tokens < thresholds.commit:
-        return AsyncCompressionOutcome(AsyncCompressionAction.READY, messages, system_message)
-
-    try:
-        compressed, prompt = commit_prepared_context(
-            agent=agent,
-            messages=messages,
-            system_message=system_message,
-            prepared=prepared,
-            approx_tokens=current_tokens,
-            task_id=task_id,
-            emit_abort_warning=emit_abort_warning,
+    state = str(job["state"])
+    if state == "ready":
+        prepared_payload = job.get("prepared_payload")
+        if not prepared_payload:
+            db.mark_compression_job_stale(session_id, str(job["job_id"]))
+            return AsyncCompressionOutcome(AsyncCompressionAction.STALE, messages, system_message)
+        prepared = _deserialize_prepared(prepared_payload)
+        auxiliary_fingerprint, _ = _auxiliary_route(agent)
+        prepared_route = prepared.compression.auxiliary_route_fingerprint
+        persisted_route = job.get("prepared_auxiliary_route_fingerprint")
+        prepared_context_length = prepared.compression.auxiliary_context_length
+        prepared_input_budget = prepared.compression.auxiliary_input_budget
+        if (
+            job.get("main_route_fingerprint") != _main_route_fingerprint(agent)
+            or job.get("auxiliary_route_fingerprint") != auxiliary_fingerprint
+            or not prepared_route
+            or prepared_route != persisted_route
+            or prepared_context_length
+            != job.get("prepared_auxiliary_context_length")
+            or prepared_input_budget != job.get("prepared_auxiliary_input_budget")
+            or not prepared_snapshot_is_current(prepared, agent, messages)
+        ):
+            db.mark_compression_job_stale(session_id, str(job["job_id"]))
+            return AsyncCompressionOutcome(AsyncCompressionAction.STALE, messages, system_message)
+        if current_tokens < thresholds.commit:
+            return AsyncCompressionOutcome(AsyncCompressionAction.READY, messages, system_message)
+        holder = f"commit:{os.getpid()}:{threading.get_ident()}:{uuid.uuid4().hex}"
+        committing = db.claim_ready_compression_job(
+            session_id=session_id,
+            job_id=str(job["job_id"]),
+            fence_id=str(job["fence_id"]),
+            holder=holder,
         )
-    except ValueError:
-        with _registry_lock:
-            _registry.pop(key, None)
-        if current_tokens >= thresholds.emergency:
-            return _sync_fallback(
-                agent, messages, system_message, current_tokens, task_id, emit_abort_warning
+        if committing is None:
+            return AsyncCompressionOutcome(AsyncCompressionAction.PREPARING, messages, system_message)
+        try:
+            compressed, prompt = commit_prepared_context(
+                agent=agent,
+                messages=messages,
+                system_message=system_message,
+                prepared=prepared,
+                approx_tokens=current_tokens,
+                task_id=task_id,
+                emit_abort_warning=emit_abort_warning,
+                compression_job=committing,
             )
+        except (RuntimeError, ValueError):
+            db.mark_compression_job_stale(session_id, str(job["job_id"]))
+            return AsyncCompressionOutcome(AsyncCompressionAction.STALE, messages, system_message)
+        return AsyncCompressionOutcome(AsyncCompressionAction.COMMITTED, compressed, prompt)
+    if state in {"cooldown", "degraded"}:
+        return AsyncCompressionOutcome(AsyncCompressionAction.FAILED, messages, system_message)
+    if state in {"stale", "cancelled"}:
         return AsyncCompressionOutcome(AsyncCompressionAction.STALE, messages, system_message)
-
-    with _registry_lock:
-        _registry.pop(key, None)
-    return AsyncCompressionOutcome(AsyncCompressionAction.COMMITTED, compressed, prompt)
+    return AsyncCompressionOutcome(AsyncCompressionAction.PREPARING, messages, system_message)
 
 
 def _reset_async_compression_for_tests() -> None:
-    global _executor
-    with _registry_lock:
-        for record in _registry.values():
-            if record.future is not None:
-                record.future.cancel()
-        _registry.clear()
-    if _executor is not None:
-        _executor.shutdown(wait=False, cancel_futures=True)
-        _executor = None
+    with _orchestrators_lock:
+        orchestrators = tuple(_orchestrators.values())
+        _orchestrators.clear()
+    for orchestrator in orchestrators:
+        orchestrator.close()

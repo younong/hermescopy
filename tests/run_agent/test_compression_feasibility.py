@@ -57,8 +57,11 @@ def _make_agent(
 
     compressor = MagicMock(spec=ContextCompressor)
     compressor.context_length = main_context
+    compressor.max_tokens = 0
+    compressor.threshold_percent = threshold_percent
     compressor.threshold_tokens = int(main_context * threshold_percent)
     agent.context_compressor = compressor
+    agent.compression_prepare_threshold = threshold_percent
 
     return agent
 
@@ -114,7 +117,6 @@ def test_caps_raised_async_prepare_without_raising_sync_threshold(
 ):
     """A user-raised async trigger must still fit the auxiliary model."""
     agent = _make_agent(main_context=200_000, threshold_percent=0.50)
-    agent.compression_async_prepare = True
     agent.compression_prepare_threshold = 0.75
     mock_client = MagicMock()
     mock_client.base_url = "https://openrouter.ai/api/v1"

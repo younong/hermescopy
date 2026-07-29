@@ -896,12 +896,13 @@ class AIAgent:
             and getattr(self, "platform", "") == "cli"
         )
 
-    def _emit_status(self, message: str) -> None:
-        """Emit a lifecycle status message to both CLI and gateway channels.
+    def _emit_status(self, message: str, *, kind: str = "lifecycle") -> None:
+        """Emit a transient status to both CLI and structured gateway channels.
 
         CLI users see the message via ``_vprint(force=True)`` so it is always
-        visible regardless of verbose/quiet mode.  Gateway consumers receive
-        it through ``status_callback("lifecycle", ...)``.
+        visible regardless of verbose/quiet mode. Gateway consumers receive
+        the explicit ``kind`` through ``status_callback``; callers that do not
+        need a structured lifecycle retain the generic ``lifecycle`` default.
 
         This helper never raises — exceptions are swallowed so it cannot
         interrupt the retry/fallback logic.
@@ -912,7 +913,7 @@ class AIAgent:
             pass
         if self.status_callback:
             try:
-                self.status_callback("lifecycle", message)
+                self.status_callback(kind, message)
             except Exception:
                 logger.debug("status_callback error in _emit_status", exc_info=True)
 
