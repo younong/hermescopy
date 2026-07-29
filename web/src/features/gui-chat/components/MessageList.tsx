@@ -74,7 +74,7 @@ export function MessageList({
         });
       }
     }
-    if (state.statusLines.length > 0) result.push({ id: "status", kind: "status" });
+    if (state.compressionStatus || state.statusLines.length > 0) result.push({ id: "status", kind: "status" });
     return result;
   }, [state]);
 
@@ -240,6 +240,9 @@ export function MessageList({
                 ) : null;
               })() : (
                 <div className="space-y-1 text-xs text-text-tertiary">
+                  {state.compressionStatus ? (
+                    <div className="truncate">{state.compressionStatus.text}</div>
+                  ) : null}
                   {state.statusLines.slice(-3).map((line, index) => <div className="truncate" key={`${index}-${line}`}>{line}</div>)}
                 </div>
               )}

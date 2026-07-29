@@ -430,6 +430,11 @@ def build_turn_context(
                 tools=agent.tools or None,
             )
             _compressor = agent.context_compressor
+            _preflight_tokens = getattr(
+                _compressor,
+                "calibrated_prompt_tokens",
+                lambda tokens: tokens,
+            )(_preflight_tokens)
             _defer_preflight = getattr(
                 _compressor,
                 "should_defer_preflight_to_real_usage",
@@ -469,9 +474,7 @@ def build_turn_context(
                     _compressor.threshold_tokens,
                     int(_compression_cooldown.get("remaining_seconds", 0.0)),
                 )
-            elif getattr(agent, "compression_async_prepare", False) and getattr(
-                agent, "_using_builtin_context_compressor", False
-            ):
+            elif getattr(agent, "_using_builtin_context_compressor", False):
                 from agent.async_context_compression import (
                     AsyncCompressionAction,
                     maybe_handle_async_compression,
@@ -484,10 +487,7 @@ def build_turn_context(
                     current_tokens=_preflight_tokens,
                     task_id=effective_task_id,
                 )
-                if _async_outcome.action in {
-                    AsyncCompressionAction.COMMITTED,
-                    AsyncCompressionAction.SYNCHRONOUS_FALLBACK,
-                }:
+                if _async_outcome.action is AsyncCompressionAction.COMMITTED:
                     messages = _async_outcome.messages
                     active_system_prompt = _async_outcome.system_prompt
                     conversation_history = conversation_history_after_compression(

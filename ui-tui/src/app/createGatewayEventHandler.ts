@@ -29,6 +29,16 @@ const NO_PROVIDER_RE = /\bNo (?:LLM|inference) provider configured\b/i
 
 const statusFromBusy = () => (getUiState().busy ? 'running…' : 'ready')
 
+const COMPRESSION_STATUS_KINDS = new Set([
+  'compression.blocked',
+  'compression.completed',
+  'compression.cooldown',
+  'compression.degraded',
+  'compression.preparing',
+  'compression.ready'
+])
+const COMPRESSION_STATUS_CLEARS_BUSY = new Set(['compression.completed', 'compression.ready'])
+
 const applySkin = (s: GatewaySkin) =>
   patchUiState({
     theme: fromSkin(
@@ -483,13 +493,17 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           return
         }
 
-        setStatus(p.text)
-
-        if (p.kind === 'compressing') {
-          sys(p.text)
+        if (p.kind && COMPRESSION_STATUS_KINDS.has(p.kind)) {
+          if (COMPRESSION_STATUS_CLEARS_BUSY.has(p.kind)) {
+            setStatus(statusFromBusy())
+          } else {
+            setStatus(p.text)
+          }
 
           return
         }
+
+        setStatus(p.text)
 
         if (!p.kind || p.kind === 'status') {
           return

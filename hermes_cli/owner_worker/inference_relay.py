@@ -12,11 +12,14 @@ import base64
 import json
 import logging
 import os
+import queue
 import socket
 import struct
 import threading
 import time
-from dataclasses import dataclass
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
@@ -26,9 +29,16 @@ from agent.stream_diag import flatten_exception_chain, stream_diag_init
 from hermes_cli.dashboard_auth.authority import AuthorityStore, AuthorizationRejected, OwnerWorkerAuthorityLease, WorkerLeaseState
 from hermes_cli.deployment_inference import DeploymentInferencePolicy
 
+_PROTOCOL_VERSION = 1
 _MAX_FRAME_BYTES = 64 * 1024 * 1024
+_MAX_AGGREGATE_REQUEST_BYTES = 64 * 1024 * 1024
 _RELAY_CONNECT_TIMEOUT_SECONDS = 30.0
 _RELAY_READ_TIMEOUT_SECONDS = 120.0
+_RELAY_MAX_DEADLINE_SECONDS = 150.0
+_RELAY_DEADLINE_HEADER = "x-hermes-relay-deadline-seconds"
+_MAX_CONCURRENT_BROKER_REQUESTS = 8
+_MAX_CONCURRENT_WORKER_REQUESTS = 8
+_MAX_PENDING_RESPONSE_FRAMES = 16
 _ALLOWED_PATHS = frozenset({"/v1/chat/completions", "/v1/messages"})
 _HOP_BY_HOP_HEADERS = frozenset({
     "authorization",
@@ -37,6 +47,7 @@ _HOP_BY_HOP_HEADERS = frozenset({
     "content-length",
     "proxy-authorization",
     "transfer-encoding",
+    _RELAY_DEADLINE_HEADER,
 })
 _RELAY_DIAG_HEADERS = (
     "cf-ray",
@@ -133,11 +144,42 @@ def _recv_frame(conn: socket.socket) -> dict[str, Any]:
 
 
 @dataclass
+class _BrokerRequest:
+    body_bytes: int
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    response: Any = None
+
+    def cancel(self) -> None:
+        self.cancelled.set()
+        if self.response is not None:
+            try:
+                self.response.close()
+            except Exception:
+                pass
+
+
+@dataclass
 class _RelayPeer:
     lease: OwnerWorkerAuthorityLease
     connection: socket.socket
-    lock: threading.Lock
+    send_lock: threading.Lock
     thread: threading.Thread
+    executor: ThreadPoolExecutor
+    slots: threading.BoundedSemaphore
+    requests: dict[str, _BrokerRequest] = field(default_factory=dict)
+    requests_lock: threading.Lock = field(default_factory=threading.Lock)
+    request_bytes: int = 0
+    handshake_complete: threading.Event = field(default_factory=threading.Event)
+
+
+@dataclass
+class _WorkerRequest:
+    frames: queue.Queue[dict[str, Any] | DeploymentInferenceRelayError] = field(
+        default_factory=lambda: queue.Queue(maxsize=_MAX_PENDING_RESPONSE_FRAMES)
+    )
+    failed: threading.Event = field(default_factory=threading.Event)
+    next_sequence: int = 0
+    state: str = "awaiting_start"
 
 
 class DeploymentInferenceBroker:
@@ -173,7 +215,17 @@ class DeploymentInferenceBroker:
         parent.settimeout(None)
         key = self._key(lease)
         thread = threading.Thread(target=self._serve_peer, args=(key,), daemon=True, name=f"inference-relay-{lease.worker_generation}")
-        peer = _RelayPeer(lease=lease, connection=parent, lock=threading.Lock(), thread=thread)
+        peer = _RelayPeer(
+            lease=lease,
+            connection=parent,
+            send_lock=threading.Lock(),
+            thread=thread,
+            executor=ThreadPoolExecutor(
+                max_workers=_MAX_CONCURRENT_BROKER_REQUESTS,
+                thread_name_prefix="inference-relay-request",
+            ),
+            slots=threading.BoundedSemaphore(_MAX_CONCURRENT_BROKER_REQUESTS),
+        )
         with self._lock:
             if self._closed or key in self._peers:
                 parent.close()
@@ -216,16 +268,25 @@ class DeploymentInferenceBroker:
                 peer.lease = lease
                 self._peers[self._key(lease)] = peer
 
+    @staticmethod
+    def _cancel_peer_requests(peer: _RelayPeer) -> None:
+        with peer.requests_lock:
+            requests = tuple(peer.requests.values())
+        for request in requests:
+            request.cancel()
+
     def revoke(self, lease: OwnerWorkerAuthorityLease) -> None:
         """Immediately close a relay endpoint once its generation drains."""
         with self._lock:
             peer = self._peers.pop(self._key(lease), None)
         if peer is not None:
+            self._cancel_peer_requests(peer)
             try:
                 peer.connection.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
             peer.connection.close()
+            peer.executor.shutdown(wait=False, cancel_futures=True)
 
     def close(self) -> None:
         with self._lock:
@@ -233,11 +294,60 @@ class DeploymentInferenceBroker:
             peers = tuple(self._peers.values())
             self._peers.clear()
         for peer in peers:
+            self._cancel_peer_requests(peer)
             try:
                 peer.connection.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
             peer.connection.close()
+            peer.executor.shutdown(wait=False, cancel_futures=True)
+
+    @staticmethod
+    def _send_peer_frame(peer: _RelayPeer, frame: dict[str, Any]) -> None:
+        with peer.send_lock:
+            _send_frame(peer.connection, frame)
+
+    def _dispatch_request(
+        self,
+        peer: _RelayPeer,
+        request_id: str,
+        request: dict[str, Any],
+        broker_request: _BrokerRequest,
+    ) -> None:
+        try:
+            sequence = 0
+
+            def emit(frame: dict[str, Any]) -> None:
+                nonlocal sequence
+                if broker_request.cancelled.is_set():
+                    raise DeploymentInferenceRelayError("relay request was cancelled")
+                self._send_peer_frame(peer, {
+                    **frame,
+                    "request_id": request_id,
+                    "sequence": sequence,
+                })
+                sequence += 1
+
+            try:
+                self._stream_request(
+                    peer.lease,
+                    request,
+                    emit,
+                    broker_request=broker_request,
+                )
+            except (AuthorizationRejected, DeploymentInferenceRelayError) as exc:
+                if not broker_request.cancelled.is_set():
+                    emit({
+                        "type": "error",
+                        "message": str(exc),
+                    })
+        except (DeploymentInferenceRelayError, OSError):
+            pass
+        finally:
+            with peer.requests_lock:
+                peer.requests.pop(request_id, None)
+                peer.request_bytes -= broker_request.body_bytes
+            peer.slots.release()
 
     def _serve_peer(self, key: tuple[str, int, str, int, int]) -> None:
         with self._lock:
@@ -245,23 +355,68 @@ class DeploymentInferenceBroker:
         if peer is None:
             return
         try:
+            hello = _recv_frame(peer.connection)
+            if hello != {"type": "hello", "version": _PROTOCOL_VERSION}:
+                raise DeploymentInferenceRelayError("relay protocol handshake is invalid")
+            self._send_peer_frame(
+                peer,
+                {"type": "hello_ack", "version": _PROTOCOL_VERSION},
+            )
+            peer.handshake_complete.set()
             while True:
-                request = _recv_frame(peer.connection)
-                with peer.lock:
-                    try:
-                        self._stream_request(
-                            peer.lease,
-                            request,
-                            lambda frame: _send_frame(peer.connection, frame),
-                        )
-                    except DeploymentInferenceRelayError as exc:
-                        _send_frame(peer.connection, {
-                            "type": "error",
-                            "message": str(exc),
-                        })
+                frame = _recv_frame(peer.connection)
+                request_id = frame.get("request_id")
+                if not isinstance(request_id, str) or not request_id:
+                    raise DeploymentInferenceRelayError("relay request identifier is invalid")
+                frame_type = frame.get("type")
+                if frame_type == "cancel":
+                    with peer.requests_lock:
+                        request = peer.requests.get(request_id)
+                    if request is not None:
+                        request.cancel()
+                    continue
+                if frame_type != "request_start":
+                    raise DeploymentInferenceRelayError("relay frame type is invalid")
+                body_bytes = len(str(frame.get("body") or ""))
+                if not peer.slots.acquire(blocking=False):
+                    self._send_peer_frame(peer, {
+                        "type": "error",
+                        "request_id": request_id,
+                        "sequence": 0,
+                        "message": "relay request capacity is exhausted",
+                    })
+                    continue
+                with peer.requests_lock:
+                    if (
+                        request_id in peer.requests
+                        or peer.request_bytes + body_bytes > _MAX_AGGREGATE_REQUEST_BYTES
+                    ):
+                        admitted = False
+                    else:
+                        broker_request = _BrokerRequest(body_bytes=body_bytes)
+                        peer.requests[request_id] = broker_request
+                        peer.request_bytes += body_bytes
+                        admitted = True
+                if not admitted:
+                    peer.slots.release()
+                    self._send_peer_frame(peer, {
+                        "type": "error",
+                        "request_id": request_id,
+                        "sequence": 0,
+                        "message": "relay request admission is unavailable",
+                    })
+                    continue
+                peer.executor.submit(
+                    self._dispatch_request,
+                    peer,
+                    request_id,
+                    frame,
+                    broker_request,
+                )
         except (DeploymentInferenceRelayError, OSError):
             pass
         finally:
+            self._cancel_peer_requests(peer)
             with self._lock:
                 for candidate_key, candidate in tuple(self._peers.items()):
                     if candidate is peer:
@@ -271,16 +426,13 @@ class DeploymentInferenceBroker:
                 peer.connection.close()
             except OSError:
                 pass
+            peer.executor.shutdown(wait=False, cancel_futures=True)
 
     def _request_parts(
         self,
         lease: OwnerWorkerAuthorityLease,
         request: dict[str, Any],
     ) -> tuple[str, bytes, dict[str, str]]:
-        try:
-            self._authority_store.assert_worker_lease(lease, states=frozenset({WorkerLeaseState.ACTIVE}))
-        except AuthorizationRejected as exc:
-            raise DeploymentInferenceRelayError("relay worker lease is not active") from exc
         method = str(request.get("method") or "").upper()
         path = str(request.get("path") or "")
         if method != "POST" or path not in _ALLOWED_PATHS:
@@ -303,6 +455,15 @@ class DeploymentInferenceBroker:
             for name, value in incoming_headers.items()
             if str(name).lower() not in _HOP_BY_HOP_HEADERS
         }
+        try:
+            self._authority_store.assert_worker_lease(
+                lease,
+                states=frozenset({WorkerLeaseState.ACTIVE}),
+            )
+        except AuthorizationRejected as exc:
+            raise DeploymentInferenceRelayError("relay worker lease is not active") from exc
+        # Resolve the credential only after all untrusted request validation and
+        # the exact durable ACTIVE lease check have succeeded.
         runtime = self._policy.resolve_runtime()
         if self._policy.api_mode == "anthropic_messages":
             headers["x-api-key"] = str(runtime["api_key"])
@@ -345,6 +506,8 @@ class DeploymentInferenceBroker:
         lease: OwnerWorkerAuthorityLease,
         request: dict[str, Any],
         emit: Any,
+        *,
+        broker_request: _BrokerRequest | None = None,
     ) -> None:
         upstream, body, headers = self._request_parts(lease, request)
         diag = stream_diag_init()
@@ -360,6 +523,10 @@ class DeploymentInferenceBroker:
             )
             with httpx.Client(timeout=timeout) as client:
                 with client.stream("POST", upstream, content=body, headers=headers) as response:
+                    if broker_request is not None:
+                        broker_request.response = response
+                        if broker_request.cancelled.is_set():
+                            raise DeploymentInferenceRelayError("relay request was cancelled")
                     response_started = True
                     _capture_relay_response_diag(diag, response)
                     safe_headers = {
@@ -386,6 +553,8 @@ class DeploymentInferenceBroker:
                                 "body": base64.b64encode(chunk).decode("ascii"),
                             })
                     emit({"type": "response_end"})
+                if broker_request is not None:
+                    broker_request.response = None
         except DeploymentInferenceRelayError as exc:
             _log_relay_outcome(
                 "midstream_failure" if response_started else "pre_header_transport_failure",
@@ -420,9 +589,27 @@ class OwnerInferenceRelay:
         # The descriptor is consumed by this relay only.  Future PTY/tool
         # subprocesses must not inherit it even if a caller forgets an env scrub.
         self._connection.set_inheritable(False)
-        self._lock = threading.Lock()
+        self._send_lock = threading.Lock()
+        self._requests: dict[str, _WorkerRequest] = {}
+        self._requests_lock = threading.Lock()
+        self._request_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_WORKER_REQUESTS)
+        self._connection_error: DeploymentInferenceRelayError | None = None
+        self._handshake_complete = threading.Event()
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        self._reader_thread = threading.Thread(
+            target=self._read_responses,
+            daemon=True,
+            name="owner-inference-relay-reader",
+        )
+        self._reader_thread.start()
+        self._send({"type": "hello", "version": _PROTOCOL_VERSION})
+        if not self._handshake_complete.wait(timeout=_RELAY_CONNECT_TIMEOUT_SECONDS):
+            self.close()
+            raise DeploymentInferenceRelayError("relay protocol handshake timed out")
+        if self._connection_error is not None:
+            self.close()
+            raise self._connection_error
 
     @property
     def base_url(self) -> str:
@@ -457,47 +644,162 @@ class OwnerInferenceRelay:
         except OSError:
             pass
         self._connection.close()
+        self._reader_thread.join(timeout=2)
+
+    def _send(self, frame: dict[str, Any]) -> None:
+        with self._send_lock:
+            _send_frame(self._connection, frame)
+
+    def _fail_requests(self, error: DeploymentInferenceRelayError) -> None:
+        self._connection_error = error
+        with self._requests_lock:
+            requests = tuple(self._requests.values())
+        for request in requests:
+            request.failed.set()
+            try:
+                request.frames.put_nowait(error)
+            except queue.Full:
+                pass
+
+    def _read_responses(self) -> None:
+        try:
+            frame = _recv_frame(self._connection)
+            if frame != {"type": "hello_ack", "version": _PROTOCOL_VERSION}:
+                raise DeploymentInferenceRelayError("relay protocol handshake is invalid")
+            self._handshake_complete.set()
+            while True:
+                frame = _recv_frame(self._connection)
+                request_id = frame.get("request_id")
+                if not isinstance(request_id, str) or not request_id:
+                    raise DeploymentInferenceRelayError("relay response identifier is invalid")
+                with self._requests_lock:
+                    request = self._requests.get(request_id)
+                if request is not None and not request.failed.is_set():
+                    sequence = frame.get("sequence")
+                    frame_type = frame.get("type")
+                    if not isinstance(sequence, int) or sequence != request.next_sequence:
+                        raise DeploymentInferenceRelayError("relay response sequence is invalid")
+                    if request.state == "awaiting_start":
+                        if frame_type == "response_start":
+                            request.state = "streaming"
+                        elif frame_type == "error":
+                            request.state = "finished"
+                        else:
+                            raise DeploymentInferenceRelayError("relay response transition is invalid")
+                    elif request.state == "streaming":
+                        if frame_type == "response_chunk":
+                            pass
+                        elif frame_type in {"response_end", "error"}:
+                            request.state = "finished"
+                        else:
+                            raise DeploymentInferenceRelayError("relay response transition is invalid")
+                    else:
+                        raise DeploymentInferenceRelayError("relay response transition is invalid")
+                    request.next_sequence += 1
+                    try:
+                        request.frames.put_nowait(frame)
+                    except queue.Full:
+                        request.failed.set()
+                        try:
+                            self._send({"type": "cancel", "request_id": request_id})
+                        except (DeploymentInferenceRelayError, OSError):
+                            pass
+                        # Preserve multiplexing: overload fails only this request,
+                        # never the shared response-reader thread.
+                        while True:
+                            try:
+                                request.frames.get_nowait()
+                            except queue.Empty:
+                                break
+                        request.frames.put_nowait(DeploymentInferenceRelayError(
+                            "relay response backpressure limit exceeded"
+                        ))
+        except (DeploymentInferenceRelayError, OSError) as exc:
+            self._handshake_complete.set()
+            self._fail_requests(
+                exc
+                if isinstance(exc, DeploymentInferenceRelayError)
+                else DeploymentInferenceRelayError("relay peer closed")
+            )
+
+    def _receive_for(
+        self,
+        request: _WorkerRequest,
+        *,
+        deadline: float,
+    ) -> dict[str, Any]:
+        if self._connection_error is not None:
+            raise self._connection_error
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise DeploymentInferenceRelayError("relay request deadline exceeded")
+        try:
+            frame = request.frames.get(timeout=remaining)
+        except queue.Empty as exc:
+            raise DeploymentInferenceRelayError("relay request deadline exceeded") from exc
+        if isinstance(frame, DeploymentInferenceRelayError):
+            raise frame
+        return frame
 
     def _handle_http(self, handler: BaseHTTPRequestHandler) -> None:
         headers_sent = False
+        admitted = self._request_slots.acquire(blocking=False)
+        request_id = uuid.uuid4().hex
+        worker_request = _WorkerRequest()
+        if not admitted:
+            handler.send_error(503, "deployment inference relay capacity exhausted")
+            return
+        with self._requests_lock:
+            if self._connection_error is not None:
+                self._request_slots.release()
+                raise self._connection_error
+            self._requests[request_id] = worker_request
         try:
             path = urlparse(handler.path).path
             length = int(handler.headers.get("Content-Length", "0"))
             if length < 0 or length > _MAX_FRAME_BYTES:
                 raise DeploymentInferenceRelayError("relay request is too large")
-            request = {
+            raw_deadline = handler.headers.get(_RELAY_DEADLINE_HEADER)
+            try:
+                deadline_seconds = (
+                    min(float(raw_deadline), _RELAY_MAX_DEADLINE_SECONDS)
+                    if raw_deadline is not None
+                    else _RELAY_MAX_DEADLINE_SECONDS
+                )
+            except (TypeError, ValueError) as exc:
+                raise DeploymentInferenceRelayError("relay request deadline is invalid") from exc
+            if deadline_seconds <= 0:
+                raise DeploymentInferenceRelayError("relay request deadline is invalid")
+            deadline = time.monotonic() + deadline_seconds
+            self._send({
+                "type": "request_start",
+                "request_id": request_id,
                 "method": handler.command,
                 "path": path,
                 "headers": dict(handler.headers.items()),
                 "body": base64.b64encode(handler.rfile.read(length)).decode("ascii"),
-            }
-            with self._lock:
-                _send_frame(self._connection, request)
-                response = _recv_frame(self._connection)
-                if response.get("type") == "error":
-                    raise DeploymentInferenceRelayError("relay request was rejected")
-                if response.get("type") != "response_start":
-                    raise DeploymentInferenceRelayError("relay response is invalid")
-                status = int(response["status"])
-                headers = response.get("headers")
-                if not isinstance(headers, dict):
-                    raise DeploymentInferenceRelayError("relay response is invalid")
-                downstream_error: BaseException | None = None
-                headers_sent = True
-                try:
-                    handler.send_response(status)
-                    for name, value in headers.items():
-                        if str(name).lower() not in _HOP_BY_HOP_HEADERS:
-                            handler.send_header(str(name), str(value))
-                    # Framing is intentionally delegated to the HTTP server.  Do
-                    # not add Content-Length: provider SSE responses are streamed
-                    # as they arrive over the private broker connection.
-                    handler.end_headers()
-                except (BrokenPipeError, ConnectionError, OSError) as exc:
-                    downstream_error = exc
-                    handler.close_connection = True
+            })
+            response = self._receive_for(worker_request, deadline=deadline)
+            if response.get("type") == "error":
+                raise DeploymentInferenceRelayError("relay request was rejected")
+            if response.get("type") != "response_start":
+                raise DeploymentInferenceRelayError("relay response is invalid")
+            status = int(response["status"])
+            headers = response.get("headers")
+            if not isinstance(headers, dict):
+                raise DeploymentInferenceRelayError("relay response is invalid")
+            headers_sent = True
+            try:
+                handler.send_response(status)
+                for name, value in headers.items():
+                    if str(name).lower() not in _HOP_BY_HOP_HEADERS:
+                        handler.send_header(str(name), str(value))
+                # Framing is intentionally delegated to the HTTP server.  Do
+                # not add Content-Length: provider SSE responses are streamed
+                # as they arrive over the private broker connection.
+                handler.end_headers()
                 while True:
-                    response = _recv_frame(self._connection)
+                    response = self._receive_for(worker_request, deadline=deadline)
                     response_type = response.get("type")
                     if response_type == "response_end":
                         break
@@ -506,26 +808,21 @@ class OwnerInferenceRelay:
                     if response_type != "response_chunk":
                         raise DeploymentInferenceRelayError("relay response is invalid")
                     body = base64.b64decode(str(response.get("body") or ""), validate=True)
-                    if body and downstream_error is None:
-                        try:
-                            handler.wfile.write(body)
-                            handler.wfile.flush()
-                        except (BrokenPipeError, ConnectionError, OSError) as exc:
-                            # The broker protocol is sequential and has no request
-                            # IDs. Keep consuming the abandoned response while the
-                            # lock is held so its remaining frames cannot be
-                            # mistaken for the next request's response.
-                            downstream_error = exc
-                            handler.close_connection = True
-                if downstream_error is not None:
-                    raise downstream_error
+                    if body:
+                        handler.wfile.write(body)
+                        handler.wfile.flush()
+            except (BrokenPipeError, ConnectionError, OSError):
+                handler.close_connection = True
+                try:
+                    self._send({"type": "cancel", "request_id": request_id})
+                except (DeploymentInferenceRelayError, OSError):
+                    pass
+                raise
         except Exception as exc:
             logger.warning(
-                "owner inference relay response failed phase=%s error_chain=%s",
+                "owner inference relay response failed phase=%s error_type=%s",
                 "midstream" if headers_sent else "pre_header",
-                redact_sensitive_text(
-                    flatten_exception_chain(exc), force=True, file_read=True
-                )[:600],
+                type(exc).__name__,
             )
             if headers_sent:
                 # HTTP status and headers are already on the wire. Sending a second
@@ -536,3 +833,7 @@ class OwnerInferenceRelay:
                 handler.send_error(502, "deployment inference relay unavailable")
             except (BrokenPipeError, ConnectionError, OSError):
                 handler.close_connection = True
+        finally:
+            with self._requests_lock:
+                self._requests.pop(request_id, None)
+            self._request_slots.release()

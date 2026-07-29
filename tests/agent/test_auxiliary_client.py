@@ -4969,6 +4969,162 @@ class TestAuxiliaryMaxTokensParam:
 # When the chosen candidate is reachable but too small for the compression
 # task, the call errors out instead of continuing through the chain.
 
+class TestAuxiliaryRouteMetadata:
+    def test_primary_response_reports_privacy_safe_actual_route(self):
+        from agent.auxiliary_client import AuxiliaryRouteCapacity, call_llm
+
+        client = MagicMock()
+        client.base_url = "https://secret.example/v1"
+        client.api_key = "do-not-persist"
+        client.chat.completions.create.return_value = _DummyResponse("summary")
+        observed = []
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(client, "large-model"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("custom", "large-model", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._capacity_for_client",
+            return_value=AuxiliaryRouteCapacity(
+                fingerprint="route-hash",
+                context_length=256_000,
+                max_output_tokens=8_000,
+                input_budget=248_000,
+            ),
+        ):
+            response = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                max_tokens=8_000,
+                planned_input_tokens=48_000,
+                route_metadata_callback=observed.append,
+            )
+
+        assert response.choices[0].message.content == "summary"
+        assert observed == [
+            AuxiliaryRouteCapacity(
+                fingerprint="route-hash",
+                context_length=256_000,
+                max_output_tokens=8_000,
+                input_budget=248_000,
+            )
+        ]
+        assert "secret.example" not in repr(observed)
+        assert "do-not-persist" not in repr(observed)
+
+    def test_route_too_small_is_rejected_before_provider_io(self):
+        from agent.auxiliary_client import (
+            AuxiliaryRouteCapacity,
+            AuxiliaryRouteCapacityError,
+            call_llm,
+        )
+
+        client = MagicMock()
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(client, "small-model"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("custom", "small-model", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._capacity_for_client",
+            return_value=AuxiliaryRouteCapacity(
+                fingerprint="small-route",
+                context_length=64_000,
+                max_output_tokens=8_000,
+                input_budget=56_000,
+            ),
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(None, None, ""),
+        ), patch(
+            "agent.auxiliary_client._try_main_agent_model_fallback",
+            return_value=(None, None, ""),
+        ):
+            with pytest.raises(AuxiliaryRouteCapacityError):
+                call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "summarize"}],
+                    max_tokens=8_000,
+                    planned_input_tokens=60_000,
+                )
+
+        client.chat.completions.create.assert_not_called()
+
+    def test_unavailable_primary_skips_exactly_too_small_configured_fallback(self):
+        from agent.auxiliary_client import AuxiliaryRouteCapacity, call_llm
+
+        small_client = MagicMock()
+        large_client = MagicMock()
+        large_client.chat.completions.create.return_value = _DummyResponse("summary")
+        entries = [
+            {
+                "provider": "small-provider",
+                "model": "small-model",
+                "base_url": "https://small.example/v1",
+                "api_key": "small-key",
+            },
+            {
+                "provider": "large-provider",
+                "model": "large-model",
+                "base_url": "https://large.example/v1",
+                "api_key": "large-key",
+            },
+        ]
+
+        def resolve_entry(entry):
+            if entry is entries[0]:
+                return small_client, "small-model"
+            return large_client, "large-model"
+
+        capacities = {
+            id(small_client): AuxiliaryRouteCapacity(
+                fingerprint="small-route",
+                context_length=256_000,
+                max_output_tokens=8_000,
+                input_budget=56_000,
+            ),
+            id(large_client): AuxiliaryRouteCapacity(
+                fingerprint="large-route",
+                context_length=256_000,
+                max_output_tokens=8_000,
+                input_budget=248_000,
+            ),
+        }
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(None, None),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("missing-provider", "missing-model", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={"fallback_chain": entries},
+        ), patch(
+            "agent.auxiliary_client._resolve_fallback_entry",
+            side_effect=resolve_entry,
+        ), patch(
+            "agent.auxiliary_client._candidate_context_window",
+            return_value=256_000,
+        ), patch(
+            "agent.auxiliary_client._capacity_for_client",
+            side_effect=lambda client, **_kwargs: capacities[id(client)],
+        ):
+            response = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                max_tokens=8_000,
+                planned_input_tokens=60_000,
+            )
+
+        assert response.choices[0].message.content == "summary"
+        small_client.chat.completions.create.assert_not_called()
+        large_client.chat.completions.create.assert_called_once()
+
+
 class TestCompressionFallbackContextFilter:
     """Aux fallback chains must skip candidates whose context window is
     smaller than the task minimum, then continue to the next candidate.
@@ -5039,6 +5195,46 @@ class TestCompressionFallbackContextFilter:
             "screening by context window.")
         assert model == "huge-1m"
         assert "big-provider" in label
+
+    def test_configured_chain_uses_exact_compression_request_capacity(self, monkeypatch):
+        """A fallback that clears 64K can still be too small for this request."""
+        from agent.auxiliary_client import _try_configured_fallback_chain
+
+        small_client = MagicMock(name="small_client")
+        large_client = MagicMock(name="large_client")
+        entries = [
+            self._make_chain_entry("small-provider", "medium-128k"),
+            self._make_chain_entry("big-provider", "large-256k"),
+        ]
+
+        def fake_resolve(entry):
+            if entry is entries[0]:
+                return small_client, "medium-128k"
+            return large_client, "large-256k"
+
+        def fake_ctx(model, **_kwargs):
+            return {"medium-128k": 128_000, "large-256k": 256_000}[model]
+
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {"fallback_chain": entries} if task == "compression" else {},
+        )
+
+        with patch(
+            "agent.auxiliary_client._resolve_fallback_entry",
+            side_effect=fake_resolve,
+        ), patch(
+            "agent.auxiliary_client.get_model_context_length",
+            side_effect=fake_ctx,
+        ):
+            client, model, _ = _try_configured_fallback_chain(
+                task="compression",
+                failed_provider="auto",
+                required_context_length=160_000,
+            )
+
+        assert client is large_client
+        assert model == "large-256k"
 
     def test_configured_chain_continues_after_skipping_too_small(self, monkeypatch):
         """When all small candidates are skipped and only the last is large enough,

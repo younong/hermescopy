@@ -12,7 +12,11 @@ import { gatewayEventRequiresSessionId } from '@/lib/gateway-events'
 import { triggerHaptic } from '@/lib/haptics'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
-import { setSessionCompacting } from '@/store/compaction'
+import {
+  type CompressionStatusKind,
+  setSessionCompacting,
+  setSessionCompressionStatus
+} from '@/store/compaction'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
 import { $gateway } from '@/store/gateway'
 import { dispatchNativeNotification } from '@/store/native-notifications'
@@ -561,10 +565,26 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // The process is untouched — this only drops the view.
         closeAgentTerminalByProc(payload?.process_id ?? '')
       } else if (event.type === 'status.update') {
-        if (sessionId && payload?.kind === 'compacting') {
-          setSessionCompacting(sessionId, true)
-          compactedTurnRef.current.add(sessionId)
-        } else if (sessionId && payload?.kind === 'process') {
+        const statusKind = typeof payload?.kind === 'string' ? payload.kind : ''
+
+        if (sessionId && statusKind.startsWith('compression.')) {
+          if (statusKind === 'compression.completed' || statusKind === 'compression.ready') {
+            setSessionCompressionStatus(sessionId)
+          } else if (
+            statusKind === 'compression.blocked' ||
+            statusKind === 'compression.cooldown' ||
+            statusKind === 'compression.degraded' ||
+            statusKind === 'compression.preparing'
+          ) {
+            setSessionCompressionStatus(sessionId, {
+              kind: statusKind as CompressionStatusKind,
+              text: coerceGatewayText(payload?.text)
+            })
+            if (statusKind === 'compression.preparing') {
+              compactedTurnRef.current.add(sessionId)
+            }
+          }
+        } else if (sessionId && statusKind === 'process') {
           // The gateway's notification poller announces background process
           // completions / watch matches here — re-sync the status stack.
           void refreshBackgroundProcesses(sessionId)

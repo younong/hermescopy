@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -386,6 +387,65 @@ _MAX_COMPLETION_KEYS = (
     "max_output_tokens",
     "max_tokens",
 )
+
+
+@dataclass(frozen=True)
+class ModelCapacity:
+    """Conservative input/output capacity for one concrete model route."""
+
+    context_length: int
+    max_output_tokens: int
+    input_budget: int
+
+
+def get_model_capacity(
+    model: str,
+    *,
+    base_url: str = "",
+    api_key: str = "",
+    config_context_length: int | None = None,
+    config_max_output_tokens: int | None = None,
+    provider: str = "",
+    custom_providers: list | None = None,
+    default_max_output_tokens: int = 4096,
+) -> ModelCapacity:
+    """Return conservative route capacity using existing context metadata.
+
+    Output metadata is best-effort. Explicit config wins, then endpoint or
+    OpenRouter metadata, then a small fixed reservation. Reserving output from
+    the same context window keeps callers from filling a route to its raw
+    context limit and receiving a provider overflow before generation starts.
+    """
+    context_length = get_model_context_length(
+        model,
+        base_url=base_url,
+        api_key=api_key,
+        config_context_length=config_context_length,
+        provider=provider,
+        custom_providers=custom_providers,
+    )
+    max_output = _coerce_reasonable_int(
+        config_max_output_tokens,
+        minimum=1,
+        maximum=max(1, context_length),
+    )
+    if max_output is None:
+        metadata: Dict[str, Dict[str, Any]] = {}
+        if base_url:
+            metadata = fetch_endpoint_model_metadata(base_url, api_key=api_key)
+        if not metadata:
+            metadata = fetch_model_metadata()
+        entry = metadata.get(model) or metadata.get(_strip_provider_prefix(model)) or {}
+        max_output = _extract_max_completion_tokens(entry) if entry else None
+    if max_output is None:
+        max_output = max(1, min(int(default_max_output_tokens), context_length // 4))
+    max_output = min(max_output, max(1, context_length - 1))
+    return ModelCapacity(
+        context_length=context_length,
+        max_output_tokens=max_output,
+        input_budget=max(1, context_length - max_output),
+    )
+
 
 # Local server hostnames / address patterns
 _LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1", "0.0.0.0")

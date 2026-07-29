@@ -120,7 +120,30 @@ def _make_agent_with_cooldown(db_path, session_id, *, cooldown_until=None):
     db = SessionDB(db_path=db_path)
     db.create_session(session_id, source="cli")
     if cooldown_until is not None:
-        db.record_compression_failure_cooldown(session_id, cooldown_until, "timeout")
+        job = db.enqueue_compression_job(
+            session_id=session_id,
+            job_id=f"cooldown-{session_id}",
+            fence_id=f"fence-{session_id}",
+            snapshot_message_id=None,
+            snapshot_message_count=0,
+            snapshot_digest="",
+            main_route_fingerprint="test/model",
+            auxiliary_route_fingerprint="test/model",
+            snapshot_payload="[]",
+        )
+        claimed = db.claim_compression_job(
+            session_id=session_id,
+            job_id=job["job_id"],
+            holder="test",
+        )
+        db.mark_compression_job_cooldown(
+            session_id=session_id,
+            job_id=job["job_id"],
+            holder="test",
+            lease_version=claimed["lease_version"],
+            retry_at=cooldown_until,
+            failure_code="provider_timeout",
+        )
 
     with patch("agent.context_compressor.get_model_context_length", return_value=100000):
         compressor = ContextCompressor(

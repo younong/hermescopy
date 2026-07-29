@@ -41,14 +41,16 @@ Payment / credit exhaustion fallback:
 """
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
 from hermes_cli.oauth_jwt import decode_unverified_oauth_jwt_claims
@@ -3173,6 +3175,10 @@ def _retry_same_provider_sync(
     effective_timeout: float,
     effective_extra_body: dict,
     deadline_monotonic: Optional[float] = None,
+    planned_input_tokens: Optional[int] = None,
+    route_metadata_callback: Optional[
+        Callable[["AuxiliaryRouteCapacity"], None]
+    ] = None,
 ) -> Any:
     if task == "vision":
         _, retry_client, retry_model = resolve_vision_provider_client(
@@ -3210,8 +3216,16 @@ def _retry_same_provider_sync(
     )
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
-    return _sync_create_with_deadline(
-        retry_client, retry_kwargs, task, deadline_monotonic,
+    return _sync_create_for_route(
+        retry_client,
+        retry_kwargs,
+        task,
+        deadline_monotonic,
+        provider=resolved_provider,
+        model=retry_model or final_model,
+        api_mode=resolved_api_mode,
+        planned_input_tokens=planned_input_tokens,
+        route_metadata_callback=route_metadata_callback,
     )
 
 
@@ -3334,6 +3348,8 @@ def _try_payment_fallback(
     failed_provider: str,
     task: str = None,
     reason: str = "payment error",
+    *,
+    required_context_length: Optional[int] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try alternative providers after a payment/credit or connection error.
 
@@ -3366,6 +3382,17 @@ def _try_payment_fallback(
             tried.append(f"{label} (unhealthy)")
             continue
         client, model = try_fn()
+        if client is not None and required_context_length is not None:
+            context_length = _candidate_context_window(
+                label,
+                model,
+                base_url=str(getattr(client, "base_url", "") or ""),
+            )
+            if context_length is not None and context_length < required_context_length:
+                tried.append(
+                    f"{label} (context too small: {context_length}<{required_context_length})"
+                )
+                continue
         if client is not None:
             logger.info(
                 "Auxiliary %s: %s on %s — falling back to %s (%s)",
@@ -3385,6 +3412,8 @@ def _try_main_agent_model_fallback(
     failed_provider: str,
     task: str = None,
     reason: str = "error",
+    *,
+    required_context_length: Optional[int] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Last-resort fallback to the user's main agent provider + model.
 
@@ -3421,6 +3450,14 @@ def _try_main_agent_model_fallback(
 
     if client is None:
         return None, None, ""
+    if required_context_length is not None:
+        context_length = _candidate_context_window(
+            main_provider,
+            resolved_model or main_model,
+            base_url=str(getattr(client, "base_url", "") or ""),
+        )
+        if context_length is not None and context_length < required_context_length:
+            return None, None, ""
 
     label = f"main-agent({main_provider})"
     logger.info(
@@ -3431,30 +3468,20 @@ def _try_main_agent_model_fallback(
 
 
 # ── Context-window screening for runtime fallback chains (issue #52392) ──
-#
-# When the runtime auxiliary fallback chain selects a candidate that is
-# reachable but has a context window smaller than the compression task
-# requires, the call errors out instead of continuing to the next, viable
-# candidate. The startup feasibility check in
-# ``agent.conversation_compression.check_compression_model_feasibility``
-# already filters too-small auxiliary models at startup, but the runtime
-# fallback chain (``_try_configured_fallback_chain`` and
-# ``_try_main_fallback_chain``) does not apply the same filter, so
-# compression can stop at the first alive door even if the room behind it
-# is too small.
-#
-# The helpers below screen each candidate by its effective context window
-# before it is returned. ``None`` results from ``get_model_context_length``
-# are passed through (we cannot prove a model is too small, so we do not
-# block it). This preserves the existing fallback surface for
-# unrecognised/custom models while closing the gap on the well-known ones.
+# Compression candidates must clear both the global 64K floor and, when
+# supplied, this request's planned input plus output reservation. Unknown
+# custom-model capacities remain permissive here; the exact selected client is
+# checked again immediately before provider I/O.
 
-def _task_minimum_context_length(task: Optional[str]) -> Optional[int]:
+def _task_minimum_context_length(
+    task: Optional[str],
+    *,
+    required_context_length: Optional[int] = None,
+) -> Optional[int]:
     """Return the minimum context length required for an auxiliary task.
 
-    Only ``compression`` carries an explicit minimum today (the same
-    ``MINIMUM_CONTEXT_LENGTH`` (64K) floor that
-    ``check_compression_model_feasibility`` already enforces at startup).
+    Compression uses the startup 64K floor or a larger request-specific
+    requirement supplied by the caller.
     Other tasks (``vision``, ``title_generation``, ``web_extract``,
     ``skills_hub``, ``mcp``, ``session_search``) return ``None`` — they
     have no per-task context floor and the runtime chain must remain
@@ -3466,7 +3493,10 @@ def _task_minimum_context_length(task: Optional[str]) -> Optional[int]:
     if not task:
         return None
     if task == "compression":
-        return MINIMUM_CONTEXT_LENGTH
+        return max(
+            MINIMUM_CONTEXT_LENGTH,
+            max(0, int(required_context_length or 0)),
+        )
     return None
 
 
@@ -3516,6 +3546,10 @@ def _try_configured_fallback_chain(
     task: str,
     failed_provider: str,
     reason: str = "error",
+    *,
+    required_context_length: Optional[int] = None,
+    planned_input_tokens: Optional[int] = None,
+    requested_output_tokens: int = 0,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try user-configured fallback_chain for a specific auxiliary task.
 
@@ -3536,7 +3570,9 @@ def _try_configured_fallback_chain(
 
     skip = failed_provider.lower().strip()
     tried = []
-    min_ctx = _task_minimum_context_length(task)
+    min_ctx = _task_minimum_context_length(
+        task, required_context_length=required_context_length,
+    )
 
     for i, entry in enumerate(chain):
         if not isinstance(entry, dict):
@@ -3568,6 +3604,28 @@ def _try_configured_fallback_chain(
                     )
                     tried.append(f"{label} (context too small: {fb_ctx}<{min_ctx})")
                     continue
+            if planned_input_tokens is not None:
+                capacity = _capacity_for_client(
+                    fb_client,
+                    provider=fb_provider,
+                    model=resolved_model or fb_model,
+                    api_mode=str(entry.get("api_mode") or "") or None,
+                )
+                if capacity is not None:
+                    available_input = max(
+                        1,
+                        min(
+                            capacity.input_budget,
+                            capacity.context_length
+                            - max(0, int(requested_output_tokens or 0)),
+                        ),
+                    )
+                    if int(planned_input_tokens) > available_input:
+                        tried.append(
+                            f"{label} (input budget too small: "
+                            f"{available_input}<{planned_input_tokens})"
+                        )
+                        continue
             logger.info(
                 "Auxiliary %s: %s on %s — configured fallback to %s (%s)",
                 task, reason, failed_provider, label, resolved_model or fb_model or "default",
@@ -3586,6 +3644,10 @@ def _try_configured_fallback_chain(
 def _try_configured_fallback_for_unavailable_client(
     task: Optional[str],
     failed_provider: str,
+    *,
+    required_context_length: Optional[int] = None,
+    planned_input_tokens: Optional[int] = None,
+    requested_output_tokens: int = 0,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try task fallback_chain when an explicit aux provider cannot build.
 
@@ -3598,10 +3660,19 @@ def _try_configured_fallback_for_unavailable_client(
     explicit = (failed_provider or "").strip().lower()
     if not task or not explicit or explicit in {"auto"}:
         return None, None, ""
+    capacity_filter: Dict[str, Any] = {}
+    if required_context_length is not None:
+        capacity_filter["required_context_length"] = required_context_length
+    if planned_input_tokens is not None:
+        capacity_filter.update(
+            planned_input_tokens=planned_input_tokens,
+            requested_output_tokens=requested_output_tokens,
+        )
     return _try_configured_fallback_chain(
         task,
         explicit,
         reason="provider unavailable",
+        **capacity_filter,
     )
 
 
@@ -3638,6 +3709,8 @@ def _try_main_fallback_chain(
     task: Optional[str],
     failed_provider: str = "",
     reason: str = "error",
+    *,
+    required_context_length: Optional[int] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try the top-level main-agent fallback chain for an auxiliary call.
 
@@ -3663,7 +3736,9 @@ def _try_main_fallback_chain(
     main_norm = (_read_main_provider() or "").strip().lower()
     skip = {p for p in (failed_norm, main_norm, "auto") if p}
     tried: List[str] = []
-    min_ctx = _task_minimum_context_length(task)
+    min_ctx = _task_minimum_context_length(
+        task, required_context_length=required_context_length,
+    )
 
     for i, entry in enumerate(chain):
         if not isinstance(entry, dict):
@@ -5531,6 +5606,128 @@ def _resolve_task_provider_model(
 _DEFAULT_AUX_TIMEOUT = 30.0
 
 
+@dataclass(frozen=True)
+class AuxiliaryRouteCapacity:
+    """Privacy-safe auxiliary route identity and conservative token capacity."""
+
+    fingerprint: str
+    context_length: int
+    max_output_tokens: int
+    input_budget: int
+
+
+class AuxiliaryRouteCapacityError(RuntimeError):
+    """An auxiliary route cannot safely hold the planned request."""
+
+
+def _auxiliary_route_capacity(
+    *,
+    provider: Optional[str],
+    model: Optional[str],
+    base_url: Optional[str],
+    api_key: Optional[str],
+    api_mode: Optional[str],
+    context_override: Optional[int] = None,
+    output_override: Optional[int] = None,
+) -> Optional[AuxiliaryRouteCapacity]:
+    """Return capacity metadata without retaining raw route or credential data."""
+    if not model:
+        return None
+
+    from agent.model_metadata import get_model_capacity
+
+    capacity = get_model_capacity(
+        model,
+        base_url=base_url or "",
+        api_key=api_key or "",
+        config_context_length=context_override,
+        config_max_output_tokens=output_override,
+        provider=provider,
+    )
+    resolved_provider = provider or "auto"
+    if resolved_provider == "auto":
+        try:
+            from agent.model_metadata import _infer_provider_from_url
+
+            resolved_provider = _infer_provider_from_url(base_url or "") or "auto"
+        except Exception:
+            resolved_provider = "auto"
+    route_identity = "\x1f".join(
+        (
+            str(resolved_provider).strip().lower(),
+            str(base_url or "").strip().rstrip("/").lower(),
+            str(model).strip().lower(),
+            str(api_mode or "").strip().lower(),
+        )
+    )
+    return AuxiliaryRouteCapacity(
+        fingerprint=hashlib.sha256(route_identity.encode("utf-8")).hexdigest(),
+        context_length=capacity.context_length,
+        max_output_tokens=capacity.max_output_tokens,
+        input_budget=capacity.input_budget,
+    )
+
+
+def _capacity_for_client(
+    client: Any,
+    *,
+    provider: Optional[str],
+    model: Optional[str],
+    api_mode: Optional[str],
+) -> Optional[AuxiliaryRouteCapacity]:
+    base_url = str(getattr(client, "base_url", "") or "")
+    raw_key = getattr(client, "api_key", "") or ""
+    api_key = "" if callable(raw_key) else str(raw_key)
+    return _auxiliary_route_capacity(
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+        api_mode=api_mode,
+    )
+
+
+def resolve_auxiliary_route_capacity(
+    task: str,
+    *,
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> Optional[AuxiliaryRouteCapacity]:
+    """Resolve the same route used by ``call_llm`` without making an LLM call."""
+    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task)
+    client, resolved_model = resolve_provider_client(
+        provider,
+        model=model,
+        explicit_base_url=base_url,
+        explicit_api_key=api_key,
+        api_mode=api_mode,
+        main_runtime=main_runtime,
+        task=task,
+    )
+    if client is None or not resolved_model:
+        return None
+
+    resolved_base_url = str(getattr(client, "base_url", "") or base_url or "")
+    raw_key = getattr(client, "api_key", "") or api_key or ""
+    resolved_key = "" if callable(raw_key) else str(raw_key)
+    task_config = _get_auxiliary_task_config(task)
+
+    def _optional_int(value: Any) -> Optional[int]:
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return _auxiliary_route_capacity(
+        provider=provider,
+        model=resolved_model,
+        base_url=resolved_base_url,
+        api_key=resolved_key,
+        api_mode=api_mode,
+        context_override=_optional_int(task_config.get("context_length")),
+        output_override=_optional_int(task_config.get("max_output_tokens")),
+    )
+
+
 class AuxiliaryDeadlineExceeded(TimeoutError):
     """An aggregate auxiliary-task deadline expired across retries/fallbacks."""
 
@@ -5563,6 +5760,51 @@ def _sync_create_with_deadline(
     return _validate_llm_response(
         client.chat.completions.create(**request_kwargs), task,
     )
+
+
+def _sync_create_for_route(
+    client: Any,
+    kwargs: Dict[str, Any],
+    task: Optional[str],
+    deadline_monotonic: Optional[float],
+    *,
+    provider: Optional[str],
+    model: Optional[str],
+    api_mode: Optional[str],
+    planned_input_tokens: Optional[int],
+    route_metadata_callback: Optional[Callable[[AuxiliaryRouteCapacity], None]],
+) -> Any:
+    """Validate this exact route, execute it, then publish privacy-safe metadata."""
+    capacity = None
+    if planned_input_tokens is not None or route_metadata_callback is not None:
+        capacity = _capacity_for_client(
+            client,
+            provider=provider,
+            model=model,
+            api_mode=api_mode,
+        )
+    if capacity is not None and planned_input_tokens is not None:
+        requested_output = max(
+            0,
+            int(kwargs.get("max_tokens") or kwargs.get("max_completion_tokens") or 0),
+        )
+        available_input = max(
+            1,
+            min(
+                capacity.input_budget,
+                capacity.context_length - requested_output,
+            ),
+        )
+        if int(planned_input_tokens) > available_input:
+            raise AuxiliaryRouteCapacityError(
+                "Auxiliary route is too small for the planned request"
+            )
+    response = _sync_create_with_deadline(
+        client, kwargs, task, deadline_monotonic,
+    )
+    if capacity is not None and route_metadata_callback is not None:
+        route_metadata_callback(capacity)
+    return response
 
 
 def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
@@ -6050,6 +6292,10 @@ def call_llm(
     stream: bool = False,
     stream_options: dict = None,
     deadline_monotonic: float = None,
+    planned_input_tokens: int = None,
+    route_metadata_callback: Optional[
+        Callable[[AuxiliaryRouteCapacity], None]
+    ] = None,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -6093,6 +6339,22 @@ def call_llm(
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+    required_context = (
+        max(0, int(planned_input_tokens or 0)) + max(0, int(max_tokens or 0))
+        if task == "compression" and planned_input_tokens is not None
+        else None
+    )
+    capacity_filter = (
+        {"required_context_length": required_context}
+        if required_context is not None
+        else {}
+    )
+    configured_capacity_filter = dict(capacity_filter)
+    if planned_input_tokens is not None:
+        configured_capacity_filter.update(
+            planned_input_tokens=planned_input_tokens,
+            requested_output_tokens=max(0, int(max_tokens or 0)),
+        )
 
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
@@ -6136,7 +6398,9 @@ def call_llm(
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
-                    task, _explicit,
+                    task,
+                    _explicit,
+                    **configured_capacity_filter,
                 )
                 if fb_client is not None:
                     client, final_model = fb_client, fb_model
@@ -6201,6 +6465,25 @@ def call_llm(
             kwargs["stream_options"] = stream_options
         return client.chat.completions.create(**kwargs)
 
+    def _create(
+        route_client: Any,
+        route_kwargs: Dict[str, Any],
+        *,
+        route_provider: Optional[str] = None,
+        route_model: Optional[str] = None,
+    ) -> Any:
+        return _sync_create_for_route(
+            route_client,
+            route_kwargs,
+            task,
+            deadline_monotonic,
+            provider=route_provider or resolved_provider,
+            model=route_model or route_kwargs.get("model") or final_model,
+            api_mode=resolved_api_mode,
+            planned_input_tokens=planned_input_tokens,
+            route_metadata_callback=route_metadata_callback,
+        )
+
     # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
     # then payment fallback.
     try:
@@ -6221,8 +6504,7 @@ def call_llm(
         # ``first_err`` and the existing fallback handling unchanged. Unified home
         # for the transient retry every auxiliary task shares. (PR #16587)
         try:
-            return _sync_create_with_deadline(
-                client, kwargs, task, deadline_monotonic)
+            return _create(client, kwargs)
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
                 raise
@@ -6259,8 +6541,7 @@ def call_llm(
                         )
                 time.sleep(_backoff)
                 try:
-                    return _sync_create_with_deadline(
-                        client, kwargs, task, deadline_monotonic)
+                    return _create(client, kwargs)
                 except Exception as retry_transient:
                     if not _is_transient_transport_error(retry_transient):
                         raise
@@ -6276,8 +6557,7 @@ def call_llm(
                 task or "call",
             )
             try:
-                return _sync_create_with_deadline(
-                    client, retry_kwargs, task, deadline_monotonic)
+                return _create(client, retry_kwargs)
             except Exception as retry_err:
                 retry_err_str = str(retry_err)
                 # If retry still fails, fall through to the max_tokens /
@@ -6314,8 +6594,7 @@ def call_llm(
             kwargs.pop("max_tokens", None)
             kwargs.pop("max_completion_tokens", None)
             try:
-                return _sync_create_with_deadline(
-                    client, kwargs, task, deadline_monotonic)
+                return _create(client, kwargs)
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
@@ -6344,8 +6623,7 @@ def call_llm(
                 )
                 kwargs["model"] = healed_model
                 try:
-                    return _sync_create_with_deadline(
-                        client, kwargs, task, deadline_monotonic)
+                    return _create(client, kwargs)
                 except Exception as retry_err:
                     first_err = retry_err
 
@@ -6377,8 +6655,7 @@ def call_llm(
                 if refreshed_model and refreshed_model != kwargs.get("model"):
                     kwargs["model"] = refreshed_model
                 try:
-                    return _sync_create_with_deadline(
-                        refreshed_client, kwargs, task, deadline_monotonic)
+                    return _create(refreshed_client, kwargs)
                 except Exception as retry_err:
                     if not (
                         _is_auth_error(retry_err)
@@ -6405,8 +6682,7 @@ def call_llm(
                             task or "call")
                 if refreshed_model and refreshed_model != kwargs.get("model"):
                     kwargs["model"] = refreshed_model
-                return _sync_create_with_deadline(
-                    refreshed_client, kwargs, task, deadline_monotonic)
+                return _create(refreshed_client, kwargs)
 
         # ── Auth refresh retry ───────────────────────────────────────
         if (_is_auth_error(first_err)
@@ -6433,6 +6709,8 @@ def call_llm(
                     effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
                     deadline_monotonic=deadline_monotonic,
+                    planned_input_tokens=planned_input_tokens,
+                    route_metadata_callback=route_metadata_callback,
                 )
 
         # ── Same-provider credential-pool recovery ─────────────────────
@@ -6448,8 +6726,7 @@ def call_llm(
             # won't accept another request with the same exhausted key.
             if _is_rate_limit_error(first_err) and not _is_payment_error(first_err):
                 try:
-                    return _sync_create_with_deadline(
-                        client, kwargs, task, deadline_monotonic)
+                    return _create(client, kwargs)
                 except Exception as retry_err:
                     if not (_is_auth_error(retry_err) or _is_payment_error(retry_err) or _is_rate_limit_error(retry_err)):
                         raise
@@ -6476,6 +6753,8 @@ def call_llm(
                         effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
                         deadline_monotonic=deadline_monotonic,
+                        planned_input_tokens=planned_input_tokens,
+                        route_metadata_callback=route_metadata_callback,
                     )
                 except Exception as retry2_err:
                     # The rotated key also hit a quota/auth wall.  Mark it
@@ -6577,19 +6856,39 @@ def call_llm(
             fb_client, fb_model, fb_label = (None, None, "")
             if is_auto:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
+                    task,
+                    resolved_provider or "auto",
+                    reason=reason,
+                    **configured_capacity_filter,
+                )
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                        task, resolved_provider or "auto", reason=reason)
+                        task,
+                        resolved_provider or "auto",
+                        reason=reason,
+                        **capacity_filter,
+                    )
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_payment_fallback(
-                        resolved_provider, task, reason=reason)
+                        resolved_provider,
+                        task,
+                        reason=reason,
+                        **capacity_filter,
+                    )
             else:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
+                    task,
+                    resolved_provider or "auto",
+                    reason=reason,
+                    **configured_capacity_filter,
+                )
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-                        resolved_provider, task, reason=reason)
+                        resolved_provider,
+                        task,
+                        reason=reason,
+                        **capacity_filter,
+                    )
 
             if fb_client is not None:
                 fb_kwargs = _build_call_kwargs(
@@ -6598,8 +6897,12 @@ def call_llm(
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
                     base_url=str(getattr(fb_client, "base_url", "") or ""))
-                return _sync_create_with_deadline(
-                    fb_client, fb_kwargs, task, deadline_monotonic)
+                return _create(
+                    fb_client,
+                    fb_kwargs,
+                    route_provider=fb_label,
+                    route_model=fb_model,
+                )
             # All fallback layers exhausted — emit a single user-visible
             # warning so the operator knows aux task is about to fail.
             # (#26882) The error itself is re-raised below.

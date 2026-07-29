@@ -1,16 +1,22 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { $compactingSessions, $compactionActive, setSessionCompacting } from './compaction'
+import {
+  $compactingSessions,
+  $compactionActive,
+  $compressionStatuses,
+  setSessionCompacting,
+  setSessionCompressionStatus
+} from './compaction'
 import { $activeSessionId } from './session'
 
 describe('compaction store', () => {
   beforeEach(() => {
-    $compactingSessions.set({})
+    $compressionStatuses.set({})
     $activeSessionId.set(null)
   })
 
   afterEach(() => {
-    $compactingSessions.set({})
+    $compressionStatuses.set({})
     $activeSessionId.set(null)
   })
 
@@ -31,6 +37,19 @@ describe('compaction store', () => {
 
     $activeSessionId.set('session-b')
     expect($compactionActive.get()).toBe(false)
+  })
+
+  it('keeps degraded and blocked states structured but not actively compacting', () => {
+    setSessionCompressionStatus('session-a', {
+      kind: 'compression.degraded',
+      text: 'Compression paused; run /compress or /new'
+    })
+
+    expect($compressionStatuses.get()['session-a']).toEqual({
+      kind: 'compression.degraded',
+      text: 'Compression paused; run /compress or /new'
+    })
+    expect($compactingSessions.get()).toEqual({})
   })
 
   it('clears a session without disturbing the others', () => {

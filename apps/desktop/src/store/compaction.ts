@@ -2,37 +2,72 @@ import { atom, computed } from 'nanostores'
 
 import { $activeSessionId } from './session'
 
-// Per-session flag while auto-compaction runs mid-turn. Without it the
-// transcript looks like it reset; per-session so a background chat can't
-// clobber the foreground view.
+// Per-session transient compression state. Keeping the structured kind lets the
+// thread distinguish active preparation from degraded/blocked guidance without
+// ever inserting lifecycle text into the transcript.
 const keyFor = (sessionId: string | null | undefined): string => sessionId ?? ''
 
-export const $compactingSessions = atom<Record<string, true>>({})
+export type CompressionStatusKind =
+  | 'compression.blocked'
+  | 'compression.cooldown'
+  | 'compression.degraded'
+  | 'compression.preparing'
+
+export interface CompressionStatus {
+  kind: CompressionStatusKind
+  text: string
+}
+
+export const $compressionStatuses = atom<Record<string, CompressionStatus>>({})
+export const $compactingSessions = computed($compressionStatuses, statuses =>
+  Object.fromEntries(
+    Object.entries(statuses)
+      .filter(([, status]) => status.kind === 'compression.preparing')
+      .map(([sessionId]) => [sessionId, true] as const)
+  )
+)
 
 export const $compactionActive = computed(
   [$compactingSessions, $activeSessionId],
   (sessions, activeId) => keyFor(activeId) in sessions
 )
 
-export function setSessionCompacting(sessionId: string | null | undefined, active: boolean): void {
+export function setSessionCompressionStatus(
+  sessionId: string | null | undefined,
+  status?: CompressionStatus
+): void {
   const key = keyFor(sessionId)
-  const sessions = $compactingSessions.get()
 
-  if (active) {
-    if (key in sessions) {
+  if (!key) {
+    return
+  }
+
+  const statuses = $compressionStatuses.get()
+
+  if (status) {
+    const current = statuses[key]
+
+    if (current?.kind === status.kind && current.text === status.text) {
       return
     }
 
-    $compactingSessions.set({ ...sessions, [key]: true })
+    $compressionStatuses.set({ ...statuses, [key]: status })
 
     return
   }
 
-  if (!(key in sessions)) {
+  if (!(key in statuses)) {
     return
   }
 
-  const next = { ...sessions }
+  const next = { ...statuses }
   delete next[key]
-  $compactingSessions.set(next)
+  $compressionStatuses.set(next)
+}
+
+export function setSessionCompacting(sessionId: string | null | undefined, active: boolean): void {
+  setSessionCompressionStatus(
+    sessionId,
+    active ? { kind: 'compression.preparing', text: 'Summarizing thread' } : undefined
+  )
 }

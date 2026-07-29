@@ -164,7 +164,28 @@ def test_reset_session_state_rebinds_builtin_compressor_after_session_switch(tmp
     db = SessionDB(db_path=tmp_path / "state.db")
     db.create_session("old-sid", source="cli")
     db.create_session("new-sid", source="cli")
-    db.record_compression_failure_cooldown("old-sid", 4_000_000_000.0, "old-timeout")
+    old_job = db.enqueue_compression_job(
+        session_id="old-sid",
+        job_id="old-job",
+        fence_id="old-fence",
+        snapshot_message_id=None,
+        snapshot_message_count=0,
+        snapshot_digest="",
+        main_route_fingerprint="fake-model",
+        auxiliary_route_fingerprint="fake-model",
+        snapshot_payload="[]",
+    )
+    old_claim = db.claim_compression_job(
+        session_id="old-sid", job_id=old_job["job_id"], holder="test"
+    )
+    db.mark_compression_job_cooldown(
+        session_id="old-sid",
+        job_id=old_job["job_id"],
+        holder="test",
+        lease_version=old_claim["lease_version"],
+        retry_at=4_000_000_000.0,
+        failure_code="old_timeout",
+    )
 
     monkeypatch.setattr(
         "agent.context_compressor.get_model_context_length",
@@ -188,12 +209,26 @@ def test_reset_session_state_rebinds_builtin_compressor_after_session_switch(tmp
 
     assert compressor._session_id == "new-sid"
     assert compressor.get_active_compression_failure_cooldown() is None
-    assert db.get_compression_failure_cooldown("old-sid") is not None
+    assert db.get_compression_job("old-sid")["state"] == "cooldown"
 
+    new_job = db.enqueue_compression_job(
+        session_id="new-sid",
+        job_id="new-job",
+        fence_id="new-fence",
+        snapshot_message_id=None,
+        snapshot_message_count=0,
+        snapshot_digest="",
+        main_route_fingerprint="fake-model",
+        auxiliary_route_fingerprint="fake-model",
+        snapshot_payload="[]",
+    )
+    db.claim_compression_job(
+        session_id="new-sid", job_id=new_job["job_id"], holder="test"
+    )
     compressor._record_compression_failure_cooldown(30.0, "new-timeout")
 
-    assert db.get_compression_failure_cooldown("new-sid") is not None
-    assert db.get_compression_failure_cooldown("old-sid")["error"] == "old-timeout"
+    assert db.get_compression_job("new-sid")["state"] == "cooldown"
+    assert db.get_compression_job("old-sid")["failure_code"] == "old_timeout"
 
 
 def test_update_from_response_forwards_canonical_cache_buckets():

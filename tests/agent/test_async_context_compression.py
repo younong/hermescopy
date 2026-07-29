@@ -1,8 +1,10 @@
-"""Focused tests for speculative asynchronous context compression."""
+"""Focused tests for durable asynchronous context compression."""
 
 from __future__ import annotations
 
-from concurrent.futures import Future, TimeoutError
+import json
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -17,6 +19,7 @@ from agent.async_context_compression import (
     maybe_handle_async_compression,
 )
 from agent.context_compressor import PreparedCompression
+from hermes_state import SessionDB
 
 
 class _ControlledExecutor:
@@ -24,14 +27,14 @@ class _ControlledExecutor:
         self.submissions = []
 
     def submit(self, fn, *args, **kwargs):
-        future = Future()
-        self.submissions.append((future, fn, args, kwargs))
-        return future
+        self.submissions.append((fn, args, kwargs))
 
     def complete(self, index=0):
-        future, fn, args, kwargs = self.submissions[index]
-        future.set_result(fn(*args, **kwargs))
-        return future
+        fn, args, kwargs = self.submissions[index]
+        fn(*args, **kwargs)
+
+    def shutdown(self, **_kwargs):
+        return None
 
 
 class _FakeCompressor:
@@ -39,15 +42,23 @@ class _FakeCompressor:
         self.context_length = 256_000
         self.max_tokens = 0
         self.threshold_tokens = 128_000
-        self.model = "test/model"
+        self.model = "test/summary"
         self.prepare_calls = []
-        self._last_compress_aborted = False
+        self.block = None
+        self.failure = None
+        self.result = None
 
     def should_compress(self, tokens):
         return tokens >= self.threshold_tokens
 
     def prepare_compression(self, messages, *, current_tokens=None, **_kwargs):
         self.prepare_calls.append((messages, current_tokens))
+        if self.block is not None:
+            self.block.wait(timeout=5)
+        if self.failure is not None:
+            raise self.failure
+        if self.result is not None:
+            return self.result
         return PreparedCompression(
             compressed_messages=[
                 {"role": "user", "content": "[SUMMARY] prior work"},
@@ -55,34 +66,45 @@ class _FakeCompressor:
             ],
             compressor_state={"compression_count": 1},
             aborted=False,
+            auxiliary_route_fingerprint="actual-route",
+            auxiliary_context_length=256_000,
+            auxiliary_input_budget=248_000,
         )
 
 
 class _FakeAgent:
-    def __init__(self, executor):
+    def __init__(self, db):
         self.session_id = "session-1"
         self.model = "test/model"
-        self._session_db = SimpleNamespace(db_path="/tmp/state.db")
+        self._session_db = db
         self.context_compressor = _FakeCompressor()
         self.compression_enabled = True
         self._compression_feasibility_checked = True
         self._using_builtin_context_compressor = True
-        self.compression_async_prepare = True
         self.compression_prepare_threshold = 0.50
         self.compression_commit_threshold = 0.80
         self.compression_emergency_threshold = 0.88
-        self.compression_emergency_wait_seconds = 15.0
-        self._async_compression_executor = executor
-        self._compress_context = MagicMock(
-            return_value=([{"role": "user", "content": "sync summary"}], "SYNC")
-        )
+        self._compress_context = MagicMock()
+        self.statuses = []
+
+    def _emit_status(self, message, *, kind="lifecycle"):
+        self.statuses.append((kind, message))
 
 
 @pytest.fixture(autouse=True)
-def _clear_registry():
+def _clear_orchestrators():
     _reset_async_compression_for_tests()
     yield
     _reset_async_compression_for_tests()
+
+
+@pytest.fixture
+def agent(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("session-1", "cli", model="test/model")
+    candidate = _FakeAgent(db)
+    yield candidate
+    db.close()
 
 
 def _messages():
@@ -103,8 +125,17 @@ def _handle(agent, messages, tokens):
     )
 
 
-def test_thresholds_use_effective_input_window_and_stay_monotonic():
-    agent = _FakeAgent(_ControlledExecutor())
+def _wait_for_state(agent, expected, timeout=5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        job = agent._session_db.get_compression_job(agent.session_id)
+        if job and job["state"] in expected:
+            return job
+        time.sleep(0.01)
+    raise AssertionError(f"job did not reach {expected}")
+
+
+def test_thresholds_use_effective_input_window_and_stay_monotonic(agent):
     agent.context_compressor.max_tokens = 16_000
     agent.context_compressor.threshold_tokens = 120_000
 
@@ -115,198 +146,167 @@ def test_thresholds_use_effective_input_window_and_stay_monotonic():
     assert thresholds.emergency == int(240_000 * 0.88)
 
 
-def test_explicit_prepare_threshold_can_raise_builtin_trigger():
-    agent = _FakeAgent(_ControlledExecutor())
-    agent.compression_prepare_threshold = 0.60
-
-    thresholds = compression_thresholds(agent)
-
-    assert thresholds.prepare == int(256_000 * 0.60)
-    assert thresholds.commit == int(256_000 * 0.80)
-    assert thresholds.emergency == int(256_000 * 0.88)
-
-
-def test_feasibility_check_runs_before_first_worker_submission(monkeypatch):
-    executor = _ControlledExecutor()
-    agent = _FakeAgent(executor)
-    agent._compression_feasibility_checked = False
-    events = []
-
-    def _check(candidate):
-        assert candidate is agent
-        assert executor.submissions == []
-        events.append("feasibility")
-
-    monkeypatch.setattr(
-        "agent.conversation_compression.check_compression_model_feasibility",
-        _check,
-    )
-
-    outcome = _handle(agent, _messages(), 128_000)
-
-    assert outcome.action is AsyncCompressionAction.PREPARING
-    assert events == ["feasibility"]
-    assert agent._compression_feasibility_checked is True
-    assert len(executor.submissions) == 1
-
-
-def test_feasibility_lowered_threshold_starts_prepare_at_safe_cap(monkeypatch):
-    executor = _ControlledExecutor()
-    agent = _FakeAgent(executor)
-    agent._compression_feasibility_checked = False
-    checks = []
-
-    def _check(candidate):
-        checks.append(candidate)
-        candidate.context_compressor.threshold_tokens = 80_000
-        candidate._compression_prepare_token_cap = 80_000
-
-    monkeypatch.setattr(
-        "agent.conversation_compression.check_compression_model_feasibility",
-        _check,
-    )
-
-    below = _handle(agent, _messages(), 64_000)
-    at_cap = _handle(agent, _messages(), 80_000)
-
-    assert below.action is AsyncCompressionAction.NONE
-    assert at_cap.action is AsyncCompressionAction.PREPARING
-    assert checks == [agent]
-    assert compression_thresholds(agent).prepare == 80_000
-    assert len(executor.submissions) == 1
-    assert executor.submissions[0][2][2] == 80_000
-
-
-def test_below_prepare_threshold_does_not_submit():
-    executor = _ControlledExecutor()
-    agent = _FakeAgent(executor)
-
+def test_below_prepare_threshold_does_not_enqueue(agent):
     outcome = _handle(agent, _messages(), 127_999)
 
     assert outcome.action is AsyncCompressionAction.NONE
-    assert executor.submissions == []
-    agent._compress_context.assert_not_called()
+    assert agent._session_db.get_compression_job(agent.session_id) is None
 
 
-def test_prepare_threshold_submits_once_without_changing_live_context():
-    executor = _ControlledExecutor()
-    agent = _FakeAgent(executor)
+def test_anti_thrash_veto_does_not_enqueue(agent):
+    agent.context_compressor.should_compress = MagicMock(return_value=False)
+
+    outcome = _handle(agent, _messages(), 128_000)
+
+    assert outcome.action is AsyncCompressionAction.NONE
+    agent.context_compressor.should_compress.assert_called_once_with(128_000)
+    assert agent._session_db.get_compression_job(agent.session_id) is None
+
+
+def test_prepare_threshold_enqueues_durable_snapshot_without_changing_context(agent):
+    blocker = threading.Event()
+    agent.context_compressor.block = blocker
     messages = _messages()
 
-    first = _handle(agent, messages, 128_000)
-    second = _handle(agent, messages, 150_000)
+    outcome = _handle(agent, messages, 128_000)
+    job = _wait_for_state(agent, {"queued", "preparing"})
+
+    assert outcome.action is AsyncCompressionAction.PREPARING
+    assert outcome.messages is messages
+    assert json.loads(job["snapshot_payload"]) == messages
+    assert job["snapshot_message_count"] == len(messages)
+    assert "old question" not in repr({k: job[k] for k in ("job_id", "fence_id")})
+    assert agent.statuses[0][0] == "compression.preparing"
+    blocker.set()
+
+
+def test_preparation_runs_in_background_and_never_waits_at_emergency(agent):
+    blocker = threading.Event()
+    agent.context_compressor.block = blocker
+
+    started = time.monotonic()
+    first = _handle(agent, _messages(), 128_000)
+    emergency = _handle(agent, _messages(), 226_000)
+    elapsed = time.monotonic() - started
 
     assert first.action is AsyncCompressionAction.PREPARING
-    assert second.action is AsyncCompressionAction.PREPARING
-    assert first.messages is messages
-    assert first.system_prompt == "SYSTEM"
-    assert len(executor.submissions) == 1
-    assert agent.context_compressor.prepare_calls == []
+    assert emergency.action is AsyncCompressionAction.PREPARING
+    assert elapsed < 1.0
+    agent._compress_context.assert_not_called()
+    blocker.set()
+
+
+def test_ready_job_commits_only_at_commit_threshold(agent, monkeypatch):
+    messages = _messages()
+    _handle(agent, messages, 128_000)
+    job = _wait_for_state(agent, {"ready"})
+    commit = MagicMock(return_value=([{"role": "user", "content": "ready"}], "READY"))
+    monkeypatch.setattr("agent.async_context_compression.commit_prepared_context", commit)
+
+    below = _handle(agent, messages, 190_000)
+    committed = _handle(agent, messages, 205_000)
+
+    assert below.action is AsyncCompressionAction.READY
+    assert committed.action is AsyncCompressionAction.COMMITTED
+    assert commit.call_args.kwargs["compression_job"]["job_id"] == job["job_id"]
+    assert commit.call_args.kwargs["compression_job"]["state"] == "committing"
     agent._compress_context.assert_not_called()
 
 
-def test_ready_preparation_is_not_committed_before_commit_threshold(monkeypatch):
-    executor = _ControlledExecutor()
-    agent = _FakeAgent(executor)
-    messages = _messages()
-    _handle(agent, messages, 128_000)
-    executor.complete()
-    commit = MagicMock()
-    monkeypatch.setattr("agent.async_context_compression.commit_prepared_context", commit)
+def test_failed_preparation_enters_durable_cooldown_without_sync_fallback(agent):
+    agent.context_compressor.failure = RuntimeError("provider failed")
 
-    outcome = _handle(agent, messages, 190_000)
+    outcome = _handle(agent, _messages(), 128_000)
+    job = _wait_for_state(agent, {"cooldown"})
+    observed = _handle(agent, _messages(), 226_000)
 
-    assert outcome.action is AsyncCompressionAction.READY
-    assert outcome.messages is messages
-    commit.assert_not_called()
-
-
-def test_commit_threshold_applies_ready_snapshot_plus_append_only_delta(monkeypatch):
-    executor = _ControlledExecutor()
-    agent = _FakeAgent(executor)
-    snapshot = _messages()
-    _handle(agent, snapshot, 128_000)
-    executor.complete()
-    current = snapshot + [{"role": "assistant", "content": "new delta"}]
-    committed = [
-        {"role": "user", "content": "[SUMMARY] prior work"},
-        snapshot[-1],
-        current[-1],
-    ]
-    commit = MagicMock(return_value=(committed, "COMMITTED"))
-    monkeypatch.setattr("agent.async_context_compression.commit_prepared_context", commit)
-
-    outcome = _handle(agent, current, 205_000)
-
-    assert outcome.action is AsyncCompressionAction.COMMITTED
-    assert outcome.messages == committed
-    assert outcome.system_prompt == "COMMITTED"
-    prepared = commit.call_args.kwargs["prepared"]
-    assert prepared.snapshot_length == len(snapshot)
-    assert prepared.compression.compressed_messages[-1] == snapshot[-1]
-    assert commit.call_args.kwargs["messages"] is current
+    assert outcome.action is AsyncCompressionAction.PREPARING
+    assert job["failure_code"] == "preparation_failure"
+    assert job["retry_at"] > time.time()
+    assert observed.action is AsyncCompressionAction.FAILED
+    assert "compression.cooldown" in {kind for kind, _ in agent.statuses}
     agent._compress_context.assert_not_called()
 
 
-def test_failed_preparation_is_discarded_and_can_retry(monkeypatch):
-    executor = _ControlledExecutor()
-    agent = _FakeAgent(executor)
-    messages = _messages()
-    _handle(agent, messages, 128_000)
-    executor.submissions[0][0].set_exception(RuntimeError("provider failed"))
-
-    failed = _handle(agent, messages, 150_000)
-    retried = _handle(agent, messages, 150_000)
-
-    assert failed.action is AsyncCompressionAction.FAILED
-    assert retried.action is AsyncCompressionAction.PREPARING
-    assert len(executor.submissions) == 2
-
-
-def test_noop_preparation_is_discarded_and_can_retry(monkeypatch):
-    executor = _ControlledExecutor()
-    agent = _FakeAgent(executor)
-    messages = _messages()
-    _handle(agent, messages, 128_000)
-    future = executor.complete()
-    prepared = future.result()
-    object.__setattr__(prepared.compression, "applied", False)
-
-    failed = _handle(agent, messages, 205_000)
-    retried = _handle(agent, messages, 205_000)
-
-    assert failed.action is AsyncCompressionAction.FAILED
-    assert retried.action is AsyncCompressionAction.PREPARING
-    assert len(executor.submissions) == 2
-
-
-def test_noop_preparation_is_not_committed_below_emergency(monkeypatch):
-    executor = _ControlledExecutor()
-    agent = _FakeAgent(executor)
-    messages = _messages()
-    _handle(agent, messages, 128_000)
-    future = executor.complete()
-    prepared = future.result()
-    object.__setattr__(prepared.compression, "applied", False)
-    commit = MagicMock()
-    monkeypatch.setattr(
-        "agent.async_context_compression.commit_prepared_context",
-        commit,
+def test_detached_atomic_group_failure_is_degraded_and_lossless(agent):
+    agent.context_compressor.result = PreparedCompression(
+        compressed_messages=_messages(),
+        compressor_state={
+            "_last_summary_error": (
+                "atomic tool group exceeds auxiliary input budget"
+            )
+        },
+        aborted=True,
+        applied=False,
     )
 
-    outcome = _handle(agent, messages, 205_000)
+    _handle(agent, _messages(), 128_000)
+    job = _wait_for_state(agent, {"degraded"})
 
-    assert outcome.action is AsyncCompressionAction.FAILED
-    commit.assert_not_called()
-    agent._compress_context.assert_not_called()
+    assert job["failure_code"] == "atomic_group_too_large"
+    assert "compression.degraded" in {kind for kind, _ in agent.statuses}
 
 
-def test_changed_snapshot_is_stale_and_not_committed_below_emergency(monkeypatch):
-    executor = _ControlledExecutor()
-    agent = _FakeAgent(executor)
+def test_ready_job_persists_actual_auxiliary_route_metadata(agent):
+    _handle(agent, _messages(), 128_000)
+
+    job = _wait_for_state(agent, {"ready"})
+
+    assert job["prepared_auxiliary_route_fingerprint"] == "actual-route"
+    assert job["prepared_auxiliary_context_length"] == 256_000
+    assert job["prepared_auxiliary_input_budget"] == 248_000
+    payload = json.loads(job["prepared_payload"])
+    assert payload["compression"]["auxiliary_route_fingerprint"] == "actual-route"
+    assert "base_url" not in payload["compression"]
+    assert "api_key" not in payload["compression"]
+
+
+def test_ready_transition_emits_structured_status(agent):
+    _handle(agent, _messages(), 128_000)
+
+    _wait_for_state(agent, {"ready"})
+
+    assert "compression.ready" in {kind for kind, _ in agent.statuses}
+
+
+def test_checkpoint_refreshes_exact_lease(agent, monkeypatch):
+    def prepare(messages, *, current_tokens=None, checkpoint=None, **_kwargs):
+        checkpoint(1, "rolling")
+        return PreparedCompression(
+            compressed_messages=[messages[-1]],
+            compressor_state={"compression_count": 1},
+            aborted=False,
+            auxiliary_route_fingerprint="actual-route",
+            auxiliary_context_length=256_000,
+            auxiliary_input_budget=248_000,
+        )
+
+    refresh = MagicMock(
+        wraps=agent._session_db.refresh_compression_job_lease
+    )
+    monkeypatch.setattr(
+        agent._session_db, "refresh_compression_job_lease", refresh
+    )
+    agent.context_compressor.prepare_compression = prepare
+
+    _handle(agent, _messages(), 128_000)
+    job = _wait_for_state(agent, {"ready"})
+
+    refresh.assert_called_once_with(
+        session_id=agent.session_id,
+        job_id=job["job_id"],
+        holder=refresh.call_args.kwargs["holder"],
+        lease_version=job["lease_version"],
+        lease_seconds=420.0,
+    )
+    assert job["chunk_cursor"] == 1
+    assert job["rolling_summary"] == "rolling"
+
+
+def test_changed_snapshot_is_marked_stale_and_not_committed(agent, monkeypatch):
     snapshot = _messages()
     _handle(agent, snapshot, 128_000)
-    executor.complete()
+    _wait_for_state(agent, {"ready"})
     changed = [dict(message) for message in snapshot]
     changed[0]["content"] = "edited history"
     commit = MagicMock()
@@ -315,60 +315,84 @@ def test_changed_snapshot_is_stale_and_not_committed_below_emergency(monkeypatch
     outcome = _handle(agent, changed, 205_000)
 
     assert outcome.action is AsyncCompressionAction.STALE
+    assert agent._session_db.get_compression_job(agent.session_id)["state"] == "stale"
     commit.assert_not_called()
-    agent._compress_context.assert_not_called()
 
 
-def test_emergency_waits_on_same_future_then_commits(monkeypatch):
-    executor = _ControlledExecutor()
-    agent = _FakeAgent(executor)
+def test_invalidation_durably_cancels_job(agent):
+    blocker = threading.Event()
+    agent.context_compressor.block = blocker
+    _handle(agent, _messages(), 128_000)
+    _wait_for_state(agent, {"preparing"})
+
+    invalidate_preparation(agent, reason="manual compression")
+
+    assert agent._session_db.get_compression_job(agent.session_id)["state"] == "cancelled"
+    blocker.set()
+
+
+def test_expired_preparation_lease_is_reclaimed_after_restart(agent):
+    blocker = threading.Event()
+    agent.context_compressor.block = blocker
+    _handle(agent, _messages(), 128_000)
+    job = _wait_for_state(agent, {"preparing"})
+    agent._session_db._conn.execute(
+        "UPDATE compression_jobs SET lease_expires_at=? WHERE session_id=?",
+        (time.time() - 1.0, agent.session_id),
+    )
+    agent._session_db._conn.commit()
+    blocker.set()
+    _wait_for_state(agent, {"preparing", "cooldown"})
+    _reset_async_compression_for_tests()
+    replacement = _FakeAgent(agent._session_db)
+
+    _handle(replacement, _messages(), 150_000)
+    ready = _wait_for_state(replacement, {"ready"})
+
+    assert ready["job_id"] == job["job_id"]
+    assert ready["lease_version"] >= 2
+
+
+def test_tampered_actual_route_fence_stales_prepared_projection(agent, monkeypatch):
     messages = _messages()
     _handle(agent, messages, 128_000)
-    future, fn, args, kwargs = executor.submissions[0]
-    prepared = fn(*args, **kwargs)
-    waits = []
+    _wait_for_state(agent, {"ready"})
+    agent._session_db._conn.execute(
+        "UPDATE compression_jobs SET prepared_auxiliary_route_fingerprint=? "
+        "WHERE session_id=?",
+        ("other-route", agent.session_id),
+    )
+    agent._session_db._conn.commit()
+    commit = MagicMock()
+    monkeypatch.setattr(
+        "agent.async_context_compression.commit_prepared_context", commit
+    )
 
-    def _result(timeout=None):
-        waits.append(timeout)
-        return prepared
+    outcome = _handle(agent, messages, 205_000)
 
-    monkeypatch.setattr(future, "result", _result)
-    commit = MagicMock(return_value=([{"role": "user", "content": "ready"}], "READY"))
-    monkeypatch.setattr("agent.async_context_compression.commit_prepared_context", commit)
-
-    outcome = _handle(agent, messages, 226_000)
-
-    assert waits == [15.0]
-    assert len(executor.submissions) == 1
-    assert outcome.action is AsyncCompressionAction.COMMITTED
-    agent._compress_context.assert_not_called()
+    assert outcome.action is AsyncCompressionAction.STALE
+    assert agent._session_db.get_compression_job(agent.session_id)["state"] == "stale"
+    commit.assert_not_called()
 
 
-def test_emergency_timeout_uses_existing_synchronous_fallback(monkeypatch):
-    executor = _ControlledExecutor()
-    agent = _FakeAgent(executor)
+def test_route_change_stales_prepared_projection(agent, monkeypatch):
     messages = _messages()
     _handle(agent, messages, 128_000)
-    future = executor.submissions[0][0]
-    waits = []
+    _wait_for_state(agent, {"ready"})
+    commit = MagicMock()
+    monkeypatch.setattr(
+        "agent.async_context_compression.commit_prepared_context", commit
+    )
 
-    def _timeout(timeout=None):
-        waits.append(timeout)
-        raise TimeoutError()
+    agent.model = "test/changed"
+    outcome = _handle(agent, messages, 205_000)
 
-    monkeypatch.setattr(future, "result", _timeout)
-
-    outcome = _handle(agent, messages, 226_000)
-
-    assert waits == [15.0]
-    assert len(executor.submissions) == 1
-    assert outcome.action is AsyncCompressionAction.SYNCHRONOUS_FALLBACK
-    assert outcome.messages == [{"role": "user", "content": "sync summary"}]
-    agent._compress_context.assert_called_once()
+    assert outcome.action is AsyncCompressionAction.STALE
+    assert agent._session_db.get_compression_job(agent.session_id)["state"] == "stale"
+    commit.assert_not_called()
 
 
-def test_runtime_invalidation_clears_feasibility_state():
-    agent = _FakeAgent(_ControlledExecutor())
+def test_runtime_invalidation_clears_feasibility_state(agent):
     agent._compression_prepare_token_cap = 80_000
     agent._compression_warning = "warning for old model"
 
@@ -379,114 +403,10 @@ def test_runtime_invalidation_clears_feasibility_state():
     assert agent._compression_warning is None
 
 
-def test_session_invalidation_discards_ready_result(monkeypatch):
-    executor = _ControlledExecutor()
-    agent = _FakeAgent(executor)
-    messages = _messages()
-    _handle(agent, messages, 128_000)
-    executor.complete()
-    invalidate_preparation(agent, reason="manual compression")
-    commit = MagicMock()
-    monkeypatch.setattr("agent.async_context_compression.commit_prepared_context", commit)
-
-    outcome = _handle(agent, messages, 205_000)
-
-    assert outcome.action is AsyncCompressionAction.STALE
-    commit.assert_not_called()
-
-
-def test_invalidated_preparation_uses_synchronous_fallback_at_emergency(monkeypatch):
-    executor = _ControlledExecutor()
-    agent = _FakeAgent(executor)
-    messages = _messages()
-    _handle(agent, messages, 128_000)
-    executor.complete()
-    invalidate_preparation(agent, reason="manual compression")
-    commit = MagicMock()
-    monkeypatch.setattr(
-        "agent.async_context_compression.commit_prepared_context",
-        commit,
-    )
-
-    outcome = _handle(agent, messages, 226_000)
-
-    assert outcome.action is AsyncCompressionAction.SYNCHRONOUS_FALLBACK
-    assert outcome.messages == [{"role": "user", "content": "sync summary"}]
-    commit.assert_not_called()
-    agent._compress_context.assert_called_once()
-
-
-def test_prepare_runs_on_detached_compressor_state(monkeypatch):
-    from agent.context_compressor import ContextCompressor
-
-    compressor = object.__new__(ContextCompressor)
-    compressor._session_db = object()
-    compressor._session_id = "live-session"
-    compressor._previous_summary = "live summary"
-    compressor.compression_count = 3
-    compressor._PREPARED_STATE_FIELDS = ContextCompressor._PREPARED_STATE_FIELDS
-    observed = {}
-
-    def _compress(detached, messages, **_kwargs):
-        observed["same"] = detached is compressor
-        observed["db"] = detached._session_db
-        observed["session"] = detached._session_id
-        detached._previous_summary = "prepared summary"
-        detached._last_compress_aborted = False
-        return [{"role": "user", "content": "prepared"}]
-
-    monkeypatch.setattr(ContextCompressor, "compress", _compress)
-    prepared = ContextCompressor.prepare_compression(
-        compressor,
-        _messages(),
-        current_tokens=128_000,
-    )
-
-    assert observed == {"same": False, "db": None, "session": ""}
-    assert compressor._previous_summary == "live summary"
-    assert compressor.compression_count == 3
-    assert prepared.compressor_state["_previous_summary"] == "prepared summary"
-
-
-def test_noop_preparation_does_not_increment_live_compression_count(monkeypatch):
-    from agent.context_compressor import ContextCompressor
-
-    compressor = object.__new__(ContextCompressor)
-    compressor._session_db = object()
-    compressor._session_id = "live-session"
-    compressor._previous_summary = "live summary"
-    compressor.compression_count = 3
-    compressor._last_compress_aborted = False
-    compressor._PREPARED_STATE_FIELDS = ContextCompressor._PREPARED_STATE_FIELDS
-
-    def _compress(detached, messages, **_kwargs):
-        detached._last_compress_aborted = False
-        return messages
-
-    monkeypatch.setattr(ContextCompressor, "compress", _compress)
-    messages = _messages()
-    prepared = ContextCompressor.prepare_compression(
-        compressor,
-        messages,
-        current_tokens=128_000,
-    )
-    result = ContextCompressor.apply_prepared_compression(
-        compressor,
-        prepared,
-        [],
-        current_tokens=128_000,
-    )
-
-    assert result == messages
-    assert compressor.compression_count == 3
-
-
-def test_plugin_context_engine_never_uses_async_coordinator():
-    executor = _ControlledExecutor()
-    agent = _FakeAgent(executor)
+def test_plugin_context_engine_never_uses_durable_coordinator(agent):
     agent._using_builtin_context_compressor = False
 
     outcome = _handle(agent, _messages(), 226_000)
 
     assert outcome.action is AsyncCompressionAction.NONE
-    assert executor.submissions == []
+    assert agent._session_db.get_compression_job(agent.session_id) is None

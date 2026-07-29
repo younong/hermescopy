@@ -11341,7 +11341,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # own context-length classifier.
             is_context_overflow_failure = (
                 agent_failed_early
-                and agent_result.get("failure_reason") != "compression_aborted"
+                and agent_result.get("failure_reason")
+                != "compression_hard_blocked"
                 and (
                     bool(agent_result.get("compression_exhausted"))
                     or any(p in _err_str_for_classify for p in (

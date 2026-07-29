@@ -28,6 +28,7 @@ these paths see no behavioural change.
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import tempfile
@@ -42,14 +43,8 @@ from agent.model_metadata import estimate_request_tokens_rough
 
 logger = logging.getLogger(__name__)
 
-# Stable marker the gateway matches on to re-tag the auto-compaction lifecycle
-# status as ``kind="compacting"`` (tui_gateway/server.py::_status_update), so
-# drivers like the desktop app can show an explicit "Summarizing…" indicator
-# instead of the transcript appearing to silently reset. Keep the marker phrase
-# intact if you reword COMPACTION_STATUS.
-COMPACTION_STATUS_MARKER = "Compacting context"
 COMPACTION_STATUS = (
-    f"🗜️ {COMPACTION_STATUS_MARKER} — summarizing earlier conversation so I can continue..."
+    "🗜️ Compacting context — summarizing earlier conversation so I can continue..."
 )
 
 # Automatic compression is user-blocking preflight work. Manual /compress keeps
@@ -289,11 +284,7 @@ def check_compression_model_feasibility(agent: Any) -> None:
         agent._compression_prepare_token_cap = (
             int(aux_context) if aux_context < async_prepare else None
         )
-        if (
-            aux_context >= threshold
-            and aux_context < async_prepare
-            and getattr(agent, "compression_async_prepare", False)
-        ):
+        if aux_context >= threshold and aux_context < async_prepare:
             msg = (
                 f"⚠ Compression model {aux_model} context is {aux_context:,} "
                 f"tokens, below the async preparation threshold of "
@@ -570,6 +561,7 @@ def commit_prepared_context(
     approx_tokens: Optional[int] = None,
     task_id: str = "default",
     emit_abort_warning: bool = True,
+    compression_job: Optional[dict] = None,
 ) -> Tuple[list, str]:
     """Atomically validate and commit a detached background preparation."""
     return compress_context(
@@ -580,6 +572,7 @@ def commit_prepared_context(
         task_id=task_id,
         emit_abort_warning=emit_abort_warning,
         _prepared=prepared,
+        _compression_job=compression_job,
     )
 
 
@@ -594,6 +587,7 @@ def compress_context(
     force: bool = False,
     emit_abort_warning: bool = True,
     _prepared: Any = None,
+    _compression_job: Optional[dict] = None,
 ) -> Tuple[list, str]:
     """Compress conversation context and split the session in SQLite.
 
@@ -657,8 +651,12 @@ def compress_context(
     # keeps the SAME session_id — no end_session, no parent_session_id child, no
     # `name #N` renumber, no contextvar/env/logging re-sync, no memory/context-
     # engine session-switch. The conversation keeps one durable id for life,
-    # eliminating the session-rotation bug cluster. Default False during rollout.
-    in_place = bool(getattr(agent, "compression_in_place", False))
+    # eliminating the session-rotation bug cluster. Built-in durable jobs always
+    # use this mode; synchronous callers follow compression.in_place.
+    in_place = bool(
+        _compression_job is not None
+        or getattr(agent, "compression_in_place", False)
+    )
     # Set True once the in-place DB write actually completes (the DB block can
     # raise and skip it). Surfaced to the gateway via agent._last_compaction_in_place.
     compacted_in_place = False
@@ -668,7 +666,7 @@ def compress_context(
         f"{approx_tokens:,}" if approx_tokens else "unknown", agent.model,
         focus_topic,
     )
-    agent._emit_status(COMPACTION_STATUS)
+    agent._emit_status(COMPACTION_STATUS, kind="compression.preparing")
 
     # ── Compression lock ────────────────────────────────────────────────
     # Atomic, state.db-backed lock per session_id.  Without this, two
@@ -787,6 +785,13 @@ def compress_context(
     if not force:
         deadline_monotonic = time.monotonic() + _AUTOMATIC_COMPRESSION_DEADLINE_SECONDS
 
+    _prepared_state_before = None
+    if _prepared is not None:
+        _prepared_state_before = {
+            field: copy.deepcopy(getattr(agent.context_compressor, field, None))
+            for field in agent.context_compressor._PREPARED_STATE_FIELDS
+        }
+
     try:
         if _prepared is not None:
             if not _prepared_snapshot_is_current(_prepared, agent, messages):
@@ -843,10 +848,11 @@ def compress_context(
                 and getattr(agent, "_last_compression_summary_warning", None) != _err
             ):
                 agent._last_compression_summary_warning = _err
-                agent._emit_warning(
-                    f"⚠ Compression aborted: {_err}. "
+                agent._emit_status(
+                    f"⚠ Compression paused: {_err}. "
                     "No messages were dropped and the session is unchanged. "
-                    "Run /compress to retry, or /new to start a fresh session."
+                    "Run /compress to retry, or /new to start a fresh session.",
+                    kind="compression.degraded",
                 )
             _existing_sp = getattr(agent, "_cached_system_prompt", None)
             if not _existing_sp:
@@ -925,7 +931,11 @@ def compress_context(
                     # for search/recovery (Teknium review — keep one durable id
                     # WITHOUT destroying history, unlike a hard replace_messages).
                     # See #38763.
-                    agent._session_db.archive_and_compact(agent.session_id, compressed)
+                    agent._session_db.archive_and_compact(
+                        agent.session_id,
+                        compressed,
+                        compression_job=_compression_job,
+                    )
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
                     # are passed as conversation_history next turn and skipped by
@@ -1045,6 +1055,15 @@ def compress_context(
                 agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
                 agent._last_flushed_db_idx = 0
             except Exception as e:
+                if _compression_job is not None:
+                    # A prepared projection is not committed until the exact job
+                    # fence and transcript rewrite complete in one transaction.
+                    # Restore the live compressor projection before propagating;
+                    # the durable coordinator will fence the failed job as stale.
+                    for field, value in (_prepared_state_before or {}).items():
+                        setattr(agent.context_compressor, field, value)
+                    agent._invalidate_system_prompt()
+                    raise
                 # If the rotation rolled back to the parent (orphan-avoidance
                 # above), agent.session_id is the still-indexed parent and
                 # old_session_id was cleared — so this is recovery, not an
@@ -1164,6 +1183,10 @@ def compress_context(
             "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=true",
             agent.session_id or "none", _pre_msg_count, len(compressed),
             f"{_compressed_est:,}",
+        )
+        agent._emit_status(
+            "Context compression completed.",
+            kind="compression.completed",
         )
         return compressed, new_system_prompt
     finally:
@@ -1432,7 +1455,6 @@ def try_shrink_image_parts_in_messages(
 
 __all__ = [
     "COMPACTION_STATUS",
-    "COMPACTION_STATUS_MARKER",
     "check_compression_model_feasibility",
     "replay_compression_warning",
     "compress_context",

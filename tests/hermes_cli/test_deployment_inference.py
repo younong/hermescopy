@@ -133,12 +133,7 @@ def test_broker_rejects_requests_for_starting_or_revoked_worker(tmp_path):
     worker = socket.socket(fileno=worker_fd)
     key = broker._key(claim.lease)
     peer = broker._peers[key]
-    request = {
-        "method": "POST",
-        "path": "/v1/chat/completions",
-        "headers": {},
-        "body": "e30=",
-    }
+    request = _request_for_model()
 
     with pytest.raises(DeploymentInferenceRelayError, match="not active"):
         broker._handle_request(peer.lease, request)
@@ -502,18 +497,43 @@ def test_broker_logs_midstream_failure_with_counts(tmp_path, caplog):
         thread.join(timeout=2)
 
 
-def test_owner_relay_does_not_send_second_error_after_headers(monkeypatch, caplog):
+def test_owner_relay_does_not_send_second_error_after_headers(caplog):
     import hermes_cli.owner_worker.inference_relay as relay_module
 
-    relay = OwnerInferenceRelay.__new__(OwnerInferenceRelay)
-    relay._connection = object()
-    relay._lock = threading.Lock()
-    responses = iter([
-        {"type": "response_start", "status": 200, "headers": {}},
-        {"type": "error", "message": "upstream stream failed"},
-    ])
-    monkeypatch.setattr(relay_module, "_send_frame", lambda *_args: None)
-    monkeypatch.setattr(relay_module, "_recv_frame", lambda _conn: next(responses))
+    broker_side, worker_side = socket.socketpair()
+    broker_errors: list[BaseException] = []
+
+    def fail_midstream() -> None:
+        try:
+            assert relay_module._recv_frame(broker_side) == {
+                "type": "hello",
+                "version": relay_module._PROTOCOL_VERSION,
+            }
+            relay_module._send_frame(broker_side, {
+                "type": "hello_ack",
+                "version": relay_module._PROTOCOL_VERSION,
+            })
+            request = relay_module._recv_frame(broker_side)
+            request_id = request["request_id"]
+            relay_module._send_frame(broker_side, {
+                "type": "response_start",
+                "request_id": request_id,
+                "status": 200,
+                "headers": {},
+                "sequence": 0,
+            })
+            relay_module._send_frame(broker_side, {
+                "type": "error",
+                "request_id": request_id,
+                "sequence": 1,
+                "message": "upstream stream failed",
+            })
+        except BaseException as exc:
+            broker_errors.append(exc)
+
+    broker_thread = threading.Thread(target=fail_midstream, daemon=True)
+    broker_thread.start()
+    relay = OwnerInferenceRelay(worker_side.detach())
 
     class Handler:
         path = "/v1/chat/completions"
@@ -544,58 +564,78 @@ def test_owner_relay_does_not_send_second_error_after_headers(monkeypatch, caplo
             self.error_calls.append((status, message))
 
     handler = Handler()
-    with caplog.at_level(
-        logging.WARNING,
-        logger="hermes_cli.owner_worker.inference_relay",
-    ):
-        relay._handle_http(handler)
+    try:
+        with caplog.at_level(
+            logging.WARNING,
+            logger="hermes_cli.owner_worker.inference_relay",
+        ):
+            relay._handle_http(handler)
+        assert handler.sent_status == 200
+        assert handler.ended is True
+        assert handler.error_calls == []
+        assert handler.close_connection is True
+        assert "phase=midstream" in caplog.text
+        assert "upstream stream failed" not in caplog.text
+    finally:
+        relay.close()
+        broker_side.close()
+        broker_thread.join(timeout=2)
 
-    assert handler.sent_status == 200
-    assert handler.ended is True
-    assert handler.error_calls == []
-    assert handler.close_connection is True
-    assert "phase=midstream" in caplog.text
+    assert broker_errors == []
 
 
-def test_owner_relay_drains_abandoned_response_before_next_request(caplog):
+def test_owner_relay_cancels_abandoned_response_without_blocking_next_request(caplog):
     import hermes_cli.owner_worker.inference_relay as relay_module
 
     broker_side, worker_side = socket.socketpair()
-    relay = OwnerInferenceRelay(worker_side.detach())
     broker_errors: list[BaseException] = []
 
     def serve_two_responses() -> None:
         try:
-            relay_module._recv_frame(broker_side)
-            for frame in (
+            assert relay_module._recv_frame(broker_side) == {
+                "type": "hello",
+                "version": relay_module._PROTOCOL_VERSION,
+            }
+            relay_module._send_frame(broker_side, {
+                "type": "hello_ack",
+                "version": relay_module._PROTOCOL_VERSION,
+            })
+            first = relay_module._recv_frame(broker_side)
+            first_id = first["request_id"]
+            for sequence, frame in enumerate((
                 {"type": "response_start", "status": 200, "headers": {}},
                 {
                     "type": "response_chunk",
                     "body": base64.b64encode(b"abandoned-first").decode("ascii"),
                 },
-                {
-                    "type": "response_chunk",
-                    "body": base64.b64encode(b"abandoned-second").decode("ascii"),
-                },
-                {"type": "response_end"},
-            ):
-                relay_module._send_frame(broker_side, frame)
+            )):
+                relay_module._send_frame(
+                    broker_side,
+                    {**frame, "request_id": first_id, "sequence": sequence},
+                )
 
-            relay_module._recv_frame(broker_side)
-            for frame in (
+            cancel = relay_module._recv_frame(broker_side)
+            assert cancel == {"type": "cancel", "request_id": first_id}
+            second = relay_module._recv_frame(broker_side)
+            second_id = second["request_id"]
+            for sequence, frame in enumerate((
                 {"type": "response_start", "status": 200, "headers": {}},
                 {
                     "type": "response_chunk",
                     "body": base64.b64encode(b"fresh-response").decode("ascii"),
                 },
                 {"type": "response_end"},
-            ):
-                relay_module._send_frame(broker_side, frame)
+            )):
+                relay_module._send_frame(
+                    broker_side,
+                    {**frame, "request_id": second_id, "sequence": sequence},
+                )
         except BaseException as exc:
             broker_errors.append(exc)
 
     broker_thread = threading.Thread(target=serve_two_responses, daemon=True)
     broker_thread.start()
+    relay = OwnerInferenceRelay(worker_side.detach())
 
     class Handler:
         path = "/v1/chat/completions"
@@ -663,6 +703,121 @@ def test_owner_relay_drains_abandoned_response_before_next_request(caplog):
 
     assert broker_errors == []
     assert broker_thread.is_alive() is False
+
+
+def test_owner_relay_multiplexes_slow_and_fast_requests(tmp_path):
+    slow_started = threading.Event()
+    release_slow = threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            if b'"marker":"slow"' in body:
+                slow_started.set()
+                release_slow.wait(timeout=10)
+                response_body = b"slow-response"
+            else:
+                response_body = b"fast-response"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(response_body)))
+            self.end_headers()
+            self.wfile.write(response_body)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    policy = DeploymentInferencePolicy(
+        provider="custom:deployment",
+        model="gpt-safe",
+        api_mode="chat_completions",
+        runtime_resolver=lambda: {
+            "provider": "custom:deployment",
+            "api_mode": "chat_completions",
+            "base_url": f"http://127.0.0.1:{server.server_port}",
+            "api_key": "control-plane-secret",
+        },
+    )
+    broker, active, relay = _activate_relay(AuthorityStore(tmp_path / "control"), policy)
+    slow_result: list[bytes] = []
+    slow_errors: list[BaseException] = []
+
+    def request_slow() -> None:
+        try:
+            response = httpx.post(
+                f"{relay.base_url}/chat/completions",
+                json={"model": "gpt-safe", "messages": [], "marker": "slow"},
+                timeout=5,
+            )
+            slow_result.append(response.content)
+        except BaseException as exc:
+            slow_errors.append(exc)
+
+    slow_thread = threading.Thread(target=request_slow, daemon=True)
+    slow_thread.start()
+    try:
+        assert slow_started.wait(timeout=5)
+        fast = httpx.post(
+            f"{relay.base_url}/chat/completions",
+            json={"model": "gpt-safe", "messages": [], "marker": "fast"},
+            timeout=2,
+        )
+        assert fast.status_code == 200
+        assert fast.content == b"fast-response"
+        assert slow_thread.is_alive()
+
+        release_slow.set()
+        slow_thread.join(timeout=5)
+        assert slow_errors == []
+        assert slow_result == [b"slow-response"]
+    finally:
+        release_slow.set()
+        broker.revoke(active)
+        relay.close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+
+
+def test_broker_checks_exact_lease_before_resolving_credentials(tmp_path):
+    runtime_calls = 0
+
+    def resolve_runtime():
+        nonlocal runtime_calls
+        runtime_calls += 1
+        return {
+            "provider": "custom:deployment",
+            "api_mode": "chat_completions",
+            "base_url": "https://provider.example.test/v1",
+            "api_key": "control-plane-secret",
+        }
+
+    policy = DeploymentInferencePolicy(
+        provider="custom:deployment",
+        model="gpt-safe",
+        api_mode="chat_completions",
+        runtime_resolver=resolve_runtime,
+    )
+    store = AuthorityStore(tmp_path / "control")
+    claim = store.claim_worker_start("ok1_owner", worker_id="worker-1")
+    broker = DeploymentInferenceBroker(policy=policy, authority_store=store)
+    active = store.transition_worker_lease(
+        claim.lease,
+        state=WorkerLeaseState.ACTIVE,
+        generation_state=WorkerGenerationState.ACTIVE,
+    )
+    revoked = store.transition_worker_lease(
+        active,
+        state=WorkerLeaseState.REVOKED,
+        generation_state=WorkerGenerationState.FAILED,
+    )
+
+    with pytest.raises(DeploymentInferenceRelayError, match="not active"):
+        broker._request_parts(active, _request_for_model())
+    assert revoked.state is WorkerLeaseState.REVOKED
+    assert runtime_calls == 0
 
 
 def test_owner_relay_forwards_small_sse_event_before_upstream_completes(tmp_path):

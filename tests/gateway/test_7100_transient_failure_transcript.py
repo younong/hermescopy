@@ -26,7 +26,7 @@ def _classify(agent_result: dict, history_len: int) -> tuple[bool, bool]:
     err = str(agent_result.get("error", "")).lower()
     is_context_overflow_failure = (
         agent_failed_early
-        and agent_result.get("failure_reason") != "compression_aborted"
+        and agent_result.get("failure_reason") != "compression_hard_blocked"
         and (
             bool(agent_result.get("compression_exhausted"))
             or any(p in err for p in (
@@ -108,10 +108,10 @@ class TestTransientFailureKeepsUserMessage:
         assert failed
         assert not ctx_overflow
 
-    def test_automatic_compression_failure_is_not_context_overflow(self):
+    def test_compression_hard_block_preserves_user_message(self):
         agent_result = {
             "failed": True,
-            "failure_reason": "compression_aborted",
+            "failure_reason": "compression_hard_blocked",
             "error": "Context compression failed: input exceeds token limit",
         }
         failed, ctx_overflow = _classify(agent_result, history_len=100)
