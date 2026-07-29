@@ -40,6 +40,63 @@ class ImmediateThread:
         self._target()
 
 
+def test_current_main_runtime_redacts_relay_unless_trusted():
+    from hermes_cli.deployment_inference import DEPLOYMENT_INFERENCE_RELAY_MARKER
+
+    agent = _bare_agent()
+    agent.provider = "custom:codex"
+    agent.model = "gpt-5.6-sol"
+    agent.base_url = "http://127.0.0.1:39123/v1"
+    agent.api_key = DEPLOYMENT_INFERENCE_RELAY_MARKER
+    agent.api_mode = "chat_completions"
+
+    assert agent._current_main_runtime()["api_key"] == ""
+    trusted = agent._current_main_runtime(allow_deployment_relay=True)
+    assert trusted["api_key"] == DEPLOYMENT_INFERENCE_RELAY_MARKER
+    assert trusted["base_url"] == "http://127.0.0.1:39123/v1"
+
+
+def test_background_review_fork_inherits_deployment_relay(monkeypatch):
+    from hermes_cli.deployment_inference import DEPLOYMENT_INFERENCE_RELAY_MARKER
+
+    captured_kwargs = {}
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            self._session_messages = []
+
+        def run_conversation(self, **kwargs):
+            pass
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+
+    agent = _bare_agent()
+    agent.provider = "custom:codex"
+    agent.model = "gpt-5.6-sol"
+    agent.base_url = "http://127.0.0.1:39123/v1"
+    agent.api_key = DEPLOYMENT_INFERENCE_RELAY_MARKER
+    agent.api_mode = "chat_completions"
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+    )
+
+    assert captured_kwargs["provider"] == "custom:codex"
+    assert captured_kwargs["model"] == "gpt-5.6-sol"
+    assert captured_kwargs["base_url"] == "http://127.0.0.1:39123/v1"
+    assert captured_kwargs["api_key"] == DEPLOYMENT_INFERENCE_RELAY_MARKER
+
+
 def test_background_review_shuts_down_memory_provider_before_close(monkeypatch):
     events = []
 
