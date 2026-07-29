@@ -40,9 +40,13 @@ follow the implementation and its closest focused tests.
 - Do not introduce `v2`, wrapper, fallback, or temporary compatibility paths
   without documenting why callers cannot migrate directly and what will remove
   the compatibility path.
-- After implementation and focused validation, run a dedicated simplification
-  pass (use `/simplify` when available), rerun affected validation after any
-  cleanup edits, and review the final diff for duplication and unreachable code.
+- After implementation, perform a simplification pass proportional to the chosen
+  engineering path. For Fast work, review the focused diff directly; invoke
+  `/simplify` only when the change adds one of the structural elements listed
+  above or non-trivial duplication. For Standard and Strict work, use `/simplify`
+  when available. Run focused validation on the resulting code, then review the
+  final diff for duplication and unreachable code. If later cleanup edits affect
+  behavior, rerun the corresponding checks.
 - In the completion report, identify obsolete code removed. If none was removed,
   explain why all affected existing code remains necessary. Do not optimize for
   a negative line count; optimize for the smallest complete implementation.
@@ -85,7 +89,11 @@ rg -n "session_detail_payload|resolve_resume_session_id" \
 
 ## Automated Development Lifecycle
 
-For every request that changes repository files:
+Treat one coherent user goal, including its follow-up requests, as one task and
+run one development lifecycle for it. Reuse the task's worktree, branch, and pull
+request throughout.
+
+For every task that changes repository files:
 
 1. Use exactly one dedicated worktree for the entire task, including after
    context compaction or session resumption. Before editing, determine whether
@@ -113,10 +121,12 @@ For every request that changes repository files:
    report the blocker instead. Releases do not wait for GitHub CI or other
    remote checks; only the prescribed local validation and checks performed by
    the release procedure itself gate a release.
-4. After validation succeeds, review the final diff and repository status,
-   commit all task changes with the required Claude co-author trailer, push the
-   branch to `origin`, and create a GitHub pull request targeting `main` with a
-   concise summary and test results.
+4. Once the task is coherent and validation succeeds, review the final diff and
+   repository status, commit all task changes with the required Claude co-author
+   trailer, push the branch to `origin`, and create a GitHub pull request
+   targeting `main` with a concise summary and test results. If the task already
+   has a PR, push follow-up commits to its branch and update PR metadata only
+   when its summary or reported validation materially changes.
 5. The repository owner has durably authorized commit, push, and PR creation as
    the default completion steps for development tasks in this repository. Do
    not ask for those instructions again. Still request confirmation for force
@@ -129,11 +139,18 @@ For every request that changes repository files:
 ## Choose a Work Path
 
 - **Fast:** the target file and closest focused test are known, the change is
-  local, and no Strict trigger in `AGENTS.md` applies.
+  local, and no Strict trigger in `AGENTS.md` applies. Apply the narrowest scope
+  prescribed by the search, cleanup, and validation sections. Fast work does not
+  use Plan Mode, task tracking, or subagents by default; add only the mechanism
+  needed if the user requests it or the task no longer meets the Fast criteria.
 - **Standard:** the default; use the ownership map and focused-search workflow
   above, expanding into one adjacent subsystem only when necessary.
 - **Strict:** follow the matching ownership row, read the relevant reference
   heading, and use the real-path validation policy in `AGENTS.md`.
+
+Choose orchestration by need, not file count: use Plan Mode only for unresolved
+choices that require user alignment, task tracking for staged or dependent work,
+and subagents for bounded independent work or broad unresolved discovery.
 
 Escalate to Strict before editing when work reaches owner-worker, session/resume,
 gateway/approval/security, profiles or config propagation, remote I/O, or another
