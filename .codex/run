@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+CODEX_BIN=$(command -v codex || true)
+if [ -z "$CODEX_BIN" ]; then
+  printf '%s\n' 'error: codex is not installed or not available on PATH.' >&2
+  exit 127
+fi
+
+CODEX_PROJECT_HOME=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+export CODEX_HOME="$CODEX_PROJECT_HOME"
+
+if [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
+  printf '%s\n' 'error: ANTHROPIC_AUTH_TOKEN is not set.' >&2
+  printf '%s\n' 'Launch this from Claude Code or export the project credential first.' >&2
+  exit 2
+fi
+
+exec "$CODEX_BIN" "$@"
