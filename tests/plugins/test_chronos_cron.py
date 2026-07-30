@@ -102,6 +102,29 @@ def test_arm_one_shot_sends_provision(chronos):
     assert p["agent_callback_url"] == "https://agent.example/"
 
 
+def test_arm_one_shot_namespaces_authenticated_owner(chronos, monkeypatch):
+    prov, fake = chronos
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_owner_a")
+
+    prov._arm_one_shot({"id": "j1", "next_run_at": "2026-06-18T12:00:00+00:00"})
+
+    assert fake.provisions[0]["job_id"] == "ok1_owner_a:j1"
+    assert fake.provisions[0]["dedup_key"] == (
+        "ok1_owner_a:j1:2026-06-18T12:00:00+00:00"
+    )
+
+
+def test_list_armed_filters_other_authenticated_owners(chronos, monkeypatch):
+    prov, fake = chronos
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_owner_a")
+    fake._armed = [
+        {"job_id": "ok1_owner_a:j1", "fire_at": "first"},
+        {"job_id": "ok1_owner_b:j1", "fire_at": "other"},
+    ]
+
+    assert prov._list_armed() == {"j1": "first"}
+
+
 def test_arm_one_shot_preserves_sub_minute_fire(chronos):
     """Sub-minute fire times survive — the agent owns the time, so there's no
     1-minute scheduler floor."""

@@ -871,7 +871,7 @@ code { font-size: 0.875rem; }
   }
 }
 
-[data-gui-chat] .gui-chat-skills-pane {
+[data-gui-chat] .gui-chat-workspace-pane {
   display: flex;
   min-height: 0;
   flex: 1;
@@ -881,7 +881,7 @@ code { font-size: 0.875rem; }
   color: #24262b;
 }
 
-[data-gui-chat] .gui-chat-skills-toolbar {
+[data-gui-chat] .gui-chat-workspace-toolbar {
   display: flex;
   min-height: 64px;
   flex: none;
@@ -891,7 +891,7 @@ code { font-size: 0.875rem; }
   padding: 14px 22px 10px;
 }
 
-[data-gui-chat] .gui-chat-skills-primary-button {
+[data-gui-chat] .gui-chat-workspace-primary-button {
   display: inline-flex;
   height: 34px;
   align-items: center;
@@ -906,17 +906,17 @@ code { font-size: 0.875rem; }
   transition: background-color 120ms ease;
 }
 
-[data-gui-chat] .gui-chat-skills-primary-button:hover {
+[data-gui-chat] .gui-chat-workspace-primary-button:hover {
   background: #315bd5;
 }
 
-[data-gui-chat] .gui-chat-skills-primary-button svg,
-[data-gui-chat] .gui-chat-skills-icon-button svg {
+[data-gui-chat] .gui-chat-workspace-primary-button svg,
+[data-gui-chat] .gui-chat-workspace-icon-button svg {
   width: 15px;
   height: 15px;
 }
 
-[data-gui-chat] .gui-chat-skills-icon-button {
+[data-gui-chat] .gui-chat-workspace-icon-button {
   display: inline-flex;
   width: 30px;
   height: 30px;
@@ -928,24 +928,24 @@ code { font-size: 0.875rem; }
   transition: background-color 120ms ease, color 120ms ease;
 }
 
-[data-gui-chat] .gui-chat-skills-icon-button:hover {
+[data-gui-chat] .gui-chat-workspace-icon-button:hover {
   background: #f0f2f4;
   color: #25282d;
 }
 
-[data-gui-chat] .gui-chat-skills-icon-button.is-destructive:hover {
+[data-gui-chat] .gui-chat-workspace-icon-button.is-destructive:hover {
   background: #fff2f0;
   color: #b42318;
 }
 
-[data-gui-chat] .gui-chat-skills-primary-button:disabled,
-[data-gui-chat] .gui-chat-skills-icon-button:disabled,
+[data-gui-chat] .gui-chat-workspace-primary-button:disabled,
+[data-gui-chat] .gui-chat-workspace-icon-button:disabled,
 [data-gui-chat] .gui-chat-skill-switch:disabled {
   cursor: not-allowed;
   opacity: 0.5;
 }
 
-[data-gui-chat] .gui-chat-skills-heading {
+[data-gui-chat] .gui-chat-workspace-heading {
   display: flex;
   min-height: 58px;
   flex: none;
@@ -956,20 +956,20 @@ code { font-size: 0.875rem; }
   padding: 4px 22px 12px;
 }
 
-[data-gui-chat] .gui-chat-skills-heading h1 {
+[data-gui-chat] .gui-chat-workspace-heading h1 {
   margin: 0;
   color: #202329;
   font-size: 15px;
   font-weight: 600;
 }
 
-[data-gui-chat] .gui-chat-skills-heading p {
+[data-gui-chat] .gui-chat-workspace-heading p {
   margin: 3px 0 0;
   color: #969ba3;
   font-size: 10px;
 }
 
-[data-gui-chat] .gui-chat-skills-search {
+[data-gui-chat] .gui-chat-workspace-search {
   display: flex;
   width: min(300px, 38vw);
   height: 30px;
@@ -982,18 +982,18 @@ code { font-size: 0.875rem; }
   transition: border-color 120ms ease, box-shadow 120ms ease;
 }
 
-[data-gui-chat] .gui-chat-skills-search:focus-within {
+[data-gui-chat] .gui-chat-workspace-search:focus-within {
   border-color: #6e8fec;
   box-shadow: 0 0 0 2px rgb(56 103 237 / 10%);
 }
 
-[data-gui-chat] .gui-chat-skills-search svg {
+[data-gui-chat] .gui-chat-workspace-search svg {
   width: 13px;
   height: 13px;
   flex: none;
 }
 
-[data-gui-chat] .gui-chat-skills-search input {
+[data-gui-chat] .gui-chat-workspace-search input {
   min-width: 0;
   flex: 1;
   outline: none;
@@ -1029,7 +1029,8 @@ code { font-size: 0.875rem; }
   color: #3867ed;
 }
 
-[data-gui-chat] .gui-chat-skills-feedback {
+[data-gui-chat] .gui-chat-skills-feedback,
+[data-gui-chat] .gui-chat-workspace-feedback {
   flex: none;
   border-bottom: 1px solid #f0dcda;
   background: #fff7f6;
@@ -1038,13 +1039,13 @@ code { font-size: 0.875rem; }
   font-size: 11px;
 }
 
-[data-gui-chat] .gui-chat-skills-list {
+[data-gui-chat] .gui-chat-workspace-list {
   min-height: 0;
   flex: 1;
   overflow: auto;
 }
 
-[data-gui-chat] .gui-chat-skill-row {
+[data-gui-chat] .gui-chat-workspace-row {
   display: flex;
   min-height: 68px;
   align-items: center;
@@ -1055,15 +1056,15 @@ code { font-size: 0.875rem; }
   transition: background-color 100ms ease;
 }
 
-[data-gui-chat] .gui-chat-skill-row:hover {
+[data-gui-chat] .gui-chat-workspace-row:hover {
   background: #fafbfc;
 }
 
-[data-gui-chat] .gui-chat-skill-copy {
+[data-gui-chat] .gui-chat-workspace-copy {
   min-width: 0;
 }
 
-[data-gui-chat] .gui-chat-skill-title {
+[data-gui-chat] .gui-chat-workspace-title {
   display: flex;
   min-width: 0;
   align-items: center;
@@ -1073,13 +1074,13 @@ code { font-size: 0.875rem; }
   font-weight: 550;
 }
 
-[data-gui-chat] .gui-chat-skill-title > span:first-child {
+[data-gui-chat] .gui-chat-workspace-title > span:first-child {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-[data-gui-chat] .gui-chat-skill-category {
+[data-gui-chat] .gui-chat-workspace-badge {
   flex: none;
   border-radius: 999px;
   background: #eef3ff;
@@ -1089,7 +1090,7 @@ code { font-size: 0.875rem; }
   font-weight: 500;
 }
 
-[data-gui-chat] .gui-chat-skill-copy p {
+[data-gui-chat] .gui-chat-workspace-copy p {
   max-width: 720px;
   margin: 4px 0 0;
   overflow: hidden;
@@ -1099,7 +1100,7 @@ code { font-size: 0.875rem; }
   white-space: nowrap;
 }
 
-[data-gui-chat] .gui-chat-skill-actions {
+[data-gui-chat] .gui-chat-workspace-actions {
   display: flex;
   flex: none;
   align-items: center;
@@ -1157,6 +1158,38 @@ code { font-size: 0.875rem; }
   opacity: 0.5;
 }
 
+[data-gui-chat] .gui-chat-scheduled-task-row {
+  align-items: flex-start;
+}
+
+[data-gui-chat] .gui-chat-scheduled-task-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 14px;
+  margin-top: 6px;
+  color: #777d86;
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-size: 9px;
+}
+
+[data-gui-chat] .gui-chat-scheduled-task-error {
+  margin-top: 5px;
+  color: #b42318;
+  font-size: 10px;
+}
+
+[data-gui-chat] .gui-chat-workspace-badge.is-paused,
+[data-gui-chat] .gui-chat-workspace-badge.is-disabled {
+  background: #fff5dd;
+  color: #956300;
+}
+
+[data-gui-chat] .gui-chat-workspace-badge.is-error,
+[data-gui-chat] .gui-chat-workspace-badge.is-failed {
+  background: #fff0ee;
+  color: #b42318;
+}
+
 [data-gui-chat] .gui-chat-skill-switch {
   position: relative;
   width: 32px;
@@ -1187,7 +1220,7 @@ code { font-size: 0.875rem; }
   transform: translateX(14px);
 }
 
-[data-gui-chat] .gui-chat-skills-empty {
+[data-gui-chat] .gui-chat-workspace-empty {
   display: flex;
   min-height: 220px;
   align-items: center;
@@ -1198,14 +1231,14 @@ code { font-size: 0.875rem; }
   font-size: 11px;
 }
 
-[data-gui-chat] .gui-chat-skills-empty svg {
+[data-gui-chat] .gui-chat-workspace-empty svg {
   width: 24px;
   height: 24px;
   margin-bottom: 3px;
   color: #7391e7;
 }
 
-[data-gui-chat] .gui-chat-skills-empty strong {
+[data-gui-chat] .gui-chat-workspace-empty strong {
   color: #555a62;
   font-size: 12px;
   font-weight: 600;
@@ -1368,6 +1401,23 @@ code { font-size: 0.875rem; }
   font-size: 11px;
 }
 
+[data-gui-chat] .gui-chat-scheduled-task-editor {
+  display: grid;
+  max-height: min(64vh, 620px);
+  gap: 14px;
+  overflow: auto;
+  padding-right: 3px;
+}
+
+[data-gui-chat] .gui-chat-scheduled-task-editor input,
+[data-gui-chat] .gui-chat-scheduled-task-editor textarea,
+[data-gui-chat] .gui-chat-scheduled-task-editor select {
+  border-color: #dfe2e7;
+  border-radius: 7px;
+  background: #fff;
+  color: #2c2f35;
+}
+
 [data-gui-chat] .gui-chat-workspace-dialog-actions {
   display: flex;
   justify-content: flex-end;
@@ -1403,26 +1453,26 @@ code { font-size: 0.875rem; }
 }
 
 @media (max-width: 640px) {
-  [data-gui-chat] .gui-chat-skills-toolbar {
+  [data-gui-chat] .gui-chat-workspace-toolbar {
     min-height: 58px;
     padding: 11px 12px 8px;
   }
 
-  [data-gui-chat] .gui-chat-skills-heading {
+  [data-gui-chat] .gui-chat-workspace-heading {
     min-height: 52px;
     align-items: start;
     padding: 4px 12px 10px;
   }
 
-  [data-gui-chat] .gui-chat-skills-heading p {
+  [data-gui-chat] .gui-chat-workspace-heading p {
     max-width: 72vw;
   }
 
-  [data-gui-chat] .gui-chat-skills-search {
+  [data-gui-chat] .gui-chat-workspace-search {
     width: min(144px, 38vw);
   }
 
-  [data-gui-chat] .gui-chat-skill-row {
+  [data-gui-chat] .gui-chat-workspace-row {
     padding: 12px;
   }
 

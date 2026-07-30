@@ -67,6 +67,8 @@ OWNER_WORKER_ROUTES: frozenset[tuple[str, str]] = frozenset({
 })
 # Compatibility export for callers that only need the known path inventory.
 OWNER_WORKER_PATHS: frozenset[str] = frozenset(path for _method, path in OWNER_WORKER_ROUTES)
+_CRON_ITEM_METHODS: frozenset[str] = frozenset({"GET", "PUT", "DELETE"})
+_CRON_ACTIONS: frozenset[str] = frozenset({"pause", "resume", "trigger"})
 SESSION_READER_ROUTES: frozenset[tuple[str, str]] = frozenset({
     ("GET", "/api/sessions"),
     ("GET", "/api/sessions/search"),
@@ -104,6 +106,23 @@ def _session_item_path(path: str) -> bool:
     )
 
 
+def _cron_owner_worker_route(path: str, method: str) -> bool:
+    if path == "/api/cron/jobs":
+        return method in {"GET", "POST"}
+    if path == "/api/cron/delivery-targets":
+        return method == "GET"
+    parts = path.split("/")
+    if len(parts) == 5 and parts[:4] == ["", "api", "cron", "jobs"]:
+        return bool(parts[4]) and method in _CRON_ITEM_METHODS
+    return (
+        len(parts) == 6
+        and parts[:4] == ["", "api", "cron", "jobs"]
+        and bool(parts[4])
+        and parts[5] in _CRON_ACTIONS
+        and method == "POST"
+    )
+
+
 def classify_authenticated_api(
     path: str,
     *,
@@ -137,7 +156,7 @@ def classify_authenticated_api(
         method == "GET" and _session_item_path(path)
     ):
         return AuthenticatedApiDecision(AuthenticatedApiBucket.SESSION_READER, True, "session-reader routed")
-    if (method, path) in OWNER_WORKER_ROUTES or (
+    if (method, path) in OWNER_WORKER_ROUTES or _cron_owner_worker_route(path, method) or (
         _session_item_path(path) and method in {"PATCH", "DELETE"}
     ):
         return AuthenticatedApiDecision(AuthenticatedApiBucket.OWNER_WORKER, True, "owner-worker routed")

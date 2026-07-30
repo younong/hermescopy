@@ -199,6 +199,21 @@ async def _lifespan(app: "FastAPI"):
     initialize_owner_worker_warmups(app)
     initialize_session_reader_warmups(app)
 
+    app.state.owner_cron_dispatch_stop = None
+    app.state.owner_cron_dispatch_task = None
+    owner_supervisor = getattr(app.state, "owner_worker_supervisor", None)
+    if getattr(app.state, "auth_required", False) and owner_supervisor is not None:
+        from hermes_cli.owner_worker.cron_dispatcher import run_owner_cron_dispatcher
+
+        app.state.owner_cron_dispatch_stop = asyncio.Event()
+        app.state.owner_cron_dispatch_task = asyncio.create_task(
+            run_owner_cron_dispatcher(
+                app.state.owner_cron_dispatch_stop,
+                owner_supervisor,
+                get_hermes_home(),
+            )
+        )
+
     from hermes_cli.channel_connectors.weixin_ilink.bootstrap import bootstrap_weixin_ilink
 
     app.state.weixin_ilink_service = None
@@ -241,6 +256,15 @@ async def _lifespan(app: "FastAPI"):
     try:
         yield
     finally:
+        owner_cron_stop = getattr(app.state, "owner_cron_dispatch_stop", None)
+        owner_cron_task = getattr(app.state, "owner_cron_dispatch_task", None)
+        if owner_cron_stop is not None:
+            owner_cron_stop.set()
+        if owner_cron_task is not None:
+            try:
+                await owner_cron_task
+            except asyncio.CancelledError:
+                pass
         connector_runtime = getattr(app.state, "weixin_ilink_runtime", None)
         if connector_runtime is not None:
             await connector_runtime.close()
@@ -8883,125 +8907,6 @@ class CronJobUpdate(BaseModel):
     updates: dict
 
 
-def _cron_optional_text(value: Any, *, strip_trailing_slash: bool = False) -> Optional[str]:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if strip_trailing_slash:
-        text = text.rstrip("/")
-    return text or None
-
-
-def _cron_string_list(value: Any) -> Optional[List[str]]:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        raw_items = re.split(r"[\n,]", value)
-    elif isinstance(value, (list, tuple)):
-        raw_items = value
-    else:
-        return None
-    items = [str(item).strip() for item in raw_items if str(item).strip()]
-    return items or None
-
-
-def _normalize_dashboard_cron_script(value: Any, profile_home: Path) -> Optional[str]:
-    """Validate a dashboard-selected cron script against the profile sandbox."""
-    text = _cron_optional_text(value)
-    if not text:
-        return None
-
-    scripts_root = (profile_home / "scripts").resolve()
-    raw_path = Path(text).expanduser()
-    candidate = raw_path.resolve() if raw_path.is_absolute() else (scripts_root / raw_path).resolve()
-    try:
-        relative = candidate.relative_to(scripts_root)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"script must be inside {scripts_root}",
-        ) from exc
-    if not candidate.exists():
-        raise HTTPException(status_code=400, detail=f"script does not exist: {candidate}")
-    if not candidate.is_file():
-        raise HTTPException(status_code=400, detail=f"script is not a file: {candidate}")
-    return str(relative)
-
-
-def _validate_dashboard_cron_effective_job(job: Dict[str, Any]) -> None:
-    prompt = _cron_optional_text(job.get("prompt"))
-    script = _cron_optional_text(job.get("script"))
-    skills = _cron_string_list(job.get("skills")) or _cron_string_list(job.get("skill"))
-    no_agent = bool(job.get("no_agent"))
-
-    if no_agent:
-        if not script:
-            raise HTTPException(
-                status_code=400,
-                detail="no_agent=True requires a script",
-            )
-        return
-
-    if not (prompt or skills or script):
-        raise HTTPException(
-            status_code=400,
-            detail="agent cron jobs require a prompt, skill, or script",
-        )
-
-
-def _normalize_dashboard_cron_updates(
-    updates: Dict[str, Any],
-    profile_home: Path,
-) -> Dict[str, Any]:
-    """Normalize dashboard JSON into cron.jobs.update_job's storage shape.
-
-    This intentionally stays in the dashboard adapter layer: cron/jobs.py is the
-    source of truth for scheduling behaviour; the dashboard only translates form
-    payloads into the shapes that existing core functions already accept.
-    """
-    normalized = dict(updates or {})
-
-    for key in ("model", "provider", "workdir"):
-        if key in normalized:
-            normalized[key] = _cron_optional_text(normalized[key])
-    if "script" in normalized:
-        normalized["script"] = _normalize_dashboard_cron_script(
-            normalized["script"],
-            profile_home,
-        )
-    if "base_url" in normalized:
-        normalized["base_url"] = _cron_optional_text(
-            normalized["base_url"], strip_trailing_slash=True
-        )
-    if "deliver" in normalized:
-        normalized["deliver"] = _cron_optional_text(normalized["deliver"]) or "local"
-    if "context_from" in normalized:
-        normalized["context_from"] = _cron_string_list(normalized["context_from"])
-    if "enabled_toolsets" in normalized:
-        normalized["enabled_toolsets"] = _cron_string_list(normalized["enabled_toolsets"])
-    return normalized
-
-
-def _validate_dashboard_cron_context_from(
-    refs: Optional[List[str]],
-    profile_name: str,
-) -> None:
-    if not refs:
-        return
-    for ref in refs:
-        if not _call_cron_for_profile(profile_name, "get_job", ref):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"context_from job '{ref}' not found in profile "
-                    f"'{profile_name}'"
-                ),
-            )
-
-
-_CRON_PROFILE_LOCK = threading.RLock()
-
-
 def _cron_profile_dicts() -> List[Dict[str, Any]]:
     """Return dashboard profile records, falling back to a directory scan."""
     from hermes_cli import profiles as profiles_mod
@@ -9027,69 +8932,31 @@ def _cron_profile_home(profile: Optional[str]) -> Tuple[str, Path]:
     return canon, profiles_mod.get_profile_dir(canon)
 
 
-def _annotate_cron_job(job: Dict[str, Any], profile: str, home: Path) -> Dict[str, Any]:
-    annotated = dict(job)
-    annotated["profile"] = profile
-    annotated["profile_name"] = profile
-    annotated["hermes_home"] = str(home)
-    annotated["is_default_profile"] = profile == "default"
-    return annotated
-
-
-def _call_cron_for_profile(target_profile: Optional[str], func_name: str, *args, **kwargs):
-    """Run cron.jobs helpers against the selected profile's cron directory.
-
-    cron.jobs keeps CRON_DIR/JOBS_FILE/OUTPUT_DIR as module globals resolved
-    from the process HERMES_HOME at import time. The dashboard is a single
-    process that can inspect many profiles, so temporarily retarget those
-    globals while holding a lock and restore them immediately after the call.
-    """
-    profile_name, home = _cron_profile_home(target_profile)
-    with _CRON_PROFILE_LOCK:
-        from cron import jobs as cron_jobs
-        from hermes_constants import (
-            reset_hermes_home_override,
-            set_hermes_home_override,
-        )
-
-        old_cron_dir = cron_jobs.CRON_DIR
-        old_jobs_file = cron_jobs.JOBS_FILE
-        old_output_dir = cron_jobs.OUTPUT_DIR
-        token = set_hermes_home_override(str(home))
-        cron_jobs.CRON_DIR = home / "cron"
-        cron_jobs.JOBS_FILE = cron_jobs.CRON_DIR / "jobs.json"
-        cron_jobs.OUTPUT_DIR = cron_jobs.CRON_DIR / "output"
-        try:
-            result = getattr(cron_jobs, func_name)(*args, **kwargs)
-        finally:
-            cron_jobs.CRON_DIR = old_cron_dir
-            cron_jobs.JOBS_FILE = old_jobs_file
-            cron_jobs.OUTPUT_DIR = old_output_dir
-            reset_hermes_home_override(token)
-
-    if isinstance(result, list):
-        return [_annotate_cron_job(j, profile_name, home) for j in result]
-    if isinstance(result, dict):
-        return _annotate_cron_job(result, profile_name, home)
-    return result
-
-
 def _find_cron_job_profile(job_id: str) -> Optional[str]:
     for profile in _cron_profile_dicts():
         name = str(profile.get("name") or "")
         if not name:
             continue
-        jobs = _call_cron_for_profile(name, "list_jobs", True)
+        from hermes_cli.cron_management import list_jobs
+
+        _profile_name, profile_home = _cron_profile_home(name)
+        jobs = list_jobs(profile_home)
         if any(j.get("id") == job_id or j.get("name") == job_id for j in jobs):
             return name
     return None
 
 
 @app.get("/api/cron/jobs")
-async def list_cron_jobs(profile: str = "all"):
+async def list_cron_jobs(request: Request = None, profile: str = "all"):
+    if request is not None and _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
+
+    from hermes_cli.cron_management import list_jobs as list_managed_cron_jobs
+
     requested = (profile or "all").strip()
     if requested.lower() != "all":
-        return _call_cron_for_profile(requested, "list_jobs", True)
+        profile_name, profile_home = _cron_profile_home(requested)
+        return list_managed_cron_jobs(profile_home, profile=profile_name)
 
     jobs: List[Dict[str, Any]] = []
     for item in _cron_profile_dicts():
@@ -9097,18 +8964,29 @@ async def list_cron_jobs(profile: str = "all"):
         if not name:
             continue
         try:
-            jobs.extend(_call_cron_for_profile(name, "list_jobs", True))
+            profile_name, profile_home = _cron_profile_home(name)
+            jobs.extend(list_managed_cron_jobs(profile_home, profile=profile_name))
         except Exception:
             _log.exception("Failed to list cron jobs for profile %s", name)
     return jobs
 
 
 @app.get("/api/cron/jobs/{job_id}")
-async def get_cron_job(job_id: str, profile: Optional[str] = None):
+async def get_cron_job(
+    job_id: str,
+    request: Request = None,
+    profile: Optional[str] = None,
+):
+    if request is not None and _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
-    job = _call_cron_for_profile(selected, "get_job", job_id)
+
+    from hermes_cli.cron_management import get_job as get_managed_cron_job
+
+    profile_name, profile_home = _cron_profile_home(selected)
+    job = get_managed_cron_job(profile_home, job_id, profile=profile_name)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
@@ -9134,7 +9012,10 @@ async def list_cron_job_runs(job_id: str, profile: Optional[str] = None, limit: 
     # job_id may be a human name; resolve to the canonical id used in run-session ids.
     canonical = job_id
     if selected:
-        job = _call_cron_for_profile(selected, "get_job", job_id)
+        from hermes_cli.cron_management import get_job
+
+        _profile_name, profile_home = _cron_profile_home(selected)
+        job = get_job(profile_home, job_id)
         if job and job.get("id"):
             canonical = str(job["id"])
 
@@ -9161,36 +9042,21 @@ async def list_cron_job_runs(job_id: str, profile: Optional[str] = None, limit: 
 
 
 @app.post("/api/cron/jobs")
-async def create_cron_job(body: CronJobCreate, profile: str = "default"):
+async def create_cron_job(
+    body: CronJobCreate,
+    request: Request = None,
+    profile: str = "default",
+):
+    if request is not None and _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
     try:
+        from hermes_cli.cron_management import create_job as create_managed_cron_job
+
         profile_name, profile_home = _cron_profile_home(profile)
-        script = _normalize_dashboard_cron_script(body.script, profile_home)
-        skills = _cron_string_list(body.skills)
-        context_from = _cron_string_list(body.context_from)
-        _validate_dashboard_cron_context_from(context_from, profile_name)
-        no_agent = bool(body.no_agent)
-        _validate_dashboard_cron_effective_job({
-            "prompt": body.prompt,
-            "skills": skills,
-            "script": script,
-            "no_agent": no_agent,
-        })
-        return _call_cron_for_profile(
-            profile_name,
-            "create_job",
-            prompt=body.prompt or "",
-            schedule=body.schedule,
-            name=body.name,
-            deliver=_cron_optional_text(body.deliver) or "local",
-            skills=skills,
-            model=_cron_optional_text(body.model),
-            provider=_cron_optional_text(body.provider),
-            base_url=_cron_optional_text(body.base_url, strip_trailing_slash=True),
-            script=script,
-            context_from=context_from,
-            enabled_toolsets=_cron_string_list(body.enabled_toolsets),
-            workdir=_cron_optional_text(body.workdir),
-            no_agent=no_agent,
+        return create_managed_cron_job(
+            profile_home,
+            body.model_dump(),
+            profile=profile_name,
         )
     except HTTPException:
         raise
@@ -9200,59 +9066,42 @@ async def create_cron_job(body: CronJobCreate, profile: str = "default"):
 
 
 @app.get("/api/cron/delivery-targets")
-async def get_cron_delivery_targets():
-    """Delivery targets the cron dropdown should offer.
+async def get_cron_delivery_targets(
+    request: Request = None,
+    profile: str = "default",
+):
+    """Return cron delivery targets for the selected trusted home."""
+    if request is not None and _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
 
-    Always includes the implicit ``local`` option. Beyond that, the list is
-    derived dynamically from the configured gateway platforms via
-    ``cron.scheduler.cron_delivery_targets()`` — no hardcoded platform list. A
-    configured platform that hasn't set its cron home channel is still returned
-    with ``home_target_set: false`` so the UI can surface it as "configure a
-    home channel first" rather than hiding it.
-    """
-    targets = [
-        {
-            "id": "local",
-            "name": "Local (save only)",
-            "home_target_set": True,
-            "home_env_var": None,
-        }
-    ]
-    try:
-        from cron.scheduler import cron_delivery_targets
+    from hermes_cli.cron_management import delivery_targets
 
-        targets.extend(cron_delivery_targets())
-    except Exception:
-        _log.exception("GET /api/cron/delivery-targets failed")
-    return {"targets": targets}
+    _profile_name, profile_home = _cron_profile_home(profile)
+    return {"targets": delivery_targets(profile_home)}
 
 
 @app.put("/api/cron/jobs/{job_id}")
-async def update_cron_job(job_id: str, body: CronJobUpdate, profile: Optional[str] = None):
+async def update_cron_job(
+    job_id: str,
+    body: CronJobUpdate,
+    request: Request = None,
+    profile: Optional[str] = None,
+):
+    if request is not None and _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
     try:
+        from hermes_cli.cron_management import update_job as update_managed_cron_job
+
         profile_name, profile_home = _cron_profile_home(selected)
-        existing = _call_cron_for_profile(profile_name, "get_job", job_id)
-        if not existing:
-            raise HTTPException(status_code=404, detail="Job not found")
-        updates = _normalize_dashboard_cron_updates(
-            body.updates,
+        job = update_managed_cron_job(
             profile_home,
+            job_id,
+            body.updates,
+            profile=profile_name,
         )
-        if "context_from" in updates:
-            _validate_dashboard_cron_context_from(
-                updates.get("context_from"),
-                profile_name,
-            )
-        execution_fields = {"prompt", "skill", "skills", "script", "no_agent"}
-        if execution_fields.intersection(updates):
-            effective = {**existing, **updates}
-            if "skills" in updates and "skill" not in updates:
-                effective["skill"] = None
-            _validate_dashboard_cron_effective_job(effective)
-        job = _call_cron_for_profile(profile_name, "update_job", job_id, updates)
     except HTTPException:
         raise
     except ValueError as exc:
@@ -9262,46 +9111,70 @@ async def update_cron_job(job_id: str, body: CronJobUpdate, profile: Optional[st
     return job
 
 
-@app.post("/api/cron/jobs/{job_id}/pause")
-async def pause_cron_job(job_id: str, profile: Optional[str] = None):
+async def _mutate_cron_job(
+    job_id: str,
+    action: str,
+    request: Request | None,
+    profile: str | None,
+) -> Dict[str, Any] | Response:
+    if request is not None and _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
-    job = _call_cron_for_profile(selected, "pause_job", job_id)
+
+    from hermes_cli.cron_management import mutate_job
+
+    profile_name, profile_home = _cron_profile_home(selected)
+    job = mutate_job(profile_home, job_id, action, profile=profile_name)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
+
+@app.post("/api/cron/jobs/{job_id}/pause")
+async def pause_cron_job(
+    job_id: str,
+    request: Request = None,
+    profile: Optional[str] = None,
+):
+    return await _mutate_cron_job(job_id, "pause", request, profile)
 
 
 @app.post("/api/cron/jobs/{job_id}/resume")
-async def resume_cron_job(job_id: str, profile: Optional[str] = None):
-    selected = profile or _find_cron_job_profile(job_id)
-    if not selected:
-        raise HTTPException(status_code=404, detail="Job not found")
-    job = _call_cron_for_profile(selected, "resume_job", job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return job
+async def resume_cron_job(
+    job_id: str,
+    request: Request = None,
+    profile: Optional[str] = None,
+):
+    return await _mutate_cron_job(job_id, "resume", request, profile)
 
 
 @app.post("/api/cron/jobs/{job_id}/trigger")
-async def trigger_cron_job(job_id: str, profile: Optional[str] = None):
-    selected = profile or _find_cron_job_profile(job_id)
-    if not selected:
-        raise HTTPException(status_code=404, detail="Job not found")
-    job = _call_cron_for_profile(selected, "trigger_job", job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return job
+async def trigger_cron_job(
+    job_id: str,
+    request: Request = None,
+    profile: Optional[str] = None,
+):
+    return await _mutate_cron_job(job_id, "trigger", request, profile)
 
 
 @app.delete("/api/cron/jobs/{job_id}")
-async def delete_cron_job(job_id: str, profile: Optional[str] = None):
+async def delete_cron_job(
+    job_id: str,
+    request: Request = None,
+    profile: Optional[str] = None,
+):
+    if request is not None and _authenticated_owner_request(request):
+        return await _proxy_authenticated_owner_http(request)
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
     try:
-        removed = _call_cron_for_profile(selected, "remove_job", job_id)
+        from hermes_cli.cron_management import delete_job as delete_managed_cron_job
+
+        _profile_name, profile_home = _cron_profile_home(selected)
+        removed = delete_managed_cron_job(profile_home, job_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not removed:
@@ -9314,30 +9187,20 @@ def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
     scheduler provider's ``fire_due`` (store CAS claim + ``run_one_job``).
 
     Retargets the ``cron.jobs`` module globals to the profile's cron dir under
-    the shared lock — same mechanism as ``_call_cron_for_profile`` — so the
+    the shared cron-home lock — so the
     claim and the run operate on the right profile's ``jobs.json``. Runs with
     no live adapters; delivery falls back to the per-platform send path (the
     dashboard process has no gateway adapter handles, exactly like the desktop
     cron path above).
     """
     _profile_name, home = _cron_profile_home(profile)
-    with _CRON_PROFILE_LOCK:
-        from cron import jobs as cron_jobs
+    from hermes_cli.cron_management import cron_home_scope
+
+    with cron_home_scope(home):
         from cron.scheduler_provider import resolve_cron_scheduler
 
-        old_cron_dir = cron_jobs.CRON_DIR
-        old_jobs_file = cron_jobs.JOBS_FILE
-        old_output_dir = cron_jobs.OUTPUT_DIR
-        cron_jobs.CRON_DIR = home / "cron"
-        cron_jobs.JOBS_FILE = cron_jobs.CRON_DIR / "jobs.json"
-        cron_jobs.OUTPUT_DIR = cron_jobs.CRON_DIR / "output"
-        try:
-            provider = resolve_cron_scheduler()
-            return bool(provider.fire_due(job_id, adapters=None, loop=None))
-        finally:
-            cron_jobs.CRON_DIR = old_cron_dir
-            cron_jobs.JOBS_FILE = old_jobs_file
-            cron_jobs.OUTPUT_DIR = old_output_dir
+        provider = resolve_cron_scheduler()
+        return bool(provider.fire_due(job_id, adapters=None, loop=None))
 
 
 @app.post("/api/cron/fire")
@@ -9381,6 +9244,28 @@ async def cron_fire_webhook(request: Request):
     job_id = (body or {}).get("job_id") if isinstance(body, dict) else None
     if not job_id:
         return JSONResponse({"error": "missing job_id"}, status_code=400)
+
+    if ":" in str(job_id):
+        owner_key, local_job_id = str(job_id).split(":", 1)
+        if not owner_key.startswith("ok1_") or not local_job_id:
+            return JSONResponse({"error": "invalid owner job_id"}, status_code=400)
+        from hermes_cli.owner_worker.cron_dispatcher import dispatch_owner_job
+
+        supervisor = getattr(request.app.state, "owner_worker_supervisor", None)
+        if supervisor is None:
+            return JSONResponse({"error": "owner worker unavailable"}, status_code=503)
+        asyncio.create_task(
+            asyncio.to_thread(
+                dispatch_owner_job,
+                supervisor,
+                get_hermes_home(),
+                owner_key,
+                local_job_id,
+            )
+        )
+        return JSONResponse(
+            {"status": "accepted", "job_id": job_id}, status_code=202
+        )
 
     profile = _find_cron_job_profile(job_id)
     if not profile:
@@ -9457,7 +9342,10 @@ async def instantiate_blueprint(body: AutomationBlueprintInstantiate, profile: s
         # Blueprint-created jobs deliver to the dashboard's configured target by
         # default; the form's deliver slot overrides via spec["deliver"].
         spec.pop("origin", None)
-        return _call_cron_for_profile(profile, "create_job", **spec)
+        from hermes_cli.cron_management import create_job
+
+        profile_name, profile_home = _cron_profile_home(profile)
+        return create_job(profile_home, spec, profile=profile_name)
     except HTTPException:
         raise
     except Exception as e:
@@ -11813,8 +11701,8 @@ def _profile_scope(profile: Optional[str]):
        reaches them (same pattern as ``_write_profile_model``).
     2. ``tools.skills_tool`` and ``tools.skill_manager_tool`` bind
        ``SKILLS_DIR`` at import time, so the override CANNOT reach them.
-       Like ``_call_cron_for_profile`` does for cron's module globals,
-       temporarily retarget both under a lock and restore them
+       Like ``cron_home_scope`` does for cron's module globals, temporarily
+       retarget both under a lock and restore them
        immediately after.
 
     ``profile`` of None/""/"current" means "the dashboard's own profile" —

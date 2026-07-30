@@ -100,15 +100,15 @@ export function GuiChatSkillsPane({ profile }: { profile?: string }) {
   };
 
   return (
-    <section aria-label="Skills" className="gui-chat-skills-pane" data-skills-pane>
-      <header className="gui-chat-skills-toolbar">
-        <button className="gui-chat-skills-primary-button" onClick={() => setCreateOpen(true)} type="button">
+    <section aria-label="Skills" className="gui-chat-workspace-pane" data-skills-pane>
+      <header className="gui-chat-workspace-toolbar">
+        <button className="gui-chat-workspace-primary-button" onClick={() => setCreateOpen(true)} type="button">
           <Plus aria-hidden />
           New skill
         </button>
         <button
           aria-label="Refresh skills"
-          className="gui-chat-skills-icon-button"
+          className="gui-chat-workspace-icon-button"
           disabled={loading}
           onClick={() => void load()}
           type="button"
@@ -117,12 +117,12 @@ export function GuiChatSkillsPane({ profile }: { profile?: string }) {
         </button>
       </header>
 
-      <div className="gui-chat-skills-heading">
+      <div className="gui-chat-workspace-heading">
         <div>
           <h1>Skills</h1>
           <p>Reusable instructions available to new conversations in this workspace.</p>
         </div>
-        <label className="gui-chat-skills-search">
+        <label className="gui-chat-workspace-search">
           <Search aria-hidden />
           <input
             aria-label="Search skills"
@@ -133,28 +133,28 @@ export function GuiChatSkillsPane({ profile }: { profile?: string }) {
         </label>
       </div>
 
-      {error ? <div className="gui-chat-skills-feedback is-error" role="alert">{error}</div> : null}
+      {error ? <div className="gui-chat-workspace-feedback is-error" role="alert">{error}</div> : null}
 
-      <div className="gui-chat-skills-list">
+      <div className="gui-chat-workspace-list">
         {skills === null && loading ? (
-          <div className="gui-chat-skills-empty" role="status">Loading skills…</div>
+          <div className="gui-chat-workspace-empty" role="status">Loading skills…</div>
         ) : visibleSkills.length === 0 ? (
-          <div className="gui-chat-skills-empty">
+          <div className="gui-chat-workspace-empty">
             <Sparkles aria-hidden />
             <strong>{query.trim() ? "No matching skills" : "No skills yet"}</strong>
             <span>{query.trim() ? "Try a different search." : "Create a skill to add reusable guidance."}</span>
           </div>
         ) : (
           visibleSkills.map((skill) => (
-            <article className="gui-chat-skill-row" key={skill.name}>
-              <div className="gui-chat-skill-copy">
-                <div className="gui-chat-skill-title">
+            <article className="gui-chat-workspace-row" key={skill.name}>
+              <div className="gui-chat-workspace-copy">
+                <div className="gui-chat-workspace-title">
                   <span>{skill.name}</span>
-                  {skill.category ? <span className="gui-chat-skill-category">{skill.category}</span> : null}
+                  {skill.category ? <span className="gui-chat-workspace-badge">{skill.category}</span> : null}
                 </div>
                 <p>{skill.description || "No description"}</p>
               </div>
-              <div className="gui-chat-skill-actions">
+              <div className="gui-chat-workspace-actions">
                 <button
                   aria-checked={skill.enabled}
                   aria-label={`${skill.enabled ? "Disable" : "Enable"} ${skill.name}`}
@@ -168,7 +168,7 @@ export function GuiChatSkillsPane({ profile }: { profile?: string }) {
                 </button>
                 <button
                   aria-label={`Delete ${skill.name}`}
-                  className="gui-chat-skills-icon-button is-destructive"
+                  className="gui-chat-workspace-icon-button is-destructive"
                   disabled={savingSkill === skill.name}
                   onClick={() => setPendingDelete(skill)}
                   type="button"

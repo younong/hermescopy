@@ -742,38 +742,39 @@ export const api = {
     });
   },
 
-  // Cron jobs
-  getCronJobs: (profile = "all") =>
-    fetchJSON<CronJob[]>(`/api/cron/jobs?profile=${encodeURIComponent(profile)}`),
+  // Cron jobs. Omitted profile binds to the authenticated Chat GUI owner;
+  // CronPage passes its explicit all/default/profile selection unchanged.
+  getCronJobs: (profile?: string) =>
+    fetchJSON<CronJob[]>(`/api/cron/jobs${profileQuery(profile)}`),
   getCronDeliveryTargets: () =>
     fetchJSON<{ targets: CronDeliveryTarget[] }>("/api/cron/delivery-targets"),
-  createCronJob: (job: CronJobMutation, profile = "default") =>
-    fetchJSON<CronJob>(`/api/cron/jobs?profile=${encodeURIComponent(profile)}`, {
+  createCronJob: (job: CronJobMutation, profile?: string) =>
+    fetchJSON<CronJob>(`/api/cron/jobs${profileQuery(profile)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(job),
     }),
-  pauseCronJob: (id: string, profile = "default") =>
-    fetchJSON<CronJob>(`/api/cron/jobs/${encodeURIComponent(id)}/pause?profile=${encodeURIComponent(profile)}`, { method: "POST" }),
+  pauseCronJob: (id: string, profile?: string) =>
+    fetchJSON<CronJob>(`/api/cron/jobs/${encodeURIComponent(id)}/pause${profileQuery(profile)}`, { method: "POST" }),
   updateCronJob: (
     id: string,
     updates: CronJobMutation,
-    profile = "default",
+    profile?: string,
   ) =>
     fetchJSON<CronJob>(
-      `/api/cron/jobs/${encodeURIComponent(id)}?profile=${encodeURIComponent(profile)}`,
+      `/api/cron/jobs/${encodeURIComponent(id)}${profileQuery(profile)}`,
       {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ updates }),
       },
     ),
-  resumeCronJob: (id: string, profile = "default") =>
-    fetchJSON<CronJob>(`/api/cron/jobs/${encodeURIComponent(id)}/resume?profile=${encodeURIComponent(profile)}`, { method: "POST" }),
-  triggerCronJob: (id: string, profile = "default") =>
-    fetchJSON<CronJob>(`/api/cron/jobs/${encodeURIComponent(id)}/trigger?profile=${encodeURIComponent(profile)}`, { method: "POST" }),
-  deleteCronJob: (id: string, profile = "default") =>
-    fetchJSON<{ ok: boolean }>(`/api/cron/jobs/${encodeURIComponent(id)}?profile=${encodeURIComponent(profile)}`, { method: "DELETE" }),
+  resumeCronJob: (id: string, profile?: string) =>
+    fetchJSON<CronJob>(`/api/cron/jobs/${encodeURIComponent(id)}/resume${profileQuery(profile)}`, { method: "POST" }),
+  triggerCronJob: (id: string, profile?: string) =>
+    fetchJSON<CronJob>(`/api/cron/jobs/${encodeURIComponent(id)}/trigger${profileQuery(profile)}`, { method: "POST" }),
+  deleteCronJob: (id: string, profile?: string) =>
+    fetchJSON<{ ok: boolean }>(`/api/cron/jobs/${encodeURIComponent(id)}${profileQuery(profile)}`, { method: "DELETE" }),
 
   // Automation Blueprints — parameterized automation blueprints
   getAutomationBlueprints: () =>

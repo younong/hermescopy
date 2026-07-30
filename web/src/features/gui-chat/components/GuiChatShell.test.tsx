@@ -120,6 +120,10 @@ vi.mock("./GuiChatModelsPane", () => ({
   GuiChatModelsPane: () => <section data-models-pane>Models pane</section>,
 }));
 
+vi.mock("./GuiChatScheduledTasksPane", () => ({
+  GuiChatScheduledTasksPane: () => <section data-scheduled-tasks-pane>Scheduled tasks pane</section>,
+}));
+
 let root: Root | null = null;
 
 beforeEach(() => {
@@ -342,6 +346,26 @@ describe("GuiChatShell", () => {
     expect(document.querySelector("[data-skills-pane]")).toBeNull();
     expect(document.querySelector("[data-composer-send]")).not.toBeNull();
     expect(connection.createOrAttach).toHaveBeenCalledTimes(2);
+  });
+
+  it("opens scheduled tasks without reconnecting the chat", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(<GuiChatShell />);
+    await act(async () => {
+      Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
+        .find((button) => button.textContent?.includes("Scheduled Tasks"))
+        ?.click();
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector("[data-scheduled-tasks-pane]")).not.toBeNull();
+    expect(document.querySelector("[data-composer-send]")).toBeNull();
+    expect(Array.from(document.querySelectorAll<HTMLButtonElement>('button[aria-current="page"]'))
+      .some((button) => button.textContent?.includes("Scheduled Tasks"))).toBe(true);
+    expect(connection.createOrAttach).toHaveBeenCalledTimes(1);
   });
 
   it("shows the WeChat action only when the authenticated connector is ready", async () => {

@@ -543,6 +543,44 @@ def test_authenticated_skill_routes_are_explicit_owner_worker_routes(method, pat
 @pytest.mark.parametrize(
     ("method", "path"),
     [
+        ("GET", "/api/cron/jobs"),
+        ("POST", "/api/cron/jobs"),
+        ("GET", "/api/cron/jobs/job-1"),
+        ("PUT", "/api/cron/jobs/job-1"),
+        ("DELETE", "/api/cron/jobs/job-1"),
+        ("POST", "/api/cron/jobs/job-1/pause"),
+        ("POST", "/api/cron/jobs/job-1/resume"),
+        ("POST", "/api/cron/jobs/job-1/trigger"),
+        ("GET", "/api/cron/delivery-targets"),
+    ],
+)
+def test_authenticated_cron_routes_are_owner_worker_bound(method, path):
+    from hermes_cli.dashboard_auth.api_availability import authenticated_owner_worker_api_allowed
+
+    assert authenticated_owner_worker_api_allowed(path, method=method) is True
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("DELETE", "/api/cron/jobs"),
+        ("POST", "/api/cron/jobs/job-1"),
+        ("PATCH", "/api/cron/jobs/job-1"),
+        ("GET", "/api/cron/jobs/job-1/pause"),
+        ("POST", "/api/cron/jobs/job-1/runs"),
+        ("GET", "/api/cron/jobs/job-1/private"),
+        ("POST", "/api/cron/delivery-targets"),
+    ],
+)
+def test_authenticated_cron_routes_are_method_and_path_exact(method, path):
+    from hermes_cli.dashboard_auth.api_availability import authenticated_owner_worker_api_allowed
+
+    assert authenticated_owner_worker_api_allowed(path, method=method) is False
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
         ("GET", "/api/model/registrations"),
         ("GET", "/api/model/registrations/catalog"),
         ("POST", "/api/model/registrations"),

@@ -1,4 +1,4 @@
-import { useEffect, type ReactNode } from "react";
+import { useEffect, useId, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 
@@ -17,6 +17,8 @@ export function GuiChatWorkspaceDialog({
   title: string;
   wide?: boolean;
 }) {
+  const titleId = useId();
+
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !busy) onClose();
@@ -27,11 +29,22 @@ export function GuiChatWorkspaceDialog({
 
   return createPortal(
     <div className="gui-chat-workspace-dialog-backdrop" data-gui-chat role="presentation">
-      <div aria-modal="true" className={`gui-chat-workspace-dialog${wide ? " is-wide" : ""}`} role="dialog">
-        <button aria-label="Close" className="gui-chat-workspace-dialog-close" disabled={busy} onClick={onClose} type="button">
+      <div
+        aria-labelledby={titleId}
+        aria-modal="true"
+        className={`gui-chat-workspace-dialog${wide ? " is-wide" : ""}`}
+        role="dialog"
+      >
+        <button
+          aria-label="Close"
+          className="gui-chat-workspace-dialog-close"
+          disabled={busy}
+          onClick={onClose}
+          type="button"
+        >
           <X aria-hidden />
         </button>
-        <h2>{title}</h2>
+        <h2 id={titleId}>{title}</h2>
         <p>{description}</p>
         {children}
       </div>

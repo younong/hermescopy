@@ -2806,6 +2806,115 @@ def test_worker_skill_writes_mutate_only_owner_home(tmp_path, monkeypatch):
     assert not owner_home.joinpath("skills/blocked").exists()
 
 
+def test_worker_cron_routes_are_capability_bound_and_owner_local(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
+    other_home = ensure_owner_runtime_dirs(tmp_path / "other")
+    control_home = tmp_path / "control"
+    owner_home.joinpath("config.yaml").write_text("model: test-model\n", encoding="utf-8")
+    other_home.joinpath("config.yaml").write_text("model: other-model\n", encoding="utf-8")
+    owner_home.joinpath("scripts").mkdir()
+    owner_home.joinpath("scripts/task.py").write_text("print('owner marker')\n", encoding="utf-8")
+
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_worker_cron")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+    from hermes_cli.owner_worker.entrypoint import create_app
+
+    app = create_app("ok1_worker_cron", owner_home)
+    client = TestClient(app)
+
+    def request(method: str, path: str, payload: dict | None = None):
+        token = _capability_for(app, path=path, control_home=control_home)
+        return client.request(
+            method,
+            path,
+            json=payload,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert client.get("/api/cron/jobs").status_code == 401
+    created = request(
+        "POST",
+        "/api/cron/jobs",
+        {
+            "name": "owner task",
+            "schedule": "every 1h",
+            "script": "task.py",
+            "no_agent": True,
+        },
+    )
+    assert created.status_code == 200, created.text
+    job = created.json()
+    assert job["script"] == "task.py"
+    assert owner_home.joinpath("cron/jobs.json").exists()
+    assert not other_home.joinpath("cron/jobs.json").exists()
+
+    listed = request("GET", "/api/cron/jobs")
+    assert listed.status_code == 200
+    assert [row["id"] for row in listed.json()] == [job["id"]]
+
+    item_path = f"/api/cron/jobs/{job['id']}"
+    updated = request("PUT", item_path, {"updates": {"name": "renamed"}})
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["name"] == "renamed"
+
+    paused = request("POST", f"{item_path}/pause")
+    assert paused.status_code == 200
+    assert paused.json()["enabled"] is False
+    resumed = request("POST", f"{item_path}/resume")
+    assert resumed.status_code == 200
+    assert resumed.json()["enabled"] is True
+
+    deleted = request("DELETE", item_path)
+    assert deleted.status_code == 200
+    assert deleted.json() == {"ok": True}
+    assert request("GET", "/api/cron/jobs").json() == []
+
+
+def test_worker_cron_routes_reject_external_owner_selectors(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
+    control_home = tmp_path / "control"
+    owner_home.joinpath("config.yaml").write_text("model: test-model\n", encoding="utf-8")
+    owner_home.joinpath("scripts").mkdir()
+    owner_home.joinpath("scripts/task.py").write_text("print('ok')\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_worker_cron_reject")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+    from hermes_cli.owner_worker.entrypoint import create_app
+
+    app = create_app("ok1_worker_cron_reject", owner_home)
+    client = TestClient(app)
+
+    def request(method: str, path: str, payload: dict | None = None):
+        token = _capability_for(app, path=path.split("?", 1)[0], control_home=control_home)
+        return client.request(
+            method,
+            path,
+            json=payload,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    rejected_query = request("GET", "/api/cron/jobs?owner_key=other")
+    assert rejected_query.status_code == 400
+
+    rejected_body = request(
+        "POST",
+        "/api/cron/jobs",
+        {
+            "schedule": "every 1h",
+            "script": "task.py",
+            "no_agent": True,
+            "owner_home": str(tmp_path / "other"),
+        },
+    )
+    assert rejected_body.status_code == 400
+    assert not owner_home.joinpath("cron/jobs.json").exists()
+
+
 def test_worker_managed_files_are_descriptor_scoped_to_its_owner(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
     from hermes_cli.owner_worker.entrypoint import create_app

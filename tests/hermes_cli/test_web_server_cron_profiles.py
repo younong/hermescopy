@@ -22,7 +22,14 @@ def isolated_profiles(tmp_path, monkeypatch):
     return {"default": default_home, "worker_alpha": worker_home}
 
 
-def test_call_cron_for_profile_routes_storage_and_restores_globals(isolated_profiles):
+def _create_profile_job(web_server, profile: str, **fields):
+    from hermes_cli.cron_management import create_job
+
+    profile_name, profile_home = web_server._cron_profile_home(profile)
+    return create_job(profile_home, fields, profile=profile_name)
+
+
+def test_cron_management_routes_storage_and_restores_globals(isolated_profiles):
     from cron import jobs as cron_jobs
     from hermes_cli import web_server
 
@@ -30,9 +37,9 @@ def test_call_cron_for_profile_routes_storage_and_restores_globals(isolated_prof
     old_jobs_file = cron_jobs.JOBS_FILE
     old_output_dir = cron_jobs.OUTPUT_DIR
 
-    job = web_server._call_cron_for_profile(
+    job = _create_profile_job(
+        web_server,
         "worker_alpha",
-        "create_job",
         prompt="run scheduled task",
         schedule="every 1h",
         name="worker-alpha-scan",
@@ -54,16 +61,16 @@ def test_call_cron_for_profile_routes_storage_and_restores_globals(isolated_prof
 async def test_list_cron_jobs_all_includes_default_and_named_profiles(isolated_profiles):
     from hermes_cli import web_server
 
-    default_job = web_server._call_cron_for_profile(
+    default_job = _create_profile_job(
+        web_server,
         "default",
-        "create_job",
         prompt="default heartbeat",
         schedule="every 2h",
         name="default-heartbeat",
     )
-    worker_job = web_server._call_cron_for_profile(
+    worker_job = _create_profile_job(
+        web_server,
         "worker_alpha",
-        "create_job",
         prompt="worker heartbeat",
         schedule="every 3h",
         name="worker-alpha-heartbeat",
@@ -85,16 +92,16 @@ async def test_list_cron_jobs_all_includes_default_and_named_profiles(isolated_p
 async def test_list_cron_jobs_specific_profile_filters_results(isolated_profiles):
     from hermes_cli import web_server
 
-    web_server._call_cron_for_profile(
+    _create_profile_job(
+        web_server,
         "default",
-        "create_job",
         prompt="default only",
         schedule="every 2h",
         name="default-only",
     )
-    worker_job = web_server._call_cron_for_profile(
+    worker_job = _create_profile_job(
+        web_server,
         "worker_alpha",
-        "create_job",
         prompt="worker only",
         schedule="every 3h",
         name="worker-only",
@@ -138,9 +145,9 @@ async def test_create_cron_job_normalizes_representative_core_fields(
 async def test_cron_mutation_without_profile_finds_named_profile_job(isolated_profiles):
     from hermes_cli import web_server
 
-    worker_job = web_server._call_cron_for_profile(
+    worker_job = _create_profile_job(
+        web_server,
         "worker_alpha",
-        "create_job",
         prompt="managed by named profile",
         schedule="every 1h",
         name="named-profile-job",
@@ -166,9 +173,9 @@ async def test_update_cron_job_normalizes_dashboard_core_fields(isolated_profile
     scripts_dir = isolated_profiles["worker_alpha"] / "scripts"
     scripts_dir.mkdir()
     (scripts_dir / "collect.py").write_text("print('ok')\n", encoding="utf-8")
-    job = web_server._call_cron_for_profile(
+    job = _create_profile_job(
+        web_server,
         "worker_alpha",
-        "create_job",
         prompt="managed by named profile",
         schedule="every 1h",
         name="normalizes-dashboard-fields",
@@ -273,9 +280,9 @@ async def test_dashboard_cron_rejects_missing_context_from(isolated_profiles):
     assert create_exc.value.status_code == 400
     assert "missing-job-id" in create_exc.value.detail
 
-    job = web_server._call_cron_for_profile(
+    job = _create_profile_job(
+        web_server,
         "worker_alpha",
-        "create_job",
         prompt="managed by named profile",
         schedule="every 1h",
         name="context-update-target",
@@ -300,16 +307,16 @@ async def test_dashboard_cron_rejects_missing_context_from(isolated_profiles):
 async def test_dashboard_cron_context_from_is_profile_scoped(isolated_profiles):
     from hermes_cli import web_server
 
-    default_job = web_server._call_cron_for_profile(
+    default_job = _create_profile_job(
+        web_server,
         "default",
-        "create_job",
         prompt="default upstream",
         schedule="every 1h",
         name="default-upstream",
     )
-    worker_upstream = web_server._call_cron_for_profile(
+    worker_upstream = _create_profile_job(
+        web_server,
         "worker_alpha",
-        "create_job",
         prompt="worker upstream",
         schedule="every 1h",
         name="worker-upstream",
@@ -350,9 +357,9 @@ async def test_update_cron_job_refreshes_snapshots_when_unpinning(
         lambda **kwargs: {"provider": "worker-provider"},
     )
 
-    job = web_server._call_cron_for_profile(
+    job = _create_profile_job(
+        web_server,
         "worker_alpha",
-        "create_job",
         prompt="managed by named profile",
         schedule="every 1h",
         name="pinned-job",
@@ -394,9 +401,9 @@ async def test_dashboard_cron_noop_inference_fields_keep_existing_snapshots(
         lambda **kwargs: {"provider": current_provider["name"]},
     )
 
-    job = web_server._call_cron_for_profile(
+    job = _create_profile_job(
+        web_server,
         "worker_alpha",
-        "create_job",
         prompt="managed by named profile",
         schedule="every 1h",
         name="dashboard-edit-job",
@@ -446,9 +453,9 @@ async def test_update_cron_job_clears_snapshots_for_no_agent(
     scripts_dir.mkdir()
     (scripts_dir / "collect.py").write_text("print('ok')\n", encoding="utf-8")
 
-    job = web_server._call_cron_for_profile(
+    job = _create_profile_job(
+        web_server,
         "worker_alpha",
-        "create_job",
         prompt="managed by named profile",
         schedule="every 1h",
         name="agent-to-script-job",
@@ -478,9 +485,9 @@ async def test_update_cron_job_rejects_id_mutation(isolated_profiles):
     id-mutation attempt is rejected by cron/jobs.update_job."""
     from hermes_cli import web_server
 
-    worker_job = web_server._call_cron_for_profile(
+    worker_job = _create_profile_job(
+        web_server,
         "worker_alpha",
-        "create_job",
         prompt="managed by named profile",
         schedule="every 1h",
         name="immutable-id-job",
@@ -503,16 +510,16 @@ async def test_update_cron_job_rejects_id_mutation(isolated_profiles):
 async def test_cron_delete_with_profile_deletes_only_target_profile(isolated_profiles):
     from hermes_cli import web_server
 
-    default_job = web_server._call_cron_for_profile(
+    default_job = _create_profile_job(
+        web_server,
         "default",
-        "create_job",
         prompt="same-ish default",
         schedule="every 1h",
         name="shared-name",
     )
-    worker_job = web_server._call_cron_for_profile(
+    worker_job = _create_profile_job(
+        web_server,
         "worker_alpha",
-        "create_job",
         prompt="same-ish worker",
         schedule="every 1h",
         name="shared-name-worker",

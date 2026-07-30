@@ -98,6 +98,24 @@ class ChronosCronScheduler(CronScheduler):
     def _callback_url(self) -> str:
         return str(_cfg("cron", "chronos", "callback_url") or "")
 
+    @staticmethod
+    def _external_job_id(job_id: str) -> str:
+        """Namespace NAS identities when running inside an authenticated owner."""
+        import os
+
+        owner_key = os.environ.get("HERMES_OWNER_KEY", "").strip()
+        return f"{owner_key}:{job_id}" if owner_key else job_id
+
+    @staticmethod
+    def _local_job_id(job_id: str) -> str | None:
+        import os
+
+        owner_key = os.environ.get("HERMES_OWNER_KEY", "").strip()
+        if not owner_key:
+            return job_id
+        prefix = f"{owner_key}:"
+        return job_id[len(prefix):] if job_id.startswith(prefix) else None
+
     # -- lifecycle --------------------------------------------------------
 
     def start(self, stop_event, *, adapters=None, loop=None, interval=60):
@@ -133,12 +151,13 @@ class ChronosCronScheduler(CronScheduler):
         fire is a no-op NAS-side.
         """
         job_id = job["id"]
+        external_job_id = self._external_job_id(job_id)
         fire_at = job.get("next_run_at")
         if not fire_at:
             return
-        dedup_key = f"{job_id}:{fire_at}"
+        dedup_key = f"{external_job_id}:{fire_at}"
         self._get_client().provision(
-            job_id=job_id,
+            job_id=external_job_id,
             fire_at=fire_at,
             agent_callback_url=self._callback_url(),
             dedup_key=dedup_key,
@@ -148,7 +167,7 @@ class ChronosCronScheduler(CronScheduler):
 
     def _cancel(self, job_id: str) -> None:
         try:
-            self._get_client().cancel(job_id=job_id)
+            self._get_client().cancel(job_id=self._external_job_id(job_id))
         finally:
             with self._lock:
                 self._armed.pop(job_id, None)
@@ -164,11 +183,11 @@ class ChronosCronScheduler(CronScheduler):
             if self._armed:
                 return dict(self._armed)
         try:
-            observed = {
-                item["job_id"]: item.get("fire_at", "")
-                for item in self._get_client().list_armed()
-                if item.get("job_id")
-            }
+            observed: Dict[str, str] = {}
+            for item in self._get_client().list_armed():
+                local_job_id = self._local_job_id(str(item.get("job_id") or ""))
+                if local_job_id:
+                    observed[local_job_id] = item.get("fire_at", "")
             with self._lock:
                 self._armed.update(observed)
             return observed
