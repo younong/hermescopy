@@ -350,7 +350,7 @@ export function ChatSessionList({
                     placeholder={titlePlaceholder}
                     aria-label={titlePlaceholder}
                     className={cn(
-                      "h-8 min-w-0 flex-1 py-0",
+                      "h-8 min-w-0 flex-1 bg-transparent py-0",
                       variant === "compact" ? "text-[14px] font-medium leading-[22px]" : "text-sm",
                     )}
                     disabled={rename.saving}
