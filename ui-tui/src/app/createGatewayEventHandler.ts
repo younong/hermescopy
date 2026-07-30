@@ -37,7 +37,7 @@ const COMPRESSION_STATUS_KINDS = new Set([
   'compression.preparing',
   'compression.ready'
 ])
-const COMPRESSION_STATUS_CLEARS_BUSY = new Set(['compression.completed', 'compression.ready'])
+const COMPRESSION_STATUS_CLEARS_BUSY = new Set(['compression.completed'])
 
 const applySkin = (s: GatewaySkin) =>
   patchUiState({

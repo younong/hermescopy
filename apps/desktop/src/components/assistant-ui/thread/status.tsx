@@ -9,7 +9,7 @@ import { Loader } from '@/components/ui/loader'
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
 import { $backgroundResume } from '@/store/background-delegation'
-import { $compactionActive } from '@/store/compaction'
+import { $activeCompressionStatus, $compactionActive } from '@/store/compaction'
 import { $activeSessionAwaitingInput } from '@/store/prompts'
 
 const StatusRow: FC<{ children: ReactNode; label: string } & React.ComponentPropsWithoutRef<'div'>> = ({
@@ -29,12 +29,17 @@ const StatusRow: FC<{ children: ReactNode; label: string } & React.ComponentProp
   </div>
 )
 
-// Fixed label while auto-compaction runs — decoupled from backend status text.
 const COMPACTION_LABEL = 'Summarizing thread'
 
-const CompactionHint: FC = () => (
-  <span className="shimmer min-w-0 truncate text-muted-foreground/55">{COMPACTION_LABEL}</span>
-)
+const CompactionHint: FC = () => {
+  const status = useStore($activeCompressionStatus)
+
+  return (
+    <span className="shimmer min-w-0 truncate text-muted-foreground/55">
+      {status?.text || COMPACTION_LABEL}
+    </span>
+  )
+}
 
 export const CenteredThreadSpinner: FC = () => {
   const { t } = useI18n()

@@ -115,8 +115,10 @@ export interface CompressionStatusState {
     | "compression.blocked"
     | "compression.cooldown"
     | "compression.degraded"
-    | "compression.preparing";
+    | "compression.preparing"
+    | "compression.ready";
   text: string;
+  startedAt?: number;
 }
 
 export interface GuiChatState {

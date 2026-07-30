@@ -2675,6 +2675,51 @@ class TestTransientTransportRetry:
         assert primary.chat.completions.create.call_count == 2
         assert fb_client.chat.completions.create.call_count == 1
 
+    def test_compression_timeout_is_clamped_to_ten_minutes(self):
+        client = MagicMock()
+        client.base_url = "https://openrouter.ai/api/v1"
+        client.chat.completions.create.return_value = {"ok": True}
+        p1, p2, p3 = self._patches(client)
+        with (
+            p1, p2, p3,
+            patch("agent.auxiliary_client.time.monotonic", return_value=100.0),
+        ):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hi"}],
+                timeout=900,
+            )
+        assert result == {"ok": True}
+        assert client.chat.completions.create.call_args.kwargs["timeout"] == 600.0
+
+    def test_shorter_compression_timeout_remains_effective(self):
+        client = MagicMock()
+        client.base_url = "https://openrouter.ai/api/v1"
+        client.chat.completions.create.return_value = {"ok": True}
+        p1, p2, p3 = self._patches(client)
+        with p1, p2, p3:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hi"}],
+                timeout=45,
+            )
+        assert result == {"ok": True}
+        assert client.chat.completions.create.call_args.kwargs["timeout"] == 45
+
+    def test_non_compression_timeout_is_not_clamped(self):
+        client = MagicMock()
+        client.base_url = "https://openrouter.ai/api/v1"
+        client.chat.completions.create.return_value = {"ok": True}
+        p1, p2, p3 = self._patches(client)
+        with p1, p2, p3:
+            result = call_llm(
+                task="title_generation",
+                messages=[{"role": "user", "content": "hi"}],
+                timeout=900,
+            )
+        assert result == {"ok": True}
+        assert client.chat.completions.create.call_args.kwargs["timeout"] == 900
+
     def test_compression_deadline_is_shared_with_fallback(self):
         primary = MagicMock()
         primary.base_url = "https://openrouter.ai/api/v1"

@@ -1143,7 +1143,7 @@ function applyStatusUpdate(
 ): GuiChatState {
   const kind = payload?.kind;
   if (!kind?.startsWith("compression.")) return appendStatusLine(state, payload);
-  if (kind === "compression.completed" || kind === "compression.ready") {
+  if (kind === "compression.completed") {
     return state.compressionStatus ? { ...state, compressionStatus: undefined } : state;
   }
   const text = payload?.text?.trim();
@@ -1152,11 +1152,20 @@ function applyStatusUpdate(
     kind !== "compression.blocked" &&
     kind !== "compression.cooldown" &&
     kind !== "compression.degraded" &&
-    kind !== "compression.preparing"
+    kind !== "compression.preparing" &&
+    kind !== "compression.ready"
   ) {
     return state;
   }
-  return { ...state, compressionStatus: { kind, text } };
+  const active = kind === "compression.preparing" || kind === "compression.ready";
+  return {
+    ...state,
+    compressionStatus: {
+      kind,
+      text,
+      startedAt: active ? (state.compressionStatus?.startedAt ?? Date.now()) : undefined,
+    },
+  };
 }
 
 function appendStatusLine(

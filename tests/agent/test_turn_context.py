@@ -109,69 +109,6 @@ class _FakeAgent:
         self._activity.append(desc)
 
 
-def _make_agent_with_cooldown(db_path, session_id, *, cooldown_until=None):
-    agent = _FakeAgent()
-    agent.compression_enabled = True
-    agent._emit_status = MagicMock()
-    agent._compress_context = MagicMock(
-        side_effect=lambda messages, *_a, **_k: (messages, "SYSTEM")
-    )
-
-    db = SessionDB(db_path=db_path)
-    db.create_session(session_id, source="cli")
-    if cooldown_until is not None:
-        job = db.enqueue_compression_job(
-            session_id=session_id,
-            job_id=f"cooldown-{session_id}",
-            fence_id=f"fence-{session_id}",
-            snapshot_message_id=None,
-            snapshot_message_count=0,
-            snapshot_digest="",
-            main_route_fingerprint="test/model",
-            auxiliary_route_fingerprint="test/model",
-            snapshot_payload="[]",
-        )
-        claimed = db.claim_compression_job(
-            session_id=session_id,
-            job_id=job["job_id"],
-            holder="test",
-        )
-        db.mark_compression_job_cooldown(
-            session_id=session_id,
-            job_id=job["job_id"],
-            holder="test",
-            lease_version=claimed["lease_version"],
-            retry_at=cooldown_until,
-            failure_code="provider_timeout",
-        )
-
-    with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-        compressor = ContextCompressor(
-            model="test/model",
-            threshold_percent=0.85,
-            protect_first_n=2,
-            protect_last_n=2,
-            quiet_mode=True,
-        )
-    compressor.bind_session_state(db, session_id)
-    agent.context_compressor = compressor
-    agent._session_db = db
-    return agent
-
-
-@pytest.fixture(autouse=True)
-def _stub_runtime_main():
-    """``build_turn_context`` calls ``auxiliary_client.set_runtime_main`` as a
-    production side effect (telling aux tools the live main provider/model).
-    That writes a module-level global these unit tests don't care about and
-    which would otherwise leak into sibling tests (e.g. provider-parity
-    resolution) when the per-test process isolation plugin is disabled. Stub
-    it out so the prologue tests stay hermetic.
-    """
-    with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None):
-        yield
-
-
 def _build(agent, **overrides):
     kwargs = dict(
         agent=agent,
@@ -380,63 +317,6 @@ def test_between_turns_refresh_no_churn_when_unchanged():
         _build(agent)
 
     assert agent.tools is same  # not replaced → no churn
-
-
-def test_preflight_skips_when_persisted_cooldown_survives_restart(tmp_path, caplog):
-    agent = _make_agent_with_cooldown(
-        tmp_path / "state.db",
-        "sess-1",
-        cooldown_until=4_000_000_000.0,
-    )
-    caplog.set_level(logging.INFO, logger="agent.turn_context")
-
-    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
-         patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
-        ctx = _build(agent)
-
-    assert isinstance(ctx, TurnContext)
-    agent._emit_status.assert_not_called()
-    agent._compress_context.assert_not_called()
-    assert "reason=failure_cooldown" in caplog.text
-    assert "effective_threshold=85000" in caplog.text
-
-
-def test_preflight_still_runs_for_other_session_with_same_db(tmp_path):
-    db_path = tmp_path / "state.db"
-    _make_agent_with_cooldown(
-        db_path,
-        "sess-1",
-        cooldown_until=4_000_000_000.0,
-    )
-    agent = _make_agent_with_cooldown(db_path, "sess-2")
-
-    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
-         patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
-        ctx = _build(agent)
-
-    assert isinstance(ctx, TurnContext)
-    agent._emit_status.assert_called_once()
-    agent._compress_context.assert_called()
-
-
-def test_expired_cooldown_allows_preflight(tmp_path, caplog):
-    agent = _make_agent_with_cooldown(
-        tmp_path / "state.db",
-        "sess-1",
-        cooldown_until=1.0,
-    )
-    caplog.set_level(logging.INFO, logger="agent.turn_context")
-
-    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
-         patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
-        ctx = _build(agent)
-
-    assert isinstance(ctx, TurnContext)
-    agent._emit_status.assert_called_once()
-    agent._compress_context.assert_called()
-    assert "decision=compress reason=threshold_reached" in caplog.text
-    assert "decision=stop reason=no_progress" in caplog.text
-
 
 
 def test_tool_checkpoint_runs_after_inbound_persistence_and_rebaselines_history():

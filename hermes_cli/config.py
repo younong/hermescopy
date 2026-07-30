@@ -1368,10 +1368,7 @@ DEFAULT_CONFIG = {
 
     "compression": {
         "enabled": True,
-        "threshold": 0.50,            # compressor trigger and prepare default
-        "prepare_threshold": 0.50,    # enqueue durable background preparation
-        "commit_threshold": 0.80,     # apply a ready projection at a safe boundary
-        "emergency_threshold": 0.88,  # degraded-state warning threshold; never blocks
+        "threshold": 0.50,            # synchronously compress before the next model request
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
         "hygiene_hard_message_limit": 5000,  # gateway session-hygiene force-compress threshold by message count

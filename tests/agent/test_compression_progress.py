@@ -14,7 +14,13 @@ progress.
 
 from __future__ import annotations
 
-from agent.turn_context import _compression_made_progress
+from types import SimpleNamespace
+from unittest.mock import MagicMock, call
+
+from agent.conversation_compression import (
+    _compression_made_progress,
+    run_automatic_compression,
+)
 
 
 class TestCompressionMadeProgress:
@@ -84,3 +90,66 @@ class TestCompressionMadeProgress:
         assert _compression_made_progress(
             orig_len=10, new_len=10, orig_tokens=0, new_tokens=0
         ) is False
+
+
+class TestAutomaticCompression:
+    @staticmethod
+    def _agent(compressed_messages):
+        compressor = SimpleNamespace(
+            threshold_tokens=100,
+            calibrated_prompt_tokens=lambda tokens: tokens,
+            would_hard_block=lambda tokens: tokens >= 190,
+        )
+        agent = SimpleNamespace(
+            context_compressor=compressor,
+            tools=[],
+            session_id="session-1",
+            _compress_context=MagicMock(
+                return_value=(compressed_messages, "compressed prompt")
+            ),
+            _emit_status=MagicMock(),
+        )
+        return agent
+
+    def test_blocks_until_compressed_request_is_verified_safe(self, monkeypatch):
+        original = [{"role": "user", "content": "large history"}]
+        compacted = [{"role": "user", "content": "summary"}]
+        agent = self._agent(compacted)
+        estimates = iter([150, 40])
+        monkeypatch.setattr(
+            "agent.conversation_compression.estimate_request_tokens_rough",
+            lambda *_args, **_kwargs: next(estimates),
+        )
+
+        outcome = run_automatic_compression(agent, original, "system")
+
+        assert outcome.safe_to_continue is True
+        assert outcome.messages is compacted
+        assert outcome.request_tokens == 40
+        agent._emit_status.assert_has_calls(
+            [
+                call("Compressing context (pass 1/3)…", kind="compression.preparing"),
+                call("Context compression completed.", kind="compression.completed"),
+            ]
+        )
+
+    def test_no_progress_preserves_original_request_and_blocks(self, monkeypatch):
+        original = [{"role": "user", "content": "large history"}]
+        agent = self._agent(original)
+        monkeypatch.setattr(
+            "agent.conversation_compression.estimate_request_tokens_rough",
+            lambda *_args, **_kwargs: 150,
+        )
+
+        outcome = run_automatic_compression(agent, original, "system")
+
+        assert outcome.safe_to_continue is False
+        assert outcome.messages is original
+        assert outcome.compressed is False
+        assert outcome.failure_reason == "compression_no_progress"
+        agent._emit_status.assert_any_call(
+            "Context compression could not reduce the request safely. The durable "
+            "conversation was preserved and no normal model request was sent. Run "
+            "/compress to retry or /new to start fresh.",
+            kind="compression.blocked",
+        )

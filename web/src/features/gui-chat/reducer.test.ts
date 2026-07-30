@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { buildSessionFileDownloadUrl } from "./files";
 import { guiChatReducer } from "./reducer";
@@ -219,7 +219,9 @@ describe("guiChatReducer clarification lifecycle", () => {
 });
 
 describe("guiChatReducer compression lifecycle", () => {
-  it("stores transient structured state without appending transcript status lines", () => {
+  it("stores active stages with one timer without appending transcript status lines", () => {
+    const startedAt = 123_456;
+    vi.spyOn(Date, "now").mockReturnValue(startedAt);
     const preparing = guiChatReducer(initialGuiChatState, {
       type: "event",
       event: {
@@ -234,6 +236,7 @@ describe("guiChatReducer compression lifecycle", () => {
 
     expect(preparing.compressionStatus).toEqual({
       kind: "compression.preparing",
+      startedAt,
       text: "Summarizing earlier conversation…",
     });
     expect(preparing.statusLines).toEqual([]);
@@ -247,8 +250,13 @@ describe("guiChatReducer compression lifecycle", () => {
       },
     });
 
-    expect(ready.compressionStatus).toBeUndefined();
+    expect(ready.compressionStatus).toEqual({
+      kind: "compression.ready",
+      startedAt,
+      text: "Summary ready",
+    });
     expect(ready.statusLines).toEqual([]);
+    vi.restoreAllMocks();
   });
 
   it("ignores compression statuses from another live session", () => {

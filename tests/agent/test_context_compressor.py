@@ -2,7 +2,6 @@
 
 import json
 import pytest
-import time
 from unittest.mock import patch, MagicMock
 
 from agent.context_compressor import (
@@ -11,33 +10,6 @@ from agent.context_compressor import (
     SUMMARY_PREFIX,
     COMPRESSED_SUMMARY_METADATA_KEY,
 )
-from hermes_state import SessionDB
-
-
-def _put_compression_job_cooldown(db, session_id, retry_at):
-    job = db.enqueue_compression_job(
-        session_id=session_id,
-        job_id=f"job-{session_id}",
-        fence_id=f"fence-{session_id}",
-        snapshot_message_id=None,
-        snapshot_message_count=0,
-        snapshot_digest="",
-        main_route_fingerprint="test/model",
-        auxiliary_route_fingerprint="test/model",
-        snapshot_payload="[]",
-    )
-    claimed = db.claim_compression_job(
-        session_id=session_id, job_id=job["job_id"], holder="test"
-    )
-    assert claimed is not None
-    assert db.mark_compression_job_cooldown(
-        session_id=session_id,
-        job_id=job["job_id"],
-        holder="test",
-        lease_version=claimed["lease_version"],
-        retry_at=retry_at,
-        failure_code="provider_timeout",
-    )
 
 
 @pytest.fixture()
@@ -81,71 +53,52 @@ class TestRollingSummaryPreparation:
         assert len(chunks) == 1
         assert chunks[0] == [tool_call, huge_result]
 
-    def test_durable_projection_records_actual_auxiliary_route(self, compressor):
-        from agent.auxiliary_client import AuxiliaryRouteCapacity
-
-        messages = [
-            {"role": "system", "content": "sys"},
-            {"role": "user", "content": "old question"},
-            {"role": "assistant", "content": "old answer"},
-            {"role": "user", "content": "middle question"},
-            {"role": "assistant", "content": "middle answer"},
-            {"role": "user", "content": "next question"},
-            {"role": "assistant", "content": "next answer"},
-            {"role": "user", "content": "current"},
+    def test_each_rolling_chunk_gets_a_fresh_request_deadline(self, compressor):
+        chunks = [
+            [{"role": "user", "content": "one"}],
+            [{"role": "assistant", "content": "two"}],
         ]
-        compressor.tail_token_budget = 1
-        route = AuxiliaryRouteCapacity(
-            fingerprint="actual-route-hash",
-            context_length=256_000,
-            max_output_tokens=8_000,
-            input_budget=248_000,
+        seen_deadlines = []
+
+        compressor._auxiliary_summary_capacity = MagicMock(return_value=None)
+        compressor._summary_chunks = MagicMock(return_value=chunks)
+        compressor._generate_summary = MagicMock(
+            side_effect=lambda *_a, deadline_monotonic=None, **_k: (
+                seen_deadlines.append(deadline_monotonic) or "summary"
+            )
         )
 
-        def respond(**kwargs):
-            kwargs["route_metadata_callback"](route)
-            return MagicMock(
-                choices=[MagicMock(message=MagicMock(content="useful summary"))]
-            )
-
-        with patch("agent.context_compressor.call_llm", side_effect=respond):
-            prepared = compressor.prepare_compression(
-                messages,
-                current_tokens=99_999,
-            )
-
-        assert prepared.aborted is False
-        assert prepared.auxiliary_route_fingerprint == "actual-route-hash"
-        assert prepared.auxiliary_context_length == 256_000
-        assert prepared.auxiliary_input_budget == 248_000
-
-    def test_durable_preparation_never_falls_back_to_main(self, compressor):
-        compressor.summary_model = "aux/model"
-        messages = [
-            {"role": "system", "content": "sys"},
-            {"role": "user", "content": "old question"},
-            {"role": "assistant", "content": "old answer"},
-            {"role": "user", "content": "middle question"},
-            {"role": "assistant", "content": "middle answer"},
-            {"role": "user", "content": "next question"},
-            {"role": "assistant", "content": "next answer"},
-            {"role": "user", "content": "current"},
-        ]
-        compressor.tail_token_budget = 1
-
         with patch(
-            "agent.context_compressor.call_llm",
-            side_effect=RuntimeError("auxiliary unavailable"),
-        ) as call:
-            prepared = compressor.prepare_compression(
-                messages,
-                current_tokens=99_999,
+            "agent.context_compressor.time.monotonic",
+            side_effect=[100.0, 250.0],
+        ):
+            result = compressor._generate_rolling_summary(
+                [*chunks[0], *chunks[1]],
+                focus_topic=None,
+                deadline_monotonic=None,
             )
 
-        assert prepared.aborted is True
-        assert prepared.applied is False
-        assert call.call_count == 1
-        assert compressor.summary_model == "aux/model"
+        assert result is not None
+        assert seen_deadlines == [700.0, 850.0]
+
+    def test_rolling_chunk_progress_reports_real_counts(self, compressor):
+        chunks = [
+            [{"role": "user", "content": "one"}],
+            [{"role": "assistant", "content": "two"}],
+        ]
+        progress = []
+        compressor.progress_callback = lambda index, count: progress.append((index, count))
+        compressor._summary_chunks = MagicMock(return_value=chunks)
+        compressor._generate_summary = MagicMock(return_value="summary")
+
+        compressor._generate_rolling_summary(
+            [*chunks[0], *chunks[1]],
+            focus_topic=None,
+            deadline_monotonic=None,
+        )
+
+        assert progress == [(1, 2), (2, 2)]
+
 
 
 class TestShouldCompress:
@@ -1053,6 +1006,8 @@ class TestSummaryFallbackToMainModel:
         assert c._last_aux_model_failure_model == "broken-aux-model"
         assert c._last_aux_model_failure_error is not None
         assert "404" in c._last_aux_model_failure_error
+        first_deadline = mock_call.call_args_list[0].kwargs["deadline_monotonic"]
+        assert mock_call.call_args_list[1].kwargs["deadline_monotonic"] == first_deadline
 
     def test_unknown_error_falls_back_to_main_and_succeeds(self):
         """Errors that don't match the 404/503/model_not_found fast-path
@@ -1733,64 +1688,6 @@ class TestAbortOnSummaryFailure:
         assert c._summary_failure_cooldown_until == 0.0
         assert len(result) < len(msgs)
 
-    def test_force_true_bypasses_persisted_session_cooldown(self, tmp_path):
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "summary text"
-
-        db = SessionDB(db_path=tmp_path / "state.db")
-        db.create_session("s1", "cli")
-        _put_compression_job_cooldown(db, "s1", time.time() + 999.0)
-
-        c = self._make_compressor()
-        c.bind_session_state(db, "s1")
-        msgs = self._make_msgs()
-
-        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_llm:
-            result = c.compress(msgs, current_tokens=999999, force=True)
-
-        mock_llm.assert_called()
-        assert c._last_compress_aborted is False
-        assert len(result) < len(msgs)
-        assert db.get_compression_job("s1")["state"] == "queued"
-
-    def test_aux_fallback_clears_persisted_session_cooldown_before_retry(self, tmp_path):
-        db = SessionDB(db_path=tmp_path / "state.db")
-        db.create_session("s1", "cli")
-        _put_compression_job_cooldown(db, "s1", time.time() + 999.0)
-
-        c = self._make_compressor()
-        c.bind_session_state(db, "s1")
-        c.summary_model = "aux/model"
-
-        c._fallback_to_main_for_compression(Exception("provider down"), "failed")
-
-        assert c.summary_model == ""
-        assert c._summary_failure_cooldown_until == 0.0
-        assert db.get_compression_job("s1")["state"] == "queued"
-
-    def test_success_clears_persisted_session_cooldown(self, tmp_path):
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "summary text"
-
-        db = SessionDB(db_path=tmp_path / "state.db")
-        db.create_session("s1", "cli")
-        _put_compression_job_cooldown(db, "s1", time.time() + 999.0)
-
-        c = self._make_compressor()
-        c.bind_session_state(db, "s1")
-        c._summary_failure_cooldown_until = 0.0
-        msgs = self._make_msgs()
-
-        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_llm:
-            result = c.compress(msgs, current_tokens=999999)
-
-        mock_llm.assert_called()
-        assert c._last_compress_aborted is False
-        assert len(result) < len(msgs)
-        assert db.get_compression_job("s1")["state"] == "queued"
-
     @pytest.mark.parametrize("lifecycle", ["on_session_reset", "on_session_end"])
     def test_session_boundary_clears_failure_classification(self, lifecycle):
         c = self._make_compressor()
@@ -1804,18 +1701,6 @@ class TestAbortOnSummaryFailure:
 
         assert c._last_summary_auth_failure is False
         assert c._last_summary_transient_failure is False
-
-    def test_session_end_does_not_clear_persisted_session_cooldown(self, tmp_path):
-        db = SessionDB(db_path=tmp_path / "state.db")
-        db.create_session("s1", "cli")
-        _put_compression_job_cooldown(db, "s1", time.time() + 999.0)
-
-        c = self._make_compressor()
-        c.bind_session_state(db, "s1")
-        c.on_session_end("s1", [])
-
-        assert db.get_compression_job("s1")["state"] == "cooldown"
-
 
 class TestSummaryPrefixNormalization:
     def test_legacy_prefix_is_replaced(self):

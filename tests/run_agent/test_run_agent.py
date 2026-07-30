@@ -4061,92 +4061,6 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
-    def test_post_tool_async_prepare_keeps_full_context_for_next_call(
-        self, agent
-    ):
-        self._setup_agent(agent)
-        agent.compression_enabled = True
-        agent._using_builtin_context_compressor = True
-        agent.context_compressor.last_prompt_tokens = 128_000
-
-        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
-        agent.client.chat.completions.create.side_effect = [
-            _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc]),
-            _mock_response(content="Done searching", finish_reason="stop"),
-        ]
-        source_messages = None
-
-        def _prepare(_agent, messages, system_prompt, **_kwargs):
-            nonlocal source_messages
-            source_messages = list(messages)
-            from agent.async_context_compression import AsyncCompressionAction
-
-            return SimpleNamespace(
-                action=AsyncCompressionAction.PREPARING,
-                messages=messages,
-                system_prompt=system_prompt,
-            )
-
-        with (
-            patch("run_agent.handle_function_call", return_value="search result"),
-            patch(
-                "agent.async_context_compression.maybe_handle_async_compression",
-                side_effect=_prepare,
-            ) as prepare,
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-        ):
-            result = agent.run_conversation("search something")
-
-        assert result["final_response"] == "Done searching"
-        prepare.assert_called_once()
-        assert source_messages is not None
-        second_request = agent.client.chat.completions.create.call_args_list[1]
-        sent = second_request.kwargs["messages"]
-        assert any(message.get("content") == "search result" for message in sent)
-        assert len(sent) == len(source_messages) + 1  # includes system message
-    def test_post_tool_preparation_failure_does_not_create_assistant_error(self, agent):
-        """Background compression failure does not stop or pollute the active turn."""
-        from agent.async_context_compression import (
-            AsyncCompressionAction,
-            AsyncCompressionOutcome,
-        )
-
-        self._setup_agent(agent)
-        agent.compression_enabled = True
-        agent._using_builtin_context_compressor = True
-        agent.context_compressor.last_prompt_tokens = 100_000
-        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
-        agent.client.chat.completions.create.side_effect = [
-            _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc]),
-            _mock_response(content="Done after background failure", finish_reason="stop"),
-        ]
-
-        def failed(_agent, messages, system_prompt, **_kwargs):
-            return AsyncCompressionOutcome(
-                AsyncCompressionAction.FAILED, messages, system_prompt
-            )
-
-        with (
-            patch("run_agent.handle_function_call", return_value="search result"),
-            patch(
-                "agent.async_context_compression.maybe_handle_async_compression",
-                side_effect=failed,
-            ) as prepare,
-            patch.object(agent, "_compress_context") as mock_compress,
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-        ):
-            result = agent.run_conversation("search something")
-
-        prepare.assert_called_once()
-        mock_compress.assert_not_called()
-        assert result["completed"] is True
-        assert result["final_response"] == "Done after background failure"
-        assert result["messages"][-1]["content"] == "Done after background failure"
-
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
@@ -4734,45 +4648,6 @@ class TestRunConversation:
         assert result["completed"] is True
         assert result["final_response"] == "Recovered after remint"
 
-    def test_post_tool_compression_uses_durable_coordinator(self, agent):
-        """Built-in post-tool compression never calls the synchronous path."""
-        from agent.async_context_compression import (
-            AsyncCompressionAction,
-            AsyncCompressionOutcome,
-        )
-
-        self._setup_agent(agent)
-        agent.compression_enabled = True
-        agent._using_builtin_context_compressor = True
-        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
-        agent.client.chat.completions.create.side_effect = [
-            _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc]),
-            _mock_response(content="All done", finish_reason="stop"),
-        ]
-
-        def preparing(_agent, messages, system_prompt, **_kwargs):
-            return AsyncCompressionOutcome(
-                AsyncCompressionAction.PREPARING, messages, system_prompt
-            )
-
-        with (
-            patch("run_agent.handle_function_call", return_value="result"),
-            patch(
-                "agent.async_context_compression.maybe_handle_async_compression",
-                side_effect=preparing,
-            ) as handle,
-            patch.object(agent, "_compress_context") as mock_compress,
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-        ):
-            result = agent.run_conversation("search something")
-
-        handle.assert_called_once()
-        mock_compress.assert_not_called()
-        assert result["final_response"] == "All done"
-        assert result["completed"] is True
-
     def test_glm_prompt_exceeds_max_length_blocks_losslessly(self, agent):
         self._setup_agent(agent)
         agent.compression_enabled = True
@@ -4792,7 +4667,7 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("hello", conversation_history=prefill)
 
-        mock_compress.assert_not_called()
+        mock_compress.assert_called_once()
         assert result["turn_exit_reason"] == "compression_hard_blocked"
         assert result["final_response"] is None
 
@@ -4819,7 +4694,7 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("hello", conversation_history=prefill)
 
-        mock_compress.assert_not_called()
+        mock_compress.assert_called_once()
         assert agent.context_compressor.context_length == 204_800
         assert agent.context_compressor._context_probed is False
         assert result["turn_exit_reason"] == "compression_hard_blocked"
@@ -4848,7 +4723,7 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("hello", conversation_history=prefill)
 
-        mock_compress.assert_not_called()
+        mock_compress.assert_called_once()
         assert agent.context_compressor.context_length == 200_000
         assert result["turn_exit_reason"] == "compression_hard_blocked"
         assert result["final_response"] is None

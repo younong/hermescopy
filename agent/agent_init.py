@@ -1440,41 +1440,6 @@ def init_agent(
     except Exception:
         pass
     compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
-    try:
-        _configured_prepare_threshold = float(
-            _compression_cfg.get("prepare_threshold", compression_threshold)
-        )
-        compression_commit_threshold = float(
-            _compression_cfg.get("commit_threshold", 0.80)
-        )
-        compression_emergency_threshold = float(
-            _compression_cfg.get("emergency_threshold", 0.88)
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "compression prepare/commit/emergency thresholds must be numeric ratios"
-        ) from exc
-    if not (
-        0 < _configured_prepare_threshold < 1
-        and 0 < compression_commit_threshold < 1
-        and 0 < compression_emergency_threshold < 1
-    ):
-        raise ValueError(
-            "compression thresholds must be greater than 0 and less than 1"
-        )
-    # Provider/model overrides can raise the built-in compressor threshold
-    # (for example Codex gpt-5.5 to 85%). Keep all async stages monotonic.
-    compression_prepare_threshold = max(
-        _configured_prepare_threshold, compression_threshold
-    )
-    compression_commit_threshold = max(
-        compression_prepare_threshold, compression_commit_threshold
-    )
-    compression_emergency_threshold = max(
-        compression_commit_threshold, compression_emergency_threshold
-    )
-    if compression_emergency_threshold >= 1:
-        raise ValueError("compression emergency threshold must remain below 1")
     compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
     compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
     # protect_first_n is the number of non-system messages to protect at
@@ -1747,9 +1712,6 @@ def init_agent(
             pass
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
-    agent.compression_prepare_threshold = compression_prepare_threshold
-    agent.compression_commit_threshold = compression_commit_threshold
-    agent.compression_emergency_threshold = compression_emergency_threshold
 
     # Reject models whose context window is below the minimum required
     # for reliable tool-calling workflows (64K tokens).

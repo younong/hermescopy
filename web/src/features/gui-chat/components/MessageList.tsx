@@ -1,5 +1,6 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { useCallback, useLayoutEffect, useMemo, useRef } from "react";
+import { LoaderCircle } from "lucide-react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { UIEvent } from "react";
 import { useLoadEarlierOnScroll } from "@/hooks/useLoadEarlierOnScroll";
 import type { ArtifactState, GuiChatState } from "../types";
@@ -21,6 +22,28 @@ type RenderRow =
 
 function isNearBottom(element: HTMLElement): boolean {
   return element.scrollHeight - element.scrollTop - element.clientHeight <= BOTTOM_THRESHOLD_PX;
+}
+
+function CompressionProgress({ state }: { state: GuiChatState["compressionStatus"] }) {
+  const active = state?.kind === "compression.preparing" || state?.kind === "compression.ready";
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!active) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [active, state?.startedAt]);
+
+  if (!state) return null;
+  const elapsed = active && state.startedAt ? Math.max(0, Math.floor((now - state.startedAt) / 1_000)) : null;
+  return (
+    <div className="flex min-w-0 items-center gap-2" role="status">
+      {active ? <LoaderCircle aria-hidden className="h-3.5 w-3.5 shrink-0 animate-spin" /> : null}
+      <span className="truncate">{state.text}</span>
+      {elapsed !== null ? <span className="shrink-0 tabular-nums">{elapsed}s</span> : null}
+    </div>
+  );
 }
 
 export function MessageList({
@@ -240,9 +263,7 @@ export function MessageList({
                 ) : null;
               })() : (
                 <div className="space-y-1 text-xs text-text-tertiary">
-                  {state.compressionStatus ? (
-                    <div className="truncate">{state.compressionStatus.text}</div>
-                  ) : null}
+                  <CompressionProgress state={state.compressionStatus} />
                   {state.statusLines.slice(-3).map((line, index) => <div className="truncate" key={`${index}-${line}`}>{line}</div>)}
                 </div>
               )}

@@ -643,15 +643,6 @@ class AIAgent:
         reset runtime counters, bind to the new session, and optionally
         carry retained context forward.
         """
-        try:
-            from agent.async_context_compression import invalidate_compression_runtime
-
-            invalidate_compression_runtime(
-                self, reason="context engine session transition"
-            )
-        except Exception:
-            pass
-
         engine = getattr(self, "context_compressor", None)
         if not engine:
             return
@@ -802,14 +793,6 @@ class AIAgent:
                         provider=self.provider,
                         api_mode=self.api_mode,
                     )
-                    try:
-                        from agent.async_context_compression import (
-                            invalidate_compression_runtime,
-                        )
-
-                        invalidate_compression_runtime(self, reason="model changed")
-                    except Exception:
-                        pass
         except Exception as err:
             logger.debug("LM Studio preload skipped: %s", err)
 
@@ -3491,11 +3474,6 @@ class AIAgent:
         independently guarded so a failure in one does not prevent the rest.
         """
         task_id = getattr(self, "session_id", None) or ""
-        try:
-            from agent.async_context_compression import invalidate_preparation
-            invalidate_preparation(self, reason="agent close")
-        except Exception:
-            pass
 
         # 1. Kill background processes for this task
         try:
@@ -5627,7 +5605,7 @@ class AIAgent:
             self, messages, task_id=task_id, force=force
         )
 
-    def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default", focus_topic: str = None, force: bool = False, emit_abort_warning: bool = True) -> tuple:
+    def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default", focus_topic: str = None, force: bool = False, emit_abort_warning: bool = True, emit_completion_status: bool = True, preserve_on_summary_failure: bool = False) -> tuple:
         """Forwarder — see ``agent.conversation_compression.compress_context``.
 
         ``force=True`` is passed by the manual ``/compress`` slash command
@@ -5640,6 +5618,8 @@ class AIAgent:
             self, messages, system_message,
             approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic,
             force=force, emit_abort_warning=emit_abort_warning,
+            emit_completion_status=emit_completion_status,
+            preserve_on_summary_failure=preserve_on_summary_failure,
         )
 
     def _set_tool_guardrail_halt(self, decision: ToolGuardrailDecision) -> None:
