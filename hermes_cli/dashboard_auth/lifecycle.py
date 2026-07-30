@@ -25,9 +25,10 @@ class AuthorityLifecycleLockError(RuntimeError):
 class AuthorityLifecycleLock:
     """Process-lifetime shared lock for servers and exclusive lock for recovery."""
 
-    def __init__(self, path: Path, *, exclusive: bool):
+    def __init__(self, path: Path, *, exclusive: bool, blocking: bool = False):
         self.path = path
         self.exclusive = exclusive
+        self.blocking = blocking
         self._handle = None
 
     def acquire(self) -> "AuthorityLifecycleLock":
@@ -48,10 +49,13 @@ class AuthorityLifecycleLock:
         try:
             if fcntl is not None:
                 operation = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
-                fcntl.flock(handle.fileno(), operation | fcntl.LOCK_NB)
+                if not self.blocking:
+                    operation |= fcntl.LOCK_NB
+                fcntl.flock(handle.fileno(), operation)
             elif msvcrt is not None:
                 handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                operation = msvcrt.LK_LOCK if self.blocking else msvcrt.LK_NBLCK
+                msvcrt.locking(handle.fileno(), operation, 1)
             else:  # pragma: no cover - unsupported platform
                 raise AuthorityLifecycleLockError(
                     "authority lifecycle locking is unavailable"
@@ -86,12 +90,13 @@ class AuthorityLifecycleLock:
 
 
 def authority_lifecycle_lock(
-    control_home: Path, *, exclusive: bool
+    control_home: Path, *, exclusive: bool, blocking: bool = False
 ) -> AuthorityLifecycleLock:
     """Return an unacquired shared or exclusive authority lifecycle lock."""
     return AuthorityLifecycleLock(
         control_home / _LOCK_NAME,
         exclusive=exclusive,
+        blocking=blocking,
     )
 
 
