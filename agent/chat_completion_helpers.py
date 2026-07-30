@@ -2334,6 +2334,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _dropped_tool_names=_dropped_names or None,
             )
 
+        # Treat a stream without a terminal finish_reason as a partial
+        # transport failure instead of persisting truncated text as complete.
+        if finish_reason is None and not agent._interrupt_requested:
+            raise _httpx.RemoteProtocolError(
+                "Provider stream ended without a finish_reason"
+            )
+
         effective_finish_reason = finish_reason or "stop"
         if has_truncated_tool_args:
             effective_finish_reason = "length"
