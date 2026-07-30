@@ -62,6 +62,7 @@ def test_release_archive_prunes_non_runtime_trees_and_keeps_runtime_payload(tmp_
         "hermes_cli/main.py",
         "hermes_cli/web_dist/index.html",
         "ui-tui/dist/entry.js",
+        "deploy/smoke-authority-concurrency.py",
         "deploy/powerpoint-runtime/runtime-modules/pptxgenjs/index.js",
         "skills/productivity/powerpoint/SKILL.md",
         "optional-skills/mlops/SKILL.md",

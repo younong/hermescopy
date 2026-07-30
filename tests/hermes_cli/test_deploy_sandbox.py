@@ -73,7 +73,7 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert '/etc/X11/fontpath.d/*)' in source
     assert 'if [ ! -L "$packaged_path" ]; then' in source
     assert '/usr/share/fonts/*) ;;' in source
-    assert '/etc/X11' not in source[source.index("readonly_mounts=''") : source.index('policy_tmp="$sandbox_policy.tmp.$$"')]
+    assert '/etc/X11' not in source[source.index("readonly_mounts=''") : source.index('policy_tmp="$staged_sandbox_policy"')]
     assert 'runtime_tmp/toolchain' in source
     assert 'cp -a "$release/deploy/powerpoint-runtime/runtime-modules" "$runtime_tmp/powerpoint/node_modules"' in source
     assert 'path.join(buildDir, "deploy/powerpoint-runtime/node_modules")' in source
@@ -131,8 +131,7 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert "CPUAccounting=yes" in source
     assert "MemoryAccounting=yes" in source
     assert "TasksAccounting=yes" in source
-    assert "session_reader_pids=" in source
-    assert "[h]ermes_cli.session_reader.entrypoint" in source
+    assert "KillMode=control-group" in source
     assert "hermes-log-format.conf" in source
     assert 'nginx_log_format="/etc/nginx/conf.d/00-hermes-log-format.conf"' in source
     assert 'legacy_nginx_log_format="/etc/nginx/conf.d/hermes-log-format.conf"' in source
@@ -143,7 +142,8 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert "HERMES_DEPLOY_STAGE powerpoint_runtime_smoke=passed" in source
     assert "HERMES_DEPLOY_STAGE session_reader_performance_smoke=passed" in source
     assert 'test -f "$release/deploy/run-cgroup-smoke.py"' in source
-    powerpoint_launch = source[source.index('powerpoint_smoke_owner='):source.index('echo "HERMES_DEPLOY_STAGE powerpoint_runtime_smoke=passed"')]
+    assert 'test -f "$release/deploy/smoke-authority-concurrency.py"' in source
+    powerpoint_launch = source[source.index('powerpoint_smoke_owner="$owner_root/'):source.index('echo "HERMES_DEPLOY_STAGE powerpoint_runtime_smoke=passed"')]
     assert '"$release/deploy/run-cgroup-smoke.py"' in powerpoint_launch
     assert '--managed-root "$cgroup_root"' in powerpoint_launch
     assert '--service hermes-dashboard.service' in powerpoint_launch
@@ -241,11 +241,12 @@ def test_deploy_gates_commit_on_isolated_conversation_smoke():
     source = DEPLOY.read_text(encoding="utf-8")
 
     auth_ready = source.index('if [ "$login_status" != "302" ] || [ "$api_status" != "401" ]')
-    reader_smoke = source.index('"$release/deploy/smoke-session-reader.py"')
+    authority_smoke = source.index('"$release/deploy/smoke-authority-concurrency.py"', auth_ready)
+    reader_smoke = source.index('"$release/deploy/smoke-session-reader.py"', authority_smoke)
     smoke = source.index('"$release/deploy/smoke-conversation.py" --timeout 90')
     nginx = source.index('action="reconcile"', smoke)
     commit = source.index('deployment_committed="1"', nginx)
-    assert auth_ready < reader_smoke < smoke < nginx < commit
+    assert auth_ready < authority_smoke < reader_smoke < smoke < nginx < commit
     assert 'runuser -u "$service_user" -- env -i' in source
     assert 'HOME="$smoke_root"' in source
     assert 'TMPDIR="$smoke_root"' in source
@@ -255,7 +256,18 @@ def test_deploy_gates_commit_on_isolated_conversation_smoke():
     assert ". $env_file" not in smoke_block
     cleanup = source[source.index("cleanup_release_tmp"):source.index("trap cleanup_release_tmp EXIT")]
     assert 'rm -rf -- "$smoke_root"' in cleanup
+    assert 'rm -rf -- "$authority_smoke_root"' in cleanup
     assert 'rm -rf -- "$reader_smoke_root"' in cleanup
+    authority_block = source[source.rindex("# Exercise the candidate authority", 0, authority_smoke):reader_smoke]
+    assert 'runuser -u "$service_user" -- env -i' in authority_block
+    assert 'HOME="$authority_smoke_root"' in authority_block
+    assert 'TMPDIR="$authority_smoke_root"' in authority_block
+    assert 'HERMES_HOME="$authority_smoke_root"' in authority_block
+    assert 'PYTHONPATH="$release"' in authority_block
+    assert "$env_file" not in authority_block
+    assert '"hermes.authority-concurrency-smoke"' in authority_block
+    assert 'result.get("status") != "passed"' in authority_block
+    assert authority_block.index('result.get("status")') < authority_block.index("authority_concurrency_smoke=passed")
     reader_block = source[source.rindex("# Gate Reader performance", 0, reader_smoke):smoke]
     assert 'runuser -u "$service_user" -- env -i' in reader_block
     assert 'HOME="$reader_smoke_root"' in reader_block
@@ -285,8 +297,11 @@ def test_deploy_runs_public_smoke_only_after_remote_commit_and_does_not_roll_bac
     assert "deployment committed and all smoke passed" in source
     assert "rolled back before commit" in source
     assert 'remoteStagePassed(error, "powerpoint_runtime_smoke")' in source
+    assert 'remoteStagePassed(error, "authority_concurrency_smoke")' in source
     assert 'remoteStagePassed(error, "session_reader_performance_smoke")' in source
     assert 'console.log(`PowerPoint runtime smoke: ${result.powerpointSmoke}`)' in source
+    assert 'console.log(`Authority concurrency smoke: ${result.authorityConcurrencySmoke}`)' in source
+    assert "Authority checkpoint/integrity/schema/recovery" in source
     assert 'console.log(`Session Reader performance smoke: ${result.readerPerformanceSmoke}`)' in source
     assert "Public Session Reader latency (informational)" in source
 
