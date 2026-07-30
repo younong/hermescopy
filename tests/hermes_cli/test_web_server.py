@@ -6407,6 +6407,50 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
         assert captured["path"] == "/api/analytics/usage?days=7"
         assert captured["owner_key"] == self.supervisor.owners[0].owner_key
 
+    @pytest.mark.parametrize(
+        ("method", "path", "payload"),
+        [
+            ("GET", "/api/cron/jobs", None),
+            ("POST", "/api/cron/jobs", {"schedule": "every 1h", "prompt": "owner task"}),
+            ("GET", "/api/cron/jobs/job-1", None),
+            ("PUT", "/api/cron/jobs/job-1", {"updates": {"name": "renamed"}}),
+            ("POST", "/api/cron/jobs/job-1/pause", None),
+            ("POST", "/api/cron/jobs/job-1/resume", None),
+            ("DELETE", "/api/cron/jobs/job-1", None),
+            ("GET", "/api/cron/delivery-targets", None),
+        ],
+    )
+    def test_authenticated_cron_routes_proxy_to_owner_worker(
+        self,
+        monkeypatch,
+        method,
+        path,
+        payload,
+    ):
+        import hermes_cli.owner_worker.client as owner_client
+
+        captured = {}
+
+        def fake_request(self, request_method, request_path, *, lease, headers=None, content=None):
+            import httpx
+
+            captured.update(
+                method=request_method,
+                path=request_path,
+                owner_key=lease.owner_key,
+                content=content,
+            )
+            response = {"targets": []} if request_path == "/api/cron/delivery-targets" else []
+            return httpx.Response(200, json=response)
+
+        monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fake_request)
+        response = self.client.request(method, path, json=payload)
+
+        assert response.status_code == 200
+        assert captured["method"] == method
+        assert captured["path"] == path
+        assert captured["owner_key"] == self.supervisor.owners[0].owner_key
+
     def test_authenticated_logs_are_proxied_to_owner_worker(self, monkeypatch):
         import hermes_cli.owner_worker.client as owner_client
 

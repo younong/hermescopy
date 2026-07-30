@@ -4,6 +4,7 @@ import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { Button } from "@nous-research/ui/ui/components/button";
 import {
   AlertCircle,
+  CalendarClock,
   CircleHelp,
   FolderOpen,
   LogOut,
@@ -47,6 +48,7 @@ import {
 } from "../types";
 import { Composer } from "./Composer";
 import { GuiChatModelsPane } from "./GuiChatModelsPane";
+import { GuiChatScheduledTasksPane } from "./GuiChatScheduledTasksPane";
 import { GuiChatSkillsPane } from "./GuiChatSkillsPane";
 import { MessageList } from "./MessageList";
 
@@ -61,8 +63,9 @@ export function GuiChatShell() {
   const workspacePath = location.pathname.replace(/\/$/, "");
   const filesOpen = workspacePath === "/chat-gui/files";
   const skillsOpen = workspacePath === "/chat-gui/skills";
+  const scheduledTasksOpen = workspacePath === "/chat-gui/scheduled-tasks";
   const modelsOpen = workspacePath === "/chat-gui/models";
-  const workspacePaneOpen = filesOpen || skillsOpen || modelsOpen;
+  const workspacePaneOpen = filesOpen || skillsOpen || scheduledTasksOpen || modelsOpen;
   const [state, dispatch] = useReducer(guiChatReducer, initialGuiChatState);
   const connectionRef = useRef<GuiChatConnection | null>(null);
   const historyAbortRef = useRef<AbortController | null>(null);
@@ -687,6 +690,18 @@ export function GuiChatShell() {
           <span>Skills</span>
         </button>
         <button
+          aria-current={scheduledTasksOpen ? "page" : undefined}
+          className="gui-chat-nav-item"
+          onClick={() => {
+            closeMobilePanel();
+            navigate("/chat-gui/scheduled-tasks");
+          }}
+          type="button"
+        >
+          <CalendarClock />
+          <span>Scheduled Tasks</span>
+        </button>
+        <button
           aria-current={modelsOpen ? "page" : undefined}
           aria-label="Manage models"
           className="gui-chat-nav-item"
@@ -799,7 +814,15 @@ export function GuiChatShell() {
           ) : <div className="w-8" />}
           <div className="pointer-events-none absolute inset-x-20 top-1/2 min-w-0 -translate-y-1/2 text-center">
             <h1 className="truncate text-[14px] font-medium leading-[22px] text-[#25282d]">
-              {filesOpen ? "Files" : skillsOpen ? "Skills" : modelsOpen ? "Models" : conversationTitle}
+              {filesOpen
+                ? "Files"
+                : skillsOpen
+                  ? "Skills"
+                  : scheduledTasksOpen
+                    ? "Scheduled Tasks"
+                    : modelsOpen
+                      ? "Models"
+                      : conversationTitle}
             </h1>
             <p className="truncate text-[0.625rem] text-[#969aa1]">
               {workspacePaneOpen
@@ -831,6 +854,8 @@ export function GuiChatShell() {
           <GuiChatFilesPane />
         ) : skillsOpen ? (
           <GuiChatSkillsPane profile={profile} />
+        ) : scheduledTasksOpen ? (
+          <GuiChatScheduledTasksPane profile={profile} />
         ) : modelsOpen ? (
           <GuiChatModelsPane
             busy={state.isGenerating}

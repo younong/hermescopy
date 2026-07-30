@@ -115,15 +115,18 @@ describe("AuthenticatedApp", () => {
     },
   );
 
-  it("allows members to open the Chat GUI files route", async () => {
-    mocks.identity.mockReturnValue(identity({ authMe: authMe("member") }));
+  it.each(["/chat-gui/files", "/chat-gui/scheduled-tasks"])(
+    "allows members to open the Chat GUI workspace route %s",
+    async (path) => {
+      mocks.identity.mockReturnValue(identity({ authMe: authMe("member") }));
 
-    renderApp("/chat-gui/files");
-    await flush();
+      renderApp(path);
+      await flush();
 
-    expect(document.querySelector("[data-member-chat]")?.getAttribute("data-pathname"))
-      .toBe("/chat-gui/files");
-  });
+      expect(document.querySelector("[data-member-chat]")?.getAttribute("data-pathname"))
+        .toBe(path);
+    },
+  );
 
   it("preserves a member chat resume deep link", async () => {
     mocks.identity.mockReturnValue(identity({ authMe: authMe("member") }));
