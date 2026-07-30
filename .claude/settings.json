@@ -7,6 +7,18 @@
     "baseRef": "fresh"
   },
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "printf 'export CODEX_HOME=%q\\n' \"$CLAUDE_PROJECT_DIR/.codex\" >> \"$CLAUDE_ENV_FILE\"",
+            "timeout": 5,
+            "statusMessage": "Configuring project-local Codex"
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Agent|Workflow",
