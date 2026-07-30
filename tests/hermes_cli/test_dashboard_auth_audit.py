@@ -137,6 +137,48 @@ def test_authority_audit_is_allowlisted_and_control_plane_only(tmp_path, monkeyp
         assert forbidden not in raw
 
 
+def test_authority_recovery_audits_are_allowlisted_and_deidentified(tmp_path, monkeypatch):
+    control_home = tmp_path / "control-plane"
+    control_home.mkdir()
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+
+    audit_authority(
+        AuthorityAuditEvent.CORRUPTION_DETECTED,
+        correlation_id="e" * 32,
+        reason=AuthorityAuditReason.CORRUPTION_DETECTED,
+        audience_class="none",
+        incident_digest="d" * 64,
+    )
+    audit_authority(
+        AuthorityAuditEvent.EVIDENCE_PRESERVED,
+        correlation_id="f" * 32,
+        reason=AuthorityAuditReason.EVIDENCE_PRESERVATION_FAILED,
+        audience_class="none",
+        incident_digest="d" * 64,
+    )
+    audit_authority(
+        AuthorityAuditEvent.RECOVERY_REQUIRED,
+        correlation_id="a" * 32,
+        reason=AuthorityAuditReason.RECOVERY_REQUIRED,
+        audience_class="none",
+        incident_digest="d" * 64,
+    )
+
+    entries = [
+        json.loads(line)
+        for line in (control_home / "logs" / "authority.log").read_text().splitlines()
+    ]
+    assert [entry["event"] for entry in entries] == [
+        "authority_corruption_detected",
+        "authority_evidence_preserved",
+        "authority_recovery_required",
+    ]
+    assert all(entry["incident_digest"] == "d" * 64 for entry in entries)
+    raw = (control_home / "logs" / "authority.log").read_text()
+    for forbidden in ("database disk image", "first_32", "authority.sqlite3"):
+        assert forbidden not in raw
+
+
 def test_persisted_scope_audit_is_allowlisted(tmp_path, monkeypatch):
     control_home = tmp_path / "control-plane"
     control_home.mkdir()

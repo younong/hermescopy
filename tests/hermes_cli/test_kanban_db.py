@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import sqlite_util
 
 
 @pytest.fixture
@@ -4163,6 +4164,17 @@ def test_repeated_corrupt_open_reuses_single_backup(tmp_path):
     (backup,) = backups
     assert backup.exists()
     assert backup.read_bytes() == original
+
+    # Existing SQLite sidecars are preserved under the same content-addressed
+    # main backup name so later recovery has the complete forensic set.
+    wal = db_path.with_name(db_path.name + "-wal")
+    shm = db_path.with_name(db_path.name + "-shm")
+    wal.write_bytes(b"wal evidence")
+    shm.write_bytes(b"shm evidence")
+    sidecar_backup = sqlite_util.copy_sqlite_forensics(db_path)
+    assert sidecar_backup == backup
+    assert backup.with_name(backup.name + "-wal").read_bytes() == b"wal evidence"
+    assert backup.with_name(backup.name + "-shm").read_bytes() == b"shm evidence"
 
     # Mutate the corrupt bytes — fingerprint changes, separate backup preserved.
     with db_path.open("r+b") as f:

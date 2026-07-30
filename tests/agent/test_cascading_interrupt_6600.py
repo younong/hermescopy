@@ -66,8 +66,8 @@ def test_non_streaming_cancel_does_not_surface_network_error():
 
     fake_client.chat.completions.create.side_effect = _create
     agent._create_request_openai_client.return_value = fake_client
-    agent._close_request_openai_client = MagicMock()
-    agent._abort_request_openai_client = MagicMock()
+    agent._close_request_api_client = MagicMock()
+    agent._abort_request_api_client = MagicMock()
 
     t0 = time.time()
     with pytest.raises(InterruptedError):
@@ -88,8 +88,8 @@ def test_normal_transient_error_still_raises_when_not_cancelled():
         "genuine network drop"
     )
     agent._create_request_openai_client.return_value = fake_client
-    agent._close_request_openai_client = MagicMock()
-    agent._abort_request_openai_client = MagicMock()
+    agent._close_request_api_client = MagicMock()
+    agent._abort_request_api_client = MagicMock()
     agent._interrupt_requested = False
 
     with pytest.raises(httpx.RemoteProtocolError):
@@ -115,8 +115,8 @@ def test_request_cancelled_token_is_request_local():
 
     fake_client_1.chat.completions.create.side_effect = _create_1
     agent._create_request_openai_client.return_value = fake_client_1
-    agent._close_request_openai_client = MagicMock()
-    agent._abort_request_openai_client = MagicMock()
+    agent._close_request_api_client = MagicMock()
+    agent._abort_request_api_client = MagicMock()
 
     with pytest.raises(InterruptedError):
         cch.interruptible_api_call(agent, {"model": "x", "messages": []})

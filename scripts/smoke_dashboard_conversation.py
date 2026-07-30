@@ -186,23 +186,24 @@ def _smoke_javascript(*, base: str, path_prefix: str, marker: str, timeout_ms: i
 
   try {{
     let started = now();
-    activeCheck = 'public_ws_ticket';
+    activeCheck = 'public_ws_ticket_mint';
     await connect();
-    const ready = await waitEvent('gateway.ready');
-    if (!ready) throw new Error('gateway.ready missing');
-    pass('public_ws_ticket', started, {{ path: `${{config.pathPrefix}}api/ws` }});
+    pass('public_ws_ticket_mint', started);
 
     started = now();
-    activeCheck = 'public_session_create';
+    activeCheck = 'public_ws_admission';
+    const ready = await waitEvent('gateway.ready');
+    if (!ready) throw new Error('gateway.ready missing');
+    pass('public_ws_admission', started, {{ path: `${{config.pathPrefix}}api/ws` }});
+
+    started = now();
+    activeCheck = 'public_owner_worker_conversation';
     const created = await request('session.create', baseParams(1));
     liveSessionId = String(created.session_id || '');
     storedSessionId = String(created.stored_session_id || '');
     if (!liveSessionId || !storedSessionId) throw new Error('session.create omitted an ID');
     await waitEvent('session.info', liveSessionId);
-    pass('public_session_create', started);
 
-    started = now();
-    activeCheck = 'public_model_response';
     await request('prompt.submit', {{
       session_id: liveSessionId,
       text: `Release smoke ${{config.marker}}. Reply briefly and include this marker exactly: ${{config.marker}}`,
@@ -224,10 +225,10 @@ def _smoke_javascript(*, base: str, path_prefix: str, marker: str, timeout_ms: i
     if (!String(completion.text || '').includes(config.marker)) {{
       throw new Error('model response omitted the release marker');
     }}
-    pass('public_model_response', started, {{ deltaCount }});
+    pass('public_owner_worker_conversation', started, {{ deltaCount }});
 
     started = now();
-    activeCheck = 'public_cold_resume';
+    activeCheck = 'public_cold_session_reader_resume';
     const closed = await request('session.close', {{ session_id: liveSessionId }});
     if (closed.closed !== true) throw new Error('session.close did not close the live session');
     cleanup.sessionClosed = true;
@@ -245,7 +246,7 @@ def _smoke_javascript(*, base: str, path_prefix: str, marker: str, timeout_ms: i
     if (!liveSessionId || !restored.includes(config.marker)) {{
       throw new Error('cold resume did not restore the smoke transcript');
     }}
-    pass('public_cold_resume', started);
+    pass('public_cold_session_reader_resume', started);
 
     started = now();
     activeCheck = 'public_session_reader_list';
@@ -267,7 +268,7 @@ def _smoke_javascript(*, base: str, path_prefix: str, marker: str, timeout_ms: i
     pass('public_session_reader_messages', started);
 
     started = now();
-    activeCheck = 'public_cleanup';
+    activeCheck = 'public_cleanup_verified';
     const resumedClosed = await request('session.close', {{ session_id: liveSessionId }});
     if (resumedClosed.closed !== true) throw new Error('resumed session did not close');
     cleanup.sessionClosed = true;
@@ -277,7 +278,7 @@ def _smoke_javascript(*, base: str, path_prefix: str, marker: str, timeout_ms: i
     cleanup.sessionDeleted = true;
     storedSessionId = '';
     await closeSocket();
-    pass('public_cleanup', started);
+    pass('public_cleanup_verified', started);
     return {{ ok: true, checks, cleanup }};
   }} catch (error) {{
     return {{

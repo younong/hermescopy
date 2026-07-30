@@ -73,6 +73,12 @@ class AuthorityAuditEvent(enum.Enum):
     KEY_ROTATION_FAILURE = "authority_key_rotation_failure"
     BRIDGE_CLOSED = "authority_bridge_closed"
     PERSISTED_SCOPE_REJECTED = "persisted_scope_rejected"
+    CORRUPTION_DETECTED = "authority_corruption_detected"
+    EVIDENCE_PRESERVED = "authority_evidence_preserved"
+    RECOVERY_REQUIRED = "authority_recovery_required"
+    RECOVERY_STARTED = "authority_recovery_started"
+    RECOVERY_COMPLETED = "authority_recovery_completed"
+    RECOVERY_FAILED = "authority_recovery_failed"
 
 
 class AuthorityAuditReason(enum.Enum):
@@ -115,6 +121,13 @@ class AuthorityAuditReason(enum.Enum):
     CREDENTIAL_REVOKED_EXECUTOR = "credential_revoked_executor"
     CREDENTIAL_REVOKED_GENERATION = "credential_revoked_generation"
     PERSISTED_SCOPE_ASSERTION_MISMATCH = "persisted_scope_assertion_mismatch"
+    CORRUPTION_DETECTED = "corruption_detected"
+    EVIDENCE_PRESERVED = "evidence_preserved"
+    EVIDENCE_PRESERVATION_FAILED = "evidence_preservation_failed"
+    RECOVERY_REQUIRED = "recovery_required"
+    RECOVERY_STARTED = "recovery_started"
+    RECOVERY_COMPLETED = "recovery_completed"
+    RECOVERY_FAILED = "recovery_failed"
 
 
 _AUTHORITY_EVENT_REASONS: dict[AuthorityAuditEvent, frozenset[AuthorityAuditReason]] = {
@@ -185,6 +198,15 @@ _AUTHORITY_EVENT_REASONS: dict[AuthorityAuditEvent, frozenset[AuthorityAuditReas
     }),
     AuthorityAuditEvent.BRIDGE_CLOSED: frozenset({AuthorityAuditReason.BRIDGE_CLOSED}),
     AuthorityAuditEvent.PERSISTED_SCOPE_REJECTED: frozenset({AuthorityAuditReason.PERSISTED_SCOPE_ASSERTION_MISMATCH}),
+    AuthorityAuditEvent.CORRUPTION_DETECTED: frozenset({AuthorityAuditReason.CORRUPTION_DETECTED}),
+    AuthorityAuditEvent.EVIDENCE_PRESERVED: frozenset({
+        AuthorityAuditReason.EVIDENCE_PRESERVED,
+        AuthorityAuditReason.EVIDENCE_PRESERVATION_FAILED,
+    }),
+    AuthorityAuditEvent.RECOVERY_REQUIRED: frozenset({AuthorityAuditReason.RECOVERY_REQUIRED}),
+    AuthorityAuditEvent.RECOVERY_STARTED: frozenset({AuthorityAuditReason.RECOVERY_STARTED}),
+    AuthorityAuditEvent.RECOVERY_COMPLETED: frozenset({AuthorityAuditReason.RECOVERY_COMPLETED}),
+    AuthorityAuditEvent.RECOVERY_FAILED: frozenset({AuthorityAuditReason.RECOVERY_FAILED}),
 }
 
 _CORRELATION_ID_RE = re.compile(r"^[a-f0-9]{32,64}$")
@@ -250,6 +272,7 @@ def audit_authority(
     credential_digest: str | None = None,
     issuer_digest: str | None = None,
     policy_digest: str | None = None,
+    incident_digest: str | None = None,
     cpu_nr_throttled: int | None = None,
     cpu_throttled_usec: int | None = None,
     memory_oom: int | None = None,
@@ -301,6 +324,7 @@ def audit_authority(
         ("credential_digest", credential_digest),
         ("issuer_digest", issuer_digest),
         ("policy_digest", policy_digest),
+        ("incident_digest", incident_digest),
     ):
         if value is not None:
             normalized = str(value).strip()

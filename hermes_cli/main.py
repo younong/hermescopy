@@ -11801,6 +11801,13 @@ def cmd_dashboard_users(args):
     _impl(args)
 
 
+def cmd_dashboard_authority(args):
+    """Inspect, preserve, or recover Control Plane authorization state."""
+    from hermes_cli.dashboard_authority import cmd_dashboard_authority as _impl
+
+    _impl(args)
+
+
 def cmd_gateway_enroll(args):
     """Enroll a self-hosted gateway with a relay connector."""
     from hermes_cli.gateway_enroll import cmd_gateway_enroll as _impl
@@ -13452,6 +13459,7 @@ def main():
         cmd_dashboard=cmd_dashboard,
         cmd_dashboard_register=cmd_dashboard_register,
         cmd_dashboard_users=cmd_dashboard_users,
+        cmd_dashboard_authority=cmd_dashboard_authority,
     )
 
 

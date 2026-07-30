@@ -6692,7 +6692,7 @@ class TestAnthropicCredentialRefresh:
         ):
             assert agent._try_refresh_anthropic_client_credentials() is True
 
-        old_client.close.assert_called_once()
+        old_client.close.assert_not_called()
         rebuild.assert_called_once_with(
             "sk-ant-oat01-fresh-token", "https://api.anthropic.com", timeout=None,
         )

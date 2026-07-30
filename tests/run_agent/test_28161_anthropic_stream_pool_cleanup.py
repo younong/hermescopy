@@ -1,28 +1,17 @@
-"""Anthropic stream cleanup must call _anthropic_client.close() + _rebuild_anthropic_client(),
-not _replace_primary_openai_client(), to avoid 15-minute hangs on Anthropic-native configs.
+"""Anthropic request cleanup preserves client ownership across retries.
 
-Three cleanup sites in chat_completion_helpers.interruptible_streaming_api_call() were
-calling _replace_primary_openai_client() unconditionally.  For api_mode=anthropic_messages
-this silently fails (no OPENAI_API_KEY) and leaves the in-flight httpx stream unclosed,
-blocking the worker thread until the 900s httpx read-timeout fires.
-
-Tests cover:
-- stream_retry_pool_cleanup  (connection error on fresh stream, L1836)
-- stale_stream_pool_cleanup  (outer poll loop detects stale stream, L1987)
-
-Fixes #28161
+Native Anthropic requests use request-local SDK clients. Polling threads abort
+in-flight sockets without closing descriptors, while the request-owning worker
+closes each attempt exactly once. The long-lived shared client is never closed
+by stale/interrupt handling.
 """
+
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def _make_anthropic_agent(**kwargs):
@@ -45,7 +34,6 @@ def _make_anthropic_agent(**kwargs):
 
 
 def _good_stream_cm():
-    """Context manager whose stream yields no events and returns a valid message."""
     cm = MagicMock()
     stream = MagicMock()
     stream.__iter__ = MagicMock(return_value=iter([]))
@@ -59,92 +47,90 @@ def _good_stream_cm():
     return cm
 
 
-def _failing_stream_cm():
-    """Context manager whose __enter__ raises ConnectError immediately."""
-    cm = MagicMock()
-    cm.__enter__ = MagicMock(
-        side_effect=httpx.ConnectError("connection reset by peer")
-    )
-    return cm
+def _request_client(stream_cm):
+    client = MagicMock()
+    client.messages.stream.return_value = stream_cm
+    return client
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
-
-class TestAnthropicStreamPoolCleanup:
-    """_replace_primary_openai_client must not be called for api_mode=anthropic_messages."""
-
-    @pytest.mark.filterwarnings(
-        "ignore::pytest.PytestUnhandledThreadExceptionWarning"
-    )
-    def test_stream_retry_calls_anthropic_rebuild_not_openai(self):
-        """Connection error during stream retry → close+rebuild Anthropic client, not OpenAI."""
+class TestAnthropicRequestClientCleanup:
+    @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+    def test_stream_retry_closes_each_request_client_on_owner_thread(self, monkeypatch):
         agent = _make_anthropic_agent()
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
 
-        attempt_count = [0]
+        failing = MagicMock()
+        failing.__enter__.side_effect = httpx.ConnectError("connection reset by peer")
+        first = _request_client(failing)
+        second = _request_client(_good_stream_cm())
+        owner_threads = []
 
-        def _stream_side_effect(*args, **kwargs):
-            attempt_count[0] += 1
-            if attempt_count[0] == 1:
-                return _failing_stream_cm()
-            return _good_stream_cm()
+        def _close(client, *, reason):
+            owner_threads.append((client, reason, threading.get_ident()))
+            client.close()
 
-        agent._anthropic_client.messages.stream.side_effect = _stream_side_effect
+        with (
+            patch.object(agent, "_create_request_anthropic_client", side_effect=[first, second]),
+            patch.object(agent, "_close_request_api_client", side_effect=_close),
+            patch.object(agent, "_replace_primary_openai_client") as mock_replace,
+            patch.object(agent, "_rebuild_anthropic_client") as mock_rebuild,
+        ):
+            agent._interruptible_streaming_api_call({})
 
-        with patch.object(agent, "_rebuild_anthropic_client") as mock_rebuild:
-            with patch.object(
-                agent, "_replace_primary_openai_client"
-            ) as mock_replace:
-                agent._interruptible_streaming_api_call({})
-
+        assert [entry[0] for entry in owner_threads] == [first, second]
+        assert len({entry[2] for entry in owner_threads}) == 1
+        assert owner_threads[0][2] != threading.get_ident()
+        first.close.assert_called_once()
+        second.close.assert_called_once()
+        agent._anthropic_client.close.assert_not_called()
         mock_replace.assert_not_called()
-        mock_rebuild.assert_called_once()
-        agent._anthropic_client.close.assert_called_once()
+        mock_rebuild.assert_not_called()
 
-    @pytest.mark.filterwarnings(
-        "ignore::pytest.PytestUnhandledThreadExceptionWarning"
-    )
-    def test_stale_stream_calls_anthropic_rebuild_not_openai(self, monkeypatch):
-        """Stale-stream outer-poll detector → close+rebuild Anthropic client, not OpenAI."""
+    @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+    def test_stale_stream_aborts_then_owner_closes_request_client(self, monkeypatch):
         monkeypatch.setenv("HERMES_STREAM_STALE_TIMEOUT", "0.1")
-
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
         agent = _make_anthropic_agent()
         unblock = threading.Event()
-        attempt_count = [0]
 
-        def _stream_side_effect(*args, **kwargs):
-            attempt_count[0] += 1
-            if attempt_count[0] == 1:
-                # First attempt: stream that yields nothing (triggers stale detector),
-                # then raises ConnectError once _anthropic_client.close() unblocks it.
-                cm = MagicMock()
-                stream = MagicMock()
+        blocking_cm = MagicMock()
+        blocking_stream = MagicMock()
 
-                def _blocking_gen():
-                    unblock.wait(timeout=5.0)
-                    raise httpx.ConnectError("connection dropped after close()")
-                    yield  # make this a generator so next() triggers the wait
+        def _blocking_gen():
+            unblock.wait(timeout=5.0)
+            raise httpx.ConnectError("connection dropped after shutdown")
+            yield
 
-                stream.__iter__ = MagicMock(return_value=_blocking_gen())
-                cm.__enter__ = MagicMock(return_value=stream)
-                cm.__exit__ = MagicMock(return_value=False)
-                return cm
-            # Second attempt: succeed
-            return _good_stream_cm()
+        blocking_stream.__iter__ = MagicMock(return_value=_blocking_gen())
+        blocking_cm.__enter__ = MagicMock(return_value=blocking_stream)
+        blocking_cm.__exit__ = MagicMock(return_value=False)
+        first = _request_client(blocking_cm)
+        second = _request_client(_good_stream_cm())
+        aborts = []
+        closes = []
 
-        agent._anthropic_client.messages.stream.side_effect = _stream_side_effect
-        # close() on the mock Anthropic client unblocks the inner thread.
-        agent._anthropic_client.close.side_effect = unblock.set
+        def _abort(client, *, reason):
+            aborts.append((client, reason, threading.get_ident()))
+            unblock.set()
 
-        with patch.object(agent, "_rebuild_anthropic_client") as mock_rebuild:
-            with patch.object(
-                agent, "_replace_primary_openai_client"
-            ) as mock_replace:
-                agent._interruptible_streaming_api_call({})
+        def _close(client, *, reason):
+            closes.append((client, reason, threading.get_ident()))
+            client.close()
 
+        with (
+            patch.object(agent, "_create_request_anthropic_client", side_effect=[first, second]),
+            patch.object(agent, "_abort_request_api_client", side_effect=_abort),
+            patch.object(agent, "_close_request_api_client", side_effect=_close),
+            patch.object(agent, "_replace_primary_openai_client") as mock_replace,
+            patch.object(agent, "_rebuild_anthropic_client") as mock_rebuild,
+        ):
+            agent._interruptible_streaming_api_call({})
+
+        assert aborts == [(first, "stale_stream_kill", threading.get_ident())]
+        assert [entry[0] for entry in closes] == [first, second]
+        assert all(entry[2] != threading.get_ident() for entry in closes)
+        first.close.assert_called_once()
+        second.close.assert_called_once()
+        agent._anthropic_client.close.assert_not_called()
         mock_replace.assert_not_called()
-        # close() and rebuild called at least once by the stale detector.
-        agent._anthropic_client.close.assert_called()
-        assert mock_rebuild.call_count >= 1
+        mock_rebuild.assert_not_called()

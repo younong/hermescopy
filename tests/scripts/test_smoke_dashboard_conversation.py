@@ -173,13 +173,13 @@ def test_public_smoke_returns_redacted_success_and_always_closes_browser(
     browser_result = {
         "ok": True,
         "checks": [
-            {"name": "public_ws_ticket", "status": "passed"},
-            {"name": "public_session_create", "status": "passed"},
-            {"name": "public_model_response", "status": "passed", "deltaCount": 2},
-            {"name": "public_cold_resume", "status": "passed"},
+            {"name": "public_ws_ticket_mint", "status": "passed"},
+            {"name": "public_ws_admission", "status": "passed"},
+            {"name": "public_owner_worker_conversation", "status": "passed", "deltaCount": 2},
+            {"name": "public_cold_session_reader_resume", "status": "passed"},
             {"name": "public_session_reader_list", "status": "passed", "durationMs": 109},
             {"name": "public_session_reader_messages", "status": "passed", "durationMs": 147},
-            {"name": "public_cleanup", "status": "passed"},
+            {"name": "public_cleanup_verified", "status": "passed"},
         ],
         "cleanup": {"sessionClosed": True, "sessionDeleted": True, "socketClosed": True},
     }
@@ -208,13 +208,13 @@ def test_public_smoke_returns_redacted_success_and_always_closes_browser(
     assert result["status"] == "passed"
     assert {item["name"] for item in result["checks"]} == {
         "public_login",
-        "public_ws_ticket",
-        "public_session_create",
-        "public_model_response",
-        "public_cold_resume",
+        "public_ws_ticket_mint",
+        "public_ws_admission",
+        "public_owner_worker_conversation",
+        "public_cold_session_reader_resume",
         "public_session_reader_list",
         "public_session_reader_messages",
-        "public_cleanup",
+        "public_cleanup_verified",
     }
     checks = {item["name"]: item for item in result["checks"]}
     assert checks["public_session_reader_list"]["durationMs"] == 109
@@ -245,11 +245,11 @@ def test_public_smoke_classifies_browser_failure_without_leaking_secrets(
         lambda **_kwargs: json.dumps(
             {
                 "ok": False,
-                "checks": [{"name": "public_ws_ticket", "status": "passed"}],
+                "checks": [{"name": "public_ws_ticket_mint", "status": "passed"}],
                 "cleanup": {"socketClosed": True},
                 "failure": {
                     "code": "timeout",
-                    "check": "public_model_response",
+                    "check": "public_owner_worker_conversation",
                     "message": f"timed out for {credentials.username} {credentials.password}",
                 },
             }
@@ -272,7 +272,7 @@ def test_public_smoke_classifies_browser_failure_without_leaking_secrets(
     assert status == 1
     assert result["status"] == "failed"
     assert result["failure"]["code"] == "timeout"
-    assert result["failure"]["check"] == "public_model_response"
+    assert result["failure"]["check"] == "public_owner_worker_conversation"
     serialized = json.dumps(result)
     assert credentials.username not in serialized
     assert credentials.password not in serialized

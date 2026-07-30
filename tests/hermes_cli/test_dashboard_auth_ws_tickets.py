@@ -33,7 +33,6 @@ from hermes_cli.dashboard_auth.ws_tickets import (
     begin_browser_ticket_key_rotation,
     browser_ticket_keyring_backup_paths,
     complete_browser_ticket_key_rotation,
-    complete_browser_ticket_replay_recovery,
     TicketInvalid,
     _reset_for_tests,
     browser_ws_audience,
@@ -557,22 +556,6 @@ class TestBrowserTicketKeyring:
         with pytest.raises((TicketInvalid, Exception)):
             mint_ticket(user_id="u1", provider="stub")
         assert not (owner_home / "control-plane").exists()
-
-    def test_replay_recovery_invalidates_old_ticket_and_allows_new_ticket(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        now = int(ws_tickets.time.time())
-        old_ticket = mint_ticket(user_id="u1", provider="stub", now=now)
-        from hermes_cli.dashboard_auth.ws_tickets import authority_store
-
-        authority_store().mark_replay_continuity_untrusted(reason="test")
-        with pytest.raises(TicketInvalid, match="continuity"):
-            consume_ticket(old_ticket, now=now + 1)
-
-        complete_browser_ticket_replay_recovery()
-        with pytest.raises(TicketInvalid, match="ticket_rejected"):
-            consume_ticket(old_ticket, now=now + 1)
-        assert consume_ticket(mint_ticket(user_id="u1", provider="stub", now=now + 1), now=now + 1)["user_id"] == "u1"
-
 
 class TestInternalCredential:
     def test_minted_once_is_stable(self):

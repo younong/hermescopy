@@ -3972,17 +3972,17 @@ class AIAgent:
         return create_openai_client(self, client_kwargs, reason=reason, shared=shared)
 
     @staticmethod
-    def _force_close_tcp_sockets(client: Any) -> int:
-        """Forwarder — see ``agent.agent_runtime_helpers.force_close_tcp_sockets``."""
-        from agent.agent_runtime_helpers import force_close_tcp_sockets
-        return force_close_tcp_sockets(client)
+    def _abort_tcp_sockets(client: Any) -> int:
+        """Forwarder — see ``agent.agent_runtime_helpers.abort_tcp_sockets``."""
+        from agent.agent_runtime_helpers import abort_tcp_sockets
+        return abort_tcp_sockets(client)
 
     def _close_openai_client(self, client: Any, *, reason: str, shared: bool) -> None:
         if client is None:
             return
         # Force-close TCP sockets first to prevent CLOSE-WAIT accumulation,
         # then do the graceful SDK-level close.
-        force_closed = self._force_close_tcp_sockets(client)
+        force_closed = self._abort_tcp_sockets(client)
         try:
             client.close()
             logger.info(
@@ -4111,13 +4111,13 @@ class AIAgent:
             request_kwargs["default_headers"] = self._copilot_headers_for_request(is_vision=True)
         return self._create_openai_client(request_kwargs, reason=reason, shared=False)
 
-    def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
+    def _close_request_api_client(self, client: Any, *, reason: str) -> None:
         self._close_openai_client(client, reason=reason, shared=False)
 
-    def _abort_request_openai_client(self, client: Any, *, reason: str) -> None:
+    def _abort_request_api_client(self, client: Any, *, reason: str) -> None:
         """Cross-thread abort: shut sockets down without releasing FDs.
 
-        Companion to :meth:`_close_request_openai_client` for stranger-thread
+        Companion to :meth:`_close_request_api_client` for stranger-thread
         callers (interrupt-check loop, stale-call detector). Calling
         ``client.close()`` from a thread that does not own the active httpx
         connection raced the still-live SSL BIO and corrupted unrelated file
@@ -4131,9 +4131,9 @@ class AIAgent:
         if client is None:
             return
         try:
-            shutdown_count = self._force_close_tcp_sockets(client)
+            shutdown_count = self._abort_tcp_sockets(client)
             logger.info(
-                "OpenAI client aborted (%s, shared=False, tcp_force_closed=%d, "
+                "Request API client aborted (%s, shared=False, tcp_force_closed=%d, "
                 "deferred_close=stranger_thread) %s",
                 reason,
                 shutdown_count,
@@ -4369,11 +4369,6 @@ class AIAgent:
             return False
 
         try:
-            self._anthropic_client.close()
-        except Exception:
-            pass
-
-        try:
             self._anthropic_client = build_anthropic_client(
                 new_token,
                 getattr(self, "_anthropic_base_url", None),
@@ -4490,11 +4485,6 @@ class AIAgent:
         if self.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token
 
-            try:
-                self._anthropic_client.close()
-            except Exception:
-                pass
-
             self._anthropic_api_key = runtime_key
             self._anthropic_base_url = runtime_base
             self._anthropic_client = build_anthropic_client(
@@ -4539,15 +4529,39 @@ class AIAgent:
             return False
         return pool.has_available()
 
-    def _anthropic_messages_create(self, api_kwargs: dict):
-        if self.api_mode == "anthropic_messages":
+    def _create_request_anthropic_client(self) -> Any:
+        """Build a request-local Anthropic SDK client from current credentials."""
+        _drop_1m = bool(getattr(self, "_oauth_1m_beta_disabled", False))
+        if getattr(self, "provider", None) == "bedrock":
+            from agent.anthropic_adapter import build_anthropic_bedrock_client
+
+            region = getattr(self, "_bedrock_region", "us-east-1") or "us-east-1"
+            return build_anthropic_bedrock_client(region)
+
+        from agent.anthropic_adapter import build_anthropic_client
+
+        return build_anthropic_client(
+            self._anthropic_api_key,
+            getattr(self, "_anthropic_base_url", None),
+            timeout=get_provider_request_timeout(self.provider, self.model),
+            drop_context_1m_beta=_drop_1m,
+        )
+
+    def _anthropic_messages_create(
+        self,
+        api_kwargs: dict,
+        *,
+        client: Any = None,
+        refresh_credentials: bool = True,
+    ):
+        if refresh_credentials and self.api_mode == "anthropic_messages":
             self._try_refresh_anthropic_client_credentials()
         # Defensive: strip Responses-only kwargs that can leak in under an
         # api_mode-flip race (the Anthropic SDK raises a non-retryable
         # TypeError on them). See #31673.
         from agent.anthropic_adapter import create_anthropic_message
         return create_anthropic_message(
-            self._anthropic_client,
+            client if client is not None else self._anthropic_client,
             api_kwargs,
             log_prefix=getattr(self, "log_prefix", ""),
             prefer_stream=not bool(getattr(self, "_disable_streaming", False)),
@@ -4565,19 +4579,7 @@ class AIAgent:
         path when an OAuth subscription rejects the 1M-context beta) so the
         rebuilt client carries the reduced beta set.
         """
-        _drop_1m = bool(getattr(self, "_oauth_1m_beta_disabled", False))
-        if getattr(self, "provider", None) == "bedrock":
-            from agent.anthropic_adapter import build_anthropic_bedrock_client
-            region = getattr(self, "_bedrock_region", "us-east-1") or "us-east-1"
-            self._anthropic_client = build_anthropic_bedrock_client(region)
-        else:
-            from agent.anthropic_adapter import build_anthropic_client
-            self._anthropic_client = build_anthropic_client(
-                self._anthropic_api_key,
-                getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
-                drop_context_1m_beta=_drop_1m,
-            )
+        self._anthropic_client = self._create_request_anthropic_client()
 
     def _interruptible_api_call(self, api_kwargs: dict):
         """Forwarder — see ``agent.chat_completion_helpers.interruptible_api_call``."""

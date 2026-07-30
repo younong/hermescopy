@@ -104,7 +104,8 @@ class TestOAuthFlagOnCredentialSwap:
         agent.provider = "glm"              # ← Zhipu GLM via /anthropic
         agent._anthropic_api_key = "old-key"
         agent._anthropic_base_url = "https://open.bigmodel.cn/api/anthropic"
-        agent._anthropic_client = MagicMock()
+        old_client = MagicMock()
+        agent._anthropic_client = old_client
         agent._is_anthropic_oauth = False
 
         entry = MagicMock()
@@ -116,6 +117,7 @@ class TestOAuthFlagOnCredentialSwap:
             agent._swap_credential(entry)
 
         assert agent._is_anthropic_oauth is False
+        old_client.close.assert_not_called()
 
 
 class TestOAuthFlagOnConstruction:
