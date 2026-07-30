@@ -287,18 +287,32 @@ class TestLengthContinuationPromptBranching:
         prompt = self._simulate_branch("")
         assert "output length limit" in prompt
 
-    def test_dropped_tool_call_uses_chunking_prompt(self):
-        """When the stub dropped a tool call, the continuation prompt
-        must guide the model to break its output into smaller chunks
-        instead of retrying the same large tool call (#31998)."""
+    def test_dropped_tool_call_uses_truthful_incremental_prompt(self):
+        """A dropped tool call gets bounded retry guidance without inventing
+        a provider limit or implying that incomplete arguments executed."""
         prompt = self._simulate_branch(
             PARTIAL_STREAM_STUB_ID, dropped_tools=["write_file"],
         )
-        assert "too large" in prompt
-        assert "break" in prompt.lower()
+        assert "upstream response stream ended" in prompt
+        assert "did not run" in prompt
+        assert "does not establish any fixed token or payload-size limit" in prompt
+        assert "exactly one small, self-contained tool call" in prompt
+        assert "short skeleton" in prompt
+        assert "separate patch calls" in prompt
         assert "write_file" in prompt
-        assert "network error" not in prompt
+        assert "8K" not in prompt
+        assert "too large" not in prompt
         assert "output length limit" not in prompt
+
+    def test_repeated_drop_requires_smaller_scope_not_full_rewrite(self):
+        prompt = _get_continuation_prompt(
+            True,
+            ["write_file"],
+            retry_attempt=2,
+        )
+        assert "happened again" in prompt
+        assert "reduce the scope further" in prompt
+        assert "do not substitute another full-payload rewrite" in prompt
 
 
 # ── Integration: live conversation loop ───────────────────────────────────
@@ -391,6 +405,52 @@ class TestConversationLoopPartialStreamContinuation:
         # And the final response stitches both halves together.
         assert "first half of" in result["final_response"]
         assert "forty-two" in result["final_response"]
+
+    def test_repeated_dropped_tool_call_tightens_incremental_guidance(
+        self, loop_agent,
+    ):
+        """Each interrupted retry remains truthful, and a repeated drop tells
+        the model to shrink the next operation rather than rewrite everything."""
+        from tests.run_agent.test_run_agent import _mock_response
+
+        def _dropped_write_stub():
+            response = _mock_response(content="", finish_reason=FINISH_REASON_LENGTH)
+            response.id = PARTIAL_STREAM_STUB_ID
+            response._dropped_tool_names = ["write_file"]
+            return response
+
+        loop_agent.client.chat.completions.create.side_effect = [
+            _dropped_write_stub(),
+            _dropped_write_stub(),
+            _mock_response(content="Recovered incrementally.", finish_reason="stop"),
+        ]
+
+        with (
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+        ):
+            result = loop_agent.run_conversation("write a long report")
+
+        assert result["completed"] is True
+        assert loop_agent.client.chat.completions.create.call_count == 3
+
+        retry_prompts = []
+        for call in loop_agent.client.chat.completions.create.call_args_list[1:]:
+            msgs = call.kwargs.get("messages") or call.args[0].get("messages")
+            retry_prompts.append(
+                next(m["content"] for m in reversed(msgs) if m.get("role") == "user")
+            )
+
+        first_retry, second_retry = retry_prompts
+        for prompt in retry_prompts:
+            assert "exactly one small, self-contained tool call" in prompt
+            assert "8K" not in prompt
+            assert "output length limit" not in prompt
+        assert "happened again" not in first_retry
+        assert "happened again" in second_retry
+        assert "reduce the scope further" in second_retry
+        assert "full-payload rewrite" in second_retry
 
 
 class TestContentFilterStallActivatesFallback:
