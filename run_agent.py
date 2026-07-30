@@ -1165,12 +1165,15 @@ class AIAgent:
             detail = detail[:217].rstrip() + "..."
         self._emit_warning(f"⚠ Auxiliary {task} failed: {detail}")
 
-    def _current_main_runtime(self) -> Dict[str, str]:
+    def _current_main_runtime(
+        self, *, allow_deployment_relay: bool = False,
+    ) -> Dict[str, str]:
         """Return the live main runtime for session-scoped auxiliary routing."""
         api_key = getattr(self, "api_key", "") or ""
-        if is_deployment_inference_relay(api_key):
+        if is_deployment_inference_relay(api_key) and not allow_deployment_relay:
             # This marker only authorizes the owner-local relay and is not a
-            # credential.  Do not serialize it into session or auxiliary state.
+            # credential. Do not serialize it into session or ordinary
+            # auxiliary state; trusted in-process forks may opt in explicitly.
             api_key = ""
         return {
             "model": getattr(self, "model", "") or "",

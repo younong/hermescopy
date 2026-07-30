@@ -67,3 +67,30 @@ def test_init_raises_when_no_fallback_configured():
                 skip_memory=True,
                 fallback_model=None,
             )
+
+
+def test_init_named_custom_error_does_not_invent_invalid_env_var():
+    with patch("agent.auxiliary_client.resolve_provider_client", return_value=(None, None)), \
+         patch(
+             "agent.auxiliary_client.provider_api_key_env_hint",
+             return_value=None,
+         ), \
+         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs()), \
+         patch("run_agent.check_toolset_requirements", return_value={}), \
+         patch("run_agent.OpenAI", return_value=MagicMock()):
+
+        with pytest.raises(RuntimeError) as exc_info:
+            AIAgent(
+                provider="custom:codex",
+                model="gpt-5.6-sol",
+                api_key=None,
+                base_url=None,
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                fallback_model=None,
+            )
+
+    message = str(exc_info.value)
+    assert "Configure api_key or key_env" in message
+    assert "CUSTOM:CODEX_API_KEY" not in message

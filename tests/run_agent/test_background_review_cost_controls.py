@@ -29,7 +29,7 @@ class _FakeAgent:
         self.provider = provider
         self.model = model
 
-    def _current_main_runtime(self):
+    def _current_main_runtime(self, *, allow_deployment_relay=False):
         return {
             "api_key": "parent-key",
             "base_url": "https://chatgpt.com/backend-api/codex",
@@ -46,6 +46,29 @@ def test_routing_auto_inherits_parent_and_downgrades_codex_app_server():
     assert rt["provider"] == "openai-codex"
     assert rt["model"] == "gpt-5.5"
     assert rt["api_mode"] == "codex_responses"  # downgraded so agent-loop tools dispatch
+
+
+def test_background_review_requests_trusted_deployment_relay_runtime():
+    calls = []
+    agent = _FakeAgent(provider="custom:codex", model="gpt-5.6-sol")
+
+    def current_runtime(*, allow_deployment_relay=False):
+        calls.append(allow_deployment_relay)
+        return {
+            "api_key": "deployment-inference-relay" if allow_deployment_relay else "",
+            "base_url": "http://127.0.0.1:39123/v1",
+            "api_mode": "chat_completions",
+        }
+
+    agent._current_main_runtime = current_runtime
+    with patch("hermes_cli.config.load_config", return_value={}):
+        rt = br._resolve_review_runtime(agent)
+
+    assert calls == [True]
+    assert rt["provider"] == "custom:codex"
+    assert rt["api_key"] == "deployment-inference-relay"
+    assert rt["base_url"] == "http://127.0.0.1:39123/v1"
+    assert rt["routed"] is False
 
 
 def test_routing_to_different_model_marks_routed_and_resolves_credentials():

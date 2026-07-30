@@ -59,7 +59,7 @@ class TestNormalizeVisionProvider:
 
     def test_custom_colon_named_provider_preserved(self):
         from agent.auxiliary_client import _normalize_vision_provider
-        assert _normalize_vision_provider("custom:beans") == "beans"
+        assert _normalize_vision_provider("custom:beans") == "custom:beans"
 
     def test_codex_alias_still_works(self):
         from agent.auxiliary_client import _normalize_vision_provider
@@ -148,6 +148,55 @@ class TestResolveProviderClientNamedCustom:
         assert client is not None
         # Should use _read_main_model() fallback
         assert model == "main-model"
+
+    def test_custom_codex_does_not_route_to_builtin_codex_oauth(self, tmp_path):
+        _write_config(tmp_path, {
+            "model": {"default": "gpt-5.6-sol"},
+            "custom_providers": [
+                {
+                    "name": "codex",
+                    "base_url": "http://codex-relay.local/v1",
+                    "api_key": "relay-key",
+                },
+            ],
+        })
+        from agent.auxiliary_client import resolve_provider_client
+
+        client, model = resolve_provider_client("custom:codex", "gpt-5.6-sol")
+
+        assert client is not None
+        assert "codex-relay.local" in str(client.base_url)
+        assert client.api_key == "relay-key"
+        assert model == "gpt-5.6-sol"
+
+    def test_named_custom_key_env_is_used_in_missing_key_hint(self, tmp_path):
+        _write_config(tmp_path, {
+            "providers": {
+                "codex": {
+                    "base_url": "https://codex.example.com/v1",
+                    "key_env": "CODEX_RELAY_API_KEY",
+                },
+            },
+        })
+        from agent.auxiliary_client import format_missing_provider_api_key
+
+        message = format_missing_provider_api_key("custom:codex")
+
+        assert "CODEX_RELAY_API_KEY" in message
+        assert "CUSTOM:CODEX_API_KEY" not in message
+
+    def test_keyless_named_custom_hint_does_not_invent_env_var(self, tmp_path):
+        _write_config(tmp_path, {
+            "custom_providers": [
+                {"name": "codex", "base_url": "https://codex.example.com/v1"},
+            ],
+        })
+        from agent.auxiliary_client import format_missing_provider_api_key
+
+        message = format_missing_provider_api_key("custom:codex")
+
+        assert "Configure api_key or key_env" in message
+        assert "CUSTOM:CODEX_API_KEY" not in message
 
     def test_named_custom_no_api_key_uses_fallback(self, tmp_path):
         _write_config(tmp_path, {

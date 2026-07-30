@@ -52,7 +52,7 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
     ``auxiliary.background_review.{provider,model}`` names a concrete model
     different from the parent's, resolve that runtime and set ``routed=True``.
     """
-    parent_runtime = agent._current_main_runtime()
+    parent_runtime = agent._current_main_runtime(allow_deployment_relay=True)
     parent_api_mode = parent_runtime.get("api_mode") or None
     if parent_api_mode == "codex_app_server":
         parent_api_mode = "codex_responses"

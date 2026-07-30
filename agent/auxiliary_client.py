@@ -45,6 +45,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -282,9 +283,7 @@ def _normalize_aux_provider(provider: Optional[str]) -> str:
     normalized = (provider or "auto").strip().lower()
     if normalized.startswith("custom:"):
         suffix = normalized.split(":", 1)[1].strip()
-        if not suffix:
-            return "custom"
-        normalized = suffix
+        return f"custom:{suffix}" if suffix else "custom"
     if normalized == "codex":
         return "openai-codex"
     if normalized == "main":
@@ -296,6 +295,53 @@ def _normalize_aux_provider(provider: Optional[str]) -> str:
         else:
             return "custom"
     return _PROVIDER_ALIASES.get(normalized, normalized)
+
+
+_ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def provider_api_key_env_hint(provider: str) -> Optional[str]:
+    """Return a configured, syntactically valid API-key env var name."""
+    explicit = (provider or "").strip().lower()
+    if not explicit:
+        return None
+    try:
+        from hermes_cli.runtime_provider import _get_named_custom_provider
+
+        custom_entry = _get_named_custom_provider(explicit)
+        if custom_entry:
+            key_env = str(
+                custom_entry.get("key_env") or custom_entry.get("api_key_env") or ""
+            ).strip()
+            return key_env if _ENV_VAR_NAME_RE.fullmatch(key_env) else None
+    except Exception:
+        pass
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+
+        provider_config = PROVIDER_REGISTRY.get(_normalize_aux_provider(explicit))
+        if provider_config and provider_config.api_key_env_vars:
+            key_env = str(provider_config.api_key_env_vars[0]).strip()
+            return key_env if _ENV_VAR_NAME_RE.fullmatch(key_env) else None
+    except Exception:
+        pass
+    return None
+
+
+def format_missing_provider_api_key(provider: str) -> str:
+    """Build actionable credential guidance without inventing env var names."""
+    explicit = (provider or "").strip().lower()
+    env_hint = provider_api_key_env_hint(explicit)
+    if env_hint:
+        action = f"Set the {env_hint} environment variable"
+    elif explicit.startswith("custom:"):
+        action = "Configure api_key or key_env for that named custom provider"
+    else:
+        action = "Configure credentials for that provider"
+    return (
+        f"Provider '{explicit}' is set in config.yaml but no API key was found. "
+        f"{action}, or switch to a different provider with `hermes model`."
+    )
 
 
 # Sentinel: when returned by _fixed_temperature_for_model(), callers must
@@ -6406,11 +6452,7 @@ def call_llm(
                     client, final_model = fb_client, fb_model
                     resolved_provider = fb_label or resolved_provider
                 else:
-                    raise RuntimeError(
-                        f"Provider '{_explicit}' is set in config.yaml but no API key "
-                        f"was found. Set the {_explicit.upper()}_API_KEY environment "
-                        f"variable, or switch to a different provider with `hermes model`."
-                    )
+                    raise RuntimeError(format_missing_provider_api_key(_explicit))
             # For auto/custom with no credentials, try the full auto chain
             # rather than hardcoding OpenRouter (which may be depleted).
             # Pass model=None so each provider uses its own default —
@@ -7050,11 +7092,7 @@ async def async_call_llm(
                     )
                     resolved_provider = fb_label or resolved_provider
                 else:
-                    raise RuntimeError(
-                        f"Provider '{_explicit}' is set in config.yaml but no API key "
-                        f"was found. Set the {_explicit.upper()}_API_KEY environment "
-                        f"variable, or switch to a different provider with `hermes model`."
-                    )
+                    raise RuntimeError(format_missing_provider_api_key(_explicit))
             if client is None and not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
