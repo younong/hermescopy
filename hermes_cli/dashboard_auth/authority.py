@@ -20,6 +20,10 @@ import time
 from enum import StrEnum
 
 from hermes_constants import get_hermes_home
+from hermes_cli.dashboard_auth.lifecycle import (
+    AuthorityLifecycleLockError,
+    authority_lifecycle_lock,
+)
 from hermes_cli.sqlite_util import (
     classify_sqlite_header,
     copy_sqlite_forensics,
@@ -558,6 +562,7 @@ class AuthorityStore:
                 self._raise_if_recovery_required()
                 self._validate_path()
                 return
+            lifecycle_lock = None
             try:
                 self.control_home.mkdir(parents=True, exist_ok=True)
                 control_stat = self.control_home.lstat()
@@ -565,6 +570,11 @@ class AuthorityStore:
                     raise AuthorityUnavailable(f"control home must be a directory: {self.control_home}")
                 if os.name != "nt" and control_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
                     raise AuthorityUnavailable(f"control home has unsafe permissions: {self.control_home}")
+                lifecycle_lock = authority_lifecycle_lock(
+                    self.control_home,
+                    exclusive=True,
+                    blocking=True,
+                ).acquire()
                 self._raise_if_recovery_required()
                 created = False
                 if not self.path.exists():
@@ -626,8 +636,13 @@ class AuthorityStore:
                 self._initialized = True
             except AuthorityUnavailable:
                 raise
+            except AuthorityLifecycleLockError as exc:
+                raise AuthorityUnavailable("authority store initialization is locked") from exc
             except (OSError, sqlite3.Error) as exc:
                 raise AuthorityUnavailable("authority store is unavailable") from exc
+            finally:
+                if lifecycle_lock is not None:
+                    lifecycle_lock.close()
 
     @staticmethod
     def _migrate_schema(conn: sqlite3.Connection) -> None:
