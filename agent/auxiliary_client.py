@@ -5778,6 +5778,17 @@ class AuxiliaryDeadlineExceeded(TimeoutError):
     """An aggregate auxiliary-task deadline expired across retries/fallbacks."""
 
 
+_MAX_COMPRESSION_REQUEST_SECONDS = 600.0
+
+
+def _compression_request_deadline(
+    task: Optional[str], deadline_monotonic: Optional[float]
+) -> Optional[float]:
+    if task != "compression" or deadline_monotonic is not None:
+        return deadline_monotonic
+    return time.monotonic() + _MAX_COMPRESSION_REQUEST_SECONDS
+
+
 def _remaining_deadline_timeout(
     configured_timeout: float,
     deadline_monotonic: Optional[float],
@@ -6379,6 +6390,7 @@ def call_llm(
     Raises:
         RuntimeError: If no provider is configured.
     """
+    deadline_monotonic = _compression_request_deadline(task, deadline_monotonic)
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     if api_mode:

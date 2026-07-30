@@ -12,17 +12,22 @@ export type CompressionStatusKind =
   | 'compression.cooldown'
   | 'compression.degraded'
   | 'compression.preparing'
+  | 'compression.ready'
 
 export interface CompressionStatus {
   kind: CompressionStatusKind
   text: string
+  startedAt?: number
 }
 
 export const $compressionStatuses = atom<Record<string, CompressionStatus>>({})
 export const $compactingSessions = computed($compressionStatuses, statuses =>
   Object.fromEntries(
     Object.entries(statuses)
-      .filter(([, status]) => status.kind === 'compression.preparing')
+      .filter(
+        ([, status]) =>
+          status.kind === 'compression.preparing' || status.kind === 'compression.ready'
+      )
       .map(([sessionId]) => [sessionId, true] as const)
   )
 )
@@ -30,6 +35,11 @@ export const $compactingSessions = computed($compressionStatuses, statuses =>
 export const $compactionActive = computed(
   [$compactingSessions, $activeSessionId],
   (sessions, activeId) => keyFor(activeId) in sessions
+)
+
+export const $activeCompressionStatus = computed(
+  [$compressionStatuses, $activeSessionId],
+  (statuses, activeId) => statuses[keyFor(activeId)]
 )
 
 export function setSessionCompressionStatus(
@@ -51,7 +61,14 @@ export function setSessionCompressionStatus(
       return
     }
 
-    $compressionStatuses.set({ ...statuses, [key]: status })
+    const active = status.kind === 'compression.preparing' || status.kind === 'compression.ready'
+    $compressionStatuses.set({
+      ...statuses,
+      [key]: {
+        ...status,
+        startedAt: active ? (current?.startedAt ?? status.startedAt ?? Date.now()) : undefined
+      }
+    })
 
     return
   }

@@ -568,13 +568,14 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         const statusKind = typeof payload?.kind === 'string' ? payload.kind : ''
 
         if (sessionId && statusKind.startsWith('compression.')) {
-          if (statusKind === 'compression.completed' || statusKind === 'compression.ready') {
+          if (statusKind === 'compression.completed') {
             setSessionCompressionStatus(sessionId)
           } else if (
             statusKind === 'compression.blocked' ||
             statusKind === 'compression.cooldown' ||
             statusKind === 'compression.degraded' ||
-            statusKind === 'compression.preparing'
+            statusKind === 'compression.preparing' ||
+            statusKind === 'compression.ready'
           ) {
             setSessionCompressionStatus(sessionId, {
               kind: statusKind as CompressionStatusKind,

@@ -45,19 +45,6 @@ from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
-@dataclass(frozen=True)
-class PreparedCompression:
-    """Detached compression output safe to pass between worker and owner threads."""
-
-    compressed_messages: List[Dict[str, Any]]
-    compressor_state: Dict[str, Any]
-    aborted: bool
-    applied: bool = True
-    auxiliary_route_fingerprint: Optional[str] = None
-    auxiliary_context_length: Optional[int] = None
-    auxiliary_input_budget: Optional[int] = None
-
-
 HISTORICAL_TASK_HEADING = "## Historical Task Snapshot"
 HISTORICAL_IN_PROGRESS_HEADING = "## Historical In-Progress State"
 HISTORICAL_PENDING_ASKS_HEADING = "## Historical Pending User Asks"
@@ -1597,6 +1584,12 @@ class ContextCompressor(ContextEngine):
 
         for index in range(cursor, len(chunks)):
             chunk = chunks[index]
+            progress_callback = getattr(self, "progress_callback", None)
+            if callable(progress_callback):
+                try:
+                    progress_callback(index + 1, len(chunks))
+                except Exception:
+                    logger.debug("compression progress callback failed", exc_info=True)
             if estimate_tokens_rough(self._serialize_for_summary(chunk)) > input_budget:
                 self._last_summary_error = "atomic tool group exceeds auxiliary input budget"
                 self._last_summary_transient_failure = True
@@ -1605,10 +1598,13 @@ class ContextCompressor(ContextEngine):
                 chunk,
                 max_output_tokens=output_budget or None,
             )
+            request_deadline = deadline_monotonic
+            if request_deadline is None:
+                request_deadline = time.monotonic() + 600.0
             summary = self._generate_summary(
                 chunk,
                 focus_topic=focus_topic,
-                deadline_monotonic=deadline_monotonic,
+                deadline_monotonic=request_deadline,
                 _summary_budget=summary_budget,
             )
             if not summary:
@@ -2128,6 +2124,12 @@ This compaction should PRIORITISE preserving all information related to the focu
             def _record_route(capacity: AuxiliaryRouteCapacity) -> None:
                 self._last_auxiliary_route_capacity = capacity
 
+            # Each rolling-summary chunk receives its own request deadline.
+            # Recursive aux-model → main-model recovery reuses the incoming
+            # deadline, so fallback cannot silently obtain a fresh ten minutes.
+            summary_request_deadline = deadline_monotonic
+            if summary_request_deadline is None:
+                summary_request_deadline = time.monotonic() + 600.0
             call_kwargs = {
                 "task": "compression",
                 "main_runtime": {
@@ -2139,11 +2141,11 @@ This compaction should PRIORITISE preserving all information related to the focu
                 },
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": int(summary_budget * 1.3),
-                "deadline_monotonic": deadline_monotonic,
+                "deadline_monotonic": summary_request_deadline,
                 "planned_input_tokens": planned_input_tokens,
                 "route_metadata_callback": _record_route,
-                # Per-request timeout is resolved from config and clamped to the
-                # aggregate automatic-compression deadline by call_llm.
+                # Configured timeouts below ten minutes remain effective; call_llm
+                # clamps all retries and fallbacks to this request deadline.
             }
             if self.summary_model:
                 call_kwargs["model"] = self.summary_model
@@ -2292,8 +2294,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                     e,
                 )
             if (
-                not getattr(self, "_durable_preparation", False)
-                and self.summary_model
+                self.summary_model
                 and self.summary_model != self.model
                 and not getattr(self, "_summary_model_fallen_back", False)
             ):
@@ -2311,7 +2312,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 return self._generate_summary(
                     turns_to_summarize,
                     focus_topic=focus_topic,
-                    deadline_monotonic=deadline_monotonic,
+                    deadline_monotonic=summary_request_deadline,
                     _summary_budget=summary_budget,
                 )
 
@@ -3113,100 +3114,6 @@ This compaction should PRIORITISE preserving all information related to the focu
         return compress_start < compress_end
 
     # ------------------------------------------------------------------
-    # Speculative preparation
-    # ------------------------------------------------------------------
-
-    _PREPARED_STATE_FIELDS = (
-        "_previous_summary",
-        "_last_summary_error",
-        "_last_summary_dropped_count",
-        "_last_summary_fallback_used",
-        "_last_compress_aborted",
-        "_last_summary_auth_failure",
-        "_last_summary_transient_failure",
-        "_last_aux_model_failure_error",
-        "_last_aux_model_failure_model",
-        "_summary_model_fallen_back",
-        "_summary_chunk_checkpoint",
-        "_last_auxiliary_route_capacity",
-        "_last_compression_savings_pct",
-        "_ineffective_compression_count",
-        "summary_model",
-    )
-
-    def prepare_compression(
-        self,
-        messages: List[Dict[str, Any]],
-        *,
-        current_tokens: Optional[int] = None,
-        focus_topic: Optional[str] = None,
-        deadline_monotonic: Optional[float] = None,
-        chunk_cursor: int = 0,
-        rolling_summary: Optional[str] = None,
-        checkpoint: Optional[Any] = None,
-    ) -> PreparedCompression:
-        """Build a compression projection without mutating live session state."""
-        snapshot = copy.deepcopy(messages)
-        detached = copy.copy(self)
-        initial_compression_count = int(
-            getattr(detached, "compression_count", 0) or 0
-        )
-        detached._session_db = None
-        detached._session_id = ""
-        detached._summary_chunk_checkpoint = max(0, int(chunk_cursor or 0))
-        if rolling_summary:
-            detached._previous_summary = rolling_summary
-        detached._rolling_checkpoint = checkpoint
-        detached._last_auxiliary_route_capacity = None
-        detached._durable_preparation = True
-        compressed = detached.compress(
-            snapshot,
-            current_tokens=current_tokens,
-            focus_topic=focus_topic,
-            deadline_monotonic=deadline_monotonic,
-        )
-        state = {
-            field: copy.deepcopy(getattr(detached, field, None))
-            for field in self._PREPARED_STATE_FIELDS
-        }
-        route_capacity = getattr(detached, "_last_auxiliary_route_capacity", None)
-        return PreparedCompression(
-            compressed_messages=copy.deepcopy(compressed),
-            compressor_state=state,
-            aborted=bool(detached._last_compress_aborted),
-            applied=(
-                int(getattr(detached, "compression_count", 0) or 0)
-                > initial_compression_count
-            ),
-            auxiliary_route_fingerprint=getattr(
-                route_capacity, "fingerprint", None
-            ),
-            auxiliary_context_length=getattr(
-                route_capacity, "context_length", None
-            ),
-            auxiliary_input_budget=getattr(route_capacity, "input_budget", None),
-        )
-
-    def apply_prepared_compression(
-        self,
-        prepared: PreparedCompression,
-        delta: List[Dict[str, Any]],
-        *,
-        current_tokens: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
-        """Apply validated prepared state and append turns added after its snapshot."""
-        for field in self._PREPARED_STATE_FIELDS:
-            if field in prepared.compressor_state:
-                setattr(self, field, copy.deepcopy(prepared.compressor_state[field]))
-
-        compressed = copy.deepcopy(prepared.compressed_messages)
-        compressed.extend(copy.deepcopy(delta))
-        compressed = self._sanitize_tool_pairs(compressed)
-        compressed = _strip_historical_media(compressed)
-
-        return compressed
-
-    # ------------------------------------------------------------------
     # Main compression entry point
     # ------------------------------------------------------------------
 
@@ -3217,6 +3124,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         focus_topic: str = None,
         force: bool = False,
         deadline_monotonic: Optional[float] = None,
+        preserve_on_summary_failure: bool = False,
     ) -> List[Dict[str, Any]]:
         """Compress conversation messages by summarizing middle turns.
 
@@ -3237,7 +3145,9 @@ This compaction should PRIORITISE preserving all information related to the focu
                 everything else.  Inspired by Claude Code's ``/compact``.
             force: If True, clear any active summary-failure cooldown before
                 running so a manual ``/compress`` can retry immediately after
-                an auto-compression abort.  Auto-compress callers pass False.
+                an auto-compression abort. Auto-compress callers pass False.
+            preserve_on_summary_failure: If True, any unusable summary aborts
+                without replacing source turns with a static fallback marker.
         """
         # Reset per-call summary failure state — callers inspect these fields
         # after compress() returns to decide whether to surface a warning.
@@ -3382,11 +3292,11 @@ This compaction should PRIORITISE preserving all information related to the focu
             checkpoint=getattr(self, "_rolling_checkpoint", None),
         )
 
-        # Durable automatic preparation must preserve the source transcript on
-        # every failed chunk. Legacy/manual direct calls retain their explicit
-        # deterministic recovery behavior.
+        # Automatic safety gates and durable preparation preserve the source
+        # transcript on every failed chunk. Manual direct calls retain their
+        # explicit deterministic recovery behavior unless configured otherwise.
         if not summary and (
-            getattr(self, "_durable_preparation", False)
+            preserve_on_summary_failure
             or self.abort_on_summary_failure
             or self._last_summary_auth_failure
             or self._last_summary_transient_failure

@@ -28,13 +28,13 @@ these paths see no behavioural change.
 
 from __future__ import annotations
 
-import copy
 import logging
 import os
 import tempfile
 import time
 import uuid
 import threading
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Tuple
@@ -47,9 +47,184 @@ COMPACTION_STATUS = (
     "🗜️ Compacting context — summarizing earlier conversation so I can continue..."
 )
 
-# Automatic compression is user-blocking preflight work. Manual /compress keeps
-# the configured task timeout because the user explicitly requested it.
-_AUTOMATIC_COMPRESSION_DEADLINE_SECONDS = 360.0
+@dataclass(frozen=True)
+class AutomaticCompressionOutcome:
+    """Result of the synchronous safety gate before a normal model request."""
+
+    messages: list
+    system_prompt: str
+    request_tokens: int
+    compressed: bool
+    safe_to_continue: bool
+    failure_reason: Optional[str] = None
+
+
+def _compression_made_progress(
+    *, orig_len: int, new_len: int, orig_tokens: int, new_tokens: int
+) -> bool:
+    """Return whether a pass materially reduced rows or estimated tokens."""
+    if new_len < orig_len:
+        return True
+    return orig_tokens > 0 and new_tokens < orig_tokens * 0.95
+
+
+def run_automatic_compression(
+    agent: Any,
+    messages: list,
+    system_message: str,
+    *,
+    current_tokens: Optional[int] = None,
+    task_id: str = "default",
+    force: bool = False,
+    emit_abort_warning: bool = True,
+) -> AutomaticCompressionOutcome:
+    """Synchronously compact until the full outgoing request is safe.
+
+    This is the single automatic compression gate used by preflight, post-tool,
+    and provider-overflow recovery. It blocks only the active session worker,
+    re-estimates the complete request after every pass, and fails closed without
+    mutating the caller's message list when compression cannot make progress.
+    """
+    compressor = agent.context_compressor
+    active_prompt = system_message or getattr(agent, "_cached_system_prompt", "") or ""
+    base_request_tokens = estimate_request_tokens_rough(
+        messages,
+        system_prompt=active_prompt,
+        tools=agent.tools or None,
+    )
+    # A caller at the final API boundary may include ephemeral request-only
+    # context (deferred skills, plugin context, prefill). Preserve that measured
+    # overhead while re-estimating each compressed candidate.
+    raw_request_tokens = max(base_request_tokens, int(current_tokens or 0))
+    request_token_overhead = max(0, raw_request_tokens - base_request_tokens)
+    request_tokens = getattr(
+        compressor, "calibrated_prompt_tokens", lambda tokens: tokens
+    )(raw_request_tokens)
+    threshold_tokens = int(getattr(compressor, "threshold_tokens", 0) or 0)
+    should_compress = force or request_tokens >= threshold_tokens
+    hard_blocked = getattr(compressor, "would_hard_block", lambda _tokens: False)(
+        raw_request_tokens
+    )
+    if not should_compress and not hard_blocked:
+        return AutomaticCompressionOutcome(
+            messages, active_prompt, request_tokens, False, True
+        )
+
+    original_messages = messages
+    original_prompt = active_prompt
+    working_messages = messages
+    compressed_any = False
+
+    for compression_pass in range(3):
+        before_messages = working_messages
+        before_tokens = request_tokens
+        agent._emit_status(
+            f"Compressing context (pass {compression_pass + 1}/3)…",
+            kind="compression.preparing",
+        )
+        try:
+            candidate_messages, candidate_prompt = agent._compress_context(
+                working_messages,
+                system_message,
+                approx_tokens=raw_request_tokens,
+                task_id=task_id,
+                force=force,
+                emit_abort_warning=emit_abort_warning,
+                emit_completion_status=False,
+                preserve_on_summary_failure=True,
+            )
+        except Exception as exc:
+            logger.warning(
+                "automatic compression failed: session=%s pass=%d error=%s",
+                getattr(agent, "session_id", None) or "none",
+                compression_pass + 1,
+                exc,
+            )
+            agent._emit_status(
+                "Context compression failed. The durable conversation was preserved "
+                "and no normal model request was sent. Run /compress to retry or "
+                "/new to start fresh.",
+                kind="compression.blocked",
+            )
+            return AutomaticCompressionOutcome(
+                working_messages,
+                active_prompt,
+                before_tokens,
+                compressed_any,
+                False,
+                "compression_failed",
+            )
+
+        candidate_raw_tokens = estimate_request_tokens_rough(
+            candidate_messages,
+            system_prompt=candidate_prompt or "",
+            tools=agent.tools or None,
+        ) + request_token_overhead
+        candidate_tokens = getattr(
+            compressor, "calibrated_prompt_tokens", lambda tokens: tokens
+        )(candidate_raw_tokens)
+        made_progress = _compression_made_progress(
+            orig_len=len(before_messages),
+            new_len=len(candidate_messages),
+            orig_tokens=before_tokens,
+            new_tokens=candidate_tokens,
+        )
+        if not made_progress:
+            failure = (
+                "compression_aborted"
+                if getattr(agent, "_last_compression_attempt_aborted", False)
+                else "compression_no_progress"
+            )
+            agent._emit_status(
+                "Context compression could not reduce the request safely. The "
+                "durable conversation was preserved and no normal model request was "
+                "sent. Run /compress to retry or /new to start fresh.",
+                kind="compression.blocked",
+            )
+            return AutomaticCompressionOutcome(
+                working_messages,
+                active_prompt,
+                before_tokens,
+                compressed_any,
+                False,
+                failure,
+            )
+
+        working_messages = candidate_messages
+        active_prompt = candidate_prompt
+        request_tokens = candidate_tokens
+        compressed_any = True
+
+        hard_blocked = getattr(
+            compressor, "would_hard_block", lambda _tokens: False
+        )(candidate_raw_tokens)
+        if request_tokens < threshold_tokens and not hard_blocked:
+            agent._emit_status(
+                "Context compression completed.",
+                kind="compression.completed",
+            )
+            return AutomaticCompressionOutcome(
+                working_messages,
+                active_prompt,
+                request_tokens,
+                compressed_any,
+                True,
+            )
+
+    agent._emit_status(
+        "Context is still too large after compression. The durable conversation "
+        "was preserved and no normal model request was sent. Run /compress to retry "
+        "or /new to start fresh.",
+        kind="compression.blocked",
+    )
+    return AutomaticCompressionOutcome(
+        working_messages,
+        active_prompt,
+        request_tokens,
+        compressed_any,
+        False,
+        "compression_still_unsafe",
+    )
 
 
 def _compression_lock_holder(agent: Any) -> str:
@@ -264,42 +439,7 @@ def check_compression_model_feasibility(agent: Any) -> None:
             )
 
         threshold = agent.context_compressor.threshold_tokens
-        # Async preparation may be configured above the synchronous compressor
-        # threshold. Cap that speculative snapshot independently so it always
-        # fits the auxiliary model without changing synchronous semantics.
         main_ctx = agent.context_compressor.context_length
-        max_tokens = int(getattr(agent.context_compressor, "max_tokens", 0) or 0)
-        usable = max(1, int(main_ctx or 0) - max_tokens)
-        configured_prepare = int(
-            usable
-            * float(
-                getattr(
-                    agent,
-                    "compression_prepare_threshold",
-                    getattr(agent.context_compressor, "threshold_percent", 0.50),
-                )
-            )
-        )
-        async_prepare = max(int(threshold), configured_prepare)
-        agent._compression_prepare_token_cap = (
-            int(aux_context) if aux_context < async_prepare else None
-        )
-        if aux_context >= threshold and aux_context < async_prepare:
-            msg = (
-                f"⚠ Compression model {aux_model} context is {aux_context:,} "
-                f"tokens, below the async preparation threshold of "
-                f"{async_prepare:,} tokens. Capped background preparation at "
-                f"{aux_context:,} tokens for this session."
-            )
-            agent._compression_warning = msg
-            agent._emit_status(msg)
-            logger.warning(
-                "Auxiliary compression model %s capped async preparation from "
-                "%d to %d tokens.",
-                aux_model,
-                async_prepare,
-                aux_context,
-            )
         if aux_context < threshold:
             # Auto-correct: lower the live session threshold so
             # compression actually works this session.  The hard floor
@@ -313,10 +453,6 @@ def check_compression_model_feasibility(agent: Any) -> None:
             old_threshold = threshold
             new_threshold = aux_context
             agent.context_compressor.threshold_tokens = new_threshold
-            # Async preparation must obey the auxiliary model's absolute
-            # input limit even when compression.prepare_threshold is configured
-            # as a higher ratio of the main model's context window.
-            agent._compression_prepare_token_cap = new_threshold
             # Keep threshold_percent in sync so future main-model
             # context_length changes (update_model) re-derive from a
             # sensible number rather than the original too-high value.
@@ -503,12 +639,6 @@ def maybe_compact_tool_payloads(
         agent._last_flushed_db_idx = 0
         agent._last_compaction_in_place = True
         try:
-            from agent.async_context_compression import invalidate_preparation
-
-            invalidate_preparation(agent, reason="tool payload checkpoint")
-        except Exception:
-            pass
-        try:
             compressor.on_session_start(
                 session_id,
                 boundary_reason="tool_payload_checkpoint",
@@ -546,36 +676,6 @@ def maybe_compact_tool_payloads(
                 logger.debug("tool checkpoint lock release failed: %s", exc)
 
 
-def _prepared_snapshot_is_current(prepared: Any, agent: Any, messages: list) -> bool:
-    from agent.async_context_compression import prepared_snapshot_is_current
-
-    return prepared_snapshot_is_current(prepared, agent, messages)
-
-
-def commit_prepared_context(
-    agent: Any,
-    messages: list,
-    system_message: str,
-    *,
-    prepared: Any,
-    approx_tokens: Optional[int] = None,
-    task_id: str = "default",
-    emit_abort_warning: bool = True,
-    compression_job: Optional[dict] = None,
-) -> Tuple[list, str]:
-    """Atomically validate and commit a detached background preparation."""
-    return compress_context(
-        agent,
-        messages,
-        system_message,
-        approx_tokens=approx_tokens,
-        task_id=task_id,
-        emit_abort_warning=emit_abort_warning,
-        _prepared=prepared,
-        _compression_job=compression_job,
-    )
-
-
 def compress_context(
     agent: Any,
     messages: list,
@@ -586,8 +686,8 @@ def compress_context(
     focus_topic: Optional[str] = None,
     force: bool = False,
     emit_abort_warning: bool = True,
-    _prepared: Any = None,
-    _compression_job: Optional[dict] = None,
+    emit_completion_status: bool = True,
+    preserve_on_summary_failure: bool = False,
 ) -> Tuple[list, str]:
     """Compress conversation context and split the session in SQLite.
 
@@ -607,6 +707,11 @@ def compress_context(
         emit_abort_warning: Emit the generic compression-aborted warning.
             The post-tool loop disables this because it returns one terminal
             response instead.
+        emit_completion_status: Emit ``compression.completed`` after this
+            low-level commit. Automatic safety gates disable this and emit the
+            terminal event only after full-request revalidation succeeds.
+        preserve_on_summary_failure: Require summary generation to abort
+            losslessly rather than insert a static fallback marker.
 
     Returns:
         ``(compressed_messages, new_system_prompt)`` tuple.  When
@@ -618,16 +723,6 @@ def compress_context(
     # This marker describes only this high-level attempt. The compressor's
     # own flag can predate an early return (for example lock contention).
     agent._last_compression_attempt_aborted = False
-
-    # Any synchronous attempt supersedes a speculative snapshot. Prepared
-    # commits pass the matching record explicitly and invalidate it only after
-    # the coordinator has completed the atomic commit.
-    if _prepared is None:
-        try:
-            from agent.async_context_compression import invalidate_preparation
-            invalidate_preparation(agent, reason="synchronous compression")
-        except Exception:
-            pass
 
     # Lazy feasibility check — run the auxiliary-provider probe + context
     # length lookup just-in-time on the first compression attempt instead of
@@ -651,12 +746,8 @@ def compress_context(
     # keeps the SAME session_id — no end_session, no parent_session_id child, no
     # `name #N` renumber, no contextvar/env/logging re-sync, no memory/context-
     # engine session-switch. The conversation keeps one durable id for life,
-    # eliminating the session-rotation bug cluster. Built-in durable jobs always
-    # use this mode; synchronous callers follow compression.in_place.
-    in_place = bool(
-        _compression_job is not None
-        or getattr(agent, "compression_in_place", False)
-    )
+    # eliminating the session-rotation bug cluster.
+    in_place = bool(getattr(agent, "compression_in_place", False))
     # Set True once the in-place DB write actually completes (the DB block can
     # raise and skip it). Surfaced to the gateway via agent._last_compaction_in_place.
     compacted_in_place = False
@@ -667,6 +758,13 @@ def compress_context(
         focus_topic,
     )
     agent._emit_status(COMPACTION_STATUS, kind="compression.preparing")
+    old_progress_callback = getattr(agent.context_compressor, "progress_callback", None)
+
+    def _emit_chunk_progress(chunk_index: int, chunk_count: int) -> None:
+        agent._emit_status(
+            f"Compressing context ({chunk_index}/{chunk_count})…",
+            kind="compression.preparing",
+        )
 
     # ── Compression lock ────────────────────────────────────────────────
     # Atomic, state.db-backed lock per session_id.  Without this, two
@@ -781,49 +879,37 @@ def compress_context(
             except Exception as _rel_err:
                 logger.debug("compression lock release failed: %s", _rel_err)
 
-    deadline_monotonic = None
-    if not force:
-        deadline_monotonic = time.monotonic() + _AUTOMATIC_COMPRESSION_DEADLINE_SECONDS
-
-    _prepared_state_before = None
-    if _prepared is not None:
-        _prepared_state_before = {
-            field: copy.deepcopy(getattr(agent.context_compressor, field, None))
-            for field in agent.context_compressor._PREPARED_STATE_FIELDS
-        }
-
     try:
-        if _prepared is not None:
-            if not _prepared_snapshot_is_current(_prepared, agent, messages):
-                raise ValueError("prepared compression snapshot is stale")
-            delta = messages[_prepared.snapshot_length:]
-            compressed = agent.context_compressor.apply_prepared_compression(
-                _prepared.compression,
-                delta,
-                current_tokens=approx_tokens,
-            )
-        else:
-            compressed = agent.context_compressor.compress(
-                messages,
-                current_tokens=approx_tokens,
-                focus_topic=focus_topic,
-                force=force,
-                deadline_monotonic=deadline_monotonic,
-            )
+        try:
+            agent.context_compressor.progress_callback = _emit_chunk_progress
+        except Exception:
+            pass
+        compressed = agent.context_compressor.compress(
+            messages,
+            current_tokens=approx_tokens,
+            focus_topic=focus_topic,
+            force=force,
+            preserve_on_summary_failure=preserve_on_summary_failure,
+        )
     except TypeError:
-        if _prepared is not None:
-            _release_lock()
-            raise
         # Plugin context engine with strict signature that doesn't accept
         # focus_topic / force — fall back to calling without them.
         try:
             compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens)
         except BaseException:
+            try:
+                agent.context_compressor.progress_callback = old_progress_callback
+            except Exception:
+                pass
             _release_lock()
             raise
     except BaseException:
         # ANY exception during compress() must release the lock so the
         # session isn't permanently blocked from future compression.
+        try:
+            agent.context_compressor.progress_callback = old_progress_callback
+        except Exception:
+            pass
         _release_lock()
         raise
 
@@ -859,11 +945,19 @@ def compress_context(
                 _existing_sp = agent._build_system_prompt(system_message)
             return messages, _existing_sp
         finally:
+            try:
+                agent.context_compressor.progress_callback = old_progress_callback
+            except Exception:
+                pass
             _release_lock()
 
+    agent._emit_status(
+        "Context summary is ready. Applying it and checking request safety…",
+        kind="compression.ready",
+    )
     try:
-        # Preparation is pure. Notify memory only after a valid projection exists
-        # and immediately before live transcript state is committed.
+        # Notify memory only after a valid projection exists and immediately
+        # before live transcript state is committed.
         if agent._memory_manager:
             try:
                 agent._memory_manager.on_pre_compress(messages)
@@ -934,7 +1028,6 @@ def compress_context(
                     agent._session_db.archive_and_compact(
                         agent.session_id,
                         compressed,
-                        compression_job=_compression_job,
                     )
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
@@ -1055,15 +1148,6 @@ def compress_context(
                 agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
                 agent._last_flushed_db_idx = 0
             except Exception as e:
-                if _compression_job is not None:
-                    # A prepared projection is not committed until the exact job
-                    # fence and transcript rewrite complete in one transaction.
-                    # Restore the live compressor projection before propagating;
-                    # the durable coordinator will fence the failed job as stale.
-                    for field, value in (_prepared_state_before or {}).items():
-                        setattr(agent.context_compressor, field, value)
-                    agent._invalidate_system_prompt()
-                    raise
                 # If the rotation rolled back to the parent (orphan-avoidance
                 # above), agent.session_id is the still-indexed parent and
                 # old_session_id was cleared — so this is recovery, not an
@@ -1184,12 +1268,17 @@ def compress_context(
             agent.session_id or "none", _pre_msg_count, len(compressed),
             f"{_compressed_est:,}",
         )
-        agent._emit_status(
-            "Context compression completed.",
-            kind="compression.completed",
-        )
+        if emit_completion_status:
+            agent._emit_status(
+                "Context compression completed.",
+                kind="compression.completed",
+            )
         return compressed, new_system_prompt
     finally:
+        try:
+            agent.context_compressor.progress_callback = old_progress_callback
+        except Exception:
+            pass
         # Release the lock on the OLD session_id only AFTER rotation completed
         # and all post-rotation bookkeeping (memory manager, context engine,
         # file dedup) ran. A concurrent path that wakes up the moment we

@@ -159,7 +159,7 @@ describe('createGatewayEventHandler', () => {
       type: 'status.update'
     } as any)
 
-    expect(getUiState().status).toBe('ready')
+    expect(getUiState().status).toBe('Summary ready')
     expect(ctx.system.sys).not.toHaveBeenCalled()
   })
 

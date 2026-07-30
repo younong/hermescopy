@@ -3446,6 +3446,37 @@ class TestListSessionsRich:
         assert json.loads(row["model_config"])["_delegate_from"] == "__orphaned__"
         db.close()
 
+    def test_v20_migration_drops_only_legacy_compression_jobs(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        db.create_session("kept", "cli")
+        db.append_message("kept", "user", "preserve me")
+        db._conn.execute(
+            "CREATE TABLE compression_jobs (session_id TEXT PRIMARY KEY, state TEXT)"
+        )
+        db._conn.execute(
+            "INSERT INTO compression_jobs (session_id, state) VALUES (?, ?)",
+            ("kept", "degraded"),
+        )
+        db._conn.execute("UPDATE schema_version SET version = 19")
+        db._conn.commit()
+        db.close()
+
+        migrated = SessionDB(db_path=db_path)
+        tables = {
+            row[0]
+            for row in migrated._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert "compression_jobs" not in tables
+        assert migrated.get_session("kept") is not None
+        assert [
+            {"role": message["role"], "content": message["content"]}
+            for message in migrated.get_messages_as_conversation("kept")
+        ] == [{"role": "user", "content": "preserve me"}]
+        migrated.close()
+
     def test_branch_session_visible_after_parent_reopen_and_reend(self, db):
         """Branch sessions stay visible after the parent is reopened and re-ended.
 
@@ -4900,109 +4931,6 @@ def test_gateway_session_recovery_reopens_legacy_agent_close_rows(db):
         chat_id="chat-1",
         chat_type="dm",
     ) is None
-
-
-def test_compression_job_cooldown_preserves_safe_retry_state(db):
-    db.create_session("s1", "cli")
-    job = db.enqueue_compression_job(
-        session_id="s1",
-        job_id="job-1",
-        fence_id="fence-1",
-        snapshot_message_id=None,
-        snapshot_message_count=2,
-        snapshot_digest="digest",
-        main_route_fingerprint="main",
-        auxiliary_route_fingerprint="aux",
-        snapshot_payload="[]",
-    )
-    claimed = db.claim_compression_job(
-        session_id="s1", job_id=job["job_id"], holder="worker"
-    )
-    assert claimed is not None
-    retry_at = time.time() + 60.0
-    assert db.mark_compression_job_cooldown(
-        session_id="s1",
-        job_id="job-1",
-        holder="worker",
-        lease_version=claimed["lease_version"],
-        retry_at=retry_at,
-        failure_code="provider_timeout",
-    )
-
-    state = db.get_compression_job("s1")
-    assert state["state"] == "cooldown"
-    assert state["retry_at"] == retry_at
-    assert state["failure_code"] == "provider_timeout"
-    assert db.requeue_due_compression_job("s1", "job-1") is False
-
-
-def test_compression_job_degraded_requires_exact_preparation_lease(db):
-    db.create_session("s1", "cli")
-    job = db.enqueue_compression_job(
-        session_id="s1",
-        job_id="job-1",
-        fence_id="fence-1",
-        snapshot_message_id=None,
-        snapshot_message_count=2,
-        snapshot_digest="digest",
-        main_route_fingerprint="main",
-        auxiliary_route_fingerprint="aux",
-        snapshot_payload="[]",
-    )
-    claimed = db.claim_compression_job(
-        session_id="s1", job_id=job["job_id"], holder="worker-a"
-    )
-    assert claimed is not None
-
-    assert db.mark_compression_job_degraded(
-        session_id="s1",
-        job_id="job-1",
-        holder="worker-b",
-        lease_version=claimed["lease_version"],
-        failure_code="atomic_group_too_large",
-    ) is False
-    assert db.get_compression_job("s1")["state"] == "preparing"
-    assert db.mark_compression_job_degraded(
-        session_id="s1",
-        job_id="job-1",
-        holder="worker-a",
-        lease_version=claimed["lease_version"],
-        failure_code="atomic_group_too_large",
-    ) is True
-    assert db.get_compression_job("s1")["state"] == "degraded"
-
-
-def test_expired_compression_job_cooldown_requeues(db):
-    db.create_session("s1", "cli")
-    job = db.enqueue_compression_job(
-        session_id="s1",
-        job_id="job-1",
-        fence_id="fence-1",
-        snapshot_message_id=None,
-        snapshot_message_count=2,
-        snapshot_digest="digest",
-        main_route_fingerprint="main",
-        auxiliary_route_fingerprint="aux",
-        snapshot_payload="[]",
-    )
-    claimed = db.claim_compression_job(
-        session_id="s1", job_id=job["job_id"], holder="worker"
-    )
-    assert claimed is not None
-    assert db.mark_compression_job_cooldown(
-        session_id="s1",
-        job_id="job-1",
-        holder="worker",
-        lease_version=claimed["lease_version"],
-        retry_at=time.time() - 60.0,
-        failure_code="provider_timeout",
-    )
-
-    assert db.requeue_due_compression_job("s1", "job-1") is True
-    state = db.get_compression_job("s1")
-    assert state["state"] == "queued"
-    assert state["retry_at"] is None
-    assert state["failure_code"] is None
 
 
 def test_refresh_compression_lock_requires_holder_and_preserves_reclaimability(db, monkeypatch):

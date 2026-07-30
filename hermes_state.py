@@ -127,7 +127,7 @@ def get_default_db_path() -> Path:
 
 DEFAULT_DB_PATH = get_default_db_path()
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -789,40 +789,6 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS compression_jobs (
-    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
-    job_id TEXT NOT NULL UNIQUE,
-    fence_id TEXT NOT NULL,
-    state TEXT NOT NULL CHECK(state IN (
-        'queued', 'preparing', 'ready', 'committing', 'cooldown',
-        'degraded', 'stale', 'cancelled', 'completed'
-    )),
-    snapshot_message_id INTEGER,
-    snapshot_message_count INTEGER NOT NULL,
-    snapshot_digest TEXT NOT NULL,
-    main_route_fingerprint TEXT NOT NULL,
-    auxiliary_route_fingerprint TEXT NOT NULL,
-    prepared_auxiliary_route_fingerprint TEXT,
-    prepared_auxiliary_context_length INTEGER,
-    prepared_auxiliary_input_budget INTEGER,
-    main_budget_tokens INTEGER,
-    auxiliary_budget_tokens INTEGER,
-    chunk_cursor INTEGER NOT NULL DEFAULT 0,
-    rolling_summary TEXT,
-    snapshot_payload TEXT,
-    prepared_payload TEXT,
-    lease_holder TEXT,
-    lease_version INTEGER NOT NULL DEFAULT 0,
-    lease_expires_at REAL,
-    attempt_count INTEGER NOT NULL DEFAULT 0,
-    retry_at REAL,
-    deadline_at REAL,
-    failure_code TEXT,
-    effects_state TEXT NOT NULL DEFAULT 'pending' CHECK(effects_state IN ('pending', 'completed')),
-    created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS external_turn_receipts (
     turn_key TEXT PRIMARY KEY,
     stored_session_id TEXT NOT NULL,
@@ -841,8 +807,6 @@ CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
-CREATE INDEX IF NOT EXISTS idx_compression_jobs_claim
-    ON compression_jobs(state, retry_at, lease_expires_at, updated_at);
 """
 
 # Indexes that reference columns added in later schema versions must be
@@ -1504,6 +1468,10 @@ class SessionDB(SessionQueryMixin):
         cursor = self._conn.cursor()
 
         cursor.executescript(SCHEMA_SQL)
+        # The synchronous safety gate supersedes durable background jobs. Drop
+        # only the detached job metadata; session and message rows are untouched.
+        cursor.execute("DROP INDEX IF EXISTS idx_compression_jobs_claim")
+        cursor.execute("DROP TABLE IF EXISTS compression_jobs")
 
         # ── Declarative column reconciliation ──────────────────────────
         # Diff live tables against SCHEMA_SQL and ADD any missing columns.
@@ -1681,32 +1649,6 @@ class SessionDB(SessionQueryMixin):
                     )
                 except sqlite3.OperationalError:
                     pass
-            if current_version < 18:
-                # v18: move any still-active legacy session cooldown into the
-                # durable compression job state machine. The old physical
-                # columns remain for additive migration safety but have no live
-                # API after this version.
-                now = time.time()
-                cursor.execute(
-                    """
-                    INSERT OR IGNORE INTO compression_jobs (
-                        session_id, job_id, fence_id, state,
-                        snapshot_message_count, snapshot_digest,
-                        main_route_fingerprint, auxiliary_route_fingerprint,
-                        retry_at, failure_code,
-                        effects_state, created_at, updated_at
-                    )
-                    SELECT id,
-                           'legacy-' || lower(hex(randomblob(16))),
-                           lower(hex(randomblob(16))),
-                           'cooldown', 0, '', 'legacy', 'legacy',
-                           compression_failure_cooldown_until,
-                           'legacy_compression_failure', 'pending', ?, ?
-                    FROM sessions
-                    WHERE compression_failure_cooldown_until > ?
-                    """,
-                    (now, now, now),
-                )
             if current_version < SCHEMA_VERSION and fts_migrations_complete:
                 cursor.execute(
                     "UPDATE schema_version SET version = ?",
@@ -2054,395 +1996,6 @@ class SessionDB(SessionQueryMixin):
                 )
 
         self._execute_write(_do)
-
-    # ──────────────────────────────────────────────────────────────────────
-    # Durable compression jobs
-    # ──────────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _compression_job_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
-        return dict(row) if row is not None else None
-
-    def get_compression_job(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Return the durable compression job for one session, if present."""
-        if not session_id:
-            return None
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM compression_jobs WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-        return self._compression_job_dict(row)
-
-    def enqueue_compression_job(
-        self,
-        *,
-        session_id: str,
-        job_id: str,
-        fence_id: str,
-        snapshot_message_id: Optional[int],
-        snapshot_message_count: int,
-        snapshot_digest: str,
-        main_route_fingerprint: str,
-        auxiliary_route_fingerprint: str,
-        snapshot_payload: Optional[str] = None,
-        main_budget_tokens: Optional[int] = None,
-        auxiliary_budget_tokens: Optional[int] = None,
-        deadline_at: Optional[float] = None,
-    ) -> Dict[str, Any]:
-        """Create one queued job per session without replacing live work.
-
-        Terminal rows are replaced by the new exact snapshot. Non-terminal rows
-        enforce durable single-flight and are returned unchanged.
-        """
-        now = time.time()
-        terminal = ("completed", "cancelled", "stale", "degraded")
-
-        def _do(conn):
-            row = conn.execute(
-                "SELECT * FROM compression_jobs WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-            if row is not None and row["state"] not in terminal:
-                return dict(row)
-            conn.execute(
-                """
-                INSERT INTO compression_jobs (
-                    session_id, job_id, fence_id, state, snapshot_message_id,
-                    snapshot_message_count, snapshot_digest, snapshot_payload,
-                    main_route_fingerprint, auxiliary_route_fingerprint,
-                    main_budget_tokens, auxiliary_budget_tokens, chunk_cursor,
-                    lease_version, attempt_count, deadline_at, effects_state,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, 'pending', ?, ?)
-                ON CONFLICT(session_id) DO UPDATE SET
-                    job_id=excluded.job_id, fence_id=excluded.fence_id,
-                    state='queued', snapshot_message_id=excluded.snapshot_message_id,
-                    snapshot_message_count=excluded.snapshot_message_count,
-                    snapshot_digest=excluded.snapshot_digest,
-                    snapshot_payload=excluded.snapshot_payload,
-                    main_route_fingerprint=excluded.main_route_fingerprint,
-                    auxiliary_route_fingerprint=excluded.auxiliary_route_fingerprint,
-                    main_budget_tokens=excluded.main_budget_tokens,
-                    auxiliary_budget_tokens=excluded.auxiliary_budget_tokens,
-                    chunk_cursor=0, rolling_summary=NULL, prepared_payload=NULL,
-                    prepared_auxiliary_route_fingerprint=NULL,
-                    prepared_auxiliary_context_length=NULL,
-                    prepared_auxiliary_input_budget=NULL,
-                    lease_holder=NULL, lease_expires_at=NULL,
-                    attempt_count=0, retry_at=NULL, deadline_at=excluded.deadline_at,
-                    failure_code=NULL, effects_state='pending',
-                    created_at=excluded.created_at, updated_at=excluded.updated_at
-                """,
-                (
-                    session_id, job_id, fence_id, snapshot_message_id,
-                    snapshot_message_count, snapshot_digest, snapshot_payload,
-                    main_route_fingerprint, auxiliary_route_fingerprint,
-                    main_budget_tokens, auxiliary_budget_tokens, deadline_at,
-                    now, now,
-                ),
-            )
-            return dict(conn.execute(
-                "SELECT * FROM compression_jobs WHERE session_id = ?",
-                (session_id,),
-            ).fetchone())
-
-        return self._execute_write(_do)
-
-    def claim_compression_job(
-        self,
-        *,
-        session_id: str,
-        job_id: str,
-        holder: str,
-        lease_seconds: float = 300.0,
-    ) -> Optional[Dict[str, Any]]:
-        """CAS-claim queued or expired work and return its new lease fence."""
-        now = time.time()
-        expires_at = now + max(1.0, lease_seconds)
-
-        def _do(conn):
-            changed = conn.execute(
-                """
-                UPDATE compression_jobs
-                SET state='preparing', lease_holder=?,
-                    lease_version=lease_version + 1, lease_expires_at=?,
-                    attempt_count=attempt_count + 1, updated_at=?
-                WHERE session_id=? AND job_id=?
-                  AND (state='queued' OR (
-                      state='preparing'
-                      AND COALESCE(lease_expires_at, 0) < ?
-                  ))
-                  AND COALESCE(retry_at, 0) <= ?
-                """,
-                (holder, expires_at, now, session_id, job_id, now, now),
-            ).rowcount
-            if changed != 1:
-                return None
-            return dict(conn.execute(
-                "SELECT * FROM compression_jobs WHERE session_id=? AND job_id=?",
-                (session_id, job_id),
-            ).fetchone())
-
-        return self._execute_write(_do)
-
-    def refresh_compression_job_lease(
-        self,
-        *,
-        session_id: str,
-        job_id: str,
-        holder: str,
-        lease_version: int,
-        lease_seconds: float = 300.0,
-    ) -> bool:
-        """Refresh a job lease only for its exact holder and lease version."""
-        now = time.time()
-        expires_at = now + max(1.0, lease_seconds)
-
-        def _do(conn):
-            return conn.execute(
-                """
-                UPDATE compression_jobs SET lease_expires_at=?, updated_at=?
-                WHERE session_id=? AND job_id=? AND lease_holder=?
-                  AND lease_version=? AND state IN ('preparing', 'committing')
-                  AND lease_expires_at >= ?
-                """,
-                (expires_at, now, session_id, job_id, holder, lease_version, now),
-            ).rowcount == 1
-
-        return bool(self._execute_write(_do))
-
-    def checkpoint_compression_job(
-        self,
-        *,
-        session_id: str,
-        job_id: str,
-        holder: str,
-        lease_version: int,
-        chunk_cursor: int,
-        rolling_summary: Optional[str],
-    ) -> bool:
-        """Persist resumable preparation progress under an exact lease fence."""
-        now = time.time()
-
-        def _do(conn):
-            return conn.execute(
-                """
-                UPDATE compression_jobs
-                SET chunk_cursor=?, rolling_summary=?, updated_at=?
-                WHERE session_id=? AND job_id=? AND lease_holder=?
-                  AND lease_version=? AND state='preparing'
-                  AND lease_expires_at >= ?
-                """,
-                (
-                    chunk_cursor, rolling_summary, now, session_id, job_id,
-                    holder, lease_version, now,
-                ),
-            ).rowcount == 1
-
-        return bool(self._execute_write(_do))
-
-    def mark_compression_job_ready(
-        self,
-        *,
-        session_id: str,
-        job_id: str,
-        holder: str,
-        lease_version: int,
-        prepared_payload: str,
-        auxiliary_route_fingerprint: Optional[str] = None,
-        auxiliary_context_length: Optional[int] = None,
-        auxiliary_input_budget: Optional[int] = None,
-    ) -> bool:
-        """Publish a prepared projection and release its worker lease."""
-        now = time.time()
-
-        def _do(conn):
-            return conn.execute(
-                """
-                UPDATE compression_jobs
-                SET state='ready', prepared_payload=?,
-                    prepared_auxiliary_route_fingerprint=?,
-                    prepared_auxiliary_context_length=?,
-                    prepared_auxiliary_input_budget=?, lease_holder=NULL,
-                    lease_expires_at=NULL, retry_at=NULL, failure_code=NULL,
-                    updated_at=?
-                WHERE session_id=? AND job_id=? AND lease_holder=?
-                  AND lease_version=? AND state='preparing'
-                  AND lease_expires_at >= ?
-                """,
-                (
-                    prepared_payload,
-                    auxiliary_route_fingerprint,
-                    auxiliary_context_length,
-                    auxiliary_input_budget,
-                    now,
-                    session_id,
-                    job_id,
-                    holder,
-                    lease_version,
-                    now,
-                ),
-            ).rowcount == 1
-
-        return bool(self._execute_write(_do))
-
-    def mark_compression_job_cooldown(
-        self,
-        *,
-        session_id: str,
-        job_id: str,
-        holder: str,
-        lease_version: int,
-        retry_at: float,
-        failure_code: str,
-    ) -> bool:
-        """Move a claimed job into bounded retry cooldown with a safe code."""
-        now = time.time()
-
-        def _do(conn):
-            return conn.execute(
-                """
-                UPDATE compression_jobs
-                SET state='cooldown', retry_at=?, failure_code=?,
-                    lease_holder=NULL, lease_expires_at=NULL, updated_at=?
-                WHERE session_id=? AND job_id=? AND lease_holder=?
-                  AND lease_version=? AND state='preparing'
-                """,
-                (
-                    retry_at, failure_code, now, session_id, job_id,
-                    holder, lease_version,
-                ),
-            ).rowcount == 1
-
-        return bool(self._execute_write(_do))
-
-    def requeue_due_compression_job(
-        self, session_id: str, job_id: str, *, force: bool = False
-    ) -> bool:
-        """CAS-transition an elapsed (or explicitly cleared) cooldown to queued."""
-        now = time.time()
-
-        def _do(conn):
-            return conn.execute(
-                """
-                UPDATE compression_jobs
-                SET state='queued', retry_at=NULL, failure_code=NULL, updated_at=?
-                WHERE session_id=? AND job_id=? AND state='cooldown'
-                  AND (? OR retry_at <= ?)
-                """,
-                (now, session_id, job_id, 1 if force else 0, now),
-            ).rowcount == 1
-
-        return bool(self._execute_write(_do))
-
-    def mark_compression_job_degraded(
-        self,
-        *,
-        session_id: str,
-        job_id: str,
-        holder: str,
-        lease_version: int,
-        failure_code: str,
-    ) -> bool:
-        """Stop a preparation only under its exact active lease fence."""
-        now = time.time()
-
-        def _do(conn):
-            return conn.execute(
-                """
-                UPDATE compression_jobs
-                SET state='degraded', failure_code=?, lease_holder=NULL,
-                    lease_expires_at=NULL, updated_at=?
-                WHERE session_id=? AND job_id=? AND lease_holder=?
-                  AND lease_version=? AND state='preparing'
-                """,
-                (
-                    failure_code,
-                    now,
-                    session_id,
-                    job_id,
-                    holder,
-                    lease_version,
-                ),
-            ).rowcount == 1
-
-        return bool(self._execute_write(_do))
-
-    def mark_compression_job_stale(
-        self, session_id: str, job_id: str, *, failure_code: str = "snapshot_stale"
-    ) -> bool:
-        """Fence a job whose snapshot no longer matches live session state."""
-        return self._finish_compression_job_state(
-            session_id, job_id, "stale", failure_code=failure_code
-        )
-
-    def cancel_compression_job(
-        self, session_id: str, *, failure_code: str = "cancelled"
-    ) -> bool:
-        """Cancel the current non-terminal job for a session."""
-        job = self.get_compression_job(session_id)
-        if job is None:
-            return False
-        return self._finish_compression_job_state(
-            session_id, job["job_id"], "cancelled", failure_code=failure_code
-        )
-
-    def _finish_compression_job_state(
-        self,
-        session_id: str,
-        job_id: str,
-        state: str,
-        *,
-        failure_code: Optional[str] = None,
-    ) -> bool:
-        now = time.time()
-
-        def _do(conn):
-            return conn.execute(
-                """
-                UPDATE compression_jobs
-                SET state=?, failure_code=?, lease_holder=NULL,
-                    lease_expires_at=NULL, updated_at=?
-                WHERE session_id=? AND job_id=?
-                  AND state NOT IN ('completed', 'cancelled')
-                """,
-                (state, failure_code, now, session_id, job_id),
-            ).rowcount == 1
-
-        return bool(self._execute_write(_do))
-
-    def claim_ready_compression_job(
-        self,
-        *,
-        session_id: str,
-        job_id: str,
-        fence_id: str,
-        holder: str,
-        lease_seconds: float = 300.0,
-    ) -> Optional[Dict[str, Any]]:
-        """CAS a ready exact snapshot into a lease-fenced committing state."""
-        now = time.time()
-        expires_at = now + max(1.0, lease_seconds)
-
-        def _do(conn):
-            changed = conn.execute(
-                """
-                UPDATE compression_jobs
-                SET state='committing', lease_holder=?,
-                    lease_version=lease_version + 1, lease_expires_at=?, updated_at=?
-                WHERE session_id=? AND job_id=? AND fence_id=? AND state='ready'
-                """,
-                (holder, expires_at, now, session_id, job_id, fence_id),
-            ).rowcount
-            if changed != 1:
-                return None
-            return dict(conn.execute(
-                "SELECT * FROM compression_jobs WHERE session_id=? AND job_id=?",
-                (session_id, job_id),
-            ).fetchone())
-
-        return self._execute_write(_do)
 
     def record_context_usage_calibration(
         self,
@@ -3575,8 +3128,6 @@ class SessionDB(SessionQueryMixin):
         self,
         session_id: str,
         compacted_messages: List[Dict[str, Any]],
-        *,
-        compression_job: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -3603,29 +3154,9 @@ class SessionDB(SessionQueryMixin):
         for compaction. ``message_count`` is set to the ACTIVE (compacted) count,
         matching what the live load returns. Returns the new active count.
 
-        When ``compression_job`` is supplied, the projection write and exact
-        durable job completion share this transaction. A retry after commit sees
-        ``effects_state='completed'`` and returns without archiving twice.
         """
 
         def _do(conn):
-            if compression_job is not None:
-                job_id = compression_job["job_id"]
-                fence_id = compression_job["fence_id"]
-                job = conn.execute(
-                    "SELECT state, effects_state FROM compression_jobs "
-                    "WHERE session_id=? AND job_id=? AND fence_id=?",
-                    (session_id, job_id, fence_id),
-                ).fetchone()
-                if job is None:
-                    raise RuntimeError("compression job fence is no longer valid")
-                if job["effects_state"] == "completed":
-                    return int(conn.execute(
-                        "SELECT COUNT(*) FROM messages WHERE session_id=? AND active=1",
-                        (session_id,),
-                    ).fetchone()[0])
-                if job["state"] != "committing":
-                    raise RuntimeError("compression job is not committing")
             # Soft-archive the live turns: active=0 hides them from the live
             # context load, compacted=1 marks them as "summarized away" (vs
             # rewind/undo's active=0+compacted=0, which means "user took it
@@ -3650,22 +3181,6 @@ class SessionDB(SessionQueryMixin):
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                 (inserted, tool_calls_total, session_id),
             )
-            if compression_job is not None:
-                changed = conn.execute(
-                    """
-                    UPDATE compression_jobs
-                    SET state='completed', effects_state='completed',
-                        lease_holder=NULL, lease_expires_at=NULL, updated_at=?
-                    WHERE session_id=? AND job_id=? AND fence_id=?
-                      AND state='committing' AND effects_state='pending'
-                    """,
-                    (
-                        time.time(), session_id, compression_job["job_id"],
-                        compression_job["fence_id"],
-                    ),
-                ).rowcount
-                if changed != 1:
-                    raise RuntimeError("compression job commit fence was lost")
             return inserted
 
         return self._execute_write(_do)

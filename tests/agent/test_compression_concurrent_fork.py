@@ -281,8 +281,8 @@ def test_post_compress_exception_stops_lock_refresher(tmp_path: Path, monkeypatc
     assert db.try_acquire_compression_lock(parent_sid, "probe", ttl_seconds=1.0) is True
 
 
-def test_abort_warning_exception_stops_lock_refresher(tmp_path: Path, monkeypatch) -> None:
-    """An abort-path warning exception must still release the refreshed lock."""
+def test_abort_status_stops_lock_refresher(tmp_path: Path, monkeypatch) -> None:
+    """An abort status must still release the refreshed lock."""
     real_try_acquire = SessionDB.try_acquire_compression_lock
 
     def _short_ttl(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> bool:
@@ -304,12 +304,14 @@ def test_abort_warning_exception_stops_lock_refresher(tmp_path: Path, monkeypatc
         return [{"role": "user", "content": "tail"}]
 
     agent.context_compressor.compress.side_effect = _aborting_compress
-    agent._emit_warning = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("abort boom"))
+    statuses = []
+    agent._emit_status = lambda text, *, kind="lifecycle": statuses.append((kind, text))
 
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 
-    with pytest.raises(RuntimeError, match="abort boom"):
-        agent._compress_context(messages, "sys", approx_tokens=120_000)
+    returned, _ = agent._compress_context(messages, "sys", approx_tokens=120_000)
+    assert returned is messages
+    assert "compression.degraded" in {kind for kind, _ in statuses}
 
     time.sleep(1.3)
     assert db.try_acquire_compression_lock(parent_sid, "probe", ttl_seconds=1.0) is True
@@ -643,7 +645,7 @@ def test_lease_refresher_stops_on_persistent_raise() -> None:
     assert db.calls == refresher._max_consecutive_failures
 
 
-def test_auto_compression_passes_deadline_but_manual_does_not(tmp_path: Path) -> None:
+def test_compression_deadline_is_owned_by_each_summary_request(tmp_path: Path) -> None:
     db = SessionDB(db_path=tmp_path / "state.db")
     session_id = "DEADLINE_TEST_SESSION"
     db.create_session(session_id, source="test")
@@ -651,12 +653,11 @@ def test_auto_compression_passes_deadline_but_manual_does_not(tmp_path: Path) ->
     agent.compression_in_place = True
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 
-    with patch("agent.conversation_compression.time.monotonic", return_value=100.0):
-        agent._compress_context(messages, "sys", approx_tokens=120_000)
+    agent._compress_context(messages, "sys", approx_tokens=120_000)
     auto_kwargs = agent.context_compressor.compress.call_args.kwargs
-    assert auto_kwargs["deadline_monotonic"] == 460.0
+    assert "deadline_monotonic" not in auto_kwargs
 
     agent.context_compressor.compress.reset_mock()
     agent._compress_context(messages, "sys", approx_tokens=120_000, force=True)
     manual_kwargs = agent.context_compressor.compress.call_args.kwargs
-    assert manual_kwargs["deadline_monotonic"] is None
+    assert "deadline_monotonic" not in manual_kwargs

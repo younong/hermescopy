@@ -369,9 +369,19 @@ def test_broker_uses_bounded_cloud_timeout(tmp_path, monkeypatch):
 
     timeout = captured["timeout"]
     assert timeout.connect == 30.0
-    assert timeout.read == 120.0
-    assert timeout.write == 120.0
+    assert timeout.read == 360.0
+    assert timeout.write == 360.0
     assert timeout.pool == 30.0
+
+
+def test_owner_relay_allows_extended_request_deadline():
+    import hermes_cli.owner_worker.inference_relay as relay_module
+
+    assert relay_module._RELAY_MAX_DEADLINE_SECONDS == 420.0
+    assert (
+        relay_module._RELAY_MAX_DEADLINE_SECONDS
+        > relay_module._RELAY_READ_TIMEOUT_SECONDS
+    )
 
 
 def test_broker_logs_pre_header_failure_without_secret_or_url(

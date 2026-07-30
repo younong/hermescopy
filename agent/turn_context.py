@@ -29,7 +29,10 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from agent.conversation_compression import conversation_history_after_compression
+from agent.conversation_compression import (
+    conversation_history_after_compression,
+    run_automatic_compression,
+)
 from agent.iteration_budget import IterationBudget
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
@@ -71,29 +74,6 @@ class _TurnPhase:
             elapsed_ms,
         )
         return False
-
-
-def _compression_made_progress(
-    orig_len: int, new_len: int, orig_tokens: int, new_tokens: int
-) -> bool:
-    """Return ``True`` if a compression pass materially reduced the request.
-
-    Compression can succeed by summarising message contents — reducing the
-    estimated request token count — without reducing the message row
-    count.  Treating row count as the sole progress signal false-positives
-    on size-only wins and surfaces a misleading "Cannot compress further"
-    failure even when post-compression tokens are well below the model
-    context window.  See issue #39548 for an observed case: 220 → 220
-    messages, ~288k → ~183k tokens on a 1M-context model still triggered
-    auto-reset.
-
-    The token reduction must be *material* (>5%) to count as progress — the
-    same floor the overflow-handler retry path uses (conversation_loop.py,
-    #39550) — so a sub-5% wobble doesn't keep the multi-pass loop spinning.
-    """
-    if new_len < orig_len:
-        return True
-    return orig_tokens > 0 and new_tokens < orig_tokens * 0.95
 
 
 def _should_run_preflight_estimate(
@@ -143,6 +123,9 @@ class TurnContext:
     turn_id: str
     # Index of the current user turn within ``messages``.
     current_turn_user_idx: int
+    # Whether the turn may issue a normal model request after preflight.
+    compression_safe_to_continue: bool = True
+    compression_failure_reason: Optional[str] = None
     # Whether the post-turn memory review should fire.
     should_review_memory: bool = False
     # Full instructions for a large slash-invoked skill. Attached only to API
@@ -378,6 +361,8 @@ def build_turn_context(
                 exc_info=True,
             )
 
+    compression_safe_to_continue = True
+    compression_failure_reason = None
     with _TurnPhase(agent, turn_id, "preflight_compression"):
         # Commit a stable deterministic tool-only checkpoint before the expensive
         # full request estimate. The inbound user turn was persisted above, while
@@ -424,7 +409,7 @@ def build_turn_context(
             getattr(agent.context_compressor, "threshold_tokens", 0),
         )
         if _preflight_gate:
-            _preflight_tokens = estimate_request_tokens_rough(
+            _preflight_raw_tokens = estimate_request_tokens_rough(
                 messages,
                 system_prompt=active_system_prompt or "",
                 tools=agent.tools or None,
@@ -434,71 +419,13 @@ def build_turn_context(
                 _compressor,
                 "calibrated_prompt_tokens",
                 lambda tokens: tokens,
-            )(_preflight_tokens)
-            _defer_preflight = getattr(
-                _compressor,
-                "should_defer_preflight_to_real_usage",
-                lambda _tokens: False,
-            )
-            _preflight_deferred = _defer_preflight(_preflight_tokens)
+            )(_preflight_raw_tokens)
+            _last = _compressor.last_prompt_tokens
+            # Do NOT overwrite the -1 sentinel (#36718).
+            if _last >= 0 and _preflight_tokens > _last:
+                _compressor.last_prompt_tokens = _preflight_tokens
 
-            if not _preflight_deferred:
-                _last = _compressor.last_prompt_tokens
-                # Do NOT overwrite the -1 sentinel (#36718).
-                if _last >= 0 and _preflight_tokens > _last:
-                    _compressor.last_prompt_tokens = _preflight_tokens
-
-            _compression_cooldown = getattr(
-                _compressor,
-                "get_active_compression_failure_cooldown",
-                lambda: None,
-            )()
-
-            if _preflight_deferred:
-                logger.info(
-                    "compression preflight decision=skip reason=defer_to_real_usage "
-                    "session=%s rough_tokens=%d effective_threshold=%d "
-                    "last_real_prompt_tokens=%d",
-                    agent.session_id or "none",
-                    _preflight_tokens,
-                    _compressor.threshold_tokens,
-                    _compressor.last_real_prompt_tokens,
-                )
-            elif _compression_cooldown:
-                logger.info(
-                    "compression preflight decision=skip reason=failure_cooldown "
-                    "session=%s rough_tokens=%d effective_threshold=%d "
-                    "remaining_seconds=%d",
-                    agent.session_id or "none",
-                    _preflight_tokens,
-                    _compressor.threshold_tokens,
-                    int(_compression_cooldown.get("remaining_seconds", 0.0)),
-                )
-            elif getattr(agent, "_using_builtin_context_compressor", False):
-                from agent.async_context_compression import (
-                    AsyncCompressionAction,
-                    maybe_handle_async_compression,
-                )
-
-                _async_outcome = maybe_handle_async_compression(
-                    agent,
-                    messages,
-                    active_system_prompt or system_message or "",
-                    current_tokens=_preflight_tokens,
-                    task_id=effective_task_id,
-                )
-                if _async_outcome.action is AsyncCompressionAction.COMMITTED:
-                    messages = _async_outcome.messages
-                    active_system_prompt = _async_outcome.system_prompt
-                    conversation_history = conversation_history_after_compression(
-                        agent, messages
-                    )
-                    agent._empty_content_retries = 0
-                    agent._thinking_prefill_retries = 0
-                    agent._last_content_with_tools = None
-                    agent._last_content_tools_all_housekeeping = False
-                    agent._mute_post_response = False
-            elif _compressor.should_compress(_preflight_tokens):
+            if _compressor.should_compress(_preflight_tokens):
                 logger.info(
                     "compression preflight decision=compress reason=threshold_reached "
                     "session=%s rough_tokens=%d effective_threshold=%d model=%s "
@@ -509,42 +436,18 @@ def build_turn_context(
                     agent.model,
                     _compressor.context_length,
                 )
-                agent._emit_status(
-                    f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
-                    f">= {_compressor.threshold_tokens:,} threshold. "
-                    "This may take a moment."
+                outcome = run_automatic_compression(
+                    agent,
+                    messages,
+                    active_system_prompt or system_message or "",
+                    current_tokens=_preflight_raw_tokens,
+                    task_id=effective_task_id,
                 )
-                for _pass in range(3):
-                    _orig_len = len(messages)
-                    _orig_tokens = _preflight_tokens
-                    messages, active_system_prompt = agent._compress_context(
-                        messages, system_message, approx_tokens=_preflight_tokens,
-                        task_id=effective_task_id,
-                    )
-                    # Re-estimate now so size-only compression (same row count,
-                    # lower token count — e.g. summarising tool outputs) is
-                    # recognised as progress instead of being misread as
-                    # "Cannot compress further". Fixes #39548.
-                    _preflight_tokens = estimate_request_tokens_rough(
-                        messages,
-                        system_prompt=active_system_prompt or "",
-                        tools=agent.tools or None,
-                    )
-                    if not _compression_made_progress(
-                        _orig_len, len(messages), _orig_tokens, _preflight_tokens
-                    ):
-                        logger.info(
-                            "compression preflight decision=stop reason=no_progress "
-                            "session=%s pass=%d messages_before=%d messages_after=%d "
-                            "rough_tokens_before=%d rough_tokens_after=%d",
-                            agent.session_id or "none",
-                            _pass + 1,
-                            _orig_len,
-                            len(messages),
-                            _orig_tokens,
-                            _preflight_tokens,
-                        )
-                        break  # Cannot compress further: neither rows nor tokens moved
+                compression_safe_to_continue = outcome.safe_to_continue
+                compression_failure_reason = outcome.failure_reason
+                if outcome.compressed:
+                    messages = outcome.messages
+                    active_system_prompt = outcome.system_prompt
                     conversation_history = conversation_history_after_compression(
                         agent, messages
                     )
@@ -553,16 +456,6 @@ def build_turn_context(
                     agent._last_content_with_tools = None
                     agent._last_content_tools_all_housekeeping = False
                     agent._mute_post_response = False
-                    if not _compressor.should_compress(_preflight_tokens):
-                        logger.info(
-                            "compression preflight decision=stop reason=below_threshold "
-                            "session=%s pass=%d rough_tokens=%d effective_threshold=%d",
-                            agent.session_id or "none",
-                            _pass + 1,
-                            _preflight_tokens,
-                            _compressor.threshold_tokens,
-                        )
-                        break
             else:
                 logger.info(
                     "compression preflight decision=skip reason=below_threshold "
@@ -572,19 +465,20 @@ def build_turn_context(
                     _compressor.threshold_tokens,
                 )
 
+    deferred_skill_context = ""
     with _TurnPhase(agent, turn_id, "deferred_skill"):
-        # Resolve large slash-skill instructions only after persistence and preflight.
-        # The compact activation remains durable; the full body is current-turn-only.
-        deferred_skill_context = ""
-        try:
-            from agent.skill_commands import build_deferred_skill_context
+        # Do not expand transient prompt context after a failed compression gate;
+        # the turn must return losslessly without issuing a normal model request.
+        if compression_safe_to_continue:
+            try:
+                from agent.skill_commands import build_deferred_skill_context
 
-            deferred_skill_context = build_deferred_skill_context(
-                user_message,
-                task_id=effective_task_id,
-            )
-        except Exception:
-            logger.warning("Deferred skill activation failed", exc_info=True)
+                deferred_skill_context = build_deferred_skill_context(
+                    user_message,
+                    task_id=effective_task_id,
+                )
+            except Exception:
+                logger.warning("Deferred skill activation failed", exc_info=True)
 
     # Compression can replace/reindex messages. Re-find this turn's compact user
     # message so ephemeral context is attached to the correct provider copy.
@@ -600,32 +494,34 @@ def build_turn_context(
 
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
-    try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
-        with _TurnPhase(agent, turn_id, "pre_llm_call"):
-            _pre_results = _invoke_hook(
-                "pre_llm_call",
-                timeout_seconds=5.0,
-                session_id=agent.session_id,
-                task_id=effective_task_id,
-                turn_id=turn_id,
-                user_message=original_user_message,
-                conversation_history=list(messages),
-                is_first_turn=(not bool(conversation_history)),
-                model=agent.model,
-                platform=getattr(agent, "platform", None) or "",
-                sender_id=getattr(agent, "_user_id", None) or "",
-            )
-        _ctx_parts: list[str] = []
-        for r in _pre_results:
-            if isinstance(r, dict) and r.get("context"):
-                _ctx_parts.append(str(r["context"]))
-            elif isinstance(r, str) and r.strip():
-                _ctx_parts.append(r)
-        if _ctx_parts:
-            plugin_user_context = "\n\n".join(_ctx_parts)
-    except Exception as exc:
-        logger.warning("pre_llm_call hook failed: %s", exc)
+    with _TurnPhase(agent, turn_id, "pre_llm_call"):
+        if compression_safe_to_continue:
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+
+                _pre_results = _invoke_hook(
+                    "pre_llm_call",
+                    timeout_seconds=5.0,
+                    session_id=agent.session_id,
+                    task_id=effective_task_id,
+                    turn_id=turn_id,
+                    user_message=original_user_message,
+                    conversation_history=list(messages),
+                    is_first_turn=(not bool(conversation_history)),
+                    model=agent.model,
+                    platform=getattr(agent, "platform", None) or "",
+                    sender_id=getattr(agent, "_user_id", None) or "",
+                )
+                _ctx_parts: list[str] = []
+                for r in _pre_results:
+                    if isinstance(r, dict) and r.get("context"):
+                        _ctx_parts.append(str(r["context"]))
+                    elif isinstance(r, str) and r.strip():
+                        _ctx_parts.append(r)
+                if _ctx_parts:
+                    plugin_user_context = "\n\n".join(_ctx_parts)
+            except Exception as exc:
+                logger.warning("pre_llm_call hook failed: %s", exc)
 
     # Per-turn file-mutation verifier state.
     agent._turn_failed_file_mutations = {}
@@ -674,6 +570,8 @@ def build_turn_context(
         effective_task_id=effective_task_id,
         turn_id=turn_id,
         current_turn_user_idx=current_turn_user_idx,
+        compression_safe_to_continue=compression_safe_to_continue,
+        compression_failure_reason=compression_failure_reason,
         should_review_memory=should_review_memory,
         deferred_skill_context=deferred_skill_context,
         plugin_user_context=plugin_user_context,

@@ -601,6 +601,23 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    if not _ctx.compression_safe_to_continue:
+        compression_error = (
+            "Context compression did not produce a safe request. The conversation "
+            "was preserved; run /compress to retry or /new to start fresh."
+        )
+        return {
+            "final_response": compression_error,
+            "messages": messages,
+            "api_calls": 0,
+            "completed": False,
+            "partial": True,
+            "failed": True,
+            "error": compression_error,
+            "failure_reason": _ctx.compression_failure_reason or "compression_failed",
+            "turn_exit_reason": "compression_hard_blocked",
+        }
+
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
     final_response = None
@@ -616,45 +633,33 @@ def run_conversation(
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
 
     def _handle_builtin_overflow_compression(current_tokens: int) -> bool:
-        """Commit a ready durable projection or stop without changing history."""
+        """Synchronously compress an authoritative provider overflow."""
         nonlocal messages, active_system_prompt, conversation_history
         nonlocal failed, terminal_error, terminal_failure_reason, _turn_exit_reason
 
-        from agent.async_context_compression import (
-            AsyncCompressionAction,
-            compression_thresholds,
-            maybe_handle_async_compression,
-        )
+        from agent.conversation_compression import run_automatic_compression
 
-        # A provider overflow is authoritative pressure. Raise the observation to
-        # the commit boundary so an already-prepared projection can be applied;
-        # otherwise enqueue/advance preparation without waiting for it.
-        pressure = max(int(current_tokens), compression_thresholds(agent).commit)
-        outcome = maybe_handle_async_compression(
+        outcome = run_automatic_compression(
             agent,
             messages,
             active_system_prompt or system_message or "",
-            current_tokens=pressure,
+            current_tokens=current_tokens,
             task_id=effective_task_id,
+            force=True,
             emit_abort_warning=False,
         )
-        if outcome.action is AsyncCompressionAction.COMMITTED:
+        if outcome.compressed:
             messages = outcome.messages
             active_system_prompt = outcome.system_prompt
             conversation_history = conversation_history_after_compression(
                 agent, messages
             )
+        if outcome.safe_to_continue and outcome.compressed:
             return True
 
-        agent._emit_status(
-            "The provider rejected this request because the context is too large. "
-            "Compression is continuing in the background; run /compress or /new "
-            "before continuing.",
-            kind="compression.blocked",
-        )
         failed = True
-        terminal_error = "provider context overflow while durable compression was not ready"
-        terminal_failure_reason = "compression_hard_blocked"
+        terminal_error = "provider context overflow and synchronous compression failed"
+        terminal_failure_reason = outcome.failure_reason or "compression_hard_blocked"
         _turn_exit_reason = "compression_hard_blocked"
         return False
 
@@ -1027,16 +1032,42 @@ def run_conversation(
             "would_hard_block",
             lambda _tokens: False,
         )(_raw_request_tokens)
-        if agent.compression_enabled and _hard_block:
-            agent._emit_status(
-                "Context is too full for another safe model request. "
-                "Run /compress or /new before continuing.",
-                kind="compression.blocked",
+        _at_compression_threshold = (
+            approx_request_tokens
+            >= int(getattr(agent.context_compressor, "threshold_tokens", 0) or 0)
+        )
+        if agent.compression_enabled and (_at_compression_threshold or _hard_block):
+            from agent.conversation_compression import run_automatic_compression
+
+            outcome = run_automatic_compression(
+                agent,
+                messages,
+                active_system_prompt or system_message or "",
+                current_tokens=_raw_request_tokens,
+                task_id=effective_task_id,
+                emit_abort_warning=False,
             )
+            if outcome.compressed:
+                messages = outcome.messages
+                active_system_prompt = outcome.system_prompt
+                conversation_history = conversation_history_after_compression(
+                    agent, messages
+                )
+            if outcome.safe_to_continue and outcome.compressed:
+                api_call_count -= 1
+                agent._api_call_count = api_call_count
+                try:
+                    agent.iteration_budget.refund()
+                except Exception:
+                    pass
+                continue
+
             _turn_exit_reason = "compression_hard_blocked"
             failed = True
-            terminal_error = "context pressure reached the safe request boundary"
-            terminal_failure_reason = "compression_hard_blocked"
+            terminal_error = "context compression did not produce a safe request"
+            terminal_failure_reason = (
+                outcome.failure_reason or "compression_hard_blocked"
+            )
             api_call_count -= 1
             agent._api_call_count = api_call_count
             try:
@@ -3082,14 +3113,6 @@ def run_conversation(
                             provider=agent.provider,
                             api_mode=agent.api_mode,
                         )
-                        try:
-                            from agent.async_context_compression import (
-                                invalidate_compression_runtime,
-                            )
-
-                            invalidate_compression_runtime(agent, reason="model changed")
-                        except Exception:
-                            pass
                         # Context probing flags — only set on built-in
                         # compressor (plugin engines manage their own).
                         if hasattr(compressor, "_context_probed"):
@@ -3547,14 +3570,6 @@ def run_conversation(
                             provider=agent.provider,
                             api_mode=agent.api_mode,
                         )
-                        try:
-                            from agent.async_context_compression import (
-                                invalidate_compression_runtime,
-                            )
-
-                            invalidate_compression_runtime(agent, reason="model changed")
-                        except Exception:
-                            pass
                         # Context probing flags — only set on built-in
                         # compressor (plugin engines manage their own).  This
                         # value came from the provider, so it is safe to cache.
@@ -4699,46 +4714,21 @@ def run_conversation(
                 if _tc_names == {"execute_code"}:
                     agent.iteration_budget.refund()
                 
-                # Use real token counts from the API response to decide
-                # compression.  prompt_tokens + completion_tokens is the
-                # actual context size the provider reported plus the
-                # assistant turn — a tight lower bound for the next prompt.
-                # Tool results appended above aren't counted yet, but the
-                # threshold (default 50%) leaves ample headroom; if tool
-                # results push past it, the next API call will report the
-                # real total and trigger compression then.
-                #
-                # If last_prompt_tokens is 0 (stale after API disconnect
-                # or provider returned no usage data), fall back to rough
-                # estimate to avoid missing compression.  Without this,
-                # a session can grow unbounded after disconnects because
-                # should_compress(0) never fires.  (#2153)
+                # Tool results were appended above, so provider usage from the
+                # preceding request is stale. Estimate the complete next request
+                # now (messages + active system prompt + tool schemas), then apply
+                # provider-observed calibration before deciding whether to block.
                 _compressor = agent.context_compressor
-                if _compressor.last_prompt_tokens > 0:
-                    # Only use prompt_tokens — completion/reasoning
-                    # tokens don't consume context window space.
-                    # Thinking models (GLM-5.1, QwQ, DeepSeek R1)
-                    # inflate completion_tokens with reasoning,
-                    # causing premature compression.  (#12026)
-                    _real_tokens = _compressor.last_prompt_tokens
-                elif _compressor.last_prompt_tokens == -1:
-                    # Compression just ran and no API-reported prompt count
-                    # has arrived yet. Avoid treating a schema-heavy rough
-                    # post-compression estimate as real context pressure.
-                    _real_tokens = 0
-                else:
-                    # Include tool schemas — with 50+ tools enabled
-                    # these add 20-30K tokens the messages-only
-                    # estimate misses, which can skip compression
-                    # past the configured threshold (#14695).
-                    _rough_tokens = estimate_request_tokens_rough(
-                        messages, tools=agent.tools or None
-                    )
-                    _real_tokens = getattr(
-                        _compressor,
-                        "calibrated_prompt_tokens",
-                        lambda tokens: tokens,
-                    )(_rough_tokens)
+                _rough_tokens = estimate_request_tokens_rough(
+                    messages,
+                    system_prompt=active_system_prompt or system_message or "",
+                    tools=agent.tools or None,
+                )
+                _real_tokens = getattr(
+                    _compressor,
+                    "calibrated_prompt_tokens",
+                    lambda tokens: tokens,
+                )(_rough_tokens)
 
                 # Tool outputs can dominate the next prompt long before the
                 # overall context threshold is reached. Once the model has consumed
@@ -4753,7 +4743,9 @@ def run_conversation(
                             agent, messages
                         )
                         _rough_tokens = estimate_request_tokens_rough(
-                            messages, tools=agent.tools or None
+                            messages,
+                            system_prompt=active_system_prompt or system_message or "",
+                            tools=agent.tools or None,
                         )
                         _real_tokens = getattr(
                             _compressor,
@@ -4761,42 +4753,32 @@ def run_conversation(
                             lambda tokens: tokens,
                         )(_rough_tokens)
 
-                _post_tool_compacted = False
-                if (
-                    agent.compression_enabled
-                    and getattr(agent, "_using_builtin_context_compressor", False)
-                ):
-                    from agent.async_context_compression import (
-                        AsyncCompressionAction,
-                        maybe_handle_async_compression,
-                    )
+                if agent.compression_enabled and _compressor.should_compress(_real_tokens):
+                    from agent.conversation_compression import run_automatic_compression
 
-                    _async_outcome = maybe_handle_async_compression(
+                    agent._safe_print("  ⟳ compacting context…")
+                    outcome = run_automatic_compression(
                         agent,
                         messages,
                         active_system_prompt or system_message or "",
-                        current_tokens=_real_tokens,
+                        current_tokens=_rough_tokens,
                         task_id=effective_task_id,
                         emit_abort_warning=False,
                     )
-                    if _async_outcome.action is AsyncCompressionAction.COMMITTED:
-                        messages = _async_outcome.messages
-                        active_system_prompt = _async_outcome.system_prompt
-                        _post_tool_compacted = True
-                elif agent.compression_enabled and _compressor.should_compress(_real_tokens):
-                    agent._safe_print("  ⟳ compacting context…")
-                    messages, active_system_prompt = agent._compress_context(
-                        messages, system_message,
-                        approx_tokens=agent.context_compressor.last_prompt_tokens,
-                        task_id=effective_task_id,
-                        emit_abort_warning=False,
-                    )
-                    _post_tool_compacted = True
-
-                if _post_tool_compacted:
-                    conversation_history = conversation_history_after_compression(
-                        agent, messages
-                    )
+                    if outcome.compressed:
+                        messages = outcome.messages
+                        active_system_prompt = outcome.system_prompt
+                        conversation_history = conversation_history_after_compression(
+                            agent, messages
+                        )
+                    if not outcome.safe_to_continue:
+                        failed = True
+                        terminal_error = "context compression did not produce a safe request"
+                        terminal_failure_reason = (
+                            outcome.failure_reason or "compression_hard_blocked"
+                        )
+                        _turn_exit_reason = "compression_hard_blocked"
+                        break
 
                 # Save session log incrementally (so progress is visible even if interrupted)
                 agent._session_messages = messages
