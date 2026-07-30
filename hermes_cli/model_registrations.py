@@ -11,6 +11,7 @@ from hermes_cli.config import (
     _normalize_custom_provider_entry,
     load_config,
     load_env,
+    remove_env_value,
     save_config,
     save_env_value,
 )
@@ -406,8 +407,17 @@ def delete_model_registration(registration_id: str) -> dict[str, Any]:
         active = _active(config, registrations).get(str(item.get("kind")), {})
         if active.get("registration_id") == registration_id:
             raise ModelRegistrationConflict("Active registration must be switched before deletion")
+        preserve_keys = {("model_registrations",)}
+        if item.get("kind") == "chat" and item.get("source") == "custom":
+            providers = config.get("providers")
+            if isinstance(providers, dict):
+                providers.pop(str(item.get("provider") or ""), None)
+                preserve_keys.add(("providers",))
+            key_env = str(item.get("key_env") or "")
+            if key_env:
+                remove_env_value(key_env)
         del registrations[registration_id]
-        save_config(config, preserve_keys={("model_registrations",)})
+        save_config(config, preserve_keys=preserve_keys)
     return {"ok": True, "id": registration_id}
 
 

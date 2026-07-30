@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
-import { createPortal } from "react-dom";
-import { Plus, RefreshCw, Search, Sparkles, Trash2, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Plus, RefreshCw, Search, Sparkles, Trash2 } from "lucide-react";
 import { api, type SkillInfo } from "@/lib/api";
+import { GuiChatWorkspaceDialog } from "./GuiChatWorkspaceDialog";
 
 const CREATE_TEMPLATE = `---
 name: my-skill
@@ -202,19 +202,19 @@ export function GuiChatSkillsPane({ profile }: { profile?: string }) {
       ) : null}
 
       {pendingDelete ? (
-        <GuiChatSkillsDialog
+        <GuiChatWorkspaceDialog
           busy={savingSkill === pendingDelete.name}
           description="This permanently removes the skill and its supporting files. This action cannot be undone."
           onClose={() => setPendingDelete(null)}
           title={`Delete ${pendingDelete.name}?`}
         >
-          <div className="gui-chat-skills-dialog-actions">
+          <div className="gui-chat-workspace-dialog-actions">
             <button disabled={savingSkill === pendingDelete.name} onClick={() => setPendingDelete(null)} type="button">Cancel</button>
             <button className="is-destructive" disabled={savingSkill === pendingDelete.name} onClick={() => void deleteSkill()} type="button">
               {savingSkill === pendingDelete.name ? "Deleting…" : "Delete"}
             </button>
           </div>
-        </GuiChatSkillsDialog>
+        </GuiChatWorkspaceDialog>
       ) : null}
     </section>
   );
@@ -253,7 +253,7 @@ function CreateSkillDialog({
   };
 
   return (
-    <GuiChatSkillsDialog
+    <GuiChatWorkspaceDialog
       busy={busy}
       description="Add YAML frontmatter and markdown instructions. The skill becomes available to new conversations."
       onClose={onClose}
@@ -275,51 +275,13 @@ function CreateSkillDialog({
         <textarea aria-label="SKILL.md" disabled={busy} onChange={(event) => setContent(event.target.value)} spellCheck={false} value={content} />
       </label>
       {error ? <div className="gui-chat-skills-editor-error" role="alert">{error}</div> : null}
-      <div className="gui-chat-skills-dialog-actions">
+      <div className="gui-chat-workspace-dialog-actions">
         <button disabled={busy} onClick={onClose} type="button">Cancel</button>
         <button className="is-primary" disabled={busy} onClick={() => void submit()} type="button">
           {busy ? "Creating…" : "Create skill"}
         </button>
       </div>
-    </GuiChatSkillsDialog>
-  );
-}
-
-function GuiChatSkillsDialog({
-  busy,
-  children,
-  description,
-  onClose,
-  title,
-  wide = false,
-}: {
-  busy: boolean;
-  children: ReactNode;
-  description: string;
-  onClose: () => void;
-  title: string;
-  wide?: boolean;
-}) {
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !busy) onClose();
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [busy, onClose]);
-
-  return createPortal(
-    <div className="gui-chat-skills-dialog-backdrop" data-gui-chat role="presentation">
-      <div aria-labelledby="gui-chat-skills-dialog-title" aria-modal="true" className={`gui-chat-skills-dialog${wide ? " is-wide" : ""}`} role="dialog">
-        <button aria-label="Close" className="gui-chat-skills-dialog-close" disabled={busy} onClick={onClose} type="button">
-          <X aria-hidden />
-        </button>
-        <h2 id="gui-chat-skills-dialog-title">{title}</h2>
-        <p>{description}</p>
-        {children}
-      </div>
-    </div>,
-    document.body,
+    </GuiChatWorkspaceDialog>
   );
 }
 
