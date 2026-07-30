@@ -16,6 +16,7 @@ except ImportError:  # pragma: no cover - POSIX
 
 
 _LOCK_NAME = "authority.lifecycle.lock"
+_INIT_LOCK_NAME = "authority.init.lock"
 
 
 class AuthorityLifecycleLockError(RuntimeError):
@@ -97,6 +98,15 @@ def authority_lifecycle_lock(
         control_home / _LOCK_NAME,
         exclusive=exclusive,
         blocking=blocking,
+    )
+
+
+def authority_init_lock(control_home: Path) -> AuthorityLifecycleLock:
+    """Return the blocking exclusive lock that serializes first-time setup."""
+    return AuthorityLifecycleLock(
+        control_home / _INIT_LOCK_NAME,
+        exclusive=True,
+        blocking=True,
     )
 
 

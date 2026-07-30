@@ -22,7 +22,7 @@ from enum import StrEnum
 from hermes_constants import get_hermes_home
 from hermes_cli.dashboard_auth.lifecycle import (
     AuthorityLifecycleLockError,
-    authority_lifecycle_lock,
+    authority_init_lock,
 )
 from hermes_cli.sqlite_util import (
     classify_sqlite_header,
@@ -570,11 +570,7 @@ class AuthorityStore:
                     raise AuthorityUnavailable(f"control home must be a directory: {self.control_home}")
                 if os.name != "nt" and control_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
                     raise AuthorityUnavailable(f"control home has unsafe permissions: {self.control_home}")
-                lifecycle_lock = authority_lifecycle_lock(
-                    self.control_home,
-                    exclusive=True,
-                    blocking=True,
-                ).acquire()
+                lifecycle_lock = authority_init_lock(self.control_home).acquire()
                 self._raise_if_recovery_required()
                 created = False
                 if not self.path.exists():
