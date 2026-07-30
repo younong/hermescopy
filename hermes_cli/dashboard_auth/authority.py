@@ -532,7 +532,12 @@ class AuthorityStore:
         if isinstance(exc, sqlite3.DatabaseError) and not isinstance(
             exc, (sqlite3.OperationalError, sqlite3.IntegrityError)
         ):
-            return self._quarantine_corruption(f"sqlite transaction failed: {exc}")
+            try:
+                integrity_reason = probe_sqlite_integrity(self.path, self._raw_connect)
+            except sqlite3.OperationalError:
+                integrity_reason = None
+            if integrity_reason is not None:
+                return self._quarantine_corruption(integrity_reason)
         return AuthorityUnavailable("authority transaction failed")
 
     def _validate_existing_database(self) -> None:

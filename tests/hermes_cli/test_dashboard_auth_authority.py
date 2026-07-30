@@ -527,10 +527,7 @@ def test_tls_header_corruption_is_preserved_and_marked(tmp_path):
     assert not store.path.exists()
 
 
-def test_transaction_database_error_is_preserved_and_marked(tmp_path, monkeypatch):
-    store = AuthorityStore(tmp_path / "control-plane")
-    store.activate(_scope())
-
+def _raise_transaction_database_error(store: AuthorityStore, monkeypatch) -> None:
     class _CorruptConnection:
         def __enter__(self):
             raise sqlite3.DatabaseError("database disk image is malformed")
@@ -540,12 +537,63 @@ def test_transaction_database_error_is_preserved_and_marked(tmp_path, monkeypatc
 
     monkeypatch.setattr(store, "_connect", lambda: _CorruptConnection())
 
+
+def test_transaction_database_error_with_healthy_probe_is_not_quarantined(
+    tmp_path, monkeypatch,
+):
+    store = AuthorityStore(tmp_path / "control-plane")
+    store.activate(_scope())
+    _raise_transaction_database_error(store, monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.dashboard_auth.authority.probe_sqlite_integrity",
+        lambda _path, _connect: None,
+    )
+
+    with pytest.raises(AuthorityUnavailable, match="transaction failed"):
+        store.activate(_scope(session_id="session-b"))
+
+    assert not store.recovery_marker_path.exists()
+    assert not list(store.control_home.glob("authority.sqlite3.corrupt.*.bak"))
+
+
+def test_transaction_database_error_with_confirmed_corruption_is_quarantined(
+    tmp_path, monkeypatch,
+):
+    store = AuthorityStore(tmp_path / "control-plane")
+    store.activate(_scope())
+    _raise_transaction_database_error(store, monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.dashboard_auth.authority.probe_sqlite_integrity",
+        lambda _path, _connect: "integrity_check returned 'corrupt'",
+    )
+
     with pytest.raises(AuthorityCorrupt) as excinfo:
         store.activate(_scope(session_id="session-b"))
 
     assert excinfo.value.classification == "sqlite_integrity_failure"
     assert store.recovery_marker_path.exists()
     assert list(store.control_home.glob("authority.sqlite3.corrupt.*.bak"))
+
+
+def test_transaction_database_error_with_locked_probe_is_not_quarantined(
+    tmp_path, monkeypatch,
+):
+    store = AuthorityStore(tmp_path / "control-plane")
+    store.activate(_scope())
+    _raise_transaction_database_error(store, monkeypatch)
+
+    def _locked(_path, _connect):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(
+        "hermes_cli.dashboard_auth.authority.probe_sqlite_integrity", _locked
+    )
+
+    with pytest.raises(AuthorityUnavailable, match="transaction failed"):
+        store.activate(_scope(session_id="session-b"))
+
+    assert not store.recovery_marker_path.exists()
+    assert not list(store.control_home.glob("authority.sqlite3.corrupt.*.bak"))
 
 
 def test_transaction_lock_failure_is_not_quarantined(tmp_path, monkeypatch):
