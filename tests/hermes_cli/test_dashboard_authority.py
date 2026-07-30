@@ -1,0 +1,249 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from hermes_cli.dashboard_auth.authority import (
+    AuthorizationScope,
+    AuthorityStore,
+    AuthorizationRejected,
+    ReaderGenerationState,
+    ReaderLeaseState,
+    WorkerGenerationState,
+    WorkerLeaseState,
+)
+from hermes_cli.dashboard_auth import ws_tickets
+from hermes_cli.dashboard_authority import (
+    AuthorityRecoveryError,
+    acquire_authority_server_lock,
+    authority_status,
+    preserve_authority,
+    recover_authority,
+)
+from hermes_cli.sqlite_util import sha256_file
+
+
+def _scope() -> AuthorizationScope:
+    return AuthorizationScope("stub", "tenant", "user", "session", "revision")
+
+
+def _corrupt_tls_header(path: Path) -> None:
+    data = bytearray(path.read_bytes())
+    data[5:10] = bytes.fromhex("17 03 03 00 13")
+    path.write_bytes(data)
+
+
+def _incident(
+    control_home: Path,
+) -> tuple[AuthorityStore, Path, dict[str, object], object, object, object]:
+    store = AuthorityStore(control_home)
+    state = store.activate(_scope())
+    worker = store.claim_worker_start("owner", worker_id="worker")
+    worker_lease = store.transition_worker_lease(
+        worker.lease,
+        state=WorkerLeaseState.ACTIVE,
+        generation_state=WorkerGenerationState.ACTIVE,
+    )
+    reader = store.claim_reader_start("owner", reader_id="reader")
+    store.transition_reader_lease(
+        reader.lease,
+        state=ReaderLeaseState.ACTIVE,
+        generation_state=ReaderGenerationState.ACTIVE,
+    )
+    store.check_and_consume(
+        _scope(), token_class="ticket", issuer_key_version="key", jti="old-jti",
+        audience="browser-ws:/api/ws", expires_at=9999999999,
+        claim_epoch=state.epoch, claim_recovery_generation=state.recovery_generation,
+    )
+    store.check_and_consume_owner_worker_bootstrap(
+        worker_lease, issuer_key_version="key", jti="old-worker-jti",
+        audience="worker", expires_at=9999999999,
+    )
+    old_scope_state = store.read_state(_scope())
+    old_worker_lease = store.read_owner_worker_lease("owner")
+    old_reader_lease = store.read_session_reader_lease("owner")
+    assert old_worker_lease is not None
+    assert old_reader_lease is not None
+    source = control_home / "source.sqlite3"
+    source.write_bytes(store.path.read_bytes())
+    _corrupt_tls_header(source)
+    store.path.write_bytes(source.read_bytes())
+    with pytest.raises(Exception):
+        store.activate(AuthorizationScope("stub", "tenant", "user", "new-session", "revision"))
+    marker = json.loads(store.recovery_marker_path.read_text())
+    return store, source, marker, old_scope_state, old_worker_lease, old_reader_lease
+
+
+def test_status_is_read_only_for_uninitialized_home(tmp_path):
+    home = tmp_path / "control-plane"
+    status = authority_status(home)
+    assert status.state == "uninitialized"
+    assert not home.exists()
+
+
+def test_status_refuses_preexisting_zero_byte_database(tmp_path):
+    home = tmp_path / "control-plane"
+    home.mkdir(mode=0o700)
+    (home / "authority.sqlite3").touch(mode=0o600)
+
+    with pytest.raises(AuthorityRecoveryError, match="status is unavailable"):
+        authority_status(home)
+
+
+def test_recovery_requires_matching_incident_digest_and_offline_lock(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    control_home = tmp_path / "control-plane"
+    control_home.mkdir(mode=0o700)
+    ws_tickets.mint_ticket(user_id="user", provider="stub")
+    store, source, marker, _, _, _ = _incident(control_home)
+
+    with pytest.raises(AuthorityRecoveryError, match="incident ID"):
+        recover_authority(
+            incident_id="0" * 16,
+            source=source,
+            expected_sha256=str(marker["sha256"]),
+            repair_tls_offset_5=True,
+            control_home=control_home,
+        )
+    with pytest.raises(AuthorityRecoveryError, match="digest"):
+        recover_authority(
+            incident_id=str(marker["incident_id"]),
+            source=source,
+            expected_sha256="0" * 64,
+            repair_tls_offset_5=True,
+            control_home=control_home,
+        )
+
+    lock = acquire_authority_server_lock(control_home)
+    try:
+        with pytest.raises(AuthorityRecoveryError, match="active dashboard"):
+            recover_authority(
+                incident_id=str(marker["incident_id"]),
+                source=source,
+                expected_sha256=str(marker["sha256"]),
+                repair_tls_offset_5=True,
+                control_home=control_home,
+            )
+    finally:
+        lock.close()
+    assert store.recovery_marker_path.exists()
+
+
+def test_tls_offset_5_recovery_fences_old_authority_and_clears_marker(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    control_home = tmp_path / "control-plane"
+    control_home.mkdir(mode=0o700)
+    ws_tickets.mint_ticket(user_id="user", provider="stub")
+    (
+        store,
+        source,
+        marker,
+        old_scope_state,
+        old_worker_lease,
+        old_reader_lease,
+    ) = _incident(control_home)
+
+    result = recover_authority(
+        incident_id=str(marker["incident_id"]),
+        source=source,
+        expected_sha256=str(marker["sha256"]),
+        repair_tls_offset_5=True,
+        control_home=control_home,
+    )
+
+    assert result.state == "healthy"
+    assert result.recovery_generation == 1
+    assert not store.recovery_marker_path.exists()
+    with sqlite3.connect(store.path) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        assert conn.execute("SELECT COUNT(*) FROM authorization_scopes WHERE revoked=0").fetchone() == (0,)
+        assert conn.execute("SELECT COUNT(*) FROM consumed_credentials").fetchone() == (0,)
+        assert conn.execute("SELECT COUNT(*) FROM owner_worker_bootstrap_consumptions").fetchone() == (0,)
+        assert {row[0] for row in conn.execute("SELECT state FROM owner_worker_leases")} == {"revoked"}
+        assert {row[0] for row in conn.execute("SELECT state FROM session_reader_leases")} == {"revoked"}
+    keyring = json.loads((control_home / "browser_ws_ticket_keyring.json").read_text())
+    assert keyring["replay_continuity"]["recovery_generation"] == 1
+    assert keyring["replay_continuity"]["state"] == "ready"
+    recovered_store = AuthorityStore(control_home)
+    with pytest.raises(AuthorizationRejected, match="session_revoked"):
+        recovered_store.check_and_consume(
+            _scope(), token_class="ticket", issuer_key_version="key", jti="fresh-jti",
+            audience="browser-ws:/api/ws", expires_at=9999999999,
+            claim_epoch=old_scope_state.epoch,
+            claim_recovery_generation=old_scope_state.recovery_generation,
+        )
+    with pytest.raises(AuthorizationRejected, match="stale"):
+        recovered_store.assert_worker_lease(old_worker_lease)
+    with pytest.raises(AuthorizationRejected, match="stale"):
+        recovered_store.assert_reader_lease(old_reader_lease)
+
+
+def test_preserve_retries_failed_evidence_without_changing_incident(tmp_path, monkeypatch):
+    control_home = tmp_path / "control-plane"
+    control_home.mkdir(mode=0o700)
+    store = AuthorityStore(control_home)
+    store.activate(_scope())
+    _corrupt_tls_header(store.path)
+    monkeypatch.setattr(
+        "hermes_cli.dashboard_auth.authority.copy_sqlite_forensics",
+        lambda _path: None,
+    )
+    with pytest.raises(Exception):
+        store.activate(AuthorizationScope("stub", "tenant", "user", "new", "revision"))
+    original = json.loads(store.recovery_marker_path.read_text())
+    assert original["preserved"] is False
+
+    monkeypatch.undo()
+    result = preserve_authority(control_home)
+
+    updated = json.loads(store.recovery_marker_path.read_text())
+    assert result.state == "recovery_required"
+    assert result.preserved is True
+    assert updated["incident_id"] == original["incident_id"]
+    assert updated["detected_at"] == original["detected_at"]
+    assert list(control_home.glob("authority.sqlite3.corrupt.*.bak"))
+
+
+def test_recovery_refuses_symlink_source(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    control_home = tmp_path / "control-plane"
+    control_home.mkdir(mode=0o700)
+    ws_tickets.mint_ticket(user_id="user", provider="stub")
+    store, source, marker, _, _, _ = _incident(control_home)
+    linked = control_home / "linked-source.sqlite3"
+    linked.symlink_to(source)
+
+    with pytest.raises(AuthorityRecoveryError, match="regular file"):
+        recover_authority(
+            incident_id=str(marker["incident_id"]),
+            source=linked,
+            expected_sha256=str(marker["sha256"]),
+            repair_tls_offset_5=True,
+            control_home=control_home,
+        )
+    assert store.recovery_marker_path.exists()
+
+
+def test_recovery_refuses_non_exact_tls_shape(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    control_home = tmp_path / "control-plane"
+    control_home.mkdir(mode=0o700)
+    ws_tickets.mint_ticket(user_id="user", provider="stub")
+    store, source, marker, _, _, _ = _incident(control_home)
+    data = bytearray(source.read_bytes())
+    data[9] ^= 1
+    source.write_bytes(data)
+    digest = sha256_file(source)
+    marker["sha256"] = digest
+    marker["incident_id"] = digest[:16]
+    store.recovery_marker_path.write_text(json.dumps(marker))
+
+    with pytest.raises(AuthorityRecoveryError, match="exact TLS"):
+        recover_authority(
+            incident_id=digest[:16], source=source, expected_sha256=digest,
+            repair_tls_offset_5=True, control_home=control_home,
+        )
+    assert store.recovery_marker_path.exists()

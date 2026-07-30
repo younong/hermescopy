@@ -62,7 +62,7 @@ class TestPartialStreamStubFinishReason:
     upstream connection dies mid-flight."""
 
     @patch("run_agent.AIAgent._create_request_openai_client")
-    @patch("run_agent.AIAgent._close_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_api_client")
     def test_text_only_partial_returns_length(self, _mock_close, mock_create, monkeypatch):
         """#30963: text-only partials must classify as length so the loop
         keeps continuing instead of exiting with budget remaining."""
@@ -91,7 +91,7 @@ class TestPartialStreamStubFinishReason:
         assert response.choices[0].message.tool_calls is None
 
     @patch("run_agent.AIAgent._create_request_openai_client")
-    @patch("run_agent.AIAgent._close_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_api_client")
     def test_partial_tool_call_uses_length(self, _mock_close, mock_create, monkeypatch):
         """Mid-tool-call partials now use finish_reason=length so the
         conversation loop's continuation machinery fires — bounded 3-retry
@@ -152,7 +152,7 @@ class TestCleanStreamEndMidToolCall:
     """
 
     @patch("run_agent.AIAgent._create_request_openai_client")
-    @patch("run_agent.AIAgent._close_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_api_client")
     def test_no_finish_reason_partial_tool_args_routes_to_stub(
         self, _mock_close, mock_create, monkeypatch,
     ):
@@ -193,7 +193,7 @@ class TestCleanStreamEndMidToolCall:
         assert getattr(response, "_dropped_tool_names", None) == ["execute_code"]
 
     @patch("run_agent.AIAgent._create_request_openai_client")
-    @patch("run_agent.AIAgent._close_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_api_client")
     def test_real_length_truncation_still_uses_uuid_id(
         self, _mock_close, mock_create, monkeypatch,
     ):
@@ -384,7 +384,7 @@ class TestContentFilterStallActivatesFallback:
     """
 
     @patch("run_agent.AIAgent._create_request_openai_client")
-    @patch("run_agent.AIAgent._close_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_api_client")
     def test_streaming_call_tags_content_filter_stub(
         self, _mock_close, mock_create, monkeypatch,
     ):
@@ -421,7 +421,7 @@ class TestContentFilterStallActivatesFallback:
         )
 
     @patch("run_agent.AIAgent._create_request_openai_client")
-    @patch("run_agent.AIAgent._close_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_api_client")
     def test_plain_network_stall_not_tagged(
         self, _mock_close, mock_create, monkeypatch,
     ):

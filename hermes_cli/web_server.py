@@ -15832,6 +15832,7 @@ def start_server(
         )
     app.state.owner_worker_supervisor = None
     app.state.session_reader_supervisor = None
+    app.state.authority_lifecycle_lock = None
     if app.state.auth_required:
         from hermes_cli.deployment_image import (
             DeploymentImagePolicyInvalid,
@@ -15899,15 +15900,18 @@ def start_server(
             future.result()
 
         control_home = global_home / "control-plane"
+        from hermes_cli.dashboard_auth.lifecycle import acquire_authority_server_lock
+
+        app.state.authority_lifecycle_lock = acquire_authority_server_lock(control_home)
         authority_store = AuthorityStore(control_home)
-        authority_store.ensure_ready()
-        app.state.session_reader_supervisor = SessionReaderSupervisor(
-            global_home=global_home,
-            control_home=control_home,
-            resource_manager=resource_manager,
-            authority_store=authority_store,
-        )
         try:
+            authority_store.ensure_ready()
+            app.state.session_reader_supervisor = SessionReaderSupervisor(
+                global_home=global_home,
+                control_home=control_home,
+                resource_manager=resource_manager,
+                authority_store=authority_store,
+            )
             app.state.owner_worker_supervisor = OwnerWorkerSupervisor(
                 global_home=global_home,
                 control_home=control_home,
@@ -15919,10 +15923,16 @@ def start_server(
                 resource_manager=resource_manager,
             )
         except Exception:
-            app.state.session_reader_supervisor.shutdown()
-            app.state.session_reader_supervisor = None
+            session_reader_supervisor = getattr(
+                app.state, "session_reader_supervisor", None
+            )
+            if session_reader_supervisor is not None:
+                session_reader_supervisor.shutdown()
+                app.state.session_reader_supervisor = None
             if resource_manager is not None:
                 resource_manager.close()
+            app.state.authority_lifecycle_lock.close()
+            app.state.authority_lifecycle_lock = None
             raise
 
     # ``--insecure`` no longer disables the auth gate (June 2026 hardening:
@@ -16121,6 +16131,12 @@ def start_server(
             if server.started:
                 await server.shutdown()
 
+    def close_authority_lifecycle_lock() -> None:
+        lifecycle_lock = getattr(app.state, "authority_lifecycle_lock", None)
+        if lifecycle_lock is not None:
+            lifecycle_lock.close()
+            app.state.authority_lifecycle_lock = None
+
     # On POSIX, keep the long-standing ``asyncio.run(_serve())`` behavior
     # unchanged — Python's default loop there is already a SelectorEventLoop
     # (or uvloop when uvicorn[standard] installs it), which is exactly what
@@ -16137,7 +16153,10 @@ def start_server(
     # no TCP handshake completing (#50641). So *only on Windows* we mirror
     # uvicorn's own machinery and run on the loop factory it picks.
     if sys.platform != "win32":
-        asyncio.run(_serve())
+        try:
+            asyncio.run(_serve())
+        finally:
+            close_authority_lifecycle_lock()
         return
 
     # Windows-only path. Resolve the runner + loop factory FIRST (and fall back
@@ -16159,7 +16178,10 @@ def start_server(
         except Exception:
             pass
 
-    if _runner is not None:
-        _runner(_serve(), loop_factory=_loop_factory)
-    else:
-        asyncio.run(_serve())
+    try:
+        if _runner is not None:
+            _runner(_serve(), loop_factory=_loop_factory)
+        else:
+            asyncio.run(_serve())
+    finally:
+        close_authority_lifecycle_lock()

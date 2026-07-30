@@ -1368,6 +1368,26 @@ while :; do
   sleep 1
 done
 
+# Candidate-release authority preflight runs before any service or active
+# artifact changes. It is strictly read-only and refuses recovery-required or
+# unreadable state; operators must use the offline authority workflow instead.
+if ! authority_status="$(
+  runuser -u "$service_user" -- env -i \
+    HOME="$shared" HERMES_HOME="$hermes_home" PYTHONPATH="$release" \
+    "$venv/bin/python" -m hermes_cli.main dashboard authority status --json
+)"; then
+  echo "HERMES_DEPLOY_STAGE authority_preflight=failed" >&2
+  echo "Authority preflight failed; run 'hermes dashboard authority status' and the documented offline recovery workflow" >&2
+  exit 1
+fi
+printf '%s' "$authority_status" | "$venv/bin/python" -c '
+import json, sys
+payload = json.load(sys.stdin)
+if payload.get("state") not in {"healthy", "uninitialized"}:
+    raise SystemExit("authority recovery is required before deployment")
+'
+echo "HERMES_DEPLOY_STAGE authority_preflight=passed"
+
 # Stop the old release before changing any active artifact. Dashboard shutdown
 # drains its Owner Workers; Gateway SIGTERM reuses its resume/flush shutdown.
 services_touched="1"

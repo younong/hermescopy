@@ -268,6 +268,16 @@ def _load_keyring(
             raise TicketInvalid("replay_continuity_unavailable") from exc
 
 
+def load_ticket_keyring_for_recovery(store: AuthorityStore) -> dict[str, Any]:
+    """Load signer state without enforcing the quarantined DB witness."""
+    return _load_keyring(store, create=False, require_continuity=False)
+
+
+def write_ticket_keyring_for_recovery(payload: Mapping[str, Any]) -> None:
+    """Durably publish signer state prepared by the offline recovery command."""
+    _write_keyring(payload)
+
+
 def _ticket_keyring(store: AuthorityStore | None = None) -> tuple[AuthorityStore, dict[str, Any]]:
     active_store = store or authority_store()
     try:
@@ -327,23 +337,6 @@ def prune_expired_browser_ticket_issuers(*, now: int | None = None) -> None:
         if int(record["verify_until"]) >= current
     ]
     _write_keyring(keyring)
-
-
-def complete_browser_ticket_replay_recovery() -> int:
-    """Explicitly reconcile the keyring witness after a replay-store incident."""
-    store = authority_store()
-    try:
-        keyring = _load_keyring(store, require_continuity=False)
-    except AuthorityUnavailable as exc:
-        raise TicketInvalid("replay_continuity_unavailable") from exc
-    witness = keyring["replay_continuity"]
-    try:
-        recovered = store.complete_replay_recovery(witness)
-    except AuthorityUnavailable as exc:
-        raise TicketInvalid("replay_continuity_unavailable") from exc
-    keyring["replay_continuity"] = recovered
-    _write_keyring(keyring)
-    return recovered.recovery_generation
 
 
 def _scope_from_material(

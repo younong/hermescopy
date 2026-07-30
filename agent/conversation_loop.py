@@ -2669,12 +2669,14 @@ def run_conversation(
                 # Anthropic OAuth subscription rejected the 1M-context beta
                 # header ("long context beta is not yet available for this
                 # subscription"). Disable the beta for the rest of this
-                # session, rebuild the client, and retry once.  1M-capable
-                # subscriptions never hit this branch — they accept the
-                # beta and keep full 1M context.  See PR #17680 for the
-                # original report (we chose reactive recovery over the
-                # proposed unconditional omit so capable subscriptions
-                # don't silently lose the capability).
+                # session and retry once. The failed request-local client has
+                # already unwound, and the retry builds a fresh client from the
+                # updated flag; the shared seed client must not be closed here.
+                # 1M-capable subscriptions never hit this branch — they accept
+                # the beta and keep full 1M context. See PR #17680 for the
+                # original report (we chose reactive recovery over the proposed
+                # unconditional omit so capable subscriptions don't silently
+                # lose the capability).
                 if (
                     classified.reason == FailoverReason.oauth_long_context_beta_forbidden
                     and agent.api_mode == "anthropic_messages"
@@ -2684,11 +2686,6 @@ def run_conversation(
                     _retry.oauth_1m_beta_retry_attempted = True
                     if not getattr(agent, "_oauth_1m_beta_disabled", False):
                         agent._oauth_1m_beta_disabled = True
-                        try:
-                            agent._anthropic_client.close()
-                        except Exception:
-                            pass
-                        agent._rebuild_anthropic_client()
                         agent._vprint(
                             f"{agent.log_prefix}🔕 OAuth subscription doesn't support "
                             f"the 1M-context beta — disabled for this session and retrying...",

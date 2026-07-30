@@ -29,6 +29,10 @@ def test_remote_cutover_stops_before_atomic_current_switch():
     assert "cross-release continuity preparation failed before remote deployment" in script
     drain = script.index("write_drain_request(principal=", cutover - 10_000)
     assert drain < stop_dashboard
+    authority_preflight = script.index("HERMES_DEPLOY_STAGE authority_preflight=passed")
+    assert authority_preflight < stop_dashboard
+    assert 'dashboard authority status --json' in script
+    assert "documented offline recovery workflow" in script
     assert 'gateway_drain_status" = "draining:0"' in script
     assert 'print("{}:{}".format(s.get("gateway_state", ""), s.get("active_agents", 0)))' in script
     assert "is_gateway_runtime_lock_active() or get_running_pid()" in script

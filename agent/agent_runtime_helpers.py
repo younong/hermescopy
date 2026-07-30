@@ -2971,7 +2971,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
 
 
 
-def force_close_tcp_sockets(client: Any) -> int:
+def abort_tcp_sockets(client: Any) -> int:
     """Abort in-flight TCP I/O by shutting down sockets WITHOUT closing FDs.
 
     When a provider drops a connection mid-stream — or the user issues an
@@ -3048,5 +3048,5 @@ __all__ = [
     "extract_api_error_context",
     "apply_pending_steer_to_tool_results",
     "_iter_pool_sockets",
-    "force_close_tcp_sockets",
+    "abort_tcp_sockets",
 ]

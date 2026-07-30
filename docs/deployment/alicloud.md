@@ -76,6 +76,35 @@ ssh -L 9119:localhost:9119 root@106.15.186.104
 
 然后在本机打开 `http://localhost:9119`。服务始终保留 `--require-auth`，所以 tunnel 访问仍需 Hermes user 登录。
 
+## Authority 损坏恢复
+
+部署在停止服务和切换 `current` 之前，会用候选 release 只读运行：
+
+```bash
+hermes dashboard authority status --json
+```
+
+如果 authority 无法读取或存在 `authority.sqlite3.recovery-required.json`，部署会停止，且不会删除 marker、修复数据库或回滚 authority。按以下离线流程恢复：
+
+1. 停止 Dashboard（以及可能持有 authority 生命周期锁的 owner 进程），不要删除或改名 marker。
+2. 查看状态并确保 forensic copy 已保存：
+   ```bash
+   hermes dashboard authority status --json
+   hermes dashboard authority preserve --json
+   ```
+3. 从 marker 记录的 incident ID 与 SHA-256 固定来源执行恢复。仅当来源精确匹配 `SQLit` 后 byte 5 的 TLS record 损坏时才使用专用模式：
+   ```bash
+   hermes dashboard authority recover \
+     --incident <incident-id> \
+     --source <untouched-source.sqlite3> \
+     --sha256 <sha256> \
+     --repair-tls-offset-5 \
+     --json
+   ```
+4. 启动 Dashboard，并验证新登录、WS ticket、Owner Worker 对话和冷 Session Reader resume。
+
+恢复命令不修改来源文件。它在同目录 staging DB 上验证完整性和 schema，通过 SQLite backup 重建，推进 recovery generation，撤销旧 scope/ticket/bootstrap/Worker/Reader authority，并在 DB 与 browser-ticket keyring witness 均持久化一致后才清除 marker。禁止直接恢复陈旧 DB、手工删除 marker 或跳过 recovery fencing。
+
 ## 推荐：使用 SSH key
 
 ```bash
