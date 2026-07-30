@@ -81,7 +81,6 @@ import SessionsPage from "@/pages/SessionsPage";
 import LogsPage from "@/pages/LogsPage";
 import AnalyticsPage from "@/pages/AnalyticsPage";
 import ModelsPage from "@/pages/ModelsPage";
-import ModelRegistrationsPage from "@/pages/ModelRegistrationsPage";
 import CronPage from "@/pages/CronPage";
 import ProfilesPage from "@/pages/ProfilesPage";
 import ProfileBuilderPage from "@/pages/ProfileBuilderPage";
@@ -144,7 +143,6 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/files": FilesPage,
   "/analytics": AnalyticsPage,
   "/models": ModelsPage,
-  "/model-registrations": ModelRegistrationsPage,
   "/logs": LogsPage,
   "/cron": CronPage,
   "/skills": SkillsPage,
@@ -189,12 +187,6 @@ const BUILTIN_NAV_REST: NavItem[] = [
     labelKey: "models",
     label: "Models",
     icon: Cpu,
-  },
-  {
-    path: "/model-registrations",
-    labelKey: "modelRegistrations",
-    label: "Model Registrations",
-    icon: PanelsTopLeft,
   },
   { path: "/logs", labelKey: "logs", label: "Logs", icon: FileText },
   { path: "/cron", labelKey: "cron", label: "Cron", icon: Clock },

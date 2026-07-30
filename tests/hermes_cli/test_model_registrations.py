@@ -8,7 +8,7 @@ from agent import image_gen_registry, video_gen_registry
 from agent.image_gen_provider import ImageGenProvider
 from agent.video_gen_provider import VideoGenProvider
 from hermes_cli import model_registrations
-from hermes_cli.config import DEFAULT_CONFIG, load_config, load_env
+from hermes_cli.config import DEFAULT_CONFIG, load_config, load_env, save_config
 
 
 class _ImageProvider(ImageGenProvider):
@@ -138,6 +138,81 @@ def test_custom_chat_secret_is_env_only_and_empty_update_preserves():
     })
     assert updated["credential_configured"] is True
     assert load_env()[registration["key_env"]] == "super-secret-value"
+
+
+def test_custom_chat_registration_resolves_through_runtime_provider():
+    created = model_registrations.create_model_registration({
+        "name": "Runtime endpoint",
+        "kind": "chat",
+        "source": "custom",
+        "model": "runtime-model",
+        "base_url": "https://runtime.example/v1",
+        "api_mode": "anthropic_messages",
+        "api_key": "runtime-secret",
+    })
+
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    resolved = resolve_runtime_provider(requested=created["provider"])
+
+    assert resolved["provider"] == "custom"
+    assert resolved["api_mode"] == "anthropic_messages"
+    assert resolved["base_url"] == "https://runtime.example/v1"
+    assert resolved["api_key"] == "runtime-secret"
+    assert resolved["model"] == "runtime-model"
+    assert resolved["requested_provider"] == created["provider"]
+
+
+def test_deleting_inactive_custom_chat_cleans_generated_provider_and_secret():
+    created = model_registrations.create_model_registration({
+        "name": "Disposable endpoint",
+        "kind": "chat",
+        "source": "custom",
+        "model": "disposable-model",
+        "base_url": "https://disposable.example/v1",
+        "api_mode": "openai",
+        "api_key": "disposable-secret",
+    })
+    config = load_config()
+    registration = config["model_registrations"][created["id"]]
+    provider = registration["provider"]
+    key_env = registration["key_env"]
+
+    assert model_registrations.delete_model_registration(created["id"]) == {
+        "ok": True,
+        "id": created["id"],
+    }
+
+    config = load_config()
+    assert created["id"] not in config["model_registrations"]
+    assert provider not in config["providers"]
+    assert key_env not in load_env()
+
+
+def test_active_custom_chat_delete_has_no_partial_cleanup():
+    created = model_registrations.create_model_registration({
+        "name": "Active endpoint",
+        "kind": "chat",
+        "source": "custom",
+        "model": "active-model",
+        "base_url": "https://active.example/v1",
+        "api_mode": "openai",
+        "api_key": "active-secret",
+    })
+    config = load_config()
+    registration = config["model_registrations"][created["id"]]
+    provider = registration["provider"]
+    key_env = registration["key_env"]
+    config["model"] = {"provider": provider, "default": registration["model"]}
+    save_config(config, preserve_keys={("model",)})
+
+    with pytest.raises(model_registrations.ModelRegistrationConflict):
+        model_registrations.delete_model_registration(created["id"])
+
+    config = load_config()
+    assert config["model_registrations"][created["id"]] == registration
+    assert provider in config["providers"]
+    assert load_env()[key_env] == "active-secret"
 
 
 def test_duplicate_type_and_catalog_validation(monkeypatch):

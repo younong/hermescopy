@@ -46,9 +46,9 @@ import {
   type MessageAttachmentState,
 } from "../types";
 import { Composer } from "./Composer";
+import { GuiChatModelsPane } from "./GuiChatModelsPane";
 import { GuiChatSkillsPane } from "./GuiChatSkillsPane";
 import { MessageList } from "./MessageList";
-import { RegisteredModelPickerDialog } from "./RegisteredModelPickerDialog";
 
 export function GuiChatShell() {
   const { t } = useI18n();
@@ -61,7 +61,8 @@ export function GuiChatShell() {
   const workspacePath = location.pathname.replace(/\/$/, "");
   const filesOpen = workspacePath === "/chat-gui/files";
   const skillsOpen = workspacePath === "/chat-gui/skills";
-  const workspacePaneOpen = filesOpen || skillsOpen;
+  const modelsOpen = workspacePath === "/chat-gui/models";
+  const workspacePaneOpen = filesOpen || skillsOpen || modelsOpen;
   const [state, dispatch] = useReducer(guiChatReducer, initialGuiChatState);
   const connectionRef = useRef<GuiChatConnection | null>(null);
   const historyAbortRef = useRef<AbortController | null>(null);
@@ -90,7 +91,6 @@ export function GuiChatShell() {
   const [sessionQuery, setSessionQuery] = useState("");
   const [activeSessionTitle, setActiveSessionTitle] = useState<string | null>(null);
   const [connectWeChatOpen, setConnectWeChatOpen] = useState(false);
-  const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const { authMe, authRequired, ownerKey, ready: authIdentityReady } = useDashboardAuthIdentity();
   const weChatStatus = authMe?.feature_status?.weixin_ilink_connect;
   const weChatReady = Boolean(authMe?.features?.weixin_ilink_connect);
@@ -687,12 +687,12 @@ export function GuiChatShell() {
           <span>Skills</span>
         </button>
         <button
-          aria-label="Switch registered model"
+          aria-current={modelsOpen ? "page" : undefined}
+          aria-label="Manage models"
           className="gui-chat-nav-item"
-          disabled={!state.sessionId || state.connection !== "open"}
           onClick={() => {
             closeMobilePanel();
-            setModelPickerOpen(true);
+            navigate("/chat-gui/models");
           }}
           type="button"
         >
@@ -777,16 +777,6 @@ export function GuiChatShell() {
           unavailableMessage={weChatUnavailableMessage}
         />
       ) : null}
-      {modelPickerOpen && state.sessionId ? (
-        <RegisteredModelPickerDialog
-          busy={state.isGenerating}
-          currentModel={state.model}
-          currentProvider={state.provider}
-          onClose={() => setModelPickerOpen(false)}
-          onSwitchChat={switchChatModel}
-          profile={profile}
-        />
-      ) : null}
       {!narrow ? (
         <aside aria-label="Chat workspace" className="gui-chat-sidebar">
           {sidebar}
@@ -809,7 +799,7 @@ export function GuiChatShell() {
           ) : <div className="w-8" />}
           <div className="pointer-events-none absolute inset-x-20 top-1/2 min-w-0 -translate-y-1/2 text-center">
             <h1 className="truncate text-[14px] font-medium leading-[22px] text-[#25282d]">
-              {filesOpen ? "Files" : skillsOpen ? "Skills" : conversationTitle}
+              {filesOpen ? "Files" : skillsOpen ? "Skills" : modelsOpen ? "Models" : conversationTitle}
             </h1>
             <p className="truncate text-[0.625rem] text-[#969aa1]">
               {workspacePaneOpen
@@ -841,6 +831,15 @@ export function GuiChatShell() {
           <GuiChatFilesPane />
         ) : skillsOpen ? (
           <GuiChatSkillsPane profile={profile} />
+        ) : modelsOpen ? (
+          <GuiChatModelsPane
+            busy={state.isGenerating}
+            canSwitchChat={Boolean(state.sessionId && state.connection === "open")}
+            currentModel={state.model}
+            currentProvider={state.provider}
+            onSwitchChat={switchChatModel}
+            profile={profile}
+          />
         ) : (
           <>
             {resumeNotice ? (
