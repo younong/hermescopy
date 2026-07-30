@@ -269,8 +269,15 @@ def _validate_candidate(path: Path) -> ReplayContinuity:
         raise AuthorityRecoveryError("recovery candidate validation failed") from exc
 
 
-def _fence_candidate(path: Path, *, keyring_generation: int) -> ReplayContinuity:
+def _fence_candidate(
+    path: Path,
+    *,
+    keyring_authority_id: str,
+    keyring_generation: int,
+) -> ReplayContinuity:
     current = _validate_candidate(path)
+    if current.authority_id != keyring_authority_id:
+        raise AuthorityRecoveryError("recovery candidate authority identity mismatch")
     with sqlite3.connect(path, timeout=5, isolation_level=None) as conn:
         with write_txn(conn):
             generation = max(current.recovery_generation, keyring_generation) + 1
@@ -336,8 +343,8 @@ def recover_authority(
     if str(marker["incident_id"]) != str(incident_id):
         raise AuthorityRecoveryError("incident ID does not match recovery marker")
     expected = str(expected_sha256).lower()
-    if expected != str(marker["sha256"]) or len(expected) != 64:
-        raise AuthorityRecoveryError("recovery digest does not match recovery marker")
+    if len(expected) != 64 or any(ch not in "0123456789abcdef" for ch in expected):
+        raise AuthorityRecoveryError("recovery source digest is invalid")
     source = Path(source)
     try:
         source_status = source.lstat()
@@ -381,9 +388,14 @@ def recover_authority(
                 witness = keyring["replay_continuity"]
                 fenced = _fence_candidate(
                     rebuilt,
+                    keyring_authority_id=witness.authority_id,
                     keyring_generation=witness.recovery_generation,
                 )
                 _validate_candidate(rebuilt)
+                live_stat = store.path.stat()
+                if os.name != "nt":
+                    os.chown(rebuilt, live_stat.st_uid, live_stat.st_gid)
+                os.chmod(rebuilt, stat.S_IMODE(live_stat.st_mode))
                 # A WAL/SHM/journal belonging to the quarantined inode must never
                 # be replayed against the rebuilt database after replacement.
                 for suffix in SQLITE_SIDECAR_SUFFIXES:
@@ -406,6 +418,13 @@ def recover_authority(
                             "WHERE key='recovery_required'"
                         )
                 _validate_candidate(store.path)
+                for suffix in SQLITE_SIDECAR_SUFFIXES:
+                    owned_path = store.path.with_name(store.path.name + suffix)
+                    try:
+                        if os.name != "nt":
+                            os.chown(owned_path, live_stat.st_uid, live_stat.st_gid)
+                    except FileNotFoundError:
+                        pass
                 store.recovery_marker_path.unlink()
                 _fsync_directory(home)
             finally:

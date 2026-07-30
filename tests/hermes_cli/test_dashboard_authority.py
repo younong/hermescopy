@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pytest
 
 from hermes_cli.dashboard_auth.authority import (
     AuthorizationScope,
+    AuthorityCorrupt,
     AuthorityStore,
     AuthorizationRejected,
     ReaderGenerationState,
@@ -67,12 +69,16 @@ def _incident(
     old_reader_lease = store.read_session_reader_lease("owner")
     assert old_worker_lease is not None
     assert old_reader_lease is not None
+    healthy_source = control_home / "healthy-source.sqlite3"
+    healthy_source.write_bytes(store.path.read_bytes())
     source = control_home / "source.sqlite3"
-    source.write_bytes(store.path.read_bytes())
+    source.write_bytes(healthy_source.read_bytes())
     _corrupt_tls_header(source)
     store.path.write_bytes(source.read_bytes())
-    with pytest.raises(Exception):
-        store.activate(AuthorizationScope("stub", "tenant", "user", "new-session", "revision"))
+    with pytest.raises(AuthorityCorrupt):
+        raise store._quarantine_corruption(  # noqa: SLF001 - incident fixture
+            "integrity_check returned 'file is not a database'"
+        )
     marker = json.loads(store.recovery_marker_path.read_text())
     return store, source, marker, old_scope_state, old_worker_lease, old_reader_lease
 
@@ -108,7 +114,15 @@ def test_recovery_requires_matching_incident_digest_and_offline_lock(tmp_path, m
             repair_tls_offset_5=True,
             control_home=control_home,
         )
-    with pytest.raises(AuthorityRecoveryError, match="digest"):
+    with pytest.raises(AuthorityRecoveryError, match="digest is invalid"):
+        recover_authority(
+            incident_id=str(marker["incident_id"]),
+            source=source,
+            expected_sha256="not-a-sha256",
+            repair_tls_offset_5=True,
+            control_home=control_home,
+        )
+    with pytest.raises(AuthorityRecoveryError, match="digest mismatch"):
         recover_authority(
             incident_id=str(marker["incident_id"]),
             source=source,
@@ -132,6 +146,51 @@ def test_recovery_requires_matching_incident_digest_and_offline_lock(tmp_path, m
     assert store.recovery_marker_path.exists()
 
 
+def test_recovery_accepts_separately_digest_pinned_healthy_source(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    control_home = tmp_path / "control-plane"
+    control_home.mkdir(mode=0o700)
+    ws_tickets.mint_ticket(user_id="user", provider="stub")
+    store, _, marker, _, _, _ = _incident(control_home)
+
+    healthy_source = control_home / "healthy-source.sqlite3"
+    healthy_digest = sha256_file(healthy_source)
+    assert healthy_digest != marker["sha256"]
+
+    result = recover_authority(
+        incident_id=str(marker["incident_id"]),
+        source=healthy_source,
+        expected_sha256=healthy_digest,
+        repair_tls_offset_5=False,
+        control_home=control_home,
+    )
+
+    assert result.state == "healthy"
+    assert result.recovery_generation == 1
+    assert not store.recovery_marker_path.exists()
+
+
+def test_recovery_rejects_foreign_authority_source(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    control_home = tmp_path / "control-plane"
+    control_home.mkdir(mode=0o700)
+    ws_tickets.mint_ticket(user_id="user", provider="stub")
+    store, _, marker, _, _, _ = _incident(control_home)
+    foreign = AuthorityStore(tmp_path / "foreign-control-plane")
+    foreign.activate(_scope())
+
+    with pytest.raises(AuthorityRecoveryError, match="authority identity mismatch"):
+        recover_authority(
+            incident_id=str(marker["incident_id"]),
+            source=foreign.path,
+            expected_sha256=sha256_file(foreign.path),
+            repair_tls_offset_5=False,
+            control_home=control_home,
+        )
+
+    assert store.recovery_marker_path.exists()
+
+
 def test_tls_offset_5_recovery_fences_old_authority_and_clears_marker(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     control_home = tmp_path / "control-plane"
@@ -146,6 +205,15 @@ def test_tls_offset_5_recovery_fences_old_authority_and_clears_marker(tmp_path, 
         old_reader_lease,
     ) = _incident(control_home)
 
+    live_stat = store.path.stat()
+    chown_calls = []
+    real_chown = os.chown
+
+    def _record_chown(path, uid, gid):
+        chown_calls.append((Path(path), uid, gid))
+        real_chown(path, uid, gid)
+
+    monkeypatch.setattr("hermes_cli.dashboard_authority.os.chown", _record_chown)
     result = recover_authority(
         incident_id=str(marker["incident_id"]),
         source=source,
@@ -155,6 +223,17 @@ def test_tls_offset_5_recovery_fences_old_authority_and_clears_marker(tmp_path, 
     )
 
     assert result.state == "healthy"
+    assert any(
+        path.name.startswith(".authority-recovery-built.")
+        and (uid, gid) == (live_stat.st_uid, live_stat.st_gid)
+        for path, uid, gid in chown_calls
+    )
+    recovered_stat = store.path.stat()
+    assert (recovered_stat.st_uid, recovered_stat.st_gid) == (
+        live_stat.st_uid,
+        live_stat.st_gid,
+    )
+    assert recovered_stat.st_mode & 0o777 == live_stat.st_mode & 0o777
     assert result.recovery_generation == 1
     assert not store.recovery_marker_path.exists()
     with sqlite3.connect(store.path) as conn:
@@ -191,8 +270,10 @@ def test_preserve_retries_failed_evidence_without_changing_incident(tmp_path, mo
         "hermes_cli.dashboard_auth.authority.copy_sqlite_forensics",
         lambda _path: None,
     )
-    with pytest.raises(Exception):
-        store.activate(AuthorizationScope("stub", "tenant", "user", "new", "revision"))
+    with pytest.raises(AuthorityCorrupt):
+        raise store._quarantine_corruption(  # noqa: SLF001 - incident fixture
+            "integrity_check returned 'file is not a database'"
+        )
     original = json.loads(store.recovery_marker_path.read_text())
     assert original["preserved"] is False
 

@@ -1556,7 +1556,12 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         return
     if str(resolved) in _INITIALIZED_PATHS:
         return
-    reason = probe_sqlite_integrity(resolved, _sqlite_connect)
+    try:
+        reason = probe_sqlite_integrity(resolved, _sqlite_connect)
+    except sqlite3.OperationalError:
+        raise
+    except sqlite3.DatabaseError as exc:
+        reason = f"sqlite refused to open file: {exc}"
     if reason is None:
         return
     backup = copy_sqlite_forensics(resolved)

@@ -152,23 +152,18 @@ def probe_sqlite_integrity(
     """Return a corruption reason, or ``None`` when integrity is healthy.
 
     ``connect`` must open read/write so SQLite can recover or checkpoint a
-    healthy WAL/hot-journal database. Lock/busy and other
-    :class:`sqlite3.OperationalError` failures propagate unchanged and must not
-    be classified as corruption. Other SQLite database errors become a reason
-    suitable for a caller-owned corruption policy.
+    healthy WAL/hot-journal database. SQLite exceptions propagate unchanged;
+    an active failure window is not stable evidence of corruption. Only a
+    completed integrity check with a non-``ok`` result returns a corruption
+    reason for the caller's policy.
     """
+    probe = connect(path)
     try:
-        probe = connect(path)
-        try:
-            row = probe.execute("PRAGMA integrity_check").fetchone()
-        finally:
-            probe.close()
-        if not row or (row[0] or "").lower() != "ok":
-            return f"integrity_check returned {row[0] if row else '<no row>'!r}"
-    except sqlite3.OperationalError:
-        raise
-    except sqlite3.DatabaseError as exc:
-        return f"sqlite refused to open file: {exc}"
+        row = probe.execute("PRAGMA integrity_check").fetchone()
+    finally:
+        probe.close()
+    if not row or (row[0] or "").lower() != "ok":
+        return f"integrity_check returned {row[0] if row else '<no row>'!r}"
     return None
 
 

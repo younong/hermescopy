@@ -25,7 +25,6 @@ from hermes_cli.dashboard_auth.lifecycle import (
     authority_init_lock,
 )
 from hermes_cli.sqlite_util import (
-    classify_sqlite_header,
     copy_sqlite_forensics,
     probe_sqlite_integrity,
     sha256_file,
@@ -366,12 +365,6 @@ class AuthorityStore:
 
     @staticmethod
     def _corruption_classification(reason: str) -> str:
-        if "byte offset 5" in reason:
-            return "tls_record_at_offset_5"
-        if "byte offset 0" in reason:
-            return "tls_record_at_offset_0"
-        if "invalid SQLite header" in reason:
-            return "invalid_sqlite_header"
         if "zero-byte" in reason:
             return "zero_length_database"
         return "sqlite_integrity_failure"
@@ -539,13 +532,10 @@ class AuthorityStore:
             raise AuthorityUnavailable("authority store cannot be inspected") from exc
         if size == 0:
             raise self._quarantine_corruption("pre-existing zero-byte database")
-        header_reason = classify_sqlite_header(self.path)
-        if header_reason is not None:
-            raise self._quarantine_corruption(header_reason)
         try:
             integrity_reason = probe_sqlite_integrity(self.path, self._raw_connect)
-        except sqlite3.OperationalError:
-            raise
+        except sqlite3.Error as exc:
+            raise AuthorityUnavailable("authority store is unavailable") from exc
         if integrity_reason is not None:
             raise self._quarantine_corruption(integrity_reason)
 
@@ -733,15 +723,8 @@ class AuthorityStore:
 
     def _connect(self) -> sqlite3.Connection:
         self._raise_if_recovery_required()
-        header_reason = classify_sqlite_header(self.path)
-        if header_reason is not None:
-            raise self._quarantine_corruption(header_reason)
         try:
             return self._raw_connect(self.path)
-        except sqlite3.DatabaseError as exc:
-            raise self._quarantine_corruption(
-                f"sqlite refused to open file: {exc}"
-            ) from exc
         except sqlite3.Error as exc:
             raise AuthorityUnavailable("authority store cannot be opened") from exc
 
