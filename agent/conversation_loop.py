@@ -422,21 +422,31 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     return True
 
 
-def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List[str]] = None) -> str:
+def _get_continuation_prompt(
+    is_partial_stub: bool,
+    dropped_tools: Optional[List[str]] = None,
+    retry_attempt: int = 1,
+) -> str:
     if is_partial_stub and dropped_tools:
         tool_list = ", ".join(dropped_tools[:3])
+        repeated_retry = (
+            " This has happened again, so reduce the scope further; do not "
+            "substitute another full-payload rewrite."
+            if retry_attempt > 1
+            else ""
+        )
         return (
-            "[System: Your previous tool call "
-            f"({tool_list}) was too large and "
-            "the stream timed out before it "
-            "could be delivered. Do NOT retry "
-            "the same tool call with the same "
-            "large content. Instead, break the "
-            "content into multiple smaller tool "
-            "calls (e.g. use multiple patch calls "
-            "or write smaller files). Each tool "
-            "call's arguments must be under ~8K "
-            "tokens to avoid stream timeouts.]"
+            "[System: The upstream response stream ended before the arguments "
+            f"for your previous tool call ({tool_list}) were complete. The "
+            "incomplete call was discarded and did not run. This interruption "
+            "does not establish any fixed token or payload-size limit. Do not "
+            "regenerate the complete payload. On this retry, make exactly one "
+            "small, self-contained tool call that advances the task "
+            "incrementally. For a large file, write only a short skeleton or "
+            "one section, then add later sections with separate patch calls. "
+            "If prior work may already exist, use this retry to inspect it and "
+            "continue from that state on the following turn."
+            f"{repeated_retry}]"
         )
     elif is_partial_stub:
         return (
@@ -627,6 +637,7 @@ def run_conversation(
     terminal_failure_reason = None
     codex_ack_continuations = 0
     length_continue_retries = 0
+    dropped_tool_stream_retries = 0
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
     compression_attempts = 0
@@ -1893,6 +1904,7 @@ def run_conversation(
                                     messages = agent._get_messages_up_to_last_assistant(messages)
                                 agent._session_messages = messages
                                 length_continue_retries = 0
+                                dropped_tool_stream_retries = 0
                                 truncated_response_parts = []
                                 retry_count = 0
                                 compression_attempts = 0
@@ -1923,6 +1935,7 @@ def run_conversation(
                                 )
 
                                 if _is_partial_stream_stub and _dropped_tools:
+                                    dropped_tool_stream_retries += 1
                                     _tool_list = ", ".join(_dropped_tools[:3])
                                     agent._vprint(
                                         f"{agent.log_prefix}↻ Stream interrupted mid "
@@ -1943,7 +1956,9 @@ def run_conversation(
                                     )
 
                                 _continue_content = _get_continuation_prompt(
-                                    _is_partial_stream_stub, _dropped_tools
+                                    _is_partial_stream_stub,
+                                    _dropped_tools,
+                                    retry_attempt=dropped_tool_stream_retries,
                                 )
                                 continue_msg = {
                                     "role": "user",
