@@ -1,0 +1,11 @@
+# Project-local Codex CLI configuration.
+# Credentials stay in the environment; never put tokens in this file.
+model = "gpt-5.6-sol"
+model_provider = "slade"
+
+[model_providers.slade]
+name = "Slade OpenAI-compatible gateway"
+base_url = "https://sub.sladezhang.tech/v1"
+env_key = "ANTHROPIC_AUTH_TOKEN"
+wire_api = "responses"
+requires_openai_auth = false
