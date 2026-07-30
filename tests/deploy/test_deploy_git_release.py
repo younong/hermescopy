@@ -286,6 +286,7 @@ def test_create_tag_cli_dry_run_reports_powerpoint_provisioning(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert "PowerPoint runtime smoke: planned" in result.stdout
+    assert "Authority concurrency smoke: planned" in result.stdout
     assert "PowerPoint host provisioning: enabled" in result.stdout
     assert 'npm ci --omit=dev --ignore-scripts --no-audit' in result.stdout
     assert "v-test-powerpoint" in result.stdout

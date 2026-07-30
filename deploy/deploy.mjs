@@ -710,6 +710,8 @@ rollback_dir=""
 deployment_committed="0"
 services_touched="0"
 smoke_root=""
+authority_smoke_root=""
+authority_smoke_result=""
 reader_smoke_root=""
 reader_smoke_result=""
 powerpoint_smoke_owner=""
@@ -763,6 +765,7 @@ cleanup_release_tmp() {
   fi
   rm -rf -- "$release_tmp"
   [ -z "$smoke_root" ] || rm -rf -- "$smoke_root"
+  [ -z "$authority_smoke_root" ] || rm -rf -- "$authority_smoke_root"
   [ -z "$reader_smoke_root" ] || rm -rf -- "$reader_smoke_root"
   [ -z "$powerpoint_smoke_owner" ] || rm -rf -- "$powerpoint_smoke_owner"
   rm -f -- "$staged_runner" "$staged_gateway_unit" "$staged_dashboard_unit" "$staged_sandbox_policy" "$staged_sandbox_seccomp" "$current.next.$$" "$current.rollback.$$"
@@ -944,6 +947,9 @@ test -f "$release/deploy/smoke-powerpoint-runtime.py"
 test -f "$release/deploy/check-executor-cgroup-host.py"
 test -f "$release/deploy/smoke-executor-resources.py"
 test -f "$release/deploy/run-cgroup-smoke.py"
+test -f "$release/deploy/smoke-authority-concurrency.py"
+test -f "$release/deploy/smoke-session-reader.py"
+test -f "$release/deploy/smoke-conversation.py"
 test -f "$release/skills/productivity/powerpoint/scripts/office/soffice.py"
 
 powerpoint_manifest="$release/deploy/runtime/alicloud3-powerpoint-packages.json"
@@ -1368,6 +1374,26 @@ while :; do
   sleep 1
 done
 
+# Candidate-release authority preflight runs before any service or active
+# artifact changes. It is strictly read-only and refuses recovery-required or
+# unreadable state; operators must use the offline authority workflow instead.
+if ! authority_status="$(
+  runuser -u "$service_user" -- env -i \
+    HOME="$shared" HERMES_HOME="$hermes_home" PYTHONPATH="$release" \
+    "$venv/bin/python" -m hermes_cli.main dashboard authority status --json
+)"; then
+  echo "HERMES_DEPLOY_STAGE authority_preflight=failed" >&2
+  echo "Authority preflight failed; run 'hermes dashboard authority status' and the documented offline recovery workflow" >&2
+  exit 1
+fi
+printf '%s' "$authority_status" | "$venv/bin/python" -c '
+import json, sys
+payload = json.load(sys.stdin)
+if payload.get("state") not in {"healthy", "uninitialized"}:
+    raise SystemExit("authority recovery is required before deployment")
+'
+echo "HERMES_DEPLOY_STAGE authority_preflight=passed"
+
 # Stop the old release before changing any active artifact. Dashboard shutdown
 # drains its Owner Workers; Gateway SIGTERM reuses its resume/flush shutdown.
 services_touched="1"
@@ -1477,6 +1503,72 @@ else
   echo "HERMES_DEPLOY_STAGE executor_resource_preflight=unavailable"
   echo "Authenticated tools remain fail closed until the documented cgroup v2 migration is complete"
 fi
+
+# Exercise the candidate authority implementation with isolated synthetic state.
+# This deliberately never points HOME, TMPDIR, or HERMES_HOME at shared state.
+authority_smoke_root="$(mktemp -d /tmp/hermes-authority-release-smoke.XXXXXX)"
+chown "$service_user:$service_group" "$authority_smoke_root"
+chmod 0700 "$authority_smoke_root"
+echo "Running deterministic authority concurrency smoke before deployment commit"
+if ! authority_smoke_result="$(
+  cd "$authority_smoke_root"
+  exec runuser -u "$service_user" -- env -i \
+    HOME="$authority_smoke_root" \
+    TMPDIR="$authority_smoke_root" \
+    HERMES_HOME="$authority_smoke_root" \
+    PATH="$venv/bin:/usr/local/bin:/usr/bin:/bin" \
+    PYTHONPATH="$release" \
+    PYTHONUNBUFFERED=1 \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    "$venv/bin/python" "$release/deploy/smoke-authority-concurrency.py" \
+    --root "$authority_smoke_root/work"
+)"; then
+  printf '%s\n' "$authority_smoke_result"
+  echo "HERMES_DEPLOY_STAGE authority_concurrency_smoke=failed" >&2
+  echo "Authority concurrency smoke failed; deployment remains uncommitted and will be rolled back" >&2
+  exit 1
+fi
+printf '%s\n' "$authority_smoke_result"
+if ! printf '%s' "$authority_smoke_result" | "$venv/bin/python" -c '
+import json, sys
+result = json.load(sys.stdin)
+required = {
+    "environment_isolation", "concurrent_initialization", "scope_visibility",
+    "browser_exact_once", "worker_bootstrap_exact_once", "worker_lifecycle",
+    "authority_checkpoint", "authority_integrity", "authority_schema",
+    "authority_recovery_state", "recovery_artifacts", "artifact_cleanup",
+}
+checks = {
+    item.get("name") for item in result.get("checks", [])
+    if isinstance(item, dict) and item.get("status") == "passed"
+}
+cleanup = result.get("cleanup") or {}
+observations = result.get("observations") or {}
+if result.get("schemaVersion") != 1:
+    raise SystemExit("unsupported authority concurrency smoke schema")
+if result.get("kind") != "hermes.authority-concurrency-smoke":
+    raise SystemExit("unexpected authority concurrency smoke kind")
+if result.get("status") != "passed" or not required.issubset(checks):
+    raise SystemExit("authority concurrency smoke did not pass all required checks")
+if (
+    observations.get("checkpoint", {}).get("busy") != 0
+    or observations.get("integrity") != "ok"
+    or observations.get("schemaVersion") != 6
+    or observations.get("recoveryRequired") != 0
+    or observations.get("recoveryArtifacts") != 0
+):
+    raise SystemExit("authority concurrency smoke observations are invalid")
+if not cleanup or not all(bool(value) for value in cleanup.values()):
+    raise SystemExit("authority concurrency smoke cleanup was incomplete")
+'; then
+  echo "HERMES_DEPLOY_STAGE authority_concurrency_smoke=failed" >&2
+  echo "Authority concurrency smoke result validation failed; deployment remains uncommitted and will be rolled back" >&2
+  exit 1
+fi
+echo "HERMES_DEPLOY_STAGE authority_concurrency_smoke=passed"
+rm -rf -- "$authority_smoke_root"
+authority_smoke_root=""
 
 # Gate Reader performance before commit using only isolated synthetic state.
 reader_smoke_root="$(mktemp -d /tmp/hermes-reader-release-smoke.XXXXXX)"
@@ -1689,6 +1781,24 @@ function remoteStagePassed(error, stage) {
   return output.includes(`HERMES_DEPLOY_STAGE ${stage}=passed`);
 }
 
+function authorityConcurrencySummary(smoke) {
+  if (!smoke) {
+    return null;
+  }
+  const observations = smoke.observations || {};
+  const checkpoint = observations.checkpoint || {};
+  return {
+    health: [
+      `checkpointBusy=${checkpoint.busy ?? "?"}`,
+      `integrity=${observations.integrity ?? "?"}`,
+      `schema=${observations.schemaVersion ?? "?"}`,
+      `recoveryRequired=${observations.recoveryRequired ?? "?"}`,
+    ].join(" "),
+    cleanup: Object.values(smoke.cleanup || {}).every(Boolean) ? "passed" : "failed",
+    failure: smoke.failure || null,
+  };
+}
+
 function readerPerformanceSummary(smoke) {
   if (!smoke) {
     return null;
@@ -1736,6 +1846,15 @@ function printSummary(args, result) {
   );
   console.log(`PowerPoint runtime smoke: ${result.powerpointSmoke}`);
   console.log(`PowerPoint host provisioning: ${args.provisionPowerpointDeps ? "enabled" : "preflight only"}`);
+  console.log(`Authority concurrency smoke: ${result.authorityConcurrencySmoke}`);
+  const authoritySummary = authorityConcurrencySummary(result.authorityConcurrencyResult);
+  if (authoritySummary) {
+    console.log(`Authority checkpoint/integrity/schema/recovery: ${authoritySummary.health}`);
+    console.log(`Authority cleanup: ${authoritySummary.cleanup}`);
+    if (authoritySummary.failure) {
+      console.log(`Authority failure: ${authoritySummary.failure.code}/${authoritySummary.failure.check}`);
+    }
+  }
   console.log(`Session Reader performance smoke: ${result.readerPerformanceSmoke}`);
   const readerSummary = readerPerformanceSummary(result.readerPerformanceResult);
   if (readerSummary) {
@@ -1807,6 +1926,7 @@ function main() {
   args.releaseId = releaseIdFor(args);
   const { tmp, archivePath } = createArchive(args, { dryRun: args.dryRun });
   let deploymentCommitted = false;
+  let authorityConcurrencyResult = null;
   let readerPerformanceResult = null;
   let continuityPrepare = null;
   try {
@@ -1818,6 +1938,9 @@ function main() {
     }
     try {
       const remoteResult = deployArchive(args, archivePath);
+      authorityConcurrencyResult = args.dryRun
+        ? null
+        : parseSmokeResult(remoteResult.stdout, "hermes.authority-concurrency-smoke");
       readerPerformanceResult = args.dryRun
         ? null
         : parseSmokeResult(remoteResult.stdout, "hermes.session-reader-performance-smoke");
@@ -1826,6 +1949,10 @@ function main() {
         throw new Error("remote deployment completed without a commit marker");
       }
     } catch (error) {
+      authorityConcurrencyResult = parseSmokeResult(
+        error?.commandResult?.stdout,
+        "hermes.authority-concurrency-smoke",
+      );
       readerPerformanceResult = parseSmokeResult(
         error?.commandResult?.stdout,
         "hermes.session-reader-performance-smoke",
@@ -1836,6 +1963,12 @@ function main() {
           : remoteStagePassed(error, "powerpoint_runtime_smoke")
             ? "passed"
             : "failed or not reached",
+        authorityConcurrencySmoke: args.dryRun
+          ? "planned"
+          : remoteStagePassed(error, "authority_concurrency_smoke")
+            ? "passed"
+            : "failed or not reached",
+        authorityConcurrencyResult,
         readerPerformanceSmoke: args.dryRun
           ? "planned"
           : remoteStagePassed(error, "session_reader_performance_smoke")
@@ -1869,6 +2002,8 @@ function main() {
         : "deployment committed but public smoke failed";
     printSummary(args, {
       powerpointSmoke: args.dryRun ? "planned" : "passed",
+      authorityConcurrencySmoke: args.dryRun ? "planned" : "passed",
+      authorityConcurrencyResult,
       readerPerformanceSmoke: args.dryRun ? "planned" : "passed",
       readerPerformanceResult,
       deterministicSmoke: args.dryRun ? "planned" : "passed",

@@ -71,7 +71,6 @@ new locking.
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import json
 import os
 import re
@@ -89,7 +88,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli.sqlite_util import (
+    add_column_if_missing as _add_column_if_missing,
+    classify_sqlite_header,
+    copy_sqlite_forensics,
+    probe_sqlite_integrity,
+)
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -1282,7 +1286,6 @@ CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_
 
 _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
-_SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
 
 # Bounded acquire for the cross-process init lock (#36644). The original bare
@@ -1496,57 +1499,6 @@ def _dispatch_tick_lock(db_path: Path):
                 handle.close()
 
 
-def _looks_like_tls_record_at(data: bytes, offset: int) -> bool:
-    """Return True for a TLS record header at ``data[offset:]``."""
-    if len(data) < offset + 5:
-        return False
-    content_type = data[offset]
-    major = data[offset + 1]
-    minor = data[offset + 2]
-    length = int.from_bytes(data[offset + 3:offset + 5], "big")
-    return (
-        content_type in {0x14, 0x15, 0x16, 0x17}
-        and major == 0x03
-        and minor in {0x00, 0x01, 0x02, 0x03, 0x04}
-        and 0 < length <= 18432
-    )
-
-
-def _validate_sqlite_header(path: Path) -> None:
-    """Fail early with an actionable error for non-SQLite Kanban DB files.
-
-    ``sqlite3.connect()`` creates missing and zero-byte files, so those are
-    allowed. Existing non-empty files must have the SQLite header before we
-    hand them to SQLite/WAL setup. This keeps corrupted page-0 failures from
-    being collapsed into a generic PRAGMA error and lets the gateway's corrupt
-    board handling identify the board by fingerprint.
-    """
-    try:
-        stat = path.stat()
-    except FileNotFoundError:
-        return
-    except OSError:
-        return
-    if stat.st_size == 0:
-        return
-    try:
-        with path.open("rb") as handle:
-            head = handle.read(64)
-    except OSError:
-        return
-    if head.startswith(_SQLITE_HEADER):
-        return
-    signature = ""
-    if head.startswith(b"SQLit") and _looks_like_tls_record_at(head, 5):
-        signature = " (TLS record header detected at byte offset 5)"
-    elif _looks_like_tls_record_at(head, 0):
-        signature = " (TLS record header detected at byte offset 0)"
-    raise sqlite3.DatabaseError(
-        "file is not a database: invalid SQLite header for "
-        f"{path}{signature}; first_32={head[:32].hex(' ')}"
-    )
-
-
 class KanbanDbCorruptError(RuntimeError):
     """Raised when an existing kanban DB file fails integrity checks.
 
@@ -1564,60 +1516,6 @@ class KanbanDbCorruptError(RuntimeError):
             f"Refusing to open corrupt kanban DB at {db_path}: {reason}. "
             f"Original preserved; backup at {backup_str}."
         )
-
-
-def _backup_corrupt_db(path: Path) -> Optional[Path]:
-    """Copy a corrupt DB (and its WAL/SHM sidecars) to a content-addressed backup.
-
-    The backup filename is deterministic in the main DB's sha256, so repeated
-    quarantines of the same corrupt bytes (gateway restarts, dispatcher retries,
-    multi-profile fleets all hitting the same shared DB) reuse one backup
-    instead of amplifying disk usage by N. If the corrupt bytes actually
-    change between attempts — e.g. a partial repair or further damage — the
-    fingerprint changes and a separate backup is preserved.
-
-    Returns the backup path of the main DB file, or ``None`` if the copy
-    itself failed (the caller still raises loudly in that case).
-
-    Writes are confined to the original DB's parent directory. The backup
-    basename is derived purely from ``path.name`` and a content hash, never
-    from caller-supplied directory segments — no traversal is possible.
-    """
-    # Resolve once and pin the parent so subsequent path operations cannot
-    # escape it. ``Path.resolve()`` collapses any ``..`` segments and
-    # symlinks, and we only ever write inside ``parent``.
-    resolved = path.resolve()
-    parent = resolved.parent
-    base_name = resolved.name  # basename only
-    digest = hashlib.sha256()
-    try:
-        with resolved.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-    except OSError:
-        return None
-    token = digest.hexdigest()[:16]
-    candidate = parent / f"{base_name}.corrupt.{token}.bak"
-    # Defensive: candidate must still be inside parent after construction.
-    if candidate.parent != parent:
-        return None
-    if not candidate.exists():
-        try:
-            shutil.copy2(resolved, candidate)
-        except OSError:
-            return None
-    for suffix in ("-wal", "-shm"):
-        sidecar = parent / (base_name + suffix)
-        if sidecar.parent != parent or not sidecar.exists():
-            continue
-        sidecar_backup = parent / (candidate.name + suffix)
-        if sidecar_backup.parent != parent or sidecar_backup.exists():
-            continue
-        try:
-            shutil.copy2(sidecar, sidecar_backup)
-        except OSError:
-            pass
-    return candidate
 
 
 def _guard_existing_db_is_healthy(path: Path) -> None:
@@ -1658,23 +1556,15 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         return
     if str(resolved) in _INITIALIZED_PATHS:
         return
-    reason: Optional[str] = None
     try:
-        probe = _sqlite_connect(resolved)
-        try:
-            row = probe.execute("PRAGMA integrity_check").fetchone()
-        finally:
-            probe.close()
-        if not row or (row[0] or "").lower() != "ok":
-            reason = f"integrity_check returned {row[0] if row else '<no row>'!r}"
+        reason = probe_sqlite_integrity(resolved, _sqlite_connect)
     except sqlite3.OperationalError:
-        # Lock contention, busy, transient IO — not corruption. Let it propagate.
         raise
     except sqlite3.DatabaseError as exc:
         reason = f"sqlite refused to open file: {exc}"
     if reason is None:
         return
-    backup = _backup_corrupt_db(resolved)
+    backup = copy_sqlite_forensics(resolved)
     raise KanbanDbCorruptError(resolved, backup, reason)
 
 
@@ -1738,7 +1628,9 @@ def connect(
     with _cross_process_init_lock(path):
         # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
         # and other invalid-header cases without opening a sqlite connection.
-        _validate_sqlite_header(path)
+        header_reason = classify_sqlite_header(path)
+        if header_reason is not None:
+            raise sqlite3.DatabaseError(header_reason)
         # Full integrity probe — catches corruption past the header (malformed
         # pages, broken internal metadata). Cached per-path after first success
         # via _INITIALIZED_PATHS so it only runs once per process per path.

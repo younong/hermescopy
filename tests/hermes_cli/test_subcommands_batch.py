@@ -89,12 +89,18 @@ def test_single_handler_builders(name, builder, kw, argv):
 def test_dashboard_builder_two_handlers():
     parser = argparse.ArgumentParser(prog="hermes")
     sub = parser.add_subparsers(dest="command")
-    dash, reg, users = _h("dashboard"), _h("dashboard_register"), _h("dashboard_users")
+    dash, reg, users, authority = (
+        _h("dashboard"),
+        _h("dashboard_register"),
+        _h("dashboard_users"),
+        _h("dashboard_authority"),
+    )
     build_dashboard_parser(
         sub,
         cmd_dashboard=dash,
         cmd_dashboard_register=reg,
         cmd_dashboard_users=users,
+        cmd_dashboard_authority=authority,
     )
     # bare dashboard -> launch handler
     assert parser.parse_args(["dashboard"]).func is dash
@@ -110,6 +116,16 @@ def test_dashboard_builder_two_handlers():
     assert parser.parse_args(
         ["dashboard", "users", "make-admin", "alice"]
     ).func is users
+    assert parser.parse_args(["dashboard", "authority", "status"]).func is authority
+    recover = parser.parse_args([
+        "dashboard", "authority", "recover",
+        "--incident", "a" * 16,
+        "--source", "/tmp/source.sqlite3",
+        "--sha256", "b" * 64,
+        "--repair-tls-offset-5",
+    ])
+    assert recover.func is authority
+    assert recover.repair_tls_offset_5 is True
 
 
 # ── deprecated `hermes login` fails gracefully, not with argparse error ────

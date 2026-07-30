@@ -9,21 +9,33 @@ store cannot be reached.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import secrets
 import sqlite3
 import stat
+import tempfile
 import threading
 import time
 from enum import StrEnum
 
 from hermes_constants import get_hermes_home
+from hermes_cli.dashboard_auth.lifecycle import (
+    AuthorityLifecycleLockError,
+    authority_init_lock,
+)
+from hermes_cli.sqlite_util import (
+    copy_sqlite_forensics,
+    probe_sqlite_integrity,
+    sha256_file,
+)
 from dataclasses import dataclass
 from pathlib import Path
 
 
 _SCHEMA_VERSION = 6
 _DB_NAME = "authority.sqlite3"
+_RECOVERY_MARKER_SUFFIX = ".recovery-required.json"
 
 
 class ReaderLeaseState(StrEnum):
@@ -155,6 +167,18 @@ def control_plane_home() -> Path:
 
 class AuthorityUnavailable(RuntimeError):
     """Authority storage is unavailable or unsafe; callers must fail closed."""
+
+
+class AuthorityCorrupt(AuthorityUnavailable):
+    """Confirmed authority corruption was preserved and requires recovery."""
+
+    def __init__(self, *, incident_id: str, classification: str):
+        self.incident_id = incident_id
+        self.classification = classification
+        super().__init__(
+            f"authority recovery is required (incident={incident_id}, "
+            f"classification={classification})"
+        )
 
 
 class AuthorizationRejected(RuntimeError):
@@ -325,6 +349,9 @@ class AuthorityStore:
     def __init__(self, control_home: str | Path | None = None, *, db_name: str = _DB_NAME):
         self.control_home = Path(control_home) if control_home is not None else control_plane_home()
         self.path = self.control_home / db_name
+        self.recovery_marker_path = self.control_home / (
+            db_name + _RECOVERY_MARKER_SUFFIX
+        )
         self._init_lock = threading.Lock()
         self._initialized = False
 
@@ -332,14 +359,197 @@ class AuthorityStore:
         """Initialize and validate the durable authority store."""
         self._ensure_ready()
 
+    @staticmethod
+    def _raw_connect(path: Path) -> sqlite3.Connection:
+        return sqlite3.connect(path, timeout=5, isolation_level=None)
+
+    @staticmethod
+    def _corruption_classification(reason: str) -> str:
+        if "zero-byte" in reason:
+            return "zero_length_database"
+        return "sqlite_integrity_failure"
+
+    def _read_recovery_marker(self) -> dict[str, object] | None:
+        if not self.recovery_marker_path.exists():
+            return None
+        try:
+            marker_stat = self.recovery_marker_path.lstat()
+            if stat.S_ISLNK(marker_stat.st_mode) or not stat.S_ISREG(marker_stat.st_mode):
+                raise AuthorityUnavailable("authority recovery marker is unsafe")
+            payload = json.loads(self.recovery_marker_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("marker is not an object")
+            return payload
+        except AuthorityUnavailable:
+            raise
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise AuthorityUnavailable("authority recovery marker is invalid") from exc
+
+    def _raise_if_recovery_required(self) -> None:
+        marker = self._read_recovery_marker()
+        if marker is None:
+            return
+        raise AuthorityCorrupt(
+            incident_id=str(marker.get("incident_id") or "unknown"),
+            classification=str(marker.get("classification") or "unknown"),
+        )
+
+    def _write_recovery_marker(
+        self,
+        *,
+        incident_id: str,
+        classification: str,
+        digest: str,
+        size: int,
+        preserved: bool,
+        detected_at: int | None = None,
+    ) -> None:
+        marker = {
+            "version": 1,
+            "incident_id": incident_id,
+            "classification": classification,
+            "sha256": digest,
+            "size": size,
+            "detected_at": int(time.time()) if detected_at is None else int(detected_at),
+            "preserved": preserved,
+        }
+        fd, temporary = tempfile.mkstemp(
+            prefix=self.recovery_marker_path.name + ".",
+            dir=self.control_home,
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(marker, handle, sort_keys=True, separators=(",", ":"))
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.recovery_marker_path)
+            directory_fd = os.open(self.control_home, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    def _retry_forensic_preservation(self, marker: dict[str, object]) -> bool:
+        """Retry a previously failed evidence copy without changing incident identity."""
+        digest = str(marker["sha256"])
+        preserved = copy_sqlite_forensics(self.path) is not None
+        if preserved:
+            self._write_recovery_marker(
+                incident_id=str(marker["incident_id"]),
+                classification=str(marker["classification"]),
+                digest=digest,
+                size=int(marker["size"]),
+                preserved=True,
+                detected_at=int(marker["detected_at"]),
+            )
+        from hermes_cli.dashboard_auth.audit import AuthorityAuditEvent, AuthorityAuditReason
+
+        self._audit_recovery_event(
+            AuthorityAuditEvent.EVIDENCE_PRESERVED,
+            AuthorityAuditReason.EVIDENCE_PRESERVED
+            if preserved
+            else AuthorityAuditReason.EVIDENCE_PRESERVATION_FAILED,
+            digest=digest,
+        )
+        return preserved
+
+    @staticmethod
+    def _audit_recovery_event(event, reason, *, digest: str) -> None:
+        from hermes_cli.dashboard_auth.audit import (
+            audit_authority,
+            new_authority_correlation_id,
+        )
+
+        audit_authority(
+            event,
+            correlation_id=new_authority_correlation_id(),
+            reason=reason,
+            audience_class="none",
+            incident_digest=digest,
+        )
+
+    def _quarantine_corruption(self, reason: str) -> AuthorityCorrupt:
+        existing = self._read_recovery_marker()
+        if existing is not None:
+            return AuthorityCorrupt(
+                incident_id=str(existing.get("incident_id") or "unknown"),
+                classification=str(existing.get("classification") or "unknown"),
+            )
+        classification = self._corruption_classification(reason)
+        try:
+            digest = sha256_file(self.path)
+            size = self.path.stat().st_size
+        except OSError as exc:
+            raise AuthorityUnavailable("authority corruption cannot be preserved") from exc
+        from hermes_cli.dashboard_auth.audit import AuthorityAuditEvent, AuthorityAuditReason
+
+        self._audit_recovery_event(
+            AuthorityAuditEvent.CORRUPTION_DETECTED,
+            AuthorityAuditReason.CORRUPTION_DETECTED,
+            digest=digest,
+        )
+        incident_id = digest[:16]
+        preserved = copy_sqlite_forensics(self.path) is not None
+        self._audit_recovery_event(
+            AuthorityAuditEvent.EVIDENCE_PRESERVED,
+            AuthorityAuditReason.EVIDENCE_PRESERVED
+            if preserved
+            else AuthorityAuditReason.EVIDENCE_PRESERVATION_FAILED,
+            digest=digest,
+        )
+        self._write_recovery_marker(
+            incident_id=incident_id,
+            classification=classification,
+            digest=digest,
+            size=size,
+            preserved=preserved,
+        )
+        self._audit_recovery_event(
+            AuthorityAuditEvent.RECOVERY_REQUIRED,
+            AuthorityAuditReason.RECOVERY_REQUIRED,
+            digest=digest,
+        )
+        return AuthorityCorrupt(
+            incident_id=incident_id,
+            classification=classification,
+        )
+
+    @staticmethod
+    def _availability_error(_exc: sqlite3.Error | OSError) -> AuthorityUnavailable:
+        return AuthorityUnavailable("authority transaction failed")
+
+    def _validate_existing_database(self) -> None:
+        try:
+            size = self.path.stat().st_size
+        except OSError as exc:
+            raise AuthorityUnavailable("authority store cannot be inspected") from exc
+        if size == 0:
+            raise self._quarantine_corruption("pre-existing zero-byte database")
+        try:
+            integrity_reason = probe_sqlite_integrity(self.path, self._raw_connect)
+        except sqlite3.Error as exc:
+            raise AuthorityUnavailable("authority store is unavailable") from exc
+        if integrity_reason is not None:
+            raise self._quarantine_corruption(integrity_reason)
+
     def _ensure_ready(self) -> None:
         if self._initialized:
+            self._raise_if_recovery_required()
             self._validate_path()
             return
         with self._init_lock:
             if self._initialized:
+                self._raise_if_recovery_required()
                 self._validate_path()
                 return
+            lifecycle_lock = None
             try:
                 self.control_home.mkdir(parents=True, exist_ok=True)
                 control_stat = self.control_home.lstat()
@@ -347,6 +557,9 @@ class AuthorityStore:
                     raise AuthorityUnavailable(f"control home must be a directory: {self.control_home}")
                 if os.name != "nt" and control_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
                     raise AuthorityUnavailable(f"control home has unsafe permissions: {self.control_home}")
+                lifecycle_lock = authority_init_lock(self.control_home).acquire()
+                self._raise_if_recovery_required()
+                created = False
                 if not self.path.exists():
                     try:
                         fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -354,7 +567,10 @@ class AuthorityStore:
                         pass
                     else:
                         os.close(fd)
+                        created = True
                 self._validate_path()
+                if not created:
+                    self._validate_existing_database()
                 with self._connect() as conn:
                     conn.execute("PRAGMA foreign_keys=ON")
                     conn.execute(
@@ -403,8 +619,13 @@ class AuthorityStore:
                 self._initialized = True
             except AuthorityUnavailable:
                 raise
+            except AuthorityLifecycleLockError as exc:
+                raise AuthorityUnavailable("authority store initialization is locked") from exc
             except (OSError, sqlite3.Error) as exc:
                 raise AuthorityUnavailable("authority store is unavailable") from exc
+            finally:
+                if lifecycle_lock is not None:
+                    lifecycle_lock.close()
 
     @staticmethod
     def _migrate_schema(conn: sqlite3.Connection) -> None:
@@ -501,8 +722,9 @@ class AuthorityStore:
             raise AuthorityUnavailable("authority store cannot be inspected") from exc
 
     def _connect(self) -> sqlite3.Connection:
+        self._raise_if_recovery_required()
         try:
-            return sqlite3.connect(self.path, timeout=5, isolation_level=None)
+            return self._raw_connect(self.path)
         except sqlite3.Error as exc:
             raise AuthorityUnavailable("authority store cannot be opened") from exc
 
@@ -637,7 +859,7 @@ class AuthorityStore:
         except sqlite3.IntegrityError as exc:
             raise AuthorizationRejected("reader_generation_conflict") from exc
         except (sqlite3.Error, OSError) as exc:
-            raise AuthorityUnavailable("authority transaction failed") from exc
+            raise self._availability_error(exc) from exc
 
     def read_session_reader_lease(self, owner_key: str) -> SessionReaderAuthorityLease | None:
         """Return the current Session Reader fence without granting admission."""
@@ -651,7 +873,7 @@ class AuthorityStore:
                 ).fetchone()
                 return None if row is None else self._reader_lease_from_row(row)
         except (sqlite3.Error, OSError) as exc:
-            raise AuthorityUnavailable("authority transaction failed") from exc
+            raise self._availability_error(exc) from exc
 
     def assert_reader_lease(
         self, lease: SessionReaderAuthorityLease, *, states: frozenset[ReaderLeaseState] | None = None
@@ -676,7 +898,7 @@ class AuthorityStore:
         except AuthorizationRejected:
             raise
         except (sqlite3.Error, OSError) as exc:
-            raise AuthorityUnavailable("authority transaction failed") from exc
+            raise self._availability_error(exc) from exc
 
     def transition_reader_lease(
         self,
@@ -730,7 +952,7 @@ class AuthorityStore:
         except AuthorizationRejected:
             raise
         except (sqlite3.Error, OSError) as exc:
-            raise AuthorityUnavailable("authority transaction failed") from exc
+            raise self._availability_error(exc) from exc
 
     def claim_worker_start(self, owner_key: str, *, worker_id: str | None = None) -> WorkerStartClaim:
         """Atomically fence an owner and allocate its sole starting generation."""
@@ -785,7 +1007,7 @@ class AuthorityStore:
         except sqlite3.IntegrityError as exc:
             raise AuthorizationRejected("worker_generation_conflict") from exc
         except (sqlite3.Error, OSError) as exc:
-            raise AuthorityUnavailable("authority transaction failed") from exc
+            raise self._availability_error(exc) from exc
 
     def read_owner_worker_lease(self, owner_key: str) -> OwnerWorkerAuthorityLease | None:
         """Return the current owner fence, if any; it grants no admission alone."""
@@ -799,7 +1021,7 @@ class AuthorityStore:
                 ).fetchone()
                 return None if row is None else self._worker_lease_from_row(row)
         except (sqlite3.Error, OSError) as exc:
-            raise AuthorityUnavailable("authority transaction failed") from exc
+            raise self._availability_error(exc) from exc
 
     def assert_worker_lease(
         self, lease: OwnerWorkerAuthorityLease, *, states: frozenset[WorkerLeaseState] | None = None
@@ -824,7 +1046,7 @@ class AuthorityStore:
         except AuthorizationRejected:
             raise
         except (sqlite3.Error, OSError) as exc:
-            raise AuthorityUnavailable("authority transaction failed") from exc
+            raise self._availability_error(exc) from exc
 
     def transition_worker_lease(
         self, lease: OwnerWorkerAuthorityLease, *, state: WorkerLeaseState, generation_state: WorkerGenerationState
@@ -888,7 +1110,7 @@ class AuthorityStore:
         except AuthorizationRejected:
             raise
         except (sqlite3.Error, OSError) as exc:
-            raise AuthorityUnavailable("authority transaction failed") from exc
+            raise self._availability_error(exc) from exc
 
     def allocate_worker_generation(self, owner_key: str, *, worker_id: str | None = None) -> WorkerGeneration:
         """Allocate the next durable ``starting`` generation for one owner."""
@@ -916,7 +1138,7 @@ class AuthorityStore:
         except sqlite3.IntegrityError as exc:
             raise AuthorizationRejected("worker_generation_conflict") from exc
         except (sqlite3.Error, OSError) as exc:
-            raise AuthorityUnavailable("authority transaction failed") from exc
+            raise self._availability_error(exc) from exc
 
     def read_worker_generation(self, owner_key: str, worker_generation: int) -> WorkerGeneration:
         """Read one exact owner generation without granting it any authority."""
@@ -938,7 +1160,7 @@ class AuthorityStore:
         except AuthorizationRejected:
             raise
         except (sqlite3.Error, OSError) as exc:
-            raise AuthorityUnavailable("authority transaction failed") from exc
+            raise self._availability_error(exc) from exc
 
     def transition_worker_generation(
         self,
@@ -988,7 +1210,7 @@ class AuthorityStore:
         except AuthorizationRejected:
             raise
         except (sqlite3.Error, OSError) as exc:
-            raise AuthorityUnavailable("authority transaction failed") from exc
+            raise self._availability_error(exc) from exc
 
     @staticmethod
     def _continuity_in_transaction(conn: sqlite3.Connection) -> ReplayContinuity:
@@ -1024,7 +1246,7 @@ class AuthorityStore:
             with self._connect() as conn:
                 return self._keyring_is_bound(conn)
         except (sqlite3.Error, OSError) as exc:
-            raise AuthorityUnavailable("authority transaction failed") from exc
+            raise self._availability_error(exc) from exc
 
     def replay_continuity(self) -> ReplayContinuity:
         """Return the persisted replay witness without authorizing a ticket."""
@@ -1033,7 +1255,7 @@ class AuthorityStore:
             with self._connect() as conn:
                 return self._continuity_in_transaction(conn)
         except (sqlite3.Error, OSError) as exc:
-            raise AuthorityUnavailable("authority transaction failed") from exc
+            raise self._availability_error(exc) from exc
 
     def bind_replay_continuity(self, witness: ReplayContinuity) -> ReplayContinuity:
         """Bind a newly created keyring witness to this authority exactly once."""
@@ -1053,7 +1275,7 @@ class AuthorityStore:
         except AuthorityUnavailable:
             raise
         except (sqlite3.Error, OSError) as exc:
-            raise AuthorityUnavailable("authority transaction failed") from exc
+            raise self._availability_error(exc) from exc
 
     def assert_replay_continuity(self, witness: ReplayContinuity) -> ReplayContinuity:
         """Require an exact, ready keyring witness before ticket authority use."""
@@ -1081,40 +1303,7 @@ class AuthorityStore:
                 conn.commit()
                 return self._continuity_in_transaction(conn)
         except (sqlite3.Error, OSError) as exc:
-            raise AuthorityUnavailable("authority transaction failed") from exc
-
-    def complete_replay_recovery(self, witness: ReplayContinuity) -> ReplayContinuity:
-        """Explicitly reconcile a known witness after invalidating old claims."""
-        self._ensure_ready()
-        if not witness.authority_id:
-            raise AuthorityUnavailable("authority replay continuity is unavailable")
-        try:
-            with self._connect() as conn:
-                conn.execute("BEGIN IMMEDIATE")
-                current = self._continuity_in_transaction(conn)
-                if current.authority_id != witness.authority_id:
-                    # A newly created/replaced SQLite file has no bound keyring
-                    # witness. Explicit recovery may adopt the independently
-                    # persisted keyring identity, but never silently during
-                    # normal mint/consume startup.
-                    if self._keyring_is_bound(conn):
-                        raise AuthorityUnavailable("authority replay continuity mismatch")
-                    conn.execute(
-                        "UPDATE authority_meta SET value=? WHERE key='authority_id'",
-                        (witness.authority_id,),
-                    )
-                conn.execute(
-                    "UPDATE authority_meta SET value=? WHERE key='recovery_generation'",
-                    (max(current.recovery_generation, witness.recovery_generation) + 1,),
-                )
-                conn.execute("UPDATE authority_meta SET value=0 WHERE key='recovery_required'")
-                conn.execute("UPDATE authority_meta SET value=1 WHERE key='keyring_bound'")
-                conn.commit()
-                return self._continuity_in_transaction(conn)
-        except AuthorityUnavailable:
-            raise
-        except (sqlite3.Error, OSError) as exc:
-            raise AuthorityUnavailable("authority transaction failed") from exc
+            raise self._availability_error(exc) from exc
 
     def _state_in_transaction(self, conn: sqlite3.Connection, scope: AuthorizationScope) -> AuthorizationState:
         row = conn.execute(
@@ -1175,7 +1364,7 @@ class AuthorityStore:
                     for row in rows
                 )
         except (sqlite3.Error, OSError) as exc:
-            raise AuthorityUnavailable("authority transaction failed") from exc
+            raise self._availability_error(exc) from exc
 
     def worker_changes_since(self, sequence: int) -> tuple[WorkerLeaseChange, ...]:
         """Read exact Worker lifecycle transitions after ``sequence``."""
@@ -1201,7 +1390,9 @@ class AuthorityStore:
                     )
                     for row in rows
                 )
-        except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+        except (sqlite3.Error, OSError) as exc:
+            raise self._availability_error(exc) from exc
+        except (TypeError, ValueError) as exc:
             raise AuthorityUnavailable("authority worker change transaction failed") from exc
 
     def activate(self, scope: AuthorizationScope) -> AuthorizationState:
@@ -1276,7 +1467,7 @@ class AuthorityStore:
         except AuthorizationRejected:
             raise
         except (sqlite3.Error, OSError) as exc:
-            raise AuthorityUnavailable("authority transaction failed") from exc
+            raise self._availability_error(exc) from exc
 
     def read_state(self, scope: AuthorizationScope) -> AuthorizationState:
         self._ensure_ready()
@@ -1291,7 +1482,7 @@ class AuthorityStore:
         except AuthorizationRejected:
             raise
         except (sqlite3.Error, OSError) as exc:
-            raise AuthorityUnavailable("authority transaction failed") from exc
+            raise self._availability_error(exc) from exc
 
     def revoke_principal_and_bump(
         self, *, provider: str, user_id: str, reason: str
@@ -1344,7 +1535,7 @@ class AuthorityStore:
                     changes=changes,
                 )
         except (sqlite3.Error, OSError) as exc:
-            raise AuthorityUnavailable("authority transaction failed") from exc
+            raise self._availability_error(exc) from exc
 
     def revoke_and_bump(self, scope: AuthorizationScope, *, reason: str) -> AuthorizationState:
         """Revoke this verified session scope and increment its epoch."""
@@ -1383,7 +1574,7 @@ class AuthorityStore:
         except AuthorizationRejected:
             raise
         except (sqlite3.Error, OSError) as exc:
-            raise AuthorityUnavailable("authority transaction failed") from exc
+            raise self._availability_error(exc) from exc
 
     def check_and_consume(
         self,
@@ -1430,7 +1621,7 @@ class AuthorityStore:
         except AuthorizationRejected:
             raise
         except (sqlite3.Error, OSError) as exc:
-            raise AuthorityUnavailable("authority transaction failed") from exc
+            raise self._availability_error(exc) from exc
 
     def check_and_consume_owner_worker_bootstrap(
         self,
@@ -1482,7 +1673,7 @@ class AuthorityStore:
         except (AuthorizationRejected, AuthorityUnavailable):
             raise
         except (sqlite3.Error, OSError) as exc:
-            raise AuthorityUnavailable("authority transaction failed") from exc
+            raise self._availability_error(exc) from exc
 
     def invalidate_outstanding_credentials(self, *, reason: str) -> int:
         """Advance recovery generation; all previously minted claims become stale."""
@@ -1496,4 +1687,4 @@ class AuthorityStore:
                 conn.commit()
                 return value
         except (sqlite3.Error, OSError) as exc:
-            raise AuthorityUnavailable("authority transaction failed") from exc
+            raise self._availability_error(exc) from exc

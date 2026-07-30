@@ -24,12 +24,22 @@ def _register(args):
     return args
 
 
+def _users(args):
+    return args
+
+
+def _authority(args):
+    return args
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     build_dashboard_parser(
         parser.add_subparsers(dest="command"),
         cmd_dashboard=_dash,
         cmd_dashboard_register=_register,
+        cmd_dashboard_users=_users,
+        cmd_dashboard_authority=_authority,
     )
     return parser
 

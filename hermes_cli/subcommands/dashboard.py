@@ -105,6 +105,7 @@ def build_dashboard_parser(
     cmd_dashboard: Callable,
     cmd_dashboard_register: Callable,
     cmd_dashboard_users: Callable,
+    cmd_dashboard_authority: Callable,
 ) -> None:
     """Attach the ``dashboard`` and ``serve`` subcommands.
 
@@ -213,6 +214,44 @@ def build_dashboard_parser(
         ),
     )
     dashboard_register_parser.set_defaults(func=cmd_dashboard_register)
+
+    authority_parser = dashboard_subparsers.add_parser(
+        "authority",
+        help="Inspect, preserve, or recover Control Plane authorization state",
+    )
+    authority_subparsers = authority_parser.add_subparsers(
+        dest="dashboard_authority_action",
+        required=True,
+    )
+    authority_status_parser = authority_subparsers.add_parser(
+        "status", help="Inspect authority health without changing it"
+    )
+    authority_status_parser.add_argument(
+        "--json", action="store_true", help="Print safe status metadata as JSON"
+    )
+    authority_status_parser.set_defaults(func=cmd_dashboard_authority)
+    authority_preserve_parser = authority_subparsers.add_parser(
+        "preserve", help="Create or verify forensic evidence without repairing"
+    )
+    authority_preserve_parser.add_argument(
+        "--json", action="store_true", help="Print safe status metadata as JSON"
+    )
+    authority_preserve_parser.set_defaults(func=cmd_dashboard_authority)
+    authority_recover_parser = authority_subparsers.add_parser(
+        "recover", help="Recover from a digest-pinned authority source"
+    )
+    authority_recover_parser.add_argument("--incident", required=True, metavar="ID")
+    authority_recover_parser.add_argument("--source", required=True, metavar="PATH")
+    authority_recover_parser.add_argument("--sha256", required=True, metavar="HEX")
+    authority_recover_parser.add_argument(
+        "--repair-tls-offset-5",
+        action="store_true",
+        help="Repair only the exact SQLit + TLS-record-at-offset-5 signature",
+    )
+    authority_recover_parser.add_argument(
+        "--json", action="store_true", help="Print safe status metadata as JSON"
+    )
+    authority_recover_parser.set_defaults(func=cmd_dashboard_authority)
 
     # ``hermes dashboard users`` manages the durable, local multi-user Basic
     # auth authority. Passwords never travel in argv: reset reads stdin (or an
