@@ -136,7 +136,36 @@ class TestPartialStreamStubFinishReason:
         assert "write_file" in content
 
 
-# ── Clean stream-end mid-tool-call (no exception, no finish_reason) ─────────
+# ── Clean stream-end without finish_reason ─────────────────────────────────
+
+class TestCleanStreamEndText:
+    """A text stream without a terminal finish_reason is an upstream drop."""
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_api_client")
+    def test_no_finish_reason_text_routes_to_partial_stub(
+        self, _mock_close, mock_create, monkeypatch,
+    ):
+        def _clean_ending_stream():
+            yield _make_stream_chunk(content="Here's my answer so far")
+            # The HTTP/SSE iterator ends without a terminal finish_reason.
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = (
+            lambda *a, **kw: _clean_ending_stream()
+        )
+        mock_create.return_value = mock_client
+
+        agent = _make_agent()
+        agent._current_streamed_assistant_text = "Here's my answer so far"
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert response.id == PARTIAL_STREAM_STUB_ID
+        assert response.choices[0].finish_reason == FINISH_REASON_LENGTH
+        assert response.choices[0].message.content == "Here's my answer so far"
+        assert response.choices[0].message.tool_calls is None
 
 class TestCleanStreamEndMidToolCall:
     """The upstream closes the SSE stream cleanly after delivering a tool
