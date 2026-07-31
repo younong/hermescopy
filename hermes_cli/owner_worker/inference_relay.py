@@ -624,6 +624,8 @@ class OwnerInferenceRelay:
         relay = self
 
         class _Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
             def do_POST(self) -> None:  # noqa: N802
                 relay._handle_http(self)
 
@@ -794,14 +796,14 @@ class OwnerInferenceRelay:
                 for name, value in headers.items():
                     if str(name).lower() not in _HOP_BY_HOP_HEADERS:
                         handler.send_header(str(name), str(value))
-                # Framing is intentionally delegated to the HTTP server.  Do
-                # not add Content-Length: provider SSE responses are streamed
-                # as they arrive over the private broker connection.
+                handler.send_header("Transfer-Encoding", "chunked")
                 handler.end_headers()
                 while True:
                     response = self._receive_for(worker_request, deadline=deadline)
                     response_type = response.get("type")
                     if response_type == "response_end":
+                        handler.wfile.write(b"0\r\n\r\n")
+                        handler.wfile.flush()
                         break
                     if response_type == "error":
                         raise DeploymentInferenceRelayError("relay response failed")
@@ -809,7 +811,9 @@ class OwnerInferenceRelay:
                         raise DeploymentInferenceRelayError("relay response is invalid")
                     body = base64.b64decode(str(response.get("body") or ""), validate=True)
                     if body:
+                        handler.wfile.write(f"{len(body):X}\r\n".encode("ascii"))
                         handler.wfile.write(body)
+                        handler.wfile.write(b"\r\n")
                         handler.wfile.flush()
             except (BrokenPipeError, ConnectionError, OSError):
                 handler.close_connection = True

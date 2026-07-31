@@ -184,6 +184,48 @@ def _upstream_server():
         thread.join(timeout=2)
 
 
+@contextmanager
+def _incomplete_chunked_upstream():
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):  # noqa: N802
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("x-openrouter-id", "openrouter-safe")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.wfile.write(b"7\r\npartial\r\n")
+            self.wfile.flush()
+            self.connection.shutdown(socket.SHUT_RDWR)
+            self.connection.close()
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    try:
+        yield DeploymentInferencePolicy(
+            provider="custom:deployment",
+            model="gpt-safe",
+            api_mode="chat_completions",
+            runtime_resolver=lambda: {
+                "provider": "custom:deployment",
+                "api_mode": "chat_completions",
+                "base_url": base_url,
+                "api_key": "control-plane-secret",
+            },
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def _request_for_model(model: str = "gpt-safe") -> dict[str, object]:
     import base64
     import json
@@ -446,65 +488,53 @@ def test_broker_logs_pre_header_failure_without_secret_or_url(
 
 
 def test_broker_logs_midstream_failure_with_counts(tmp_path, caplog):
-    class Handler(BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
+    with _incomplete_chunked_upstream() as policy:
+        store = AuthorityStore(tmp_path / "control")
+        claim = store.claim_worker_start("ok1_owner", worker_id="worker-1")
+        broker = DeploymentInferenceBroker(policy=policy, authority_store=store)
+        active = store.transition_worker_lease(
+            claim.lease,
+            state=WorkerLeaseState.ACTIVE,
+            generation_state=WorkerGenerationState.ACTIVE,
+        )
+        try:
+            with caplog.at_level(logging.WARNING, logger="hermes_cli.owner_worker.inference_relay"):
+                with pytest.raises(DeploymentInferenceRelayError, match="unavailable"):
+                    broker._stream_request(active, _request_for_model(), lambda _frame: None)
+            assert "outcome=midstream_failure" in caplog.text
+            assert "http_status=200" in caplog.text
+            # Native transport chunks are forwarded before httpcore detects that the
+            # terminating chunk is missing, so diagnostics include bytes that already
+            # reached the worker.
+            assert "bytes=7" in caplog.text
+            assert "chunks=1" in caplog.text
+            assert "x-openrouter-id=openrouter-safe" in caplog.text
+            assert "partial" not in caplog.text
+        finally:
+            broker.close()
 
-        def do_POST(self):  # noqa: N802
-            self.rfile.read(int(self.headers["Content-Length"]))
-            self.send_response(200)
-            self.send_header("x-openrouter-id", "openrouter-safe")
-            self.send_header("Transfer-Encoding", "chunked")
-            self.end_headers()
-            self.wfile.write(b"7\r\npartial\r\n")
-            self.wfile.flush()
-            # Close before the terminating zero-size chunk. httpx must classify
-            # this as an incomplete response rather than a normal EOF.
-            self.connection.shutdown(socket.SHUT_RDWR)
-            self.connection.close()
 
-        def log_message(self, _format, *_args):
-            return
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    policy = DeploymentInferencePolicy(
-        provider="custom:deployment",
-        model="gpt-safe",
-        api_mode="chat_completions",
-        runtime_resolver=lambda: {
-            "provider": "custom:deployment",
-            "api_mode": "chat_completions",
-            "base_url": f"http://127.0.0.1:{server.server_port}",
-            "api_key": "control-plane-secret",
-        },
-    )
-    store = AuthorityStore(tmp_path / "control")
-    claim = store.claim_worker_start("ok1_owner", worker_id="worker-1")
-    broker = DeploymentInferenceBroker(policy=policy, authority_store=store)
-    active = store.transition_worker_lease(
-        claim.lease,
-        state=WorkerLeaseState.ACTIVE,
-        generation_state=WorkerGenerationState.ACTIVE,
-    )
-    try:
-        with caplog.at_level(logging.WARNING, logger="hermes_cli.owner_worker.inference_relay"):
-            with pytest.raises(DeploymentInferenceRelayError, match="unavailable"):
-                broker._stream_request(active, _request_for_model(), lambda _frame: None)
-        assert "outcome=midstream_failure" in caplog.text
-        assert "http_status=200" in caplog.text
-        # Native transport chunks are forwarded before httpcore detects that the
-        # terminating chunk is missing, so diagnostics include bytes that already
-        # reached the worker.
-        assert "bytes=7" in caplog.text
-        assert "chunks=1" in caplog.text
-        assert "x-openrouter-id=openrouter-safe" in caplog.text
-        assert "partial" not in caplog.text
-    finally:
-        broker.close()
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+def test_owner_relay_surfaces_midstream_failure_as_incomplete_chunked_response(tmp_path):
+    with _incomplete_chunked_upstream() as policy:
+        broker, active, relay = _activate_relay(AuthorityStore(tmp_path / "control"), policy)
+        chunks = bytearray()
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                with client.stream(
+                    "POST",
+                    f"{relay.base_url}/chat/completions",
+                    json={"model": "gpt-safe", "stream": True, "messages": []},
+                ) as response:
+                    assert response.status_code == 200
+                    assert response.http_version == "HTTP/1.1"
+                    assert response.headers["transfer-encoding"] == "chunked"
+                    with pytest.raises(httpx.RemoteProtocolError, match="incomplete chunked read"):
+                        for chunk in response.iter_raw():
+                            chunks.extend(chunk)
+            assert chunks == b"partial"
+        finally:
+            broker.revoke(active)
+            relay.close()
 
 
 def test_owner_relay_does_not_send_second_error_after_headers(caplog):
@@ -558,14 +588,15 @@ def test_owner_relay_does_not_send_second_error_after_headers(caplog):
 
         def __init__(self):
             self.sent_status = None
+            self.sent_headers = []
             self.ended = False
             self.error_calls = []
 
         def send_response(self, status):
             self.sent_status = status
 
-        def send_header(self, _name, _value):
-            pass
+        def send_header(self, name, value):
+            self.sent_headers.append((name, value))
 
         def end_headers(self):
             self.ended = True
@@ -581,6 +612,7 @@ def test_owner_relay_does_not_send_second_error_after_headers(caplog):
         ):
             relay._handle_http(handler)
         assert handler.sent_status == 200
+        assert handler.sent_headers == [("Transfer-Encoding", "chunked")]
         assert handler.ended is True
         assert handler.error_calls == []
         assert handler.close_connection is True
@@ -702,7 +734,7 @@ def test_owner_relay_cancels_abandoned_response_without_blocking_next_request(ca
 
         assert first_handler.close_connection is True
         assert first_handler.error_calls == []
-        assert bytes(second_writer.body) == b"fresh-response"
+        assert bytes(second_writer.body) == b"E\r\nfresh-response\r\n0\r\n\r\n"
         assert second_handler.error_calls == []
         assert "abandoned-first" not in caplog.text
         assert "abandoned-second" not in caplog.text
