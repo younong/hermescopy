@@ -476,7 +476,7 @@ class TestReviewForkApiModeDowngrade:
         agent._user_profile_enabled = True
         # Mock _current_main_runtime to return the parent's codex_app_server
         # state so we can confirm the helper detects + downgrades it.
-        agent._current_main_runtime = lambda: {
+        agent._current_main_runtime = lambda **_kwargs: {
             "api_mode": "codex_app_server",
             "base_url": "https://chatgpt.com/backend-api/codex",
             "api_key": "stub-token",

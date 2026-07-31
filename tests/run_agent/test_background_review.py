@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import run_agent as run_agent_module
+from agent.review_coordination import ReviewCoordinator
 from run_agent import AIAgent
 
 
@@ -28,6 +29,7 @@ def _bare_agent() -> AIAgent:
     agent._COMBINED_REVIEW_PROMPT = "review both"
     agent.background_review_callback = None
     agent.status_callback = None
+    agent._review_coordinator = ReviewCoordinator()
     agent._safe_print = lambda *_args, **_kwargs: None
     return agent
 
@@ -416,6 +418,64 @@ def test_background_review_fork_skips_external_memory_plugins(monkeypatch):
         "the fork leaks harness prompts into the user's real memory "
         "namespace via on_turn_start / prefetch_all / sync_all."
     )
+
+
+def test_background_review_trigger_is_single_flight(monkeypatch):
+    targets = []
+
+    class DeferredThread:
+        def __init__(self, *, target, daemon=None, name=None):
+            targets.append(target)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(run_agent_module.threading, "Thread", DeferredThread)
+    agent = _bare_agent()
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "first"}],
+        review_memory=True,
+    )
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "second"}],
+        review_memory=True,
+    )
+
+    assert len(targets) == 1
+
+
+def test_foreground_interrupts_running_review_before_starting():
+    import threading
+
+    coordinator = ReviewCoordinator()
+    interrupted = threading.Event()
+    review_finished = threading.Event()
+    foreground_started = threading.Event()
+
+    class ReviewAgent:
+        def interrupt(self):
+            interrupted.set()
+            coordinator.end_review()
+            review_finished.set()
+
+    assert coordinator.reserve_review() is True
+    coordinator.begin_review()
+    coordinator.set_review_agent(ReviewAgent())
+
+    foreground = threading.Thread(
+        target=lambda: (coordinator.begin_foreground(), foreground_started.set())
+    )
+    foreground.start()
+
+    assert interrupted.wait(timeout=1)
+    assert review_finished.wait(timeout=1)
+    assert foreground_started.wait(timeout=1)
+    coordinator.end_foreground()
+    foreground.join(timeout=1)
+    assert not foreground.is_alive()
 
 
 # ---------------------------------------------------------------------------

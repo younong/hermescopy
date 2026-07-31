@@ -22,6 +22,7 @@ import re
 import threading
 import time
 import uuid
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
@@ -31,6 +32,7 @@ from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
+from agent.runtime_memory import submit_inference
 from agent.message_sanitization import (
     _sanitize_surrogates,
     _repair_tool_call_arguments,
@@ -40,6 +42,13 @@ from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
+
+
+def _wait_for_future(future, timeout: float) -> None:
+    try:
+        future.result(timeout=timeout)
+    except FutureTimeoutError:
+        pass
 
 
 class _RequestClientOwner:
@@ -432,11 +441,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
     _call_start = time.time()
     agent._touch_activity("waiting for non-streaming API response")
 
-    t = threading.Thread(target=_call, daemon=True)
-    t.start()
+    request_future = submit_inference(_call)
     _poll_count = 0
-    while t.is_alive():
-        t.join(timeout=0.3)
+    while not request_future.done():
+        _wait_for_future(request_future, 0.3)
         _poll_count += 1
 
         # Touch activity every ~30s so the gateway's inactivity
@@ -493,7 +501,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 f"codex stream killed after {int(_elapsed)}s with no first byte"
             )
             # Wait briefly for the worker to notice the closed connection.
-            t.join(timeout=2.0)
+            _wait_for_future(request_future, 2.0)
             if result["error"] is None and result["response"] is None:
                 if _silent_hint:
                     result["error"] = TimeoutError(
@@ -538,7 +546,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
             agent._touch_activity(
                 f"codex stream killed after {int(_event_stale_elapsed)}s with no SSE events"
             )
-            t.join(timeout=2.0)
+            _wait_for_future(request_future, 2.0)
             if result["error"] is None and result["response"] is None:
                 result["error"] = TimeoutError(
                     f"Codex stream produced no SSE events for {int(_event_stale_elapsed)}s "
@@ -583,7 +591,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 f"stale non-streaming call killed after {int(_elapsed)}s"
             )
             # Wait briefly for the thread to notice the closed connection.
-            t.join(timeout=2.0)
+            _wait_for_future(request_future, 2.0)
             if result["error"] is None and result["response"] is None:
                 if _silent_hint:
                     result["error"] = TimeoutError(
@@ -1904,10 +1912,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     ),
                 )
 
-        t = threading.Thread(target=_bedrock_call, daemon=True)
-        t.start()
-        while t.is_alive():
-            t.join(timeout=0.3)
+        request_future = submit_inference(_bedrock_call)
+        while not request_future.done():
+            _wait_for_future(request_future, 0.3)
             if agent._interrupt_requested:
                 raise InterruptedError("Agent interrupted during Bedrock API call")
         if result["error"] is not None:
@@ -2805,12 +2812,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         if _reasoning_floor is not None:
             _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
 
-    t = threading.Thread(target=_call, daemon=True)
-    t.start()
+    request_future = submit_inference(_call)
     _last_heartbeat = time.time()
     _HEARTBEAT_INTERVAL = 30.0  # seconds between gateway activity touches
-    while t.is_alive():
-        t.join(timeout=0.3)
+    while not request_future.done():
+        _wait_for_future(request_future, 0.3)
 
         # Periodic heartbeat: touch the agent's activity tracker so the
         # gateway's inactivity monitor knows we're alive while waiting
