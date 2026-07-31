@@ -7,45 +7,45 @@ plus its curator-mode reply into the user's REAL session, and the next live
 turn re-read that injected user message as a standing instruction — the agent
 "became" the curator and refused the actual task.
 
-``_strip_background_review_harness`` is the load-on-read defense-in-depth that
+``strip_legacy_synthetic_messages`` is the load-on-read defense-in-depth that
 removes any such stray harness message (and the assistant reply that followed
 it) so a polluted session resumes clean.
 """
 
-from hermes_state import (
-    _is_background_review_harness_message,
-    _strip_background_review_harness,
+from hermes_session_queries import (
+    _legacy_synthetic_message_kind,
+    strip_legacy_synthetic_messages,
 )
 
 
-class TestIsBackgroundReviewHarnessMessage:
+class TestLegacySyntheticMessageKind:
     def test_matches_skill_review_prompt(self):
         msg = {"role": "user", "content": "Review the conversation above and update the skill library now."}
-        assert _is_background_review_harness_message(msg) is True
+        assert _legacy_synthetic_message_kind(msg) == "background_review"
 
     def test_matches_memory_review_prompt(self):
         msg = {"role": "system", "content": "Review the conversation above and consider saving to memory."}
-        assert _is_background_review_harness_message(msg) is True
+        assert _legacy_synthetic_message_kind(msg) == "background_review"
 
     def test_matches_after_leading_whitespace(self):
         msg = {"role": "user", "content": "\n\n   Review the conversation above and update the skill library."}
-        assert _is_background_review_harness_message(msg) is True
+        assert _legacy_synthetic_message_kind(msg) == "background_review"
 
     def test_ignores_normal_user_message(self):
         msg = {"role": "user", "content": "Please review my PR and update the changelog."}
-        assert _is_background_review_harness_message(msg) is False
+        assert _legacy_synthetic_message_kind(msg) is None
 
     def test_ignores_assistant_role(self):
         # An assistant message that quotes the harness text is not itself a harness prompt.
         msg = {"role": "assistant", "content": "Review the conversation above and update the skill library"}
-        assert _is_background_review_harness_message(msg) is False
+        assert _legacy_synthetic_message_kind(msg) is None
 
     def test_ignores_non_string_content(self):
         msg = {"role": "user", "content": [{"type": "text", "text": "Review the conversation above and update the skill library"}]}
-        assert _is_background_review_harness_message(msg) is False
+        assert _legacy_synthetic_message_kind(msg) is None
 
     def test_ignores_non_dict(self):
-        assert _is_background_review_harness_message("not a dict") is False  # type: ignore[arg-type]
+        assert _legacy_synthetic_message_kind("not a dict") is None
 
 
 class TestStripBackgroundReviewHarness:
@@ -57,7 +57,7 @@ class TestStripBackgroundReviewHarness:
             {"role": "assistant", "content": "Nothing to save."},
             {"role": "user", "content": "Thanks, now book a flight."},
         ]
-        out = _strip_background_review_harness(messages)
+        out = strip_legacy_synthetic_messages(messages)
         contents = [m["content"] for m in out]
         assert contents == ["What's the weather?", "It's sunny.", "Thanks, now book a flight."]
 
@@ -67,7 +67,7 @@ class TestStripBackgroundReviewHarness:
             {"role": "user", "content": "Hi"},
             {"role": "user", "content": "Review the conversation above and consider saving to memory."},
         ]
-        out = _strip_background_review_harness(messages)
+        out = strip_legacy_synthetic_messages(messages)
         assert out == [{"role": "user", "content": "Hi"}]
 
     def test_does_not_skip_user_turn_after_harness(self):
@@ -77,7 +77,7 @@ class TestStripBackgroundReviewHarness:
             {"role": "user", "content": "Review the conversation above and update the skill library."},
             {"role": "user", "content": "Actually, ignore that and help me debug."},
         ]
-        out = _strip_background_review_harness(messages)
+        out = strip_legacy_synthetic_messages(messages)
         assert out == [{"role": "user", "content": "Actually, ignore that and help me debug."}]
 
     def test_clean_history_passes_through_unchanged(self):
@@ -86,10 +86,10 @@ class TestStripBackgroundReviewHarness:
             {"role": "assistant", "content": "Answer one"},
             {"role": "user", "content": "Question two"},
         ]
-        assert _strip_background_review_harness(messages) == messages
+        assert strip_legacy_synthetic_messages(messages) == messages
 
     def test_empty_list(self):
-        assert _strip_background_review_harness([]) == []
+        assert strip_legacy_synthetic_messages([]) == []
 
     def test_multiple_harness_pairs(self):
         messages = [
@@ -100,7 +100,7 @@ class TestStripBackgroundReviewHarness:
             {"role": "user", "content": "Review the conversation above and consider saving to memory."},
             {"role": "assistant", "content": "Saved one entry."},
         ]
-        out = _strip_background_review_harness(messages)
+        out = strip_legacy_synthetic_messages(messages)
         assert [m["content"] for m in out] == ["real question", "real answer"]
 
 
