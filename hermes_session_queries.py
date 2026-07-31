@@ -13,6 +13,54 @@ from typing import Any, Dict, List, Tuple
 logger = logging.getLogger(__name__)
 MAX_FTS5_QUERY_CHARS = 2_048
 
+_BACKGROUND_REVIEW_HARNESS_PREFIXES = (
+    "Review the conversation above and update the skill library",
+    "Review the conversation above and consider saving to memory",
+)
+_LEGACY_NETWORK_CONTINUATION_PROMPT = (
+    "[System: The previous response was cut off by a network error mid-stream. "
+    "Continue exactly where you left off. Do not restart or repeat prior text. "
+    "Finish the answer directly.]"
+)
+
+
+def _legacy_synthetic_message_kind(message: Any) -> str | None:
+    """Classify synthetic user/system turns persisted by older builds."""
+    if not isinstance(message, dict):
+        return None
+    if message.get("role") not in {"user", "system"}:
+        return None
+    content = message.get("content")
+    if not isinstance(content, str):
+        return None
+    stripped = content.strip()
+    if stripped == _LEGACY_NETWORK_CONTINUATION_PROMPT:
+        return "network_continuation"
+    if any(
+        stripped.startswith(prefix) for prefix in _BACKGROUND_REVIEW_HARNESS_PREFIXES
+    ):
+        return "background_review"
+    return None
+
+
+def strip_legacy_synthetic_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Remove synthetic turns persisted by older recovery/review paths."""
+    result: list[dict[str, Any]] = []
+    skip_next_assistant = False
+    for message in messages:
+        synthetic_kind = _legacy_synthetic_message_kind(message)
+        if synthetic_kind:
+            skip_next_assistant = synthetic_kind == "background_review"
+            continue
+        if skip_next_assistant:
+            skip_next_assistant = False
+            if message.get("role") == "assistant":
+                continue
+        result.append(message)
+    return result
+
 
 def _delegate_from_json(column: str = "model_config") -> str:
     return f"json_extract(COALESCE({column}, '{{}}'), '$._delegate_from')"
@@ -916,33 +964,6 @@ class SessionQueryMixin:
             ).fetchone()
         return int(row[0])
 
-    @staticmethod
-    def _strip_background_review_harness(
-        messages: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        prefixes = (
-            "Review the conversation above and update the skill library",
-            "Review the conversation above and consider saving to memory",
-        )
-        result: list[dict[str, Any]] = []
-        skip_next_assistant = False
-        for message in messages:
-            content = message.get("content")
-            is_harness = (
-                message.get("role") in {"user", "system"}
-                and isinstance(content, str)
-                and any(content.lstrip().startswith(prefix) for prefix in prefixes)
-            )
-            if is_harness:
-                skip_next_assistant = True
-                continue
-            if skip_next_assistant:
-                skip_next_assistant = False
-                if message.get("role") == "assistant":
-                    continue
-            result.append(message)
-        return result
-
     def get_session(self, session_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._conn.execute(
@@ -1229,7 +1250,7 @@ class SessionQueryMixin:
             if include_ancestors and self._is_duplicate_replayed_user_message(hydrated, msg):
                 continue
             hydrated.append(msg)
-        hydrated = self._strip_background_review_harness(hydrated)
+        hydrated = strip_legacy_synthetic_messages(hydrated)
         messages = [msg for msg in hydrated if msg.get("_row_id") in page_ids]
 
         tool_calls: Dict[str, tuple[str, Any]] = {}

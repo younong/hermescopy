@@ -213,6 +213,47 @@ def test_in_place_compaction_displays_originals_but_model_loads_projection(db):
     assert db.display_message_count("compact") == 4
 
 
+def test_legacy_network_continuation_prompt_is_hidden_from_replay_and_display(db):
+    marker = (
+        "[System: The previous response was cut off by a network error mid-stream. "
+        "Continue exactly where you left off. Do not restart or repeat prior text. "
+        "Finish the answer directly.]"
+    )
+    db.create_session("legacy-network-marker", source="tui")
+    db.append_message("legacy-network-marker", role="user", content="original question")
+    db.append_message("legacy-network-marker", role="assistant", content="partial answer")
+    db.append_message("legacy-network-marker", role="user", content=marker)
+    db.append_message("legacy-network-marker", role="assistant", content="continued answer")
+
+    assert _contents(db.get_messages_as_conversation("legacy-network-marker")) == [
+        "original question",
+        "partial answer",
+        "continued answer",
+    ]
+    assert _contents(
+        db.get_conversation_page("legacy-network-marker", limit=20)["messages"]
+    ) == [
+        "original question",
+        "partial answer",
+        "continued answer",
+    ]
+
+
+def test_user_message_quoting_network_marker_is_preserved(db):
+    db.create_session("quoted-network-marker", source="tui")
+    quoted = (
+        "历史消息中还是有 [System: The previous response was cut off by a network "
+        "error mid-stream. Continue exactly where you left off. Do not restart or "
+        "repeat prior text. Finish the answer directly.]"
+    )
+    db.append_message("quoted-network-marker", role="user", content=quoted)
+
+    assert _contents(db.get_messages_as_conversation("quoted-network-marker")) == [quoted]
+    assert _contents(
+        db.get_conversation_page("quoted-network-marker", limit=20)["messages"]
+    ) == [quoted]
+
+
 def test_repeated_compaction_hides_old_projections_and_keeps_new_turns(db):
     db.create_session("repeated", source="tui")
     db.append_message("repeated", role="user", content="original")
