@@ -141,6 +141,7 @@ class TestChatCompletionsBasic:
             {"role": "user", "content": "run the task"},
             {"role": "assistant", "content": "(empty)", "_empty_recovery_synthetic": True},
             {"role": "user", "content": "continue", "_empty_recovery_synthetic": True},
+            {"role": "user", "content": "retry", "_transient_model_instruction": True},
             {"role": "assistant", "content": "done", "_thinking_prefill": True,
              "_empty_terminal_sentinel": True},
         ]

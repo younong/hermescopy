@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.transient_messages import is_transient_message, strip_transient_messages
 
 
 def finalize_turn(
@@ -397,6 +398,12 @@ def finalize_turn(
         if msg.get("role") == "assistant" and msg.get("reasoning"):
             last_reasoning = msg["reasoning"]
             break
+
+    # Persistence normally performs this projection. Repeat it only if that
+    # cleanup failed so caller-owned history never exposes model-only messages.
+    if any(is_transient_message(message) for message in messages):
+        messages[:] = strip_transient_messages(messages)
+        agent._session_messages = messages
 
     # Build result with interrupt info if applicable
     result = {

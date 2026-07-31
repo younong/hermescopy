@@ -5,11 +5,10 @@ user nudge to keep the agent going one more turn before it can claim completion.
 These messages exist only to drive the loop; persisting them poisons the resumed
 transcript and breaks prompt-prefix cache reuse on later turns (#55733).
 
-Both persistence sinks (SQLite flush + JSON snapshot) route through the single
-``_is_ephemeral_scaffolding`` chokepoint, which is driven by
-``_EPHEMERAL_SCAFFOLDING_FLAGS``. These tests assert that the verification-loop
-flags are registered there and that both sinks drop the flagged messages while
-keeping the real conversation.
+Both persistence sinks (SQLite flush + JSON snapshot) route through the shared
+``is_transient_message`` chokepoint. These tests assert that verification-loop
+flags remain covered and that both sinks drop flagged messages while keeping
+the real conversation.
 """
 
 import json
@@ -17,6 +16,8 @@ import sys
 from unittest.mock import MagicMock
 
 import pytest
+
+from agent.transient_messages import is_transient_message
 
 
 def _fresh_run_agent(hermes_home):
@@ -27,22 +28,16 @@ def _fresh_run_agent(hermes_home):
     return sys.modules["run_agent"]
 
 
-def test_verification_flags_registered_as_ephemeral(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-    ra = _fresh_run_agent(tmp_path)
-
-    assert "_verification_stop_synthetic" in ra._EPHEMERAL_SCAFFOLDING_FLAGS
-    assert "_pre_verify_synthetic" in ra._EPHEMERAL_SCAFFOLDING_FLAGS
-
+def test_verification_flags_are_transient():
     # The central classifier drives both persistence sinks.
-    assert ra._is_ephemeral_scaffolding(
+    assert is_transient_message(
         {"role": "assistant", "content": "done", "_verification_stop_synthetic": True}
     )
-    assert ra._is_ephemeral_scaffolding(
+    assert is_transient_message(
         {"role": "user", "content": "[System: run tests]", "_pre_verify_synthetic": True}
     )
     # Real messages are not scaffolding.
-    assert not ra._is_ephemeral_scaffolding({"role": "user", "content": "hi"})
+    assert not is_transient_message({"role": "user", "content": "hi"})
 
 
 def _make_agent(ra, session_id, tmp_path):
@@ -73,6 +68,7 @@ def test_db_flush_drops_verification_scaffolding(tmp_path, monkeypatch):
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "premature done", "_verification_stop_synthetic": True},
         {"role": "user", "content": "[System: run tests]", "_verification_stop_synthetic": True},
+        {"role": "user", "content": "[System: continue]", "_transient_model_instruction": True},
         {"role": "assistant", "content": "verified and clean"},
     ]
 
@@ -86,6 +82,7 @@ def test_db_flush_drops_verification_scaffolding(tmp_path, monkeypatch):
     assert "verified and clean" in persisted
     assert "premature done" not in persisted
     assert "[System: run tests]" not in persisted
+    assert "[System: continue]" not in persisted
 
 
 def test_json_log_drops_verification_scaffolding(tmp_path, monkeypatch):
@@ -97,6 +94,7 @@ def test_json_log_drops_verification_scaffolding(tmp_path, monkeypatch):
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "premature done", "_pre_verify_synthetic": True},
         {"role": "user", "content": "[System: run tests]", "_pre_verify_synthetic": True},
+        {"role": "user", "content": "[System: continue]", "_transient_model_instruction": True},
         {"role": "assistant", "content": "verified and clean"},
     ]
 
@@ -108,3 +106,4 @@ def test_json_log_drops_verification_scaffolding(tmp_path, monkeypatch):
     contents = [m.get("content") for m in data["messages"]]
     assert contents == ["hi", "verified and clean"]
     assert all(not m.get("_pre_verify_synthetic") for m in data["messages"])
+    assert all(not m.get("_transient_model_instruction") for m in data["messages"])

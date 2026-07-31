@@ -24,6 +24,15 @@ _LEGACY_NETWORK_CONTINUATION_PROMPT = (
 )
 
 
+def is_network_continuation_prompt(role: Any, content: Any) -> bool:
+    """Return whether role/content are the internal network-recovery marker."""
+    return (
+        role in {"user", "system"}
+        and isinstance(content, str)
+        and content.strip() == _LEGACY_NETWORK_CONTINUATION_PROMPT
+    )
+
+
 def _legacy_synthetic_message_kind(message: Any) -> str | None:
     """Classify synthetic user/system turns persisted by older builds."""
     if not isinstance(message, dict):
