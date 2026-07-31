@@ -55,7 +55,7 @@ describe("GuiChatModelsPane", () => {
     await renderPane();
 
     expect(api.getModelRegistrations).toHaveBeenCalledWith("profile-a");
-    expect(document.querySelector("[data-models-pane]")).not.toBeNull();
+    expect(document.querySelector("[data-models-pane].gui-chat-workspace-pane")).not.toBeNull();
     expect(document.body.textContent).toContain("Current conversation");
     expect(document.body.textContent).toContain("Default");
 

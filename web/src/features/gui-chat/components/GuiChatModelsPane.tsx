@@ -362,15 +362,15 @@ export function GuiChatModelsPane({
   };
 
   return (
-    <section aria-label="Models" className="gui-chat-skills-pane" data-models-pane>
-      <header className="gui-chat-skills-toolbar">
-        <button className="gui-chat-skills-primary-button" onClick={openCreate} type="button">
+    <section aria-label="Models" className="gui-chat-workspace-pane" data-models-pane>
+      <header className="gui-chat-workspace-toolbar">
+        <button className="gui-chat-workspace-primary-button" onClick={openCreate} type="button">
           <Plus aria-hidden />
           Add model
         </button>
         <button
           aria-label="Refresh models"
-          className="gui-chat-skills-icon-button"
+          className="gui-chat-workspace-icon-button"
           disabled={loading}
           onClick={() => void load()}
           type="button"
@@ -379,12 +379,12 @@ export function GuiChatModelsPane({
         </button>
       </header>
 
-      <div className="gui-chat-skills-heading gui-chat-models-heading">
+      <div className="gui-chat-workspace-heading">
         <div>
           <h1>Models</h1>
           <p>Manage models and choose which ones power conversations and generation.</p>
         </div>
-        <label className="gui-chat-skills-search">
+        <label className="gui-chat-workspace-search">
           <Search aria-hidden />
           <input
             aria-label="Search models"
@@ -411,16 +411,16 @@ export function GuiChatModelsPane({
       </div>
 
       {error || busy ? (
-        <div className="gui-chat-skills-feedback is-error" role="alert">
+        <div className="gui-chat-workspace-feedback is-error" role="alert">
           {error ?? "Stop the current response before switching chat models."}
         </div>
       ) : null}
 
-      <div className="gui-chat-skills-list">
+      <div className="gui-chat-workspace-list">
         {data === null && loading ? (
-          <div className="gui-chat-skills-empty" role="status">Loading models…</div>
+          <div className="gui-chat-workspace-empty" role="status">Loading models…</div>
         ) : visibleRegistrations.length === 0 ? (
-          <div className="gui-chat-skills-empty">
+          <div className="gui-chat-workspace-empty">
             <Cpu aria-hidden />
             <strong>{query.trim() ? "No matching models" : `No ${selectedKind} models yet`}</strong>
             <span>{query.trim() ? "Try a different search." : "Add a model to make it available here."}</span>
@@ -433,9 +433,9 @@ export function GuiChatModelsPane({
           const active = registration.kind === "chat" ? current : configured;
           const working = workingId === registration.id;
           return (
-            <article className="gui-chat-skill-row gui-chat-model-row" key={registration.id}>
-              <div className="gui-chat-skill-copy">
-                <div className="gui-chat-skill-title">
+            <article className="gui-chat-workspace-row gui-chat-model-row" key={registration.id}>
+              <div className="gui-chat-workspace-copy">
+                <div className="gui-chat-workspace-title">
                   <span>{registration.name}</span>
                   <ModelBadge>{KIND_LABELS[registration.kind]}</ModelBadge>
                   <ModelBadge>{registration.source === "custom" ? "Custom" : "Catalog"}</ModelBadge>
@@ -450,7 +450,7 @@ export function GuiChatModelsPane({
                 </div>
                 <p>{registration.provider} · {registration.model}</p>
               </div>
-              <div className="gui-chat-skill-actions gui-chat-model-actions">
+              <div className="gui-chat-workspace-actions gui-chat-model-actions">
                 {registration.kind === "chat" ? (
                   <>
                     <button
@@ -484,7 +484,7 @@ export function GuiChatModelsPane({
                 ) : null}
                 <button
                   aria-label={`Edit ${registration.name}`}
-                  className="gui-chat-skills-icon-button"
+                  className="gui-chat-workspace-icon-button"
                   disabled={working}
                   onClick={() => openEdit(registration)}
                   type="button"
@@ -493,7 +493,7 @@ export function GuiChatModelsPane({
                 </button>
                 <button
                   aria-label={`Delete ${registration.name}`}
-                  className="gui-chat-skills-icon-button is-destructive"
+                  className="gui-chat-workspace-icon-button is-destructive"
                   disabled={working || configured}
                   onClick={() => setPendingDelete(registration)}
                   title={configured ? "Switch the active model before deleting this registration." : undefined}
