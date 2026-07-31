@@ -1291,6 +1291,7 @@ Environment=HERMES_REMOTE_ROOT=$remote_root
 Environment=HERMES_HOME=$hermes_home
 Environment=HERMES_ENV_FILE=$env_file
 Environment=VIRTUAL_ENV=$venv
+Environment=MALLOC_ARENA_MAX=2
 Environment=HERMES_SANDBOX_DEPLOYMENT_POLICY=hermes_cli.owner_worker.host_sandbox:host_sandbox_deployment_policy
 Environment=HERMES_DISABLE_LAZY_INSTALLS=1
 WorkingDirectory=$current
@@ -1325,6 +1326,7 @@ Environment=HERMES_REMOTE_ROOT=$remote_root
 Environment=HERMES_HOME=$hermes_home
 Environment=HERMES_ENV_FILE=$env_file
 Environment=VIRTUAL_ENV=$venv
+Environment=MALLOC_ARENA_MAX=2
 Environment=HERMES_DASHBOARD_PUBLIC_URL=$dashboard_public_url
 Environment=HERMES_SANDBOX_DEPLOYMENT_POLICY=hermes_cli.owner_worker.host_sandbox:host_sandbox_deployment_policy
 Environment=HERMES_DISABLE_LAZY_INSTALLS=1

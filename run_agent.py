@@ -1611,6 +1611,14 @@ class AIAgent:
         here so existing tests that patch ``run_agent.threading.Thread``
         keep working.
         """
+        from agent.review_coordination import ReviewCoordinator
+
+        coordinator = getattr(self, "_review_coordinator", None)
+        if coordinator is None:
+            coordinator = self._review_coordinator = ReviewCoordinator()
+        if not coordinator.reserve_review():
+            return
+
         from agent.background_review import spawn_background_review_thread
         from tools.thread_context import propagate_context_to_thread
         target, _prompt = spawn_background_review_thread(
@@ -1624,7 +1632,11 @@ class AIAgent:
         t = threading.Thread(
             target=propagate_context_to_thread(target), daemon=True, name="bg-review"
         )
-        t.start()
+        try:
+            t.start()
+        except Exception:
+            coordinator.cancel_review()
+            raise
 
     def _build_memory_write_metadata(
         self,
@@ -5788,18 +5800,29 @@ class AIAgent:
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.conversation_loop import run_conversation
-        return run_conversation(
-            self,
-            user_message,
-            system_message,
-            conversation_history,
-            task_id,
-            stream_callback,
-            persist_user_message,
-            persist_user_timestamp=persist_user_timestamp,
-            persist_user_attachments=persist_user_attachments,
-            moa_config=moa_config,
-        )
+
+        coordinate_foreground = not getattr(self, "_persist_disabled", False)
+        if coordinate_foreground:
+            self._review_coordinator.begin_foreground()
+        try:
+            return run_conversation(
+                self,
+                user_message,
+                system_message,
+                conversation_history,
+                task_id,
+                stream_callback,
+                persist_user_message,
+                persist_user_timestamp=persist_user_timestamp,
+                persist_user_attachments=persist_user_attachments,
+                moa_config=moa_config,
+            )
+        finally:
+            if coordinate_foreground:
+                from agent.runtime_memory import maybe_trim_allocator
+
+                self._review_coordinator.end_foreground()
+                maybe_trim_allocator("foreground_turn")
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

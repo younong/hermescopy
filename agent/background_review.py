@@ -600,9 +600,13 @@ def _run_review_in_thread(
     except Exception:
         pass
 
+    coordinator = agent._review_coordinator
     review_agent = None
     review_messages: List[Dict] = []
+    review_started = False
     try:
+        coordinator.begin_review()
+        review_started = True
         # Silence stdout/stderr for THIS worker thread only.  A process-global
         # ``contextlib.redirect_stdout(devnull)`` here would also blank
         # ``sys.stdout``/``sys.stderr`` for every other thread — including a
@@ -660,6 +664,7 @@ def _run_review_in_thread(
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 skip_memory=True,
             )
+            coordinator.set_review_agent(review_agent)
             review_agent._memory_write_origin = "background_review"
             review_agent._memory_write_context = "background_review"
             # The review fork pins the parent's cached system prompt and keeps
@@ -867,6 +872,16 @@ def _run_review_in_thread(
             _set_approval_callback(None)
         except Exception:
             pass
+        if review_started:
+            coordinator.end_review()
+            try:
+                from agent.runtime_memory import maybe_trim_allocator
+
+                maybe_trim_allocator("background_review")
+            except Exception:
+                pass
+        else:
+            coordinator.cancel_review()
 
 
 def spawn_background_review_thread(

@@ -46,6 +46,7 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert "Environment=HERMES_DASHBOARD_PUBLIC_URL=$dashboard_public_url" in source
     assert source.count("Environment=HERMES_SANDBOX_DEPLOYMENT_POLICY=") == 2
     assert source.count("Environment=HERMES_DISABLE_LAZY_INSTALLS=1") == 2
+    assert source.count("Environment=MALLOC_ARENA_MAX=2") == 2
     assert "--require-auth --trust-proxy-headers" in source
     assert (
         "Environment=HERMES_SANDBOX_DEPLOYMENT_POLICY="
