@@ -1,5 +1,6 @@
 """Regression tests for empty-response recovery transcript persistence."""
 
+from hermes_state import SessionDB
 from run_agent import AIAgent
 
 
@@ -80,6 +81,55 @@ def test_persist_session_strips_trailing_empty_recovery_scaffolding():
     ]
     assert agent.flushed_session_db_messages[-1] == messages
     assert all(not msg.get("_empty_recovery_synthetic") for msg in messages)
+
+
+def test_persist_session_strips_generic_transient_instruction():
+    agent = _agent_with_stubbed_persistence()
+    messages = [
+        {"role": "user", "content": "run the task"},
+        {
+            "role": "user",
+            "content": "[System: continue the interrupted response]",
+            "_transient_model_instruction": True,
+        },
+        {"role": "assistant", "content": "Done."},
+    ]
+
+    AIAgent._persist_session(agent, messages, conversation_history=[])
+
+    assert messages == [
+        {"role": "user", "content": "run the task"},
+        {"role": "assistant", "content": "Done."},
+    ]
+    assert agent._session_messages == messages
+    assert agent.flushed_session_db_messages[-1] == messages
+
+
+def test_persist_session_strips_transient_instruction_from_real_session_db(tmp_path):
+    agent = _agent_with_capturing_db()
+    agent._session_db = SessionDB(db_path=tmp_path / "state.db")
+    agent._session_db.create_session(agent.session_id, source="test")
+    agent._session_json_enabled = False
+
+    messages = [
+        {"role": "user", "content": "run the task"},
+        {
+            "role": "user",
+            "content": "[System: continue the interrupted response]",
+            "_transient_model_instruction": True,
+        },
+        {"role": "assistant", "content": "Done."},
+    ]
+
+    try:
+        AIAgent._persist_session(agent, messages, conversation_history=[])
+        persisted = agent._session_db.get_messages_as_conversation(agent.session_id)
+    finally:
+        agent._session_db.close()
+
+    assert [message["content"] for message in persisted] == ["run the task", "Done."]
+    assert [message["content"] for message in messages] == ["run the task", "Done."]
+    assert all(not message.get("_transient_model_instruction") for message in messages)
 
 
 def test_persist_session_keeps_unmarked_terminal_empty_response():

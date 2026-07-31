@@ -1859,7 +1859,7 @@ def test_run_conversation_codex_continues_after_ack_stop_message(monkeypatch):
         and "inspect ~/openclaw-studio" in (msg.get("content") or "")
         for msg in result["messages"]
     )
-    assert any(
+    assert not any(
         msg.get("role") == "user"
         and "Continue now. Execute the required tool calls" in (msg.get("content") or "")
         for msg in result["messages"]
@@ -1900,7 +1900,7 @@ def test_run_conversation_codex_continues_after_ack_for_directory_listing_prompt
         and "current directory" in (msg.get("content") or "")
         for msg in result["messages"]
     )
-    assert any(
+    assert not any(
         msg.get("role") == "user"
         and "Continue now. Execute the required tool calls" in (msg.get("content") or "")
         for msg in result["messages"]

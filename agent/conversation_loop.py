@@ -60,6 +60,10 @@ from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.retry_utils import adaptive_rate_limit_backoff, jittered_backoff
 from agent.trajectory import has_incomplete_scratchpad
+from agent.transient_messages import (
+    consume_transient_model_instruction,
+    transient_model_instruction,
+)
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
@@ -1380,7 +1384,9 @@ def run_conversation(
                 )
                 
                 api_duration = time.time() - api_start_time
-                
+                consume_transient_model_instruction(messages)
+                agent._session_messages = messages
+
                 # Stop thinking spinner silently -- the response box or tool
                 # execution messages that follow are more informative.
                 if thinking_spinner:
@@ -1970,13 +1976,12 @@ def run_conversation(
                                         f"({length_continue_retries}/4)..."
                                     )
 
-                                continue_msg = {
-                                    "role": "user",
-                                    "content": _get_continuation_prompt(
+                                continue_msg = transient_model_instruction(
+                                    _get_continuation_prompt(
                                         _dropped_tools,
                                         retry_attempt=dropped_tool_stream_retries,
-                                    ),
-                                }
+                                    )
+                                )
                                 messages.append(continue_msg)
                                 agent._session_messages = messages
                                 _retry.restart_with_length_continuation = True
@@ -5121,13 +5126,10 @@ def run_conversation(
                     messages.append(interim_msg)
                     agent._emit_interim_assistant_message(interim_msg)
 
-                    continue_msg = {
-                        "role": "user",
-                        "content": (
-                            "[System: Continue now. Execute the required tool calls and only "
-                            "send your final answer after completing the task.]"
-                        ),
-                    }
+                    continue_msg = transient_model_instruction(
+                        "[System: Continue now. Execute the required tool calls and only "
+                        "send your final answer after completing the task.]"
+                    )
                     messages.append(continue_msg)
                     agent._session_messages = messages
                     continue

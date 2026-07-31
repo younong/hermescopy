@@ -198,6 +198,7 @@ from agent.trajectory import (
     convert_scratchpad_to_think,
     save_trajectory as _save_trajectory_to_file,
 )
+from agent.transient_messages import is_transient_message, strip_transient_messages
 from agent.tool_dispatch_helpers import (
     _should_parallelize_tool_batch,
     _is_destructive_command,  # noqa: F401  # re-exported for tests that access `run_agent._is_destructive_command`
@@ -212,36 +213,6 @@ from agent.tool_dispatch_helpers import (
     _trajectory_normalize_msg,  # noqa: F401  # re-exported for tests that `from run_agent import _trajectory_normalize_msg`
 )
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
-
-
-# Internal flags that mark a message as ephemeral empty-response/prefill
-# recovery scaffolding: the synthetic assistant "(empty)" turn and user nudge
-# injected after an empty response, the terminal "(empty)" sentinel, and the
-# thinking-only prefill placeholder. These exist only to drive the next API
-# retry; the in-memory loop pops them before appending the real response.
-# Persistence must mirror that, otherwise an append-only flush can commit them
-# to the session store and a resumed session replays synthetic "(empty)"/nudge
-# turns as if they were genuine context.
-_EPHEMERAL_SCAFFOLDING_FLAGS = (
-    "_empty_recovery_synthetic",
-    "_empty_terminal_sentinel",
-    "_thinking_prefill",
-    # verify-on-stop and pre_verify nudges append a synthetic assistant
-    # "done" plus a synthetic user nudge to keep the agent going one more
-    # turn before it can claim completion. Those messages exist only to
-    # drive the verification loop; persisting them poisons the resumed
-    # transcript and breaks prompt-prefix cache reuse on later turns. (#55733)
-    "_verification_stop_synthetic",
-    "_pre_verify_synthetic",
-)
-
-
-def _is_ephemeral_scaffolding(msg: Any) -> bool:
-    """Return True when ``msg`` is internal recovery scaffolding that must never
-    be persisted to the durable transcript (SQLite session store or JSON log)."""
-    return isinstance(msg, dict) and any(
-        msg.get(flag) for flag in _EPHEMERAL_SCAFFOLDING_FLAGS
-    )
 
 
 _MAX_TOOL_WORKERS = 8
@@ -1702,6 +1673,7 @@ class AIAgent:
         # Scaffolding removal mutates the live list (desired — ephemeral
         # retry/failure sentinels must not survive into the real transcript).
         self._drop_trailing_empty_response_scaffolding(messages)
+        messages[:] = strip_transient_messages(messages)
         self._session_messages = messages
         self._save_session_log(messages)
         self._flush_messages_to_session_db(messages, conversation_history)
@@ -1857,7 +1829,7 @@ class AIAgent:
                 # "(empty)"/nudge/thinking-prefill turns as if they were genuine
                 # context. Skip regardless of position: an answered nudge leaves
                 # the synthetic pair buried mid-list, not just at the tail.
-                if _is_ephemeral_scaffolding(msg):
+                if is_transient_message(msg):
                     continue
                 if msg.get(_DB_PERSISTED_MARKER):
                     continue
@@ -2602,7 +2574,7 @@ class AIAgent:
             for msg in messages:
                 # Mirror the SQLite flush: ephemeral recovery scaffolding is
                 # internal retry state, never durable transcript content.
-                if _is_ephemeral_scaffolding(msg):
+                if is_transient_message(msg):
                     continue
                 if msg.get("role") == "assistant" and msg.get("content"):
                     msg = dict(msg)

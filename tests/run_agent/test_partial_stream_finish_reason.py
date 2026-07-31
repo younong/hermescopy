@@ -577,3 +577,18 @@ class TestContentFilterStallActivatesFallback:
             "_try_activate_fallback — it should fall through to continuation."
         )
         assert result["completed"] is True
+        continuation = _get_continuation_prompt(["write_file"])
+        retry_messages = [
+            message
+            for request in loop_agent.client.chat.completions.create.call_args_list[1:]
+            for message in request.kwargs["messages"]
+        ]
+        assert any(
+            message.get("role") == "user"
+            and message.get("content") == continuation
+            for message in retry_messages
+        )
+        assert all(
+            message.get("content") != continuation
+            for message in result["messages"]
+        )
