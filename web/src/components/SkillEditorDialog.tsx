@@ -6,11 +6,11 @@ import { Label } from "@nous-research/ui/ui/components/label";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import {
   Dialog,
-  DialogContent,
   DialogDescription,
   DialogHeader,
   DialogTitle,
 } from "@nous-research/ui/ui/components/dialog";
+import { CenteredDialogContent } from "@/components/CenteredDialogContent";
 
 /* ------------------------------------------------------------------ */
 /*  SkillEditorDialog — create or edit a SKILL.md from the dashboard   */
@@ -57,7 +57,7 @@ export function SkillEditorDialog({
   // initializers — no reset-on-open effect (react-hooks/set-state-in-effect).
   return (
     <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="max-w-3xl">
+      <CenteredDialogContent className="max-w-3xl">
         {open && (
           <EditorBody
             key={editName ?? "__create__"}
@@ -67,7 +67,7 @@ export function SkillEditorDialog({
             onSaved={onSaved}
           />
         )}
-      </DialogContent>
+      </CenteredDialogContent>
     </Dialog>
   );
 }
