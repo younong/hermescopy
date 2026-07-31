@@ -1244,7 +1244,7 @@ code { font-size: 0.875rem; }
   font-weight: 600;
 }
 
-[data-gui-chat] .gui-chat-workspace-dialog-backdrop {
+[data-gui-chat].gui-chat-workspace-dialog-backdrop {
   position: fixed;
   z-index: 100;
   inset: 0;
