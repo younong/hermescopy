@@ -3,14 +3,15 @@
 Pins the contract:
 
 - text-only partial stream → stub.finish_reason == "length" so the
-  conversation loop's existing length-continuation path can keep the
-  agent moving against an unfinished goal.
+  conversation loop can identify the interrupted transport and finalize
+  the assistant content already delivered to the user.
 - partial mid-tool-call → stub.finish_reason == "length" so the loop
   triggers continuation machinery with targeted chunking guidance
   instead of ending the turn immediately.
-- conversation_loop's length-continuation prompt distinguishes a real
-  output-length truncation from a partial-stream-stub network error
-  via response.id.
+- text-only network interruptions are logged and finalized from delivered
+  assistant content without a synthetic continuation message.
+- genuine output-length truncation and dropped-tool recovery retain targeted
+  continuation prompts.
 """
 
 from __future__ import annotations
@@ -263,53 +264,27 @@ class TestCleanStreamEndMidToolCall:
 # ── Length-continuation prompt branching ──────────────────────────────────
 
 class TestLengthContinuationPromptBranching:
-    """When finish_reason=length, the continuation prompt that reaches the
-    model has to tell the truth: real truncation vs. network interruption
-    vs. dropped tool call (#31998).  Three distinct prompts now exist."""
-
-    def _simulate_branch(self, response_id: str, dropped_tools=None) -> str:
-        """Return the continuation prompt text the loop would inject for
-        a `finish_reason=length` response with the given id."""
-        is_partial = response_id == PARTIAL_STREAM_STUB_ID
-        return _get_continuation_prompt(is_partial, dropped_tools)
-
-    def test_partial_stream_stub_uses_network_prompt(self):
-        prompt = self._simulate_branch(PARTIAL_STREAM_STUB_ID)
-        assert "network error mid-stream" in prompt
-        assert "output length limit" not in prompt
+    """Only genuine length caps and dropped-tool recovery prompt the model."""
 
     def test_real_truncation_uses_length_prompt(self):
-        prompt = self._simulate_branch("chatcmpl-abc123")
+        prompt = _get_continuation_prompt()
         assert "output length limit" in prompt
         assert "network error" not in prompt
 
-    def test_no_id_falls_through_to_length_prompt(self):
-        prompt = self._simulate_branch("")
-        assert "output length limit" in prompt
-
     def test_dropped_tool_call_uses_truthful_incremental_prompt(self):
-        """A dropped tool call gets bounded retry guidance without inventing
-        a provider limit or implying that incomplete arguments executed."""
-        prompt = self._simulate_branch(
-            PARTIAL_STREAM_STUB_ID, dropped_tools=["write_file"],
-        )
+        """Dropped tool calls retain the latest targeted retry guidance."""
+        prompt = _get_continuation_prompt(["write_file"])
         assert "upstream response stream ended" in prompt
         assert "did not run" in prompt
         assert "does not establish any fixed token or payload-size limit" in prompt
         assert "exactly one small, self-contained tool call" in prompt
-        assert "short skeleton" in prompt
-        assert "separate patch calls" in prompt
         assert "write_file" in prompt
         assert "8K" not in prompt
         assert "too large" not in prompt
         assert "output length limit" not in prompt
 
     def test_repeated_drop_requires_smaller_scope_not_full_rewrite(self):
-        prompt = _get_continuation_prompt(
-            True,
-            ["write_file"],
-            retry_attempt=2,
-        )
+        prompt = _get_continuation_prompt(["write_file"], retry_attempt=2)
         assert "happened again" in prompt
         assert "reduce the scope further" in prompt
         assert "do not substitute another full-payload rewrite" in prompt
@@ -319,8 +294,7 @@ class TestLengthContinuationPromptBranching:
 
 @pytest.fixture()
 def loop_agent():
-    """AIAgent with a mocked OpenAI client (mirrors test_run_agent's fixture)
-    so we can stage a stub + continuation pair on .chat.completions.create."""
+    """AIAgent with a mocked OpenAI client for conversation-loop responses."""
     from run_agent import AIAgent
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
@@ -344,113 +318,55 @@ def loop_agent():
 
 
 class TestConversationLoopPartialStreamContinuation:
-    """End-to-end: a partial-stream stub feeds the loop and the loop
-    asks for continuation instead of exiting with finish_reason=stop."""
+    """Text-only network interruption stays out of model and session history."""
 
-    def test_partial_stream_stub_does_not_exit_loop_immediately(self, loop_agent):
-        """The stub from chat_completion_helpers used to exit the loop with
-        text_response(finish_reason=stop). Now finish_reason=length routes
-        through length_continue_retries — the loop persists the partial
-        content and asks the model to continue."""
+    def test_partial_stream_stub_is_logged_without_synthetic_message(
+        self, loop_agent, caplog, tmp_path,
+    ):
+        from hermes_state import SessionDB
+        from tests.run_agent.test_run_agent import _mock_assistant_msg
 
-        from tests.run_agent.test_run_agent import _mock_response, _mock_assistant_msg
+        session_db = SessionDB(db_path=tmp_path / "state.db")
+        loop_agent._session_db = session_db
+        loop_agent._session_db_created = False
 
-        # First API call: the partial-stream stub (length on partial-stream-stub id).
         partial_stub = SimpleNamespace(
             id=PARTIAL_STREAM_STUB_ID,
             model="test/model",
             choices=[SimpleNamespace(
                 index=0,
-                message=_mock_assistant_msg(content="The first half of "),
+                message=_mock_assistant_msg(content="The delivered partial answer."),
                 finish_reason=FINISH_REASON_LENGTH,
             )],
             usage=None,
         )
-        # Second API call: model continues with the rest, clean stop.
-        continuation = _mock_response(
-            content="the answer is forty-two.", finish_reason="stop",
-        )
+        loop_agent.client.chat.completions.create.return_value = partial_stub
 
-        loop_agent.client.chat.completions.create.side_effect = [
-            partial_stub, continuation,
+        try:
+            with (
+                patch.object(loop_agent, "_save_trajectory"),
+                patch.object(loop_agent, "_cleanup_task_resources"),
+                caplog.at_level("WARNING", logger="agent.conversation_loop"),
+            ):
+                result = loop_agent.run_conversation("ask me something")
+            persisted = session_db.get_messages_as_conversation(loop_agent.session_id)
+        finally:
+            session_db.close()
+
+        assert loop_agent.client.chat.completions.create.call_count == 1
+        assert result["final_response"] == "The delivered partial answer."
+        assert result["turn_exit_reason"] == "text_response(partial_stream_network_error)"
+        assert result["response_previewed"] is True
+        assert [message["role"] for message in result["messages"]] == [
+            "user", "assistant",
         ]
-
-        with (
-            patch.object(loop_agent, "_persist_session"),
-            patch.object(loop_agent, "_save_trajectory"),
-            patch.object(loop_agent, "_cleanup_task_resources"),
-        ):
-            result = loop_agent.run_conversation("ask me something")
-
-        # The loop made TWO API calls (stub + continuation), not one.
-        assert loop_agent.client.chat.completions.create.call_count == 2, (
-            "Partial-stream-stub must trigger a continuation API call, not "
-            "exit the loop after one call."
-        )
-        # The continuation prompt the loop appended must be the network-error
-        # variant, not the "output length limit" lie — otherwise the model
-        # no-ops with "I wasn't truncated, I'm done."
-        # We assert it indirectly by inspecting the second-call kwargs.
-        second_call_kwargs = loop_agent.client.chat.completions.create.call_args_list[1]
-        msgs = second_call_kwargs.kwargs.get("messages") or second_call_kwargs.args[0].get("messages")
-        last_user = next(
-            (m for m in reversed(msgs) if m.get("role") == "user"), None,
-        )
-        assert last_user is not None
-        assert "network error mid-stream" in (last_user.get("content") or ""), (
-            "Continuation prompt for partial-stream-stub must mention the "
-            "network error, not the 'output length limit'."
-        )
-
-        # And the final response stitches both halves together.
-        assert "first half of" in result["final_response"]
-        assert "forty-two" in result["final_response"]
-
-    def test_repeated_dropped_tool_call_tightens_incremental_guidance(
-        self, loop_agent,
-    ):
-        """Each interrupted retry remains truthful, and a repeated drop tells
-        the model to shrink the next operation rather than rewrite everything."""
-        from tests.run_agent.test_run_agent import _mock_response
-
-        def _dropped_write_stub():
-            response = _mock_response(content="", finish_reason=FINISH_REASON_LENGTH)
-            response.id = PARTIAL_STREAM_STUB_ID
-            response._dropped_tool_names = ["write_file"]
-            return response
-
-        loop_agent.client.chat.completions.create.side_effect = [
-            _dropped_write_stub(),
-            _dropped_write_stub(),
-            _mock_response(content="Recovered incrementally.", finish_reason="stop"),
+        assert result["messages"][-1]["content"] == "The delivered partial answer."
+        assert result["messages"][-1]["finish_reason"] == FINISH_REASON_LENGTH
+        assert [message["role"] for message in persisted] == ["user", "assistant"]
+        assert [message["content"] for message in persisted] == [
+            "ask me something", "The delivered partial answer.",
         ]
-
-        with (
-            patch.object(loop_agent, "_persist_session"),
-            patch.object(loop_agent, "_save_trajectory"),
-            patch.object(loop_agent, "_cleanup_task_resources"),
-        ):
-            result = loop_agent.run_conversation("write a long report")
-
-        assert result["completed"] is True
-        assert loop_agent.client.chat.completions.create.call_count == 3
-
-        retry_prompts = []
-        for call in loop_agent.client.chat.completions.create.call_args_list[1:]:
-            msgs = call.kwargs.get("messages") or call.args[0].get("messages")
-            retry_prompts.append(
-                next(m["content"] for m in reversed(msgs) if m.get("role") == "user")
-            )
-
-        first_retry, second_retry = retry_prompts
-        for prompt in retry_prompts:
-            assert "exactly one small, self-contained tool call" in prompt
-            assert "8K" not in prompt
-            assert "output length limit" not in prompt
-        assert "happened again" not in first_retry
-        assert "happened again" in second_retry
-        assert "reduce the scope further" in second_retry
-        assert "full-payload rewrite" in second_retry
+        assert "keeping the delivered assistant content" in caplog.text
 
 
 class TestContentFilterStallActivatesFallback:

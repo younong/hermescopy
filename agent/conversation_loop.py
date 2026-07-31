@@ -423,11 +423,10 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
 
 
 def _get_continuation_prompt(
-    is_partial_stub: bool,
     dropped_tools: Optional[List[str]] = None,
     retry_attempt: int = 1,
 ) -> str:
-    if is_partial_stub and dropped_tools:
+    if dropped_tools:
         tool_list = ", ".join(dropped_tools[:3])
         repeated_retry = (
             " This has happened again, so reduce the scope further; do not "
@@ -448,19 +447,11 @@ def _get_continuation_prompt(
             "continue from that state on the following turn."
             f"{repeated_retry}]"
         )
-    elif is_partial_stub:
-        return (
-            "[System: The previous response was cut off by a "
-            "network error mid-stream. Continue exactly where "
-            "you left off. Do not restart or repeat prior text. "
-            "Finish the answer directly.]"
-        )
-    else:
-        return (
-            "[System: Your previous response was truncated by the output "
-            "length limit. Continue exactly where you left off. Do not "
-            "restart or repeat prior text. Finish the answer directly.]"
-        )
+    return (
+        "[System: Your previous response was truncated by the output "
+        "length limit. Continue exactly where you left off. Do not "
+        "restart or repeat prior text. Finish the answer directly.]"
+    )
 
 
 # Shared recovery hint appended to every content-policy refusal message. Both
@@ -1772,13 +1763,7 @@ def run_conversation(
                     )
 
                 if finish_reason == "length":
-                    if getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID:
-                        agent._vprint(
-                            f"{agent.log_prefix}⚠️  Stream interrupted by network error "
-                            f"(finish_reason='length' on partial-stream-stub)",
-                            force=True,
-                        )
-                    else:
+                    if getattr(response, "id", "") != PARTIAL_STREAM_STUB_ID:
                         agent._vprint(
                             f"{agent.log_prefix}⚠️  Response truncated "
                             f"(finish_reason='length') - model hit max output tokens",
@@ -1920,6 +1905,34 @@ def run_conversation(
                                 force=True,
                             )
                         if assistant_message is not None and not _trunc_has_tool_calls:
+                            _is_partial_stream_stub = (
+                                getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
+                            )
+                            _dropped_tools = getattr(
+                                response, "_dropped_tool_names", None
+                            )
+                            if _is_partial_stream_stub and not _dropped_tools:
+                                _partial_content = agent._strip_think_blocks(
+                                    assistant_message.content or ""
+                                ).strip()
+                                logger.warning(
+                                    "Partial response stream ended after %d chars; "
+                                    "keeping the delivered assistant content without "
+                                    "injecting a continuation message (session=%s)",
+                                    len(_partial_content),
+                                    agent.session_id or "none",
+                                )
+                                final_response = _partial_content
+                                if _partial_content:
+                                    messages.append(
+                                        agent._build_assistant_message(
+                                            assistant_message, finish_reason
+                                        )
+                                    )
+                                agent._response_was_previewed = bool(_partial_content)
+                                _turn_exit_reason = "text_response(partial_stream_network_error)"
+                                break
+
                             length_continue_retries += 1
                             interim_msg = agent._build_assistant_message(assistant_message, finish_reason)
                             messages.append(interim_msg)
@@ -1927,14 +1940,7 @@ def run_conversation(
                                 truncated_response_parts.append(assistant_message.content)
 
                             if length_continue_retries < 4:
-                                _is_partial_stream_stub = (
-                                    getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
-                                )
-                                _dropped_tools = getattr(
-                                    response, "_dropped_tool_names", None
-                                )
-
-                                if _is_partial_stream_stub and _dropped_tools:
+                                if _dropped_tools:
                                     dropped_tool_stream_retries += 1
                                     _tool_list = ", ".join(_dropped_tools[:3])
                                     agent._vprint(
@@ -1943,26 +1949,18 @@ def run_conversation(
                                         f"chunked retry "
                                         f"({length_continue_retries}/4)..."
                                     )
-                                elif _is_partial_stream_stub:
-                                    agent._vprint(
-                                        f"{agent.log_prefix}↻ Stream interrupted — "
-                                        f"requesting continuation "
-                                        f"({length_continue_retries}/4)..."
-                                    )
                                 else:
                                     agent._vprint(
                                         f"{agent.log_prefix}↻ Requesting continuation "
                                         f"({length_continue_retries}/4)..."
                                     )
 
-                                _continue_content = _get_continuation_prompt(
-                                    _is_partial_stream_stub,
-                                    _dropped_tools,
-                                    retry_attempt=dropped_tool_stream_retries,
-                                )
                                 continue_msg = {
                                     "role": "user",
-                                    "content": _continue_content,
+                                    "content": _get_continuation_prompt(
+                                        _dropped_tools,
+                                        retry_attempt=dropped_tool_stream_retries,
+                                    ),
                                 }
                                 messages.append(continue_msg)
                                 agent._session_messages = messages
@@ -4168,6 +4166,9 @@ def run_conversation(
         # If the API call was interrupted, skip response processing
         if interrupted:
             _turn_exit_reason = "interrupted_during_api_call"
+            break
+
+        if _turn_exit_reason == "text_response(partial_stream_network_error)":
             break
 
         if _retry.restart_with_compressed_messages:
