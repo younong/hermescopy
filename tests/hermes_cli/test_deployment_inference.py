@@ -21,6 +21,7 @@ from hermes_cli.owner_worker.inference_relay import (
     DeploymentInferenceBroker,
     DeploymentInferenceRelayError,
     OwnerInferenceRelay,
+    _BrokerRequest,
 )
 
 
@@ -626,6 +627,28 @@ def test_owner_relay_does_not_send_second_error_after_headers(caplog):
     assert broker_errors == []
 
 
+def test_broker_request_only_closes_response_for_forced_shutdown():
+    class Response:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    request = _BrokerRequest(body_bytes=0)
+    response = Response()
+    request.response = response
+
+    request.cancel()
+
+    assert request.cancelled.is_set()
+    assert response.close_calls == 0
+
+    request.abort()
+
+    assert response.close_calls == 1
+
+
 def test_owner_relay_cancels_abandoned_response_without_blocking_next_request(caplog):
     import hermes_cli.owner_worker.inference_relay as relay_module
 
@@ -656,6 +679,11 @@ def test_owner_relay_cancels_abandoned_response_without_blocking_next_request(ca
                     {**frame, "request_id": first_id, "sequence": sequence},
                 )
 
+            start_consumed = relay_module._recv_frame(broker_side)
+            assert start_consumed == {
+                "type": "response_consumed",
+                "request_id": first_id,
+            }
             cancel = relay_module._recv_frame(broker_side)
             assert cancel == {"type": "cancel", "request_id": first_id}
             second = relay_module._recv_frame(broker_side)
@@ -739,6 +767,170 @@ def test_owner_relay_cancels_abandoned_response_without_blocking_next_request(ca
         assert "abandoned-first" not in caplog.text
         assert "abandoned-second" not in caplog.text
     finally:
+        relay.close()
+        broker_side.close()
+        broker_thread.join(timeout=2)
+
+    assert broker_errors == []
+    assert broker_thread.is_alive() is False
+
+
+def test_owner_relay_backpressures_burst_until_downstream_resumes():
+    import hermes_cli.owner_worker.inference_relay as relay_module
+
+    broker_side, worker_side = socket.socketpair()
+    chunks = [f"chunk-{index:02d}|".encode("ascii") for index in range(32)]
+    backpressure_observed = threading.Event()
+    all_frames_sent = threading.Event()
+    writer_blocked = threading.Event()
+    release_writer = threading.Event()
+    handler_completed = threading.Event()
+    broker_errors: list[BaseException] = []
+    owner_frames: list[dict[str, object]] = []
+    consumed_frames = 0
+
+    def serve_burst() -> None:
+        nonlocal consumed_frames
+        try:
+            assert relay_module._recv_frame(broker_side) == {
+                "type": "hello",
+                "version": relay_module._PROTOCOL_VERSION,
+            }
+            relay_module._send_frame(broker_side, {
+                "type": "hello_ack",
+                "version": relay_module._PROTOCOL_VERSION,
+            })
+            request = relay_module._recv_frame(broker_side)
+            request_id = request["request_id"]
+            broker_side.settimeout(0.05)
+            frames = [
+                {"type": "response_start", "status": 200, "headers": {}},
+                *(
+                    {
+                        "type": "response_chunk",
+                        "body": base64.b64encode(chunk).decode("ascii"),
+                    }
+                    for chunk in chunks
+                ),
+                {"type": "response_end"},
+            ]
+
+            def record_owner_frame(owner_frame):
+                nonlocal consumed_frames
+                if owner_frame.get("type") == "response_consumed":
+                    consumed_frames += 1
+                    return True
+                owner_frames.append(owner_frame)
+                return False
+
+            next_sequence = 0
+            available_slots = relay_module._MAX_IN_FLIGHT_RESPONSE_FRAMES
+            while next_sequence < len(frames):
+                if available_slots:
+                    relay_module._send_frame(
+                        broker_side,
+                        {
+                            **frames[next_sequence],
+                            "request_id": request_id,
+                            "sequence": next_sequence,
+                        },
+                    )
+                    next_sequence += 1
+                    available_slots -= 1
+                    continue
+                try:
+                    if record_owner_frame(relay_module._recv_frame(broker_side)):
+                        available_slots += 1
+                except TimeoutError:
+                    backpressure_observed.set()
+                    continue
+            all_frames_sent.set()
+
+            while consumed_frames < len(frames):
+                try:
+                    record_owner_frame(relay_module._recv_frame(broker_side))
+                except TimeoutError:
+                    if handler_completed.is_set():
+                        break
+        except BaseException as exc:
+            broker_errors.append(exc)
+
+    broker_thread = threading.Thread(target=serve_burst, daemon=True)
+    broker_thread.start()
+    relay = OwnerInferenceRelay(worker_side.detach())
+
+    class BlockingWriter:
+        def __init__(self):
+            self.body = bytearray()
+            self._blocked = False
+
+        def write(self, body):
+            if not self._blocked and body != b"0\r\n\r\n":
+                self._blocked = True
+                writer_blocked.set()
+                assert release_writer.wait(timeout=5)
+            self.body.extend(body)
+
+        def flush(self):
+            pass
+
+    class Handler:
+        path = "/v1/chat/completions"
+        command = "POST"
+        headers = {"Content-Length": "0"}
+        rfile = type("Reader", (), {"read": staticmethod(lambda _length: b"")})()
+        close_connection = False
+
+        def __init__(self, writer):
+            self.wfile = writer
+            self.error_calls = []
+
+        def send_response(self, _status):
+            pass
+
+        def send_header(self, _name, _value):
+            pass
+
+        def end_headers(self):
+            pass
+
+        def send_error(self, status, message):
+            self.error_calls.append((status, message))
+
+    writer = BlockingWriter()
+    handler = Handler(writer)
+
+    def handle_request() -> None:
+        try:
+            relay._handle_http(handler)
+        finally:
+            handler_completed.set()
+
+    handler_thread = threading.Thread(target=handle_request, daemon=True)
+    handler_thread.start()
+    try:
+        assert writer_blocked.wait(timeout=5)
+        assert backpressure_observed.wait(timeout=5)
+        assert all_frames_sent.is_set() is False
+        assert handler_completed.is_set() is False
+
+        release_writer.set()
+        assert all_frames_sent.wait(timeout=5)
+        assert handler_completed.wait(timeout=5)
+        broker_thread.join(timeout=2)
+        expected = b"".join(
+            f"{len(chunk):X}\r\n".encode("ascii") + chunk + b"\r\n"
+            for chunk in chunks
+        ) + b"0\r\n\r\n"
+        assert bytes(writer.body) == expected
+        assert handler.error_calls == []
+        assert handler.close_connection is False
+        assert owner_frames == []
+        assert consumed_frames == len(chunks) + 2
+    finally:
+        release_writer.set()
+        handler_completed.set()
+        handler_thread.join(timeout=2)
         relay.close()
         broker_side.close()
         broker_thread.join(timeout=2)
