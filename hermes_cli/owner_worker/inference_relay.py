@@ -29,7 +29,7 @@ from agent.stream_diag import flatten_exception_chain, stream_diag_init
 from hermes_cli.dashboard_auth.authority import AuthorityStore, AuthorizationRejected, OwnerWorkerAuthorityLease, WorkerLeaseState
 from hermes_cli.deployment_inference import DeploymentInferencePolicy
 
-_PROTOCOL_VERSION = 1
+_PROTOCOL_VERSION = 2
 _MAX_FRAME_BYTES = 64 * 1024 * 1024
 _MAX_AGGREGATE_REQUEST_BYTES = 64 * 1024 * 1024
 _RELAY_CONNECT_TIMEOUT_SECONDS = 30.0
@@ -38,7 +38,7 @@ _RELAY_MAX_DEADLINE_SECONDS = 420.0
 _RELAY_DEADLINE_HEADER = "x-hermes-relay-deadline-seconds"
 _MAX_CONCURRENT_BROKER_REQUESTS = 8
 _MAX_CONCURRENT_WORKER_REQUESTS = 8
-_MAX_PENDING_RESPONSE_FRAMES = 16
+_MAX_IN_FLIGHT_RESPONSE_FRAMES = 16
 _ALLOWED_PATHS = frozenset({"/v1/chat/completions", "/v1/messages"})
 _HOP_BY_HOP_HEADERS = frozenset({
     "authorization",
@@ -147,13 +147,24 @@ def _recv_frame(conn: socket.socket) -> dict[str, Any]:
 class _BrokerRequest:
     body_bytes: int
     cancelled: threading.Event = field(default_factory=threading.Event)
+    response_slots: threading.BoundedSemaphore = field(
+        default_factory=lambda: threading.BoundedSemaphore(
+            _MAX_IN_FLIGHT_RESPONSE_FRAMES
+        )
+    )
     response: Any = None
+    response_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def cancel(self) -> None:
         self.cancelled.set()
-        if self.response is not None:
+
+    def abort(self) -> None:
+        self.cancel()
+        with self.response_lock:
+            response = self.response
+        if response is not None:
             try:
-                self.response.close()
+                response.close()
             except Exception:
                 pass
 
@@ -175,7 +186,7 @@ class _RelayPeer:
 @dataclass
 class _WorkerRequest:
     frames: queue.Queue[dict[str, Any] | DeploymentInferenceRelayError] = field(
-        default_factory=lambda: queue.Queue(maxsize=_MAX_PENDING_RESPONSE_FRAMES)
+        default_factory=lambda: queue.Queue(maxsize=_MAX_IN_FLIGHT_RESPONSE_FRAMES)
     )
     failed: threading.Event = field(default_factory=threading.Event)
     next_sequence: int = 0
@@ -273,7 +284,7 @@ class DeploymentInferenceBroker:
         with peer.requests_lock:
             requests = tuple(peer.requests.values())
         for request in requests:
-            request.cancel()
+            request.abort()
 
     def revoke(self, lease: OwnerWorkerAuthorityLease) -> None:
         """Immediately close a relay endpoint once its generation drains."""
@@ -319,13 +330,19 @@ class DeploymentInferenceBroker:
 
             def emit(frame: dict[str, Any]) -> None:
                 nonlocal sequence
+                broker_request.response_slots.acquire()
                 if broker_request.cancelled.is_set():
+                    broker_request.response_slots.release()
                     raise DeploymentInferenceRelayError("relay request was cancelled")
-                self._send_peer_frame(peer, {
-                    **frame,
-                    "request_id": request_id,
-                    "sequence": sequence,
-                })
+                try:
+                    self._send_peer_frame(peer, {
+                        **frame,
+                        "request_id": request_id,
+                        "sequence": sequence,
+                    })
+                except BaseException:
+                    broker_request.response_slots.release()
+                    raise
                 sequence += 1
 
             try:
@@ -369,11 +386,13 @@ class DeploymentInferenceBroker:
                 if not isinstance(request_id, str) or not request_id:
                     raise DeploymentInferenceRelayError("relay request identifier is invalid")
                 frame_type = frame.get("type")
-                if frame_type == "cancel":
+                if frame_type in {"cancel", "response_consumed"}:
                     with peer.requests_lock:
                         request = peer.requests.get(request_id)
                     if request is not None:
-                        request.cancel()
+                        if frame_type == "cancel":
+                            request.cancel()
+                        request.response_slots.release()
                     continue
                 if frame_type != "request_start":
                     raise DeploymentInferenceRelayError("relay frame type is invalid")
@@ -524,7 +543,8 @@ class DeploymentInferenceBroker:
             with httpx.Client(timeout=timeout) as client:
                 with client.stream("POST", upstream, content=body, headers=headers) as response:
                     if broker_request is not None:
-                        broker_request.response = response
+                        with broker_request.response_lock:
+                            broker_request.response = response
                         if broker_request.cancelled.is_set():
                             raise DeploymentInferenceRelayError("relay request was cancelled")
                     response_started = True
@@ -554,7 +574,8 @@ class DeploymentInferenceBroker:
                             })
                     emit({"type": "response_end"})
                 if broker_request is not None:
-                    broker_request.response = None
+                    with broker_request.response_lock:
+                        broker_request.response = None
         except DeploymentInferenceRelayError as exc:
             _log_relay_outcome(
                 "midstream_failure" if response_started else "pre_header_transport_failure",
@@ -698,24 +719,7 @@ class OwnerInferenceRelay:
                     else:
                         raise DeploymentInferenceRelayError("relay response transition is invalid")
                     request.next_sequence += 1
-                    try:
-                        request.frames.put_nowait(frame)
-                    except queue.Full:
-                        request.failed.set()
-                        try:
-                            self._send({"type": "cancel", "request_id": request_id})
-                        except (DeploymentInferenceRelayError, OSError):
-                            pass
-                        # Preserve multiplexing: overload fails only this request,
-                        # never the shared response-reader thread.
-                        while True:
-                            try:
-                                request.frames.get_nowait()
-                            except queue.Empty:
-                                break
-                        request.frames.put_nowait(DeploymentInferenceRelayError(
-                            "relay response backpressure limit exceeded"
-                        ))
+                    request.frames.put_nowait(frame)
         except (DeploymentInferenceRelayError, OSError) as exc:
             self._handshake_complete.set()
             self._fail_requests(
@@ -723,6 +727,12 @@ class OwnerInferenceRelay:
                 if isinstance(exc, DeploymentInferenceRelayError)
                 else DeploymentInferenceRelayError("relay peer closed")
             )
+
+    def _acknowledge_response(self, frame: dict[str, Any]) -> None:
+        self._send({
+            "type": "response_consumed",
+            "request_id": str(frame["request_id"]),
+        })
 
     def _receive_for(
         self,
@@ -782,6 +792,7 @@ class OwnerInferenceRelay:
                 "body": base64.b64encode(handler.rfile.read(length)).decode("ascii"),
             })
             response = self._receive_for(worker_request, deadline=deadline)
+            self._acknowledge_response(response)
             if response.get("type") == "error":
                 raise DeploymentInferenceRelayError("relay request was rejected")
             if response.get("type") != "response_start":
@@ -799,15 +810,21 @@ class OwnerInferenceRelay:
                 handler.send_header("Transfer-Encoding", "chunked")
                 handler.end_headers()
                 while True:
-                    response = self._receive_for(worker_request, deadline=deadline)
+                    response = self._receive_for(
+                        worker_request,
+                        deadline=deadline,
+                    )
                     response_type = response.get("type")
                     if response_type == "response_end":
                         handler.wfile.write(b"0\r\n\r\n")
                         handler.wfile.flush()
+                        self._acknowledge_response(response)
                         break
                     if response_type == "error":
+                        self._acknowledge_response(response)
                         raise DeploymentInferenceRelayError("relay response failed")
                     if response_type != "response_chunk":
+                        self._acknowledge_response(response)
                         raise DeploymentInferenceRelayError("relay response is invalid")
                     body = base64.b64decode(str(response.get("body") or ""), validate=True)
                     if body:
@@ -815,6 +832,7 @@ class OwnerInferenceRelay:
                         handler.wfile.write(body)
                         handler.wfile.write(b"\r\n")
                         handler.wfile.flush()
+                    self._acknowledge_response(response)
             except (BrokenPipeError, ConnectionError, OSError):
                 handler.close_connection = True
                 try:
