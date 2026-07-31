@@ -57,7 +57,7 @@ export function SkillEditorDialog({
   // initializers — no reset-on-open effect (react-hooks/set-state-in-effect).
   return (
     <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="max-w-3xl">
+      <DialogContent className="max-w-3xl [transform:translate(-50%,-50%)] [translate:none]">
         {open && (
           <EditorBody
             key={editName ?? "__create__"}
