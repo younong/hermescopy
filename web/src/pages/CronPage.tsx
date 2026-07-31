@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useState } from "react";
-import { Clock, Pause, Pencil, Play, Trash2, X, Zap } from "lucide-react";
+import { Clock, Pause, Pencil, Play, Trash2, Zap } from "lucide-react";
 import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Select, SelectOption } from "@nous-research/ui/ui/components/select";
@@ -32,7 +32,12 @@ import {
 } from "@/lib/schedule";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
 import { useConfirmDelete } from "@nous-research/ui/hooks/use-confirm-delete";
-import { useModalBehavior } from "@/hooks/useModalBehavior";
+import {
+  Dialog,
+  DialogHeader,
+  DialogTitle,
+} from "@nous-research/ui/ui/components/dialog";
+import { CenteredDialogContent } from "@/components/CenteredDialogContent";
 import { Toast } from "@nous-research/ui/ui/components/toast";
 import { Card, CardContent } from "@nous-research/ui/ui/components/card";
 import { Label } from "@nous-research/ui/ui/components/label";
@@ -41,7 +46,6 @@ import { usePageHeader } from "@/contexts/usePageHeader";
 import { PluginSlot } from "@/plugins";
 import { Segmented } from "@nous-research/ui/ui/components/segmented";
 import { AutomationBlueprints } from "@/components/AutomationBlueprints";
-import { cn, themedBody } from "@/lib/utils";
 
 function formatTime(iso?: string | null): string {
   if (!iso) return "—";
@@ -174,11 +178,6 @@ export default function CronPage() {
   const [createForm, setCreateForm] = useState<CronJobEditorState>(
     emptyCronJobForm,
   );
-  const closeCreateModal = useCallback(() => setCreateModalOpen(false), []);
-  const createModalRef = useModalBehavior({
-    open: createModalOpen,
-    onClose: closeCreateModal,
-  });
   const [deliveryTargets, setDeliveryTargets] = useState<CronDeliveryTarget[]>([
     { id: "local", name: "Local", home_target_set: true, home_env_var: null },
   ]);
@@ -190,11 +189,6 @@ export default function CronPage() {
     emptyCronJobForm,
   );
   const [saving, setSaving] = useState(false);
-  const closeEditModal = useCallback(() => setEditJob(null), []);
-  const editModalRef = useModalBehavior({
-    open: editJob !== null,
-    onClose: closeEditModal,
-  });
 
   // Skills installed in the profile a job will run under, for the
   // attach-skill selector (parity with `hermes cron edit --add-skill`).
@@ -438,110 +432,65 @@ export default function CronPage() {
         loading={jobDelete.isDeleting}
       />
 
-      {/* Create job modal */}
-      {createModalOpen && (
-        <div
-          ref={createModalRef}
-          className="fixed inset-0 z-[100] flex items-center justify-center bg-background/85 p-4"
-          onClick={(e) => e.target === e.currentTarget && setCreateModalOpen(false)}
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="create-cron-title"
-        >
-          <div className={cn(themedBody, "relative w-full max-w-3xl max-h-[90vh] border border-border bg-card shadow-2xl flex flex-col")}>
-            <Button
-              ghost
-              size="icon"
-              onClick={() => setCreateModalOpen(false)}
-              className="absolute right-2 top-2 text-muted-foreground hover:text-foreground"
-              aria-label="Close"
-            >
-              <X />
-            </Button>
+      <Dialog
+        open={createModalOpen}
+        onOpenChange={(open) => !open && setCreateModalOpen(false)}
+      >
+        <CenteredDialogContent className="max-w-3xl max-h-[90vh] flex flex-col">
+          <DialogHeader>
+            <DialogTitle>{t.cron.newJob}</DialogTitle>
+          </DialogHeader>
 
-            <header className="p-5 pb-3 border-b border-border">
-              <h2
-                id="create-cron-title"
-                className="font-mondwest text-display text-base tracking-wider"
+          <div className="min-h-0 overflow-y-auto p-5 grid gap-4">
+            <div className="grid gap-2">
+              <Label htmlFor="cron-profile">Profile</Label>
+              <Select
+                id="cron-profile"
+                value={createProfile}
+                onValueChange={(v) => setCreateProfile(v)}
               >
-                {t.cron.newJob}
-              </h2>
-            </header>
+                {profiles.map((profile) => (
+                  <SelectOption key={profile} value={profile}>
+                    {profile}
+                  </SelectOption>
+                ))}
+              </Select>
+            </div>
 
-            <div className="min-h-0 overflow-y-auto p-5 grid gap-4">
-              <div className="grid gap-2">
-                <Label htmlFor="cron-profile">Profile</Label>
-                <Select
-                  id="cron-profile"
-                  value={createProfile}
-                  onValueChange={(v) => setCreateProfile(v)}
-                >
-                  {profiles.map((profile) => (
-                    <SelectOption key={profile} value={profile}>
-                      {profile}
-                    </SelectOption>
-                  ))}
-                </Select>
-              </div>
+            <CronJobFormFields
+              idPrefix="cron"
+              autoFocus
+              form={createForm}
+              onChange={setCreateForm}
+              resources={{
+                availableSkills,
+                availableToolsets,
+                modelOptions,
+                deliveryTargets,
+              }}
+            />
 
-              <CronJobFormFields
-                idPrefix="cron"
-                autoFocus
-                form={createForm}
-                onChange={setCreateForm}
-                resources={{
-                  availableSkills,
-                  availableToolsets,
-                  modelOptions,
-                  deliveryTargets,
-                }}
-              />
-
-              <div className="flex justify-end">
-                <Button
-                  className="uppercase"
-                  size="sm"
-                  onClick={handleCreate}
-                  disabled={creating}
-                  prefix={creating ? <Spinner /> : undefined}
-                >
-                  {creating ? t.common.creating : t.common.create}
-                </Button>
-              </div>
+            <div className="flex justify-end">
+              <Button
+                className="uppercase"
+                size="sm"
+                onClick={handleCreate}
+                disabled={creating}
+                prefix={creating ? <Spinner /> : undefined}
+              >
+                {creating ? t.common.creating : t.common.create}
+              </Button>
             </div>
           </div>
-        </div>
-      )}
+        </CenteredDialogContent>
+      </Dialog>
 
-      {/* Edit job modal */}
       {editJob && (
-        <div
-          ref={editModalRef}
-          className="fixed inset-0 z-[100] flex items-center justify-center bg-background/85 p-4"
-          onClick={(e) => e.target === e.currentTarget && setEditJob(null)}
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="edit-cron-title"
-        >
-          <div className={cn(themedBody, "relative w-full max-w-3xl max-h-[90vh] border border-border bg-card shadow-2xl flex flex-col")}>
-            <Button
-              ghost
-              size="icon"
-              onClick={() => setEditJob(null)}
-              className="absolute right-2 top-2 text-muted-foreground hover:text-foreground"
-              aria-label="Close"
-            >
-              <X />
-            </Button>
-
-            <header className="p-5 pb-3 border-b border-border">
-              <h2
-                id="edit-cron-title"
-                className="font-mondwest text-display text-base tracking-wider"
-              >
-                Edit job
-              </h2>
-            </header>
+        <Dialog open onOpenChange={(open) => !open && setEditJob(null)}>
+          <CenteredDialogContent className="max-w-3xl max-h-[90vh] flex flex-col">
+            <DialogHeader>
+              <DialogTitle>Edit job</DialogTitle>
+            </DialogHeader>
 
             <div className="min-h-0 overflow-y-auto p-5 grid gap-4">
               <CronJobFormFields
@@ -572,8 +521,8 @@ export default function CronPage() {
                 </Button>
               </div>
             </div>
-          </div>
-        </div>
+          </CenteredDialogContent>
+        </Dialog>
       )}
 
       {view === "jobs" && (
