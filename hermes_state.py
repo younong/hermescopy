@@ -27,7 +27,11 @@ import time
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
-from hermes_session_queries import SessionQueryMixin, strip_legacy_synthetic_messages
+from hermes_session_queries import (
+    SessionQueryMixin,
+    is_network_continuation_prompt,
+    strip_legacy_synthetic_messages,
+)
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -2833,6 +2837,9 @@ class SessionDB(SessionQueryMixin):
         platform-specific flows like yuanbao's recall guard to redact a
         message by its platform-side identifier.
         """
+        if is_network_continuation_prompt(role, content):
+            return 0
+
         # Serialize structured fields to JSON before entering the write txn
         reasoning_details_json = (
             json.dumps(reasoning_details)

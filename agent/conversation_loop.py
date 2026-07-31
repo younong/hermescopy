@@ -63,6 +63,7 @@ from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
+from hermes_session_queries import is_network_continuation_prompt
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
@@ -550,6 +551,20 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    if is_network_continuation_prompt("user", user_message):
+        logger.warning(
+            "Ignoring internal network recovery marker submitted as a user turn "
+            "(session=%s)",
+            agent.session_id or "none",
+        )
+        return {
+            "final_response": None,
+            "messages": list(conversation_history or []),
+            "api_calls": 0,
+            "completed": True,
+            "turn_exit_reason": "ignored_internal_network_recovery_marker",
+        }
+
     if moa_config is None:
         try:
             from hermes_cli.moa_config import decode_moa_turn

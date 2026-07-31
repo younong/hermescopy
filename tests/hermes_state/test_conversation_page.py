@@ -239,6 +239,20 @@ def test_legacy_network_continuation_prompt_is_hidden_from_replay_and_display(db
     ]
 
 
+def test_network_continuation_prompt_is_rejected_at_persistence_boundary(db):
+    marker = (
+        "[System: The previous response was cut off by a network error mid-stream. "
+        "Continue exactly where you left off. Do not restart or repeat prior text. "
+        "Finish the answer directly.]"
+    )
+    db.create_session("new-network-marker", source="tui")
+
+    assert db.append_message("new-network-marker", role="user", content=marker) == 0
+    assert db.get_messages_as_conversation("new-network-marker") == []
+    assert db.get_conversation_page("new-network-marker", limit=20)["messages"] == []
+    assert db.message_count("new-network-marker") == 0
+
+
 def test_user_message_quoting_network_marker_is_preserved(db):
     db.create_session("quoted-network-marker", source="tui")
     quoted = (
