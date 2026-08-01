@@ -1009,7 +1009,8 @@ if [ -z "$node_path" ]; then
 fi
 node_identity="$(printf '%s\n' "$(node --version)" "$(sha256sum "$node_path" | cut -d ' ' -f1)" | sha256sum | cut -d ' ' -f1)"
 python_version="3.11"
-runtime_inputs_hash="$(printf '%s\n' "$lock_hash" "$powerpoint_lock_hash" "$powerpoint_package_hash" "$node_identity" 'sandbox10' | sha256sum | cut -d ' ' -f1)"
+runtime_dependency_profile="all,anthropic,ddgs,voice"
+runtime_inputs_hash="$(printf '%s\n' "$lock_hash" "$powerpoint_lock_hash" "$powerpoint_package_hash" "$node_identity" "$runtime_dependency_profile" 'sandbox10' | sha256sum | cut -d ' ' -f1)"
 runtime_id="py311-${"${"}architecture}-${"${"}runtime_inputs_hash}-sandbox10"
 venv="$runtimes_dir/$runtime_id"
 # One manifest drives both packaging and preflight. Keep it aligned with
@@ -1046,7 +1047,7 @@ if [ ! -x "$venv/bin/python3" ]; then
   UV_PYTHON_DOWNLOADS=never uv venv --relocatable --python "$base_python" "$runtime_tmp/venv"
   cd "$release"
   UV_PROJECT_ENVIRONMENT="$runtime_tmp/venv" UV_DEFAULT_INDEX="$python_package_index" \
-    uv sync --extra all --extra ddgs --extra voice --locked --no-editable --link-mode copy
+    uv sync --extra all --extra anthropic --extra ddgs --extra voice --locked --no-editable --link-mode copy
   cp -a "$runtime_tmp/venv/." "$runtime_tmp/"
   rm -rf -- "$runtime_tmp/venv"
   python_target="$(readlink "$runtime_tmp/bin/python3" || true)"
@@ -1245,7 +1246,7 @@ for command in $executor_commands; do
     *) PATH="$venv/toolchain/usr/bin:$venv/toolchain/bin" command -v "$command" >/dev/null ;;
   esac
 done
-PYTHONPATH="$release" "$venv/bin/python" -c 'import faster_whisper, hermes_cli.tool_executor_runtime.entrypoint, pilk, tools.registry, tools.silk_decoder'
+PYTHONPATH="$release" "$venv/bin/python" -c 'import anthropic, faster_whisper, hermes_cli.tool_executor_runtime.entrypoint, pilk, tools.registry, tools.silk_decoder'
 
 release_target="$(resolved_path "$release")"
 new_current_target="$release_target"
