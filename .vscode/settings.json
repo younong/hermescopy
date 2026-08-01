@@ -1,4 +1,16 @@
 {
+  "terminal.integrated.profiles.osx": {
+    "Hermes Codex": {
+      "path": "${workspaceFolder}/.codex/shell"
+    }
+  },
+  "terminal.integrated.defaultProfile.osx": "Hermes Codex",
+  "terminal.integrated.profiles.linux": {
+    "Hermes Codex": {
+      "path": "${workspaceFolder}/.codex/shell"
+    }
+  },
+  "terminal.integrated.defaultProfile.linux": "Hermes Codex",
   "files.watcherExclude": {
     "**/.git/**": true,
     "**/.venv/**": true,
