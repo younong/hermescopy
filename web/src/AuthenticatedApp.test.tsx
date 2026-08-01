@@ -111,11 +111,15 @@ describe("AuthenticatedApp", () => {
         "/chat-gui",
       );
       expect(document.querySelector("[data-admin-app]")).toBeNull();
-      expect(document.querySelector("[data-system-actions]")).toBeNull();
+      expect(document.querySelector("[data-system-actions]")).not.toBeNull();
     },
   );
 
-  it.each(["/chat-gui/files", "/chat-gui/scheduled-tasks"])(
+  it.each([
+    "/chat-gui/files",
+    "/chat-gui/scheduled-tasks",
+    "/chat-gui/statistics",
+  ])(
     "allows members to open the Chat GUI workspace route %s",
     async (path) => {
       mocks.identity.mockReturnValue(identity({ authMe: authMe("member") }));
@@ -125,6 +129,7 @@ describe("AuthenticatedApp", () => {
 
       expect(document.querySelector("[data-member-chat]")?.getAttribute("data-pathname"))
         .toBe(path);
+      expect(document.querySelector("[data-system-actions]")).not.toBeNull();
     },
   );
 
