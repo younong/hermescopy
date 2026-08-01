@@ -912,7 +912,11 @@ export function GuiChatShell() {
 
         {statisticsOpen ? (
           <PageHeaderContext.Provider value={EMBEDDED_PAGE_HEADER}>
-            <div data-statistics-pane className="min-h-0 flex-1 overflow-auto bg-background p-4 text-foreground sm:p-6">
+            <div
+              data-statistics-pane
+              data-theme="chat-workspace"
+              className="gui-chat-statistics-pane min-h-0 flex-1 overflow-auto"
+            >
               <SessionsPage />
             </div>
           </PageHeaderContext.Provider>

@@ -345,7 +345,10 @@ describe("GuiChatShell", () => {
       await Promise.resolve();
     });
 
-    expect(document.querySelector("[data-statistics-pane]")).not.toBeNull();
+    const statisticsPane = document.querySelector("[data-statistics-pane]");
+    expect(statisticsPane).not.toBeNull();
+    expect(statisticsPane?.getAttribute("data-theme")).toBe("chat-workspace");
+    expect(statisticsPane?.classList.contains("gui-chat-statistics-pane")).toBe(true);
     expect(document.body.textContent).toContain("Message statistics");
     expect(document.querySelector("[data-composer-send]")).toBeNull();
     expect(Array.from(document.querySelectorAll<HTMLButtonElement>('button[aria-current="page"]'))

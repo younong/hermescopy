@@ -19,12 +19,12 @@ import {
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
 
 const COLORS = [
-  "oklch(0.65 0.18 250)",
-  "oklch(0.68 0.17 155)",
-  "oklch(0.72 0.16 75)",
-  "oklch(0.65 0.18 315)",
-  "oklch(0.68 0.15 25)",
-  "oklch(0.62 0.12 205)",
+  "var(--composition-series-1, oklch(0.65 0.18 250))",
+  "var(--composition-series-2, oklch(0.68 0.17 155))",
+  "var(--composition-series-3, oklch(0.72 0.16 75))",
+  "var(--composition-series-4, oklch(0.65 0.18 315))",
+  "var(--composition-series-5, oklch(0.68 0.15 25))",
+  "var(--composition-series-6, oklch(0.62 0.12 205))",
 ] as const;
 const CIRCUMFERENCE = 2 * Math.PI * 42;
 

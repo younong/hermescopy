@@ -1420,7 +1420,7 @@ export default function SessionsPage() {
   }
 
   return (
-    <div className="flex min-w-0 w-full max-w-full flex-col gap-4">
+    <div className="session-statistics-content flex min-w-0 w-full max-w-full flex-col gap-4">
       <PluginSlot name="sessions:top" />
       <Toast toast={toast} />
 
