@@ -1834,6 +1834,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         *,
         _summary_budget: Optional[int] = None,
         _serialized_content: Optional[str] = None,
+        _prompt_only: bool = False,
+        _today: Optional[str] = None,
     ) -> Optional[str]:
         """Generate a structured summary of conversation turns.
 
@@ -1877,12 +1879,15 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         # is a mid-conversation message that is NOT part of the cached prefix, so a
         # date here never affects prompt-cache stability. Resolved defensively —
         # a clock failure must never block compaction.
-        try:
-            from hermes_time import now as _hermes_now
+        if _today is not None:
+            _today_str = _today
+        else:
+            try:
+                from hermes_time import now as _hermes_now
 
-            _today_str = _hermes_now().strftime("%Y-%m-%d")
-        except Exception:  # pragma: no cover - clock resolution is best-effort
-            _today_str = ""
+                _today_str = _hermes_now().strftime("%Y-%m-%d")
+            except Exception:  # pragma: no cover - clock resolution is best-effort
+                _today_str = ""
 
         # Preamble shared by both first-compaction and iterative-update prompts.
         # Keep the wording deliberately plain: Azure/OpenAI-compatible content
@@ -2030,6 +2035,9 @@ Use this exact structure:
 
 FOCUS TOPIC: "{focus_topic}"
 This compaction should PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
+
+        if _prompt_only:
+            return prompt
 
         try:
             planned_input_tokens = estimate_tokens_rough(prompt)
@@ -3026,6 +3034,120 @@ This compaction should PRIORITISE preserving all information related to the focu
         compress_start = self._align_boundary_forward(messages, self._protect_head_size(messages))
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
         return compress_start < compress_end
+
+    def reconstruct_next_compression_request(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        today: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Reconstruct the next deterministic summary request without I/O.
+
+        The reconstruction intentionally uses the runtime's preprocessing,
+        boundary, serialization, and prompt builder. It reports only the first
+        rolling chunk because every later prompt depends on the model-generated
+        summary from the preceding chunk.
+        """
+        working = copy.deepcopy(messages)
+        minimum = self._protect_head_size(working) + 4
+        if len(working) <= minimum:
+            return {
+                "availability": "unavailable",
+                "reason": "insufficient_messages",
+                "omitted_follow_up_chunks": 0,
+            }
+        working, _tool_stats = self.compact_tool_payloads(working, force=True)
+        working, _pruned = self._prune_old_tool_results(
+            working,
+            protect_tail_count=self.protect_last_n,
+            protect_tail_tokens=self.tail_token_budget,
+        )
+        compress_start = self._align_boundary_forward(
+            working, self._protect_head_size(working)
+        )
+        compress_end = self._find_tail_cut_by_tokens(working, compress_start)
+        if compress_start >= compress_end:
+            return {
+                "availability": "unavailable",
+                "reason": "no_compressible_window",
+                "omitted_follow_up_chunks": 0,
+            }
+
+        previous_summary: Optional[str] = None
+        summary_search_start = 1 if working and working[0].get("role") == "system" else 0
+        summary_idx, summary_body = self._find_latest_context_summary(
+            working, summary_search_start, compress_end
+        )
+        turns = working[compress_start:compress_end]
+        if summary_idx is not None:
+            previous_summary = summary_body or None
+            turns = working[max(compress_start, summary_idx + 1):compress_end]
+        if not turns:
+            return {
+                "availability": "unavailable",
+                "reason": "no_new_turns_after_summary",
+                "omitted_follow_up_chunks": 0,
+            }
+
+        input_budget = max(
+            1,
+            min(
+                _AUX_INPUT_HARD_CAP_TOKENS,
+                int(self.hard_input_limit() * _AUX_INPUT_SAFETY_RATIO),
+            ),
+        )
+        chunks = self._summary_chunks(turns, input_budget=input_budget)
+        if not chunks:
+            return {
+                "availability": "unavailable",
+                "reason": "no_summary_chunk",
+                "omitted_follow_up_chunks": 0,
+            }
+        first_chunk = chunks[0]
+        summary_budget = self._compute_summary_budget(first_chunk)
+        saved_previous = self._previous_summary
+        try:
+            self._previous_summary = previous_summary
+            focus_topic = self._derive_auto_focus_topic(working)
+            prompt = self._generate_summary(
+                first_chunk,
+                focus_topic=focus_topic,
+                _summary_budget=summary_budget,
+                _prompt_only=True,
+                _today=today,
+            )
+        finally:
+            self._previous_summary = saved_previous
+        serialized_turns = self._serialize_for_summary(first_chunk)
+        serialized_components: Dict[str, str] = {
+            "user": "",
+            "assistant": "",
+            "tool": "",
+            "other": "",
+        }
+        for message in first_chunk:
+            role = str(message.get("role") or "other")
+            bucket = role if role in {"user", "assistant", "tool"} else "other"
+            rendered = self._serialize_for_summary([message])
+            if rendered:
+                separator = "\n\n" if serialized_components[bucket] else ""
+                serialized_components[bucket] += separator + rendered
+        return {
+            "availability": "available",
+            "reason": None,
+            "prompt": prompt,
+            "serialized_turns": serialized_turns,
+            "serialized_components": serialized_components,
+            "previous_summary": previous_summary,
+            "summary_budget": summary_budget,
+            "window": {
+                "start": compress_start,
+                "end": compress_end,
+                "message_count": len(turns),
+                "chunk_message_count": len(first_chunk),
+            },
+            "omitted_follow_up_chunks": max(0, len(chunks) - 1),
+        }
 
     # ------------------------------------------------------------------
     # Main compression entry point

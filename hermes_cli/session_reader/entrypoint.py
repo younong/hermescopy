@@ -30,6 +30,7 @@ _SOCKET_READ_TIMEOUT = 5.0
 _LITERAL_SESSION_PATHS = frozenset({
     "/api/sessions",
     "/api/sessions/search",
+    "/api/sessions/composition",
     "/api/sessions/empty/count",
     "/api/sessions/stats",
 })
@@ -140,6 +141,18 @@ def _int_query(query: dict[str, list[str]], name: str, default: int) -> int:
         return int(_single_query_value(query, name, default))
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be an integer") from exc
+
+
+def _float_query(
+    query: dict[str, list[str]], name: str, default: float | None = None
+) -> float | None:
+    value = _single_query_value(query, name, default)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number") from exc
 
 
 def _bool_query(query: dict[str, list[str]], name: str, default: bool) -> bool:
@@ -333,6 +346,9 @@ def _create_handler(
             exclude_sources = str(_single_query_value(query, "exclude_sources", "")) or None
             cwd_prefix = str(_single_query_value(query, "cwd_prefix", "")) or None
             compact = _bool_query(query, "compact", False)
+            active_from = _float_query(query, "active_from")
+            active_before = _float_query(query, "active_before")
+            composition_ids = query.get("ids", [])
             search_query = str(_single_query_value(query, "q", ""))
             before = str(_single_query_value(query, "before", "")) or None
         except ValueError as exc:
@@ -342,6 +358,8 @@ def _create_handler(
                 return 200, {"sessions": [], "total": 0, "limit": limit, "offset": offset}
             if route_path == "/api/sessions/search":
                 return 200, {"results": []}
+            if route_path == "/api/sessions/composition":
+                return 404, {"detail": "Session not found"}
             if route_path == "/api/sessions/empty/count":
                 return 200, {"count": 0}
             if route_path == "/api/sessions/stats":
@@ -371,9 +389,17 @@ def _create_handler(
                         source=source,
                         exclude_sources=exclude_sources,
                         cwd_prefix=cwd_prefix,
+                        active_from=active_from,
+                        active_before=active_before,
                         recovery_scope=recovery_scope,
                         compact=compact,
                         latency_trace_id=headers.get("x-request-id", ""),
+                    )
+                elif route_path == "/api/sessions/composition":
+                    payload = session_api.session_composition_payload(
+                        db,
+                        ids=composition_ids,
+                        recovery_scope=recovery_scope,
                     )
                 elif route_path == "/api/sessions/search":
                     payload = session_api.search_sessions_payload(

@@ -8,7 +8,6 @@ with compression thresholds — not exact tokenizer counts.
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -26,18 +25,6 @@ _CATEGORY_COLORS = {
     "memory": "var(--context-usage-memory)",
     "conversation": "var(--context-usage-conversation)",
 }
-
-
-def _chars_to_tokens(text: str) -> int:
-    if not text:
-        return 0
-    return (len(text) + 3) // 4
-
-
-def _json_tokens(value: Any) -> int:
-    if not value:
-        return 0
-    return _chars_to_tokens(json.dumps(value, ensure_ascii=False))
 
 
 def _tool_name(tool: dict) -> str:
@@ -91,7 +78,11 @@ def compute_session_context_breakdown(
     messages: Optional[List[dict]] = None,
 ) -> Dict[str, Any]:
     """Return a Cursor-style context usage breakdown for one live agent."""
-    from agent.model_metadata import estimate_messages_tokens_rough
+    from agent.model_metadata import (
+        estimate_json_tokens_rough,
+        estimate_messages_tokens_rough,
+        estimate_tokens_rough,
+    )
     from agent.system_prompt import build_system_prompt_parts
 
     parts = build_system_prompt_parts(agent)
@@ -115,13 +106,13 @@ def compute_session_context_breakdown(
     conversation_tokens = estimate_messages_tokens_rough(messages or [])
 
     categories = [
-        ("system_prompt", "System prompt", _chars_to_tokens(system_prompt_text)),
-        ("tool_definitions", "Tool definitions", _json_tokens(builtin_tools)),
-        ("rules", "Rules", _chars_to_tokens(context)),
-        ("skills", "Skills", _chars_to_tokens(skills_index)),
-        ("mcp", "MCP", _json_tokens(mcp_tools)),
-        ("subagent_definitions", "Subagent definitions", _json_tokens(subagent_tools)),
-        ("memory", "Memory", _chars_to_tokens(memory_text)),
+        ("system_prompt", "System prompt", estimate_tokens_rough(system_prompt_text)),
+        ("tool_definitions", "Tool definitions", estimate_json_tokens_rough(builtin_tools)),
+        ("rules", "Rules", estimate_tokens_rough(context)),
+        ("skills", "Skills", estimate_tokens_rough(skills_index)),
+        ("mcp", "MCP", estimate_json_tokens_rough(mcp_tools)),
+        ("subagent_definitions", "Subagent definitions", estimate_json_tokens_rough(subagent_tools)),
+        ("memory", "Memory", estimate_tokens_rough(memory_text)),
         ("conversation", "Conversation", conversation_tokens),
     ]
 

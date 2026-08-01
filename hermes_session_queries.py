@@ -556,6 +556,8 @@ class SessionQueryMixin:
         include_archived: bool = False,
         archived_only: bool = False,
         id_query: str | None = None,
+        active_from: float | None = None,
+        active_before: float | None = None,
         recovery_scope: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         where_sql, params, scope_clause, scope_params = self._where(
@@ -584,8 +586,23 @@ class SessionQueryMixin:
             )
             where_sql += (" AND " if where_sql else "WHERE ") + clause
             params.extend((f"%{escaped.lower()}%", f"%{escaped.lower()}%"))
-        if order_by_last_active:
+        if order_by_last_active or active_from is not None or active_before is not None:
             chain_child_scope = scope_clause.replace("s.", "child.")
+            activity_clauses: list[str] = []
+            activity_params: list[Any] = []
+            if active_from is not None:
+                activity_clauses.append("COALESCE(cm.effective_last_active, s.started_at) >= ?")
+                activity_params.append(active_from)
+            if active_before is not None:
+                activity_clauses.append("COALESCE(cm.effective_last_active, s.started_at) < ?")
+                activity_params.append(active_before)
+            activity_where = (
+                " AND " + " AND ".join(activity_clauses) if activity_clauses else ""
+            )
+            activity_order = (
+                "_effective_last_active DESC, s.started_at DESC, s.id DESC"
+                if order_by_last_active else "s.started_at DESC"
+            )
             query = f"""
                 WITH RECURSIVE chain(root_id, cur_id) AS (
                     SELECT s.id, s.id FROM sessions s {where_sql}
@@ -617,11 +634,11 @@ class SessionQueryMixin:
                              s.started_at) AS last_active,
                     COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
                 FROM sessions s LEFT JOIN chain_max cm ON cm.root_id = s.id
-                {where_sql}
-                ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
+                {where_sql}{activity_where}
+                ORDER BY {activity_order}
                 LIMIT ? OFFSET ?
             """
-            query_params = params + scope_params + params + [limit, offset]
+            query_params = params + scope_params + params + activity_params + [limit, offset]
         else:
             query = f"""
                 SELECT s.*,
@@ -677,6 +694,9 @@ class SessionQueryMixin:
                 JOIN sessions parent ON parent.id = child.parent_session_id
                 WHERE ancestry.depth < 100
                   AND parent.end_reason = 'compression'
+                  AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
+                  AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
+                  AND COALESCE(child.source, '') != 'tool'
                   AND parent.ended_at IS NOT NULL
                   AND child.started_at IS NOT NULL
                   AND child.started_at >= parent.ended_at
@@ -782,6 +802,73 @@ class SessionQueryMixin:
             result[str(session["id"])] = session
         return result
 
+    def resolve_canonical_session_ids(
+        self,
+        session_ids: list[str],
+        *,
+        recovery_scope: dict[str, Any] | None = None,
+    ) -> dict[str, dict[str, str]]:
+        """Resolve exact visible IDs to their canonical compression root and tip."""
+        requested = list(dict.fromkeys(str(sid) for sid in session_ids if sid))
+        if not requested:
+            return {}
+        placeholders = ",".join("?" for _ in requested)
+        scope_clause, scope_params = self._recovery_scope_clause(
+            recovery_scope, alias="s"
+        )
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT s.id FROM sessions s WHERE s.id IN ({placeholders}){scope_clause}",
+                (*requested, *scope_params),
+            ).fetchall()
+        visible = {str(row["id"]) for row in rows}
+        lineage = self.compression_lineage(
+            [sid for sid in requested if sid in visible], recovery_scope=recovery_scope
+        )
+        return {sid: lineage[sid] for sid in requested if sid in lineage}
+
+    def display_message_role_counts(
+        self,
+        session_ids: list[str],
+        *,
+        recovery_scope: dict[str, Any] | None = None,
+    ) -> dict[str, dict[str, int]]:
+        """Count canonical display rows by role over each requested full lineage."""
+        requested = list(dict.fromkeys(str(sid) for sid in session_ids if sid))
+        if not requested:
+            return {}
+        values_sql = ",".join("(?, ?, 0)" for _ in requested)
+        values_params = [value for sid in requested for value in (sid, sid)]
+        scope_clause, scope_params = self._recovery_scope_clause(
+            recovery_scope, alias="s"
+        )
+        sql = f"""
+            WITH RECURSIVE lineage(request_id, id, depth) AS (
+                VALUES {values_sql}
+                UNION ALL
+                SELECT lineage.request_id, s.parent_session_id, lineage.depth + 1
+                FROM lineage JOIN sessions s ON s.id = lineage.id
+                WHERE lineage.depth < 100 AND s.parent_session_id IS NOT NULL{scope_clause}
+            )
+            SELECT lineage.request_id, m.role, COUNT(m.id) AS message_count
+            FROM lineage
+            JOIN sessions s ON s.id = lineage.id{scope_clause}
+            JOIN messages m ON m.session_id = lineage.id
+              AND m.context_projection = 0
+              AND (m.active = 1 OR m.compacted = 1)
+            GROUP BY lineage.request_id, m.role
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                sql, (*values_params, *scope_params, *scope_params)
+            ).fetchall()
+        result = {sid: {} for sid in requested}
+        for row in rows:
+            result[str(row["request_id"])][str(row["role"] or "unknown")] = int(
+                row["message_count"]
+            )
+        return result
+
     def display_message_counts(
         self,
         session_ids: list[str],
@@ -845,7 +932,8 @@ class SessionQueryMixin:
             key: options[key]
             for key in (
                 "source", "cwd_prefix", "min_message_count", "include_archived",
-                "archived_only", "exclude_sources", "recovery_scope",
+                "archived_only", "exclude_sources", "active_from", "active_before",
+                "recovery_scope",
             )
             if key in options
         }
@@ -955,6 +1043,8 @@ class SessionQueryMixin:
         archived_only: bool = False,
         exclude_children: bool = False,
         exclude_sources: list[str] | None = None,
+        active_from: float | None = None,
+        active_before: float | None = None,
         recovery_scope: dict[str, Any] | None = None,
     ) -> int:
         where_sql, params, _scope_clause, _scope_params = self._where(
@@ -967,9 +1057,52 @@ class SessionQueryMixin:
             archived_only=archived_only,
             recovery_scope=recovery_scope,
         )
+        if active_from is None and active_before is None:
+            with self._lock:
+                row = self._conn.execute(
+                    f"SELECT COUNT(*) FROM sessions s {where_sql}", params
+                ).fetchone()
+            return int(row[0])
+
+        scope_clause, scope_params = self._recovery_scope_clause(
+            recovery_scope, alias="s"
+        )
+        child_scope = scope_clause.replace("s.", "child.")
+        activity_clauses: list[str] = []
+        activity_params: list[Any] = []
+        if active_from is not None:
+            activity_clauses.append("COALESCE(cm.effective_last_active, s.started_at) >= ?")
+            activity_params.append(active_from)
+        if active_before is not None:
+            activity_clauses.append("COALESCE(cm.effective_last_active, s.started_at) < ?")
+            activity_params.append(active_before)
+        activity_where = " AND ".join(activity_clauses)
+        query = f"""
+            WITH RECURSIVE chain(root_id, cur_id) AS (
+                SELECT s.id, s.id FROM sessions s {where_sql}
+                UNION ALL
+                SELECT chain.root_id, child.id FROM chain
+                JOIN sessions parent ON parent.id = chain.cur_id
+                JOIN sessions child INDEXED BY idx_sessions_parent
+                  ON child.parent_session_id = chain.cur_id
+                WHERE parent.end_reason = 'compression'
+                  AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
+                  AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
+                  AND COALESCE(child.source, '') != 'tool'{child_scope}
+            ), chain_max AS (
+                SELECT root_id, MAX(COALESCE(
+                    (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = cur_id),
+                    (SELECT started_at FROM sessions ss WHERE ss.id = cur_id)
+                )) AS effective_last_active
+                FROM chain GROUP BY root_id
+            )
+            SELECT COUNT(*) FROM sessions s
+            LEFT JOIN chain_max cm ON cm.root_id = s.id
+            {where_sql} AND {activity_where}
+        """
         with self._lock:
             row = self._conn.execute(
-                f"SELECT COUNT(*) FROM sessions s {where_sql}", params
+                query, (*params, *scope_params, *params, *activity_params)
             ).fetchone()
         return int(row[0])
 

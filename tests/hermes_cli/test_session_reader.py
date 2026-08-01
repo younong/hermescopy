@@ -1167,6 +1167,10 @@ def test_reader_route_parser_rejects_ambiguous_or_encoded_session_paths():
         "/api/sessions/session-1",
         "session-1",
     )
+    assert _session_route("/api/sessions/composition") == (
+        "/api/sessions/composition",
+        None,
+    )
     assert _session_route("/api/sessions/session-1/messages") == (
         "/api/sessions/session-1/messages",
         "session-1",

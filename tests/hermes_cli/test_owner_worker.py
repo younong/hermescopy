@@ -3232,6 +3232,7 @@ def test_worker_session_routes_reject_legacy_profile_selection(tmp_path, monkeyp
     [
         ("/api/sessions?limit=20&min_messages=0", "/api/sessions"),
         ("/api/sessions/search?q=owner", "/api/sessions/search"),
+        ("/api/sessions/composition?ids=owner-visible", "/api/sessions/composition"),
         ("/api/sessions/owner-visible", "/api/sessions/owner-visible"),
         ("/api/sessions/owner-visible/messages", "/api/sessions/owner-visible/messages"),
         ("/api/sessions/stats", "/api/sessions/stats"),

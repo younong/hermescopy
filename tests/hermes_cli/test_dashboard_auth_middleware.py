@@ -480,6 +480,7 @@ def test_authenticated_owner_worker_routes_are_method_and_path_exact(method, pat
     [
         "/api/sessions",
         "/api/sessions/search",
+        "/api/sessions/composition",
         "/api/sessions/empty/count",
         "/api/sessions/stats",
         "/api/sessions/session-id",

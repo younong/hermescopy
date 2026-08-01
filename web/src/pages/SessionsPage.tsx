@@ -30,6 +30,7 @@ import {
 } from "lucide-react";
 import { api } from "@/lib/api";
 import { shouldRefreshSessions } from "@/lib/session-refresh";
+import { SessionCompositionCharts } from "@/components/sessions/SessionCompositionCharts";
 import type {
   SessionInfo,
   SessionMessage,
@@ -60,7 +61,7 @@ import {
 } from "@nous-research/ui/ui/components/dialog";
 import { useSystemActions } from "@/contexts/useSystemActions";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
-import { useI18n } from "@/i18n";
+import { sessionCompositionTranslations, useI18n } from "@/i18n";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { PluginSlot } from "@/plugins";
 import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
@@ -681,7 +682,11 @@ function SessionRow({
       </div>
 
       {isExpanded && (
-        <div className="min-w-0 border-t border-border bg-background/50 p-4">
+        <div className="flex min-w-0 flex-col gap-4 border-t border-border bg-background/50 p-4">
+          <SessionCompositionCharts
+            ids={[session.id]}
+            title={sessionCompositionTranslations(t).title}
+          />
           {initialLoading && messages === null && (
             <div className="flex items-center justify-center py-8">
               <Spinner className="text-xl text-primary" />
@@ -716,6 +721,44 @@ type SessionsView = "list" | "overview";
 
 const PAGE_SIZE = 20;
 const OVERVIEW_SESSION_LIMIT = 30;
+const COMPOSITION_SESSION_LIMIT = 50;
+const DEFAULT_DATE_RANGE_DAYS = 30;
+
+export interface SessionDateRange {
+  allTime: boolean;
+  start: string;
+  end: string;
+}
+
+function toLocalDateInput(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+export function defaultSessionDateRange(now = new Date()): SessionDateRange {
+  const end = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const start = new Date(end);
+  start.setDate(start.getDate() - (DEFAULT_DATE_RANGE_DAYS - 1));
+  return { allTime: false, start: toLocalDateInput(start), end: toLocalDateInput(end) };
+}
+
+function localDateEpoch(date: string, nextDay = false): number | undefined {
+  const parts = date.split("-").map(Number);
+  if (parts.length !== 3 || parts.some((part) => !Number.isInteger(part))) return undefined;
+  const [year, month, day] = parts;
+  const local = new Date(year, month - 1, day + (nextDay ? 1 : 0));
+  return Number.isNaN(local.getTime()) ? undefined : Math.floor(local.getTime() / 1000);
+}
+
+export function sessionDateFilter(range: SessionDateRange) {
+  if (range.allTime) return {};
+  return {
+    active_from: localDateEpoch(range.start),
+    active_before: localDateEpoch(range.end, true),
+  };
+}
 
 export function fetchSessionsOverview() {
   return api.getSessions(OVERVIEW_SESSION_LIMIT, 0, undefined, "recent", true);
@@ -790,6 +833,9 @@ export default function SessionsPage() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(0);
+  const [dateRange, setDateRange] = useState<SessionDateRange>(
+    defaultSessionDateRange,
+  );
   const [loading, setLoading] = useState(true);
   const [readerUnavailable, setReaderUnavailable] = useState(false);
   const [search, setSearch] = useState("");
@@ -800,6 +846,7 @@ export default function SessionsPage() {
   const [searching, setSearching] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout>>(null);
   const searchAbortRef = useRef<AbortController | null>(null);
+  const listAbortRef = useRef<AbortController | null>(null);
   const logScrollRef = useRef<HTMLPreElement | null>(null);
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [overviewSessions, setOverviewSessions] = useState<SessionInfo[]>([]);
@@ -834,6 +881,7 @@ export default function SessionsPage() {
   const [pruning, setPruning] = useState(false);
   const { toast, showToast } = useToast();
   const { t } = useI18n();
+  const compositionText = sessionCompositionTranslations(t);
   const { setAfterTitle, setEnd } = usePageHeader();
   const { activeAction, actionStatus, dismissLog } = useSystemActions();
   const resumeInChatEnabled = isDashboardEmbeddedChatEnabled();
@@ -883,22 +931,34 @@ export default function SessionsPage() {
 
   const loadSessions = useCallback((p: number, silent = false) => {
     // ``silent`` skips the loading spinner so background refreshes
-    // (triggered when the overview poll detects a new session from
-    // another process) don't flicker the whole page or drop the user's
-    // scroll position.
+    // don't flicker the page. Superseding requests are aborted so a stale
+    // date/page response can never replace the current candidate set.
+    listAbortRef.current?.abort();
+    const controller = new AbortController();
+    listAbortRef.current = controller;
     if (!silent) setLoading(true);
     api
-      .getSessions(PAGE_SIZE, p * PAGE_SIZE)
+      .getSessions(
+        PAGE_SIZE,
+        p * PAGE_SIZE,
+        undefined,
+        "created",
+        false,
+        { ...sessionDateFilter(dateRange), signal: controller.signal },
+      )
       .then((resp) => {
+        if (controller.signal.aborted) return;
         setSessions(resp.sessions);
         setTotal(resp.total);
         setReaderUnavailable(false);
       })
-      .catch(() => setReaderUnavailable(true))
+      .catch(() => {
+        if (!controller.signal.aborted) setReaderUnavailable(true);
+      })
       .finally(() => {
-        if (!silent) setLoading(false);
+        if (!silent && !controller.signal.aborted) setLoading(false);
       });
-  }, []);
+  }, [dateRange]);
 
   const loadStats = useCallback(() => {
     api
@@ -994,6 +1054,15 @@ export default function SessionsPage() {
     },
     [clearSelection],
   );
+  const updateDateRange = useCallback(
+    (next: SessionDateRange) => {
+      setDateRange(next);
+      setPage(0);
+      setExpandedId(null);
+      clearSelection();
+    },
+    [clearSelection],
+  );
 
   // Debounced FTS search
   useEffect(() => {
@@ -1011,7 +1080,12 @@ export default function SessionsPage() {
     searchAbortRef.current = controller;
     debounceRef.current = setTimeout(() => {
       api
-        .searchSessions(search.trim(), undefined, controller.signal)
+        .searchSessions(
+          search.trim(),
+          undefined,
+          controller.signal,
+          sessionDateFilter(dateRange),
+        )
         .then((resp) => {
           if (!controller.signal.aborted) {
             setSearchResults(resp.results);
@@ -1030,7 +1104,7 @@ export default function SessionsPage() {
       if (debounceRef.current) clearTimeout(debounceRef.current);
       controller.abort();
     };
-  }, [search]);
+  }, [dateRange, search]);
 
   const sessionDelete = useConfirmDelete({
     onDelete: useCallback(
@@ -1101,9 +1175,12 @@ export default function SessionsPage() {
             else next.delete(rowId);
           }
         } else if (willSelect) {
-          next.add(id);
+          if (next.size < COMPOSITION_SESSION_LIMIT) next.add(id);
         } else {
           next.delete(id);
+        }
+        if (next.size > COMPOSITION_SESSION_LIMIT) {
+          return new Set(Array.from(next).slice(0, COMPOSITION_SESSION_LIMIT));
         }
         return next;
       });
@@ -1118,7 +1195,10 @@ export default function SessionsPage() {
   const selectAllOnPage = useCallback((visibleList: SessionInfo[]) => {
     setSelectedIds((prev) => {
       const next = new Set(prev);
-      for (const s of visibleList) next.add(s.id);
+      for (const s of visibleList) {
+        if (next.size >= COMPOSITION_SESSION_LIMIT) break;
+        next.add(s.id);
+      }
       return next;
     });
   }, []);
@@ -1589,6 +1669,46 @@ export default function SessionsPage() {
         </div>
       )}
 
+      {showList && (
+        <div className="flex min-w-0 flex-col gap-2 border border-border bg-background-base/40 p-3" aria-label={compositionText.dateRange}>
+          <div className="flex flex-wrap items-end gap-3">
+            <label className="flex min-w-36 flex-1 flex-col gap-1 text-xs font-medium text-muted-foreground sm:flex-none">
+              {compositionText.startDate}
+              <Input
+                aria-label={compositionText.startDate}
+                type="date"
+                value={dateRange.start}
+                disabled={dateRange.allTime}
+                max={dateRange.end}
+                onChange={(event) => updateDateRange({ ...dateRange, start: event.target.value })}
+                className="h-8 py-0 text-xs"
+              />
+            </label>
+            <label className="flex min-w-36 flex-1 flex-col gap-1 text-xs font-medium text-muted-foreground sm:flex-none">
+              {compositionText.endDate}
+              <Input
+                aria-label={compositionText.endDate}
+                type="date"
+                value={dateRange.end}
+                disabled={dateRange.allTime}
+                min={dateRange.start}
+                onChange={(event) => updateDateRange({ ...dateRange, end: event.target.value })}
+                className="h-8 py-0 text-xs"
+              />
+            </label>
+            <Button
+              outlined={!dateRange.allTime}
+              size="sm"
+              aria-pressed={dateRange.allTime}
+              onClick={() => updateDateRange({ ...dateRange, allTime: !dateRange.allTime })}
+            >
+              {compositionText.allTime}
+            </Button>
+          </div>
+          <p className="text-xs text-muted-foreground">{compositionText.dateHelp}</p>
+        </div>
+      )}
+
       {(showOverviewTab && !isSearching) || showList ? (
         <div className="flex w-full min-w-0 flex-wrap items-center gap-2 sm:gap-3">
           <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2 sm:gap-3">
@@ -1663,9 +1783,10 @@ export default function SessionsPage() {
       ) : null}
 
       {showList && selectedIds.size > 0 && (
-        <div
-          className="flex flex-wrap items-center gap-2 border border-primary/30 bg-primary/[0.06] px-3 py-2"
-          role="region"
+        <div className="flex min-w-0 flex-col gap-3">
+          <div
+            className="flex flex-wrap items-center gap-2 border border-primary/30 bg-primary/[0.06] px-3 py-2"
+            role="region"
           aria-label={t.sessions.selectedCount.replace(
             "{count}",
             String(selectedIds.size),
@@ -1723,7 +1844,15 @@ export default function SessionsPage() {
                 String(selectedIds.size),
               )}
             </span>
-          </Button>
+            </Button>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            {compositionText.selectionLimit}
+          </p>
+          <SessionCompositionCharts
+            ids={Array.from(selectedIds)}
+            title={compositionText.selectedTitle}
+          />
         </div>
       )}
 

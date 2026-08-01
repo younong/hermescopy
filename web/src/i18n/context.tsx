@@ -2,6 +2,7 @@ import { createContext, useContext, useState, useCallback, type ReactNode } from
 import type { Locale, Translations } from "./types";
 import { en } from "./en";
 import { zh } from "./zh";
+import type { SessionCompositionTranslations } from "./types";
 import { zhHant } from "./zh-hant";
 import { ja } from "./ja";
 import { de } from "./de";
@@ -120,4 +121,10 @@ export function I18nProvider({ children }: { children: ReactNode }) {
 
 export function useI18n() {
   return useContext(I18nContext);
+}
+
+export function sessionCompositionTranslations(
+  translations: Translations,
+): SessionCompositionTranslations {
+  return translations.sessions.composition ?? en.sessions.composition!;
 }

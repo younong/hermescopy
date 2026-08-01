@@ -511,13 +511,37 @@ export const api = {
     profile = getManagementProfile(),
     order: "created" | "recent" = "created",
     compact = false,
-  ) =>
-    fetchSessionReaderJSON<PaginatedSessions>(
-      appendProfileParam(
-        `/api/sessions?limit=${limit}&offset=${offset}&order=${order}${compact ? "&compact=true" : ""}`,
-        profile,
-      ),
-    ),
+    options: SessionListOptions = {},
+  ) => {
+    const params = new URLSearchParams({
+      limit: String(limit),
+      offset: String(offset),
+      order,
+    });
+    if (compact) params.set("compact", "true");
+    if (options.active_from !== undefined) {
+      params.set("active_from", String(options.active_from));
+    }
+    if (options.active_before !== undefined) {
+      params.set("active_before", String(options.active_before));
+    }
+    return fetchSessionReaderJSON<PaginatedSessions>(
+      appendProfileParam(`/api/sessions?${params.toString()}`, profile),
+      { signal: options.signal },
+    );
+  },
+  getSessionComposition: (
+    ids: string[],
+    options: { signal?: AbortSignal } = {},
+    profile = getManagementProfile(),
+  ) => {
+    const params = new URLSearchParams();
+    for (const id of ids) params.append("ids", id);
+    return fetchSessionReaderJSON<SessionCompositionResponse>(
+      appendProfileParam(`/api/sessions/composition?${params.toString()}`, profile),
+      { signal: options.signal },
+    );
+  },
   getSessionMessages: (
     id: string,
     options: { before?: string; limit?: number; signal?: AbortSignal } = {},
@@ -970,11 +994,20 @@ export const api = {
     q: string,
     profile = getManagementProfile(),
     signal?: AbortSignal,
-  ) =>
-    fetchSessionReaderJSON<SessionSearchResponse>(
-      appendProfileParam(`/api/sessions/search?q=${encodeURIComponent(q)}`, profile),
+    options: SessionDateFilter = {},
+  ) => {
+    const params = new URLSearchParams({ q });
+    if (options.active_from !== undefined) {
+      params.set("active_from", String(options.active_from));
+    }
+    if (options.active_before !== undefined) {
+      params.set("active_before", String(options.active_before));
+    }
+    return fetchSessionReaderJSON<SessionSearchResponse>(
+      appendProfileParam(`/api/sessions/search?${params.toString()}`, profile),
       { signal },
-    ),
+    );
+  },
 
   // OAuth provider management
   getOAuthProviders: () =>
@@ -2001,6 +2034,83 @@ export interface PaginatedSessions {
   total: number;
   limit: number;
   offset: number;
+}
+
+export interface SessionDateFilter {
+  active_from?: number;
+  active_before?: number;
+}
+
+export interface SessionListOptions extends SessionDateFilter {
+  signal?: AbortSignal;
+}
+
+export type SessionCompositionAvailability =
+  | "available"
+  | "partial"
+  | "unavailable";
+export type SessionCompositionUnit = "messages" | "rough_tokens";
+export type SessionCompositionAccuracy =
+  | "exact_count"
+  | "rough_heuristic"
+  | "unavailable";
+export type SessionCompositionSegmentStatus =
+  | "exact"
+  | "estimated"
+  | "unavailable";
+
+export interface SessionCompositionLimitation {
+  code?: string;
+  message?: string;
+  [key: string]: unknown;
+}
+
+export interface SessionCompositionCoverage {
+  requested_sessions?: number;
+  included_sessions?: number;
+  available_sessions?: number;
+  unavailable_sessions?: number;
+  [key: string]: unknown;
+}
+
+export interface SessionCompositionSegment {
+  id: string;
+  label: string;
+  value: number | null;
+  percentage: number | null;
+  unit: SessionCompositionUnit;
+  status: SessionCompositionSegmentStatus;
+}
+
+export interface SessionCompositionChart {
+  id: string;
+  label: string;
+  availability: SessionCompositionAvailability;
+  accuracy: SessionCompositionAccuracy;
+  unit: SessionCompositionUnit;
+  total: number | null;
+  known_total: number;
+  segments: SessionCompositionSegment[];
+  limitations: SessionCompositionLimitation[];
+  coverage: SessionCompositionCoverage;
+}
+
+export interface SessionCompositionScope {
+  requested_ids: string[];
+  canonical_session_count: number;
+  canonical_root_ids: string[];
+  canonical_tip_ids: string[];
+  aggregation: string;
+  date_truncation: boolean;
+  [key: string]: unknown;
+}
+
+export interface SessionCompositionResponse {
+  schema_version?: number;
+  scope: SessionCompositionScope;
+  charts: SessionCompositionChart[];
+  limitations: SessionCompositionLimitation[];
+  coverage: SessionCompositionCoverage;
 }
 
 export interface EnvVarInfo {
