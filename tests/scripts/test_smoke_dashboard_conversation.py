@@ -68,6 +68,23 @@ def test_generated_smoke_uses_public_ticket_and_full_session_lifecycle(smoke_mod
     assert "release-marker" in javascript
 
 
+def test_generated_smoke_can_select_an_exact_managed_route(smoke_module):
+    javascript = smoke_module._smoke_javascript(
+        base="https://example.com/hermes/",
+        path_prefix="/hermes/",
+        marker="release-marker",
+        timeout_ms=15_000,
+        provider="custom:kimi-code",
+        model="k3-256k",
+    )
+
+    assert "model.options" in javascript
+    assert "config.set" in javascript
+    assert "custom:kimi-code" in javascript
+    assert "k3-256k" in javascript
+    assert "public_model_picker_route" in javascript
+
+
 def test_generated_continuity_smoke_holds_then_reconnects_same_session(smoke_module):
     prepare = smoke_module._continuity_javascript(
         base="https://example.com/hermes/",
@@ -102,7 +119,7 @@ def test_continuity_phases_keep_browser_open_until_verify(smoke_module, monkeypa
     credentials = smoke_module.Credentials("member@example.com", "secret value")
     close_calls: list[list[str]] = []
     phases: list[str] = []
-    monkeypatch.setattr(smoke_module, "load_credentials", lambda _root: credentials)
+    monkeypatch.setattr(smoke_module, "load_credentials", lambda _root, _path: credentials)
     monkeypatch.setattr(smoke_module, "login_dashboard", lambda **_kwargs: {"ok": True})
 
     def fake_secure(**kwargs):
@@ -167,7 +184,7 @@ def test_public_smoke_returns_redacted_success_and_always_closes_browser(
     calls: list[list[str]] = []
     observed: dict[str, str] = {}
     monkeypatch.setattr(smoke_module.shutil, "which", lambda _name: "playwright-cli")
-    monkeypatch.setattr(smoke_module, "load_credentials", lambda _root: credentials)
+    monkeypatch.setattr(smoke_module, "load_credentials", lambda _root, _path: credentials)
     monkeypatch.setattr(smoke_module, "login_dashboard", lambda **_kwargs: {"ok": True})
 
     browser_result = {
@@ -237,7 +254,7 @@ def test_public_smoke_classifies_browser_failure_without_leaking_secrets(
     smoke_module, monkeypatch, tmp_path
 ):
     credentials = smoke_module.Credentials("member@example.com", "secret value")
-    monkeypatch.setattr(smoke_module, "load_credentials", lambda _root: credentials)
+    monkeypatch.setattr(smoke_module, "load_credentials", lambda _root, _path: credentials)
     monkeypatch.setattr(smoke_module, "login_dashboard", lambda **_kwargs: {"ok": True})
     monkeypatch.setattr(
         smoke_module,

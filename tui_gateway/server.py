@@ -2921,6 +2921,16 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     reasoning_config = getattr(agent, "reasoning_config", None)
     service_tier = getattr(agent, "service_tier", None)
 
+    try:
+        from hermes_cli.deployment_inference import is_deployment_inference_relay
+
+        if is_deployment_inference_relay(getattr(agent, "api_key", None)):
+            # The loopback relay address belongs to this worker process only. The
+            # descriptor can restore the exact provider/model route without it.
+            base_url = ""
+    except Exception:
+        logger.debug("deployment relay persistence check failed", exc_info=True)
+
     if model:
         config["model"] = model
     if provider:
@@ -3398,6 +3408,12 @@ def _restart_slash_worker(sid: str, session: dict):
 
 
 def _persist_model_switch(result) -> None:
+    # Deployment routes are Control-Plane-owned and backed by a worker-local,
+    # short-lived relay. Keeping them session-scoped preserves the rule that an
+    # explicit owner model config never gains access to shared credentials.
+    if getattr(result, "deployment_managed", False):
+        return
+
     # Use targeted, atomic key writes (comment/ordering-preserving) instead of
     # rewriting the whole `model:` block. A full-block rewrite via save_config()
     # destroys sibling keys the user set under `model:` — `model_slots`,
@@ -3589,8 +3605,8 @@ def _apply_model_switch(
         session["model_override"] = {
             "model": result.new_model,
             "provider": result.target_provider,
-            "base_url": result.base_url,
-            "api_key": result.api_key,
+            "base_url": None if getattr(result, "deployment_managed", False) else result.base_url,
+            "api_key": None if getattr(result, "deployment_managed", False) else result.api_key,
             "api_mode": result.api_mode,
         }
     if persist_global:

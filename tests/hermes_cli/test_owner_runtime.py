@@ -1,3 +1,4 @@
+import json
 import os
 import stat
 from pathlib import Path
@@ -227,7 +228,10 @@ def test_owner_worker_runtime_contract_rejects_forbidden_inherited_environment(t
 
 
 def test_owner_worker_environment_serializes_only_safe_deployment_descriptor(tmp_path):
-    from hermes_cli.deployment_inference import DeploymentInferenceDescriptor
+    from hermes_cli.deployment_inference import (
+        DeploymentInferenceDescriptor,
+        DeploymentInferenceRouteDescriptor,
+    )
 
     owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
     env = owner_worker_env_for(
@@ -246,14 +250,37 @@ def test_owner_worker_environment_serializes_only_safe_deployment_descriptor(tmp
             model="gpt-safe",
             api_mode="chat_completions",
             policy_id="policy-v1",
-            allowed_models=("gpt-safe",),
+            allowed_models=("gpt-safe", "k3-256k"),
             supports_vision=True,
+            routes=(
+                DeploymentInferenceRouteDescriptor(
+                    provider="custom:deployment",
+                    model="gpt-safe",
+                    api_mode="chat_completions",
+                    supports_vision=True,
+                ),
+                DeploymentInferenceRouteDescriptor(
+                    provider="custom:kimi-code",
+                    model="k3-256k",
+                    api_mode="anthropic_messages",
+                    name="Kimi Code",
+                    supports_vision=False,
+                ),
+            ),
         ),
     )
 
     assert env["HERMES_DEPLOYMENT_INFERENCE_PROVIDER"] == "custom:deployment"
     assert env["HERMES_DEPLOYMENT_INFERENCE_MODEL"] == "gpt-safe"
     assert env["HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION"] == "true"
+    routes = json.loads(env["HERMES_DEPLOYMENT_INFERENCE_ROUTES"])
+    assert routes[1] == {
+        "api_mode": "anthropic_messages",
+        "model": "k3-256k",
+        "name": "Kimi Code",
+        "provider": "custom:kimi-code",
+        "supports_vision": False,
+    }
     assert "API_KEY" not in " ".join(env)
     assert "BASE_URL" not in " ".join(env)
     validate_owner_worker_runtime_environment(owner_home=owner_home, source=env)

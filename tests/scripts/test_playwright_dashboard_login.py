@@ -61,6 +61,22 @@ def test_load_credentials_reads_safe_ignored_file(login_module, monkeypatch, tmp
     assert credentials.password == "secret value"
 
 
+def test_load_credentials_reads_explicit_ignored_file(login_module, monkeypatch, tmp_path):
+    path = tmp_path / ".env.user1"
+    path.write_text(
+        f"{login_module.USERNAME_KEY}=member@example.com\n"
+        f"{login_module.PASSWORD_KEY}=secret-value\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+    _allow_ignored_untracked(monkeypatch, login_module)
+
+    credentials = login_module.load_credentials(tmp_path, ".env.user1")
+
+    assert credentials.username == "member@example.com"
+    assert credentials.password == "secret-value"
+
+
 def test_load_credentials_requires_file(login_module, monkeypatch, tmp_path):
     _allow_ignored_untracked(monkeypatch, login_module)
 

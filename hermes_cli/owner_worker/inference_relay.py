@@ -47,6 +47,7 @@ _HOP_BY_HOP_HEADERS = frozenset({
     "content-length",
     "proxy-authorization",
     "transfer-encoding",
+    "x-api-key",
     _RELAY_DEADLINE_HEADER,
 })
 _RELAY_DIAG_HEADERS = (
@@ -456,16 +457,20 @@ class DeploymentInferenceBroker:
         path = str(request.get("path") or "")
         if method != "POST" or path not in _ALLOWED_PATHS:
             raise DeploymentInferenceRelayError("relay request is not allowed")
-        expected_path = "/v1/messages" if self._policy.api_mode == "anthropic_messages" else "/v1/chat/completions"
-        if path != expected_path:
-            raise DeploymentInferenceRelayError("relay request API mode does not match policy")
         try:
             body = base64.b64decode(str(request.get("body") or ""), validate=True)
             payload = json.loads(body)
         except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise DeploymentInferenceRelayError("relay request body is invalid") from exc
-        if not isinstance(payload, dict) or not self._policy.descriptor().allows_model(str(payload.get("model") or "")):
+        if not isinstance(payload, dict):
             raise DeploymentInferenceRelayError("relay request model is not allowed")
+        selected_model = str(payload.get("model") or "")
+        route = self._policy.route_for(selected_model)
+        if route is None:
+            raise DeploymentInferenceRelayError("relay request model is not allowed")
+        expected_path = "/v1/messages" if route.api_mode == "anthropic_messages" else "/v1/chat/completions"
+        if path != expected_path:
+            raise DeploymentInferenceRelayError("relay request API mode does not match policy")
         incoming_headers = request.get("headers")
         if not isinstance(incoming_headers, dict):
             raise DeploymentInferenceRelayError("relay request headers are invalid")
@@ -483,8 +488,8 @@ class DeploymentInferenceBroker:
             raise DeploymentInferenceRelayError("relay worker lease is not active") from exc
         # Resolve the credential only after all untrusted request validation and
         # the exact durable ACTIVE lease check have succeeded.
-        runtime = self._policy.resolve_runtime()
-        if self._policy.api_mode == "anthropic_messages":
+        runtime = self._policy.resolve_route_runtime(route)
+        if route.api_mode == "anthropic_messages":
             headers["x-api-key"] = str(runtime["api_key"])
         else:
             headers["Authorization"] = f"Bearer {runtime['api_key']}"

@@ -14,6 +14,7 @@ from hermes_cli.dashboard_auth.authority import AuthorityStore, WorkerGeneration
 from hermes_cli.deployment_inference import (
     DeploymentInferencePolicy,
     DeploymentInferencePolicyInvalid,
+    DeploymentInferenceRoute,
     deployment_descriptor_from_environment,
     policy_from_control_plane_environment,
 )
@@ -1182,6 +1183,68 @@ def test_owner_relay_streams_sse_and_injects_control_plane_credential(tmp_path, 
             assert upstream["path"] == "/v1/chat/completions"
             assert upstream["headers"]["Authorization"] == "Bearer control-plane-secret"
             assert "worker-marker" not in str(upstream["headers"])
+        finally:
+            broker.revoke(active)
+            relay.close()
+
+
+def test_owner_relay_routes_models_to_distinct_api_modes_and_credentials(tmp_path):
+    with _upstream_server() as (server, received):
+        policy = DeploymentInferencePolicy(
+            provider="custom:deployment",
+            model="gpt-safe",
+            api_mode="chat_completions",
+            runtime_resolver=lambda: {
+                "provider": "custom:deployment",
+                "api_mode": "chat_completions",
+                "base_url": f"http://127.0.0.1:{server.server_port}/openai/v1",
+                "api_key": "gpt-control-plane-secret",
+            },
+            allowed_models=("gpt-safe", "k3-256k"),
+            routes=(
+                DeploymentInferenceRoute(
+                    provider="custom:kimi-code",
+                    model="k3-256k",
+                    api_mode="anthropic_messages",
+                    name="Kimi Code",
+                    runtime_resolver=lambda: {
+                        "provider": "custom",
+                        "requested_provider": "custom:kimi-code",
+                        "api_mode": "anthropic_messages",
+                        "base_url": f"http://127.0.0.1:{server.server_port}/kimi/v1",
+                        "api_key": "kimi-control-plane-secret",
+                    },
+                ),
+            ),
+        )
+        broker, active, relay = _activate_relay(AuthorityStore(tmp_path / "control"), policy)
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                gpt = client.post(
+                    f"{relay.base_url}/chat/completions",
+                    headers={"Authorization": "Bearer worker-marker"},
+                    json={"model": "gpt-safe", "messages": []},
+                )
+                kimi = client.post(
+                    f"{relay.base_url}/messages",
+                    headers={
+                        "Authorization": "Bearer worker-marker",
+                        "x-api-key": "worker-marker",
+                    },
+                    json={"model": "k3-256k", "messages": [], "max_tokens": 1},
+                )
+
+            assert gpt.status_code == 200
+            assert kimi.status_code == 200
+            gpt_headers = {name.lower(): value for name, value in received[0]["headers"].items()}
+            kimi_headers = {name.lower(): value for name, value in received[1]["headers"].items()}
+            assert received[0]["path"] == "/openai/v1/chat/completions"
+            assert gpt_headers["authorization"] == "Bearer gpt-control-plane-secret"
+            assert "x-api-key" not in gpt_headers
+            assert received[1]["path"] == "/kimi/v1/messages"
+            assert kimi_headers["x-api-key"] == "kimi-control-plane-secret"
+            assert "authorization" not in kimi_headers
+            assert "worker-marker" not in str(received)
         finally:
             broker.revoke(active)
             relay.close()

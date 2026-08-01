@@ -167,6 +167,7 @@ def build_models_payload(
         refresh=refresh,
         allow_network=allow_network,
     )
+    rows = _merge_deployment_routes(rows, ctx)
 
     moa_row = _moa_provider_row(ctx.current_provider)
     if moa_row is not None:
@@ -274,6 +275,49 @@ def _apply_capabilities(rows: list[dict]) -> None:
 
 
 # ─── Internal: row post-processing ──────────────────────────────────────
+
+
+def _merge_deployment_routes(rows: list[dict], ctx: ConfigContext) -> list[dict]:
+    """Merge non-secret deployment routes into the shared model inventory."""
+    try:
+        from hermes_cli.deployment_inference import deployment_descriptor_from_environment
+
+        descriptor = deployment_descriptor_from_environment()
+    except Exception:
+        descriptor = None
+    if descriptor is None:
+        return rows
+
+    merged = [dict(row) for row in rows]
+    by_slug = {str(row.get("slug") or "").lower(): row for row in merged}
+    for route in descriptor.routes:
+        row = by_slug.get(route.provider)
+        if row is None:
+            row = {
+                "slug": route.provider,
+                "name": route.name or route.provider.removeprefix("custom:"),
+                "is_current": route.provider == str(ctx.current_provider or "").lower(),
+                "is_user_defined": False,
+                "models": [],
+                "total_models": 0,
+                "source": "deployment",
+                "authenticated": True,
+                "managed": True,
+                "credentials_read_only": True,
+            }
+            merged.append(row)
+            by_slug[route.provider] = row
+        models = list(row.get("models") or [])
+        if route.model not in models:
+            models.append(route.model)
+        row["models"] = models
+        row["total_models"] = len(models)
+        row["authenticated"] = True
+        row["managed"] = True
+        row["credentials_read_only"] = True
+        if route.provider == str(ctx.current_provider or "").lower():
+            row["is_current"] = True
+    return merged
 
 
 def _append_unconfigured_rows(rows: list[dict], ctx: ConfigContext) -> list[dict]:
