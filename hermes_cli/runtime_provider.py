@@ -1552,24 +1552,15 @@ def resolve_deployment_inference_runtime(
     if descriptor is None:
         return None
     raw_owner = _explicit_owner_model_selection()
-    # A deliberate owner config has always owned its credentials and transport.
-    # Do not override it merely because its provider/model happens to match the
-    # deployment policy; relay fallback is for otherwise blank owner homes.
-    if raw_owner:
-        return None
     requested_provider = str(requested or "").strip().lower()
-    configured_provider = str(raw_owner.get("provider") or "").strip().lower()
-    selected_provider = requested_provider or configured_provider or descriptor.provider
-    selected_model = str(
-        target_model or raw_owner.get("default") or raw_owner.get("model") or descriptor.model
-    ).strip()
-    selected_base_url = str(explicit_base_url or raw_owner.get("base_url") or "").strip()
-    selected_api_mode = str(raw_owner.get("api_mode") or "").strip()
-    if selected_provider != descriptor.provider.lower():
+    selected_model = str(target_model or descriptor.model).strip()
+    route = descriptor.route_for(selected_model, provider=requested_provider or None)
+    if route is None:
         return None
-    if selected_base_url or (selected_api_mode and selected_api_mode != descriptor.api_mode):
+    selected_base_url = str(explicit_base_url or "").strip()
+    if selected_base_url:
         return None
-    if not descriptor.allows_model(selected_model):
+    if raw_owner:
         return None
     relay_base_url = os.environ.get("HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL", "").strip()
     if not relay_base_url:
@@ -1577,9 +1568,12 @@ def resolve_deployment_inference_runtime(
     parsed_relay = urlparse(relay_base_url)
     if parsed_relay.scheme != "http" or parsed_relay.hostname not in {"127.0.0.1", "::1", "localhost"}:
         return None
-    runtime = descriptor.relay_runtime(model=selected_model)
+    runtime = descriptor.relay_runtime(
+        model=selected_model,
+        provider=requested_provider or None,
+    )
     runtime["base_url"] = relay_base_url.rstrip("/")
-    runtime["requested_provider"] = requested_provider or descriptor.provider
+    runtime["requested_provider"] = requested_provider or route.provider
     return runtime
 
 

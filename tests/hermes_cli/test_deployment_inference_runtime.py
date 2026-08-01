@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from hermes_cli import runtime_provider as rp
 
 
@@ -60,6 +62,41 @@ def test_explicit_owner_config_never_uses_deployment_relay(monkeypatch):
     )
 
     assert rp.resolve_deployment_inference_runtime(target_model="gpt-safe") is None
+
+
+def test_blank_owner_selects_exact_secondary_deployment_route(monkeypatch):
+    _deployment_env(monkeypatch)
+    monkeypatch.setenv(
+        "HERMES_DEPLOYMENT_INFERENCE_ROUTES",
+        json.dumps([
+            {
+                "provider": "custom:deployment",
+                "model": "gpt-safe",
+                "api_mode": "chat_completions",
+            },
+            {
+                "provider": "custom:kimi-code",
+                "model": "gpt-safe-mini",
+                "api_mode": "anthropic_messages",
+                "name": "Kimi Code",
+            },
+        ]),
+    )
+    monkeypatch.setattr(rp, "read_raw_config", lambda: {})
+
+    resolved = rp.resolve_deployment_inference_runtime(
+        requested="custom:kimi-code",
+        target_model="gpt-safe-mini",
+    )
+
+    assert resolved["provider"] == "custom:kimi-code"
+    assert resolved["api_mode"] == "anthropic_messages"
+    assert resolved["model"] == "gpt-safe-mini"
+    assert resolved["base_url"] == "http://127.0.0.1:39123/v1"
+    assert rp.resolve_deployment_inference_runtime(
+        requested="custom:deployment",
+        target_model="gpt-safe-mini",
+    ) is None
 
 
 def test_deployment_relay_requires_loopback_endpoint(monkeypatch):

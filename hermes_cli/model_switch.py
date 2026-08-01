@@ -300,6 +300,7 @@ class ModelSwitchResult:
     capabilities: Optional[ModelCapabilities] = None
     model_info: Optional[ModelInfo] = None
     is_global: bool = False
+    deployment_managed: bool = False
 # ---------------------------------------------------------------------------
 # Flag parsing
 # ---------------------------------------------------------------------------
@@ -813,6 +814,18 @@ def switch_model(
     new_model = raw_input.strip()
     target_provider = current_provider
     resolved_moa_preset = False
+    deployment_route = None
+    try:
+        from hermes_cli.deployment_inference import deployment_descriptor_from_environment
+
+        deployment_descriptor = deployment_descriptor_from_environment()
+        if deployment_descriptor is not None and new_model:
+            deployment_route = deployment_descriptor.route_for(
+                new_model,
+                provider=explicit_provider or None,
+            )
+    except Exception:
+        deployment_route = None
 
     # =================================================================
     # PATH A: Explicit --provider given
@@ -826,6 +839,15 @@ def switch_model(
         )
         if pdef is None and explicit_provider.strip().lower() == "custom":
             pdef = _bare_custom_provider_def(current_base_url)
+        if pdef is None and deployment_route is not None:
+            pdef = ProviderDef(
+                id=deployment_route.provider,
+                name=deployment_route.name or get_label(deployment_route.provider),
+                transport=deployment_route.api_mode,
+                api_key_env_vars=(),
+                auth_type="deployment",
+                source="deployment",
+            )
         if pdef is None:
             _switch_err = (
                 f"Unknown provider '{explicit_provider}'. "
@@ -1218,22 +1240,37 @@ def switch_model(
     # --- Normalize model name for target provider ---
     new_model = normalize_model_for_provider(new_model, target_provider)
 
-    # --- Validate ---
-    try:
-        validation = validate_requested_model(
-            new_model,
-            target_provider,
-            api_key=api_key,
-            base_url=base_url,
-            api_mode=api_mode or None,
-        )
-    except Exception as e:
+    deployment_managed = bool(
+        deployment_route is not None
+        and deployment_route.provider == target_provider
+        and deployment_route.model == new_model
+    )
+    # Deployment routes are an exact operator allowlist and the worker cannot
+    # query their private upstream catalogs. Treat only that exact route as
+    # validated; all ordinary providers retain normal catalog validation.
+    if deployment_managed:
         validation = {
-            "accepted": False,
-            "persist": False,
-            "recognized": False,
-            "message": f"Could not validate `{new_model}`: {e}",
+            "accepted": True,
+            "persist": True,
+            "recognized": True,
+            "message": "",
         }
+    else:
+        try:
+            validation = validate_requested_model(
+                new_model,
+                target_provider,
+                api_key=api_key,
+                base_url=base_url,
+                api_mode=api_mode or None,
+            )
+        except Exception as e:
+            validation = {
+                "accepted": False,
+                "persist": False,
+                "recognized": False,
+                "message": f"Could not validate `{new_model}`: {e}",
+            }
 
     # Override rejection if model is in the user's saved provider config.
     # API /v1/models may not list cloud/aliased models even though the server supports them.
@@ -1347,6 +1384,7 @@ def switch_model(
         capabilities=capabilities,
         model_info=model_info,
         is_global=is_global,
+        deployment_managed=deployment_managed,
     )
 
 
