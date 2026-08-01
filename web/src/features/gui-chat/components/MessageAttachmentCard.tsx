@@ -1,4 +1,4 @@
-import { Download, LoaderCircle } from "lucide-react";
+import { Download, LoaderCircle, RotateCcw } from "lucide-react";
 import { useEffect, useState, type MouseEvent } from "react";
 
 import { fetchJSON, withHermesAssetAuth } from "@/lib/api";
@@ -9,9 +9,11 @@ import { FileTypeIcon } from "./FileTypeIcon";
 
 export function MessageAttachmentCard({
   attachment,
+  onUseAgain,
   variant = "card",
 }: {
   attachment: MessageAttachmentState;
+  onUseAgain?: (attachment: MessageAttachmentState) => void;
   variant?: "bubble" | "card";
 }) {
   const isPdf = attachment.kind === "pdf";
@@ -27,6 +29,20 @@ export function MessageAttachmentCard({
     .filter(Boolean)
     .join(" · ");
   const dimensions = validImageDimensions(attachment.width, attachment.height);
+  const canUseAgain = Boolean(
+    onUseAgain && attachment.downloadUrl && (attachment.sourcePath || attachment.refText),
+  );
+  const useAgainAction = canUseAgain ? (
+    <button
+      aria-label={`Use ${attachment.name} again`}
+      className="inline-flex h-7 items-center gap-1 px-2 text-xs text-midground hover:text-primary"
+      onClick={() => onUseAgain?.(attachment)}
+      type="button"
+    >
+      <RotateCcw aria-hidden className="h-3.5 w-3.5" />
+      Use again
+    </button>
+  ) : null;
   const download = (event: MouseEvent<HTMLAnchorElement>) => {
     event.preventDefault();
     if (!attachment.downloadUrl || downloading) return;
@@ -63,7 +79,8 @@ export function MessageAttachmentCard({
           )}
         </div>
         {attachment.downloadUrl ? (
-          <div className="mt-1 flex justify-end">
+          <div className="mt-1 flex justify-end gap-1">
+            {useAgainAction}
             <a
               aria-busy={downloading}
               aria-disabled={downloading}
@@ -112,13 +129,6 @@ export function MessageAttachmentCard({
         </div>
         <div className="truncate text-xs leading-5 text-text-tertiary">{meta}</div>
       </div>
-      {attachment.downloadUrl ? (
-        downloading ? (
-          <LoaderCircle aria-hidden className="h-4 w-4 shrink-0 animate-spin" />
-        ) : (
-          <Download aria-hidden className="h-4 w-4 shrink-0" />
-        )
-      ) : null}
     </>
   );
   const className = "flex h-[64px] w-full max-w-[280px] items-center gap-3 rounded-2xl border border-current/10 bg-background-base/60 px-3 py-2 text-left shadow-sm sm:w-[260px]";
@@ -136,6 +146,7 @@ export function MessageAttachmentCard({
       >
         {content}
       </a>
+      {useAgainAction}
       {downloadError ? (
         <p
           className="mt-1 text-xs text-destructive"

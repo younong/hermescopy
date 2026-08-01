@@ -49,7 +49,6 @@ def test_switch_model_clears_previous_config_context_length(mock_ctx_len):
     assert agent.context_compressor.context_length == 32_768  # From config override
 
     agent._compression_feasibility_checked = True
-    agent._compression_prepare_token_cap = 80_000
 
     agent.switch_model(
         "new-model",
@@ -66,7 +65,6 @@ def test_switch_model_clears_previous_config_context_length(mock_ctx_len):
     assert agent.context_compressor.model == "new-model"
     assert agent.context_compressor.context_length == 131_072
     assert agent._compression_feasibility_checked is False
-    assert agent._compression_prepare_token_cap is None
 
 
 def test_switch_model_without_config_context_length():

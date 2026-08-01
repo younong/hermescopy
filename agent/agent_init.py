@@ -1919,7 +1919,6 @@ def init_agent(
     # ``ensure_compression_feasibility_checked`` (called from
     # ``run_conversation``'s preflight) runs it at most once per agent.
     agent._compression_feasibility_checked = False
-    agent._compression_prepare_token_cap = None
 
     # Snapshot primary runtime for per-turn restoration.  When fallback
     # activates during a turn, the next turn restores these values so the

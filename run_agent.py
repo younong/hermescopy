@@ -178,6 +178,8 @@ from agent.message_sanitization import (  # noqa: F401
     _sanitize_tools_non_ascii,
     _strip_images_from_messages,
     _sanitize_structure_non_ascii,
+    compact_user_attachment_content,
+    project_attachment_content,
 )
 from agent.codex_responses_adapter import (
     _derive_responses_function_call_id as _codex_derive_responses_function_call_id,
@@ -1851,20 +1853,19 @@ class AIAgent:
                         content = _ov_content
                     if _ov_timestamp is not None:
                         _row_timestamp = _ov_timestamp
-                # Persist multimodal tool results as their text summary only —
-                # base64 images would bloat the session DB and aren't useful
-                # for cross-session replay.
+                # Persist tool-generated multimodal results as their existing text
+                # summary. User/provider rich content keeps ordinary text and
+                # stable attachment receipts, never payload bytes. Attachment
+                # metadata remains in the dedicated DB column for UI replay.
                 if _is_multimodal_tool_result(content):
                     content = _multimodal_text_summary(content)
-                elif isinstance(content, list):
-                    # List of OpenAI-style content parts: strip images, keep text.
-                    _txt = []
-                    for p in content:
-                        if isinstance(p, dict) and p.get("type") == "text":
-                            _txt.append(str(p.get("text", "")))
-                        elif isinstance(p, dict) and p.get("type") in {"image", "image_url", "input_image"}:
-                            _txt.append("[screenshot]")
-                    content = "\n".join(_txt) if _txt else None
+                elif role == "user" and msg.get("attachments") and _ov_idx == _msg_idx:
+                    content = compact_user_attachment_content(
+                        _ov_content if _ov_content is not None else content,
+                        msg.get("attachments"),
+                    )
+                else:
+                    content = project_attachment_content(content)
                 tool_calls_data = None
                 if hasattr(msg, "tool_calls") and isinstance(msg.tool_calls, list) and msg.tool_calls:
                     tool_calls_data = [
@@ -5589,7 +5590,7 @@ class AIAgent:
             self, messages, task_id=task_id, force=force
         )
 
-    def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default", focus_topic: str = None, force: bool = False, emit_abort_warning: bool = True, emit_completion_status: bool = True, preserve_on_summary_failure: bool = False) -> tuple:
+    def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default", focus_topic: str = None, force: bool = False, emit_abort_warning: bool = True, emit_completion_status: bool = True, preserve_on_summary_failure: bool = False, preserve_attachment_index: int = None) -> tuple:
         """Forwarder — see ``agent.conversation_compression.compress_context``.
 
         ``force=True`` is passed by the manual ``/compress`` slash command
@@ -5604,6 +5605,7 @@ class AIAgent:
             force=force, emit_abort_warning=emit_abort_warning,
             emit_completion_status=emit_completion_status,
             preserve_on_summary_failure=preserve_on_summary_failure,
+            preserve_attachment_index=preserve_attachment_index,
         )
 
     def _set_tool_guardrail_halt(self, decision: ToolGuardrailDecision) -> None:

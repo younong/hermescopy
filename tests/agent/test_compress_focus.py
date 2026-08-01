@@ -16,6 +16,7 @@ def _make_compressor():
     compressor.protect_last_n = 5
     compressor.tail_token_budget = 20000
     compressor.context_length = 200000
+    compressor.max_tokens = 0
     compressor.threshold_percent = 0.80
     compressor.threshold_tokens = 160000
     compressor.max_summary_tokens = 10000

@@ -41,6 +41,7 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_tokens_rough,
 )
+from agent.message_sanitization import project_historical_attachments
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,15 @@ HISTORICAL_TASK_HEADING = "## Historical Task Snapshot"
 HISTORICAL_IN_PROGRESS_HEADING = "## Historical In-Progress State"
 HISTORICAL_PENDING_ASKS_HEADING = "## Historical Pending User Asks"
 HISTORICAL_REMAINING_WORK_HEADING = "## Historical Remaining Work"
+
+
+@dataclass(frozen=True)
+class _SummaryChunk:
+    """Serialized summary input scoped to one compression attempt."""
+
+    messages: tuple[Dict[str, Any], ...]
+    serialized: str
+    token_estimate: int
 
 
 SUMMARY_PREFIX = (
@@ -413,114 +423,6 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
     return json.dumps(shrunken, ensure_ascii=False)
 
 
-_IMAGE_PART_TYPES = frozenset({"image_url", "input_image", "image"})
-
-
-def _is_image_part(part: Any) -> bool:
-    """True if ``part`` is a multimodal image content block.
-
-    Recognizes all three shapes the agent handles:
-      - OpenAI chat.completions: ``{"type": "image_url", "image_url": ...}``
-      - OpenAI Responses API:    ``{"type": "input_image", "image_url": "..."}``
-      - Anthropic native:        ``{"type": "image", "source": {...}}``
-    """
-    if not isinstance(part, dict):
-        return False
-    return part.get("type") in _IMAGE_PART_TYPES
-
-
-def _content_has_images(content: Any) -> bool:
-    """True if a message's ``content`` is a multimodal list with image parts."""
-    if not isinstance(content, list):
-        return False
-    return any(_is_image_part(p) for p in content)
-
-
-def _strip_images_from_content(content: Any) -> Any:
-    """Return a copy of ``content`` with every image part replaced by a
-    short text placeholder.
-
-    - String content is returned unchanged.
-    - Non-list, non-string content is returned unchanged.
-    - List content: image parts become ``{"type": "text", "text": "[Attached
-      image — stripped after compression]"}``; other parts are preserved as-is.
-
-    Input is never mutated.
-    """
-    if not isinstance(content, list):
-        return content
-    if not any(_is_image_part(p) for p in content):
-        return content
-
-    new_parts: List[Any] = []
-    for p in content:
-        if _is_image_part(p):
-            new_parts.append({
-                "type": "text",
-                "text": "[Attached image — stripped after compression]",
-            })
-        else:
-            new_parts.append(p)
-    return new_parts
-
-
-def _strip_historical_media(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Replace image parts in older messages with placeholder text.
-
-    The anchor is the *last* user message that has any image content. Every
-    message before that anchor gets its image parts replaced with a short
-    placeholder so the outgoing request stops re-shipping the same multi-MB
-    base-64 image blobs on every turn.
-
-    If no user message carries images, the list is returned unchanged.
-    If the only user message with images is the very first one (nothing
-    earlier to strip), the list is returned unchanged.
-
-    Shallow copies of touched messages only; input is never mutated.
-    Port of Kilo-Org/kilocode#9434 (adapted for the OpenAI-style message
-    shape the hermes compressor emits).
-    """
-    if not messages:
-        return messages
-
-    # Find the newest user message that carries at least one image part.
-    # We anchor on image-bearing user messages (not all user messages) so
-    # a plain text follow-up after a big-image turn still strips the old
-    # image — matching the problem kilocode#9434 set out to solve.
-    anchor = -1
-    for i in range(len(messages) - 1, -1, -1):
-        msg = messages[i]
-        if not isinstance(msg, dict):
-            continue
-        if msg.get("role") != "user":
-            continue
-        if _content_has_images(msg.get("content")):
-            anchor = i
-            break
-
-    if anchor <= 0:
-        # No image-bearing user message, or it's the very first message —
-        # nothing before it to strip.
-        return messages
-
-    changed = False
-    result: List[Dict[str, Any]] = []
-    for i, msg in enumerate(messages):
-        if i >= anchor or not isinstance(msg, dict):
-            result.append(msg)
-            continue
-        content = msg.get("content")
-        if not _content_has_images(content):
-            result.append(msg)
-            continue
-        new_msg = msg.copy()
-        new_msg["content"] = _strip_images_from_content(content)
-        result.append(new_msg)
-        changed = True
-
-    return result if changed else messages
-
-
 def _utf8_size(value: Any) -> int:
     """Return the UTF-8 payload size used by tool-compaction accounting."""
     if isinstance(value, str):
@@ -743,7 +645,6 @@ class ContextCompressor(ContextEngine):
         self._usage_calibration_ratio = 1.0
         self._usage_calibration_samples = 0
         self._last_request_rough_tokens = 0
-        self._summary_chunk_checkpoint = 0
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         """Clear all per-session compaction state at a real session boundary.
@@ -785,7 +686,6 @@ class ContextCompressor(ContextEngine):
         self._usage_calibration_ratio = 1.0
         self._usage_calibration_samples = 0
         self._last_request_rough_tokens = 0
-        self._summary_chunk_checkpoint = 0
 
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
         """Bind the current session row and restore route-scoped pressure state."""
@@ -1130,7 +1030,6 @@ class ContextCompressor(ContextEngine):
         self._usage_calibration_ratio = 1.0
         self._usage_calibration_samples = 0
         self._last_request_rough_tokens = 0
-        self._summary_chunk_checkpoint = 0
 
         self.summary_model = summary_model_override or ""
         self._session_db: Any = None
@@ -1531,25 +1430,41 @@ class ContextCompressor(ContextEngine):
         turns: List[Dict[str, Any]],
         *,
         input_budget: int,
-    ) -> List[List[Dict[str, Any]]]:
-        """Pack complete atomic groups into bounded auxiliary prompt chunks."""
-        chunks: List[List[Dict[str, Any]]] = []
-        chunk: List[Dict[str, Any]] = []
+    ) -> List[_SummaryChunk]:
+        """Pack complete atomic groups into serialized, request-bounded chunks."""
+        chunks: List[_SummaryChunk] = []
+        chunk_messages: List[Dict[str, Any]] = []
+        chunk_parts: List[str] = []
         chunk_tokens = 0
+
+        def flush_chunk() -> None:
+            nonlocal chunk_messages, chunk_parts, chunk_tokens
+            serialized = "\n\n".join(chunk_parts)
+            chunks.append(
+                _SummaryChunk(
+                    messages=tuple(chunk_messages),
+                    serialized=serialized,
+                    token_estimate=chunk_tokens,
+                )
+            )
+            chunk_messages = []
+            chunk_parts = []
+            chunk_tokens = 0
+
         for group in self._atomic_summary_groups(turns):
-            group_tokens = estimate_tokens_rough(self._serialize_for_summary(group))
-            if chunk and chunk_tokens + group_tokens > input_budget:
-                chunks.append(chunk)
-                chunk = []
-                chunk_tokens = 0
-            chunk.extend(group)
-            chunk_tokens += group_tokens
+            serialized_group = self._serialize_for_summary(group)
+            group_tokens = estimate_tokens_rough(serialized_group)
+            separator_tokens = 1 if chunk_messages else 0
+            if chunk_messages and chunk_tokens + separator_tokens + group_tokens > input_budget:
+                flush_chunk()
+                separator_tokens = 0
+            chunk_messages.extend(group)
+            chunk_parts.append(serialized_group)
+            chunk_tokens += separator_tokens + group_tokens
             if chunk_tokens >= input_budget:
-                chunks.append(chunk)
-                chunk = []
-                chunk_tokens = 0
-        if chunk:
-            chunks.append(chunk)
+                flush_chunk()
+        if chunk_messages:
+            flush_chunk()
         return chunks
 
     def _generate_rolling_summary(
@@ -1558,11 +1473,8 @@ class ContextCompressor(ContextEngine):
         *,
         focus_topic: Optional[str],
         deadline_monotonic: Optional[float],
-        start_cursor: int = 0,
-        rolling_summary: Optional[str] = None,
-        checkpoint: Optional[Any] = None,
     ) -> Optional[str]:
-        """Fold bounded atomic chunks into a resumable rolling summary."""
+        """Fold bounded atomic chunks into the current rolling summary."""
         capacity = self._auxiliary_summary_capacity()
         route_budget = int(getattr(capacity, "input_budget", 0) or 0)
         output_budget = int(getattr(capacity, "max_output_tokens", 0) or 0)
@@ -1579,41 +1491,37 @@ class ContextCompressor(ContextEngine):
             ),
         )
         chunks = self._summary_chunks(turns, input_budget=input_budget)
-        cursor = max(0, min(int(start_cursor or 0), len(chunks)))
-        self._previous_summary = rolling_summary or self._previous_summary
 
-        for index in range(cursor, len(chunks)):
-            chunk = chunks[index]
+        for index, chunk in enumerate(chunks):
             progress_callback = getattr(self, "progress_callback", None)
             if callable(progress_callback):
                 try:
                     progress_callback(index + 1, len(chunks))
                 except Exception:
                     logger.debug("compression progress callback failed", exc_info=True)
-            if estimate_tokens_rough(self._serialize_for_summary(chunk)) > input_budget:
+            if chunk.token_estimate > input_budget:
                 self._last_summary_error = "atomic tool group exceeds auxiliary input budget"
                 self._last_summary_transient_failure = True
                 return None
+            chunk_messages = list(chunk.messages)
             summary_budget = self._compute_summary_budget(
-                chunk,
+                chunk_messages,
                 max_output_tokens=output_budget or None,
             )
             request_deadline = deadline_monotonic
             if request_deadline is None:
                 request_deadline = time.monotonic() + 600.0
             summary = self._generate_summary(
-                chunk,
+                chunk_messages,
                 focus_topic=focus_topic,
                 deadline_monotonic=request_deadline,
                 _summary_budget=summary_budget,
+                _serialized_content=chunk.serialized,
             )
             if not summary:
                 return None
             rolling = self._strip_summary_prefix(summary) or summary
             self._previous_summary = rolling
-            self._summary_chunk_checkpoint = index + 1
-            if checkpoint is not None:
-                checkpoint(index + 1, rolling)
         return self._with_summary_prefix(self._previous_summary) if self._previous_summary else None
 
     def _auxiliary_summary_capacity(self):
@@ -1925,6 +1833,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         deadline_monotonic: Optional[float] = None,
         *,
         _summary_budget: Optional[int] = None,
+        _serialized_content: Optional[str] = None,
     ) -> Optional[str]:
         """Generate a structured summary of conversation turns.
 
@@ -1956,7 +1865,11 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             if _summary_budget is not None
             else self._compute_summary_budget(turns_to_summarize)
         )
-        content_to_summarize = self._serialize_for_summary(turns_to_summarize)
+        content_to_summarize = (
+            _serialized_content
+            if _serialized_content is not None
+            else self._serialize_for_summary(turns_to_summarize)
+        )
 
         # Current date for temporal anchoring (see ## Temporal Anchoring below).
         # Date-only granularity matches system_prompt.py:337 (PR #20451) and the
@@ -2314,6 +2227,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                     focus_topic=focus_topic,
                     deadline_monotonic=summary_request_deadline,
                     _summary_budget=summary_budget,
+                    _serialized_content=content_to_summarize,
                 )
 
             # Transient errors (timeout, rate limit, network, JSON decode,
@@ -3125,6 +3039,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         force: bool = False,
         deadline_monotonic: Optional[float] = None,
         preserve_on_summary_failure: bool = False,
+        preserve_attachment_index: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Compress conversation messages by summarizing middle turns.
 
@@ -3148,6 +3063,10 @@ This compaction should PRIORITISE preserving all information related to the focu
                 an auto-compression abort. Auto-compress callers pass False.
             preserve_on_summary_failure: If True, any unusable summary aborts
                 without replacing source turns with a static fallback marker.
+            preserve_attachment_index: Optional index in ``messages`` whose rich
+                attachment payload is still needed for the current turn's first
+                provider request. All other retained attachment bodies become
+                compact receipts.
         """
         # Reset per-call summary failure state — callers inspect these fields
         # after compress() returns to decide whether to surface a warning.
@@ -3287,13 +3206,10 @@ This compaction should PRIORITISE preserving all information related to the focu
             turns_to_summarize,
             focus_topic=summary_focus_topic,
             deadline_monotonic=deadline_monotonic,
-            start_cursor=int(getattr(self, "_summary_chunk_checkpoint", 0) or 0),
-            rolling_summary=self._previous_summary,
-            checkpoint=getattr(self, "_rolling_checkpoint", None),
         )
 
-        # Automatic safety gates and durable preparation preserve the source
-        # transcript on every failed chunk. Manual direct calls retain their
+        # Automatic safety gates preserve the source transcript on every failed
+        # chunk. Manual direct calls retain their
         # explicit deterministic recovery behavior unless configured otherwise.
         if not summary and (
             preserve_on_summary_failure
@@ -3335,8 +3251,11 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         # Phase 4: Assemble compressed message list
         compressed = []
+        compressed_preserve_index = None
         for i in range(compress_start):
             msg = messages[i].copy()
+            if i == preserve_attachment_index:
+                compressed_preserve_index = len(compressed)
             if i == 0 and msg.get("role") == "system":
                 existing = msg.get("content")
                 _compression_note = "[Note: Some earlier conversation turns have been compacted into a handoff summary to preserve context space. The current session state may still reflect earlier work, so build on that summary and state rather than re-doing work. Your persistent memory (MEMORY.md, USER.md) remains fully authoritative regardless of compaction.]"
@@ -3437,19 +3356,22 @@ This compaction should PRIORITISE preserving all information related to the focu
                 # containing a compression summary prefix.
                 msg[COMPRESSED_SUMMARY_METADATA_KEY] = True
                 _merge_summary_into_tail = False
+            if i == preserve_attachment_index:
+                compressed_preserve_index = len(compressed)
             compressed.append(msg)
 
         self.compression_count += 1
 
         compressed = self._sanitize_tool_pairs(compressed)
 
-        # Replace image parts in all compressed messages before the newest
-        # image-bearing user turn with a short text placeholder. Without
-        # this, tail messages keep their original multi-MB base-64 image
-        # payloads forever, which can push every subsequent API request
-        # past the provider's body-size limit and wedge the session.
-        # Port of Kilo-Org/kilocode#9434.
-        compressed = _strip_historical_media(compressed)
+        # Compressed output is reusable historical context, except that a
+        # preflight pass may retain the current inbound attachment for its one
+        # allowed provider request. Assembly records its shifted tail index; if
+        # compression summarized that turn away, no payload remains to preserve.
+        compressed = project_historical_attachments(
+            compressed,
+            preserve_index=compressed_preserve_index,
+        )
 
         new_estimate = estimate_messages_tokens_rough(compressed)
         saved_estimate = display_tokens - new_estimate

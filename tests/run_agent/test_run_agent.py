@@ -126,6 +126,39 @@ def test_persist_user_message_override_rewrites_text_turns(agent):
     assert messages == [{"role": "user", "content": "hello"}]
 
 
+def test_flush_persists_compact_attachment_receipt_and_metadata(agent):
+    session_db = MagicMock()
+    agent._session_db = session_db
+    agent._session_db_created = True
+    agent._last_flushed_db_idx = 0
+    agent._persist_user_message_idx = 0
+    agent._persist_user_message_override = "describe this"
+    attachments = [
+        {"kind": "image", "name": "shot.png", "path": "/tmp/shot.png"},
+        {"kind": "file", "name": "notes.txt", "ref_text": "@file:notes.txt"},
+    ]
+    data_url = "data:image/png;base64," + ("A" * 512)
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "describe this"},
+            {"type": "image_url", "image_url": {"url": data_url}},
+        ],
+        "attachments": attachments,
+    }]
+
+    agent._flush_messages_to_session_db(messages)
+
+    kwargs = session_db.append_message.call_args.kwargs
+    assert kwargs["attachments"] == attachments
+    assert data_url not in str(kwargs["content"])
+    assert kwargs["content"] == (
+        "describe this\n"
+        "[Attached image: shot.png — payload omitted; explicitly attach it again to reuse]\n"
+        "[Attached file: notes.txt — payload omitted; explicitly attach it again to reuse]"
+    )
+
+
 def test_persist_user_message_override_preserves_multimodal_turns(agent):
     multimodal_content = [
         {"type": "text", "text": "What color is this?"},
@@ -4042,6 +4075,75 @@ class TestRunConversation:
         assert not agent.client.chat.completions.create.called
         assert "Ollama runtime context too small for Hermes tool use" in caplog.text
         assert "runtime_context=4096" in caplog.text
+
+    def test_attachment_payload_is_sent_once_across_tool_loop(self, agent):
+        self._setup_agent(agent)
+        agent._model_supports_vision = lambda: True
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc]),
+            _mock_response(content="Done", finish_reason="stop"),
+        ]
+        data_url = "data:image/png;base64," + ("A" * 256)
+        content = [
+            {"type": "text", "text": "describe this"},
+            {"type": "image_url", "image_url": {"url": data_url}},
+        ]
+        attachments = [{"kind": "image", "name": "shot.png", "path": "/tmp/shot.png"}]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                content,
+                persist_user_message="describe this",
+                persist_user_attachments=attachments,
+            )
+
+        first, second = agent.client.chat.completions.create.call_args_list
+        assert data_url in str(first.kwargs["messages"])
+        assert data_url not in str(second.kwargs["messages"])
+        second_user = next(
+            message for message in second.kwargs["messages"]
+            if message.get("role") == "user"
+        )
+        assert second_user["content"] == (
+            "describe this\n"
+            "[Attached image: shot.png — payload omitted; explicitly attach it again to reuse]"
+        )
+        assert all("attachments" not in message for message in second.kwargs["messages"])
+        assert data_url in str(result["messages"])
+
+    def test_historical_attachment_payload_is_not_replayed(self, agent):
+        self._setup_agent(agent)
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Done", finish_reason="stop"
+        )
+        data_url = "data:image/png;base64," + ("B" * 256)
+        history = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "old image"},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+            {"role": "assistant", "content": "seen"},
+        ]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.run_conversation("follow up", conversation_history=history)
+
+        sent = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        assert data_url not in str(sent)
+        assert "payload omitted" in str(sent)
 
     def test_tool_calls_then_stop(self, agent):
         self._setup_agent(agent)

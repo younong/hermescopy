@@ -70,6 +70,20 @@ export function sessionFileType(name: string, mimeType?: string): SessionFileTyp
   return "generic";
 }
 
+export async function readSessionFile(
+  url: string,
+  filename: string,
+  mimeType?: string,
+): Promise<File> {
+  if (!url.startsWith("/api/files/download?")) {
+    throw new Error("This attachment cannot be reused from its stored location.");
+  }
+  const response = await authedFetch(url);
+  await requireSuccessfulFileResponse(response);
+  const blob = await response.blob();
+  return new File([blob], filename, { type: mimeType || blob.type });
+}
+
 export async function downloadSessionFile(url: string, filename: string): Promise<void> {
   if (url.startsWith("data:") || url.startsWith("blob:")) {
     triggerDownload(url, filename);
@@ -79,20 +93,7 @@ export async function downloadSessionFile(url: string, filename: string): Promis
   const response = url.startsWith("/api/")
     ? await authedFetch(url)
     : await fetch(url, { credentials: "include" });
-  if (!response.ok) {
-    let detail = "";
-    try {
-      const body = await response.clone().json() as { detail?: string; error?: string };
-      detail = String(body.detail ?? body.error ?? "").trim();
-    } catch {
-      detail = (await response.text().catch(() => "")).trim();
-    }
-    throw new Error(
-      detail
-        ? `Download failed (${response.status}): ${detail}`
-        : `Download failed (${response.status})`,
-    );
-  }
+  await requireSuccessfulFileResponse(response);
   const blob = await response.blob();
   const objectUrl = URL.createObjectURL(blob);
   try {
@@ -100,6 +101,22 @@ export async function downloadSessionFile(url: string, filename: string): Promis
   } finally {
     window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
   }
+}
+
+async function requireSuccessfulFileResponse(response: Response): Promise<void> {
+  if (response.ok) return;
+  let detail = "";
+  try {
+    const body = await response.clone().json() as { detail?: string; error?: string };
+    detail = String(body.detail ?? body.error ?? "").trim();
+  } catch {
+    detail = (await response.text().catch(() => "")).trim();
+  }
+  throw new Error(
+    detail
+      ? `Download failed (${response.status}): ${detail}`
+      : `Download failed (${response.status})`,
+  );
 }
 
 export function triggerDownload(url: string, filename: string): void {

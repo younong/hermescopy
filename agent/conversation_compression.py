@@ -39,6 +39,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
+from agent.message_sanitization import project_historical_attachments
 from agent.model_metadata import estimate_request_tokens_rough
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,7 @@ def run_automatic_compression(
     task_id: str = "default",
     force: bool = False,
     emit_abort_warning: bool = True,
+    preserve_attachment_index: Optional[int] = None,
 ) -> AutomaticCompressionOutcome:
     """Synchronously compact until the full outgoing request is safe.
 
@@ -87,8 +89,12 @@ def run_automatic_compression(
     """
     compressor = agent.context_compressor
     active_prompt = system_message or getattr(agent, "_cached_system_prompt", "") or ""
-    base_request_tokens = estimate_request_tokens_rough(
+    projected_messages = project_historical_attachments(
         messages,
+        preserve_index=preserve_attachment_index,
+    )
+    base_request_tokens = estimate_request_tokens_rough(
+        projected_messages,
         system_prompt=active_prompt,
         tools=agent.tools or None,
     )
@@ -113,6 +119,7 @@ def run_automatic_compression(
     original_messages = messages
     original_prompt = active_prompt
     working_messages = messages
+    working_preserve_index = preserve_attachment_index
     compressed_any = False
 
     for compression_pass in range(3):
@@ -132,6 +139,7 @@ def run_automatic_compression(
                 emit_abort_warning=emit_abort_warning,
                 emit_completion_status=False,
                 preserve_on_summary_failure=True,
+                preserve_attachment_index=working_preserve_index,
             )
         except Exception as exc:
             logger.warning(
@@ -155,8 +163,25 @@ def run_automatic_compression(
                 "compression_failed",
             )
 
-        candidate_raw_tokens = estimate_request_tokens_rough(
+        working_preserve_index = (
+            next(
+                (
+                    index
+                    for index in range(len(candidate_messages) - 1, -1, -1)
+                    if candidate_messages[index].get("role") == "user"
+                    and candidate_messages[index].get("attachments")
+                ),
+                None,
+            )
+            if working_preserve_index is not None
+            else None
+        )
+        candidate_projection = project_historical_attachments(
             candidate_messages,
+            preserve_index=working_preserve_index,
+        )
+        candidate_raw_tokens = estimate_request_tokens_rough(
+            candidate_projection,
             system_prompt=candidate_prompt or "",
             tools=agent.tools or None,
         ) + request_token_overhead
@@ -327,18 +352,13 @@ class _CompressionLockLeaseRefresher:
 
 
 def check_compression_model_feasibility(agent: Any) -> None:
-    """Warn at session start if the auxiliary compression model's context
-    window is smaller than the main model's compression threshold.
+    """Validate the auxiliary compression route's minimum context capacity.
 
-    When the auxiliary model cannot fit the content that needs summarising,
-    compression will either fail outright (the LLM call errors) or produce
-    a severely truncated summary.
+    Summary input is split into requests bounded by the auxiliary route, so its
+    context window does not need to contain the main compression threshold.
 
-    Called during ``AIAgent.__init__`` so CLI users see the warning
-    immediately (via ``_vprint``).  The gateway sets ``status_callback``
-    *after* construction, so :func:`replay_compression_warning` re-sends
-    the stored warning through the callback on the first
-    ``run_conversation()`` call.
+    Called lazily on the first compression attempt. Provider warnings are
+    stored on the agent so late-bound gateway callbacks can replay them.
     """
     if not agent.compression_enabled:
         return
@@ -421,11 +441,8 @@ def check_compression_model_feasibility(agent: Any) -> None:
         )
 
         # Hard floor: the auxiliary compression model must have at least
-        # MINIMUM_CONTEXT_LENGTH (64K) tokens of context.  The main model
-        # is already required to meet this floor (checked earlier in
-        # __init__), so the compression model must too — otherwise it
-        # cannot summarise a full threshold-sized window of main-model
-        # content.  Mirrors the main-model rejection pattern.
+        # MINIMUM_CONTEXT_LENGTH (64K) tokens of context. The main model is
+        # already required to meet this floor (checked earlier in __init__).
         if aux_context and aux_context < MINIMUM_CONTEXT_LENGTH:
             raise ValueError(
                 f"Auxiliary compression model {aux_model} has a context "
@@ -439,88 +456,13 @@ def check_compression_model_feasibility(agent: Any) -> None:
             )
 
         threshold = agent.context_compressor.threshold_tokens
-        main_ctx = agent.context_compressor.context_length
-        if aux_context < threshold:
-            # Auto-correct: lower the live session threshold so
-            # compression actually works this session.  The hard floor
-            # above guarantees aux_context >= MINIMUM_CONTEXT_LENGTH,
-            # so the new threshold is always >= 64K.
-            #
-            # The compression summariser sends a single user-role
-            # prompt (no system prompt, no tools) to the aux model, so
-            # new_threshold == aux_context is safe: the request is
-            # the raw messages plus a small summarisation instruction.
-            old_threshold = threshold
-            new_threshold = aux_context
-            agent.context_compressor.threshold_tokens = new_threshold
-            # Keep threshold_percent in sync so future main-model
-            # context_length changes (update_model) re-derive from a
-            # sensible number rather than the original too-high value.
-            if main_ctx:
-                agent.context_compressor.threshold_percent = (
-                    new_threshold / main_ctx
-                )
-            safe_pct = int((aux_context / main_ctx) * 100) if main_ctx else 50
-            # Build human-readable "model (provider)" labels for both
-            # the main model and the compression model so users can
-            # tell at a glance which provider each side is actually
-            # using. When the configured provider is empty or "auto",
-            # fall back to the client's base_url hostname.
-            _main_model = getattr(agent, "model", "") or "?"
-            _main_provider = getattr(agent, "provider", "") or ""
-            _aux_provider_label = (
-                _aux_cfg_provider
-                if _aux_cfg_provider and _aux_cfg_provider != "auto"
-                else ""
-            )
-            if not _aux_provider_label:
-                try:
-                    from urllib.parse import urlparse
-                    _aux_provider_label = (
-                        urlparse(aux_base_url).hostname or aux_base_url
-                    )
-                except Exception:
-                    _aux_provider_label = aux_base_url or "auto"
-            _main_label = (
-                f"{_main_model} ({_main_provider})"
-                if _main_provider
-                else _main_model
-            )
-            _aux_label = f"{aux_model} ({_aux_provider_label})"
-            msg = (
-                f"⚠ Compression model {_aux_label} context is "
-                f"{aux_context:,} tokens, but the main model "
-                f"{_main_label}'s compression threshold was "
-                f"{old_threshold:,} tokens. "
-                f"Auto-lowered this session's threshold to "
-                f"{new_threshold:,} tokens so compression can run.\n"
-                f"  To make this permanent, edit config.yaml — either:\n"
-                f"  1. Use a larger compression model:\n"
-                f"       auxiliary:\n"
-                f"         compression:\n"
-                f"           model: <model-with-{old_threshold:,}+-context>\n"
-                f"  2. Lower the compression threshold:\n"
-                f"       compression:\n"
-                f"         threshold: 0.{safe_pct:02d}"
-            )
-            agent._compression_warning = msg
-            agent._emit_status(msg)
-            logger.warning(
-                "compression feasibility decision=adjust_threshold model=%s "
-                "auxiliary_context=%d original_threshold=%d effective_threshold=%d",
-                aux_model,
-                aux_context,
-                old_threshold,
-                new_threshold,
-            )
-        else:
-            logger.info(
-                "compression feasibility decision=keep_threshold model=%s "
-                "auxiliary_context=%d effective_threshold=%d",
-                aux_model,
-                aux_context,
-                threshold,
-            )
+        logger.info(
+            "compression feasibility decision=keep_threshold model=%s "
+            "auxiliary_context=%d effective_threshold=%d",
+            aux_model,
+            aux_context,
+            threshold,
+        )
     except ValueError:
         # Hard rejections (aux below minimum context) must propagate
         # so the session refuses to start.
@@ -688,6 +630,7 @@ def compress_context(
     emit_abort_warning: bool = True,
     emit_completion_status: bool = True,
     preserve_on_summary_failure: bool = False,
+    preserve_attachment_index: Optional[int] = None,
 ) -> Tuple[list, str]:
     """Compress conversation context and split the session in SQLite.
 
@@ -712,6 +655,8 @@ def compress_context(
             terminal event only after full-request revalidation succeeds.
         preserve_on_summary_failure: Require summary generation to abort
             losslessly rather than insert a static fallback marker.
+        preserve_attachment_index: Optional current-turn attachment index to
+            retain through preflight compression for its first provider request.
 
     Returns:
         ``(compressed_messages, new_system_prompt)`` tuple.  When
@@ -890,6 +835,7 @@ def compress_context(
             focus_topic=focus_topic,
             force=force,
             preserve_on_summary_failure=preserve_on_summary_failure,
+            preserve_attachment_index=preserve_attachment_index,
         )
     except TypeError:
         # Plugin context engine with strict signature that doesn't accept

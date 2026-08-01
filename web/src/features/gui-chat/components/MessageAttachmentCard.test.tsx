@@ -145,6 +145,34 @@ describe("MessageAttachmentCard", () => {
     await act(async () => root.unmount());
   });
 
+  it("offers an explicit use-again action for stored attachments", async () => {
+    const onUseAgain = vi.fn();
+    const attachment = {
+      downloadUrl: "/api/files/download?path=report.txt",
+      id: "stored-file",
+      kind: "file" as const,
+      name: "report.txt",
+      refText: "@file:/workspace/report.txt",
+      sizeBytes: 42,
+      sourcePath: "/workspace/report.txt",
+    };
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(
+        <MessageAttachmentCard attachment={attachment} onUseAgain={onUseAgain} />,
+      );
+    });
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="Use report.txt again"]')?.click();
+    });
+
+    expect(onUseAgain).toHaveBeenCalledWith(attachment);
+    await act(async () => root.unmount());
+  });
+
   it("renders type-specific icons and a download action", async () => {
     const container = document.createElement("div");
     document.body.appendChild(container);

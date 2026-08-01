@@ -28,6 +28,19 @@ afterEach(async () => {
 });
 
 describe("Composer attachment transfers", () => {
+  it("queues a file supplied by an explicit historical reuse action", async () => {
+    const file = new File(["again"], "again.txt", { type: "text/plain" });
+    const onAttachmentQueued = vi.fn();
+    const container = renderComposer({
+      attachmentToQueue: { file, requestId: 7 },
+      onAttachmentQueued,
+    });
+    await act(async () => Promise.resolve());
+
+    expect(container.querySelector('[title="again.txt"]')).not.toBeNull();
+    expect(onAttachmentQueued).toHaveBeenCalledWith(7);
+  });
+
   it("queues pasted files and prevents the browser paste", async () => {
     const container = renderComposer();
     const textarea = getTextarea(container);
@@ -252,13 +265,17 @@ describe("Composer attachment transfers", () => {
 
 function renderComposer({
   allowSendWhileGenerating = false,
+  attachmentToQueue,
   disabled = false,
   isGenerating = false,
+  onAttachmentQueued,
   onSend = vi.fn().mockResolvedValue(undefined),
 }: {
   allowSendWhileGenerating?: boolean;
+  attachmentToQueue?: ComponentProps<typeof Composer>["attachmentToQueue"];
   disabled?: boolean;
   isGenerating?: boolean;
+  onAttachmentQueued?: ComponentProps<typeof Composer>["onAttachmentQueued"];
   onSend?: ComponentProps<typeof Composer>["onSend"];
 } = {}) {
   const container = document.createElement("div");
@@ -268,8 +285,10 @@ function renderComposer({
     root?.render(
       <Composer
         allowSendWhileGenerating={allowSendWhileGenerating}
+        attachmentToQueue={attachmentToQueue}
         disabled={disabled}
         isGenerating={isGenerating}
+        onAttachmentQueued={onAttachmentQueued}
         onSend={onSend}
         onStop={vi.fn()}
       />,

@@ -3,7 +3,7 @@ import { LoaderCircle } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { UIEvent } from "react";
 import { useLoadEarlierOnScroll } from "@/hooks/useLoadEarlierOnScroll";
-import type { ArtifactState, GuiChatState } from "../types";
+import type { ArtifactState, GuiChatState, MessageAttachmentState } from "../types";
 import { ApprovalCard } from "./ApprovalCard";
 import { ArtifactCard } from "./ArtifactCard";
 import { ClarifyCard } from "./ClarifyCard";
@@ -52,6 +52,7 @@ export function MessageList({
   onApprovalRespond,
   onClarifyRespond,
   onLoadEarlier,
+  onUseAttachmentAgain,
   state,
 }: {
   disabled?: boolean;
@@ -59,6 +60,7 @@ export function MessageList({
   onApprovalRespond: (id: string, approved: boolean) => void;
   onClarifyRespond: (id: string, answer: string) => void;
   onLoadEarlier?: () => void;
+  onUseAttachmentAgain?: (attachment: MessageAttachmentState) => void;
   state: GuiChatState;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -246,7 +248,13 @@ export function MessageList({
                 </div>
               ) : row.kind === "message" ? (() => {
                 const message = state.messages.find((value) => value.id === row.messageId);
-                return message ? <MessageBubble artifacts={message.artifactIds.map((id) => state.artifacts[id]).filter(Boolean)} message={message} /> : null;
+                return message ? (
+                  <MessageBubble
+                    artifacts={message.artifactIds.map((id) => state.artifacts[id]).filter(Boolean)}
+                    message={message}
+                    onUseAttachmentAgain={onUseAttachmentAgain}
+                  />
+                ) : null;
               })() : row.kind === "artifact" ? (
                 <ArtifactCard artifact={row.artifact} />
               ) : row.kind === "approval" ? (() => {

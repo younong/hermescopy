@@ -51,7 +51,8 @@ class TestRollingSummaryPreparation:
         )
 
         assert len(chunks) == 1
-        assert chunks[0] == [tool_call, huge_result]
+        assert list(chunks[0].messages) == [tool_call, huge_result]
+        assert chunks[0].token_estimate < 4_000
 
     def test_each_rolling_chunk_gets_a_fresh_request_deadline(self, compressor):
         chunks = [
@@ -60,8 +61,9 @@ class TestRollingSummaryPreparation:
         ]
         seen_deadlines = []
 
-        compressor._auxiliary_summary_capacity = MagicMock(return_value=None)
-        compressor._summary_chunks = MagicMock(return_value=chunks)
+        compressor._auxiliary_summary_capacity = MagicMock(
+            return_value=MagicMock(input_budget=6, max_output_tokens=100)
+        )
         compressor._generate_summary = MagicMock(
             side_effect=lambda *_a, deadline_monotonic=None, **_k: (
                 seen_deadlines.append(deadline_monotonic) or "summary"
@@ -88,7 +90,9 @@ class TestRollingSummaryPreparation:
         ]
         progress = []
         compressor.progress_callback = lambda index, count: progress.append((index, count))
-        compressor._summary_chunks = MagicMock(return_value=chunks)
+        compressor._auxiliary_summary_capacity = MagicMock(
+            return_value=MagicMock(input_budget=6, max_output_tokens=100)
+        )
         compressor._generate_summary = MagicMock(return_value="summary")
 
         compressor._generate_rolling_summary(
@@ -99,6 +103,77 @@ class TestRollingSummaryPreparation:
 
         assert progress == [(1, 2), (2, 2)]
 
+    def test_atomic_group_over_route_budget_aborts_without_request(self, compressor):
+        turns = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "Read", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": "x" * 1_000,
+            },
+        ]
+        compressor._auxiliary_summary_capacity = MagicMock(
+            return_value=MagicMock(input_budget=100, max_output_tokens=100)
+        )
+        compressor._generate_summary = MagicMock(return_value="summary")
+
+        result = compressor._generate_rolling_summary(
+            turns,
+            focus_topic=None,
+            deadline_monotonic=None,
+        )
+
+        assert result is None
+        assert compressor._last_summary_error == (
+            "atomic tool group exceeds auxiliary input budget"
+        )
+        compressor._generate_summary.assert_not_called()
+
+    def test_serialization_is_reused_within_attempt_but_not_across_attempts(
+        self, compressor
+    ):
+        turns = [
+            {"role": "user", "content": "x" * 100},
+            {"role": "assistant", "content": "y" * 100},
+        ]
+        compressor._auxiliary_summary_capacity = MagicMock(
+            return_value=MagicMock(input_budget=80, max_output_tokens=100)
+        )
+        compressor._generate_summary = MagicMock(return_value="summary")
+        compressor._atomic_summary_groups = MagicMock(
+            return_value=[[turns[0]], [turns[1]]]
+        )
+
+        with patch.object(
+            compressor,
+            "_serialize_for_summary",
+            wraps=compressor._serialize_for_summary,
+        ) as serialize:
+            compressor._generate_rolling_summary(
+                turns,
+                focus_topic=None,
+                deadline_monotonic=100.0,
+            )
+            compressor._generate_rolling_summary(
+                turns,
+                focus_topic=None,
+                deadline_monotonic=100.0,
+            )
+
+        assert serialize.call_count == 4
+        assert compressor._generate_summary.call_count == 4
+        for call in compressor._generate_summary.call_args_list:
+            assert call.kwargs["_serialized_content"]
 
 
 class TestShouldCompress:

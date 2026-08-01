@@ -96,9 +96,15 @@ class ModelStub:
         self.server.server_close()
         self.thread.join(timeout=3)
 
-    def saw_text(self, marker: str) -> bool:
+    def count_requests_with_text(self, marker: str) -> int:
         with self._lock:
-            return any(marker in json.dumps(item, ensure_ascii=False) for item in self.requests)
+            return sum(
+                marker in json.dumps(item, ensure_ascii=False)
+                for item in self.requests
+            )
+
+    def saw_text(self, marker: str) -> bool:
+        return self.count_requests_with_text(marker) > 0
 
     @staticmethod
     def _text_chunks(parts: list[str]) -> list[dict[str, Any]]:
@@ -571,9 +577,20 @@ def run_smoke(repo_root: Path, timeout: float) -> tuple[dict[str, Any], int]:
         deltas, complete = _wait_complete(gateway, sid)
         if len([item for item in deltas if item]) < 2 or RESUME_MARKER not in str(complete.get("text") or ""):
             raise SmokeFailure("stream_contract_failed", "prompt_stream", "Expected multiple deltas and completion marker")
-        if not model.saw_text(ATTACHMENT_MARKER) or not model.saw_text(SAFE_TOOL_MARKER):
-            raise SmokeFailure("model_context_missing", "prompt_stream", "Attachment or tool output did not reach the model")
-        _record(checks, "prompt_stream", stage, deltaCount=len(deltas))
+        attachment_request_count = model.count_requests_with_text(ATTACHMENT_MARKER)
+        if attachment_request_count != 1 or not model.saw_text(SAFE_TOOL_MARKER):
+            raise SmokeFailure(
+                "model_context_missing",
+                "prompt_stream",
+                "Attachment must reach exactly one model request and tool output must reach the follow-up",
+            )
+        _record(
+            checks,
+            "prompt_stream",
+            stage,
+            deltaCount=len(deltas),
+            attachmentRequestCount=attachment_request_count,
+        )
 
         stage = time.monotonic()
         gateway.request("prompt.submit", {"session_id": sid, "text": "approval-deny"})
@@ -596,8 +613,27 @@ def run_smoke(repo_root: Path, timeout: float) -> tuple[dict[str, Any], int]:
         resumed = gateway.request("session.resume", {"session_id": stored_id, "cols": 96})
         resumed_sid = str(resumed.get("session_id") or "")
         messages = resumed.get("messages") or []
-        if not resumed_sid or RESUME_MARKER not in json.dumps(messages, ensure_ascii=False):
+        serialized_messages = json.dumps(messages, ensure_ascii=False)
+        if not resumed_sid or RESUME_MARKER not in serialized_messages:
             raise SmokeFailure("resume_history_missing", "cold_resume", "Cold resume did not restore conversation history")
+        if ATTACHMENT_MARKER in serialized_messages:
+            raise SmokeFailure(
+                "attachment_payload_persisted",
+                "cold_resume",
+                "Cold resume restored an attachment payload instead of compact metadata",
+            )
+        if not any(
+            attachment.get("name") == "smoke-note.txt"
+            for message in messages
+            if isinstance(message, dict)
+            for attachment in message.get("attachments", [])
+            if isinstance(attachment, dict)
+        ):
+            raise SmokeFailure(
+                "attachment_metadata_missing",
+                "cold_resume",
+                "Cold resume did not restore attachment metadata",
+            )
         resumed_info = resumed.get("info") or {}
         if resumed_info.get("model") != MODEL:
             raise SmokeFailure("resume_config_missing", "cold_resume", "Cold resume did not restore the model")

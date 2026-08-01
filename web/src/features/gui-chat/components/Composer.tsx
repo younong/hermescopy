@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useRef,
   useState,
@@ -22,12 +23,16 @@ export function Composer({
   disabled,
   isGenerating,
   allowSendWhileGenerating = false,
+  attachmentToQueue,
+  onAttachmentQueued,
   onSend,
   onStop,
 }: {
   disabled?: boolean;
   isGenerating: boolean;
   allowSendWhileGenerating?: boolean;
+  attachmentToQueue?: { file: File; requestId: number };
+  onAttachmentQueued?: (requestId: number) => void;
   onSend: (
     text: string,
     attachments: GuiComposerAttachment[],
@@ -114,10 +119,10 @@ export function Composer({
     void submit();
   };
 
-  const addFiles = (files: FileList | File[]) => {
+  const addFiles = useCallback((files: FileList | File[]) => {
     const nextAttachments: GuiComposerAttachment[] = [];
     const errors: string[] = [];
-    const availableSlots = COMPOSER_ATTACHMENT_MAX_COUNT - attachments.length;
+    const availableSlots = COMPOSER_ATTACHMENT_MAX_COUNT - attachmentsRef.current.length;
 
     for (const file of Array.from(files)) {
       const validation = validateComposerAttachment(file);
@@ -146,7 +151,13 @@ export function Composer({
       setAttachments((current) => [...current, ...nextAttachments]);
     }
     setLocalError(errors[0] ?? null);
-  };
+  }, []);
+
+  useEffect(() => {
+    if (!attachmentToQueue) return;
+    addFiles([attachmentToQueue.file]);
+    onAttachmentQueued?.(attachmentToQueue.requestId);
+  }, [addFiles, attachmentToQueue, onAttachmentQueued]);
 
   const onFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     if (event.target.files) addFiles(event.target.files);
