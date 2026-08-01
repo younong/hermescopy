@@ -13,7 +13,7 @@ Fix: both display paths now go through ``resolve_display_context_length()``.
 """
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from hermes_cli.model_switch import ModelSwitchResult
 
@@ -52,6 +52,29 @@ def _run_display(monkeypatch, result):
     monkeypatch.setattr(cli_mod, "save_config_value", lambda *a, **k: None)
     cli_mod.HermesCLI._apply_model_switch_result(_StubCLI(), result, False)
     return captured
+
+
+def test_picker_path_forwards_deployment_relay_provider(monkeypatch):
+    agent = MagicMock()
+    cli = _StubCLI()
+    cli.agent = agent
+    result = ModelSwitchResult(
+        success=True,
+        new_model="k3-256k",
+        target_provider="custom:kimi-code",
+        api_key="deployment-inference-relay",
+        base_url="http://127.0.0.1:39123/v1",
+        api_mode="anthropic_messages",
+        relay_provider="custom:kimi-code",
+    )
+
+    import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "_cprint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli_mod, "save_config_value", lambda *args, **kwargs: None)
+    cli_mod.HermesCLI._apply_model_switch_result(cli, result, False)
+
+    assert agent.switch_model.call_args.kwargs["relay_provider"] == "custom:kimi-code"
 
 
 def test_picker_path_uses_provider_aware_context_on_codex(monkeypatch):

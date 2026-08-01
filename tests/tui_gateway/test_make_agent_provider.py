@@ -8,6 +8,8 @@ provider/base_url/api_key empty in AIAgent, causing HTTP 404.
 import os
 from unittest.mock import MagicMock, patch
 
+from hermes_cli.deployment_inference import DeploymentInferenceRouteDescriptor
+
 
 def test_make_agent_passes_resolved_provider():
     """_make_agent forwards provider/base_url/api_key/api_mode from
@@ -161,6 +163,16 @@ def test_owner_home_without_model_field_builds_agent_with_deployment_runtime(
         patch("tui_gateway.server._load_enabled_toolsets", return_value=None),
         patch("hermes_cli.mcp_startup.wait_for_mcp_discovery"),
         patch("tui_gateway.entry.wait_for_mcp_discovery"),
+        patch(
+            "hermes_cli.deployment_inference.route_descriptors_from_control_plane",
+            return_value=(
+                DeploymentInferenceRouteDescriptor(
+                    provider="custom:codex",
+                    model="gpt-5.6-sol",
+                    api_mode="chat_completions",
+                ),
+            ),
+        ),
         patch("run_agent.AIAgent") as mock_agent,
     ):
         from tui_gateway import server
@@ -176,6 +188,7 @@ def test_owner_home_without_model_field_builds_agent_with_deployment_runtime(
     assert kwargs["api_mode"] == "chat_completions"
     assert kwargs["api_key"] == "deployment-inference-relay"
     assert kwargs["base_url"] == "http://127.0.0.1:39123/v1"
+    assert kwargs["relay_provider"] == "custom:codex"
 
 
 def test_make_agent_forwards_provider_routing():

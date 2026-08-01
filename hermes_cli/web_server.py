@@ -15729,6 +15729,7 @@ def start_server(
         from hermes_cli.deployment_inference import (
             DeploymentInferencePolicyInvalid,
             load_deployment_inference_policy,
+            policy_from_control_plane_environment,
         )
         from hermes_cli.dashboard_auth.authority import AuthorityStore
         from hermes_cli.owner_worker import OwnerWorkerSupervisor
@@ -15739,6 +15740,12 @@ def start_server(
         policy_spec = os.environ.get("HERMES_DEPLOYMENT_INFERENCE_POLICY", "")
         try:
             deployment_inference_policy = load_deployment_inference_policy(policy_spec)
+            deployment_inference_policy_resolver = (
+                policy_from_control_plane_environment
+                if policy_spec.strip()
+                == "hermes_cli.deployment_inference:policy_from_control_plane_environment"
+                else None
+            )
         except DeploymentInferencePolicyInvalid as exc:
             raise RuntimeError("deployment inference policy is invalid") from exc
         image_policy_spec = os.environ.get("HERMES_DEPLOYMENT_IMAGE_POLICY", "")
@@ -15807,6 +15814,7 @@ def start_server(
                 control_ws_base=f"{worker_scheme}://{worker_netloc}",
                 generation_bridge_revoker=revoke_generation_bridges,
                 deployment_inference_policy=deployment_inference_policy,
+                deployment_inference_policy_resolver=deployment_inference_policy_resolver,
                 deployment_image_policy=deployment_image_policy,
                 resource_manager=resource_manager,
             )

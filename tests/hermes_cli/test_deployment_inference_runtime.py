@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import json
-
 from hermes_cli import runtime_provider as rp
+from hermes_cli.deployment_inference import DeploymentInferenceRouteDescriptor
 
 
 def _deployment_env(monkeypatch) -> None:
@@ -13,6 +12,22 @@ def _deployment_env(monkeypatch) -> None:
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", "policy-v1")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", "gpt-safe,gpt-safe-mini")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL", "http://127.0.0.1:39123/v1")
+    monkeypatch.setattr(
+        "hermes_cli.deployment_inference.route_descriptors_from_control_plane",
+        lambda: (
+            DeploymentInferenceRouteDescriptor(
+                provider="custom:deployment",
+                model="gpt-safe",
+                api_mode="chat_completions",
+            ),
+            DeploymentInferenceRouteDescriptor(
+                provider="custom:kimi-code",
+                model="gpt-safe-mini",
+                api_mode="anthropic_messages",
+                name="Kimi Code",
+            ),
+        ),
+    )
 
 
 def test_blank_owner_uses_deployment_relay(monkeypatch):
@@ -31,6 +46,7 @@ def test_blank_owner_uses_deployment_relay(monkeypatch):
         "model": "gpt-safe",
         "base_url": "http://127.0.0.1:39123/v1",
         "requested_provider": "custom:deployment",
+        "relay_provider": "custom:deployment",
     }
 
 
@@ -66,22 +82,6 @@ def test_explicit_owner_config_never_uses_deployment_relay(monkeypatch):
 
 def test_blank_owner_selects_exact_secondary_deployment_route(monkeypatch):
     _deployment_env(monkeypatch)
-    monkeypatch.setenv(
-        "HERMES_DEPLOYMENT_INFERENCE_ROUTES",
-        json.dumps([
-            {
-                "provider": "custom:deployment",
-                "model": "gpt-safe",
-                "api_mode": "chat_completions",
-            },
-            {
-                "provider": "custom:kimi-code",
-                "model": "gpt-safe-mini",
-                "api_mode": "anthropic_messages",
-                "name": "Kimi Code",
-            },
-        ]),
-    )
     monkeypatch.setattr(rp, "read_raw_config", lambda: {})
 
     resolved = rp.resolve_deployment_inference_runtime(

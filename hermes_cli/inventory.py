@@ -277,20 +277,21 @@ def _apply_capabilities(rows: list[dict]) -> None:
 # ─── Internal: row post-processing ──────────────────────────────────────
 
 
-def _merge_deployment_routes(rows: list[dict], ctx: ConfigContext) -> list[dict]:
-    """Merge non-secret deployment routes into the shared model inventory."""
-    try:
-        from hermes_cli.deployment_inference import deployment_descriptor_from_environment
+def _deployment_route_descriptors() -> tuple:
+    from hermes_cli.deployment_inference import route_descriptors_from_control_plane
 
-        descriptor = deployment_descriptor_from_environment()
-    except Exception:
-        descriptor = None
-    if descriptor is None:
+    return route_descriptors_from_control_plane()
+
+
+def _merge_deployment_routes(rows: list[dict], ctx: ConfigContext) -> list[dict]:
+    """Merge current Control Plane deployment routes into the model inventory."""
+    routes = _deployment_route_descriptors()
+    if not routes:
         return rows
 
     merged = [dict(row) for row in rows]
     by_slug = {str(row.get("slug") or "").lower(): row for row in merged}
-    for route in descriptor.routes:
+    for route in routes:
         row = by_slug.get(route.provider)
         if row is None:
             row = {

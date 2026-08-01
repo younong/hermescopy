@@ -301,6 +301,7 @@ class ModelSwitchResult:
     model_info: Optional[ModelInfo] = None
     is_global: bool = False
     deployment_managed: bool = False
+    relay_provider: str = ""
 # ---------------------------------------------------------------------------
 # Flag parsing
 # ---------------------------------------------------------------------------
@@ -814,18 +815,6 @@ def switch_model(
     new_model = raw_input.strip()
     target_provider = current_provider
     resolved_moa_preset = False
-    deployment_route = None
-    try:
-        from hermes_cli.deployment_inference import deployment_descriptor_from_environment
-
-        deployment_descriptor = deployment_descriptor_from_environment()
-        if deployment_descriptor is not None and new_model:
-            deployment_route = deployment_descriptor.route_for(
-                new_model,
-                provider=explicit_provider or None,
-            )
-    except Exception:
-        deployment_route = None
 
     # =================================================================
     # PATH A: Explicit --provider given
@@ -839,15 +828,32 @@ def switch_model(
         )
         if pdef is None and explicit_provider.strip().lower() == "custom":
             pdef = _bare_custom_provider_def(current_base_url)
-        if pdef is None and deployment_route is not None:
-            pdef = ProviderDef(
-                id=deployment_route.provider,
-                name=deployment_route.name or get_label(deployment_route.provider),
-                transport=deployment_route.api_mode,
-                api_key_env_vars=(),
-                auth_type="deployment",
-                source="deployment",
-            )
+        if pdef is None:
+            try:
+                from hermes_cli.deployment_inference import (
+                    route_descriptors_from_control_plane,
+                )
+
+                deployment_route = next(
+                    (
+                        route
+                        for route in route_descriptors_from_control_plane()
+                        if route.provider == explicit_provider.strip().lower()
+                        and route.model == new_model
+                    ),
+                    None,
+                )
+                if deployment_route is not None:
+                    pdef = ProviderDef(
+                        id=deployment_route.provider,
+                        name=deployment_route.name or get_label(deployment_route.provider),
+                        transport=deployment_route.api_mode,
+                        api_key_env_vars=(),
+                        auth_type="deployment",
+                        source="deployment",
+                    )
+            except Exception:
+                pass
         if pdef is None:
             _switch_err = (
                 f"Unknown provider '{explicit_provider}'. "
@@ -1149,6 +1155,7 @@ def switch_model(
     api_key = current_api_key
     base_url = current_base_url
     api_mode = ""
+    runtime: dict[str, Any] = {}
 
     if provider_changed or explicit_provider:
         import os
@@ -1240,11 +1247,16 @@ def switch_model(
     # --- Normalize model name for target provider ---
     new_model = normalize_model_for_provider(new_model, target_provider)
 
-    deployment_managed = bool(
-        deployment_route is not None
-        and deployment_route.provider == target_provider
-        and deployment_route.model == new_model
-    )
+    try:
+        from hermes_cli.deployment_inference import is_deployment_inference_relay
+
+        deployment_managed = bool(
+            is_deployment_inference_relay(api_key)
+            and runtime.get("relay_provider") == target_provider
+            and runtime.get("model") == new_model
+        )
+    except Exception:
+        deployment_managed = False
     # Deployment routes are an exact operator allowlist and the worker cannot
     # query their private upstream catalogs. Treat only that exact route as
     # validated; all ordinary providers retain normal catalog validation.
@@ -1385,6 +1397,7 @@ def switch_model(
         model_info=model_info,
         is_global=is_global,
         deployment_managed=deployment_managed,
+        relay_provider=target_provider if deployment_managed else "",
     )
 
 

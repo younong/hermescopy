@@ -22,6 +22,7 @@ from __future__ import annotations
 from unittest.mock import patch
 
 
+from hermes_cli.deployment_inference import DeploymentInferenceRouteDescriptor
 from hermes_cli.inventory import (
     ConfigContext,
     build_models_payload,
@@ -171,28 +172,21 @@ def test_build_models_payload_returns_expected_shape():
 
 
 def test_build_models_payload_merges_deployment_managed_routes(monkeypatch):
-    import json
-
-    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_PROVIDER", "custom:codex")
-    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", "gpt-safe")
-    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_API_MODE", "chat_completions")
-    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", "policy-v2")
-    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", "gpt-safe,k3-256k")
-    monkeypatch.setenv(
-        "HERMES_DEPLOYMENT_INFERENCE_ROUTES",
-        json.dumps([
-            {
-                "provider": "custom:codex",
-                "model": "gpt-safe",
-                "api_mode": "chat_completions",
-            },
-            {
-                "provider": "custom:kimi-code",
-                "model": "k3-256k",
-                "api_mode": "anthropic_messages",
-                "name": "Kimi Code",
-            },
-        ]),
+    monkeypatch.setattr(
+        "hermes_cli.inventory._deployment_route_descriptors",
+        lambda: (
+            DeploymentInferenceRouteDescriptor(
+                provider="custom:codex",
+                model="gpt-safe",
+                api_mode="chat_completions",
+            ),
+            DeploymentInferenceRouteDescriptor(
+                provider="custom:kimi-code",
+                model="k3-256k",
+                api_mode="anthropic_messages",
+                name="Kimi Code",
+            ),
+        ),
     )
     ctx = _empty_ctx(provider="custom:codex", model="gpt-safe")
 

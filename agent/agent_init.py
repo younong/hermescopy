@@ -231,6 +231,7 @@ def init_agent(
     iteration_budget: "IterationBudget" = None,
     fallback_model: Dict[str, Any] = None,
     credential_pool=None,
+    relay_provider: str = None,
     checkpoints_enabled: bool = False,
     checkpoint_max_snapshots: int = 20,
     checkpoint_max_total_size_mb: int = 500,
@@ -289,6 +290,7 @@ def init_agent(
     _install_safe_stdio()
 
     agent.model = model
+    agent.relay_provider = str(relay_provider or "").strip().lower()
     agent.max_iterations = max_iterations
     # Shared iteration budget — parent creates, children inherit.
     # Consumed by every LLM turn across parent + all subagents.
@@ -704,7 +706,17 @@ def init_agent(
             # the third-party identity-injection bug.
             from agent.anthropic_adapter import _is_oauth_token as _is_oat
             agent._is_anthropic_oauth = _is_oat(effective_key) if (_is_native_anthropic and isinstance(effective_key, str)) else False
-            agent._anthropic_client = build_anthropic_client(effective_key, base_url, timeout=_provider_timeout)
+            default_headers = (
+                {"x-hermes-deployment-provider": agent.relay_provider}
+                if agent.relay_provider
+                else None
+            )
+            agent._anthropic_client = build_anthropic_client(
+                effective_key,
+                base_url,
+                timeout=_provider_timeout,
+                default_headers=default_headers,
+            )
             # No OpenAI client needed for Anthropic mode
             agent.client = None
             agent._client_kwargs = {}
@@ -936,6 +948,10 @@ def init_agent(
                         "configuration."
                     )
         
+        if agent.relay_provider:
+            relay_headers = dict(client_kwargs.get("default_headers") or {})
+            relay_headers["x-hermes-deployment-provider"] = agent.relay_provider
+            client_kwargs["default_headers"] = relay_headers
         agent._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
 
         # Enable fine-grained tool streaming for Claude on OpenRouter.
@@ -1931,6 +1947,7 @@ def init_agent(
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
+        "relay_provider": agent.relay_provider,
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import json
-
+from hermes_cli.deployment_inference import DeploymentInferenceRouteDescriptor
 from hermes_cli.model_switch import switch_model
 
 
@@ -13,21 +12,21 @@ def test_switch_model_accepts_exact_managed_route_without_owner_provider_config(
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", "policy-v2")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", "gpt-safe,k3-256k")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL", "http://127.0.0.1:39123/v1")
-    monkeypatch.setenv(
-        "HERMES_DEPLOYMENT_INFERENCE_ROUTES",
-        json.dumps([
-            {
-                "provider": "custom:codex",
-                "model": "gpt-safe",
-                "api_mode": "chat_completions",
-            },
-            {
-                "provider": "custom:kimi-code",
-                "model": "k3-256k",
-                "api_mode": "anthropic_messages",
-                "name": "Kimi Code",
-            },
-        ]),
+    monkeypatch.setattr(
+        "hermes_cli.deployment_inference.route_descriptors_from_control_plane",
+        lambda: (
+            DeploymentInferenceRouteDescriptor(
+                provider="custom:codex",
+                model="gpt-safe",
+                api_mode="chat_completions",
+            ),
+            DeploymentInferenceRouteDescriptor(
+                provider="custom:kimi-code",
+                model="k3-256k",
+                api_mode="anthropic_messages",
+                name="Kimi Code",
+            ),
+        ),
     )
     monkeypatch.setattr("hermes_cli.runtime_provider.read_raw_config", lambda: {})
 

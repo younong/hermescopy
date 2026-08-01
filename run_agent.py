@@ -464,6 +464,7 @@ class AIAgent:
         iteration_budget: "IterationBudget" = None,
         fallback_model: Dict[str, Any] = None,
         credential_pool=None,
+        relay_provider: str = None,
         checkpoints_enabled: bool = False,
         checkpoint_max_snapshots: int = 20,
         checkpoint_max_total_size_mb: int = 500,
@@ -539,6 +540,7 @@ class AIAgent:
             iteration_budget=iteration_budget,
             fallback_model=fallback_model,
             credential_pool=credential_pool,
+            relay_provider=relay_provider,
             checkpoints_enabled=checkpoints_enabled,
             checkpoint_max_snapshots=checkpoint_max_snapshots,
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
@@ -769,10 +771,26 @@ class AIAgent:
         except Exception as err:
             logger.debug("LM Studio preload skipped: %s", err)
 
-    def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
+    def switch_model(
+        self,
+        new_model,
+        new_provider,
+        api_key='',
+        base_url='',
+        api_mode='',
+        relay_provider='',
+    ):
         """Forwarder — see ``agent.agent_runtime_helpers.switch_model``."""
         from agent.agent_runtime_helpers import switch_model
-        return switch_model(self, new_model, new_provider, api_key, base_url, api_mode)
+        return switch_model(
+            self,
+            new_model,
+            new_provider,
+            api_key,
+            base_url,
+            api_mode,
+            relay_provider,
+        )
 
     def _safe_print(self, *args, **kwargs):
         """Print that silently handles broken pipes / closed stdout.

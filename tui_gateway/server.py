@@ -3566,6 +3566,7 @@ def _apply_model_switch(
                 api_key=result.api_key,
                 base_url=result.base_url,
                 api_mode=result.api_mode,
+                relay_provider=getattr(result, "relay_provider", ""),
             )
         except Exception as exc:
             # The in-place swap rolled the agent back to the old working
@@ -3605,6 +3606,7 @@ def _apply_model_switch(
         session["model_override"] = {
             "model": result.new_model,
             "provider": result.target_provider,
+            "relay_provider": getattr(result, "relay_provider", "") or None,
             "base_url": None if getattr(result, "deployment_managed", False) else result.base_url,
             "api_key": None if getattr(result, "deployment_managed", False) else result.api_key,
             "api_mode": result.api_mode,
@@ -5182,6 +5184,7 @@ def _make_agent(
     if isinstance(model_override, dict) and model_override.get("model"):
         model = str(model_override.get("model") or "")
         requested_provider = model_override.get("provider") or provider_override or None
+        relay_provider = model_override.get("relay_provider")
         override_base_url = model_override.get("base_url")
         override_api_key = model_override.get("api_key")
         override_api_mode = model_override.get("api_mode")
@@ -5219,6 +5222,8 @@ def _make_agent(
             runtime["api_key"] = override_api_key
         if override_api_mode:
             runtime["api_mode"] = override_api_mode
+        if relay_provider:
+            runtime["relay_provider"] = relay_provider
     else:
         model, requested_provider = _resolve_startup_runtime()
         if isinstance(model_override, str) and model_override:
@@ -5241,6 +5246,11 @@ def _make_agent(
         acp_command=runtime.get("command"),
         acp_args=runtime.get("args"),
         credential_pool=runtime.get("credential_pool"),
+        relay_provider=runtime.get("relay_provider") or (
+            runtime.get("requested_provider")
+            if runtime.get("api_key") == "deployment-inference-relay"
+            else None
+        ),
         quiet_mode=True,
         # verbose_logging controls DEBUG-level agent logging; it is intentionally
         # independent of tool_progress_mode (which only controls per-tool

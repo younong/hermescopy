@@ -1554,9 +1554,7 @@ def resolve_deployment_inference_runtime(
     raw_owner = _explicit_owner_model_selection()
     requested_provider = str(requested or "").strip().lower()
     selected_model = str(target_model or descriptor.model).strip()
-    route = descriptor.route_for(selected_model, provider=requested_provider or None)
-    if route is None:
-        return None
+    selected_provider = requested_provider or descriptor.provider
     selected_base_url = str(explicit_base_url or "").strip()
     if selected_base_url:
         return None
@@ -1568,12 +1566,33 @@ def resolve_deployment_inference_runtime(
     parsed_relay = urlparse(relay_base_url)
     if parsed_relay.scheme != "http" or parsed_relay.hostname not in {"127.0.0.1", "::1", "localhost"}:
         return None
-    runtime = descriptor.relay_runtime(
-        model=selected_model,
-        provider=requested_provider or None,
+    runtime = descriptor.relay_runtime()
+    routes = ()
+    try:
+        from hermes_cli.deployment_inference import route_descriptors_from_control_plane
+
+        routes = route_descriptors_from_control_plane()
+    except Exception:
+        pass
+    route = next(
+        (
+            candidate
+            for candidate in routes
+            if candidate.provider == selected_provider
+            and candidate.model == selected_model
+        ),
+        None,
     )
-    runtime["base_url"] = relay_base_url.rstrip("/")
-    runtime["requested_provider"] = requested_provider or route.provider
+    if route is None:
+        return None
+    runtime.update({
+        "provider": selected_provider,
+        "requested_provider": selected_provider,
+        "relay_provider": selected_provider,
+        "model": selected_model,
+        "base_url": relay_base_url.rstrip("/"),
+        "api_mode": route.api_mode,
+    })
     return runtime
 
 

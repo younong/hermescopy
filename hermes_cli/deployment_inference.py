@@ -8,17 +8,16 @@ receive only display-safe route descriptors and a private relay connection.
 from __future__ import annotations
 
 import importlib
-import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 from urllib.parse import urlparse
 
 
 _SUPPORTED_API_MODES = frozenset({"chat_completions", "anthropic_messages"})
 _SUPPORTS_VISION_ENV = "HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION"
-_ROUTES_ENV = "HERMES_DEPLOYMENT_INFERENCE_ROUTES"
 DEPLOYMENT_INFERENCE_RELAY_MARKER = "deployment-inference-relay"
+_DEPLOYMENT_ROUTES_PATH = "/v1/hermes/deployment-routes"
 
 
 def is_deployment_inference_relay(api_key: object) -> bool:
@@ -81,6 +80,19 @@ class DeploymentInferenceRouteDescriptor:
             ),
         )
 
+    def payload(self) -> dict[str, Any]:
+        """Return the stable non-secret representation exposed to workers."""
+        payload: dict[str, Any] = {
+            "provider": self.provider,
+            "model": self.model,
+            "api_mode": self.api_mode,
+        }
+        if self.name:
+            payload["name"] = self.name
+        if self.supports_vision is not None:
+            payload["supports_vision"] = self.supports_vision
+        return payload
+
 
 @dataclass(frozen=True)
 class DeploymentInferenceDescriptor:
@@ -92,7 +104,6 @@ class DeploymentInferenceDescriptor:
     policy_id: str
     allowed_models: tuple[str, ...]
     supports_vision: bool | None = None
-    routes: tuple[DeploymentInferenceRouteDescriptor, ...] = ()
 
     def __post_init__(self) -> None:
         provider = str(self.provider or "").strip().lower()
@@ -112,81 +123,29 @@ class DeploymentInferenceDescriptor:
         if model not in allowed:
             raise DeploymentInferencePolicyInvalid("deployment inference descriptor models are invalid")
 
-        routes = tuple(self.routes) or tuple(
-            DeploymentInferenceRouteDescriptor(
-                provider=provider,
-                model=allowed_model,
-                api_mode=self.api_mode,
-                supports_vision=self.supports_vision if allowed_model == model else None,
-            )
-            for allowed_model in allowed
-        )
-        route_models = tuple(route.model for route in routes)
-        if len(set(route_models)) != len(route_models) or set(route_models) != set(allowed):
-            raise DeploymentInferencePolicyInvalid("deployment inference descriptor routes are invalid")
-        default_route = next((route for route in routes if route.model == model), None)
-        if (
-            default_route is None
-            or default_route.provider != provider
-            or default_route.api_mode != self.api_mode
-        ):
-            raise DeploymentInferencePolicyInvalid("deployment inference default route is invalid")
-
         object.__setattr__(self, "provider", provider)
         object.__setattr__(self, "model", model)
         object.__setattr__(self, "policy_id", policy_id)
         object.__setattr__(self, "allowed_models", allowed)
-        object.__setattr__(self, "supports_vision", default_route.supports_vision)
-        object.__setattr__(self, "routes", routes)
-
-    def route_for(
-        self,
-        model: str,
-        *,
-        provider: str | None = None,
-    ) -> DeploymentInferenceRouteDescriptor | None:
-        selected_model = str(model or "").strip()
-        selected_provider = str(provider or "").strip().lower()
-        for route in self.routes:
-            if route.model != selected_model:
-                continue
-            if selected_provider and route.provider != selected_provider:
-                continue
-            return route
-        return None
-
-    def allows_model(self, model: str) -> bool:
-        return self.route_for(model) is not None
-
-    def routes_json(self) -> str:
-        return json.dumps(
-            [
-                {key: value for key, value in asdict(route).items() if value not in {"", None}}
-                for route in self.routes
-            ],
-            separators=(",", ":"),
-            sort_keys=True,
+        object.__setattr__(
+            self,
+            "supports_vision",
+            _parse_optional_bool(
+                self.supports_vision,
+                field="deployment inference supports_vision",
+            ),
         )
 
-    def relay_runtime(
-        self,
-        *,
-        model: str | None = None,
-        provider: str | None = None,
-    ) -> dict[str, str]:
-        """Return only inert, owner-safe fields for a local relay client."""
-        selected_model = str(model or self.model).strip()
-        route = self.route_for(selected_model, provider=provider)
-        if route is None:
-            raise DeploymentInferenceSelectionRejected("deployment inference route is not allowed")
+    def relay_runtime(self) -> dict[str, str]:
+        """Return only inert fields for the default worker relay client."""
         return {
-            "provider": route.provider,
-            "api_mode": route.api_mode,
+            "provider": self.provider,
+            "api_mode": self.api_mode,
             "api_key": DEPLOYMENT_INFERENCE_RELAY_MARKER,
             "source": "deployment-relay",
             "selection_source": "deployment",
             "policy_id": self.policy_id,
-            "model": route.model,
+            "model": self.model,
         }
 
 
@@ -292,6 +251,9 @@ class DeploymentInferencePolicy:
         object.__setattr__(self, "routes", routes[1:])
         object.__setattr__(self, "_all_routes", routes)
 
+    def route_descriptors(self) -> tuple[DeploymentInferenceRouteDescriptor, ...]:
+        return tuple(route.descriptor() for route in self._all_routes)
+
     def descriptor(self) -> DeploymentInferenceDescriptor:
         return DeploymentInferenceDescriptor(
             provider=self.provider,
@@ -300,13 +262,23 @@ class DeploymentInferencePolicy:
             policy_id=self.policy_id,
             allowed_models=self.allowed_models,
             supports_vision=self.supports_vision,
-            routes=tuple(route.descriptor() for route in self._all_routes),
         )
 
-    def route_for(self, model: str) -> DeploymentInferenceRoute | None:
+    def route_for(
+        self,
+        model: str,
+        *,
+        provider: str | None = None,
+    ) -> DeploymentInferenceRoute | None:
         selected_model = str(model or "").strip()
+        selected_provider = str(provider or "").strip().lower()
         return next(
-            (route for route in self._all_routes if route.model == selected_model),
+            (
+                route
+                for route in self._all_routes
+                if route.model == selected_model
+                and (not selected_provider or route.provider == selected_provider)
+            ),
             None,
         )
 
@@ -340,24 +312,6 @@ class DeploymentInferencePolicy:
         return self.resolve_route_runtime(route)
 
 
-def _routes_from_json(raw: str) -> tuple[DeploymentInferenceRouteDescriptor, ...]:
-    try:
-        values = json.loads(raw)
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise DeploymentInferencePolicyInvalid("deployment inference descriptor routes are invalid") from exc
-    if not isinstance(values, list):
-        raise DeploymentInferencePolicyInvalid("deployment inference descriptor routes are invalid")
-    routes: list[DeploymentInferenceRouteDescriptor] = []
-    for value in values:
-        if not isinstance(value, dict):
-            raise DeploymentInferencePolicyInvalid("deployment inference descriptor routes are invalid")
-        unexpected = set(value) - {"provider", "model", "api_mode", "name", "supports_vision"}
-        if unexpected:
-            raise DeploymentInferencePolicyInvalid("deployment inference descriptor routes are invalid")
-        routes.append(DeploymentInferenceRouteDescriptor(**value))
-    return tuple(routes)
-
-
 def deployment_descriptor_from_environment(
     source: Mapping[str, str] | None = None,
 ) -> DeploymentInferenceDescriptor | None:
@@ -369,8 +323,7 @@ def deployment_descriptor_from_environment(
     policy_id = str(env.get("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", "")).strip()
     raw_allowed = str(env.get("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", ""))
     raw_supports_vision = env.get(_SUPPORTS_VISION_ENV)
-    raw_routes = str(env.get(_ROUTES_ENV, "")).strip()
-    if not any((provider, model, api_mode, policy_id, raw_allowed.strip(), raw_supports_vision, raw_routes)):
+    if not any((provider, model, api_mode, policy_id, raw_allowed.strip(), raw_supports_vision)):
         return None
     if not all((provider, model, api_mode, policy_id)):
         raise DeploymentInferencePolicyInvalid("deployment inference descriptor is incomplete")
@@ -387,7 +340,6 @@ def deployment_descriptor_from_environment(
             raw_supports_vision,
             field=_SUPPORTS_VISION_ENV,
         ),
-        routes=_routes_from_json(raw_routes) if raw_routes else (),
     )
 
 
@@ -397,6 +349,47 @@ def _declared_models(entry: Mapping[str, Any]) -> tuple[str, ...]:
     if isinstance(models, dict):
         values.extend(str(candidate or "").strip() for candidate in models)
     return tuple(dict.fromkeys(value for value in values if value))
+
+
+def request_path_for_api_mode(api_mode: str) -> str:
+    if api_mode == "anthropic_messages":
+        return "/v1/messages"
+    if api_mode == "chat_completions":
+        return "/v1/chat/completions"
+    raise DeploymentInferencePolicyInvalid("deployment inference route api mode is unsupported")
+
+
+def deployment_routes_path() -> str:
+    return _DEPLOYMENT_ROUTES_PATH
+
+
+def route_descriptors_from_control_plane() -> tuple[DeploymentInferenceRouteDescriptor, ...]:
+    """Read the current non-secret route list over the private worker relay."""
+    try:
+        import httpx
+
+        from hermes_cli.owner_runtime import is_owner_worker_env
+
+        relay_base_url = os.environ.get(
+            "HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL", ""
+        ).strip().rstrip("/")
+        if not is_owner_worker_env() or not relay_base_url:
+            return ()
+        response = httpx.get(
+            relay_base_url.removesuffix("/v1") + deployment_routes_path(),
+            timeout=5.0,
+        )
+        response.raise_for_status()
+        values = response.json()
+        if not isinstance(values, list):
+            return ()
+        return tuple(
+            DeploymentInferenceRouteDescriptor(**value)
+            for value in values
+            if isinstance(value, dict)
+        )
+    except Exception:
+        return ()
 
 
 def _configured_route_index() -> dict[str, list[tuple[str, str, str, bool | None]]]:
@@ -418,19 +411,24 @@ def _configured_route_index() -> dict[str, list[tuple[str, str, str, bool | None
                 if isinstance(metadata, dict) and "supports_vision" in metadata
                 else None
             )
-            index.setdefault(model, []).append((provider, name, api_mode, supports_vision))
+            index.setdefault(model, []).append(
+                (provider, name, api_mode, supports_vision)
+            )
     return index
 
 
 def policy_from_control_plane_environment() -> DeploymentInferencePolicy:
-    """Build deployment routes from operator settings and global provider config."""
-    provider = os.environ.get("HERMES_DEPLOYMENT_INFERENCE_PROVIDER", "").strip().lower()
-    model = os.environ.get("HERMES_DEPLOYMENT_INFERENCE_MODEL", "").strip()
-    api_mode = os.environ.get("HERMES_DEPLOYMENT_INFERENCE_API_MODE", "").strip().lower()
-    policy_id = os.environ.get("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", "deployment-default-v1").strip()
+    """Build current deployment routes from Control Plane config and settings."""
+    from hermes_cli.config import load_env
+
+    current_env = {**os.environ, **load_env()}
+    provider = current_env.get("HERMES_DEPLOYMENT_INFERENCE_PROVIDER", "").strip().lower()
+    model = current_env.get("HERMES_DEPLOYMENT_INFERENCE_MODEL", "").strip()
+    api_mode = current_env.get("HERMES_DEPLOYMENT_INFERENCE_API_MODE", "").strip().lower()
+    policy_id = current_env.get("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", "deployment-default-v1").strip()
     allowed_models = tuple(dict.fromkeys(
         item.strip()
-        for item in os.environ.get("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", "").split(",")
+        for item in current_env.get("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", "").split(",")
         if item.strip()
     ))
     if not provider or not model or not api_mode:
@@ -440,7 +438,7 @@ def policy_from_control_plane_environment() -> DeploymentInferencePolicy:
     if model not in allowed_models:
         allowed_models = (model, *allowed_models)
 
-    raw_supports_vision = os.environ.get(_SUPPORTS_VISION_ENV)
+    raw_supports_vision = current_env.get(_SUPPORTS_VISION_ENV)
     if raw_supports_vision is not None:
         supports_vision = _parse_optional_bool(
             raw_supports_vision,
@@ -460,15 +458,22 @@ def policy_from_control_plane_environment() -> DeploymentInferencePolicy:
         except Exception:
             pass
 
-    def _runtime_resolver(route_provider: str, route_model: str) -> Callable[[], Mapping[str, Any]]:
+    route_index = _configured_route_index()
+
+    def _runtime_resolver(
+        route_provider: str,
+        route_model: str,
+    ) -> Callable[[], Mapping[str, Any]]:
         def resolve() -> Mapping[str, Any]:
             from hermes_cli.runtime_provider import resolve_runtime_provider
 
-            return resolve_runtime_provider(requested=route_provider, target_model=route_model)
+            return resolve_runtime_provider(
+                requested=route_provider,
+                target_model=route_model,
+            )
 
         return resolve
 
-    route_index = _configured_route_index()
     extra_routes: list[DeploymentInferenceRoute] = []
     for allowed_model in allowed_models:
         if allowed_model == model:
