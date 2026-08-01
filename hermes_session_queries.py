@@ -1276,6 +1276,49 @@ class SessionQueryMixin:
     _CONVERSATION_PAGE_MAX_ATTACHMENTS = 64
     _CONVERSATION_PAGE_MAX_SERIALIZED_BYTES = 2 * 1024 * 1024
 
+    def get_messages_as_conversation(
+        self,
+        session_id: str,
+        include_ancestors: bool = False,
+        include_inactive: bool = False,
+        *,
+        recovery_scope: dict[str, Any] | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Load active model replay in chronological insertion order."""
+        session_ids = [session_id]
+        if include_ancestors:
+            session_ids = self._session_lineage_root_to_tip(
+                session_id, recovery_scope=recovery_scope
+            )
+
+        active_clause = "" if include_inactive else " AND m.active = 1"
+        scope_clause, scope_params = self._recovery_scope_clause(
+            recovery_scope, alias="s"
+        )
+        placeholders = ",".join("?" for _ in session_ids)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT m.role, m.content, m.attachments, m.tool_call_id, "
+                "m.tool_calls, m.tool_name, m.finish_reason, m.reasoning, "
+                "m.reasoning_content, m.reasoning_details, "
+                "m.codex_reasoning_items, m.codex_message_items, "
+                "m.platform_message_id, m.observed, m.timestamp "
+                "FROM messages m JOIN sessions s ON s.id = m.session_id "
+                f"WHERE m.session_id IN ({placeholders}){scope_clause}"
+                f"{active_clause} ORDER BY m.id",
+                (*session_ids, *scope_params),
+            ).fetchall()
+
+        messages: List[Dict[str, Any]] = []
+        for row in rows:
+            message = self._conversation_message_from_row(row)
+            if include_ancestors and self._is_duplicate_replayed_user_message(
+                messages, message
+            ):
+                continue
+            messages.append(message)
+        return strip_legacy_synthetic_messages(messages)
+
     def get_conversation_page(
         self,
         session_id: str,
