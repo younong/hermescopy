@@ -958,6 +958,7 @@ def test_reader_read_only_adapter_matches_session_db_payloads(tmp_path):
         latest_descendant_payload,
         list_sessions_payload,
         search_sessions_payload,
+        session_composition_payload,
         session_detail_payload,
         session_messages_payload,
         stats_payload,
@@ -1045,6 +1046,11 @@ def test_reader_read_only_adapter_matches_session_db_payloads(tmp_path):
                 "root",
                 recovery_scope=reader_scope,
             ) == session_messages_payload(db, "root", recovery_scope=scope)
+            assert session_composition_payload(
+                reader_db,
+                ids=["root"],
+                recovery_scope=reader_scope,
+            ) == session_composition_payload(db, ids=["root"], recovery_scope=scope)
             assert export_session_payload(
                 reader_db,
                 "root",
@@ -1166,6 +1172,10 @@ def test_reader_route_parser_rejects_ambiguous_or_encoded_session_paths():
     assert _session_route("/api/sessions/session-1") == (
         "/api/sessions/session-1",
         "session-1",
+    )
+    assert _session_route("/api/sessions/composition") == (
+        "/api/sessions/composition",
+        None,
     )
     assert _session_route("/api/sessions/session-1/messages") == (
         "/api/sessions/session-1/messages",

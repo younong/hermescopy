@@ -72,6 +72,7 @@ _CRON_ACTIONS: frozenset[str] = frozenset({"pause", "resume", "trigger"})
 SESSION_READER_ROUTES: frozenset[tuple[str, str]] = frozenset({
     ("GET", "/api/sessions"),
     ("GET", "/api/sessions/search"),
+    ("GET", "/api/sessions/composition"),
     ("GET", "/api/sessions/empty/count"),
     ("GET", "/api/sessions/stats"),
 })

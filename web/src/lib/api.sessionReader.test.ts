@@ -105,6 +105,51 @@ describe("fetchSessionReaderJSON", () => {
     expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ signal: controller.signal });
   });
 
+  it("encodes repeated composition IDs and forwards abort through retry", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      response(503, { error: "session_reader_unavailable" }, "1"),
+    );
+    const controller = new AbortController();
+    const pending = api.getSessionComposition(
+      ["session a", "session/b"],
+      { signal: controller.signal },
+      "worker",
+    );
+    const rejection = expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    await vi.advanceTimersByTimeAsync(1);
+    controller.abort();
+
+    await rejection;
+    const url = new URL(String(fetchMock.mock.calls[0]?.[0]), window.location.origin);
+    expect(url.pathname).toContain("/api/sessions/composition");
+    expect(url.searchParams.getAll("ids")).toEqual(["session a", "session/b"]);
+    expect(url.searchParams.get("profile")).toBe("worker");
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ signal: controller.signal });
+  });
+
+  it("encodes inclusive/exclusive dates for list and search without changing defaults", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      response(200, { sessions: [], results: [], total: 0, limit: 20, offset: 0 }),
+    );
+
+    await api.getSessions(20, 0, undefined, "created", false, {
+      active_from: 100,
+      active_before: 200,
+    });
+    await api.searchSessions("hello world", undefined, undefined, {
+      active_from: 100,
+      active_before: 200,
+    });
+
+    const listUrl = new URL(String(fetchMock.mock.calls[0]?.[0]), window.location.origin);
+    const searchUrl = new URL(String(fetchMock.mock.calls[1]?.[0]), window.location.origin);
+    expect(listUrl.searchParams.get("active_from")).toBe("100");
+    expect(listUrl.searchParams.get("active_before")).toBe("200");
+    expect(searchUrl.searchParams.get("q")).toBe("hello world");
+    expect(searchUrl.searchParams.get("active_from")).toBe("100");
+    expect(searchUrl.searchParams.get("active_before")).toBe("200");
+  });
+
   it("keeps session mutations on the non-retrying JSON path", async () => {
     const fetchMock = vi
       .spyOn(globalThis, "fetch")

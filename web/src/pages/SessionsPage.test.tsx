@@ -2,13 +2,21 @@
 
 import { act } from "react";
 import { createRoot } from "react-dom/client";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "@/lib/api";
-import {
+import SessionsPage, {
   fetchSessionsOverview,
   scheduleSessionsOverviewPoll,
   SessionMessageList,
 } from "./SessionsPage";
+
+vi.mock("@/contexts/usePageHeader", () => ({
+  usePageHeader: () => ({ setAfterTitle: vi.fn(), setEnd: vi.fn(), setTitle: vi.fn() }),
+}));
+vi.mock("@/contexts/useSystemActions", () => ({
+  useSystemActions: () => ({ activeAction: null, actionStatus: null, dismissLog: vi.fn() }),
+}));
 
 beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
@@ -69,6 +77,134 @@ function scroll(element: HTMLElement, scrollTop: number) {
   element.scrollTop = scrollTop;
   element.dispatchEvent(new Event("scroll", { bubbles: true }));
 }
+
+function session(id: string) {
+  return {
+    id,
+    source: "cli",
+    model: "test/model",
+    title: id,
+    started_at: 1,
+    ended_at: 2,
+    last_active: 2,
+    is_active: false,
+    message_count: 1,
+    tool_call_count: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    preview: "preview",
+  };
+}
+
+function mockSessionsPageApi() {
+  vi.spyOn(api, "getSessions").mockResolvedValue({
+    limit: 20,
+    offset: 0,
+    sessions: [session("session-a")],
+    total: 1,
+  });
+  vi.spyOn(api, "getSessionComposition").mockResolvedValue({
+    scope: {
+      requested_ids: ["session-a"],
+      canonical_session_count: 1,
+      canonical_root_ids: ["session-a"],
+      canonical_tip_ids: ["session-a"],
+      aggregation: "full_canonical_lineages",
+      date_truncation: false,
+    },
+    charts: [],
+    coverage: {},
+    limitations: [],
+  });
+  vi.spyOn(api, "getStatus").mockResolvedValue({
+    active_sessions: 0,
+    config_path: "",
+    config_version: 1,
+    env_path: "",
+    gateway_exit_reason: null,
+    gateway_health_url: null,
+    gateway_pid: null,
+    gateway_platforms: {},
+    gateway_running: false,
+    gateway_state: null,
+    gateway_updated_at: null,
+    hermes_home: "",
+    latest_config_version: 1,
+    release_date: "",
+    version: "",
+  });
+  vi.spyOn(api, "getSessionStats").mockResolvedValue({
+    total: 1,
+    active_store: 0,
+    archived: 0,
+    messages: 1,
+    by_source: {},
+  });
+  vi.spyOn(api, "getEmptySessionsCount").mockResolvedValue({ count: 0 });
+  vi.spyOn(api, "getSessionMessages").mockResolvedValue({
+    session_id: "session-a",
+    messages: [],
+  });
+}
+
+async function renderSessionsPage() {
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  const root = createRoot(container);
+  await act(async () => {
+    root.render(<MemoryRouter><SessionsPage /></MemoryRouter>);
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  return { container, root };
+}
+
+function click(element: Element) {
+  element.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+}
+
+describe("SessionsPage composition flow", () => {
+  it("resets selection and expansion on date change and requests aggregate/detail composition without dates", async () => {
+    mockSessionsPageApi();
+    const { container, root } = await renderSessionsPage();
+    const history = Array.from(container.querySelectorAll('[role="radio"]')).find((button) => button.textContent === "History")!;
+    await act(async () => click(history));
+
+    await vi.waitFor(() => {
+      expect(container.querySelector('[role="checkbox"]'), container.innerHTML).not.toBeNull();
+    });
+    const checkbox = container.querySelector('[role="checkbox"]')!;
+    await act(async () => click(checkbox));
+    expect(api.getSessionComposition).toHaveBeenCalledWith(["session-a"], expect.objectContaining({ signal: expect.any(AbortSignal) }));
+
+    const row = Array.from(container.querySelectorAll("div")).find((node) =>
+      node.textContent?.includes("session-a") && node.className.includes("cursor-pointer"),
+    )!;
+    await act(async () => click(row));
+    expect(api.getSessionComposition).toHaveBeenCalledTimes(2);
+
+    const allTime = Array.from(container.querySelectorAll("button")).find((button) => button.textContent === "All time")!;
+    await act(async () => click(allTime));
+    await vi.waitFor(() => expect(container.textContent).not.toContain("1 selected"));
+    expect(api.getSessions).toHaveBeenCalledWith(
+      20,
+      0,
+      undefined,
+      "created",
+      false,
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    const filteredCalls = vi.mocked(api.getSessions).mock.calls.filter(([limit]) => limit === 20);
+    expect(filteredCalls.at(-1)?.[5]).not.toHaveProperty("active_from");
+    expect(filteredCalls.at(-1)?.[5]).not.toHaveProperty("active_before");
+    for (const [ids, options] of vi.mocked(api.getSessionComposition).mock.calls) {
+      expect(ids).toEqual(["session-a"]);
+      expect(options).not.toHaveProperty("active_from");
+      expect(options).not.toHaveProperty("active_before");
+    }
+    await act(async () => root.unmount());
+  });
+});
 
 describe("SessionMessageList", () => {
   it("loads earlier messages on upward scrolling but not at initial top", async () => {

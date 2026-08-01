@@ -16,6 +16,33 @@ export type Locale =
   | "ru"
   | "hu";
 
+export interface SessionCompositionTranslations {
+  title: string;
+  selectedTitle: string;
+  dateRange: string;
+  startDate: string;
+  endDate: string;
+  allTime: string;
+  dateHelp: string;
+  selectionLimit: string;
+  loading: string;
+  loadError: string;
+  retry: string;
+  unavailable: string;
+  partial: string;
+  partialKnownTotal: string;
+  knownTotal: string;
+  total: string;
+  legend: string;
+  exact: string;
+  estimated: string;
+  messages: string;
+  roughTokens: string;
+  percentage: string;
+  coverage: string;
+  limitations: string;
+}
+
 export interface Translations {
   // ── Common ──
   common: {
@@ -198,6 +225,7 @@ export interface Translations {
     failedToRename?: string;
     previousPage: string;
     nextPage: string;
+    composition?: SessionCompositionTranslations;
     roles: {
       user: string;
       assistant: string;

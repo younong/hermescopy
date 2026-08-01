@@ -1,6 +1,9 @@
 """Tests for live session context breakdown."""
 
+import json
 from unittest.mock import MagicMock, patch
+
+from agent.model_metadata import estimate_tokens_rough
 
 from agent.context_breakdown import compute_session_context_breakdown
 
@@ -58,3 +61,16 @@ def test_breakdown_uses_measured_context_when_available():
 
     assert data["context_used"] == 42_000
     assert data["context_percent"] == 21
+
+
+def test_breakdown_preserves_json_bucket_serialization_totals():
+    tools = [{"type": "function", "function": {"name": "terminal", "description": "你好"}}]
+    agent, parts = _make_agent(stable="", volatile="", tools=tools)
+
+    with patch("agent.system_prompt.build_system_prompt_parts", return_value=parts):
+        data = compute_session_context_breakdown(agent, [])
+
+    tool_bucket = next(item for item in data["categories"] if item["id"] == "tool_definitions")
+    assert tool_bucket["tokens"] == estimate_tokens_rough(
+        json.dumps(tools, ensure_ascii=False)
+    )

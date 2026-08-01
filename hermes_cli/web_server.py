@@ -92,7 +92,7 @@ from utils import env_var_enabled
 
 try:
     from fastapi import (
-        FastAPI, File, Form, HTTPException, Request, UploadFile,
+        FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
         WebSocket, WebSocketDisconnect,
     )
     from fastapi.middleware.cors import CORSMiddleware
@@ -107,7 +107,7 @@ except ImportError:
         from tools.lazy_deps import ensure as _lazy_ensure
         _lazy_ensure("tool.dashboard", prompt=False)
         from fastapi import (
-            FastAPI, File, Form, HTTPException, Request, UploadFile,
+            FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
             WebSocket, WebSocketDisconnect,
         )
         from fastapi.middleware.cors import CORSMiddleware
@@ -4179,6 +4179,8 @@ async def get_sessions(
     source: str = None,
     exclude_sources: str = None,
     cwd_prefix: str = None,
+    active_from: float = None,
+    active_before: float = None,
     profile: Optional[str] = None,
     compact: bool = False,
 ):
@@ -4213,6 +4215,8 @@ async def get_sessions(
                 source=source,
                 exclude_sources=exclude_sources,
                 cwd_prefix=cwd_prefix,
+                active_from=active_from,
+                active_before=active_before,
                 profile_name=profile_name,
                 compact=compact,
                 latency_trace_id=request.headers.get("x-request-id", ""),
@@ -4348,6 +4352,22 @@ def get_profiles_sessions(
     }
 
 
+@app.get("/api/sessions/composition")
+async def get_session_composition(
+    request: Request,
+    ids: List[str] = Query(default=[]),
+    profile: Optional[str] = None,
+):
+    if _authenticated_owner_request(request):
+        _reject_authenticated_profile_param(profile)
+        return await _proxy_authenticated_session_reader_http(request)
+    db = _open_session_db_for_profile(profile)
+    try:
+        return session_api.session_composition_payload(db, ids=ids)
+    finally:
+        db.close()
+
+
 @app.get("/api/sessions/search")
 async def search_sessions(request: Request, q: str = "", limit: int = 20, profile: Optional[str] = None):
     """Search sessions by ID plus full-text message content using FTS5.
@@ -4363,149 +4383,10 @@ async def search_sessions(request: Request, q: str = "", limit: int = 20, profil
     if _authenticated_owner_request(request):
         _reject_authenticated_profile_param(profile)
         return await _proxy_authenticated_session_reader_http(request)
-    if not q or not q.strip():
-        return {"results": []}
     try:
         db = _open_session_db_for_profile(profile)
         try:
-            safe_limit = max(1, min(int(limit or 20), 100))
-
-            # Walk parent_session_id to the compression root, memoized so a
-            # chain of compression segments only costs one walk. We deliberately
-            # stop at branch/delegate edges: those sessions may diverge from the
-            # parent and should remain searchable on their own.
-            root_cache: dict = {}
-
-            def compression_root(session_id: str) -> str:
-                if not session_id:
-                    return session_id
-                if session_id in root_cache:
-                    return root_cache[session_id]
-                chain = []
-                cur = session_id
-                visited = set()
-                root = session_id
-                while cur and cur not in visited:
-                    visited.add(cur)
-                    chain.append(cur)
-                    if cur in root_cache:
-                        root = root_cache[cur]
-                        break
-                    try:
-                        s = db.get_session(cur)
-                    except Exception:
-                        s = None
-                    if not s:
-                        root = cur
-                        break
-                    parent = s.get("parent_session_id") if isinstance(s, dict) else None
-                    if not parent:
-                        root = cur
-                        break
-                    try:
-                        parent_session = db.get_session(parent)
-                    except Exception:
-                        parent_session = None
-                    if not parent_session:
-                        root = cur
-                        break
-                    parent_ended_at = parent_session.get("ended_at")
-                    started_at = s.get("started_at")
-                    is_compression_edge = (
-                        parent_session.get("end_reason") == "compression"
-                        and parent_ended_at is not None
-                        and started_at is not None
-                        and started_at >= parent_ended_at
-                    )
-                    if not is_compression_edge:
-                        root = cur
-                        break
-                    cur = parent
-                for node in chain:
-                    root_cache[node] = root
-                return root
-
-            tip_cache: dict = {}
-
-            def lineage_tip(root_id: str) -> str:
-                if root_id in tip_cache:
-                    return tip_cache[root_id]
-                tip = root_id
-                try:
-                    resolved = db.get_compression_tip(root_id)
-                    if resolved:
-                        tip = resolved
-                except Exception:
-                    pass
-                tip_cache[root_id] = tip
-                return tip
-
-            # Both ID matches and content matches share one keyspace, keyed by
-            # compression lineage root, so an id-hit and a content-hit on the
-            # same logical conversation collapse to a single result. The first
-            # hit for a lineage wins; ID matches run first and take priority.
-            seen: dict = {}
-
-            def add_lineage_result(raw_sid: str, payload: dict) -> None:
-                if not raw_sid:
-                    return
-                root = compression_root(raw_sid)
-                if root in seen or len(seen) >= safe_limit:
-                    return
-                payload = dict(payload)
-                payload["session_id"] = lineage_tip(root)
-                payload["lineage_root"] = root
-                seen[root] = payload
-
-            # Direct ID matches first: users often paste a session id from CLI,
-            # logs, or another Hermes surface. FTS can't find those unless the
-            # id happens to appear in message text. search_sessions_by_id is
-            # SQL-bounded, so this stays cheap even with thousands of sessions.
-            for row in db.search_sessions_by_id(q, limit=safe_limit, include_archived=True):
-                sid = row.get("id")
-                preview = (row.get("preview") or "").strip()
-                snippet = preview or f"Session ID: {sid}"
-                add_lineage_result(
-                    sid,
-                    {
-                        "snippet": snippet,
-                        "role": None,
-                        "source": row.get("source"),
-                        "model": row.get("model"),
-                        "session_started": row.get("started_at"),
-                    },
-                )
-
-            # Auto-add prefix wildcards so partial words match
-            # e.g. "nimb" → "nimb*" matches "nimby"
-            # Preserve quoted phrases and existing wildcards as-is
-            import re
-            terms = []
-            for token in re.findall(r'"[^"]*"|\S+', q.strip()):
-                if token.startswith('"') or token.endswith("*"):
-                    terms.append(token)
-                else:
-                    terms.append(token + "*")
-            prefix_query = " ".join(terms)
-            # Over-fetch so lineage dedup can still surface `limit` distinct
-            # conversations even when several hits collapse onto one root.
-            fetch_limit = max(safe_limit * 5, 50)
-            matches = db.search_messages(query=prefix_query, limit=fetch_limit)
-
-            for m in matches:
-                if len(seen) >= safe_limit:
-                    break
-                add_lineage_result(
-                    m["session_id"],
-                    {
-                        "snippet": m.get("snippet", ""),
-                        "role": m.get("role"),
-                        "source": m.get("source"),
-                        "model": m.get("model"),
-                        "session_started": m.get("session_started"),
-                    },
-                )
-            return {"results": list(seen.values())}
+            return session_api.search_sessions_payload(db, q=q, limit=limit)
         finally:
             db.close()
     except HTTPException:

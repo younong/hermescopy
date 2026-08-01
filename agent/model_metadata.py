@@ -2390,6 +2390,13 @@ def estimate_tokens_rough(text: str) -> int:
     return (len(text) + 3) // 4
 
 
+def estimate_json_tokens_rough(value: Any) -> int:
+    """Estimate one JSON bucket using the dashboard's stable serialization."""
+    if not value:
+        return 0
+    return estimate_tokens_rough(json.dumps(value, ensure_ascii=False))
+
+
 def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
     """Rough token estimate for a message list (pre-flight only).
 

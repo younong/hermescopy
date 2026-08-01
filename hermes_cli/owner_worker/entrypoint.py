@@ -314,7 +314,7 @@ def create_app(
     except (OSError, RuntimeError) as exc:
         raise RuntimeError(f"owner worker startup self-check failed: {exc}") from exc
 
-    from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+    from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
     from fastapi.responses import JSONResponse
 
     @asynccontextmanager
@@ -952,6 +952,8 @@ def create_app(
         source: str | None = None,
         exclude_sources: str | None = None,
         cwd_prefix: str | None = None,
+        active_from: float | None = None,
+        active_before: float | None = None,
         profile: str | None = None,
         compact: bool = False,
         _: None = Depends(_require_owner_token),
@@ -972,9 +974,32 @@ def create_app(
                 source=source,
                 exclude_sources=exclude_sources,
                 cwd_prefix=cwd_prefix,
+                active_from=active_from,
+                active_before=active_before,
                 recovery_scope=(scope if socket_path is not None and scope is not None else None),
                 compact=compact,
                 latency_trace_id=request.headers.get("x-request-id", ""),
+            )
+        finally:
+            db.close()
+
+    @app.get("/api/sessions/composition")
+    def get_session_composition(
+        ids: list[str] = Query(default=[]),
+        profile: str | None = None,
+        _: None = Depends(_require_owner_token),
+    ) -> dict[str, Any]:
+        _reject_profile(profile)
+        from gateway.session import current_historical_resume_scope
+
+        scope = current_historical_resume_scope()
+        recovery_scope = scope if socket_path is not None and scope is not None else None
+        if socket_path is not None and recovery_scope is None:
+            raise HTTPException(status_code=403, detail="owner recovery scope is unavailable")
+        db = _open_db()
+        try:
+            return session_api.session_composition_payload(
+                db, ids=ids, recovery_scope=recovery_scope
             )
         finally:
             db.close()
