@@ -124,7 +124,10 @@ models-dev-upstream/
 # Local editor / agent tooling (machine-specific; keep in global config, not the repo)
 .codex/*
 !.codex/config.toml
-!.codex/run
+!.codex/shell
+!.codex/bin/
+.codex/bin/*
+!.codex/bin/codex
 .cursor/
 .gemini/
 .zed/

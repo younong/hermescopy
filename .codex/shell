@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+PROJECT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+USER_SHELL=${SHELL:-/bin/zsh}
+
+case ${USER_SHELL##*/} in
+  bash|zsh)
+    exec "$USER_SHELL" -l -c \
+      'export PATH="$1/.codex/bin:$PATH"; exec "$2" -i' \
+      hermes-codex-shell "$PROJECT_ROOT" "$USER_SHELL"
+    ;;
+  *)
+    printf 'error: the Hermes terminal profile does not support %s.\n' "$USER_SHELL" >&2
+    exit 2
+    ;;
+esac

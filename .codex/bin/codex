@@ -1,0 +1,52 @@
+#!/bin/sh
+set -eu
+
+PROJECT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+
+find_codex() (
+  IFS=:
+  for directory in $PATH; do
+    [ -n "$directory" ] || directory=.
+    candidate=$directory/codex
+    if [ -x "$candidate" ] && [ "$candidate" != "$0" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+)
+
+CODEX_BIN=$(find_codex || true)
+if [ -z "$CODEX_BIN" ]; then
+  printf '%s\n' 'error: codex is not installed or not available on PATH.' >&2
+  exit 127
+fi
+
+export CODEX_HOME="$PROJECT_ROOT/.codex"
+
+if [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
+  SETTINGS_FILE=$PROJECT_ROOT/.claude/settings.local.json
+  if [ -f "$SETTINGS_FILE" ]; then
+    ANTHROPIC_AUTH_TOKEN=$(
+      python3 - "$SETTINGS_FILE" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as settings_file:
+    value = json.load(settings_file).get("env", {}).get("ANTHROPIC_AUTH_TOKEN", "")
+
+if isinstance(value, str):
+    print(value, end="")
+PY
+    )
+    export ANTHROPIC_AUTH_TOKEN
+  fi
+fi
+
+if [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
+  printf '%s\n' 'error: ANTHROPIC_AUTH_TOKEN is not configured for this project.' >&2
+  printf '%s\n' 'Set it in .claude/settings.local.json under env.ANTHROPIC_AUTH_TOKEN.' >&2
+  exit 2
+fi
+
+exec "$CODEX_BIN" "$@"
