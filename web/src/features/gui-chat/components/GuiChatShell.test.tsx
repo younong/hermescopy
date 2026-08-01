@@ -299,6 +299,7 @@ describe("GuiChatShell", () => {
     const sidebar = document.querySelector('aside[aria-label="Chat workspace"]');
     expect(sidebar).not.toBeNull();
     expect(sidebar?.querySelector('[aria-label="Manage models"]')?.textContent).toContain("Models");
+    expect(sidebar?.querySelector('[aria-label="Message composition statistics"]')?.textContent).toContain("Message statistics");
     expect(document.querySelector('main header [aria-label="Manage models"]')).toBeNull();
     expect(document.querySelector('[aria-label="Log out"]')).not.toBeNull();
   });

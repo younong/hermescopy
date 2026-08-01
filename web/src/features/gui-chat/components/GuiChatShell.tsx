@@ -10,6 +10,7 @@ import {
   LogOut,
   Menu,
   MessageSquarePlus,
+  PieChart,
   RefreshCw,
   Search,
   QrCode,
@@ -699,6 +700,18 @@ export function GuiChatShell() {
         >
           <MessageSquarePlus />
           <span>New chat</span>
+        </button>
+        <button
+          aria-label="Message composition statistics"
+          className="gui-chat-nav-item"
+          onClick={() => {
+            closeMobilePanel();
+            navigate("/sessions");
+          }}
+          type="button"
+        >
+          <PieChart />
+          <span>Message statistics</span>
         </button>
         <button
           aria-current={filesOpen ? "page" : undefined}
