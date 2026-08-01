@@ -4526,6 +4526,11 @@ class AIAgent:
             getattr(self, "_anthropic_base_url", None),
             timeout=get_provider_request_timeout(self.provider, self.model),
             drop_context_1m_beta=_drop_1m,
+            default_headers=(
+                {"x-hermes-deployment-provider": self.relay_provider}
+                if getattr(self, "relay_provider", "")
+                else None
+            ),
         )
 
     def _anthropic_messages_create(

@@ -82,6 +82,22 @@ def test_switch_model_installs_private_provider_header_on_openai_client():
     assert agent._primary_runtime["relay_provider"] == "custom:deployment-next"
 
 
+def test_request_local_anthropic_client_keeps_private_provider_header():
+    agent = _agent(api_mode="anthropic_messages")
+
+    with (
+        patch("agent.anthropic_adapter.build_anthropic_client") as build_client,
+        patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None),
+    ):
+        request_client = MagicMock()
+        build_client.return_value = request_client
+        assert agent._create_request_anthropic_client() is request_client
+
+    assert build_client.call_args.kwargs["default_headers"] == {
+        "x-hermes-deployment-provider": "custom:deployment",
+    }
+
+
 def test_restore_primary_runtime_keeps_private_provider_header():
     agent = _agent(api_mode="anthropic_messages")
     agent._primary_runtime = {
