@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { Button } from "@nous-research/ui/ui/components/button";
@@ -22,6 +22,7 @@ import {
 import { ChatSessionList } from "@/components/ChatSessionList";
 import { ConnectWeChatModal } from "@/features/ilink/ConnectWeChatModal";
 import { useProfileScope } from "@/contexts/useProfileScope";
+import { PageHeaderContext } from "@/contexts/page-header-context";
 import { GuiChatFilesPane } from "@/features/files/components/GuiChatFilesPane";
 import { useI18n } from "@/i18n";
 import SessionsPage from "@/pages/SessionsPage";
@@ -53,6 +54,12 @@ import { GuiChatModelsPane } from "./GuiChatModelsPane";
 import { GuiChatScheduledTasksPane } from "./GuiChatScheduledTasksPane";
 import { GuiChatSkillsPane } from "./GuiChatSkillsPane";
 import { MessageList } from "./MessageList";
+
+const EMBEDDED_PAGE_HEADER = {
+  setAfterTitle: (_node: ReactNode) => undefined,
+  setEnd: (_node: ReactNode) => undefined,
+  setTitle: (_title: string | null) => undefined,
+};
 
 export function GuiChatShell() {
   const { t } = useI18n();
@@ -904,9 +911,11 @@ export function GuiChatShell() {
         </header>
 
         {statisticsOpen ? (
-          <div data-statistics-pane className="min-h-0 flex-1 overflow-auto bg-background p-4 text-foreground sm:p-6">
-            <SessionsPage />
-          </div>
+          <PageHeaderContext.Provider value={EMBEDDED_PAGE_HEADER}>
+            <div data-statistics-pane className="min-h-0 flex-1 overflow-auto bg-background p-4 text-foreground sm:p-6">
+              <SessionsPage />
+            </div>
+          </PageHeaderContext.Provider>
         ) : filesOpen ? (
           <GuiChatFilesPane />
         ) : skillsOpen ? (
