@@ -15,6 +15,36 @@
             "command": "printf 'export CODEX_HOME=%q\\n' \"$CLAUDE_PROJECT_DIR/.codex\" >> \"$CLAUDE_ENV_FILE\"",
             "timeout": 5,
             "statusMessage": "Configuring project-local Codex"
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/require-development-worktree.py\"",
+            "timeout": 5,
+            "statusMessage": "Restoring worktree task ownership"
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/require-development-worktree.py\"",
+            "timeout": 5,
+            "statusMessage": "Restoring worktree task ownership"
+          }
+        ]
+      }
+    ],
+    "CwdChanged": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/require-development-worktree.py\"",
+            "timeout": 5,
+            "statusMessage": "Checking worktree task ownership"
           }
         ]
       }
@@ -32,13 +62,26 @@
         ]
       },
       {
-        "matcher": "Write|Edit|NotebookEdit",
+        "matcher": "EnterWorktree|Write|Edit|NotebookEdit|Bash|Agent|Workflow",
         "hooks": [
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/require-development-worktree.py\"",
             "timeout": 5,
-            "statusMessage": "Enforcing worktree development policy"
+            "statusMessage": "Enforcing worktree task ownership"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "EnterWorktree",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/require-development-worktree.py\"",
+            "timeout": 5,
+            "statusMessage": "Registering worktree task ownership"
           }
         ]
       }
