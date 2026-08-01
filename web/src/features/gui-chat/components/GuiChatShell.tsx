@@ -24,6 +24,7 @@ import { ConnectWeChatModal } from "@/features/ilink/ConnectWeChatModal";
 import { useProfileScope } from "@/contexts/useProfileScope";
 import { GuiChatFilesPane } from "@/features/files/components/GuiChatFilesPane";
 import { useI18n } from "@/i18n";
+import SessionsPage from "@/pages/SessionsPage";
 import { api } from "@/lib/api";
 import { JsonRpcGatewayError, type GatewayEvent } from "@/lib/gatewayClient";
 import { emitChatDiagnostic } from "@/lib/chatDiagnostics";
@@ -62,11 +63,12 @@ export function GuiChatShell() {
   const resumeSessionId = searchParams.get("resume");
   const mockMode = searchParams.get("mock") === "1";
   const workspacePath = location.pathname.replace(/\/$/, "");
+  const statisticsOpen = workspacePath === "/chat-gui/statistics";
   const filesOpen = workspacePath === "/chat-gui/files";
   const skillsOpen = workspacePath === "/chat-gui/skills";
   const scheduledTasksOpen = workspacePath === "/chat-gui/scheduled-tasks";
   const modelsOpen = workspacePath === "/chat-gui/models";
-  const workspacePaneOpen = filesOpen || skillsOpen || scheduledTasksOpen || modelsOpen;
+  const workspacePaneOpen = statisticsOpen || filesOpen || skillsOpen || scheduledTasksOpen || modelsOpen;
   const [state, dispatch] = useReducer(guiChatReducer, initialGuiChatState);
   const connectionRef = useRef<GuiChatConnection | null>(null);
   const historyAbortRef = useRef<AbortController | null>(null);
@@ -702,11 +704,12 @@ export function GuiChatShell() {
           <span>New chat</span>
         </button>
         <button
+          aria-current={statisticsOpen ? "page" : undefined}
           aria-label="Message composition statistics"
           className="gui-chat-nav-item"
           onClick={() => {
             closeMobilePanel();
-            navigate("/sessions");
+            navigate("/chat-gui/statistics");
           }}
           type="button"
         >
@@ -862,8 +865,10 @@ export function GuiChatShell() {
           ) : <div className="w-8" />}
           <div className="pointer-events-none absolute inset-x-20 top-1/2 min-w-0 -translate-y-1/2 text-center">
             <h1 className="truncate text-[14px] font-medium leading-[22px] text-[#25282d]">
-              {filesOpen
-                ? "Files"
+              {statisticsOpen
+                ? "Message statistics"
+                : filesOpen
+                  ? "Files"
                 : skillsOpen
                   ? "Skills"
                   : scheduledTasksOpen
@@ -898,7 +903,11 @@ export function GuiChatShell() {
           ) : null}
         </header>
 
-        {filesOpen ? (
+        {statisticsOpen ? (
+          <div data-statistics-pane className="min-h-0 flex-1 overflow-auto bg-background p-4 text-foreground sm:p-6">
+            <SessionsPage />
+          </div>
+        ) : filesOpen ? (
           <GuiChatFilesPane />
         ) : skillsOpen ? (
           <GuiChatSkillsPane profile={profile} />

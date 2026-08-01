@@ -25,6 +25,9 @@ const mocks = vi.hoisted(() => ({
   startGuiChatLatencyTrace: vi.fn(),
   getModelRegistrations: vi.fn(),
   activateModelRegistration: vi.fn(),
+  getSessions: vi.fn(),
+  getEmptySessionsCount: vi.fn(),
+  getSessionStats: vi.fn(),
 }));
 
 vi.mock("@/lib/api", async (importOriginal) => {
@@ -39,6 +42,9 @@ vi.mock("@/lib/api", async (importOriginal) => {
       getSessionMessages: mocks.getSessionMessages,
       getModelRegistrations: mocks.getModelRegistrations,
       activateModelRegistration: mocks.activateModelRegistration,
+      getSessions: mocks.getSessions,
+      getEmptySessionsCount: mocks.getEmptySessionsCount,
+      getSessionStats: mocks.getSessionStats,
       logout: mocks.logout,
     },
   };
@@ -61,11 +67,22 @@ vi.mock("@/contexts/useProfileScope", () => ({
   useProfileScope: () => ({ profile: "" }),
 }));
 
-vi.mock("@/i18n", () => ({
-  useI18n: () => ({
-    t: { common: { retry: "Retry" }, sessions: { title: "Sessions" } },
-  }),
+vi.mock("@/contexts/usePageHeader", () => ({
+  usePageHeader: () => ({ setAfterTitle: vi.fn(), setEnd: vi.fn() }),
 }));
+
+vi.mock("@/contexts/useSystemActions", () => ({
+  useSystemActions: () => ({ activeAction: null, actionStatus: null, dismissLog: vi.fn() }),
+}));
+
+vi.mock("@/i18n", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/i18n")>();
+  const { en } = await import("@/i18n/en");
+  return {
+    ...actual,
+    useI18n: () => ({ t: en }),
+  };
+});
 
 vi.mock("@/components/ChatSessionList", () => ({
   ChatSessionList: () => null,
@@ -167,6 +184,18 @@ beforeEach(() => {
   mocks.getAuthMe.mockReset();
   mocks.getILinkEnrollment.mockReset();
   mocks.getSessionMessages.mockReset();
+  mocks.getSessions.mockReset();
+  mocks.getSessions.mockResolvedValue({ sessions: [], total: 0, limit: 20, offset: 0 });
+  mocks.getEmptySessionsCount.mockReset();
+  mocks.getEmptySessionsCount.mockResolvedValue({ count: 0 });
+  mocks.getSessionStats.mockReset();
+  mocks.getSessionStats.mockResolvedValue({
+    total: 0,
+    active_store: 0,
+    archived: 0,
+    messages: 0,
+    by_source: {},
+  });
   mocks.getSessionMessages.mockResolvedValue({
     history_page: { cursor: null, has_more: false, returned_count: 0 },
     messages: [],
@@ -302,6 +331,25 @@ describe("GuiChatShell", () => {
     expect(sidebar?.querySelector('[aria-label="Message composition statistics"]')?.textContent).toContain("Message statistics");
     expect(document.querySelector('main header [aria-label="Manage models"]')).toBeNull();
     expect(document.querySelector('[aria-label="Log out"]')).not.toBeNull();
+  });
+
+  it("opens message statistics inside the dedicated workspace", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(<GuiChatShell />);
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[aria-label="Message composition statistics"]')?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector("[data-statistics-pane]")).not.toBeNull();
+    expect(document.body.textContent).toContain("Message statistics");
+    expect(document.querySelector("[data-composer-send]")).toBeNull();
+    expect(Array.from(document.querySelectorAll<HTMLButtonElement>('button[aria-current="page"]'))
+      .some((button) => button.textContent?.includes("Message statistics"))).toBe(true);
   });
 
   it("opens models inside the dedicated workspace instead of a picker dialog", async () => {
