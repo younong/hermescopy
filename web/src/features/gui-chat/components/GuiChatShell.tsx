@@ -30,7 +30,7 @@ import { dashboardAuthTransition } from "@/lib/dashboardAuthTransition";
 import { useDashboardAuthIdentity } from "@/lib/useDashboardAuthIdentity";
 import { cn } from "@/lib/utils";
 import { connectGuiChat, type GuiChatConnection } from "../api";
-import { buildSessionFileDownloadUrl } from "../files";
+import { buildSessionFileDownloadUrl, readSessionFile } from "../files";
 import { createGatewayEventFrameQueue } from "../gatewayEventFrameQueue";
 import {
   navigationStartedAt,
@@ -90,6 +90,11 @@ export function GuiChatShell() {
   const switchTraceByGenerationRef = useRef(new Map<number, GuiChatLatencyTrace>());
   const [resumeNotice, setResumeNotice] = useState<string | null>(null);
   const [sendScrollNonce, setSendScrollNonce] = useState(0);
+  const [attachmentsToQueue, setAttachmentsToQueue] = useState<Array<{
+    file: File;
+    requestId: number;
+  }>>([]);
+  const attachmentRequestIdRef = useRef(0);
   const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false);
   const [sessionQuery, setSessionQuery] = useState("");
   const [activeSessionTitle, setActiveSessionTitle] = useState<string | null>(null);
@@ -162,6 +167,7 @@ export function GuiChatShell() {
 
   const startNewGuiChat = useCallback(() => {
     historyAbortRef.current?.abort();
+    setAttachmentsToQueue([]);
     reconnectLifecycleRef.current?.cancelRecovery();
     setResumeNotice(null);
     skipClearedRouteRef.current = true;
@@ -270,6 +276,7 @@ export function GuiChatShell() {
     reconnectLifecycleRef.current?.cancelRecovery();
     setResumeNotice(null);
     historyAbortRef.current?.abort();
+    setAttachmentsToQueue([]);
     const existingTrace = latencyTraceRef.current;
     const navigationStart = navigationStartedAt();
     const trace = existingTrace ?? startGuiChatLatencyTrace(
@@ -516,6 +523,34 @@ export function GuiChatShell() {
     },
     [state.sessionId],
   );
+
+  const useAttachmentAgain = useCallback(async (attachment: MessageAttachmentState) => {
+    if (!attachment.downloadUrl) return;
+    const sessionId = stateRef.current.sessionId;
+    const generation = stateRef.current.switchGeneration;
+    try {
+      const file = await readSessionFile(
+        attachment.downloadUrl,
+        attachment.name,
+        attachment.mimeType,
+      );
+      if (
+        stateRef.current.sessionId !== sessionId
+        || stateRef.current.switchGeneration !== generation
+      ) return;
+      const requestId = ++attachmentRequestIdRef.current;
+      setAttachmentsToQueue((current) => [...current, { file, requestId }]);
+    } catch (error) {
+      if (
+        stateRef.current.sessionId !== sessionId
+        || stateRef.current.switchGeneration !== generation
+      ) return;
+      dispatch({
+        type: "error",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }, []);
 
   const stop = useCallback(() => {
     const sessionId = state.sessionId;
@@ -887,12 +922,19 @@ export function GuiChatShell() {
                 onApprovalRespond={respondToApproval}
                 onClarifyRespond={respondToClarify}
                 onLoadEarlier={loadEarlier}
+                onUseAttachmentAgain={useAttachmentAgain}
                 state={state}
               />
               <Composer
                 allowSendWhileGenerating={hasPendingClarification}
+                attachmentToQueue={attachmentsToQueue[0]}
                 disabled={disabled}
                 isGenerating={state.isGenerating}
+                onAttachmentQueued={(requestId) => {
+                  setAttachmentsToQueue((current) =>
+                    current.filter((request) => request.requestId !== requestId)
+                  );
+                }}
                 onSend={send}
                 onStop={stop}
               />

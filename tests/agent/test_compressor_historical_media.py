@@ -13,12 +13,10 @@ from unittest.mock import patch
 
 import pytest
 
-from agent.context_compressor import (
-    ContextCompressor,
-    _content_has_images,
-    _is_image_part,
-    _strip_historical_media,
-    _strip_images_from_content,
+from agent.context_compressor import ContextCompressor
+from agent.message_sanitization import (
+    project_attachment_content,
+    project_historical_attachments,
 )
 
 
@@ -38,80 +36,90 @@ TEXT = {"type": "text", "text": "hi"}
 INPUT_TEXT = {"type": "input_text", "text": "hi"}
 
 
+def is_image_part(part):
+    return isinstance(part, dict) and part.get("type") in {"image", "image_url", "input_image"}
+
+
+def content_has_images(content):
+    return isinstance(content, list) and any(is_image_part(part) for part in content)
+
+
 class TestIsImagePart:
     def test_openai_chat_shape(self):
-        assert _is_image_part(IMG_URL) is True
+        assert is_image_part(IMG_URL) is True
 
     def test_openai_responses_shape(self):
-        assert _is_image_part(INPUT_IMG) is True
+        assert is_image_part(INPUT_IMG) is True
 
     def test_anthropic_native_shape(self):
-        assert _is_image_part(ANTHROPIC_IMG) is True
+        assert is_image_part(ANTHROPIC_IMG) is True
 
     def test_text_part_is_not_image(self):
-        assert _is_image_part(TEXT) is False
-        assert _is_image_part(INPUT_TEXT) is False
+        assert is_image_part(TEXT) is False
+        assert is_image_part(INPUT_TEXT) is False
 
     def test_non_dict_rejected(self):
-        assert _is_image_part("image") is False
-        assert _is_image_part(None) is False
-        assert _is_image_part(42) is False
+        assert is_image_part("image") is False
+        assert is_image_part(None) is False
+        assert is_image_part(42) is False
 
 
 class TestContentHasImages:
     def test_string_content(self):
-        assert _content_has_images("a string") is False
+        assert content_has_images("a string") is False
 
     def test_empty_list(self):
-        assert _content_has_images([]) is False
+        assert content_has_images([]) is False
 
     def test_text_only_list(self):
-        assert _content_has_images([TEXT, TEXT]) is False
+        assert content_has_images([TEXT, TEXT]) is False
 
     def test_list_with_image(self):
-        assert _content_has_images([TEXT, IMG_URL]) is True
+        assert content_has_images([TEXT, IMG_URL]) is True
 
     def test_none(self):
-        assert _content_has_images(None) is False
+        assert content_has_images(None) is False
 
 
 class TestStripImagesFromContent:
     def test_string_passthrough(self):
-        assert _strip_images_from_content("hello") == "hello"
+        assert project_attachment_content("hello") == "hello"
 
     def test_none_passthrough(self):
-        assert _strip_images_from_content(None) is None
+        assert project_attachment_content(None) is None
 
     def test_text_only_passthrough(self):
         parts = [TEXT, {"type": "text", "text": "world"}]
-        assert _strip_images_from_content(parts) == parts
+        assert project_attachment_content(parts) == parts
 
     def test_replaces_image_with_placeholder(self):
         parts = [TEXT, IMG_URL]
-        out = _strip_images_from_content(parts)
+        out = project_attachment_content(parts)
         assert len(out) == 2
         assert out[0] == TEXT
         assert out[1] == {
             "type": "text",
-            "text": "[Attached image — stripped after compression]",
+            "text": (
+                "[Attached image — payload omitted; explicitly attach it again to reuse]"
+            ),
         }
 
     def test_does_not_mutate_input(self):
         parts = [IMG_URL, TEXT]
-        _ = _strip_images_from_content(parts)
+        _ = project_attachment_content(parts)
         assert parts[0] is IMG_URL  # original list untouched
         assert parts[1] is TEXT
 
     def test_handles_all_three_shapes(self):
         parts = [IMG_URL, INPUT_IMG, ANTHROPIC_IMG, TEXT]
-        out = _strip_images_from_content(parts)
+        out = project_attachment_content(parts)
         assert sum(1 for p in out if p.get("type") == "text") == 4
-        assert not any(_is_image_part(p) for p in out)
+        assert not any(is_image_part(p) for p in out)
 
 
 class TestStripHistoricalMedia:
     def test_empty_passthrough(self):
-        assert _strip_historical_media([]) == []
+        assert project_historical_attachments([]) == []
 
     def test_no_images_anywhere(self):
         msgs = [
@@ -119,18 +127,17 @@ class TestStripHistoricalMedia:
             {"role": "assistant", "content": "hey"},
             {"role": "user", "content": "bye"},
         ]
-        assert _strip_historical_media(msgs) is msgs  # identity — no copy
+        assert project_historical_attachments(msgs) is msgs  # identity — no copy
 
-    def test_single_image_user_only_first_message(self):
-        # Only image-bearing user is the first message — nothing before it.
+    def test_single_image_user_is_projected(self):
         msgs = [
             {"role": "user", "content": [TEXT, IMG_URL]},
             {"role": "assistant", "content": "ok"},
         ]
-        out = _strip_historical_media(msgs)
-        assert out is msgs  # no-op
-        # Image still there.
-        assert _content_has_images(out[0]["content"])
+        out = project_historical_attachments(msgs)
+        assert out is not msgs
+        assert not content_has_images(out[0]["content"])
+        assert "payload omitted" in str(out[0]["content"])
 
     def test_strips_older_user_image_keeps_newest(self):
         msgs = [
@@ -138,12 +145,12 @@ class TestStripHistoricalMedia:
             {"role": "assistant", "content": "looked at it"},
             {"role": "user", "content": [TEXT, INPUT_IMG]},   # newest — keep
         ]
-        out = _strip_historical_media(msgs)
+        out = project_historical_attachments(msgs)
         assert out is not msgs  # new list
         # First message's image was replaced
-        assert not _content_has_images(out[0]["content"])
-        # Newest user still has its image
-        assert _content_has_images(out[2]["content"])
+        assert not content_has_images(out[0]["content"])
+        # The universal projection no longer preserves a newest-image anchor.
+        assert not content_has_images(out[2]["content"])
 
     def test_strips_assistant_and_tool_images_before_anchor(self):
         msgs = [
@@ -152,10 +159,10 @@ class TestStripHistoricalMedia:
             {"role": "tool", "content": [TEXT, IMG_URL], "tool_call_id": "t1"},
             {"role": "user", "content": [TEXT, IMG_URL]},          # newest user — keep
         ]
-        out = _strip_historical_media(msgs)
+        out = project_historical_attachments(msgs)
         for i in range(3):
-            assert not _content_has_images(out[i]["content"]), f"msg {i} still has image"
-        assert _content_has_images(out[3]["content"])
+            assert not content_has_images(out[i]["content"]), f"msg {i} still has image"
+        assert not content_has_images(out[3]["content"])
 
     def test_text_only_newest_user_still_strips_older_images(self):
         # The anchor is "newest user WITH images". If the newest user is
@@ -167,32 +174,32 @@ class TestStripHistoricalMedia:
             {"role": "assistant", "content": "done"},
             {"role": "user", "content": "follow-up text only"},
         ]
-        out = _strip_historical_media(msgs)
+        out = project_historical_attachments(msgs)
         # First image-bearing user (index 0) was stripped — it was before the
         # newest image-bearing user (index 2).
-        assert not _content_has_images(out[0]["content"])
-        # Anchor (index 2) keeps its image.
-        assert _content_has_images(out[2]["content"])
+        assert not content_has_images(out[0]["content"])
+        # The former anchor is projected too; only request-time code may preserve
+        # the current attachment for its first call.
+        assert not content_has_images(out[2]["content"])
 
-    def test_no_image_bearing_user_is_noop(self):
+    def test_assistant_image_is_projected_without_user_anchor(self):
         msgs = [
             {"role": "user", "content": "first"},
-            {"role": "assistant", "content": [TEXT, IMG_URL]},  # assistant image only
+            {"role": "assistant", "content": [TEXT, IMG_URL]},
             {"role": "user", "content": "second"},
         ]
-        out = _strip_historical_media(msgs)
-        # No image-bearing user anchor → no stripping.
-        assert out is msgs
-        assert _content_has_images(out[1]["content"])
+        out = project_historical_attachments(msgs)
+        assert out is not msgs
+        assert not content_has_images(out[1]["content"])
 
     def test_does_not_mutate_input_messages(self):
         msg0 = {"role": "user", "content": [TEXT, IMG_URL]}
         msg1 = {"role": "user", "content": [TEXT, IMG_URL]}
         msgs = [msg0, msg1]
-        _ = _strip_historical_media(msgs)
+        _ = project_historical_attachments(msgs)
         # Originals untouched
-        assert _content_has_images(msg0["content"])
-        assert _content_has_images(msg1["content"])
+        assert content_has_images(msg0["content"])
+        assert content_has_images(msg1["content"])
 
     def test_idempotent(self):
         msgs = [
@@ -200,8 +207,8 @@ class TestStripHistoricalMedia:
             {"role": "assistant", "content": "k"},
             {"role": "user", "content": [TEXT, IMG_URL]},
         ]
-        first = _strip_historical_media(msgs)
-        second = _strip_historical_media(first)
+        first = project_historical_attachments(msgs)
+        second = project_historical_attachments(first)
         # Second pass is a no-op — no images left before the anchor.
         assert second is first
 
@@ -212,10 +219,10 @@ class TestStripHistoricalMedia:
             {"role": "assistant", "content": "ok"},
             {"role": "user", "content": [TEXT, IMG_URL]},
         ]
-        out = _strip_historical_media(msgs)
+        out = project_historical_attachments(msgs)
         assert out[0] == "not-a-dict"
         # Image-bearing user at index 1 is before the anchor (index 3) → stripped.
-        assert not _content_has_images(out[1]["content"])
+        assert not content_has_images(out[1]["content"])
 
 
 class TestCompressIntegration:
@@ -251,16 +258,12 @@ class TestCompressIntegration:
         with patch.object(compressor, "_generate_summary", return_value="SUMMARY TEXT"):
             out = compressor.compress(msgs, current_tokens=60_000)
 
-        # Newest user turn with image should still have it (it's in the tail).
-        user_imgs = [m for m in out if m.get("role") == "user" and _content_has_images(m.get("content"))]
-        assert len(user_imgs) == 1, (
-            "Expected exactly one user message with images after compression "
-            f"(the newest one); got {len(user_imgs)}"
-        )
-        # No assistant or tool messages should carry images either.
+        # Compression emits reusable historical context, so no attachment body
+        # survives — including the newest tail image.
+        user_imgs = [m for m in out if m.get("role") == "user" and content_has_images(m.get("content"))]
+        assert user_imgs == []
+        assert "payload omitted" in str(out)
         for m in out:
-            if m is user_imgs[0]:
-                continue
-            assert not _content_has_images(m.get("content")), (
+            assert not content_has_images(m.get("content")), (
                 f"Stale image in {m.get('role')!r} message after compression"
             )

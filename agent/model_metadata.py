@@ -21,6 +21,10 @@ import yaml
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname
 
 from hermes_constants import OPENROUTER_MODELS_URL
+from agent.message_sanitization import (
+    _decode_structured_content,
+    project_attachment_content,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2407,6 +2411,7 @@ def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
     """Count image-like content parts in a message; return their token cost."""
     count = 0
     content = msg.get("content") if isinstance(msg, dict) else None
+    content, _ = _decode_structured_content(content)
     if isinstance(content, list):
         for part in content:
             if not isinstance(part, dict):
@@ -2442,21 +2447,13 @@ def _estimate_message_chars(msg: Dict[str, Any]) -> int:
         if k == "_anthropic_content_blocks":
             continue
         if k == "content":
-            if isinstance(v, list):
-                cleaned = []
-                for part in v:
-                    if isinstance(part, dict):
-                        if part.get("type") in {"image", "image_url", "input_image"}:
-                            cleaned.append({"type": part.get("type"), "image": "[stripped]"})
-                        else:
-                            cleaned.append(part)
-                    else:
-                        cleaned.append(part)
-                shadow[k] = cleaned
-            elif isinstance(v, dict) and v.get("_multimodal"):
-                shadow[k] = v.get("text_summary", "")
+            decoded, _ = _decode_structured_content(v)
+            if isinstance(decoded, list):
+                shadow[k] = project_attachment_content(decoded)
+            elif isinstance(decoded, dict) and decoded.get("_multimodal"):
+                shadow[k] = decoded.get("text_summary", "")
             else:
-                shadow[k] = v
+                shadow[k] = decoded
         else:
             shadow[k] = v
     return len(str(shadow))
@@ -2467,6 +2464,7 @@ def estimate_request_tokens_rough(
     *,
     system_prompt: str = "",
     tools: Optional[List[Dict[str, Any]]] = None,
+    precomputed_message_tokens: Optional[int] = None,
 ) -> int:
     """Rough token estimate for a full chat-completions request.
 
@@ -2475,11 +2473,16 @@ def estimate_request_tokens_rough(
     tools enabled, schemas alone can add 20-30K tokens — a significant
     blind spot when only counting messages. Image content is counted
     at a flat per-image cost (see estimate_messages_tokens_rough).
+
+    ``precomputed_message_tokens`` may be supplied only when it was computed
+    from the same message snapshot; explicit zero is a valid estimate.
     """
     total = 0
     if system_prompt:
         total += (len(system_prompt) + 3) // 4
-    if messages:
+    if precomputed_message_tokens is not None:
+        total += precomputed_message_tokens
+    elif messages:
         total += estimate_messages_tokens_rough(messages)
     if tools:
         total += (len(str(tools)) + 3) // 4

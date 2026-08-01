@@ -76,7 +76,7 @@ def test_handoff_in_protected_head_populates_previous_summary_before_update():
     seen_turns = []
 
     def fake_generate_summary(
-        turns_to_summarize, focus_topic=None, deadline_monotonic=None
+        turns_to_summarize, focus_topic=None, deadline_monotonic=None, **_kwargs
     ):
         seen_turns.extend(turns_to_summarize)
         return "new summary from resumed turns"
@@ -84,6 +84,60 @@ def test_handoff_in_protected_head_populates_previous_summary_before_update():
     with patch.object(compressor, "_generate_summary", side_effect=fake_generate_summary):
         compressor.compress(_messages_with_handoff(old_summary))
 
-    assert compressor._previous_summary == old_summary
+    assert compressor._previous_summary == "new summary from resumed turns"
     assert seen_turns
     assert all(old_summary not in str(msg.get("content", "")) for msg in seen_turns)
+
+
+def test_each_changed_transcript_starts_its_own_chunk_plan_from_the_beginning():
+    """A completed prior chunk plan must never skip chunks from later turns."""
+    compressor = _compressor()
+    first_groups = [
+        [{"role": "user", "content": "first transcript chunk one"}],
+        [{"role": "assistant", "content": "first transcript chunk two"}],
+    ]
+    second_groups = [
+        [{"role": "user", "content": "NEW SECOND TRANSCRIPT CONTENT"}],
+    ]
+    seen = []
+
+    compressor._auxiliary_summary_capacity = MagicMock(
+        return_value=MagicMock(input_budget=25, max_output_tokens=100)
+    )
+    compressor._atomic_summary_groups = MagicMock(
+        side_effect=[first_groups, second_groups]
+    )
+
+    def fake_generate_summary(turns, **_kwargs):
+        seen.append([message["content"] for message in turns])
+        return f"summary {len(seen)}"
+
+    compressor._generate_summary = MagicMock(side_effect=fake_generate_summary)
+
+    first_messages = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "first request"},
+        {"role": "assistant", "content": "first response"},
+        {"role": "user", "content": "second request"},
+        {"role": "assistant", "content": "second response"},
+        {"role": "user", "content": "third request"},
+        {"role": "assistant", "content": "third response"},
+        {"role": "user", "content": "active tail request"},
+    ]
+    first_compacted = compressor.compress(first_messages)
+    second_messages = [
+        *first_compacted,
+        {"role": "assistant", "content": "work after first compaction"},
+        {"role": "user", "content": "new request after first compaction"},
+        {"role": "assistant", "content": "new response after first compaction"},
+        {"role": "user", "content": "another new request"},
+        {"role": "assistant", "content": "another new response"},
+        {"role": "user", "content": "latest active request"},
+    ]
+    compressor.compress(second_messages)
+
+    assert seen == [
+        ["first transcript chunk one"],
+        ["first transcript chunk two"],
+        ["NEW SECOND TRANSCRIPT CONTENT"],
+    ]

@@ -10,6 +10,7 @@ Coverage levels:
   Persistent cache       — save/load, corruption, update, provider isolation
 """
 
+import json
 import time
 
 import pytest
@@ -23,6 +24,7 @@ from agent.model_metadata import (
     _strip_provider_prefix,
     estimate_tokens_rough,
     estimate_messages_tokens_rough,
+    estimate_request_tokens_rough,
     get_model_context_length,
     get_next_probe_tier,
     get_cached_context_length,
@@ -109,6 +111,17 @@ class TestEstimateMessagesTokensRough:
         # string representation.
         assert 1500 <= result < 2000
 
+    def test_legacy_serialized_image_stays_bounded(self):
+        huge = "A" * (1024 * 1024)
+        content = "\x00json:" + json.dumps([
+            {"type": "text", "text": "describe"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{huge}"}},
+        ])
+
+        result = estimate_messages_tokens_rough([{"role": "user", "content": content}])
+
+        assert 1500 <= result < 5000
+
     def test_message_with_huge_base64_image_stays_bounded(self):
         """A 1MB base64 PNG must not explode to ~250K tokens."""
         huge = "A" * (1024 * 1024)
@@ -118,6 +131,40 @@ class TestEstimateMessagesTokensRough:
         ]}
         result = estimate_messages_tokens_rough([msg])
         assert result < 5000
+
+
+class TestEstimateRequestTokensRough:
+    def test_precomputed_message_tokens_match_normal_estimate(self):
+        messages = [{"role": "user", "content": "hello"}]
+        tools = [{"type": "function", "function": {"name": "read"}}]
+        message_tokens = estimate_messages_tokens_rough(messages)
+
+        expected = estimate_request_tokens_rough(
+            messages,
+            system_prompt="system",
+            tools=tools,
+        )
+        actual = estimate_request_tokens_rough(
+            messages,
+            system_prompt="system",
+            tools=tools,
+            precomputed_message_tokens=message_tokens,
+        )
+
+        assert actual == expected
+
+    def test_precomputed_zero_is_a_valid_message_estimate(self):
+        with patch(
+            "agent.model_metadata.estimate_messages_tokens_rough"
+        ) as mock_estimate:
+            result = estimate_request_tokens_rough(
+                [{"role": "user", "content": "ignored"}],
+                system_prompt="system",
+                precomputed_message_tokens=0,
+            )
+
+        mock_estimate.assert_not_called()
+        assert result == estimate_tokens_rough("system")
 
 
 # =========================================================================

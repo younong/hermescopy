@@ -84,6 +84,7 @@ compression:
   threshold: 0.50            # Fraction of context window (default: 0.50 = 50%)
   target_ratio: 0.20         # How much of threshold to keep as tail (default: 0.20)
   protect_last_n: 20         # Minimum protected tail messages (default: 20)
+  in_place: true             # Keep one session ID and archive original rows
   codex_gpt55_autoraise: true  # gpt-5.5 on Codex OAuth: raise trigger to 85% (default: true)
 
 # Summarization model/provider configured under auxiliary:
@@ -102,6 +103,7 @@ auxiliary:
 | `target_ratio` | `0.20` | 0.10-0.80 | Controls tail protection token budget: `threshold_tokens × target_ratio` |
 | `protect_last_n` | `20` | ≥1 | Minimum number of recent messages always preserved |
 | `protect_first_n` | `3` | (hardcoded) | System prompt + first exchange always preserved |
+| `in_place` | `true` | bool | Keep the same session ID, archive original rows, and load only compacted active rows on resume |
 | `codex_gpt55_autoraise` | `true` | bool | Raise the trigger to 85% for gpt-5.5 on the ChatGPT Codex OAuth route (see below). Set `false` to keep the global `threshold` |
 
 ### Codex gpt-5.5 threshold autoraise
@@ -144,9 +146,12 @@ summary can be produced, not when compression fires.
 
 The `ContextCompressor.compress()` method follows a 4-phase algorithm:
 
-### Phase 1: Prune Old Tool Results (cheap, no LLM call)
+### Phase 1: Compact Consumed Tool Payloads and Prune Old Results
 
-Old tool results (>200 chars) outside the protected tail are replaced with:
+Before full summarization, Hermes can deterministically compact consumed tool
+arguments and results once they leave the protected tail. This checkpoint may
+reduce request pressure without an auxiliary-model call. The legacy pruning pass
+then replaces old tool results (>200 chars) outside the protected tail with:
 ```
 [Old tool output cleared to save context space]
 ```
@@ -177,11 +182,17 @@ to find the parent assistant message, keeping groups intact.
 
 ### Phase 3: Generate Structured Summary
 
-:::warning Summary model context length
-The summary model must have a context window **at least as large** as the main agent model's. The entire middle section is sent to the summary model in a single `call_llm(task="compression")` call. If the summary model's context is smaller, the API returns a context-length error — `_generate_summary()` catches it, logs a warning, and returns `None`. The compressor then drops the middle turns **without a summary**, silently losing conversation context. This is the most common cause of degraded compaction quality.
+:::note Summary model context length
+The summary model does **not** need a context window as large as the main model's
+compression threshold. Hermes packs complete assistant-tool/result groups into
+rolling chunks bounded by the resolved auxiliary route's input capacity and
+applies a safety margin and hard cap to every request. An indivisible atomic tool
+group that exceeds that budget aborts automatic compression without changing the
+source transcript. Auxiliary models below Hermes' minimum supported context are
+still rejected.
 :::
 
-The middle turns are summarized using the auxiliary LLM with a structured
+The middle turns are summarized using bounded auxiliary-LLM requests with a structured
 template:
 
 ```
@@ -236,7 +247,16 @@ information across multiple compactions — items move from "In Progress" to "Do
 new progress is added, and obsolete information is removed.
 
 The `_previous_summary` field on the compressor instance stores the last summary
-text for this purpose.
+text for this purpose. Every new transcript snapshot builds a fresh chunk plan
+from its first chunk; only the summary text carries across attempts.
+
+### Session Persistence
+
+With the default `compression.in_place: true`, compaction keeps the existing
+session ID. The pre-compaction rows are soft-archived for search and recovery,
+while the compacted summary and protected tail become the active rows loaded by
+resume. Setting `compression.in_place: false` opts into legacy continuation-session
+rotation.
 
 
 ## Before/After Example

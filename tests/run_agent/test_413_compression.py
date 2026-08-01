@@ -366,6 +366,35 @@ class TestPreflightCompression:
         mock_compress.assert_not_called()
         assert result["completed"] is True
 
+    def test_api_preflight_reuses_same_snapshot_message_estimate(self, agent):
+        """Full request sizing should not traverse unchanged messages twice."""
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 1_000_000
+        agent.context_compressor.threshold_tokens = 850_000
+        ok_resp = _mock_response(content="No compression needed", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [ok_resp]
+
+        with (
+            patch(
+                "agent.conversation_loop.estimate_messages_tokens_rough",
+                return_value=123,
+            ),
+            patch(
+                "agent.conversation_loop.estimate_request_tokens_rough",
+                return_value=123,
+            ) as request_estimate,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", conversation_history=[])
+
+        assert result["completed"] is True
+        assert any(
+            call.kwargs.get("precomputed_message_tokens") == 123
+            for call in request_estimate.call_args_list
+        )
+
     def test_no_preflight_when_compression_disabled(self, agent):
         """Preflight should not run when compression is disabled."""
         agent.compression_enabled = False

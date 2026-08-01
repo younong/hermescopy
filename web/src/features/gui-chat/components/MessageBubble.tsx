@@ -3,7 +3,7 @@ import { useDeferredValue, useMemo } from "react";
 import { Markdown, type MarkdownFileLink } from "@/components/Markdown";
 import { cn } from "@/lib/utils";
 import { normalizeSessionFileReference } from "../files";
-import type { ArtifactState, ChatMessage } from "../types";
+import type { ArtifactState, ChatMessage, MessageAttachmentState } from "../types";
 import { ArtifactCard } from "./ArtifactCard";
 import { InlineFileLink } from "./InlineFileLink";
 import { MessageAttachmentCard } from "./MessageAttachmentCard";
@@ -11,9 +11,11 @@ import { MessageAttachmentCard } from "./MessageAttachmentCard";
 export function MessageBubble({
   artifacts,
   message,
+  onUseAttachmentAgain,
 }: {
   artifacts: ArtifactState[];
   message: ChatMessage;
+  onUseAttachmentAgain?: (attachment: MessageAttachmentState) => void;
 }) {
   const isUser = message.role === "user";
 
@@ -27,6 +29,7 @@ export function MessageBubble({
                 <MessageAttachmentCard
                   attachment={attachment}
                   key={attachment.id}
+                  onUseAgain={onUseAttachmentAgain}
                   variant="bubble"
                 />
               ))}
@@ -77,7 +80,11 @@ export function MessageBubble({
         {message.attachments?.length ? (
           <div className="mt-3 flex flex-wrap gap-2">
             {message.attachments.map((attachment) => (
-              <MessageAttachmentCard attachment={attachment} key={attachment.id} />
+              <MessageAttachmentCard
+                attachment={attachment}
+                key={attachment.id}
+                onUseAgain={onUseAttachmentAgain}
+              />
             ))}
           </div>
         ) : null}

@@ -58,7 +58,7 @@ def test_repeated_compression_warning_routed_through_emit_status(tmp_path: Path)
     agent = _build_agent_with_db(db, sid, compression_count=2)
 
     emitted: list[str] = []
-    agent._emit_status = lambda message: emitted.append(message)
+    agent._emit_status = lambda message, **_kwargs: emitted.append(message)
 
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
     agent._compress_context(messages, "sys", approx_tokens=120_000)
@@ -79,7 +79,7 @@ def test_no_warning_below_threshold(tmp_path: Path) -> None:
     # compression_count == 1 → no repeated-compression warning.
     agent = _build_agent_with_db(db, sid, compression_count=1)
     emitted: list[str] = []
-    agent._emit_status = lambda message: emitted.append(message)
+    agent._emit_status = lambda message, **_kwargs: emitted.append(message)
 
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
     agent._compress_context(messages, "sys", approx_tokens=120_000)

@@ -21,6 +21,34 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_CONTENT_JSON_PREFIX = "\x00json:"
+_ATTACHMENT_PART_TYPES = frozenset(
+    {
+        "audio",
+        "document",
+        "file",
+        "image",
+        "image_url",
+        "input_audio",
+        "input_file",
+        "input_image",
+        "resource",
+        "resource_link",
+    }
+)
+_ATTACHMENT_KIND_BY_TYPE = {
+    "audio": "audio",
+    "document": "document",
+    "file": "file",
+    "image": "image",
+    "image_url": "image",
+    "input_audio": "audio",
+    "input_file": "file",
+    "input_image": "image",
+    "resource": "file",
+    "resource_link": "file",
+}
+
 # Lone surrogate code points are invalid in UTF-8 and crash json.dumps
 # inside the OpenAI SDK.  Used by every surrogate-sanitization helper
 # below as well as by run_agent and the CLI for paste-from-clipboard
@@ -384,6 +412,132 @@ def _sanitize_tools_non_ascii(tools: list) -> bool:
     return _sanitize_structure_non_ascii(tools)
 
 
+def _decode_structured_content(content: Any) -> tuple[Any, bool]:
+    """Decode legacy SessionDB structured content without mutating its source."""
+    if not isinstance(content, str) or not content.startswith(_CONTENT_JSON_PREFIX):
+        return content, False
+    try:
+        decoded = json.loads(content[len(_CONTENT_JSON_PREFIX):])
+    except (TypeError, ValueError):
+        return content, False
+    return decoded, True
+
+
+def _is_attachment_part(part: Any) -> bool:
+    """Return whether a rich content part carries or references an attachment."""
+    return isinstance(part, dict) and part.get("type") in _ATTACHMENT_PART_TYPES
+
+
+def _attachment_receipt_text(kind: str, name: str = "") -> str:
+    """Build stable receipt text for a durable attachment reference."""
+    label = f"{kind}: {name}" if name else kind
+    return f"[Attached {label} — payload omitted; explicitly attach it again to reuse]"
+
+
+def _attachment_receipt(part: dict[str, Any]) -> dict[str, str]:
+    """Build a stable text receipt for a payload-bearing rich content part."""
+    part_type = str(part.get("type") or "file")
+    kind = _ATTACHMENT_KIND_BY_TYPE.get(part_type, "file")
+    name = ""
+    for key in ("filename", "file_name", "name", "title"):
+        value = part.get(key)
+        if isinstance(value, str) and value.strip():
+            name = value.strip()
+            break
+    if not name:
+        nested = part.get("file")
+        if isinstance(nested, dict):
+            for key in ("filename", "file_name", "name"):
+                value = nested.get(key)
+                if isinstance(value, str) and value.strip():
+                    name = value.strip()
+                    break
+    return {"type": "text", "text": _attachment_receipt_text(kind, name)}
+
+
+def project_attachment_content(content: Any) -> Any:
+    """Return model-safe content with attachment bodies replaced by receipts.
+
+    The projection understands current list-shaped rich content and legacy
+    ``\0json:`` rows. It is non-mutating and idempotent; plain text and unknown
+    content parts pass through unchanged.
+    """
+    decoded, was_serialized = _decode_structured_content(content)
+    if not isinstance(decoded, list):
+        return decoded if was_serialized else content
+
+    for index, part in enumerate(decoded):
+        if _is_attachment_part(part):
+            projected = decoded[:index]
+            break
+    else:
+        return decoded if was_serialized else content
+    projected.extend(
+        _attachment_receipt(part) if _is_attachment_part(part) else part
+        for part in decoded[index:]
+    )
+    return projected
+
+
+def compact_user_attachment_content(
+    original_content: Any,
+    attachments: Any,
+) -> Any:
+    """Build durable/follow-up content from clean user text and metadata."""
+    if not isinstance(original_content, str):
+        return project_attachment_content(original_content)
+    receipts = []
+    if isinstance(attachments, list):
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            kind = str(attachment.get("kind") or "file")
+            name = str(attachment.get("name") or attachment.get("filename") or "").strip()
+            receipts.append(_attachment_receipt_text(kind, name))
+    parts = [original_content.strip(), *receipts]
+    return "\n".join(part for part in parts if part)
+
+
+def project_message_attachments(message: Any) -> Any:
+    """Return a shallow-copied message with rich attachment payloads omitted."""
+    if not isinstance(message, dict):
+        return message
+    content = message.get("content")
+    projected = project_attachment_content(content)
+    stashed = message.get("_anthropic_content_blocks")
+    projected_stashed = project_attachment_content(stashed)
+    if projected is content and projected_stashed is stashed:
+        return message
+    result = message.copy()
+    if projected is not content:
+        result["content"] = projected
+    if projected_stashed is not stashed:
+        result["_anthropic_content_blocks"] = projected_stashed
+    return result
+
+
+def project_historical_attachments(
+    messages: list,
+    *,
+    preserve_index: int | None = None,
+) -> list:
+    """Project every attachment payload except an explicitly preserved message."""
+    for index, message in enumerate(messages):
+        next_message = message if index == preserve_index else project_message_attachments(message)
+        if next_message is message:
+            continue
+        projected = messages[:index]
+        projected.append(next_message)
+        projected.extend(
+            candidate
+            if next_index == preserve_index
+            else project_message_attachments(candidate)
+            for next_index, candidate in enumerate(messages[index + 1 :], index + 1)
+        )
+        return projected
+    return messages
+
+
 def _strip_images_from_messages(messages: list) -> bool:
     """Remove image_url content parts from all messages in-place.
 
@@ -472,6 +626,12 @@ __all__ = [
     "_strip_non_ascii",
     "_sanitize_messages_non_ascii",
     "_sanitize_tools_non_ascii",
+    "_decode_structured_content",
+    "_is_attachment_part",
+    "project_attachment_content",
+    "compact_user_attachment_content",
+    "project_message_attachments",
+    "project_historical_attachments",
     "_strip_images_from_messages",
     "_sanitize_structure_non_ascii",
 ]

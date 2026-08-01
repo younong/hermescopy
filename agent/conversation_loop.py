@@ -46,6 +46,8 @@ from agent.message_sanitization import (
     _sanitize_tools_non_ascii,
     _strip_images_from_messages,
     _strip_non_ascii,
+    compact_user_attachment_content,
+    project_historical_attachments,
 )
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -856,9 +858,30 @@ def run_conversation(
 
         from agent.skill_commands import strip_deferred_skill_descriptor
 
+        # Attachment bytes/expanded rich parts are turn-scoped. Preserve the
+        # newly attached user payload only for this turn's first provider request;
+        # every historical turn and tool-loop follow-up gets a compact receipt.
+        preserve_attachment_index = (
+            current_turn_user_idx if api_call_count == 1 else None
+        )
+        projected_messages = project_historical_attachments(
+            messages,
+            preserve_index=preserve_attachment_index,
+        )
         api_messages = []
-        for idx, msg in enumerate(messages):
-            api_msg = msg.copy()
+        for idx, (msg, projected_msg) in enumerate(zip(messages, projected_messages)):
+            preserve_current_attachment = idx == preserve_attachment_index
+            api_msg = projected_msg.copy()
+            if (
+                not preserve_current_attachment
+                and idx == current_turn_user_idx
+                and msg.get("role") == "user"
+                and msg.get("attachments")
+            ):
+                api_msg["content"] = compact_user_attachment_content(
+                    original_user_message,
+                    msg.get("attachments"),
+                )
             if msg.get("role") == "user":
                 api_msg["content"] = strip_deferred_skill_descriptor(
                     api_msg.get("content"),
@@ -1035,7 +1058,9 @@ def run_conversation(
         total_chars = sum(len(str(msg)) for msg in api_messages)
         approx_tokens = estimate_messages_tokens_rough(api_messages)
         _raw_request_tokens = estimate_request_tokens_rough(
-            api_messages, tools=agent.tools or None
+            api_messages,
+            tools=agent.tools or None,
+            precomputed_message_tokens=approx_tokens,
         )
         _note_request_estimate = getattr(
             agent.context_compressor,

@@ -73,18 +73,34 @@ vi.mock("@/components/ChatSessionList", () => ({
 
 vi.mock("./Composer", () => ({
   Composer: (props: Record<string, unknown>) => (
-    <button
-      data-composer-send
-      onClick={() =>
-        void (props.onSend as (...args: unknown[]) => unknown)(
-          "new message",
-          [],
-          () => undefined,
-        )
-      }
-    >
-      Composer send
-    </button>
+    <div>
+      <span data-composer-reused-file>
+        {(props.attachmentToQueue as { file?: File } | undefined)?.file?.name}
+      </span>
+      <button
+        data-composer-ack-reused-file
+        onClick={() => {
+          const request = props.attachmentToQueue as { requestId?: number } | undefined;
+          if (request?.requestId !== undefined) {
+            (props.onAttachmentQueued as (requestId: number) => void)?.(request.requestId);
+          }
+        }}
+      >
+        Ack reused attachment
+      </button>
+      <button
+        data-composer-send
+        onClick={() =>
+          void (props.onSend as (...args: unknown[]) => unknown)(
+            "new message",
+            [],
+            () => undefined,
+          )
+        }
+      >
+        Composer send
+      </button>
+    </div>
   ),
 }));
 
@@ -96,6 +112,23 @@ vi.mock("./MessageList", () => ({
           ?.map((message) => message.text)
           .join("|")}
       </div>
+      <button
+        data-use-attachment-again
+        onClick={() =>
+          void (props.onUseAttachmentAgain as (...args: unknown[]) => unknown)({
+            downloadUrl: "/api/files/download?path=%2Fworkspace%2Fnotes.txt",
+            id: "stored-file",
+            kind: "file",
+            mimeType: "text/plain",
+            name: "notes.txt",
+            refText: "@file:/workspace/notes.txt",
+            sizeBytes: 5,
+            sourcePath: "/workspace/notes.txt",
+          })
+        }
+      >
+        Use attachment again
+      </button>
       <button
         data-clarify-answer
         onClick={() =>
@@ -228,6 +261,31 @@ afterEach(async () => {
 });
 
 describe("GuiChatShell", () => {
+  it("downloads a stored attachment before queuing an explicit reuse", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("notes", {
+        headers: { "Content-Type": "text/plain" },
+        status: 200,
+      }),
+    );
+
+    await renderShell(<GuiChatShell />);
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>("[data-use-attachment-again]")?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/files/download?path=%2Fworkspace%2Fnotes.txt",
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(document.querySelector("[data-composer-reused-file]")?.textContent).toBe("notes.txt");
+  });
+
   it("renders the dedicated workspace navigation", async () => {
     const connection = createConnection();
     mocks.getAuthMe.mockResolvedValue(authIdentity());

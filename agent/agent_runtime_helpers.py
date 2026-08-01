@@ -1911,6 +1911,9 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             provider=agent.provider,
             api_mode=agent.api_mode,
         )
+        # Auxiliary route feasibility is model/provider-specific. Re-resolve it
+        # lazily before this switched runtime's next compression attempt.
+        agent._compression_feasibility_checked = False
 
     # ── Invalidate cached system prompt so it rebuilds next turn ──
     agent._cached_system_prompt = None

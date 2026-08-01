@@ -34,6 +34,7 @@ from agent.conversation_compression import (
     run_automatic_compression,
 )
 from agent.iteration_budget import IterationBudget
+from agent.message_sanitization import project_historical_attachments
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
@@ -409,8 +410,16 @@ def build_turn_context(
             getattr(agent.context_compressor, "threshold_tokens", 0),
         )
         if _preflight_gate:
-            _preflight_raw_tokens = estimate_request_tokens_rough(
+            # Historical attachment payloads are not replayed to providers. Keep
+            # the current inbound attachment for its first request estimate, but
+            # project every older rich payload to the same receipts used by the
+            # request loop. This also fixes legacy sentinel-prefixed DB rows.
+            _preflight_messages = project_historical_attachments(
                 messages,
+                preserve_index=current_turn_user_idx,
+            )
+            _preflight_raw_tokens = estimate_request_tokens_rough(
+                _preflight_messages,
                 system_prompt=active_system_prompt or "",
                 tools=agent.tools or None,
             )
@@ -442,12 +451,26 @@ def build_turn_context(
                     active_system_prompt or system_message or "",
                     current_tokens=_preflight_raw_tokens,
                     task_id=effective_task_id,
+                    preserve_attachment_index=current_turn_user_idx,
                 )
                 compression_safe_to_continue = outcome.safe_to_continue
                 compression_failure_reason = outcome.failure_reason
                 if outcome.compressed:
                     messages = outcome.messages
                     active_system_prompt = outcome.system_prompt
+                    # Compression can shift the protected current user turn. Keep
+                    # the request-loop cursor attached to that turn so its fresh
+                    # attachment survives exactly the first logical API call.
+                    for index in range(len(messages) - 1, -1, -1):
+                        candidate = messages[index]
+                        if (
+                            candidate.get("role") == "user"
+                            and candidate.get("content") == user_message
+                            and candidate.get("attachments")
+                            == (list(persist_user_attachments) if persist_user_attachments else None)
+                        ):
+                            current_turn_user_idx = index
+                            break
                     conversation_history = conversation_history_after_compression(
                         agent, messages
                     )

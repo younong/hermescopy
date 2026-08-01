@@ -5,7 +5,7 @@ message list and rebuilds the system prompt but keeps the SAME ``session_id``:
 no ``end_session``, no ``parent_session_id`` child row, no ``name #N`` title
 renumber, no flush-cursor reset. This eliminates the session-rotation bug
 cluster (#33618 /goal loss, #14238 lost response, #33907 orphans, #45117 search
-gaps, #42228 null cwd). When the flag is False (default), rotation behaves
+gaps, #42228 null cwd). When the flag is explicitly False, rotation behaves
 exactly as before.
 """
 
@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
-def _make_agent(session_db, session_id, *, in_place):
+def _make_agent(session_db, session_id, *, in_place, mock_compressor=True):
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
         from run_agent import AIAgent
 
@@ -33,18 +33,25 @@ def _make_agent(session_db, session_id, *, in_place):
             skip_memory=True,
         )
     agent.compression_in_place = in_place
-    # Mock the compressor to return a deterministic shrunk transcript so the
-    # test exercises the DB-mutation path, not summarization quality.
-    def _fake_compress(messages, current_tokens=None, focus_topic=None, force=False):
-        return [
-            {"role": "user", "content": "[CONTEXT COMPACTION] summary of prior turns"},
-            {"role": "assistant", "content": "recent reply"},
-        ]
+    if mock_compressor:
+        # Return a deterministic shrunk transcript so most tests exercise the
+        # DB-mutation path rather than summarization quality.
+        def _fake_compress(
+            messages,
+            current_tokens=None,
+            focus_topic=None,
+            force=False,
+            **_kwargs,
+        ):
+            return [
+                {"role": "user", "content": "[CONTEXT COMPACTION] summary of prior turns"},
+                {"role": "assistant", "content": "recent reply"},
+            ]
 
-    agent.context_compressor.compress = _fake_compress
-    agent.context_compressor._last_compress_aborted = False
-    agent.context_compressor._last_summary_error = None
-    agent.context_compressor.compression_count = 1
+        agent.context_compressor.compress = _fake_compress
+        agent.context_compressor._last_compress_aborted = False
+        agent.context_compressor._last_summary_error = None
+        agent.context_compressor.compression_count = 1
     return agent
 
 
@@ -126,6 +133,89 @@ class TestInPlaceCompaction:
             assert agent._last_compaction_in_place is True
             # Live transcript actually shrank.
             assert len(compressed) == 2
+
+    def test_real_two_pass_compaction_resume_preserves_new_turns(self):
+        """Resume rehydrates one handoff and summarizes new turns from chunk zero."""
+        from agent.context_compressor import SUMMARY_PREFIX
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+
+        summaries = [
+            "first durable summary",
+            "second summary includes NEW TURN AFTER RESUME",
+        ]
+
+        def _response(content):
+            response = MagicMock()
+            response.choices = [MagicMock()]
+            response.choices[0].message.content = content
+            return response
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[_response(value) for value in summaries],
+        ) as call_llm:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260619_two_pass"
+            _seed(db, sid, "resume", n=12)
+            first = _make_agent(db, sid, in_place=True, mock_compressor=False)
+            first.context_compressor.protect_first_n = 1
+            first.context_compressor.protect_last_n = 1
+            initial = db.get_messages_as_conversation(sid)
+
+            first_compacted, _ = compress_context(
+                first,
+                initial,
+                approx_tokens=100_000,
+                system_message="sys",
+                force=True,
+            )
+
+            assert first.session_id == sid
+            assert sum(
+                SUMMARY_PREFIX in str(message.get("content", ""))
+                for message in first_compacted
+            ) == 1
+
+            resumed = _make_agent(db, sid, in_place=True, mock_compressor=False)
+            resumed.context_compressor.protect_first_n = 1
+            resumed.context_compressor.protect_last_n = 1
+            resumed_messages = db.get_messages_as_conversation(sid)
+            resumed_messages.extend(
+                [
+                    {"role": "assistant", "content": "resumed acknowledgement"},
+                    {"role": "user", "content": "NEW TURN AFTER RESUME"},
+                    {"role": "assistant", "content": "new work"},
+                    {"role": "user", "content": "latest active request"},
+                ]
+            )
+
+            second_compacted, _ = compress_context(
+                resumed,
+                resumed_messages,
+                approx_tokens=100_000,
+                system_message="sys",
+                force=True,
+            )
+
+            assert resumed.session_id == sid
+            assert sum(
+                SUMMARY_PREFIX in str(message.get("content", ""))
+                for message in second_compacted
+            ) == 1
+            second_prompt = call_llm.call_args_list[1].kwargs["messages"][0]["content"]
+            assert second_prompt.count("first durable summary") == 1
+            assert "NEW TURN AFTER RESUME" in second_prompt
+            active = db.get_messages_as_conversation(sid)
+            assert [
+                (message["role"], message.get("content")) for message in active
+            ] == [
+                (message["role"], message.get("content"))
+                for message in second_compacted
+            ]
+            all_rows = db.get_messages(sid, include_inactive=True)
+            assert len(all_rows) > len(active)
+            assert any(not row.get("active", 1) for row in all_rows)
 
     def test_in_place_alternation_preserved(self):
         """The compacted list must not introduce consecutive same-role messages."""

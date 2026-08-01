@@ -38,9 +38,11 @@ def _make_compressor():
     c.api_key = "test-key"
     c.api_mode = ""
     c.context_length = 128000
+    c.max_tokens = 0
     c.threshold_tokens = 64000
     c.threshold_percent = 0.50
     c.tail_token_budget = 20000
+    c.max_summary_tokens = 6400
     c.protect_last_n = 12
     c.summary_model = ""
     c.last_prompt_tokens = 100000
@@ -95,13 +97,17 @@ def test_stale_previous_summary_cleared_when_no_handoff():
 
     messages = _conversation_without_handoff()
 
-    with patch.object(c, "_generate_summary",
-                      return_value="[CONTEXT COMPACTION] Fresh summary."):
+    with patch.object(
+        c,
+        "_generate_summary",
+        return_value="[CONTEXT COMPACTION] Fresh summary.",
+    ) as generate_summary:
         result = c.compress(messages)
 
-    assert c._previous_summary is None, (
-        "compress() must clear stale _previous_summary when no handoff "
-        f"summary exists in current messages. Got: {c._previous_summary!r}"
+    assert c._previous_summary == "[CONTEXT COMPACTION] Fresh summary."
+    assert all(
+        "STALE CRON SUMMARY" not in str(call)
+        for call in generate_summary.call_args_list
     )
     assert result != messages
     assert any(
@@ -130,8 +136,7 @@ def test_previous_summary_preserved_when_handoff_found():
 
 
 def test_no_false_positive_when_previous_summary_already_none():
-    """When _previous_summary is already None and no handoff found, nothing
-    should break (the guard is a no-op in this case)."""
+    """Without prior state or a handoff, compression starts a fresh summary."""
     c = _make_compressor()
     c._previous_summary = None
 
@@ -141,5 +146,5 @@ def test_no_false_positive_when_previous_summary_already_none():
                       return_value="[CONTEXT COMPACTION] Fresh summary."):
         c.compress(messages)
 
-    # Should still be None — guard is no-op
-    assert c._previous_summary is None
+    # The fresh summary becomes the next iteration's state.
+    assert c._previous_summary == "[CONTEXT COMPACTION] Fresh summary."
