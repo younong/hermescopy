@@ -390,6 +390,47 @@ def test_broker_logs_upstream_http_error(tmp_path, caplog):
         thread.join(timeout=2)
 
 
+def test_broker_logs_bounded_rejection_code_without_request_content(tmp_path, caplog):
+    policy = DeploymentInferencePolicy(
+        provider="custom:deployment",
+        model="gpt-safe",
+        api_mode="chat_completions",
+        runtime_resolver=lambda: {
+            "provider": "custom:deployment",
+            "api_mode": "chat_completions",
+            "base_url": "https://provider.example.test/v1",
+            "api_key": "control-plane-secret",
+        },
+    )
+    store = AuthorityStore(tmp_path / "control")
+    broker, active, relay = _activate_relay(store, policy)
+    try:
+        with caplog.at_level(
+            logging.WARNING,
+            logger="hermes_cli.owner_worker.inference_relay",
+        ):
+            response = httpx.post(
+                f"{relay.base_url}/messages",
+                headers={
+                    "x-hermes-deployment-provider": "custom:deployment",
+                },
+                json={
+                    "model": "gpt-safe",
+                    "messages": [{"role": "user", "content": "must-not-log"}],
+                },
+                timeout=5,
+            )
+
+        assert response.status_code == 502
+        assert "code=api_mode_mismatch" in caplog.text
+        assert "must-not-log" not in caplog.text
+        assert "control-plane-secret" not in caplog.text
+        assert "provider.example.test" not in caplog.text
+    finally:
+        broker.revoke(active)
+        relay.close()
+
+
 def test_broker_uses_bounded_cloud_timeout(tmp_path, monkeypatch):
     import httpx
 

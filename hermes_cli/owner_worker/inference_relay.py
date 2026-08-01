@@ -69,6 +69,18 @@ _RELAY_DIAG_HEADERS = (
     "x-openrouter-id",
     "x-vercel-id",
 )
+_RELAY_REJECTION_CODES = {
+    "relay request is not allowed": "request_not_allowed",
+    "relay request body is invalid": "body_invalid",
+    "relay request model is not allowed": "model_invalid",
+    "relay request headers are invalid": "headers_invalid",
+    "relay provider/model route is not allowed": "route_not_allowed",
+    "relay worker lease is not active": "lease_inactive",
+    "relay routing policy is unavailable": "policy_unavailable",
+    "relay request API mode does not match policy": "api_mode_mismatch",
+    "relay request was cancelled": "cancelled",
+    "deployment inference upstream is unavailable": "upstream_unavailable",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -369,10 +381,15 @@ class DeploymentInferenceBroker:
                     broker_request=broker_request,
                 )
             except (AuthorizationRejected, DeploymentInferenceRelayError) as exc:
+                message = str(exc)
+                logger.warning(
+                    "deployment inference relay rejected request code=%s",
+                    _RELAY_REJECTION_CODES.get(message, "internal_rejection"),
+                )
                 if not broker_request.cancelled.is_set():
                     emit({
                         "type": "error",
-                        "message": str(exc),
+                        "message": message,
                     })
         except (DeploymentInferenceRelayError, OSError):
             pass
