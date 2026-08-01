@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 from hermes_cli.deployment_inference import DeploymentInferenceRouteDescriptor
 from hermes_cli.model_switch import switch_model
 
@@ -12,9 +14,8 @@ def test_switch_model_accepts_exact_managed_route_without_owner_provider_config(
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", "policy-v2")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", "gpt-safe,k3-256k")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL", "http://127.0.0.1:39123/v1")
-    monkeypatch.setattr(
-        "hermes_cli.deployment_inference.route_descriptors_from_control_plane",
-        lambda: (
+    route_resolver = Mock(
+        return_value=(
             DeploymentInferenceRouteDescriptor(
                 provider="custom:codex",
                 model="gpt-safe",
@@ -26,9 +27,20 @@ def test_switch_model_accepts_exact_managed_route_without_owner_provider_config(
                 api_mode="anthropic_messages",
                 name="Kimi Code",
             ),
-        ),
+        )
+    )
+    monkeypatch.setattr(
+        "hermes_cli.deployment_inference.route_descriptors_from_control_plane",
+        route_resolver,
     )
     monkeypatch.setattr("hermes_cli.runtime_provider.read_raw_config", lambda: {})
+    ordinary_resolver = Mock(
+        side_effect=AssertionError("managed route must not use ordinary provider resolution")
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        ordinary_resolver,
+    )
 
     result = switch_model(
         raw_input="k3-256k",
@@ -46,3 +58,5 @@ def test_switch_model_accepts_exact_managed_route_without_owner_provider_config(
     assert result.base_url == "http://127.0.0.1:39123/v1"
     assert result.api_key == "deployment-inference-relay"
     assert result.deployment_managed is True
+    ordinary_resolver.assert_not_called()
+    route_resolver.assert_called_once_with()

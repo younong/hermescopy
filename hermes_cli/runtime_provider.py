@@ -1535,6 +1535,7 @@ def resolve_deployment_inference_runtime(
     requested: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
     target_model: Optional[str] = None,
+    route_descriptors: tuple[Any, ...] | None = None,
 ) -> Dict[str, Any] | None:
     """Return the safe relay runtime when selection matches deployment policy.
 
@@ -1567,13 +1568,14 @@ def resolve_deployment_inference_runtime(
     if parsed_relay.scheme != "http" or parsed_relay.hostname not in {"127.0.0.1", "::1", "localhost"}:
         return None
     runtime = descriptor.relay_runtime()
-    routes = ()
-    try:
-        from hermes_cli.deployment_inference import route_descriptors_from_control_plane
+    routes = route_descriptors
+    if routes is None:
+        try:
+            from hermes_cli.deployment_inference import route_descriptors_from_control_plane
 
-        routes = route_descriptors_from_control_plane()
-    except Exception:
-        pass
+            routes = route_descriptors_from_control_plane()
+        except Exception:
+            routes = ()
     route = next(
         (
             candidate

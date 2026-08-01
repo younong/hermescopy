@@ -815,6 +815,7 @@ def switch_model(
     new_model = raw_input.strip()
     target_provider = current_provider
     resolved_moa_preset = False
+    deployment_route = None
 
     # =================================================================
     # PATH A: Explicit --provider given
@@ -1200,10 +1201,23 @@ def switch_model(
             api_mode = determine_api_mode(target_provider, base_url)
         else:
             try:
-                runtime = resolve_runtime_provider(
-                    requested=target_provider,
-                    target_model=new_model,
-                )
+                if deployment_route is not None:
+                    from hermes_cli.runtime_provider import (
+                        resolve_deployment_inference_runtime,
+                    )
+
+                    runtime = resolve_deployment_inference_runtime(
+                        requested=target_provider,
+                        target_model=new_model,
+                        route_descriptors=(deployment_route,),
+                    )
+                    if runtime is None:
+                        raise RuntimeError("deployment inference route is unavailable")
+                else:
+                    runtime = resolve_runtime_provider(
+                        requested=target_provider,
+                        target_model=new_model,
+                    )
                 api_key = runtime.get("api_key", "")
                 base_url = runtime.get("base_url", "")
                 api_mode = runtime.get("api_mode", "")
