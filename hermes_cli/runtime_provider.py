@@ -1559,7 +1559,7 @@ def resolve_deployment_inference_runtime(
     selected_base_url = str(explicit_base_url or "").strip()
     if selected_base_url:
         return None
-    if raw_owner:
+    if raw_owner and route_descriptors is None:
         return None
     relay_base_url = os.environ.get("HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL", "").strip()
     if not relay_base_url:

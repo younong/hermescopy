@@ -33,7 +33,15 @@ def test_switch_model_accepts_exact_managed_route_without_owner_provider_config(
         "hermes_cli.deployment_inference.route_descriptors_from_control_plane",
         route_resolver,
     )
-    monkeypatch.setattr("hermes_cli.runtime_provider.read_raw_config", lambda: {})
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.read_raw_config",
+        lambda: {
+            "model": {
+                "provider": "custom:codex",
+                "default": "gpt-safe",
+            }
+        },
+    )
     ordinary_resolver = Mock(
         side_effect=AssertionError("managed route must not use ordinary provider resolution")
     )
