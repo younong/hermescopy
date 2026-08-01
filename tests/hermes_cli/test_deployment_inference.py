@@ -14,6 +14,7 @@ from hermes_cli.dashboard_auth.authority import AuthorityStore, WorkerGeneration
 from hermes_cli.deployment_inference import (
     DeploymentInferencePolicy,
     DeploymentInferencePolicyInvalid,
+    DeploymentInferenceRoute,
     deployment_descriptor_from_environment,
     policy_from_control_plane_environment,
 )
@@ -126,6 +127,29 @@ def test_descriptor_rejects_invalid_vision_capability(monkeypatch):
         deployment_descriptor_from_environment()
 
 
+def test_broker_requires_exact_provider_and_model_pair(tmp_path):
+    store = AuthorityStore(tmp_path / "control")
+    claim = store.claim_worker_start("ok1_owner", worker_id="worker-1")
+    broker = DeploymentInferenceBroker(policy=_policy(), authority_store=store)
+    active = store.transition_worker_lease(
+        claim.lease,
+        state=WorkerLeaseState.ACTIVE,
+        generation_state=WorkerGenerationState.ACTIVE,
+    )
+
+    missing_provider = _request_for_model()
+    missing_provider["headers"] = {}
+    with pytest.raises(DeploymentInferenceRelayError, match="provider/model"):
+        broker._request_parts(active, missing_provider)
+
+    wrong_provider = _request_for_model()
+    wrong_provider["headers"] = {
+        "x-hermes-deployment-provider": "custom:other",
+    }
+    with pytest.raises(DeploymentInferenceRelayError, match="provider/model"):
+        broker._request_parts(active, wrong_provider)
+
+
 def test_broker_rejects_requests_for_starting_or_revoked_worker(tmp_path):
     store = AuthorityStore(tmp_path / "control")
     claim = store.claim_worker_start("ok1_owner", worker_id="worker-1")
@@ -234,7 +258,7 @@ def _request_for_model(model: str = "gpt-safe") -> dict[str, object]:
     return {
         "method": "POST",
         "path": "/v1/chat/completions",
-        "headers": {},
+        "headers": {"x-hermes-deployment-provider": "custom:deployment"},
         "body": base64.b64encode(
             json.dumps({"model": model, "messages": []}).encode()
         ).decode("ascii"),
@@ -364,6 +388,47 @@ def test_broker_logs_upstream_http_error(tmp_path, caplog):
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_broker_logs_bounded_rejection_code_without_request_content(tmp_path, caplog):
+    policy = DeploymentInferencePolicy(
+        provider="custom:deployment",
+        model="gpt-safe",
+        api_mode="chat_completions",
+        runtime_resolver=lambda: {
+            "provider": "custom:deployment",
+            "api_mode": "chat_completions",
+            "base_url": "https://provider.example.test/v1",
+            "api_key": "control-plane-secret",
+        },
+    )
+    store = AuthorityStore(tmp_path / "control")
+    broker, active, relay = _activate_relay(store, policy)
+    try:
+        with caplog.at_level(
+            logging.WARNING,
+            logger="hermes_cli.owner_worker.inference_relay",
+        ):
+            response = httpx.post(
+                f"{relay.base_url}/messages",
+                headers={
+                    "x-hermes-deployment-provider": "custom:deployment",
+                },
+                json={
+                    "model": "gpt-safe",
+                    "messages": [{"role": "user", "content": "must-not-log"}],
+                },
+                timeout=5,
+            )
+
+        assert response.status_code == 502
+        assert "code=api_mode_mismatch" in caplog.text
+        assert "must-not-log" not in caplog.text
+        assert "control-plane-secret" not in caplog.text
+        assert "provider.example.test" not in caplog.text
+    finally:
+        broker.revoke(active)
+        relay.close()
 
 
 def test_broker_uses_bounded_cloud_timeout(tmp_path, monkeypatch):
@@ -524,6 +589,7 @@ def test_owner_relay_surfaces_midstream_failure_as_incomplete_chunked_response(t
                 with client.stream(
                     "POST",
                     f"{relay.base_url}/chat/completions",
+                    headers={"x-hermes-deployment-provider": "custom:deployment"},
                     json={"model": "gpt-safe", "stream": True, "messages": []},
                 ) as response:
                     assert response.status_code == 200
@@ -982,6 +1048,7 @@ def test_owner_relay_multiplexes_slow_and_fast_requests(tmp_path):
         try:
             response = httpx.post(
                 f"{relay.base_url}/chat/completions",
+                headers={"x-hermes-deployment-provider": "custom:deployment"},
                 json={"model": "gpt-safe", "messages": [], "marker": "slow"},
                 timeout=5,
             )
@@ -995,6 +1062,7 @@ def test_owner_relay_multiplexes_slow_and_fast_requests(tmp_path):
         assert slow_started.wait(timeout=5)
         fast = httpx.post(
             f"{relay.base_url}/chat/completions",
+            headers={"x-hermes-deployment-provider": "custom:deployment"},
             json={"model": "gpt-safe", "messages": [], "marker": "fast"},
             timeout=2,
         )
@@ -1054,6 +1122,54 @@ def test_broker_checks_exact_lease_before_resolving_credentials(tmp_path):
     assert runtime_calls == 0
 
 
+def test_owner_relay_drops_upstream_location_and_link_headers(tmp_path):
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(307)
+            self.send_header("Location", "https://private-upstream.example.test/signed")
+            self.send_header("Link", "<https://private-upstream.example.test/meta>; rel=next")
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    policy = DeploymentInferencePolicy(
+        provider="custom:deployment",
+        model="gpt-safe",
+        api_mode="chat_completions",
+        runtime_resolver=lambda: {
+            "provider": "custom:deployment",
+            "api_mode": "chat_completions",
+            "base_url": f"http://127.0.0.1:{server.server_port}",
+            "api_key": "control-plane-secret",
+        },
+    )
+    broker, active, relay = _activate_relay(AuthorityStore(tmp_path / "control"), policy)
+    try:
+        response = httpx.post(
+            f"{relay.base_url}/chat/completions",
+            headers={"x-hermes-deployment-provider": "custom:deployment"},
+            json={"model": "gpt-safe", "messages": []},
+            follow_redirects=False,
+        )
+        assert response.status_code == 307
+        assert "location" not in response.headers
+        assert "link" not in response.headers
+        assert response.headers["content-type"] == "application/json"
+    finally:
+        broker.revoke(active)
+        relay.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_owner_relay_forwards_small_sse_event_before_upstream_completes(tmp_path):
     first_event = b"data: first\n\n"
     second_event = b"data: second\n\n"
@@ -1111,7 +1227,10 @@ def test_owner_relay_forwards_small_sse_event_before_upstream_completes(tmp_path
                 with client.stream(
                     "POST",
                     f"{relay.base_url}/chat/completions",
-                    headers={"Authorization": "Bearer worker-marker"},
+                    headers={
+                        "Authorization": "Bearer worker-marker",
+                        "x-hermes-deployment-provider": "custom:deployment",
+                    },
                     json={"model": "gpt-safe", "stream": True, "messages": []},
                 ) as response:
                     assert response.status_code == 200
@@ -1171,7 +1290,10 @@ def test_owner_relay_streams_sse_and_injects_control_plane_credential(tmp_path, 
                 with client.stream(
                     "POST",
                     f"{relay.base_url}/chat/completions",
-                    headers={"Authorization": "Bearer worker-marker"},
+                    headers={
+                        "Authorization": "Bearer worker-marker",
+                        "x-hermes-deployment-provider": "custom:deployment",
+                    },
                     json={"model": "gpt-safe", "stream": True, "messages": []},
                 ) as response:
                     assert response.status_code == 200
@@ -1185,6 +1307,162 @@ def test_owner_relay_streams_sse_and_injects_control_plane_credential(tmp_path, 
         finally:
             broker.revoke(active)
             relay.close()
+
+
+def test_owner_relay_routes_models_to_distinct_api_modes_and_credentials(tmp_path):
+    with _upstream_server() as (server, received):
+        policy = DeploymentInferencePolicy(
+            provider="custom:deployment",
+            model="gpt-safe",
+            api_mode="chat_completions",
+            runtime_resolver=lambda: {
+                "provider": "custom:deployment",
+                "api_mode": "chat_completions",
+                "base_url": f"http://127.0.0.1:{server.server_port}/openai/v1",
+                "api_key": "gpt-control-plane-secret",
+            },
+            allowed_models=("gpt-safe", "k3-256k"),
+            routes=(
+                DeploymentInferenceRoute(
+                    provider="custom:kimi-code",
+                    model="k3-256k",
+                    api_mode="anthropic_messages",
+                    name="Kimi Code",
+                    runtime_resolver=lambda: {
+                        "provider": "custom",
+                        "requested_provider": "custom:kimi-code",
+                        "api_mode": "anthropic_messages",
+                        "base_url": f"http://127.0.0.1:{server.server_port}/kimi/v1",
+                        "api_key": "kimi-control-plane-secret",
+                    },
+                ),
+            ),
+        )
+        broker, active, relay = _activate_relay(AuthorityStore(tmp_path / "control"), policy)
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                gpt = client.post(
+                    f"{relay.base_url}/chat/completions",
+                    headers={
+                        "Authorization": "Bearer worker-marker",
+                        "x-hermes-deployment-provider": "custom:deployment",
+                    },
+                    json={"model": "gpt-safe", "messages": []},
+                )
+                kimi = client.post(
+                    f"{relay.base_url}/messages",
+                    headers={
+                        "Authorization": "Bearer worker-marker",
+                        "x-api-key": "worker-marker",
+                        "x-hermes-deployment-provider": "custom:kimi-code",
+                    },
+                    json={"model": "k3-256k", "messages": [], "max_tokens": 1},
+                )
+
+            assert gpt.status_code == 200
+            assert kimi.status_code == 200
+            gpt_headers = {name.lower(): value for name, value in received[0]["headers"].items()}
+            kimi_headers = {name.lower(): value for name, value in received[1]["headers"].items()}
+            assert received[0]["path"] == "/openai/v1/chat/completions"
+            assert gpt_headers["authorization"] == "Bearer gpt-control-plane-secret"
+            assert "x-api-key" not in gpt_headers
+            assert received[1]["path"] == "/kimi/v1/messages"
+            assert kimi_headers["x-api-key"] == "kimi-control-plane-secret"
+            assert "authorization" not in kimi_headers
+            assert "x-hermes-deployment-provider" not in kimi_headers
+            assert "worker-marker" not in str(received)
+        finally:
+            broker.revoke(active)
+            relay.close()
+
+
+def test_owner_relay_route_metadata_is_live_lease_fenced_and_secret_free(tmp_path):
+    initial_policy = DeploymentInferencePolicy(
+        provider="custom:deployment",
+        model="gpt-safe",
+        api_mode="chat_completions",
+        runtime_resolver=lambda: {
+            "provider": "custom:deployment",
+            "api_mode": "chat_completions",
+            "base_url": "https://upstream.example.test/v1",
+            "api_key": "control-plane-secret",
+        },
+    )
+    current_policy = initial_policy
+    store = AuthorityStore(tmp_path / "control")
+    claim = store.claim_worker_start("ok1_owner", worker_id="worker-1")
+    broker = DeploymentInferenceBroker(
+        policy=initial_policy,
+        authority_store=store,
+        policy_resolver=lambda: current_policy,
+    )
+    worker_fd = broker.register(claim.lease)
+    active = store.transition_worker_lease(
+        claim.lease,
+        state=WorkerLeaseState.ACTIVE,
+        generation_state=WorkerGenerationState.ACTIVE,
+    )
+    broker.activate(active)
+    relay = OwnerInferenceRelay(worker_fd)
+    relay.start()
+    try:
+        response = httpx.get(
+            relay.base_url.removesuffix("/v1") + "/v1/hermes/deployment-routes",
+            timeout=5,
+        )
+        assert response.status_code == 200
+        assert response.json() == [{
+            "provider": "custom:deployment",
+            "model": "gpt-safe",
+            "api_mode": "chat_completions",
+        }]
+        assert "secret" not in response.text
+        assert "upstream.example.test" not in response.text
+
+        current_policy = DeploymentInferencePolicy(
+            provider="custom:deployment",
+            model="gpt-safe",
+            api_mode="chat_completions",
+            runtime_resolver=initial_policy.runtime_resolver,
+            allowed_models=("gpt-safe", "k3-256k"),
+            routes=(
+                DeploymentInferenceRoute(
+                    provider="custom:kimi-code",
+                    model="k3-256k",
+                    api_mode="anthropic_messages",
+                    name="Kimi Code",
+                    runtime_resolver=lambda: {
+                        "provider": "custom",
+                        "requested_provider": "custom:kimi-code",
+                        "api_mode": "anthropic_messages",
+                        "base_url": "https://api.kimi.example.test/v1",
+                        "api_key": "kimi-control-plane-secret",
+                    },
+                ),
+            ),
+        )
+        updated = httpx.get(
+            relay.base_url.removesuffix("/v1") + "/v1/hermes/deployment-routes",
+            timeout=5,
+        )
+        assert updated.status_code == 200
+        assert [route["model"] for route in updated.json()] == ["gpt-safe", "k3-256k"]
+        assert "secret" not in updated.text
+        assert "kimi.example.test" not in updated.text
+
+        store.transition_worker_lease(
+            active,
+            state=WorkerLeaseState.REVOKED,
+            generation_state=WorkerGenerationState.FAILED,
+        )
+        rejected = httpx.get(
+            relay.base_url.removesuffix("/v1") + "/v1/hermes/deployment-routes",
+            timeout=5,
+        )
+        assert rejected.status_code == 502
+    finally:
+        broker.revoke(active)
+        relay.close()
 
 
 def test_owner_relay_preserves_upstream_prefix_for_anthropic_messages(tmp_path):
@@ -1209,6 +1487,7 @@ def test_owner_relay_preserves_upstream_prefix_for_anthropic_messages(tmp_path):
                     headers={
                         "Authorization": "Bearer worker-marker",
                         "x-api-key": "worker-marker",
+                        "x-hermes-deployment-provider": "custom:deployment",
                     },
                     json={
                         "model": "claude-safe",

@@ -970,14 +970,21 @@ def try_recover_primary_transport(
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
+        agent.relay_provider = rt.get("relay_provider", "")
 
         if agent.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client
             agent._anthropic_api_key = rt["anthropic_api_key"]
             agent._anthropic_base_url = rt["anthropic_base_url"]
             agent._anthropic_client = build_anthropic_client(
-                rt["anthropic_api_key"], rt["anthropic_base_url"],
+                rt["anthropic_api_key"],
+                rt["anthropic_base_url"],
                 timeout=get_provider_request_timeout(agent.provider, agent.model),
+                default_headers=(
+                    {"x-hermes-deployment-provider": agent.relay_provider}
+                    if agent.relay_provider
+                    else None
+                ),
             )
             agent._is_anthropic_oauth = rt["is_anthropic_oauth"]
             agent.client = None
@@ -1133,6 +1140,7 @@ def restore_primary_runtime(agent) -> bool:
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
+        agent.relay_provider = rt.get("relay_provider", "")
         agent._client_kwargs = dict(rt["client_kwargs"])
         agent._use_prompt_caching = rt["use_prompt_caching"]
         # Default to native layout when the restored snapshot predates the
@@ -1148,8 +1156,14 @@ def restore_primary_runtime(agent) -> bool:
             agent._anthropic_api_key = rt["anthropic_api_key"]
             agent._anthropic_base_url = rt["anthropic_base_url"]
             agent._anthropic_client = build_anthropic_client(
-                rt["anthropic_api_key"], rt["anthropic_base_url"],
+                rt["anthropic_api_key"],
+                rt["anthropic_base_url"],
                 timeout=get_provider_request_timeout(agent.provider, agent.model),
+                default_headers=(
+                    {"x-hermes-deployment-provider": agent.relay_provider}
+                    if agent.relay_provider
+                    else None
+                ),
             )
             agent._is_anthropic_oauth = rt["is_anthropic_oauth"]
             agent.client = None
@@ -1641,7 +1655,15 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     return client
 
 
-def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mode=''):
+def switch_model(
+    agent,
+    new_model,
+    new_provider,
+    api_key='',
+    base_url='',
+    api_mode='',
+    relay_provider='',
+):
     """Switch the model/provider in-place for a live agent.
 
     Called by the /model command handlers (CLI and gateway) after
@@ -1697,6 +1719,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             "base_url",
             "api_mode",
             "api_key",
+            "relay_provider",
             "client",
             "_anthropic_client",
             "_anthropic_api_key",
@@ -1730,6 +1753,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         if base_url:
             agent.base_url = base_url
         agent.api_mode = api_mode
+        agent.relay_provider = str(relay_provider or "").strip().lower()
         # Invalidate transport cache — new api_mode may need a different transport
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
@@ -1808,8 +1832,14 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             agent._anthropic_api_key = effective_key
             agent._anthropic_base_url = base_url or getattr(agent, "_anthropic_base_url", None)
             agent._anthropic_client = build_anthropic_client(
-                effective_key, agent._anthropic_base_url,
+                effective_key,
+                agent._anthropic_base_url,
                 timeout=get_provider_request_timeout(agent.provider, agent.model),
+                default_headers=(
+                    {"x-hermes-deployment-provider": agent.relay_provider}
+                    if agent.relay_provider
+                    else None
+                ),
             )
             agent._is_anthropic_oauth = _is_oauth_token(effective_key) if (_is_native_anthropic and isinstance(effective_key, str)) else False
             agent.client = None
@@ -1821,6 +1851,10 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                 "api_key": effective_key,
                 "base_url": effective_base,
             }
+            if agent.relay_provider:
+                agent._client_kwargs["default_headers"] = {
+                    "x-hermes-deployment-provider": agent.relay_provider,
+                }
             try:
                 from hermes_cli.config import (
                     apply_custom_provider_tls_to_client_kwargs,
@@ -1914,6 +1948,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         # Auxiliary route feasibility is model/provider-specific. Re-resolve it
         # lazily before this switched runtime's next compression attempt.
         agent._compression_feasibility_checked = False
+        agent._compression_prepare_token_cap = None
 
     # ── Invalidate cached system prompt so it rebuilds next turn ──
     agent._cached_system_prompt = None
@@ -1926,6 +1961,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
+        "relay_provider": getattr(agent, "relay_provider", ""),
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,

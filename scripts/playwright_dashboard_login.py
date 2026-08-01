@@ -142,8 +142,13 @@ def _parse_credentials(raw: str) -> dict[str, str]:
     return values
 
 
-def load_credentials(repo_root: Path) -> Credentials:
-    path = repo_root / CREDENTIALS_FILENAME
+def load_credentials(
+    repo_root: Path,
+    credentials_file: str | Path = CREDENTIALS_FILENAME,
+) -> Credentials:
+    path = Path(credentials_file)
+    if not path.is_absolute():
+        path = repo_root / path
     _verify_credentials_git_state(repo_root, path)
     raw = _read_credentials_file(path)
     values = _parse_credentials(raw)

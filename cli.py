@@ -7777,6 +7777,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     api_key=result.api_key,
                     base_url=result.base_url,
                     api_mode=result.api_mode,
+                    relay_provider=getattr(result, "relay_provider", ""),
                 )
             except Exception as exc:
                 # The agent rolled itself back to the old working model/client.
@@ -8084,6 +8085,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     api_key=result.api_key,
                     base_url=result.base_url,
                     api_mode=result.api_mode,
+                    relay_provider=getattr(result, "relay_provider", ""),
                 )
             except Exception as exc:
                 # Agent rolled itself back; roll the CLI back too and abort so a

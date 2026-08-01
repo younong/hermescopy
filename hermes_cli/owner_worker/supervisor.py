@@ -274,6 +274,7 @@ class OwnerWorkerSupervisor:
         authority_store: AuthorityStore | None = None,
         generation_bridge_revoker: Callable[..., None] | None = None,
         deployment_inference_policy: DeploymentInferencePolicy | None = None,
+        deployment_inference_policy_resolver: Callable[[], DeploymentInferencePolicy] | None = None,
         deployment_image_policy: DeploymentImagePolicy | None = None,
         resource_manager: Any | None = None,
         launcher: Any | None = None,
@@ -346,6 +347,7 @@ class OwnerWorkerSupervisor:
             DeploymentInferenceBroker(
                 policy=deployment_inference_policy,
                 authority_store=self.authority_store,
+                policy_resolver=deployment_inference_policy_resolver,
             )
             if deployment_inference_policy is not None
             else None

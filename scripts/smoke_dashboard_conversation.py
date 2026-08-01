@@ -38,7 +38,15 @@ def _bounded(value: object, limit: int = 500) -> str:
     return text[:limit] + ("..." if len(text) > limit else "")
 
 
-def _smoke_javascript(*, base: str, path_prefix: str, marker: str, timeout_ms: int) -> str:
+def _smoke_javascript(
+    *,
+    base: str,
+    path_prefix: str,
+    marker: str,
+    timeout_ms: int,
+    provider: str = "",
+    model: str = "",
+) -> str:
     config = json.dumps(
         {
             "base": base,
@@ -46,6 +54,8 @@ def _smoke_javascript(*, base: str, path_prefix: str, marker: str, timeout_ms: i
             "marker": marker,
             "browserId": f"release-smoke-{marker}",
             "timeoutMs": timeout_ms,
+            "provider": provider,
+            "model": model,
         },
         ensure_ascii=False,
     )
@@ -203,6 +213,26 @@ def _smoke_javascript(*, base: str, path_prefix: str, marker: str, timeout_ms: i
     storedSessionId = String(created.stored_session_id || '');
     if (!liveSessionId || !storedSessionId) throw new Error('session.create omitted an ID');
     await waitEvent('session.info', liveSessionId);
+
+    if (config.provider || config.model) {{
+      activeCheck = 'public_model_picker_route';
+      const options = await request('model.options', {{ session_id: liveSessionId }});
+      const providerRow = Array.isArray(options.providers)
+        ? options.providers.find((row) => String(row && row.slug || '') === config.provider)
+        : null;
+      if (!providerRow || !Array.isArray(providerRow.models) || !providerRow.models.includes(config.model)) {{
+        throw new Error('target model route is not visible');
+      }}
+      const switched = await request('config.set', {{
+        session_id: liveSessionId,
+        key: 'model',
+        value: `${{config.model}} --provider ${{config.provider}} --session`,
+      }});
+      if (String(switched.value || '') !== config.model) throw new Error('target model switch failed');
+      pass('public_model_picker_route', started, {{ provider: config.provider, model: config.model }});
+      started = now();
+      activeCheck = 'public_owner_worker_conversation';
+    }}
 
     await request('prompt.submit', {{
       session_id: liveSessionId,
@@ -576,6 +606,9 @@ def run_public_smoke(
     session: str,
     playwright_cli: str | None,
     timeout: float,
+    credentials_file: str | Path = ".env.local",
+    provider: str = "",
+    model: str = "",
 ) -> tuple[dict[str, Any], int]:
     started = time.monotonic()
     cli = playwright_cli or shutil.which("playwright-cli")
@@ -594,7 +627,7 @@ def run_public_smoke(
             raise LoginError("playwright-cli is not installed or is not available on PATH.")
         session = validate_session_name(session)
         urls = normalize_dashboard_url(raw_url)
-        credentials = load_credentials(repo_root)
+        credentials = load_credentials(repo_root, credentials_file)
         login_started = time.monotonic()
         login_dashboard(
             repo_root=repo_root,
@@ -619,6 +652,8 @@ def run_public_smoke(
                 path_prefix=urls.path_prefix,
                 marker=marker,
                 timeout_ms=max(10_000, round(timeout * 1000)),
+                provider=provider,
+                model=model,
             ),
             credentials=credentials,
             timeout=timeout + 30,
@@ -711,7 +746,7 @@ def run_continuity_smoke(
             raise LoginError("playwright-cli is not installed or is not available on PATH.")
         session = validate_session_name(session)
         urls = normalize_dashboard_url(raw_url)
-        credentials = load_credentials(repo_root)
+        credentials = load_credentials(repo_root, ".env.local")
         if phase == "prepare":
             login_started = time.monotonic()
             login_dashboard(
@@ -813,6 +848,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--session", default=DEFAULT_SESSION)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     parser.add_argument("--continuity-phase", choices=("prepare", "verify"))
+    parser.add_argument("--credentials-file", default=".env.local")
+    parser.add_argument("--provider", default="")
+    parser.add_argument("--model", default="")
     parser.add_argument("--playwright-cli", help=argparse.SUPPRESS)
     return parser
 
@@ -830,6 +868,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
     if args.continuity_phase:
         kwargs["phase"] = args.continuity_phase
+    else:
+        if bool(args.provider) != bool(args.model):
+            raise SystemExit("--provider and --model must be supplied together")
+        kwargs["credentials_file"] = args.credentials_file
+        kwargs["provider"] = args.provider
+        kwargs["model"] = args.model
     result, status = runner(**kwargs)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return status

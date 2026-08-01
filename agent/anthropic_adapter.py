@@ -706,6 +706,7 @@ def build_anthropic_client(
     timeout: float = None,
     *,
     drop_context_1m_beta: bool = False,
+    default_headers: dict[str, str] | None = None,
 ):
     """Create an Anthropic client, auto-detecting setup-tokens vs API keys.
 
@@ -781,6 +782,7 @@ def build_anthropic_client(
         normalized_base_url,
         drop_context_1m_beta=drop_context_1m_beta,
     )
+    supplied_headers = dict(default_headers or {})
 
     if _is_kimi_coding_endpoint(base_url):
         # Kimi's /coding endpoint requires User-Agent: claude-code/0.1.0
@@ -788,8 +790,9 @@ def build_anthropic_client(
         # Check this BEFORE _requires_bearer_auth since both match api.kimi.com/coding.
         kwargs["api_key"] = api_key
         kwargs["default_headers"] = {
+            **supplied_headers,
             "User-Agent": "claude-code/0.1.0",
-            **( {"anthropic-beta": ",".join(common_betas)} if common_betas else {} )
+            **({"anthropic-beta": ",".join(common_betas)} if common_betas else {}),
         }
     elif _requires_bearer_auth(normalized_base_url):
         # Some Anthropic-compatible providers (e.g. MiniMax) expect the API key in
@@ -800,7 +803,7 @@ def build_anthropic_client(
         # Anthropic OAuth/setup tokens.
         kwargs["auth_token"] = api_key
         if common_betas:
-            kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
+            kwargs["default_headers"] = {**supplied_headers, "anthropic-beta": ",".join(common_betas)}
     elif _is_third_party_anthropic_endpoint(base_url):
         # Third-party proxies (Microsoft Foundry, AWS Bedrock, etc.) use their
         # own API keys with x-api-key auth. Skip OAuth detection — their keys
@@ -808,7 +811,7 @@ def build_anthropic_client(
         # misclassified as OAuth tokens.
         kwargs["api_key"] = api_key
         if common_betas:
-            kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
+            kwargs["default_headers"] = {**supplied_headers, "anthropic-beta": ",".join(common_betas)}
     elif _is_oauth_token(api_key):
         # OAuth access token / setup-token → Bearer auth + Claude Code identity.
         # Anthropic routes OAuth requests based on user-agent and headers;
@@ -816,6 +819,7 @@ def build_anthropic_client(
         all_betas = common_betas + _OAUTH_ONLY_BETAS
         kwargs["auth_token"] = api_key
         kwargs["default_headers"] = {
+            **supplied_headers,
             "anthropic-beta": ",".join(all_betas),
             "user-agent": f"claude-code/{_get_claude_code_version()} (external, cli)",
             "x-app": "cli",
@@ -824,8 +828,10 @@ def build_anthropic_client(
         # Regular API key → x-api-key header + common betas
         kwargs["api_key"] = api_key
         if common_betas:
-            kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
+            kwargs["default_headers"] = {**supplied_headers, "anthropic-beta": ",".join(common_betas)}
 
+    if supplied_headers and "default_headers" not in kwargs:
+        kwargs["default_headers"] = supplied_headers
     return _anthropic_sdk.Anthropic(**kwargs)
 
 
@@ -908,7 +914,7 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
 
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except (TypeError, json.JSONDecodeError):
         logger.debug("Keychain: credentials payload is not valid JSON")
         return None
 

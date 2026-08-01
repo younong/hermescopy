@@ -1,3 +1,4 @@
+import json
 import os
 import stat
 from pathlib import Path
@@ -246,7 +247,7 @@ def test_owner_worker_environment_serializes_only_safe_deployment_descriptor(tmp
             model="gpt-safe",
             api_mode="chat_completions",
             policy_id="policy-v1",
-            allowed_models=("gpt-safe",),
+            allowed_models=("gpt-safe", "k3-256k"),
             supports_vision=True,
         ),
     )
@@ -254,6 +255,7 @@ def test_owner_worker_environment_serializes_only_safe_deployment_descriptor(tmp
     assert env["HERMES_DEPLOYMENT_INFERENCE_PROVIDER"] == "custom:deployment"
     assert env["HERMES_DEPLOYMENT_INFERENCE_MODEL"] == "gpt-safe"
     assert env["HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION"] == "true"
+    assert "HERMES_DEPLOYMENT_INFERENCE_ROUTES" not in env
     assert "API_KEY" not in " ".join(env)
     assert "BASE_URL" not in " ".join(env)
     validate_owner_worker_runtime_environment(owner_home=owner_home, source=env)

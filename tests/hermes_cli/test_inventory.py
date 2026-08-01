@@ -22,6 +22,7 @@ from __future__ import annotations
 from unittest.mock import patch
 
 
+from hermes_cli.deployment_inference import DeploymentInferenceRouteDescriptor
 from hermes_cli.inventory import (
     ConfigContext,
     build_models_payload,
@@ -168,6 +169,42 @@ def test_build_models_payload_returns_expected_shape():
     assert payload["providers"][0]["slug"] == "moa"
     assert payload["providers"][0]["models"] == ["default"]
     assert payload["providers"][1:] == rows
+
+
+def test_build_models_payload_merges_deployment_managed_routes(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.inventory._deployment_route_descriptors",
+        lambda: (
+            DeploymentInferenceRouteDescriptor(
+                provider="custom:codex",
+                model="gpt-safe",
+                api_mode="chat_completions",
+            ),
+            DeploymentInferenceRouteDescriptor(
+                provider="custom:kimi-code",
+                model="k3-256k",
+                api_mode="anthropic_messages",
+                name="Kimi Code",
+            ),
+        ),
+    )
+    ctx = _empty_ctx(provider="custom:codex", model="gpt-safe")
+
+    with _list_auth_returning([]):
+        payload = build_models_payload(ctx, picker_hints=True)
+
+    managed = {
+        row["slug"]: row
+        for row in payload["providers"]
+        if row.get("managed")
+    }
+    assert managed["custom:codex"]["models"] == ["gpt-safe"]
+    assert managed["custom:kimi-code"]["models"] == ["k3-256k"]
+    assert managed["custom:kimi-code"]["name"] == "Kimi Code"
+    assert managed["custom:kimi-code"]["authenticated"] is True
+    assert managed["custom:kimi-code"]["credentials_read_only"] is True
+    assert "base_url" not in managed["custom:kimi-code"]
+    assert "api_key" not in managed["custom:kimi-code"]
 
 
 def test_build_models_payload_does_not_call_provider_model_ids():

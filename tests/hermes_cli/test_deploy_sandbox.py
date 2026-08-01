@@ -22,6 +22,8 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert 'powerpoint_lock_hash="$(sha256sum "$release/deploy/powerpoint-runtime/package-lock.json"' in source
     assert 'powerpoint_package_hash=' in source
     assert 'node_identity=' in source
+    assert 'runtime_dependency_profile="all,anthropic,ddgs,voice"' in source
+    assert '"$runtime_dependency_profile"' in source
     powerpoint_packages = {
         package["name"]
         for package in json.loads(
@@ -57,8 +59,15 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert "uv python install \"$python_version\" --install-dir \"$runtime_tmp/python-base\" --no-bin" in source
     assert 'const DEFAULT_PYTHON_PACKAGE_INDEX = "https://mirrors.aliyun.com/pypi/simple"' in source
     assert 'UV_DEFAULT_INDEX="$python_package_index"' in source
-    assert "uv sync --extra all --extra ddgs --extra voice --locked --no-editable --link-mode copy" in source
-    assert "import faster_whisper, hermes_cli.tool_executor_runtime.entrypoint, pilk, tools.registry, tools.silk_decoder" in source
+    assert (
+        "uv sync --extra all --extra anthropic --extra ddgs --extra voice "
+        "--locked --no-editable --link-mode copy"
+    ) in source
+    assert (
+        "import anthropic, faster_whisper, "
+        "hermes_cli.tool_executor_runtime.entrypoint, pilk, tools.registry, "
+        "tools.silk_decoder"
+    ) in source
     optional_dependencies = tomllib.loads(
         (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     )["project"]["optional-dependencies"]

@@ -27,7 +27,11 @@ from urllib.parse import urlparse
 from agent.redact import redact_sensitive_text
 from agent.stream_diag import flatten_exception_chain, stream_diag_init
 from hermes_cli.dashboard_auth.authority import AuthorityStore, AuthorizationRejected, OwnerWorkerAuthorityLease, WorkerLeaseState
-from hermes_cli.deployment_inference import DeploymentInferencePolicy
+from hermes_cli.deployment_inference import (
+    DeploymentInferencePolicy,
+    deployment_routes_path,
+    request_path_for_api_mode,
+)
 
 _PROTOCOL_VERSION = 2
 _MAX_FRAME_BYTES = 64 * 1024 * 1024
@@ -40,6 +44,7 @@ _MAX_CONCURRENT_BROKER_REQUESTS = 8
 _MAX_CONCURRENT_WORKER_REQUESTS = 8
 _MAX_IN_FLIGHT_RESPONSE_FRAMES = 16
 _ALLOWED_PATHS = frozenset({"/v1/chat/completions", "/v1/messages"})
+_PROVIDER_HEADER = "x-hermes-deployment-provider"
 _HOP_BY_HOP_HEADERS = frozenset({
     "authorization",
     "connection",
@@ -47,7 +52,16 @@ _HOP_BY_HOP_HEADERS = frozenset({
     "content-length",
     "proxy-authorization",
     "transfer-encoding",
+    "x-api-key",
+    _PROVIDER_HEADER,
     _RELAY_DEADLINE_HEADER,
+})
+_SAFE_RESPONSE_HEADERS = frozenset({
+    "cache-control",
+    "content-encoding",
+    "content-type",
+    "retry-after",
+    "x-request-id",
 })
 _RELAY_DIAG_HEADERS = (
     "cf-ray",
@@ -55,6 +69,18 @@ _RELAY_DIAG_HEADERS = (
     "x-openrouter-id",
     "x-vercel-id",
 )
+_RELAY_REJECTION_CODES = {
+    "relay request is not allowed": "request_not_allowed",
+    "relay request body is invalid": "body_invalid",
+    "relay request model is not allowed": "model_invalid",
+    "relay request headers are invalid": "headers_invalid",
+    "relay provider/model route is not allowed": "route_not_allowed",
+    "relay worker lease is not active": "lease_inactive",
+    "relay routing policy is unavailable": "policy_unavailable",
+    "relay request API mode does not match policy": "api_mode_mismatch",
+    "relay request was cancelled": "cancelled",
+    "deployment inference upstream is unavailable": "upstream_unavailable",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -201,8 +227,10 @@ class DeploymentInferenceBroker:
         *,
         policy: DeploymentInferencePolicy,
         authority_store: AuthorityStore,
+        policy_resolver: Any | None = None,
     ) -> None:
-        self._policy = policy
+        policy.descriptor()
+        self._policy_resolver = policy_resolver or (lambda: policy)
         self._authority_store = authority_store
         self._peers: dict[tuple[str, int, str, int, int], _RelayPeer] = {}
         self._lock = threading.RLock()
@@ -353,10 +381,15 @@ class DeploymentInferenceBroker:
                     broker_request=broker_request,
                 )
             except (AuthorizationRejected, DeploymentInferenceRelayError) as exc:
+                message = str(exc)
+                logger.warning(
+                    "deployment inference relay rejected request code=%s",
+                    _RELAY_REJECTION_CODES.get(message, "internal_rejection"),
+                )
                 if not broker_request.cancelled.is_set():
                     emit({
                         "type": "error",
-                        "message": str(exc),
+                        "message": message,
                     })
         except (DeploymentInferenceRelayError, OSError):
             pass
@@ -454,26 +487,31 @@ class DeploymentInferenceBroker:
     ) -> tuple[str, bytes, dict[str, str]]:
         method = str(request.get("method") or "").upper()
         path = str(request.get("path") or "")
+        if method == "GET" and path == deployment_routes_path():
+            raise DeploymentInferenceRelayError("relay metadata request requires dedicated handling")
         if method != "POST" or path not in _ALLOWED_PATHS:
             raise DeploymentInferenceRelayError("relay request is not allowed")
-        expected_path = "/v1/messages" if self._policy.api_mode == "anthropic_messages" else "/v1/chat/completions"
-        if path != expected_path:
-            raise DeploymentInferenceRelayError("relay request API mode does not match policy")
         try:
             body = base64.b64decode(str(request.get("body") or ""), validate=True)
             payload = json.loads(body)
         except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise DeploymentInferenceRelayError("relay request body is invalid") from exc
-        if not isinstance(payload, dict) or not self._policy.descriptor().allows_model(str(payload.get("model") or "")):
+        if not isinstance(payload, dict):
             raise DeploymentInferenceRelayError("relay request model is not allowed")
         incoming_headers = request.get("headers")
         if not isinstance(incoming_headers, dict):
             raise DeploymentInferenceRelayError("relay request headers are invalid")
-        headers = {
-            str(name): str(value)
-            for name, value in incoming_headers.items()
-            if str(name).lower() not in _HOP_BY_HOP_HEADERS
-        }
+        selected_provider = next(
+            (
+                str(value or "").strip().lower()
+                for name, value in incoming_headers.items()
+                if str(name).lower() == _PROVIDER_HEADER
+            ),
+            "",
+        )
+        selected_model = str(payload.get("model") or "")
+        if not selected_provider:
+            raise DeploymentInferenceRelayError("relay provider/model route is not allowed")
         try:
             self._authority_store.assert_worker_lease(
                 lease,
@@ -481,10 +519,25 @@ class DeploymentInferenceBroker:
             )
         except AuthorizationRejected as exc:
             raise DeploymentInferenceRelayError("relay worker lease is not active") from exc
+        try:
+            policy = self._policy_resolver()
+        except Exception as exc:
+            raise DeploymentInferenceRelayError("relay routing policy is unavailable") from exc
+        route = policy.route_for(selected_model, provider=selected_provider)
+        if route is None:
+            raise DeploymentInferenceRelayError("relay provider/model route is not allowed")
+        expected_path = request_path_for_api_mode(route.api_mode)
+        if path != expected_path:
+            raise DeploymentInferenceRelayError("relay request API mode does not match policy")
+        headers = {
+            str(name): str(value)
+            for name, value in incoming_headers.items()
+            if str(name).lower() not in _HOP_BY_HOP_HEADERS
+        }
         # Resolve the credential only after all untrusted request validation and
         # the exact durable ACTIVE lease check have succeeded.
-        runtime = self._policy.resolve_runtime()
-        if self._policy.api_mode == "anthropic_messages":
+        runtime = policy.resolve_route_runtime(route)
+        if route.api_mode == "anthropic_messages":
             headers["x-api-key"] = str(runtime["api_key"])
         else:
             headers["Authorization"] = f"Bearer {runtime['api_key']}"
@@ -528,6 +581,30 @@ class DeploymentInferenceBroker:
         *,
         broker_request: _BrokerRequest | None = None,
     ) -> None:
+        if (
+            str(request.get("method") or "").upper() == "GET"
+            and str(request.get("path") or "") == deployment_routes_path()
+        ):
+            try:
+                self._authority_store.assert_worker_lease(
+                    lease,
+                    states=frozenset({WorkerLeaseState.ACTIVE}),
+                )
+                policy = self._policy_resolver()
+            except Exception as exc:
+                raise DeploymentInferenceRelayError("relay routing policy is unavailable") from exc
+            body = json.dumps(
+                [route.payload() for route in policy.route_descriptors()],
+                separators=(",", ":"),
+            ).encode("utf-8")
+            emit({
+                "type": "response_start",
+                "status": 200,
+                "headers": {"Content-Type": "application/json"},
+            })
+            emit({"type": "response_chunk", "body": base64.b64encode(body).decode("ascii")})
+            emit({"type": "response_end"})
+            return
         upstream, body, headers = self._request_parts(lease, request)
         diag = stream_diag_init()
         response_started = False
@@ -552,7 +629,7 @@ class DeploymentInferenceBroker:
                     safe_headers = {
                         name: value
                         for name, value in response.headers.items()
-                        if name.lower() not in _HOP_BY_HOP_HEADERS
+                        if name.lower() in _SAFE_RESPONSE_HEADERS
                     }
                     emit({
                         "type": "response_start",
@@ -646,6 +723,9 @@ class OwnerInferenceRelay:
 
         class _Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+
+            def do_GET(self) -> None:  # noqa: N802
+                relay._handle_http(self)
 
             def do_POST(self) -> None:  # noqa: N802
                 relay._handle_http(self)
@@ -769,6 +849,8 @@ class OwnerInferenceRelay:
         try:
             path = urlparse(handler.path).path
             length = int(handler.headers.get("Content-Length", "0"))
+            if handler.command == "GET" and path != deployment_routes_path():
+                raise DeploymentInferenceRelayError("relay request is not allowed")
             if length < 0 or length > _MAX_FRAME_BYTES:
                 raise DeploymentInferenceRelayError("relay request is too large")
             raw_deadline = handler.headers.get(_RELAY_DEADLINE_HEADER)

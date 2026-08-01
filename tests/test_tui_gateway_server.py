@@ -1887,6 +1887,40 @@ def test_persist_live_session_runtime_preserves_resume_metadata(monkeypatch):
     )
 
 
+def test_persist_live_session_runtime_omits_deployment_relay_endpoint(monkeypatch):
+    updates = {}
+
+    class FakeDB:
+        def get_session(self, _session_id):
+            return {"model_config": {}}
+
+        def update_session_meta(self, session_id, model_config_json, model=None):
+            updates["meta"] = (session_id, json.loads(model_config_json), model)
+
+    agent = types.SimpleNamespace(
+        model="k3-256k",
+        provider="custom:kimi-code",
+        base_url="http://127.0.0.1:39123/v1",
+        api_key="deployment-inference-relay",
+        api_mode="anthropic_messages",
+        _session_db=FakeDB(),
+    )
+
+    server._persist_live_session_runtime(
+        {"agent": agent, "session_key": "stored-session"}
+    )
+
+    assert updates["meta"] == (
+        "stored-session",
+        {
+            "model": "k3-256k",
+            "provider": "custom:kimi-code",
+            "api_mode": "anthropic_messages",
+        },
+        "k3-256k",
+    )
+
+
 def test_status_callback_emits_kind_and_text():
     with patch("tui_gateway.server._emit") as emit:
         cb = server._agent_cbs("sid")["status_callback"]
@@ -4306,6 +4340,25 @@ def test_config_set_model_global_persists(monkeypatch):
     assert saved_values["model.base_url"] == "https://api.anthropic.com"
 
 
+def test_persist_model_switch_keeps_deployment_routes_session_scoped(monkeypatch):
+    saved_values = {}
+    monkeypatch.setattr(
+        "cli.save_config_value",
+        lambda key, value: saved_values.__setitem__(key, value),
+    )
+
+    server._persist_model_switch(
+        types.SimpleNamespace(
+            new_model="k3-256k",
+            target_provider="custom:kimi-code",
+            base_url="http://127.0.0.1:39123/v1",
+            deployment_managed=True,
+        )
+    )
+
+    assert saved_values == {}
+
+
 def test_config_set_model_explicit_provider_skips_broken_default_init(monkeypatch):
     seen = {"build": 0, "wait": 0, "requested": []}
     session = _session()
@@ -4585,6 +4638,7 @@ def test_config_set_model_switches_agent_without_touching_env(monkeypatch):
             base_url="https://api.anthropic.com",
             api_mode="anthropic_messages",
             warning_message="",
+            deployment_managed=False,
         )
 
     monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch_model)
