@@ -3104,28 +3104,30 @@ This compaction should PRIORITISE preserving all information related to the focu
                 "omitted_follow_up_chunks": 0,
             }
         first_chunk = chunks[0]
-        summary_budget = self._compute_summary_budget(first_chunk)
+        first_chunk_messages = list(first_chunk.messages)
+        summary_budget = self._compute_summary_budget(first_chunk_messages)
         saved_previous = self._previous_summary
         try:
             self._previous_summary = previous_summary
             focus_topic = self._derive_auto_focus_topic(working)
             prompt = self._generate_summary(
-                first_chunk,
+                first_chunk_messages,
                 focus_topic=focus_topic,
                 _summary_budget=summary_budget,
+                _serialized_content=first_chunk.serialized,
                 _prompt_only=True,
                 _today=today,
             )
         finally:
             self._previous_summary = saved_previous
-        serialized_turns = self._serialize_for_summary(first_chunk)
+        serialized_turns = first_chunk.serialized
         serialized_components: Dict[str, str] = {
             "user": "",
             "assistant": "",
             "tool": "",
             "other": "",
         }
-        for message in first_chunk:
+        for message in first_chunk_messages:
             role = str(message.get("role") or "other")
             bucket = role if role in {"user", "assistant", "tool"} else "other"
             rendered = self._serialize_for_summary([message])
@@ -3144,7 +3146,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 "start": compress_start,
                 "end": compress_end,
                 "message_count": len(turns),
-                "chunk_message_count": len(first_chunk),
+                "chunk_message_count": len(first_chunk_messages),
             },
             "omitted_follow_up_chunks": max(0, len(chunks) - 1),
         }
