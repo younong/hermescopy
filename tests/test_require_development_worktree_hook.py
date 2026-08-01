@@ -64,11 +64,15 @@ def _run_hook(
     *,
     raw_payload: str | None = None,
     path_prefix: Path | None = None,
+    session_id: str = "task-session",
 ) -> subprocess.CompletedProcess[str]:
     payload = raw_payload
     if payload is None:
         payload = json.dumps(
             {
+                "hook_event_name": "PreToolUse",
+                "session_id": session_id,
+                "cwd": str(project_dir),
                 "tool_name": "Write",
                 "tool_input": {"file_path": str(target)},
             }
@@ -92,6 +96,44 @@ def _denial_reason(result: subprocess.CompletedProcess[str]) -> str:
     hook_output = output["hookSpecificOutput"]
     assert hook_output["permissionDecision"] == "deny"
     return hook_output["permissionDecisionReason"]
+
+
+def _payload(
+    event: str,
+    project_dir: Path,
+    *,
+    session_id: str,
+    tool_name: str | None = None,
+    tool_input: dict | None = None,
+    tool_response: object | None = None,
+    cwd: Path | None = None,
+) -> str:
+    payload: dict[str, object] = {
+        "hook_event_name": event,
+        "session_id": session_id,
+        "transcript_path": f"/transcripts/{session_id}.jsonl",
+        "cwd": str(cwd or project_dir),
+    }
+    if tool_name is not None:
+        payload["tool_name"] = tool_name
+    if tool_input is not None:
+        payload["tool_input"] = tool_input
+    if tool_response is not None:
+        payload["tool_response"] = tool_response
+    return json.dumps(payload)
+
+
+def _owner_path(worktree: Path) -> Path:
+    git_dir = Path(_git(worktree, "rev-parse", "--git-dir").stdout.strip())
+    if not git_dir.is_absolute():
+        git_dir = worktree / git_dir
+    return git_dir.resolve() / "claude-task-owner.json"
+
+
+def _write_owner(worktree: Path, task_id: str) -> None:
+    _owner_path(worktree).write_text(
+        json.dumps({"version": 1, "task_id": task_id}) + "\n"
+    )
 
 
 def _load_hook_module():
@@ -139,13 +181,36 @@ def test_primary_checkout_without_candidates_remains_blocked(tmp_path):
     assert "Only after confirming" in reason
 
 
-def test_edit_targeting_linked_worktree_is_allowed(tmp_path):
+def test_edit_targeting_owned_linked_worktree_is_allowed(tmp_path):
     repo = _new_repo(tmp_path)
     worktree = _add_worktree(repo, "active-task")
+    _write_owner(worktree, "task-session")
 
     result = _run_hook(repo, worktree / "new-file.txt")
 
     assert result.stdout == ""
+
+
+def test_edit_targeting_unowned_linked_worktree_is_blocked(tmp_path):
+    repo = _new_repo(tmp_path)
+    worktree = _add_worktree(repo, "unowned-task")
+
+    reason = _denial_reason(_run_hook(repo, worktree / "new-file.txt"))
+
+    assert "not registered to any task" in reason
+
+
+def test_edit_targeting_another_tasks_worktree_is_blocked(tmp_path):
+    repo = _new_repo(tmp_path)
+    worktree = _add_worktree(repo, "other-task")
+    _write_owner(worktree, "first-task")
+
+    reason = _denial_reason(
+        _run_hook(repo, worktree / "new-file.txt", session_id="second-task")
+    )
+
+    assert "belongs to task first-task" in reason
+    assert "current task is second-task" in reason
 
 
 def test_outside_target_is_not_intercepted(tmp_path):
@@ -237,6 +302,218 @@ def test_unverifiable_repository_target_fails_closed(tmp_path):
     assert "could not verify" in reason
 
 
+def test_enter_existing_owned_worktree_is_allowed(tmp_path):
+    repo = _new_repo(tmp_path)
+    worktree = _add_worktree(repo, "owned-task")
+    _write_owner(worktree, "task-session")
+
+    result = _run_hook(
+        repo,
+        worktree,
+        raw_payload=_payload(
+            "PreToolUse",
+            repo,
+            session_id="task-session",
+            tool_name="EnterWorktree",
+            tool_input={"path": str(worktree)},
+        ),
+    )
+
+    assert result.stdout == ""
+
+
+def test_enter_existing_worktree_owned_by_another_task_is_blocked(tmp_path):
+    repo = _new_repo(tmp_path)
+    worktree = _add_worktree(repo, "owned-task")
+    _write_owner(worktree, "first-task")
+
+    reason = _denial_reason(
+        _run_hook(
+            repo,
+            worktree,
+            raw_payload=_payload(
+                "PreToolUse",
+                repo,
+                session_id="second-task",
+                tool_name="EnterWorktree",
+                tool_input={"path": str(worktree)},
+            ),
+        )
+    )
+
+    assert "cross-task reuse is blocked" in reason
+
+
+def test_post_enter_registers_clean_new_worktree(tmp_path):
+    repo = _new_repo(tmp_path)
+    worktree = _add_worktree(repo, "new-task")
+
+    result = _run_hook(
+        repo,
+        worktree,
+        raw_payload=_payload(
+            "PostToolUse",
+            repo,
+            session_id="new-task-session",
+            tool_name="EnterWorktree",
+            tool_input={"name": "new-task"},
+            tool_response=(
+                f"Created worktree at {worktree} on branch worktree-new-task."
+            ),
+            cwd=worktree,
+        ),
+    )
+
+    owner = json.loads(_owner_path(worktree).read_text())
+    assert owner == {"version": 1, "task_id": "new-task-session"}
+    assert "authorized worktree" in result.stdout
+
+
+def test_post_enter_does_not_claim_dirty_unowned_worktree(tmp_path):
+    repo = _new_repo(tmp_path)
+    worktree = _add_worktree(repo, "dirty-task")
+    (worktree / "dirty.txt").write_text("uncommitted\n")
+
+    result = _run_hook(
+        repo,
+        worktree,
+        raw_payload=_payload(
+            "PostToolUse",
+            repo,
+            session_id="new-task-session",
+            tool_name="EnterWorktree",
+            tool_input={"path": str(worktree)},
+            tool_response=f"Entered worktree at {worktree} on branch worktree-dirty-task.",
+            cwd=worktree,
+        ),
+    )
+
+    output = json.loads(result.stdout)
+    assert output["continue"] is False
+    assert "has changes and cannot be claimed" in output["stopReason"]
+    assert not _owner_path(worktree).exists()
+
+
+def test_session_start_claims_clean_unowned_worktree(tmp_path):
+    repo = _new_repo(tmp_path)
+    worktree = _add_worktree(repo, "resumed-task")
+
+    result = _run_hook(
+        repo,
+        worktree,
+        raw_payload=_payload(
+            "SessionStart",
+            repo,
+            session_id="resumed-session",
+            cwd=worktree,
+        ),
+    )
+
+    owner = json.loads(_owner_path(worktree).read_text())
+    assert owner["task_id"] == "resumed-session"
+    assert "Persistent task identity" in result.stdout
+
+
+def test_post_compact_preserves_existing_task_identity(tmp_path):
+    repo = _new_repo(tmp_path)
+    worktree = _add_worktree(repo, "compact-task")
+    _write_owner(worktree, "compact-session")
+
+    result = _run_hook(
+        repo,
+        worktree,
+        raw_payload=_payload(
+            "PostCompact",
+            repo,
+            session_id="compact-session",
+            cwd=worktree,
+        ),
+    )
+
+    assert "Persistent task identity: compact-session" in result.stdout
+
+
+def test_lifecycle_event_rejects_another_tasks_worktree(tmp_path):
+    repo = _new_repo(tmp_path)
+    worktree = _add_worktree(repo, "first-task")
+    _write_owner(worktree, "first-session")
+
+    result = _run_hook(
+        repo,
+        worktree,
+        raw_payload=_payload(
+            "CwdChanged",
+            repo,
+            session_id="second-session",
+            cwd=worktree,
+        ),
+    )
+
+    output = json.loads(result.stdout)
+    assert output["continue"] is False
+    assert "belongs to task first-session" in output["stopReason"]
+
+
+def test_bash_in_another_tasks_worktree_is_blocked(tmp_path):
+    repo = _new_repo(tmp_path)
+    worktree = _add_worktree(repo, "first-task")
+    _write_owner(worktree, "first-session")
+
+    reason = _denial_reason(
+        _run_hook(
+            repo,
+            worktree,
+            raw_payload=_payload(
+                "PreToolUse",
+                repo,
+                session_id="second-session",
+                tool_name="Bash",
+                tool_input={"command": "git status"},
+                cwd=worktree,
+            ),
+        )
+    )
+
+    assert "belongs to task first-session" in reason
+
+
+def test_concurrent_clean_worktree_claim_has_one_owner(tmp_path):
+    repo = _new_repo(tmp_path)
+    worktree = _add_worktree(repo, "contended-task")
+    env = os.environ.copy()
+    env["CLAUDE_PROJECT_DIR"] = str(repo)
+    processes = []
+    for session_id in ("first-session", "second-session"):
+        processes.append(
+            subprocess.Popen(
+                ["python3", str(HOOK_PATH)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+        )
+        assert processes[-1].stdin is not None
+        processes[-1].stdin.write(
+            _payload("SessionStart", repo, session_id=session_id, cwd=worktree)
+        )
+        processes[-1].stdin.close()
+
+    outputs = []
+    for process in processes:
+        assert process.stdout is not None
+        assert process.stderr is not None
+        outputs.append(process.stdout.read())
+        stderr = process.stderr.read()
+        assert process.wait() == 0, stderr
+
+    owner = json.loads(_owner_path(worktree).read_text())
+    assert owner["task_id"] in {"first-session", "second-session"}
+    assert sum("Persistent task identity" in output for output in outputs) == 1
+    assert sum('"continue": false' in output for output in outputs) == 1
+
+
 def test_malformed_payload_does_not_crash(tmp_path):
     repo = _new_repo(tmp_path)
 
@@ -281,14 +558,23 @@ def test_candidate_output_is_bounded():
     assert "task-20" not in reason
 
 
-def test_settings_keep_edit_hook_and_fresh_base():
+def test_settings_enable_ownership_guard_across_lifecycle_events():
     settings = json.loads((REPO_ROOT / ".claude" / "settings.json").read_text())
 
     assert settings["worktree"]["baseRef"] == "fresh"
-    edit_hooks = [
+    pretool_hooks = [
         entry
         for entry in settings["hooks"]["PreToolUse"]
-        if entry.get("matcher") == "Write|Edit|NotebookEdit"
+        if entry.get("matcher")
+        == "EnterWorktree|Write|Edit|NotebookEdit|Bash|Agent|Workflow"
     ]
-    assert len(edit_hooks) == 1
-    assert "require-development-worktree.py" in edit_hooks[0]["hooks"][0]["command"]
+    assert len(pretool_hooks) == 1
+    assert "require-development-worktree.py" in pretool_hooks[0]["hooks"][0]["command"]
+    assert settings["hooks"]["PostToolUse"][0]["matcher"] == "EnterWorktree"
+    for event in ("SessionStart", "CwdChanged", "PostCompact"):
+        commands = [
+            hook["command"]
+            for entry in settings["hooks"][event]
+            for hook in entry["hooks"]
+        ]
+        assert any("require-development-worktree.py" in command for command in commands)
