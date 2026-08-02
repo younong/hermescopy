@@ -107,11 +107,14 @@ def _payload(
     tool_input: dict | None = None,
     tool_response: object | None = None,
     cwd: Path | None = None,
+    transcript_path: Path | None = None,
 ) -> str:
     payload: dict[str, object] = {
         "hook_event_name": event,
         "session_id": session_id,
-        "transcript_path": f"/transcripts/{session_id}.jsonl",
+        "transcript_path": str(
+            transcript_path or Path("/transcripts") / f"{session_id}.jsonl"
+        ),
         "cwd": str(cwd or project_dir),
     }
     if tool_name is not None:
@@ -133,6 +136,52 @@ def _owner_path(worktree: Path) -> Path:
 def _write_owner(worktree: Path, task_id: str) -> None:
     _owner_path(worktree).write_text(
         json.dumps({"version": 1, "task_id": task_id}) + "\n"
+    )
+
+
+def _write_worktree_state(
+    transcript: Path,
+    worktree: Path,
+    session_id: str,
+    *,
+    outer_session_id: str | None = None,
+    append: bool = False,
+) -> None:
+    with transcript.open("a" if append else "w") as stream:
+        stream.write(
+            json.dumps(
+                {
+                    "type": "worktree-state",
+                    "worktreeSession": {
+                        "worktreePath": str(worktree),
+                        "sessionId": session_id,
+                    },
+                    "sessionId": outer_session_id or session_id,
+                }
+            )
+            + "\n"
+        )
+
+
+def _run_worktree_write(
+    repo: Path,
+    worktree: Path,
+    transcript: Path,
+    *,
+    session_id: str = "task-session",
+) -> subprocess.CompletedProcess[str]:
+    return _run_hook(
+        repo,
+        worktree / "new-file.txt",
+        raw_payload=_payload(
+            "PreToolUse",
+            repo,
+            session_id=session_id,
+            tool_name="Write",
+            tool_input={"file_path": str(worktree / "new-file.txt")},
+            cwd=worktree,
+            transcript_path=transcript,
+        ),
     )
 
 
@@ -198,6 +247,81 @@ def test_edit_targeting_unowned_linked_worktree_is_blocked(tmp_path):
     reason = _denial_reason(_run_hook(repo, worktree / "new-file.txt"))
 
     assert "not registered to any task" in reason
+    assert "TaskCreate does not register worktree ownership" in reason
+
+
+def test_missing_owner_recovers_from_matching_transcript_state(tmp_path):
+    repo = _new_repo(tmp_path)
+    worktree = _add_worktree(repo, "recover-task")
+    (worktree / "dirty.txt").write_text("task changes\n")
+    transcript = tmp_path / "task-session.jsonl"
+    _write_worktree_state(transcript, worktree, "task-session")
+
+    result = _run_worktree_write(repo, worktree, transcript)
+
+    assert result.stdout == ""
+    assert json.loads(_owner_path(worktree).read_text()) == {
+        "version": 1,
+        "task_id": "task-session",
+    }
+
+
+def test_missing_owner_rejects_transcript_for_another_session(tmp_path):
+    repo = _new_repo(tmp_path)
+    worktree = _add_worktree(repo, "unowned-task")
+    transcript = tmp_path / "task-session.jsonl"
+    _write_worktree_state(
+        transcript,
+        worktree,
+        "other-session",
+        outer_session_id="other-session",
+    )
+
+    reason = _denial_reason(_run_worktree_write(repo, worktree, transcript))
+
+    assert "does not prove ownership" in reason
+    assert not _owner_path(worktree).exists()
+
+
+def test_missing_owner_rejects_transcript_for_another_worktree(tmp_path):
+    repo = _new_repo(tmp_path)
+    worktree = _add_worktree(repo, "unowned-task")
+    other = _add_worktree(repo, "other-task")
+    transcript = tmp_path / "task-session.jsonl"
+    _write_worktree_state(transcript, other, "task-session")
+
+    reason = _denial_reason(_run_worktree_write(repo, worktree, transcript))
+
+    assert "does not prove ownership" in reason
+    assert not _owner_path(worktree).exists()
+
+
+def test_missing_owner_uses_latest_matching_session_state(tmp_path):
+    repo = _new_repo(tmp_path)
+    worktree = _add_worktree(repo, "current-task")
+    old = _add_worktree(repo, "old-task")
+    transcript = tmp_path / "task-session.jsonl"
+    _write_worktree_state(transcript, old, "task-session")
+    with transcript.open("a") as stream:
+        stream.write("not json\n")
+    _write_worktree_state(transcript, worktree, "task-session", append=True)
+
+    result = _run_worktree_write(repo, worktree, transcript)
+
+    assert result.stdout == ""
+    assert json.loads(_owner_path(worktree).read_text())["task_id"] == "task-session"
+
+
+def test_missing_owner_rejects_missing_or_malformed_transcript(tmp_path):
+    repo = _new_repo(tmp_path)
+    worktree = _add_worktree(repo, "unowned-task")
+    malformed = tmp_path / "malformed.jsonl"
+    malformed.write_text("not json\n")
+
+    for transcript in (tmp_path / "missing.jsonl", malformed):
+        reason = _denial_reason(_run_worktree_write(repo, worktree, transcript))
+        assert "does not prove ownership" in reason
+        assert not _owner_path(worktree).exists()
 
 
 def test_edit_targeting_another_tasks_worktree_is_blocked(tmp_path):
