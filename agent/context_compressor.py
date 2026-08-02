@@ -3031,7 +3031,13 @@ This compaction should PRIORITISE preserving all information related to the focu
                 )
             return messages
 
-        display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
+        # Automatic callers pass canonical prepared-request pressure. Manual
+        # compression may omit it, in which case this value is diagnostic only.
+        display_tokens = (
+            current_tokens
+            if current_tokens is not None
+            else estimate_messages_tokens_rough(messages)
+        )
 
         # Phase 1: deterministically shrink eligible old tool payloads. Full
         # compression force-enables this pre-pass even below the standalone
