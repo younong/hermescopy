@@ -133,6 +133,42 @@ class TestAutomaticCompression:
             ]
         )
 
+    def test_preserved_current_turn_tracks_by_identity_after_compression(self, monkeypatch):
+        old_attached = {
+            "role": "user",
+            "content": "old",
+            "attachments": [{"kind": "image", "name": "old.png"}],
+        }
+        current = {"role": "user", "content": "current"}
+        original = [old_attached, current]
+        compacted = [old_attached, {"role": "assistant", "content": "summary"}, current]
+        agent = self._agent(compacted)
+        agent.context_compressor.protect_last_n = 0
+        estimates = iter([150, 40])
+        monkeypatch.setattr(
+            "agent.conversation_compression.estimate_request_tokens_rough",
+            lambda *_args, **_kwargs: next(estimates),
+        )
+        projected_indices = []
+
+        def _project(messages, *, current_turn_index, protect_last_n):
+            projected_indices.append(current_turn_index)
+            return messages
+
+        monkeypatch.setattr(
+            "agent.conversation_compression.project_provider_history", _project
+        )
+
+        outcome = run_automatic_compression(
+            agent,
+            original,
+            "system",
+            preserve_attachment_index=1,
+        )
+
+        assert outcome.safe_to_continue is True
+        assert projected_indices == [1, 2]
+
     def test_no_progress_below_hard_boundary_degrades_safely(self, monkeypatch):
         original = [{"role": "user", "content": "large history"}]
         agent = self._agent(original)

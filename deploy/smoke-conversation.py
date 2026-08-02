@@ -578,11 +578,11 @@ def run_smoke(repo_root: Path, timeout: float) -> tuple[dict[str, Any], int]:
         if len([item for item in deltas if item]) < 2 or RESUME_MARKER not in str(complete.get("text") or ""):
             raise SmokeFailure("stream_contract_failed", "prompt_stream", "Expected multiple deltas and completion marker")
         attachment_request_count = model.count_requests_with_text(ATTACHMENT_MARKER)
-        if attachment_request_count != 1 or not model.saw_text(SAFE_TOOL_MARKER):
+        if attachment_request_count != 2 or not model.saw_text(SAFE_TOOL_MARKER):
             raise SmokeFailure(
                 "model_context_missing",
                 "prompt_stream",
-                "Attachment must reach exactly one model request and tool output must reach the follow-up",
+                "Current attachment must reach both active tool-loop requests and tool output must reach the follow-up",
             )
         _record(
             checks,

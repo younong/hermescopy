@@ -336,6 +336,7 @@ class TestConversationLoopPartialStreamContinuation:
         result = loop_agent.run_conversation(marker, conversation_history=history)
 
         loop_agent.client.chat.completions.create.assert_not_called()
+        assert result["final_response"] is None
         assert result["messages"] == history
         assert result["turn_exit_reason"] == "ignored_internal_network_recovery_marker"
 
