@@ -59,8 +59,8 @@ def test_run_conversation_dict_returns_include_final_response():
     """Structurally enforce final_response on dict returns from run_conversation().
 
     This parses source, including nested helpers, so it requires the .py file
-    to be available. It guards key presence and literal None values; runtime
-    tests still cover branch-specific values.
+    to be available. User-facing branches need actionable text; the no-op branch
+    that rejects an internal recovery marker intentionally returns no response.
     """
     from agent import conversation_loop
 
@@ -83,7 +83,16 @@ def test_run_conversation_dict_returns_include_final_response():
             continue
         value = node.value.values[keys.index("final_response")]
         if isinstance(value, ast.Constant) and value.value is None:
-            literal_none.append(node.lineno)
+            exit_reason = (
+                node.value.values[keys.index("turn_exit_reason")]
+                if "turn_exit_reason" in keys
+                else None
+            )
+            if not (
+                isinstance(exit_reason, ast.Constant)
+                and exit_reason.value == "ignored_internal_network_recovery_marker"
+            ):
+                literal_none.append(node.lineno)
 
     assert missing == [], (
         "run_conversation() dict returns must preserve the final_response "
@@ -4076,7 +4085,7 @@ class TestRunConversation:
         assert "Ollama runtime context too small for Hermes tool use" in caplog.text
         assert "runtime_context=4096" in caplog.text
 
-    def test_attachment_payload_is_sent_once_across_tool_loop(self, agent):
+    def test_current_attachment_payload_is_replayed_across_tool_loop(self, agent):
         self._setup_agent(agent)
         agent._model_supports_vision = lambda: True
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
@@ -4105,15 +4114,7 @@ class TestRunConversation:
 
         first, second = agent.client.chat.completions.create.call_args_list
         assert data_url in str(first.kwargs["messages"])
-        assert data_url not in str(second.kwargs["messages"])
-        second_user = next(
-            message for message in second.kwargs["messages"]
-            if message.get("role") == "user"
-        )
-        assert second_user["content"] == (
-            "describe this\n"
-            "[Attached image: shot.png — payload omitted; explicitly attach it again to reuse]"
-        )
+        assert data_url in str(second.kwargs["messages"])
         assert all("attachments" not in message for message in second.kwargs["messages"])
         assert data_url in str(result["messages"])
 
@@ -4133,6 +4134,14 @@ class TestRunConversation:
             },
             {"role": "assistant", "content": "seen"},
         ]
+        history.extend(
+            message
+            for index in range(agent.context_compressor.protect_last_n // 2 + 1)
+            for message in (
+                {"role": "user", "content": f"padding {index}"},
+                {"role": "assistant", "content": "ack"},
+            )
+        )
 
         with (
             patch.object(agent, "_persist_session"),
@@ -4144,6 +4153,68 @@ class TestRunConversation:
         sent = agent.client.chat.completions.create.call_args.kwargs["messages"]
         assert data_url not in str(sent)
         assert "payload omitted" in str(sent)
+
+    def test_old_tool_episode_is_projected_only_in_provider_copy(self, agent):
+        self._setup_agent(agent)
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Done", finish_reason="stop"
+        )
+        tool_calls = [
+            {
+                "id": "old-call",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{"path":"old.py"}',
+                },
+            }
+        ]
+        history = [
+            {"role": "user", "content": "inspect old.py"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": tool_calls,
+                "reasoning_details": [{"signature": "stored-signature"}],
+            },
+            {"role": "tool", "tool_call_id": "old-call", "content": "old body"},
+            {"role": "assistant", "content": "inspection complete"},
+        ]
+        history.extend(
+            message
+            for index in range(agent.context_compressor.protect_last_n // 2 + 1)
+            for message in (
+                {"role": "user", "content": f"padding {index}"},
+                {"role": "assistant", "content": "ack"},
+            )
+        )
+        persisted = []
+
+        with (
+            patch.object(
+                agent,
+                "_persist_session",
+                side_effect=lambda messages, *_: persisted.append(list(messages)),
+            ),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("follow up", conversation_history=history)
+
+        sent = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        assert "Historical tool episode summary" in str(sent)
+        assert not any(message.get("role") == "tool" for message in sent)
+        assert not any(message.get("tool_calls") for message in sent)
+        assert any(message.get("tool_calls") == tool_calls for message in result["messages"])
+        assert any(
+            message.get("tool_call_id") == "old-call"
+            for message in result["messages"]
+        )
+        assert any(
+            message.get("reasoning_details") == [{"signature": "stored-signature"}]
+            for snapshot in persisted
+            for message in snapshot
+        )
 
     def test_tool_calls_then_stop(self, agent):
         self._setup_agent(agent)
@@ -7133,13 +7204,15 @@ class TestAnthropicInterruptHandler:
         assert "anthropic_messages" in source, \
             "interruptible_api_call must handle Anthropic interrupt (api_mode check)"
 
-    def test_interruptible_rebuilds_anthropic_client(self):
-        """After interrupting, the Anthropic client should be rebuilt."""
+    def test_interruptible_uses_request_local_anthropic_client(self):
+        """Anthropic interrupts must abort only the request-local client."""
         import inspect
         from agent.chat_completion_helpers import interruptible_api_call
         source = inspect.getsource(interruptible_api_call)
-        assert "build_anthropic_client" in source, \
-            "interruptible_api_call must rebuild Anthropic client after interrupt"
+        assert "_create_request_anthropic_client" in source, \
+            "interruptible_api_call must create a request-local Anthropic client"
+        assert 'request_client_owner.finish("interrupt_abort")' in source, \
+            "interruptible_api_call must abort the request-local client on interrupt"
 
     def test_streaming_has_anthropic_branch(self):
         """_streaming_api_call must also handle Anthropic interrupt."""

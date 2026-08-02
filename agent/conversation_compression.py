@@ -39,7 +39,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
-from agent.message_sanitization import project_historical_attachments
+from agent.message_sanitization import project_provider_history
 from agent.model_metadata import estimate_request_tokens_rough
 
 logger = logging.getLogger(__name__)
@@ -91,9 +91,15 @@ def run_automatic_compression(
     compressor = agent.context_compressor
     would_hard_block = getattr(compressor, "would_hard_block", lambda _tokens: False)
     active_prompt = system_message or getattr(agent, "_cached_system_prompt", "") or ""
-    projected_messages = project_historical_attachments(
+    projection_index = (
+        preserve_attachment_index
+        if preserve_attachment_index is not None
+        else max(0, len(messages) - 1)
+    )
+    projected_messages = project_provider_history(
         messages,
-        preserve_index=preserve_attachment_index,
+        current_turn_index=projection_index,
+        protect_last_n=getattr(compressor, "protect_last_n", 20),
     )
     base_request_tokens = estimate_request_tokens_rough(
         projected_messages,
@@ -123,6 +129,12 @@ def run_automatic_compression(
     for compression_pass in range(3):
         before_messages = working_messages
         before_tokens = request_tokens
+        protected_user = (
+            working_messages[working_preserve_index]
+            if working_preserve_index is not None
+            and 0 <= working_preserve_index < len(working_messages)
+            else None
+        )
         agent._emit_status(
             f"Compressing context (pass {compression_pass + 1}/3)…",
             kind="compression.preparing",
@@ -181,17 +193,22 @@ def run_automatic_compression(
                 (
                     index
                     for index in range(len(candidate_messages) - 1, -1, -1)
-                    if candidate_messages[index].get("role") == "user"
-                    and candidate_messages[index].get("attachments")
+                    if candidate_messages[index] is protected_user
                 ),
                 None,
             )
-            if working_preserve_index is not None
+            if protected_user is not None
             else None
         )
-        candidate_projection = project_historical_attachments(
+        candidate_projection_index = (
+            working_preserve_index
+            if working_preserve_index is not None
+            else max(0, len(candidate_messages) - 1)
+        )
+        candidate_projection = project_provider_history(
             candidate_messages,
-            preserve_index=working_preserve_index,
+            current_turn_index=candidate_projection_index,
+            protect_last_n=getattr(compressor, "protect_last_n", 20),
         )
         candidate_raw_tokens = estimate_request_tokens_rough(
             candidate_projection,

@@ -46,8 +46,7 @@ from agent.message_sanitization import (
     _sanitize_tools_non_ascii,
     _strip_images_from_messages,
     _strip_non_ascii,
-    compact_user_attachment_content,
-    project_historical_attachments,
+    project_provider_history,
 )
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -618,6 +617,20 @@ def run_conversation(
     effective_task_id = _ctx.effective_task_id
     turn_id = _ctx.turn_id
     current_turn_user_idx = _ctx.current_turn_user_idx
+
+    def _refresh_current_turn_user_idx() -> None:
+        """Keep the provider projection boundary attached to this user turn."""
+        nonlocal current_turn_user_idx
+        current_turn_user_idx = next(
+            (
+                index
+                for index in range(len(messages) - 1, -1, -1)
+                if messages[index].get("role") == "user"
+                and messages[index].get("content") == user_message
+            ),
+            current_turn_user_idx,
+        )
+
     _should_review_memory = _ctx.should_review_memory
     _deferred_skill_context = _ctx.deferred_skill_context
     _plugin_user_context = _ctx.plugin_user_context
@@ -671,9 +684,11 @@ def run_conversation(
             task_id=effective_task_id,
             force=True,
             emit_abort_warning=False,
+            preserve_attachment_index=current_turn_user_idx,
         )
         if outcome.compressed:
             messages = outcome.messages
+            _refresh_current_turn_user_idx()
             active_system_prompt = outcome.system_prompt
             conversation_history = conversation_history_after_compression(
                 agent, messages
@@ -859,30 +874,9 @@ def run_conversation(
 
         from agent.skill_commands import strip_deferred_skill_descriptor
 
-        # Attachment bytes/expanded rich parts are turn-scoped. Preserve the
-        # newly attached user payload only for this turn's first provider request;
-        # every historical turn and tool-loop follow-up gets a compact receipt.
-        preserve_attachment_index = (
-            current_turn_user_idx if api_call_count == 1 else None
-        )
-        projected_messages = project_historical_attachments(
-            messages,
-            preserve_index=preserve_attachment_index,
-        )
         api_messages = []
-        for idx, (msg, projected_msg) in enumerate(zip(messages, projected_messages)):
-            preserve_current_attachment = idx == preserve_attachment_index
-            api_msg = projected_msg.copy()
-            if (
-                not preserve_current_attachment
-                and idx == current_turn_user_idx
-                and msg.get("role") == "user"
-                and msg.get("attachments")
-            ):
-                api_msg["content"] = compact_user_attachment_content(
-                    original_user_message,
-                    msg.get("attachments"),
-                )
+        for idx, msg in enumerate(messages):
+            api_msg = msg.copy()
             if msg.get("role") == "user":
                 api_msg["content"] = strip_deferred_skill_descriptor(
                     api_msg.get("content"),
@@ -932,6 +926,12 @@ def run_conversation(
             # Keep 'reasoning_details' - OpenRouter uses this for multi-turn reasoning context
             # The signature field helps maintain reasoning continuity
             api_messages.append(api_msg)
+
+        api_messages = project_provider_history(
+            api_messages,
+            current_turn_index=current_turn_user_idx,
+            protect_last_n=agent.context_compressor.protect_last_n,
+        )
 
         # Build the final system message: cached prompt + ephemeral system prompt.
         # Ephemeral additions are API-call-time only (not persisted to session DB).
@@ -1095,9 +1095,11 @@ def run_conversation(
                 current_tokens=_raw_request_tokens,
                 task_id=effective_task_id,
                 emit_abort_warning=False,
+                preserve_attachment_index=current_turn_user_idx,
             )
             if outcome.compressed:
                 messages = outcome.messages
+                _refresh_current_turn_user_idx()
                 active_system_prompt = outcome.system_prompt
                 conversation_history = conversation_history_after_compression(
                     agent, messages
@@ -4832,9 +4834,11 @@ def run_conversation(
                         current_tokens=_rough_tokens,
                         task_id=effective_task_id,
                         emit_abort_warning=False,
+                        preserve_attachment_index=current_turn_user_idx,
                     )
                     if outcome.compressed:
                         messages = outcome.messages
+                        _refresh_current_turn_user_idx()
                         active_system_prompt = outcome.system_prompt
                         conversation_history = conversation_history_after_compression(
                             agent, messages

@@ -34,7 +34,7 @@ from agent.conversation_compression import (
     run_automatic_compression,
 )
 from agent.iteration_budget import IterationBudget
-from agent.message_sanitization import project_historical_attachments
+from agent.message_sanitization import project_provider_history
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
@@ -412,13 +412,13 @@ def build_turn_context(
             getattr(agent.context_compressor, "threshold_tokens", 0),
         )
         if _preflight_gate:
-            # Historical attachment payloads are not replayed to providers. Keep
-            # the current inbound attachment for its first request estimate, but
-            # project every older rich payload to the same receipts used by the
-            # request loop. This also fixes legacy sentinel-prefixed DB rows.
-            _preflight_messages = project_historical_attachments(
+            # Estimate the same old-history projection used by the provider copy.
+            # The boundary is anchored to this user row and stays fixed if the
+            # current turn later appends tool calls and results.
+            _preflight_messages = project_provider_history(
                 messages,
-                preserve_index=current_turn_user_idx,
+                current_turn_index=current_turn_user_idx,
+                protect_last_n=agent.context_compressor.protect_last_n,
             )
             _preflight_raw_tokens = estimate_request_tokens_rough(
                 _preflight_messages,
@@ -462,8 +462,8 @@ def build_turn_context(
                     messages = outcome.messages
                     active_system_prompt = outcome.system_prompt
                     # Compression can shift the protected current user turn. Keep
-                    # the request-loop cursor attached to that turn so its fresh
-                    # attachment survives exactly the first logical API call.
+                    # the request-loop cursor attached to that turn so its recent
+                    # payload stays complete throughout the active tool loop.
                     for index in range(len(messages) - 1, -1, -1):
                         candidate = messages[index]
                         if (

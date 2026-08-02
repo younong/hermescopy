@@ -19,6 +19,8 @@ import logging
 import re
 from typing import Any
 
+from agent.message_content import flatten_message_text
+
 logger = logging.getLogger(__name__)
 
 _CONTENT_JSON_PREFIX = "\x00json:"
@@ -428,6 +430,117 @@ def _is_attachment_part(part: Any) -> bool:
     return isinstance(part, dict) and part.get("type") in _ATTACHMENT_PART_TYPES
 
 
+def summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) -> str:
+    """Create an informative one-line summary of a tool call and result."""
+    try:
+        args = json.loads(tool_args) if tool_args else {}
+    except (json.JSONDecodeError, TypeError):
+        args = {}
+    if not isinstance(args, dict):
+        args = {}
+
+    content = tool_content or ""
+    content_len = len(content)
+    line_count = content.count("\n") + 1 if content.strip() else 0
+
+    if tool_name == "terminal":
+        cmd = str(args.get("command", ""))
+        if len(cmd) > 80:
+            cmd = cmd[:77] + "..."
+        exit_match = re.search(r'"exit_code"\s*:\s*(-?\d+)', content)
+        exit_code = exit_match.group(1) if exit_match else "?"
+        return f"[terminal] ran `{cmd}` -> exit {exit_code}, {line_count} lines output"
+
+    if tool_name == "read_file":
+        path = args.get("path", "?")
+        offset = args.get("offset", 1)
+        return f"[read_file] read {path} from line {offset} ({content_len:,} chars)"
+
+    if tool_name == "write_file":
+        path = args.get("path", "?")
+        written = args.get("content", "")
+        written_lines = written.count("\n") + 1 if isinstance(written, str) and written else "?"
+        return f"[write_file] wrote to {path} ({written_lines} lines)"
+
+    if tool_name == "search_files":
+        pattern = args.get("pattern", "?")
+        path = args.get("path", ".")
+        target = args.get("target", "content")
+        match_count = re.search(r'"total_count"\s*:\s*(\d+)', content)
+        count = match_count.group(1) if match_count else "?"
+        return f"[search_files] {target} search for '{pattern}' in {path} -> {count} matches"
+
+    if tool_name == "patch":
+        path = args.get("path", "?")
+        mode = args.get("mode", "replace")
+        return f"[patch] {mode} in {path} ({content_len:,} chars result)"
+
+    if tool_name in {
+        "browser_navigate",
+        "browser_click",
+        "browser_snapshot",
+        "browser_type",
+        "browser_scroll",
+        "browser_vision",
+    }:
+        url = args.get("url", "")
+        ref = args.get("ref", "")
+        detail = f" {url}" if url else (f" ref={ref}" if ref else "")
+        return f"[{tool_name}]{detail} ({content_len:,} chars)"
+
+    if tool_name == "web_search":
+        query = args.get("query", "?")
+        return f"[web_search] query='{query}' ({content_len:,} chars result)"
+
+    if tool_name == "web_extract":
+        urls = args.get("urls", [])
+        url_desc = urls[0] if isinstance(urls, list) and urls else "?"
+        if isinstance(urls, list) and len(urls) > 1:
+            url_desc = f"{url_desc} (+{len(urls) - 1} more)"
+        return f"[web_extract] {url_desc} ({content_len:,} chars)"
+
+    if tool_name == "delegate_task":
+        goal = str(args.get("goal", ""))
+        if len(goal) > 60:
+            goal = goal[:57] + "..."
+        return f"[delegate_task] '{goal}' ({content_len:,} chars result)"
+
+    if tool_name == "execute_code":
+        code = str(args.get("code") or "")
+        code_preview = code[:60].replace("\n", " ")
+        if len(code) > 60:
+            code_preview += "..."
+        return f"[execute_code] `{code_preview}` ({line_count} lines output)"
+
+    if tool_name in {"skill_view", "skills_list", "skill_manage"}:
+        name = args.get("name", "?")
+        return f"[{tool_name}] name={name} ({content_len:,} chars)"
+
+    if tool_name == "vision_analyze":
+        question = str(args.get("question", ""))[:50]
+        return f"[vision_analyze] '{question}' ({content_len:,} chars)"
+
+    if tool_name == "memory":
+        action = args.get("action", "?")
+        target = args.get("target", "?")
+        return f"[memory] {action} on {target}"
+    if tool_name == "todo":
+        return "[todo] updated task list"
+    if tool_name == "clarify":
+        return "[clarify] asked user a question"
+    if tool_name == "text_to_speech":
+        return f"[text_to_speech] generated audio ({content_len:,} chars)"
+    if tool_name == "cronjob":
+        return f"[cronjob] {args.get('action', '?')}"
+    if tool_name == "process":
+        return f"[process] {args.get('action', '?')} session={args.get('session_id', '?')}"
+
+    first_args = "".join(
+        f" {key}={str(value)[:40]}" for key, value in list(args.items())[:2]
+    )
+    return f"[{tool_name}]{first_args} ({content_len:,} chars result)"
+
+
 def _attachment_receipt_text(kind: str, name: str = "") -> str:
     """Build stable receipt text for a durable attachment reference."""
     label = f"{kind}: {name}" if name else kind
@@ -538,6 +651,201 @@ def project_historical_attachments(
     return messages
 
 
+def _tool_result_text(content: Any) -> tuple[str, bool]:
+    """Return text usable by a receipt and whether rich payloads were omitted."""
+    decoded, _ = _decode_structured_content(content)
+    omitted_media = isinstance(decoded, list) and any(
+        _is_attachment_part(part) for part in decoded
+    )
+    return flatten_message_text(decoded), omitted_media
+
+
+def _tool_call_fields(tool_call: Any) -> tuple[str, str, str] | None:
+    """Return a validated ``(id, name, arguments)`` tool-call tuple."""
+    if not isinstance(tool_call, dict):
+        return None
+    call_id = tool_call.get("id")
+    function = tool_call.get("function")
+    if not isinstance(call_id, str) or not call_id or not isinstance(function, dict):
+        return None
+    name = function.get("name")
+    arguments = function.get("arguments", "")
+    if not isinstance(name, str) or not name:
+        return None
+    if not isinstance(arguments, str):
+        try:
+            arguments = json.dumps(
+                arguments, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+            )
+        except (TypeError, ValueError):
+            return None
+    return call_id, name, arguments
+
+
+def _completed_tool_episode(
+    messages: list,
+    start: int,
+    eligible_end: int,
+) -> tuple[int, list[tuple[str, str, str, dict[str, Any]]], int | None] | None:
+    """Parse complete contiguous tool rounds without crossing ``eligible_end``."""
+    index = start
+    records: list[tuple[str, str, str, dict[str, Any]]] = []
+    while index < eligible_end:
+        assistant = messages[index]
+        if not isinstance(assistant, dict) or assistant.get("role") != "assistant":
+            return None
+        tool_calls = assistant.get("tool_calls")
+        if not isinstance(tool_calls, list) or not tool_calls:
+            return None
+
+        parsed_calls = [_tool_call_fields(call) for call in tool_calls]
+        if any(call is None for call in parsed_calls):
+            return None
+        calls = [call for call in parsed_calls if call is not None]
+        call_ids = [call[0] for call in calls]
+        call_id_set = set(call_ids)
+        if len(call_id_set) != len(call_ids):
+            return None
+
+        result_by_id: dict[str, dict[str, Any]] = {}
+        index += 1
+        while index < eligible_end:
+            result = messages[index]
+            if not isinstance(result, dict) or result.get("role") != "tool":
+                break
+            result_id = result.get("tool_call_id")
+            if (
+                not isinstance(result_id, str)
+                or result_id not in call_id_set
+                or result_id in result_by_id
+            ):
+                return None
+            result_by_id[result_id] = result
+            index += 1
+
+        if result_by_id.keys() != call_id_set:
+            return None
+        records.extend((*call, result_by_id[call[0]]) for call in calls)
+
+        if index >= len(messages):
+            return index, records, None
+        following = messages[index]
+        if not isinstance(following, dict):
+            return None
+        if following.get("role") == "assistant":
+            if index >= eligible_end:
+                return None
+            if following.get("tool_calls"):
+                continue
+            return index + 1, records, index
+        return index, records, None
+    return None
+
+
+def _tool_episode_summary(
+    records: list[tuple[str, str, str, dict[str, Any]]],
+) -> str:
+    """Render a bounded deterministic provider-facing tool-episode summary."""
+    lines = ["[Historical tool episode summary]"]
+    for _, name, arguments, result in records:
+        result_text, omitted_media = _tool_result_text(result.get("content"))
+        receipt = summarize_tool_result(name, arguments, result_text)
+        if len(receipt) > 500:
+            receipt = receipt[:497] + "..."
+        flags = []
+        if result.get("is_error") or result.get("error"):
+            flags.append("error")
+        if omitted_media:
+            flags.append("media_omitted")
+        suffix = f"; flags={','.join(flags)}" if flags else ""
+        lines.append(f"- tool={name[:80]}; result={receipt}{suffix}")
+    return "\n".join(lines)
+
+
+def _collapsed_tool_episode(
+    messages: list,
+    records: list[tuple[str, str, str, dict[str, Any]]],
+    final_index: int | None,
+) -> dict[str, Any]:
+    """Build one ordinary assistant message for a completed old tool episode."""
+    summary = _tool_episode_summary(records)
+    if final_index is None:
+        return {"role": "assistant", "content": summary}
+
+    final = project_message_attachments(messages[final_index])
+    final_content = final.get("content") if isinstance(final, dict) else None
+    if isinstance(final_content, list):
+        content = [{"type": "text", "text": summary}, *final_content]
+    elif isinstance(final_content, str) and final_content.strip():
+        content = f"{summary}\n\n{final_content}"
+    else:
+        content = summary
+    return {"role": "assistant", "content": content}
+
+
+def project_provider_history(
+    messages: list,
+    *,
+    current_turn_index: int,
+    protect_last_n: int,
+) -> list:
+    """Project only old provider history while preserving recent/current rows.
+
+    The boundary is anchored to the current user row, so appending tool-loop rows
+    does not move it. Complete old tool episodes become ordinary assistant text;
+    old rich payloads become receipts. Canonical history is never mutated.
+    """
+    if not messages or current_turn_index <= 0:
+        return messages
+    current_turn_index = min(current_turn_index, len(messages) - 1)
+    protected_start = max(0, current_turn_index - max(0, protect_last_n))
+    if protected_start <= 0:
+        return messages
+
+    projected: list[Any] = []
+    changed = False
+    index = 0
+    while index < protected_start:
+        message = messages[index]
+        is_tool_start = (
+            isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and bool(message.get("tool_calls"))
+        )
+        if is_tool_start:
+            episode = _completed_tool_episode(messages, index, protected_start)
+            if episode is not None:
+                end, records, final_index = episode
+                previous_role = messages[index - 1].get("role") if index else None
+                following_role = (
+                    messages[end].get("role")
+                    if end < len(messages) and isinstance(messages[end], dict)
+                    else None
+                )
+                if previous_role == "user" and following_role in {"user", None}:
+                    projected.append(
+                        _collapsed_tool_episode(messages, records, final_index)
+                    )
+                    index = end
+                    changed = True
+                    continue
+
+        if isinstance(message, dict) and (
+            message.get("role") == "tool" or message.get("tool_calls")
+        ):
+            next_message = message
+        else:
+            next_message = project_message_attachments(message)
+        projected.append(next_message)
+        changed = changed or next_message is not message
+        index += 1
+
+    if not changed:
+        return messages
+    projected.extend(messages[protected_start:])
+    return projected
+
+
 def _strip_images_from_messages(messages: list) -> bool:
     """Remove image_url content parts from all messages in-place.
 
@@ -632,6 +940,8 @@ __all__ = [
     "compact_user_attachment_content",
     "project_message_attachments",
     "project_historical_attachments",
+    "project_provider_history",
+    "summarize_tool_result",
     "_strip_images_from_messages",
     "_sanitize_structure_non_ascii",
 ]
