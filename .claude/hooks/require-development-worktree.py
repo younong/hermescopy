@@ -339,6 +339,51 @@ def worktree_is_clean(paths: RepositoryPaths) -> bool | None:
     return None if output is None else not output.strip()
 
 
+def transcript_worktree(payload: dict[str, Any]) -> Path | None:
+    transcript_value = payload.get("transcript_path")
+    if not isinstance(transcript_value, str) or not transcript_value:
+        return None
+
+    task_id = payload_session_id(payload)
+    latest_state: object = None
+    try:
+        with Path(transcript_value).open(encoding="utf-8") as transcript:
+            for line in transcript:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    isinstance(entry, dict)
+                    and entry.get("type") == "worktree-state"
+                    and entry.get("sessionId") == task_id
+                ):
+                    latest_state = entry.get("worktreeSession")
+    except OSError:
+        return None
+
+    if not isinstance(latest_state, dict) or latest_state.get("sessionId") != task_id:
+        return None
+    path_value = latest_state.get("worktreePath")
+    if not isinstance(path_value, str) or not path_value:
+        return None
+    return Path(path_value).resolve()
+
+
+def recover_owner(payload: dict[str, Any], paths: RepositoryPaths) -> dict[str, Any]:
+    with owner_lock(paths):
+        owner = read_owner(paths.owner_path)
+        if owner is not None:
+            return validate_owner(owner, payload, paths)
+        if transcript_worktree(payload) != paths.worktree:
+            raise GuardError(
+                f"worktree is not registered to any task: {paths.worktree}. The current "
+                "session transcript does not prove ownership of this worktree. TaskCreate "
+                "does not register worktree ownership; inspect and migrate it manually."
+            )
+        return create_owner(payload, paths)
+
+
 def validate_owner(
     owner: dict[str, Any] | None,
     payload: dict[str, Any],
@@ -361,7 +406,10 @@ def validate_owner(
 
 
 def verify_owner(payload: dict[str, Any], paths: RepositoryPaths) -> dict[str, Any]:
-    return validate_owner(read_owner(paths.owner_path), payload, paths)
+    owner = read_owner(paths.owner_path)
+    if owner is None:
+        return recover_owner(payload, paths)
+    return validate_owner(owner, payload, paths)
 
 
 def claim_clean_worktree(payload: dict[str, Any], paths: RepositoryPaths) -> dict[str, Any]:
