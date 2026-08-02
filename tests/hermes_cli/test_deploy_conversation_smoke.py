@@ -54,6 +54,7 @@ def test_deterministic_conversation_smoke_exercises_core_gateway_flow():
     assert set(checks) == EXPECTED_CHECKS
     assert all(item["status"] == "passed" for item in checks.values())
     assert checks["prompt_stream"]["deltaCount"] >= 2
+    assert checks["prompt_stream"]["attachmentRequestCount"] == 2
     assert checks["config_propagation"]["provider"] == "custom:hermes-smoke"
 
 
