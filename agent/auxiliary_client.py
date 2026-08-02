@@ -5603,7 +5603,13 @@ def _resolve_task_provider_model(
     if cfg_model and cfg_model.lower() == "auto":
         cfg_model = None
 
-    resolved_model = model or cfg_model
+    deployment_compression_model = (
+        os.getenv("HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL", "").strip()
+        if task == "compression" and (not cfg_provider or cfg_provider == "auto")
+        else None
+    )
+
+    resolved_model = model or cfg_model or deployment_compression_model
     resolved_api_mode = cfg_api_mode
 
     # Convenience aliases for direct API-key endpoints that aren't first-class

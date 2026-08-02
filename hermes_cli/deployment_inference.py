@@ -51,6 +51,15 @@ class DeploymentInferenceSelectionRejected(RuntimeError):
     """An explicit owner/request selection cannot use deployment inference."""
 
 
+def _normalize_compression_model(raw: object, allowed: tuple[str, ...]) -> str:
+    compression_model = str(raw or "").strip()
+    if compression_model and compression_model not in allowed:
+        raise DeploymentInferencePolicyInvalid(
+            "deployment inference compression model is not allowed"
+        )
+    return compression_model
+
+
 @dataclass(frozen=True)
 class DeploymentInferenceRouteDescriptor:
     """One non-secret provider/model route safe to pass to an owner worker."""
@@ -104,6 +113,7 @@ class DeploymentInferenceDescriptor:
     policy_id: str
     allowed_models: tuple[str, ...]
     supports_vision: bool | None = None
+    compression_model: str = ""
 
     def __post_init__(self) -> None:
         provider = str(self.provider or "").strip().lower()
@@ -122,11 +132,15 @@ class DeploymentInferenceDescriptor:
             allowed = (model,)
         if model not in allowed:
             raise DeploymentInferencePolicyInvalid("deployment inference descriptor models are invalid")
+        compression_model = _normalize_compression_model(
+            self.compression_model, allowed
+        )
 
         object.__setattr__(self, "provider", provider)
         object.__setattr__(self, "model", model)
         object.__setattr__(self, "policy_id", policy_id)
         object.__setattr__(self, "allowed_models", allowed)
+        object.__setattr__(self, "compression_model", compression_model)
         object.__setattr__(
             self,
             "supports_vision",
@@ -196,6 +210,7 @@ class DeploymentInferencePolicy:
     policy_id: str = "deployment-default-v1"
     allowed_models: tuple[str, ...] = ()
     supports_vision: bool | None = None
+    compression_model: str = ""
     routes: tuple[DeploymentInferenceRoute, ...] = ()
 
     def __post_init__(self) -> None:
@@ -217,6 +232,9 @@ class DeploymentInferencePolicy:
             allowed = (model,)
         if model not in allowed:
             allowed = (model, *allowed)
+        compression_model = _normalize_compression_model(
+            self.compression_model, allowed
+        )
 
         default_route = DeploymentInferenceRoute(
             provider=provider,
@@ -248,6 +266,7 @@ class DeploymentInferencePolicy:
         object.__setattr__(self, "policy_id", policy_id)
         object.__setattr__(self, "allowed_models", allowed)
         object.__setattr__(self, "supports_vision", default_route.supports_vision)
+        object.__setattr__(self, "compression_model", compression_model)
         object.__setattr__(self, "routes", routes[1:])
         object.__setattr__(self, "_all_routes", routes)
 
@@ -262,6 +281,7 @@ class DeploymentInferencePolicy:
             policy_id=self.policy_id,
             allowed_models=self.allowed_models,
             supports_vision=self.supports_vision,
+            compression_model=self.compression_model,
         )
 
     def route_for(
@@ -323,7 +343,18 @@ def deployment_descriptor_from_environment(
     policy_id = str(env.get("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", "")).strip()
     raw_allowed = str(env.get("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", ""))
     raw_supports_vision = env.get(_SUPPORTS_VISION_ENV)
-    if not any((provider, model, api_mode, policy_id, raw_allowed.strip(), raw_supports_vision)):
+    compression_model = str(
+        env.get("HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL", "")
+    ).strip()
+    if not any((
+        provider,
+        model,
+        api_mode,
+        policy_id,
+        raw_allowed.strip(),
+        raw_supports_vision,
+        compression_model,
+    )):
         return None
     if not all((provider, model, api_mode, policy_id)):
         raise DeploymentInferencePolicyInvalid("deployment inference descriptor is incomplete")
@@ -340,6 +371,7 @@ def deployment_descriptor_from_environment(
             raw_supports_vision,
             field=_SUPPORTS_VISION_ENV,
         ),
+        compression_model=compression_model,
     )
 
 
@@ -426,6 +458,9 @@ def policy_from_control_plane_environment() -> DeploymentInferencePolicy:
     model = current_env.get("HERMES_DEPLOYMENT_INFERENCE_MODEL", "").strip()
     api_mode = current_env.get("HERMES_DEPLOYMENT_INFERENCE_API_MODE", "").strip().lower()
     policy_id = current_env.get("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", "deployment-default-v1").strip()
+    compression_model = current_env.get(
+        "HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL", ""
+    ).strip()
     allowed_models = tuple(dict.fromkeys(
         item.strip()
         for item in current_env.get("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", "").split(",")
@@ -505,6 +540,7 @@ def policy_from_control_plane_environment() -> DeploymentInferencePolicy:
         policy_id=policy_id,
         allowed_models=allowed_models,
         supports_vision=supports_vision,
+        compression_model=compression_model,
         routes=tuple(extra_routes),
     )
 
