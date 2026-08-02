@@ -42,6 +42,7 @@ from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
+_EPHEMERAL_OUTPUT_UNSET = object()
 
 
 def _wait_for_future(future, timeout: float) -> None:
@@ -237,7 +238,7 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def interruptible_api_call(agent, api_kwargs: dict):
+def interruptible_api_call(agent, api_kwargs: dict, *, dispatch_metadata=None):
     """
     Run the API call in a background thread so the main conversation loop
     can detect interrupts without waiting for the full HTTP round-trip.
@@ -301,8 +302,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     is_stale_connection_error,
                     normalize_converse_response,
                 )
-                region = api_kwargs.pop("__bedrock_region__", "us-east-1")
-                api_kwargs.pop("__bedrock_converse__", None)
+                region = (dispatch_metadata or {}).get(
+                    "bedrock_region",
+                    getattr(agent, "_bedrock_region", None) or "us-east-1",
+                )
                 client = _get_bedrock_runtime_client(region)
                 try:
                     raw_response = client.converse(**api_kwargs)
@@ -629,8 +632,24 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
-def build_api_kwargs(agent, api_messages: list) -> dict:
-    """Build the keyword arguments dict for the active API mode."""
+def build_api_kwargs(
+    agent,
+    api_messages: list,
+    *,
+    ephemeral_max_output_tokens: Any = _EPHEMERAL_OUTPUT_UNSET,
+) -> dict:
+    """Build provider kwargs for one logical request.
+
+    ``ephemeral_max_output_tokens`` is explicit so retries can reuse one prepared
+    payload without consuming mutable agent state during request construction.
+    The default preserves the public helper's historical consume-on-call behavior.
+    """
+    if ephemeral_max_output_tokens is _EPHEMERAL_OUTPUT_UNSET:
+        ephemeral_max_output_tokens = getattr(
+            agent, "_ephemeral_max_output_tokens", None
+        )
+        if ephemeral_max_output_tokens is not None:
+            agent._ephemeral_max_output_tokens = None
     tools_for_api = agent.tools
 
     if agent.api_mode == "anthropic_messages":
@@ -638,9 +657,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         anthropic_messages = agent._prepare_anthropic_messages_for_api(api_messages)
         ctx_len = getattr(agent, "context_compressor", None)
         ctx_len = ctx_len.context_length if ctx_len else None
-        ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
-        if ephemeral_out is not None:
-            agent._ephemeral_max_output_tokens = None  # consume immediately
+        ephemeral_out = ephemeral_max_output_tokens
         return _transport.build_kwargs(
             model=agent.model,
             messages=anthropic_messages,
@@ -822,9 +839,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         _profile = None
 
     if _profile:
-        _ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
-        if _ephemeral_out is not None:
-            agent._ephemeral_max_output_tokens = None
+        _ephemeral_out = ephemeral_max_output_tokens
 
         # Strip image parts for non-vision models that have provider profiles
         # (e.g. DeepSeek, Kimi). The legacy path below already does this, but
@@ -856,9 +871,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
     # ── Legacy flag path ────────────────────────────────────────────
     # Reached only when get_provider_profile() returns None — i.e. a
     # completely unknown provider not in providers/ registry.
-    _ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
-    if _ephemeral_out is not None:
-        agent._ephemeral_max_output_tokens = None
+    _ephemeral_out = ephemeral_max_output_tokens
 
     # Strip image parts for non-vision models (no-op when vision-capable).
     _msgs_for_chat = agent._prepare_messages_for_non_vision_model(api_messages)
@@ -1786,7 +1799,9 @@ def cleanup_task_resources(agent, task_id: str) -> None:
 
 
 
-def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None):
+def interruptible_streaming_api_call(
+    agent, api_kwargs: dict, *, on_first_delta=None, dispatch_metadata=None
+):
     """Streaming variant of _interruptible_api_call for real-time token delivery.
 
     Handles all three api_modes:
@@ -1812,7 +1827,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # temporarily so _run_codex_stream can pick it up.
         agent._codex_on_first_delta = on_first_delta
         try:
-            return agent._interruptible_api_call(api_kwargs)
+            return interruptible_api_call(
+                agent, api_kwargs, dispatch_metadata=dispatch_metadata
+            )
         finally:
             agent._codex_on_first_delta = None
 
@@ -1843,8 +1860,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     normalize_converse_response,
                     stream_converse_with_callbacks,
                 )
-                region = api_kwargs.pop("__bedrock_region__", "us-east-1")
-                api_kwargs.pop("__bedrock_converse__", None)
+                region = (dispatch_metadata or {}).get(
+                    "bedrock_region",
+                    getattr(agent, "_bedrock_region", None) or "us-east-1",
+                )
                 client = _get_bedrock_runtime_client(region)
                 try:
                     raw_response = client.converse_stream(**api_kwargs)

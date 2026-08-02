@@ -355,7 +355,6 @@ Future messages in this room will use that transcript until `/reset` or another 
     breakdown_cat_conversation: "Konuşma"
     header_session_info:      "📊 **Oturum Bilgisi**"
     label_messages:           "Mesajlar: {count}"
-    label_estimated_context:  "Tahmini bağlam: ~{count} token"
     detailed_after_first:     "_(Ayrıntılı kullanım, ilk ajan yanıtından sonra kullanılabilir)_"
     no_data:                  "Bu oturum için kullanım verisi yok."
 

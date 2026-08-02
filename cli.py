@@ -4614,22 +4614,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         compressor = getattr(agent, "context_compressor", None)
         if compressor:
-            # last_prompt_tokens is parked at the -1 sentinel right after a
-            # compression, until the next real API call reports a prompt count
-            # (awaiting_real_usage_after_compression). The status bar must not
-            # render that sentinel verbatim — it produced "-1/200K" / "-1%".
-            # Clamp it to 0 so the one transitional turn reads as empty context.
-            context_tokens = getattr(compressor, "last_prompt_tokens", 0) or 0
-            if context_tokens < 0:
-                context_tokens = 0
-            context_length = getattr(compressor, "context_length", 0) or 0
-            if context_length < 0:
-                context_length = 0
-            snapshot["context_tokens"] = context_tokens
-            snapshot["context_length"] = context_length or None
             snapshot["compressions"] = getattr(compressor, "compression_count", 0) or 0
-            if context_length:
-                snapshot["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
+        try:
+            from agent.prepared_model_request import prepared_context_payload
+
+            context = prepared_context_payload(
+                getattr(agent, "_prepared_model_request", None)
+            )
+            if context and context.get("accounting_source") == "prepared_request":
+                snapshot["context_tokens"] = context["context_used"]
+                snapshot["context_length"] = context["context_max"] or None
+                snapshot["context_percent"] = context["context_percent"]
+        except Exception:
+            pass
 
         return snapshot
 
@@ -9512,9 +9509,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         total = agent.session_total_tokens
 
         compressor = agent.context_compressor
-        last_prompt = compressor.last_prompt_tokens if compressor.last_prompt_tokens > 0 else 0
-        ctx_len = compressor.context_length
-        pct = min(100, (last_prompt / ctx_len * 100)) if ctx_len else 0
+        from agent.prepared_model_request import prepared_context_payload
+
+        context = prepared_context_payload(
+            getattr(agent, "_prepared_model_request", None)
+        )
+        if context and context.get("accounting_source") == "prepared_request":
+            last_prompt = context["context_used"]
+            ctx_len = context["context_max"]
+            pct = context["context_percent"]
+        else:
+            last_prompt = 0
+            ctx_len = 0
+            pct = 0
         compressions = compressor.compression_count
 
         msg_count = len(self.conversation_history)

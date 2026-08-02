@@ -26,6 +26,7 @@ from hermes_cli.middleware import (
     VALID_MIDDLEWARE,
     apply_llm_request_middleware,
     apply_tool_request_middleware,
+    run_llm_execution_middleware,
     run_tool_execution_middleware,
 )
 
@@ -188,6 +189,53 @@ class TestPluginDiscovery:
         assert result.original_payload == args
         assert result.changed is True
         assert result.trace == [{"source": "same-payload"}]
+
+    def test_llm_execution_middleware_rejects_prepared_request_substitution(self, monkeypatch):
+        prepared = {"messages": [{"role": "user", "content": "original"}]}
+        calls = []
+
+        def middleware(**kwargs):
+            return kwargs["next_call"](
+                {"messages": [{"role": "user", "content": "rewritten"}]}
+            )
+
+        manager = types.SimpleNamespace(_middleware={"llm_execution": [middleware]})
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+
+        with pytest.raises(RuntimeError, match="cannot substitute the prepared request"):
+            run_llm_execution_middleware(
+                prepared, lambda request: calls.append(request) or request
+            )
+
+        assert calls == []
+
+    def test_llm_execution_middleware_cannot_forward_prior_frame_payload(
+        self, monkeypatch
+    ):
+        prepared = {"messages": [{"role": "user", "content": "original"}]}
+        terminal_calls = []
+
+        def outer(**kwargs):
+            return kwargs["next_call"]()
+
+        def inner(**kwargs):
+            return kwargs["next_call"](kwargs["original_request"])
+
+        manager = types.SimpleNamespace(
+            _middleware={"llm_execution": [outer, inner]}
+        )
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+
+        with pytest.raises(RuntimeError, match="cannot substitute the prepared request"):
+            run_llm_execution_middleware(
+                prepared,
+                lambda request: terminal_calls.append(request) or request,
+                original_request={
+                    "messages": [{"role": "user", "content": "pre-middleware"}]
+                },
+            )
+
+        assert terminal_calls == []
 
     def test_execution_middleware_post_next_call_error_does_not_retry(self, monkeypatch):
         calls = []

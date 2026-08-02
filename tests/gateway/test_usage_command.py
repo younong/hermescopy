@@ -6,6 +6,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.prepared_model_request import prepare_model_request_snapshot
+
 
 def _make_mock_agent(**overrides):
     """Create a mock AIAgent with realistic session counters."""
@@ -14,6 +16,8 @@ def _make_mock_agent(**overrides):
         "model": "anthropic/claude-sonnet-4.6",
         "provider": "openrouter",
         "base_url": None,
+        "api_mode": "chat_completions",
+        "max_tokens": 4_096,
         "session_total_tokens": 50_000,
         "session_api_calls": 5,
         "session_prompt_tokens": 40_000,
@@ -36,8 +40,19 @@ def _make_mock_agent(**overrides):
     ctx = MagicMock()
     ctx.last_prompt_tokens = 30_000
     ctx.context_length = 200_000
+    ctx.threshold_tokens = 150_000
+    ctx.calibrated_prompt_tokens = lambda _value: 30_000
     ctx.compression_count = 1
     agent.context_compressor = ctx
+    agent._prepared_model_request = prepare_model_request_snapshot(
+        agent,
+        request_id="usage:1",
+        payload={
+            "model": agent.model,
+            "messages": [{"role": "user", "content": "usage"}],
+            "max_tokens": 4_096,
+        },
+    )
 
     return agent
 
@@ -127,8 +142,8 @@ class TestUsageCachedAgent:
         assert "Session Token Usage" in result
 
     @pytest.mark.asyncio
-    async def test_no_agent_anywhere_falls_to_history(self):
-        """No running or cached agent → rough estimate from transcript."""
+    async def test_no_agent_anywhere_reports_history_without_context_occupancy(self):
+        """A transcript alone cannot reconstruct provider-shaped occupancy."""
         runner = _make_runner(SK)
         event = MagicMock()
 
@@ -140,12 +155,12 @@ class TestUsageCachedAgent:
             {"role": "assistant", "content": "hi there"},
         ]
 
-        with patch("agent.model_metadata.estimate_messages_tokens_rough", return_value=500):
-            result = await runner._handle_usage_command(event)
+        result = await runner._handle_usage_command(event)
 
         assert "Session Info" in result
         assert "Messages: 2" in result
-        assert "~500" in result
+        assert "Estimated context" not in result
+        assert "~500" not in result
 
     @pytest.mark.asyncio
     async def test_cache_read_write_hidden_when_zero(self):

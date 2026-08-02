@@ -299,17 +299,30 @@ class TestSessionOps:
         assert model_cmd.input.root.hint == "model name to switch to"
 
     def test_build_usage_update_for_zed_context_indicator(self, agent, mock_manager):
-        state = mock_manager.create_session(cwd="/tmp")
-        state.history = [{"role": "user", "content": "hello"}]
-        state.agent.context_compressor = MagicMock(context_length=100_000)
-        state.agent._cached_system_prompt = "system"
-        state.agent.tools = [{"type": "function", "function": {"name": "demo"}}]
+        from agent.prepared_model_request import prepare_model_request_snapshot
 
-        with patch(
-            "agent.model_metadata.estimate_request_tokens_rough",
-            return_value=25_000,
-        ):
-            update = agent._build_usage_update(state)
+        state = mock_manager.create_session(cwd="/tmp")
+        state.agent.provider = "openai"
+        state.agent.model = "test-model"
+        state.agent.base_url = "https://example.test/v1"
+        state.agent.api_mode = "chat_completions"
+        state.agent.max_tokens = 4_000
+        state.agent.context_compressor = MagicMock(
+            context_length=100_000,
+            threshold_tokens=75_000,
+            calibrated_prompt_tokens=lambda _value: 25_000,
+        )
+        state.agent._prepared_model_request = prepare_model_request_snapshot(
+            state.agent,
+            request_id="acp:1",
+            payload={
+                "model": state.agent.model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 4_000,
+            },
+        )
+
+        update = agent._build_usage_update(state)
 
         assert isinstance(update, UsageUpdate)
         assert update.session_update == "usage_update"
@@ -319,15 +332,12 @@ class TestSessionOps:
     @pytest.mark.asyncio
     async def test_send_usage_update_to_client(self, agent, mock_manager):
         state = mock_manager.create_session(cwd="/tmp")
-        state.agent.context_compressor = MagicMock(context_length=100_000)
+        update = UsageUpdate(session_update="usage_update", size=100_000, used=25_000)
         mock_conn = MagicMock(spec=acp.Client)
         mock_conn.session_update = AsyncMock()
         agent._conn = mock_conn
 
-        with patch(
-            "agent.model_metadata.estimate_request_tokens_rough",
-            return_value=25_000,
-        ):
+        with patch.object(agent, "_build_usage_update", return_value=update):
             await agent._send_usage_update(state)
 
         mock_conn.session_update.assert_awaited_once()
@@ -1498,41 +1508,53 @@ class TestSlashCommands:
         assert "user: 1" in result
 
     def test_context_shows_usage_and_compression_threshold(self, agent, mock_manager):
+        from agent.prepared_model_request import prepare_model_request_snapshot
+
         state = self._make_state(mock_manager)
         state.history = [{"role": "user", "content": "hello"}]
         state.agent.context_compressor = MagicMock(
             context_length=100_000,
             threshold_tokens=80_000,
+            calibrated_prompt_tokens=lambda _tokens: 25_000,
         )
-        state.agent._cached_system_prompt = "system"
-        state.agent.tools = [{"type": "function", "function": {"name": "demo"}}]
+        state.agent.max_tokens = 4_096
+        state.agent.api_mode = "chat_completions"
+        state.agent.base_url = "https://example.test/v1"
+        state.agent._prepared_model_request = prepare_model_request_snapshot(
+            state.agent,
+            request_id="turn:1",
+            payload={"model": "test-model", "messages": state.history},
+        )
 
-        with patch(
-            "agent.model_metadata.estimate_request_tokens_rough",
-            return_value=25_000,
-        ):
-            result = agent._handle_slash_command("/context", state)
+        result = agent._handle_slash_command("/context", state)
 
-        assert "Context usage: ~25,000 / 100,000 tokens (25.0%)" in result
-        assert "Compression: ~55,000 tokens until threshold (~80,000, 80%)" in result
+        assert "Context usage: 25,000 / 100,000 tokens (25.0%)" in result
+        assert "Compression: 55,000 tokens until threshold (80,000, 80%)" in result
         assert "Tip: run /compact" in result
 
     def test_context_says_compression_due_when_past_threshold(self, agent, mock_manager):
+        from agent.prepared_model_request import prepare_model_request_snapshot
+
         state = self._make_state(mock_manager)
         state.history = [{"role": "user", "content": "hello"}]
         state.agent.context_compressor = MagicMock(
             context_length=100_000,
             threshold_tokens=80_000,
+            calibrated_prompt_tokens=lambda _tokens: 82_000,
+        )
+        state.agent.max_tokens = 4_096
+        state.agent.api_mode = "chat_completions"
+        state.agent.base_url = "https://example.test/v1"
+        state.agent._prepared_model_request = prepare_model_request_snapshot(
+            state.agent,
+            request_id="turn:1",
+            payload={"model": "test-model", "messages": state.history},
         )
 
-        with patch(
-            "agent.model_metadata.estimate_request_tokens_rough",
-            return_value=82_000,
-        ):
-            result = agent._handle_slash_command("/context", state)
+        result = agent._handle_slash_command("/context", state)
 
-        assert "Context usage: ~82,000 / 100,000 tokens (82.0%)" in result
-        assert "Compression: due now (threshold ~80,000, 80%). Run /compact." in result
+        assert "Context usage: 82,000 / 100,000 tokens (82.0%)" in result
+        assert "Compression: due now (threshold 80,000, 80%). Run /compact." in result
 
     def test_reset_clears_history(self, agent, mock_manager):
         state = self._make_state(mock_manager)
@@ -1618,7 +1640,7 @@ class TestSlashCommands:
             for call in mock_conn.session_update.call_args_list
         ]
         assert any(update.session_update == "agent_message_chunk" for update in updates)
-        assert any(update.session_update == "usage_update" for update in updates)
+        assert not any(update.session_update == "usage_update" for update in updates)
 
     @pytest.mark.asyncio
     async def test_unknown_slash_falls_through_to_llm(self, agent, mock_manager):

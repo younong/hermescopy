@@ -250,6 +250,10 @@ def _run_execution_chain(
             super().__init__(str(original))
             self.original = original
 
+    prepared_llm_request = (
+        kwargs.get("request") if kind == LLM_EXECUTION_MIDDLEWARE else None
+    )
+
     def call_at(index: int, payload: Any) -> Any:
         if index >= len(callbacks):
             return terminal_call(payload)
@@ -273,7 +277,17 @@ def _run_execution_chain(
                 )
             next_called = True
             try:
-                next_result = call_at(index + 1, payload if next_payload is None else next_payload)
+                if kind == LLM_EXECUTION_MIDDLEWARE and (
+                    next_payload is not None
+                    and next_payload is not prepared_llm_request
+                ):
+                    raise RuntimeError(
+                        "LLM execution middleware cannot substitute the prepared request; "
+                        "rewrite requests in llm_request middleware instead"
+                    )
+                next_result = call_at(
+                    index + 1, payload if next_payload is None else next_payload
+                )
                 next_succeeded = True
                 return next_result
             except Exception as exc:

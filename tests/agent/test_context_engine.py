@@ -118,17 +118,14 @@ class TestDefaults:
         assert status["last_prompt_tokens"] == 50000
         assert status["context_length"] == 200000
         assert status["threshold_tokens"] == 100000
-        assert 0 < status["usage_percent"] <= 100
+        assert "usage_percent" not in status
 
-    def test_default_get_status_clamps_post_compression_sentinel(self):
-        """After a compression, last_prompt_tokens is the -1 sentinel. get_status
-        must clamp it to 0 rather than export a raw -1 or a negative
-        usage_percent on the transitional turn."""
+    def test_default_get_status_labels_observed_usage_without_occupancy(self):
         engine = StubEngine()
         engine.last_prompt_tokens = -1
         status = engine.get_status()
         assert status["last_prompt_tokens"] == 0
-        assert status["usage_percent"] >= 0
+        assert "usage_percent" not in status
 
     def test_on_session_reset(self):
         engine = StubEngine()
@@ -137,11 +134,6 @@ class TestDefaults:
         engine.on_session_reset()
         assert engine.last_prompt_tokens == 0
         assert engine.compression_count == 0
-
-    def test_should_compress_preflight_default_false(self):
-        engine = StubEngine()
-        assert engine.should_compress_preflight([]) is False
-
 
 # ---------------------------------------------------------------------------
 # StubEngine behavior

@@ -10,18 +10,20 @@ Selection is config-driven: ``context.engine`` in config.yaml.
 Default is ``"compressor"`` (the built-in). Only one engine is active.
 
 The engine is responsible for:
-  - Deciding when compaction should fire
   - Performing compaction (summarization, DAG construction, etc.)
   - Optionally exposing tools the agent can call (e.g. lcm_grep)
-  - Tracking token usage from API responses
+  - Tracking token usage from API responses for metrics and calibration
+
+Hermes decides automatic request safety from the canonical prepared payload.
+The engine receives canonical pressure and returns a compacted transcript; it
+never declares a provider request safe to dispatch.
 
 Lifecycle:
   1. Engine is instantiated and registered (plugin register() or default)
   2. on_session_start() called when a conversation begins
   3. update_from_response() called after each API response with usage data
-  4. should_compress() checked after each turn
-  5. compress() called when should_compress() returns True
-  6. on_session_end() called at real session boundaries (CLI exit, /reset,
+  4. compress() called when Hermes' prepared-request gate requires compaction
+  5. on_session_end() called at real session boundaries (CLI exit, /reset,
      gateway session expiry) — NOT per-turn
 """
 
@@ -50,11 +52,10 @@ class ContextEngine(ABC):
     context_length: int = 0
     compression_count: int = 0
 
-    # -- Compaction parameters (read by run_agent.py for preflight) --------
+    # -- Compaction parameters ---------------------------------------------
     #
-    # These control the preflight compression check.  Subclasses may
-    # override via __init__ or property; defaults are sensible for most
-    # engines.
+    # These control compaction behavior. Subclasses may override via __init__
+    # or property; defaults are sensible for most engines.
     #
     # protect_first_n semantics (since PR #13754): count of non-system head
     # messages always preserved verbatim, IN ADDITION to the system prompt
@@ -81,7 +82,11 @@ class ContextEngine(ABC):
 
     @abstractmethod
     def should_compress(self, prompt_tokens: int = None) -> bool:
-        """Return True if compaction should fire this turn."""
+        """Return True for caller-supplied canonical request pressure.
+
+        ``last_prompt_tokens`` is observed response metadata and must not be used
+        as current request occupancy when ``prompt_tokens`` is omitted.
+        """
 
     @abstractmethod
     def compress(
@@ -104,25 +109,6 @@ class ContextEngine(ABC):
                 preserving information related to this topic.  Engines that
                 don't support it may simply ignore this argument.
         """
-
-    # -- Optional: pre-flight check ----------------------------------------
-
-    def should_compress_preflight(self, messages: List[Dict[str, Any]]) -> bool:
-        """Quick rough check before the API call (no real token count yet).
-
-        Default returns False (skip pre-flight). Override if your engine
-        can do a cheap estimate.
-        """
-        return False
-
-    def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
-        """Return True when preflight should trust recent real usage instead.
-
-        Built-in compression uses this to avoid re-compacting from known-noisy
-        rough estimates after a compressed request has already fit. Third-party
-        engines can ignore it safely.
-        """
-        return False
 
     # -- Optional: manual /compress preflight ------------------------------
 
@@ -194,19 +180,12 @@ class ContextEngine(ABC):
 
         Default returns the standard fields run_agent.py expects.
         """
-        # Clamp the -1 "compression just ran, awaiting real usage" sentinel
-        # (set by conversation_compression) to 0 so status readers don't see a
-        # raw -1 or a negative usage_percent on the transitional turn. Mirrors
-        # the CLI/gateway status-bar paths (cli.py, tui_gateway/server.py).
-        last_prompt = self.last_prompt_tokens if self.last_prompt_tokens > 0 else 0
         return {
-            "last_prompt_tokens": last_prompt,
+            # Provider-observed usage is historical response metadata. Current
+            # request occupancy is exposed from PreparedModelRequest instead.
+            "last_prompt_tokens": max(0, int(self.last_prompt_tokens or 0)),
             "threshold_tokens": self.threshold_tokens,
             "context_length": self.context_length,
-            "usage_percent": (
-                min(100, last_prompt / self.context_length * 100)
-                if self.context_length else 0
-            ),
             "compression_count": self.compression_count,
         }
 

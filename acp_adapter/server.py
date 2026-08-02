@@ -672,27 +672,22 @@ class HermesACPAgent(acp.Agent):
         tool schemas.
         """
         agent = state.agent
-        compressor = getattr(agent, "context_compressor", None)
-        size = int(getattr(compressor, "context_length", 0) or 0)
-        if size <= 0:
-            return None
-
         try:
-            from agent.model_metadata import estimate_request_tokens_rough
+            from agent.prepared_model_request import prepared_context_payload
 
-            used = estimate_request_tokens_rough(
-                state.history,
-                system_prompt=getattr(agent, "_cached_system_prompt", "") or "",
-                tools=getattr(agent, "tools", None) or None,
+            context = prepared_context_payload(
+                getattr(agent, "_prepared_model_request", None)
             )
         except Exception:
-            logger.debug("Could not estimate ACP native context usage", exc_info=True)
-            used = int(getattr(compressor, "last_prompt_tokens", 0) or 0)
+            logger.debug("Could not read ACP prepared context usage", exc_info=True)
+            return None
+        if not context or context.get("accounting_source") != "prepared_request":
+            return None
 
         return UsageUpdate(
             session_update="usage_update",
-            size=max(size, 0),
-            used=max(used, 0),
+            size=max(int(context["context_max"]), 0),
+            used=max(int(context["context_used"]), 0),
         )
 
     async def _send_usage_update(self, state: SessionState) -> None:
@@ -1837,19 +1832,16 @@ class HermesACPAgent(acp.Agent):
         context_length = int(getattr(compressor, "context_length", 0) or 0)
         threshold_tokens = int(getattr(compressor, "threshold_tokens", 0) or 0)
 
-        try:
-            from agent.model_metadata import estimate_request_tokens_rough
+        from agent.prepared_model_request import prepared_context_payload
 
-            system_prompt = getattr(agent, "_cached_system_prompt", "") or ""
-            tools = getattr(agent, "tools", None) or None
-            approx_tokens = estimate_request_tokens_rough(
-                state.history,
-                system_prompt=system_prompt,
-                tools=tools,
-            )
-        except Exception:
-            logger.debug("Could not estimate ACP context usage", exc_info=True)
-            approx_tokens = 0
+        context = prepared_context_payload(
+            getattr(agent, "_prepared_model_request", None)
+        )
+        context_used = (
+            context["context_used"]
+            if context and context.get("accounting_source") == "prepared_request"
+            else 0
+        )
 
         if threshold_tokens <= 0 and context_length > 0:
             threshold_tokens = int(context_length * 0.80)
@@ -1865,34 +1857,36 @@ class HermesACPAgent(acp.Agent):
             lines.append(f"Model: {model}")
         lines.append(f"Provider: {provider}")
 
-        if approx_tokens > 0:
+        if context_used > 0:
             if context_length > 0:
-                usage_pct = (approx_tokens / context_length) * 100
+                usage_pct = (context_used / context_length) * 100
                 lines.append(
-                    f"Context usage: ~{approx_tokens:,} / {context_length:,} tokens ({usage_pct:.1f}%)"
+                    f"Context usage: {context_used:,} / {context_length:,} tokens ({usage_pct:.1f}%)"
                 )
             else:
-                lines.append(f"Context usage: ~{approx_tokens:,} tokens")
+                lines.append(f"Context usage: {context_used:,} tokens")
+        else:
+            lines.append("Context usage: unknown until a model request is prepared.")
 
         if threshold_tokens > 0:
-            if approx_tokens > 0:
+            if context_used > 0:
                 threshold_pct = (threshold_tokens / context_length) * 100 if context_length > 0 else 0
-                remaining = max(threshold_tokens - approx_tokens, 0)
-                if approx_tokens >= threshold_tokens:
+                remaining = max(threshold_tokens - context_used, 0)
+                if context_used >= threshold_tokens:
                     lines.append(
-                        f"Compression: due now (threshold ~{threshold_tokens:,}"
+                        f"Compression: due now (threshold {threshold_tokens:,}"
                         + (f", {threshold_pct:.0f}%" if threshold_pct else "")
                         + "). Run /compact."
                     )
                 else:
                     lines.append(
-                        f"Compression: ~{remaining:,} tokens until threshold "
-                        f"(~{threshold_tokens:,}"
+                        f"Compression: {remaining:,} tokens until threshold "
+                        f"({threshold_tokens:,}"
                         + (f", {threshold_pct:.0f}%" if threshold_pct else "")
                         + ")."
                     )
             else:
-                lines.append(f"Compression threshold: ~{threshold_tokens:,} tokens")
+                lines.append(f"Compression threshold: {threshold_tokens:,} tokens")
 
         if getattr(agent, "compression_enabled", True) is False:
             lines.append("Compression is disabled for this agent.")

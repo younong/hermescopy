@@ -48,7 +48,6 @@ class BedrockTransport(ProviderTransport):
         """
         from agent.bedrock_adapter import build_converse_kwargs
 
-        region = params.get("region", "us-east-1")
         guardrail = params.get("guardrail_config")
 
         kwargs = build_converse_kwargs(
@@ -59,9 +58,6 @@ class BedrockTransport(ProviderTransport):
             temperature=params.get("temperature"),
             guardrail_config=guardrail,
         )
-        # Sentinel keys for dispatch — agent pops these before the boto3 call
-        kwargs["__bedrock_converse__"] = True
-        kwargs["__bedrock_region__"] = region
         return kwargs
 
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:

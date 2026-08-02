@@ -520,10 +520,9 @@ class GatewaySlashCommandsMixin:
                 db_total_tokens = 0
 
         # Resolve model/context for cockpit-style status. Prefer the live or
-        # cached agent because it carries the actual runtime route and context
-        # compressor. Fall back to persisted SessionDB metadata plus the
-        # SessionStore's last_prompt_tokens so /status remains useful between
-        # turns without making billing/account calls.
+        # cached agent because it carries the actual runtime route and canonical
+        # prepared-request snapshot. Persisted metadata may supply route identity,
+        # but observed response usage never substitutes for current occupancy.
         status_agent = agent if is_running else None
         if status_agent is None:
             cache_lock = getattr(self, "_agent_cache_lock", None)
@@ -546,18 +545,24 @@ class GatewaySlashCommandsMixin:
             model_name = _clean_str(getattr(status_agent, "model", ""))
             provider_name = _clean_str(getattr(status_agent, "provider", ""))
             base_url = _clean_str(getattr(status_agent, "base_url", ""))
-            ctx = getattr(status_agent, "context_compressor", None)
-            if ctx is not None:
-                context_used = _int_value(getattr(ctx, "last_prompt_tokens", 0))
-                context_total = _int_value(getattr(ctx, "context_length", 0))
+            try:
+                from agent.prepared_model_request import prepared_context_payload
+
+                context = prepared_context_payload(
+                    getattr(status_agent, "_prepared_model_request", None)
+                )
+                if context and context.get("accounting_source") == "prepared_request":
+                    context_used = _int_value(context.get("context_used"))
+                    context_total = _int_value(context.get("context_max"))
+            except Exception:
+                pass
 
         model_name = model_name or _clean_str(session_row.get("model"))
         provider_name = provider_name or _clean_str(session_row.get("billing_provider"))
         base_url = base_url or _clean_str(session_row.get("billing_base_url"))
-        context_used = context_used or _int_value(getattr(session_entry, "last_prompt_tokens", 0))
 
         user_config: dict[str, Any] = {}
-        if not model_name or not provider_name or not context_total:
+        if not model_name or not provider_name:
             try:
                 user_config = _load_gateway_config()
             except Exception:
@@ -568,12 +573,6 @@ class GatewaySlashCommandsMixin:
             model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
             if isinstance(model_cfg, dict):
                 provider_name = _clean_str(model_cfg.get("provider"))
-        if not context_total:
-            model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
-            configured_context = model_cfg.get("context_length") if isinstance(model_cfg, dict) else None
-            if isinstance(configured_context, int) and configured_context > 0:
-                context_total = configured_context
-
         model_line = ""
         if model_name:
             if provider_name:
@@ -3838,22 +3837,11 @@ class GatewaySlashCommandsMixin:
         return "\n".join(lines)
 
     def _context_breakdown_lines(self, agent, source) -> list[str]:
-        """Render the per-category context breakdown for /usage.
-
-        Estimated (chars/4) — same engine the desktop popover uses. Returns an
-        empty list and never raises on failure so /usage stays robust.
-        """
+        """Render the canonical prepared-request breakdown for /usage."""
         try:
             from agent.context_breakdown import compute_session_context_breakdown
 
-            history: list[dict] = []
-            try:
-                entry = self.session_store.get_or_create_session(source)
-                history = self.session_store.load_transcript(entry.session_id) or []
-            except Exception:
-                history = []
-
-            payload = compute_session_context_breakdown(agent, history)
+            payload = compute_session_context_breakdown(agent)
             categories = payload.get("categories") or []
             if not categories:
                 return []
@@ -3971,17 +3959,24 @@ class GatewaySlashCommandsMixin:
 
             # Context window and compressions
             ctx = agent.context_compressor
-            _lpt = ctx.last_prompt_tokens if ctx.last_prompt_tokens > 0 else 0
-            if _lpt:
-                pct = min(100, _lpt / ctx.context_length * 100) if ctx.context_length else 0
-                lines.append(t("gateway.usage.label_context", used=f"{_lpt:,}", total=f"{ctx.context_length:,}", pct=f"{pct:.0f}"))
+            from agent.prepared_model_request import prepared_context_payload
+
+            context = prepared_context_payload(
+                getattr(agent, "_prepared_model_request", None)
+            )
+            if context and context.get("accounting_source") == "prepared_request":
+                context_used = context["context_used"]
+                context_max = context["context_max"]
+                lines.append(t(
+                    "gateway.usage.label_context",
+                    used=f"{context_used:,}",
+                    total=f"{context_max:,}",
+                    pct=f"{context['context_percent']:.0f}",
+                ))
             if ctx.compression_count:
                 lines.append(t("gateway.usage.label_compressions", count=ctx.compression_count))
 
-            # Per-category context breakdown (estimated — chars/4 heuristic).
-            # Same engine the desktop popover uses (PR #54907). The system
-            # prompt / tools / skills / memory slices read off the live agent;
-            # the conversation slice is estimated from the session transcript.
+            # Per-category context breakdown from that same prepared request.
             breakdown_lines = self._context_breakdown_lines(agent, source)
             if breakdown_lines:
                 lines.append("")
@@ -3996,17 +3991,16 @@ class GatewaySlashCommandsMixin:
 
             return "\n".join(lines)
 
-        # No agent at all -- check session history for a rough count
+        # A persisted transcript is not a provider-shaped request. Until an
+        # agent has prepared one, report history size without inventing current
+        # context-window occupancy.
         session_entry = self.session_store.get_or_create_session(source)
         history = self.session_store.load_transcript(session_entry.session_id)
         if history:
-            from agent.model_metadata import estimate_messages_tokens_rough
             msgs = [m for m in history if m.get("role") in {"user", "assistant"} and m.get("content")]
-            approx = estimate_messages_tokens_rough(msgs)
             lines = [
                 t("gateway.usage.header_session_info"),
                 t("gateway.usage.label_messages", count=len(msgs)),
-                t("gateway.usage.label_estimated_context", count=f"{approx:,}"),
                 t("gateway.usage.detailed_after_first"),
             ]
             if account_lines:

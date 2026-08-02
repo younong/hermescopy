@@ -1,76 +1,75 @@
-"""Tests for live session context breakdown."""
+"""Tests for canonical live session context breakdown."""
 
-import json
-from unittest.mock import MagicMock, patch
-
-from agent.model_metadata import estimate_tokens_rough
+from types import SimpleNamespace
 
 from agent.context_breakdown import compute_session_context_breakdown
+from agent.prepared_model_request import (
+    ProviderManagedRequest,
+    prepare_model_request_snapshot,
+    request_route,
+)
 
 
-def _make_agent(
-    *,
-    stable: str = "identity and guidance",
-    context: str = "",
-    volatile: str = "timestamp line",
-    tools: list | None = None,
-    context_length: int = 200_000,
-    last_prompt_tokens: int = 0,
-):
-    agent = MagicMock()
-    agent.model = "openai/gpt-5.4"
-    agent.tools = tools or [
-        {"type": "function", "function": {"name": "terminal", "description": "run"}},
-        {"type": "function", "function": {"name": "mcp_demo_tool", "description": "mcp"}},
-        {"type": "function", "function": {"name": "delegate_task", "description": "spawn"}},
-    ]
-    agent._memory_store = None
-    agent._memory_enabled = True
-    agent._user_profile_enabled = True
-    agent.context_compressor = MagicMock(
-        context_length=context_length,
-        last_prompt_tokens=last_prompt_tokens,
+def _make_agent():
+    return SimpleNamespace(
+        provider="openai",
+        model="openai/gpt-5.4",
+        base_url="https://example.test/v1",
+        api_mode="chat_completions",
+        max_tokens=8_000,
+        _prepared_model_request=None,
+        context_compressor=SimpleNamespace(
+            context_length=200_000,
+            threshold_tokens=150_000,
+            calibrated_prompt_tokens=lambda value: value,
+            last_prompt_tokens=42_000,
+        ),
     )
-    return agent, {"stable": stable, "context": context, "volatile": volatile}
 
 
-def test_breakdown_includes_major_categories():
-    stable = (
-        "base guidance\n"
-        "<available_skills>\n  demo:\n    - hello: hi\n</available_skills>"
+def test_breakdown_formats_canonical_prepared_request():
+    agent = _make_agent()
+    agent._prepared_model_request = prepare_model_request_snapshot(
+        agent,
+        request_id="turn:1",
+        payload={
+            "model": agent.model,
+            "messages": [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "hello"},
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "terminal"}},
+            ],
+            "max_completion_tokens": 4_096,
+        },
     )
-    context = "# Project Context\nFollow AGENTS.md"
-    volatile = "Current time: now"
-    history = [{"role": "user", "content": "hello there"}]
-    agent, parts = _make_agent(stable=stable, context=context, volatile=volatile)
 
-    with patch("agent.system_prompt.build_system_prompt_parts", return_value=parts):
-        data = compute_session_context_breakdown(agent, history)
+    data = compute_session_context_breakdown(agent)
 
-    ids = {item["id"] for item in data["categories"]}
-    assert {"system_prompt", "tool_definitions", "rules", "skills", "mcp", "subagent_definitions", "conversation"} <= ids
+    assert data["accounting_source"] == "prepared_request"
     assert data["context_max"] == 200_000
-    assert data["estimated_total"] > 0
+    assert data["context_used"] == data["estimated_total"]
+    assert sum(item["tokens"] for item in data["categories"]) == data["context_used"]
+    assert all(item["color"] for item in data["categories"])
+    assert data["context_used"] != agent.context_compressor.last_prompt_tokens
 
 
-def test_breakdown_uses_measured_context_when_available():
-    agent, parts = _make_agent(last_prompt_tokens=42_000)
+def test_breakdown_is_unknown_before_a_request_is_prepared():
+    data = compute_session_context_breakdown(_make_agent())
 
-    with patch("agent.system_prompt.build_system_prompt_parts", return_value=parts):
-        data = compute_session_context_breakdown(agent, [])
-
-    assert data["context_used"] == 42_000
-    assert data["context_percent"] == 21
+    assert data["accounting_source"] == "unknown"
+    assert data["categories"] == []
+    assert data["context_used"] == 0
 
 
-def test_breakdown_preserves_json_bucket_serialization_totals():
-    tools = [{"type": "function", "function": {"name": "terminal", "description": "你好"}}]
-    agent, parts = _make_agent(stable="", volatile="", tools=tools)
+def test_breakdown_does_not_fabricate_provider_managed_context():
+    agent = _make_agent()
+    agent.api_mode = "codex_app_server"
+    agent._prepared_model_request = ProviderManagedRequest(request_route(agent))
 
-    with patch("agent.system_prompt.build_system_prompt_parts", return_value=parts):
-        data = compute_session_context_breakdown(agent, [])
+    data = compute_session_context_breakdown(agent)
 
-    tool_bucket = next(item for item in data["categories"] if item["id"] == "tool_definitions")
-    assert tool_bucket["tokens"] == estimate_tokens_rough(
-        json.dumps(tools, ensure_ascii=False)
-    )
+    assert data["accounting_source"] == "provider_managed"
+    assert data["categories"] == []
+    assert data["context_used"] == 0

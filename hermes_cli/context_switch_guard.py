@@ -30,36 +30,16 @@ def _threshold_tokens(context_length: int, threshold_percent: float) -> int:
 
 
 def _estimate_tokens(agent: Any, messages: Optional[List[dict]]) -> Optional[int]:
-    cc = getattr(agent, "context_compressor", None)
-    if cc is None:
-        return None
+    del messages  # A transcript is not a provider-shaped request.
+    try:
+        from agent.prepared_model_request import PreparedModelRequest
 
-    if messages is not None:
-        protect = int(getattr(cc, "protect_first_n", 3)) + int(
-            getattr(cc, "protect_last_n", 20)
-        ) + 1
-        if len(messages) <= protect:
-            return None
-        try:
-            from agent.model_metadata import estimate_request_tokens_rough
-
-            system_prompt = getattr(agent, "_cached_system_prompt", None) or ""
-            tools = getattr(agent, "tools", None)
-            return int(
-                estimate_request_tokens_rough(
-                    messages,
-                    system_prompt=system_prompt,
-                    tools=tools or None,
-                )
-            )
-        except Exception:
-            pass
-
-    last = int(getattr(cc, "last_prompt_tokens", 0) or 0)
-    if last > 0:
-        return last
-    session_prompt = int(getattr(agent, "session_prompt_tokens", 0) or 0)
-    return session_prompt if session_prompt > 0 else None
+        prepared = getattr(agent, "_prepared_model_request", None)
+        if isinstance(prepared, PreparedModelRequest):
+            return prepared.accounting.effective_input_tokens
+    except Exception:
+        pass
+    return None
 
 
 def merge_preflight_compression_warning(

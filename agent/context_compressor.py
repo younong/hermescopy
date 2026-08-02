@@ -519,10 +519,6 @@ class ContextCompressor(ContextEngine):
         self._last_compress_aborted = False
         self._last_summary_auth_failure = False
         self._last_summary_transient_failure = False
-        self.last_real_prompt_tokens = 0
-        self.last_compression_rough_tokens = 0
-        self.last_rough_tokens_when_real_prompt_fit = 0
-        self.awaiting_real_usage_after_compression = False
         self._usage_calibration_ratio = 1.0
         self._usage_calibration_samples = 0
         self._last_request_rough_tokens = 0
@@ -560,10 +556,6 @@ class ContextCompressor(ContextEngine):
         self._last_summary_transient_failure = False
         self._context_probed = False
         self._context_probe_persistable = False
-        self.last_real_prompt_tokens = 0
-        self.last_compression_rough_tokens = 0
-        self.last_rough_tokens_when_real_prompt_fit = 0
-        self.awaiting_real_usage_after_compression = False
         self._usage_calibration_ratio = 1.0
         self._usage_calibration_samples = 0
         self._last_request_rough_tokens = 0
@@ -726,26 +718,11 @@ class ContextCompressor(ContextEngine):
             int(context_length * 0.05), _SUMMARY_TOKENS_CEILING,
         )
 
-        # Reset cross-call calibration state captured under the PREVIOUS model.
-        # These fields encode "the provider proved this prompt fit" / "preflight
-        # can be deferred" decisions that are only valid for the model that
-        # produced them. Carrying them across a switch to a smaller-context
-        # model would let should_defer_preflight_to_real_usage() suppress a
-        # preflight compression the new model actually needs — the exact
-        # oversized-send-after-switch failure in #23767. The new model's first
-        # response repopulates them via update_from_response(). Setting
-        # last_prompt_tokens to 0 (NOT -1) is deliberate: 0 is the documented
-        # "no real usage yet -> use the rough estimate" state, so the post-
-        # response should_compress path falls back to estimate_request_tokens_rough
-        # rather than skipping compression. -1 is a different sentinel
-        # (#36718, "compression just ran, await real usage") and must not be set here.
+        # Response usage and calibration belong to the route that produced them.
+        # A model switch must not carry either into the new route.
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
-        self.last_real_prompt_tokens = 0
-        self.last_rough_tokens_when_real_prompt_fit = 0
-        self.last_compression_rough_tokens = 0
-        self.awaiting_real_usage_after_compression = False
         self._usage_calibration_ratio = 1.0
         self._usage_calibration_samples = 0
         self._last_request_rough_tokens = 0
@@ -904,10 +881,6 @@ class ContextCompressor(ContextEngine):
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
-        self.last_real_prompt_tokens = 0
-        self.last_compression_rough_tokens = 0
-        self.last_rough_tokens_when_real_prompt_fit = 0
-        self.awaiting_real_usage_after_compression = False
         self._usage_calibration_ratio = 1.0
         self._usage_calibration_samples = 0
         self._last_request_rough_tokens = 0
@@ -977,9 +950,6 @@ class ContextCompressor(ContextEngine):
         available = max(1, int(self.context_length) - int(self.max_tokens or 0))
         return max(1, int(available * 0.95))
 
-    def would_hard_block(self, rough_tokens: int) -> bool:
-        return self.calibrated_prompt_tokens(rough_tokens) >= self.hard_input_limit()
-
     def update_from_response(self, usage: Dict[str, Any]):
         """Update authoritative usage and conservatively calibrate rough estimates."""
         self.last_prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
@@ -989,7 +959,6 @@ class ContextCompressor(ContextEngine):
             or 0
         )
         if self.last_prompt_tokens > 0:
-            self.last_real_prompt_tokens = self.last_prompt_tokens
             rough = int(self._last_request_rough_tokens or 0)
             if rough > 0:
                 observed_ratio = min(
@@ -1016,55 +985,7 @@ class ContextCompressor(ContextEngine):
                         )
                     except Exception:
                         logger.debug("context usage calibration persist failed", exc_info=True)
-            if self.last_prompt_tokens < self.threshold_tokens:
-                if self.awaiting_real_usage_after_compression and self.last_compression_rough_tokens > 0:
-                    self.last_rough_tokens_when_real_prompt_fit = self.last_compression_rough_tokens
-            else:
-                self.last_rough_tokens_when_real_prompt_fit = 0
         self._last_request_rough_tokens = 0
-        self.awaiting_real_usage_after_compression = False
-
-    def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
-        """Return True when a high rough preflight estimate is known-noisy.
-
-        ``estimate_request_tokens_rough(..., tools=...)`` intentionally
-        overestimates schema-heavy requests so Hermes compresses before a
-        provider rejects the payload. After a successful compressed API call,
-        though, provider ``prompt_tokens`` are a better signal than repeating
-        compaction from the same rough schema overhead. Defer only while the
-        rough estimate has grown modestly since a request the provider proved
-        fit under the threshold.
-        """
-        if rough_tokens < self.threshold_tokens:
-            return False
-        # Immediately after a compaction the post-compression path sets
-        # ``awaiting_real_usage_after_compression`` and parks
-        # ``last_prompt_tokens = -1``, but ``last_real_prompt_tokens`` still
-        # holds the STALE pre-compression value (above threshold — that's why
-        # compaction fired).  Without this guard that stale value defeats the
-        # ``last_real_prompt_tokens >= threshold_tokens`` check below, so
-        # preflight fires a SECOND compaction before the provider has reported
-        # real token usage for the now-shorter conversation.  Defer for exactly
-        # one turn; update_from_response() clears the flag when real usage
-        # arrives.  (#36718)
-        if self.awaiting_real_usage_after_compression:
-            return True
-        if self.last_real_prompt_tokens <= 0:
-            return False
-        if self.last_real_prompt_tokens >= self.threshold_tokens:
-            return False
-
-        baseline = self.last_rough_tokens_when_real_prompt_fit or self.last_compression_rough_tokens
-        if baseline <= 0:
-            return False
-
-        growth = max(0, rough_tokens - baseline)
-        tolerated_growth = max(4096, int(self.threshold_tokens * 0.05))
-        if growth > tolerated_growth:
-            return False
-
-        self.last_rough_tokens_when_real_prompt_fit = max(baseline, rough_tokens)
-        return True
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
         """Check if context exceeds the compression threshold.
@@ -1073,7 +994,9 @@ class ContextCompressor(ContextEngine):
         each saved less than 10%, skip compression to avoid infinite loops
         where each pass removes only 1-2 messages.
         """
-        tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
+        if prompt_tokens is None:
+            return False
+        tokens = max(0, int(prompt_tokens))
         if tokens < self.threshold_tokens:
             return False
         # Do not trigger compression while the summary LLM is in cooldown.
@@ -3108,7 +3031,13 @@ This compaction should PRIORITISE preserving all information related to the focu
                 )
             return messages
 
-        display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
+        # Automatic callers pass canonical prepared-request pressure. Manual
+        # compression may omit it, in which case this value is diagnostic only.
+        display_tokens = (
+            current_tokens
+            if current_tokens is not None
+            else estimate_messages_tokens_rough(messages)
+        )
 
         # Phase 1: deterministically shrink eligible old tool payloads. Full
         # compression force-enables this pre-pass even below the standalone
