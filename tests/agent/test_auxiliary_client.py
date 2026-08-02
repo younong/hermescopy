@@ -168,6 +168,36 @@ class TestResolveTaskProviderModel:
         assert api_key == "sk-test"
         assert api_mode is None
 
+    def test_deployment_compression_model_overrides_auto(self, monkeypatch):
+        monkeypatch.setenv(
+            "HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL", "gpt-5.6-luna"
+        )
+
+        provider, model, base_url, api_key, api_mode = (
+            _resolve_task_provider_model("compression")
+        )
+
+        assert provider == "auto"
+        assert model == "gpt-5.6-luna"
+        assert base_url is None
+        assert api_key is None
+        assert api_mode is None
+
+    def test_explicit_compression_config_wins_over_deployment_default(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL", "gpt-5.6-luna"
+        )
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={"provider": "openrouter", "model": "configured-model"},
+        ):
+            provider, model, *_ = _resolve_task_provider_model("compression")
+
+        assert provider == "openrouter"
+        assert model == "configured-model"
+
 
 class TestBuildCallKwargsMaxTokens:
     """_build_call_kwargs should not cap output by default (#34530).
