@@ -3,8 +3,12 @@ so that _resolve_auto() can route custom: providers in Step 1.
 
 Fixes https://github.com/NousResearch/hermes-agent/issues/34777
 """
-import pytest
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch, MagicMock
+
+import pytest
 
 
 def _get_globals(mod):
@@ -187,6 +191,86 @@ class TestResolveAutoCustomEndToEnd:
             assert base and base.rstrip("/") == "https://ephemeral.live/v1"
         finally:
             mod.clear_runtime_main()
+
+    def test_compression_call_reaches_relay_chat_endpoint(self, tmp_path, monkeypatch):
+        """Real OpenAI transport must send the deployment route selector."""
+        import agent.auxiliary_client as mod
+        from hermes_cli.deployment_inference import DEPLOYMENT_INFERENCE_RELAY_MARKER
+
+        captured = {}
+
+        class RelayHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                captured["path"] = self.path
+                captured["provider"] = self.headers.get(
+                    "x-hermes-deployment-provider"
+                )
+                length = int(self.headers.get("Content-Length", "0"))
+                captured["body"] = json.loads(self.rfile.read(length))
+                payload = json.dumps({
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "gpt-5.6-sol",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "summary"},
+                        "finish_reason": "stop",
+                    }],
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), RelayHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        relay_url = f"http://127.0.0.1:{server.server_port}/v1"
+
+        for var in ("OPENROUTER_API_KEY", "NOUS_API_KEY", "OPENAI_API_KEY",
+                    "OPENAI_BASE_URL"):
+            monkeypatch.delenv(var, raising=False)
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "model:\n"
+            "  default: gpt-5.6-sol\n"
+            "  provider: 'custom:codex'\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        mod.clear_runtime_main()
+        mod.shutdown_cached_clients()
+        try:
+            mod.set_runtime_main(
+                "custom:codex",
+                "gpt-5.6-sol",
+                base_url=relay_url,
+                api_key=DEPLOYMENT_INFERENCE_RELAY_MARKER,
+                api_mode="chat_completions",
+            )
+
+            response = mod.call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                max_tokens=32,
+            )
+
+            assert response.choices[0].message.content == "summary"
+            assert captured["path"] == "/v1/chat/completions"
+            assert captured["provider"] == "custom:codex"
+            assert captured["body"]["model"] == "gpt-5.6-sol"
+        finally:
+            mod.shutdown_cached_clients()
+            mod.clear_runtime_main()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
     def test_named_custom_with_config_entry_still_routes(self, tmp_path, monkeypatch):
         """Regression guard: custom:<name> WITH a custom_providers entry must

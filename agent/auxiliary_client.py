@@ -536,6 +536,25 @@ _OR_HEADERS_BASE = {
 _TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 
 
+def _deployment_relay_headers(
+    api_key: object,
+    main_runtime: Optional[Dict[str, Any]],
+) -> dict[str, str]:
+    """Return the route selector required by the owner-local inference relay."""
+    try:
+        from hermes_cli.deployment_inference import is_deployment_inference_relay
+
+        if not is_deployment_inference_relay(api_key):
+            return {}
+    except ImportError:
+        return {}
+    runtime = _normalize_main_runtime(main_runtime)
+    provider = str(runtime.get("provider") or "").strip().lower()
+    if not provider:
+        return {}
+    return {"x-hermes-deployment-provider": provider}
+
+
 def _apply_user_default_headers(headers: dict | None) -> dict | None:
     """Merge user-configured ``model.default_headers`` onto resolved headers.
 
@@ -3983,6 +4002,7 @@ def _resolve_auto(
                 explicit_base_url=explicit_base_url,
                 explicit_api_key=explicit_api_key,
                 api_mode=runtime_api_mode or None,
+                main_runtime={"provider": main_provider},
             )
             if client is not None:
                 logger.info("Auxiliary auto-detect: using main provider %s (%s)",
@@ -4373,6 +4393,9 @@ def resolve_provider_client(
                 provider,
             )
             extra = {}
+            relay_headers = _deployment_relay_headers(custom_key, main_runtime)
+            if relay_headers:
+                extra["default_headers"] = relay_headers
             _clean_base, _dq = _extract_url_query_params(custom_base)
             if _dq:
                 extra["default_query"] = _dq
