@@ -10817,34 +10817,49 @@ def test_get_usage_does_not_substitute_cumulative_total_for_context_used():
     assert "context_percent" not in usage
 
 
-def test_get_usage_reports_real_current_occupancy():
-    """When the compressor reports a real current prompt size, context_used is
-    that value (not the cumulative total) and the percent is sane."""
+def test_get_usage_reports_prepared_request_occupancy():
+    from agent.prepared_model_request import prepare_model_request_snapshot
+
     agent = types.SimpleNamespace(
+        provider="openai",
         model="test-model",
+        base_url="https://example.test/v1",
+        api_mode="chat_completions",
+        max_tokens=4_000,
         session_total_tokens=1_900_000,
         context_compressor=types.SimpleNamespace(
             last_prompt_tokens=60_000,
             context_length=120_000,
+            threshold_tokens=90_000,
+            calibrated_prompt_tokens=lambda value: value,
             compression_count=2,
         ),
     )
+    agent._prepared_model_request = prepare_model_request_snapshot(
+        agent,
+        request_id="usage:1",
+        payload={
+            "model": agent.model,
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 4_000,
+        },
+    )
+
     usage = server._get_usage(agent)
-    assert usage["context_used"] == 60_000
+
+    accounting = agent._prepared_model_request.accounting
+    assert usage["context_used"] == accounting.effective_input_tokens
+    assert usage["context_used"] != agent.context_compressor.last_prompt_tokens
     assert usage["context_max"] == 120_000
-    assert usage["context_percent"] == 50
+    assert usage["context_accounting_source"] == "prepared_request"
 
 
-def test_get_usage_clamps_post_compression_sentinel():
-    """Right after a compression, last_prompt_tokens is the -1 sentinel
-    (conversation_compression sets it until the next real usage report). It is
-    truthy, so `or 0` doesn't neutralize it — the guard must clamp <0 to 0 so
-    the transitional turn emits no gauge instead of leaking context_used=-1."""
+def test_get_usage_does_not_expose_observed_usage_without_prepared_request():
     agent = types.SimpleNamespace(
         model="test-model",
         session_total_tokens=4_000_000,
         context_compressor=types.SimpleNamespace(
-            last_prompt_tokens=-1,
+            last_prompt_tokens=75_000,
             context_length=1_048_576,
             compression_count=6,
         ),

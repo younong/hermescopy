@@ -37,10 +37,10 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
-from agent.message_sanitization import project_provider_history
 from agent.model_metadata import estimate_request_tokens_rough
+from agent.prepared_model_request import PreparedModelRequest
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,7 @@ class AutomaticCompressionOutcome:
     safe_to_continue: bool
     failure_reason: Optional[str] = None
     degraded: bool = False
+    prepared_request: Optional[PreparedModelRequest] = None
 
 
 def _compression_made_progress(
@@ -75,60 +76,92 @@ def run_automatic_compression(
     messages: list,
     system_message: str,
     *,
-    current_tokens: Optional[int] = None,
+    prepared_request: PreparedModelRequest,
+    prepare_candidate: Callable[[list, str], PreparedModelRequest],
     task_id: str = "default",
     force: bool = False,
     emit_abort_warning: bool = True,
     preserve_attachment_index: Optional[int] = None,
 ) -> AutomaticCompressionOutcome:
-    """Synchronously compact until the full outgoing request is safe.
+    """Synchronously compact canonical requests until one is safe to dispatch.
 
-    This is the single automatic compression gate used by preflight, post-tool,
-    and provider-overflow recovery. It blocks only the active session worker and
-    re-estimates the complete request after every pass. Ordinary compression may
-    continue below the hard request boundary; forced overflow recovery fails closed.
+    Every automatic caller supplies the provider-shaped request that caused the
+    decision and the same preparation function used for dispatch. Ordinary
+    proactive compression may proceed in degraded mode below the hard boundary;
+    forced provider-overflow recovery remains fail-closed.
     """
-    compressor = agent.context_compressor
-    would_hard_block = getattr(compressor, "would_hard_block", lambda _tokens: False)
+    if not isinstance(prepared_request, PreparedModelRequest):
+        raise TypeError("automatic compression requires a PreparedModelRequest")
+    if not callable(prepare_candidate):
+        raise TypeError("automatic compression requires a candidate preparer")
+
     active_prompt = system_message or getattr(agent, "_cached_system_prompt", "") or ""
-    projection_index = (
-        preserve_attachment_index
-        if preserve_attachment_index is not None
-        else max(0, len(messages) - 1)
-    )
-    projected_messages = project_provider_history(
-        messages,
-        current_turn_index=projection_index,
-        protect_last_n=getattr(compressor, "protect_last_n", 20),
-    )
-    base_request_tokens = estimate_request_tokens_rough(
-        projected_messages,
-        system_prompt=active_prompt,
-        tools=agent.tools or None,
-    )
-    # A caller at the final API boundary may include ephemeral request-only
-    # context (deferred skills, plugin context, prefill). Preserve that measured
-    # overhead while re-estimating each compressed candidate.
-    raw_request_tokens = max(base_request_tokens, int(current_tokens or 0))
-    request_token_overhead = max(0, raw_request_tokens - base_request_tokens)
-    request_tokens = getattr(
-        compressor, "calibrated_prompt_tokens", lambda tokens: tokens
-    )(raw_request_tokens)
-    threshold_tokens = int(getattr(compressor, "threshold_tokens", 0) or 0)
-    should_compress = force or request_tokens >= threshold_tokens
-    hard_blocked = would_hard_block(raw_request_tokens)
-    if not should_compress and not hard_blocked:
+    working_prepared = prepared_request
+    accounting = working_prepared.accounting
+    request_tokens = accounting.effective_input_tokens
+    if not force and not accounting.requires_compression and not accounting.exceeds_hard_input_limit:
         return AutomaticCompressionOutcome(
-            messages, active_prompt, request_tokens, False, True
+            messages=messages,
+            system_prompt=active_prompt,
+            request_tokens=request_tokens,
+            compressed=False,
+            safe_to_continue=True,
+            prepared_request=working_prepared,
         )
 
     working_messages = messages
     working_preserve_index = preserve_attachment_index
     compressed_any = False
 
+    def _degraded_or_blocked(reason: str, *, no_progress: bool = False):
+        hard_blocked = working_prepared.accounting.exceeds_hard_input_limit
+        if not force and not hard_blocked:
+            if no_progress:
+                status = (
+                    "Context compression could not reduce the request, but it remains "
+                    "below the safe context boundary. Continuing with the preserved "
+                    "conversation."
+                )
+            else:
+                status = (
+                    "Context compression failed, but the request remains below the "
+                    "safe context boundary. Continuing with the preserved conversation."
+                )
+            agent._emit_status(status, kind="compression.degraded")
+            return AutomaticCompressionOutcome(
+                messages=working_messages,
+                system_prompt=active_prompt,
+                request_tokens=working_prepared.accounting.effective_input_tokens,
+                compressed=compressed_any,
+                safe_to_continue=True,
+                failure_reason=reason,
+                degraded=True,
+                prepared_request=working_prepared,
+            )
+
+        status = (
+            "Context compression could not reduce the request safely. The durable "
+            "conversation was preserved and no normal model request was sent. Run "
+            "/compress to retry or /new to start fresh."
+            if no_progress
+            else "Context compression failed. The durable conversation was preserved "
+            "and no normal model request was sent. Run /compress to retry or "
+            "/new to start fresh."
+        )
+        agent._emit_status(status, kind="compression.blocked")
+        return AutomaticCompressionOutcome(
+            messages=working_messages,
+            system_prompt=active_prompt,
+            request_tokens=working_prepared.accounting.effective_input_tokens,
+            compressed=compressed_any,
+            safe_to_continue=False,
+            failure_reason=reason,
+            prepared_request=working_prepared,
+        )
+
     for compression_pass in range(3):
         before_messages = working_messages
-        before_tokens = request_tokens
+        before_tokens = working_prepared.accounting.effective_input_tokens
         protected_user = (
             working_messages[working_preserve_index]
             if working_preserve_index is not None
@@ -142,8 +175,8 @@ def run_automatic_compression(
         try:
             candidate_messages, candidate_prompt = agent._compress_context(
                 working_messages,
-                system_message,
-                approx_tokens=raw_request_tokens,
+                active_prompt,
+                approx_tokens=before_tokens,
                 task_id=task_id,
                 force=force,
                 emit_abort_warning=emit_abort_warning,
@@ -158,37 +191,9 @@ def run_automatic_compression(
                 compression_pass + 1,
                 exc,
             )
-            if not force and not hard_blocked:
-                agent._emit_status(
-                    "Context compression failed, but the request remains below the "
-                    "safe context boundary. Continuing with the preserved conversation.",
-                    kind="compression.degraded",
-                )
-                return AutomaticCompressionOutcome(
-                    working_messages,
-                    active_prompt,
-                    before_tokens,
-                    compressed_any,
-                    True,
-                    "compression_failed",
-                    True,
-                )
-            agent._emit_status(
-                "Context compression failed. The durable conversation was preserved "
-                "and no normal model request was sent. Run /compress to retry or "
-                "/new to start fresh.",
-                kind="compression.blocked",
-            )
-            return AutomaticCompressionOutcome(
-                working_messages,
-                active_prompt,
-                before_tokens,
-                compressed_any,
-                False,
-                "compression_failed",
-            )
+            return _degraded_or_blocked("compression_failed")
 
-        working_preserve_index = (
+        candidate_preserve_index = (
             next(
                 (
                     index
@@ -200,24 +205,10 @@ def run_automatic_compression(
             if protected_user is not None
             else None
         )
-        candidate_projection_index = (
-            working_preserve_index
-            if working_preserve_index is not None
-            else max(0, len(candidate_messages) - 1)
-        )
-        candidate_projection = project_provider_history(
-            candidate_messages,
-            current_turn_index=candidate_projection_index,
-            protect_last_n=getattr(compressor, "protect_last_n", 20),
-        )
-        candidate_raw_tokens = estimate_request_tokens_rough(
-            candidate_projection,
-            system_prompt=candidate_prompt or "",
-            tools=agent.tools or None,
-        ) + request_token_overhead
-        candidate_tokens = getattr(
-            compressor, "calibrated_prompt_tokens", lambda tokens: tokens
-        )(candidate_raw_tokens)
+        candidate_prepared = prepare_candidate(candidate_messages, candidate_prompt)
+        if not isinstance(candidate_prepared, PreparedModelRequest):
+            raise TypeError("candidate preparer must return a PreparedModelRequest")
+        candidate_tokens = candidate_prepared.accounting.effective_input_tokens
         made_progress = _compression_made_progress(
             orig_len=len(before_messages),
             new_len=len(candidate_messages),
@@ -230,45 +221,20 @@ def run_automatic_compression(
                 if getattr(agent, "_last_compression_attempt_aborted", False)
                 else "compression_no_progress"
             )
-            if not force and not hard_blocked:
-                agent._emit_status(
-                    "Context compression could not reduce the request, but it remains "
-                    "below the safe context boundary. Continuing with the preserved "
-                    "conversation.",
-                    kind="compression.degraded",
-                )
-                return AutomaticCompressionOutcome(
-                    working_messages,
-                    active_prompt,
-                    before_tokens,
-                    compressed_any,
-                    True,
-                    failure,
-                    True,
-                )
-            agent._emit_status(
-                "Context compression could not reduce the request safely. The "
-                "durable conversation was preserved and no normal model request was "
-                "sent. Run /compress to retry or /new to start fresh.",
-                kind="compression.blocked",
-            )
-            return AutomaticCompressionOutcome(
-                working_messages,
-                active_prompt,
-                before_tokens,
-                compressed_any,
-                False,
-                failure,
-            )
+            return _degraded_or_blocked(failure, no_progress=True)
 
         working_messages = candidate_messages
+        working_preserve_index = candidate_preserve_index
         active_prompt = candidate_prompt
+        working_prepared = candidate_prepared
         request_tokens = candidate_tokens
         compressed_any = True
 
-        hard_blocked = would_hard_block(candidate_raw_tokens)
-        if not hard_blocked and (request_tokens < threshold_tokens or not force):
-            degraded = request_tokens >= threshold_tokens
+        candidate_accounting = candidate_prepared.accounting
+        if not candidate_accounting.exceeds_hard_input_limit and (
+            not candidate_accounting.requires_compression or not force
+        ):
+            degraded = candidate_accounting.requires_compression
             agent._emit_status(
                 (
                     "Context compression did not reach its target, but the request is "
@@ -279,13 +245,13 @@ def run_automatic_compression(
                 kind="compression.degraded" if degraded else "compression.completed",
             )
             return AutomaticCompressionOutcome(
-                working_messages,
-                active_prompt,
-                request_tokens,
-                compressed_any,
-                True,
-                None,
-                degraded,
+                messages=working_messages,
+                system_prompt=active_prompt,
+                request_tokens=request_tokens,
+                compressed=True,
+                safe_to_continue=True,
+                degraded=degraded,
+                prepared_request=working_prepared,
             )
 
     agent._emit_status(
@@ -295,14 +261,14 @@ def run_automatic_compression(
         kind="compression.blocked",
     )
     return AutomaticCompressionOutcome(
-        working_messages,
-        active_prompt,
-        request_tokens,
-        compressed_any,
-        False,
-        "compression_still_unsafe",
+        messages=working_messages,
+        system_prompt=active_prompt,
+        request_tokens=request_tokens,
+        compressed=compressed_any,
+        safe_to_continue=False,
+        failure_reason="compression_still_unsafe",
+        prepared_request=working_prepared,
     )
-
 
 def _compression_lock_holder(agent: Any) -> str:
     """Build a unique holder id for the lock: pid:tid:agent-instance:uuid.
@@ -1248,8 +1214,6 @@ def compress_context(
             tools=agent.tools or None,
         )
         agent.context_compressor.last_compression_rough_tokens = _compressed_est
-        agent.context_compressor.last_prompt_tokens = -1
-        agent.context_compressor.last_completion_tokens = 0
         agent.context_compressor.awaiting_real_usage_after_compression = True
 
         # Clear the file-read dedup cache.  After compression the original

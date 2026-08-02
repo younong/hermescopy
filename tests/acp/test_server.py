@@ -299,17 +299,30 @@ class TestSessionOps:
         assert model_cmd.input.root.hint == "model name to switch to"
 
     def test_build_usage_update_for_zed_context_indicator(self, agent, mock_manager):
-        state = mock_manager.create_session(cwd="/tmp")
-        state.history = [{"role": "user", "content": "hello"}]
-        state.agent.context_compressor = MagicMock(context_length=100_000)
-        state.agent._cached_system_prompt = "system"
-        state.agent.tools = [{"type": "function", "function": {"name": "demo"}}]
+        from agent.prepared_model_request import prepare_model_request_snapshot
 
-        with patch(
-            "agent.model_metadata.estimate_request_tokens_rough",
-            return_value=25_000,
-        ):
-            update = agent._build_usage_update(state)
+        state = mock_manager.create_session(cwd="/tmp")
+        state.agent.provider = "openai"
+        state.agent.model = "test-model"
+        state.agent.base_url = "https://example.test/v1"
+        state.agent.api_mode = "chat_completions"
+        state.agent.max_tokens = 4_000
+        state.agent.context_compressor = MagicMock(
+            context_length=100_000,
+            threshold_tokens=75_000,
+            calibrated_prompt_tokens=lambda _value: 25_000,
+        )
+        state.agent._prepared_model_request = prepare_model_request_snapshot(
+            state.agent,
+            request_id="acp:1",
+            payload={
+                "model": state.agent.model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 4_000,
+            },
+        )
+
+        update = agent._build_usage_update(state)
 
         assert isinstance(update, UsageUpdate)
         assert update.session_update == "usage_update"
@@ -319,15 +332,12 @@ class TestSessionOps:
     @pytest.mark.asyncio
     async def test_send_usage_update_to_client(self, agent, mock_manager):
         state = mock_manager.create_session(cwd="/tmp")
-        state.agent.context_compressor = MagicMock(context_length=100_000)
+        update = UsageUpdate(session_update="usage_update", size=100_000, used=25_000)
         mock_conn = MagicMock(spec=acp.Client)
         mock_conn.session_update = AsyncMock()
         agent._conn = mock_conn
 
-        with patch(
-            "agent.model_metadata.estimate_request_tokens_rough",
-            return_value=25_000,
-        ):
+        with patch.object(agent, "_build_usage_update", return_value=update):
             await agent._send_usage_update(state)
 
         mock_conn.session_update.assert_awaited_once()
@@ -1618,7 +1628,7 @@ class TestSlashCommands:
             for call in mock_conn.session_update.call_args_list
         ]
         assert any(update.session_update == "agent_message_chunk" for update in updates)
-        assert any(update.session_update == "usage_update" for update in updates)
+        assert not any(update.session_update == "usage_update" for update in updates)
 
     @pytest.mark.asyncio
     async def test_unknown_slash_falls_through_to_llm(self, agent, mock_manager):

@@ -331,8 +331,11 @@ class _Runtime:
             return request_body
 
         def _normalize(next_request: Any) -> Any:
-            next_body = getattr(next_request, "content", next_request)
-            return next_body if isinstance(next_body, dict) else request_body
+            # LLM execution middleware may intercept execution, but downstream
+            # Hermes dispatch is bound to the already-prepared request. Relay's
+            # adaptive request object is observational here; request rewriting
+            # belongs in llm_request middleware before accounting.
+            return kwargs.get("request") or request_body
 
         def _make_managed(impl: Callable[[Any], Any]) -> Any:
             async def _managed_execute() -> Any:

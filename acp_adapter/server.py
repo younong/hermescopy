@@ -672,27 +672,22 @@ class HermesACPAgent(acp.Agent):
         tool schemas.
         """
         agent = state.agent
-        compressor = getattr(agent, "context_compressor", None)
-        size = int(getattr(compressor, "context_length", 0) or 0)
-        if size <= 0:
-            return None
-
         try:
-            from agent.model_metadata import estimate_request_tokens_rough
+            from agent.prepared_model_request import prepared_context_payload
 
-            used = estimate_request_tokens_rough(
-                state.history,
-                system_prompt=getattr(agent, "_cached_system_prompt", "") or "",
-                tools=getattr(agent, "tools", None) or None,
+            context = prepared_context_payload(
+                getattr(agent, "_prepared_model_request", None)
             )
         except Exception:
-            logger.debug("Could not estimate ACP native context usage", exc_info=True)
-            used = int(getattr(compressor, "last_prompt_tokens", 0) or 0)
+            logger.debug("Could not read ACP prepared context usage", exc_info=True)
+            return None
+        if not context or context.get("accounting_source") != "prepared_request":
+            return None
 
         return UsageUpdate(
             session_update="usage_update",
-            size=max(size, 0),
-            used=max(used, 0),
+            size=max(int(context["context_max"]), 0),
+            used=max(int(context["context_used"]), 0),
         )
 
     async def _send_usage_update(self, state: SessionState) -> None:

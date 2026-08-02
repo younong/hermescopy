@@ -46,12 +46,12 @@ from agent.message_sanitization import (
     _sanitize_tools_non_ascii,
     _strip_images_from_messages,
     _strip_non_ascii,
+    compact_user_attachment_content,
     project_provider_history,
 )
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
     estimate_messages_tokens_rough,
-    estimate_request_tokens_rough,
     get_context_length_from_provider_error,
     is_output_cap_error,
     parse_available_output_tokens_from_error,
@@ -522,6 +522,228 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     return sp
 
 
+def _project_provider_messages(
+    agent,
+    messages: list,
+    *,
+    active_system_prompt: str,
+    current_turn_user_idx: int,
+    original_user_message: str,
+    deferred_skill_context: str,
+    ext_prefetch_cache: str,
+    plugin_user_context: str,
+    moa_config: Optional[dict[str, Any]],
+    moa_context: Optional[str],
+    suppress_reasoning_details: bool,
+) -> tuple[list, str]:
+    """Project persisted transcript state into API-only messages."""
+    from agent.skill_commands import strip_deferred_skill_descriptor
+
+    projected_messages = project_provider_history(
+        messages,
+        current_turn_index=current_turn_user_idx,
+        protect_last_n=agent.context_compressor.protect_last_n,
+    )
+    api_messages = []
+    for idx, (message, projected_message) in enumerate(
+        zip(messages, projected_messages)
+    ):
+        api_message = projected_message.copy()
+        if (
+            projected_message is not message
+            and idx == current_turn_user_idx
+            and message.get("role") == "user"
+            and message.get("attachments")
+        ):
+            api_message["content"] = compact_user_attachment_content(
+                original_user_message,
+                message.get("attachments"),
+            )
+        if message.get("role") == "user":
+            api_message["content"] = strip_deferred_skill_descriptor(
+                api_message.get("content"),
+                active=(idx == current_turn_user_idx),
+            )
+
+        if idx == current_turn_user_idx and message.get("role") == "user":
+            injections = []
+            if deferred_skill_context:
+                injections.append(deferred_skill_context)
+            if ext_prefetch_cache:
+                fenced = build_memory_context_block(ext_prefetch_cache)
+                if fenced:
+                    injections.append(fenced)
+            if plugin_user_context:
+                injections.append(plugin_user_context)
+            if injections:
+                content = api_message.get("content", "")
+                if isinstance(content, str):
+                    api_message["content"] = content + "\n\n" + "\n\n".join(injections)
+
+        agent._copy_reasoning_content_for_api(message, api_message)
+        api_message.pop("reasoning", None)
+        api_message.pop("finish_reason", None)
+        api_message.pop("_thinking_prefill", None)
+        api_message.pop("attachments", None)
+        if agent._should_sanitize_tool_calls():
+            agent._sanitize_tool_calls_for_strict_api(api_message, model=agent.model)
+        if suppress_reasoning_details:
+            api_message.pop("reasoning_details", None)
+        api_messages.append(api_message)
+
+    effective_system = active_system_prompt or ""
+    if agent.ephemeral_system_prompt:
+        effective_system = (
+            effective_system + "\n\n" + agent.ephemeral_system_prompt
+        ).strip()
+    if effective_system:
+        api_messages.insert(0, {"role": "system", "content": effective_system})
+
+    if moa_config and moa_context is None:
+        try:
+            from agent.moa_loop import aggregate_moa_context
+
+            moa_context = aggregate_moa_context(
+                user_prompt=(
+                    original_user_message
+                    if isinstance(original_user_message, str)
+                    else str(original_user_message)
+                ),
+                api_messages=api_messages,
+                reference_models=moa_config.get("reference_models") or [],
+                aggregator=moa_config.get("aggregator") or {},
+                temperature=float(moa_config.get("reference_temperature", 0.6) or 0.6),
+                aggregator_temperature=float(
+                    moa_config.get("aggregator_temperature", 0.4) or 0.4
+                ),
+                max_tokens=moa_config.get("reference_max_tokens"),
+            )
+        except Exception as exc:
+            logger.warning("MoA context aggregation failed: %s", exc)
+            moa_context = ""
+
+    if moa_context:
+        for message in reversed(api_messages):
+            if message.get("role") == "user":
+                content = message.get("content", "")
+                if isinstance(content, str):
+                    message["content"] = content + "\n\n" + moa_context
+                break
+
+    if agent.prefill_messages:
+        system_offset = (
+            1 if api_messages and api_messages[0].get("role") == "system" else 0
+        )
+        for idx, prefill in enumerate(agent.prefill_messages):
+            api_messages.insert(system_offset + idx, prefill.copy())
+
+    if agent._use_prompt_caching:
+        api_messages = apply_anthropic_cache_control(
+            api_messages,
+            cache_ttl=agent._cache_ttl,
+            native_anthropic=agent._use_native_cache_layout,
+        )
+
+    api_messages = agent._sanitize_api_messages(api_messages)
+    api_messages = agent._drop_thinking_only_and_merge_users(
+        api_messages,
+        drop_codex_reasoning_items=agent.api_mode != "codex_responses",
+    )
+
+    for message in api_messages:
+        if isinstance(message.get("content"), str):
+            message["content"] = message["content"].strip()
+        tool_calls = message.get("tool_calls")
+        if not tool_calls:
+            continue
+        normalized_calls = []
+        for tool_call in tool_calls:
+            if isinstance(tool_call, dict) and "function" in tool_call:
+                try:
+                    args_obj = json.loads(tool_call["function"]["arguments"])
+                    tool_call = {
+                        **tool_call,
+                        "function": {
+                            **tool_call["function"],
+                            "arguments": json.dumps(
+                                args_obj,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ),
+                        },
+                    }
+                except Exception:
+                    tool_call["function"]["arguments"] = _repair_tool_call_arguments(
+                        tool_call["function"]["arguments"],
+                        tool_call["function"].get("name", "?"),
+                    )
+            normalized_calls.append(tool_call)
+        message["tool_calls"] = normalized_calls
+
+    _sanitize_messages_surrogates(api_messages)
+    return api_messages, moa_context or ""
+
+
+def _request_messages_for_observers(payload: dict, *, fallback: list) -> list:
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        messages = payload.get("input")
+    return messages if isinstance(messages, list) else fallback
+
+
+def _prepare_provider_request(
+    agent,
+    api_messages: list,
+    *,
+    request_id: str,
+    effective_task_id: str,
+    turn_id: str,
+    api_call_count: int,
+    ephemeral_max_output_tokens: Optional[int],
+):
+    """Build, rewrite, and account for one exact provider payload."""
+    from agent.chat_completion_helpers import build_api_kwargs
+    from agent.prepared_model_request import prepare_model_request_snapshot
+    from hermes_cli.middleware import apply_llm_request_middleware
+
+    agent._reapply_reasoning_echo_for_provider(api_messages)
+    payload = build_api_kwargs(
+        agent,
+        api_messages,
+        ephemeral_max_output_tokens=ephemeral_max_output_tokens,
+    )
+    if agent._force_ascii_payload:
+        _sanitize_structure_non_ascii(payload)
+    if agent.api_mode == "codex_responses":
+        payload = agent._get_transport().preflight_kwargs(payload, allow_stream=False)
+
+    middleware_result = apply_llm_request_middleware(
+        payload,
+        task_id=effective_task_id,
+        turn_id=turn_id,
+        api_request_id=request_id,
+        session_id=agent.session_id or "",
+        platform=agent.platform or "",
+        model=agent.model,
+        provider=agent.provider,
+        base_url=agent.base_url,
+        api_mode=agent.api_mode,
+        api_call_count=api_call_count,
+    )
+    dispatch_metadata = {}
+    if agent.api_mode == "bedrock_converse":
+        dispatch_metadata["bedrock_region"] = (
+            getattr(agent, "_bedrock_region", None) or "us-east-1"
+        )
+    return prepare_model_request_snapshot(
+        agent,
+        request_id=request_id,
+        payload=middleware_result.payload,
+        original_payload=middleware_result.original_payload,
+        middleware_trace=middleware_result.trace,
+        dispatch_metadata=dispatch_metadata,
+    )
+
 def run_conversation(
     agent,
     user_message: str,
@@ -635,8 +857,6 @@ def run_conversation(
     _deferred_skill_context = _ctx.deferred_skill_context
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
-    _allow_degraded_request = _ctx.compression_degraded
-
     if not _ctx.compression_safe_to_continue:
         compression_error = (
             "Context compression did not produce a safe request. The conversation "
@@ -669,39 +889,6 @@ def run_conversation(
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
 
-    def _handle_builtin_overflow_compression(current_tokens: int) -> bool:
-        """Synchronously compress an authoritative provider overflow."""
-        nonlocal messages, active_system_prompt, conversation_history
-        nonlocal failed, terminal_error, terminal_failure_reason, _turn_exit_reason
-
-        from agent.conversation_compression import run_automatic_compression
-
-        outcome = run_automatic_compression(
-            agent,
-            messages,
-            active_system_prompt or system_message or "",
-            current_tokens=current_tokens,
-            task_id=effective_task_id,
-            force=True,
-            emit_abort_warning=False,
-            preserve_attachment_index=current_turn_user_idx,
-        )
-        if outcome.compressed:
-            messages = outcome.messages
-            _refresh_current_turn_user_idx()
-            active_system_prompt = outcome.system_prompt
-            conversation_history = conversation_history_after_compression(
-                agent, messages
-            )
-        if outcome.safe_to_continue and outcome.compressed:
-            return True
-
-        failed = True
-        terminal_error = "provider context overflow and synchronous compression failed"
-        terminal_failure_reason = outcome.failure_reason or "compression_hard_blocked"
-        _turn_exit_reason = "compression_hard_blocked"
-        return False
-
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
     # ``try_refresh_current()`` "succeed" forever on a single-entry OAuth pool,
@@ -715,6 +902,9 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        from agent.prepared_model_request import ProviderManagedRequest, request_route
+
+        agent._prepared_model_request = ProviderManagedRequest(request_route(agent))
         return agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
@@ -722,6 +912,11 @@ def run_conversation(
             effective_task_id=effective_task_id,
             should_review_memory=_should_review_memory,
         )
+
+    # Request-shape recoveries survive the inner transport retry loop so the
+    # next outer preparation can rebuild provider kwargs from corrected source
+    # state without mutating the accepted prepared payload.
+    _suppress_reasoning_details = False
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
@@ -872,231 +1067,98 @@ def run_conversation(
                 agent.session_id or "-",
             )
 
-        from agent.skill_commands import strip_deferred_skill_descriptor
-
-        api_messages = []
-        for idx, msg in enumerate(messages):
-            api_msg = msg.copy()
-            if msg.get("role") == "user":
-                api_msg["content"] = strip_deferred_skill_descriptor(
-                    api_msg.get("content"),
-                    active=(idx == current_turn_user_idx),
-                )
-
-            # Inject ephemeral context into the current turn's user message.
-            # Sources: memory manager prefetch + plugin pre_llm_call hooks
-            # with target="user_message" (the default).  Both are
-            # API-call-time only — the original message in `messages` is
-            # never mutated, so nothing leaks into session persistence.
-            if idx == current_turn_user_idx and msg.get("role") == "user":
-                _injections = []
-                if _deferred_skill_context:
-                    _injections.append(_deferred_skill_context)
-                if _ext_prefetch_cache:
-                    _fenced = build_memory_context_block(_ext_prefetch_cache)
-                    if _fenced:
-                        _injections.append(_fenced)
-                if _plugin_user_context:
-                    _injections.append(_plugin_user_context)
-                if _injections:
-                    _base = api_msg.get("content", "")
-                    if isinstance(_base, str):
-                        api_msg["content"] = _base + "\n\n" + "\n\n".join(_injections)
-
-            # For ALL assistant messages, pass reasoning back to the API
-            # This ensures multi-turn reasoning context is preserved
-            agent._copy_reasoning_content_for_api(msg, api_msg)
-
-            # Remove 'reasoning' field - it's for trajectory storage only
-            # We've copied it to 'reasoning_content' for the API above
-            if "reasoning" in api_msg:
-                api_msg.pop("reasoning")
-            # Remove finish_reason - not accepted by strict APIs (e.g. Mistral)
-            if "finish_reason" in api_msg:
-                api_msg.pop("finish_reason")
-            # Strip internal transcript fields that providers do not accept.
-            api_msg.pop("_thinking_prefill", None)
-            api_msg.pop("attachments", None)
-            # Strip Codex Responses API fields (call_id, response_item_id) for
-            # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
-            # Uses new dicts so the internal messages list retains the fields
-            # for Codex Responses compatibility.
-            if agent._should_sanitize_tool_calls():
-                agent._sanitize_tool_calls_for_strict_api(api_msg, model=agent.model)
-            # Keep 'reasoning_details' - OpenRouter uses this for multi-turn reasoning context
-            # The signature field helps maintain reasoning continuity
-            api_messages.append(api_msg)
-
-        api_messages = project_provider_history(
-            api_messages,
-            current_turn_index=current_turn_user_idx,
-            protect_last_n=agent.context_compressor.protect_last_n,
+        api_messages, _moa_context = _project_provider_messages(
+            agent,
+            messages,
+            active_system_prompt=active_system_prompt,
+            current_turn_user_idx=current_turn_user_idx,
+            original_user_message=original_user_message,
+            deferred_skill_context=_deferred_skill_context,
+            ext_prefetch_cache=_ext_prefetch_cache,
+            plugin_user_context=_plugin_user_context,
+            moa_config=moa_config,
+            moa_context=None,
+            suppress_reasoning_details=_suppress_reasoning_details,
         )
 
-        # Build the final system message: cached prompt + ephemeral system prompt.
-        # Ephemeral additions are API-call-time only (not persisted to session DB).
-        # External recall context is injected into the user message, not the system
-        # prompt, so the stable cache prefix remains unchanged.
-        #
-        # NOTE: Plugin context from pre_llm_call hooks is injected into the
-        # user message (see injection block above), NOT the system prompt.
-        # This is intentional — system prompt modifications break the prompt
-        # cache prefix.  The system prompt is reserved for Hermes internals.
-        #
-        # Hermes invariant: the system prompt is built ONCE per session
-        # (cached on ``_cached_system_prompt``) and replayed verbatim on
-        # every turn.  We send it as a single content string so the
-        # bytes are byte-stable across turns and upstream prompt caches
-        # stay warm.
-        effective_system = active_system_prompt or ""
-        if agent.ephemeral_system_prompt:
-            effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
-        if effective_system:
-            api_messages = [{"role": "system", "content": effective_system}] + api_messages
-
-        if moa_config:
-            try:
-                from agent.moa_loop import aggregate_moa_context
-
-                _moa_context = aggregate_moa_context(
-                    user_prompt=original_user_message if isinstance(original_user_message, str) else str(original_user_message),
-                    api_messages=api_messages,
-                    reference_models=moa_config.get("reference_models") or [],
-                    aggregator=moa_config.get("aggregator") or {},
-                    temperature=float(moa_config.get("reference_temperature", 0.6) or 0.6),
-                    aggregator_temperature=float(moa_config.get("aggregator_temperature", 0.4) or 0.4),
-                    max_tokens=moa_config.get("reference_max_tokens"),
-                )
-                if _moa_context:
-                    for _msg in reversed(api_messages):
-                        if _msg.get("role") == "user":
-                            _base = _msg.get("content", "")
-                            if isinstance(_base, str):
-                                _msg["content"] = _base + "\n\n" + _moa_context
-                            break
-            except Exception as _moa_exc:
-                logger.warning("MoA context aggregation failed: %s", _moa_exc)
-
-        # Inject ephemeral prefill messages right after the system prompt
-        # but before conversation history. Same API-call-time-only pattern.
-        if agent.prefill_messages:
-            sys_offset = 1 if (api_messages and api_messages[0].get("role") == "system") else 0
-            for idx, pfm in enumerate(agent.prefill_messages):
-                api_messages.insert(sys_offset + idx, pfm.copy())
-
-        # Apply Anthropic prompt caching for Claude models on native
-        # Anthropic, OpenRouter, and third-party Anthropic-compatible
-        # gateways. Auto-detected: if ``_use_prompt_caching`` is set,
-        # inject cache_control breakpoints (system + last 3 messages)
-        # to reduce input token costs by ~75% on multi-turn
-        # conversations.
-        if agent._use_prompt_caching:
-            api_messages = apply_anthropic_cache_control(
-                api_messages,
-                cache_ttl=agent._cache_ttl,
-                native_anthropic=agent._use_native_cache_layout,
-            )
-
-        # Safety net: strip orphaned tool results / add stubs for missing
-        # results before sending to the API.  Runs unconditionally — not
-        # gated on context_compressor — so orphans from session loading or
-        # manual message manipulation are always caught.
-        api_messages = agent._sanitize_api_messages(api_messages)
-
-        # Drop thinking-only assistant turns (reasoning but no visible
-        # output and no tool_calls) and merge any adjacent user messages
-        # left behind. Prevents Anthropic 400s ("The final block in an
-        # assistant message cannot be `thinking`.") and equivalent errors
-        # from third-party Anthropic-compatible gateways that can't replay
-        # a thinking-only turn. Runs on the per-call copy only — the
-        # stored conversation history keeps the reasoning block for the
-        # UI transcript and session persistence.
-        api_messages = agent._drop_thinking_only_and_merge_users(
-            api_messages,
-            drop_codex_reasoning_items=agent.api_mode != "codex_responses",
-        )
-
-        # Normalize message whitespace and tool-call JSON for consistent
-        # prefix matching.  Ensures bit-perfect prefixes across turns,
-        # which enables KV cache reuse on local inference servers
-        # (llama.cpp, vLLM, Ollama) and improves cache hit rates for
-        # cloud providers.  Operates on api_messages (the API copy) so
-        # the original conversation history in `messages` is untouched.
-        for am in api_messages:
-            if isinstance(am.get("content"), str):
-                am["content"] = am["content"].strip()
-        for am in api_messages:
-            tcs = am.get("tool_calls")
-            if not tcs:
-                continue
-            new_tcs = []
-            for tc in tcs:
-                if isinstance(tc, dict) and "function" in tc:
-                    try:
-                        args_obj = json.loads(tc["function"]["arguments"])
-                        tc = {**tc, "function": {
-                            **tc["function"],
-                            "arguments": json.dumps(
-                                args_obj, separators=(",", ":"),
-                                sort_keys=True,
-                            ),
-                        }}
-                    except Exception:
-                        tc["function"]["arguments"] = _repair_tool_call_arguments(
-                            tc["function"]["arguments"],
-                            tc["function"].get("name", "?"),
-                        )
-                new_tcs.append(tc)
-            am["tool_calls"] = new_tcs
-
-        # Proactively strip any surrogate characters before the API call.
-        # Models served via Ollama (Kimi K2.5, GLM-5, Qwen) can return
-        # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
-        # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
-        _sanitize_messages_surrogates(api_messages)
-
-        # Calculate approximate request size for logging
+        # Provider-specific kwargs and request middleware are applied before the
+        # authoritative safety gate so accounting sees exactly what dispatch sees.
         total_chars = sum(len(str(msg)) for msg in api_messages)
         approx_tokens = estimate_messages_tokens_rough(api_messages)
-        _raw_request_tokens = estimate_request_tokens_rough(
-            api_messages,
-            tools=agent.tools or None,
-            precomputed_message_tokens=approx_tokens,
+        api_request_id = f"{turn_id}:api:{api_call_count}"
+        agent._current_api_request_id = api_request_id
+        _ephemeral_output_override = getattr(
+            agent, "_ephemeral_max_output_tokens", None
         )
-        _note_request_estimate = getattr(
-            agent.context_compressor,
-            "note_request_estimate",
-            None,
-        )
-        approx_request_tokens = (
-            _note_request_estimate(_raw_request_tokens)
-            if _note_request_estimate is not None
-            else _raw_request_tokens
-        )
+        if _ephemeral_output_override is not None:
+            agent._ephemeral_max_output_tokens = None
 
-        _hard_block = getattr(
-            agent.context_compressor,
-            "would_hard_block",
-            lambda _tokens: False,
-        )(_raw_request_tokens)
-        _at_compression_threshold = (
-            approx_request_tokens
-            >= int(getattr(agent.context_compressor, "threshold_tokens", 0) or 0)
+        prepared_request = _prepare_provider_request(
+            agent,
+            api_messages,
+            request_id=api_request_id,
+            effective_task_id=effective_task_id,
+            turn_id=turn_id,
+            api_call_count=api_call_count,
+            ephemeral_max_output_tokens=_ephemeral_output_override,
         )
-        if agent.compression_enabled and (
-            _hard_block or (_at_compression_threshold and not _allow_degraded_request)
-        ):
+        accounting = prepared_request.accounting
+        approx_request_tokens = accounting.effective_input_tokens
+
+        def _prepare_compression_candidate(candidate_messages, candidate_prompt):
+            candidate_user_idx = next(
+                (
+                    idx
+                    for idx in range(len(candidate_messages) - 1, -1, -1)
+                    if candidate_messages[idx].get("role") == "user"
+                    and candidate_messages[idx].get("content") == user_message
+                ),
+                len(candidate_messages) - 1,
+            )
+            candidate_api_messages, _ = _project_provider_messages(
+                agent,
+                candidate_messages,
+                active_system_prompt=candidate_prompt,
+                current_turn_user_idx=candidate_user_idx,
+                original_user_message=original_user_message,
+                deferred_skill_context=_deferred_skill_context,
+                ext_prefetch_cache=_ext_prefetch_cache,
+                plugin_user_context=_plugin_user_context,
+                moa_config=moa_config,
+                moa_context=_moa_context,
+                suppress_reasoning_details=_suppress_reasoning_details,
+            )
+            return _prepare_provider_request(
+                agent,
+                candidate_api_messages,
+                request_id=api_request_id,
+                effective_task_id=effective_task_id,
+                turn_id=turn_id,
+                api_call_count=api_call_count,
+                ephemeral_max_output_tokens=_ephemeral_output_override,
+            )
+
+        def _compress_prepared_request(*, force: bool):
             from agent.conversation_compression import run_automatic_compression
 
-            outcome = run_automatic_compression(
+            return run_automatic_compression(
                 agent,
                 messages,
                 active_system_prompt or system_message or "",
-                current_tokens=_raw_request_tokens,
+                prepared_request=prepared_request,
+                prepare_candidate=_prepare_compression_candidate,
                 task_id=effective_task_id,
+                force=force,
                 emit_abort_warning=False,
                 preserve_attachment_index=current_turn_user_idx,
             )
+
+        def _adopt_compression_outcome(outcome, *, failure_error: str) -> bool:
+            nonlocal messages, active_system_prompt, conversation_history
+            nonlocal prepared_request, api_messages, accounting
+            nonlocal approx_request_tokens, approx_tokens, total_chars
+            nonlocal failed, terminal_error, terminal_failure_reason, _turn_exit_reason
+
             if outcome.compressed:
                 messages = outcome.messages
                 _refresh_current_turn_user_idx()
@@ -1104,22 +1166,35 @@ def run_conversation(
                 conversation_history = conversation_history_after_compression(
                     agent, messages
                 )
-            if outcome.safe_to_continue and outcome.compressed:
-                _allow_degraded_request = outcome.degraded
-                api_call_count -= 1
-                agent._api_call_count = api_call_count
-                try:
-                    agent.iteration_budget.refund()
-                except Exception:
-                    pass
-                continue
-            if not outcome.safe_to_continue:
-                _turn_exit_reason = "compression_hard_blocked"
+            if not outcome.safe_to_continue or outcome.prepared_request is None:
                 failed = True
-                terminal_error = "context compression did not produce a safe request"
+                terminal_error = failure_error
                 terminal_failure_reason = (
                     outcome.failure_reason or "compression_hard_blocked"
                 )
+                _turn_exit_reason = "compression_hard_blocked"
+                return False
+
+            prepared_request = outcome.prepared_request
+            api_messages = _request_messages_for_observers(
+                prepared_request.payload,
+                fallback=api_messages,
+            )
+            accounting = prepared_request.accounting
+            approx_request_tokens = accounting.effective_input_tokens
+            total_chars = sum(len(str(message)) for message in api_messages)
+            approx_tokens = approx_request_tokens
+            agent._prepared_model_request = prepared_request
+            return True
+
+        if agent.compression_enabled and (
+            accounting.requires_compression or accounting.exceeds_hard_input_limit
+        ):
+            outcome = _compress_prepared_request(force=False)
+            if not _adopt_compression_outcome(
+                outcome,
+                failure_error="context compression did not produce a safe request",
+            ):
                 api_call_count -= 1
                 agent._api_call_count = api_call_count
                 try:
@@ -1128,9 +1203,6 @@ def run_conversation(
                     pass
                 break
 
-        # A degraded result permits one rebuilt request above the preferred
-        # compression threshold. Any following iteration must evaluate normally.
-        _allow_degraded_request = False
         _runtime_context_error = _ollama_context_limit_error(
             agent, approx_request_tokens
         )
@@ -1147,7 +1219,7 @@ def run_conversation(
             except Exception:
                 pass
             break
-        
+
         # Thinking spinner for quiet mode (animated during API call)
         thinking_spinner = None
         
@@ -1184,9 +1256,7 @@ def run_conversation(
 
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
-        api_kwargs = None  # Guard against UnboundLocalError in except handler
-        api_request_id = f"{turn_id}:api:{api_call_count}"
-        agent._current_api_request_id = api_request_id
+        api_kwargs = prepared_request.payload
 
         while retry_count < max_retries:
             # ── Nous Portal rate limit guard ──────────────────────
@@ -1216,7 +1286,8 @@ def run_conversation(
                             retry_count = 0
                             compression_attempts = 0
                             _retry.primary_recovery_attempted = False
-                            continue
+                            _retry.restart_with_rebuilt_messages = True
+                            break
                         # No fallback available — surface buffered context
                         # so user sees the rate-limit message that led here.
                         agent._flush_status_buffer()
@@ -1241,41 +1312,14 @@ def run_conversation(
 
             try:
                 agent._reset_stream_delivery_tracking()
-                # api_messages is built once, before this retry loop, while the
-                # primary provider is active.  A mid-conversation fallback can
-                # switch to a require-side provider (DeepSeek / Kimi / MiMo) that
-                # rejects assistant turns lacking reasoning_content.  Re-apply the
-                # echo-back pad for the *current* provider here (idempotent no-op
-                # unless the active provider needs it) so the fallback request
-                # isn't sent with stale, primary-shaped reasoning fields.
-                agent._reapply_reasoning_echo_for_provider(api_messages)
-                api_kwargs = agent._build_api_kwargs(api_messages)
-                if agent._force_ascii_payload:
-                    _sanitize_structure_non_ascii(api_kwargs)
-                if agent.api_mode == "codex_responses":
-                    api_kwargs = agent._get_transport().preflight_kwargs(api_kwargs, allow_stream=False)
-                try:
-                    from hermes_cli.middleware import apply_llm_request_middleware
+                # Ordinary transport/credential retries reuse this exact payload.
+                # Any route or request-shape recovery exits to the outer loop,
+                # where provider conversion and request middleware run again.
+                api_kwargs = prepared_request.payload
+                _original_api_kwargs = prepared_request.original_payload
+                _llm_middleware_trace = prepared_request.middleware_trace
 
-                    _llm_request_mw = apply_llm_request_middleware(
-                        api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                    )
-                    api_kwargs = _llm_request_mw.payload
-                    _original_api_kwargs = _llm_request_mw.original_payload
-                    _llm_middleware_trace = _llm_request_mw.trace
-                except Exception:
-                    _original_api_kwargs = dict(api_kwargs)
-                    _llm_middleware_trace = []
+                agent._prepared_model_request = prepared_request
 
                 try:
                     from hermes_cli.plugins import (
@@ -1283,11 +1327,10 @@ def run_conversation(
                         invoke_hook as _invoke_hook,
                     )
                     if has_hook("pre_api_request"):
-                        request_messages = api_kwargs.get("messages")
-                        if not isinstance(request_messages, list):
-                            request_messages = api_kwargs.get("input")
-                        if not isinstance(request_messages, list):
-                            request_messages = api_messages
+                        request_messages = _request_messages_for_observers(
+                            api_kwargs,
+                            fallback=api_messages,
+                        )
                         # Shallow-copy the outer list so plugins that retain the
                         # reference for async snapshotting don't observe later
                         # mutations of api_messages.  The inner dicts are not
@@ -1322,11 +1365,11 @@ def run_conversation(
                             request_messages=list(request_messages)
                             if isinstance(request_messages, list)
                             else [],
-                            message_count=len(api_messages),
-                            tool_count=len(agent.tools or []),
-                            approx_input_tokens=approx_tokens,
-                            request_char_count=total_chars,
-                            max_tokens=agent.max_tokens,
+                            message_count=prepared_request.message_count,
+                            tool_count=prepared_request.tool_count,
+                            approx_input_tokens=prepared_request.accounting.effective_input_tokens,
+                            request_char_count=prepared_request.request_char_count,
+                            max_tokens=prepared_request.accounting.output_token_limit,
                             started_at=api_start_time,
                             middleware_trace=list(_llm_middleware_trace),
                             request=_request_payload,
@@ -1385,18 +1428,44 @@ def run_conversation(
                     _use_streaming = False
                 elif not agent._has_stream_consumers():
                     # No display/TTS consumer. Still prefer streaming for
-                    # health checking, but skip for Mock clients in tests
-                    # (mocks return SimpleNamespace, not stream iterators).
+                    # health checking, but skip for mocked/overridden dispatch
+                    # helpers in tests and embedders that provide a complete
+                    # non-streaming response contract.
                     from unittest.mock import Mock
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
+                    elif "_interruptible_api_call" in getattr(agent, "__dict__", {}):
+                        _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    # Built-in dispatch helpers accept request-local metadata that
+                    # must stay outside provider bodies (currently Bedrock region).
+                    # Instance overrides retain their historical signatures.
+                    dispatch_metadata = prepared_request.dispatch_metadata
                     if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
+                        if "_interruptible_streaming_api_call" in getattr(agent, "__dict__", {}):
+                            return agent._interruptible_streaming_api_call(
+                                next_api_kwargs, on_first_delta=_stop_spinner
+                            )
+                        from agent.chat_completion_helpers import (
+                            interruptible_streaming_api_call,
                         )
-                    return agent._interruptible_api_call(next_api_kwargs)
+
+                        return interruptible_streaming_api_call(
+                            agent,
+                            next_api_kwargs,
+                            on_first_delta=_stop_spinner,
+                            dispatch_metadata=dispatch_metadata,
+                        )
+                    if "_interruptible_api_call" in getattr(agent, "__dict__", {}):
+                        return agent._interruptible_api_call(next_api_kwargs)
+                    from agent.chat_completion_helpers import interruptible_api_call
+
+                    return interruptible_api_call(
+                        agent,
+                        next_api_kwargs,
+                        dispatch_metadata=dispatch_metadata,
+                    )
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
@@ -1556,7 +1625,8 @@ def run_conversation(
                         retry_count = 0
                         compression_attempts = 0
                         _retry.primary_recovery_attempted = False
-                        continue
+                        _retry.restart_with_rebuilt_messages = True
+                        break
 
                     # Check for error field in response (some providers include this)
                     error_msg = "Unknown"
@@ -1629,7 +1699,8 @@ def run_conversation(
                             retry_count = 0
                             compression_attempts = 0
                             _retry.primary_recovery_attempted = False
-                            continue
+                            _retry.restart_with_rebuilt_messages = True
+                            break
                         # Terminal — flush buffered retry trace so user sees what happened.
                         agent._flush_status_buffer()
                         agent._emit_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
@@ -1778,7 +1849,8 @@ def run_conversation(
                         retry_count = 0
                         compression_attempts = 0
                         _retry.primary_recovery_attempted = False
-                        continue
+                        _retry.restart_with_rebuilt_messages = True
+                        break
 
                     agent._flush_status_buffer()
                     _refusal_log = (
@@ -2449,7 +2521,8 @@ def run_conversation(
                             agent._buffer_vprint(
                                 f"⚠️  Surrogate encoding error — retrying after full-payload sanitization..."
                             )
-                        continue
+                        _retry.restart_with_rebuilt_messages = True
+                        break
                     if _is_ascii_codec:
                         agent._force_ascii_payload = True
                         # ASCII codec: the system encoding can't handle
@@ -2556,7 +2629,8 @@ def run_conversation(
                                 f"{agent.log_prefix}⚠️  System encoding is ASCII — enabling full-payload sanitization for retry...",
                                 force=True,
                             )
-                        continue
+                        _retry.restart_with_rebuilt_messages = True
+                        break
 
                 # ── Image-rejection recovery ──────────────────────────────
                 # Some providers (mlx-lm, text-only endpoints, text-only
@@ -2647,7 +2721,8 @@ def run_conversation(
                         + (". Stripped images from history and retrying." if _imgs_removed else "."),
                         force=True,
                     )
-                    continue
+                    _retry.restart_with_rebuilt_messages = True
+                    break
 
                 status_code = getattr(api_error, "status_code", None)
                 error_context = agent._extract_api_error_context(api_error)
@@ -2724,7 +2799,7 @@ def run_conversation(
                     _retry.image_shrink_retry_attempted = True
                     image_max_dimension = _image_error_max_dimension(api_error) or 8000
                     if agent._try_shrink_image_parts_in_messages(
-                        api_messages,
+                        messages,
                         max_dimension=image_max_dimension,
                     ):
                         agent._vprint(
@@ -2732,7 +2807,8 @@ def run_conversation(
                             f"shrank and retrying...",
                             force=True,
                         )
-                        continue
+                        _retry.restart_with_rebuilt_messages = True
+                        break
                     else:
                         logger.info(
                             "image-shrink recovery: no data-URL image parts found "
@@ -2751,13 +2827,14 @@ def run_conversation(
                     and not _retry.multimodal_tool_content_retry_attempted
                 ):
                     _retry.multimodal_tool_content_retry_attempted = True
-                    if agent._try_strip_image_parts_from_tool_messages(api_messages):
+                    if agent._try_strip_image_parts_from_tool_messages(messages):
                         agent._vprint(
                             f"{agent.log_prefix}📐 Provider rejected list-type tool content — "
                             f"downgraded screenshots to text and retrying...",
                             force=True,
                         )
-                        continue
+                        _retry.restart_with_rebuilt_messages = True
+                        break
                     else:
                         logger.info(
                             "multimodal-tool-content recovery: no list-type tool "
@@ -2924,11 +3001,12 @@ def run_conversation(
                     and not _retry.thinking_sig_retry_attempted
                 ):
                     _retry.thinking_sig_retry_attempted = True
-                    _api_stripped = 0
-                    for _m in api_messages:
-                        if isinstance(_m, dict) and "reasoning_details" in _m:
-                            _m.pop("reasoning_details", None)
-                            _api_stripped += 1
+                    _api_stripped = sum(
+                        1
+                        for _m in api_messages
+                        if isinstance(_m, dict) and "reasoning_details" in _m
+                    )
+                    _suppress_reasoning_details = True
                     agent._vprint(
                         f"{agent.log_prefix}⚠️  Thinking block signature invalid, "
                         f"stripped reasoning_details from api_messages for retry...",
@@ -2940,7 +3018,8 @@ def run_conversation(
                         "(canonical messages unchanged)",
                         agent.log_prefix, _api_stripped,
                     )
-                    continue
+                    _retry.restart_with_rebuilt_messages = True
+                    break
 
                 # ── Invalid encrypted reasoning replay recovery ───────
                 # OpenAI Responses API surfaces (and some compatible relays)
@@ -2983,7 +3062,8 @@ def run_conversation(
                         replay_stats["items"],
                         replay_stats["messages"],
                     )
-                    continue
+                    _retry.restart_with_rebuilt_messages = True
+                    break
 
                 # ── llama.cpp grammar-parse recovery ──────────────────
                 # llama.cpp's ``json-schema-to-grammar`` converter rejects
@@ -3019,7 +3099,8 @@ def run_conversation(
                             "pattern/format keyword(s) from tool schemas",
                             agent.log_prefix, _stripped,
                         )
-                        continue
+                        _retry.restart_with_rebuilt_messages = True
+                        break
                     # No keywords found to strip — fall through to normal
                     # retry path rather than loop forever on the same error.
                     logger.warning(
@@ -3198,7 +3279,11 @@ def run_conversation(
                     compression_attempts += 1
                     if compression_attempts <= max_compression_attempts:
                         if getattr(agent, "_using_builtin_context_compressor", False):
-                            if not _handle_builtin_overflow_compression(approx_tokens):
+                            outcome = _compress_prepared_request(force=True)
+                            if not _adopt_compression_outcome(
+                                outcome,
+                                failure_error="provider context overflow and synchronous compression failed",
+                            ):
                                 break
                         else:
                             original_len = len(messages)
@@ -3285,7 +3370,8 @@ def run_conversation(
                             retry_count = 0
                             compression_attempts = 0
                             _retry.primary_recovery_attempted = False
-                            continue
+                            _retry.restart_with_rebuilt_messages = True
+                            break
 
                 # ── Auth-failure provider failover ───────────────────────
                 # A 401/403 that survives the per-provider credential-refresh
@@ -3318,7 +3404,8 @@ def run_conversation(
                         retry_count = 0
                         compression_attempts = 0
                         _retry.primary_recovery_attempted = False
-                        continue
+                        _retry.restart_with_rebuilt_messages = True
+                        break
 
                 # ── Nous Portal: record rate limit & skip retries ─────
                 # When Nous returns a 429 that is a genuine account-
@@ -3448,7 +3535,11 @@ def run_conversation(
                     agent._buffer_status(f"⚠️  Request payload too large (413) — compression attempt {compression_attempts}/{max_compression_attempts}...")
 
                     if getattr(agent, "_using_builtin_context_compressor", False):
-                        if _handle_builtin_overflow_compression(approx_tokens):
+                        outcome = _compress_prepared_request(force=True)
+                        if _adopt_compression_outcome(
+                            outcome,
+                            failure_error="provider context overflow and synchronous compression failed",
+                        ):
                             _retry.restart_with_compressed_messages = True
                         break
 
@@ -3479,14 +3570,15 @@ def run_conversation(
                         break
                     else:
                         if agent._try_strip_image_parts_from_tool_messages(
-                            api_messages,
+                            messages,
                             remember_model=False,
                         ):
                             agent._buffer_status(
                                 "📐 Compression could not reduce the request further — "
                                 "removed retained vision payloads and retrying..."
                             )
-                            continue
+                            _retry.restart_with_rebuilt_messages = True
+                            break
 
                         # Terminal — surface buffered context so the user
                         # sees what compression attempts were made.
@@ -3532,8 +3624,8 @@ def run_conversation(
                     available_out = parse_available_output_tokens_from_error(error_msg)
                     if available_out is not None:
                         # Error is purely about the output cap being too large.
-                        # Cap output to the available space and retry without
-                        # touching context_length or triggering compression.
+                        # Capture a new logical-call override and return to outer
+                        # preparation; the accepted payload is never edited in place.
                         safe_out = max(1, available_out - 64)  # small safety margin
                         agent._ephemeral_max_output_tokens = safe_out
                         agent._buffer_vprint(
@@ -3561,7 +3653,7 @@ def run_conversation(
                                 "failed": True,
                                 "compression_exhausted": True,
                             }
-                        _retry.restart_with_compressed_messages = True
+                        _retry.restart_with_rebuilt_messages = True
                         break
 
                     # The error is output-cap-shaped (about max_tokens being
@@ -3676,7 +3768,11 @@ def run_conversation(
                     agent._buffer_status(f"🗜️ Context too large (~{approx_tokens:,} tokens) — compressing ({compression_attempts}/{max_compression_attempts})...")
 
                     if getattr(agent, "_using_builtin_context_compressor", False):
-                        if _handle_builtin_overflow_compression(approx_tokens):
+                        outcome = _compress_prepared_request(force=True)
+                        if _adopt_compression_outcome(
+                            outcome,
+                            failure_error="provider context overflow and synchronous compression failed",
+                        ):
                             _retry.restart_with_compressed_messages = True
                         break
 
@@ -3813,7 +3909,8 @@ def run_conversation(
                         retry_count = 0
                         compression_attempts = 0
                         _retry.primary_recovery_attempted = False
-                        continue
+                        _retry.restart_with_rebuilt_messages = True
+                        break
                     if api_kwargs is not None:
                         agent._dump_api_request_debug(
                             api_kwargs, reason="non_retryable_client_error", error=api_error,
@@ -3969,7 +4066,8 @@ def run_conversation(
                         retry_count = 0
                         compression_attempts = 0
                         _retry.primary_recovery_attempted = False
-                        continue
+                        _retry.restart_with_rebuilt_messages = True
+                        break
                     # Terminal — flush buffered retry/fallback trace.
                     agent._flush_status_buffer()
                     _final_summary = agent._summarize_api_error(api_error)
@@ -4784,25 +4882,9 @@ def run_conversation(
                 if _tc_names == {"execute_code"}:
                     agent.iteration_budget.refund()
                 
-                # Tool results were appended above, so provider usage from the
-                # preceding request is stale. Estimate the complete next request
-                # now (messages + active system prompt + tool schemas), then apply
-                # provider-observed calibration before deciding whether to block.
-                _compressor = agent.context_compressor
-                _rough_tokens = estimate_request_tokens_rough(
-                    messages,
-                    system_prompt=active_system_prompt or system_message or "",
-                    tools=agent.tools or None,
-                )
-                _real_tokens = getattr(
-                    _compressor,
-                    "calibrated_prompt_tokens",
-                    lambda tokens: tokens,
-                )(_rough_tokens)
-
-                # Tool outputs can dominate the next prompt long before the
-                # overall context threshold is reached. Once the model has consumed
-                # them, advance a deterministic non-destructive checkpoint first.
+                # Tool outputs may be compacted cheaply here, but final context
+                # safety is decided after the next iteration prepares the exact
+                # provider payload (including middleware and output cap).
                 _tool_checkpoint = getattr(agent, "_maybe_compact_tool_payloads", None)
                 if agent.compression_enabled and _tool_checkpoint is not None:
                     messages, _tool_checkpoint_changed = _tool_checkpoint(
@@ -4812,46 +4894,7 @@ def run_conversation(
                         conversation_history = conversation_history_after_compression(
                             agent, messages
                         )
-                        _rough_tokens = estimate_request_tokens_rough(
-                            messages,
-                            system_prompt=active_system_prompt or system_message or "",
-                            tools=agent.tools or None,
-                        )
-                        _real_tokens = getattr(
-                            _compressor,
-                            "calibrated_prompt_tokens",
-                            lambda tokens: tokens,
-                        )(_rough_tokens)
 
-                if agent.compression_enabled and _compressor.should_compress(_real_tokens):
-                    from agent.conversation_compression import run_automatic_compression
-
-                    agent._safe_print("  ⟳ compacting context…")
-                    outcome = run_automatic_compression(
-                        agent,
-                        messages,
-                        active_system_prompt or system_message or "",
-                        current_tokens=_rough_tokens,
-                        task_id=effective_task_id,
-                        emit_abort_warning=False,
-                        preserve_attachment_index=current_turn_user_idx,
-                    )
-                    if outcome.compressed:
-                        messages = outcome.messages
-                        _refresh_current_turn_user_idx()
-                        active_system_prompt = outcome.system_prompt
-                        conversation_history = conversation_history_after_compression(
-                            agent, messages
-                        )
-                    if not outcome.safe_to_continue:
-                        failed = True
-                        terminal_error = "context compression did not produce a safe request"
-                        terminal_failure_reason = (
-                            outcome.failure_reason or "compression_hard_blocked"
-                        )
-                        _turn_exit_reason = "compression_hard_blocked"
-                        break
-                    _allow_degraded_request = outcome.degraded
 
                 # Save session log incrementally (so progress is visible even if interrupted)
                 agent._session_messages = messages

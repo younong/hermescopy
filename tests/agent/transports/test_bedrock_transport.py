@@ -28,18 +28,8 @@ class TestBedrockBuildKwargs:
         msgs = [{"role": "user", "content": "Hello"}]
         kw = transport.build_kwargs(model="anthropic.claude-3-5-sonnet-20241022-v2:0", messages=msgs)
         assert kw["modelId"] == "anthropic.claude-3-5-sonnet-20241022-v2:0"
-        assert kw["__bedrock_converse__"] is True
-        assert kw["__bedrock_region__"] == "us-east-1"
         assert "messages" in kw
-
-    def test_custom_region(self, transport):
-        msgs = [{"role": "user", "content": "Hi"}]
-        kw = transport.build_kwargs(
-            model="anthropic.claude-3-5-sonnet-20241022-v2:0",
-            messages=msgs,
-            region="eu-west-1",
-        )
-        assert kw["__bedrock_region__"] == "eu-west-1"
+        assert not any(key.startswith("__bedrock_") for key in kw)
 
     def test_max_tokens(self, transport):
         msgs = [{"role": "user", "content": "Hi"}]

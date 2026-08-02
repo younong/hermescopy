@@ -15,6 +15,8 @@ progress.
 from __future__ import annotations
 
 from types import SimpleNamespace
+
+from agent.prepared_model_request import PreparedModelRequest, PreparedRequestAccounting
 from unittest.mock import MagicMock, call
 
 from agent.conversation_compression import (
@@ -94,15 +96,36 @@ class TestCompressionMadeProgress:
 
 class TestAutomaticCompression:
     @staticmethod
-    def _agent(compressed_messages):
-        compressor = SimpleNamespace(
-            threshold_tokens=100,
-            calibrated_prompt_tokens=lambda tokens: tokens,
-            would_hard_block=lambda tokens: tokens >= 190,
+    def _prepared(tokens, *, threshold=100, hard_limit=190, label="request"):
+        return PreparedModelRequest(
+            request_id=label,
+            route=SimpleNamespace(
+                provider="test",
+                model="test/model",
+                base_url="http://test",
+                api_mode="chat_completions",
+            ),
+            payload={"messages": [{"role": "user", "content": label}]},
+            original_payload={},
+            middleware_trace=(),
+            accounting=PreparedRequestAccounting(
+                raw_input_tokens=tokens,
+                effective_input_tokens=tokens,
+                output_token_limit=10,
+                context_limit=200,
+                compression_threshold=threshold,
+                hard_input_limit=hard_limit,
+                categories=(),
+            ),
+            message_count=1,
+            tool_count=0,
+            request_char_count=len(label),
         )
+
+    @staticmethod
+    def _agent(compressed_messages):
         agent = SimpleNamespace(
-            context_compressor=compressor,
-            tools=[],
+            context_compressor=SimpleNamespace(protect_last_n=0),
             session_id="session-1",
             _compress_context=MagicMock(
                 return_value=(compressed_messages, "compressed prompt")
@@ -111,21 +134,23 @@ class TestAutomaticCompression:
         )
         return agent
 
-    def test_blocks_until_compressed_request_is_verified_safe(self, monkeypatch):
+    def test_blocks_until_compressed_request_is_verified_safe(self):
         original = [{"role": "user", "content": "large history"}]
         compacted = [{"role": "user", "content": "summary"}]
         agent = self._agent(compacted)
-        estimates = iter([150, 40])
-        monkeypatch.setattr(
-            "agent.conversation_compression.estimate_request_tokens_rough",
-            lambda *_args, **_kwargs: next(estimates),
-        )
 
-        outcome = run_automatic_compression(agent, original, "system")
+        outcome = run_automatic_compression(
+            agent,
+            original,
+            "system",
+            prepared_request=self._prepared(150),
+            prepare_candidate=lambda *_: self._prepared(40, label="candidate"),
+        )
 
         assert outcome.safe_to_continue is True
         assert outcome.messages is compacted
         assert outcome.request_tokens == 40
+        assert outcome.prepared_request.accounting.effective_input_tokens == 40
         agent._emit_status.assert_has_calls(
             [
                 call("Compressing context (pass 1/3)…", kind="compression.preparing"),
@@ -133,7 +158,7 @@ class TestAutomaticCompression:
             ]
         )
 
-    def test_preserved_current_turn_tracks_by_identity_after_compression(self, monkeypatch):
+    def test_preserved_current_turn_tracks_by_identity_after_compression(self):
         old_attached = {
             "role": "user",
             "content": "old",
@@ -143,62 +168,55 @@ class TestAutomaticCompression:
         original = [old_attached, current]
         compacted = [old_attached, {"role": "assistant", "content": "summary"}, current]
         agent = self._agent(compacted)
-        agent.context_compressor.protect_last_n = 0
-        estimates = iter([150, 40])
-        monkeypatch.setattr(
-            "agent.conversation_compression.estimate_request_tokens_rough",
-            lambda *_args, **_kwargs: next(estimates),
-        )
-        projected_indices = []
-
-        def _project(messages, *, current_turn_index, protect_last_n):
-            projected_indices.append(current_turn_index)
-            return messages
-
-        monkeypatch.setattr(
-            "agent.conversation_compression.project_provider_history", _project
-        )
 
         outcome = run_automatic_compression(
             agent,
             original,
             "system",
             preserve_attachment_index=1,
+            prepared_request=self._prepared(150),
+            prepare_candidate=lambda *_: self._prepared(40, label="candidate"),
         )
 
         assert outcome.safe_to_continue is True
-        assert projected_indices == [1, 2]
+        assert agent._compress_context.call_args.kwargs["preserve_attachment_index"] == 1
 
-    def test_no_progress_below_hard_boundary_degrades_safely(self, monkeypatch):
+    def test_no_progress_below_hard_boundary_degrades_safely(self):
         original = [{"role": "user", "content": "large history"}]
         agent = self._agent(original)
-        monkeypatch.setattr(
-            "agent.conversation_compression.estimate_request_tokens_rough",
-            lambda *_args, **_kwargs: 150,
-        )
+        prepared = self._prepared(150)
 
-        outcome = run_automatic_compression(agent, original, "system")
+        outcome = run_automatic_compression(
+            agent,
+            original,
+            "system",
+            prepared_request=prepared,
+            prepare_candidate=lambda *_: self._prepared(150, label="candidate"),
+        )
 
         assert outcome.safe_to_continue is True
         assert outcome.degraded is True
         assert outcome.messages is original
         assert outcome.compressed is False
         assert outcome.failure_reason == "compression_no_progress"
+        assert outcome.prepared_request is prepared
         agent._emit_status.assert_any_call(
             "Context compression could not reduce the request, but it remains below "
             "the safe context boundary. Continuing with the preserved conversation.",
             kind="compression.degraded",
         )
 
-    def test_no_progress_at_hard_boundary_blocks(self, monkeypatch):
+    def test_no_progress_at_hard_boundary_blocks(self):
         original = [{"role": "user", "content": "large history"}]
         agent = self._agent(original)
-        monkeypatch.setattr(
-            "agent.conversation_compression.estimate_request_tokens_rough",
-            lambda *_args, **_kwargs: 190,
-        )
 
-        outcome = run_automatic_compression(agent, original, "system")
+        outcome = run_automatic_compression(
+            agent,
+            original,
+            "system",
+            prepared_request=self._prepared(190),
+            prepare_candidate=lambda *_: self._prepared(190, label="candidate"),
+        )
 
         assert outcome.safe_to_continue is False
         assert outcome.degraded is False
@@ -210,52 +228,62 @@ class TestAutomaticCompression:
             kind="compression.blocked",
         )
 
-    def test_partial_progress_below_hard_boundary_degrades_safely(self, monkeypatch):
+    def test_partial_progress_below_hard_boundary_degrades_safely(self):
         original = [
             {"role": "user", "content": "large history"},
             {"role": "assistant", "content": "large response"},
         ]
         compacted = [{"role": "user", "content": "summary"}]
         agent = self._agent(compacted)
-        estimates = iter([180, 120])
-        monkeypatch.setattr(
-            "agent.conversation_compression.estimate_request_tokens_rough",
-            lambda *_args, **_kwargs: next(estimates),
-        )
+        candidate = self._prepared(120, label="candidate")
 
-        outcome = run_automatic_compression(agent, original, "system")
+        outcome = run_automatic_compression(
+            agent,
+            original,
+            "system",
+            prepared_request=self._prepared(180),
+            prepare_candidate=lambda *_: candidate,
+        )
 
         assert outcome.safe_to_continue is True
         assert outcome.degraded is True
         assert outcome.compressed is True
         assert outcome.messages is compacted
+        assert outcome.prepared_request is candidate
         assert outcome.failure_reason is None
 
-    def test_exception_below_hard_boundary_degrades_safely(self, monkeypatch):
+    def test_exception_below_hard_boundary_degrades_safely(self):
         original = [{"role": "user", "content": "large history"}]
         agent = self._agent(original)
         agent._compress_context.side_effect = RuntimeError("summary unavailable")
-        monkeypatch.setattr(
-            "agent.conversation_compression.estimate_request_tokens_rough",
-            lambda *_args, **_kwargs: 150,
-        )
+        prepared = self._prepared(150)
 
-        outcome = run_automatic_compression(agent, original, "system")
+        outcome = run_automatic_compression(
+            agent,
+            original,
+            "system",
+            prepared_request=prepared,
+            prepare_candidate=lambda *_: self._prepared(40, label="candidate"),
+        )
 
         assert outcome.safe_to_continue is True
         assert outcome.degraded is True
         assert outcome.failure_reason == "compression_failed"
+        assert outcome.prepared_request is prepared
 
-    def test_forced_exception_below_hard_boundary_remains_strict(self, monkeypatch):
+    def test_forced_exception_below_hard_boundary_remains_strict(self):
         original = [{"role": "user", "content": "large history"}]
         agent = self._agent(original)
         agent._compress_context.side_effect = RuntimeError("summary unavailable")
-        monkeypatch.setattr(
-            "agent.conversation_compression.estimate_request_tokens_rough",
-            lambda *_args, **_kwargs: 150,
-        )
 
-        outcome = run_automatic_compression(agent, original, "system", force=True)
+        outcome = run_automatic_compression(
+            agent,
+            original,
+            "system",
+            force=True,
+            prepared_request=self._prepared(150),
+            prepare_candidate=lambda *_: self._prepared(40, label="candidate"),
+        )
 
         assert outcome.safe_to_continue is False
         assert outcome.degraded is False

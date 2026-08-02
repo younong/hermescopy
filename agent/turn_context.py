@@ -3,7 +3,7 @@
 ``run_conversation`` opened with ~470 lines of straight-line setup before the
 tool-calling loop ever started: stdio guarding, runtime-main wiring, retry-counter
 resets, user-message sanitization, todo/nudge-counter hydration, system-prompt
-restore-or-build, crash-resilience persistence, preflight context compression, the
+restore-or-build, crash-resilience persistence, deterministic tool compaction, the
 ``pre_llm_call`` plugin hook, and external-memory prefetch.
 
 All of that is *prologue* — it runs once per turn, has no back-references into the
@@ -29,16 +29,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from agent.conversation_compression import (
-    conversation_history_after_compression,
-    run_automatic_compression,
-)
+from agent.conversation_compression import conversation_history_after_compression
 from agent.iteration_budget import IterationBudget
-from agent.message_sanitization import project_provider_history
-from agent.model_metadata import (
-    estimate_messages_tokens_rough,
-    estimate_request_tokens_rough,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -77,33 +69,6 @@ class _TurnPhase:
         return False
 
 
-def _should_run_preflight_estimate(
-    messages: List[Dict[str, Any]],
-    protect_first_n: int,
-    protect_last_n: int,
-    threshold_tokens: int,
-) -> bool:
-    """Cheap gate for the (expensive) full preflight token estimate.
-
-    Returns ``True`` when either:
-      (a) message count exceeds the protected ranges (the historical gate), or
-      (b) a cheap char-based estimate already crosses the configured threshold
-          — the few-but-huge case from issue #27405 that the count-only gate
-          would silently skip (a handful of very large messages never trips
-          the count condition, so compression was never attempted and the
-          turn hit a hard context-overflow error).
-
-    Branch (b) uses ``estimate_messages_tokens_rough`` (the shared char-based
-    estimator) so a single large base64 image isn't mistaken for ~250K tokens.
-    It intentionally undercounts vs. the full request estimate — it omits the
-    system prompt and tool schemas — because it is only a *hint* deciding
-    whether to pay for the authoritative ``estimate_request_tokens_rough``,
-    which (together with ``should_compress``) makes the real decision.
-    """
-    if len(messages) > protect_first_n + protect_last_n + 1:
-        return True
-    return estimate_messages_tokens_rough(messages) >= threshold_tokens
-
 
 @dataclass
 class TurnContext:
@@ -115,7 +80,7 @@ class TurnContext:
     original_user_message: Any
     # Working message list for this turn (loop appends to it).
     messages: List[Dict[str, Any]]
-    # May be reset to None by preflight compression (new session created).
+    # May be reset to None when compression creates a successor session.
     conversation_history: Optional[List[Dict[str, Any]]]
     # Cached system prompt active for this turn (may be rebuilt by compression).
     active_system_prompt: Optional[str]
@@ -124,10 +89,9 @@ class TurnContext:
     turn_id: str
     # Index of the current user turn within ``messages``.
     current_turn_user_idx: int
-    # Whether the turn may issue a normal model request after preflight.
+    # Whether the turn may issue a normal model request after setup.
     compression_safe_to_continue: bool = True
     compression_failure_reason: Optional[str] = None
-    compression_degraded: bool = False
     # Whether the post-turn memory review should fire.
     should_review_memory: bool = False
     # Full instructions for a large slash-invoked skill. Attached only to API
@@ -365,10 +329,9 @@ def build_turn_context(
 
     compression_safe_to_continue = True
     compression_failure_reason = None
-    compression_degraded = False
-    with _TurnPhase(agent, turn_id, "preflight_compression"):
-        # Commit a stable deterministic tool-only checkpoint before the expensive
-        # full request estimate. The inbound user turn was persisted above, while
+    with _TurnPhase(agent, turn_id, "tool_payload_compaction"):
+        # Commit a stable deterministic tool-only checkpoint before provider
+        # request preparation. The inbound user turn was persisted above, while
         # the protected tail keeps it and recent tool work byte-for-byte intact.
         _tool_checkpoint = getattr(agent, "_maybe_compact_tool_payloads", None)
         if agent.compression_enabled and _tool_checkpoint is not None:
@@ -380,120 +343,13 @@ def build_turn_context(
                     agent, messages
                 )
 
-        # ── Preflight context compression ──
-        # Gate the (expensive) full token estimate behind a cheap pre-check.
-        # See ``_should_run_preflight_estimate`` for the OR semantics that fix
-        # issue #27405 (a few very large messages slipping past the count gate).
-        _preflight_gate = False
-        if agent.compression_enabled:
-            _preflight_gate = _should_run_preflight_estimate(
-                messages,
-                agent.context_compressor.protect_first_n,
-                agent.context_compressor.protect_last_n,
-                agent.context_compressor.threshold_tokens,
-            )
-        logger.info(
-            "compression preflight decision=%s reason=%s session=%s messages=%d "
-            "protected=%d threshold=%d",
-            "estimate" if _preflight_gate else "skip",
-            (
-                "gate_open"
-                if _preflight_gate
-                else "compression_disabled"
-                if not agent.compression_enabled
-                else "below_cheap_gate"
-            ),
-            agent.session_id or "none",
-            len(messages),
-            (
-                agent.context_compressor.protect_first_n
-                + agent.context_compressor.protect_last_n
-            ),
-            getattr(agent.context_compressor, "threshold_tokens", 0),
-        )
-        if _preflight_gate:
-            # Estimate the same old-history projection used by the provider copy.
-            # The boundary is anchored to this user row and stays fixed if the
-            # current turn later appends tool calls and results.
-            _preflight_messages = project_provider_history(
-                messages,
-                current_turn_index=current_turn_user_idx,
-                protect_last_n=agent.context_compressor.protect_last_n,
-            )
-            _preflight_raw_tokens = estimate_request_tokens_rough(
-                _preflight_messages,
-                system_prompt=active_system_prompt or "",
-                tools=agent.tools or None,
-            )
-            _compressor = agent.context_compressor
-            _preflight_tokens = getattr(
-                _compressor,
-                "calibrated_prompt_tokens",
-                lambda tokens: tokens,
-            )(_preflight_raw_tokens)
-            _last = _compressor.last_prompt_tokens
-            # Do NOT overwrite the -1 sentinel (#36718).
-            if _last >= 0 and _preflight_tokens > _last:
-                _compressor.last_prompt_tokens = _preflight_tokens
-
-            if _compressor.should_compress(_preflight_tokens):
-                logger.info(
-                    "compression preflight decision=compress reason=threshold_reached "
-                    "session=%s rough_tokens=%d effective_threshold=%d model=%s "
-                    "context_length=%d",
-                    agent.session_id or "none",
-                    _preflight_tokens,
-                    _compressor.threshold_tokens,
-                    agent.model,
-                    _compressor.context_length,
-                )
-                outcome = run_automatic_compression(
-                    agent,
-                    messages,
-                    active_system_prompt or system_message or "",
-                    current_tokens=_preflight_raw_tokens,
-                    task_id=effective_task_id,
-                    preserve_attachment_index=current_turn_user_idx,
-                )
-                compression_safe_to_continue = outcome.safe_to_continue
-                compression_failure_reason = outcome.failure_reason
-                compression_degraded = outcome.degraded
-                if outcome.compressed:
-                    messages = outcome.messages
-                    active_system_prompt = outcome.system_prompt
-                    # Compression can shift the protected current user turn. Keep
-                    # the request-loop cursor attached to that turn so its recent
-                    # payload stays complete throughout the active tool loop.
-                    for index in range(len(messages) - 1, -1, -1):
-                        candidate = messages[index]
-                        if (
-                            candidate.get("role") == "user"
-                            and candidate.get("content") == user_message
-                            and candidate.get("attachments")
-                            == (list(persist_user_attachments) if persist_user_attachments else None)
-                        ):
-                            current_turn_user_idx = index
-                            break
-                    conversation_history = conversation_history_after_compression(
-                        agent, messages
-                    )
-                    agent._empty_content_retries = 0
-                    agent._thinking_prefill_retries = 0
-                    agent._last_content_with_tools = None
-                    agent._last_content_tools_all_housekeeping = False
-                    agent._mute_post_response = False
-            else:
-                logger.info(
-                    "compression preflight decision=skip reason=below_threshold "
-                    "session=%s rough_tokens=%d effective_threshold=%d",
-                    agent.session_id or "none",
-                    _preflight_tokens,
-                    _compressor.threshold_tokens,
-                )
+        # Final request safety is decided only after provider shaping and request
+        # middleware. The turn prologue intentionally keeps just the cheap,
+        # deterministic tool-payload compaction above.
 
     deferred_skill_context = ""
     with _TurnPhase(agent, turn_id, "deferred_skill"):
-        # Do not expand transient prompt context after a failed compression gate;
+        # Do not expand transient prompt context after a failed setup gate;
         # the turn must return losslessly without issuing a normal model request.
         if compression_safe_to_continue:
             try:
@@ -598,7 +454,6 @@ def build_turn_context(
         current_turn_user_idx=current_turn_user_idx,
         compression_safe_to_continue=compression_safe_to_continue,
         compression_failure_reason=compression_failure_reason,
-        compression_degraded=compression_degraded,
         should_review_memory=should_review_memory,
         deferred_skill_context=deferred_skill_context,
         plugin_user_context=plugin_user_context,

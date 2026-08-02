@@ -598,6 +598,9 @@ def init_agent(
     # Internal stream callback (set during streaming TTS).
     # Initialized here so _vprint can reference it before run_conversation.
     agent._stream_callback = None
+    # Last canonical dispatch-ready/dispatched provider request. UI occupancy
+    # remains unknown until the first Hermes-owned request is prepared.
+    agent._prepared_model_request = None
     # Deferred paragraph break flag — set after tool iterations so a
     # single "\n\n" is prepended to the next real text delta.
     agent._stream_needs_break = False

@@ -3817,32 +3817,22 @@ def _get_usage(agent) -> dict:
     }
     comp = getattr(agent, "context_compressor", None)
     if comp:
-        # context_used is the *current-window* occupancy. Do NOT fall back to
-        # usage["total"] (cumulative lifetime session_total_tokens): for an
-        # external context engine that doesn't report last_prompt_tokens that
-        # substitution showed lifetime totals as the live context fill, yielding
-        # impossible readings such as 1.9m/120k clamped to 100% (#50421).
-        #
-        # Per the issue, populate context_used/percent only from a *real*
-        # current-occupancy value and "leave it unknown otherwise" — so a falsy
-        # last_prompt_tokens (0 or missing, i.e. an engine that doesn't track
-        # per-window occupancy) intentionally emits no gauge rather than a
-        # fabricated 0% or the old cumulative reading. The built-in compressor
-        # always reports a real last_prompt_tokens once a turn runs, so it is
-        # unaffected.
-        # Clamp the -1 "compression just ran, awaiting real usage" sentinel
-        # (conversation_compression.py) to 0 so the transitional turn reads as
-        # unknown (no gauge) instead of leaking context_used=-1. Matches the
-        # CLI status-bar path (cli.py _get_status_bar_snapshot).
-        last_prompt = getattr(comp, "last_prompt_tokens", 0) or 0
-        if last_prompt < 0:
-            last_prompt = 0
-        ctx_max = getattr(comp, "context_length", 0) or 0
-        if ctx_max and last_prompt:
-            usage["context_used"] = last_prompt
-            usage["context_max"] = ctx_max
-            usage["context_percent"] = max(0, min(100, round(last_prompt / ctx_max * 100)))
         usage["compressions"] = getattr(comp, "compression_count", 0) or 0
+    try:
+        from agent.prepared_model_request import prepared_context_payload
+
+        context = prepared_context_payload(
+            getattr(agent, "_prepared_model_request", None)
+        )
+        if context and context.get("accounting_source") == "prepared_request":
+            usage["context_used"] = context["context_used"]
+            usage["context_max"] = context["context_max"]
+            usage["context_percent"] = context["context_percent"]
+            usage["context_accounting_source"] = context["accounting_source"]
+        elif context:
+            usage["context_accounting_source"] = context["accounting_source"]
+    except Exception:
+        pass
     # Live count of background/async subagents still running (delegate_task
     # batches + background single delegations). Mirrors the classic CLI status
     # bar's ⛓ indicator; sourced from the same async_delegation registry.
@@ -7601,12 +7591,10 @@ def _(rid, params: dict) -> dict:
                 "model": "",
             },
         )
-    with session["history_lock"]:
-        history = list(session.get("history", []))
     try:
         from agent.context_breakdown import compute_session_context_breakdown
 
-        payload = compute_session_context_breakdown(agent, history)
+        payload = compute_session_context_breakdown(agent)
     except Exception as exc:
         return _err(rid, 5000, f"Could not compute context breakdown: {exc}")
     return _ok(rid, payload)

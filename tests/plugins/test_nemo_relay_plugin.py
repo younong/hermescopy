@@ -788,7 +788,8 @@ mode = "observe_only"
 
     assert response.model == "demo-model"
     assert response.choices == [raw_choice]
-    assert seen_request["intercepted"] is True
+    assert "intercepted" not in seen_request
+    assert seen_request == {"messages": [{"role": "user", "content": "hi"}]}
     execute_start = next(event for event in fake.events if event[0] == "llm.execute.start")
     assert execute_start[3]["data"]["mode"] == "observe_only"
     execute_end = next(event for event in fake.events if event[0] == "llm.execute.end")
