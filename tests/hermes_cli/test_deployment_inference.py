@@ -28,6 +28,12 @@ from hermes_cli.owner_worker.inference_relay import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _bypass_loopback_proxy(monkeypatch):
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+
+
 def _policy(
     *,
     api_mode: str = "chat_completions",
@@ -1379,8 +1385,6 @@ def test_compression_auxiliary_smoke_through_owner_relay(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL", "gpt-5.6-luna"
     )
-    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
-    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
     auxiliary_client.shutdown_cached_clients()
     auxiliary_client.clear_runtime_main()
     try:
