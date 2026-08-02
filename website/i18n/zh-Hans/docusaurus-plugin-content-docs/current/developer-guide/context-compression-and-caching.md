@@ -1,14 +1,14 @@
 ---
 title: 上下文压缩与缓存
-description: Hermes Agent 如何通过双重压缩系统和 Anthropic prompt 缓存高效管理上下文窗口。
+description: Hermes Agent 如何通过 canonical 压缩门控和 Anthropic prompt 缓存高效管理上下文窗口。
 ---
 
 # 上下文压缩与缓存
 
-Hermes Agent 使用双重压缩系统和 Anthropic prompt（提示词）缓存，在长对话中高效管理上下文窗口用量。
+Hermes Agent 使用 canonical 压缩门控和 Anthropic prompt（提示词）缓存，在长对话中高效管理上下文窗口用量。
 
 源文件：`agent/context_engine.py`（ABC）、`agent/context_compressor.py`（默认引擎）、
-`agent/prompt_caching.py`、`gateway/run.py`（会话清理）、`run_agent.py`（搜索 `_compress_context`）
+`agent/prompt_caching.py` 和 `agent/conversation_loop.py`（canonical request 门控）
 
 
 ## 可插拔上下文引擎
@@ -22,10 +22,12 @@ context:
 ```
 
 引擎负责：
-- 决定何时触发压缩（`should_compress()`）
 - 执行压缩（`compress()`）
 - 可选地暴露 agent 可调用的工具（例如 `lcm_grep`）
-- 追踪 API 响应中的 token 用量
+- 追踪 API 响应中的 token 用量，用于历史指标和 estimator calibration
+
+Hermes 根据 canonical prepared request 决定何时需要自动压缩。插件引擎不负责
+判定某个请求是否可安全 dispatch。
 
 通过 `config.yaml` 中的 `context.engine` 进行配置驱动选择。解析顺序：
 1. 检查 `plugins/context_engine/<name>/` 目录
@@ -38,37 +40,17 @@ context:
 
 关于构建上下文引擎插件，请参阅 [Context Engine 插件](/developer-guide/context-engine-plugin)。
 
-## 双重压缩系统
+## Canonical 压缩门控
 
-Hermes 有两个独立运行的压缩层：
+Hermes 在 `agent/conversation_loop.py` 中只有一个自动压缩门控。它先构建
+provider-specific payload、执行 request middleware，再对该 payload 计数，最终
+发送同一个被接受的 snapshot。压缩候选与 provider overflow recovery 都重复同一
+preparation 步骤。
 
-```
-                     ┌──────────────────────────┐
-  Incoming message   │   Gateway Session Hygiene │  Fires at 85% of context
-  ─────────────────► │   (pre-agent, rough est.) │  Safety net for large sessions
-                     └─────────────┬────────────┘
-                                   │
-                                   ▼
-                     ┌──────────────────────────┐
-                     │   Agent ContextCompressor │  Fires at 50% of context (default)
-                     │   (in-loop, real tokens)  │  Normal context management
-                     └──────────────────────────┘
-```
-
-### 1. Gateway 会话清理（85% 阈值）
-
-位于 `gateway/run.py`（搜索 `Session hygiene: auto-compress`）。这是一个**安全网**，在 agent 处理消息之前运行。它防止会话在两次交互之间增长过大时（例如 Telegram/Discord 中的隔夜积累）导致 API 失败。
-
-- **阈值**：固定为模型上下文长度的 85%
-- **Token 来源**：优先使用上一轮 API 实际报告的 token 数；回退到基于字符的粗略估算（`estimate_messages_tokens_rough`）
-- **触发条件**：仅当 `len(history) >= 4` 且压缩已启用时
-- **目的**：捕获逃过 agent 自身压缩器的会话
-
-Gateway 清理阈值有意高于 agent 压缩器的阈值。将其设置为 50%（与 agent 相同）会导致长 gateway 会话在每一轮都过早触发压缩。
-
-### 2. Agent ContextCompressor（50% 阈值，可配置）
-
-位于 `agent/context_compressor.py`。这是**主要压缩系统**，在 agent 的工具循环内运行，可访问准确的 API 报告 token 数。
+`agent/context_compressor.py` 中的内置 `ContextCompressor` 负责执行压缩本身。
+第三方 context engine 保留相同的压缩接口，但 Hermes 始终根据 canonical prepared
+payload 判断请求安全，而不是使用 provider 上一轮报告的 usage 或 transcript-only
+粗略估算。
 
 
 ## 配置
@@ -323,4 +305,4 @@ CLI 在启动时显示缓存状态：
 
 ## 上下文压力警告
 
-中间上下文压力警告已被移除（参见 `run_agent.py` 中的迭代预算块，其中注明："No intermediate pressure warnings — they caused models to 'give up' prematurely on complex tasks"）。压缩在 prompt token 达到配置的 `compression.threshold`（默认 50%）时触发，无需事先警告步骤；gateway 会话清理作为二级安全网在模型上下文窗口的 85% 处触发。
+中间上下文压力警告已被移除（参见 `run_agent.py` 中的迭代预算块，其中注明："No intermediate pressure warnings — they caused models to 'give up' prematurely on complex tasks"）。当 canonical prepared request 达到配置的 `compression.threshold`（默认 50%）时触发压缩，无需事先警告步骤；provider overflow recovery 也复用同一个 canonical candidate-preparation 门控。

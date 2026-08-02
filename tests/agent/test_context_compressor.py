@@ -177,28 +177,19 @@ class TestRollingSummaryPreparation:
 
 
 class TestShouldCompress:
-    def test_below_threshold(self, compressor):
-        compressor.last_prompt_tokens = 50000
-        assert compressor.should_compress() is False
-
-    def test_above_threshold(self, compressor):
+    def test_observed_usage_is_not_implicit_request_pressure(self, compressor):
         compressor.last_prompt_tokens = 90000
-        assert compressor.should_compress() is True
-
-    def test_exact_threshold(self, compressor):
-        compressor.last_prompt_tokens = 85000
-        assert compressor.should_compress() is True
+        assert compressor.should_compress() is False
 
     def test_explicit_tokens(self, compressor):
         assert compressor.should_compress(prompt_tokens=90000) is True
+        assert compressor.should_compress(prompt_tokens=85000) is True
         assert compressor.should_compress(prompt_tokens=50000) is False
 
 
 
 class TestUpdateFromResponse:
     def test_updates_fields(self, compressor):
-        compressor.awaiting_real_usage_after_compression = True
-        compressor.last_compression_rough_tokens = 90_000
         compressor.update_from_response({
             "prompt_tokens": 5000,
             "completion_tokens": 1000,
@@ -206,9 +197,6 @@ class TestUpdateFromResponse:
         })
         assert compressor.last_prompt_tokens == 5000
         assert compressor.last_completion_tokens == 1000
-        assert compressor.last_real_prompt_tokens == 5000
-        assert compressor.last_rough_tokens_when_real_prompt_fit == 90_000
-        assert compressor.awaiting_real_usage_after_compression is False
 
     def test_missing_fields_default_zero(self, compressor):
         compressor.update_from_response({})
@@ -228,60 +216,11 @@ class TestUpdateFromResponse:
         assert compressor.calibrated_prompt_tokens(60_000) == 120_000
         assert compressor._usage_calibration_samples == 1
 
-    def test_hard_block_reserves_output_and_uses_calibration(self, compressor):
+    def test_hard_input_limit_reserves_output(self, compressor):
         compressor.context_length = 100_000
         compressor.max_tokens = 10_000
-        compressor._usage_calibration_ratio = 2.0
 
         assert compressor.hard_input_limit() == 85_500
-        assert compressor.would_hard_block(42_749) is False
-        assert compressor.would_hard_block(42_750) is True
-
-
-class TestPreflightDeferral:
-    def test_defers_when_recent_real_usage_fit_and_rough_growth_is_small(self, compressor):
-        compressor.threshold_tokens = 85_000
-        compressor.last_real_prompt_tokens = 50_000
-        compressor.last_rough_tokens_when_real_prompt_fit = 90_000
-
-        assert compressor.should_defer_preflight_to_real_usage(93_000) is True
-        assert compressor.last_rough_tokens_when_real_prompt_fit == 93_000
-
-    def test_does_not_defer_when_rough_growth_is_large(self, compressor):
-        compressor.threshold_tokens = 85_000
-        compressor.last_real_prompt_tokens = 50_000
-        compressor.last_rough_tokens_when_real_prompt_fit = 90_000
-
-        assert compressor.should_defer_preflight_to_real_usage(100_000) is False
-
-    def test_does_not_defer_without_recent_real_usage(self, compressor):
-        compressor.threshold_tokens = 85_000
-        compressor.last_real_prompt_tokens = 0
-        compressor.last_rough_tokens_when_real_prompt_fit = 90_000
-
-        assert compressor.should_defer_preflight_to_real_usage(93_000) is False
-
-    def test_defers_immediately_after_compaction_with_stale_real_prompt(self, compressor):
-        """#36718: right after a compaction, last_real_prompt_tokens still holds
-        the stale pre-compression value (above threshold). The awaiting flag
-        must force deferral so preflight doesn't fire a SECOND compaction before
-        real post-compaction usage arrives."""
-        compressor.threshold_tokens = 85_000
-        # Stale pre-compression value — would hit the `>= threshold => False`
-        # short-circuit and defeat deferral without the flag guard.
-        compressor.last_real_prompt_tokens = 120_000
-        compressor.awaiting_real_usage_after_compression = True
-        assert compressor.should_defer_preflight_to_real_usage(95_000) is True
-
-    def test_resumes_normal_deferral_after_flag_cleared(self, compressor):
-        """Once update_from_response() clears the flag, the normal baseline/
-        growth deferral logic governs again (no permanent deferral)."""
-        compressor.threshold_tokens = 85_000
-        compressor.last_real_prompt_tokens = 120_000
-        compressor.awaiting_real_usage_after_compression = False
-        # Stale-high real prompt with the flag cleared => the >= threshold
-        # short-circuit applies => no deferral.
-        assert compressor.should_defer_preflight_to_real_usage(95_000) is False
 
 
 
@@ -2899,50 +2838,26 @@ class TestUpdateModelBudgets:
 
 
 class TestUpdateModelResetsCalibration:
-    """#23767: update_model() must clear stale cross-call calibration state.
-
-    Old-model real-usage / defer baselines must not suppress a preflight
-    compression the new (smaller) model actually needs.
-    """
+    """Route changes clear observed usage and estimator calibration."""
 
     def _comp(self):
         from unittest.mock import patch
         with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
             return ContextCompressor("big-model", threshold_percent=0.50, quiet_mode=True)
 
-    def test_real_usage_state_cleared(self):
+    def test_observed_usage_and_calibration_cleared(self):
         comp = self._comp()
-        # Simulate a large-model session that proved a prompt fit.
         comp.last_prompt_tokens = 120_000
-        comp.last_real_prompt_tokens = 120_000
-        comp.last_rough_tokens_when_real_prompt_fit = 130_000
-        comp.last_compression_rough_tokens = 130_000
-        comp.awaiting_real_usage_after_compression = True
+        comp._usage_calibration_ratio = 1.8
+        comp._usage_calibration_samples = 3
         comp._ineffective_compression_count = 2
 
         comp.update_model("small-model", context_length=65_536)
 
         assert comp.last_prompt_tokens == 0
-        assert comp.last_real_prompt_tokens == 0
-        assert comp.last_rough_tokens_when_real_prompt_fit == 0
-        assert comp.last_compression_rough_tokens == 0
-        assert comp.awaiting_real_usage_after_compression is False
+        assert comp._usage_calibration_ratio == 1.0
+        assert comp._usage_calibration_samples == 0
         assert comp._ineffective_compression_count == 0
-
-    def test_defer_no_longer_suppresses_after_switch(self):
-        """The exact #23767 failure: old model's 'it fit' must not defer
-        preflight on the new smaller model."""
-        comp = self._comp()
-        comp.last_real_prompt_tokens = 50_000
-        comp.last_rough_tokens_when_real_prompt_fit = 90_000
-        # Before switch, a modest rough growth would defer.
-        comp.threshold_tokens = 85_000
-        assert comp.should_defer_preflight_to_real_usage(93_000) is True
-
-        # After switching to a 65K model, the stale state is gone, so a rough
-        # estimate over the new threshold is NOT deferred — preflight will run.
-        comp.update_model("small-model", context_length=65_536)
-        assert comp.should_defer_preflight_to_real_usage(comp.threshold_tokens + 5_000) is False
 
 
 class TestTruncateToolCallArgsJson:

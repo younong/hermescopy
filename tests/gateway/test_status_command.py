@@ -178,7 +178,7 @@ async def test_status_command_tokens_zero_when_session_db_row_missing():
 
 
 @pytest.mark.asyncio
-async def test_status_command_includes_live_agent_model_and_context():
+async def test_status_command_includes_live_agent_model_without_observed_context():
     session_entry = SessionEntry(
         session_key=build_session_key(_make_source()),
         session_id="sess-1",
@@ -211,13 +211,13 @@ async def test_status_command_includes_live_agent_model_and_context():
     result = await runner._handle_message(_make_event("/status"))
 
     assert "**Model:** `openai/gpt-test` (openai)" in result
-    assert "**Context:** 12,345 / 100,000 (12%)" in result
+    assert "**Context:**" not in result
     assert "**Cumulative API tokens (re-sent each call):** 1,250" in result
     assert "1,250 (cumulative)" not in result
 
 
 @pytest.mark.asyncio
-async def test_status_command_includes_persisted_model_and_context_when_agent_not_running(monkeypatch):
+async def test_status_command_does_not_treat_persisted_usage_as_context(monkeypatch):
     session_entry = SessionEntry(
         session_key=build_session_key(_make_source()),
         session_id="sess-1",
@@ -244,12 +244,12 @@ async def test_status_command_includes_persisted_model_and_context_when_agent_no
     result = await runner._handle_message(_make_event("/status"))
 
     assert "**Model:** `openai/gpt-persisted` (openai-codex)" in result
-    assert "**Context:** 24,000 / 272,000 (9%)" in result
+    assert "**Context:**" not in result
     assert "**Cumulative API tokens (re-sent each call):** 2,500" in result
 
 
 @pytest.mark.asyncio
-async def test_status_command_includes_cached_agent_model_and_context():
+async def test_status_command_does_not_use_cached_observed_context():
     session_entry = SessionEntry(
         session_key=build_session_key(_make_source()),
         session_id="sess-1",
@@ -273,7 +273,7 @@ async def test_status_command_includes_cached_agent_model_and_context():
     result = await runner._handle_message(_make_event("/status"))
 
     assert "**Model:** `anthropic/claude-sonnet-test` (openrouter)" in result
-    assert "**Context:** 10,000 / 200,000 (5%)" in result
+    assert "**Context:**" not in result
 
 
 @pytest.mark.asyncio

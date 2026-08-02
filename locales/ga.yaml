@@ -359,7 +359,6 @@ Future messages in this room will use that transcript until `/reset` or another 
     breakdown_cat_conversation: "Comhrá"
     header_session_info:      "📊 **Eolas Seisiúin**"
     label_messages:           "Teachtaireachtaí: {count}"
-    label_estimated_context:  "Comhthéacs measta: ~{count} comhartha"
     detailed_after_first:     "_(Úsáid mhionsonraithe ar fáil tar éis chéad fhreagra an ghníomhaire)_"
     no_data:                  "Níl aon sonraí úsáide ar fáil don seisiún seo."
 

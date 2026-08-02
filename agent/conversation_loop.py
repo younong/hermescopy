@@ -51,7 +51,6 @@ from agent.message_sanitization import (
 )
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
-    estimate_messages_tokens_rough,
     get_context_length_from_provider_error,
     is_output_cap_error,
     parse_available_output_tokens_from_error,
@@ -1084,7 +1083,6 @@ def run_conversation(
         # Provider-specific kwargs and request middleware are applied before the
         # authoritative safety gate so accounting sees exactly what dispatch sees.
         total_chars = sum(len(str(msg)) for msg in api_messages)
-        approx_tokens = estimate_messages_tokens_rough(api_messages)
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
         _ephemeral_output_override = getattr(
@@ -1105,6 +1103,11 @@ def run_conversation(
         accounting = prepared_request.accounting
         approx_request_tokens = accounting.effective_input_tokens
 
+        # Legacy error-classifier/logging consumers use this local name, but its
+        # value is the canonical prepared-request pressure, not a transcript estimate.
+        approx_tokens = approx_request_tokens
+
+
         def _prepare_compression_candidate(candidate_messages, candidate_prompt):
             candidate_user_idx = next(
                 (
@@ -1120,6 +1123,8 @@ def run_conversation(
                 candidate_messages,
                 active_system_prompt=candidate_prompt,
                 current_turn_user_idx=candidate_user_idx,
+
+
                 original_user_message=original_user_message,
                 deferred_skill_context=_deferred_skill_context,
                 ext_prefetch_cache=_ext_prefetch_cache,
@@ -1166,7 +1171,9 @@ def run_conversation(
                 conversation_history = conversation_history_after_compression(
                     agent, messages
                 )
+
             if not outcome.safe_to_continue or outcome.prepared_request is None:
+
                 failed = True
                 terminal_error = failure_error
                 terminal_failure_reason = (
@@ -2253,6 +2260,13 @@ def run_conversation(
                     # can make decisions on cache hit ratios / reasoning costs,
                     # not just legacy aggregate tokens. Legacy keys stay for
                     # back-compat with engines that only read prompt/completion/total.
+                    note_request_estimate = getattr(
+                        agent.context_compressor, "note_request_estimate", None
+                    )
+                    if callable(note_request_estimate):
+                        note_request_estimate(
+                            prepared_request.accounting.raw_input_tokens
+                        )
                     usage_dict = {
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
@@ -3278,32 +3292,21 @@ def run_conversation(
 
                     compression_attempts += 1
                     if compression_attempts <= max_compression_attempts:
-                        if getattr(agent, "_using_builtin_context_compressor", False):
-                            outcome = _compress_prepared_request(force=True)
-                            if not _adopt_compression_outcome(
-                                outcome,
-                                failure_error="provider context overflow and synchronous compression failed",
-                            ):
-                                break
-                        else:
-                            original_len = len(messages)
-                            messages, active_system_prompt = agent._compress_context(
-                                messages, system_message,
-                                approx_tokens=approx_tokens,
-                                task_id=effective_task_id,
-                            )
-                            conversation_history = conversation_history_after_compression(
-                                agent, messages
-                            )
-                            if len(messages) >= original_len and old_ctx <= _reduced_ctx:
-                                continue
+                        outcome = _compress_prepared_request(force=True)
+                        if not _adopt_compression_outcome(
+                            outcome,
+                            failure_error=(
+                                "provider long-context tier overflow and synchronous "
+                                "compression failed"
+                            ),
+                        ):
+                            break
                         agent._buffer_status(
                             f"🗜️ Context reduced to {_reduced_ctx:,} tokens "
                             f"(was {old_ctx:,}), retrying..."
                         )
                         time.sleep(2)
-                        _retry.restart_with_compressed_messages = True
-                        break
+                        continue
                     # Fall through to normal error handling if compression
                     # is exhausted or didn't help.
 
@@ -3534,70 +3537,21 @@ def run_conversation(
                         }
                     agent._buffer_status(f"⚠️  Request payload too large (413) — compression attempt {compression_attempts}/{max_compression_attempts}...")
 
-                    if getattr(agent, "_using_builtin_context_compressor", False):
-                        outcome = _compress_prepared_request(force=True)
-                        if _adopt_compression_outcome(
-                            outcome,
-                            failure_error="provider context overflow and synchronous compression failed",
-                        ):
-                            _retry.restart_with_compressed_messages = True
+                    before_tokens = accounting.effective_input_tokens
+                    outcome = _compress_prepared_request(force=True)
+                    if not _adopt_compression_outcome(
+                        outcome,
+                        failure_error=(
+                            "provider payload overflow and synchronous compression failed"
+                        ),
+                    ):
                         break
-
-                    original_len = len(messages)
-                    original_tokens = estimate_messages_tokens_rough(messages)
-                    messages, active_system_prompt = agent._compress_context(
-                        messages, system_message, approx_tokens=approx_tokens,
-                        task_id=effective_task_id,
+                    agent._buffer_status(
+                        f"🗜️ Compressed canonical request ~{before_tokens:,} → "
+                        f"~{accounting.effective_input_tokens:,} tokens, retrying..."
                     )
-                    conversation_history = conversation_history_after_compression(
-                        agent, messages
-                    )
-
-                    # Re-estimate tokens after compression.  Same-message-count
-                    # compression (tool-result pruning, in-place summarization)
-                    # can materially reduce request size without reducing the
-                    # message array.  (#39550)
-                    new_tokens = estimate_messages_tokens_rough(messages)
-                    approx_tokens = new_tokens  # update for downstream logging
-
-                    if len(messages) < original_len or (new_tokens > 0 and new_tokens < original_tokens * 0.95):
-                        if len(messages) < original_len:
-                            agent._buffer_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
-                        else:
-                            agent._buffer_status(f"🗜️ Compressed ~{original_tokens:,} → ~{new_tokens:,} tokens, retrying...")
-                        time.sleep(2)  # Brief pause between compression retries
-                        _retry.restart_with_compressed_messages = True
-                        break
-                    else:
-                        if agent._try_strip_image_parts_from_tool_messages(
-                            messages,
-                            remember_model=False,
-                        ):
-                            agent._buffer_status(
-                                "📐 Compression could not reduce the request further — "
-                                "removed retained vision payloads and retrying..."
-                            )
-                            _retry.restart_with_rebuilt_messages = True
-                            break
-
-                        # Terminal — surface buffered context so the user
-                        # sees what compression attempts were made.
-                        agent._flush_status_buffer()
-                        agent._vprint(f"{agent.log_prefix}❌ Payload too large and cannot compress further.", force=True)
-                        agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
-                        logger.error(f"{agent.log_prefix}413 payload too large. Cannot compress further.")
-                        agent._persist_session(messages, conversation_history)
-                        _final_response = "Request payload too large (413). Cannot compress further."
-                        return {
-                            "final_response": _final_response,
-                            "messages": messages,
-                            "completed": False,
-                            "api_calls": api_call_count,
-                            "error": _final_response,
-                            "partial": True,
-                            "failed": True,
-                            "compression_exhausted": True,
-                        }
+                    time.sleep(2)
+                    continue
 
                 # Check for context-length errors BEFORE generic 4xx handler.
                 # The classifier detects context overflow from: explicit error
@@ -3767,58 +3721,21 @@ def run_conversation(
                         }
                     agent._buffer_status(f"🗜️ Context too large (~{approx_tokens:,} tokens) — compressing ({compression_attempts}/{max_compression_attempts})...")
 
-                    if getattr(agent, "_using_builtin_context_compressor", False):
-                        outcome = _compress_prepared_request(force=True)
-                        if _adopt_compression_outcome(
-                            outcome,
-                            failure_error="provider context overflow and synchronous compression failed",
-                        ):
-                            _retry.restart_with_compressed_messages = True
+                    before_tokens = accounting.effective_input_tokens
+                    outcome = _compress_prepared_request(force=True)
+                    if not _adopt_compression_outcome(
+                        outcome,
+                        failure_error=(
+                            "provider context overflow and synchronous compression failed"
+                        ),
+                    ):
                         break
-
-                    original_len = len(messages)
-                    original_tokens = estimate_messages_tokens_rough(messages)
-                    messages, active_system_prompt = agent._compress_context(
-                        messages, system_message, approx_tokens=approx_tokens,
-                        task_id=effective_task_id,
+                    agent._buffer_status(
+                        f"🗜️ Compressed canonical request ~{before_tokens:,} → "
+                        f"~{accounting.effective_input_tokens:,} tokens, retrying..."
                     )
-                    conversation_history = conversation_history_after_compression(
-                        agent, messages
-                    )
-
-                    # Re-estimate tokens after compression.  Same-message-count
-                    # compression (tool-result pruning, in-place summarization)
-                    # can materially reduce request size without reducing the
-                    # message array.  (#39550)
-                    new_tokens = estimate_messages_tokens_rough(messages)
-                    approx_tokens = new_tokens  # update for downstream logging
-
-                    if len(messages) < original_len or (new_tokens > 0 and new_tokens < original_tokens * 0.95) or (new_ctx and new_ctx < old_ctx):
-                        if len(messages) < original_len:
-                            agent._buffer_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
-                        elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
-                            agent._buffer_status(f"🗜️ Compressed ~{original_tokens:,} → ~{new_tokens:,} tokens, retrying...")
-                        time.sleep(2)  # Brief pause between compression retries
-                        _retry.restart_with_compressed_messages = True
-                        break
-                    else:
-                        # Can't compress further and already at minimum tier
-                        agent._flush_status_buffer()
-                        agent._vprint(f"{agent.log_prefix}❌ Context length exceeded and cannot compress further.", force=True)
-                        agent._vprint(f"{agent.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
-                        logger.error(f"{agent.log_prefix}Context length exceeded: {new_tokens:,} tokens. Cannot compress further.")
-                        agent._persist_session(messages, conversation_history)
-                        _final_response = f"Context length exceeded ({new_tokens:,} tokens). Cannot compress further."
-                        return {
-                            "final_response": _final_response,
-                            "messages": messages,
-                            "completed": False,
-                            "api_calls": api_call_count,
-                            "error": _final_response,
-                            "partial": True,
-                            "failed": True,
-                            "compression_exhausted": True,
-                        }
+                    time.sleep(2)
+                    continue
 
                 # Check for non-retryable client errors.  The classifier
                 # already accounts for 413, 429, 529 (transient), context
@@ -4322,16 +4239,6 @@ def run_conversation(
 
         if _turn_exit_reason == "text_response(partial_stream_network_error)":
             break
-
-        if _retry.restart_with_compressed_messages:
-            api_call_count -= 1
-            agent.iteration_budget.refund()
-            # Count compression restarts toward the retry limit to prevent
-            # infinite loops when compression reduces messages but not enough
-            # to fit the context window.
-            retry_count += 1
-            _retry.restart_with_compressed_messages = False
-            continue
 
         if _retry.restart_with_rebuilt_messages:
             # A content-filter stream stall (#32421) was escalated to the

@@ -1,10 +1,10 @@
 # Context Compression and Caching
 
-Hermes Agent uses a dual compression system and Anthropic prompt caching to
+Hermes Agent uses a canonical compression gate and Anthropic prompt caching to
 manage context window usage efficiently across long conversations.
 
 Source files: `agent/context_engine.py` (ABC), `agent/context_compressor.py` (default engine),
-`agent/prompt_caching.py`, `gateway/run.py` (session hygiene), `run_agent.py` (search for `_compress_context`)
+`agent/prompt_caching.py`, and `agent/conversation_loop.py` (canonical request gate)
 
 
 ## Pluggable Context Engine
@@ -18,10 +18,12 @@ context:
 ```
 
 The engine is responsible for:
-- Deciding when compaction should fire (`should_compress()`)
 - Performing compaction (`compress()`)
 - Optionally exposing tools the agent can call (e.g., `lcm_grep`)
-- Tracking token usage from API responses
+- Tracking token usage from API responses for metrics and estimator calibration
+
+Hermes itself decides when automatic compaction is required from the canonical
+prepared request. A plugin engine does not provide the dispatch safety verdict.
 
 Selection is config-driven via `context.engine` in `config.yaml`. The resolution order:
 1. Check `plugins/context_engine/<name>/` directory
@@ -34,44 +36,17 @@ Configure via `hermes plugins` → Provider Plugins → Context Engine, or edit 
 
 For building a context engine plugin, see [Context Engine Plugins](/developer-guide/context-engine-plugin).
 
-## Dual Compression System
+## Canonical Compression Gate
 
-Hermes has two separate compression layers that operate independently:
+Hermes has one automatic compression gate in `agent/conversation_loop.py`.
+It prepares the provider-specific payload, applies request middleware, accounts
+that exact payload, and dispatches the same accepted snapshot. Compression
+candidates and provider-overflow recovery repeat this same preparation step.
 
-```
-                     ┌──────────────────────────┐
-  Incoming message   │   Gateway Session Hygiene │  Fires at 85% of context
-  ─────────────────► │   (pre-agent, rough est.) │  Safety net for large sessions
-                     └─────────────┬────────────┘
-                                   │
-                                   ▼
-                     ┌──────────────────────────┐
-                     │   Agent ContextCompressor │  Fires at 50% of context (default)
-                     │   (in-loop, real tokens)  │  Normal context management
-                     └──────────────────────────┘
-```
-
-### 1. Gateway Session Hygiene (85% threshold)
-
-Located in `gateway/run.py` (search for `Session hygiene: auto-compress`). This is a **safety net** that
-runs before the agent processes a message. It prevents API failures when sessions
-grow too large between turns (e.g., overnight accumulation in Telegram/Discord).
-
-- **Threshold**: Fixed at 85% of model context length
-- **Token source**: Prefers actual API-reported tokens from last turn; falls back
-  to rough character-based estimate (`estimate_messages_tokens_rough`)
-- **Fires**: Only when `len(history) >= 4` and compression is enabled
-- **Purpose**: Catch sessions that escaped the agent's own compressor
-
-The gateway hygiene threshold is intentionally higher than the agent's compressor.
-Setting it at 50% (same as the agent) caused premature compression on every turn
-in long gateway sessions.
-
-### 2. Agent ContextCompressor (50% threshold, configurable)
-
-Located in `agent/context_compressor.py`. This is the **primary compression
-system** that runs inside the agent's tool loop with access to accurate,
-API-reported token counts.
+The built-in `ContextCompressor` in `agent/context_compressor.py` performs the
+compaction itself. Third-party context engines retain the same compaction
+interface, but Hermes decides request safety from the canonical prepared
+payload rather than provider-reported usage or transcript-only estimates.
 
 
 ## Configuration
@@ -393,4 +368,4 @@ The CLI shows caching status at startup:
 
 ## Context Pressure Warnings
 
-Intermediate context-pressure warnings have been removed (see the iteration-budget block in `run_agent.py`, which notes: "No intermediate pressure warnings — they caused models to 'give up' prematurely on complex tasks"). Compression fires when prompt tokens reach the configured `compression.threshold` (default 50%) with no prior warning step; gateway session hygiene fires as the secondary safety net at 85% of the model's context window.
+Intermediate context-pressure warnings have been removed (see the iteration-budget block in `run_agent.py`, which notes: "No intermediate pressure warnings — they caused models to 'give up' prematurely on complex tasks"). Compression fires when the canonical prepared request reaches the configured `compression.threshold` (default 50%) with no prior warning step. Provider overflow recovery runs the same canonical candidate-preparation gate.

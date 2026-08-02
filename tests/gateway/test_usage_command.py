@@ -142,8 +142,8 @@ class TestUsageCachedAgent:
         assert "Session Token Usage" in result
 
     @pytest.mark.asyncio
-    async def test_no_agent_anywhere_falls_to_history(self):
-        """No running or cached agent → rough estimate from transcript."""
+    async def test_no_agent_anywhere_reports_history_without_context_occupancy(self):
+        """A transcript alone cannot reconstruct provider-shaped occupancy."""
         runner = _make_runner(SK)
         event = MagicMock()
 
@@ -155,12 +155,12 @@ class TestUsageCachedAgent:
             {"role": "assistant", "content": "hi there"},
         ]
 
-        with patch("agent.model_metadata.estimate_messages_tokens_rough", return_value=500):
-            result = await runner._handle_usage_command(event)
+        result = await runner._handle_usage_command(event)
 
         assert "Session Info" in result
         assert "Messages: 2" in result
-        assert "~500" in result
+        assert "Estimated context" not in result
+        assert "~500" not in result
 
     @pytest.mark.asyncio
     async def test_cache_read_write_hidden_when_zero(self):

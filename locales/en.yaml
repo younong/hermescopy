@@ -367,7 +367,6 @@ gateway:
     breakdown_cat_conversation:         "Conversation"
     header_session_info:      "📊 **Session Info**"
     label_messages:           "Messages: {count}"
-    label_estimated_context:  "Estimated context: ~{count} tokens"
     detailed_after_first:     "_(Detailed usage available after the first agent response)_"
     no_data:                  "No usage data available for this session."
 

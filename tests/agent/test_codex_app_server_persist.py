@@ -62,36 +62,6 @@ def _make_agent(session_db=None, session_id="sess-codex"):
     return agent
 
 
-def test_codex_hard_block_preserves_turn_without_spawning_runtime():
-    agent = _make_agent(session_db=None)
-    compressor = MagicMock()
-    compressor.note_request_estimate.side_effect = lambda tokens: tokens
-    compressor.would_hard_block.return_value = True
-    agent.context_compressor = compressor
-    agent.compression_enabled = True
-    agent.tools = []
-    statuses = []
-    agent._emit_status = lambda message, *, kind="lifecycle": statuses.append(
-        (kind, message)
-    )
-    messages = [{"role": "user", "content": "large request"}]
-
-    result = run_codex_app_server_turn(
-        agent,
-        user_message="large request",
-        original_user_message="large request",
-        messages=messages,
-        effective_task_id="task-1",
-    )
-
-    assert result["turn_exit_reason"] == "compression_hard_blocked"
-    assert result["final_response"] is None
-    assert result["messages"] is messages
-    assert statuses[0][0] == "compression.blocked"
-    agent._codex_session.run_turn.assert_not_called()
-    compressor.note_request_estimate.assert_called_once()
-
-
 def test_codex_success_flushes_and_reports_persisted():
     """Codex success turn must self-persist and return agent_persisted=True."""
     agent = _make_agent(session_db=None)  # no DB -> flush is a no-op, still True

@@ -29,7 +29,6 @@ EXPECTED_FIELDS = {
     "primary_recovery_attempted",
     "has_retried_429",
     "auth_failover_attempted",
-    "restart_with_compressed_messages",
     "restart_with_length_continuation",
     "restart_with_rebuilt_messages",
 }
@@ -59,9 +58,9 @@ def test_loop_control_vars_are_not_on_state():
 def test_guards_are_independently_mutable():
     s = TurnRetryState()
     s.codex_auth_retry_attempted = True
-    s.restart_with_compressed_messages = True
+    s.restart_with_rebuilt_messages = True
     assert s.codex_auth_retry_attempted is True
-    assert s.restart_with_compressed_messages is True
+    assert s.restart_with_rebuilt_messages is True
     # untouched guards stay False
     assert s.has_retried_429 is False
     assert s.anthropic_auth_retry_attempted is False

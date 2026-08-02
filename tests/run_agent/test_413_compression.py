@@ -202,10 +202,6 @@ class TestHTTP413Compression:
                 "_compress_context",
                 return_value=(compacted, "compressed prompt"),
             ) as mock_compress,
-            patch(
-                "agent.conversation_compression.estimate_request_tokens_rough",
-                side_effect=[80, 40],
-            ),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -222,6 +218,16 @@ class TestHTTP413Compression:
         assert result["completed"] is True
         assert result["final_response"] == "Recovered"
         assert agent.client.chat.completions.create.call_count == 2
+        first_payload, second_payload = [
+            call.kwargs for call in agent.client.chat.completions.create.call_args_list
+        ]
+        assert first_payload is not second_payload
+        # SDK **kwargs expansion copies the outer dict, but the dispatched values
+        # must be exactly the accepted canonical snapshot.
+        assert second_payload == agent._prepared_model_request.payload
+        assert agent._prepared_model_request.accounting.effective_input_tokens < (
+            agent.context_compressor.threshold_tokens
+        )
 
     def test_overflow_preserves_vision_payload_when_projection_not_ready(self, agent):
         error = _make_413_error()

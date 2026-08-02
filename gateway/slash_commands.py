@@ -562,7 +562,7 @@ class GatewaySlashCommandsMixin:
         base_url = base_url or _clean_str(session_row.get("billing_base_url"))
 
         user_config: dict[str, Any] = {}
-        if not model_name or not provider_name or not context_total:
+        if not model_name or not provider_name:
             try:
                 user_config = _load_gateway_config()
             except Exception:
@@ -573,12 +573,6 @@ class GatewaySlashCommandsMixin:
             model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
             if isinstance(model_cfg, dict):
                 provider_name = _clean_str(model_cfg.get("provider"))
-        if not context_total:
-            model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
-            configured_context = model_cfg.get("context_length") if isinstance(model_cfg, dict) else None
-            if isinstance(configured_context, int) and configured_context > 0:
-                context_total = configured_context
-
         model_line = ""
         if model_name:
             if provider_name:
@@ -3997,17 +3991,16 @@ class GatewaySlashCommandsMixin:
 
             return "\n".join(lines)
 
-        # No agent at all -- check session history for a rough count
+        # A persisted transcript is not a provider-shaped request. Until an
+        # agent has prepared one, report history size without inventing current
+        # context-window occupancy.
         session_entry = self.session_store.get_or_create_session(source)
         history = self.session_store.load_transcript(session_entry.session_id)
         if history:
-            from agent.model_metadata import estimate_messages_tokens_rough
             msgs = [m for m in history if m.get("role") in {"user", "assistant"} and m.get("content")]
-            approx = estimate_messages_tokens_rough(msgs)
             lines = [
                 t("gateway.usage.header_session_info"),
                 t("gateway.usage.label_messages", count=len(msgs)),
-                t("gateway.usage.label_estimated_context", count=f"{approx:,}"),
                 t("gateway.usage.detailed_after_first"),
             ]
             if account_lines:

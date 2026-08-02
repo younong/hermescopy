@@ -355,7 +355,6 @@ Future messages in this room will use that transcript until `/reset` or another 
     breakdown_cat_conversation: "Beszélgetés"
     header_session_info:      "📊 **Munkamenet-információ**"
     label_messages:           "Üzenetek: {count}"
-    label_estimated_context:  "Becsült kontextus: ~{count} token"
     detailed_after_first:     "_(A részletes használat az első ügynökválasz után érhető el)_"
     no_data:                  "Ehhez a munkamenethez nincsenek elérhető használati adatok."
 
