@@ -74,14 +74,6 @@ class PreparedRequestAccounting:
             min(100, round(self.effective_input_tokens / self.context_limit * 100)),
         )
 
-    @property
-    def requires_compression(self) -> bool:
-        return self.effective_input_tokens >= self.compression_threshold
-
-    @property
-    def exceeds_hard_input_limit(self) -> bool:
-        return self.effective_input_tokens >= self.hard_input_limit
-
 
 @dataclass(frozen=True)
 class PreparedModelRequest:
