@@ -622,6 +622,7 @@ def run_conversation(
     _deferred_skill_context = _ctx.deferred_skill_context
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+    _allow_degraded_request = _ctx.compression_degraded
 
     if not _ctx.compression_safe_to_continue:
         compression_error = (
@@ -1082,7 +1083,9 @@ def run_conversation(
             approx_request_tokens
             >= int(getattr(agent.context_compressor, "threshold_tokens", 0) or 0)
         )
-        if agent.compression_enabled and (_at_compression_threshold or _hard_block):
+        if agent.compression_enabled and (
+            _hard_block or (_at_compression_threshold and not _allow_degraded_request)
+        ):
             from agent.conversation_compression import run_automatic_compression
 
             outcome = run_automatic_compression(
@@ -1100,6 +1103,7 @@ def run_conversation(
                     agent, messages
                 )
             if outcome.safe_to_continue and outcome.compressed:
+                _allow_degraded_request = outcome.degraded
                 api_call_count -= 1
                 agent._api_call_count = api_call_count
                 try:
@@ -1107,21 +1111,24 @@ def run_conversation(
                 except Exception:
                     pass
                 continue
+            if not outcome.safe_to_continue:
+                _turn_exit_reason = "compression_hard_blocked"
+                failed = True
+                terminal_error = "context compression did not produce a safe request"
+                terminal_failure_reason = (
+                    outcome.failure_reason or "compression_hard_blocked"
+                )
+                api_call_count -= 1
+                agent._api_call_count = api_call_count
+                try:
+                    agent.iteration_budget.refund()
+                except Exception:
+                    pass
+                break
 
-            _turn_exit_reason = "compression_hard_blocked"
-            failed = True
-            terminal_error = "context compression did not produce a safe request"
-            terminal_failure_reason = (
-                outcome.failure_reason or "compression_hard_blocked"
-            )
-            api_call_count -= 1
-            agent._api_call_count = api_call_count
-            try:
-                agent.iteration_budget.refund()
-            except Exception:
-                pass
-            break
-
+        # A degraded result permits one rebuilt request above the preferred
+        # compression threshold. Any following iteration must evaluate normally.
+        _allow_degraded_request = False
         _runtime_context_error = _ollama_context_limit_error(
             agent, approx_request_tokens
         )
@@ -4840,6 +4847,7 @@ def run_conversation(
                         )
                         _turn_exit_reason = "compression_hard_blocked"
                         break
+                    _allow_degraded_request = outcome.degraded
 
                 # Save session log incrementally (so progress is visible even if interrupted)
                 agent._session_messages = messages

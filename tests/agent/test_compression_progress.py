@@ -133,7 +133,7 @@ class TestAutomaticCompression:
             ]
         )
 
-    def test_no_progress_preserves_original_request_and_blocks(self, monkeypatch):
+    def test_no_progress_below_hard_boundary_degrades_safely(self, monkeypatch):
         original = [{"role": "user", "content": "large history"}]
         agent = self._agent(original)
         monkeypatch.setattr(
@@ -143,9 +143,29 @@ class TestAutomaticCompression:
 
         outcome = run_automatic_compression(agent, original, "system")
 
-        assert outcome.safe_to_continue is False
+        assert outcome.safe_to_continue is True
+        assert outcome.degraded is True
         assert outcome.messages is original
         assert outcome.compressed is False
+        assert outcome.failure_reason == "compression_no_progress"
+        agent._emit_status.assert_any_call(
+            "Context compression could not reduce the request, but it remains below "
+            "the safe context boundary. Continuing with the preserved conversation.",
+            kind="compression.degraded",
+        )
+
+    def test_no_progress_at_hard_boundary_blocks(self, monkeypatch):
+        original = [{"role": "user", "content": "large history"}]
+        agent = self._agent(original)
+        monkeypatch.setattr(
+            "agent.conversation_compression.estimate_request_tokens_rough",
+            lambda *_args, **_kwargs: 190,
+        )
+
+        outcome = run_automatic_compression(agent, original, "system")
+
+        assert outcome.safe_to_continue is False
+        assert outcome.degraded is False
         assert outcome.failure_reason == "compression_no_progress"
         agent._emit_status.assert_any_call(
             "Context compression could not reduce the request safely. The durable "
@@ -153,3 +173,54 @@ class TestAutomaticCompression:
             "/compress to retry or /new to start fresh.",
             kind="compression.blocked",
         )
+
+    def test_partial_progress_below_hard_boundary_degrades_safely(self, monkeypatch):
+        original = [
+            {"role": "user", "content": "large history"},
+            {"role": "assistant", "content": "large response"},
+        ]
+        compacted = [{"role": "user", "content": "summary"}]
+        agent = self._agent(compacted)
+        estimates = iter([180, 120])
+        monkeypatch.setattr(
+            "agent.conversation_compression.estimate_request_tokens_rough",
+            lambda *_args, **_kwargs: next(estimates),
+        )
+
+        outcome = run_automatic_compression(agent, original, "system")
+
+        assert outcome.safe_to_continue is True
+        assert outcome.degraded is True
+        assert outcome.compressed is True
+        assert outcome.messages is compacted
+        assert outcome.failure_reason is None
+
+    def test_exception_below_hard_boundary_degrades_safely(self, monkeypatch):
+        original = [{"role": "user", "content": "large history"}]
+        agent = self._agent(original)
+        agent._compress_context.side_effect = RuntimeError("summary unavailable")
+        monkeypatch.setattr(
+            "agent.conversation_compression.estimate_request_tokens_rough",
+            lambda *_args, **_kwargs: 150,
+        )
+
+        outcome = run_automatic_compression(agent, original, "system")
+
+        assert outcome.safe_to_continue is True
+        assert outcome.degraded is True
+        assert outcome.failure_reason == "compression_failed"
+
+    def test_forced_exception_below_hard_boundary_remains_strict(self, monkeypatch):
+        original = [{"role": "user", "content": "large history"}]
+        agent = self._agent(original)
+        agent._compress_context.side_effect = RuntimeError("summary unavailable")
+        monkeypatch.setattr(
+            "agent.conversation_compression.estimate_request_tokens_rough",
+            lambda *_args, **_kwargs: 150,
+        )
+
+        outcome = run_automatic_compression(agent, original, "system", force=True)
+
+        assert outcome.safe_to_continue is False
+        assert outcome.degraded is False
+        assert outcome.failure_reason == "compression_failed"

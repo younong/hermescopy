@@ -127,6 +127,7 @@ class TurnContext:
     # Whether the turn may issue a normal model request after preflight.
     compression_safe_to_continue: bool = True
     compression_failure_reason: Optional[str] = None
+    compression_degraded: bool = False
     # Whether the post-turn memory review should fire.
     should_review_memory: bool = False
     # Full instructions for a large slash-invoked skill. Attached only to API
@@ -364,6 +365,7 @@ def build_turn_context(
 
     compression_safe_to_continue = True
     compression_failure_reason = None
+    compression_degraded = False
     with _TurnPhase(agent, turn_id, "preflight_compression"):
         # Commit a stable deterministic tool-only checkpoint before the expensive
         # full request estimate. The inbound user turn was persisted above, while
@@ -455,6 +457,7 @@ def build_turn_context(
                 )
                 compression_safe_to_continue = outcome.safe_to_continue
                 compression_failure_reason = outcome.failure_reason
+                compression_degraded = outcome.degraded
                 if outcome.compressed:
                     messages = outcome.messages
                     active_system_prompt = outcome.system_prompt
@@ -595,6 +598,7 @@ def build_turn_context(
         current_turn_user_idx=current_turn_user_idx,
         compression_safe_to_continue=compression_safe_to_continue,
         compression_failure_reason=compression_failure_reason,
+        compression_degraded=compression_degraded,
         should_review_memory=should_review_memory,
         deferred_skill_context=deferred_skill_context,
         plugin_user_context=plugin_user_context,
