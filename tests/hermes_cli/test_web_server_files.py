@@ -258,6 +258,31 @@ def test_gated_local_mode_still_defaults_to_home(monkeypatch, tmp_path):
     assert policy.can_change_path is True
 
 
+def test_authenticated_stream_upload_proxies_unconsumed_body(
+    authenticated_files_client,
+    monkeypatch,
+):
+    client, _home = authenticated_files_client
+    observed = {}
+
+    async def fake_proxy(request):
+        observed["content_type"] = request.headers["content-type"]
+        observed["body"] = await request.body()
+        return web_server.Response(content=b'{"ok":true}', media_type="application/json")
+
+    monkeypatch.setattr(web_server, "_proxy_authenticated_owner_http", fake_proxy)
+    response = client.post(
+        "/api/files/upload-stream",
+        data={"path": "folder/upload.txt", "overwrite": "true"},
+        files={"file": ("upload.txt", b"proxied", "text/plain")},
+    )
+
+    assert response.status_code == 200
+    assert b"folder/upload.txt" in observed["body"]
+    assert b"proxied" in observed["body"]
+    assert observed["content_type"].startswith("multipart/form-data; boundary=")
+
+
 def test_authenticated_mode_proxies_file_apis_to_owner_worker(authenticated_files_client):
     client, home = authenticated_files_client
     existing = home / "existing.txt"
@@ -571,17 +596,18 @@ def test_stream_upload_cleans_temp_on_cancellation(forced_files_client):
         async def close(self):
             return None
 
-    request = SimpleNamespace()
+    class _UploadRequest:
+        async def form(self):
+            return {
+                "file": _AbortingUpload(),
+                "path": str(target),
+                "overwrite": "true",
+            }
+
+    request = _UploadRequest()
 
     with pytest.raises(asyncio.CancelledError):
-        asyncio.run(
-            web_server.upload_managed_file_stream(
-                request=request,
-                file=_AbortingUpload(),
-                path=str(target),
-                overwrite=True,
-            )
-        )
+        asyncio.run(web_server.upload_managed_file_stream(request=request))
 
     # No partial data was promoted into place ...
     assert not target.exists()
