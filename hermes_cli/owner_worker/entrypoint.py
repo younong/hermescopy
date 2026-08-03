@@ -314,7 +314,7 @@ def create_app(
     except (OSError, RuntimeError) as exc:
         raise RuntimeError(f"owner worker startup self-check failed: {exc}") from exc
 
-    from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+    from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
     from fastapi.responses import JSONResponse
 
     @asynccontextmanager
@@ -893,8 +893,20 @@ def create_app(
 
     @app.post("/api/files/upload-stream")
     async def upload_file_stream(
-        file: UploadFile = File(...), path: str = Form(...), overwrite: bool = Form(True), _: None = Depends(_require_owner_token)
+        request: Request,
+        _: None = Depends(_require_owner_token),
     ) -> dict[str, Any]:
+        form = await request.form()
+        file = form.get("file")
+        path = form.get("path")
+        overwrite_value = form.get("overwrite", "true")
+        if (
+            not callable(getattr(file, "read", None))
+            or not callable(getattr(file, "close", None))
+            or not isinstance(path, str)
+        ):
+            raise HTTPException(status_code=422, detail="Invalid upload form")
+        overwrite = str(overwrite_value).strip().lower() in {"1", "true", "on", "yes"}
         relative_path = _file_path(path)
         writer = None
         try:

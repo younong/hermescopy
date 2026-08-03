@@ -2955,6 +2955,16 @@ def test_worker_managed_files_are_descriptor_scoped_to_its_owner(tmp_path, monke
     assert not (owner_a / "workspaces" / "project" / "note.txt").exists()
     assert not (owner_b / "workspaces" / "project" / "note.txt").exists()
 
+    streamed = client.post(
+        "/api/files/upload-stream",
+        headers=request("/api/files/upload-stream"),
+        data={"path": "project/streamed.txt", "overwrite": "true"},
+        files={"file": ("streamed.txt", b"streamed-owner-a", "text/plain")},
+    )
+    assert streamed.status_code == 200, streamed.text
+    assert streamed.json()["path"] == "project/streamed.txt"
+    assert (default_workspace / "project" / "streamed.txt").read_bytes() == b"streamed-owner-a"
+
     root_upload = client.post(
         "/api/files/upload",
         headers=request("/api/files/upload"),
