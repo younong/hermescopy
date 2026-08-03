@@ -58,7 +58,7 @@ Systemd 服务：
 /sys/fs/cgroup/system.slice/hermes-dashboard.service/authenticated-owners
 ```
 
-Dashboard unit 使用 `Delegate=cpu memory pids`、CPU/Memory/Tasks accounting 和 `KillMode=control-group`。可信 bootstrap 先把 Dashboard 进程移入 `control-plane/`，再启用 unit root controller 并建立空的 `authenticated-owners/`；应用只管理该空 subtree。生产专用首版预算为：全局 1500m CPU/2304 MiB/512 PID/最多 5 worker 和 2 executor；单 owner 1000m/896 MiB/128 PID/1 executor；单 invocation 750m/512 MiB/swap 0/64 PID/64 FD/120 秒/200,000 字节。它们只针对当前 2 vCPU、约 3.48 GiB 主机，不是跨部署默认值。
+Dashboard unit 使用 `Delegate=cpu memory pids`、CPU/Memory/Tasks accounting 和 `KillMode=mixed`。停止服务时 systemd 先只向 Dashboard 主进程发送 `SIGTERM`，让现有 shutdown hook 最多用 120 秒排空 Owner Worker；150 秒停止期限到达后，systemd 仍会强制清理 cgroup 中的残留进程。可信 bootstrap 先把 Dashboard 进程移入 `control-plane/`，再启用 unit root controller 并建立空的 `authenticated-owners/`；应用只管理该空 subtree。生产专用首版预算为：全局 1500m CPU/2304 MiB/512 PID/最多 5 worker 和 2 executor；单 owner 1000m/896 MiB/128 PID/1 executor；单 invocation 750m/512 MiB/swap 0/64 PID/64 FD/120 秒/200,000 字节。它们只针对当前 2 vCPU、约 3.48 GiB 主机，不是跨部署默认值。
 
 Dashboard 只监听服务器本机 `127.0.0.1:9119`，公开入口为：
 

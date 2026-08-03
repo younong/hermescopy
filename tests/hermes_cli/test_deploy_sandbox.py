@@ -141,7 +141,11 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert "CPUAccounting=yes" in source
     assert "MemoryAccounting=yes" in source
     assert "TasksAccounting=yes" in source
-    assert "KillMode=control-group" in source
+    assert "owner_worker_drain_timeout=120" in source
+    assert 'dashboard_stop_timeout="$((owner_worker_drain_timeout + 30))"' in source
+    assert "Environment=HERMES_OWNER_WORKER_DRAIN_TIMEOUT=$owner_worker_drain_timeout" in source
+    assert "KillMode=mixed" in source
+    assert "TimeoutStopSec=$dashboard_stop_timeout" in source
     assert "hermes-log-format.conf" in source
     assert 'nginx_log_format="/etc/nginx/conf.d/00-hermes-log-format.conf"' in source
     assert 'legacy_nginx_log_format="/etc/nginx/conf.d/hermes-log-format.conf"' in source

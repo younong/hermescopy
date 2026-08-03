@@ -77,7 +77,7 @@ def inspect(managed_root: Path, *, service: str) -> dict[str, Any]:
         and systemd.get("CPUAccounting") == "yes"
         and systemd.get("MemoryAccounting") == "yes"
         and systemd.get("TasksAccounting") == "yes"
-        and systemd.get("KillMode") == "control-group"
+        and systemd.get("KillMode") == "mixed"
     )
     unified = mount is not None and (mount == service_root or mount in service_root.parents)
     service_processes = len(_read(service_root / "cgroup.procs").split())

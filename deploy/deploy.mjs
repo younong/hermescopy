@@ -703,6 +703,8 @@ cgroup_root="/sys/fs/cgroup/system.slice/hermes-dashboard.service/authenticated-
 owner_root="$hermes_home/users"
 service_user="hermes"
 service_group="hermes"
+owner_worker_drain_timeout=120
+dashboard_stop_timeout="$((owner_worker_drain_timeout + 30))"
 old_current_target=""
 new_current_target=""
 release_target=""
@@ -1331,6 +1333,7 @@ Environment=MALLOC_ARENA_MAX=2
 Environment=HERMES_DASHBOARD_PUBLIC_URL=$dashboard_public_url
 Environment=HERMES_SANDBOX_DEPLOYMENT_POLICY=hermes_cli.owner_worker.host_sandbox:host_sandbox_deployment_policy
 Environment=HERMES_DISABLE_LAZY_INSTALLS=1
+Environment=HERMES_OWNER_WORKER_DRAIN_TIMEOUT=$owner_worker_drain_timeout
 WorkingDirectory=$current
 ExecStart=$venv/bin/python -m hermes_cli.owner_worker.cgroup_bootstrap --managed-root $cgroup_root -- $runner dashboard --host 127.0.0.1 --port 9119 --no-open --skip-build --require-auth --trust-proxy-headers
 Restart=always
@@ -1339,11 +1342,11 @@ Delegate=cpu memory pids
 CPUAccounting=yes
 MemoryAccounting=yes
 TasksAccounting=yes
-# Keep owner workers in the dashboard service cgroup so shutdown cleanup can
-# revoke their authority fence before systemd reaps any remaining children.
-KillMode=control-group
+# Signal only the Dashboard first so its shutdown hook can drain owner workers;
+# systemd still SIGKILLs any processes left in the cgroup after the stop timeout.
+KillMode=mixed
 KillSignal=SIGTERM
-TimeoutStopSec=90
+TimeoutStopSec=$dashboard_stop_timeout
 StandardOutput=journal
 StandardError=journal
 
