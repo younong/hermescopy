@@ -535,6 +535,25 @@ _OR_HEADERS_BASE = {
 _TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 
 
+def _deployment_relay_headers(
+    api_key: object,
+    main_runtime: Optional[Dict[str, Any]],
+) -> dict[str, str]:
+    """Return the route selector required by the owner-local inference relay."""
+    try:
+        from hermes_cli.deployment_inference import is_deployment_inference_relay
+
+        if not is_deployment_inference_relay(api_key):
+            return {}
+    except ImportError:
+        return {}
+    runtime = _normalize_main_runtime(main_runtime)
+    provider = str(runtime.get("provider") or "").strip().lower()
+    if not provider:
+        return {}
+    return {"x-hermes-deployment-provider": provider}
+
+
 def _apply_user_default_headers(headers: dict | None) -> dict | None:
     """Merge user-configured ``model.default_headers`` onto resolved headers.
 
@@ -3982,6 +4001,7 @@ def _resolve_auto(
                 explicit_base_url=explicit_base_url,
                 explicit_api_key=explicit_api_key,
                 api_mode=runtime_api_mode or None,
+                main_runtime={"provider": main_provider},
             )
             if client is not None:
                 logger.info("Auxiliary auto-detect: using main provider %s (%s)",
@@ -4372,6 +4392,9 @@ def resolve_provider_client(
                 provider,
             )
             extra = {}
+            relay_headers = _deployment_relay_headers(custom_key, main_runtime)
+            if relay_headers:
+                extra["default_headers"] = relay_headers
             _clean_base, _dq = _extract_url_query_params(custom_base)
             if _dq:
                 extra["default_query"] = _dq
@@ -5535,6 +5558,35 @@ _AUX_DIRECT_API_BASE_URLS: Dict[str, str] = {
 }
 
 
+def get_compression_summary_model(
+    explicit_model: Optional[str] = None,
+    *,
+    task_config: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Return the currently selected compression-summary model.
+
+    Existing model choices keep their normal precedence: an explicit request
+    override, ``auxiliary.compression.model``, then the deployment-managed
+    default when compression is using the automatic provider route. ``None``
+    means the selected provider may use its normal default/main-runtime model.
+    """
+    config = (
+        task_config
+        if isinstance(task_config, dict)
+        else _get_auxiliary_task_config("compression")
+    )
+    configured_model = str(config.get("model", "")).strip() or None
+    if configured_model and configured_model.lower() == "auto":
+        configured_model = None
+    configured_provider = str(config.get("provider", "")).strip() or None
+    deployment_model = (
+        os.getenv("HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL", "").strip()
+        if not configured_provider or configured_provider == "auto"
+        else ""
+    )
+    return explicit_model or configured_model or deployment_model or None
+
+
 def _resolve_task_provider_model(
     task: str = None,
     provider: str = None,
@@ -5579,7 +5631,11 @@ def _resolve_task_provider_model(
     if cfg_model and cfg_model.lower() == "auto":
         cfg_model = None
 
-    resolved_model = model or cfg_model
+    resolved_model = (
+        get_compression_summary_model(model, task_config=task_config)
+        if task == "compression"
+        else model or cfg_model
+    )
     resolved_api_mode = cfg_api_mode
 
     # Convenience aliases for direct API-key endpoints that aren't first-class
@@ -6392,6 +6448,7 @@ def call_llm(
     deadline_monotonic = _compression_request_deadline(task, deadline_monotonic)
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
+    selected_compression_model = resolved_model if task == "compression" else None
     if api_mode:
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
@@ -6460,7 +6517,8 @@ def call_llm(
                     **configured_capacity_filter,
                 )
                 if fb_client is not None:
-                    client, final_model = fb_client, fb_model
+                    client = fb_client
+                    final_model = selected_compression_model or fb_model
                     resolved_provider = fb_label or resolved_provider
                 else:
                     raise RuntimeError(format_missing_provider_api_key(_explicit))
@@ -6472,7 +6530,12 @@ def call_llm(
             if client is None and not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
-                client, final_model = _get_cached_client("auto", main_runtime=main_runtime, task=task)
+                client, final_model = _get_cached_client(
+                    "auto",
+                    model=selected_compression_model,
+                    main_runtime=main_runtime,
+                    task=task,
+                )
         if client is None:
             raise RuntimeError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
@@ -6668,7 +6731,11 @@ def call_llm(
         if _is_model_not_found_error(first_err) and _heal_is_nous:
             healed_model = _refresh_nous_recommended_model(
                 vision=(task == "vision"), stale_model=kwargs.get("model"))
-            if healed_model and healed_model != kwargs.get("model"):
+            if (
+                not selected_compression_model
+                and healed_model
+                and healed_model != kwargs.get("model")
+            ):
                 logger.warning(
                     "Auxiliary %s: model %r no longer in Nous catalog; "
                     "retrying with refreshed recommendation %r",
@@ -6705,8 +6772,9 @@ def call_llm(
                     "Auxiliary %s: refreshed Nous runtime credentials after paid account check, retrying",
                     task or "call",
                 )
-                if refreshed_model and refreshed_model != kwargs.get("model"):
-                    kwargs["model"] = refreshed_model
+                retry_model = selected_compression_model or refreshed_model
+                if retry_model and retry_model != kwargs.get("model"):
+                    kwargs["model"] = retry_model
                 try:
                     return _create(refreshed_client, kwargs)
                 except Exception as retry_err:
@@ -6733,8 +6801,9 @@ def call_llm(
             if refreshed_client is not None:
                 logger.info("Auxiliary %s: refreshed Nous runtime credentials after 401, retrying",
                             task or "call")
-                if refreshed_model and refreshed_model != kwargs.get("model"):
-                    kwargs["model"] = refreshed_model
+                retry_model = selected_compression_model or refreshed_model
+                if retry_model and retry_model != kwargs.get("model"):
+                    kwargs["model"] = retry_model
                 return _create(refreshed_client, kwargs)
 
         # ── Auth refresh retry ───────────────────────────────────────
@@ -6944,8 +7013,9 @@ def call_llm(
                     )
 
             if fb_client is not None:
+                fallback_model = selected_compression_model or fb_model
                 fb_kwargs = _build_call_kwargs(
-                    fb_label, fb_model, messages,
+                    fb_label, fallback_model, messages,
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
@@ -6954,7 +7024,7 @@ def call_llm(
                     fb_client,
                     fb_kwargs,
                     route_provider=fb_label,
-                    route_model=fb_model,
+                    route_model=fallback_model,
                 )
             # All fallback layers exhausted — emit a single user-visible
             # warning so the operator knows aux task is about to fail.
@@ -7055,6 +7125,7 @@ async def async_call_llm(
     """
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
+    selected_compression_model = resolved_model if task == "compression" else None
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
 
@@ -7098,16 +7169,23 @@ async def async_call_llm(
                     task, _explicit,
                 )
                 if fb_client is not None:
-                    client, final_model = _to_async_client(
+                    client, async_model = _to_async_client(
                         fb_client, fb_model or "", is_vision=(task == "vision")
                     )
+                    final_model = selected_compression_model or async_model
                     resolved_provider = fb_label or resolved_provider
                 else:
                     raise RuntimeError(format_missing_provider_api_key(_explicit))
             if client is None and not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
-                client, final_model = _get_cached_client("auto", async_mode=True, main_runtime=main_runtime, task=task)
+                client, final_model = _get_cached_client(
+                    "auto",
+                    model=selected_compression_model,
+                    async_mode=True,
+                    main_runtime=main_runtime,
+                    task=task,
+                )
         if client is None:
             raise RuntimeError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
@@ -7220,7 +7298,11 @@ async def async_call_llm(
         if _is_model_not_found_error(first_err) and _heal_is_nous:
             healed_model = _refresh_nous_recommended_model(
                 vision=(task == "vision"), stale_model=kwargs.get("model"))
-            if healed_model and healed_model != kwargs.get("model"):
+            if (
+                not selected_compression_model
+                and healed_model
+                and healed_model != kwargs.get("model")
+            ):
                 logger.warning(
                     "Auxiliary %s (async): model %r no longer in Nous catalog; "
                     "retrying with refreshed recommendation %r",
@@ -7257,8 +7339,9 @@ async def async_call_llm(
                     "Auxiliary %s (async): refreshed Nous runtime credentials after paid account check, retrying",
                     task or "call",
                 )
-                if refreshed_model and refreshed_model != kwargs.get("model"):
-                    kwargs["model"] = refreshed_model
+                retry_model = selected_compression_model or refreshed_model
+                if retry_model and retry_model != kwargs.get("model"):
+                    kwargs["model"] = retry_model
                 try:
                     return _validate_llm_response(
                         await refreshed_client.chat.completions.create(**kwargs), task)
@@ -7285,8 +7368,9 @@ async def async_call_llm(
             if refreshed_client is not None:
                 logger.info("Auxiliary %s (async): refreshed Nous runtime credentials after 401, retrying",
                             task or "call")
-                if refreshed_model and refreshed_model != kwargs.get("model"):
-                    kwargs["model"] = refreshed_model
+                retry_model = selected_compression_model or refreshed_model
+                if retry_model and retry_model != kwargs.get("model"):
+                    kwargs["model"] = retry_model
                 return _validate_llm_response(
                     await refreshed_client.chat.completions.create(**kwargs), task)
 
@@ -7429,18 +7513,18 @@ async def async_call_llm(
                         resolved_provider, task, reason=reason)
 
             if fb_client is not None:
+                # Convert sync fallback client to async before selecting the
+                # final wire model; adapters may normalize provider defaults.
+                async_fb, async_fb_model = _to_async_client(
+                    fb_client, fb_model or "", is_vision=(task == "vision")
+                )
+                fallback_model = selected_compression_model or async_fb_model
                 fb_kwargs = _build_call_kwargs(
-                    fb_label, fb_model, messages,
+                    fb_label, fallback_model, messages,
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
                     base_url=str(getattr(fb_client, "base_url", "") or ""))
-                # Convert sync fallback client to async
-                async_fb, async_fb_model = _to_async_client(
-                    fb_client, fb_model or "", is_vision=(task == "vision")
-                )
-                if async_fb_model and async_fb_model != fb_kwargs.get("model"):
-                    fb_kwargs["model"] = async_fb_model
                 return _validate_llm_response(
                     await async_fb.chat.completions.create(**fb_kwargs), task)
             # All fallback layers exhausted — warn before re-raising. (#26882)

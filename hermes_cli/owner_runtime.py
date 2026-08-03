@@ -46,6 +46,7 @@ OWNER_WORKER_DEPLOYMENT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     "HERMES_DEPLOYMENT_INFERENCE_POLICY_ID",
     "HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS",
     "HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION",
+    "HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL",
     "HERMES_DEPLOYMENT_INFERENCE_RELAY_FD",
     "HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL",
     "HERMES_DEPLOYMENT_IMAGE_PROVIDER",
@@ -259,6 +260,10 @@ def owner_worker_env_for(
         if deployment_inference_descriptor.supports_vision is not None:
             env["HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION"] = (
                 "true" if deployment_inference_descriptor.supports_vision else "false"
+            )
+        if deployment_inference_descriptor.compression_model:
+            env["HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL"] = (
+                deployment_inference_descriptor.compression_model
             )
     if deployment_image_descriptor is not None:
         from hermes_cli.deployment_image import DeploymentImageDescriptor

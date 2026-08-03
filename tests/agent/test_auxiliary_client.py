@@ -168,6 +168,57 @@ class TestResolveTaskProviderModel:
         assert api_key == "sk-test"
         assert api_mode is None
 
+    def test_deployment_compression_model_overrides_auto(self, monkeypatch):
+        monkeypatch.setenv(
+            "HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL", "gpt-5.6-luna"
+        )
+
+        provider, model, base_url, api_key, api_mode = (
+            _resolve_task_provider_model("compression")
+        )
+
+        assert provider == "auto"
+        assert model == "gpt-5.6-luna"
+        assert base_url is None
+        assert api_key is None
+        assert api_mode is None
+
+    def test_explicit_compression_config_wins_over_deployment_default(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL", "gpt-5.6-luna"
+        )
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={"provider": "openrouter", "model": "configured-model"},
+        ):
+            provider, model, *_ = _resolve_task_provider_model("compression")
+
+        assert provider == "openrouter"
+        assert model == "configured-model"
+
+    def test_compression_model_getter_preserves_existing_precedence(self, monkeypatch):
+        from agent.auxiliary_client import get_compression_summary_model
+
+        monkeypatch.setenv(
+            "HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL", "gpt-5.6-luna"
+        )
+
+        assert get_compression_summary_model(
+            "explicit-model",
+            task_config={"provider": "auto", "model": "configured-model"},
+        ) == "explicit-model"
+        assert get_compression_summary_model(
+            task_config={"provider": "openrouter", "model": "configured-model"},
+        ) == "configured-model"
+        assert get_compression_summary_model(
+            task_config={"provider": "auto", "model": ""},
+        ) == "gpt-5.6-luna"
+        assert get_compression_summary_model(
+            task_config={"provider": "openrouter", "model": ""},
+        ) is None
+
 
 class TestBuildCallKwargsMaxTokens:
     """_build_call_kwargs should not cap output by default (#34530).
@@ -2027,6 +2078,66 @@ class TestCallLlmPaymentFallback:
         assert fallback_client.chat.completions.create.called
         # Labelled as an auth error, not mis-tagged as a connection error.
         assert mock_fb.call_args.kwargs.get("reason") == "auth error"
+
+    @pytest.mark.parametrize("selected_model", ["gpt-5.6-luna", "configured-summary-model"])
+    def test_compression_fallback_preserves_selected_model(self, selected_model):
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = self._make_429_rate_limit_error()
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = _DummyResponse("summary")
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, selected_model),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", selected_model, None, None, None),
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(fallback_client, "fallback-entry-model", "fallback-provider"),
+        ):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "summary"
+        request = fallback_client.chat.completions.create.call_args.kwargs
+        assert request["model"] == selected_model
+
+    @pytest.mark.asyncio
+    async def test_async_compression_fallback_preserves_luna(self):
+        primary_client = MagicMock()
+        primary_client.chat.completions.create = AsyncMock(
+            side_effect=self._make_429_rate_limit_error()
+        )
+        fallback_client = MagicMock()
+        async_fallback_client = MagicMock()
+        async_fallback_client.chat.completions.create = AsyncMock(
+            return_value=_DummyResponse("summary")
+        )
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "gpt-5.6-luna"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", "gpt-5.6-luna", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(fallback_client, "fallback-entry-model", "fallback-provider"),
+        ), patch(
+            "agent.auxiliary_client._to_async_client",
+            return_value=(async_fallback_client, "fallback-entry-model"),
+        ):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "summary"
+        request = async_fallback_client.chat.completions.create.call_args.kwargs
+        assert request["model"] == "gpt-5.6-luna"
 
     def test_401_auth_error_no_fallback_with_explicit_provider(self, monkeypatch):
         """401 on an explicitly-configured provider must NOT silently switch.

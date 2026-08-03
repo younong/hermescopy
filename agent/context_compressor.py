@@ -32,6 +32,7 @@ from agent.auxiliary_client import (
     _is_connection_error,
     aux_interrupt_protection,
     call_llm,
+    get_compression_summary_model,
     resolve_auxiliary_route_capacity,
 )
 from agent.context_engine import ContextEngine
@@ -885,7 +886,10 @@ class ContextCompressor(ContextEngine):
         self._usage_calibration_samples = 0
         self._last_request_rough_tokens = 0
 
-        self.summary_model = summary_model_override or ""
+        self._summary_model_override = summary_model_override
+        self.summary_model = get_compression_summary_model(
+            summary_model_override,
+        ) or ""
         self._session_db: Any = None
         self._session_id: str = ""
 
@@ -1609,8 +1613,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         Centralises the bookkeeping shared by every fallback branch in
         :meth:`_generate_summary` (model-not-found, timeout, JSON decode,
         unknown error): record the aux-model failure for ``/usage``-style
-        callers, clear the summary model so the next call uses the main one,
-        and clear the cooldown so the immediate retry can run.
+        callers and clear the cooldown so the immediate main-model retry can
+        run.
 
         ``reason`` is a short human-readable phrase ("unavailable",
         "timed out", "returned invalid JSON", "failed") that is interpolated
@@ -1627,7 +1631,6 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             _err_text = _err_text[:217].rstrip() + "..."
         self._last_aux_model_failure_error = _err_text
         self._last_aux_model_failure_model = self.summary_model
-        self.summary_model = ""  # empty = use main model
         self._clear_compression_failure_cooldown()  # no cooldown — retry immediately
 
     def _generate_summary(
@@ -1640,6 +1643,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         _serialized_content: Optional[str] = None,
         _prompt_only: bool = False,
         _today: Optional[str] = None,
+        _use_main_model: bool = False,
     ) -> Optional[str]:
         """Generate a structured summary of conversation turns.
 
@@ -1872,7 +1876,19 @@ This compaction should PRIORITISE preserving all information related to the focu
                 # Configured timeouts below ten minutes remain effective; call_llm
                 # clamps all retries and fallbacks to this request deadline.
             }
-            if self.summary_model:
+            if _use_main_model:
+                # The sole intentional model switch: after every normal
+                # compression route has failed, retry once on the complete main
+                # chat route. Explicit fields keep task config/deployment
+                # selection from routing this recovery back to the aux model.
+                call_kwargs.update(
+                    provider=self.provider,
+                    model=self.model,
+                    base_url=self.base_url,
+                    api_key=self.api_key,
+                    api_mode=self.api_mode,
+                )
+            elif self.summary_model:
                 call_kwargs["model"] = self.summary_model
             # Compression is atomic: protect the in-flight summary call from a
             # mid-turn gateway interrupt. Without this, an incoming user message
@@ -2040,6 +2056,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                     deadline_monotonic=summary_request_deadline,
                     _summary_budget=summary_budget,
                     _serialized_content=content_to_summarize,
+                    _use_main_model=True,
                 )
 
             # Transient errors (timeout, rate limit, network, JSON decode,
@@ -3004,6 +3021,12 @@ This compaction should PRIORITISE preserving all information related to the focu
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
         self._last_compress_aborted = False
+        # Re-read the selected option so a long-running agent picks up model
+        # configuration changes before the next compression attempt.
+        self.summary_model = get_compression_summary_model(
+            self._summary_model_override,
+        ) or ""
+        self._summary_model_fallen_back = False
         # NOTE: do NOT reset _last_summary_auth_failure or
         # _last_summary_transient_failure here.  These flags are set by
         # _generate_summary() on a terminal failure and are already cleared on
