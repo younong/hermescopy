@@ -1010,8 +1010,8 @@ class TestSummaryFallbackToMainModel:
         assert mock_call.call_count == 2
         # First call used the misconfigured aux model
         assert mock_call.call_args_list[0].kwargs.get("model") == "broken-aux-model"
-        # Second call used the main model (no model kwarg → call_llm uses main)
-        assert "model" not in mock_call.call_args_list[1].kwargs
+        # Second call explicitly used the complete main-model route.
+        assert mock_call.call_args_list[1].kwargs["model"] == "main-model"
         assert result is not None
         assert "summary via main model" in result
         # Aux-model failure is recorded even though retry succeeded — this is
@@ -1051,7 +1051,7 @@ class TestSummaryFallbackToMainModel:
 
         assert mock_call.call_count == 2
         assert mock_call.call_args_list[0].kwargs.get("model") == "broken-aux-model"
-        assert "model" not in mock_call.call_args_list[1].kwargs
+        assert mock_call.call_args_list[1].kwargs["model"] == "main-model"
         assert result is not None
         assert "summary via main model" in result
         # Aux-model failure recorded despite successful recovery
@@ -1139,7 +1139,7 @@ class TestSummaryFallbackToMainModel:
 
         assert mock_call.call_count == 2
         assert mock_call.call_args_list[0].kwargs.get("model") == "aux-via-broken-proxy"
-        assert "model" not in mock_call.call_args_list[1].kwargs
+        assert mock_call.call_args_list[1].kwargs["model"] == "main-model"
         assert result is not None
         assert "summary via main model" in result
         # Aux-model failure recorded so /usage / gateway warnings can surface it
@@ -1251,7 +1251,7 @@ class TestStreamingClosedFallback:
 
         assert mock_call.call_count == 2
         assert mock_call.call_args_list[0].kwargs.get("model") == "aux-stream-model"
-        assert "model" not in mock_call.call_args_list[1].kwargs
+        assert mock_call.call_args_list[1].kwargs["model"] == "main-model"
         assert result is not None
         assert "summary via main model" in result
 
@@ -1410,14 +1410,15 @@ class TestAuxModelFallbackSurfacedToCallers:
             c.compress(self._make_msgs())
         assert c._last_aux_model_failure_model == "broken-aux-model"
 
-        # Call 2: clean run on main (summary_model was cleared to "" after
-        # first fallback).  Aux-failure fields MUST reset at compress() start
-        # so the old warning state doesn't leak into this call.
+        # Call 2 starts from the selected auxiliary model again. Aux-failure
+        # fields MUST reset at compress() start so the old warning state doesn't
+        # leak into this call.
         with patch(
             "agent.context_compressor.call_llm",
             return_value=mock_ok,
-        ):
+        ) as mock_call:
             c.compress(self._make_msgs())
+        assert mock_call.call_args.kwargs["model"] == "broken-aux-model"
         assert c._last_aux_model_failure_model is None
         assert c._last_aux_model_failure_error is None
 
