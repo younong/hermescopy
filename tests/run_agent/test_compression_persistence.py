@@ -19,8 +19,37 @@ Bug scenario (pre-fix):
 import os
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
+from agent.prepared_model_request import PreparedModelRequest, PreparedRequestAccounting
+
+
+def _prepared(tokens, *, label="request"):
+    return PreparedModelRequest(
+        request_id=label,
+        route=SimpleNamespace(
+            provider="test",
+            model="test/model",
+            base_url="http://test",
+            api_mode="chat_completions",
+        ),
+        payload={"messages": [{"role": "user", "content": label}]},
+        original_payload={},
+        middleware_trace=(),
+        accounting=PreparedRequestAccounting(
+            raw_input_tokens=tokens,
+            effective_input_tokens=tokens,
+            output_token_limit=10,
+            context_limit=200,
+            compression_threshold=100,
+            hard_input_limit=190,
+            categories=(),
+        ),
+        message_count=1,
+        tool_count=0,
+        request_char_count=len(label),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +220,177 @@ class TestFlushAfterCompression:
                 "final answer",
             ]
 
+    def test_bounded_recovery_persists_projection_and_archives_canonical_turns(self):
+        """A failed semantic summary leaves one durable, resumable projection."""
+        from agent.context_compressor import ContextCompressor
+        from agent.conversation_compression import (
+            conversation_history_after_compression,
+            run_automatic_compression,
+        )
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "agent.context_compressor.get_model_context_length", return_value=100000
+        ):
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            agent.compression_in_place = True
+            agent.context_compressor = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=0,
+                protect_last_n=0,
+            )
+            agent._emit_status = MagicMock()
+            agent._ensure_db_session()
+
+            original = [
+                {"role": "user", "content": "old question"},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "recent question"},
+                {"role": "assistant", "content": "recent answer"},
+                {"role": "user", "content": "current request"},
+            ]
+            agent._flush_messages_to_session_db(original, [])
+            agent._compress_context = MagicMock(return_value=(original, "system"))
+            candidates = iter(
+                [
+                    _prepared(190, label="summary-no-progress"),
+                    _prepared(40, label="bounded-recovery"),
+                ]
+            )
+
+            outcome = run_automatic_compression(
+                agent,
+                original,
+                "system",
+                prepared_request=_prepared(190),
+                prepare_candidate=lambda *_: next(candidates),
+            )
+
+            assert outcome.safe_to_continue is True
+            assert outcome.compressed is True
+            assert outcome.prepared_request.request_id == "bounded-recovery"
+            assert sum(
+                agent.context_compressor._is_context_summary_content(
+                    message.get("content")
+                )
+                for message in outcome.messages
+            ) == 1
+            assert [message["content"] for message in outcome.messages[-3:]] == [
+                "recent question",
+                "recent answer",
+                "current request",
+            ]
+
+            resumed = db.get_messages_as_conversation("original-session")
+            assert [message["content"] for message in resumed] == [
+                message["content"] for message in outcome.messages
+            ]
+            all_rows = db.get_messages("original-session", include_inactive=True)
+            assert any(
+                row["content"] == "old question" and row["active"] == 0
+                for row in all_rows
+            )
+            assert any(
+                row["content"] == "current request" and row["active"] == 0
+                for row in all_rows
+            )
+            assert sum(
+                row["content"] == "current request" and row["active"] == 1
+                for row in all_rows
+            ) == 1
+
+            baseline = conversation_history_after_compression(
+                agent, outcome.messages
+            )
+            continued = outcome.messages + [
+                {"role": "assistant", "content": "final answer"}
+            ]
+            agent._flush_messages_to_session_db(continued, baseline)
+            active = db.get_messages("original-session")
+            assert [row["content"] for row in active].count("current request") == 1
+            assert [row["content"] for row in active][-1] == "final answer"
+
+    def test_repeated_recovery_replaces_prior_projection_with_one_summary(self):
+        from agent.context_compressor import ContextCompressor
+        from agent.conversation_compression import (
+            conversation_history_after_compression,
+            run_automatic_compression,
+        )
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "agent.context_compressor.get_model_context_length", return_value=100000
+        ):
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            agent.context_compressor = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=0,
+                protect_last_n=0,
+            )
+            agent._emit_status = MagicMock()
+            agent._ensure_db_session()
+
+            initial = [
+                {"role": "user", "content": "old question"},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "first current"},
+            ]
+            agent._flush_messages_to_session_db(initial, [])
+            agent._compress_context = MagicMock(return_value=(initial, "system"))
+            first_candidates = iter(
+                [_prepared(190, label="no-progress-1"), _prepared(40, label="recovery-1")]
+            )
+            first = run_automatic_compression(
+                agent,
+                initial,
+                "system",
+                prepared_request=_prepared(190),
+                prepare_candidate=lambda *_: next(first_candidates),
+            )
+
+            second_input = first.messages + [
+                {"role": "assistant", "content": "first answer"},
+                {"role": "user", "content": "second current"},
+            ]
+            agent._flush_messages_to_session_db(
+                second_input,
+                conversation_history_after_compression(agent, first.messages),
+            )
+            agent._compress_context = MagicMock(return_value=(second_input, "system"))
+            second_candidates = iter(
+                [_prepared(190, label="no-progress-2"), _prepared(40, label="recovery-2")]
+            )
+            second = run_automatic_compression(
+                agent,
+                second_input,
+                "system",
+                prepared_request=_prepared(190),
+                prepare_candidate=lambda *_: next(second_candidates),
+            )
+
+            resumed = db.get_messages_as_conversation("original-session")
+            assert [message["content"] for message in resumed] == [
+                message["content"] for message in second.messages
+            ]
+            assert sum(
+                agent.context_compressor._is_context_summary_content(
+                    message.get("content")
+                )
+                for message in resumed
+            ) == 1
+            all_rows = db.get_messages("original-session", include_inactive=True)
+            assert any(
+                row.get("context_projection") == 1 and row["active"] == 0
+                for row in all_rows
+            )
+            assert any(
+                row["content"] == "old question" and row["active"] == 0
+                for row in all_rows
+            )
 
     def test_tool_checkpoint_preserves_full_archived_rows_and_resumes_compacted(self):
         """Tool-only checkpoints archive full payloads without deleting history."""

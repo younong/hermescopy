@@ -71,6 +71,160 @@ def _compression_made_progress(
     return orig_tokens > 0 and new_tokens < orig_tokens * 0.95
 
 
+def _commit_in_place_projection(
+    agent: Any,
+    projection: list,
+    *,
+    task_id: str,
+    boundary_reason: str,
+    source_messages: Optional[list] = None,
+) -> bool:
+    """Atomically replace live context while retaining canonical archived rows."""
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None) or ""
+    if session_db is None or not session_id:
+        return False
+
+    holder = _compression_lock_holder(agent)
+    try:
+        locked = bool(
+            session_db.try_acquire_compression_lock(
+                session_id, holder, ttl_seconds=60.0
+            )
+        )
+    except Exception as exc:
+        logger.warning(
+            "%s skipped: compression lock unavailable for session=%s (%s)",
+            boundary_reason,
+            session_id,
+            exc,
+        )
+        return False
+    if not locked:
+        logger.info(
+            "%s skipped: session=%s is already compacting",
+            boundary_reason,
+            session_id,
+        )
+        return False
+
+    try:
+        memory_manager = getattr(agent, "_memory_manager", None)
+        if source_messages is not None and memory_manager is not None:
+            try:
+                memory_manager.on_pre_compress(source_messages)
+            except Exception:
+                pass
+
+        session_db.archive_and_compact(session_id, projection)
+        agent._flushed_db_message_ids = set()
+        agent._last_flushed_db_idx = 0
+        agent._last_compaction_in_place = True
+        try:
+            agent.context_compressor.on_session_start(
+                session_id,
+                boundary_reason=boundary_reason,
+                old_session_id=session_id,
+                session_db=session_db,
+                platform=getattr(agent, "platform", None) or "cli",
+                conversation_id=getattr(agent, "_gateway_session_key", None),
+            )
+        except Exception as exc:
+            logger.debug("context engine %s notification failed: %s", boundary_reason, exc)
+        if source_messages is not None and memory_manager is not None:
+            try:
+                memory_manager.on_session_switch(
+                    session_id,
+                    parent_session_id=session_id,
+                    reset=False,
+                    reason=boundary_reason,
+                )
+            except Exception as exc:
+                logger.debug("memory manager %s notification failed: %s", boundary_reason, exc)
+        try:
+            from tools.file_tools import reset_file_dedup
+
+            reset_file_dedup(task_id)
+        except Exception:
+            pass
+        return True
+    except Exception as exc:
+        logger.warning(
+            "%s failed; canonical transcript preserved: %s", boundary_reason, exc
+        )
+        return False
+    finally:
+        try:
+            session_db.release_compression_lock(session_id, holder)
+        except Exception as exc:
+            logger.debug("%s lock release failed: %s", boundary_reason, exc)
+
+
+def _attempt_recovery_projection(
+    agent: Any,
+    messages: list,
+    active_prompt: str,
+    *,
+    prepare_candidate: Callable[[list, str], PreparedModelRequest],
+    preserve_attachment_index: Optional[int],
+    reason: str,
+    task_id: str,
+) -> Optional[AutomaticCompressionOutcome]:
+    """Return the smallest safe deterministic projection, if history is reducible."""
+    build_projection = getattr(agent.context_compressor, "build_recovery_projection", None)
+    if not callable(build_projection):
+        return None
+
+    for mode in ("summary", "minimal"):
+        candidate_messages = build_projection(
+            messages,
+            mode=mode,
+            preserve_attachment_index=preserve_attachment_index,
+        )
+        if candidate_messages == messages:
+            continue
+        candidate_prepared = prepare_candidate(candidate_messages, active_prompt)
+        if not isinstance(candidate_prepared, PreparedModelRequest):
+            raise TypeError("candidate preparer must return a PreparedModelRequest")
+        if candidate_prepared.accounting.exceeds_hard_input_limit:
+            continue
+
+        committed = _commit_in_place_projection(
+            agent,
+            candidate_messages,
+            task_id=task_id,
+            boundary_reason="context_recovery",
+            source_messages=messages,
+        )
+        if committed:
+            try:
+                agent.context_compressor.compression_count += 1
+            except (AttributeError, TypeError):
+                pass
+            logger.info(
+                "bounded recovery projection committed: session=%s messages=%d->%d",
+                getattr(agent, "session_id", None) or "none",
+                len(messages),
+                len(candidate_messages),
+            )
+        agent._emit_status(
+            "Compression summary was unavailable, so Hermes switched to a bounded "
+            "local recovery context. The complete conversation remains stored.",
+            kind="compression.degraded",
+        )
+        return AutomaticCompressionOutcome(
+            messages=candidate_messages if committed else messages,
+            system_prompt=active_prompt,
+            request_tokens=candidate_prepared.accounting.effective_input_tokens,
+            compressed=committed,
+            safe_to_continue=True,
+            failure_reason=reason,
+            degraded=True,
+            prepared_request=candidate_prepared,
+        )
+    return None
+
+
 def run_automatic_compression(
     agent: Any,
     messages: list,
@@ -115,6 +269,18 @@ def run_automatic_compression(
 
     def _degraded_or_blocked(reason: str, *, no_progress: bool = False):
         hard_blocked = working_prepared.accounting.exceeds_hard_input_limit
+        if hard_blocked:
+            recovery = _attempt_recovery_projection(
+                agent,
+                working_messages,
+                active_prompt,
+                prepare_candidate=prepare_candidate,
+                preserve_attachment_index=working_preserve_index,
+                reason=reason,
+                task_id=task_id,
+            )
+            if recovery is not None:
+                return recovery
         if not force and not hard_blocked:
             if no_progress:
                 status = (
@@ -254,10 +420,22 @@ def run_automatic_compression(
                 prepared_request=working_prepared,
             )
 
+    recovery = _attempt_recovery_projection(
+        agent,
+        working_messages,
+        active_prompt,
+        prepare_candidate=prepare_candidate,
+        preserve_attachment_index=working_preserve_index,
+        reason="compression_still_unsafe",
+        task_id=task_id,
+    )
+    if recovery is not None:
+        return recovery
+
     agent._emit_status(
-        "Context is still too large after compression. The durable conversation "
-        "was preserved and no normal model request was sent. Run /compress to retry "
-        "or /new to start fresh.",
+        "Context is still too large after bounded recovery. The durable conversation "
+        "was preserved, but the system prompt, tools, and current turn cannot fit "
+        "safely in this model window.",
         kind="compression.blocked",
     )
     return AutomaticCompressionOutcome(
@@ -564,76 +742,26 @@ def maybe_compact_tool_payloads(
         )
         return messages, False
 
-    session_db = getattr(agent, "_session_db", None)
-    session_id = getattr(agent, "session_id", None) or ""
     # A stable checkpoint must be durable. Without the SQLite archive path an
     # in-memory projection would disappear on resume (and rewriting a gateway
     # transcript would destroy the only full-fidelity copy), so fail closed.
-    if session_db is None or not session_id:
+    if not _commit_in_place_projection(
+        agent,
+        compacted,
+        task_id=task_id,
+        boundary_reason="tool_payload_checkpoint",
+    ):
         return messages, False
 
-    holder = None
-    locked = False
-    if session_db is not None and session_id:
-        holder = _compression_lock_holder(agent)
-        try:
-            locked = bool(session_db.try_acquire_compression_lock(
-                session_id, holder, ttl_seconds=60.0
-            ))
-        except Exception as exc:
-            logger.warning(
-                "tool payload checkpoint skipped: compression lock unavailable "
-                "for session=%s (%s)", session_id, exc,
-            )
-            return messages, False
-        if not locked:
-            logger.info(
-                "tool payload checkpoint skipped: session=%s is already compacting",
-                session_id,
-            )
-            return messages, False
-
-    try:
-        session_db.archive_and_compact(session_id, compacted)
-        agent._flushed_db_message_ids = set()
-        agent._last_flushed_db_idx = 0
-        agent._last_compaction_in_place = True
-        try:
-            compressor.on_session_start(
-                session_id,
-                boundary_reason="tool_payload_checkpoint",
-                old_session_id=session_id,
-                session_db=session_db,
-                platform=getattr(agent, "platform", None) or "cli",
-                conversation_id=getattr(agent, "_gateway_session_key", None),
-            )
-        except Exception as exc:
-            logger.debug("context engine tool checkpoint notification failed: %s", exc)
-        try:
-            from tools.file_tools import reset_file_dedup
-            reset_file_dedup(task_id)
-        except Exception:
-            pass
-        logger.info(
-            "tool payload checkpoint committed: session=%s original_bytes=%d "
-            "compacted_bytes=%d reduction=%.1f%% results=%d arguments=%d",
-            session_id or "none", original_bytes, compacted_bytes,
-            float(stats.get("reduction_ratio") or 0.0) * 100.0,
-            int(stats.get("tool_results_compacted") or 0),
-            int(stats.get("tool_arguments_compacted") or 0),
-        )
-        return compacted, True
-    except Exception as exc:
-        logger.warning(
-            "tool payload checkpoint failed; canonical transcript preserved: %s", exc
-        )
-        return messages, False
-    finally:
-        if session_db is not None and session_id and holder and locked:
-            try:
-                session_db.release_compression_lock(session_id, holder)
-            except Exception as exc:
-                logger.debug("tool checkpoint lock release failed: %s", exc)
+    logger.info(
+        "tool payload checkpoint committed: session=%s original_bytes=%d "
+        "compacted_bytes=%d reduction=%.1f%% results=%d arguments=%d",
+        getattr(agent, "session_id", None) or "none", original_bytes, compacted_bytes,
+        float(stats.get("reduction_ratio") or 0.0) * 100.0,
+        int(stats.get("tool_results_compacted") or 0),
+        int(stats.get("tool_arguments_compacted") or 0),
+    )
+    return compacted, True
 
 
 def compress_context(

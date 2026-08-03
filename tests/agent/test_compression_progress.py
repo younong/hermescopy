@@ -123,10 +123,26 @@ class TestAutomaticCompression:
         )
 
     @staticmethod
-    def _agent(compressed_messages):
+    def _agent(compressed_messages, *, recovery_projection=None):
+        compressor = SimpleNamespace(
+            protect_last_n=0,
+            compression_count=0,
+            on_session_start=MagicMock(),
+        )
+        if recovery_projection is not None:
+            compressor.build_recovery_projection = MagicMock(
+                return_value=recovery_projection
+            )
+        session_db = MagicMock()
+        session_db.try_acquire_compression_lock.return_value = True
         agent = SimpleNamespace(
-            context_compressor=SimpleNamespace(protect_last_n=0),
+            context_compressor=compressor,
             session_id="session-1",
+            _session_db=session_db,
+            _memory_manager=None,
+            _flushed_db_message_ids={123},
+            _last_flushed_db_idx=4,
+            _last_compaction_in_place=False,
             _compress_context=MagicMock(
                 return_value=(compressed_messages, "compressed prompt")
             ),
@@ -227,6 +243,118 @@ class TestAutomaticCompression:
             "/compress to retry or /new to start fresh.",
             kind="compression.blocked",
         )
+
+    def test_hard_block_uses_bounded_recovery_after_summary_no_progress(self):
+        original = [{"role": "user", "content": "large history"}]
+        recovered = [{"role": "user", "content": "bounded recovery"}]
+        agent = self._agent(original, recovery_projection=recovered)
+        prepared_calls = iter(
+            [
+                self._prepared(190, label="compressed-no-progress"),
+                self._prepared(40, label="recovery"),
+            ]
+        )
+
+        outcome = run_automatic_compression(
+            agent,
+            original,
+            "system",
+            prepared_request=self._prepared(190),
+            prepare_candidate=lambda *_: next(prepared_calls),
+        )
+
+        assert outcome.safe_to_continue is True
+        assert outcome.degraded is True
+        assert outcome.compressed is True
+        assert outcome.messages is recovered
+        assert outcome.failure_reason == "compression_no_progress"
+        assert outcome.prepared_request.request_id == "recovery"
+        agent.context_compressor.build_recovery_projection.assert_called_once_with(
+            original,
+            mode="summary",
+            preserve_attachment_index=None,
+        )
+        agent._session_db.archive_and_compact.assert_called_once_with(
+            "session-1", recovered
+        )
+        assert agent._last_compaction_in_place is True
+        assert agent._last_flushed_db_idx == 0
+        assert agent._flushed_db_message_ids == set()
+
+    def test_recovery_shrinks_to_minimal_projection_when_summary_still_overflows(self):
+        original = [{"role": "user", "content": "large history"}]
+        summary_projection = [{"role": "user", "content": "summary recovery"}]
+        minimal_projection = [{"role": "user", "content": "minimal recovery"}]
+        agent = self._agent(original)
+        agent.context_compressor.build_recovery_projection = MagicMock(
+            side_effect=[summary_projection, minimal_projection]
+        )
+        prepared_calls = iter(
+            [
+                self._prepared(190, label="compressed-no-progress"),
+                self._prepared(190, label="summary-recovery"),
+                self._prepared(40, label="minimal-recovery"),
+            ]
+        )
+
+        outcome = run_automatic_compression(
+            agent,
+            original,
+            "system",
+            prepared_request=self._prepared(190),
+            prepare_candidate=lambda *_: next(prepared_calls),
+        )
+
+        assert outcome.safe_to_continue is True
+        assert outcome.messages is minimal_projection
+        assert outcome.prepared_request.request_id == "minimal-recovery"
+        assert [
+            item.kwargs["mode"]
+            for item in agent.context_compressor.build_recovery_projection.call_args_list
+        ] == ["summary", "minimal"]
+
+    def test_recovery_without_durable_store_is_request_local(self):
+        original = [{"role": "user", "content": "large history"}]
+        recovered = [{"role": "user", "content": "bounded recovery"}]
+        agent = self._agent(original, recovery_projection=recovered)
+        agent._session_db = None
+        prepared_calls = iter(
+            [
+                self._prepared(190, label="compressed-no-progress"),
+                self._prepared(40, label="request-local-recovery"),
+            ]
+        )
+
+        outcome = run_automatic_compression(
+            agent,
+            original,
+            "system",
+            prepared_request=self._prepared(190),
+            prepare_candidate=lambda *_: next(prepared_calls),
+        )
+
+        assert outcome.safe_to_continue is True
+        assert outcome.compressed is False
+        assert outcome.messages is original
+        assert outcome.prepared_request.request_id == "request-local-recovery"
+        assert agent._last_compaction_in_place is False
+
+    def test_recovery_blocks_when_minimum_request_still_overflows(self):
+        original = [{"role": "user", "content": "large history"}]
+        recovered = [{"role": "user", "content": "minimal recovery"}]
+        agent = self._agent(original, recovery_projection=recovered)
+
+        outcome = run_automatic_compression(
+            agent,
+            original,
+            "system",
+            prepared_request=self._prepared(190),
+            prepare_candidate=lambda *_: self._prepared(190, label="still-large"),
+        )
+
+        assert outcome.safe_to_continue is False
+        assert outcome.failure_reason == "compression_no_progress"
+        agent._session_db.archive_and_compact.assert_not_called()
 
     def test_partial_progress_below_hard_boundary_degrades_safely(self):
         original = [

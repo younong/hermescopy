@@ -213,6 +213,12 @@ _AUTO_FOCUS_MAX_CHARS = 700
 # high for small/light tails, but using all 20 as a hard floor here would bring
 # back the old large-tool-output case where nothing can be compacted.
 _MAX_TAIL_MESSAGE_FLOOR = 8
+_RECOVERY_MODES = {"summary", "minimal"}
+_MINIMAL_RECOVERY_SUMMARY = """## Continuity Status
+Earlier conversation context was omitted because it could not fit safely in the model window. The complete transcript remains stored in the session.
+
+## Active State
+Continue from the latest user message and the complete current-turn tool exchange below. Verify older details from files or session history when needed."""
 
 # Deterministic tool-payload checkpoints run before LLM summarization. Small
 # consumed results can add up, so fields enter the batch from 128 bytes while
@@ -2199,6 +2205,90 @@ This compaction should PRIORITISE preserving all information related to the focu
             if cls._is_context_summary_content(content):
                 return idx, cls._strip_summary_prefix(_content_text_for_contains(content))
         return None, ""
+
+    def build_recovery_projection(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        mode: str = "summary",
+        preserve_attachment_index: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Build a local, bounded context projection without an LLM call.
+
+        The canonical transcript is left untouched. The returned projection keeps
+        the current user turn, a shrinking complete recent tail, and exactly one
+        recovery summary. ``mode='minimal'`` replaces that summary with a fixed
+        capsule so callers can keep reducing a request that is still oversized.
+        """
+        if mode not in _RECOVERY_MODES:
+            raise ValueError(f"unsupported recovery projection mode: {mode}")
+        if not messages:
+            return []
+
+        head_end = 1 if messages[0].get("role") == "system" else 0
+        current_user_idx = (
+            preserve_attachment_index
+            if preserve_attachment_index is not None
+            and head_end <= preserve_attachment_index < len(messages)
+            and messages[preserve_attachment_index].get("role") == "user"
+            and not self._is_context_summary_content(
+                messages[preserve_attachment_index].get("content")
+            )
+            else self._find_last_user_message_idx(messages, head_end)
+        )
+        if current_user_idx < 0:
+            return list(messages)
+
+        tail_start = current_user_idx
+        if mode == "summary":
+            preceding_user_idx = self._find_last_user_message_idx(
+                messages[:current_user_idx], head_end
+            )
+            if preceding_user_idx >= 0:
+                tail_start = preceding_user_idx
+            dropped = [
+                message
+                for message in messages[head_end:tail_start]
+                if not self._is_context_summary_content(message.get("content"))
+            ]
+            summary = self._build_static_fallback_summary(
+                dropped,
+                reason=self._last_summary_error or "automatic context recovery",
+            )
+        else:
+            summary = self._with_summary_prefix(_MINIMAL_RECOVERY_SUMMARY)
+        summary = summary + "\n\n" + _SUMMARY_END_MARKER
+
+        projection: List[Dict[str, Any]] = []
+        if head_end:
+            projection.append(messages[0].copy())
+        projection.append(
+            {
+                "role": "user",
+                "content": summary,
+                COMPRESSED_SUMMARY_METADATA_KEY: True,
+            }
+        )
+        protected_copy = None
+        tail_end = self._find_turn_pair_end(messages, current_user_idx)
+        for index in range(tail_start, tail_end):
+            copied = messages[index].copy()
+            projection.append(copied)
+            if index == preserve_attachment_index:
+                protected_copy = copied
+        projection = self._sanitize_tool_pairs(projection)
+        projected_preserve_index = (
+            next(
+                (index for index, message in enumerate(projection) if message is protected_copy),
+                None,
+            )
+            if protected_copy is not None
+            else None
+        )
+        return project_historical_attachments(
+            projection,
+            preserve_index=projected_preserve_index,
+        )
 
     # ------------------------------------------------------------------
     # Tool-call / tool-result pair integrity helpers
