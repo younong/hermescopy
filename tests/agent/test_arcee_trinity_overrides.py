@@ -82,8 +82,8 @@ def test_compression_threshold_default_none_for_other_models() -> None:
 #
 # ChatGPT's Codex OAuth backend caps gpt-5.5 at a 272K window (verified live:
 # ~330K-token request rejected with context_length_exceeded, ~250K accepted).
-# The default 50% compaction trigger would fire at ~136K — half the usable
-# window — so this route raises the trigger to 85%. Only the Codex OAuth route
+# The global 65% compaction trigger still leaves useful route-specific headroom,
+# so this route raises the trigger to 85%. Only the Codex OAuth route
 # is affected; the same slug on OpenAI direct / OpenRouter / Copilot exposes a
 # larger window and keeps the user's global threshold.
 # ---------------------------------------------------------------------------

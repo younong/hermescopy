@@ -60,7 +60,7 @@ payload 判断请求安全，而不是使用 provider 上一轮报告的 usage �
 ```yaml
 compression:
   enabled: true              # Enable/disable compression (default: true)
-  threshold: 0.50            # Fraction of context window (default: 0.50 = 50%)
+  threshold: 0.65            # 有效输入预算的比例（默认：0.65 = 65%）
   target_ratio: 0.20         # How much of threshold to keep as tail (default: 0.20)
   protect_last_n: 20         # Minimum protected tail messages (default: 20)
 
@@ -76,7 +76,7 @@ auxiliary:
 
 | 参数 | 默认值 | 范围 | 描述 |
 |-----------|---------|-------|-------------|
-| `threshold` | `0.50` | 0.0-1.0 | 当 prompt token 数 ≥ `threshold × context_length` 时触发压缩 |
+| `threshold` | `0.65` | 0.0-1.0 | 当 prompt token 数 ≥ `threshold × effective_input_budget` 时触发压缩 |
 | `target_ratio` | `0.20` | 0.10-0.80 | 控制尾部保护 token 预算：`threshold_tokens × target_ratio` |
 | `protect_last_n` | `20` | ≥1 | 始终保留的最近消息最小数量 |
 | `protect_first_n` | `3` | （硬编码）| 系统提示词 + 首次交互始终保留 |
@@ -84,10 +84,12 @@ auxiliary:
 ### 计算值（200K 上下文模型，默认参数）
 
 ```
-context_length       = 200,000
-threshold_tokens     = 200,000 × 0.50 = 100,000
-tail_token_budget    = 100,000 × 0.20 = 20,000
-max_summary_tokens   = min(200,000 × 0.05, 12,000) = 10,000
+context_length         = 200,000
+显式 max_tokens        = 0
+input_budget           = 200,000
+threshold_tokens       = 200,000 × 0.65 = 130,000
+tail_token_budget      = 130,000 × 0.20 = 26,000
+max_summary_tokens     = min(200,000 × 0.05, 12,000) = 10,000
 ```
 
 
@@ -305,4 +307,4 @@ CLI 在启动时显示缓存状态：
 
 ## 上下文压力警告
 
-中间上下文压力警告已被移除（参见 `run_agent.py` 中的迭代预算块，其中注明："No intermediate pressure warnings — they caused models to 'give up' prematurely on complex tasks"）。当 canonical prepared request 达到配置的 `compression.threshold`（默认 50%）时触发压缩，无需事先警告步骤；provider overflow recovery 也复用同一个 canonical candidate-preparation 门控。
+中间上下文压力警告已被移除（参见 `run_agent.py` 中的迭代预算块，其中注明："No intermediate pressure warnings — they caused models to 'give up' prematurely on complex tasks"）。当 canonical prepared request 达到配置的 `compression.threshold`（默认为有效输入预算的 65%）时触发压缩，无需事先警告步骤；provider overflow recovery 也复用同一个 canonical candidate-preparation 门控。

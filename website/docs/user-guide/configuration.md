@@ -733,7 +733,7 @@ All compression settings live in `config.yaml` (no environment variables).
 ```yaml
 compression:
   enabled: true                                     # Toggle compression on/off
-  threshold: 0.50                                   # Compress at this % of context limit
+  threshold: 0.65                                   # Compress at this fraction of the effective input budget
   target_ratio: 0.20                                # Fraction of threshold to preserve as recent tail
   protect_last_n: 20                                # Min recent messages to keep uncompressed
   protect_first_n: 3                                # Non-system head messages pinned across compactions (0 = pin nothing)
@@ -762,7 +762,7 @@ As of recent releases, editing `model.context_length` or any `compression.*` key
 ```yaml
 compression:
   enabled: true
-  threshold: 0.50
+  threshold: 0.65
 ```
 Uses your main provider and main model. Override per-task (e.g. `auxiliary.compression.provider: openrouter` + `model: google/gemini-2.5-flash`) if you want compression on a cheaper model than your main chat model.
 
@@ -879,13 +879,13 @@ Separate from iteration budget pressure, context pressure tracks how close the c
 In the CLI, context pressure appears as a progress bar in the tool output feed:
 
 ```
-  ◐ context ████████████░░░░░░░░ 62% to compaction  48k threshold (50%) · approaching compaction
+  ◐ context ████████████░░░░░░░░ 62% to compaction  48k threshold (65%) · approaching compaction
 ```
 
 On messaging platforms, a plain-text notification is sent:
 
 ```
-◐ Context: ████████████░░░░░░░░ 62% to compaction (threshold: 50% of window).
+◐ Context: ████████████░░░░░░░░ 62% to compaction (threshold: 65% of input budget).
 ```
 
 If auto-compression is disabled, the warning tells you context may be truncated instead.
