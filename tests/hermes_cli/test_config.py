@@ -29,6 +29,10 @@ from hermes_cli.config import (
 )
 
 
+def test_compression_threshold_defaults_to_65_percent():
+    assert DEFAULT_CONFIG["compression"]["threshold"] == 0.65
+
+
 def test_ilink_connector_is_enabled_by_default_and_can_be_disabled(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     assert load_config()["channel_connectors"]["weixin_ilink"]["enabled"] is True

@@ -1470,6 +1470,7 @@ def setup_terminal_backend(config: dict):
 
 def _apply_default_agent_settings(config: dict):
     """Apply recommended defaults for all agent settings without prompting."""
+    compression_threshold = DEFAULT_CONFIG["compression"]["threshold"]
     config.setdefault("agent", {})["max_turns"] = 150
     # config.yaml is the authoritative source for max_turns; the gateway
     # bridges it into HERMES_MAX_ITERATIONS at startup. We no longer write
@@ -1480,7 +1481,7 @@ def _apply_default_agent_settings(config: dict):
     config.setdefault("display", {})["tool_progress"] = "all"
 
     config.setdefault("compression", {})["enabled"] = True
-    config["compression"]["threshold"] = 0.50
+    config["compression"]["threshold"] = compression_threshold
 
     # Default to never auto-resetting sessions. The gateway treats absent
     # session_reset as "both", so we must write "none" explicitly to make
@@ -1491,7 +1492,7 @@ def _apply_default_agent_settings(config: dict):
     print_success("Applied recommended defaults:")
     print_info("  Max iterations: 150")
     print_info("  Tool progress: all")
-    print_info("  Compression threshold: 0.50")
+    print_info(f"  Compression threshold: {compression_threshold}")
     print_info("  Session reset: never (use /reset or compression)")
     print_info("  Run `hermes setup agent` later to customize.")
 
@@ -1559,7 +1560,10 @@ def setup_agent_settings(config: dict):
 
     config.setdefault("compression", {})["enabled"] = True
 
-    current_threshold = cfg_get(config, "compression", "threshold", default=0.50)
+    default_threshold = DEFAULT_CONFIG["compression"]["threshold"]
+    current_threshold = cfg_get(
+        config, "compression", "threshold", default=default_threshold
+    )
     threshold_str = prompt("Compression threshold (0.5-0.95)", str(current_threshold))
     try:
         threshold = float(threshold_str)
@@ -1569,7 +1573,7 @@ def setup_agent_settings(config: dict):
         pass
 
     print_success(
-        f"Context compression threshold set to {config['compression'].get('threshold', 0.50)}"
+        f"Context compression threshold set to {config['compression'].get('threshold', default_threshold)}"
     )
 
     # ── Session Reset Policy ──

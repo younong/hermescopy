@@ -368,7 +368,7 @@ CLI 会话存储在 Hermes 的 SQLite 状态数据库 `~/.hermes/state.db` 中�
 # 在 ~/.hermes/config.yaml 中
 compression:
   enabled: true
-  threshold: 0.50    # 默认在上下文限制的 50% 时压缩
+  threshold: 0.65    # 默认在有效输入预算的 65% 时压缩
 
 # 摘要模型在 auxiliary 下配置：
 auxiliary:

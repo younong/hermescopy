@@ -552,7 +552,7 @@ Hermes 自动压缩长对话以保持在模型的上下文窗口内。压缩摘�
 ```yaml
 compression:
   enabled: true                                     # 开启/关闭压缩
-  threshold: 0.50                                   # 在上下文限制的此百分比时压缩
+  threshold: 0.65                                   # 在有效输入预算的此比例时压缩
   target_ratio: 0.20                                # 保留为最近尾部的阈值分数
   protect_last_n: 20                                # 保持未压缩的最少最近消息数
 
@@ -578,7 +578,7 @@ auxiliary:
 ```yaml
 compression:
   enabled: true
-  threshold: 0.50
+  threshold: 0.65
 ```
 使用您的主 provider 和主模型。如果您希望在比主聊天模型更便宜的模型上进行压缩，请覆盖每任务（例如 `auxiliary.compression.provider: openrouter` + `model: google/gemini-2.5-flash`）。
 
@@ -684,13 +684,13 @@ Hermes 对流式传输有单独的超时层，以及用于非流式调用的陈�
 在 CLI 中，上下文压力在工具输出流中显示为进度条：
 
 ```
-  ◐ context ████████████░░░░░░░░ 62% to compaction  48k threshold (50%) · approaching compaction
+  ◐ context ████████████░░░░░░░░ 62% to compaction  48k threshold (65%) · approaching compaction
 ```
 
 在消息平台上，发送纯文本通知：
 
 ```
-◐ Context: ████████████░░░░░░░░ 62% to compaction (threshold: 50% of window).
+◐ Context: ████████████░░░░░░░░ 62% to compaction (threshold: 65% of input budget).
 ```
 
 如果自动压缩被禁用，警告会告诉您上下文可能被截断。
