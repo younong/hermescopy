@@ -1616,6 +1616,107 @@ class TestSummaryFailureTrackingForGatewayWarning:
         assert c._last_summary_dropped_count == 0
 
 
+class TestBoundedRecoveryProjection:
+    def _compressor(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            return ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+            )
+
+    def test_summary_projection_keeps_one_summary_and_recent_complete_turns(self):
+        compressor = self._compressor()
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "old request"},
+            {"role": "assistant", "content": "old answer"},
+            {
+                "role": "user",
+                "content": compressor._with_summary_prefix("older summary"),
+                "_compressed_summary": True,
+            },
+            {"role": "user", "content": "recent request"},
+            {"role": "assistant", "content": "recent answer"},
+            {"role": "user", "content": "current request"},
+        ]
+
+        projection = compressor.build_recovery_projection(messages, mode="summary")
+
+        summaries = [
+            message
+            for message in projection
+            if compressor._is_context_summary_content(message.get("content"))
+        ]
+        assert len(summaries) == 1
+        assert [message.get("content") for message in projection[-3:]] == [
+            "recent request",
+            "recent answer",
+            "current request",
+        ]
+        assert all("older summary" not in str(message.get("content")) for message in projection)
+
+    def test_minimal_projection_keeps_current_tool_exchange_and_attachment(self):
+        compressor = self._compressor()
+        messages = [
+            {"role": "user", "content": "old request"},
+            {"role": "assistant", "content": "old answer"},
+            {
+                "role": "user",
+                "content": "current request",
+                "attachments": [{"kind": "image", "name": "current.png"}],
+            },
+            {
+                "role": "assistant",
+                "content": "checking",
+                "tool_calls": [{"id": "call-1", "function": {"name": "read", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+        ]
+
+        projection = compressor.build_recovery_projection(
+            messages,
+            mode="minimal",
+            preserve_attachment_index=2,
+        )
+
+        assert [message["role"] for message in projection] == [
+            "user",
+            "user",
+            "assistant",
+            "tool",
+        ]
+        assert projection[1]["content"] == "current request"
+        assert projection[1]["attachments"][0]["name"] == "current.png"
+        assert projection[-1]["tool_call_id"] == "call-1"
+
+    def test_projection_anchors_before_synthetic_followup(self):
+        compressor = self._compressor()
+        messages = [
+            {"role": "user", "content": "old request"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "current request"},
+            {"role": "assistant", "content": "checking"},
+            {"role": "user", "content": "synthetic tool-loop nudge"},
+        ]
+
+        projection = compressor.build_recovery_projection(
+            messages,
+            mode="minimal",
+            preserve_attachment_index=2,
+        )
+
+        assert [message["content"] for message in projection[-2:]] == [
+            "current request",
+            "checking",
+        ]
+        assert all(
+            message.get("content") != "synthetic tool-loop nudge"
+            for message in projection
+        )
+
+
 class TestAbortOnSummaryFailure:
     """Opt-in behavior (compression.abort_on_summary_failure=True):
     summary-generation failure ABORTS compression entirely — returns the
