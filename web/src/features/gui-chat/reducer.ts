@@ -1452,7 +1452,7 @@ function imagePreviewUrl(source: string, cwd?: string): string {
 
 function generatedImagePreviewUrl(source: string): string | null {
   const path = source.split(/[?#]/, 1)[0] ?? source;
-  const match = path.match(/(?:^|[/\\])\.hermes[/\\](?:images|cache[/\\]images)[/\\]([^/\\]+)$/);
+  const match = path.match(/(?:^|[/\\])\.hermes[/\\]cache[/\\]images[/\\]([^/\\]+)$/);
   if (!match?.[1]) return null;
   return `/api/generated-images/${encodeURIComponent(match[1])}`;
 }

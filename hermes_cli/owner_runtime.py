@@ -386,6 +386,7 @@ def owner_worker_runtime_paths(
         "mirror_sessions_index": home / "sessions" / "sessions.json",
         "process_registry": home / "processes.json",
         "restart_marker": home / "runtime" / "restart.marker",
+        "user_files_migration": home / "runtime" / "user-files-migration-v1.json",
         "skills": home / "skills",
         "memories": home / "memories",
         "workspace_root": workspace_root,

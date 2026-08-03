@@ -57,7 +57,7 @@ export function useManagedFiles() {
 
   const uploadFiles = useCallback(async (files: File[], path: string) => {
     if (files.length === 0) return;
-    if (!path) throw new Error("Directory unavailable");
+    if (!listing) throw new Error("Directory unavailable");
     setUploading(true);
     try {
       for (const file of files) {
@@ -67,10 +67,10 @@ export function useManagedFiles() {
     } finally {
       setUploading(false);
     }
-  }, [load]);
+  }, [listing, load]);
 
   const createDirectory = useCallback(async (name: string, path: string) => {
-    if (!path) throw new Error("Directory unavailable");
+    if (!listing) throw new Error("Directory unavailable");
     if (!name.trim()) throw new Error("Folder name required");
     setCreating(true);
     try {
@@ -79,7 +79,7 @@ export function useManagedFiles() {
     } finally {
       setCreating(false);
     }
-  }, [load]);
+  }, [listing, load]);
 
   const downloadFile = useCallback(async (entry: ManagedFileEntry) => {
     if (entry.is_directory) return;
@@ -100,7 +100,7 @@ export function useManagedFiles() {
   return {
     activePath,
     canChangePath: listing?.can_change_path ?? false,
-    canUpload: Boolean(activePath) && !uploading,
+    canUpload: listing !== null && !uploading,
     createDirectory,
     creating,
     currentPath,

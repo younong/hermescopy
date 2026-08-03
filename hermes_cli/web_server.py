@@ -2342,15 +2342,22 @@ _UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 
 @app.post("/api/files/upload-stream")
-async def upload_managed_file_stream(
-    request: Request,
-    file: UploadFile = File(...),
-    path: str = Form(...),
-    overwrite: bool = Form(True),
-):
+async def upload_managed_file_stream(request: Request):
     if hasattr(request, "app") and _authenticated_owner_request(request):
         return await _proxy_authenticated_owner_http(request)
     _reject_authenticated_filesystem_api(request)
+
+    form = await request.form()
+    file = form.get("file")
+    path = form.get("path")
+    overwrite_value = form.get("overwrite", "true")
+    if (
+        not callable(getattr(file, "read", None))
+        or not callable(getattr(file, "close", None))
+        or not isinstance(path, str)
+    ):
+        raise HTTPException(status_code=422, detail="Invalid upload form")
+    overwrite = str(overwrite_value).strip().lower() in {"1", "true", "on", "yes"}
     policy, target, display_path = _resolve_managed_path(path, request, for_write=True)
     if target.exists() and target.is_dir():
         raise HTTPException(status_code=409, detail="A directory already exists at that path")

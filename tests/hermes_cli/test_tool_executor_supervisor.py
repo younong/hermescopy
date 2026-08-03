@@ -552,6 +552,10 @@ def test_default_web_tools_use_tool_none_broker_while_other_network_tools_stay_p
     assert policy.select("web_search") is EgressProfile.TOOL_NONE
     assert policy.select("web_extract") is EgressProfile.TOOL_NONE
     assert policy.select("image_generate") is EgressProfile.TOOL_NONE
+    assert policy.select("text_to_speech") is EgressProfile.TOOL_NONE
+    assert policy.select("video_generate") is EgressProfile.TOOL_NONE
+    assert policy.select("xai_video_edit") is EgressProfile.TOOL_NONE
+    assert policy.select("xai_video_extend") is EgressProfile.TOOL_NONE
     assert policy.select("browser_navigate") is EgressProfile.TOOL_PUBLIC
 
 

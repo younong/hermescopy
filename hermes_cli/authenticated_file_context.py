@@ -8,8 +8,9 @@ an ambient cwd, environment variable, or a user-provided path.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
-from hermes_cli.controlled_roots import ControlledRoots
+from hermes_cli.controlled_roots import ControlledRoots, RootKind
 
 
 @dataclass(frozen=True)
@@ -55,3 +56,55 @@ class AuthenticatedWorkspaceContext:
         if any(component in {"", ".", ".."} for component in components):
             raise ValueError("path must not contain empty, dot, or parent components")
         return f"{self.workspace_prefix}/{path}"
+
+    def controlled_api_path(
+        self,
+        path: str | None,
+        *,
+        allow_workspace_root: bool = False,
+    ) -> str:
+        """Map one API path into this context's fixed workspace capability."""
+        value = str(path or "").strip()
+        if not value:
+            if allow_workspace_root:
+                return self.workspace_prefix
+            raise ValueError("path must identify an entry in the workspace")
+        if value == "/workspace" or value.startswith("/workspace/"):
+            return self.controlled_workspace_path(
+                value,
+                allow_workspace_root=allow_workspace_root,
+            )
+
+        candidate = Path(value)
+        if candidate.is_absolute():
+            workspace = self.workspace_path
+            if candidate == workspace and allow_workspace_root:
+                return self.workspace_prefix
+            try:
+                value = candidate.relative_to(workspace).as_posix()
+            except ValueError as exc:
+                raise ValueError("absolute path is outside the authenticated workspace") from exc
+        return self.controlled_workspace_path(
+            value,
+            allow_workspace_root=allow_workspace_root,
+        )
+
+    def visible_workspace_path(self, controlled_path: str) -> str:
+        """Return a selected-workspace-relative API path."""
+        prefix = f"{self.workspace_prefix}/"
+        if controlled_path == self.workspace_prefix:
+            return ""
+        if not controlled_path.startswith(prefix):
+            raise ValueError("controlled path is outside the authenticated workspace")
+        return controlled_path[len(prefix) :]
+
+    @property
+    def workspace_path(self) -> Path:
+        """Return the canonical path used only for diagnostics and libraries."""
+        root = self.roots.get(RootKind.WORKSPACE).canonical_path
+        return root / self.workspace_prefix
+
+    def diagnostic_path(self, controlled_path: str) -> Path:
+        """Return a diagnostic path after validating the controlled prefix."""
+        visible = self.visible_workspace_path(controlled_path)
+        return self.workspace_path if not visible else self.workspace_path / visible

@@ -103,7 +103,7 @@ _NETWORK_TOOL_NAMES = frozenset({
     "browser_navigate", "browser_snapshot",
     "browser_click", "browser_type", "browser_scroll", "browser_back",
     "browser_press", "browser_get_images", "browser_vision", "browser_console",
-    "image_generation", "text_to_speech", "speech_to_text",
+    "image_generation", "speech_to_text",
 })
 
 

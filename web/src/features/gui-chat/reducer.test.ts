@@ -1346,10 +1346,23 @@ describe("guiChatReducer history image restoration", () => {
     );
   });
 
+  it("uses authenticated preview paths for selected-workspace images", () => {
+    const path = "generated/images/apiyi_generated.png";
+    const state = restoreWithMessage(`生成路径：\`${path}\``);
+    const artifact = imageArtifact(state, state.messages[0].artifactIds[0]);
+
+    expect(artifact).toMatchObject({
+      downloadUrl:
+        "/api/files/download?path=generated%2Fimages%2Fapiyi_generated.png&filename=apiyi_generated.png",
+      url:
+        "/api/fs/read-data-url?path=generated%2Fimages%2Fapiyi_generated.png",
+    });
+  });
+
   it.each([
     ["生成路径", "生成路径："],
     ["已生成", "已生成："],
-  ])("restores owner images from %s replies", (_label, prefix) => {
+  ])("restores legacy owner images from %s replies", (_label, prefix) => {
     const path =
       "/opt/hermes/shared/.hermes/users/ok1_owner/images/apiyi_generated.png";
     const state = restoreWithMessage(`${prefix}\`${path}\``);

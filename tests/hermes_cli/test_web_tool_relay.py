@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import json
 import os
 import socket
 import struct
 import sys
+from pathlib import Path
 
 import pytest
 
+from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
+from hermes_cli.controlled_roots import controlled_roots_for
 from hermes_cli.dashboard_auth.authority import OwnerWorkerAuthorityLease, WorkerLeaseState
+from hermes_cli.owner_runtime import ensure_owner_runtime_dirs, owner_worker_runtime_paths
 from hermes_cli.owner_worker.executor_identity import ExecutorIdentity, ExecutorInvocation
 from hermes_cli.owner_worker.owner_tool_relay import (
     OWNER_RELAY_TOOL_NAMES,
@@ -116,10 +121,315 @@ def test_web_relay_rejects_noncanonical_operations_and_arguments(tool_name, argu
 def test_owner_relay_allowlist_excludes_skill_manage():
     assert OWNER_RELAY_TOOL_NAMES == {
         "web_search", "web_extract", "skills_list", "skill_view", "image_generate",
+        "text_to_speech", "video_generate", "xai_video_edit", "xai_video_extend",
         "read_file", "write_file", "patch", "search_files",
     }
     assert "skill_manage" not in OWNER_RELAY_TOOL_NAMES
 
+
+
+def _workspace_context(tmp_path, monkeypatch):
+    import hermes_cli.controlled_roots as controlled_roots
+
+    monkeypatch.setattr(controlled_roots.sys, "platform", "linux")
+    monkeypatch.setattr(controlled_roots, "_openat2", lambda *_args: None)
+    owner = ensure_owner_runtime_dirs(tmp_path / "owner")
+    roots = controlled_roots_for(
+        owner_worker_runtime_paths(owner_home=owner, worker_generation=1)
+    )
+    return owner, roots, AuthenticatedWorkspaceContext(roots)
+
+
+@pytest.mark.parametrize(
+    "tool_name,arguments",
+    [
+        ("text_to_speech", {"text": "Hello", "output_path": "/tmp/forged.mp3"}),
+        ("video_generate", {"prompt": "ocean", "duration": True}),
+        ("video_generate", {"prompt": "ocean", "aspect_ratio": "wide"}),
+        ("xai_video_edit", {"prompt": "rain", "video_url": "file:///tmp/a.mp4"}),
+        ("xai_video_extend", {"prompt": "rain", "video_url": "https://example.com/a.mp4", "duration": False}),
+    ],
+)
+def test_owner_relay_rejects_noncanonical_media_arguments(tool_name, arguments):
+    broker = OwnerToolRelayBroker(
+        identity_validator=lambda _identity: None,
+        workspace_context=object(),
+    )
+    try:
+        with pytest.raises(OwnerToolRelayError):
+            broker.register(_invocation(tool_name, arguments, invocation_id="bad-media"))
+    finally:
+        broker.close()
+
+
+def test_owner_relay_media_invocation_uses_exact_argument_equality():
+    expected = _invocation(
+        "text_to_speech", {"text": "owner text"}, invocation_id="tts-exact"
+    )
+    broker = OwnerToolRelayBroker(
+        identity_validator=lambda _identity: None,
+        workspace_context=object(),
+    )
+    child_fd = broker.register(expected)
+    connection = socket.socket(fileno=child_fd)
+    try:
+        from hermes_cli.owner_worker.owner_tool_relay import _recv_frame, _send_frame
+
+        _send_frame(
+            connection,
+            {
+                "identity": expected.identity.to_payload(),
+                "invocation_id": expected.invocation_id,
+                "tool_name": expected.tool_name,
+                "arguments": {"text": "forged text"},
+            },
+            limit=256 * 1024,
+        )
+        assert _recv_frame(connection, limit=2 * 1024 * 1024)["ok"] is False
+    finally:
+        connection.close()
+        broker.close()
+
+
+def test_owner_side_tts_publishes_workspace_audio_and_cleans_staging(tmp_path, monkeypatch):
+    from tools import tts_tool
+
+    owner, roots, context = _workspace_context(tmp_path, monkeypatch)
+    staging_paths = []
+
+    def fake_tts(text, output_path=None):
+        assert text == "Hello owner"
+        assert output_path is not None
+        path = Path(output_path)
+        staging_paths.append(path)
+        path.write_bytes(b"ID3owner-audio")
+        return json.dumps({
+            "success": True,
+            "file_path": str(path),
+            "media_tag": f"MEDIA:{path}",
+            "provider": "fake",
+            "voice_compatible": True,
+        })
+
+    monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_tts)
+    invocation = _invocation(
+        "text_to_speech", {"text": "Hello owner"}, invocation_id="tts-publish"
+    )
+    broker = OwnerToolRelayBroker(
+        identity_validator=lambda _identity: None,
+        workspace_context=context,
+    )
+    try:
+        result = json.loads(dispatch_owner_tool_over_relay(broker.register(invocation), invocation))
+        published = Path(result["file_path"])
+        assert published.parent == owner / "workspaces" / "default" / "generated" / "audio"
+        assert published.read_bytes() == b"ID3owner-audio"
+        assert result["media_tag"] == f"[[audio_as_voice]]\nMEDIA:{published}"
+        assert staging_paths and not staging_paths[0].parent.exists()
+        assert "HERMES_HOME" not in str(invocation.to_payload())
+    finally:
+        broker.close()
+        roots.close()
+
+
+def test_owner_side_video_downloads_validates_and_publishes_workspace_video(tmp_path, monkeypatch):
+    from tools import video_generation_tool
+    import httpx
+
+    owner, roots, context = _workspace_context(tmp_path, monkeypatch)
+    video_bytes = b"\x00\x00\x00\x18ftypmp42owner-video"
+    monkeypatch.setattr(
+        video_generation_tool,
+        "_handle_video_generate",
+        lambda args: json.dumps({
+            "success": True,
+            "video": "https://cdn.example/generated.mp4",
+            "provider": "fake",
+            "prompt": args["prompt"],
+        }),
+    )
+    class Stream:
+        headers = {"content-type": "video/mp4"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield video_bytes
+
+    monkeypatch.setattr(httpx, "stream", lambda *_args, **_kwargs: Stream())
+    monkeypatch.setattr("tools.url_safety.is_safe_url", lambda _url: True)
+    invocation = _invocation(
+        "video_generate", {"prompt": "ocean"}, invocation_id="video-publish"
+    )
+    broker = OwnerToolRelayBroker(
+        identity_validator=lambda _identity: None,
+        workspace_context=context,
+    )
+    try:
+        result = json.loads(dispatch_owner_tool_over_relay(broker.register(invocation), invocation))
+        published = Path(result["video"])
+        assert published.parent == owner / "workspaces" / "default" / "generated" / "videos"
+        assert published.read_bytes() == video_bytes
+        assert result["media_tag"] == f"MEDIA:{published}"
+    finally:
+        broker.close()
+        roots.close()
+
+
+
+def test_owner_side_video_accepts_provider_cache_staging_and_removes_it(tmp_path, monkeypatch):
+    from tools import video_generation_tool
+
+    owner, roots, context = _workspace_context(tmp_path, monkeypatch)
+    cached = owner / "cache" / "videos" / "provider.mp4"
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(b"\x00\x00\x00\x18ftypmp42cached-video")
+    monkeypatch.setattr(
+        video_generation_tool,
+        "_handle_video_generate",
+        lambda _args: json.dumps({"success": True, "video": str(cached)}),
+    )
+    invocation = _invocation(
+        "video_generate", {"prompt": "ocean"}, invocation_id="video-cache"
+    )
+    broker = OwnerToolRelayBroker(
+        identity_validator=lambda _identity: None,
+        workspace_context=context,
+    )
+    try:
+        result = json.loads(dispatch_owner_tool_over_relay(broker.register(invocation), invocation))
+        published = Path(result["video"])
+        assert published.read_bytes() == b"\x00\x00\x00\x18ftypmp42cached-video"
+        assert published.parent == owner / "workspaces" / "default" / "generated" / "videos"
+        assert not cached.exists()
+    finally:
+        broker.close()
+        roots.close()
+
+
+@pytest.mark.parametrize(
+    "tool_name,arguments,provider_function",
+    [
+        (
+            "xai_video_edit",
+            {"prompt": "add rain", "video_url": "https://example.com/source.mp4"},
+            "run_xai_video_edit",
+        ),
+        (
+            "xai_video_extend",
+            {
+                "prompt": "continue",
+                "video_url": "https://example.com/source.mp4",
+                "duration": 5,
+            },
+            "run_xai_video_extend",
+        ),
+    ],
+)
+def test_owner_side_xai_video_tools_publish_workspace_video(
+    tmp_path, monkeypatch, tool_name, arguments, provider_function
+):
+    from tools import xai_video_tools
+    import httpx
+
+    owner, roots, context = _workspace_context(tmp_path, monkeypatch)
+    seen = []
+    monkeypatch.setattr(xai_video_tools, "_configured_for_xai_video", lambda: True)
+
+    def fake_provider(**kwargs):
+        seen.append(kwargs)
+        return {
+            "success": True,
+            "video": "https://cdn.example/xai.mp4",
+            "provider": "xai",
+        }
+
+    monkeypatch.setattr(xai_video_tools, provider_function, fake_provider)
+
+    class Stream:
+        headers = {"content-type": "video/mp4"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield b"\x00\x00\x00\x18ftypmp42xai-video"
+
+    monkeypatch.setattr(httpx, "stream", lambda *_args, **_kwargs: Stream())
+    monkeypatch.setattr("tools.url_safety.is_safe_url", lambda _url: True)
+    invocation = _invocation(tool_name, arguments, invocation_id=f"{tool_name}-publish")
+    broker = OwnerToolRelayBroker(
+        identity_validator=lambda _identity: None,
+        workspace_context=context,
+    )
+    try:
+        result = json.loads(dispatch_owner_tool_over_relay(broker.register(invocation), invocation))
+        published = Path(result["video"])
+        assert published.parent == owner / "workspaces" / "default" / "generated" / "videos"
+        assert published.read_bytes().endswith(b"xai-video")
+        assert seen and seen[0]["prompt"] == arguments["prompt"]
+    finally:
+        broker.close()
+        roots.close()
+
+def test_owner_side_video_rejects_invalid_download_without_publication(tmp_path, monkeypatch):
+    from tools import video_generation_tool
+    import httpx
+
+    owner, roots, context = _workspace_context(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        video_generation_tool,
+        "_handle_video_generate",
+        lambda _args: json.dumps({
+            "success": True,
+            "video": "https://cdn.example/generated.mp4",
+        }),
+    )
+    class Stream:
+        headers = {"content-type": "text/html"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield b"not video"
+
+    monkeypatch.setattr(httpx, "stream", lambda *_args, **_kwargs: Stream())
+    monkeypatch.setattr("tools.url_safety.is_safe_url", lambda _url: True)
+    invocation = _invocation(
+        "video_generate", {"prompt": "ocean"}, invocation_id="video-invalid"
+    )
+    broker = OwnerToolRelayBroker(
+        identity_validator=lambda _identity: None,
+        workspace_context=context,
+    )
+    try:
+        with pytest.raises(OwnerToolRelayError, match="rejected"):
+            dispatch_owner_tool_over_relay(broker.register(invocation), invocation)
+        output = owner / "workspaces" / "default" / "generated" / "videos"
+        assert not output.exists() or not list(output.iterdir())
+    finally:
+        broker.close()
+        roots.close()
 
 def test_owner_relay_dispatches_canonical_file_invocations():
     seen = []

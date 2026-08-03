@@ -314,7 +314,7 @@ def create_app(
     except (OSError, RuntimeError) as exc:
         raise RuntimeError(f"owner worker startup self-check failed: {exc}") from exc
 
-    from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+    from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
     from fastapi.responses import JSONResponse
 
     @asynccontextmanager
@@ -422,6 +422,9 @@ def create_app(
     from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
 
     workspace_context = AuthenticatedWorkspaceContext(controlled_roots)
+    from hermes_cli.owner_worker.user_files import migrate_legacy_user_files
+
+    migrate_legacy_user_files(workspace_context)
     from hermes_cli.owner_worker.audit import report_executor_authority_decision
     from hermes_cli.owner_worker.credential_broker import CredentialBroker
     from hermes_cli.owner_worker.tool_executor_sandbox import load_sandbox_deployment_policy
@@ -461,9 +464,11 @@ def create_app(
                 if relay_client is None:
                     raise RuntimeError("deployment image relay is unavailable")
                 return dispatch_deployment_image(
-                    arguments, relay_client=relay_client, descriptor=relay_client.descriptor,
-                    controlled_roots=controlled_roots, owner_home=owner_home,
-                    workspace_root=runtime_paths.workspace_root,
+                    arguments,
+                    relay_client=relay_client,
+                    descriptor=relay_client.descriptor,
+                    workspace_context=workspace_context,
+                    owner_home=owner_home,
                 )
 
             app.state.tool_executor_supervisor = ToolExecutorSupervisor(
@@ -500,43 +505,62 @@ def create_app(
             )
 
     def _file_path(path: str | None, *, allow_empty: bool = False) -> str:
-        value = str(path or "").strip()
-        if allow_empty and not value:
-            return ""
-        if not value:
-            raise HTTPException(status_code=400, detail="Path is required")
         try:
             app.state.owner_worker_controlled_roots._require_linux()
-            components = value.split("/")
-            if value.startswith("/") or "\x00" in value or any(part in {"", ".", ".."} for part in components):
-                raise ValueError
+            return workspace_context.controlled_api_path(
+                path,
+                allow_workspace_root=allow_empty,
+            )
         except (TypeError, ValueError, RuntimeError):
-            raise HTTPException(status_code=400, detail="Path must be a relative workspace path")
-        return value
+            raise HTTPException(
+                status_code=400,
+                detail="Path must be inside the authenticated workspace",
+            ) from None
 
-    def _owner_image_path(path: str | None) -> str:
+    def _visible_file_path(controlled_path: str) -> str:
+        try:
+            return workspace_context.visible_workspace_path(controlled_path)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid workspace path") from None
+
+    def _legacy_artifact_path(path: str | None) -> tuple[RootKind, str]:
         value = str(path or "").strip()
         if not value or "\x00" in value:
-            raise HTTPException(status_code=400, detail="Invalid image path")
+            raise HTTPException(status_code=400, detail="Invalid artifact path")
         try:
             candidate = Path(value)
             if not candidate.is_absolute():
                 raise ValueError
-            relative_path = candidate.relative_to(owner_home).as_posix()
-            components = relative_path.split("/")
-            if (
-                len(components) != 2
-                or components[0] != "images"
-                or any(part in {"", ".", ".."} for part in components)
-            ):
+            owner_relative = candidate.relative_to(owner_home).as_posix()
+            components = owner_relative.split("/")
+            allowed = (
+                len(components) == 2 and components[0] == "images"
+            ) or (
+                len(components) == 3
+                and components[0] == "cache"
+                and components[1] in {"images", "audio", "videos"}
+            )
+            if not allowed or any(part in {"", ".", ".."} for part in components):
                 raise ValueError
             app.state.owner_worker_controlled_roots._require_linux()
         except (OSError, TypeError, ValueError, RuntimeError):
             raise HTTPException(
                 status_code=400,
-                detail="Image path must be in the owner images directory",
-            )
-        return relative_path
+                detail="Artifact path is outside the authenticated workspace",
+            ) from None
+
+        from hermes_cli.owner_worker.user_files import migrated_legacy_path
+
+        migrated = migrated_legacy_path(workspace_context, owner_relative)
+        if migrated is not None:
+            return RootKind.WORKSPACE, workspace_context.controlled_workspace_path(migrated)
+        return RootKind.OWNER_WRITABLE, owner_relative
+
+    def _artifact_path(path: str | None) -> tuple[RootKind, str]:
+        try:
+            return RootKind.WORKSPACE, _file_path(path)
+        except HTTPException:
+            return _legacy_artifact_path(path)
 
     def _file_entry(relative_path: str):
         roots = app.state.owner_worker_controlled_roots
@@ -548,7 +572,7 @@ def create_app(
         name = relative_path.rsplit("/", 1)[-1]
         return {
             "name": name,
-            "path": relative_path,
+            "path": _visible_file_path(relative_path),
             "is_directory": False,
             "size": metadata.st_size,
             "mtime": metadata.st_mtime,
@@ -713,7 +737,7 @@ def create_app(
             entries = [
                 {
                     "name": entry.name,
-                    "path": entry.relative_path,
+                    "path": _visible_file_path(entry.relative_path),
                     "is_directory": entry.is_directory,
                     "size": entry.size,
                     "mtime": entry.mtime,
@@ -723,10 +747,11 @@ def create_app(
             ]
         except Exception as exc:
             raise _files_error(exc) from exc
+        visible_path = _visible_file_path(relative_path)
         parent = None
-        if relative_path:
-            parent = relative_path.rsplit("/", 1)[0] if "/" in relative_path else ""
-        return {"path": relative_path, "parent": parent, "entries": entries, "root": "", "locked_root": "", "can_change_path": False}
+        if visible_path:
+            parent = visible_path.rsplit("/", 1)[0] if "/" in visible_path else ""
+        return {"path": visible_path, "parent": parent, "entries": entries, "root": "", "locked_root": "", "can_change_path": False}
 
     @app.get("/api/files/read")
     def read_file(path: str, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
@@ -753,14 +778,14 @@ def create_app(
             raise _files_error(exc) from exc
         name = relative_path.rsplit("/", 1)[-1]
         mime_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
-        return {"name": name, "path": relative_path, "size": len(data), "mime_type": mime_type, "data_url": f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}", "root": "", "locked_root": "", "can_change_path": False}
+        return {"name": name, "path": _visible_file_path(relative_path), "size": len(data), "mime_type": mime_type, "data_url": f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}", "root": "", "locked_root": "", "can_change_path": False}
 
     @app.get("/api/fs/read-data-url")
     def read_image_data_url(path: str, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
-        relative_path = _owner_image_path(path)
+        root_kind, relative_path = _artifact_path(path)
         try:
             fd = app.state.owner_worker_controlled_roots.open_relative(
-                RootKind.OWNER_WRITABLE,
+                root_kind,
                 relative_path,
                 expected_type=ExpectedType.REGULAR_FILE,
             )
@@ -785,25 +810,11 @@ def create_app(
         return {"dataUrl": f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}"}
 
     def _workspace_cwd_path(cwd: str) -> str:
-        raw_cwd = str(cwd or "").strip()
-        if not raw_cwd or "\x00" in raw_cwd:
-            raise HTTPException(status_code=400, detail="Invalid cwd")
-        if raw_cwd == "/workspace" or raw_cwd.startswith("/workspace/"):
-            try:
-                return workspace_context.controlled_workspace_path(
-                    raw_cwd, allow_workspace_root=True
-                )
-            except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid cwd") from None
-
-        cwd_path = Path(raw_cwd)
-        if not cwd_path.is_absolute():
-            raise HTTPException(status_code=400, detail="Invalid cwd")
-        workspace_root = app.state.owner_worker_controlled_roots.get(
-            RootKind.WORKSPACE
-        ).canonical_path
         try:
-            return _file_path(cwd_path.relative_to(workspace_root).as_posix())
+            return workspace_context.controlled_api_path(
+                cwd,
+                allow_workspace_root=True,
+            )
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid cwd") from None
 
@@ -815,27 +826,19 @@ def create_app(
         _: None = Depends(_require_owner_token),
     ):
         value = str(path or "").strip()
-        workspace_root = app.state.owner_worker_controlled_roots.get(RootKind.WORKSPACE).canonical_path
         root_kind = RootKind.WORKSPACE
         try:
             cwd_relative = _workspace_cwd_path(cwd) if cwd is not None else None
-            if value == "/workspace" or value.startswith("/workspace/"):
-                relative_path = workspace_context.controlled_workspace_path(value)
+            candidate = Path(value)
+            if candidate.is_absolute():
+                root_kind, relative_path = _artifact_path(value)
+            elif cwd_relative is not None:
+                cwd_visible = _visible_file_path(cwd_relative)
+                relative_path = _file_path(
+                    f"{cwd_visible}/{value}" if cwd_visible else value
+                )
             else:
-                candidate = Path(value)
-                if candidate.is_absolute():
-                    try:
-                        relative_path = _file_path(
-                            candidate.relative_to(workspace_root).as_posix()
-                        )
-                    except ValueError:
-                        relative_path = _owner_image_path(value)
-                        root_kind = RootKind.OWNER_WRITABLE
-                else:
-                    relative_path = value
-                    if cwd_relative is not None:
-                        relative_path = f"{cwd_relative}/{relative_path}"
-                    relative_path = _file_path(relative_path)
+                relative_path = _file_path(value)
 
             fd = app.state.owner_worker_controlled_roots.open_relative(
                 root_kind, relative_path, expected_type=ExpectedType.REGULAR_FILE
@@ -886,12 +889,24 @@ def create_app(
             raise HTTPException(status_code=409, detail="A file already exists at that path") from exc
         except Exception as exc:
             raise _files_error(exc) from exc
-        return {"ok": True, "entry": entry, "path": relative_path, "root": "", "locked_root": "", "can_change_path": False}
+        return {"ok": True, "entry": entry, "path": _visible_file_path(relative_path), "root": "", "locked_root": "", "can_change_path": False}
 
     @app.post("/api/files/upload-stream")
     async def upload_file_stream(
-        file: UploadFile = File(...), path: str = Form(...), overwrite: bool = Form(True), _: None = Depends(_require_owner_token)
+        request: Request,
+        _: None = Depends(_require_owner_token),
     ) -> dict[str, Any]:
+        form = await request.form()
+        file = form.get("file")
+        path = form.get("path")
+        overwrite_value = form.get("overwrite", "true")
+        if (
+            not callable(getattr(file, "read", None))
+            or not callable(getattr(file, "close", None))
+            or not isinstance(path, str)
+        ):
+            raise HTTPException(status_code=422, detail="Invalid upload form")
+        overwrite = str(overwrite_value).strip().lower() in {"1", "true", "on", "yes"}
         relative_path = _file_path(path)
         writer = None
         try:
@@ -917,7 +932,7 @@ def create_app(
             if writer is not None:
                 writer.abort()
             await file.close()
-        return {"ok": True, "entry": entry, "path": relative_path, "root": "", "locked_root": "", "can_change_path": False}
+        return {"ok": True, "entry": entry, "path": _visible_file_path(relative_path), "root": "", "locked_root": "", "can_change_path": False}
 
     @app.post("/api/files/mkdir")
     def create_directory(payload: ManagedDirectoryCreate, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
@@ -928,7 +943,8 @@ def create_app(
             entry = next(item for item in entries if item.relative_path == relative_path)
         except Exception as exc:
             raise _files_error(exc) from exc
-        return {"ok": True, "entry": {"name": entry.name, "path": entry.relative_path, "is_directory": True, "size": None, "mtime": entry.mtime, "mime_type": None}, "path": relative_path, "root": "", "locked_root": "", "can_change_path": False}
+        visible_path = _visible_file_path(relative_path)
+        return {"ok": True, "entry": {"name": entry.name, "path": visible_path, "is_directory": True, "size": None, "mtime": entry.mtime, "mime_type": None}, "path": visible_path, "root": "", "locked_root": "", "can_change_path": False}
 
     @app.delete("/api/files")
     def delete_file(payload: ManagedFileDelete, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
@@ -939,7 +955,7 @@ def create_app(
             raise HTTPException(status_code=409 if not payload.recursive else 400, detail="Could not delete path") from exc
         except Exception as exc:
             raise _files_error(exc) from exc
-        return {"ok": True, "path": relative_path, "root": "", "locked_root": "", "can_change_path": False}
+        return {"ok": True, "path": _visible_file_path(relative_path), "root": "", "locked_root": "", "can_change_path": False}
 
     @app.get("/api/sessions")
     def get_sessions(
