@@ -23,6 +23,7 @@ from agent.prompt_builder import (
     _get_context_file_max_chars,
     _CONTEXT_FILE_DYNAMIC_CEILING,
     DEFAULT_AGENT_IDENTITY,
+    RESPONSE_STYLE_GUIDANCE,
     drain_truncation_warnings,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
@@ -43,6 +44,21 @@ from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatu
 
 
 class TestGuidanceConstants:
+    def test_response_style_defaults_to_concise_without_losing_long_deliverables(self):
+        assert "Default to concise responses" in RESPONSE_STYLE_GUIDANCE
+        assert "explicitly asks for more detail" in RESPONSE_STYLE_GUIDANCE
+        assert "inherently long-form deliverable" in RESPONSE_STYLE_GUIDANCE
+        assert "full content in chat" in RESPONSE_STYLE_GUIDANCE
+
+    def test_response_style_offloads_only_to_usable_artifacts(self):
+        assert "can create and deliver a usable file or artifact" in RESPONSE_STYLE_GUIDANCE
+        assert "concise summary and pointer" in RESPONSE_STYLE_GUIDANCE
+        assert "no usable file or artifact mechanism" in RESPONSE_STYLE_GUIDANCE
+        assert "correctness, safety, or task completion" in RESPONSE_STYLE_GUIDANCE
+
+    def test_default_identity_has_no_overlapping_verbosity_policy(self):
+        assert "useful over being verbose" not in DEFAULT_AGENT_IDENTITY
+
     def test_memory_guidance_discourages_task_logs(self):
         assert "durable facts" in MEMORY_GUIDANCE
         assert "Do NOT save task progress" in MEMORY_GUIDANCE

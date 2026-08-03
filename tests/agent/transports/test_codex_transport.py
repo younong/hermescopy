@@ -4,6 +4,7 @@ import json
 import pytest
 from types import SimpleNamespace
 
+from agent.prompt_builder import DEFAULT_AGENT_INSTRUCTIONS, RESPONSE_STYLE_GUIDANCE
 from agent.transports import get_transport
 from agent.transports.types import NormalizedResponse
 
@@ -62,10 +63,11 @@ class TestCodexBuildKwargs:
         kw = transport.build_kwargs(model="gpt-5.4", messages=messages, tools=[])
         assert kw["instructions"] == "Custom system prompt"
 
-    def test_no_system_uses_default(self, transport):
+    def test_no_system_uses_default_instructions(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(model="gpt-5.4", messages=messages, tools=[])
-        assert kw["instructions"]  # should be non-empty default
+        assert kw["instructions"] == DEFAULT_AGENT_INSTRUCTIONS
+        assert RESPONSE_STYLE_GUIDANCE in kw["instructions"]
 
     def test_reasoning_config(self, transport):
         messages = [{"role": "user", "content": "Hi"}]

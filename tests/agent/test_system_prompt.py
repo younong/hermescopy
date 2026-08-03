@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from agent.prompt_builder import DEFAULT_AGENT_IDENTITY, RESPONSE_STYLE_GUIDANCE
 from agent.system_prompt import build_system_prompt_parts
 
 
@@ -57,14 +58,28 @@ class TestContextFileCwd:
         assert _captured_context_cwd(_make_agent()) == tmp_path
 
 
-def _stable_prompt(agent):
+def _stable_prompt(agent, *, soul=""):
     with (
-        patch("run_agent.load_soul_md", return_value=""),
+        patch("run_agent.load_soul_md", return_value=soul),
         patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value=""),
     ):
         return build_system_prompt_parts(agent)["stable"]
+
+
+class TestResponseStyleGuidance:
+    def test_present_once_without_tools(self):
+        stable = _stable_prompt(_make_agent(valid_tool_names=[]))
+        assert stable.count(RESPONSE_STYLE_GUIDANCE) == 1
+
+    def test_present_once_with_custom_soul(self):
+        custom_soul = "You are a custom careful assistant."
+        stable = _stable_prompt(_make_agent(load_soul_identity=True), soul=custom_soul)
+        assert custom_soul in stable
+        assert DEFAULT_AGENT_IDENTITY not in stable
+        assert stable.count(RESPONSE_STYLE_GUIDANCE) == 1
+        assert stable.index(custom_soul) < stable.index(RESPONSE_STYLE_GUIDANCE)
 
 
 def _init_code_repo(path):

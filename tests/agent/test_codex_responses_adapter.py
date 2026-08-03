@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent.prompt_builder import DEFAULT_AGENT_INSTRUCTIONS
 from agent.codex_responses_adapter import (
     _format_responses_error,
     _normalize_codex_response,
@@ -137,6 +138,23 @@ def test_normalize_codex_response_in_progress_message_still_incomplete():
     _assistant_message, finish_reason = _normalize_codex_response(response)
 
     assert finish_reason == "incomplete"
+
+
+# ---------------------------------------------------------------------------
+# _preflight_codex_api_kwargs — request defaults and built-in tools
+# ---------------------------------------------------------------------------
+
+
+def test_preflight_blank_instructions_use_global_default():
+    kwargs = {
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+    }
+
+    out = _preflight_codex_api_kwargs(kwargs)
+
+    assert out["instructions"] == DEFAULT_AGENT_INSTRUCTIONS
 
 
 # ---------------------------------------------------------------------------
