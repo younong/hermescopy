@@ -11,11 +11,16 @@ import json
 import logging
 import os
 import socket
+import stat
 import struct
+import tempfile
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
+from hermes_cli.controlled_roots import ExpectedType, RootKind
 from hermes_cli.owner_worker.executor_identity import (
     EgressProfile,
     ExecutorIdentity,
@@ -27,12 +32,20 @@ logger = logging.getLogger(__name__)
 OWNER_FILE_TOOL_NAMES = frozenset({
     "read_file", "write_file", "patch", "search_files",
 })
+_OWNER_MEDIA_TOOL_NAMES = frozenset({
+    "text_to_speech", "video_generate", "xai_video_edit", "xai_video_extend",
+})
 _OWNER_ALWAYS_RELAY_TOOL_NAMES = frozenset({
     "web_search", "web_extract", "skills_list", "skill_view", "image_generate",
-})
+}) | _OWNER_MEDIA_TOOL_NAMES
 OWNER_RELAY_TOOL_NAMES = _OWNER_ALWAYS_RELAY_TOOL_NAMES | OWNER_FILE_TOOL_NAMES
 _MAX_REQUEST_BYTES = 256 * 1024
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+_MAX_MEDIA_BYTES = 512 * 1024 * 1024
+_MEDIA_SUFFIXES = {
+    "audio": frozenset({".mp3", ".ogg", ".wav", ".flac", ".m4a", ".aac"}),
+    "video": frozenset({".mp4", ".webm", ".mov", ".m4v"}),
+}
 
 
 class OwnerToolRelayError(RuntimeError):
@@ -186,6 +199,89 @@ def _validated_arguments(tool_name: str, arguments: object) -> dict[str, Any]:
             **({"file_glob": file_glob} if file_glob is not None else {}),
             "limit": limit, "offset": offset, "output_mode": output_mode, "context": context,
         }
+    if tool_name == "text_to_speech":
+        if set(arguments) - {"text"}:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        text = arguments.get("text")
+        if not isinstance(text, str) or not text.strip() or len(text) > 40_000 or "\x00" in text:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        return {"text": text}
+    if tool_name == "video_generate":
+        allowed = {
+            "prompt", "image_url", "reference_image_urls", "duration", "aspect_ratio",
+            "resolution", "negative_prompt", "audio", "seed", "model",
+        }
+        if set(arguments) - allowed:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        prompt = arguments.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 32_768 or "\x00" in prompt:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        result: dict[str, Any] = {"prompt": prompt}
+        for key in ("image_url", "negative_prompt", "model"):
+            value = arguments.get(key)
+            if value is not None:
+                if not isinstance(value, str) or not value.strip() or len(value) > 16_384 or "\x00" in value:
+                    raise OwnerToolRelayError("owner tool relay arguments are invalid")
+                result[key] = value
+        references = arguments.get("reference_image_urls")
+        if references is not None:
+            if not isinstance(references, list) or len(references) > 16 or any(
+                not isinstance(value, str) or not value.strip() or len(value) > 16_384 or "\x00" in value
+                for value in references
+            ):
+                raise OwnerToolRelayError("owner tool relay arguments are invalid")
+            result["reference_image_urls"] = list(references)
+        for key in ("duration", "seed"):
+            value = arguments.get(key)
+            if value is not None:
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    raise OwnerToolRelayError("owner tool relay arguments are invalid")
+                result[key] = value
+        aspect_ratio = arguments.get("aspect_ratio")
+        if aspect_ratio is not None:
+            from agent.video_gen_provider import COMMON_ASPECT_RATIOS
+            if aspect_ratio not in COMMON_ASPECT_RATIOS:
+                raise OwnerToolRelayError("owner tool relay arguments are invalid")
+            result["aspect_ratio"] = aspect_ratio
+        resolution = arguments.get("resolution")
+        if resolution is not None:
+            from agent.video_gen_provider import COMMON_RESOLUTIONS
+            if resolution not in COMMON_RESOLUTIONS:
+                raise OwnerToolRelayError("owner tool relay arguments are invalid")
+            result["resolution"] = resolution
+        audio = arguments.get("audio")
+        if audio is not None:
+            if not isinstance(audio, bool):
+                raise OwnerToolRelayError("owner tool relay arguments are invalid")
+            result["audio"] = audio
+        return result
+    if tool_name in {"xai_video_edit", "xai_video_extend"}:
+        allowed = {"prompt", "video_url", "model"}
+        if tool_name == "xai_video_extend":
+            allowed.add("duration")
+        if set(arguments) - allowed:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        prompt = arguments.get("prompt")
+        video_url = arguments.get("video_url")
+        if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 32_768 or "\x00" in prompt:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        if not isinstance(video_url, str) or len(video_url) > 16_384 or "\x00" in video_url:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        parsed = urlparse(video_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        result = {"prompt": prompt, "video_url": video_url}
+        model = arguments.get("model")
+        if model is not None:
+            if not isinstance(model, str) or not model.strip() or len(model) > 1024 or "\x00" in model:
+                raise OwnerToolRelayError("owner tool relay arguments are invalid")
+            result["model"] = model
+        if tool_name == "xai_video_extend" and arguments.get("duration") is not None:
+            duration = arguments["duration"]
+            if not isinstance(duration, int) or isinstance(duration, bool) or duration < 0:
+                raise OwnerToolRelayError("owner tool relay arguments are invalid")
+            result["duration"] = duration
+        return result
     if tool_name == "image_generate":
         if set(arguments) - {"prompt", "aspect_ratio", "image_url", "reference_image_urls"}:
             raise OwnerToolRelayError("owner tool relay arguments are invalid")
@@ -261,6 +357,251 @@ def owner_file_tool_relay_admissible(invocation: ExecutorInvocation) -> bool:
     return True
 
 
+def _media_path_from_result(result: dict[str, Any], *, category: str) -> str:
+    field = "file_path" if category == "audio" else "video"
+    raw = result.get(field)
+    if not isinstance(raw, str) or not raw:
+        raise OwnerToolRelayError("owner media tool did not produce an artifact")
+    return raw
+
+
+def _media_content_is_valid(data: bytes, suffix: str) -> bool:
+    if suffix == ".mp3":
+        return data.startswith(b"ID3") or (len(data) >= 2 and data[0] == 0xFF and data[1] & 0xE0 == 0xE0)
+    if suffix == ".ogg":
+        return data.startswith(b"OggS")
+    if suffix == ".wav":
+        return len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WAVE"
+    if suffix == ".flac":
+        return data.startswith(b"fLaC")
+    if suffix == ".aac":
+        return len(data) >= 2 and data[0] == 0xFF and data[1] & 0xF6 == 0xF0
+    if suffix in {".m4a", ".mp4", ".mov", ".m4v"}:
+        return len(data) >= 12 and data[4:8] == b"ftyp"
+    if suffix == ".webm":
+        return data.startswith(b"\x1aE\xdf\xa3")
+    return False
+
+
+def _read_media_file(
+    path: Path,
+    *,
+    category: str,
+    staging_root: Path,
+    workspace_context: Any,
+) -> tuple[bytes, str]:
+    suffix = path.suffix.lower()
+    if suffix not in _MEDIA_SUFFIXES[category]:
+        raise OwnerToolRelayError("owner media artifact type is invalid")
+
+    fd = -1
+    try:
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(staging_root.resolve(strict=True))
+        except (OSError, ValueError):
+            if category != "video" or not path.is_absolute():
+                raise OwnerToolRelayError(
+                    "owner media artifact is outside controlled staging"
+                ) from None
+            owner_root = workspace_context.roots.get(RootKind.OWNER_WRITABLE).canonical_path
+            try:
+                owner_relative = path.relative_to(owner_root).as_posix()
+            except ValueError:
+                raise OwnerToolRelayError(
+                    "owner media artifact is outside controlled staging"
+                ) from None
+            components = owner_relative.split("/")
+            if (
+                len(components) != 3
+                or components[:2] != ["cache", "videos"]
+                or any(component in {"", ".", ".."} for component in components)
+            ):
+                raise OwnerToolRelayError(
+                    "owner media artifact is outside controlled staging"
+                )
+            fd = workspace_context.roots.open_relative(
+                RootKind.OWNER_WRITABLE,
+                owner_relative,
+                expected_type=ExpectedType.REGULAR_FILE,
+            )
+        else:
+            fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+
+        metadata = os.fstat(fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size <= 0
+            or metadata.st_size > _MAX_MEDIA_BYTES
+        ):
+            raise OwnerToolRelayError("owner media artifact is invalid")
+        data = bytearray()
+        while len(data) <= _MAX_MEDIA_BYTES:
+            chunk = os.read(fd, min(1024 * 1024, _MAX_MEDIA_BYTES + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        if len(data) != metadata.st_size or not _media_content_is_valid(data, suffix):
+            raise OwnerToolRelayError("owner media artifact content is invalid")
+        return bytes(data), path.name
+    except OSError as exc:
+        raise OwnerToolRelayError("owner media artifact is invalid") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _download_video(url: str, *, staging_root: Path) -> Path:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise OwnerToolRelayError("owner video artifact URL is invalid")
+    suffix = Path(parsed.path).suffix.lower()
+    if suffix not in _MEDIA_SUFFIXES["video"]:
+        suffix = ".mp4"
+    destination = staging_root / f"video{suffix}"
+    try:
+        import httpx
+        from tools.url_safety import is_safe_url, redirect_target_from_response
+
+        if not is_safe_url(url):
+            raise OwnerToolRelayError("owner video artifact URL is unsafe")
+
+        def _reject_unsafe_redirect(response: Any) -> None:
+            redirect_url = redirect_target_from_response(response)
+            if redirect_url and not is_safe_url(redirect_url):
+                raise OwnerToolRelayError("owner video artifact redirect is unsafe")
+
+        with httpx.stream(
+            "GET",
+            url,
+            follow_redirects=True,
+            timeout=120.0,
+            event_hooks={"response": [_reject_unsafe_redirect]},
+        ) as response:
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            if content_type and not (
+                content_type.startswith("video/")
+                or content_type == "application/octet-stream"
+            ):
+                raise OwnerToolRelayError("owner video artifact content type is invalid")
+            total = 0
+            with destination.open("xb") as output:
+                for chunk in response.iter_bytes():
+                    total += len(chunk)
+                    if total > _MAX_MEDIA_BYTES:
+                        raise OwnerToolRelayError("owner video artifact is too large")
+                    output.write(chunk)
+    except OwnerToolRelayError:
+        destination.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        destination.unlink(missing_ok=True)
+        raise OwnerToolRelayError("owner video artifact download failed") from exc
+    return destination
+
+
+def _rewrite_media_result(
+    raw_result: str,
+    result: dict[str, Any],
+    *,
+    category: str,
+    staging_root: Path,
+    workspace_context: Any,
+) -> str:
+    if result.get("success") is not True:
+        return raw_result
+    source_value = _media_path_from_result(result, category=category)
+    source = (
+        _download_video(source_value, staging_root=staging_root)
+        if category == "video" and source_value.lower().startswith(("http://", "https://"))
+        else Path(source_value)
+    )
+    data, filename = _read_media_file(
+        source,
+        category=category,
+        staging_root=staging_root,
+        workspace_context=workspace_context,
+    )
+    from hermes_cli.owner_worker.user_files import publish_unique_user_bytes
+
+    published = publish_unique_user_bytes(workspace_context, category, filename, data)
+    diagnostic = str(published.diagnostic_path)
+    if category == "audio":
+        result["file_path"] = diagnostic
+        voice_prefix = "[[audio_as_voice]]\n" if result.get("voice_compatible") is True else ""
+        result["media_tag"] = f"{voice_prefix}MEDIA:{diagnostic}"
+    else:
+        result["video"] = diagnostic
+        result["media_tag"] = f"MEDIA:{diagnostic}"
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _dispatch_owner_media_tool(
+    tool_name: str,
+    arguments: dict[str, Any],
+    workspace_context: Any,
+) -> str:
+    if workspace_context is None:
+        raise OwnerToolRelayError("owner media relay workspace is unavailable")
+    from hermes_cli.config import reload_env
+    reload_env()
+
+    temporary_root = workspace_context.roots.get(RootKind.TEMPORARY).canonical_path
+    with tempfile.TemporaryDirectory(
+        prefix=f"{tool_name}-",
+        dir=temporary_root,
+    ) as directory:
+        staging_root = Path(directory)
+        if tool_name == "text_to_speech":
+            from tools.tts_tool import text_to_speech_tool
+            raw_result = text_to_speech_tool(
+                arguments["text"], output_path=str(staging_root / "speech.mp3")
+            )
+            category = "audio"
+        else:
+            if tool_name == "video_generate":
+                from tools.video_generation_tool import _handle_video_generate
+                raw_result = _handle_video_generate(dict(arguments))
+            else:
+                from tools.xai_video_tools import _handle_xai_video_edit, _handle_xai_video_extend
+                handler = (
+                    _handle_xai_video_edit
+                    if tool_name == "xai_video_edit"
+                    else _handle_xai_video_extend
+                )
+                raw_result = handler(dict(arguments))
+            category = "video"
+        raw_result = str(raw_result)
+        try:
+            result_payload = json.loads(raw_result)
+        except json.JSONDecodeError as exc:
+            raise OwnerToolRelayError("owner media tool result is invalid") from exc
+        if not isinstance(result_payload, dict):
+            raise OwnerToolRelayError("owner media tool result is invalid")
+        video_source = (
+            _media_path_from_result(result_payload, category="video")
+            if category == "video" and result_payload.get("success") is True
+            else None
+        )
+        result = _rewrite_media_result(
+            raw_result,
+            result_payload,
+            category=category,
+            staging_root=staging_root,
+            workspace_context=workspace_context,
+        )
+        if video_source is not None:
+            source_path = Path(video_source)
+            owner_root = workspace_context.roots.get(RootKind.OWNER_WRITABLE).canonical_path
+            if source_path.is_absolute() and source_path.parent == owner_root / "cache" / "videos":
+                workspace_context.roots.remove(
+                    RootKind.OWNER_WRITABLE,
+                    source_path.relative_to(owner_root).as_posix(),
+                )
+        return result
+
+
 def _dispatch_owner_tool(
     tool_name: str,
     arguments: dict[str, Any],
@@ -268,6 +609,9 @@ def _dispatch_owner_tool(
     skill_dir_materializer: Callable[[Any], str] | None,
     workspace_context: Any | None = None,
 ) -> str:
+    if tool_name in _OWNER_MEDIA_TOOL_NAMES:
+        return _dispatch_owner_media_tool(tool_name, arguments, workspace_context)
+
     if tool_name in OWNER_FILE_TOOL_NAMES:
         if workspace_context is None:
             raise OwnerToolRelayError("owner file relay workspace is unavailable")
@@ -480,7 +824,7 @@ class OwnerToolRelayBroker:
             dispatcher = self._image_dispatcher if expected.tool_name == "image_generate" else self._dispatcher
             dispatcher_args = (
                 (expected.tool_name, arguments, expected, skill_dir_materializer, self._workspace_context)
-                if expected.tool_name in OWNER_FILE_TOOL_NAMES
+                if expected.tool_name in OWNER_FILE_TOOL_NAMES | _OWNER_MEDIA_TOOL_NAMES
                 else (expected.tool_name, arguments, expected, skill_dir_materializer)
             )
             result = dispatcher(*dispatcher_args)

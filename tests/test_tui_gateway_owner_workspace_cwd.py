@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import base64
+from pathlib import Path
+import sys
+import types
+
 import pytest
 
 from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
@@ -132,6 +137,126 @@ def test_authenticated_project_callback_accepts_selected_workspace(authenticated
         server._sessions.pop("sid", None)
 
 
+def test_authenticated_image_bytes_publish_to_user_uploads(
+    authenticated_runtime,
+    monkeypatch,
+):
+    fake_cli = types.ModuleType("cli")
+    fake_cli._IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
+    session = {
+        "image_counter": 0,
+        "attached_images": [],
+        "pending_attachments": [],
+        "running": False,
+    }
+    server._sessions["authenticated-upload"] = session
+    try:
+        payload = base64.b64encode(b"\x89PNG\r\n\x1a\nimage").decode("ascii")
+        response = server.handle_request({
+            "id": "1",
+            "method": "image.attach_bytes",
+            "params": {
+                "session_id": "authenticated-upload",
+                "content_base64": payload,
+                "filename": "shot.png",
+            },
+        })
+
+        visible = response["result"]["path"]
+        assert visible.startswith("uploads/upload_")
+        stored = (
+            authenticated_runtime.get(RootKind.WORKSPACE).canonical_path
+            / "default"
+            / visible
+        )
+        assert stored.read_bytes() == b"\x89PNG\r\n\x1a\nimage"
+        assert session["attached_images"] == [str(stored)]
+    finally:
+        server._sessions.pop("authenticated-upload", None)
+
+
+def test_authenticated_file_bytes_publish_to_user_uploads(
+    authenticated_runtime,
+):
+    selected = authenticated_runtime.get(RootKind.WORKSPACE).canonical_path / "default"
+    session = {
+        "cwd": str(selected),
+        "running": False,
+        "pending_attachments": [],
+    }
+    server._sessions["authenticated-file"] = session
+    try:
+        payload = base64.b64encode(b"report").decode("ascii")
+        response = server.handle_request({
+            "id": "1",
+            "method": "file.attach",
+            "params": {
+                "session_id": "authenticated-file",
+                "data_url": f"data:text/plain;base64,{payload}",
+                "name": "report.txt",
+            },
+        })
+
+        result = response["result"]
+        assert result["path"] == "uploads/report.txt"
+        assert result["ref_text"] == "@file:uploads/report.txt"
+        assert (selected / "uploads" / "report.txt").read_bytes() == b"report"
+    finally:
+        server._sessions.pop("authenticated-file", None)
+
+
+def test_authenticated_pdf_pages_use_temporary_root_until_turn_cleanup(
+    authenticated_runtime,
+    monkeypatch,
+):
+    fake_cli = types.ModuleType("cli")
+    fake_cli._IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
+    monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/pdftoppm")
+
+    def fake_run(argv, **_kwargs):
+        Path(f"{argv[-1]}-1.png").write_bytes(b"\x89PNG\r\n\x1a\npage")
+        return types.SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    selected = authenticated_runtime.get(RootKind.WORKSPACE).canonical_path / "default"
+    session = {
+        "cwd": str(selected),
+        "image_counter": 0,
+        "attached_images": [],
+        "pending_attachments": [],
+        "running": False,
+    }
+    server._sessions["authenticated-pdf"] = session
+    try:
+        payload = base64.b64encode(b"%PDF-1.4\nfile").decode("ascii")
+        response = server.handle_request({
+            "id": "1",
+            "method": "pdf.attach",
+            "params": {
+                "session_id": "authenticated-pdf",
+                "content_base64": payload,
+                "filename": "report.pdf",
+                "last_page": 1,
+            },
+        })
+
+        result = response["result"]
+        assert result["path"] == "uploads/report.pdf"
+        page = Path(result["pages"][0]["path"])
+        assert page.is_relative_to(
+            authenticated_runtime.get(RootKind.TEMPORARY).canonical_path
+        )
+        assert page.exists()
+        assert not (selected / "uploads" / page.name).exists()
+        assert session["_attachment_temp_roots"]
+    finally:
+        for relative in session.get("_attachment_temp_roots", []):
+            server._cleanup_authenticated_temporary(relative)
+        server._sessions.pop("authenticated-pdf", None)
+
+
 def test_authenticated_runtime_missing_capability_fails_closed():
     runtime = server.OwnerWorkerGatewayRuntime(
         owner_key="owner-a",
@@ -188,7 +313,6 @@ def test_owner_config_save_uses_runtime_home_not_import_home(monkeypatch, tmp_pa
     owner, _root, _default = _owner_env(monkeypatch, tmp_path)
     import_home = tmp_path / "import-home"
     import_home.mkdir()
-    monkeypatch.setattr(server, "_hermes_home", import_home)
     monkeypatch.setattr(server, "_cfg_cache", None)
     monkeypatch.setattr(server, "_cfg_mtime", None)
     monkeypatch.setattr(server, "_cfg_path", None)

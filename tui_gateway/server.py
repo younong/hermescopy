@@ -10473,6 +10473,8 @@ def _run_prompt_submit(
                 {"text": raw, "usage": _get_usage(agent), "status": "error"},
             )
         finally:
+            for temporary_root in session.pop("_attachment_temp_roots", []):
+                _cleanup_authenticated_temporary(temporary_root)
             try:
                 if approval_token is not None:
                     reset_current_session_key(approval_token)
@@ -10594,30 +10596,58 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5027, f"clipboard unavailable: {e}")
 
     session["image_counter"] = session.get("image_counter", 0) + 1
-    img_dir = _gateway_home() / "images"
-    img_dir.mkdir(parents=True, exist_ok=True)
-    img_path = (
-        img_dir
-        / f"clip_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{session['image_counter']}.png"
+    filename = (
+        f"clip_{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
+        f"{session['image_counter']}.png"
     )
+    temporary = _authenticated_temporary_directory()
+    temporary_relative = temporary[1] if temporary is not None else None
+    if temporary is None:
+        img_dir = _gateway_home() / "images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        clipboard_path = img_dir / filename
+    else:
+        from hermes_cli.controlled_roots import RootKind
 
-    # Save-first: mirrors CLI keybinding path; more robust than has_image() precheck
-    if not save_clipboard_image(img_path):
-        session["image_counter"] = max(0, session["image_counter"] - 1)
-        msg = (
-            "Clipboard has image but extraction failed"
-            if has_clipboard_image()
-            else "No image found in clipboard"
+        clipboard_path = temporary[0] / filename
+        context = _authenticated_workspace_context()
+        context.roots.replace_bytes(
+            RootKind.TEMPORARY,
+            f"{temporary_relative}/{filename}",
+            b"",
+            overwrite=False,
         )
-        return _ok(rid, {"attached": False, "message": msg})
+
+    try:
+        # Save-first: mirrors CLI keybinding path; more robust than has_image() precheck
+        if not save_clipboard_image(clipboard_path):
+            session["image_counter"] = max(0, session["image_counter"] - 1)
+            msg = (
+                "Clipboard has image but extraction failed"
+                if has_clipboard_image()
+                else "No image found in clipboard"
+            )
+            return _ok(rid, {"attached": False, "message": msg})
+        if temporary is None:
+            img_path = clipboard_path
+        else:
+            img_path = _publish_authenticated_upload(
+                filename,
+                clipboard_path.read_bytes(),
+            )
+            if img_path is None:
+                raise RuntimeError("authenticated upload publication failed")
+    finally:
+        _cleanup_authenticated_temporary(temporary_relative)
 
     session.setdefault("attached_images", []).append(str(img_path))
     _queue_attachment_metadata(session, _image_attachment_metadata(img_path))
+    visible_path = _authenticated_visible_path(img_path)
     return _ok(
         rid,
         {
             "attached": True,
-            "path": str(img_path),
+            "path": visible_path or str(img_path),
             "count": len(session["attached_images"]),
             **_image_meta(img_path),
         },
@@ -10651,13 +10681,18 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 4016, f"image not found: {path_token}")
         if image_path.suffix.lower() not in _IMAGE_EXTENSIONS:
             return _err(rid, 4016, f"unsupported image: {image_path.name}")
+        try:
+            image_path = _authenticated_diagnostic_path(image_path)
+        except ValueError:
+            return _err(rid, 4016, "authenticated image path is outside the workspace")
         session.setdefault("attached_images", []).append(str(image_path))
         _queue_attachment_metadata(session, _image_attachment_metadata(image_path))
+        visible_path = _authenticated_visible_path(image_path)
         return _ok(
             rid,
             {
                 "attached": True,
-                "path": str(image_path),
+                "path": visible_path or str(image_path),
                 "count": len(session["attached_images"]),
                 "remainder": remainder,
                 "text": remainder or f"[User attached image: {image_path.name}]",
@@ -10736,20 +10771,114 @@ def _allowed_image_extensions() -> frozenset[str]:
         return frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"})
 
 
-def _queue_attached_image(session: dict, img_bytes: bytes, ext: str, *, prefix: str) -> Path:
-    """Write image bytes into the gateway's images dir and queue them.
+def _authenticated_workspace_context():
+    runtime = current_owner_worker_gateway_runtime()
+    return runtime.filesystem_context if runtime is not None else None
 
-    Mirrors what ``image.attach`` does for a local path: appends to
-    ``session["attached_images"]`` so the next ``prompt.submit`` picks it up via
-    the existing native-image-attach pipeline. Returns the written path.
-    """
-    session["image_counter"] = session.get("image_counter", 0) + 1
-    img_dir = _gateway_home() / "images"
-    img_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    img_path = img_dir / f"{prefix}_{ts}_{session['image_counter']}{ext}"
+
+def _publish_authenticated_upload(filename: str, data: bytes) -> Path | None:
+    context = _authenticated_workspace_context()
+    if context is None:
+        return None
+    from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
+    from hermes_cli.owner_worker.user_files import publish_unique_user_bytes
+
+    if not isinstance(context, AuthenticatedWorkspaceContext):
+        raise RuntimeError("authenticated owner worker lacks filesystem capability")
+    return publish_unique_user_bytes(
+        context,
+        "upload",
+        filename,
+        data,
+    ).diagnostic_path
+
+
+def _authenticated_visible_path(path: Path) -> str | None:
+    context = _authenticated_workspace_context()
+    if context is None:
+        return None
     try:
-        img_path.write_bytes(img_bytes)
+        controlled = context.controlled_api_path(str(path))
+        return context.visible_workspace_path(controlled)
+    except (AttributeError, ValueError):
+        raise ValueError("authenticated attachment path is outside the workspace") from None
+
+
+def _authenticated_diagnostic_path(path: Path) -> Path:
+    context = _authenticated_workspace_context()
+    if context is None:
+        return path
+    try:
+        return context.diagnostic_path(context.controlled_api_path(str(path)))
+    except (AttributeError, ValueError):
+        raise ValueError("authenticated attachment path is outside the workspace") from None
+
+
+def _authenticated_temporary_directory() -> tuple[Path, str] | None:
+    context = _authenticated_workspace_context()
+    if context is None:
+        return None
+    from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
+    from hermes_cli.controlled_roots import RootKind
+
+    if not isinstance(context, AuthenticatedWorkspaceContext):
+        raise RuntimeError("authenticated owner worker lacks filesystem capability")
+    relative = f"attachments/{uuid.uuid4().hex}"
+    context.roots.mkdirs(RootKind.TEMPORARY, relative)
+    return context.roots.get(RootKind.TEMPORARY).canonical_path / relative, relative
+
+
+def _cleanup_authenticated_temporary(relative: str | None) -> None:
+    if relative is None:
+        return
+    context = _authenticated_workspace_context()
+    if context is None:
+        return
+    from hermes_cli.controlled_roots import RootKind
+
+    try:
+        context.roots.remove_tree_for_cleanup(RootKind.TEMPORARY, relative)
+    except Exception:
+        logger.warning("authenticated attachment cleanup failed", exc_info=True)
+
+
+@contextlib.contextmanager
+def _attachment_conversion_directory(session: dict):
+    import tempfile
+
+    temporary = _authenticated_temporary_directory()
+    if temporary is None:
+        with tempfile.TemporaryDirectory(prefix="pdf_attach_") as directory:
+            yield Path(directory), lambda: None
+        return
+
+    directory, relative = temporary
+    retained = False
+
+    def retain() -> None:
+        nonlocal retained
+        retained = True
+        session.setdefault("_attachment_temp_roots", []).append(relative)
+
+    try:
+        yield directory, retain
+    finally:
+        if not retained:
+            _cleanup_authenticated_temporary(relative)
+
+
+def _queue_attached_image(session: dict, img_bytes: bytes, ext: str, *, prefix: str) -> Path:
+    """Publish image bytes and queue the verified path for the next turn."""
+    session["image_counter"] = session.get("image_counter", 0) + 1
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{prefix}_{ts}_{session['image_counter']}{ext}"
+    try:
+        img_path = _publish_authenticated_upload(filename, img_bytes)
+        if img_path is None:
+            img_dir = _gateway_home() / "images"
+            img_dir.mkdir(parents=True, exist_ok=True)
+            img_path = img_dir / filename
+            img_path.write_bytes(img_bytes)
     except Exception:
         session["image_counter"] = max(0, session["image_counter"] - 1)
         raise
@@ -10807,12 +10936,13 @@ def _(rid, params: dict) -> dict:
         session,
         _image_attachment_metadata(img_path, name=filename or img_path.name),
     )
+    visible_path = _authenticated_visible_path(img_path)
 
     return _ok(
         rid,
         {
             "attached": True,
-            "path": str(img_path),
+            "path": visible_path or str(img_path),
             "count": len(session["attached_images"]),
             "remainder": "",
             "text": f"[User attached image: {img_path.name}]",
@@ -10836,7 +10966,6 @@ def _(rid, params: dict) -> dict:
     """
     import shutil
     import subprocess
-    import tempfile
 
     session, err = _sess(params, rid)
     if err:
@@ -10850,8 +10979,7 @@ def _(rid, params: dict) -> dict:
     if not raw_path and not raw_b64:
         return _err(rid, 4015, "path or content_base64 required")
 
-    with tempfile.TemporaryDirectory(prefix="pdf_attach_") as td:
-        td_path = Path(td)
+    with _attachment_conversion_directory(session) as (td_path, retain_temporary):
         if raw_b64:
             pdf_bytes = _decode_attach_base64(raw_b64, mime_prefix="application/pdf")
             if pdf_bytes is None:
@@ -10937,14 +11065,26 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 5028, "pdftoppm produced no pages (corrupt PDF?)")
 
         attached_pages = []
+        authenticated = _authenticated_workspace_context() is not None
         for src in rendered:
             page_num = src.stem.split("-", 1)[-1]
             try:
                 page_int = int(page_num)
             except ValueError:
                 page_int = first_page + len(attached_pages)
-            dst = _queue_attached_image(session, src.read_bytes(), ".png", prefix=f"pdf_p{page_num}")
+            if authenticated:
+                dst = src
+                session.setdefault("attached_images", []).append(str(dst))
+            else:
+                dst = _queue_attached_image(
+                    session,
+                    src.read_bytes(),
+                    ".png",
+                    prefix=f"pdf_p{page_num}",
+                )
             attached_pages.append({"path": str(dst), "page": page_int, **_image_meta(dst)})
+        if authenticated:
+            retain_temporary()
 
         _queue_attachment_metadata(
             session,
@@ -10958,12 +11098,13 @@ def _(rid, params: dict) -> dict:
                 "source_paths": [page["path"] for page in attached_pages],
             },
         )
+        visible_pdf_path = _authenticated_visible_path(pdf_path)
         return _ok(
             rid,
             {
                 "attached": True,
                 "filename": display_name,
-                "path": str(pdf_path),
+                "path": visible_pdf_path or str(pdf_path),
                 "pages_attached": len(attached_pages),
                 "pages": attached_pages,
                 "count": len(session["attached_images"]),
@@ -10999,6 +11140,9 @@ def _format_ref_value(value: str) -> str:
 
 def _attachment_ref_path(session: dict, target: Path) -> str:
     """Workspace-relative path for an attachment, or the absolute path if outside."""
+    authenticated = _authenticated_visible_path(target)
+    if authenticated is not None:
+        return authenticated
     workspace = Path(_session_cwd(session)).resolve()
     try:
         rel = target.resolve().relative_to(workspace)
@@ -11102,13 +11246,26 @@ def _stage_session_file_attachment(
             resolved.relative_to(workspace)
             return resolved, False
         except ValueError:
-            payload = resolved.read_bytes()
-            filename = resolved.name
+            if _authenticated_workspace_context() is not None:
+                if not data_url:
+                    raise ValueError("authenticated uploads require file bytes")
+                payload = _decode_attachment_data_url(data_url)
+                filename = _sanitize_attachment_name(name or resolved.name)
+            else:
+                payload = resolved.read_bytes()
+                filename = resolved.name
     else:
         if not data_url:
             raise ValueError("file not found on gateway and no data_url provided")
         payload = _decode_attachment_data_url(data_url)
         filename = _sanitize_attachment_name(name or Path(str(raw_path or "")).name)
+
+    authenticated = _publish_authenticated_upload(
+        _sanitize_attachment_name(filename),
+        payload,
+    )
+    if authenticated is not None:
+        return authenticated, True
 
     upload_dir = _desktop_attachment_dir(session)
     target = _unique_attachment_path(upload_dir, _sanitize_attachment_name(filename))
@@ -11333,7 +11490,7 @@ def _(rid, params: dict) -> dict:
             {
                 "attached": True,
                 "name": stored_path.name,
-                "path": str(stored_path),
+                "path": ref_path if _authenticated_workspace_context() is not None else str(stored_path),
                 "ref_path": ref_path,
                 "ref_text": ref_text,
                 "uploaded": uploaded,
@@ -11386,6 +11543,14 @@ def _(rid, params: dict) -> dict:
         drop_path = dropped["path"]
         remainder = dropped["remainder"]
         if dropped["is_image"]:
+            try:
+                drop_path = _authenticated_diagnostic_path(drop_path)
+            except ValueError:
+                return _err(
+                    rid,
+                    4016,
+                    "authenticated image path is outside the workspace",
+                )
             session.setdefault("attached_images", []).append(str(drop_path))
             _queue_attachment_metadata(session, _image_attachment_metadata(drop_path))
             text = remainder or f"[User attached image: {drop_path.name}]"

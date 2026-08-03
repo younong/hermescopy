@@ -2213,6 +2213,7 @@ def test_supervisor_real_worker_shutdown_reclaims_only_generation_runtime(tmp_pa
 
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="owner worker requires Linux")
 def test_worker_health_over_unix_socket_reports_owner_env(tmp_path, monkeypatch):
     # macOS AF_UNIX paths are capped at 104 bytes. pytest's default temporary
     # root can exceed that before the owner runtime suffix is appended, so keep
@@ -2950,12 +2951,50 @@ def test_worker_managed_files_are_descriptor_scoped_to_its_owner(tmp_path, monke
         json={"path": "project/note.txt", "data_url": "data:text/plain;base64,b3duZXItYQ=="},
     )
     assert created.status_code == 200
-    assert (owner_a / "workspaces" / "project" / "note.txt").read_text() == "owner-a"
+    assert (default_workspace / "project" / "note.txt").read_text() == "owner-a"
+    assert not (owner_a / "workspaces" / "project" / "note.txt").exists()
     assert not (owner_b / "workspaces" / "project" / "note.txt").exists()
+
+    root_upload = client.post(
+        "/api/files/upload",
+        headers=request("/api/files/upload"),
+        json={"path": "root.txt", "data_url": "data:text/plain;base64,cm9vdA=="},
+    )
+    assert root_upload.status_code == 200
+    assert (default_workspace / "root.txt").read_text() == "root"
+
+    created_directory = client.post(
+        "/api/files/mkdir",
+        headers=request("/api/files/mkdir"),
+        json={"path": "created"},
+    )
+    assert created_directory.status_code == 200
+    assert created_directory.json()["entry"]["path"] == "created"
+    assert (default_workspace / "created").is_dir()
 
     listed = client.get("/api/files", headers=request("/api/files"))
     assert listed.status_code == 200
+    assert listed.json()["path"] == ""
+    assert listed.json()["parent"] is None
     assert "project" in [entry["path"] for entry in listed.json()["entries"]]
+    assert "default" not in [entry["path"] for entry in listed.json()["entries"]]
+
+    read = client.get(
+        "/api/files/read",
+        headers=request("/api/files/read"),
+        params={"path": "project/note.txt"},
+    )
+    assert read.status_code == 200
+    assert read.json()["path"] == "project/note.txt"
+
+    deleted = client.request(
+        "DELETE",
+        "/api/files",
+        headers=request("/api/files"),
+        json={"path": "root.txt", "recursive": False},
+    )
+    assert deleted.status_code == 200
+    assert not (default_workspace / "root.txt").exists()
 
     leaked = client.get(
         "/api/files/read",
@@ -2977,7 +3016,7 @@ def test_worker_managed_files_are_descriptor_scoped_to_its_owner(tmp_path, monke
         headers=request("/api/files/download"),
         params={
             "path": "note.txt",
-            "cwd": str(owner_a / "workspaces" / "project"),
+            "cwd": str(default_workspace / "project"),
             "filename": "owner note.txt",
         },
     )
@@ -3028,7 +3067,7 @@ def test_worker_managed_files_are_descriptor_scoped_to_its_owner(tmp_path, monke
 
     for rejected_path, rejected_cwd in (
         (str(owner_b / "workspaces" / "secret.txt"), None),
-        ("../secret.txt", str(owner_a / "workspaces" / "project")),
+        ("../secret.txt", str(default_workspace / "project")),
         ("secret.txt", str(owner_b / "workspaces")),
         ("/workspace", None),
         ("/workspace2/report.html", None),
@@ -3082,6 +3121,10 @@ def test_worker_image_preview_is_descriptor_scoped_to_owner_images(tmp_path, mon
     def request(path: str) -> dict[str, str]:
         return {"Authorization": f"Bearer {_capability_for(app, path, control_home=control_home)}"}
 
+    migrated_image = owner_a / "workspaces" / "default" / "generated" / "images" / "upload.png"
+    assert migrated_image.read_bytes() == b"pngbytes"
+    assert not image.exists()
+
     preview = client.get(
         "/api/fs/read-data-url",
         headers=request("/api/fs/read-data-url"),
@@ -3098,7 +3141,7 @@ def test_worker_image_preview_is_descriptor_scoped_to_owner_images(tmp_path, mon
             headers=request("/api/fs/read-data-url"),
             params={"path": str(rejected_path)},
         )
-        assert response.status_code == 400
+        assert response.status_code in {400, 404}
         assert "pngbytes" not in response.text
         assert "secret" not in response.text
         assert "owner-b" not in response.text
