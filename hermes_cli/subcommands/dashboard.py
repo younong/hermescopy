@@ -22,29 +22,11 @@ def _add_server_runtime_args(parser) -> None:
         "--host", default="127.0.0.1", help="Host (default 127.0.0.1)"
     )
     parser.add_argument(
-        "--insecure",
-        action="store_true",
-        help=(
-            "DEPRECATED / NO-OP. Formerly bypassed auth on a non-loopback "
-            "bind. As of the June 2026 hardening it no longer disables "
-            "authentication — a public bind always requires an auth provider "
-            "(password or OAuth). Bind 127.0.0.1 + tunnel to keep it local."
-        ),
-    )
-    parser.add_argument(
-        "--require-auth",
-        action="store_true",
-        help=(
-            "Require cookie-based dashboard authentication on a loopback bind. "
-            "Use for multi-user access through an SSH tunnel or trusted proxy."
-        ),
-    )
-    parser.add_argument(
         "--trust-proxy-headers",
         action="store_true",
         help=(
             "Trust forwarded request metadata from a loopback reverse proxy. "
-            "Requires --require-auth, a loopback bind, and dashboard.public_url."
+            "Requires a loopback bind and dashboard.public_url."
         ),
     )
     parser.add_argument(

@@ -6,10 +6,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 SMOKE = ROOT / "deploy" / "smoke-conversation.py"
 EXPECTED_CHECKS = {
-    "gateway_ready",
+    "authenticated_web_ready",
+    "ws_ticket",
     "session_create",
     "config_propagation",
     "file_attachment",
@@ -34,7 +37,11 @@ def _load_smoke_module():
     return module
 
 
-def test_deterministic_conversation_smoke_exercises_core_gateway_flow():
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="the production Owner Worker launcher requires Linux pidfds",
+)
+def test_deterministic_conversation_smoke_exercises_authenticated_web_flow():
     completed = subprocess.run(
         [sys.executable, str(SMOKE), "--timeout", "90"],
         cwd=ROOT,
