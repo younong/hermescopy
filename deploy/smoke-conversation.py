@@ -5,10 +5,10 @@ from __future__ import annotations
 
 import argparse
 import base64
-import itertools
 import json
 import os
 import queue
+import secrets
 import shutil
 import signal
 import subprocess
@@ -19,6 +19,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -195,21 +196,38 @@ class ModelStub:
         return self._text_chunks(["smoke ", "ok"])
 
 
-class GatewayProcess:
-    _sequence = itertools.count(1)
+class DashboardGateway:
+    def __init__(
+        self,
+        repo_root: Path,
+        env: dict[str, str],
+        *,
+        username: str,
+        password: str,
+    ):
+        import httpx
+        from websockets.sync.client import connect
 
-    def __init__(self, repo_root: Path, env: dict[str, str]):
-        self.messages: queue.Queue[dict[str, Any]] = queue.Queue()
         self.stderr: list[str] = []
         self.pending: list[dict[str, Any]] = []
         self.next_id = 1
-        launch_env = env.copy()
-        launch_env["HERMES_SMOKE_RUN_ID"] = f"{os.getpid()}-{next(self._sequence)}"
+        self._messages: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._closed = False
         self.process = subprocess.Popen(
-            [sys.executable, "-m", "tui_gateway.entry"],
+            [
+                sys.executable,
+                "-m",
+                "hermes_cli.main",
+                "dashboard",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "0",
+                "--no-open",
+                "--skip-build",
+            ],
             cwd=repo_root,
-            env=launch_env,
-            stdin=subprocess.PIPE,
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -217,20 +235,62 @@ class GatewayProcess:
             start_new_session=(os.name == "posix"),
         )
         assert self.process.stdout is not None and self.process.stderr is not None
-        self.stdout_thread = threading.Thread(target=self._read_stdout, daemon=True)
+        ready: queue.Queue[int] = queue.Queue(maxsize=1)
+
+        def read_stdout() -> None:
+            assert self.process.stdout is not None
+            for raw in self.process.stdout:
+                if raw.startswith("HERMES_DASHBOARD_READY port="):
+                    try:
+                        ready.put_nowait(int(raw.rsplit("=", 1)[1]))
+                    except (ValueError, queue.Full):
+                        pass
+
+        self.stdout_thread = threading.Thread(target=read_stdout, daemon=True)
         self.stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
         self.stdout_thread.start()
         self.stderr_thread.start()
-
-    def _read_stdout(self) -> None:
-        assert self.process.stdout is not None
-        for raw in self.process.stdout:
+        deadline = time.monotonic() + STEP_TIMEOUT
+        while True:
             try:
-                value = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict):
-                self.messages.put(value)
+                port = ready.get(timeout=min(0.2, max(0.0, deadline - time.monotonic())))
+                break
+            except queue.Empty as exc:
+                if self.process.poll() is not None or time.monotonic() >= deadline:
+                    detail = " | ".join(self.stderr[-5:]) if self.stderr else "no dashboard error output"
+                    self.close()
+                    raise SmokeFailure(
+                        "dashboard_start_failed",
+                        "authenticated_web_ready",
+                        f"Dashboard did not become ready: {detail}",
+                    ) from exc
+
+        self.client = httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=15.0)
+        login = self.client.post(
+            "/auth/password-login",
+            json={"provider": "basic", "username": username, "password": password},
+        )
+        if login.status_code != 200:
+            self.close()
+            raise SmokeFailure("login_failed", "authenticated_web_ready", f"Dashboard login returned HTTP {login.status_code}")
+        ticket_response = self.client.post(
+            "/api/auth/ws-ticket",
+            json={"audience": "browser-ws:/api/ws"},
+        )
+        if ticket_response.status_code != 200:
+            self.close()
+            raise SmokeFailure("ticket_failed", "ws_ticket", f"Ticket mint returned HTTP {ticket_response.status_code}")
+        ticket = str(ticket_response.json().get("ticket") or "")
+        if not ticket:
+            self.close()
+            raise SmokeFailure("ticket_missing", "ws_ticket", "Ticket response was empty")
+        self.websocket = connect(
+            f"ws://127.0.0.1:{port}/api/ws?ticket={quote(ticket, safe='')}",
+            open_timeout=15,
+            close_timeout=3,
+        )
+        self.reader_thread = threading.Thread(target=self._read_messages, daemon=True)
+        self.reader_thread.start()
 
     def _read_stderr(self) -> None:
         assert self.process.stderr is not None
@@ -240,11 +300,23 @@ class GatewayProcess:
             if len(self.stderr) > 80:
                 del self.stderr[0]
 
+    def _read_messages(self) -> None:
+        try:
+            for raw in self.websocket:
+                try:
+                    value = json.loads(raw)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if isinstance(value, dict):
+                    self._messages.put(value)
+        except Exception:
+            return
+
     def _next(self, deadline: float) -> dict[str, Any]:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise queue.Empty
-        return self.messages.get(timeout=remaining)
+        return self._messages.get(timeout=remaining)
 
     def wait_event(
         self,
@@ -264,31 +336,19 @@ class GatewayProcess:
                 ):
                     return self.pending.pop(index)
             try:
-                message = self._next(deadline)
+                self.pending.append(self._next(deadline))
             except queue.Empty as exc:
-                detail = " | ".join(self.stderr[-5:]) if self.stderr else "no gateway error output"
-                buffered: list[str] = []
-                for item in self.pending[-12:]:
-                    params = item.get("params") or {}
-                    label = str(params.get("type") or item.get("id") or "unknown")
-                    if label == "error":
-                        label = f"error:{_bounded(_event_payload(item).get('message'), 240)}"
-                    buffered.append(label)
+                detail = " | ".join(self.stderr[-5:]) if self.stderr else "no dashboard error output"
                 raise SmokeFailure(
                     "event_timeout",
                     event_type,
-                    f"Timed out waiting for {event_type}: {detail}; buffered={buffered}",
+                    f"Timed out waiting for {event_type}: {detail}",
                 ) from exc
-            self.pending.append(message)
 
     def request(self, method: str, params: dict[str, Any], timeout: float = STEP_TIMEOUT) -> dict[str, Any]:
         request_id = f"smoke-{self.next_id}"
         self.next_id += 1
-        payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
-        if self.process.poll() is not None or self.process.stdin is None:
-            raise SmokeFailure("gateway_exited", method, f"Gateway exited before {method}")
-        self.process.stdin.write(json.dumps(payload) + "\n")
-        self.process.stdin.flush()
+        self.websocket.send(json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}))
         deadline = time.monotonic() + timeout
         while True:
             for index, message in enumerate(self.pending):
@@ -314,35 +374,42 @@ class GatewayProcess:
             return result
 
     def close(self) -> None:
-        if self.process.poll() is None:
-            if self.process.stdin is not None:
-                try:
-                    self.process.stdin.close()
-                except OSError:
-                    pass
+        if self._closed:
+            return
+        self._closed = True
+        websocket = getattr(self, "websocket", None)
+        if websocket is not None:
             try:
-                self.process.wait(timeout=4)
+                websocket.close()
+            except Exception:
+                pass
+        client = getattr(self, "client", None)
+        if client is not None:
+            client.close()
+        process = getattr(self, "process", None)
+        if process is not None and process.poll() is None:
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            else:
+                process.terminate()
+            try:
+                process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 if os.name == "posix":
                     try:
-                        os.killpg(self.process.pid, signal.SIGTERM)
+                        os.killpg(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
                 else:
-                    self.process.terminate()
-                try:
-                    self.process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    if os.name == "posix":
-                        try:
-                            os.killpg(self.process.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                    else:
-                        self.process.kill()
-                    self.process.wait(timeout=3)
-        self.stdout_thread.join(timeout=2)
-        self.stderr_thread.join(timeout=2)
+                    process.kill()
+                process.wait(timeout=3)
+        for thread_name in ("reader_thread", "stdout_thread", "stderr_thread"):
+            thread = getattr(self, thread_name, None)
+            if thread is not None:
+                thread.join(timeout=2)
 
 
 def _event_payload(event: dict[str, Any]) -> dict[str, Any]:
@@ -361,7 +428,7 @@ def _record(checks: list[dict[str, Any]], name: str, started: float, **details: 
     checks.append(item)
 
 
-def _wait_complete(gateway: GatewayProcess, sid: str) -> tuple[list[str], dict[str, Any]]:
+def _wait_complete(gateway: DashboardGateway, sid: str) -> tuple[list[str], dict[str, Any]]:
     deltas: list[str] = []
     deadline = time.monotonic() + STEP_TIMEOUT
     while True:
@@ -393,7 +460,7 @@ def _wait_complete(gateway: GatewayProcess, sid: str) -> tuple[list[str], dict[s
             continue
 
 
-def _write_config(home: Path, base_url: str) -> None:
+def _write_config(home: Path, base_url: str, *, username: str, password: str) -> None:
     home.mkdir(parents=True, exist_ok=True)
     (home / "config.yaml").write_text(
         "model:\n"
@@ -410,7 +477,11 @@ def _write_config(home: Path, base_url: str) -> None:
         "display:\n"
         "  tool_progress: full\n"
         "approvals:\n"
-        "  mode: ask\n",
+        "  mode: ask\n"
+        "dashboard:\n"
+        "  basic_auth:\n"
+        f"    username: {username}\n"
+        f"    password: {password}\n",
         encoding="utf-8",
     )
 
@@ -472,7 +543,7 @@ socket.socket.connect_ex = _guarded_connect_ex
 
 
 
-def _gateway_env(home: Path, workspace: Path, network_guard: Path) -> dict[str, str]:
+def _dashboard_env(home: Path, workspace: Path, network_guard: Path) -> dict[str, str]:
     env = os.environ.copy()
     for key in list(env):
         if (
@@ -515,22 +586,30 @@ def run_smoke(repo_root: Path, timeout: float) -> tuple[dict[str, Any], int]:
     sentinel = protected / "sentinel.txt"
     sentinel.write_text("must-survive", encoding="utf-8")
     model = ModelStub(workspace)
-    gateway: GatewayProcess | None = None
+    gateway: DashboardGateway | None = None
     stored_id = ""
     failure: SmokeFailure | None = None
+    username = f"smoke-{secrets.token_hex(8)}"
+    password = secrets.token_urlsafe(24)
 
     try:
         model.start()
-        _write_config(home, model.base_url)
+        _write_config(home, model.base_url, username=username, password=password)
         _seed_offline_caches(home)
         network_guard = _write_network_guard(temporary)
-        env = _gateway_env(home, workspace, network_guard)
+        env = _dashboard_env(home, workspace, network_guard)
         deadline = time.monotonic() + timeout
 
         stage = time.monotonic()
-        gateway = GatewayProcess(repo_root, env)
+        gateway = DashboardGateway(
+            repo_root,
+            env,
+            username=username,
+            password=password,
+        )
         gateway.wait_event("gateway.ready", timeout=min(STEP_TIMEOUT, deadline - time.monotonic()))
-        _record(checks, "gateway_ready", stage)
+        _record(checks, "authenticated_web_ready", stage)
+        _record(checks, "ws_ticket", stage)
 
         stage = time.monotonic()
         created = gateway.request("session.create", {"cols": 96, "cwd": str(workspace)})
@@ -608,7 +687,12 @@ def run_smoke(repo_root: Path, timeout: float) -> tuple[dict[str, Any], int]:
         stage = time.monotonic()
         gateway.request("session.close", {"session_id": sid})
         gateway.close()
-        gateway = GatewayProcess(repo_root, env)
+        gateway = DashboardGateway(
+            repo_root,
+            env,
+            username=username,
+            password=password,
+        )
         gateway.wait_event("gateway.ready")
         resumed = gateway.request("session.resume", {"session_id": stored_id, "cols": 96})
         resumed_sid = str(resumed.get("session_id") or "")

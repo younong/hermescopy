@@ -25,7 +25,7 @@ const TAG_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const COMMIT_SHA_RE = /^[0-9a-f]{40}$/;
 const DEFAULT_KEEP_RELEASES = 5;
 const DEFAULT_DASHBOARD_PUBLIC_URL = "https://abinllm.xyz/hermes";
-const DEPLOY_NPM_WORKSPACES = ["web", "ui-tui"];
+const DEPLOY_NPM_WORKSPACES = ["web"];
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
@@ -512,12 +512,9 @@ export function createReleaseArchive(buildDir, archivePath, { dryRun = false } =
       "--exclude=*/._*",
       "--exclude=./node_modules",
       "--exclude=./web/node_modules",
-      "--exclude=./ui-tui/node_modules",
-      "--exclude=./apps/*/node_modules",
       "--exclude=./deploy/powerpoint-runtime/runtime-modules/.package-lock.json",
       "--exclude=./tests",
       "--exclude=./website",
-      "--exclude=./apps",
       "--exclude=./.github",
       "--exclude=./docs",
       "-C",
@@ -568,7 +565,6 @@ export function createArchive(args, { dryRun }) {
 
 function buildArtifact(buildDir, { dryRun }) {
   const webOutDir = path.join(buildDir, "hermes_cli/web_dist");
-  const tuiOutFile = path.join(buildDir, "ui-tui/dist/entry.js");
   const npmRegistry = process.env.HERMES_DEPLOY_NPM_REGISTRY || DEFAULT_NPM_REGISTRY;
   run(
     "npm",
@@ -588,18 +584,12 @@ function buildArtifact(buildDir, { dryRun }) {
     cwd: buildDir,
     env: { HERMES_WEB_OUT_DIR: webOutDir },
   });
-  run("npm", ["run", "build", "--workspace", "ui-tui"], {
-    dryRun,
-    cwd: buildDir,
-    env: { HERMES_TUI_OUTFILE: tuiOutFile },
-  });
   run(
     "npm",
     ["ci", "--omit=dev", "--ignore-scripts", "--no-audit"],
     { dryRun, cwd: path.join(buildDir, "deploy/powerpoint-runtime") },
   );
   run("test", ["-f", path.join(buildDir, "hermes_cli/web_dist/index.html")], { dryRun, cwd: buildDir });
-  run("test", ["-f", path.join(buildDir, "ui-tui/dist/entry.js")], { dryRun, cwd: buildDir });
 }
 
 function sshBaseArgs(args) {
@@ -695,7 +685,6 @@ sandbox_dir="/etc/hermes"
 sandbox_policy="$sandbox_dir/executor-sandbox.json"
 sandbox_seccomp="$sandbox_dir/executor-x86_64.bpf"
 staged_runner="$tmp_dir/hermes-service-runner.$$.sh"
-staged_gateway_unit="$tmp_dir/hermes-gateway.$$.service"
 staged_dashboard_unit="$tmp_dir/hermes-dashboard.$$.service"
 staged_sandbox_policy="$tmp_dir/executor-sandbox.$$.json"
 staged_sandbox_seccomp="$tmp_dir/executor-x86_64.$$.bpf"
@@ -711,6 +700,8 @@ release_target=""
 rollback_dir=""
 deployment_committed="0"
 services_touched="0"
+legacy_gateway_was_enabled="0"
+legacy_gateway_was_active="0"
 smoke_root=""
 authority_smoke_root=""
 authority_smoke_result=""
@@ -725,6 +716,8 @@ legacy_nginx_log_format="/etc/nginx/conf.d/hermes-log-format.conf"
 
 backup_deployment_state() {
   rollback_dir="$(mktemp -d "$tmp_dir/hermes-rollback.XXXXXX")"
+  systemctl is-enabled --quiet hermes-gateway.service && legacy_gateway_was_enabled="1" || true
+  systemctl is-active --quiet hermes-gateway.service && legacy_gateway_was_active="1" || true
   for path in "$gateway_unit" "$dashboard_unit" "$runner" "$sandbox_policy" "$sandbox_seccomp" "$nginx_log_format" "$legacy_nginx_log_format"; do
     if [ -e "$path" ]; then
       cp -a -- "$path" "$rollback_dir/$(printf '%s' "$path" | sed 's#/#_#g')"
@@ -758,10 +751,12 @@ cleanup_release_tmp() {
     systemctl daemon-reload || true
     if [ "$services_touched" = "1" ] && [ -n "$old_current_target" ]; then
       systemctl stop hermes-dashboard.service hermes-gateway.service || true
-      runuser -u "$service_user" -- env -i \
-        HOME="$shared" HERMES_HOME="$hermes_home" PYTHONPATH="$old_current_target" \
-        "$venv/bin/python" -c 'from gateway.drain_control import clear_drain_request; clear_drain_request()' || true
-      systemctl start hermes-gateway.service || true
+      if [ "$legacy_gateway_was_enabled" = "1" ]; then
+        systemctl enable hermes-gateway.service || true
+      fi
+      if [ "$legacy_gateway_was_active" = "1" ]; then
+        systemctl start hermes-gateway.service || true
+      fi
       systemctl start hermes-dashboard.service || true
     fi
   fi
@@ -770,7 +765,7 @@ cleanup_release_tmp() {
   [ -z "$authority_smoke_root" ] || rm -rf -- "$authority_smoke_root"
   [ -z "$reader_smoke_root" ] || rm -rf -- "$reader_smoke_root"
   [ -z "$powerpoint_smoke_owner" ] || rm -rf -- "$powerpoint_smoke_owner"
-  rm -f -- "$staged_runner" "$staged_gateway_unit" "$staged_dashboard_unit" "$staged_sandbox_policy" "$staged_sandbox_seccomp" "$current.next.$$" "$current.rollback.$$"
+  rm -f -- "$staged_runner" "$staged_dashboard_unit" "$staged_sandbox_policy" "$staged_sandbox_seccomp" "$current.next.$$" "$current.rollback.$$"
   [ -z "$rollback_dir" ] || rm -rf -- "$rollback_dir"
   rm -f -- "$archive"
   rmdir -- "$release_lock" 2>/dev/null || true
@@ -928,7 +923,6 @@ else
     exit 1
   fi
   test -f "$release_tmp/hermes_cli/web_dist/index.html"
-  test -f "$release_tmp/ui-tui/dist/entry.js"
   chown -R root:root "$release_tmp"
   find "$release_tmp" -type d -exec chmod go-w {} +
   find "$release_tmp" -type f -exec chmod go-w {} +
@@ -941,7 +935,6 @@ export UV_NO_CONFIG=1
 export HERMES_HOME="$hermes_home"
 
 test -f "$release/hermes_cli/web_dist/index.html"
-test -f "$release/ui-tui/dist/entry.js"
 test -f "$release/deploy/powerpoint-runtime/package-lock.json"
 test -d "$release/deploy/powerpoint-runtime/runtime-modules/pptxgenjs"
 test -f "$release/deploy/runtime/alicloud3-powerpoint-packages.json"
@@ -1279,46 +1272,11 @@ exec "$venv/bin/python" -m hermes_cli.main "$@"
 RUNNER
 chmod 0755 "$staged_runner"
 
-cat > "$staged_gateway_unit" <<UNIT
-[Unit]
-Description=Hermes Gateway
-After=network-online.target
-Wants=network-online.target
-StartLimitIntervalSec=0
-
-[Service]
-Type=simple
-User=$service_user
-Group=$service_group
-Environment=HERMES_REMOTE_ROOT=$remote_root
-Environment=HERMES_HOME=$hermes_home
-Environment=HERMES_ENV_FILE=$env_file
-Environment=VIRTUAL_ENV=$venv
-Environment=MALLOC_ARENA_MAX=2
-Environment=HERMES_SANDBOX_DEPLOYMENT_POLICY=hermes_cli.owner_worker.host_sandbox:host_sandbox_deployment_policy
-Environment=HERMES_DISABLE_LAZY_INSTALLS=1
-WorkingDirectory=$current
-# Gateway does not execute authenticated tools. Resource governance is admitted
-# by Dashboard/Owner Worker and may fail closed without making Gateway unavailable.
-ExecStart=$runner gateway run --replace
-ExecReload=/bin/kill -USR1 \$MAINPID
-Restart=always
-RestartSec=5
-KillMode=mixed
-KillSignal=SIGTERM
-TimeoutStopSec=120
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
 cat > "$staged_dashboard_unit" <<UNIT
 [Unit]
 Description=Hermes Dashboard
-After=network-online.target hermes-gateway.service
-Wants=network-online.target hermes-gateway.service
+After=network-online.target
+Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
@@ -1335,7 +1293,7 @@ Environment=HERMES_SANDBOX_DEPLOYMENT_POLICY=hermes_cli.owner_worker.host_sandbo
 Environment=HERMES_DISABLE_LAZY_INSTALLS=1
 Environment=HERMES_OWNER_WORKER_DRAIN_TIMEOUT=$owner_worker_drain_timeout
 WorkingDirectory=$current
-ExecStart=$venv/bin/python -m hermes_cli.owner_worker.cgroup_bootstrap --managed-root $cgroup_root -- $runner dashboard --host 127.0.0.1 --port 9119 --no-open --skip-build --require-auth --trust-proxy-headers
+ExecStart=$venv/bin/python -m hermes_cli.owner_worker.cgroup_bootstrap --managed-root $cgroup_root -- $runner dashboard --host 127.0.0.1 --port 9119 --no-open --skip-build --trust-proxy-headers
 Restart=always
 RestartSec=5
 Delegate=cpu memory pids
@@ -1353,32 +1311,6 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 UNIT
-
-# Close Gateway turn admission through its established marker/status contract.
-# The marker writer and status reader run as the service user against the active
-# release and durable HERMES_HOME; no deployment secret or new control channel.
-runuser -u "$service_user" -- env -i \
-  HOME="$shared" HERMES_HOME="$hermes_home" PYTHONPATH="$old_current_target" \
-  "$venv/bin/python" -c \
-  'from gateway.drain_control import write_drain_request; write_drain_request(principal="release", suppress_notification=True)'
-gateway_drain_timeout="$(
-  runuser -u "$service_user" -- env -i \
-    HOME="$shared" HERMES_HOME="$hermes_home" PYTHONPATH="$old_current_target" \
-    "$venv/bin/python" -c \
-    'from hermes_cli.config import load_config; from gateway.restart import parse_restart_drain_timeout; cfg=load_config() or {}; raw=((cfg.get("agent") or {}).get("restart_drain_timeout")); print(parse_restart_drain_timeout(raw))'
-)"
-gateway_drain_deadline="$(( $(date +%s) + ${"${"}gateway_drain_timeout%.*} ))"
-while :; do
-  gateway_drain_status="$(
-    runuser -u "$service_user" -- env -i \
-      HOME="$shared" HERMES_HOME="$hermes_home" PYTHONPATH="$old_current_target" \
-      "$venv/bin/python" -c \
-      'from gateway.status import read_runtime_status; s=read_runtime_status() or {}; print("{}:{}".format(s.get("gateway_state", ""), s.get("active_agents", 0)))'
-  )"
-  [ "$gateway_drain_status" = "draining:0" ] && break
-  [ "$(date +%s)" -ge "$gateway_drain_deadline" ] && break
-  sleep 1
-done
 
 # Candidate-release authority preflight runs before any service or active
 # artifact changes. It is strictly read-only and refuses recovery-required or
@@ -1401,49 +1333,34 @@ if payload.get("state") not in {"healthy", "uninitialized"}:
 echo "HERMES_DEPLOY_STAGE authority_preflight=passed"
 
 # Stop the old release before changing any active artifact. Dashboard shutdown
-# drains its Owner Workers; Gateway SIGTERM reuses its resume/flush shutdown.
+# drains and revokes its Owner Workers. A legacy standalone Gateway is retired
+# only when present; it is never installed or started by the candidate release.
 services_touched="1"
 systemctl stop hermes-dashboard.service
-systemctl stop hermes-gateway.service
+if systemctl list-unit-files hermes-gateway.service --no-legend 2>/dev/null | grep -q '^hermes-gateway.service'; then
+  systemctl stop hermes-gateway.service || true
+  systemctl disable hermes-gateway.service || true
+fi
 if systemctl is-active --quiet hermes-dashboard.service || systemctl is-active --quiet hermes-gateway.service; then
   echo "Old services did not stop before release switch" >&2
   exit 1
 fi
-if ! runuser -u "$service_user" -- env -i \
-  HOME="$shared" HERMES_HOME="$hermes_home" PYTHONPATH="$old_current_target" \
-  "$venv/bin/python" -c \
-  'from gateway.status import get_running_pid, is_gateway_runtime_lock_active; raise SystemExit(1 if is_gateway_runtime_lock_active() or get_running_pid() else 0)'; then
-  echo "Old Gateway runtime lock or PID remained after service stop" >&2
-  exit 1
-fi
+rm -f -- "$gateway_unit"
 install -o root -g root -m 0755 "$staged_runner" "$runner"
-install -o root -g root -m 0644 "$staged_gateway_unit" "$gateway_unit"
 install -o root -g root -m 0644 "$staged_dashboard_unit" "$dashboard_unit"
 install -o root -g root -m 0644 "$staged_sandbox_policy" "$sandbox_policy"
 install -o root -g root -m 0444 "$staged_sandbox_seccomp" "$sandbox_seccomp"
 next_current="$current.next.$$"
 ln -sT "$release" "$next_current"
 mv -Tf "$next_current" "$current"
-runuser -u "$service_user" -- env -i \
-  HOME="$shared" HERMES_HOME="$hermes_home" PYTHONPATH="$release" \
-  "$venv/bin/python" -c 'from gateway.drain_control import clear_drain_request; clear_drain_request()'
 systemctl daemon-reload
-systemctl enable hermes-gateway.service hermes-dashboard.service
-if ! systemctl start hermes-gateway.service || ! systemctl start hermes-dashboard.service || \
-   ! systemctl is-active --quiet hermes-gateway.service || \
+systemctl enable hermes-dashboard.service
+if ! systemctl start hermes-dashboard.service || \
    ! systemctl is-active --quiet hermes-dashboard.service; then
-  echo "New services failed; restoring previous deployment state" >&2
-  restore_deployment_state
-  deployment_committed="1"
-  systemctl daemon-reload
-  if [ -n "$old_current_target" ]; then
-    systemctl stop hermes-dashboard.service hermes-gateway.service || true
-    systemctl start hermes-gateway.service || true
-    systemctl start hermes-dashboard.service || true
-  fi
+  echo "New service failed; deployment remains uncommitted and will be rolled back" >&2
   exit 1
 fi
-systemctl --no-pager --full status hermes-gateway.service hermes-dashboard.service || true
+systemctl --no-pager --full status hermes-dashboard.service || true
 
 # systemd reports active as soon as the Dashboard process starts, before app
 # construction has initialized the managed cgroup hierarchy. Wait for Uvicorn's
@@ -1845,7 +1762,7 @@ function printSummary(args, result) {
   console.log(`Current symlink: ${remoteRoot}/current -> ${remoteRoot}/releases/${args.releaseId}`);
   console.log(`State dir: ${remoteRoot}/shared/.hermes`);
   console.log(`Env file: ${remoteRoot}/shared/.env`);
-  console.log(`Services: hermes-gateway.service, hermes-dashboard.service`);
+  console.log(`Service: hermes-dashboard.service`);
   console.log(`Dashboard: ${args.dashboardPublicUrl} (Hermes user login only)`);
   console.log(
     `Nginx: ${args.migrateNginxHermes ? "explicit legacy-block migration" : "managed snippet reconciliation"}`,
@@ -1886,7 +1803,7 @@ function printSummary(args, result) {
       ? `Release retention: keep newest ${args.keepReleases} releases plus protected current/deployed releases`
       : `Release retention: disabled (--no-prune-releases)`,
   );
-  console.log(`Status: ssh ${target} 'systemctl status --no-pager hermes-gateway hermes-dashboard'`);
+  console.log(`Status: ssh ${target} 'systemctl status --no-pager hermes-dashboard'`);
   console.log("Rollback example: npm run deploy -- --tag <previous-tag>");
 }
 
