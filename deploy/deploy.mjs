@@ -748,8 +748,8 @@ restore_deployment_state() {
 }
 
 snapshot_authority() {
-  authority_snapshot="$rollback_dir/authority.sqlite3"
-  install -o "$service_user" -g "$service_group" -m 0600 /dev/null "$authority_snapshot"
+  authority_snapshot="$rollback_dir/authority/authority.sqlite3"
+  install -d -o "$service_user" -g "$service_group" -m 0700 "$(dirname "$authority_snapshot")"
   runuser -u "$service_user" -- env -i \
     HOME="$shared" HERMES_HOME="$hermes_home" PYTHONPATH="$release" \
     "$venv/bin/python" - "$authority_snapshot" <<'PY'
@@ -777,7 +777,8 @@ with authority_lifecycle_lock(store.control_home, exclusive=True, blocking=True)
         source.close()
 os.chmod(destination, 0o600)
 PY
-  chown root:"$service_group" "$authority_snapshot"
+  chown -R root:"$service_group" "$(dirname "$authority_snapshot")"
+  chmod 0710 "$(dirname "$authority_snapshot")"
   chmod 0640 "$authority_snapshot"
 }
 
