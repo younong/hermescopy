@@ -765,7 +765,7 @@ store = AuthorityStore(control_plane_home())
 destination = Path(sys.argv[1])
 with authority_lifecycle_lock(store.control_home, exclusive=True, blocking=True):
     store._validate_path()
-    source = sqlite3.connect(f"file:{store.path.resolve().as_posix()}?mode=ro", uri=True, timeout=30)
+    source = sqlite3.connect(store.path, timeout=30)
     target = sqlite3.connect(destination, timeout=30)
     try:
         source.backup(target)
@@ -797,7 +797,7 @@ from hermes_cli.dashboard_auth.lifecycle import authority_lifecycle_lock
 source_path = Path(sys.argv[1])
 store = AuthorityStore(control_plane_home())
 with authority_lifecycle_lock(store.control_home, exclusive=True, blocking=True):
-    source = sqlite3.connect(f"file:{source_path.resolve().as_posix()}?mode=ro", uri=True, timeout=30)
+    source = sqlite3.connect(source_path, timeout=30)
     target = sqlite3.connect(store.path, timeout=30)
     try:
         source.backup(target)
