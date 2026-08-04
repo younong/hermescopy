@@ -7,7 +7,7 @@ import os
 import platform
 import stat
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping
 
@@ -30,6 +30,7 @@ from hermes_cli.owner_worker.tool_executor_sandbox import (
 )
 
 _DEFAULT_POLICY_PATH = Path("/etc/hermes/executor-sandbox.json")
+_ISOLATED_SMOKE_PARENT = Path("/tmp")
 _MAX_POLICY_BYTES = 64 << 10
 _DIGEST_RE = "sha256:"
 
@@ -353,6 +354,41 @@ def host_sandbox_deployment_policy(
 ) -> SandboxDeploymentPolicy:
     """Production factory requiring an operator-installed v2 resource policy."""
     policy = build_host_sandbox_deployment_policy(load_host_sandbox_config(policy_path))
+    if policy.resource_policy is None:
+        raise HostSandboxInvalid("host sandbox resource policy is required")
+    return policy
+
+
+def isolated_smoke_sandbox_deployment_policy(
+    policy_path: str | Path = _DEFAULT_POLICY_PATH,
+) -> SandboxDeploymentPolicy:
+    """Bind the production sandbox artifacts to a deployment smoke Owner root."""
+    config = load_host_sandbox_config(policy_path)
+    owner_key = os.environ.get("HERMES_OWNER_KEY", "").strip()
+    home = _canonical(os.environ.get("HERMES_HOME", ""), "smoke Owner home")
+    control_home = _canonical(
+        os.environ.get("HERMES_CONTROL_HOME", ""),
+        "smoke control home",
+    )
+    smoke_root = home.parents[2] if len(home.parents) > 2 else home
+    expected_home = smoke_root / "home" / "users" / owner_key
+    if (
+        not owner_key
+        or home != expected_home
+        or control_home != smoke_root / "home" / "control-plane"
+        or smoke_root.parent != _ISOLATED_SMOKE_PARENT
+        or not smoke_root.name.startswith("hcs-")
+    ):
+        raise HostSandboxInvalid("isolated smoke Owner root is invalid")
+    owner_root = _directory(
+        home.parent,
+        "isolated smoke Owner root",
+        require_root_owner=False,
+        mode=0o750,
+        owner_uid=config.uid,
+        owner_gid=config.gid,
+    )
+    policy = build_host_sandbox_deployment_policy(replace(config, owner_root=owner_root))
     if policy.resource_policy is None:
         raise HostSandboxInvalid("host sandbox resource policy is required")
     return policy
