@@ -33,6 +33,16 @@ def test_remote_cutover_stops_before_atomic_current_switch():
     assert "cross-release continuity preparation failed before remote deployment" in script
     authority_preflight = script.index("HERMES_DEPLOY_STAGE authority_preflight=passed")
     assert authority_preflight < stop_dashboard
+    authority_snapshot = script.index("snapshot_authority", stop_gateway)
+    assert stop_gateway < authority_snapshot < switch_current
+    rollback_stop = script.index(
+        "systemctl stop hermes-dashboard.service hermes-gateway.service || true"
+    )
+    rollback_authority = script.index("restore_authority_snapshot || true", rollback_stop)
+    rollback_artifacts = script.index("restore_deployment_state || true", rollback_authority)
+    assert rollback_stop < rollback_authority < rollback_artifacts
+    assert "source.backup(target)" in script
+    assert "PRAGMA integrity_check" in script
     assert 'dashboard authority status --json' in script
     assert "documented offline recovery workflow" in script
     assert "write_drain_request" not in script

@@ -583,7 +583,7 @@ def run_smoke(repo_root: Path, timeout: float) -> tuple[dict[str, Any], int]:
     checks: list[dict[str, Any]] = []
     temporary = Path(tempfile.mkdtemp(prefix="hcs-", dir="/tmp"))
     home = temporary / "home"
-    workspace = temporary / "workspace"
+    workspace = home / "workspaces" / "default"
     workspace.mkdir(parents=True)
     protected = workspace / "protected"
     protected.mkdir()
