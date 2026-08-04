@@ -284,8 +284,12 @@ class DashboardGateway:
         if not ticket:
             self.close()
             raise SmokeFailure("ticket_missing", "ws_ticket", "Ticket response was empty")
+        cookie_header = "; ".join(
+            f"{name}={value}" for name, value in self.client.cookies.items()
+        )
         self.websocket = connect(
             f"ws://127.0.0.1:{port}/api/ws?ticket={quote(ticket, safe='')}",
+            additional_headers={"Cookie": cookie_header},
             open_timeout=15,
             close_timeout=3,
         )
