@@ -1474,7 +1474,7 @@ if result.get("status") != "passed" or not required.issubset(checks):
 if (
     observations.get("checkpoint", {}).get("busy") != 0
     or observations.get("integrity") != "ok"
-    or observations.get("schemaVersion") != 6
+    or observations.get("schemaVersion") != 9
     or observations.get("recoveryRequired") != 0
     or observations.get("recoveryArtifacts") != 0
 ):
