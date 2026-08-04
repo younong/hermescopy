@@ -204,6 +204,7 @@ class DashboardGateway:
         *,
         username: str,
         password: str,
+        model_base_url: str,
     ):
         import httpx
         from websockets.sync.client import connect
@@ -273,6 +274,7 @@ class DashboardGateway:
         if login.status_code != 200:
             self.close()
             raise SmokeFailure("login_failed", "authenticated_web_ready", f"Dashboard login returned HTTP {login.status_code}")
+
         ticket_response = self.client.post(
             "/api/auth/ws-ticket",
             json={"audience": "browser-ws:/api/ws"},
@@ -284,6 +286,24 @@ class DashboardGateway:
         if not ticket:
             self.close()
             raise SmokeFailure("ticket_missing", "ws_ticket", "Ticket response was empty")
+
+        from hermes_cli.dashboard_auth.authority import AuthorityStore
+
+        home = Path(env["HERMES_HOME"])
+        owners = AuthorityStore(home / "control-plane").list_authenticated_owners()
+        if len(owners) != 1:
+            self.close()
+            raise SmokeFailure(
+                "owner_registry_mismatch",
+                "ws_ticket",
+                "Ticket mint did not register exactly one authenticated Owner",
+            )
+        _write_owner_config(
+            home,
+            owner_key=owners[0].owner_key,
+            base_url=model_base_url,
+        )
+
         cookie_header = "; ".join(
             f"{cookie.name}={cookie.value}" for cookie in self.client.cookies.jar
         )
@@ -490,6 +510,31 @@ def _write_config(home: Path, base_url: str, *, username: str, password: str) ->
     )
 
 
+def _write_owner_config(home: Path, *, owner_key: str, base_url: str) -> None:
+    owner_root = home / "users"
+    owner_home = owner_root / owner_key
+    owner_home.mkdir(parents=True, exist_ok=True)
+    owner_root.chmod(0o750)
+    (owner_home / "config.yaml").write_text(
+        "model:\n"
+        f"  default: {MODEL}\n"
+        f"  provider: {PROVIDER}\n"
+        "  api_mode: chat_completions\n"
+        "custom_providers:\n"
+        "  - name: hermes-smoke\n"
+        f"    base_url: {base_url}\n"
+        "    api_key: smoke-local-only\n"
+        "    api_mode: chat_completions\n"
+        "agent:\n"
+        "  max_turns: 8\n"
+        "display:\n"
+        "  tool_progress: full\n"
+        "approvals:\n"
+        "  mode: ask\n",
+        encoding="utf-8",
+    )
+
+
 def _seed_offline_caches(home: Path) -> None:
     # Gateway startup performs a best-effort update check in a daemon thread.
     # A fresh cache exercises that production path without allowing git/PyPI I/O.
@@ -547,7 +592,13 @@ socket.socket.connect_ex = _guarded_connect_ex
 
 
 
-def _dashboard_env(home: Path, workspace: Path, network_guard: Path) -> dict[str, str]:
+def _dashboard_env(
+    home: Path,
+    workspace: Path,
+    network_guard: Path,
+    *,
+    sandbox_policy: str | None = None,
+) -> dict[str, str]:
     env = os.environ.copy()
     for key in list(env):
         if (
@@ -575,10 +626,17 @@ def _dashboard_env(home: Path, workspace: Path, network_guard: Path) -> dict[str
             "PYTHONUNBUFFERED": "1",
         }
     )
+    if sandbox_policy:
+        env["HERMES_SANDBOX_DEPLOYMENT_POLICY"] = sandbox_policy
     return env
 
 
-def run_smoke(repo_root: Path, timeout: float) -> tuple[dict[str, Any], int]:
+def run_smoke(
+    repo_root: Path,
+    timeout: float,
+    *,
+    sandbox_policy: str | None = None,
+) -> tuple[dict[str, Any], int]:
     started_all = time.monotonic()
     checks: list[dict[str, Any]] = []
     temporary = Path(tempfile.mkdtemp(prefix="hcs-", dir="/tmp"))
@@ -601,7 +659,12 @@ def run_smoke(repo_root: Path, timeout: float) -> tuple[dict[str, Any], int]:
         _write_config(home, model.base_url, username=username, password=password)
         _seed_offline_caches(home)
         network_guard = _write_network_guard(temporary)
-        env = _dashboard_env(home, workspace, network_guard)
+        env = _dashboard_env(
+            home,
+            workspace,
+            network_guard,
+            sandbox_policy=sandbox_policy,
+        )
         deadline = time.monotonic() + timeout
 
         stage = time.monotonic()
@@ -610,13 +673,17 @@ def run_smoke(repo_root: Path, timeout: float) -> tuple[dict[str, Any], int]:
             env,
             username=username,
             password=password,
+            model_base_url=model.base_url,
         )
         gateway.wait_event("gateway.ready", timeout=min(STEP_TIMEOUT, deadline - time.monotonic()))
         _record(checks, "authenticated_web_ready", stage)
         _record(checks, "ws_ticket", stage)
 
         stage = time.monotonic()
-        created = gateway.request("session.create", {"cols": 96, "cwd": str(workspace)})
+        created = gateway.request(
+            "session.create",
+            {"cols": 96, "model": MODEL, "provider": "custom"},
+        )
         sid = str(created.get("session_id") or "")
         stored_id = str(created.get("stored_session_id") or "")
         if not sid or not stored_id:
@@ -624,8 +691,7 @@ def run_smoke(repo_root: Path, timeout: float) -> tuple[dict[str, Any], int]:
         _record(checks, "session_create", stage)
 
         stage = time.monotonic()
-        info_event = gateway.wait_event("session.info", session_id=sid)
-        info = _event_payload(info_event)
+        info = created.get("info") or {}
         if info.get("model") != MODEL or info.get("provider") != "custom":
             raise SmokeFailure("config_mismatch", "config_propagation", "Custom provider/model did not reach the live agent")
         _record(checks, "config_propagation", stage, model=MODEL, provider=PROVIDER)
@@ -696,6 +762,7 @@ def run_smoke(repo_root: Path, timeout: float) -> tuple[dict[str, Any], int]:
             env,
             username=username,
             password=password,
+            model_base_url=model.base_url,
         )
         gateway.wait_event("gateway.ready")
         resumed = gateway.request("session.resume", {"session_id": stored_id, "cols": 96})
@@ -775,8 +842,13 @@ def run_smoke(repo_root: Path, timeout: float) -> tuple[dict[str, Any], int]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    parser.add_argument("--sandbox-policy")
     args = parser.parse_args(argv)
-    result, status = run_smoke(REPO_ROOT, max(10.0, args.timeout))
+    result, status = run_smoke(
+        REPO_ROOT,
+        max(10.0, args.timeout),
+        sandbox_policy=str(args.sandbox_policy or "").strip() or None,
+    )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return status
 

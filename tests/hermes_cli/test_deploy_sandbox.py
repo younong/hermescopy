@@ -262,15 +262,18 @@ def test_deploy_gates_commit_on_isolated_conversation_smoke():
     auth_ready = source.index('if [ "$login_status" != "302" ] || [ "$api_status" != "401" ]')
     authority_smoke = source.index('"$release/deploy/smoke-authority-concurrency.py"', auth_ready)
     reader_smoke = source.index('"$release/deploy/smoke-session-reader.py"', authority_smoke)
-    smoke = source.index('"$release/deploy/smoke-conversation.py" --timeout 90')
+    smoke = source.index('"$release/deploy/smoke-conversation.py"', reader_smoke)
     nginx = source.index('action="reconcile"', smoke)
     commit = source.index('deployment_committed="1"', nginx)
     assert auth_ready < authority_smoke < reader_smoke < smoke < nginx < commit
-    assert 'runuser -u "$service_user" -- env -i' in source
+    assert '"$release/deploy/run-cgroup-smoke.py"' in source
+    assert '--service hermes-dashboard.service' in source
+    assert '--user "$service_user"' in source
     assert 'HOME="$smoke_root"' in source
     assert 'TMPDIR="$smoke_root"' in source
     assert 'PYTHONPATH="$release"' in source
-    smoke_block = source[source.index("if ! (", auth_ready) : nginx]
+    assert "--sandbox-policy hermes_cli.owner_worker.host_sandbox:host_sandbox_deployment_policy" in source
+    smoke_block = source[source.index("if ! env -i", reader_smoke) : nginx]
     assert "$env_file" not in smoke_block
     assert ". $env_file" not in smoke_block
     cleanup = source[source.index("cleanup_release_tmp"):source.index("trap cleanup_release_tmp EXIT")]
