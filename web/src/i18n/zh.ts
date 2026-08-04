@@ -350,10 +350,9 @@ export const zh: Translations = {
     triggerNow: "立即触发",
     delivery: {
       local: "本地",
-      telegram: "Telegram",
-      discord: "Discord",
-      slack: "Slack",
-      email: "邮件",
+      weixin_ilink: "Weixin iLink",
+      feishu: "Feishu",
+      webhook: "Webhook",
     },
   },
 
@@ -484,7 +483,6 @@ export const zh: Translations = {
       tts: "文字转语音",
       stt: "语音转文字",
       logging: "日志",
-      discord: "Discord",
       auxiliary: "辅助",
     },
   },

@@ -29,7 +29,7 @@ vi.mock("@/components/ForcedPasswordChangePage", () => ({
   ForcedPasswordChangePage: () => <div data-forced-password>Change password</div>,
 }));
 
-vi.mock("@/pages/StandaloneGuiChatPage", () => ({
+vi.mock("@/pages/GuiChatPage", () => ({
   default: MemberChatProbe,
 }));
 
@@ -52,6 +52,14 @@ beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
     .IS_REACT_ACT_ENVIRONMENT = true;
   mocks.identity.mockReset();
+  Object.defineProperty(window, "matchMedia", {
+    configurable: true,
+    value: vi.fn().mockReturnValue({
+      addEventListener: vi.fn(),
+      matches: false,
+      removeEventListener: vi.fn(),
+    }),
+  });
   document.body.innerHTML = "";
 });
 
@@ -100,7 +108,7 @@ describe("AuthenticatedApp", () => {
   });
 
   it.each(["/", "/sessions", "/system", "/chat", "/plugin-page"])(
-    "redirects a member from %s to standalone chat",
+    "redirects a member from %s to authenticated chat",
     async (entry) => {
       mocks.identity.mockReturnValue(identity({ authMe: authMe("member") }));
 
@@ -108,7 +116,7 @@ describe("AuthenticatedApp", () => {
       await flush();
 
       expect(document.querySelector("[data-member-chat]")?.getAttribute("data-pathname")).toBe(
-        "/chat-gui",
+        "/chat",
       );
       expect(document.querySelector("[data-admin-app]")).toBeNull();
       expect(document.querySelector("[data-system-actions]")).not.toBeNull();
@@ -116,9 +124,9 @@ describe("AuthenticatedApp", () => {
   );
 
   it.each([
-    "/chat-gui/files",
-    "/chat-gui/scheduled-tasks",
-    "/chat-gui/statistics",
+    "/chat/files",
+    "/chat/scheduled-tasks",
+    "/chat/statistics",
   ])(
     "allows members to open the Chat GUI workspace route %s",
     async (path) => {
@@ -136,11 +144,11 @@ describe("AuthenticatedApp", () => {
   it("preserves a member chat resume deep link", async () => {
     mocks.identity.mockReturnValue(identity({ authMe: authMe("member") }));
 
-    renderApp("/chat-gui?resume=session-a");
+    renderApp("/chat?resume=session-a");
     await flush();
 
     const chat = document.querySelector("[data-member-chat]");
-    expect(chat?.getAttribute("data-pathname")).toBe("/chat-gui");
+    expect(chat?.getAttribute("data-pathname")).toBe("/chat");
     expect(chat?.getAttribute("data-search")).toBe("?resume=session-a");
   });
 
@@ -174,7 +182,7 @@ describe("AuthenticatedApp", () => {
     await flush();
 
     expect(document.querySelector("[data-member-chat]")?.getAttribute("data-pathname")).toBe(
-      "/chat-gui",
+      "/chat",
     );
   });
 });

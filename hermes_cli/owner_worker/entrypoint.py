@@ -14,6 +14,7 @@ import os
 import sys
 import time
 import urllib.parse
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -114,8 +115,13 @@ class CronJobUpdate(BaseModel):
     owner_key: str | None = None
 
 
+class CronTick(BaseModel):
+    tick_id: str
+
+
 class CronJobFire(BaseModel):
     job_id: str
+    fire_id: str
 
 
 class ModelRegistrationPayload(BaseModel):
@@ -362,9 +368,13 @@ def create_app(
                 None,
             )
             if runtime is not None:
-                from tui_gateway.server import force_owner_worker_gateway_drain
+                from tui_gateway.server import (
+                    _shutdown_sessions,
+                    force_owner_worker_gateway_drain,
+                )
 
                 _cleanup(lambda: force_owner_worker_gateway_drain(runtime))
+                _cleanup(lambda: _shutdown_sessions(runtime))
             os.environ.pop("HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL", None)
             if relay is not None:
                 _cleanup(relay.close)
@@ -1087,12 +1097,6 @@ def create_app(
         finally:
             db.close()
 
-    @app.get("/api/profiles")
-    def get_profiles(_: None = Depends(_require_owner_token)) -> dict[str, Any]:
-        from hermes_cli.dashboard_owner_payloads import owner_singleton_profile_payload
-
-        return owner_singleton_profile_payload(owner_home)
-
     @app.get("/api/config")
     def get_config(profile: str | None = None, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(profile)
@@ -1101,31 +1105,194 @@ def create_app(
 
         return normalize_config_for_web(load_config())
 
+    class _CronGatewayTransport:
+        def __init__(self) -> None:
+            import queue
+
+            self.frames = queue.Queue()
+
+        def write(self, frame: dict) -> bool:
+            self.frames.put(frame)
+            return True
+
+        def close(self) -> None:
+            return None
+
+        def wait_for(self, predicate, *, timeout: float = 1800.0) -> dict:
+            import queue
+
+            deadline = time.monotonic() + timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("cron gateway dispatch timed out")
+                try:
+                    frame = self.frames.get(timeout=remaining)
+                except queue.Empty as exc:
+                    raise TimeoutError("cron gateway dispatch timed out") from exc
+                if predicate(frame):
+                    return frame
+
+    def _gateway_call(transport: _CronGatewayTransport, method: str, params: dict) -> dict:
+        from tui_gateway.server import dispatch
+
+        request_id = f"cron-{uuid.uuid4().hex}"
+        response = dispatch(
+            {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
+            transport=transport,
+            runtime=app.state.owner_worker_live_state.gateway_runtime,
+        )
+        if response is None:
+            response = transport.wait_for(lambda frame: frame.get("id") == request_id)
+        if response.get("error"):
+            raise RuntimeError(str(response["error"].get("message") or "gateway call failed"))
+        return response.get("result") or {}
+
+    def _cron_job_workdir(job: dict) -> str | None:
+        raw = str(job.get("workdir") or "").strip()
+        if not raw:
+            return None
+        candidate = Path(raw).expanduser().resolve()
+        workspace_root = runtime_paths.workspace_root.resolve()
+        try:
+            candidate.relative_to(workspace_root)
+        except ValueError as exc:
+            raise ValueError("cron workdir is outside the Owner workspace") from exc
+        if not candidate.is_dir():
+            raise ValueError("cron workdir is not a directory")
+        return str(candidate)
+
+    def _run_agent_cron_job(job: dict, fire_id: str) -> dict | None:
+        from cron.scheduler import _build_job_prompt, complete_job_run
+
+        transport = _CronGatewayTransport()
+        try:
+            prompt = _build_job_prompt(job)
+            if prompt is None:
+                return complete_job_run(
+                    job,
+                    success=True,
+                    output="",
+                    final_response="[SILENT]",
+                    fire_id=fire_id,
+                )
+            created = _gateway_call(
+                transport,
+                "session.create",
+                {
+                    "source": "cron",
+                    "title": str(job.get("name") or "Scheduled job"),
+                    "cwd": _cron_job_workdir(job),
+                    "close_on_disconnect": True,
+                    **({"model": job["model"]} if job.get("model") else {}),
+                    **({"provider": job["provider"]} if job.get("provider") else {}),
+                },
+            )
+            session_id = str(created["session_id"])
+            _gateway_call(
+                transport,
+                "prompt.submit",
+                {
+                    "session_id": session_id,
+                    "text": prompt,
+                    "idempotency_key": fire_id,
+                },
+            )
+            frame = transport.wait_for(
+                lambda item: item.get("method") == "event"
+                and (item.get("params") or {}).get("type") == "message.complete"
+                and (item.get("params") or {}).get("session_id") == session_id
+            )
+            payload = (frame.get("params") or {}).get("payload") or {}
+            text = str(payload.get("text") or "")
+            status = str(payload.get("status") or "")
+            success = status == "complete"
+            output = (
+                f"# Cron Job: {job.get('name') or job['id']}\n\n"
+                f"**Job ID:** {job['id']}\n\n{text}\n"
+            )
+            return complete_job_run(
+                job,
+                success=success,
+                output=output,
+                final_response=text,
+                error=None if success else f"Agent turn ended with status {status or 'unknown'}",
+                fire_id=fire_id,
+            )
+        finally:
+            transport.close()
+
+    def _pending_cron_deliveries() -> list[dict]:
+        from cron.jobs import CronStore, pending_deliveries, use_store
+
+        with use_store(CronStore(owner_home)):
+            return pending_deliveries()
+
+    def _fire_cron_job(job_id: str, fire_id: str) -> tuple[bool, dict | None]:
+        from cron.jobs import CronStore, claim_job_for_fire, get_job, use_store
+        from cron.scheduler import run_one_job
+
+        with use_store(CronStore(owner_home)):
+            if not claim_job_for_fire(job_id, fire_id=fire_id):
+                return False, None
+            job = get_job(job_id)
+            if job is None:
+                return False, None
+            if job.get("no_agent"):
+                executed = run_one_job(job, fire_id=fire_id, verbose=False)
+                pending = _pending_cron_deliveries()
+                delivery = next(
+                    (item for item in pending if item.get("fire_id") == fire_id),
+                    None,
+                )
+                return executed, delivery
+            return True, _run_agent_cron_job(job, fire_id)
+
     @app.post("/internal/cron/tick")
-    def tick_cron_jobs(_: None = Depends(_require_owner_token)) -> dict[str, int]:
-        from hermes_cli.cron_management import cron_home_scope
+    def tick_cron_jobs(
+        body: CronTick,
+        _: None = Depends(_require_owner_token),
+    ) -> dict[str, Any]:
+        from cron.jobs import CronStore, use_store
+        from cron.scheduler import due_jobs_for_tick
 
-        with cron_home_scope(owner_home):
-            from cron.scheduler import tick
-
-            return {"executed": tick(verbose=False, adapters=None, loop=None, sync=True)}
+        executed = 0
+        with use_store(CronStore(owner_home)):
+            due_jobs = due_jobs_for_tick()
+        for job in due_jobs:
+            scheduled_at = str(job.get("next_run_at") or body.tick_id)
+            fire_id = f"cron:{owner_key}:{job['id']}:{scheduled_at}"
+            did_execute, _ = _fire_cron_job(job["id"], fire_id)
+            executed += int(did_execute)
+        return {"executed": executed, "deliveries": _pending_cron_deliveries()}
 
     @app.post("/internal/cron/fire")
     def fire_cron_job(
         body: CronJobFire,
         _: None = Depends(_require_owner_token),
+    ) -> dict[str, Any]:
+        if not body.fire_id.strip():
+            raise HTTPException(status_code=400, detail="fire_id is required")
+        executed, delivery = _fire_cron_job(body.job_id, body.fire_id)
+        deliveries = [delivery] if delivery is not None else _pending_cron_deliveries()
+        response: dict[str, Any] = {"executed": executed}
+        if deliveries:
+            response["deliveries"] = deliveries
+        return response
+
+    @app.post("/internal/cron/delivery/{fire_id}/ack")
+    def ack_cron_delivery(
+        fire_id: str,
+        body: dict[str, Any],
+        _: None = Depends(_require_owner_token),
     ) -> dict[str, bool]:
-        from hermes_cli.cron_management import cron_home_scope
+        from cron.jobs import CronStore, record_delivery_result, use_store
 
-        with cron_home_scope(owner_home):
-            from cron.scheduler_provider import resolve_cron_scheduler
-
-            ran = resolve_cron_scheduler().fire_due(
-                body.job_id,
-                adapters=None,
-                loop=None,
-            )
-        return {"executed": bool(ran)}
+        error = body.get("error")
+        if error is not None and not isinstance(error, str):
+            raise HTTPException(status_code=400, detail="delivery error must be text")
+        with use_store(CronStore(owner_home)):
+            return {"recorded": record_delivery_result(fire_id, error=error)}
 
     @app.get("/api/cron/jobs")
     def list_cron_jobs(

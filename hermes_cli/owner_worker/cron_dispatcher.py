@@ -1,98 +1,66 @@
-"""Bounded Control Plane dispatch for due authenticated-owner cron jobs."""
+"""Control Plane dispatch for authenticated Owner cron schedules."""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
 import os
-import stat
+import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from hermes_cli.dashboard_auth.owner_context import owner_context_from_owner_key
+from hermes_cli.dashboard_auth.authority import AuthorityStore
+from hermes_cli.dashboard_auth.owner_context import owner_context_from_registry
 from hermes_cli.owner_worker.client import OwnerWorkerClient
 from hermes_cli.owner_worker.gateway_client import authority_lease_for_handle
 
-
 _log = logging.getLogger(__name__)
-_OWNER_KEY_PREFIX = "ok1_"
 
 
 @dataclass(frozen=True)
 class _StoredOwner:
-    owner_key: str
-    owner_home: Path
+    owner_context: Any
+
+    @property
+    def owner_key(self) -> str:
+        return self.owner_context.owner_key
+
+    @property
+    def owner_home(self) -> Path:
+        return self.owner_context.owner_home
 
 
-def _canonical_owner_homes(global_home: str | Path) -> list[_StoredOwner]:
-    root = Path(global_home).expanduser().resolve() / "users"
-    try:
-        root_info = root.lstat()
-    except FileNotFoundError:
-        return []
-    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
-        _log.warning("owner cron scan skipped unsafe users root")
-        return []
-
+def _authenticated_owners(
+    authority_store: AuthorityStore,
+    global_home: str | Path,
+) -> tuple[_StoredOwner, ...]:
+    """Revalidate every trusted registry row before selecting an Owner home."""
     owners: list[_StoredOwner] = []
-    try:
-        candidates = list(root.iterdir())
-    except OSError:
-        _log.warning("owner cron scan could not read users root")
-        return []
-    for candidate in candidates:
-        if not candidate.name.startswith(_OWNER_KEY_PREFIX):
-            continue
+    for row in authority_store.list_authenticated_owners():
         try:
-            info = candidate.lstat()
-        except OSError:
+            owner = owner_context_from_registry(
+                auth_provider=row.auth_provider,
+                tenant_id=row.tenant_id,
+                canonical_user_id=row.canonical_user_id,
+                expected_owner_key=row.owner_key,
+                global_home=global_home,
+            )
+        except (RuntimeError, ValueError):
+            _log.error("authenticated Owner registry row failed canonical validation")
             continue
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            continue
-        resolved = candidate.resolve()
-        if resolved.parent != root:
-            continue
-        owners.append(_StoredOwner(candidate.name, resolved))
-    return owners
-
-
-def _owner_may_be_due(owner: _StoredOwner) -> bool:
-    from hermes_cli.cron_management import cron_home_scope
-
-    with cron_home_scope(owner.owner_home):
-        from cron.jobs import list_jobs
-
-        now = datetime.now(timezone.utc)
-        for job in list_jobs(include_disabled=False):
-            next_run_at = job.get("next_run_at")
-            if not next_run_at:
-                continue
-            try:
-                due_at = datetime.fromisoformat(str(next_run_at).replace("Z", "+00:00"))
-                if due_at.tzinfo is None:
-                    due_at = due_at.replace(tzinfo=timezone.utc)
-            except (TypeError, ValueError):
-                continue
-            if due_at <= now:
-                return True
-        return False
+        owners.append(_StoredOwner(owner))
+    return tuple(owners)
 
 
 def _dispatch_owner_request(
     supervisor: Any,
-    global_home: Path,
     owner: _StoredOwner,
     path: str,
     *,
     content: bytes | None = None,
 ) -> dict[str, Any]:
-    owner_context = owner_context_from_owner_key(
-        owner.owner_key,
-        global_home=global_home,
-    )
-    handle = supervisor.get_or_start(owner_context)
+    handle = supervisor.get_or_start(owner.owner_context)
     with supervisor.acquire_use(handle):
         response = OwnerWorkerClient(
             handle.socket_path,
@@ -109,42 +77,116 @@ def _dispatch_owner_request(
         return response.json()
 
 
+def _ack_delivery(
+    supervisor: Any,
+    owner: _StoredOwner,
+    fire_id: str,
+    *,
+    error: str | None,
+) -> None:
+    _dispatch_owner_request(
+        supervisor,
+        owner,
+        f"/internal/cron/delivery/{fire_id}/ack",
+        content=json.dumps({"error": error}).encode("utf-8"),
+    )
+
+
+def _enqueue_deliveries(
+    supervisor: Any,
+    owner: _StoredOwner,
+    deliveries: Any,
+    enqueue_delivery: Callable[..., str] | None,
+) -> None:
+    if not isinstance(deliveries, list):
+        raise RuntimeError("Owner Worker cron deliveries are invalid")
+    if deliveries and enqueue_delivery is None:
+        raise RuntimeError("canonical channel outbox is unavailable")
+    for delivery in deliveries[:128]:
+        if not isinstance(delivery, dict):
+            continue
+        fire_id = str(delivery.get("fire_id") or "").strip()
+        binding_id = str(delivery.get("binding_id") or "").strip()
+        payload = str(delivery.get("payload") or "")
+        if not fire_id or not binding_id or not payload.strip() or len(payload.encode("utf-8")) > 256_000:
+            continue
+        try:
+            assert enqueue_delivery is not None
+            enqueue_delivery(
+                owner_key=owner.owner_key,
+                binding_id=binding_id,
+                fire_id=fire_id,
+                payload=payload,
+            )
+        except Exception as exc:
+            try:
+                _ack_delivery(
+                    supervisor,
+                    owner,
+                    fire_id,
+                    error=f"{type(exc).__name__}: {exc}"[:512],
+                )
+            except Exception:
+                _log.exception("owner cron delivery failure ack failed owner=%s", owner.owner_key)
+            continue
+        _ack_delivery(supervisor, owner, fire_id, error=None)
+
+
 def dispatch_owner_job(
     supervisor: Any,
     global_home: str | Path,
     owner_key: str,
     job_id: str,
+    fire_id: str,
+    *,
+    authority_store: AuthorityStore | None = None,
+    enqueue_delivery: Callable[..., str] | None = None,
 ) -> bool:
-    resolved_home = Path(global_home).expanduser().resolve()
+    store = authority_store or AuthorityStore(getattr(supervisor, "control_home", None))
     owner = next(
-        (item for item in _canonical_owner_homes(resolved_home) if item.owner_key == owner_key),
+        (
+            item
+            for item in _authenticated_owners(store, global_home)
+            if item.owner_key == owner_key
+        ),
         None,
     )
     if owner is None:
         return False
     payload = _dispatch_owner_request(
         supervisor,
-        resolved_home,
         owner,
         "/internal/cron/fire",
-        content=json.dumps({"job_id": job_id}).encode("utf-8"),
+        content=json.dumps({"job_id": job_id, "fire_id": fire_id}).encode("utf-8"),
     )
+    _enqueue_deliveries(supervisor, owner, payload.get("deliveries", []), enqueue_delivery)
     return bool(payload.get("executed"))
 
 
-def dispatch_owner_due_jobs(supervisor: Any, global_home: str | Path) -> int:
-    """Wake due owners and synchronously tick each while holding a use lease."""
-    resolved_home = Path(global_home).expanduser().resolve()
+def dispatch_owner_due_jobs(
+    supervisor: Any,
+    global_home: str | Path,
+    *,
+    authority_store: AuthorityStore | None = None,
+    enqueue_delivery: Callable[..., str] | None = None,
+) -> int:
+    """Ask each registered Owner Worker to claim and execute its due jobs."""
+    store = authority_store or AuthorityStore(getattr(supervisor, "control_home", None))
     executed = 0
-    for owner in _canonical_owner_homes(resolved_home):
+    tick_id = f"tick:{uuid.uuid4().hex}"
+    for owner in _authenticated_owners(store, global_home):
         try:
-            if not _owner_may_be_due(owner):
-                continue
             payload = _dispatch_owner_request(
                 supervisor,
-                resolved_home,
                 owner,
                 "/internal/cron/tick",
+                content=json.dumps({"tick_id": tick_id}).encode("utf-8"),
+            )
+            _enqueue_deliveries(
+                supervisor,
+                owner,
+                payload.get("deliveries", []),
+                enqueue_delivery,
             )
             executed += int(payload.get("executed") or 0)
         except Exception:
@@ -157,14 +199,23 @@ async def run_owner_cron_dispatcher(
     supervisor: Any,
     global_home: str | Path,
     *,
+    authority_store: AuthorityStore | None = None,
+    enqueue_delivery: Callable[..., str] | None = None,
     interval: float | None = None,
 ) -> None:
     delay = max(
         1.0,
         float(interval or os.environ.get("HERMES_OWNER_CRON_INTERVAL", "15") or 15),
     )
+    store = authority_store or AuthorityStore(getattr(supervisor, "control_home", None))
     while not stop.is_set():
-        await asyncio.to_thread(dispatch_owner_due_jobs, supervisor, global_home)
+        await asyncio.to_thread(
+            dispatch_owner_due_jobs,
+            supervisor,
+            global_home,
+            authority_store=store,
+            enqueue_delivery=enqueue_delivery,
+        )
         try:
             await asyncio.wait_for(stop.wait(), timeout=delay)
         except asyncio.TimeoutError:

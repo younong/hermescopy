@@ -139,7 +139,7 @@ def test_forced_change_blocks_regular_api_and_ws_ticket_but_allows_recovery(loca
     assert me.json()["capabilities"] == ["auth.me", "auth.password.change", "auth.logout"]
     assert client.get("/api/sessions").status_code == 403
     assert client.post(
-        "/api/auth/ws-ticket", json={"audience": "browser-ws:/api/pty"}
+        "/api/auth/ws-ticket", json={"audience": "browser-ws:/api/ws"}
     ).status_code == 403
 
     wrong = client.post(

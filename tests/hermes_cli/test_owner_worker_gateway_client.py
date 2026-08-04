@@ -114,6 +114,38 @@ async def test_client_uses_exact_socket_correlates_rpc_and_releases_once():
 
 
 @pytest.mark.asyncio
+async def test_next_event_decodes_pending_and_live_events():
+    client = OwnerWorkerGatewayClient(SimpleNamespace(), SimpleNamespace())
+    client.websocket = SimpleNamespace()
+    client._bootstrap = "bootstrap"
+    client._pending_events.append(
+        {"method": "message.delta", "params": {"session_id": "s", "text": "one"}}
+    )
+    client._recv_data = AsyncMock(
+        return_value=json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {
+                    "type": "message.complete",
+                    "session_id": "s",
+                    "payload": {"text": "done"},
+                },
+            }
+        )
+    )
+
+    first = await client.next_event()
+    second = await client.next_event(timeout=1)
+
+    assert first["method"] == "message.delta"
+    assert second == {
+        "method": "message.complete",
+        "params": {"text": "done", "session_id": "s"},
+    }
+
+
+@pytest.mark.asyncio
 async def test_failed_handshake_releases_lease():
     owner = SimpleNamespace(owner_key="ok1_owner")
     handle = SimpleNamespace(

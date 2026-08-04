@@ -162,8 +162,6 @@ class Platform(Enum):
     WECOM_CALLBACK = "wecom_callback"
     WEIXIN = "weixin"
     BLUEBUBBLES = "bluebubbles"
-    QQBOT = "qqbot"
-    YUANBAO = "yuanbao"
     RELAY = "relay"  # generic relay adapter fronted by the connector (EXPERIMENTAL)
     @classmethod
     def _missing_(cls, value):
@@ -550,12 +548,6 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     ),
     Platform.BLUEBUBBLES: lambda cfg: bool(
         cfg.extra.get("server_url") and cfg.extra.get("password")
-    ),
-    Platform.QQBOT: lambda cfg: bool(
-        cfg.extra.get("app_id") and cfg.extra.get("client_secret")
-    ),
-    Platform.YUANBAO: lambda cfg: bool(
-        cfg.extra.get("app_id") and cfg.extra.get("app_secret")
     ),
     # Relay dials OUT to a connector; it is "connected" once an endpoint URL is
     # configured (extra["relay_url"] or extra["url"]). The capability descriptor
@@ -1877,91 +1869,6 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             name=os.getenv("BLUEBUBBLES_HOME_CHANNEL_NAME", "Home"),
             thread_id=os.getenv("BLUEBUBBLES_HOME_CHANNEL_THREAD_ID") or None,
         )
-
-    # QQ (Official Bot API v2)
-    qq_app_id = os.getenv("QQ_APP_ID")
-    qq_client_secret = os.getenv("QQ_CLIENT_SECRET")
-    if qq_app_id or qq_client_secret:
-        if Platform.QQBOT not in config.platforms:
-            config.platforms[Platform.QQBOT] = PlatformConfig()
-        config.platforms[Platform.QQBOT].enabled = True
-        extra = config.platforms[Platform.QQBOT].extra
-        if qq_app_id:
-            extra["app_id"] = qq_app_id
-        if qq_client_secret:
-            extra["client_secret"] = qq_client_secret
-        qq_allowed_users = os.getenv("QQ_ALLOWED_USERS", "").strip()
-        if qq_allowed_users:
-            extra["allow_from"] = qq_allowed_users
-        qq_group_allowed = os.getenv("QQ_GROUP_ALLOWED_USERS", "").strip()
-        if qq_group_allowed:
-            extra["group_allow_from"] = qq_group_allowed
-        qq_home = os.getenv("QQBOT_HOME_CHANNEL", "").strip()
-        qq_home_name_env = "QQBOT_HOME_CHANNEL_NAME"
-        if not qq_home:
-            # Back-compat: accept the pre-rename name and log a one-time warning.
-            legacy_home = os.getenv("QQ_HOME_CHANNEL", "").strip()
-            if legacy_home:
-                qq_home = legacy_home
-                qq_home_name_env = "QQ_HOME_CHANNEL_NAME"
-                logging.getLogger(__name__).warning(
-                    "QQ_HOME_CHANNEL is deprecated; rename to QQBOT_HOME_CHANNEL "
-                    "in your .env for consistency with the platform key."
-                )
-        if qq_home:
-            config.platforms[Platform.QQBOT].home_channel = HomeChannel(
-                platform=Platform.QQBOT,
-                chat_id=qq_home,
-                name=os.getenv("QQBOT_HOME_CHANNEL_NAME") or os.getenv(qq_home_name_env, "Home"),
-                thread_id=(
-                    os.getenv("QQBOT_HOME_CHANNEL_THREAD_ID")
-                    or os.getenv("QQ_HOME_CHANNEL_THREAD_ID")
-                    or None
-                ),
-            )
-
-    # Yuanbao — YUANBAO_APP_ID preferred
-    yuanbao_app_id = os.getenv("YUANBAO_APP_ID") or os.getenv("YUANBAO_APP_KEY")
-    yuanbao_app_secret = os.getenv("YUANBAO_APP_SECRET")
-    if yuanbao_app_id and yuanbao_app_secret:
-        if Platform.YUANBAO not in config.platforms:
-            config.platforms[Platform.YUANBAO] = PlatformConfig()
-        config.platforms[Platform.YUANBAO].enabled = True
-        extra = config.platforms[Platform.YUANBAO].extra
-        extra["app_id"] = yuanbao_app_id
-        extra["app_secret"] = yuanbao_app_secret
-        yuanbao_bot_id = os.getenv("YUANBAO_BOT_ID")
-        if yuanbao_bot_id:
-            extra["bot_id"] = yuanbao_bot_id
-        yuanbao_ws_url = os.getenv("YUANBAO_WS_URL")
-        if yuanbao_ws_url:
-            extra["ws_url"] = yuanbao_ws_url
-        yuanbao_api_domain = os.getenv("YUANBAO_API_DOMAIN")
-        if yuanbao_api_domain:
-            extra["api_domain"] = yuanbao_api_domain
-        yuanbao_route_env = os.getenv("YUANBAO_ROUTE_ENV")
-        if yuanbao_route_env:
-            extra["route_env"] = yuanbao_route_env
-        yuanbao_home = os.getenv("YUANBAO_HOME_CHANNEL")
-        if yuanbao_home:
-            config.platforms[Platform.YUANBAO].home_channel = HomeChannel(
-                platform=Platform.YUANBAO,
-                chat_id=yuanbao_home,
-                name=os.getenv("YUANBAO_HOME_CHANNEL_NAME", "Home"),
-                thread_id=os.getenv("YUANBAO_HOME_CHANNEL_THREAD_ID") or None,
-            )
-        yuanbao_dm_policy = os.getenv("YUANBAO_DM_POLICY")
-        if yuanbao_dm_policy:
-            extra["dm_policy"] = yuanbao_dm_policy.strip().lower()
-        yuanbao_dm_allow_from = os.getenv("YUANBAO_DM_ALLOW_FROM")
-        if yuanbao_dm_allow_from:
-            extra["dm_allow_from"] = yuanbao_dm_allow_from
-        yuanbao_group_policy = os.getenv("YUANBAO_GROUP_POLICY")
-        if yuanbao_group_policy:
-            extra["group_policy"] = yuanbao_group_policy.strip().lower()
-        yuanbao_group_allow_from = os.getenv("YUANBAO_GROUP_ALLOW_FROM")
-        if yuanbao_group_allow_from:
-            extra["group_allow_from"] = yuanbao_group_allow_from
 
     # Session settings
     idle_minutes = os.getenv("SESSION_IDLE_MINUTES")

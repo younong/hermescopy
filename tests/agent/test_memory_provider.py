@@ -1363,7 +1363,7 @@ class TestMemoryToolToolsetGate:
     def test_composite_toolset_with_memory_injects(self):
         """Composite toolsets that include memory should inject provider tools."""
         mgr = self._mgr_with_tools("hindsight_recall")
-        tools, names = self._run_memory_injection(["hermes-acp"], mgr)
+        tools, names = self._run_memory_injection(["hermes-api-server"], mgr)
         assert "hindsight_recall" in names
         assert any(t["function"]["name"] == "hindsight_recall" for t in tools)
 

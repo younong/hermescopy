@@ -2368,20 +2368,20 @@ class BasePlatformAdapter(ABC):
         self._background_tasks: set[asyncio.Task] = set()
         # One-shot callbacks to fire after the main response is delivered.
         # Keyed by session_key. Values are either a bare callback (legacy) or
-        # a ``(generation, callback)`` tuple so GatewayRunner can make deferred
+        # a ``(generation, callback)`` tuple so the gateway runtime can make deferred
         # deliveries generation-aware and avoid stale runs clearing callbacks
         # registered by a fresher run for the same session.
         self._post_delivery_callbacks: Dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
-        # Optional authorization check, registered by GatewayRunner. Used by
+        # Optional authorization check, registered by the gateway runtime. Used by
         # adapters that fetch external context (e.g. Slack thread history) to
         # mark senders not on the allowlist as unverified in LLM context,
         # mitigating indirect prompt injection from third parties in a shared
         # thread/channel.
         self._authorization_check: Optional[Callable[[str, Optional[str], Optional[str]], bool]] = None
         # Auto-TTS on voice input: ``_auto_tts_default`` is the global default
-        # (``voice.auto_tts`` in config.yaml, pushed by GatewayRunner on connect).
+        # (``voice.auto_tts`` in config.yaml, pushed by the gateway runtime on connect).
         # Per-chat overrides live in two sets populated from ``_voice_mode``:
         #   - ``_auto_tts_enabled_chats``: chat explicitly opted in via ``/voice on``
         #     or ``/voice tts`` (mode is ``voice_only`` or ``all``). Fires even when
@@ -3062,7 +3062,7 @@ class BasePlatformAdapter(ABC):
         """Send a three-option slash-command confirmation prompt.
 
         Used by the gateway's generic slash-confirm primitive (see
-        ``GatewayRunner._request_slash_confirm``) for commands that have a
+        ``the gateway runtime._request_slash_confirm``) for commands that have a
         non-destructive but expensive side effect the user should explicitly
         acknowledge — the current caller is ``/reload-mcp``, which
         invalidates the provider prompt cache.
@@ -3071,7 +3071,7 @@ class BasePlatformAdapter(ABC):
         Matrix, Feishu) should override this to render three buttons:
         Approve Once / Always Approve / Cancel.  Button callbacks MUST be
         routed back through the gateway by calling
-        ``GatewayRunner._resolve_slash_confirm(confirm_id, choice)`` where
+        ``the gateway runtime._resolve_slash_confirm(confirm_id, choice)`` where
         ``choice`` is ``"once"`` / ``"always"`` / ``"cancel"``.
 
         Platforms without button UIs leave this as the default and fall
@@ -3111,14 +3111,14 @@ class BasePlatformAdapter(ABC):
             question as a plain text message; the next user message in the
             session is captured by the gateway's text-intercept and
             resolves the clarify automatically (see
-            ``GatewayRunner._maybe_intercept_clarify_text``).
+            ``the gateway runtime._maybe_intercept_clarify_text``).
 
         The default implementation falls back to a numbered text list,
         which works on every platform — the user replies with a number
         ("2") or with the literal choice text, and the gateway intercepts
         and resolves.  For the text fallback path, the default calls
         ``mark_awaiting_text()`` so that the gateway text-intercept
-        (:meth:`GatewayRunner._maybe_intercept_clarify_text`) catches the
+        (:meth:`the gateway runtime._maybe_intercept_clarify_text`) catches the
         user's reply instead of timing out.
         Adapters with native button UIs (Telegram, Discord) SHOULD
         override this for a richer UX.
@@ -5239,7 +5239,7 @@ class BasePlatformAdapter(ABC):
             #
             # Snapshot the callback generation HERE (after the agent has run),
             # not at the top of this task.  _hermes_run_generation is set on
-            # the interrupt event by GatewayRunner._bind_adapter_run_generation
+            # the interrupt event by the gateway runtime._bind_adapter_run_generation
             # during _handle_message_with_agent — which happens DURING the
             # self._message_handler(event) await above.  Snapshotting earlier
             # always captured None, which bypassed the generation-ownership

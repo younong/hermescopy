@@ -40,7 +40,6 @@ interface GuiChatModelsPaneProps {
     confirmExpensiveModel?: boolean,
     persistGlobally?: boolean,
   ): Promise<GuiChatModelSwitchResponse>;
-  profile?: string;
 }
 
 interface RegistrationFormState {
@@ -111,9 +110,7 @@ export function GuiChatModelsPane({
   currentModel,
   currentProvider,
   onSwitchChat,
-  profile,
 }: GuiChatModelsPaneProps) {
-  const scopedProfile = profile || undefined;
   const [data, setData] = useState<ModelRegistrationsResponse | null>(null);
   const [catalogs, setCatalogs] = useState<
     Partial<
@@ -144,20 +141,20 @@ export function GuiChatModelsPane({
     setLoading(true);
     setError(null);
     try {
-      setData(await api.getModelRegistrations(scopedProfile));
+      setData(await api.getModelRegistrations());
     } catch (cause) {
       setError(errorMessage(cause));
       setData((current) => current ?? { active: emptyActive(), registrations: [] });
     } finally {
       setLoading(false);
     }
-  }, [scopedProfile]);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    void api.getModelRegistrations(scopedProfile).then((response) => {
+    void api.getModelRegistrations().then((response) => {
       if (!cancelled) setData(response);
     }).catch((cause: unknown) => {
       if (!cancelled) {
@@ -170,7 +167,7 @@ export function GuiChatModelsPane({
     return () => {
       cancelled = true;
     };
-  }, [scopedProfile]);
+  }, []);
 
   useEffect(() => {
     if (busy) setPendingChatSwitch(null);
@@ -180,14 +177,14 @@ export function GuiChatModelsPane({
     if (catalogs[kind] || catalogsLoading[kind]) return;
     setCatalogsLoading((current) => ({ ...current, [kind]: true }));
     try {
-      const response = await api.getModelRegistrationCatalog(kind, scopedProfile);
+      const response = await api.getModelRegistrationCatalog(kind, );
       setCatalogs((current) => ({ ...current, [kind]: response.providers }));
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
       setCatalogsLoading((current) => ({ ...current, [kind]: false }));
     }
-  }, [catalogs, catalogsLoading, scopedProfile]);
+  }, [catalogs, catalogsLoading, ]);
 
   const visibleRegistrations = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
@@ -337,7 +334,7 @@ export function GuiChatModelsPane({
     setWorkingId(registration.id);
     setError(null);
     try {
-      await api.activateModelRegistration(registration.id, scopedProfile);
+      await api.activateModelRegistration(registration.id, );
       await load();
     } catch (cause) {
       setError(errorMessage(cause));

@@ -24,7 +24,6 @@
           "azure-identity"
           "bedrock"
           "daytona"
-          "dingtalk"
           "edge-tts"
           "exa"
           "fal"
@@ -37,9 +36,7 @@
           "parallel-web"
           "tts-premium"
           "voice"
-        ]
-        # matrix is Linux-only (oqs/liboqs lacks aarch64-darwin wheels).
-        ++ lib.optionals pkgs.stdenv.isLinux [ "matrix" ];
+        ];
       };
     in
     {
@@ -48,16 +45,13 @@
 
         inherit minimal;
 
-        # Ships discord.py + python-telegram-bot + slack-sdk so a plain
-        # `nix profile install .#messaging` connects to Discord/Telegram/Slack
-        # on first run — lazy-install can't write to the read-only /nix/store.
+        # Ships the retained Weixin iLink and Webhook transport dependencies.
+        # Feishu remains available in the full package through its own extra.
         messaging = minimal.override {
           extraDependencyGroups = [ "messaging" ];
         };
 
-        tui = full.hermesTui;
         web = full.hermesWeb;
-        desktop = full.hermesDesktop;
       };
     };
 }

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from hermes_cli.dashboard_auth.owner_context import owner_context_from_registry
 from hermes_cli.dashboard_auth.authority import (
     AuthorityCorrupt,
     AuthorityStore,
@@ -79,6 +80,75 @@ def test_revoke_marks_session_and_bumps_epoch(tmp_path):
 
     with pytest.raises(AuthorizationRejected, match="session_revoked"):
         store.read_state(scope)
+
+
+def test_authenticated_owner_registry_only_lists_active_principals(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_OWNER_SECRET", "authority-owner-secret")
+    store = AuthorityStore(tmp_path / "control-plane")
+    active = _scope(user_id="active", session_id="active-session")
+    revoked = _scope(user_id="revoked", session_id="revoked-session")
+
+    store.activate(active)
+    store.activate(revoked)
+    assert {row.canonical_user_id for row in store.list_authenticated_owners()} == {
+        "active",
+        "revoked",
+    }
+
+    store.revoke_and_bump(revoked, reason="logout")
+    assert [row.canonical_user_id for row in store.list_authenticated_owners()] == [
+        "active"
+    ]
+
+
+def test_machine_credential_is_owner_bound_and_disable_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_OWNER_SECRET", "machine-credential-owner-secret")
+    global_home = tmp_path / "global"
+    store = AuthorityStore(global_home / "control-plane")
+    owner = owner_context_from_registry(
+        auth_provider="stub",
+        tenant_id="tenant-a",
+        canonical_user_id="user-a",
+        global_home=global_home,
+    )
+
+    credential, token = store.create_machine_credential(
+        auth_provider=owner.auth_provider,
+        tenant_id=owner.tenant_id,
+        canonical_user_id=owner.owner_user_id,
+        owner_key=owner.owner_key,
+        scope="openai.chat.completions",
+    )
+
+    assert token not in store.path.read_bytes().decode("utf-8", errors="ignore")
+    assert store.verify_machine_token(token) == credential
+    assert store.resolve_machine_credential(
+        provider=credential.provider,
+        principal=credential.principal,
+        required_scope="openai.chat.completions",
+    ) == credential
+    assert store.resolve_machine_credential(
+        provider=credential.provider,
+        principal=credential.principal,
+        required_scope="other",
+    ) is None
+    assert store.disable_machine_credential(credential.credential_id) is True
+    assert store.verify_machine_token(token) is None
+    assert store.disable_machine_credential(credential.credential_id) is False
+
+
+def test_machine_credential_rejects_mismatched_owner_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_OWNER_SECRET", "machine-credential-owner-secret")
+    store = AuthorityStore(tmp_path / "control-plane")
+
+    with pytest.raises(RuntimeError, match="owner key does not match"):
+        store.create_machine_credential(
+            auth_provider="stub",
+            tenant_id="tenant-a",
+            canonical_user_id="user-a",
+            owner_key="ok1_wrong",
+            scope="openai.chat.completions",
+        )
 
 
 def test_principal_revocation_fences_all_active_scopes_for_one_user(tmp_path):
@@ -237,7 +307,7 @@ def test_wrong_audience_is_not_a_replay_key_collision(tmp_path):
         token_class="browser-ws",
         issuer_key_version="bwt1",
         jti="same-jti",
-        audience="browser-ws:/api/pty",
+        audience="browser-ws:/api/pub",
         expires_at=1_000,
         claim_epoch=state.epoch,
         claim_recovery_generation=state.recovery_generation,

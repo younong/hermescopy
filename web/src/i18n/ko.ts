@@ -272,10 +272,9 @@ export const ko: Translations = {
     triggerNow: "지금 실행",
     delivery: {
       local: "로컬",
-      telegram: "Telegram",
-      discord: "Discord",
-      slack: "Slack",
-      email: "Email",
+      weixin_ilink: "Weixin iLink",
+      feishu: "Feishu",
+      webhook: "Webhook",
     },
   },
 
@@ -407,7 +406,6 @@ export const ko: Translations = {
       tts: "텍스트 음성 변환",
       stt: "음성 텍스트 변환",
       logging: "로깅",
-      discord: "Discord",
       auxiliary: "보조",
     },
   },

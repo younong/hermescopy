@@ -63,10 +63,6 @@ vi.mock("../latencyTrace", () => ({
   startGuiChatLatencyTrace: mocks.startGuiChatLatencyTrace,
 }));
 
-vi.mock("@/contexts/useProfileScope", () => ({
-  useProfileScope: () => ({ profile: "" }),
-}));
-
 vi.mock("@/contexts/usePageHeader", () => ({
   usePageHeader: () => ({ setAfterTitle: vi.fn(), setEnd: vi.fn() }),
 }));
@@ -599,7 +595,7 @@ describe("GuiChatShell", () => {
     root = createRoot(container);
     act(() => {
       root?.render(
-        <MemoryRouter initialEntries={["/chat-gui"]}>
+        <MemoryRouter initialEntries={["/chat"]}>
           <DashboardAuthIdentityProvider>
             <ReadyProbe />
             <GuiChatShell />
@@ -620,8 +616,8 @@ describe("GuiChatShell", () => {
 
     expect(mocks.connectGuiChat).toHaveBeenCalledTimes(2);
     expect(mocks.connectGuiChat.mock.calls).toEqual([
-      [{ ownerKey: undefined, profile: "" }],
-      [{ ownerKey: "owner-a", profile: "" }],
+      [{ ownerKey: undefined }],
+      [{ ownerKey: "owner-a" }],
     ]);
     expect(document.querySelector("[data-ready]")?.outerHTML).toContain('data-ready="true"');
     expect(firstConnection.close).toHaveBeenCalledOnce();
@@ -659,7 +655,7 @@ describe("GuiChatShell", () => {
     root = createRoot(container)
     await act(async () => {
       root?.render(
-        <MemoryRouter initialEntries={["/chat-gui"]}>
+        <MemoryRouter initialEntries={["/chat"]}>
           <DashboardAuthIdentityProvider>
             <GuiChatShell />
           </DashboardAuthIdentityProvider>
@@ -687,7 +683,7 @@ describe("GuiChatShell", () => {
     root = createRoot(container);
     await act(async () => {
       root?.render(
-        <MemoryRouter initialEntries={["/chat-gui"]}>
+        <MemoryRouter initialEntries={["/chat"]}>
           <DashboardAuthIdentityProvider>
             <GuiChatShell />
           </DashboardAuthIdentityProvider>
@@ -731,7 +727,7 @@ describe("GuiChatShell", () => {
     root = createRoot(container);
     await act(async () => {
       root?.render(
-        <MemoryRouter initialEntries={["/chat-gui?resume=requested"]}>
+        <MemoryRouter initialEntries={["/chat?resume=requested"]}>
           <DashboardAuthIdentityProvider>
             <GuiChatShell />
           </DashboardAuthIdentityProvider>
@@ -753,7 +749,6 @@ describe("GuiChatShell", () => {
     expect(mocks.getSessionMessages).toHaveBeenCalledWith(
       "requested",
       expect.objectContaining({ limit: 100, signal: expect.any(AbortSignal) }),
-      "",
     );
     expect(connection.createOrAttach).toHaveBeenCalledOnce();
     expect(container.textContent).toContain("saved answer");
@@ -778,7 +773,7 @@ describe("GuiChatShell", () => {
     root = createRoot(container);
     await act(async () => {
       root?.render(
-        <MemoryRouter initialEntries={["/chat-gui?resume=requested"]}>
+        <MemoryRouter initialEntries={["/chat?resume=requested"]}>
           <DashboardAuthIdentityProvider>
             <GuiChatShell />
           </DashboardAuthIdentityProvider>
@@ -802,7 +797,7 @@ describe("GuiChatShell", () => {
     root = createRoot(container);
     await act(async () => {
       root?.render(
-        <MemoryRouter initialEntries={["/chat-gui?resume=session-a"]}>
+        <MemoryRouter initialEntries={["/chat?resume=session-a"]}>
           <DashboardAuthIdentityProvider>
             <NavigationProbe
               onReady={(nextNavigate) => {
@@ -820,7 +815,7 @@ describe("GuiChatShell", () => {
     expect(navigate).not.toBeNull();
     for (const sessionId of ["session-b", "session-c", "session-d"]) {
       await act(async () => {
-        navigate?.(`/chat-gui?resume=${sessionId}`);
+        navigate?.(`/chat?resume=${sessionId}`);
         await Promise.resolve();
         await Promise.resolve();
       });
@@ -852,7 +847,7 @@ async function renderShell(shell: ReactNode) {
   root = createRoot(container);
   await act(async () => {
     root?.render(
-      <MemoryRouter initialEntries={["/chat-gui"]}>
+      <MemoryRouter initialEntries={["/chat"]}>
         <DashboardAuthIdentityProvider>{shell}</DashboardAuthIdentityProvider>
       </MemoryRouter>,
     );

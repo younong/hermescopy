@@ -1,0 +1,249 @@
+"""Tests for authenticated startup of retained messaging connectors."""
+
+import base64
+import json
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from hermes_cli.channel_connectors import bootstrap as connector_bootstrap
+from hermes_cli.channel_connectors.supervisor import ConnectorSupervisor
+
+
+class _Supervisor:
+    def __init__(self, tmp_path):
+        self.global_home = tmp_path
+        self.control_home = tmp_path / "control-plane"
+        self.deployment_inference_policy = object()
+        self.deployment_image_policy = object()
+        self.resource_manager = object()
+
+
+@pytest.mark.anyio
+async def test_disabled_configuration_initializes_control_plane_store(
+    monkeypatch,
+    tmp_path,
+):
+    crypto = object()
+    store = MagicMock()
+    monkeypatch.setattr(
+        connector_bootstrap.ChannelCrypto,
+        "from_env",
+        lambda **kwargs: crypto,
+    )
+    create_store = MagicMock(return_value=store)
+    monkeypatch.setattr(connector_bootstrap, "ChannelIdentityStore", create_store)
+
+    runtime = await connector_bootstrap.bootstrap_channel_connectors(
+        {"webhook": {"enabled": False}},
+        auth_required=True,
+        supervisor=_Supervisor(tmp_path),
+    )
+
+    assert runtime.status.ready is True
+    assert runtime.status.states == {}
+    assert runtime.store is store
+    assert runtime.session is None
+    create_store.assert_called_once_with(
+        crypto,
+        tmp_path / "control-plane",
+        global_home=tmp_path,
+    )
+    await runtime.close()
+
+
+@pytest.mark.anyio
+async def test_disabled_webhook_real_path_creates_provisioning_store(
+    monkeypatch,
+    tmp_path,
+):
+    encoded_lookup = base64.b64encode(b"l" * 32).decode("ascii")
+    encoded_encryption = base64.b64encode(b"e" * 32).decode("ascii")
+    monkeypatch.setenv(
+        "HERMES_ILINK_LOOKUP_KEYS_JSON",
+        json.dumps({"1": encoded_lookup}),
+    )
+    monkeypatch.setenv(
+        "HERMES_ILINK_ENCRYPTION_KEYS_JSON",
+        json.dumps({"1": encoded_encryption}),
+    )
+
+    runtime = await connector_bootstrap.bootstrap_channel_connectors(
+        {"webhook": {"enabled": False}},
+        auth_required=True,
+        supervisor=_Supervisor(tmp_path),
+    )
+
+    assert runtime.store is not None
+    assert runtime.session is None
+    assert (tmp_path / "control-plane" / "channel_identities.sqlite3").exists()
+    await runtime.close()
+
+
+@pytest.mark.anyio
+async def test_enabled_connector_requires_authenticated_owner_supervisor():
+    runtime = await connector_bootstrap.bootstrap_channel_connectors(
+        {"feishu": {"enabled": True}},
+        auth_required=False,
+        supervisor=None,
+    )
+    assert runtime.status.ready is False
+    assert runtime.status.states == {"feishu": "authenticated_dashboard_required"}
+
+
+@pytest.mark.anyio
+async def test_removed_connector_is_rejected_without_loading_keyrings(monkeypatch):
+    monkeypatch.setattr(
+        connector_bootstrap.ChannelCrypto,
+        "from_env",
+        lambda **kwargs: pytest.fail("removed connectors must not read keyrings"),
+    )
+    runtime = await connector_bootstrap.bootstrap_channel_connectors(
+        {"telegram": {"enabled": True}},
+        auth_required=True,
+        supervisor=object(),
+    )
+    assert runtime.status.ready is False
+    assert runtime.status.states == {"telegram": "unsupported"}
+
+
+@pytest.mark.anyio
+async def test_feishu_requires_exactly_one_active_account(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        connector_bootstrap.ChannelCrypto,
+        "from_env",
+        lambda **kwargs: object(),
+    )
+    store = MagicMock()
+    read_context = MagicMock()
+    connection = MagicMock()
+    connection.execute.return_value.fetchall.return_value = []
+    read_context.__enter__.return_value = connection
+    read_context.__exit__.return_value = False
+    store.read.return_value = read_context
+    monkeypatch.setattr(
+        connector_bootstrap,
+        "ChannelIdentityStore",
+        lambda *args, **kwargs: store,
+    )
+
+    runtime = await connector_bootstrap.bootstrap_channel_connectors(
+        {"feishu": {"enabled": True}},
+        auth_required=True,
+        supervisor=_Supervisor(tmp_path),
+    )
+
+    assert runtime.status.ready is False
+    assert runtime.status.states == {"feishu": "account_unavailable"}
+    await runtime.close()
+
+
+@pytest.mark.anyio
+async def test_feishu_registers_with_shared_supervisor(monkeypatch, tmp_path):
+    service = AsyncMock()
+    service.start = AsyncMock()
+    service.close = AsyncMock()
+    monkeypatch.setattr(
+        connector_bootstrap.ChannelCrypto,
+        "from_env",
+        lambda **kwargs: object(),
+    )
+    store = MagicMock()
+    read_context = MagicMock()
+    connection = MagicMock()
+    connection.execute.return_value.fetchall.return_value = [{"account_id": "ca_feishu"}]
+    read_context.__enter__.return_value = connection
+    read_context.__exit__.return_value = False
+    store.read.return_value = read_context
+    monkeypatch.setattr(
+        connector_bootstrap,
+        "ChannelIdentityStore",
+        lambda *args, **kwargs: store,
+    )
+    monkeypatch.setattr(
+        connector_bootstrap,
+        "FeishuConnector",
+        lambda *args, **kwargs: service,
+    )
+
+    runtime = await connector_bootstrap.bootstrap_channel_connectors(
+        {"feishu": {"enabled": True}},
+        auth_required=True,
+        supervisor=_Supervisor(tmp_path),
+    )
+
+    assert isinstance(runtime.connectors, ConnectorSupervisor)
+    assert runtime.get("feishu") is service
+    assert runtime.status.ready is True
+    assert runtime.status.states == {"feishu": "ready"}
+    service.start.assert_awaited_once()
+    await runtime.close()
+    service.close.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_webhook_registers_only_with_active_account(monkeypatch, tmp_path):
+    service = AsyncMock()
+    service.start = AsyncMock()
+    service.close = AsyncMock()
+    monkeypatch.setattr(
+        connector_bootstrap.ChannelCrypto,
+        "from_env",
+        lambda **kwargs: object(),
+    )
+    store = MagicMock()
+    read_context = MagicMock()
+    connection = MagicMock()
+    connection.execute.return_value.fetchall.return_value = [
+        {"account_id": "ca_webhook"}
+    ]
+    read_context.__enter__.return_value = connection
+    read_context.__exit__.return_value = False
+    store.read.return_value = read_context
+    monkeypatch.setattr(
+        connector_bootstrap,
+        "ChannelIdentityStore",
+        lambda *args, **kwargs: store,
+    )
+    monkeypatch.setattr(
+        connector_bootstrap,
+        "WebhookService",
+        lambda *args, **kwargs: service,
+    )
+
+    runtime = await connector_bootstrap.bootstrap_channel_connectors(
+        {"webhook": {"enabled": True}},
+        auth_required=True,
+        supervisor=_Supervisor(tmp_path),
+    )
+
+    assert runtime.get("webhook") is service
+    assert runtime.status.ready is True
+    assert runtime.status.states == {"webhook": "ready"}
+    service.start.assert_awaited_once()
+    await runtime.close()
+    service.close.assert_awaited_once()
+
+
+def test_connector_supervisor_starts_one_provider_without_rollback():
+    supervisor = ConnectorSupervisor()
+    first = object()
+    second = object()
+
+    async def start_first():
+        return first
+
+    async def start_second():
+        return second
+
+    supervisor.register("first", start_first)
+    supervisor.register("second", start_second)
+
+    async def run():
+        assert await supervisor.start_provider("first") is first
+        assert supervisor.get("second") is None
+        await supervisor.close()
+
+    import asyncio
+
+    asyncio.run(run())

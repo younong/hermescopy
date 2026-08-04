@@ -5,13 +5,13 @@ Model Tools Module
 Thin orchestration layer over the tool registry. Each tool file in tools/
 self-registers its schema, handler, and metadata via tools.registry.register().
 This module triggers discovery (by importing all tool modules), then provides
-the public API that run_agent.py, cli.py, batch_runner.py, and the RL
+the public API that run_agent.py, cli.py, and the RL
 environments consume.
 
 Public API (signatures preserved from the original 2,400-line version):
     get_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode) -> list
     handle_function_call(function_name, function_args, task_id, user_task) -> str
-    TOOL_TO_TOOLSET_MAP: dict          (for batch_runner.py)
+    TOOL_TO_TOOLSET_MAP: dict          (for runtime toolset lookup)
     TOOLSET_REQUIREMENTS: dict         (for cli.py, doctor.py)
     get_all_tool_names() -> list
     get_toolset_for_tool(name) -> str
@@ -198,7 +198,6 @@ discover_builtin_tools()
 #   - gateway/run.py            -> start_gateway() uses run_in_executor
 #   - cli.py, hermes_cli/*      -> inline on startup (no event loop)
 #   - tui_gateway/server.py     -> inline on startup (no event loop)
-#   - acp_adapter/server.py     -> asyncio.to_thread on session init
 
 # Plugin tool discovery (user/project/pip plugins)
 try:
@@ -1152,20 +1151,6 @@ def handle_function_call(
                     middleware_trace=list(_tool_middleware_trace),
                 )
                 return result
-
-        # ACP/Zed edit approval runs before any file mutation.  The requester
-        # is bound via ContextVar only for ACP sessions, so CLI/gateway paths
-        # are unaffected when it is unset.
-        try:
-            from acp_adapter.edit_approval import maybe_require_edit_approval
-
-            edit_block_message = maybe_require_edit_approval(function_name, function_args)
-            if edit_block_message is not None:
-                return edit_block_message
-        except Exception as _edit_approval_err:
-            logger.debug("ACP edit approval guard error: %s", _edit_approval_err)
-            if function_name in {"write_file", "patch"}:
-                return json.dumps({"error": "Edit approval denied: approval guard failed"}, ensure_ascii=False)
 
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).

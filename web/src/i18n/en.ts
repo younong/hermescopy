@@ -48,7 +48,7 @@ export const en: Translations = {
     copyFailed: "Copy failed",
     gateway: "Gateway",
     gatewayHint:
-      "Messaging platforms, the API server and webhooks are configured on the Channels page. These are gateway-wide settings (proxy/relay mode and the global allowlist).",
+      "Weixin iLink and Feishu are configured on the Channels page. The authenticated OpenAI-compatible API remains a separate control-plane surface.",
     pluginLoadFailed:
       "Could not load this plugin’s script. Check the Network tab (dashboard-plugins/…) and the server’s plugin path.",
     pluginNotRegistered:
@@ -371,10 +371,9 @@ export const en: Translations = {
     triggerNow: "Trigger now",
     delivery: {
       local: "Local",
-      telegram: "Telegram",
-      discord: "Discord",
-      slack: "Slack",
-      email: "Email",
+      weixin_ilink: "Weixin iLink",
+      feishu: "Feishu",
+      webhook: "Webhook",
       needsHomeChannel: "set a home channel first",
       noneConfigured:
         "No messaging platforms configured. Set one up under Channels to deliver reports.",
@@ -546,7 +545,6 @@ export const en: Translations = {
       tts: "Text-to-Speech",
       stt: "Speech-to-Text",
       logging: "Logging",
-      discord: "Discord",
       auxiliary: "Auxiliary",
     },
   },

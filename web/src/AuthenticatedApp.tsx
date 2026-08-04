@@ -4,7 +4,7 @@ import App from "@/App";
 import { ForcedPasswordChangePage } from "@/components/ForcedPasswordChangePage";
 import { SystemActionsProvider } from "@/contexts/SystemActions";
 import { useDashboardAuthIdentity } from "@/lib/useDashboardAuthIdentity";
-import StandaloneGuiChatPage from "@/pages/StandaloneGuiChatPage";
+import GuiChatPage from "@/pages/GuiChatPage";
 
 export default function AuthenticatedApp() {
   const authIdentity = useDashboardAuthIdentity();
@@ -41,8 +41,8 @@ export default function AuthenticatedApp() {
     return (
       <SystemActionsProvider>
         <Routes>
-          <Route path="/chat-gui/*" element={<StandaloneGuiChatPage />} />
-          <Route path="*" element={<Navigate to="/chat-gui" replace />} />
+          <Route path="/chat/*" element={<GuiChatPage />} />
+          <Route path="*" element={<Navigate to="/chat" replace />} />
         </Routes>
       </SystemActionsProvider>
     );

@@ -982,16 +982,10 @@ def _disable_nagle(ws: Any) -> None:
 async def handle_ws(
     ws: Any,
     *,
-    runtime: server.OwnerWorkerGatewayRuntime | None = None,
-    require_owner_runtime: bool = False,
+    runtime: server.OwnerWorkerGatewayRuntime,
 ) -> None:
-    """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``.
-
-    Owner-worker routes must supply their app-local immutable runtime fence.  A
-    missing fence is rejected at the route boundary rather than falling back to
-    the standalone module-global dispatch path.
-    """
-    if require_owner_runtime and runtime is None:
+    """Run one authenticated Owner Worker WebSocket session."""
+    if runtime is None:
         await ws.close(code=1011, reason="owner gateway runtime unavailable")
         return
     peer = _ws_peer_label(ws)

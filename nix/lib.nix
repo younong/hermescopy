@@ -4,7 +4,7 @@
 # root package-lock.json.  mkNpmPassthru provides the shared src, npmDeps,
 # npmRoot, and npmConfigHook so individual .nix files don't duplicate them.
 #
-# mkNpmPassthru returns packageJsonPath (e.g. "ui-tui/package.json")
+# mkNpmPassthru returns packageJsonPath
 # instead of a per-package devShellHook.  The root devshell hook
 # (mkNpmDevShellHook) collects all package.json paths, stamps them,
 # and if any changed, runs a single `npm i --package-lock-only` from
@@ -33,15 +33,13 @@ in
   #   nodejs                     — fixed nodejs version for all packages we use in the repo
   #
   # Usage:
-  #   npm = hermesNpmLib.mkNpmPassthru { folder = "ui-tui"; attr = "tui"; pname = "hermes-tui"; };
   #   pkgs.buildNpmPackage (npm // {
-  #     sourceRoot = "ui-tui";
   #     buildPhase = '' ... '';
   #     installPhase = '' ... '';
   #   })
   mkNpmPassthru =
     {
-      folder, # repo-relative folder with package.json, e.g. "ui-tui"
+      folder, # repo-relative folder with package.json
       attr, # flake package attr, e.g. "tui"
       ...
     }:

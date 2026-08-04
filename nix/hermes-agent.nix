@@ -11,7 +11,6 @@
   callPackage,
   python312,
   nodejs_22,
-  electron,
   ripgrep,
   git,
   openssh,
@@ -48,10 +47,6 @@ let
 
   hermesNpmLib = callPackage ./lib.nix {
     inherit npm-lockfile-fix nodejs;
-  };
-
-  hermesTui = callPackage ./tui.nix {
-    inherit hermesNpmLib;
   };
 
   hermesWeb = callPackage ./web.nix {
@@ -167,9 +162,6 @@ stdenv.mkDerivation (finalAttrs: {
     cp -r ${bundledLocales} $out/share/hermes-agent/locales
     cp -r ${hermesWeb} $out/share/hermes-agent/web_dist
 
-    mkdir -p $out/ui-tui
-    cp -r ${hermesTui}/lib/hermes-tui/* $out/ui-tui/
-
     ${lib.concatMapStringsSep "\n"
       (name: ''
         makeWrapper ${hermesVenv}/bin/${name} $out/bin/${name} \
@@ -178,7 +170,6 @@ stdenv.mkDerivation (finalAttrs: {
           --set HERMES_BUNDLED_PLUGINS $out/share/hermes-agent/plugins \
           --set HERMES_BUNDLED_LOCALES $out/share/hermes-agent/locales \
           --set HERMES_WEB_DIST $out/share/hermes-agent/web_dist \
-          --set HERMES_TUI_DIR $out/ui-tui \
           --set HERMES_PYTHON ${hermesVenv}/bin/python3 \
           --set HERMES_NODE ${lib.getExe nodejs} \
           ${lib.optionalString (rev != null) ''--set HERMES_REVISION ${rev} \''}
@@ -186,8 +177,6 @@ stdenv.mkDerivation (finalAttrs: {
       '')
       [
         "hermes"
-        "hermes-agent"
-        "hermes-acp"
       ]
     }
 
@@ -202,23 +191,10 @@ stdenv.mkDerivation (finalAttrs: {
 
   passthru = {
     inherit
-      hermesTui
       hermesWeb
       hermesNpmLib
       hermesVenv
       ;
-
-    # `hermesDesktop` references `finalAttrs.finalPackage` (this whole
-    # derivation, after all overrides are applied) so the desktop wrapper
-    # can prepend its `/bin` to PATH.  The desktop's resolver step 4
-    # ("existing hermes on PATH") then picks up the fully wrapped
-    # `hermes` binary — venv with all deps, bundled skills/plugins,
-    # runtime PATH (ripgrep/git/ffmpeg/etc).  No re-implementation
-    # of the agent resolution in the desktop wrapper.
-    hermesDesktop = callPackage ./desktop.nix {
-      inherit hermesNpmLib electron;
-      hermesAgent = finalAttrs.finalPackage;
-    };
 
     devShellHook = ''
       export HERMES_PYTHON=${hermesVenv}/bin/python3

@@ -1,21 +1,11 @@
-"""Shared cron management operations for dashboard and owner-worker APIs.
-
-The cron store resolves paths from process globals because most Hermes processes
-serve exactly one HERMES_HOME.  The dashboard is the exception: legacy profile
-management serves several homes from one process.  This module keeps the path
-retargeting, validation, persistence, and scheduler notification in one place so
-all HTTP surfaces enforce the same rules.
-"""
+"""Owner-scoped cron management operations used inside Owner Workers."""
 from __future__ import annotations
 
 import re
-import threading
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Mapping
 
-
-_CRON_HOME_LOCK = threading.RLock()
+from cron.jobs import CronStore, use_store
 
 
 def optional_text(value: Any, *, strip_trailing_slash: bool = False) -> str | None:
@@ -40,28 +30,8 @@ def string_list(value: Any) -> list[str] | None:
     return items or None
 
 
-@contextmanager
-def cron_home_scope(home: str | Path) -> Iterator[None]:
-    """Bind cron modules and profile-aware helpers to one trusted home."""
-    selected_home = Path(home).expanduser().resolve()
-    with _CRON_HOME_LOCK:
-        from cron import jobs as cron_jobs
-        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-
-        old_cron_dir = cron_jobs.CRON_DIR
-        old_jobs_file = cron_jobs.JOBS_FILE
-        old_output_dir = cron_jobs.OUTPUT_DIR
-        token = set_hermes_home_override(str(selected_home))
-        cron_jobs.CRON_DIR = selected_home / "cron"
-        cron_jobs.JOBS_FILE = cron_jobs.CRON_DIR / "jobs.json"
-        cron_jobs.OUTPUT_DIR = cron_jobs.CRON_DIR / "output"
-        try:
-            yield
-        finally:
-            cron_jobs.CRON_DIR = old_cron_dir
-            cron_jobs.JOBS_FILE = old_jobs_file
-            cron_jobs.OUTPUT_DIR = old_output_dir
-            reset_hermes_home_override(token)
+def _store(home: str | Path) -> CronStore:
+    return CronStore(home)
 
 
 def _normalize_script(value: Any, home: Path) -> str | None:
@@ -187,67 +157,36 @@ def _notify_provider() -> None:
     _notify_provider_jobs_changed()
 
 
-def annotate_job(
-    job: Mapping[str, Any],
-    *,
-    profile: str | None,
-    home: Path,
-) -> dict[str, Any]:
-    result = dict(job)
-    if profile is not None:
-        result.update(
-            profile=profile,
-            profile_name=profile,
-            hermes_home=str(home),
-            is_default_profile=profile == "default",
-        )
-    return result
-
-
-def list_jobs(
-    home: str | Path,
-    *,
-    profile: str | None = None,
-    include_disabled: bool = True,
-) -> list[dict[str, Any]]:
-    selected_home = Path(home).expanduser().resolve()
-    with cron_home_scope(selected_home):
+def list_jobs(home: str | Path, *, include_disabled: bool = True) -> list[dict[str, Any]]:
+    with use_store(_store(home)):
         from cron.jobs import list_jobs as load_jobs
 
-        jobs = load_jobs(include_disabled)
-    return [annotate_job(job, profile=profile, home=selected_home) for job in jobs]
+        return [dict(job) for job in load_jobs(include_disabled)]
 
 
-def get_job(
-    home: str | Path,
-    job_id: str,
-    *,
-    profile: str | None = None,
-) -> dict[str, Any] | None:
-    selected_home = Path(home).expanduser().resolve()
-    with cron_home_scope(selected_home):
+def get_job(home: str | Path, job_id: str) -> dict[str, Any] | None:
+    with use_store(_store(home)):
         from cron.jobs import get_job as load_job
 
         job = load_job(job_id)
-    return annotate_job(job, profile=profile, home=selected_home) if job else None
+        return dict(job) if job else None
 
 
 def create_job(
     home: str | Path,
     values: Mapping[str, Any],
     *,
-    profile: str | None = None,
     allowed_workdir_root: Path | None = None,
 ) -> dict[str, Any]:
-    selected_home = Path(home).expanduser().resolve()
+    store = _store(home)
     normalized = _normalize_updates(
-        values, selected_home, allowed_workdir_root=allowed_workdir_root
+        values, store.owner_home, allowed_workdir_root=allowed_workdir_root
     )
     normalized.setdefault("prompt", "")
     normalized.setdefault("deliver", "local")
     _validate_effective_job(normalized)
 
-    with cron_home_scope(selected_home):
+    with use_store(store):
         _validate_context_refs(normalized.get("context_from"))
         from cron.jobs import create_job as persist_job
 
@@ -267,7 +206,7 @@ def create_job(
             no_agent=bool(normalized.get("no_agent")),
         )
         _notify_provider()
-    return annotate_job(job, profile=profile, home=selected_home)
+        return dict(job)
 
 
 def update_job(
@@ -275,14 +214,13 @@ def update_job(
     job_id: str,
     updates: Mapping[str, Any],
     *,
-    profile: str | None = None,
     allowed_workdir_root: Path | None = None,
 ) -> dict[str, Any] | None:
-    selected_home = Path(home).expanduser().resolve()
+    store = _store(home)
     normalized = _normalize_updates(
-        updates, selected_home, allowed_workdir_root=allowed_workdir_root
+        updates, store.owner_home, allowed_workdir_root=allowed_workdir_root
     )
-    with cron_home_scope(selected_home):
+    with use_store(store):
         from cron.jobs import get_job as load_job
         from cron.jobs import update_job as persist_update
 
@@ -298,17 +236,10 @@ def update_job(
         job = persist_update(job_id, normalized)
         if job:
             _notify_provider()
-    return annotate_job(job, profile=profile, home=selected_home) if job else None
+        return dict(job) if job else None
 
 
-def mutate_job(
-    home: str | Path,
-    job_id: str,
-    action: str,
-    *,
-    profile: str | None = None,
-) -> dict[str, Any] | None:
-    selected_home = Path(home).expanduser().resolve()
+def mutate_job(home: str | Path, job_id: str, action: str) -> dict[str, Any] | None:
     functions = {
         "pause": "pause_job",
         "resume": "resume_job",
@@ -316,29 +247,28 @@ def mutate_job(
     }
     if action not in functions:
         raise ValueError(f"unsupported cron action: {action}")
-    with cron_home_scope(selected_home):
+    with use_store(_store(home)):
         from cron import jobs as cron_jobs
 
         job = getattr(cron_jobs, functions[action])(job_id)
         if job:
             _notify_provider()
-    return annotate_job(job, profile=profile, home=selected_home) if job else None
+        return dict(job) if job else None
 
 
 def delete_job(home: str | Path, job_id: str) -> bool:
-    selected_home = Path(home).expanduser().resolve()
-    with cron_home_scope(selected_home):
+    with use_store(_store(home)):
         from cron.jobs import remove_job
 
         removed = remove_job(job_id)
         if removed:
             _notify_provider()
-    return removed
+        return removed
 
 
 def delivery_targets(home: str | Path) -> list[dict[str, Any]]:
-    selected_home = Path(home).expanduser().resolve()
-    targets: list[dict[str, Any]] = [
+    del home
+    return [
         {
             "id": "local",
             "name": "Local (save only)",
@@ -346,11 +276,3 @@ def delivery_targets(home: str | Path) -> list[dict[str, Any]]:
             "home_env_var": None,
         }
     ]
-    with cron_home_scope(selected_home):
-        try:
-            from cron.scheduler import cron_delivery_targets
-
-            targets.extend(cron_delivery_targets())
-        except Exception:
-            pass
-    return targets

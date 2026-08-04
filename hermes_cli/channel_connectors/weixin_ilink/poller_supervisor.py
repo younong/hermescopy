@@ -35,7 +35,10 @@ class PollerSupervisor:
         with self.store.read() as conn:
             account_ids = {
                 row["account_id"]
-                for row in conn.execute("SELECT account_id FROM ilink_accounts WHERE status='active'")
+                for row in conn.execute(
+                    "SELECT account_id FROM connector_accounts "
+                    "WHERE provider='weixin_ilink' AND status='active'"
+                )
             }
         for account_id in account_ids - self._tasks.keys():
             lease = acquire_poll_lease(self.store, account_id=account_id, holder=self.holder)

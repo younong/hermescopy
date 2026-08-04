@@ -63,7 +63,7 @@ beforeEach(() => {
 
 describe("connectGuiChat", () => {
   it("reuses one connection for repeated warm session attaches", async () => {
-    const connection = connectGuiChat({ ownerKey: "owner-a", profile: "worker" });
+    const connection = connectGuiChat({ ownerKey: "owner-a" });
     const firstStages: string[] = [];
     const secondStages: string[] = [];
 
@@ -82,7 +82,6 @@ describe("connectGuiChat", () => {
       "session.attach",
       expect.objectContaining({
         browser_id: "browser-test",
-        profile: "worker",
         session_id: "stored-a",
         switch_generation: 1,
       }),

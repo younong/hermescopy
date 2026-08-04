@@ -16,7 +16,6 @@ import base64
 import binascii
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import hmac
 import importlib.util
 import json
 import logging
@@ -31,7 +30,6 @@ import sys
 import tempfile
 import threading
 import time
-import uuid
 import urllib.error
 import urllib.parse
 import zipfile
@@ -40,6 +38,8 @@ from hermes_cli._subprocess_compat import windows_detach_flags, windows_hide_fla
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from hermes_cli.channel_identity import register_connector_binding_for_owner
 
 import yaml
 
@@ -67,7 +67,7 @@ from hermes_cli.config import (
     format_docker_update_message,
     recommended_update_command_for_method,
     redact_key,
-    write_platform_config_field,
+    write_channel_connector_config_field,
     _deep_merge,
 )
 from hermes_cli.memory_providers import (
@@ -176,8 +176,6 @@ def _resolve_restart_drain_timeout() -> float:
 async def _lifespan(app: "FastAPI"):
     app.state.event_channels = {}  # dict[str, set]
     app.state.event_lock = asyncio.Lock()
-    app.state.pty_browser_sessions = {}  # browser_id -> active /api/pty owner
-    app.state.pty_browser_lock = asyncio.Lock()
     app.state.authorized_ws_bridges = {}  # scope digest -> {(websocket, epoch)}
     app.state.authorized_ws_bridges_by_worker = {}  # exact worker fence -> {websocket}
     app.state.revoked_ws_bridge_worker_fences = set()  # exact durable fences
@@ -188,11 +186,6 @@ async def _lifespan(app: "FastAPI"):
     app.state.server_event_loop = asyncio.get_running_loop()
     app.state.authority_change_stop = asyncio.Event()
     app.state.authority_change_task = None
-    # Serializes chat-argv resolution so concurrent /api/pty connections
-    # don't trigger overlapping ``npm install`` / ``npm run build`` work.
-    # On app.state (not a module global) so the Lock binds to the running
-    # event loop during lifespan startup — see _get_event_state's docstring.
-    app.state.chat_argv_lock = asyncio.Lock()
     from hermes_cli.owner_worker.readiness import initialize_owner_worker_warmups
     from hermes_cli.session_reader.readiness import initialize_session_reader_warmups
 
@@ -202,33 +195,44 @@ async def _lifespan(app: "FastAPI"):
     app.state.owner_cron_dispatch_stop = None
     app.state.owner_cron_dispatch_task = None
     owner_supervisor = getattr(app.state, "owner_worker_supervisor", None)
+
+    from hermes_cli.channel_connectors.bootstrap import (
+        bootstrap_channel_connectors,
+        ilink_status,
+    )
+
+    app.state.weixin_ilink_service = None
+    app.state.weixin_ilink_runtime = None
+    app.state.weixin_ilink_status = None
+    connectors = load_config().get("channel_connectors") or {}
+    connector_runtime = await bootstrap_channel_connectors(
+        connectors,
+        auth_required=bool(getattr(app.state, "auth_required", False)),
+        supervisor=getattr(app.state, "owner_worker_supervisor", None),
+    )
+    app.state.channel_connector_runtime = connector_runtime
+    app.state.weixin_ilink_runtime = connector_runtime
+    app.state.weixin_ilink_status = ilink_status(connector_runtime)
+    app.state.weixin_ilink_service = connector_runtime.get("weixin_ilink")
+
     if getattr(app.state, "auth_required", False) and owner_supervisor is not None:
+        from hermes_cli.channel_dispatch import ChannelOutbox
         from hermes_cli.owner_worker.cron_dispatcher import run_owner_cron_dispatcher
 
+        enqueue_delivery = (
+            ChannelOutbox(connector_runtime.store).enqueue_cron_result
+            if connector_runtime.store is not None
+            else None
+        )
         app.state.owner_cron_dispatch_stop = asyncio.Event()
         app.state.owner_cron_dispatch_task = asyncio.create_task(
             run_owner_cron_dispatcher(
                 app.state.owner_cron_dispatch_stop,
                 owner_supervisor,
                 get_hermes_home(),
+                enqueue_delivery=enqueue_delivery,
             )
         )
-
-    from hermes_cli.channel_connectors.weixin_ilink.bootstrap import bootstrap_weixin_ilink
-
-    app.state.weixin_ilink_service = None
-    app.state.weixin_ilink_runtime = None
-    app.state.weixin_ilink_status = None
-    connectors = load_config().get("channel_connectors") or {}
-    connector_config = connectors.get("weixin_ilink") or {}
-    connector_runtime = await bootstrap_weixin_ilink(
-        connector_config,
-        auth_required=bool(getattr(app.state, "auth_required", False)),
-        supervisor=getattr(app.state, "owner_worker_supervisor", None),
-    )
-    app.state.weixin_ilink_runtime = connector_runtime
-    app.state.weixin_ilink_status = connector_runtime.status
-    app.state.weixin_ilink_service = connector_runtime.service
 
     # Fire hermes_cli.gateway import into a background thread so the event
     # loop is not blocked and HERMES_DASHBOARD_READY fires without delay.
@@ -265,7 +269,7 @@ async def _lifespan(app: "FastAPI"):
                 await owner_cron_task
             except asyncio.CancelledError:
                 pass
-        connector_runtime = getattr(app.state, "weixin_ilink_runtime", None)
+        connector_runtime = getattr(app.state, "channel_connector_runtime", None)
         if connector_runtime is not None:
             await connector_runtime.close()
         authority_change_stop = getattr(app.state, "authority_change_stop", None)
@@ -325,33 +329,6 @@ def _get_event_state(app: "FastAPI"):
         return app.state.event_channels, app.state.event_lock
 
 
-def _get_chat_argv_lock(app: "FastAPI") -> asyncio.Lock:
-    """Return the chat-argv resolution lock from app.state.
-
-    Mirrors :func:`_get_event_state`: prefers the lifespan-initialised Lock
-    (created on the correct event loop) but lazily initialises it for
-    non-``with`` TestClient usages.
-    """
-    try:
-        return app.state.chat_argv_lock
-    except AttributeError:
-        app.state.chat_argv_lock = asyncio.Lock()
-        return app.state.chat_argv_lock
-
-
-def _get_pty_browser_state(app: "FastAPI") -> tuple[dict[str, dict], asyncio.Lock]:
-    """Return browser_id -> active PTY owner state for dashboard chat."""
-    try:
-        sessions = app.state.pty_browser_sessions
-        lock = app.state.pty_browser_lock
-    except AttributeError:
-        app.state.pty_browser_sessions = {}
-        app.state.pty_browser_lock = asyncio.Lock()
-        sessions = app.state.pty_browser_sessions
-        lock = app.state.pty_browser_lock
-    return sessions, lock
-
-
 app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
 
 # Memory-provider OAuth connect routes live in the memory layer, not here.
@@ -360,23 +337,14 @@ from hermes_cli.memory_oauth import router as _memory_oauth_router  # noqa: E402
 app.include_router(_memory_oauth_router)
 
 from hermes_cli.channel_connectors.weixin_ilink.api import router as _ilink_enrollment_router  # noqa: E402
+from hermes_cli.api_ingress import router as _api_ingress_router  # noqa: E402
 
 app.include_router(_ilink_enrollment_router)
+app.include_router(_api_ingress_router)
 
-# ---------------------------------------------------------------------------
-# Session token for protecting sensitive endpoints (reveal).
-# The desktop shell mints the token and injects it via
-# HERMES_DASHBOARD_SESSION_TOKEN so its main process can authenticate the
-# /api calls it makes on the user's behalf; otherwise we generate one fresh
-# on every server start. Either way it dies when the process exits and is
-# injected into the SPA HTML so only the legitimate web UI can use it.
-# ---------------------------------------------------------------------------
-_SESSION_TOKEN = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or secrets.token_urlsafe(32)
-_SESSION_HEADER_NAME = "X-Hermes-Session-Token"
-
-# In-browser Chat tab (/chat, /api/pty, /api/ws, …).  Always enabled: the
+# In-browser Chat tab (/chat and /api/ws). Always enabled: the
 # desktop app and the dashboard's own Chat tab both drive the agent over the
-# `/api/ws` + `/api/pty` WebSockets, so the embedded-chat surface is an
+# `/api/ws` WebSocket, so the embedded-chat surface is an
 # unconditional part of the dashboard.  Kept as a module-level constant (rather
 # than inlining ``True`` at every gate) so the WS endpoints and the SPA token
 # injection share a single, testable seam.
@@ -417,42 +385,6 @@ from hermes_cli.dashboard_auth.api_availability import (
     authenticated_session_reader_api_allowed,
 )
 from hermes_cli.dashboard_auth.public_paths import is_public_api_route
-
-
-def _has_valid_session_token(request: Request) -> bool:
-    """True if the request carries a valid dashboard session token.
-
-    The dedicated session header avoids collisions with reverse proxies that
-    already use ``Authorization`` (for example Caddy ``basic_auth``). We still
-    accept the legacy Bearer path for backward compatibility with older
-    dashboard bundles.
-    """
-    session_header = request.headers.get(_SESSION_HEADER_NAME, "")
-    if session_header and hmac.compare_digest(
-        session_header.encode(),
-        _SESSION_TOKEN.encode(),
-    ):
-        return True
-
-    auth = request.headers.get("authorization", "")
-    expected = f"Bearer {_SESSION_TOKEN}"
-    return hmac.compare_digest(auth.encode(), expected.encode())
-
-
-# Routes that may also authenticate via a ``?token=`` query param, for download
-# links opened by the OS shell or a new browser tab where the session header
-# can't be set. Kept narrow — same query-token tradeoff as the /api/pty WS.
-_QUERY_TOKEN_API_PATHS: frozenset[str] = frozenset({"/api/files/download"})
-_QUERY_TOKEN_API_PREFIXES: tuple[str, ...] = ("/api/generated-images/",)
-
-
-def _has_valid_query_token(request: Request, path: str) -> bool:
-    if path not in _QUERY_TOKEN_API_PATHS and not any(
-        path.startswith(prefix) for prefix in _QUERY_TOKEN_API_PREFIXES
-    ):
-        return False
-    token = request.query_params.get("token", "")
-    return bool(token) and hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode())
 
 
 def _authenticated_owner_request(request: Request) -> bool:
@@ -869,42 +801,6 @@ async def _proxy_authenticated_owner_http(request: Request) -> Response:
     )
 
 
-def _require_token(request: Request) -> None:
-    """Authorize a sensitive endpoint, raising 401 if the caller isn't allowed.
-
-    Two auth schemes protect the dashboard, exactly one active per bind:
-
-    * **Loopback / ``--insecure`` mode** (``auth_required`` False): the
-      ephemeral ``_SESSION_TOKEN`` is injected into the SPA HTML and echoed
-      back via ``X-Hermes-Session-Token`` (or the legacy ``Bearer`` header).
-      Validate it here.
-    * **Gated / OAuth mode** (``auth_required`` True): ``_SESSION_TOKEN`` is
-      NOT injected (the SPA authenticates with a session cookie), so there is
-      no token to check. The ``gated_auth_middleware`` has already verified the
-      cookie before the request reached this handler — any non-public ``/api/``
-      route it lets through carries a verified ``request.state.session``. The
-      legacy ``auth_middleware`` likewise short-circuits in this mode. Requiring
-      the (absent) token here would 401 every cookie-authenticated request,
-      making plugin install/enable/disable and the other ``_require_token``
-      endpoints permanently unreachable behind the gate. Defer to the gate.
-    """
-    if getattr(request.state, "token_authenticated", False):
-        return
-    if getattr(request.app.state, "auth_required", False):
-        # In owner-authenticated mode these legacy management endpoints would
-        # otherwise run in the Control Plane and read/write the global home.
-        # Keep them fail-closed until each surface is explicitly routed to an
-        # Owner Worker.
-        if _authenticated_owner_request(request):
-            raise HTTPException(
-                status_code=403,
-                detail="This management API is not available in authenticated owner mode until routed through the Owner Worker",
-            )
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    if not _has_valid_session_token(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-
 # Accepted Host header values for loopback binds. DNS rebinding attacks
 # point a victim browser at an attacker-controlled hostname (evil.test)
 # which resolves to 127.0.0.1 after a TTL flip — bypassing same-origin
@@ -914,28 +810,6 @@ def _require_token(request: Request) -> None:
 _LOOPBACK_HOST_VALUES: frozenset = frozenset({
     "localhost", "127.0.0.1", "::1",
 })
-
-
-def should_require_auth(host: str, allow_public: bool = False) -> bool:
-    """Return True iff the dashboard auth gate must be active.
-
-    Truth table:
-      host == loopback        → False (no auth — local-only, trusted operator)
-      host != loopback        → True  (gate engages — OAuth or password required)
-
-    "Loopback" is 127.0.0.1, localhost, ::1. RFC1918 / CGNAT / link-local are
-    deliberately treated as PUBLIC — a hostile device on the same LAN is exactly
-    the threat model the gate is designed for.
-
-    ``allow_public`` (the legacy ``--insecure`` escape hatch) NO LONGER disables
-    the gate. It is accepted for backward-compat with old launch scripts and
-    desktop shells but is ignored: a non-loopback bind ALWAYS requires an auth
-    provider (OAuth or the bundled password provider). This closes the
-    unauthenticated-public-dashboard hole behind the June 2026 ``hermes-0day``
-    MCP-persistence campaign, where ``--insecure --host 0.0.0.0`` left the
-    config/MCP/agent surface open to internet scanners.
-    """
-    return host not in _LOOPBACK_HOST_VALUES
 
 
 def _host_name(host_header: str) -> str:
@@ -1065,8 +939,6 @@ async def _plugin_api_runtime_gate(request: Request, call_next):
         _authed = (
             getattr(request.state, "token_authenticated", False)
             or getattr(request.app.state, "auth_required", False)
-            or _has_valid_session_token(request)
-            or _has_valid_query_token(request, path)
         )
         if _authed:
             # Extract plugin name from /api/plugins/<name>/...
@@ -1109,11 +981,9 @@ async def _plugin_api_runtime_gate(request: Request, call_next):
 
 
 # ---------------------------------------------------------------------------
-# Dashboard OAuth auth gate — engaged only when start_server flags the
-# bind as non-loopback-without-insecure.  No-op pass-through in loopback
-# mode so the legacy auth_middleware (below) handles those binds via
-# the injected ``_SESSION_TOKEN``.  Registered between host_header and
-# auth_middleware so the order is: host check → cookie auth → token auth.
+# Dashboard authentication gate. The retained Web surface always requires a
+# verified cookie session; the separate machine-token seam owns opted-in API
+# routes used by service callers.
 # ---------------------------------------------------------------------------
 
 
@@ -1121,29 +991,6 @@ async def _plugin_api_runtime_gate(request: Request, call_next):
 async def _dashboard_auth_gate(request: Request, call_next):
     from hermes_cli.dashboard_auth.middleware import gated_auth_middleware
     return await gated_auth_middleware(request, call_next)
-
-
-@app.middleware("http")
-async def auth_middleware(request: Request, call_next):
-    """Require the session token on all /api/ routes except the public list."""
-    # A request already authenticated by the token-auth seam (a service caller
-    # presenting a bearer token on a registered token route) carries
-    # ``token_authenticated`` — never bounce it through the cookie/session gate.
-    if getattr(request.state, "token_authenticated", False):
-        return await call_next(request)
-    # When the OAuth gate is active, cookie-based auth (gated_auth_middleware
-    # above) is authoritative.  The legacy _SESSION_TOKEN path is loopback-only
-    # and is skipped here so the gate's session attachment isn't overridden.
-    if getattr(request.app.state, "auth_required", False):
-        return await call_next(request)
-    path = request.url.path
-    if path.startswith("/api/") and not is_public_api_route(path, method=request.method):
-        if not _has_valid_session_token(request) and not _has_valid_query_token(request, path):
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Unauthorized"},
-            )
-    return await call_next(request)
 
 
 @app.middleware("http")
@@ -1289,10 +1136,6 @@ _CATEGORY_MERGE: Dict[str, str] = {
     # (`onboarding.seen` is an internal latch dict, not a user setting), so fold
     # it into the agent tab rather than spawning a one-field orphan category.
     "onboarding": "agent",
-    # Only `telegram.reactions` currently lives under telegram — fold it in
-    # with the other messaging-platform config (discord) so it isn't an
-    # orphan tab of one field.
-    "telegram": "discord",
     # `computer_use.cua_telemetry` is the only schema-surfaced computer_use
     # field — fold it into the agent tab rather than spawning a one-field
     # orphan category.
@@ -1413,15 +1256,6 @@ class MessagingPlatformUpdate(BaseModel):
     clear_env: List[str] = []
     # Explicit body profile beats the query param injected by the global
     # dashboard profile switcher (same precedence as other scoped writes).
-    profile: Optional[str] = None
-
-
-class TelegramOnboardingStart(BaseModel):
-    bot_name: Optional[str] = None
-
-
-class TelegramOnboardingApply(BaseModel):
-    allowed_user_ids: List[str]
     profile: Optional[str] = None
 
 
@@ -2276,7 +2110,7 @@ async def download_managed_file(
     that live on *this* gateway's disk, not theirs. Auth-gated like every other
     managed-files route — ``auth_middleware`` additionally accepts the session
     token as a ``?token=`` query param here so a shell/browser-opened download
-    (which can't set the session header) still authenticates. See ``/api/pty``
+    (which cannot set the session header) still authenticates.
     for the same query-token precedent.
     """
     if _authenticated_owner_request(request):
@@ -3021,9 +2855,7 @@ async def get_status(profile: Optional[str] = None):
         # reaches it, and leaking host metadata there contradicts the allowlist's
         # own contract ("version, gateway state, active session count, and the
         # dashboard auth-gate shape. No bodies, no session content, no secrets").
-        # Surface this detail only on a loopback / ``--insecure`` bind, where the
-        # dashboard is local-only and the caller is already inside the trust
-        # envelope — the same loopback/gated split ``should_require_auth`` draws.
+        # Isolated tests may disable the gate; production startup always enables it.
         if not auth_required:
             status.update({
                 "hermes_home": str(get_hermes_home()),
@@ -3535,184 +3367,6 @@ def _tail_lines(path: Path, n: int) -> List[str]:
         return []
     lines = text.splitlines()
     return lines[-n:] if n > 0 else lines
-
-
-def _gateway_subcommand(profile: Optional[str], verb: str) -> List[str]:
-    return _profile_cli_args(profile) + ["gateway", verb]
-
-
-def _gateway_display_command(profile: Optional[str], verb: str) -> str:
-    return " ".join(["hermes", *_gateway_subcommand(profile, verb)])
-
-
-# Slack member IDs (users U..., Enterprise Grid W...). Kept in sync with the
-# frontend SLACK_MEMBER_ID_RE in web/src/pages/ChannelsPage.tsx.
-_SLACK_MEMBER_ID_RE = re.compile(r"[UW][A-Z0-9]{2,}")
-
-
-def _validate_messaging_env_value(platform_id: str, key: str, value: str) -> None:
-    """Reject platform credentials that are clearly in the wrong field."""
-    if platform_id != "slack" or not value:
-        return
-
-    if key == "SLACK_BOT_TOKEN" and not value.startswith("xoxb-"):
-        raise HTTPException(
-            status_code=400,
-            detail="Slack Bot Token must start with xoxb-. Paste the bot token from OAuth & Permissions.",
-        )
-    if key == "SLACK_APP_TOKEN" and not value.startswith("xapp-"):
-        raise HTTPException(
-            status_code=400,
-            detail="Slack App Token must start with xapp-. Paste the app-level token from Basic Information > App-Level Tokens.",
-        )
-    if key == "SLACK_ALLOWED_USERS":
-        # Mirror the gateway's parse (gateway/platforms/slack.py): split on comma,
-        # strip, and drop empty entries so a trailing/interior comma isn't rejected
-        # here when the runtime would accept it. "*" is the allow-all wildcard.
-        user_ids = [part.strip() for part in value.split(",") if part.strip()]
-        invalid = [
-            user_id
-            for user_id in user_ids
-            if user_id != "*" and not _SLACK_MEMBER_ID_RE.fullmatch(user_id)
-        ]
-        if invalid:
-            raise HTTPException(
-                status_code=400,
-                detail="Slack allowed user IDs must be comma-separated member IDs like U01ABC2DEF3.",
-            )
-
-
-def _spawn_gateway_restart(profile: Optional[str] = None) -> Tuple[subprocess.Popen, bool]:
-    """Spawn ``hermes gateway restart``, reusing an in-flight restart.
-
-    Multiple dashboard paths can request a restart in quick succession
-    (restart button double-click, or a stale cached frontend firing its own
-    restart after the server already auto-restarted post-onboarding). Two
-    concurrent ``hermes gateway restart`` children race each other on the
-    manual kill-and-start path, so reuse the live one instead.
-
-    Returns ``(proc, reused)``.
-    """
-    subcommand = _gateway_subcommand(profile, "restart")
-    existing = _ACTION_PROCS.get("gateway-restart")
-    if existing is not None and existing.poll() is None:
-        existing_command = _ACTION_COMMANDS.get("gateway-restart")
-        if existing_command is None or existing_command == tuple(subcommand):
-            return existing, True
-        raise RuntimeError("gateway restart already in progress for another profile")
-    return _spawn_hermes_action(subcommand, "gateway-restart"), False
-
-
-def _restart_gateway_after_webhook_enable(profile: Optional[str] = None) -> dict[str, Any]:
-    """Best-effort gateway restart after enabling the webhook platform."""
-    try:
-        proc, reused = _spawn_gateway_restart(profile)
-    except Exception as exc:
-        _log.exception("Failed to auto-restart gateway after enabling webhooks")
-        return {
-            "restart_started": False,
-            "restart_error": str(exc),
-        }
-    if reused:
-        _log.info(
-            "Webhook enable: reusing in-flight gateway restart (pid %s)",
-            proc.pid,
-        )
-    return {
-        "restart_started": True,
-        "restart_action": "gateway-restart",
-        "restart_pid": proc.pid,
-    }
-
-
-@app.post("/api/gateway/restart")
-async def restart_gateway(profile: Optional[str] = None):
-    """Kick off a ``hermes gateway restart`` in the background."""
-    try:
-        proc, _reused = _spawn_gateway_restart(profile)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        _log.exception("Failed to spawn gateway restart")
-        raise HTTPException(status_code=500, detail=f"Failed to restart gateway: {exc}")
-    return {
-        "ok": True,
-        "pid": proc.pid,
-        "name": "gateway-restart",
-    }
-
-
-@app.post("/api/gateway/drain")
-async def gateway_drain(request: Request):
-    """Begin or cancel an external (NAS-driven) gateway drain.
-
-    Authenticated by the non-interactive token-auth seam: the
-    ``dashboard_auth/drain`` plugin registers this exact path as a token route
-    and verifies the ``Authorization`` bearer secret. If that plugin isn't
-    active (no ``HERMES_DASHBOARD_DRAIN_SECRET``), the route is NOT a token
-    route, so on a gated bind the cookie gate handles it (a browser session can
-    still drive it from the dashboard) and on a loopback bind the legacy
-    session-token gate applies — either way it is never unauthenticated on a
-    network-exposed bind.
-
-    Body: ``{"action": "drain"}`` (begin) or ``{"action": "cancel"}`` (cancel).
-    Begin writes the ``.drain_request.json`` marker the gateway's
-    ``_drain_control_watcher`` observes (flip to ``draining`` + refuse new
-    turns); cancel removes it (revert to ``running`` + re-accept). Idempotent
-    on both sides. This endpoint only writes/removes the marker — the gateway
-    process owns the actual state transition (there is no HTTP control channel
-    into the running gateway; the marker IS the channel, decisions.md Q-B).
-
-    The force-override (D6: "unless a user commands it") is NOT here — an
-    immediate, drain-skipping action maps onto the existing
-    ``POST /api/gateway/restart`` force path, which supersedes a drain.
-    """
-    from gateway.drain_control import (
-        clear_drain_request,
-        drain_requested,
-        write_drain_request,
-    )
-
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    action = str((body or {}).get("action", "drain")).strip().lower()
-
-    # Attribute the request to the verified token principal when present
-    # (token-auth seam attaches it); fall back to a generic label otherwise.
-    principal_obj = getattr(request.state, "token_principal", None)
-    principal = getattr(principal_obj, "principal", None) or "dashboard"
-
-    if action == "cancel":
-        existed = clear_drain_request()
-        _log.info("Gateway drain CANCEL requested by %s (existed=%s)", principal, existed)
-        return {"ok": True, "action": "cancel", "was_draining": existed}
-
-    if action != "drain":
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown drain action {action!r}; expected 'drain' or 'cancel'",
-        )
-
-    payload = write_drain_request(
-        principal=str(principal),
-        suppress_notification=bool((body or {}).get("suppress_notification", False)),
-    )
-    _log.info(
-        "Gateway drain BEGIN requested by %s (suppress_notification=%s)",
-        principal,
-        payload["suppress_notification"],
-    )
-    return {
-        "ok": True,
-        "action": "drain",
-        "requested_at": payload["requested_at"],
-        # Echo so a caller polling /api/status knows the marker is now set;
-        # the gateway watcher flips gateway_state -> draining within ~1s.
-        "draining": drain_requested(),
-        "suppress_notification": payload["suppress_notification"],
-    }
 
 
 @app.post("/api/hermes/update")
@@ -4235,128 +3889,6 @@ async def get_sessions(
     except Exception:
         _log.exception("GET /api/sessions failed")
         raise HTTPException(status_code=500, detail="Internal server error")
-
-
-@app.get("/api/profiles/sessions")
-def get_profiles_sessions(
-    request: Request,
-    limit: int = 20,
-    offset: int = 0,
-    min_messages: int = 0,
-    archived: str = "exclude",
-    order: str = "recent",
-    profile: str = "all",
-    source: str = None,
-    exclude_sources: str = None,
-):
-    """Unified, read-only session list aggregated across ALL profiles.
-
-    Intentionally process-light: this opens each profile's ``state.db`` directly
-    from disk — it does NOT spawn a dashboard backend per profile. Each returned
-    session is tagged with its owning ``profile`` so the desktop renders one
-    browsable list and only spins up a profile's backend when the user actually
-    interacts (sends a message). A user with a single (default) profile gets the
-    same rows as ``/api/sessions``, just tagged ``profile="default"``.
-    """
-    if archived not in ("exclude", "only", "include"):
-        raise HTTPException(status_code=400, detail="archived must be one of: exclude, only, include")
-    if order not in ("created", "recent"):
-        raise HTTPException(status_code=400, detail="order must be one of: created, recent")
-    if _authenticated_owner_request(request):
-        raise HTTPException(status_code=403, detail="profile session aggregation is not available in authenticated mode")
-
-    from hermes_state import SessionDB
-    from hermes_cli import profiles as profiles_mod
-
-    targets: List[Tuple[str, Path]] = []
-    if profile and profile != "all":
-        name, home = _cron_profile_home(profile)
-        targets.append((name, home))
-    else:
-        try:
-            infos = profiles_mod.list_profiles()
-            targets = [(info.name, info.path) for info in infos]
-        except Exception:
-            _log.exception("GET /api/profiles/sessions: list_profiles failed")
-            targets = []
-        if not targets:
-            targets.append(("default", profiles_mod.get_profile_dir("default")))
-
-    min_message_count = max(0, min_messages)
-    archived_only = archived == "only"
-    include_archived = archived == "include"
-    # Source scoping (see /api/sessions): recents pass exclude_sources=cron,
-    # the cron-jobs section passes source=cron — two independent lists so
-    # newest cron sessions can't starve the recents page.
-    source_filter = source or None
-    exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
-    # Over-fetch per profile so the merged+sorted window is correct for the
-    # requested page. Capped so a huge profile can't blow up the response.
-    per_profile = min(max(limit + offset, limit), 500)
-
-    merged: List[Dict[str, Any]] = []
-    total = 0
-    profile_totals: Dict[str, int] = {}
-    errors: List[Dict[str, str]] = []
-    now = time.time()
-    for name, home in targets:
-        db_path = Path(home) / "state.db"
-        if not db_path.exists():
-            continue
-        try:
-            # Read-only: this loop runs on every sidebar refresh, so it must
-            # never DDL/write-lock another profile's live DB (see SessionDB
-            # read_only docstring).
-            db = SessionDB(db_path=db_path, read_only=True)
-        except Exception as exc:
-            errors.append({"profile": name, "error": str(exc)})
-            continue
-        try:
-            rows = db.list_sessions_rich(
-                source=source_filter,
-                exclude_sources=exclude_list or None,
-                limit=per_profile,
-                offset=0,
-                min_message_count=min_message_count,
-                include_archived=include_archived,
-                archived_only=archived_only,
-                order_by_last_active=order == "recent",
-            )
-            profile_total = db.session_count(
-                source=source_filter,
-                exclude_sources=exclude_list or None,
-                min_message_count=min_message_count,
-                include_archived=include_archived,
-                archived_only=archived_only,
-                exclude_children=True,
-            )
-            total += profile_total
-            profile_totals[name] = profile_total
-            for s in rows:
-                s["profile"] = name
-                s["is_default_profile"] = name == "default"
-                s["is_active"] = (
-                    s.get("ended_at") is None
-                    and (now - s.get("last_active", s.get("started_at", 0))) < 300
-                )
-                s["archived"] = bool(s.get("archived"))
-                merged.append(s)
-        except Exception as exc:
-            errors.append({"profile": name, "error": str(exc)})
-        finally:
-            db.close()
-
-    sort_key = "last_active" if order == "recent" else "started_at"
-    merged.sort(key=lambda s: s.get(sort_key) or s.get("started_at") or 0, reverse=True)
-    window = merged[offset:offset + limit]
-    return {
-        "sessions": window,
-        "total": total,
-        "profile_totals": profile_totals,
-        "limit": limit,
-        "offset": offset,
-        "errors": errors,
-    }
 
 
 @app.get("/api/sessions/composition")
@@ -5236,8 +4768,6 @@ def _apply_model_assignment_sync(
     }
 
 
-
-
 def _infer_provider_on_model_change(model_val: str, prev_provider: str) -> tuple[str, str]:
     """Infer which provider serves ``model_val`` when the flat Config-page Model
     field changes, given the previously-saved ``prev_provider``.
@@ -5622,7 +5152,6 @@ async def validate_provider_credential(body: EnvVarUpdate, request: Request):
     reachable=False means the network probe couldn't run (caller may save with
     a warning rather than hard-blocking offline users).
     """
-    _require_token(request)
     import httpx
 
     key = (body.key or "").strip()
@@ -5707,7 +5236,6 @@ async def reveal_env_var(
     - Audit logging
     """
     # --- Token check ---
-    _require_token(request)
 
     # --- Rate limit ---
     now = time.time()
@@ -5728,407 +5256,37 @@ async def reveal_env_var(
     return {"key": body.key, "value": value}
 
 
-# Entries omit fields they don't need to override; the catalog builder fills
-# in env_vars from OPTIONAL_ENV_VARS via prefix matching when not specified,
-# and pulls required_env from a plugin's PlatformEntry when available.
+# Canonical connector metadata exposed by the dashboard backend.
 _PLATFORM_OVERRIDES: dict[str, dict[str, Any]] = {
-    "telegram": {
-        "name": "Telegram",
-        "description": "Run Hermes from Telegram DMs, groups, and topics.",
-        "docs_url": "https://core.telegram.org/bots/features#botfather",
-        "env_vars": ("TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_USERS", "TELEGRAM_PROXY"),
-        "required_env": ("TELEGRAM_BOT_TOKEN",),
-    },
-    "discord": {
-        "name": "Discord",
-        "description": "Connect Hermes to Discord DMs, channels, and threads.",
-        "docs_url": "https://discord.com/developers/applications",
-        "env_vars": (
-            "DISCORD_BOT_TOKEN",
-            "DISCORD_ALLOWED_USERS",
-            "DISCORD_REPLY_TO_MODE",
-        ),
-        "required_env": ("DISCORD_BOT_TOKEN",),
-    },
-    "slack": {
-        "name": "Slack",
-        "description": "Use Hermes from Slack via Socket Mode. Add allowed Slack member IDs so connected bots can respond.",
-        "docs_url": "https://api.slack.com/apps",
-        "env_vars": ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_ALLOWED_USERS"),
-        "required_env": ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"),
-    },
-    "mattermost": {
-        "name": "Mattermost",
-        "description": "Connect Hermes to Mattermost channels and direct messages.",
-        "docs_url": "https://mattermost.com/deploy/",
-        "env_vars": ("MATTERMOST_URL", "MATTERMOST_TOKEN", "MATTERMOST_ALLOWED_USERS"),
-        "required_env": ("MATTERMOST_URL", "MATTERMOST_TOKEN"),
-    },
-    "matrix": {
-        "name": "Matrix",
-        "description": "Use Hermes in Matrix rooms and direct messages.",
-        "docs_url": "https://matrix.org/ecosystem/servers/",
-        "env_vars": (
-            "MATRIX_HOMESERVER",
-            "MATRIX_ACCESS_TOKEN",
-            "MATRIX_USER_ID",
-            "MATRIX_ALLOWED_USERS",
-        ),
-        "required_env": ("MATRIX_HOMESERVER", "MATRIX_ACCESS_TOKEN", "MATRIX_USER_ID"),
-    },
-    "signal": {
-        "name": "Signal",
-        "description": "Connect through a signal-cli REST bridge.",
-        "docs_url": "https://github.com/bbernhard/signal-cli-rest-api",
-        "env_vars": ("SIGNAL_HTTP_URL", "SIGNAL_ACCOUNT", "SIGNAL_ALLOWED_USERS"),
-        "required_env": ("SIGNAL_HTTP_URL", "SIGNAL_ACCOUNT"),
-    },
-    "whatsapp": {
-        "name": "WhatsApp",
-        "description": "Use Hermes through the bundled WhatsApp bridge with QR-based auth.",
-        "docs_url": "https://github.com/tulir/whatsmeow",
-        "env_vars": ("WHATSAPP_ENABLED", "WHATSAPP_MODE", "WHATSAPP_ALLOWED_USERS"),
-        "required_env": (),
-    },
-    "homeassistant": {
-        "name": "Home Assistant",
-        "description": "Control your smart home from Hermes via Home Assistant.",
-        "docs_url": "https://www.home-assistant.io/docs/authentication/",
-        "env_vars": ("HASS_URL", "HASS_TOKEN"),
-        "required_env": ("HASS_URL", "HASS_TOKEN"),
-    },
-    "email": {
-        "name": "Email",
-        "description": "Talk to Hermes through an IMAP/SMTP mailbox.",
-        "docs_url": "https://hermes-agent.nousresearch.com/docs/user-guide/messaging/",
-        "env_vars": (
-            "EMAIL_ADDRESS",
-            "EMAIL_PASSWORD",
-            "EMAIL_IMAP_HOST",
-            "EMAIL_SMTP_HOST",
-        ),
-        "required_env": (
-            "EMAIL_ADDRESS",
-            "EMAIL_PASSWORD",
-            "EMAIL_IMAP_HOST",
-            "EMAIL_SMTP_HOST",
-        ),
-    },
-    "sms": {
-        "name": "SMS (Twilio)",
-        "description": "Send and receive text messages via Twilio.",
-        "docs_url": "https://www.twilio.com/console",
-        "env_vars": ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN"),
-        "required_env": ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN"),
-    },
-    "dingtalk": {
-        "name": "DingTalk",
-        "description": "Connect Hermes to DingTalk groups (钉钉).",
-        "docs_url": "https://open.dingtalk.com/document/orgapp/the-robot-development-process",
-        "env_vars": ("DINGTALK_CLIENT_ID", "DINGTALK_CLIENT_SECRET"),
-        "required_env": ("DINGTALK_CLIENT_ID", "DINGTALK_CLIENT_SECRET"),
+    "weixin_ilink": {
+        "name": "Weixin iLink",
+        "description": "Canonical Weixin iLink connector.",
+        "docs_url": "https://hermes-agent.nousresearch.com/docs/user-guide/messaging/weixin-ilink",
+        "env_vars": (),
     },
     "feishu": {
-        "name": "Feishu / Lark",
-        "description": "Use Hermes inside Feishu / Lark.",
-        "docs_url": "https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/intro",
-        "env_vars": (
-            "FEISHU_APP_ID",
-            "FEISHU_APP_SECRET",
-            "FEISHU_ENCRYPT_KEY",
-            "FEISHU_VERIFICATION_TOKEN",
-        ),
-        "required_env": ("FEISHU_APP_ID", "FEISHU_APP_SECRET"),
-    },
-    "google_chat": {
-        "name": "Google Chat",
-        "description": "Connect Hermes to Google Chat via Cloud Pub/Sub.",
-        "docs_url": "https://hermes-agent.nousresearch.com/docs/user-guide/messaging/google_chat",
-    },
-    "wecom": {
-        "name": "WeCom (group bot)",
-        "description": "Send-only WeCom group bot via webhook.",
-        "docs_url": "https://developer.work.weixin.qq.com/document/path/91770",
-        "env_vars": ("WECOM_BOT_ID", "WECOM_SECRET"),
-        "required_env": ("WECOM_BOT_ID",),
-    },
-    "wecom_callback": {
-        "name": "WeCom (app)",
-        "description": "Two-way WeCom integration via callback app.",
-        "docs_url": "https://developer.work.weixin.qq.com/document/path/90930",
-        "env_vars": (
-            "WECOM_CALLBACK_CORP_ID",
-            "WECOM_CALLBACK_CORP_SECRET",
-            "WECOM_CALLBACK_AGENT_ID",
-            "WECOM_CALLBACK_TOKEN",
-            "WECOM_CALLBACK_ENCODING_AES_KEY",
-        ),
-        "required_env": (
-            "WECOM_CALLBACK_CORP_ID",
-            "WECOM_CALLBACK_CORP_SECRET",
-            "WECOM_CALLBACK_AGENT_ID",
-        ),
-    },
-    "weixin": {
-        "name": "Weixin / WeChat (Personal)",
-        "description": "Connect a personal WeChat account through Tencent's iLink Bot API.",
-        "docs_url": "https://hermes-agent.nousresearch.com/docs/user-guide/messaging/weixin/",
-        "env_vars": ("WEIXIN_ACCOUNT_ID", "WEIXIN_TOKEN", "WEIXIN_BASE_URL"),
-        "required_env": ("WEIXIN_ACCOUNT_ID", "WEIXIN_TOKEN"),
-    },
-    "bluebubbles": {
-        "name": "BlueBubbles (iMessage)",
-        "description": "Use Hermes through iMessage via a BlueBubbles server.",
-        "docs_url": "https://bluebubbles.app/",
-        "env_vars": (
-            "BLUEBUBBLES_SERVER_URL",
-            "BLUEBUBBLES_PASSWORD",
-            "BLUEBUBBLES_ALLOWED_USERS",
-        ),
-        "required_env": ("BLUEBUBBLES_SERVER_URL", "BLUEBUBBLES_PASSWORD"),
-    },
-    "qqbot": {
-        "name": "QQ Bot",
-        "description": "Connect Hermes to a QQ Bot from the QQ Open Platform.",
-        "docs_url": "https://q.qq.com",
-        "env_vars": ("QQ_APP_ID", "QQ_CLIENT_SECRET", "QQ_ALLOWED_USERS"),
-        "required_env": ("QQ_APP_ID", "QQ_CLIENT_SECRET"),
-    },
-    # Teams ships as a platform plugin, so its name/env vars come from the
-    # plugin registry. Only the docs link needs an override here so the
-    # Channels page can point at the Microsoft Teams setup guide.
-    "teams": {
-        "docs_url": "https://hermes-agent.nousresearch.com/docs/user-guide/messaging/teams",
-    },
-    "yuanbao": {
-        "name": "Yuanbao (元宝)",
-        "description": "Connect Hermes to Tencent Yuanbao.",
+        "name": "Feishu",
+        "description": "Canonical Feishu connector.",
         "docs_url": "",
-        "required_env": (),
-    },
-    "api_server": {
-        "name": "API server",
-        "description": "Expose Hermes as an OpenAI-compatible HTTP API for tools like Open WebUI.",
-        "docs_url": "https://hermes-agent.nousresearch.com/docs/user-guide/messaging/",
-        "env_vars": (
-            "API_SERVER_ENABLED",
-            "API_SERVER_KEY",
-            "API_SERVER_PORT",
-            "API_SERVER_HOST",
-            "API_SERVER_MODEL_NAME",
-        ),
-        "required_env": (),
+        "env_vars": (),
     },
     "webhook": {
-        "name": "Webhooks",
-        "description": "Receive events from GitHub, GitLab, and other webhook sources.",
-        "docs_url": "https://hermes-agent.nousresearch.com/docs/user-guide/messaging/webhooks/",
-        "env_vars": ("WEBHOOK_ENABLED", "WEBHOOK_PORT", "WEBHOOK_SECRET"),
-        "required_env": (),
+        "name": "Webhook",
+        "description": "Authenticated Owner-bound Webhook connector.",
+        "docs_url": "",
+        "env_vars": (),
     },
 }
 
-# Display order: well-known platforms surface first; unknown plugins fall to
-# the end alphabetically.
-_PLATFORM_ORDER: tuple[str, ...] = (
-    "telegram",
-    "discord",
-    "slack",
-    "mattermost",
-    "matrix",
-    "whatsapp",
-    "signal",
-    "bluebubbles",
-    "homeassistant",
-    "email",
-    "sms",
-    "dingtalk",
-    "feishu",
-    "google_chat",
-    "wecom",
-    "wecom_callback",
-    "weixin",
-    "qqbot",
-    "yuanbao",
-    "api_server",
-    "webhook",
-)
-
-# Display labels for env vars not in OPTIONAL_ENV_VARS (HOME_CHANNEL_*, bridge
-# toggles, Twilio, HASS, Email, etc.). Anything missing from OPTIONAL_ENV_VARS
-# falls back here so the UI can still render a friendly label.
-_MESSAGING_ENV_FALLBACKS: dict[str, dict[str, Any]] = {
-    "SIGNAL_HTTP_URL": {
-        "description": "signal-cli REST API base URL, e.g. http://127.0.0.1:8080",
-        "prompt": "Signal bridge URL",
-        "url": "https://github.com/bbernhard/signal-cli-rest-api",
-    },
-    "SIGNAL_ACCOUNT": {
-        "description": "Signal account phone number registered with the bridge",
-        "prompt": "Signal account",
-    },
-    "SIGNAL_ALLOWED_USERS": {
-        "description": "Comma-separated Signal users allowed to use the bot",
-        "prompt": "Allowed Signal users",
-    },
-    "WHATSAPP_ENABLED": {
-        "description": "Enable the WhatsApp gateway adapter",
-        "prompt": "Enable WhatsApp",
-        "advanced": True,
-    },
-    "WHATSAPP_MODE": {
-        "description": "WhatsApp bridge mode",
-        "prompt": "WhatsApp mode",
-        "advanced": True,
-    },
-    "WHATSAPP_ALLOWED_USERS": {
-        "description": "Comma-separated WhatsApp users allowed to use the bot",
-        "prompt": "Allowed WhatsApp users",
-    },
-    "HASS_URL": {
-        "description": "Home Assistant base URL, e.g. https://homeassistant.local:8123",
-        "prompt": "Home Assistant URL",
-    },
-    "HASS_TOKEN": {
-        "description": "Long-lived access token from Home Assistant (Profile → Security)",
-        "prompt": "Home Assistant access token",
-        "password": True,
-    },
-    "EMAIL_ADDRESS": {
-        "description": "Email address to send and receive from",
-        "prompt": "Email address",
-    },
-    "EMAIL_PASSWORD": {
-        "description": "Email account password or app password",
-        "prompt": "Email password",
-        "password": True,
-    },
-    "EMAIL_IMAP_HOST": {
-        "description": "IMAP server host (e.g. imap.gmail.com)",
-        "prompt": "IMAP host",
-    },
-    "EMAIL_SMTP_HOST": {
-        "description": "SMTP server host (e.g. smtp.gmail.com)",
-        "prompt": "SMTP host",
-    },
-    "TWILIO_ACCOUNT_SID": {
-        "description": "Twilio Account SID",
-        "prompt": "Twilio Account SID",
-        "url": "https://www.twilio.com/console",
-    },
-    "TWILIO_AUTH_TOKEN": {
-        "description": "Twilio Auth Token",
-        "prompt": "Twilio Auth Token",
-        "password": True,
-    },
-    "WECOM_BOT_ID": {"description": "WeCom group bot ID", "prompt": "WeCom Bot ID"},
-    "WECOM_SECRET": {
-        "description": "WeCom group bot secret",
-        "prompt": "WeCom Secret",
-        "password": True,
-    },
-    "WECOM_CALLBACK_CORP_ID": {
-        "description": "WeCom corp ID",
-        "prompt": "WeCom Corp ID",
-    },
-    "WECOM_CALLBACK_CORP_SECRET": {
-        "description": "WeCom app corp secret",
-        "prompt": "WeCom Corp Secret",
-        "password": True,
-    },
-    "WECOM_CALLBACK_AGENT_ID": {
-        "description": "WeCom app agent ID",
-        "prompt": "WeCom Agent ID",
-    },
-    "WECOM_CALLBACK_TOKEN": {
-        "description": "WeCom callback verification token",
-        "prompt": "WeCom Token",
-    },
-    "WECOM_CALLBACK_ENCODING_AES_KEY": {
-        "description": "WeCom callback AES encoding key",
-        "prompt": "WeCom AES Key",
-        "password": True,
-    },
-    "WEIXIN_ACCOUNT_ID": {
-        "description": "iLink Bot account ID obtained through QR login in hermes gateway setup",
-        "prompt": "iLink Bot account ID",
-    },
-    "WEIXIN_TOKEN": {
-        "description": "iLink Bot token obtained through QR login in hermes gateway setup",
-        "prompt": "iLink Bot token",
-        "password": True,
-    },
-    "WEIXIN_BASE_URL": {
-        "description": "iLink API base URL saved by QR login (default: https://ilinkai.weixin.qq.com)",
-        "prompt": "iLink API base URL",
-    },
-    "FEISHU_APP_ID": {"description": "Feishu / Lark app ID", "prompt": "App ID"},
-    "FEISHU_APP_SECRET": {
-        "description": "Feishu / Lark app secret",
-        "prompt": "App secret",
-        "password": True,
-    },
-    "FEISHU_ENCRYPT_KEY": {
-        "description": "Feishu / Lark encrypt key",
-        "prompt": "Encrypt key",
-        "password": True,
-    },
-    "FEISHU_VERIFICATION_TOKEN": {
-        "description": "Feishu / Lark verification token",
-        "prompt": "Verification token",
-        "password": True,
-    },
-    "DINGTALK_CLIENT_ID": {
-        "description": "DingTalk client ID (App key)",
-        "prompt": "Client ID",
-    },
-    "DINGTALK_CLIENT_SECRET": {
-        "description": "DingTalk client secret (App secret)",
-        "prompt": "Client secret",
-        "password": True,
-    },
-}
+_PLATFORM_ORDER: tuple[str, ...] = ("weixin_ilink", "feishu", "webhook")
 
 
 def _messaging_platform_catalog() -> tuple[dict[str, Any], ...]:
-    """Build the messaging catalog from the gateway's Platform enum + plugin registry.
-
-    Built-in platforms come from ``gateway.config.Platform`` (LOCAL is excluded).
-    Plugin platforms come from ``gateway.platform_registry.plugin_entries()``,
-    which lets newly installed adapters (e.g. IRC) appear without a code change
-    here. Per-platform UI metadata (description, docs URL, env-var picks) lives
-    in :data:`_PLATFORM_OVERRIDES`; anything not overridden gets reasonable
-    defaults derived from the platform id and required_env.
-    """
-    from gateway.config import Platform
-
-    seen: set[str] = set()
-    entries: list[dict[str, Any]] = []
-
-    for member in Platform.__members__.values():
-        if member.value == "local":
-            continue
-        if member.value in seen:
-            continue
-        seen.add(member.value)
-        entries.append(_build_catalog_entry(member.value))
-
-    try:
-        from gateway.platform_registry import platform_registry
-
-        for plugin_entry in platform_registry.plugin_entries():
-            if plugin_entry.name in seen:
-                continue
-            seen.add(plugin_entry.name)
-            entries.append(_build_catalog_entry(plugin_entry.name, plugin_entry))
-    except Exception:
-        _log.debug("plugin platform registry unavailable", exc_info=True)
-
-    order = {pid: idx for idx, pid in enumerate(_PLATFORM_ORDER)}
-    entries.sort(
-        key=lambda e: (order.get(e["id"], len(_PLATFORM_ORDER)), e["name"].lower())
+    """Return dashboard metadata for canonical messaging connectors only."""
+    return tuple(
+        {"id": provider, **_PLATFORM_OVERRIDES[provider]}
+        for provider in _PLATFORM_ORDER
     )
-    return tuple(entries)
 
 
 def _channel_managed_env_keys() -> frozenset[str]:
@@ -6150,95 +5308,6 @@ def _channel_managed_env_keys() -> frozenset[str]:
         return frozenset()
 
 
-# Cross-cutting gateway / relay knobs stay on the Keys → Settings tab even though
-# they use the ``messaging`` category in OPTIONAL_ENV_VARS. Platform-scoped vars
-# (``DISCORD_*``, ``MATRIX_*``, …) are owned by the Messaging UI instead.
-_MESSAGING_KEYS_PAGE_KEYS = frozenset({
-    "GATEWAY_ALLOW_ALL_USERS",
-    "GATEWAY_PROXY_KEY",
-    "GATEWAY_PROXY_URL",
-})
-
-
-def _platform_env_prefixes(platform_id: str) -> tuple[str, ...]:
-    """Env-var prefixes owned by a messaging platform card."""
-    aliases: dict[str, tuple[str, ...]] = {
-        "email": ("EMAIL_",),
-        "homeassistant": ("HASS_",),
-        "qqbot": ("QQ_", "QQBOT_"),
-        "sms": ("TWILIO_",),
-        "wecom": ("WECOM_BOT_", "WECOM_SECRET"),
-        "wecom_callback": ("WECOM_CALLBACK_",),
-    }
-    if platform_id in aliases:
-        return aliases[platform_id]
-    return (platform_id.upper().replace("-", "_") + "_",)
-
-
-def _discover_platform_env_vars(platform_id: str) -> tuple[str, ...]:
-    """All messaging-category env vars for a platform (override + plugin + prefix)."""
-    prefixes = _platform_env_prefixes(platform_id)
-    keys: list[str] = []
-    for name, info in OPTIONAL_ENV_VARS.items():
-        if info.get("category") != "messaging":
-            continue
-        if name in _MESSAGING_KEYS_PAGE_KEYS:
-            continue
-        if not any(name.startswith(prefix) for prefix in prefixes):
-            continue
-        keys.append(name)
-    return tuple(sorted(set(keys)))
-
-
-def _merge_platform_env_vars(
-    platform_id: str,
-    override: dict[str, Any],
-    plugin_entry: Any | None,
-) -> tuple[str, ...]:
-    """Canonical env-var list for a messaging platform card."""
-    discovered = _discover_platform_env_vars(platform_id)
-    if "env_vars" in override:
-        return tuple(dict.fromkeys((*override["env_vars"], *discovered)))
-    if plugin_entry is not None and plugin_entry.required_env:
-        return tuple(dict.fromkeys((*tuple(plugin_entry.required_env), *discovered)))
-    return discovered
-
-
-def _build_catalog_entry(
-    platform_id: str, plugin_entry: Any | None = None
-) -> dict[str, Any]:
-    override = _PLATFORM_OVERRIDES.get(platform_id, {})
-
-    env_vars = _merge_platform_env_vars(platform_id, override, plugin_entry)
-
-    if "required_env" in override:
-        required_env = tuple(override["required_env"])
-    elif plugin_entry is not None:
-        required_env = tuple(plugin_entry.required_env or ())
-    else:
-        required_env = ()
-
-    if override.get("name"):
-        name = override["name"]
-    elif plugin_entry is not None and plugin_entry.label:
-        name = plugin_entry.label
-    else:
-        name = platform_id.replace("_", " ").title()
-
-    description = override.get("description")
-    if not description and plugin_entry is not None:
-        description = plugin_entry.install_hint or ""
-
-    return {
-        "id": platform_id,
-        "name": name,
-        "description": description or "",
-        "docs_url": override.get("docs_url", ""),
-        "env_vars": env_vars,
-        "required_env": required_env,
-    }
-
-
 def _catalog_lookup(platform_id: str) -> dict[str, Any] | None:
     for entry in _messaging_platform_catalog():
         if entry["id"] == platform_id:
@@ -6246,136 +5315,110 @@ def _catalog_lookup(platform_id: str) -> dict[str, Any] | None:
     return None
 
 
-def _messaging_env_info(key: str) -> dict[str, Any]:
-    info = OPTIONAL_ENV_VARS.get(key) or _MESSAGING_ENV_FALLBACKS.get(key) or {}
+class WebhookConnectorCreate(BaseModel):
+    response_url: str
+    prompt_template: str = "{payload}"
+    allowed_events: list[str] = []
+
+
+@app.post("/api/messaging/webhook/accounts", status_code=201)
+async def create_webhook_connector_account(
+    request: Request,
+    body: WebhookConnectorCreate,
+):
+    """Provision one authenticated Webhook account for the signed-in Owner."""
+    if not bool(getattr(request.app.state, "auth_required", False)):
+        raise HTTPException(status_code=403, detail="authentication_required")
+    session = getattr(request.state, "session", None)
+    if session is None:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    runtime = getattr(request.app.state, "channel_connector_runtime", None)
+    store = getattr(runtime, "store", None)
+    if store is None:
+        raise HTTPException(status_code=503, detail="connector_runtime_unavailable")
+
+    from hermes_cli.channel_connectors.webhook import _validate_callback_url
+    from hermes_cli.dashboard_auth.owner_context import owner_context_from_session
+
+    try:
+        response_url = _validate_callback_url(body.response_url)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    route_token = secrets.token_urlsafe(32)
+    hmac_secret = secrets.token_urlsafe(48)
+    response_hmac_secret = secrets.token_urlsafe(48)
+    credentials = {
+        "hmac_secret": hmac_secret,
+        "prompt_template": body.prompt_template,
+        "allowed_events": body.allowed_events,
+        "response_url": response_url,
+        "response_hmac_secret": response_hmac_secret,
+    }
+    registered = register_connector_binding_for_owner(
+        store,
+        owner=owner_context_from_session(session),
+        provider="webhook",
+        provider_account_id=route_token,
+        external_subject=route_token,
+        conversation_id=route_token,
+        credentials=credentials,
+    )
     return {
-        "description": info.get("description", ""),
-        "prompt": info.get("prompt", key),
-        "help": info.get("help", ""),
-        "url": info.get("url"),
-        "is_password": info.get("password", False),
-        "advanced": info.get("advanced", False),
+        "account_id": registered.account_id,
+        "binding_id": registered.binding_id,
+        "route_token": route_token,
+        "webhook_path": f"/webhooks/{route_token}",
+        "hmac_secret": hmac_secret,
+        "response_hmac_secret": response_hmac_secret,
     }
 
 
-def _gateway_platform_config(platform_id: str):
-    from gateway.config import Platform, load_gateway_config
-
-    config = load_gateway_config()
-    platform = Platform(platform_id)
-    platform_config = config.platforms.get(platform)
-    return config, platform, platform_config
+def _connector_runtime_states() -> dict[str, str]:
+    runtime = getattr(app.state, "channel_connector_runtime", None)
+    status = getattr(runtime, "status", None)
+    states = getattr(status, "states", None)
+    return states if isinstance(states, dict) else {}
 
 
 def _messaging_platform_payload(
     entry: dict[str, Any],
-    env_on_disk: dict[str, str],
-    runtime: dict | None,
-    scoped: bool = False,
+    connector_states: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     platform_id = entry["id"]
-    runtime_platforms = runtime.get("platforms") if runtime else {}
-    runtime_platform = (
-        runtime_platforms.get(platform_id, {})
-        if isinstance(runtime_platforms, dict)
-        else {}
-    )
-    gateway_running = (
-        get_running_pid() is not None
-        or get_runtime_status_running_pid(runtime) is not None
-    )
-    env_vars = []
-
-    for key in entry["env_vars"]:
-        # When profile-scoped, judge only the profile's own .env — the
-        # dashboard process's os.environ carries the ROOT install's .env
-        # (loaded at startup) and would falsely report the root credentials
-        # as the profile's.
-        value = env_on_disk.get(key) or ("" if scoped else os.getenv(key, ""))
-        env_vars.append(
-            {
-                "key": key,
-                "required": key in entry["required_env"],
-                "is_set": bool(value),
-                "redacted_value": redact_key(value) if value else None,
-                **_messaging_env_info(key),
-            }
+    try:
+        connectors = load_config().get("channel_connectors") or {}
+        connector_config = connectors.get(platform_id) or {}
+        enabled = bool(
+            isinstance(connector_config, dict)
+            and connector_config.get("enabled", True)
         )
+    except Exception:
+        enabled = False
 
-    if scoped:
-        # Profile-scoped view: derive enablement/configuration from the
-        # profile's config.yaml + .env only. load_gateway_config()'s
-        # env-override layer reads os.environ and would leak the root
-        # install's tokens into the profile's reported state.
-        try:
-            cfg = load_config()
-            platforms_cfg = cfg.get("platforms") or {}
-            plat_cfg = platforms_cfg.get(platform_id)
-            if not isinstance(plat_cfg, dict):
-                plat_cfg = {}
-            enabled = bool(plat_cfg.get("enabled"))
-            hc = plat_cfg.get("home_channel")
-            home_channel = hc if isinstance(hc, dict) else None
-        except Exception:
-            enabled = False
-            home_channel = None
-        configured = all(env_on_disk.get(key) for key in entry["required_env"])
-    else:
-        try:
-            gateway_config, platform, platform_config = _gateway_platform_config(
-                platform_id
-            )
-            enabled = bool(platform_config and platform_config.enabled)
-            configured = bool(
-                platform_config
-                and gateway_config._is_platform_connected(platform, platform_config)
-            )
-            home_channel = (
-                platform_config.home_channel.to_dict()
-                if platform_config and platform_config.home_channel
-                else None
-            )
-        except Exception:
-            enabled = False
-            configured = all(
-                env_on_disk.get(key) or os.getenv(key, "")
-                for key in entry["required_env"]
-            )
-            home_channel = None
-
-    state = (
-        runtime_platform.get("state") if isinstance(runtime_platform, dict) else None
-    )
-    runtime_gateway_state = runtime.get("gateway_state") if isinstance(runtime, dict) else None
-    runtime_gateway_error = runtime.get("exit_reason") if isinstance(runtime, dict) else None
+    runtime_state = (connector_states or {}).get(platform_id)
     if not enabled:
         state = "disabled"
-    elif not configured:
-        state = "not_configured"
-    elif gateway_running and not state:
-        state = "pending_restart"
-    elif (
-        not gateway_running
-        and not state
-        and runtime_gateway_state == "startup_failed"
-    ):
-        state = "startup_failed"
-    elif not gateway_running and not state:
-        state = "gateway_stopped"
+    elif runtime_state == "ready":
+        state = "connected"
+    else:
+        state = runtime_state or "pending_restart"
 
-    error_code = (
-        runtime_platform.get("error_code")
-        if isinstance(runtime_platform, dict)
-        else None
-    )
-    error_message = (
-        runtime_platform.get("error_message")
-        if isinstance(runtime_platform, dict)
-        else None
-    )
-    if state == "startup_failed":
-        error_code = error_code or "startup_failed"
-        error_message = error_message or runtime_gateway_error
+    configured = state not in {
+        "account_unavailable",
+        "authenticated_dashboard_required",
+        "control_plane_unavailable",
+        "deployment_policy_unavailable",
+        "resource_governance_unavailable",
+        "startup_failed",
+        "unsupported",
+    }
+    error_state = state if state in {
+        "control_plane_unavailable",
+        "deployment_policy_unavailable",
+        "resource_governance_unavailable",
+        "startup_failed",
+        "unsupported",
+    } else None
 
     return {
         "id": platform_id,
@@ -6384,411 +5427,31 @@ def _messaging_platform_payload(
         "docs_url": entry["docs_url"],
         "enabled": enabled,
         "configured": configured,
-        "gateway_running": gateway_running,
+        "gateway_running": bool(connector_states),
         "state": state,
-        "error_code": error_code,
-        "error_message": error_message,
-        "updated_at": (
-            runtime_platform.get("updated_at")
-            if isinstance(runtime_platform, dict)
-            else None
-        ),
-        "home_channel": home_channel,
-        "env_vars": env_vars,
+        "error_code": error_state,
+        "error_message": None,
+        "updated_at": None,
+        "home_channel": None,
+        "env_vars": [],
     }
 
 
 def _write_platform_enabled(platform_id: str, enabled: bool) -> None:
-    write_platform_config_field(platform_id, "enabled", enabled)
-
-
-_TELEGRAM_ONBOARDING_DEFAULT_URL = "https://setup.hermes-agent.nousresearch.com"
-_TELEGRAM_ONBOARDING_USER_AGENT = f"HermesDashboard/{__version__}"
-_TELEGRAM_USER_ID_RE = re.compile(r"^\d+$")
-
-
-@dataclass
-class _TelegramOnboardingPairing:
-    poll_token: str
-    expires_at: str
-    expires_at_ts: float
-    bot_token: str | None = None
-    bot_username: str | None = None
-    owner_user_id: str | None = None
-
-
-_telegram_onboarding_pairings: dict[str, _TelegramOnboardingPairing] = {}
-_telegram_onboarding_lock = threading.RLock()
-
-
-def _telegram_onboarding_base_url() -> str:
-    return (
-        os.getenv("TELEGRAM_ONBOARDING_URL", _TELEGRAM_ONBOARDING_DEFAULT_URL)
-        .strip()
-        .rstrip("/")
-    )
-
-
-def _parse_expiry_ts(value: str) -> float:
-    try:
-        normalized = value.replace("Z", "+00:00")
-        parsed = datetime.fromisoformat(normalized)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.timestamp()
-    except Exception:
-        return time.time() + 600
-
-
-def _prune_telegram_onboarding_pairings() -> None:
-    now = time.time()
-    expired = [
-        pairing_id
-        for pairing_id, record in _telegram_onboarding_pairings.items()
-        if record.expires_at_ts <= now
-    ]
-    for pairing_id in expired:
-        _telegram_onboarding_pairings.pop(pairing_id, None)
-
-
-def _normalize_telegram_user_id(value: Any) -> str | None:
-    normalized = str(value or "").strip()
-    if _TELEGRAM_USER_ID_RE.fullmatch(normalized):
-        return normalized
-    return None
-
-
-def _telegram_onboarding_error_message(error: str, fallback: str) -> str:
-    return {
-        "not_found": "Telegram pairing was not found. Start a new setup.",
-        "expired": "Telegram setup expired. Start a new setup.",
-        "claimed": "Telegram setup was already claimed. Start a new setup.",
-        "unauthorized": "Telegram setup service rejected this request.",
-        "telegram_manager_bot_token_not_configured": "Telegram setup service is not configured.",
-        "telegram_token_fetch_failed": "Telegram could not finish bot setup. Try again.",
-    }.get(error, fallback)
-
-
-def _telegram_onboarding_request_sync(
-    method: str,
-    path: str,
-    *,
-    body: dict[str, Any] | None = None,
-    bearer_token: str | None = None,
-) -> dict[str, Any]:
-    import httpx
-
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": _TELEGRAM_ONBOARDING_USER_AGENT,
-    }
-    request_kwargs: dict[str, Any] = {}
-    if body is not None:
-        headers["Content-Type"] = "application/json"
-        request_kwargs["json"] = body
-    if bearer_token:
-        headers["Authorization"] = f"Bearer {bearer_token}"
-
-    url = f"{_telegram_onboarding_base_url()}{path}"
-    try:
-        with httpx.Client(timeout=httpx.Timeout(10.0)) as client:
-            response = client.request(
-                method,
-                url,
-                headers=headers,
-                **request_kwargs,
-            )
-            response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        try:
-            parsed = exc.response.json()
-        except Exception:
-            parsed = {}
-        error = str(parsed.get("error") or parsed.get("status") or "")
-        detail = _telegram_onboarding_error_message(
-            error,
-            "Telegram setup service returned an error.",
-        )
-        status_code = 404 if exc.response.status_code == 404 else 502
-        if error in {"expired", "claimed"}:
-            status_code = 410
-        raise HTTPException(status_code=status_code, detail=detail) from exc
-    except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="Telegram setup service is unavailable. Try again shortly.",
-        ) from exc
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="Telegram setup service is unavailable. Try again shortly.",
-        ) from exc
-
-    try:
-        parsed = response.json()
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="Telegram setup service returned an invalid response.",
-        ) from exc
-    if not isinstance(parsed, dict):
-        raise HTTPException(
-            status_code=502,
-            detail="Telegram setup service returned an invalid response.",
-        )
-    return parsed
-
-
-async def _telegram_onboarding_request(
-    method: str,
-    path: str,
-    *,
-    body: dict[str, Any] | None = None,
-    bearer_token: str | None = None,
-) -> dict[str, Any]:
-    return await asyncio.to_thread(
-        _telegram_onboarding_request_sync,
-        method,
-        path,
-        body=body,
-        bearer_token=bearer_token,
-    )
-
-
-@app.post("/api/messaging/telegram/onboarding/start")
-async def start_telegram_onboarding(body: TelegramOnboardingStart):
-    bot_name = (body.bot_name or "Hermes Agent").strip() or "Hermes Agent"
-    payload = await _telegram_onboarding_request(
-        "POST",
-        "/v1/telegram/pairings",
-        body={"bot_name": bot_name},
-    )
-
-    pairing_id = str(payload.get("pairing_id") or "").strip()
-    poll_token = str(payload.get("poll_token") or "").strip()
-    expires_at = str(payload.get("expires_at") or "").strip()
-    deep_link = str(payload.get("deep_link") or "").strip()
-    qr_payload = str(payload.get("qr_payload") or deep_link).strip()
-    suggested_username = str(payload.get("suggested_username") or "").strip()
-    if not pairing_id or not poll_token or not expires_at or not deep_link:
-        raise HTTPException(
-            status_code=502,
-            detail="Telegram setup service returned an incomplete response.",
-        )
-
-    with _telegram_onboarding_lock:
-        _prune_telegram_onboarding_pairings()
-        _telegram_onboarding_pairings[pairing_id] = _TelegramOnboardingPairing(
-            poll_token=poll_token,
-            expires_at=expires_at,
-            expires_at_ts=_parse_expiry_ts(expires_at),
-        )
-
-    return {
-        "pairing_id": pairing_id,
-        "suggested_username": suggested_username,
-        "deep_link": deep_link,
-        "qr_payload": qr_payload,
-        "expires_at": expires_at,
-    }
-
-
-@app.get("/api/messaging/telegram/onboarding/{pairing_id}")
-async def get_telegram_onboarding_status(pairing_id: str):
-    with _telegram_onboarding_lock:
-        _prune_telegram_onboarding_pairings()
-        record = _telegram_onboarding_pairings.get(pairing_id)
-        if not record:
-            raise HTTPException(
-                status_code=404,
-                detail="Telegram setup session was not found. Start a new setup.",
-            )
-        if record.bot_token:
-            return {
-                "status": "ready",
-                "bot_username": record.bot_username,
-                "owner_user_id": record.owner_user_id,
-                "expires_at": record.expires_at,
-            }
-        poll_token = record.poll_token
-
-    payload = await _telegram_onboarding_request(
-        "GET",
-        f"/v1/telegram/pairings/{urllib.parse.quote(pairing_id, safe='')}",
-        bearer_token=poll_token,
-    )
-    status = str(payload.get("status") or "").strip()
-    if status == "waiting":
-        with _telegram_onboarding_lock:
-            current = _telegram_onboarding_pairings.get(pairing_id)
-            expires_at = current.expires_at if current else ""
-        return {"status": "waiting", "expires_at": expires_at}
-
-    if status == "ready":
-        bot_token = str(payload.get("token") or "").strip()
-        bot_username = str(payload.get("bot_username") or "").strip()
-        if not bot_token:
-            raise HTTPException(
-                status_code=502,
-                detail="Telegram setup service returned an incomplete response.",
-            )
-        owner_user_id = _normalize_telegram_user_id(payload.get("owner_user_id"))
-        with _telegram_onboarding_lock:
-            record = _telegram_onboarding_pairings.get(pairing_id)
-            if not record:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Telegram setup session was not found. Start a new setup.",
-                )
-            record.bot_token = bot_token
-            record.bot_username = bot_username or None
-            record.owner_user_id = owner_user_id
-            return {
-                "status": "ready",
-                "bot_username": record.bot_username,
-                "owner_user_id": record.owner_user_id,
-                "expires_at": record.expires_at,
-            }
-
-    if status in {"expired", "claimed"}:
-        with _telegram_onboarding_lock:
-            _telegram_onboarding_pairings.pop(pairing_id, None)
-        raise HTTPException(
-            status_code=410,
-            detail=_telegram_onboarding_error_message(
-                status,
-                "Telegram setup is no longer available. Start a new setup.",
-            ),
-        )
-
-    raise HTTPException(
-        status_code=502,
-        detail="Telegram setup service returned an unknown status.",
-    )
-
-
-def _restart_gateway_after_telegram_onboarding(profile: Optional[str] = None) -> dict[str, Any]:
-    """Best-effort gateway restart after saving Telegram QR onboarding.
-
-    The QR flow naturally pulls users into Telegram on another device. If the
-    saved token waits on a separate dashboard restart click, Hermes appears
-    broken from the chat side. Keep the config save authoritative, but report
-    restart failures so the UI can fall back to the existing manual banner.
-    """
-    try:
-        proc, reused = _spawn_gateway_restart(profile)
-    except Exception as exc:
-        _log.exception("Failed to auto-restart gateway after Telegram onboarding")
-        return {
-            "restart_started": False,
-            "restart_error": str(exc),
-        }
-    if reused:
-        _log.info(
-            "Telegram onboarding: reusing in-flight gateway restart (pid %s)",
-            proc.pid,
-        )
-    return {
-        "restart_started": True,
-        "restart_action": "gateway-restart",
-        "restart_pid": proc.pid,
-    }
-
-
-@app.post("/api/messaging/telegram/onboarding/{pairing_id}/apply")
-async def apply_telegram_onboarding(
-    pairing_id: str, body: TelegramOnboardingApply, profile: Optional[str] = None
-):
-    allowed_user_ids = []
-    seen = set()
-    for raw_id in body.allowed_user_ids:
-        normalized = _normalize_telegram_user_id(raw_id)
-        if not normalized:
-            raise HTTPException(
-                status_code=400,
-                detail="Allowed Telegram user IDs must be numeric.",
-            )
-        if normalized not in seen:
-            seen.add(normalized)
-            allowed_user_ids.append(normalized)
-    if not allowed_user_ids:
-        raise HTTPException(
-            status_code=400,
-            detail="Add at least one allowed Telegram user ID.",
-        )
-
-    with _telegram_onboarding_lock:
-        _prune_telegram_onboarding_pairings()
-        record = _telegram_onboarding_pairings.get(pairing_id)
-        if not record:
-            raise HTTPException(
-                status_code=404,
-                detail="Telegram setup session was not found. Start a new setup.",
-            )
-        bot_token = record.bot_token
-        bot_username = record.bot_username
-        if not bot_token:
-            raise HTTPException(
-                status_code=409,
-                detail="Telegram setup is not ready yet.",
-            )
-
-    effective_profile = body.profile or profile
-    try:
-        with _profile_scope(effective_profile):
-            save_env_value("TELEGRAM_BOT_TOKEN", bot_token)
-            save_env_value("TELEGRAM_ALLOWED_USERS", ",".join(allowed_user_ids))
-            _write_platform_enabled("telegram", True)
-    except HTTPException:
-        raise
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        _log.exception("Telegram onboarding apply failed")
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to save Telegram setup.",
-        ) from exc
-
-    with _telegram_onboarding_lock:
-        _telegram_onboarding_pairings.pop(pairing_id, None)
-
-    restart_result = _restart_gateway_after_telegram_onboarding(effective_profile)
-
-    return {
-        "ok": True,
-        "platform": "telegram",
-        "bot_username": bot_username,
-        "needs_restart": not restart_result["restart_started"],
-        **restart_result,
-    }
-
-
-@app.delete("/api/messaging/telegram/onboarding/{pairing_id}")
-async def cancel_telegram_onboarding(pairing_id: str):
-    with _telegram_onboarding_lock:
-        _telegram_onboarding_pairings.pop(pairing_id, None)
-    return {"ok": True}
+    write_channel_connector_config_field(platform_id, "enabled", enabled)
 
 
 @app.get("/api/messaging/platforms")
 async def get_messaging_platforms(profile: Optional[str] = None):
-    # Profile-scoped so the dashboard's global profile switcher shows the
-    # TARGET profile's channel credentials/state, not the root install's.
-    # Inside _profile_scope, load_env()/read_runtime_status()/get_running_pid()
-    # all resolve against the requested profile's HERMES_HOME.
-    with _profile_scope(profile) as scoped_dir:
-        env_on_disk = load_env()
-        runtime = read_runtime_status()
+    with _profile_scope(profile):
+        connector_states = _connector_runtime_states() if profile is None else {}
         return {
             "env_path": str(get_env_path()),
             "gateway_start_command": _gateway_display_command(profile, "start"),
             "platforms": [
-                _messaging_platform_payload(
-                    entry, env_on_disk, runtime, scoped=scoped_dir is not None
-                )
+                _messaging_platform_payload(entry, connector_states)
                 for entry in _messaging_platform_catalog()
-            ]
+            ],
         }
 
 
@@ -6843,11 +5506,9 @@ async def test_messaging_platform(platform_id: str, profile: Optional[str] = Non
             status_code=404, detail=f"Unknown messaging platform: {platform_id}"
         )
 
-    with _profile_scope(profile) as scoped_dir:
-        env_on_disk = load_env()
-        payload = _messaging_platform_payload(
-            entry, env_on_disk, read_runtime_status(), scoped=scoped_dir is not None
-        )
+    with _profile_scope(profile):
+        connector_states = _connector_runtime_states() if profile is None else {}
+        payload = _messaging_platform_payload(entry, connector_states)
     if not payload["enabled"]:
         message = f"{entry['name']} is disabled. Enable it, then restart the gateway."
         return {"ok": False, "state": payload["state"], "message": message}
@@ -7364,7 +6025,6 @@ async def disconnect_oauth_provider(
     profile: Optional[str] = None,
 ):
     """Disconnect an OAuth provider. Token-protected (matches /env/reveal)."""
-    _require_token(request)
 
     with _profile_scope(profile):
         catalog_by_id = {p["id"]: p for p in _build_oauth_catalog()}
@@ -8261,7 +6921,6 @@ async def start_oauth_login(
     profile: Optional[str] = None,
 ):
     """Initiate an OAuth login flow. Token-protected."""
-    _require_token(request)
     _gc_oauth_sessions()
     _validate_oauth_profile(profile)
     valid = {p["id"] for p in _OAUTH_PROVIDER_CATALOG}
@@ -8305,7 +6964,6 @@ async def submit_oauth_code(
     profile: Optional[str] = None,
 ):
     """Submit the auth code for PKCE flows. Token-protected."""
-    _require_token(request)
     if provider_id == "anthropic":
         return await asyncio.get_running_loop().run_in_executor(
             None, _submit_anthropic_pkce, body.session_id, body.code, profile,
@@ -8346,7 +7004,6 @@ async def cancel_oauth_session(
     profile: Optional[str] = None,
 ):
     """Cancel a pending OAuth session. Token-protected."""
-    _require_token(request)
     with _oauth_sessions_lock:
         sess = _oauth_sessions.pop(session_id, None)
     if sess is None:
@@ -8357,7 +7014,6 @@ async def cancel_oauth_session(
 # ---------------------------------------------------------------------------
 # Session detail endpoints
 # ---------------------------------------------------------------------------
-
 
 
 def _session_latest_descendant(session_id: str):
@@ -8563,7 +7219,6 @@ async def get_session_detail(request: Request, session_id: str, profile: Optiona
         return session
     finally:
         db.close()
-
 
 
 @app.get("/api/sessions/{session_id}/latest-descendant")
@@ -9653,206 +8308,6 @@ async def clear_pending_pairing():
 
 
 # ---------------------------------------------------------------------------
-# Webhook subscription endpoints — list / subscribe / remove.
-#
-# Wraps the same JSON store the CLI uses (hermes_cli.webhook); the webhook
-# adapter hot-reloads it without a gateway restart.  Per-route HMAC secrets
-# are redacted on read and surfaced once on create.
-# ---------------------------------------------------------------------------
-
-
-class WebhookCreate(BaseModel):
-    name: str
-    description: Optional[str] = None
-    events: List[str] = []
-    prompt: Optional[str] = None
-    skills: List[str] = []
-    deliver: str = "log"
-    deliver_only: bool = False
-    deliver_chat_id: Optional[str] = None
-    # secret: omit to auto-generate
-    secret: Optional[str] = None
-
-
-def _webhook_route_summary(name: str, route: Dict[str, Any], base_url: str) -> Dict[str, Any]:
-    return {
-        "name": name,
-        "description": route.get("description", ""),
-        "events": list(route.get("events") or []),
-        "deliver": route.get("deliver", "log"),
-        "deliver_only": bool(route.get("deliver_only")),
-        "prompt": route.get("prompt", ""),
-        "skills": list(route.get("skills") or []),
-        "created_at": route.get("created_at"),
-        "url": f"{base_url}/webhooks/{name}",
-        # Secret is masked on read; full value only returned on create.
-        "secret_set": bool(route.get("secret")),
-        # Default-enabled; only an explicit enabled:false turns a route off.
-        "enabled": route.get("enabled", True) is not False,
-    }
-
-
-@app.get("/api/webhooks")
-async def list_webhooks():
-    import hermes_cli.webhook as wh
-
-    base_url = wh._get_webhook_base_url()
-    subs = wh._load_subscriptions()
-    return {
-        "enabled": wh._is_webhook_enabled(),
-        "base_url": base_url,
-        "subscriptions": [
-            _webhook_route_summary(name, route, base_url)
-            for name, route in subs.items()
-        ],
-    }
-
-
-@app.post("/api/webhooks/enable")
-async def enable_webhooks():
-    try:
-        _write_platform_enabled("webhook", True)
-    except Exception as exc:
-        _log.exception("Failed to enable webhook platform from dashboard")
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to enable webhook platform.",
-        ) from exc
-
-    restart_result = _restart_gateway_after_webhook_enable()
-    return {
-        "ok": True,
-        "platform": "webhook",
-        "enabled": True,
-        "needs_restart": not restart_result["restart_started"],
-        **restart_result,
-    }
-
-
-@app.post("/api/webhooks")
-async def create_webhook(body: WebhookCreate):
-    import re as _re
-    import secrets as _secrets
-    import time as _time
-    import hermes_cli.webhook as wh
-
-    if not wh._is_webhook_enabled():
-        raise HTTPException(
-            status_code=400,
-            detail="Webhook platform is not enabled. Enable it from the Webhooks page first.",
-        )
-
-    name = (body.name or "").strip().lower().replace(" ", "-")
-    if not _re.match(r"^[a-z0-9][a-z0-9_-]*$", name):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid name. Use lowercase alphanumeric with hyphens/underscores.",
-        )
-
-    if body.deliver_only and body.deliver == "log":
-        raise HTTPException(
-            status_code=400,
-            detail="Direct delivery requires a real target (telegram, discord, …), not 'log'.",
-        )
-
-    secret = body.secret or _secrets.token_urlsafe(32)
-    route: Dict[str, Any] = {
-        "description": body.description or f"Dashboard-created subscription: {name}",
-        "events": [e.strip() for e in body.events if e.strip()],
-        "secret": secret,
-        "prompt": body.prompt or "",
-        "skills": [s.strip() for s in body.skills if s.strip()],
-        "deliver": body.deliver or "log",
-        "created_at": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
-    }
-    if body.deliver_only:
-        route["deliver_only"] = True
-    if body.deliver_chat_id:
-        route["deliver_extra"] = {"chat_id": body.deliver_chat_id}
-
-    subs = wh._load_subscriptions()
-    subs[name] = route
-    wh._save_subscriptions(subs)
-
-    base_url = wh._get_webhook_base_url()
-    summary = _webhook_route_summary(name, route, base_url)
-    # Surface the secret exactly once, on create.
-    summary["secret"] = secret
-    return summary
-
-
-@app.delete("/api/webhooks/{name}")
-async def delete_webhook(name: str):
-    import hermes_cli.webhook as wh
-
-    key = (name or "").strip().lower()
-    subs = wh._load_subscriptions()
-    if key not in subs:
-        raise HTTPException(status_code=404, detail=f"No subscription named '{key}'")
-    del subs[key]
-    wh._save_subscriptions(subs)
-    return {"ok": True}
-
-
-class WebhookEnabledToggle(BaseModel):
-    enabled: bool
-
-
-@app.put("/api/webhooks/{name}/enabled")
-async def set_webhook_enabled(name: str, body: WebhookEnabledToggle):
-    """Enable or disable a webhook route.
-
-    Disabled routes stay in the subscriptions file (so they can be
-    re-enabled) but the gateway rejects incoming events with 403.  The
-    gateway hot-reloads the subscriptions file, so this takes effect on the
-    next event without a restart.
-    """
-    import hermes_cli.webhook as wh
-
-    key = (name or "").strip().lower()
-    subs = wh._load_subscriptions()
-    if key not in subs:
-        raise HTTPException(status_code=404, detail=f"No subscription named '{key}'")
-    subs[key]["enabled"] = bool(body.enabled)
-    wh._save_subscriptions(subs)
-    return {"ok": True, "name": key, "enabled": bool(body.enabled)}
-
-
-# ---------------------------------------------------------------------------
-# Gateway lifecycle endpoints — start / stop.
-#
-# restart + update already exist above; these complete the lifecycle so a
-# remote admin can bring the gateway up or down without shell access.  Both
-# spawn the real `hermes gateway <verb>` so behaviour matches the CLI exactly.
-# Status is already surfaced by /api/status (gateway_running/state/platforms).
-# ---------------------------------------------------------------------------
-
-
-@app.post("/api/gateway/start")
-async def start_gateway(profile: Optional[str] = None):
-    try:
-        proc = _spawn_hermes_action(_gateway_subcommand(profile, "start"), "gateway-start")
-    except HTTPException:
-        raise
-    except Exception as exc:
-        _log.exception("Failed to spawn gateway start")
-        raise HTTPException(status_code=500, detail=f"Failed to start gateway: {exc}")
-    return {"ok": True, "pid": proc.pid, "name": "gateway-start"}
-
-
-@app.post("/api/gateway/stop")
-async def stop_gateway(profile: Optional[str] = None):
-    try:
-        proc = _spawn_hermes_action(_gateway_subcommand(profile, "stop"), "gateway-stop")
-    except HTTPException:
-        raise
-    except Exception as exc:
-        _log.exception("Failed to spawn gateway stop")
-        raise HTTPException(status_code=500, detail=f"Failed to stop gateway: {exc}")
-    return {"ok": True, "pid": proc.pid, "name": "gateway-stop"}
-
-
-# ---------------------------------------------------------------------------
 # Credential pool endpoints — list / add / remove rotation keys.
 #
 # The credential pool (auth.json -> credential_pool.<provider>[]) holds the
@@ -10904,665 +9359,6 @@ async def scan_skill_hub(identifier: str = ""):
 
 
 # ---------------------------------------------------------------------------
-# Profile management endpoints (minimal — list/create/rename/delete + SOUL.md)
-# ---------------------------------------------------------------------------
-
-
-class ProfileCreate(BaseModel):
-    name: str
-    clone_from: Optional[str] = None
-    # Backward compatibility for older dashboard/desktop clients. New clients
-    # send clone_from="default" (or another profile name) explicitly.
-    clone_from_default: bool = False
-    clone_all: bool = False
-    no_skills: bool = False
-    description: Optional[str] = None
-    provider: Optional[str] = None
-    model: Optional[str] = None
-    # Profile-builder additions — all optional, all applied best-effort AFTER
-    # the profile directory exists, so a hiccup in any of them never 500s the
-    # create (the user can fix it from the relevant dashboard page afterward).
-    # MCP servers to write into the new profile's config.yaml.
-    mcp_servers: List["MCPServerCreate"] = []
-    # Built-in / optional skills to KEEP active. When this list is non-empty,
-    # the builder uses "replace" semantics: the bundle is seeded, then every
-    # seeded skill NOT in this list is added to the profile's disabled list.
-    # Empty list = leave the seeded bundle untouched (legacy behaviour).
-    keep_skills: List[str] = []
-    # Skills-hub identifiers to install into the new profile. Installed async
-    # via a subprocess scoped to the profile (`hermes -p <name> skills install`)
-    # because skills_hub.SKILLS_DIR is import-time-bound and the HERMES_HOME
-    # override can't redirect it. Returns spawned PIDs for the UI to poll.
-    hub_skills: List[str] = []
-
-
-class ProfileRename(BaseModel):
-    new_name: str
-
-
-class ProfileSoulUpdate(BaseModel):
-    content: str
-
-
-class ProfileActiveUpdate(BaseModel):
-    name: str
-
-
-class ProfileDescriptionUpdate(BaseModel):
-    description: str = ""
-
-
-class ProfileModelUpdate(BaseModel):
-    provider: str
-    model: str
-
-
-class ProfileDescribeAuto(BaseModel):
-    overwrite: bool = False
-
-
-def _profile_attr(info, name: str, default: Any = None) -> Any:
-    try:
-        return getattr(info, name)
-    except Exception:
-        return default
-
-
-def _profile_to_dict(info) -> Dict[str, Any]:
-    return {
-        "name": _profile_attr(info, "name", ""),
-        "path": str(_profile_attr(info, "path", "")),
-        "is_default": bool(_profile_attr(info, "is_default", False)),
-        "model": _profile_attr(info, "model"),
-        "provider": _profile_attr(info, "provider"),
-        "has_env": bool(_profile_attr(info, "has_env", False)),
-        "skill_count": int(_profile_attr(info, "skill_count", 0) or 0),
-        "gateway_running": bool(_profile_attr(info, "gateway_running", False)),
-        "description": _profile_attr(info, "description", "") or "",
-        "description_auto": bool(_profile_attr(info, "description_auto", False)),
-        "distribution_name": _profile_attr(info, "distribution_name"),
-        "distribution_version": _profile_attr(info, "distribution_version"),
-        "distribution_source": _profile_attr(info, "distribution_source"),
-        "has_alias": _profile_attr(info, "alias_path") is not None,
-    }
-
-
-def _fallback_profile_dicts(profiles_mod) -> List[Dict[str, Any]]:
-    def _safe(callable_, default):
-        try:
-            return callable_()
-        except Exception:
-            return default
-
-    profiles: List[Dict[str, Any]] = []
-    default_home = profiles_mod._get_default_hermes_home()
-    if default_home.is_dir():
-        model, provider = _safe(lambda: profiles_mod._read_config_model(default_home), (None, None))
-        profiles.append({
-            "name": "default",
-            "path": str(default_home),
-            "is_default": True,
-            "model": model,
-            "provider": provider,
-            "has_env": (default_home / ".env").exists(),
-            "skill_count": _safe(lambda: profiles_mod._count_skills(default_home), 0),
-            "gateway_running": _safe(lambda: profiles_mod._check_gateway_running(default_home), False),
-            "description": _safe(lambda: profiles_mod.read_profile_meta(default_home).get("description", ""), ""),
-            "description_auto": _safe(lambda: profiles_mod.read_profile_meta(default_home).get("description_auto", False), False),
-            "distribution_name": None,
-            "distribution_version": None,
-            "distribution_source": None,
-            "has_alias": False,
-        })
-
-    profiles_root = profiles_mod._get_profiles_root()
-    if profiles_root.is_dir():
-        for entry in sorted(profiles_root.iterdir()):
-            if not entry.is_dir() or not profiles_mod._PROFILE_ID_RE.match(entry.name):
-                continue
-            model, provider = _safe(lambda entry=entry: profiles_mod._read_config_model(entry), (None, None))
-            profiles.append({
-                "name": entry.name,
-                "path": str(entry),
-                "is_default": False,
-                "model": model,
-                "provider": provider,
-                "has_env": (entry / ".env").exists(),
-                "skill_count": _safe(lambda entry=entry: profiles_mod._count_skills(entry), 0),
-                "gateway_running": _safe(lambda entry=entry: profiles_mod._check_gateway_running(entry), False),
-                "description": _safe(lambda entry=entry: profiles_mod.read_profile_meta(entry).get("description", ""), ""),
-                "description_auto": _safe(lambda entry=entry: profiles_mod.read_profile_meta(entry).get("description_auto", False), False),
-                "distribution_name": None,
-                "distribution_version": None,
-                "distribution_source": None,
-                "has_alias": False,
-            })
-
-    return profiles
-
-
-def _resolve_profile_dir(name: str) -> Path:
-    """Validate ``name`` and resolve to its directory or raise an HTTPException."""
-    from hermes_cli import profiles as profiles_mod
-    try:
-        profiles_mod.validate_profile_name(name)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    if not profiles_mod.profile_exists(name):
-        raise HTTPException(status_code=404, detail=f"Profile '{name}' does not exist.")
-    return profiles_mod.get_profile_dir(name)
-
-
-def _profile_setup_command(name: str) -> str:
-    """Return the shell command used to configure a profile in the CLI."""
-    _resolve_profile_dir(name)
-    return "hermes setup" if name == "default" else f"{name} setup"
-
-
-def _write_profile_model(profile_dir: Path, provider: str, model: str) -> None:
-    """Write the main model assignment into a specific profile's config.yaml.
-
-    Scopes ``load_config``/``save_config`` to ``profile_dir`` via the
-    context-local HERMES_HOME override so the write lands in the target
-    profile's config rather than the dashboard process's active profile.
-    Clears any stale ``base_url`` / ``context_length`` the same way
-    ``POST /api/model/set`` does, since the new model may differ.
-    """
-    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
-
-    token = set_hermes_home_override(str(profile_dir))
-    try:
-        provider, model = _normalize_main_model_assignment(provider, model)
-        cfg = load_config()
-        cfg["model"] = _apply_main_model_assignment(cfg.get("model", {}), provider, model)
-        save_config(cfg)
-    finally:
-        reset_hermes_home_override(token)
-
-
-def _write_profile_mcp_servers(profile_dir: Path, servers: List["MCPServerCreate"]) -> int:
-    """Write MCP server entries into a specific profile's config.yaml.
-
-    Scopes ``load_config``/``save_config`` to ``profile_dir`` via the
-    context-local HERMES_HOME override (same mechanism as
-    ``_write_profile_model``) so the entries land in the target profile's
-    config rather than the dashboard process's active profile.
-
-    Mirrors the per-server shape the ``POST /api/mcp/servers`` endpoint builds,
-    but batched so the whole profile-create write is a single config save.
-    Returns the number of servers written.
-    """
-    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
-    from hermes_cli.mcp_security import validate_mcp_server_entry
-
-    written = 0
-    token = set_hermes_home_override(str(profile_dir))
-    try:
-        cfg = load_config()
-        mcp = cfg.setdefault("mcp_servers", {})
-        for server in servers:
-            name = (server.name or "").strip()
-            if not name:
-                continue
-            entry: Dict[str, Any] = {}
-            if server.url:
-                entry["url"] = server.url
-            if server.command:
-                entry["command"] = server.command
-            if server.args:
-                entry["args"] = list(server.args)
-            if server.env:
-                entry["env"] = dict(server.env)
-            if server.auth:
-                entry["auth"] = server.auth
-            if not entry:
-                # Nothing usable to write (neither url nor command) — skip
-                # rather than persist an empty, unusable server stanza.
-                continue
-            issues = validate_mcp_server_entry(name, entry)
-            if issues:
-                _log.warning("Profile-create: skipping MCP server '%s': %s", name, "; ".join(issues))
-                continue
-            mcp[name] = entry
-            written += 1
-        if written:
-            save_config(cfg)
-        elif not mcp:
-            # We created an empty mcp_servers dict but wrote nothing — don't
-            # leave a stray empty key in the new profile's config.
-            cfg.pop("mcp_servers", None)
-            save_config(cfg)
-    finally:
-        reset_hermes_home_override(token)
-    return written
-
-
-def _disable_unselected_skills(profile_dir: Path, keep: List[str]) -> int:
-    """Disable every installed skill in ``profile_dir`` not in ``keep``.
-
-    Profiles manage skill activation via a *disabled* list — all installed
-    skills are active by default and users opt out. The builder's skill step
-    uses "replace" semantics: the user picks exactly which seeded built-in /
-    optional skills stay active, and everything else gets added to the disabled
-    list. (Hub skills are installed separately via subprocess and are active on
-    install.) Scoped to the profile via the HERMES_HOME override. Returns the
-    number of skills newly disabled.
-    """
-    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
-    from hermes_cli.skills_config import get_disabled_skills, save_disabled_skills
-
-    keep_set = {s.strip() for s in keep if s and s.strip()}
-    disabled_count = 0
-    token = set_hermes_home_override(str(profile_dir))
-    try:
-        installed: List[str] = []
-        skills_root = profile_dir / "skills"
-        if skills_root.is_dir():
-            for md in skills_root.rglob("SKILL.md"):
-                installed.append(md.parent.name)
-        cfg = load_config()
-        disabled = get_disabled_skills(cfg)
-        for name in installed:
-            if name not in keep_set and name not in disabled:
-                disabled.add(name)
-                disabled_count += 1
-        if disabled_count:
-            save_disabled_skills(cfg, disabled)
-    finally:
-        reset_hermes_home_override(token)
-    return disabled_count
-
-
-def _active_profile_info(profiles_mod: Any) -> Dict[str, str]:
-    try:
-        active = profiles_mod.get_active_profile() or "default"
-    except Exception:
-        active = "default"
-    try:
-        current = profiles_mod.get_active_profile_name() or "default"
-    except Exception:
-        current = "default"
-    return {"active": active, "current": current}
-
-
-@app.get("/api/profiles/summary")
-def profile_summary_endpoint(request: Request):
-    if getattr(request.app.state, "auth_required", False):
-        return {
-            "management_mode": "owner_singleton",
-            "profiles": ["default"],
-            "current": "default",
-            "active": "default",
-        }
-
-    from hermes_cli import profiles as profiles_mod
-
-    try:
-        profile_names = [
-            name for name, _home in profiles_mod.profiles_to_serve(multiplex=True)
-        ]
-    except Exception:
-        _log.exception("GET /api/profiles/summary failed to enumerate profiles")
-        profile_names = ["default"]
-    return {
-        "management_mode": "legacy_multi_profile",
-        "profiles": profile_names,
-        **_active_profile_info(profiles_mod),
-    }
-
-
-@app.get("/api/profiles")
-async def list_profiles_endpoint(request: Request):
-    if _authenticated_owner_request(request):
-        return await _proxy_authenticated_owner_http(request)
-    from hermes_cli import profiles as profiles_mod
-    try:
-        loop = asyncio.get_running_loop()
-        profiles = await loop.run_in_executor(None, profiles_mod.list_profiles)
-        return {
-            "management_mode": "legacy_multi_profile",
-            "profiles": [_profile_to_dict(p) for p in profiles],
-        }
-    except Exception:
-        _log.exception("GET /api/profiles failed; falling back to profile directory scan")
-        return {
-            "management_mode": "legacy_multi_profile",
-            "profiles": _fallback_profile_dicts(profiles_mod),
-        }
-
-
-@app.post("/api/profiles")
-async def create_profile_endpoint(body: ProfileCreate):
-    from hermes_cli import profiles as profiles_mod
-    explicit_source = (body.clone_from or "").strip()
-    if explicit_source:
-        # Duplicating a specific profile: clone its config/skills/SOUL (or full
-        # state when clone_all) from the named source rather than "default".
-        clone = True
-        clone_from = explicit_source
-        clone_config = not body.clone_all
-    elif body.clone_all:
-        # Preserve the dashboard's historical clone-all behavior: a full-copy
-        # request with no explicit dropdown source copies from default.
-        clone = True
-        clone_from = "default"
-        clone_config = False
-    else:
-        clone = body.clone_from_default
-        clone_from = "default" if clone else None
-        clone_config = clone
-    try:
-        path = profiles_mod.create_profile(
-            name=body.name,
-            clone_from=clone_from,
-            clone_all=body.clone_all,
-            clone_config=clone_config,
-            no_skills=body.no_skills,
-            description=body.description,
-        )
-        # Match the CLI's profile-create flow: fresh named profiles get the
-        # bundled skills installed. When cloning from default, create_profile()
-        # has already copied the source profile's skills, including any
-        # user-installed skills. When no_skills=True, create_profile() wrote
-        # the opt-out marker and seed_profile_skills() will no-op.
-        if not clone:
-            profiles_mod.seed_profile_skills(path, quiet=True)
-
-        # Match the CLI's profile-create flow: named profiles should get a
-        # wrapper in ~/.local/bin when the alias is safe to create.
-        collision = profiles_mod.check_alias_collision(body.name)
-        if not collision:
-            profiles_mod.create_wrapper_script(body.name)
-    except (ValueError, FileExistsError, FileNotFoundError) as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        _log.exception("POST /api/profiles failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
-    # Optional explicit model assignment for the new profile. Best-effort:
-    # the profile already exists, so a model-write hiccup must not 500 the
-    # whole create — the user can set the model later from the Models page
-    # or `<profile> setup`.
-    provider = (body.provider or "").strip()
-    model = (body.model or "").strip()
-    model_set = False
-    if provider and model:
-        try:
-            _write_profile_model(path, provider, model)
-            model_set = True
-        except Exception:
-            _log.exception("Setting model for new profile %s failed", body.name)
-
-    # Optional MCP servers. Best-effort, same rationale as model assignment.
-    mcp_written = 0
-    if body.mcp_servers:
-        try:
-            mcp_written = _write_profile_mcp_servers(path, body.mcp_servers)
-        except Exception:
-            _log.exception("Writing MCP servers for new profile %s failed", body.name)
-
-    # Optional "keep" skill selection — replace semantics. When the builder
-    # sends an explicit keep list, disable every seeded skill not in it.
-    # Best-effort. Skipped when keep_skills is empty (legacy: keep the bundle).
-    skills_disabled = 0
-    if body.keep_skills:
-        try:
-            skills_disabled = _disable_unselected_skills(path, body.keep_skills)
-        except Exception:
-            _log.exception("Applying skill selection for new profile %s failed", body.name)
-
-    # Optional skills-hub installs. Spawned async, scoped to the new profile
-    # via `-p <name>` (a fresh subprocess re-binds skills_hub.SKILLS_DIR to the
-    # profile's HERMES_HOME at import). Returns PIDs for the UI to poll.
-    hub_installs: List[Dict[str, Any]] = []
-    for identifier in body.hub_skills:
-        ident = (identifier or "").strip()
-        if not ident:
-            continue
-        try:
-            proc = _spawn_hermes_action(
-                ["-p", body.name, "skills", "install", ident, "--yes"],
-                "skills-install",
-            )
-            hub_installs.append({"identifier": ident, "pid": proc.pid})
-        except Exception:
-            _log.exception(
-                "Spawning hub-skill install %s for new profile %s failed",
-                ident,
-                body.name,
-            )
-            hub_installs.append({"identifier": ident, "pid": None})
-
-    return {
-        "ok": True,
-        "name": body.name,
-        "path": str(path),
-        "model_set": model_set,
-        "mcp_written": mcp_written,
-        "skills_disabled": skills_disabled,
-        "hub_installs": hub_installs,
-    }
-
-
-@app.get("/api/profiles/active")
-async def get_active_profile_endpoint():
-    """Return the sticky active profile and the profile this dashboard
-    process is currently running as.
-
-    ``active`` is the sticky default written by ``hermes profile use`` —
-    the profile new CLI invocations pick up. ``current`` is the profile
-    the running dashboard/gateway is scoped to (derived from HERMES_HOME).
-    """
-    from hermes_cli import profiles as profiles_mod
-    return _active_profile_info(profiles_mod)
-
-
-@app.post("/api/profiles/active")
-async def set_active_profile_endpoint(body: ProfileActiveUpdate):
-    """Set the sticky active profile (mirrors ``hermes profile use``).
-
-    Note: this does not retarget the already-running dashboard process —
-    it changes which profile subsequent CLI commands and gateways use.
-    """
-    from hermes_cli import profiles as profiles_mod
-    try:
-        profiles_mod.set_active_profile(body.name)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        _log.exception("POST /api/profiles/active failed")
-        raise HTTPException(status_code=500, detail=str(e))
-    return {"ok": True, "active": profiles_mod.normalize_profile_name(body.name)}
-
-
-@app.get("/api/profiles/{name}/setup-command")
-async def get_profile_setup_command(name: str):
-    return {"command": _profile_setup_command(name)}
-
-
-@app.post("/api/profiles/{name}/open-terminal")
-async def open_profile_terminal_endpoint(name: str):
-    try:
-        command = _profile_setup_command(name)
-
-        if sys.platform.startswith("win"):
-            subprocess.Popen(["cmd.exe", "/c", "start", "", command])
-        elif sys.platform == "darwin":
-            escaped = command.replace("\\", "\\\\").replace('"', '\\"')
-            applescript = (
-                'tell application "Terminal"\n'
-                "activate\n"
-                f'do script "{escaped}"\n'
-                "end tell"
-            )
-            subprocess.Popen(["osascript", "-e", applescript])
-        else:
-            terminal_commands = [
-                ("x-terminal-emulator", ["x-terminal-emulator", "-e", "sh", "-lc", command]),
-                ("gnome-terminal", ["gnome-terminal", "--", "sh", "-lc", command]),
-                ("konsole", ["konsole", "-e", "sh", "-lc", command]),
-                ("xfce4-terminal", ["xfce4-terminal", "-e", f"sh -lc '{command}'"]),
-                ("mate-terminal", ["mate-terminal", "-e", f"sh -lc '{command}'"]),
-                ("lxterminal", ["lxterminal", "-e", f"sh -lc '{command}'"]),
-                ("tilix", ["tilix", "-e", "sh", "-lc", command]),
-                ("alacritty", ["alacritty", "-e", "sh", "-lc", command]),
-                ("kitty", ["kitty", "sh", "-lc", command]),
-                ("xterm", ["xterm", "-e", "sh", "-lc", command]),
-            ]
-            for executable, popen_args in terminal_commands:
-                if subprocess.call(
-                    ["which", executable],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                ) == 0:
-                    subprocess.Popen(popen_args)
-                    break
-            else:
-                raise HTTPException(
-                    status_code=400,
-                    detail="No supported terminal emulator found",
-                )
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except HTTPException:
-        raise
-    except Exception as e:
-        _log.exception("POST /api/profiles/%s/open-terminal failed", name)
-        raise HTTPException(status_code=500, detail=str(e))
-    return {"ok": True, "command": command}
-
-
-@app.patch("/api/profiles/{name}")
-async def rename_profile_endpoint(name: str, body: ProfileRename):
-    from hermes_cli import profiles as profiles_mod
-    try:
-        path = profiles_mod.rename_profile(name, body.new_name)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except (ValueError, FileExistsError) as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        _log.exception("PATCH /api/profiles/%s failed", name)
-        raise HTTPException(status_code=500, detail=str(e))
-    return {"ok": True, "name": body.new_name, "path": str(path)}
-
-
-@app.delete("/api/profiles/{name}")
-async def delete_profile_endpoint(name: str):
-    """Delete a profile. The dashboard collects the user's confirmation in
-    its own dialog before this request, so we always pass ``yes=True`` to
-    skip the CLI's interactive prompt."""
-    from hermes_cli import profiles as profiles_mod
-    try:
-        path = profiles_mod.delete_profile(name, yes=True)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        _log.exception("DELETE /api/profiles/%s failed", name)
-        raise HTTPException(status_code=500, detail=str(e))
-    return {"ok": True, "path": str(path)}
-
-
-@app.get("/api/profiles/{name}/soul")
-async def get_profile_soul(name: str):
-    soul_path = _resolve_profile_dir(name) / "SOUL.md"
-    if soul_path.exists():
-        try:
-            return {"content": soul_path.read_text(encoding="utf-8"), "exists": True}
-        except OSError as e:
-            raise HTTPException(status_code=500, detail=f"Could not read SOUL.md: {e}")
-    return {"content": "", "exists": False}
-
-
-@app.put("/api/profiles/{name}/soul")
-async def update_profile_soul(name: str, body: ProfileSoulUpdate):
-    soul_path = _resolve_profile_dir(name) / "SOUL.md"
-    try:
-        soul_path.write_text(body.content, encoding="utf-8")
-    except OSError as e:
-        _log.exception("PUT /api/profiles/%s/soul failed", name)
-        raise HTTPException(status_code=500, detail=f"Could not write SOUL.md: {e}")
-    return {"ok": True}
-
-
-@app.put("/api/profiles/{name}/description")
-async def update_profile_description_endpoint(name: str, body: ProfileDescriptionUpdate):
-    """Set or clear a profile's role description (kanban routing signal).
-
-    Empty string clears the description. Non-empty stores it as a
-    user-authored description (``description_auto: false``) so the
-    auto-describer won't overwrite it on a sweep.
-    """
-    from hermes_cli import profiles as profiles_mod
-    profile_dir = _resolve_profile_dir(name)
-    text = (body.description or "").strip()
-    try:
-        profiles_mod.write_profile_meta(
-            profile_dir,
-            description=text,
-            description_auto=False,
-        )
-    except Exception as e:
-        _log.exception("PUT /api/profiles/%s/description failed", name)
-        raise HTTPException(status_code=500, detail=str(e))
-    return {"ok": True, "description": text, "description_auto": False}
-
-
-@app.put("/api/profiles/{name}/model")
-async def update_profile_model_endpoint(name: str, body: ProfileModelUpdate):
-    """Set the main model (``model.default`` + ``model.provider``) for a
-    specific profile's config.yaml, without touching the dashboard's own
-    active profile. Mirrors ``POST /api/model/set`` (main scope) but scoped
-    to the named profile via the HERMES_HOME override.
-    """
-    profile_dir = _resolve_profile_dir(name)
-    provider = (body.provider or "").strip()
-    model = (body.model or "").strip()
-    if not provider or not model:
-        raise HTTPException(status_code=400, detail="provider and model are required")
-    try:
-        _write_profile_model(profile_dir, provider, model)
-    except Exception as e:
-        _log.exception("PUT /api/profiles/%s/model failed", name)
-        raise HTTPException(status_code=500, detail=str(e))
-    return {"ok": True, "provider": provider, "model": model}
-
-
-@app.post("/api/profiles/{name}/describe-auto")
-async def describe_profile_auto_endpoint(name: str, body: ProfileDescribeAuto):
-    """Auto-generate a profile's description via the auxiliary LLM
-    (``auxiliary.profile_describer``). Mirrors ``hermes profile describe
-    <name> --auto``.
-
-    A failed generation (no aux client, LLM error, …) is returned as
-    ``ok: false`` with a reason rather than an HTTP error so the UI can
-    surface it inline and let the operator fix config and retry.
-    """
-    _resolve_profile_dir(name)
-    try:
-        from hermes_cli import profile_describer
-        outcome = profile_describer.describe_profile(name, overwrite=bool(body.overwrite))
-    except Exception as e:
-        _log.exception("POST /api/profiles/%s/describe-auto failed", name)
-        raise HTTPException(status_code=500, detail=str(e))
-    return {
-        "ok": bool(outcome.ok),
-        "reason": outcome.reason,
-        "description": outcome.description,
-        # Only a successful generation is an auto-authored description. A failed
-        # sweep leaves any existing description untouched, so don't claim it's
-        # auto-generated.
-        "description_auto": bool(outcome.ok),
-    }
-
-
-# ---------------------------------------------------------------------------
 # Skills & Tools endpoints
 #
 # Every read/write below accepts an optional ``profile`` query param so the
@@ -12234,51 +10030,8 @@ async def get_models_analytics(request: Request, days: int = 30, profile: Option
         db.close()
 
 
-# ---------------------------------------------------------------------------
-# /api/pty — PTY-over-WebSocket bridge for the dashboard "Chat" tab.
-#
-# The endpoint spawns the same ``hermes --tui`` binary the CLI uses, behind
-# a POSIX pseudo-terminal, and forwards bytes + resize escapes across a
-# WebSocket.  The browser renders the ANSI through xterm.js (see
-# web/src/pages/ChatPage.tsx).
-#
-# Auth: ``?token=<session_token>`` query param (browsers can't set
-# Authorization on the WS upgrade).  Same ephemeral ``_SESSION_TOKEN`` as
-# REST.  Localhost-only — we defensively reject non-loopback clients even
-# though uvicorn binds to 127.0.0.1.
-# ---------------------------------------------------------------------------
-
-# PTY bridge: POSIX uses pty_bridge (fcntl/termios/ptyprocess); native Windows
-# uses win_pty_bridge (pywinpty/ConPTY, already a declared dependency).  Both
-# expose the same public surface — spawn/read/write/resize/close/is_available —
-# so the /api/pty WebSocket handler needs no platform guards.
-if sys.platform.startswith("win"):
-    try:
-        from hermes_cli.win_pty_bridge import WinPtyBridge as PtyBridge, PtyUnavailableError
-        _PTY_BRIDGE_AVAILABLE = True
-    except ImportError:  # pragma: no cover - pywinpty missing
-        PtyBridge = None  # type: ignore[assignment]
-        _PTY_BRIDGE_AVAILABLE = False
-
-        class PtyUnavailableError(RuntimeError):  # type: ignore[no-redef]
-            """Stub when win_pty_bridge cannot be imported."""
-            pass
-else:
-    try:
-        from hermes_cli.pty_bridge import PtyBridge, PtyUnavailableError
-        _PTY_BRIDGE_AVAILABLE = True
-    except ImportError:  # pragma: no cover - dev env without ptyprocess
-        PtyBridge = None  # type: ignore[assignment]
-        _PTY_BRIDGE_AVAILABLE = False
-
-        class PtyUnavailableError(RuntimeError):  # type: ignore[no-redef]
-            """Stub on platforms where pty_bridge can't be imported."""
-            pass
-
-_RESIZE_RE = re.compile(rb"\x1b\[RESIZE:(\d+);(\d+)\]")
-_PTY_READ_CHUNK_TIMEOUT = 0.2
+# WebSocket request and authentication guards shared by dashboard live routes.
 _VALID_CHANNEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
-_VALID_BROWSER_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
 # Starlette's TestClient reports the peer as "testclient"; treat it as
 # loopback so tests don't need to rewrite request scope.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "testclient"})
@@ -12315,20 +10068,10 @@ def _ws_client_reason(ws: "WebSocket") -> Optional[str]:
 def _ws_client_is_allowed(ws: "WebSocket") -> bool:
     """Check if the WebSocket client IP is acceptable.
 
-    Loopback bind: only loopback clients allowed — the legacy
-    ``?token=<_SESSION_TOKEN>`` path is the only auth we have, so we
-    don't want LAN hosts guessing tokens.
+    Loopback bind: only loopback clients are accepted.
 
-    Explicit non-loopback bind (``--host 0.0.0.0``, ``--host ::``, or a
-    specific address such as a Tailscale/LAN IP, always with
-    ``--insecure``): allow any peer. The operator explicitly opted into
-    non-loopback exposure, so the loopback-only peer restriction does not
-    apply. DNS-rebinding is still blocked by the Host/Origin guard in
-    :func:`_ws_host_origin_is_allowed`, which mirrors the HTTP layer and
-    requires the Host header to match the bound interface — the same
-    defence ``_is_accepted_host`` applies to non-loopback HTTP requests.
-
-    Gated mode: any peer is allowed — uvicorn's ``proxy_headers=True``
+    Authenticated mode allows non-loopback peers after Host/Origin and ticket
+    validation. Uvicorn's ``proxy_headers=True``
     (enabled when the OAuth gate is active so cookies can pick up
     ``X-Forwarded-Proto``) rewrites ``ws.client.host`` to the
     X-Forwarded-For value, which is the real internet client IP. The
@@ -12511,6 +10254,8 @@ def _ws_auth_result(ws: "WebSocket") -> _WsAuthResult:
         return _WsAuthResult(None, "internal_owner_token", {"owner_key": owner_key})
 
     auth_required = bool(getattr(state, "auth_required", False))
+    if not auth_required:
+        return _WsAuthResult("authentication_required", "none")
     if auth_required:
         # Lazy import — keeps this function importable in test harnesses
         # that don't bring in the dashboard_auth layer.
@@ -12632,12 +10377,7 @@ def _ws_auth_result(ws: "WebSocket") -> _WsAuthResult:
             )
             return _WsAuthResult("ticket_invalid", "ticket")
 
-    token = ws.query_params.get("token", "")
-    if not token:
-        return _WsAuthResult("no_credential", "none")
-    if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
-        return _WsAuthResult(None, "token")
-    return _WsAuthResult("token_mismatch", "token")
+    return _WsAuthResult("authentication_required", "none")
 
 
 def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
@@ -13474,234 +11214,8 @@ async def _bridge_websocket_to_owner_worker(
                 )
 
 
-# Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
-# and /api/events (dashboard → browser sidebar).  Keyed by an opaque channel id
-# the chat tab generates on mount; entries auto-evict when the last subscriber
-# drops AND the publisher has disconnected.
-# (Channel state and the chat-argv lock are initialised in _lifespan on app
-# startup — see _get_event_state / _get_chat_argv_lock above.)
-
-
-def _resolve_chat_argv(
-    resume: Optional[str] = None,
-    sidecar_url: Optional[str] = None,
-    profile: Optional[str] = None,
-    active_session_file: Optional[str] = None,
-    browser_id: Optional[str] = None,
-    app_obj: Any | None = None,
-) -> tuple[list[str], Optional[str], Optional[dict]]:
-    """Resolve the argv + cwd + env for the chat PTY.
-
-    Default: whatever ``hermes --tui`` would run.  Tests monkeypatch this
-    function to inject a tiny fake command (``cat``, ``sh -c 'printf …'``)
-    so nothing has to build Node or the TUI bundle.
-
-    Session resume is propagated via the ``HERMES_TUI_RESUME`` env var —
-    matching what ``hermes_cli.main._launch_tui`` does for the CLI path.
-    Appending ``--resume <id>`` to argv doesn't work because ``ui-tui`` does
-    not parse its argv.
-
-    ``HERMES_TUI_GATEWAY_URL`` is injected so the PTY child can attach to
-    this process's in-memory ``tui_gateway`` instance instead of spawning
-    its own Python gateway subprocess.
-
-    `sidecar_url` (when set) is forwarded as ``HERMES_TUI_SIDECAR_URL`` so
-    the spawned ``tui_gateway.entry`` can mirror dispatcher emits to the
-    dashboard's ``/api/pub`` endpoint (see :func:`pub_ws`).
-
-    `active_session_file` (when set) is forwarded as
-    ``HERMES_TUI_ACTIVE_SESSION_FILE``. The TUI writes the current session id
-    there whenever it creates/resumes/switches sessions, giving the dashboard a
-    small cross-process breadcrumb for reconnecting after an unexpected browser
-    WebSocket close.
-
-    `profile` (when set) scopes the ENTIRE chat to that profile by pointing
-    ``HERMES_HOME`` at the profile dir in the child env. Every spawned
-    process (the TUI and the ``tui_gateway.entry`` it launches) resolves
-    ``get_hermes_home()`` from that env var at its own import, so the child
-    binds the profile's config, skills, memory, and state.db from the start
-    — the same propagation ``hermes -p <name>`` performs. The in-process
-    ``HERMES_TUI_GATEWAY_URL`` attach is SKIPPED for scoped chats: the
-    dashboard's in-memory gateway runs under the dashboard's own profile,
-    so a profile-scoped chat must spawn its own gateway subprocess.
-    """
-    from hermes_cli.main import PROJECT_ROOT, _make_tui_argv
-
-    owner_worker_mode = bool(getattr(getattr(app_obj, "state", app.state), "owner_worker_mode", False))
-    profile_dir: Optional[Path] = None
-    requested = (profile or "").strip()
-    if requested and requested.lower() != "current":
-        if owner_worker_mode and requested.lower() == "default":
-            requested = ""
-        elif owner_worker_mode:
-            raise HTTPException(status_code=400, detail="profile selection is not available in authenticated mode")
-        else:
-            profile_dir = _resolve_profile_dir(requested)
-
-    tui_dir = PROJECT_ROOT / "ui-tui"
-    prebuilt_tui_dir = tui_dir if (tui_dir / "dist" / "entry.js").is_file() else None
-    old_tui_dir = os.environ.get("HERMES_TUI_DIR")
-    try:
-        if prebuilt_tui_dir is not None:
-            os.environ["HERMES_TUI_DIR"] = str(prebuilt_tui_dir)
-        argv, cwd = _make_tui_argv(tui_dir, tui_dev=False)
-    finally:
-        if old_tui_dir is None:
-            os.environ.pop("HERMES_TUI_DIR", None)
-        else:
-            os.environ["HERMES_TUI_DIR"] = old_tui_dir
-    env = os.environ.copy()
-    try:
-        from hermes_cli.config import apply_terminal_config_to_env
-        apply_terminal_config_to_env(env=env)
-    except Exception:
-        _log.debug("Failed to apply terminal config bridge for dashboard chat", exc_info=True)
-    env.setdefault("NODE_ENV", "production")
-    # Browser-embedded chat should prefer stable wheel-based scrollback over
-    # native terminal mouse tracking. When mouse tracking is enabled, wheel
-    # events are consumed by the TUI and forwarded as terminal input, which
-    # makes browser-side transcript scrolling feel broken. Keep the terminal
-    # build unchanged for native CLI usage; only disable mouse tracking for
-    # the dashboard PTY path.
-    env.setdefault("HERMES_TUI_DISABLE_MOUSE", "1")
-    env.setdefault("HERMES_TUI_INLINE", "1")
-    env["HERMES_TUI_DASHBOARD"] = "1"
-
-    if profile_dir is not None:
-        env["HERMES_HOME"] = str(profile_dir)
-
-    if resume:
-        latest_resume, _latest_path = _session_latest_descendant(resume)
-        if latest_resume:
-            resume = latest_resume
-        env["HERMES_TUI_RESUME"] = resume
-
-    if owner_worker_mode:
-        try:
-            from hermes_cli.owner_runtime import resolve_workspace_cwd
-
-            cwd = resolve_workspace_cwd(None, create_default=True)
-            env["HERMES_CWD"] = str(cwd)
-            env["TERMINAL_CWD"] = str(cwd)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    if sidecar_url:
-        env["HERMES_TUI_SIDECAR_URL"] = sidecar_url
-
-    if active_session_file:
-        env["HERMES_TUI_ACTIVE_SESSION_FILE"] = active_session_file
-
-    if browser_id:
-        env["HERMES_TUI_BROWSER_ID"] = browser_id
-
-    # Profile-scoped chats must NOT attach to the dashboard's in-memory
-    # gateway — it runs under the dashboard's own profile. Without the
-    # attach URL, gatewayClient spawns its own `tui_gateway.entry`, which
-    # inherits the profile HERMES_HOME set above.
-    if profile_dir is None:
-        if gateway_ws_url := _build_gateway_ws_url(app_obj=app_obj):
-            env["HERMES_TUI_GATEWAY_URL"] = gateway_ws_url
-
-    return list(argv), str(cwd) if cwd else None, env
-
-
-def _build_gateway_ws_url(app_obj: Any | None = None) -> Optional[str]:
-    """ws:// URL the PTY child should attach to for JSON-RPC gateway traffic.
-
-    Loopback / ``--insecure``: ``?token=<_SESSION_TOKEN>``.
-
-    Authenticated Control Plane mode returns ``None``: live PTY children must be
-    spawned inside an Owner Worker, where the worker builds an owner-bound
-    ``internal_owner_token`` URL back to this Control Plane.
-    """
-    state = getattr(app_obj, "state", app.state) if app_obj is not None else app.state
-    if getattr(state, "owner_worker_mode", False):
-        # Workers only carry public verification material. Child bootstrap is
-        # intentionally deferred until the single-use handshake capability.
-        return None
-
-    host = getattr(state, "bound_host", None)
-    port = getattr(state, "bound_port", None)
-
-    if not host or not port:
-        return None
-
-    netloc = (
-        f"[{host}]:{port}"
-        if ":" in host and not host.startswith("[")
-        else f"{host}:{port}"
-    )
-
-    if getattr(state, "auth_required", False):
-        return None
-    qs = urllib.parse.urlencode({"token": _SESSION_TOKEN})
-
-    return f"ws://{netloc}/api/ws?{qs}"
-
-
-async def _resolve_chat_argv_async(
-    resume: Optional[str] = None,
-    sidecar_url: Optional[str] = None,
-    profile: Optional[str] = None,
-    active_session_file: Optional[str] = None,
-    browser_id: Optional[str] = None,
-    app_obj: Any | None = None,
-) -> tuple[list[str], Optional[str], Optional[dict]]:
-    """Resolve chat argv without blocking the dashboard event loop.
-
-    ``_resolve_chat_argv`` may run ``npm install`` / ``npm run build`` through
-    ``_make_tui_argv``.  Keep that synchronous work off the WebSocket event
-    loop so reverse proxies and existing dashboard connections can continue
-    to exchange keepalives while the TUI launch command is prepared.  The
-    async lock preserves the previous one-build-at-a-time behavior when
-    multiple browser tabs connect at once without occupying worker threads
-    while queued connections wait.
-    """
-    kwargs = {
-        "resume": resume,
-        "sidecar_url": sidecar_url,
-        "profile": profile,
-        "browser_id": browser_id,
-        "app_obj": app_obj,
-    }
-    if active_session_file is not None:
-        kwargs["active_session_file"] = active_session_file
-    if browser_id is not None:
-        kwargs["browser_id"] = browser_id
-
-    lock_app = app_obj or app
-    async with _get_chat_argv_lock(lock_app):
-        return await asyncio.to_thread(_resolve_chat_argv, **kwargs)
-
-
-def _build_sidecar_url(channel: str, app_obj: Any | None = None) -> Optional[str]:
-    """ws:// URL the PTY child should publish events to, or None when unbound.
-
-    Loopback / ``--insecure``: uses ``?token=<_SESSION_TOKEN>``.
-
-    Authenticated Control Plane mode returns ``None``: live PTY children must be
-    spawned inside an Owner Worker, where the worker builds an owner-bound
-    ``internal_owner_token`` URL back to this Control Plane.
-    """
-    state = getattr(app_obj, "state", app.state) if app_obj is not None else app.state
-    if getattr(state, "owner_worker_mode", False):
-        del channel
-        return None
-
-    host = getattr(state, "bound_host", None)
-    port = getattr(state, "bound_port", None)
-
-    if not host or not port:
-        return None
-
-    netloc = f"[{host}]:{port}" if ":" in host and not host.startswith("[") else f"{host}:{port}"
-
-    if getattr(state, "auth_required", False):
-        return None
-    qs = urllib.parse.urlencode({"token": _SESSION_TOKEN, "channel": channel})
-
-    return f"ws://{netloc}/api/pub?{qs}"
+# Per-channel subscriber registry used by /api/pub and /api/events.
+# State is initialized in the application lifespan by _get_event_state.
 
 
 async def _broadcast_event(app: Any, channel: str, payload: str) -> None:
@@ -13719,46 +11233,11 @@ async def _broadcast_event(app: Any, channel: str, payload: str) -> None:
             _log.warning("broadcast send failed for subscriber on %s", channel, exc_info=True)
 
 
-def _browser_id_or_none(ws: WebSocket) -> Optional[str]:
-    """Return the dashboard browser id from the query string when valid."""
-    browser_id = ws.query_params.get("browser_id", "")
-
-    return browser_id if _VALID_BROWSER_ID_RE.match(browser_id) else None
-
-
 def _channel_or_close_code(ws: WebSocket) -> Optional[str]:
     """Return the channel id from the query string or None if invalid."""
     channel = ws.query_params.get("channel", "")
 
     return channel if _VALID_CHANNEL_RE.match(channel) else None
-
-
-def _active_session_file_for_browser(browser_id: str) -> Path:
-    """Return the durable owner-local active session record for one browser."""
-    from hermes_cli.owner_runtime import dashboard_current_session_relative_path
-
-    path = get_hermes_home() / dashboard_current_session_relative_path(browser_id)
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return path
-
-
-def _read_active_session_file(path: Path) -> Optional[str]:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if data.get("schema_version") != 1:
-        return None
-
-    session_id = str(data.get("session_id") or "").strip()
-    return session_id or None
-
-
-def _forget_active_session_file(path: Path) -> None:
-    try:
-        path.unlink(missing_ok=True)
-    except OSError:
-        pass
 
 
 _AUTH_SECRET_PARAM_RE = re.compile(r"(?i)(ticket|token|internal|internal_owner_token|authorization)=([^&\s]+)")
@@ -13782,362 +11261,12 @@ def _ws_close_reason(text: str) -> str:
     return encoded[:120].decode("utf-8", "ignore") + "..."
 
 
-async def _register_browser_pty_owner(
-    app: "FastAPI",
-    *,
-    browser_id: str,
-    channel: str,
-    owner_id: str,
-    ws: WebSocket,
-) -> Optional[dict[str, Any]]:
-    """Register the current /api/pty owner and return any owner it replaced."""
-    browser_sessions, browser_lock = _get_pty_browser_state(app)
-    async with browser_lock:
-        previous = browser_sessions.get(browser_id)
-        browser_sessions[browser_id] = {
-            "channel": channel,
-            "started_at": time.time(),
-            "owner_id": owner_id,
-            "ws": ws,
-            "bridge": None,
-        }
-        return previous
-
-
-async def _browser_pty_owner_is_current(
-    app: "FastAPI", *, browser_id: str, owner_id: str
-) -> bool:
-    browser_sessions, browser_lock = _get_pty_browser_state(app)
-    async with browser_lock:
-        existing = browser_sessions.get(browser_id)
-        return existing is not None and existing.get("owner_id") == owner_id
-
-
-async def _attach_browser_pty_bridge(
-    app: "FastAPI", *, browser_id: str, owner_id: str, bridge: Any
-) -> bool:
-    """Attach a spawned bridge if this handler still owns the browser PTY."""
-    browser_sessions, browser_lock = _get_pty_browser_state(app)
-    async with browser_lock:
-        existing = browser_sessions.get(browser_id)
-        if existing is None or existing.get("owner_id") != owner_id:
-            return False
-        existing["bridge"] = bridge
-        return True
-
-
-async def _release_browser_pty_owner(
-    app: "FastAPI", *, browser_id: str, owner_id: str
-) -> None:
-    """Release browser PTY ownership using compare-and-delete semantics."""
-    browser_sessions, browser_lock = _get_pty_browser_state(app)
-    async with browser_lock:
-        existing = browser_sessions.get(browser_id)
-        if existing is not None and existing.get("owner_id") == owner_id:
-            browser_sessions.pop(browser_id, None)
-
-
-async def _close_replaced_browser_pty(owner: dict[str, Any]) -> None:
-    """Best-effort cleanup for a browser PTY owner superseded by a new socket."""
-    old_ws = owner.get("ws")
-    if old_ws is not None:
-        try:
-            await old_ws.close(
-                code=4409,
-                reason=_ws_close_reason("chat connection replaced by newer socket"),
-            )
-        except Exception:
-            _log.debug("failed to close replaced browser PTY websocket", exc_info=True)
-
-    old_bridge = owner.get("bridge")
-    if old_bridge is not None:
-        try:
-            await asyncio.to_thread(old_bridge.close)
-        except Exception:
-            _log.debug("failed to close replaced browser PTY bridge", exc_info=True)
-
-
-@app.websocket("/api/pty")
-async def pty_ws(ws: WebSocket) -> None:
-    peer = ws.client.host if ws.client else "?"
-
-    if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
-        _log.info("pty refused: embedded chat disabled peer=%s", peer)
-        await ws.close(code=4404, reason="embedded chat disabled")
-        return
-
-    # --- auth + host/origin/peer check (before accept so we can close
-    #     cleanly AND tell the client WHY via the close code + reason).
-    #     Each gate maps to a distinct close code so the log and the
-    #     browser banner agree on the cause:
-    #       4401 bad credential   4403 host/origin mismatch
-    #       4408 peer not allowed  4404 chat disabled
-    auth_result = _ws_auth_result(ws)
-    auth_reason, cred = auth_result.reason, auth_result.credential
-    mode = _ws_auth_mode(ws)
-    if auth_reason is not None:
-        _log.warning(
-            "pty auth rejected reason=%s mode=%s cred=%s peer=%s",
-            auth_reason, mode, cred, peer,
-        )
-        await ws.close(code=4401, reason=_ws_close_reason(f"auth: {auth_reason}"))
-        return
-
-    host_origin_reason = _ws_host_origin_reason(ws)
-    if host_origin_reason is not None:
-        _log.warning("pty refused: %s peer=%s", host_origin_reason, peer)
-        await ws.close(code=4403, reason=_ws_close_reason(host_origin_reason))
-        return
-
-    client_reason = _ws_client_reason(ws)
-    if client_reason is not None:
-        _log.warning("pty refused: %s", client_reason)
-        await ws.close(code=4408, reason=_ws_close_reason(client_reason))
-        return
-
-    if _should_bridge_ws_to_owner_worker(ws, auth_result):
-        # Authenticated browser live-state endpoints must not fall through to this
-        # Control Plane process's shared PTY/browser maps. Server-spawned internal
-        # sidecars do not carry owner identity here and remain on the local app.
-        await _bridge_websocket_to_owner_worker(ws, path="/api/pty", auth_result=auth_result)
-        return
-
-    await ws.accept()
-    _log.info("pty accepted peer=%s mode=%s cred=%s", peer, mode, cred)
-
-    # On native Windows, the POSIX PTY bridge can't be imported.  Tell the
-    # client and close cleanly rather than pretending the feature works.
-    if not _PTY_BRIDGE_AVAILABLE:
-        await ws.send_text(
-            "\r\n\x1b[31mChat unavailable: the embedded terminal requires a "
-            "POSIX PTY, which native Windows Python doesn't provide.\x1b[0m\r\n"
-            "\x1b[33mInstall Hermes inside WSL2 to use the dashboard's /chat "
-            "tab — the rest of the dashboard works here.\x1b[0m\r\n"
-        )
-        await ws.close(code=1011)
-        return
-
-    # --- spawn PTY ------------------------------------------------------
-    resume = ws.query_params.get("resume") or None
-    profile = ws.query_params.get("profile") or None
-    browser_id = _browser_id_or_none(ws)
-    browser_registered = False
-    browser_owner_id = uuid.uuid4().hex if browser_id else ""
-    channel = _channel_or_close_code(ws)
-    sidecar_url = _build_sidecar_url(channel, app_obj=ws.app) if channel else None
-    force_fresh = (ws.query_params.get("fresh") or "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    active_session_file: Optional[Path] = None
-
-    if browser_id:
-        current_channel = channel or ""
-        replaced_owner = await _register_browser_pty_owner(
-            ws.app,
-            browser_id=browser_id,
-            channel=current_channel,
-            owner_id=browser_owner_id,
-            ws=ws,
-        )
-        browser_registered = True
-        if replaced_owner is not None:
-            _log.info(
-                "pty browser owner replaced browser_id=%s old_channel=%s new_channel=%s",
-                browser_id,
-                replaced_owner.get("channel"),
-                current_channel,
-            )
-            await _close_replaced_browser_pty(replaced_owner)
-
-    if browser_id:
-        active_session_file = _active_session_file_for_browser(browser_id)
-        if force_fresh:
-            resume = None
-            _forget_active_session_file(active_session_file)
-        elif not resume:
-            resume = _read_active_session_file(active_session_file)
-
-    resolve_kwargs = {
-        "resume": resume,
-        "sidecar_url": sidecar_url,
-        "profile": profile,
-        "browser_id": browser_id,
-    }
-    if active_session_file is not None:
-        resolve_kwargs["active_session_file"] = str(active_session_file)
-
-    try:
-        argv, cwd, env = await _resolve_chat_argv_async(**resolve_kwargs, app_obj=ws.app)
-    except HTTPException as exc:
-        # Unknown/invalid profile from _resolve_profile_dir.
-        await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc.detail}\x1b[0m\r\n")
-        if browser_registered and browser_id:
-            await _release_browser_pty_owner(
-                ws.app, browser_id=browser_id, owner_id=browser_owner_id
-            )
-        await ws.close(code=1011)
-        return
-    except SystemExit as exc:
-        # _make_tui_argv calls sys.exit(1) when node/npm is missing.
-        await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
-        if browser_registered and browser_id:
-            await _release_browser_pty_owner(
-                ws.app, browser_id=browser_id, owner_id=browser_owner_id
-            )
-        await ws.close(code=1011)
-        return
-
-    if browser_registered and browser_id:
-        try:
-            if not await _browser_pty_owner_is_current(
-                ws.app, browser_id=browser_id, owner_id=browser_owner_id
-            ):
-                await ws.close(
-                    code=4409,
-                    reason=_ws_close_reason("chat connection replaced before spawn"),
-                )
-                return
-        except Exception:
-            _log.debug("failed to check browser PTY owner before spawn", exc_info=True)
-
-    try:
-        bridge = await asyncio.to_thread(PtyBridge.spawn, argv, cwd=cwd, env=env)
-    except PtyUnavailableError as exc:
-        await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
-        if browser_registered and browser_id:
-            await _release_browser_pty_owner(
-                ws.app, browser_id=browser_id, owner_id=browser_owner_id
-            )
-        await ws.close(code=1011)
-        return
-    except (FileNotFoundError, OSError) as exc:
-        await ws.send_text(f"\r\n\x1b[31mChat failed to start: {exc}\x1b[0m\r\n")
-        if browser_registered and browser_id:
-            await _release_browser_pty_owner(
-                ws.app, browser_id=browser_id, owner_id=browser_owner_id
-            )
-        await ws.close(code=1011)
-        return
-
-    if browser_registered and browser_id:
-        try:
-            attached = await _attach_browser_pty_bridge(
-                ws.app, browser_id=browser_id, owner_id=browser_owner_id, bridge=bridge
-            )
-        except Exception:
-            attached = False
-            _log.debug("failed to attach browser PTY bridge", exc_info=True)
-        if not attached:
-            await asyncio.to_thread(bridge.close)
-            try:
-                await ws.close(
-                    code=4409,
-                    reason=_ws_close_reason("chat connection replaced after spawn"),
-                )
-            except Exception:
-                pass
-            return
-
-    loop = asyncio.get_running_loop()
-
-    # --- reader task: PTY master → WebSocket ----------------------------
-    async def pump_pty_to_ws() -> None:
-        try:
-            while True:
-                chunk = await loop.run_in_executor(
-                    None, bridge.read, _PTY_READ_CHUNK_TIMEOUT
-                )
-                if chunk is None:  # EOF
-                    return
-                if not chunk:  # no data this tick; yield control and retry
-                    await asyncio.sleep(0)
-                    continue
-                try:
-                    await ws.send_bytes(chunk)
-                except Exception:
-                    return
-        finally:
-            # The child has exited (EOF) or the send side broke.  Close the
-            # WebSocket so the writer loop's ``ws.receive()`` returns instead
-            # of blocking forever — otherwise, when the browser's socket is
-            # half-open (no FIN delivered, common on macOS/launchd) the
-            # handler never reaches its ``finally`` and the PTY's fds leak.
-            # With dashboard auto-reconnect (#52962) every dropped socket then
-            # stacks a fresh PTY on top of the orphaned one, exhausting fds.
-            #
-            # Reap the bridge here too (close() is idempotent): on child EOF the
-            # writer loop's ``finally`` is the usual closer, but if the handler
-            # task is cancelled the instant we close the WS, that ``finally``
-            # can be skipped, leaking the PTY. Closing from the EOF path makes
-            # the reap independent of that cancellation race (#54028).
-            try:
-                await asyncio.to_thread(bridge.close)
-            except Exception:
-                pass
-            try:
-                await ws.close()
-            except Exception:
-                pass
-
-    reader_task = asyncio.create_task(pump_pty_to_ws())
-
-    # --- writer loop: WebSocket → PTY master ----------------------------
-    try:
-        while True:
-            try:
-                msg = await ws.receive()
-            except RuntimeError:
-                # Raised when ws.receive() is called after the socket is
-                # already disconnected (e.g. closed by the reader task above).
-                break
-            msg_type = msg.get("type")
-            if msg_type == "websocket.disconnect":
-                break
-            raw = msg.get("bytes")
-            if raw is None:
-                text = msg.get("text")
-                raw = text.encode("utf-8") if isinstance(text, str) else b""
-            if not raw:
-                continue
-
-            # Resize escape is consumed locally, never written to the PTY.
-            match = _RESIZE_RE.match(raw)
-            if match and match.end() == len(raw):
-                cols = int(match.group(1))
-                rows = int(match.group(2))
-                bridge.resize(cols=cols, rows=rows)
-                continue
-
-            bridge.write(raw)
-    except WebSocketDisconnect:
-        pass
-    finally:
-        reader_task.cancel()
-        try:
-            await reader_task
-        except (asyncio.CancelledError, Exception):
-            pass
-        await asyncio.to_thread(bridge.close)
-        if browser_registered and browser_id:
-            try:
-                await _release_browser_pty_owner(
-                    ws.app, browser_id=browser_id, owner_id=browser_owner_id
-                )
-            except Exception:
-                _log.debug("failed to release browser PTY registration", exc_info=True)
-
-
 # ---------------------------------------------------------------------------
-# /api/ws — JSON-RPC WebSocket sidecar for the dashboard "Chat" tab.
+# /api/ws — authenticated JSON-RPC bridge to the exact Owner Worker.
 #
-# Drives the same `tui_gateway.dispatch` surface Ink uses over stdio, so the
-# dashboard can render structured metadata (model badge, tool-call sidebar,
-# slash launcher, session info) alongside the xterm.js terminal that PTY
-# already paints. Both transports bind to the same session id when one is
-# active, so a tool.start emitted by the agent fans out to both sinks.
+# The Control Plane never runs an Agent gateway locally. Browser tickets and
+# owner-bound internal credentials resolve one owner, one worker generation,
+# and one UDS route before any JSON-RPC traffic is accepted.
 # ---------------------------------------------------------------------------
 
 
@@ -14173,38 +11302,25 @@ async def gateway_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    if _should_bridge_ws_to_owner_worker(ws, auth_result):
-        log_latency_stage(
-            _log,
-            trace_id=latency_trace_id,
-            surface="gateway-ws",
-            stage="owner_bridge.start",
-            started_at=latency_started_at,
+    if not _should_bridge_ws_to_owner_worker(ws, auth_result):
+        await ws.close(
+            code=4401,
+            reason=_ws_close_reason("auth: owner credential required"),
         )
-        await _bridge_websocket_to_owner_worker(ws, path="/api/ws", auth_result=auth_result)
         return
-
-    from tui_gateway.ws import handle_ws
 
     log_latency_stage(
         _log,
         trace_id=latency_trace_id,
         surface="gateway-ws",
-        stage="local_gateway.start",
+        stage="owner_bridge.start",
         started_at=latency_started_at,
     )
-    await handle_ws(ws)
+    await _bridge_websocket_to_owner_worker(ws, path="/api/ws", auth_result=auth_result)
 
 
 # ---------------------------------------------------------------------------
-# /api/pub + /api/events — chat-tab event broadcast.
-#
-# The PTY-side ``tui_gateway.entry`` opens /api/pub at startup (driven by
-# HERMES_TUI_SIDECAR_URL set in /api/pty's PTY env) and writes every
-# dispatcher emit through it.  The dashboard fans those frames out to any
-# subscriber that opened /api/events on the same channel id.  This is what
-# gives the React sidebar its tool-call feed without breaking the PTY
-# child's stdio handshake with Ink.
+# /api/pub + /api/events — owner-worker event broadcast routes.
 # ---------------------------------------------------------------------------
 
 
@@ -14333,32 +11449,18 @@ def mount_spa(application: FastAPI):
         ``prefix`` is the normalised ``X-Forwarded-Prefix`` (e.g. ``/hermes``)
         or empty string when served at root.
 
-        When the OAuth auth gate is active (``app.state.auth_required``),
-        the legacy ``_SESSION_TOKEN`` is NOT injected — the SPA reads
-        identity from ``/api/auth/me`` over cookie auth instead.  The
-        ``__HERMES_AUTH_REQUIRED__`` flag lets the SPA pick the right
-        auth scheme for /api/pty and /api/ws (ticket vs token).
+        The SPA authenticates through the dashboard session cookie and obtains
+        a one-use browser ticket for the exact Owner Worker WebSocket.
         """
         html = _index_path.read_text(encoding="utf-8")
         chat_js = "true" if _DASHBOARD_EMBEDDED_CHAT_ENABLED else "false"
-        gated = bool(getattr(app.state, "auth_required", False))
-        gated_js = "true" if gated else "false"
-        if gated:
-            bootstrap_script = (
-                f"<script>"
-                f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
-                f'window.__HERMES_BASE_PATH__="{prefix}";'
-                f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
-                f"</script>"
-            )
-        else:
-            bootstrap_script = (
-                f'<script>window.__HERMES_SESSION_TOKEN__="{_SESSION_TOKEN}";'
-                f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
-                f'window.__HERMES_BASE_PATH__="{prefix}";'
-                f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
-                f"</script>"
-            )
+        bootstrap_script = (
+            f"<script>"
+            f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
+            f'window.__HERMES_BASE_PATH__="{prefix}";'
+            f"window.__HERMES_AUTH_REQUIRED__=true;"
+            f"</script>"
+        )
         if prefix:
             # Rewrite absolute asset URLs baked into the Vite build so the
             # browser fetches them through the same proxy prefix.
@@ -15078,7 +12180,6 @@ def _merged_plugins_hub() -> Dict[str, Any]:
 @app.get("/api/dashboard/plugins/hub")
 async def get_plugins_hub(request: Request):
     """Unified agent plugins + dashboard extension metadata (session protected)."""
-    _require_token(request)
     try:
         return _merged_plugins_hub()
     except Exception as exc:
@@ -15088,7 +12189,6 @@ async def get_plugins_hub(request: Request):
 
 @app.post("/api/dashboard/agent-plugins/install")
 async def post_agent_plugin_install(request: Request, body: _AgentPluginInstallBody):
-    _require_token(request)
     from hermes_cli.plugins_cmd import dashboard_install_plugin
 
     result = dashboard_install_plugin(
@@ -15117,7 +12217,6 @@ def _validate_plugin_name(name: str) -> str:
 
 @app.post("/api/dashboard/agent-plugins/{name:path}/enable")
 async def post_agent_plugin_enable(request: Request, name: str):
-    _require_token(request)
     name = _validate_plugin_name(name)
     from hermes_cli.plugins_cmd import dashboard_set_agent_plugin_enabled
 
@@ -15129,7 +12228,6 @@ async def post_agent_plugin_enable(request: Request, name: str):
 
 @app.post("/api/dashboard/agent-plugins/{name:path}/disable")
 async def post_agent_plugin_disable(request: Request, name: str):
-    _require_token(request)
     name = _validate_plugin_name(name)
     from hermes_cli.plugins_cmd import dashboard_set_agent_plugin_enabled
 
@@ -15141,7 +12239,6 @@ async def post_agent_plugin_disable(request: Request, name: str):
 
 @app.post("/api/dashboard/agent-plugins/{name:path}/update")
 async def post_agent_plugin_update(request: Request, name: str):
-    _require_token(request)
     name = _validate_plugin_name(name)
     from hermes_cli.plugins_cmd import dashboard_update_user_plugin
 
@@ -15154,7 +12251,6 @@ async def post_agent_plugin_update(request: Request, name: str):
 
 @app.delete("/api/dashboard/agent-plugins/{name:path}")
 async def delete_agent_plugin(request: Request, name: str):
-    _require_token(request)
     name = _validate_plugin_name(name)
     from hermes_cli.plugins_cmd import dashboard_remove_user_plugin
 
@@ -15173,7 +12269,6 @@ class _PluginProvidersPutBody(BaseModel):
 @app.put("/api/dashboard/plugin-providers")
 async def put_plugin_providers(request: Request, body: _PluginProvidersPutBody):
     """Persist memory provider / context engine selection (writes config.yaml)."""
-    _require_token(request)
     from hermes_cli.plugins_cmd import (
         _save_context_engine,
         _save_memory_provider,
@@ -15193,7 +12288,6 @@ class _PluginVisibilityBody(BaseModel):
 @app.post("/api/dashboard/plugins/{name:path}/visibility")
 async def post_plugin_visibility(request: Request, name: str, body: _PluginVisibilityBody):
     """Toggle a plugin's sidebar visibility (persists to config.yaml dashboard.hidden_plugins)."""
-    _require_token(request)
     name = _validate_plugin_name(name)
 
     config = load_config()
@@ -15533,10 +12627,6 @@ def _maybe_open_browser(
 
     _display_host = host if host not in ("0.0.0.0", "::") else "127.0.0.1"
     _open_url = f"http://{_display_host}:{actual_port}"
-    if initial_profile:
-        from urllib.parse import quote
-        _open_url += f"/?profile={quote(initial_profile)}"
-
     def _open():
         try:
             time.sleep(1.0)
@@ -15551,25 +12641,13 @@ def start_server(
     host: str = "127.0.0.1",
     port: int = 9119,
     open_browser: bool = True,
-    allow_public: bool = False,
-    require_auth: bool = False,
     trust_proxy_headers: bool = False,
-    initial_profile: str = "",
 ):
-    """Start the web UI server.
+    """Start the authenticated web UI server.
 
-    ``require_auth`` explicitly enables the cookie/session gate for a
-    loopback-bound dashboard shared through an SSH tunnel or trusted proxy.
-    It does not make the service publicly reachable.
-
-    ``trust_proxy_headers`` is restricted to an authenticated loopback bind
+    ``trust_proxy_headers`` is restricted to a loopback bind
     with an operator-declared ``dashboard.public_url``. It trusts forwarded
     metadata only from loopback peers.
-
-    ``initial_profile`` (when set) is appended to the auto-opened browser
-    URL as ``?profile=<name>`` so the SPA's profile switcher preselects it
-    — used when a profile alias (``<profile> dashboard``) routes to the
-    machine dashboard.
     """
     import uvicorn
 
@@ -15582,17 +12660,14 @@ def start_server(
     except Exception as exc:
         _log.debug("Nous auth keepalive did not start: %s", exc)
 
-    # Stash the auth-gate flag on app.state so middleware / SPA-token injection
-    # / WS-auth paths branch consistently. A public bind is always gated;
-    # --require-auth extends that same fail-closed mode to a loopback service.
-    public_bind_requires_auth = should_require_auth(host)
-    app.state.auth_required = require_auth or public_bind_requires_auth
+    # The retained Web surface always uses verified cookie/session auth.
+    app.state.auth_required = True
     app.state.trusted_proxy_public_host = ""
     app.state.trusted_proxy_public_origin = ""
     if trust_proxy_headers:
-        if host not in _LOOPBACK_HOST_VALUES or not require_auth:
+        if host not in _LOOPBACK_HOST_VALUES:
             raise SystemExit(
-                "--trust-proxy-headers requires a loopback bind and --require-auth"
+                "--trust-proxy-headers requires a loopback bind"
             )
         from hermes_cli.dashboard_auth.prefix import resolve_public_url
 
@@ -15608,6 +12683,7 @@ def start_server(
         )
     app.state.owner_worker_supervisor = None
     app.state.session_reader_supervisor = None
+    app.state.authority_store = None
     app.state.authority_lifecycle_lock = None
     if app.state.auth_required:
         from hermes_cli.deployment_image import (
@@ -15689,6 +12765,12 @@ def start_server(
         authority_store = AuthorityStore(control_home)
         try:
             authority_store.ensure_ready()
+            app.state.authority_store = authority_store
+            from hermes_cli.dashboard_auth import get_provider, register_provider
+            from hermes_cli.dashboard_auth.machine_credentials import MachineCredentialProvider
+
+            if get_provider(MachineCredentialProvider.name) is None:
+                register_provider(MachineCredentialProvider(authority_store))
             app.state.session_reader_supervisor = SessionReaderSupervisor(
                 global_home=global_home,
                 control_home=control_home,
@@ -15715,22 +12797,10 @@ def start_server(
                 app.state.session_reader_supervisor = None
             if resource_manager is not None:
                 resource_manager.close()
+            app.state.authority_store = None
             app.state.authority_lifecycle_lock.close()
             app.state.authority_lifecycle_lock = None
             raise
-
-    # ``--insecure`` no longer disables the auth gate (June 2026 hardening:
-    # the hermes-0day MCP-persistence campaign abused unauthenticated public
-    # dashboards). If a caller still passes it, warn that it is now a no-op
-    # rather than silently changing their expectation of an open bind.
-    if allow_public and host not in _LOOPBACK_HOST_VALUES:
-        _log.warning(
-            "--insecure no longer bypasses dashboard authentication. A "
-            "non-loopback bind (%s) now ALWAYS requires an auth provider "
-            "(OAuth or the bundled password provider). Configure one — see "
-            "below — or bind to 127.0.0.1 and reach it over an SSH tunnel / "
-            "Tailscale.", host,
-        )
 
     if app.state.auth_required:
         # The gate engages on every non-loopback bind. Require at least one

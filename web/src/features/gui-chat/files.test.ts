@@ -12,7 +12,6 @@ import {
 afterEach(() => {
   vi.restoreAllMocks();
   document.body.innerHTML = "";
-  delete window.__HERMES_SESSION_TOKEN__;
   delete window.__HERMES_AUTH_REQUIRED__;
   sessionStorage.clear();
 });
@@ -44,8 +43,6 @@ describe("session files", () => {
   });
 
   it("downloads authenticated API responses through a blob link", async () => {
-    window.__HERMES_SESSION_TOKEN__ = "session-token";
-    window.__HERMES_AUTH_REQUIRED__ = false;
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response("download-bytes", { status: 200 }),
     );
@@ -61,7 +58,7 @@ describe("session files", () => {
 
     const [, init] = fetchMock.mock.calls[0];
     expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/files/download?path=report.html");
-    expect(new Headers(init?.headers).get("X-Hermes-Session-Token")).toBe("session-token");
+    expect(new Headers(init?.headers).has("X-Hermes-Session-Token")).toBe(false);
     expect(init?.credentials).toBe("include");
     expect(objectUrl).toHaveBeenCalled();
     expect(click).toHaveBeenCalledOnce();

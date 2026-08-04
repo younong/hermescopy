@@ -81,7 +81,6 @@ CONFIGURABLE_TOOLSETS = [
     ("spotify",          "🎵 Spotify",                  "playback, search, playlists, library"),
     ("discord",         "💬 Discord (read/participate)", "fetch messages, search members, create thread"),
     ("discord_admin",   "🛡️  Discord Server Admin",    "list channels/roles, pin, assign roles"),
-    ("yuanbao",          "🤖 Yuanbao",                  "group info, member queries, DM"),
     ("computer_use",     "🖱️  Computer Use (macOS/Windows/Linux)", "background desktop control via cua-driver"),
 ]
 
@@ -1338,19 +1337,8 @@ def run_post_setup_command(args) -> int:
 # ─── Platform / Toolset Helpers ───────────────────────────────────────────────
 
 def _get_enabled_platforms() -> List[str]:
-    """Return platform keys that are configured (have tokens or are CLI)."""
-    enabled = ["cli"]
-    if get_env_value("TELEGRAM_BOT_TOKEN"):
-        enabled.append("telegram")
-    if get_env_value("DISCORD_BOT_TOKEN"):
-        enabled.append("discord")
-    if get_env_value("SLACK_BOT_TOKEN"):
-        enabled.append("slack")
-    if get_env_value("WHATSAPP_ENABLED"):
-        enabled.append("whatsapp")
-    if get_env_value("QQ_APP_ID"):
-        enabled.append("qqbot")
-    return enabled
+    """Return retained messaging platform keys configured in the control plane."""
+    return list(PLATFORMS)
 
 
 def _platform_toolset_summary(config: dict, platforms: Optional[List[str]] = None) -> Dict[str, Set[str]]:
@@ -1431,7 +1419,10 @@ def _get_platform_tools(
 
     configurable_keys = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
     plugin_ts_keys = _get_plugin_toolset_keys()
-    platform_default_keys = {p["default_toolset"] for p in PLATFORMS.values()}
+    platform_default_keys = {
+        *(p["default_toolset"] for p in PLATFORMS.values()),
+        "hermes-cli",
+    }
 
     # If the saved list contains any configurable keys directly, the user
     # has explicitly configured this platform — use direct membership.
@@ -1535,6 +1526,7 @@ def _get_platform_tools(
         # regressed after #14798 made cron honor per-platform tool config.
         if "homeassistant" in default_off and os.getenv("HASS_TOKEN"):
             default_off.remove("homeassistant")
+            enabled_toolsets.add("homeassistant")
         # Symmetric carve-out for x_search auto-enable (see the inject
         # block above). Without this, the default_off subtraction would
         # strip the entry we just added.
@@ -1713,7 +1705,10 @@ def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[
     # Also exclude platform default toolsets (hermes-cli, hermes-telegram, etc.)
     # These are "super" toolsets that resolve to ALL tools, so preserving them
     # would silently override the user's unchecked selections on the next read.
-    platform_default_keys = {p["default_toolset"] for p in PLATFORMS.values()}
+    platform_default_keys = {
+        *(p["default_toolset"] for p in PLATFORMS.values()),
+        "hermes-cli",
+    }
 
     # Get existing toolsets for this platform
     existing_toolsets = cfg_get(config, "platform_toolsets", platform, default=[])

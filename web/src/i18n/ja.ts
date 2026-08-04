@@ -272,10 +272,9 @@ export const ja: Translations = {
     triggerNow: "今すぐ実行",
     delivery: {
       local: "ローカル",
-      telegram: "Telegram",
-      discord: "Discord",
-      slack: "Slack",
-      email: "Email",
+      weixin_ilink: "Weixin iLink",
+      feishu: "Feishu",
+      webhook: "Webhook",
     },
   },
 
@@ -407,7 +406,6 @@ export const ja: Translations = {
       tts: "音声合成",
       stt: "音声認識",
       logging: "ロギング",
-      discord: "Discord",
       auxiliary: "補助",
     },
   },

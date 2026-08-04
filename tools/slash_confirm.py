@@ -15,10 +15,8 @@ Two delivery paths:
      gateway's ``_handle_message`` intercepts those replies and calls
      ``resolve()`` directly.
 
-State is stored module-level (like ``tools.approval``) so platform
-adapters can resolve callbacks without needing a backreference to the
-``GatewayRunner`` instance.  The CLI path (``cli.py``) uses a local
-synchronous variant — see ``_prompt_slash_confirm`` there.
+State is stored module-level (like ``tools.approval``) so transport
+adapters can resolve callbacks without needing a runtime back-reference.
 """
 
 from __future__ import annotations

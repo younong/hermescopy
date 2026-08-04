@@ -388,10 +388,9 @@ export interface Translations {
     triggerNow: string;
     delivery: {
       local: string;
-      telegram: string;
-      discord: string;
-      slack: string;
-      email: string;
+      weixin_ilink: string;
+      feishu: string;
+      webhook: string;
       needsHomeChannel?: string;
       noneConfigured?: string;
     };
@@ -565,7 +564,6 @@ export interface Translations {
       tts: string;
       stt: string;
       logging: string;
-      discord: string;
       auxiliary: string;
     };
   };

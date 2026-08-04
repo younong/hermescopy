@@ -10,18 +10,18 @@ import { Check, Search, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { cn, themedBody } from "@/lib/utils";
-import { fuzzyRank } from "@hermes/shared/fuzzy";
+import { fuzzyRank } from "../lib/fuzzy";
 
 /**
  * Two-stage model picker modal.
  *
- * Mirrors ui-tui/src/components/modelPicker.tsx:
+ * Provides the Web model selection flow:
  *   Stage 1: pick provider (authenticated providers only)
  *   Stage 2: pick model within that provider
  *
  * Two invocation modes:
  *
- * 1. Chat-session mode (ChatSidebar) — pass `gw` + `sessionId`. The picker
+ * 1. Chat-session mode — pass `gw` + `sessionId`. The picker
  *    loads options via `model.options` JSON-RPC and applies the choice via
  *    `config.set`, so expensive-model confirmation can happen before switch.
  *

@@ -163,7 +163,8 @@ def isolated_home(tmp_path, monkeypatch):
     importlib.reload(hermes_constants)
     import cron.jobs as jobs
     importlib.reload(jobs)
-    return jobs
+    with jobs.use_store(jobs.CronStore(home)):
+        yield jobs
 
 
 class TestCommandHandler:

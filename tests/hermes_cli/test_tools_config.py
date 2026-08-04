@@ -37,10 +37,10 @@ def test_agent_disabled_toolsets_suppresses_across_platforms():
     }
 
     cli_enabled = _get_platform_tools(config, "cli")
-    discord_enabled = _get_platform_tools(config, "discord")
+    feishu_enabled = _get_platform_tools(config, "feishu")
 
     assert "memory" not in cli_enabled
-    assert "memory" not in discord_enabled
+    assert "memory" not in feishu_enabled
 
 
 def test_agent_disabled_toolsets_with_explicit_platform_config():
@@ -182,16 +182,10 @@ def test_get_platform_tools_context_engine_respects_explicit_empty_selection():
     assert "context_engine" not in enabled
 
 
-def test_get_platform_tools_default_whatsapp_includes_web():
-    enabled = _get_platform_tools({}, "whatsapp")
-
-    assert "web" in enabled
-
-
-def test_get_platform_tools_homeassistant_platform_keeps_homeassistant_toolset():
-    enabled = _get_platform_tools({}, "homeassistant")
-
-    assert "homeassistant" in enabled
+def test_get_platform_tools_canonical_connectors_include_web():
+    for platform in ("weixin_ilink", "feishu"):
+        enabled = _get_platform_tools({}, platform)
+        assert "web" in enabled
 
 
 def test_get_platform_tools_homeassistant_toolset_enabled_for_cron_when_hass_token_set(monkeypatch):
@@ -211,8 +205,8 @@ def test_get_platform_tools_homeassistant_toolset_enabled_for_cron_when_hass_tok
     # moa must stay off — the original goal of #14798
     assert "moa" not in cron_enabled
 
-    cli_enabled = _get_platform_tools({}, "cli")
-    assert "homeassistant" in cli_enabled
+    owner_enabled = _get_platform_tools({}, "feishu")
+    assert "homeassistant" in owner_enabled
 
 
 def test_get_platform_tools_homeassistant_toolset_off_for_cron_when_hass_token_missing(monkeypatch):
@@ -238,7 +232,7 @@ def test_get_platform_tools_x_search_auto_enabled_when_xai_oauth_present(monkeyp
         "hermes_cli.tools_config._xai_credentials_present", lambda: True
     )
 
-    for plat in ("cli", "cron", "telegram"):
+    for plat in ("cli", "cron", "feishu"):
         enabled = _get_platform_tools({}, plat)
         assert "x_search" in enabled, f"x_search missing for {plat}"
 
@@ -523,9 +517,9 @@ def test_save_platform_tools_handles_empty_existing_config():
     config = {}
 
     with patch("hermes_cli.tools_config.save_config"):
-        _save_platform_tools(config, "telegram", {"web", "terminal"})
+        _save_platform_tools(config, "feishu", {"web", "terminal"})
 
-    saved_toolsets = config["platform_toolsets"]["telegram"]
+    saved_toolsets = config["platform_toolsets"]["feishu"]
     assert "web" in saved_toolsets
     assert "terminal" in saved_toolsets
 
@@ -546,7 +540,7 @@ def test_save_platform_tools_handles_invalid_existing_config():
 
 
 def test_save_platform_tools_does_not_preserve_platform_default_toolsets():
-    """Platform default toolsets (hermes-cli, hermes-telegram, etc.) must NOT
+    """Platform default toolsets (hermes-cli, hermes-feishu, etc.) must NOT
     be preserved across saves.
 
     These "super" toolsets resolve to ALL tools, so if they survive in the
@@ -596,12 +590,11 @@ def test_save_platform_tools_does_not_preserve_platform_default_toolsets():
     assert "moa" not in saved
 
 
-def test_save_platform_tools_does_not_preserve_hermes_telegram():
-    """Same bug for Telegram — hermes-telegram must not be preserved."""
+def test_save_platform_tools_does_not_preserve_canonical_platform_composite():
     config = {
         "platform_toolsets": {
-            "telegram": [
-                "browser", "file", "hermes-telegram", "terminal", "web",
+            "feishu": [
+                "browser", "file", "hermes-feishu", "terminal", "web",
             ]
         }
     }
@@ -609,10 +602,10 @@ def test_save_platform_tools_does_not_preserve_hermes_telegram():
     new_selection = {"browser", "file", "terminal", "web"}
 
     with patch("hermes_cli.tools_config.save_config"):
-        _save_platform_tools(config, "telegram", new_selection)
+        _save_platform_tools(config, "feishu", new_selection)
 
-    saved = config["platform_toolsets"]["telegram"]
-    assert "hermes-telegram" not in saved
+    saved = config["platform_toolsets"]["feishu"]
+    assert "hermes-feishu" not in saved
     assert "web" in saved
 
 
@@ -850,7 +843,7 @@ def test_first_install_nous_auto_configures_managed_defaults(monkeypatch):
     # set by the first as "explicit" and skips them.
     monkeypatch.setattr(
         "hermes_cli.tools_config._get_enabled_platforms",
-        lambda: ["cli"],
+        lambda: ["feishu"],
     )
     monkeypatch.setattr(
         "hermes_cli.nous_subscription.get_nous_portal_account_info",
@@ -910,7 +903,7 @@ def test_first_install_nous_auto_configures_video_gen(monkeypatch):
     monkeypatch.setattr("hermes_cli.tools_config.save_config", lambda config: None)
     monkeypatch.setattr(
         "hermes_cli.tools_config._get_enabled_platforms",
-        lambda: ["cli"],
+        lambda: ["feishu"],
     )
     monkeypatch.setattr(
         "hermes_cli.nous_subscription.get_nous_portal_account_info",
@@ -1274,80 +1267,35 @@ def test_get_platform_tools_recovers_non_configurable_toolsets_from_composite():
 
 def test_get_platform_tools_second_pass_skips_fully_claimed_toolsets():
     """Toolsets whose tools are fully covered by configurable keys should NOT
-    be added by the second pass (prevents 'search', 'hermes-acp' noise).
+    be added by the second pass (prevents redundant composite-toolset noise).
     """
     enabled = _get_platform_tools({}, "cli")
 
     assert "search" not in enabled
 
 
-def test_get_platform_tools_discord_both_off_by_default():
-    """Both `discord` and `discord_admin` are opt-in via `hermes tools`,
-    even on the Discord platform itself.  Users shouldn't auto-inherit 19
-    extra tools just because DISCORD_BOT_TOKEN is set."""
-    enabled = _get_platform_tools({}, "discord")
-    assert "discord" not in enabled
-    assert "discord_admin" not in enabled
+def test_canonical_connector_toolsets_are_the_only_messaging_composites():
+    from toolsets import TOOLSETS
+
+    messaging_composites = {
+        key for key in TOOLSETS if key.startswith("hermes-") and key not in {
+            "hermes-api-server",
+            "hermes-cli",
+            "hermes-cron",
+            "hermes-gateway",
+        }
+    }
+    assert messaging_composites == {
+        "hermes-feishu",
+        "hermes-webhook",
+        "hermes-weixin-ilink",
+    }
 
 
-def test_discord_toolsets_in_configurable_toolsets():
-    keys = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
-    assert "discord" in keys
-    assert "discord_admin" in keys
-
-
-def test_discord_toolsets_in_default_off():
-    assert "discord" in _DEFAULT_OFF_TOOLSETS
-    assert "discord_admin" in _DEFAULT_OFF_TOOLSETS
-
-
-def test_discord_toolsets_not_available_on_other_platforms():
-    """Platform-scoping: discord / discord_admin should not appear on CLI,
-    Telegram, etc. — not even as an opt-in."""
-    from hermes_cli.tools_config import _toolset_allowed_for_platform
-    for plat in ["cli", "telegram", "slack", "whatsapp", "signal"]:
-        assert not _toolset_allowed_for_platform("discord", plat), (
-            f"`discord` toolset leaked onto {plat}"
-        )
-        assert not _toolset_allowed_for_platform("discord_admin", plat), (
-            f"`discord_admin` toolset leaked onto {plat}"
-        )
-    assert _toolset_allowed_for_platform("discord", "discord")
-    assert _toolset_allowed_for_platform("discord_admin", "discord")
-
-
-def test_discord_toolsets_user_enabled_are_honored():
-    """When the user opts in via `hermes tools`, the toolset appears."""
-    config = {"platform_toolsets": {"discord": ["web", "terminal", "discord"]}}
-    enabled = _get_platform_tools(config, "discord")
-    assert "discord" in enabled
-    assert "discord_admin" not in enabled
-
-
-def test_save_platform_tools_strips_restricted_toolsets():
-    """Hand-edited or all-platforms checklist with `discord` selected for
-    Telegram must be stripped at save time."""
-    from hermes_cli.tools_config import _save_platform_tools
-    config = {}
-    _save_platform_tools(config, "telegram", {"web", "terminal", "discord", "discord_admin"})
-    saved = config["platform_toolsets"]["telegram"]
-    assert "discord" not in saved
-    assert "discord_admin" not in saved
-    assert "web" in saved
-    assert "terminal" in saved
-
-
-def test_get_platform_tools_feishu_includes_doc_and_drive():
+def test_canonical_feishu_does_not_expose_legacy_plugin_tools():
     enabled = _get_platform_tools({}, "feishu")
-    assert "feishu_doc" in enabled
-    assert "feishu_drive" in enabled
-
-
-def test_get_platform_tools_feishu_tools_not_on_other_platforms():
-    for plat in ["cli", "telegram", "discord"]:
-        enabled = _get_platform_tools({}, plat)
-        assert "feishu_doc" not in enabled, f"feishu_doc leaked onto {plat}"
-        assert "feishu_drive" not in enabled, f"feishu_drive leaked onto {plat}"
+    assert "feishu_doc" not in enabled
+    assert "feishu_drive" not in enabled
 
 
 def test_get_effective_configurable_toolsets_dedupes_bundled_plugins():
@@ -1551,7 +1499,7 @@ def test_apply_provider_selection_does_not_prompt_or_post_setup(monkeypatch):
 def test_checklist_toolset_keys_excludes_kanban():
     """``kanban`` is check_fn-gated and never appears in the checklist, so it
     must not be in the checklist's offered universe for any platform."""
-    for plat in ("cli", "telegram", "discord"):
+    for plat in ("cli", "weixin_ilink", "feishu"):
         keys = _checklist_toolset_keys(plat)
         assert "kanban" not in keys
         # Configurable toolsets that ARE offered must be present.
@@ -1567,13 +1515,13 @@ def test_kanban_not_reported_as_removed_in_diff():
     the user could not deselect is never reported as removed. The persisted
     config still keeps kanban (verified separately by _save_platform_tools).
     """
-    config = {"platform_toolsets": {"telegram": ["kanban", "web", "terminal"]}}
-    current = _get_platform_tools(config, "telegram", include_default_mcp_servers=False)
+    config = {"platform_toolsets": {"feishu": ["kanban", "web", "terminal"]}}
+    current = _get_platform_tools(config, "feishu", include_default_mcp_servers=False)
     assert "kanban" in current  # resolved as enabled at read time
 
     # The checklist can only return configurable keys it was shown; kanban
     # is never one of them.
-    universe = _checklist_toolset_keys("telegram")
+    universe = _checklist_toolset_keys("feishu")
     new_enabled = {t for t in current if t != "kanban"}
 
     # Unscoped (old, buggy) diff would surface kanban.

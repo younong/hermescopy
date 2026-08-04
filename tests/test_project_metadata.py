@@ -31,33 +31,6 @@ def test_uv_uses_locked_domestic_default_index():
     ]
 
 
-def test_matrix_extra_not_in_all():
-    """The [matrix] extra pulls `mautrix[encryption]` -> `python-olm`,
-    which has Linux-only wheels and no native build path on Windows or
-    modern macOS (archived libolm, C++ errors with Clang 21+).
-
-    With matrix in [all], `uv sync --locked` on Windows tried to build
-    python-olm from sdist and failed on `make`. As of 2026-05-12 the
-    [matrix] extra is excluded from [all] entirely and routed through
-    `tools/lazy_deps.py` (LAZY_DEPS["platform.matrix"]) — installs at
-    first use, where the user is expected to have a toolchain.
-    """
-    optional_dependencies = _load_optional_dependencies()
-
-    assert "matrix" in optional_dependencies, "[matrix] extra must still exist for explicit `pip install hermes-agent[matrix]`"
-    # Must NOT appear in [all] in any form — neither unconditional nor
-    # platform-gated. Lazy-install handles it.
-    matrix_in_all = [
-        dep for dep in optional_dependencies["all"]
-        if "matrix" in dep
-    ]
-    assert not matrix_in_all, (
-        "matrix must not appear in [all] — it's lazy-installed via "
-        "tools/lazy_deps.py LAZY_DEPS['platform.matrix']. Found: "
-        f"{matrix_in_all}"
-    )
-
-
 def test_lazy_installable_extras_excluded_from_all():
     """Policy (2026-05-12): every extra that has a `LAZY_DEPS` entry
     in `tools/lazy_deps.py` must be excluded from [all].
@@ -84,7 +57,7 @@ def test_lazy_installable_extras_excluded_from_all():
         "edge-tts", "tts-premium",
         "voice",  # faster-whisper / sounddevice / numpy
         "modal", "daytona",
-        "messaging", "slack", "matrix", "dingtalk", "feishu",
+        "messaging", "feishu",
         "honcho", "hindsight",
         "supermemory", "mem0",
         "mistral",  # mistralai — Voxtral STT/TTS, lazy-installed (stt.mistral / tts.mistral)
@@ -112,40 +85,6 @@ def _exact_pins(specs):
         package = package.split("[", 1)[0].lower().replace("_", "-")
         pins[package] = version
     return pins
-
-
-def test_pyproject_aiohttp_pins_match_lazy_slack_pin():
-    """Avoid update/lazy-install churn from conflicting aiohttp pins.
-
-    pyproject extras (messaging/slack/homeassistant/sms) exact-pin aiohttp.
-    The Slack lazy-install deps (LAZY_DEPS['platform.slack']) also pin it.
-    If the two drift, `hermes update` resolves the pyproject pin and
-    downgrades aiohttp, reopening the CVEs the lazy pin fixed (#31817) —
-    only for Slack's lazy refresh to upgrade it again on next use.
-    """
-    from tools.lazy_deps import LAZY_DEPS
-
-    optional_dependencies = _load_optional_dependencies()
-    lazy_aiohttp = _exact_pins(LAZY_DEPS["platform.slack"])["aiohttp"]
-
-    pyproject_aiohttp_pins = {
-        extra: pins["aiohttp"]
-        for extra, specs in optional_dependencies.items()
-        if "aiohttp" in (pins := _exact_pins(specs))
-    }
-
-    assert pyproject_aiohttp_pins, "expected at least one pyproject extra to pin aiohttp"
-    mismatches = {
-        extra: pin
-        for extra, pin in pyproject_aiohttp_pins.items()
-        if pin != lazy_aiohttp
-    }
-    assert not mismatches, (
-        "pyproject.toml aiohttp pins must match "
-        "LAZY_DEPS['platform.slack'] to avoid hermes update downgrading "
-        "aiohttp before Slack's lazy refresh upgrades it again. "
-        f"lazy aiohttp=={lazy_aiohttp}; mismatched extras: {mismatches}"
-    )
 
 
 def test_pyproject_pins_match_lazy_deps_pins():
@@ -224,25 +163,8 @@ def test_dev_extra_excluded_from_all():
     )
 
 
-def test_messaging_extra_includes_qrcode_for_weixin_setup():
-    optional_dependencies = _load_optional_dependencies()
-
-    messaging_extra = optional_dependencies["messaging"]
-    assert any(dep.startswith("qrcode") for dep in messaging_extra)
-
-
-def test_dingtalk_extra_includes_qrcode_for_qr_auth():
-    """DingTalk's QR-code device-flow auth (hermes_cli/dingtalk_auth.py)
-    needs the qrcode package."""
-    optional_dependencies = _load_optional_dependencies()
-
-    dingtalk_extra = optional_dependencies["dingtalk"]
-    assert any(dep.startswith("qrcode") for dep in dingtalk_extra)
-
-
 def test_feishu_extra_includes_qrcode_for_qr_login():
-    """Feishu's QR login flow (gateway/platforms/feishu.py) needs the
-    qrcode package."""
+    """Feishu's QR login flow needs the qrcode package."""
     optional_dependencies = _load_optional_dependencies()
 
     feishu_extra = optional_dependencies["feishu"]

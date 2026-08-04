@@ -35,7 +35,7 @@ export function PageHeaderProvider({
   const displayTitle = titleOverride ?? defaultTitle;
 
   const normalizedPath = pathname.replace(/\/$/, "") || "/";
-  const isChatRoute = normalizedPath === "/chat" || normalizedPath === "/chat-gui";
+  const isChatRoute = normalizedPath === "/chat" || normalizedPath === "/chat";
   /** Env jump-nav is wide — stack below title on small screens so KEYS stays readable. */
   const isEnvRoute =
     pathname === "/env" || pathname.startsWith("/env/");

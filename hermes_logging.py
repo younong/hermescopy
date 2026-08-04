@@ -18,7 +18,7 @@ Component separation:
     gateway.log only receives records from ``gateway.*`` loggers —
     platform adapters, session management, slash commands, delivery.
     gui.log receives dashboard-side records from ``hermes_cli.web_server``,
-    ``hermes_cli.pty_bridge``, ``tui_gateway.*``, and ``uvicorn.*``.
+    ``tui_gateway.*``, and ``uvicorn.*``.
     agent.log remains the catch-all (everything goes there).
 
 Session context:
@@ -235,13 +235,12 @@ COMPONENT_PREFIXES = {
     # still gateway components and their logs belong in gateway.log / match
     # ``hermes logs --component gateway``.
     "gateway": ("gateway", "hermes_plugins", "plugins.platforms"),
-    "agent": ("agent", "run_agent", "model_tools", "batch_runner"),
+    "agent": ("agent", "run_agent", "model_tools"),
     "tools": ("tools",),
     "cli": ("hermes_cli", "cli"),
     "cron": ("cron",),
     "gui": (
         "hermes_cli.web_server",
-        "hermes_cli.pty_bridge",
         "tui_gateway",
         "uvicorn",
     ),

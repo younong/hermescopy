@@ -13,8 +13,7 @@ description: One-line description of when to use this skill.
 Numbered steps, exact commands, and pitfalls go here.
 `;
 
-export function GuiChatSkillsPane({ profile }: { profile?: string }) {
-  const scopedProfile = profile || undefined;
+export function GuiChatSkillsPane() {
   const [skills, setSkills] = useState<SkillInfo[] | null>(null);
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(true);
@@ -27,7 +26,7 @@ export function GuiChatSkillsPane({ profile }: { profile?: string }) {
     setLoading(true);
     setError(null);
     try {
-      const rows = await api.getSkills(scopedProfile);
+      const rows = await api.getSkills();
       setSkills([...rows].sort((a, b) => a.name.localeCompare(b.name)));
     } catch (cause) {
       setError(errorMessage(cause));
@@ -35,12 +34,12 @@ export function GuiChatSkillsPane({ profile }: { profile?: string }) {
     } finally {
       setLoading(false);
     }
-  }, [scopedProfile]);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
     api
-      .getSkills(scopedProfile)
+      .getSkills()
       .then((rows) => {
         if (!cancelled) setSkills([...rows].sort((a, b) => a.name.localeCompare(b.name)));
       })
@@ -56,7 +55,7 @@ export function GuiChatSkillsPane({ profile }: { profile?: string }) {
     return () => {
       cancelled = true;
     };
-  }, [scopedProfile]);
+  }, []);
 
   const visibleSkills = useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -72,7 +71,7 @@ export function GuiChatSkillsPane({ profile }: { profile?: string }) {
     setSavingSkill(skill.name);
     setError(null);
     try {
-      await api.toggleSkill(skill.name, enabled, scopedProfile);
+      await api.toggleSkill(skill.name, enabled, );
       setSkills((current) =>
         current?.map((row) => row.name === skill.name ? { ...row, enabled } : row) ?? current,
       );
@@ -89,7 +88,7 @@ export function GuiChatSkillsPane({ profile }: { profile?: string }) {
     setSavingSkill(name);
     setError(null);
     try {
-      await api.deleteSkill(name, scopedProfile);
+      await api.deleteSkill(name, );
       setSkills((current) => current?.filter((skill) => skill.name !== name) ?? current);
       setPendingDelete(null);
     } catch (cause) {
@@ -189,7 +188,7 @@ export function GuiChatSkillsPane({ profile }: { profile?: string }) {
             setSavingSkill("__create__");
             setError(null);
             try {
-              await api.createSkill({ name, category: category || undefined, content }, scopedProfile);
+              await api.createSkill({ name, category: category || undefined, content }, );
               await load();
               setCreateOpen(false);
             } catch (cause) {

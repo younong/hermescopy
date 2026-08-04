@@ -60,8 +60,7 @@ def test_gated_status_is_public(gated_app):
     here surfaces every healthy agent as STARTING/down in the portal
     UI. The endpoint returns only version + gateway/auth-gate metadata
     (no user data, no session content), so it stays in the shared
-    ``PUBLIC_API_PATHS`` allowlist under both the legacy ``_SESSION_TOKEN``
-    gate and the OAuth gate.
+    ``PUBLIC_API_PATHS`` allowlist under the authenticated Web gate.
 
     The body also reports the gate's shape (``auth_required``,
     ``auth_providers``) so the SPA's StatusPage and external monitors
@@ -145,8 +144,8 @@ def test_gated_static_asset_path_is_public(gated_app):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("path", ["/chat-gui", "/chat-gui/files"])
-def test_authenticated_gui_chat_document_schedules_owner_warmup(
+@pytest.mark.parametrize("path", ["/chat", "/chat/files"])
+def test_authenticated_chat_document_schedules_owner_warmup(
     gated_app, monkeypatch, path
 ):
     from hermes_cli.owner_worker import readiness
@@ -177,11 +176,11 @@ def test_authenticated_gui_chat_document_schedules_owner_warmup(
     [
         ("GET", "/api/auth/me", {"Accept": "application/json"}),
         ("GET", "/sessions", {"Accept": "text/html", "Sec-Fetch-Dest": "document"}),
-        ("GET", "/chat-gui", {"Accept": "application/json", "Sec-Fetch-Dest": "empty"}),
-        ("POST", "/chat-gui", {"Accept": "text/html", "Sec-Fetch-Dest": "document"}),
+        ("GET", "/chat", {"Accept": "application/json", "Sec-Fetch-Dest": "empty"}),
+        ("POST", "/chat", {"Accept": "text/html", "Sec-Fetch-Dest": "document"}),
     ],
 )
-def test_non_gui_chat_documents_do_not_schedule_owner_warmup(
+def test_non_chat_documents_do_not_schedule_owner_warmup(
     gated_app, monkeypatch, method, path, headers
 ):
     from hermes_cli.owner_worker import readiness
@@ -199,7 +198,7 @@ def test_non_gui_chat_documents_do_not_schedule_owner_warmup(
     assert scheduled == []
 
 
-def test_gui_chat_warmup_requires_successful_session_authorization(gated_app, monkeypatch):
+def test_chat_warmup_requires_successful_session_authorization(gated_app, monkeypatch):
     from hermes_cli.owner_worker import readiness
 
     scheduled = []
@@ -210,7 +209,7 @@ def test_gui_chat_warmup_requires_successful_session_authorization(gated_app, mo
     )
 
     response = gated_app.get(
-        "/chat-gui",
+        "/chat",
         headers={"Accept": "text/html", "Sec-Fetch-Dest": "document"},
         follow_redirects=False,
     )
@@ -219,7 +218,7 @@ def test_gui_chat_warmup_requires_successful_session_authorization(gated_app, mo
     assert scheduled == []
 
 
-def test_gui_chat_warmup_scheduling_failure_does_not_change_document_response(
+def test_chat_warmup_scheduling_failure_does_not_change_document_response(
     gated_app, monkeypatch, caplog
 ):
     from hermes_cli.owner_worker import readiness
@@ -233,7 +232,7 @@ def test_gui_chat_warmup_scheduling_failure_does_not_change_document_response(
 
     with caplog.at_level("WARNING", logger="hermes_cli.dashboard_auth.middleware"):
         response = gated_app.get(
-            "/chat-gui",
+            "/chat",
             headers={"Accept": "text/html", "Sec-Fetch-Dest": "document"},
         )
 
@@ -366,7 +365,7 @@ def test_gated_require_token_routes_reject_cookie_session_in_owner_mode(
 @pytest.mark.parametrize(
     ("path", "allowed"),
     [
-        ("/api/profiles", True),
+        ("/api/profiles", False),
         ("/api/config", True),
         ("/api/dashboard/font", True),
         ("/api/dashboard/plugins", True),
@@ -396,56 +395,45 @@ def test_authenticated_api_availability_requires_explicit_owner_worker_routes(pa
     assert authenticated_owner_worker_api_allowed(path) is allowed
 
 
-def test_authenticated_profile_summary_is_exact_control_plane_route():
+def test_authenticated_webhook_provisioning_is_exact_control_plane_route():
     from hermes_cli.dashboard_auth.api_availability import (
         AuthenticatedApiBucket,
         classify_authenticated_api,
     )
 
-    decision = classify_authenticated_api("/api/profiles/summary", method="GET")
+    decision = classify_authenticated_api(
+        "/api/messaging/webhook/accounts", method="POST"
+    )
     assert decision.allowed is True
     assert decision.bucket == AuthenticatedApiBucket.CONTROL_PLANE_AUTH
 
     for method, path in (
-        ("POST", "/api/profiles/summary"),
-        ("GET", "/api/profiles/summary/private"),
+        ("GET", "/api/messaging/webhook/accounts"),
+        ("POST", "/api/messaging/webhook/accounts/private"),
     ):
         denied = classify_authenticated_api(path, method=method)
         assert denied.allowed is False
         assert denied.bucket == AuthenticatedApiBucket.LOCAL_ONLY_OR_UNAVAILABLE
 
 
-def test_authenticated_profile_summary_is_static_and_owner_insensitive(
-    gated_app, monkeypatch
-):
-    import hermes_cli.profiles as profiles_mod
-
-    _complete_stub_login(gated_app)
-    monkeypatch.setattr(
-        profiles_mod,
-        "profiles_to_serve",
-        lambda *_args, **_kwargs: pytest.fail("must not scan host profiles"),
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/api/profiles"),
+        ("GET", "/api/profiles/summary"),
+        ("POST", "/api/profiles/summary"),
+        ("GET", "/api/profiles/summary/private"),
+    ],
+)
+def test_authenticated_profile_routes_are_unavailable(method, path):
+    from hermes_cli.dashboard_auth.api_availability import (
+        AuthenticatedApiBucket,
+        classify_authenticated_api,
     )
-    class FailSupervisor:
-        def get_or_start(self, *_args, **_kwargs):
-            pytest.fail("must not start an owner worker")
 
-    monkeypatch.setattr(
-        web_server.app.state,
-        "owner_worker_supervisor",
-        FailSupervisor(),
-        raising=False,
-    )
-    response = gated_app.get("/api/profiles/summary")
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "management_mode": "owner_singleton",
-        "profiles": ["default"],
-        "current": "default",
-        "active": "default",
-    }
-    assert "hermes" not in response.text.lower()
+    decision = classify_authenticated_api(path, method=method)
+    assert decision.allowed is False
+    assert decision.bucket == AuthenticatedApiBucket.LOCAL_ONLY_OR_UNAVAILABLE
 
 
 @pytest.mark.parametrize(
@@ -680,7 +668,7 @@ def test_invalid_cookie_redirects_on_html(gated_app):
 def test_logout_revokes_only_verified_sessions_ticket(gated_app):
     _complete_stub_login(gated_app)
     minted = gated_app.post(
-        "/api/auth/ws-ticket", json={"audience": "browser-ws:/api/pty"}
+        "/api/auth/ws-ticket", json={"audience": "browser-ws:/api/ws"}
     )
     assert minted.status_code == 200
 
@@ -702,7 +690,7 @@ def test_logout_without_a_trusted_session_is_idempotent(gated_app):
 def test_provider_outage_logout_does_not_revoke_unverified_cookie_ticket(gated_app, monkeypatch):
     _complete_stub_login(gated_app)
     minted = gated_app.post(
-        "/api/auth/ws-ticket", json={"audience": "browser-ws:/api/pty"}
+        "/api/auth/ws-ticket", json={"audience": "browser-ws:/api/ws"}
     )
     assert minted.status_code == 200
 
@@ -726,7 +714,7 @@ def test_provider_outage_logout_does_not_revoke_unverified_cookie_ticket(gated_a
 def test_membership_transition_revokes_old_ticket_and_accepts_new_ticket(gated_app, monkeypatch):
     _complete_stub_login(gated_app)
     old_ticket = gated_app.post(
-        "/api/auth/ws-ticket", json={"audience": "browser-ws:/api/pty"}
+        "/api/auth/ws-ticket", json={"audience": "browser-ws:/api/ws"}
     ).json()["ticket"]
 
     from hermes_cli.dashboard_auth import get_provider
@@ -751,7 +739,7 @@ def test_membership_transition_revokes_old_ticket_and_accepts_new_ticket(gated_a
         consume_ticket(old_ticket)
 
     new_ticket = gated_app.post(
-        "/api/auth/ws-ticket", json={"audience": "browser-ws:/api/pty"}
+        "/api/auth/ws-ticket", json={"audience": "browser-ws:/api/ws"}
     ).json()["ticket"]
     assert consume_ticket(new_ticket)["membership_revision"] == "membership-v2"
 

@@ -75,10 +75,7 @@ class TestChatVerboseArg:
 
         assert args.verbose is True
 
-    def test_cmd_chat_forwards_none_when_verbose_is_absent(self, monkeypatch):
-        import types
-        import sys
-
+    def test_chat_without_verbose_launches_tui_without_override(self, monkeypatch):
         import hermes_cli.main as main_mod
         from hermes_cli._parser import build_top_level_parser
 
@@ -86,27 +83,15 @@ class TestChatVerboseArg:
         chat_parser.set_defaults(func=main_mod.cmd_chat)
         args = parser.parse_args(["chat"])
         captured = {}
-        fake_cli = types.ModuleType("cli")
 
-        def fake_main(**kwargs):
-            captured.update(kwargs)
-
-        setattr(fake_cli, "main", fake_main)
-        fake_banner = types.ModuleType("hermes_cli.banner")
-        setattr(fake_banner, "prefetch_update_check", lambda: None)
-        fake_skills_sync = types.ModuleType("tools.skills_sync")
-        setattr(fake_skills_sync, "sync_skills", lambda quiet=True: None)
-
-        monkeypatch.setitem(sys.modules, "cli", fake_cli)
-        monkeypatch.setitem(sys.modules, "hermes_cli.banner", fake_banner)
-        monkeypatch.setitem(sys.modules, "tools.skills_sync", fake_skills_sync)
         monkeypatch.setattr(main_mod, "_has_any_provider_configured", lambda: True)
+        monkeypatch.setattr(main_mod, "_sync_bundled_skills_for_startup", lambda: None)
         monkeypatch.setattr(main_mod, "_pin_kanban_board_env", lambda: None)
+        monkeypatch.setattr(main_mod, "_launch_tui", lambda *a, **kw: captured.update(kw))
 
         main_mod.cmd_chat(args)
 
-        assert captured["quiet"] is False
-        assert "verbose" not in captured
+        assert captured["verbose"] is None
 
 
 class TestYoloEnvVar:
@@ -148,7 +133,7 @@ class TestYoloEnvVar:
 class TestAcceptHooksOnAgentSubparsers:
     """Verify --accept-hooks is accepted at every agent-subcommand
     position (before the subcommand, between group/subcommand, and
-    after the leaf subcommand) for gateway/cron/mcp/acp.  Regression
+    after the leaf subcommand) for gateway/cron/mcp. Regression
     against prior behaviour where the flag only worked on the root
     parser and `chat`, so `hermes gateway run --accept-hooks` failed
     with `unrecognized arguments`."""
@@ -164,7 +149,6 @@ class TestAcceptHooksOnAgentSubparsers:
         ["--accept-hooks", "mcp", "serve", "--help"],
         ["mcp", "--accept-hooks", "serve", "--help"],
         ["mcp", "serve", "--accept-hooks", "--help"],
-        ["acp", "--accept-hooks", "--help"],
     ])
     def test_accepted_at_every_position(self, argv):
         """Invoking `hermes <argv>` must exit 0 (help) rather than
