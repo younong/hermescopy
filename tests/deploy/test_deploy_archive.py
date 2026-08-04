@@ -42,6 +42,7 @@ def test_remote_cutover_stops_before_atomic_current_switch():
     rollback_artifacts = script.index("restore_deployment_state || true", rollback_authority)
     assert rollback_stop < rollback_authority < rollback_artifacts
     assert "source.backup(target)" in script
+    assert 'mode=ro&immutable=1' in script
     assert "PRAGMA integrity_check" in script
     assert 'dashboard authority status --json' in script
     assert "documented offline recovery workflow" in script

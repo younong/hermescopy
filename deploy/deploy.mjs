@@ -796,7 +796,11 @@ from hermes_cli.dashboard_auth.lifecycle import authority_lifecycle_lock
 source_path = Path(sys.argv[1])
 store = AuthorityStore(control_plane_home())
 with authority_lifecycle_lock(store.control_home, exclusive=True, blocking=True):
-    source = sqlite3.connect(source_path, timeout=30)
+    source = sqlite3.connect(
+        f"file:{source_path.resolve().as_posix()}?mode=ro&immutable=1",
+        uri=True,
+        timeout=30,
+    )
     target = sqlite3.connect(store.path, timeout=30)
     try:
         source.backup(target)
@@ -1622,18 +1626,22 @@ smoke_root="$(mktemp -d "$tmp_dir/hermes-conversation-smoke.XXXXXX")"
 chown "$service_user:$service_group" "$smoke_root"
 chmod 0700 "$smoke_root"
 echo "Running deterministic conversation smoke before deployment commit"
-if ! (
-  cd "$smoke_root"
-  exec runuser -u "$service_user" -- env -i \
-    HOME="$smoke_root" \
-    TMPDIR="$smoke_root" \
-    PATH="$venv/bin:/usr/local/bin:/usr/bin:/bin" \
-    PYTHONPATH="$release" \
-    PYTHONUNBUFFERED=1 \
-    LANG=C.UTF-8 \
-    LC_ALL=C.UTF-8 \
-    "$venv/bin/python" "$release/deploy/smoke-conversation.py" --timeout 90
-); then
+if ! env -i \
+  HOME="$smoke_root" \
+  TMPDIR="$smoke_root" \
+  PATH="$venv/bin:/usr/local/bin:/usr/bin:/bin" \
+  PYTHONPATH="$release" \
+  PYTHONUNBUFFERED=1 \
+  LANG=C.UTF-8 \
+  LC_ALL=C.UTF-8 \
+  "$venv/bin/python" "$release/deploy/run-cgroup-smoke.py" \
+    --managed-root "$cgroup_root" \
+    --service hermes-dashboard.service \
+    --user "$service_user" \
+    -- \
+    "$venv/bin/python" "$release/deploy/smoke-conversation.py" \
+      --timeout 90 \
+      --sandbox-policy hermes_cli.owner_worker.host_sandbox:host_sandbox_deployment_policy; then
   echo "HERMES_DEPLOY_STAGE deterministic_smoke=failed" >&2
   echo "Deterministic conversation smoke failed; deployment remains uncommitted and will be rolled back" >&2
   exit 1
