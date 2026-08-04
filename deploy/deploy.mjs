@@ -1641,7 +1641,7 @@ if ! env -i \
     -- \
     "$venv/bin/python" "$release/deploy/smoke-conversation.py" \
       --timeout 90 \
-      --sandbox-policy hermes_cli.owner_worker.host_sandbox:host_sandbox_deployment_policy; then
+      --sandbox-policy hermes_cli.owner_worker.host_sandbox:isolated_smoke_sandbox_deployment_policy; then
   echo "HERMES_DEPLOY_STAGE deterministic_smoke=failed" >&2
   echo "Deterministic conversation smoke failed; deployment remains uncommitted and will be rolled back" >&2
   exit 1

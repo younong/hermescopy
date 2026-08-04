@@ -268,7 +268,7 @@ def test_deploy_gates_commit_on_isolated_conversation_smoke():
     assert 'HOME="$smoke_root"' in source
     assert 'TMPDIR="$smoke_root"' in source
     assert 'PYTHONPATH="$release"' in source
-    assert "--sandbox-policy hermes_cli.owner_worker.host_sandbox:host_sandbox_deployment_policy" in source
+    assert "--sandbox-policy hermes_cli.owner_worker.host_sandbox:isolated_smoke_sandbox_deployment_policy" in source
     smoke_block = source[source.index("if ! env -i", reader_smoke) : nginx]
     assert "$env_file" not in smoke_block
     assert ". $env_file" not in smoke_block

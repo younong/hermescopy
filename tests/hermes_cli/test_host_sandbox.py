@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
@@ -15,6 +16,7 @@ from hermes_cli.owner_worker.host_sandbox import (
     HostSandboxUnavailable,
     _resource_policy,
     build_host_sandbox_deployment_policy,
+    isolated_smoke_sandbox_deployment_policy,
     load_host_sandbox_config,
 )
 from hermes_cli.owner_worker.tool_executor_sandbox import SandboxLaunchBinding, SandboxMountPolicy
@@ -385,3 +387,55 @@ def test_host_verification_accepts_only_tool_none(tmp_path):
     assert record.observed_at == 100
     with pytest.raises(HostSandboxUnavailable, match="tool-none"):
         policy.verification_source(binding, mount_policy, SimpleNamespace(egress_profile="tool-public"))
+
+
+def test_isolated_smoke_policy_rebinds_only_exact_temporary_owner_root(tmp_path, monkeypatch):
+    config, _document, policy_path = _config(tmp_path)
+    smoke_root = tmp_path / f"hcs-{tmp_path.name}"
+    owner_key = "ok1_smoke"
+    owner_root = smoke_root / "home" / "users"
+    owner_home = owner_root / owner_key
+    control_home = smoke_root / "home" / "control-plane"
+    owner_home.mkdir(parents=True)
+    control_home.mkdir(parents=True)
+    owner_root.chmod(0o750)
+    monkeypatch.setenv("HERMES_OWNER_KEY", owner_key)
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+    monkeypatch.setattr(
+        "hermes_cli.owner_worker.host_sandbox._ISOLATED_SMOKE_PARENT",
+        tmp_path,
+    )
+    owner_status = owner_root.stat()
+    smoke_uid = max(1, owner_status.st_uid)
+    smoke_gid = max(1, owner_status.st_gid)
+    monkeypatch.setattr(
+        "hermes_cli.owner_worker.host_sandbox.load_host_sandbox_config",
+        lambda _path: replace(config, uid=smoke_uid, gid=smoke_gid),
+    )
+    original_stat = Path.stat
+    owner_root_text = str(owner_root.resolve())
+
+    def smoke_owned_stat(path, *args, **kwargs):
+        status = original_stat(path, *args, **kwargs)
+        if str(path) == owner_root_text:
+            return SimpleNamespace(
+                st_mode=status.st_mode,
+                st_uid=smoke_uid,
+                st_gid=smoke_gid,
+            )
+        return status
+
+    monkeypatch.setattr(Path, "stat", smoke_owned_stat)
+    try:
+        policy = isolated_smoke_sandbox_deployment_policy(policy_path)
+        assert policy.owner_root == owner_root
+        assert policy.resource_policy is config.resource_policy
+
+        monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_other")
+        with pytest.raises(HostSandboxInvalid, match="isolated smoke Owner root"):
+            isolated_smoke_sandbox_deployment_policy(policy_path)
+    finally:
+        import shutil
+
+        shutil.rmtree(smoke_root, ignore_errors=True)
