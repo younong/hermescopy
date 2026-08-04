@@ -285,7 +285,7 @@ class DashboardGateway:
             self.close()
             raise SmokeFailure("ticket_missing", "ws_ticket", "Ticket response was empty")
         cookie_header = "; ".join(
-            f"{name}={value}" for name, value in self.client.cookies.items()
+            f"{cookie.name}={cookie.value}" for cookie in self.client.cookies.jar
         )
         self.websocket = connect(
             f"ws://127.0.0.1:{port}/api/ws?ticket={quote(ticket, safe='')}",
@@ -581,7 +581,7 @@ def _dashboard_env(home: Path, workspace: Path, network_guard: Path) -> dict[str
 def run_smoke(repo_root: Path, timeout: float) -> tuple[dict[str, Any], int]:
     started_all = time.monotonic()
     checks: list[dict[str, Any]] = []
-    temporary = Path(tempfile.mkdtemp(prefix="hermes-conversation-smoke-"))
+    temporary = Path(tempfile.mkdtemp(prefix="hcs-", dir="/tmp"))
     home = temporary / "home"
     workspace = temporary / "workspace"
     workspace.mkdir(parents=True)
