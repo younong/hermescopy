@@ -749,6 +749,7 @@ restore_deployment_state() {
 
 snapshot_authority() {
   authority_snapshot="$rollback_dir/authority.sqlite3"
+  install -o "$service_user" -g "$service_group" -m 0600 /dev/null "$authority_snapshot"
   runuser -u "$service_user" -- env -i \
     HOME="$shared" HERMES_HOME="$hermes_home" PYTHONPATH="$release" \
     "$venv/bin/python" - "$authority_snapshot" <<'PY'
