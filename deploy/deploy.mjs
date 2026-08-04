@@ -706,6 +706,7 @@ authority_smoke_result=""
 reader_smoke_root=""
 reader_smoke_result=""
 powerpoint_smoke_owner=""
+authority_snapshot=""
 
 gateway_unit="/etc/systemd/system/hermes-gateway.service"
 dashboard_unit="/etc/systemd/system/hermes-dashboard.service"
@@ -714,6 +715,8 @@ legacy_nginx_log_format="/etc/nginx/conf.d/hermes-log-format.conf"
 
 backup_deployment_state() {
   rollback_dir="$(mktemp -d "$tmp_dir/hermes-rollback.XXXXXX")"
+  chown root:"$service_group" "$rollback_dir"
+  chmod 0710 "$rollback_dir"
   systemctl is-enabled --quiet hermes-gateway.service && legacy_gateway_was_enabled="1" || true
   systemctl is-active --quiet hermes-gateway.service && legacy_gateway_was_active="1" || true
   for path in "$gateway_unit" "$dashboard_unit" "$runner" "$sandbox_policy" "$sandbox_seccomp" "$nginx_log_format" "$legacy_nginx_log_format"; do
@@ -742,13 +745,84 @@ restore_deployment_state() {
   fi
 }
 
+snapshot_authority() {
+  authority_snapshot="$rollback_dir/authority.sqlite3"
+  runuser -u "$service_user" -- env -i \
+    HOME="$shared" HERMES_HOME="$hermes_home" PYTHONPATH="$release" \
+    "$venv/bin/python" - "$authority_snapshot" <<'PY'
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+from hermes_cli.dashboard_auth.authority import AuthorityStore, control_plane_home
+from hermes_cli.dashboard_auth.lifecycle import authority_lifecycle_lock
+
+store = AuthorityStore(control_plane_home())
+destination = Path(sys.argv[1])
+with authority_lifecycle_lock(store.control_home, exclusive=True, blocking=True):
+    store._validate_path()
+    source = sqlite3.connect(f"file:{store.path.resolve().as_posix()}?mode=ro", uri=True, timeout=30)
+    target = sqlite3.connect(destination, timeout=30)
+    try:
+        source.backup(target)
+        integrity = target.execute("PRAGMA integrity_check").fetchone()
+        if not integrity or str(integrity[0]).lower() != "ok":
+            raise RuntimeError("authority snapshot integrity check failed")
+    finally:
+        target.close()
+        source.close()
+os.chmod(destination, 0o600)
+PY
+  chown root:"$service_group" "$authority_snapshot"
+  chmod 0640 "$authority_snapshot"
+}
+
+restore_authority_snapshot() {
+  [ -n "$authority_snapshot" ] && [ -f "$authority_snapshot" ] || return 0
+  runuser -u "$service_user" -- env -i \
+    HOME="$shared" HERMES_HOME="$hermes_home" PYTHONPATH="$release" \
+    "$venv/bin/python" - "$authority_snapshot" <<'PY'
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+from hermes_cli.dashboard_auth.authority import AuthorityStore, control_plane_home
+from hermes_cli.dashboard_auth.lifecycle import authority_lifecycle_lock
+
+source_path = Path(sys.argv[1])
+store = AuthorityStore(control_plane_home())
+with authority_lifecycle_lock(store.control_home, exclusive=True, blocking=True):
+    source = sqlite3.connect(f"file:{source_path.resolve().as_posix()}?mode=ro", uri=True, timeout=30)
+    target = sqlite3.connect(store.path, timeout=30)
+    try:
+        source.backup(target)
+        integrity = target.execute("PRAGMA integrity_check").fetchone()
+        if not integrity or str(integrity[0]).lower() != "ok":
+            raise RuntimeError("restored authority integrity check failed")
+        target.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        target.close()
+        source.close()
+os.chmod(store.path, 0o600)
+for suffix in ("-wal", "-shm"):
+    sidecar = Path(str(store.path) + suffix)
+    if sidecar.exists():
+        sidecar.unlink()
+PY
+}
+
 cleanup_release_tmp() {
   local exit_status="$?"
   if [ "$deployment_committed" != "1" ] && [ -n "$rollback_dir" ]; then
+    if [ "$services_touched" = "1" ]; then
+      systemctl stop hermes-dashboard.service hermes-gateway.service || true
+      restore_authority_snapshot || true
+    fi
     restore_deployment_state || true
     systemctl daemon-reload || true
     if [ "$services_touched" = "1" ] && [ -n "$old_current_target" ]; then
-      systemctl stop hermes-dashboard.service hermes-gateway.service || true
       if [ "$legacy_gateway_was_enabled" = "1" ]; then
         systemctl enable hermes-gateway.service || true
       fi
@@ -1342,6 +1416,7 @@ if systemctl is-active --quiet hermes-dashboard.service || systemctl is-active -
   echo "Old services did not stop before release switch" >&2
   exit 1
 fi
+snapshot_authority
 rm -f -- "$gateway_unit"
 install -o root -g root -m 0755 "$staged_runner" "$runner"
 install -o root -g root -m 0644 "$staged_dashboard_unit" "$dashboard_unit"
