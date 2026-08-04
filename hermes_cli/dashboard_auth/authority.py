@@ -9,6 +9,7 @@ store cannot be reached.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -33,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 9
 _DB_NAME = "authority.sqlite3"
 _RECOVERY_MARKER_SUFFIX = ".recovery-required.json"
 
@@ -222,6 +223,30 @@ class AuthorizationScope:
         # dashboard sessions for the provider/user pair.
         material = "\x1f".join((self.provider, self.user_id)).encode("utf-8")
         return hashlib.sha256(material).hexdigest()
+
+
+@dataclass(frozen=True)
+class AuthenticatedOwner:
+    """Canonical identity retained for trusted Control Plane owner enumeration."""
+
+    auth_provider: str
+    tenant_id: str
+    canonical_user_id: str
+    owner_key: str
+
+
+@dataclass(frozen=True)
+class MachineCredential:
+    """Immutable machine principal binding to one canonical Owner."""
+
+    credential_id: str
+    provider: str
+    principal: str
+    scope: str
+    auth_provider: str
+    tenant_id: str
+    canonical_user_id: str
+    owner_key: str
 
 
 @dataclass(frozen=True)
@@ -684,7 +709,35 @@ class AuthorityStore:
             )
             version = 6
             conn.execute("UPDATE authority_meta SET value=? WHERE key='schema_version'", (version,))
+        if version == 6:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS authenticated_owners ("
+                "owner_key TEXT PRIMARY KEY, auth_provider TEXT NOT NULL, tenant_id TEXT NOT NULL, "
+                "canonical_user_id TEXT NOT NULL, updated_at INTEGER NOT NULL, "
+                "UNIQUE(auth_provider, tenant_id, canonical_user_id))"
+            )
+            version = 7
+            conn.execute("UPDATE authority_meta SET value=? WHERE key='schema_version'", (version,))
+        if version == 7:
+            conn.execute("ALTER TABLE authenticated_owners ADD COLUMN principal_digest TEXT")
+            version = 8
+            conn.execute("UPDATE authority_meta SET value=? WHERE key='schema_version'", (version,))
+        if version == 8:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS machine_credentials ("
+                "credential_id TEXT PRIMARY KEY, credential_digest TEXT NOT NULL UNIQUE, "
+                "provider TEXT NOT NULL, principal TEXT NOT NULL, scope TEXT NOT NULL, "
+                "auth_provider TEXT NOT NULL, tenant_id TEXT NOT NULL, "
+                "canonical_user_id TEXT NOT NULL, owner_key TEXT NOT NULL, enabled INTEGER NOT NULL, "
+                "created_at INTEGER NOT NULL, disabled_at INTEGER, "
+                "UNIQUE(provider, principal, scope))"
+            )
+            version = 9
+            conn.execute("UPDATE authority_meta SET value=? WHERE key='schema_version'", (version,))
         if version == _SCHEMA_VERSION:
+            owners = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='authenticated_owners'"
+            ).fetchone()
             generations = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='owner_worker_generations'"
             ).fetchone()
@@ -703,8 +756,12 @@ class AuthorityStore:
             reader_leases = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='session_reader_leases'"
             ).fetchone()
+            machine_credentials = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='machine_credentials'"
+            ).fetchone()
             if any(record is None for record in (
-                generations, leases, bootstraps, worker_changes, reader_generations, reader_leases,
+                owners, generations, leases, bootstraps, worker_changes, reader_generations,
+                reader_leases, machine_credentials,
             )):
                 raise AuthorityUnavailable("authority store schema is incomplete")
 
@@ -1457,6 +1514,28 @@ class AuthorityStore:
                         for digest, epoch in prior_scopes
                     )
                 state = self._state_in_transaction(conn, scope)
+                from hermes_cli.dashboard_auth.owner_context import owner_context_from_registry
+
+                owner = owner_context_from_registry(
+                    auth_provider=scope.provider,
+                    tenant_id=scope.tenant_id,
+                    canonical_user_id=scope.user_id,
+                )
+                conn.execute(
+                    "INSERT INTO authenticated_owners(owner_key, auth_provider, tenant_id, "
+                    "canonical_user_id, updated_at, principal_digest) VALUES (?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(auth_provider, tenant_id, canonical_user_id) DO UPDATE SET "
+                    "owner_key=excluded.owner_key, updated_at=excluded.updated_at, "
+                    "principal_digest=excluded.principal_digest",
+                    (
+                        owner.owner_key,
+                        scope.provider,
+                        scope.tenant_id,
+                        scope.user_id,
+                        int(time.time()),
+                        scope.principal_digest,
+                    ),
+                )
                 conn.commit()
                 return AuthorizationState(
                     epoch=state.epoch,
@@ -1466,6 +1545,170 @@ class AuthorityStore:
                 )
         except AuthorizationRejected:
             raise
+        except (sqlite3.Error, OSError) as exc:
+            raise self._availability_error(exc) from exc
+
+    @staticmethod
+    def _machine_credential_digest(token: str) -> str:
+        return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _machine_credential_from_row(row: sqlite3.Row | tuple) -> MachineCredential:
+        return MachineCredential(
+            credential_id=str(row[0]),
+            provider=str(row[1]),
+            principal=str(row[2]),
+            scope=str(row[3]),
+            auth_provider=str(row[4]),
+            tenant_id=str(row[5]),
+            canonical_user_id=str(row[6]),
+            owner_key=str(row[7]),
+        )
+
+    def create_machine_credential(
+        self,
+        *,
+        auth_provider: str,
+        tenant_id: str,
+        canonical_user_id: str,
+        owner_key: str,
+        scope: str,
+        provider: str = "machine-credential",
+        principal: str | None = None,
+    ) -> tuple[MachineCredential, str]:
+        """Create a reveal-once bearer credential immutably bound to one Owner."""
+        from hermes_cli.dashboard_auth.owner_context import owner_context_from_registry
+
+        scope = str(scope or "").strip()
+        provider = str(provider or "").strip()
+        if not provider or not scope:
+            raise ValueError("machine credential provider and scope are required")
+        owner = owner_context_from_registry(
+            auth_provider=auth_provider,
+            tenant_id=tenant_id,
+            canonical_user_id=canonical_user_id,
+            expected_owner_key=owner_key,
+            global_home=self.control_home.parent,
+        )
+        credential_id = f"mc_{secrets.token_urlsafe(18)}"
+        principal = str(principal or credential_id).strip()
+        if not principal:
+            raise ValueError("machine credential principal is required")
+        token = secrets.token_urlsafe(48)
+        digest = self._machine_credential_digest(token)
+        self._ensure_ready()
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "INSERT INTO machine_credentials(credential_id, credential_digest, provider, "
+                    "principal, scope, auth_provider, tenant_id, canonical_user_id, owner_key, "
+                    "enabled, created_at, disabled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, NULL)",
+                    (
+                        credential_id,
+                        digest,
+                        provider,
+                        principal,
+                        scope,
+                        owner.auth_provider,
+                        owner.tenant_id,
+                        owner.owner_user_id,
+                        owner.owner_key,
+                        int(time.time()),
+                    ),
+                )
+                conn.commit()
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("machine credential principal and scope already exist") from exc
+        except (sqlite3.Error, OSError) as exc:
+            raise self._availability_error(exc) from exc
+        return MachineCredential(
+            credential_id=credential_id,
+            provider=provider,
+            principal=principal,
+            scope=scope,
+            auth_provider=owner.auth_provider,
+            tenant_id=owner.tenant_id,
+            canonical_user_id=owner.owner_user_id,
+            owner_key=owner.owner_key,
+        ), token
+
+    def verify_machine_token(self, token: str) -> MachineCredential | None:
+        """Resolve one enabled strong bearer token without exposing its digest."""
+        token = str(token or "")
+        if not token:
+            return None
+        digest = self._machine_credential_digest(token)
+        self._ensure_ready()
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT credential_id, provider, principal, scope, auth_provider, tenant_id, "
+                    "canonical_user_id, owner_key, credential_digest FROM machine_credentials "
+                    "WHERE credential_digest=? AND enabled=1",
+                    (digest,),
+                ).fetchone()
+            if row is None or not hmac.compare_digest(str(row[8]), digest):
+                return None
+            return self._machine_credential_from_row(row)
+        except (sqlite3.Error, OSError) as exc:
+            raise self._availability_error(exc) from exc
+
+    def resolve_machine_credential(
+        self, *, provider: str, principal: str, required_scope: str
+    ) -> MachineCredential | None:
+        """Resolve the immutable Owner binding for a previously verified principal."""
+        self._ensure_ready()
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT credential_id, provider, principal, scope, auth_provider, tenant_id, "
+                    "canonical_user_id, owner_key FROM machine_credentials "
+                    "WHERE provider=? AND principal=? AND scope=? AND enabled=1",
+                    (str(provider), str(principal), str(required_scope)),
+                ).fetchone()
+            return None if row is None else self._machine_credential_from_row(row)
+        except (sqlite3.Error, OSError) as exc:
+            raise self._availability_error(exc) from exc
+
+    def disable_machine_credential(self, credential_id: str) -> bool:
+        """Permanently disable one credential; disabled credentials never verify."""
+        self._ensure_ready()
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.execute(
+                    "UPDATE machine_credentials SET enabled=0, disabled_at=? "
+                    "WHERE credential_id=? AND enabled=1",
+                    (int(time.time()), str(credential_id or "").strip()),
+                )
+                conn.commit()
+                return cursor.rowcount == 1
+        except (sqlite3.Error, OSError) as exc:
+            raise self._availability_error(exc) from exc
+
+    def list_authenticated_owners(self) -> tuple[AuthenticatedOwner, ...]:
+        """List canonical authenticated Owners without inspecting owner homes."""
+        self._ensure_ready()
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT ao.auth_provider, ao.tenant_id, ao.canonical_user_id, ao.owner_key "
+                    "FROM authenticated_owners AS ao "
+                    "WHERE ao.principal_digest IS NOT NULL AND EXISTS ("
+                    "SELECT 1 FROM authorization_scopes AS scopes "
+                    "WHERE scopes.principal_digest=ao.principal_digest AND scopes.revoked=0"
+                    ") ORDER BY ao.owner_key"
+                ).fetchall()
+            return tuple(
+                AuthenticatedOwner(
+                    auth_provider=str(row[0]),
+                    tenant_id=str(row[1]),
+                    canonical_user_id=str(row[2]),
+                    owner_key=str(row[3]),
+                )
+                for row in rows
+            )
         except (sqlite3.Error, OSError) as exc:
             raise self._availability_error(exc) from exc
 

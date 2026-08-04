@@ -38,8 +38,6 @@ export interface SkillEditorDialogProps {
   open: boolean;
   /** Skill name to edit, or null for create mode. */
   editName: string | null;
-  /** Profile to scope reads/writes to ("" = the dashboard's own profile). */
-  profile?: string;
   onClose: () => void;
   /** Called after a successful save so the page can refresh its list. */
   onSaved: (name: string) => void;
@@ -48,7 +46,6 @@ export interface SkillEditorDialogProps {
 export function SkillEditorDialog({
   open,
   editName,
-  profile,
   onClose,
   onSaved,
 }: SkillEditorDialogProps) {
@@ -62,7 +59,6 @@ export function SkillEditorDialog({
           <EditorBody
             key={editName ?? "__create__"}
             editName={editName}
-            profile={profile}
             onClose={onClose}
             onSaved={onSaved}
           />
@@ -74,7 +70,6 @@ export function SkillEditorDialog({
 
 function EditorBody({
   editName,
-  profile,
   onClose,
   onSaved,
 }: Omit<SkillEditorDialogProps, "open">) {
@@ -90,14 +85,14 @@ function EditorBody({
     if (!editName) return;
     let cancelled = false;
     api
-      .getSkillContent(editName, profile || undefined)
+      .getSkillContent(editName)
       .then((res) => !cancelled && setContent(res.content))
       .catch((e) => !cancelled && setError(String(e)))
       .finally(() => !cancelled && setLoading(false));
     return () => {
       cancelled = true;
     };
-  }, [editName, profile]);
+  }, [editName]);
 
   const handleSave = async () => {
     setError(null);
@@ -112,18 +107,15 @@ function EditorBody({
     setSaving(true);
     try {
       if (isEdit) {
-        await api.updateSkillContent(editName, content, profile || undefined);
+        await api.updateSkillContent(editName, content);
         onSaved(editName);
       } else {
         const trimmed = name.trim();
-        await api.createSkill(
-          {
-            name: trimmed,
-            content,
-            category: category.trim() || undefined,
-          },
-          profile || undefined,
-        );
+        await api.createSkill({
+          name: trimmed,
+          content,
+          category: category.trim() || undefined,
+        });
         onSaved(trimmed);
       }
       onClose();

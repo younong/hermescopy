@@ -272,10 +272,9 @@ export const zhHant: Translations = {
     triggerNow: "立即觸發",
     delivery: {
       local: "本機",
-      telegram: "Telegram",
-      discord: "Discord",
-      slack: "Slack",
-      email: "Email",
+      weixin_ilink: "Weixin iLink",
+      feishu: "Feishu",
+      webhook: "Webhook",
     },
   },
 
@@ -407,7 +406,6 @@ export const zhHant: Translations = {
       tts: "文字轉語音",
       stt: "語音轉文字",
       logging: "日誌",
-      discord: "Discord",
       auxiliary: "輔助",
     },
   },

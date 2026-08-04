@@ -92,7 +92,7 @@ describe("ChatSessionList", () => {
     expect(container.querySelector('[aria-current="true"]')?.textContent).toContain("UI exploration");
     expect(container.querySelector('[aria-current="true"]')?.className).toContain("bg-white");
     expect(onActiveSessionChange).toHaveBeenLastCalledWith({ id: "beta", label: "UI exploration" });
-    expect(mocks.getSessions).toHaveBeenCalledWith(30, 0, "", "recent", true);
+    expect(mocks.getSessions).toHaveBeenCalledWith(30, 0, "recent", true);
   });
 
   it("opens selected sessions on an optional destination route", async () => {
@@ -102,15 +102,15 @@ describe("ChatSessionList", () => {
     const container = mount();
 
     await render(
-      <MemoryRouter initialEntries={["/chat-gui/files"]}>
-        <ChatSessionList activeSessionId={null} sessionPath="/chat-gui" variant="compact" />
+      <MemoryRouter initialEntries={["/chat/files"]}>
+        <ChatSessionList activeSessionId={null} sessionPath="/chat" variant="compact" />
         <LocationProbe />
       </MemoryRouter>,
     );
     await click(buttonWithText(container, "Release notes"));
 
     expect(container.querySelector("[data-location]")?.getAttribute("data-location"))
-      .toBe("/chat-gui?resume=alpha");
+      .toBe("/chat?resume=alpha");
   });
 
   it("keeps the default panel chrome and exposes rename in both variants", async () => {
@@ -129,10 +129,10 @@ describe("ChatSessionList", () => {
     expect(container.textContent).toContain("New chat");
     expect(container.textContent).toContain("3 msgs");
     expect(renameButton(container, "Release notes")).toBeTruthy();
-    expect(mocks.getSessions).toHaveBeenCalledWith(30, 0, "", "recent", false);
+    expect(mocks.getSessions).toHaveBeenCalledWith(30, 0, "recent", false);
   });
 
-  it("renames within the selected profile without navigating and uses the server title", async () => {
+  it("renames within the current owner without navigating and uses the server title", async () => {
     const refresh = deferred<ReturnType<typeof sessionList>>();
     mocks.getSessions
       .mockResolvedValueOnce(sessionList([
@@ -146,14 +146,13 @@ describe("ChatSessionList", () => {
     const container = mount();
 
     await render(
-      <MemoryRouter initialEntries={["/chat-gui?resume=alpha"]}>
+      <MemoryRouter initialEntries={["/chat?resume=alpha"]}>
         <ChatSessionList
           activeSessionId="alpha"
           onActiveSessionChange={onActiveSessionChange}
           onPicked={onPicked}
           onSessionPick={onSessionPick}
-          profile="work"
-          sessionPath="/chat-gui"
+          sessionPath="/chat"
           variant="compact"
         />
         <LocationProbe />
@@ -164,7 +163,7 @@ describe("ChatSessionList", () => {
     await changeInput(input, "  Client title  ");
     await click(buttonByLabel(container, "Save"));
 
-    expect(mocks.renameSession).toHaveBeenCalledWith("alpha", "Client title", "work");
+    expect(mocks.renameSession).toHaveBeenCalledWith("alpha", "Client title");
     expect(container.textContent).toContain("Server title");
     expect(container.textContent).not.toContain("Client title");
     expect(container.querySelector('[aria-current="true"]')?.textContent).toContain("Server title");
@@ -172,7 +171,7 @@ describe("ChatSessionList", () => {
     expect(onPicked).not.toHaveBeenCalled();
     expect(onSessionPick).not.toHaveBeenCalled();
     expect(container.querySelector("[data-location]")?.getAttribute("data-location"))
-      .toBe("/chat-gui?resume=alpha");
+      .toBe("/chat?resume=alpha");
 
     await act(async () => {
       refresh.resolve(sessionList([
@@ -214,7 +213,7 @@ describe("ChatSessionList", () => {
     await click(renameButton(container, "Preview only"));
     await changeInput(titleInput(container), "Keyboard title");
     await keyDown(titleInput(container), "Enter");
-    expect(mocks.renameSession).toHaveBeenCalledWith("beta", "Keyboard title", "");
+    expect(mocks.renameSession).toHaveBeenCalledWith("beta", "Keyboard title");
     expect(container.textContent).toContain("Keyboard title");
   });
 
@@ -256,44 +255,6 @@ describe("ChatSessionList", () => {
     expect(mocks.renameSession).toHaveBeenCalledTimes(2);
   });
 
-  it("ignores a rename response after switching profiles", async () => {
-    const oldSave = deferred<{ ok: boolean; title: string }>();
-    mocks.getSessions.mockImplementation(
-      (_limit: number, _offset: number, profile: string) =>
-        Promise.resolve(
-          sessionList([
-            profile === "next"
-              ? session("next", "Next profile", "")
-              : session("alpha", "Old profile", ""),
-          ]),
-        ),
-    );
-    mocks.renameSession.mockReturnValue(oldSave.promise);
-    const container = mount();
-
-    await render(
-      <MemoryRouter>
-        <ChatSessionList activeSessionId={null} profile="old" variant="compact" />
-      </MemoryRouter>,
-    );
-    await click(renameButton(container, "Old profile"));
-    await changeInput(titleInput(container), "Stale title");
-    await click(buttonByLabel(container, "Save"));
-
-    await render(
-      <MemoryRouter>
-        <ChatSessionList activeSessionId={null} profile="next" variant="compact" />
-      </MemoryRouter>,
-    );
-    expect(container.textContent).toContain("Next profile");
-
-    await act(async () => {
-      oldSave.resolve({ ok: true, title: "Stale title" });
-      await oldSave.promise;
-    });
-    expect(container.textContent).toContain("Next profile");
-    expect(container.textContent).not.toContain("Stale title");
-  });
 });
 
 function mount(): HTMLDivElement {

@@ -1991,213 +1991,61 @@ class TestWebServerEndpoints:
 
         assert resp.status_code == 200
 
-    def test_get_messaging_platforms(self):
+    def test_get_messaging_platforms_exposes_only_canonical_connectors(self):
         resp = self.client.get("/api/messaging/platforms")
 
         assert resp.status_code == 200
         platforms = resp.json()["platforms"]
-        telegram = next(platform for platform in platforms if platform["id"] == "telegram")
-        assert telegram["name"] == "Telegram"
-        assert telegram["enabled"] is False
-        assert any(field["key"] == "TELEGRAM_BOT_TOKEN" and field["required"] for field in telegram["env_vars"])
+        assert [platform["id"] for platform in platforms] == [
+            "weixin_ilink",
+            "feishu",
+            "webhook",
+        ]
+        assert all(platform["env_vars"] == [] for platform in platforms)
+        assert platforms[0]["docs_url"].endswith("/messaging/weixin-ilink")
 
-    def test_slack_messaging_platform_exposes_user_allowlist(self):
-        resp = self.client.get("/api/messaging/platforms")
+    def test_messaging_platforms_use_connector_config_and_runtime(self, monkeypatch):
+        from hermes_cli import web_server
+        from hermes_cli.config import load_config, save_config
 
-        assert resp.status_code == 200
-        platforms = resp.json()["platforms"]
-        slack = next(platform for platform in platforms if platform["id"] == "slack")
-        fields = {field["key"]: field for field in slack["env_vars"]}
+        config = load_config()
+        config["channel_connectors"]["weixin_ilink"]["enabled"] = True
+        config["channel_connectors"]["feishu"]["enabled"] = False
+        save_config(config)
+        monkeypatch.setattr(
+            web_server,
+            "_connector_runtime_states",
+            lambda: {"weixin_ilink": "ready"},
+        )
 
-        assert "allowed Slack member IDs" in slack["description"]
-        assert set(fields) >= {
-            "SLACK_BOT_TOKEN",
-            "SLACK_APP_TOKEN",
-            "SLACK_ALLOWED_USERS",
+        platforms = {
+            item["id"]: item
+            for item in self.client.get("/api/messaging/platforms").json()["platforms"]
         }
-        assert fields["SLACK_ALLOWED_USERS"]["prompt"] == "Allowed Slack member IDs"
-        assert fields["SLACK_ALLOWED_USERS"]["is_password"] is False
-        assert "member IDs" in fields["SLACK_ALLOWED_USERS"]["description"]
-        assert "Bot User OAuth Token" in fields["SLACK_BOT_TOKEN"]["help"]
-        assert "App-Level Tokens" in fields["SLACK_APP_TOKEN"]["help"]
-        assert "Copy member ID" in fields["SLACK_ALLOWED_USERS"]["help"]
+        assert platforms["weixin_ilink"]["state"] == "connected"
+        assert platforms["weixin_ilink"]["gateway_running"] is True
+        assert platforms["feishu"]["state"] == "disabled"
 
-    def test_weixin_messaging_metadata_describes_personal_ilink_setup(self):
-        resp = self.client.get("/api/messaging/platforms")
+    def test_update_messaging_platform_writes_channel_connector_config(self):
+        from hermes_cli.config import load_config
+
+        resp = self.client.put(
+            "/api/messaging/platforms/feishu",
+            json={"enabled": True},
+        )
 
         assert resp.status_code == 200
-        weixin = next(
-            platform
-            for platform in resp.json()["platforms"]
-            if platform["id"] == "weixin"
-        )
-        assert weixin["name"] == "Weixin / WeChat (Personal)"
-        assert "personal WeChat" in weixin["description"]
-        assert "Official Account" not in f"{weixin['name']} {weixin['description']}"
-        assert weixin["docs_url"] == (
-            "https://hermes-agent.nousresearch.com/docs/user-guide/messaging/weixin/"
-        )
+        config = load_config()
+        assert config["channel_connectors"]["feishu"]["enabled"] is True
+        assert "feishu" not in (config.get("platforms") or {})
 
-        fields = {field["key"]: field for field in weixin["env_vars"]}
-        for key in ("WEIXIN_ACCOUNT_ID", "WEIXIN_TOKEN", "WEIXIN_BASE_URL"):
-            assert "iLink" in fields[key]["description"]
-            assert "QR login" in fields[key]["description"]
-            assert "Official Account" not in fields[key]["description"]
-
-    def test_teams_messaging_metadata_links_setup_guide(self):
-        # Teams is a platform plugin, so the catalog entry is built from the
-        # plugin registry. The override must still supply a docs link so the
-        # Channels page renders a working "Open setup guide" button instead of
-        # an empty href (which resolves to the packaged app's own index.html).
-        from hermes_cli.web_server import _build_catalog_entry
-
-        teams = _build_catalog_entry("teams")
-        assert teams["docs_url"] == (
-            "https://hermes-agent.nousresearch.com/docs/user-guide/messaging/teams"
-        )
-
-    def test_google_chat_messaging_metadata_links_setup_guide(self):
-        # Google Chat is a platform plugin, so the catalog entry is built from
-        # the plugin registry. The override must supply a docs link so the
-        # Channels page renders a working "Open setup guide" button instead of
-        # an empty href (which resolves to the packaged app's own index.html).
-        from hermes_cli.web_server import _build_catalog_entry
-
-        google_chat = _build_catalog_entry("google_chat")
-        assert google_chat["name"] == "Google Chat"
-        assert google_chat["docs_url"] == (
-            "https://hermes-agent.nousresearch.com/docs/user-guide/messaging/google_chat"
-        )
-
-    def test_messaging_catalog_covers_gateway_platforms(self):
-        """Catalog is derived from the Platform enum, so every built-in shows up."""
-        from gateway.config import Platform
-
-        resp = self.client.get("/api/messaging/platforms")
-        platforms = {entry["id"] for entry in resp.json()["platforms"]}
-
-        for member in Platform.__members__.values():
-            if member.value == "local":
-                continue
-            assert member.value in platforms, f"Missing gateway platform {member.value} from /api/messaging/platforms"
-
-    def test_messaging_catalog_includes_plugin_platforms(self, monkeypatch):
-        """Plugin-registered adapters appear in the catalog without per-platform code."""
-        from gateway.platform_registry import PlatformEntry, platform_registry
-
-        entry = PlatformEntry(
-            name="ircfake",
-            label="IRC (test)",
-            adapter_factory=lambda cfg: None,
-            check_fn=lambda: True,
-            required_env=["IRC_SERVER"],
-            install_hint="Connect to IRC.",
-            source="plugin",
-        )
-        platform_registry.register(entry)
-        try:
-            resp = self.client.get("/api/messaging/platforms")
-            ids = {row["id"]: row for row in resp.json()["platforms"]}
-            assert "ircfake" in ids
-            assert ids["ircfake"]["name"] == "IRC (test)"
-            assert any(field["key"] == "IRC_SERVER" and field["required"] for field in ids["ircfake"]["env_vars"])
-        finally:
-            platform_registry.unregister("ircfake")
-
-    def test_update_messaging_platform_saves_env_and_enablement(self):
-        from hermes_cli.config import load_config, load_env
-
+    def test_removed_messaging_platform_is_rejected(self):
         resp = self.client.put(
             "/api/messaging/platforms/telegram",
-            json={
-                "enabled": False,
-                "env": {"TELEGRAM_BOT_TOKEN": "1234567890abcdef"},
-            },
+            json={"enabled": True},
         )
 
-        assert resp.status_code == 200
-        assert load_env()["TELEGRAM_BOT_TOKEN"] == "1234567890abcdef"
-        assert load_config()["platforms"]["telegram"]["enabled"] is False
-
-        status = self.client.get("/api/messaging/platforms").json()["platforms"]
-        telegram = next(platform for platform in status if platform["id"] == "telegram")
-        assert telegram["enabled"] is False
-
-    def test_update_messaging_platform_saves_slack_allowed_users(self):
-        from hermes_cli.config import load_env
-
-        resp = self.client.put(
-            "/api/messaging/platforms/slack",
-            json={"env": {"SLACK_ALLOWED_USERS": "U01ABC2DEF3,U04XYZ5LMN6"}},
-        )
-
-        assert resp.status_code == 200
-        assert load_env()["SLACK_ALLOWED_USERS"] == "U01ABC2DEF3,U04XYZ5LMN6"
-
-    def test_update_messaging_platform_rejects_swapped_slack_bot_token(self):
-        resp = self.client.put(
-            "/api/messaging/platforms/slack",
-            json={"env": {"SLACK_BOT_TOKEN": "xapp-wrong-token-type"}},
-        )
-
-        assert resp.status_code == 400
-        assert "xoxb-" in resp.json()["detail"]
-
-    def test_update_messaging_platform_rejects_swapped_slack_app_token(self):
-        resp = self.client.put(
-            "/api/messaging/platforms/slack",
-            json={"env": {"SLACK_APP_TOKEN": "xoxb-wrong-token-type"}},
-        )
-
-        assert resp.status_code == 400
-        assert "xapp-" in resp.json()["detail"]
-
-    def test_update_messaging_platform_rejects_invalid_slack_allowed_users(self):
-        resp = self.client.put(
-            "/api/messaging/platforms/slack",
-            json={"env": {"SLACK_ALLOWED_USERS": "U01ABC2DEF3,not-a-user"}},
-        )
-
-        assert resp.status_code == 400
-        assert "member IDs" in resp.json()["detail"]
-
-    def test_update_messaging_platform_accepts_slack_allowed_users_wildcard(self):
-        # "*" is the gateway's allow-all wildcard (gateway/platforms/slack.py),
-        # so the dashboard must accept it rather than rejecting it as malformed.
-        from hermes_cli.config import load_env
-
-        resp = self.client.put(
-            "/api/messaging/platforms/slack",
-            json={"env": {"SLACK_ALLOWED_USERS": "*"}},
-        )
-
-        assert resp.status_code == 200
-        assert load_env()["SLACK_ALLOWED_USERS"] == "*"
-
-    def test_update_messaging_platform_accepts_slack_allowed_users_trailing_comma(self):
-        # The gateway drops empty entries (gateway/platforms/slack.py), so a
-        # trailing/interior comma must not be rejected by the dashboard.
-        from hermes_cli.config import load_env
-
-        resp = self.client.put(
-            "/api/messaging/platforms/slack",
-            json={"env": {"SLACK_ALLOWED_USERS": "U01ABC2DEF3,,W04XYZ5LMN6,"}},
-        )
-
-        assert resp.status_code == 200
-        assert load_env()["SLACK_ALLOWED_USERS"] == "U01ABC2DEF3,,W04XYZ5LMN6,"
-
-    def test_messaging_platform_test_reports_missing_required_setup(self):
-        resp = self.client.put("/api/messaging/platforms/discord", json={"enabled": True})
-        assert resp.status_code == 200
-
-        resp = self.client.post("/api/messaging/platforms/discord/test")
-
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["ok"] is False
-        assert data["state"] == "not_configured"
-        assert "DISCORD_BOT_TOKEN" in data["message"]
+        assert resp.status_code == 404
 
     def test_telegram_onboarding_worker_request_uses_httpx(self, monkeypatch):
         import httpx
@@ -7324,509 +7172,73 @@ class TestDashboardPluginManifestExtensions:
         ]
 
 
-# ---------------------------------------------------------------------------
-# /api/pty WebSocket — terminal bridge for the dashboard "Chat" tab.
-#
-# These tests drive the endpoint with a tiny fake command (typically ``cat``
-# or ``sh -c 'printf …'``) instead of the real ``hermes --tui`` binary.  The
-# endpoint resolves its argv through ``_resolve_chat_argv``, so tests
-# monkeypatch that hook.
-# ---------------------------------------------------------------------------
+def test_pub_broadcasts_to_events_subscribers(self):
+    """A frame handed to _broadcast_event is sent verbatim to every
+    subscriber registered on that channel — and not to subscribers on
+    other channels.
 
-import sys
+    This drives the broadcast unit directly under asyncio rather than
+    round-tripping through Starlette's TestClient WebSocket portal. The
+    portal version was flaky under heavy parallel CI load: the broadcast
+    had to traverse two nested threaded portals within a 10s wall-clock
+    budget, and a starved ASGI thread occasionally blew that budget even
+    though the server logic was correct. Testing _broadcast_event with
+    fake subscribers removes the scheduling surface entirely while
+    asserting the exact fan-out contract.
+    """
+    import asyncio
+    from hermes_cli import web_server as ws_mod
 
+    class _FakeSub:
+        def __init__(self):
+            self.sent: list[str] = []
 
-skip_on_windows = pytest.mark.skipif(
-    sys.platform.startswith("win"), reason="PTY bridge is POSIX-only"
-)
+        async def send_text(self, payload: str) -> None:
+            self.sent.append(payload)
 
+    app = ws_mod.app
 
-@skip_on_windows
-class TestPtyWebSocket:
-    @pytest.fixture(autouse=True)
-    def _setup(self, monkeypatch, _isolate_hermes_home):
-        from starlette.testclient import TestClient
+    async def _run():
+        sub_a1 = _FakeSub()
+        sub_a2 = _FakeSub()
+        sub_other = _FakeSub()
+        frame = '{"type":"tool.start","payload":{"tool_id":"t1"}}'
 
-        import hermes_cli.web_server as ws
-
-        # Avoid exec'ing the actual TUI in tests: every test below installs
-        # its own fake argv via ``ws._resolve_chat_argv``.
-        self.ws_module = ws
-        monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
-        self.token = ws._SESSION_TOKEN
-        self.client = TestClient(ws.app)
-
-    def _url(self, token: str | None = None, **params: str) -> str:
-        tok = token if token is not None else self.token
-        # TestClient.websocket_connect takes the path; it reconstructs the
-        # query string, so we pass it inline.
-        from urllib.parse import urlencode
-
-        q = {"token": tok, **params}
-        return f"/api/pty?{urlencode(q)}"
-
-    def test_resolve_chat_argv_uses_dashboard_scroll_env(self, monkeypatch):
-        """Dashboard chat runs the TUI in browser-scrollback mode."""
-        import hermes_cli.main as main_mod
-
-        monkeypatch.setattr(
-            main_mod,
-            "_make_tui_argv",
-            lambda project_root, tui_dev=False: (["node", "dist/entry.js"], "/tmp/ui-tui"),
-        )
-
-        _argv, _cwd, env = self.ws_module._resolve_chat_argv()
-
-        assert env["HERMES_TUI_DASHBOARD"] == "1"
-        assert env["HERMES_TUI_INLINE"] == "1"
-        assert env["HERMES_TUI_DISABLE_MOUSE"] == "1"
-
-    def test_resolve_chat_argv_applies_terminal_backend_config(
-        self, monkeypatch, _isolate_hermes_home
-    ):
-        import hermes_cli.main as main_mod
-
-        config_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
-        config_path.write_text(
-            "\n".join(
-                [
-                    "terminal:",
-                    "  backend: docker",
-                    "  docker_image: example/hermes-tools:latest",
-                    "  docker_extra_args:",
-                    "    - --network=host",
-                ]
-            ),
-            encoding="utf-8",
-        )
-        monkeypatch.delenv("TERMINAL_ENV", raising=False)
-        monkeypatch.delenv("TERMINAL_DOCKER_IMAGE", raising=False)
-        monkeypatch.delenv("TERMINAL_DOCKER_EXTRA_ARGS", raising=False)
-        monkeypatch.setattr(
-            main_mod,
-            "_make_tui_argv",
-            lambda project_root, tui_dev=False: (["node", "dist/entry.js"], "/tmp/ui-tui"),
-        )
-
-        _argv, _cwd, env = self.ws_module._resolve_chat_argv()
-
-        assert env["TERMINAL_ENV"] == "docker"
-        assert env["TERMINAL_DOCKER_IMAGE"] == "example/hermes-tools:latest"
-        assert env["TERMINAL_DOCKER_EXTRA_ARGS"] == '["--network=host"]'
-
-    def test_rejects_when_embedded_chat_disabled(self, monkeypatch):
-        monkeypatch.setattr(self.ws_module, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", False)
-        from starlette.websockets import WebSocketDisconnect
-
-        with pytest.raises(WebSocketDisconnect) as exc:
-            with self.client.websocket_connect(self._url()):
-                pass
-        assert exc.value.code == 4404
-
-    def test_rejects_missing_token(self, monkeypatch):
-        monkeypatch.setattr(
-            self.ws_module,
-            "_resolve_chat_argv",
-            lambda resume=None, sidecar_url=None, profile=None, **kwargs: (["/bin/cat"], None, None),
-        )
-        from starlette.websockets import WebSocketDisconnect
-
-        with pytest.raises(WebSocketDisconnect) as exc:
-            with self.client.websocket_connect("/api/pty"):
-                pass
-        assert exc.value.code == 4401
-
-    def test_rejects_bad_token(self, monkeypatch):
-        monkeypatch.setattr(
-            self.ws_module,
-            "_resolve_chat_argv",
-            lambda resume=None, sidecar_url=None, profile=None, **kwargs: (["/bin/cat"], None, None),
-        )
-        from starlette.websockets import WebSocketDisconnect
-
-        with pytest.raises(WebSocketDisconnect) as exc:
-            with self.client.websocket_connect(self._url(token="wrong")):
-                pass
-        assert exc.value.code == 4401
-
-    def test_resolve_chat_argv_async_uses_worker_thread(self, monkeypatch):
-        captured: dict = {}
-
-        def fake_resolve(resume=None, sidecar_url=None, profile=None, browser_id=None, app_obj=None):
-            captured["resume"] = resume
-            captured["sidecar_url"] = sidecar_url
-            captured["profile"] = profile
-            captured["browser_id"] = browser_id
-            captured["app_obj"] = app_obj
-            return (["node", "dist/entry.js"], "/tmp/ui-tui", {"NODE_ENV": "production"})
-
-        async def fake_to_thread(fn, *args, **kwargs):
-            captured["thread_fn"] = fn
-            captured["thread_args"] = args
-            captured["thread_kwargs"] = kwargs
-            return fn(*args, **kwargs)
-
-        monkeypatch.setattr(self.ws_module, "_resolve_chat_argv", fake_resolve)
-        monkeypatch.setattr(self.ws_module.asyncio, "to_thread", fake_to_thread)
-
-        argv, cwd, env = asyncio.run(
-            self.ws_module._resolve_chat_argv_async(
-                resume="sess-42",
-                sidecar_url="ws://127.0.0.1:9119/api/pub?channel=abc",
-                profile="worker",
+        event_channels, event_lock = ws_mod._get_event_state(app)
+        # Register two subscribers on the target channel and one on a
+        # different channel, exactly as the /api/events handler does.
+        async with event_lock:
+            event_channels.setdefault("broadcast-test", set()).update(
+                {sub_a1, sub_a2}
             )
-        )
-
-        assert callable(captured["thread_fn"])
-        assert captured["thread_args"] == ()
-        assert captured["thread_kwargs"] == {
-            "resume": "sess-42",
-            "sidecar_url": "ws://127.0.0.1:9119/api/pub?channel=abc",
-            "profile": "worker",
-            "browser_id": None,
-            "app_obj": None,
-        }
-        assert argv == ["node", "dist/entry.js"]
-        assert cwd == "/tmp/ui-tui"
-        assert env == {"NODE_ENV": "production"}
-        assert captured["resume"] == "sess-42"
-        assert captured["sidecar_url"] == "ws://127.0.0.1:9119/api/pub?channel=abc"
-        assert captured["profile"] == "worker"
-        assert captured["browser_id"] is None
-        assert captured["app_obj"] is None
-
-    def test_pty_ws_resolves_argv_through_async_wrapper(self, monkeypatch):
-        captured: dict = {}
-
-        async def fake_resolve_async(resume=None, sidecar_url=None, profile=None, browser_id=None, app_obj=None):
-            captured["resume"] = resume
-            captured["sidecar_url"] = sidecar_url
-            captured["profile"] = profile
-            captured["browser_id"] = browser_id
-            captured["app_obj"] = app_obj
-            return (["/bin/sh", "-c", "printf async-resolve-ok"], None, None)
-
-        monkeypatch.setattr(self.ws_module, "_resolve_chat_argv_async", fake_resolve_async)
-
-        with self.client.websocket_connect(self._url(resume="sess-99")) as conn:
-            try:
-                conn.receive_bytes()
-            except Exception:
-                pass
-
-        assert captured["resume"] == "sess-99"
-        assert captured["browser_id"] is None
-        assert captured["app_obj"] is self.ws_module.app
-
-    def _assert_pty_propagates(self, monkeypatch, raising_resolver, *, profile=None, expect_detail=None):
-        """Drive /api/pty with a resolver that raises, and assert the error
-        propagates through the real _resolve_chat_argv_async -> asyncio.to_thread
-        -> lock -> re-raise chain into pty_ws's handler: the "Chat unavailable"
-        notice is sent and the socket closes with code 1011 (the stable
-        contract — we assert the close code, not the exact notice wording)."""
-        from starlette.websockets import WebSocketDisconnect
-
-        # Patch the REAL resolver so the whole wrapper/to_thread/lock chain runs.
-        monkeypatch.setattr(self.ws_module, "_resolve_chat_argv", raising_resolver)
-
-        url = self._url(profile=profile) if profile else self._url()
-        with self.client.websocket_connect(url) as conn:
-            notice = conn.receive_text()
-            with pytest.raises(WebSocketDisconnect) as exc:
-                conn.receive_text()
-        assert "Chat unavailable" in notice
-        assert exc.value.code == 1011
-        if expect_detail is not None:
-            assert expect_detail in notice
-
-    def test_pty_ws_propagates_systemexit_through_async_wrapper(self, monkeypatch):
-        """SystemExit from _make_tui_argv (node/npm missing) propagates through
-        the async wrapper and is caught by pty_ws's ``except SystemExit``."""
-
-        def boom(resume=None, sidecar_url=None, profile=None, **kwargs):
-            raise SystemExit("node not found")
-
-        self._assert_pty_propagates(monkeypatch, boom)
-
-    def test_pty_ws_propagates_httpexception_through_async_wrapper(self, monkeypatch):
-        """An invalid-profile HTTPException raised inside the threaded resolver
-        propagates through the wrapper and hits pty_ws's ``except HTTPException``."""
-        from fastapi import HTTPException
-
-        def bad_profile(resume=None, sidecar_url=None, profile=None, **kwargs):
-            raise HTTPException(status_code=404, detail="unknown profile")
-
-        self._assert_pty_propagates(
-            monkeypatch, bad_profile, profile="ghost", expect_detail="unknown profile"
-        )
-
-    def test_streams_child_stdout_to_client(self, monkeypatch):
-        monkeypatch.setattr(
-            self.ws_module,
-            "_resolve_chat_argv",
-            lambda resume=None, sidecar_url=None, profile=None, **kwargs: (
-                ["/bin/sh", "-c", "printf hermes-ws-ok"],
-                None,
-                None,
-            ),
-        )
-        with self.client.websocket_connect(self._url()) as conn:
-            # Drain frames until we see the needle or time out.  TestClient's
-            # recv_bytes blocks; loop until we have the signal byte string.
-            buf = b""
-            import time
-
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline:
-                try:
-                    frame = conn.receive_bytes()
-                except Exception:
-                    break
-                if frame:
-                    buf += frame
-                if b"hermes-ws-ok" in buf:
-                    break
-            assert b"hermes-ws-ok" in buf
-
-    def test_client_input_reaches_child_stdin(self, monkeypatch):
-        # ``cat`` echoes stdin back, so a write → read round-trip proves
-        # the full duplex path.
-        monkeypatch.setattr(
-            self.ws_module,
-            "_resolve_chat_argv",
-            lambda resume=None, sidecar_url=None, profile=None, **kwargs: (["/bin/cat"], None, None),
-        )
-        with self.client.websocket_connect(self._url()) as conn:
-            conn.send_bytes(b"round-trip-payload\n")
-            buf = b""
-            import time
-
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline:
-                frame = conn.receive_bytes()
-                if frame:
-                    buf += frame
-                if b"round-trip-payload" in buf:
-                    break
-            assert b"round-trip-payload" in buf
-
-    def test_resize_escape_is_forwarded(self, monkeypatch):
-        # Resize escape gets intercepted and applied via TIOCSWINSZ, then the
-        # child reads the TTY ioctl directly. Avoid tput because CI may not set
-        # TERM for non-interactive shells.
-        import sys
-
-        winsize_script = (
-            "import fcntl, struct, termios, time; "
-            "time.sleep(0.5); "
-            "rows, cols, *_ = struct.unpack('HHHH', "
-            "fcntl.ioctl(0, termios.TIOCGWINSZ, b'\\0' * 8)); "
-            "print(cols); print(rows)"
-        )
-        monkeypatch.setattr(
-            self.ws_module,
-            "_resolve_chat_argv",
-            # sleep gives the test time to push the resize before the child reads the ioctl.
-            lambda resume=None, sidecar_url=None, profile=None, **kwargs: (
-                [sys.executable, "-c", winsize_script],
-                None,
-                None,
-            ),
-        )
-        with self.client.websocket_connect(self._url()) as conn:
-            conn.send_text("\x1b[RESIZE:99;41]")
-            buf = b""
-            import time
-
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline:
-                # receive_bytes() blocks; once the child prints its winsize and
-                # exits, the PTY closes and further reads raise. Without this
-                # guard a missed-marker run blocks until a test timeout
-                # (flaky failure) instead of failing fast on the assert below.
-                try:
-                    frame = conn.receive_bytes()
-                except Exception:
-                    break
-                if frame:
-                    buf += frame
-                if b"99" in buf and b"41" in buf:
-                    break
-            assert b"99" in buf and b"41" in buf
-
-    def test_unavailable_platform_closes_with_message(self, monkeypatch):
-        from hermes_cli.pty_bridge import PtyUnavailableError
-
-        def _raise(argv, **kwargs):
-            raise PtyUnavailableError("pty missing for tests")
-
-        monkeypatch.setattr(
-            self.ws_module,
-            "_resolve_chat_argv",
-            lambda resume=None, sidecar_url=None, profile=None, **kwargs: (["/bin/cat"], None, None),
-        )
-        # Patch PtyBridge.spawn at the web_server module's binding.
-        import hermes_cli.web_server as ws_mod
-
-        monkeypatch.setattr(ws_mod.PtyBridge, "spawn", classmethod(lambda cls, *a, **k: _raise(*a, **k)))
-
-        with self.client.websocket_connect(self._url()) as conn:
-            # Expect a final text frame with the error message, then close.
-            msg = conn.receive_text()
-            assert "pty missing" in msg or "unavailable" in msg.lower() or "pty" in msg.lower()
-
-    def test_resume_parameter_is_forwarded_to_argv(self, monkeypatch):
-        captured: dict = {}
-
-        def fake_resolve(resume=None, sidecar_url=None, profile=None, browser_id=None, app_obj=None):
-            captured["resume"] = resume
-            captured["browser_id"] = browser_id
-            captured["app_obj"] = app_obj
-            return (["/bin/sh", "-c", "printf resume-arg-ok"], None, None)
-
-        monkeypatch.setattr(self.ws_module, "_resolve_chat_argv", fake_resolve)
-
-        with self.client.websocket_connect(self._url(resume="sess-42")) as conn:
-            # Drain briefly so the handler actually invokes the resolver.
-            try:
-                conn.receive_bytes()
-            except Exception:
-                pass
-        assert captured.get("resume") == "sess-42"
-        assert captured["browser_id"] is None
-        assert captured["app_obj"] is self.ws_module.app
-
-    def test_channel_param_propagates_sidecar_url(self, monkeypatch):
-        """When /api/pty is opened with ?channel=, the PTY child gets a
-        HERMES_TUI_SIDECAR_URL env var pointing back at /api/pub on the
-        same channel — which is how tool events reach the dashboard sidebar."""
-        captured: dict = {}
-
-        def fake_resolve(
-            resume=None,
-            sidecar_url=None,
-            profile=None,
-            active_session_file=None,
-            browser_id=None,
-            app_obj=None,
-        ):
-            captured["sidecar_url"] = sidecar_url
-            captured["active_session_file"] = active_session_file
-            captured["browser_id"] = browser_id
-            captured["app_obj"] = app_obj
-            return (["/bin/sh", "-c", "printf sidecar-ok"], None, None)
-
-        monkeypatch.setattr(self.ws_module, "_resolve_chat_argv", fake_resolve)
-        monkeypatch.setattr(
-            self.ws_module.app.state, "bound_host", "127.0.0.1", raising=False
-        )
-        monkeypatch.setattr(
-            self.ws_module.app.state, "bound_port", 9119, raising=False
-        )
-
-        headers = {"host": "127.0.0.1:9119", "origin": "http://127.0.0.1:9119"}
-        with self.client.websocket_connect(
-            self._url(channel="abc-123"), headers=headers
-        ) as conn:
-            try:
-                conn.receive_bytes()
-            except Exception:
-                pass
-
-        url = captured.get("sidecar_url") or ""
-        assert url.startswith("ws://127.0.0.1:9119/api/pub?")
-        assert "channel=abc-123" in url
-        assert "token=" in url
-        assert captured["active_session_file"] is None
-        assert captured["browser_id"] is None
-        assert captured["app_obj"] is self.ws_module.app
-
-    def test_pub_broadcasts_to_events_subscribers(self):
-        """A frame handed to _broadcast_event is sent verbatim to every
-        subscriber registered on that channel — and not to subscribers on
-        other channels.
-
-        This drives the broadcast unit directly under asyncio rather than
-        round-tripping through Starlette's TestClient WebSocket portal. The
-        portal version was flaky under heavy parallel CI load: the broadcast
-        had to traverse two nested threaded portals within a 10s wall-clock
-        budget, and a starved ASGI thread occasionally blew that budget even
-        though the server logic was correct. Testing _broadcast_event with
-        fake subscribers removes the scheduling surface entirely while
-        asserting the exact fan-out contract.
-        """
-        import asyncio
-        from hermes_cli import web_server as ws_mod
-
-        class _FakeSub:
-            def __init__(self):
-                self.sent: list[str] = []
-
-            async def send_text(self, payload: str) -> None:
-                self.sent.append(payload)
-
-        app = ws_mod.app
-
-        async def _run():
-            sub_a1 = _FakeSub()
-            sub_a2 = _FakeSub()
-            sub_other = _FakeSub()
-            frame = '{"type":"tool.start","payload":{"tool_id":"t1"}}'
-
-            event_channels, event_lock = ws_mod._get_event_state(app)
-            # Register two subscribers on the target channel and one on a
-            # different channel, exactly as the /api/events handler does.
+            event_channels.setdefault("other-channel", set()).add(sub_other)
+        try:
+            await ws_mod._broadcast_event(app, "broadcast-test", frame)
+        finally:
             async with event_lock:
-                event_channels.setdefault("broadcast-test", set()).update(
-                    {sub_a1, sub_a2}
-                )
-                event_channels.setdefault("other-channel", set()).add(sub_other)
-            try:
-                await ws_mod._broadcast_event(app, "broadcast-test", frame)
-            finally:
-                async with event_lock:
-                    event_channels.pop("broadcast-test", None)
-                    event_channels.pop("other-channel", None)
+                event_channels.pop("broadcast-test", None)
+                event_channels.pop("other-channel", None)
 
-            return sub_a1, sub_a2, sub_other, frame
+        return sub_a1, sub_a2, sub_other, frame
 
-        sub_a1, sub_a2, sub_other, frame = asyncio.run(_run())
+    sub_a1, sub_a2, sub_other, frame = asyncio.run(_run())
 
-        # Every subscriber on the channel got the frame verbatim, exactly once.
-        assert sub_a1.sent == [frame]
-        assert sub_a2.sent == [frame]
-        # A subscriber on a different channel got nothing.
-        assert sub_other.sent == []
+    # Every subscriber on the channel got the frame verbatim, exactly once.
+    assert sub_a1.sent == [frame]
+    assert sub_a2.sent == [frame]
+    # A subscriber on a different channel got nothing.
+    assert sub_other.sent == []
 
-    def test_events_rejects_missing_channel(self):
-        from starlette.websockets import WebSocketDisconnect
+def test_events_rejects_missing_channel(self):
+    from starlette.websockets import WebSocketDisconnect
 
-        with pytest.raises(WebSocketDisconnect) as exc:
-            with self.client.websocket_connect(
-                f"/api/events?token={self.token}"
-            ):
-                pass
-        assert exc.value.code == 4400
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with self.client.websocket_connect(
+            f"/api/events?token={self.token}"
+        ):
+            pass
+    assert exc.value.code == 4400
 
-
-def test_resolve_chat_argv_injects_gateway_ws_url(monkeypatch):
-    import hermes_cli.main as cli_main
-    import hermes_cli.web_server as ws
-
-    monkeypatch.setattr(
-        cli_main,
-        "_make_tui_argv",
-        lambda *_args, **_kwargs: (["node", "fake-tui.js"], Path("/tmp")),
-    )
-    monkeypatch.setattr(ws.app.state, "bound_host", "127.0.0.1", raising=False)
-    monkeypatch.setattr(ws.app.state, "bound_port", 9119, raising=False)
-
-    _argv, _cwd, env = ws._resolve_chat_argv()
-
-    assert env is not None
-    gateway_url = env.get("HERMES_TUI_GATEWAY_URL", "")
-    assert gateway_url.startswith("ws://127.0.0.1:9119/api/ws?")
-    assert "token=" in gateway_url
 
 
 class TestDashboardPluginStaticAssetAllowlist:

@@ -36,7 +36,8 @@ def hermes_env(tmp_path, monkeypatch):
     import cron.scheduler
     importlib.reload(cron.scheduler)
 
-    return home
+    with cron.jobs.use_store(cron.jobs.CronStore(home)):
+        yield home
 
 
 # ---------------------------------------------------------------------------

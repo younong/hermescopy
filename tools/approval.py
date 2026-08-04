@@ -49,15 +49,10 @@ _approval_tool_call_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     default="",
 )
 
-# Interactive-CLI flag. Concurrent ACP sessions run on a shared
-# ThreadPoolExecutor (acp_adapter/server.py), so mutating the process-global
-# os.environ["HERMES_INTERACTIVE"] races: one session's restore in `finally`
-# can clobber another session's set mid-run, dropping it onto the
-# non-interactive auto-approve path so a dangerous command executes without
-# the approval callback firing (GHSA-96vc-wcxf-jjff). A contextvar is
-# thread/task-local, so each executor worker (or asyncio task) sees only its
-# own value. None = unset → fall back to the env var for legacy
-# single-threaded CLI callers that still export HERMES_INTERACTIVE.
+# Interactive-runtime flag. A contextvar keeps concurrent executor workers or
+# asyncio tasks from racing through process-global HERMES_INTERACTIVE changes.
+# None = unset, which falls back to the environment for retained interactive
+# runtime callers.
 _hermes_interactive_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "hermes_interactive",
     default=None,
@@ -80,10 +75,10 @@ def reset_hermes_interactive_context(token: contextvars.Token) -> None:
 
 
 def _is_interactive_cli() -> bool:
-    """True when running an interactive CLI/ACP session.
+    """True when running an interactive runtime session.
 
-    Prefers the context-local flag (set by concurrent ACP sessions) and falls
-    back to the ``HERMES_INTERACTIVE`` env var for single-threaded callers.
+    Prefers the context-local flag and falls back to the
+    ``HERMES_INTERACTIVE`` env var for single-threaded callers.
     """
     ctx_val = _hermes_interactive_ctx.get()
     if ctx_val is not None:

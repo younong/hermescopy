@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from hermes_cli.dashboard_auth.owner_context import OwnerContext, owner_context_from_registry
 
-from .models import ResolvedChannelOwner
+from .credentials import decrypt_account_credentials
+from .models import ResolvedChannelOwner, ResolvedConnectorAccount
 from .store import ChannelIdentityStore
 
 
@@ -22,15 +23,16 @@ def resolve_binding(
             SELECT b.binding_id, b.peer_ciphertext, b.peer_key_version,
                    e.external_identity_id, e.canonical_user_id,
                    o.auth_provider, o.tenant_id, o.owner_user_id, o.owner_key,
-                   a.account_id, a.base_url, a.bot_id_ciphertext, a.bot_id_key_version,
-                   a.bot_token_ciphertext, a.bot_token_key_version, a.credential_version
+                   a.provider, a.account_id, a.provider_account_id,
+                   a.credential_version
             FROM channel_bindings b
             JOIN external_identities e ON e.external_identity_id=b.external_identity_id
             JOIN canonical_users u ON u.canonical_user_id=e.canonical_user_id
             JOIN owner_bindings o ON o.canonical_user_id=u.canonical_user_id
-            JOIN ilink_accounts a ON a.account_id=b.account_id
+            JOIN connector_accounts a ON a.account_id=b.account_id
             WHERE b.binding_id=? AND b.status=? AND e.status='active'
               AND u.status IN (?, ?) AND a.status=?
+              AND a.provider=e.provider
             """,
             (binding_id, binding_status, *owner_statuses, binding_status),
         ).fetchone()
@@ -41,22 +43,9 @@ def resolve_binding(
         tenant_id=row["tenant_id"],
         canonical_user_id=row["owner_user_id"],
         expected_owner_key=row["owner_key"],
+        global_home=store.global_home,
     )
-    bot_id = store.crypto.decrypt_text(
-        row["bot_id_ciphertext"],
-        table="ilink_accounts",
-        record_id=row["account_id"],
-        field="bot_id",
-        version=row["bot_id_key_version"],
-    )
-    bot_token = store.crypto.decrypt_text(
-        row["bot_token_ciphertext"],
-        table="ilink_accounts",
-        record_id=row["account_id"],
-        field="bot_token",
-        version=row["bot_token_key_version"],
-    )
-    peer_id = store.crypto.decrypt_text(
+    conversation_id = store.crypto.decrypt_text(
         row["peer_ciphertext"],
         table="channel_bindings",
         record_id=row["binding_id"],
@@ -67,11 +56,53 @@ def resolve_binding(
         canonical_user_id=row["canonical_user_id"],
         owner_key=row["owner_key"],
         external_identity_id=row["external_identity_id"],
+        provider=row["provider"],
         account_id=row["account_id"],
+        provider_account_id=row["provider_account_id"],
         binding_id=row["binding_id"],
-        account_base_url=row["base_url"],
-        bot_id=bot_id,
-        bot_token=bot_token,
-        peer_id=peer_id,
+        conversation_id=conversation_id,
+        credential_version=row["credential_version"],
+    )
+
+
+def resolve_connector_account(
+    store: ChannelIdentityStore,
+    *,
+    provider: str,
+    account_id: str,
+    credential_version: int | None = None,
+) -> ResolvedConnectorAccount:
+    """Resolve one active account through an exact provider/version fence."""
+    exact_provider = str(provider or "").strip()
+    exact_account = str(account_id or "").strip()
+    if not exact_provider or not exact_account:
+        raise ValueError("provider and account_id are required")
+    with store.read() as conn:
+        row = conn.execute(
+            """
+            SELECT provider, account_id, provider_account_id,
+                   credentials_ciphertext, credentials_key_version,
+                   credential_version
+            FROM connector_accounts
+            WHERE provider=? AND account_id=? AND status='active'
+            """,
+            (exact_provider, exact_account),
+        ).fetchone()
+    if row is None or (
+        credential_version is not None
+        and int(row["credential_version"]) != int(credential_version)
+    ):
+        raise RuntimeError("connector account is unavailable")
+    credentials = decrypt_account_credentials(
+        store,
+        account_id=row["account_id"],
+        ciphertext=row["credentials_ciphertext"],
+        key_version=row["credentials_key_version"],
+    )
+    return ResolvedConnectorAccount(
+        provider=row["provider"],
+        account_id=row["account_id"],
+        provider_account_id=row["provider_account_id"],
+        credentials=credentials,
         credential_version=row["credential_version"],
     )

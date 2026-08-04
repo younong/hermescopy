@@ -273,10 +273,9 @@ export const pt: Translations = {
     triggerNow: "Acionar agora",
     delivery: {
       local: "Local",
-      telegram: "Telegram",
-      discord: "Discord",
-      slack: "Slack",
-      email: "Email",
+      weixin_ilink: "Weixin iLink",
+      feishu: "Feishu",
+      webhook: "Webhook",
     },
   },
 
@@ -409,7 +408,6 @@ export const pt: Translations = {
       tts: "Texto para fala",
       stt: "Fala para texto",
       logging: "Registo",
-      discord: "Discord",
       auxiliary: "Auxiliar",
     },
   },

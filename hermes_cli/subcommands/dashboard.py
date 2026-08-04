@@ -1,8 +1,6 @@
-"""``hermes dashboard`` / ``hermes serve`` subcommand parsers.
+"""``hermes dashboard`` authenticated Web administration parser.
 
-``dashboard`` is the browser web UI; ``serve`` is the same gateway, headless —
-what the desktop app and remote backends run. Both share one handler
-(``cmd_dashboard`` → ``start_server``). Extracted from
+The dashboard command starts the authenticated Web control plane. Extracted from
 ``hermes_cli/main.py:main()`` (god-file Phase 2); handler injected to avoid
 importing ``main``.
 """
@@ -14,13 +12,8 @@ from typing import Callable
 
 
 def _add_server_runtime_args(parser) -> None:
-    """Attach the runtime flags shared by ``dashboard`` and ``serve``.
+    """Attach authenticated Web server runtime flags.
 
-    Both subcommands boot the *same* ``web_server.start_server`` (the
-    JSON-RPC/WebSocket gateway). ``dashboard`` opens a browser UI on top of
-    it; ``serve`` is the headless backend the desktop app and remote clients
-    connect to. The shared server logic lives in one place — only the
-    browser-opening behavior and help framing differ.
     """
     parser.add_argument(
         "--port", type=int, default=9119, help="Port (default 9119, 0 for auto-assign by OS)"
@@ -63,24 +56,6 @@ def _add_server_runtime_args(parser) -> None:
             "where npm may not be available. Pre-build with: cd web && npm run build"
         ),
     )
-    parser.add_argument(
-        "--isolated",
-        action="store_true",
-        help=(
-            "When launched from a named profile, run a dedicated server scoped "
-            "to that profile instead of routing to the machine-level server. "
-            "Default behavior is unified: profile launches attach to (or start) "
-            "ONE machine-level server and preselect the profile."
-        ),
-    )
-    # Internal flag set by the unified-launch re-exec (cmd_dashboard) to
-    # preselect the launching profile in the SPA switcher. Hidden from --help.
-    parser.add_argument(
-        "--open-profile",
-        dest="open_profile",
-        default="",
-        help=argparse.SUPPRESS,
-    )
     # Lifecycle flags — mutually exclusive with each other and with the
     # start-a-server flags above (if both are passed, --stop / --status win
     # because they exit before the server is started).  The server has no
@@ -107,14 +82,7 @@ def build_dashboard_parser(
     cmd_dashboard_users: Callable,
     cmd_dashboard_authority: Callable,
 ) -> None:
-    """Attach the ``dashboard`` and ``serve`` subcommands.
-
-    Both share the same backend (``cmd_dashboard`` → ``start_server``).
-    ``dashboard`` is the browser UI; ``serve`` is the headless backend used by
-    the desktop app and remote clients. They are independent surfaces — neither
-    "launches" the other — so the desktop app spawns ``serve``, never
-    ``dashboard``.
-    """
+    """Attach the authenticated ``dashboard`` command."""
     # =========================================================================
     # dashboard command — the browser web UI
     # =========================================================================
@@ -127,49 +95,7 @@ def build_dashboard_parser(
     dashboard_parser.add_argument(
         "--no-open", action="store_true", help="Don't open browser automatically"
     )
-    # Backward-compat shim: older Hermes desktop app shells (<= 0.15.x) spawn the
-    # backend as `hermes dashboard --no-open --tui --host ... --port ...`. The
-    # `--tui` flag was removed from this subcommand in cae6b5486 (embedded chat is
-    # always on now). When a user's CLI updates past that commit but their desktop
-    # app binary has not, argparse used to hard-error with "unrecognized arguments:
-    # --tui" and exit(2) — the backend died before becoming ready and the GUI just
-    # showed "Hermes couldn't start" with no actionable cause. Accept and silently
-    # ignore the flag so an old app + new CLI degrades gracefully instead of
-    # bricking. Hidden from --help; safe to delete once the floor app version is
-    # well past 0.16.0.
-    dashboard_parser.add_argument(
-        "--tui",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
     dashboard_parser.set_defaults(func=cmd_dashboard)
-
-    # =========================================================================
-    # serve command — the headless backend server
-    #
-    # `serve` boots the exact same gateway as `dashboard` but never opens a
-    # browser. It exists so the Hermes Desktop app (and headless remote
-    # backends) can launch a backend WITHOUT invoking `dashboard`: the desktop
-    # app and the web dashboard are independent surfaces that merely share this
-    # server, and neither should appear to launch the other.
-    # =========================================================================
-    serve_parser = subparsers.add_parser(
-        "serve",
-        help="Start the Hermes backend server (headless; powers the desktop app and remote backends)",
-        description=(
-            "Run the Hermes backend server — the JSON-RPC/WebSocket gateway the "
-            "desktop app and remote clients connect to. Headless: it never opens "
-            "a browser UI."
-        ),
-    )
-    _add_server_runtime_args(serve_parser)
-    # Accepted but redundant: `serve` is always headless (see set_defaults
-    # below). Kept so callers that pass the legacy `--no-open` flag (e.g. the
-    # desktop backend spawn) don't trip "unrecognized arguments".
-    serve_parser.add_argument(
-        "--no-open", action="store_true", help=argparse.SUPPRESS
-    )
-    serve_parser.set_defaults(func=cmd_dashboard, no_open=True)
 
     # `hermes dashboard register` — register a self-hosted dashboard OAuth
     # client with Nous Portal and write the client_id into ~/.hermes/.env.

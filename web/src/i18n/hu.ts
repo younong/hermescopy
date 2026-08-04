@@ -273,10 +273,9 @@ export const hu: Translations = {
     triggerNow: "Indítás most",
     delivery: {
       local: "Helyi",
-      telegram: "Telegram",
-      discord: "Discord",
-      slack: "Slack",
-      email: "Email",
+      weixin_ilink: "Weixin iLink",
+      feishu: "Feishu",
+      webhook: "Webhook",
     },
   },
 
@@ -408,7 +407,6 @@ export const hu: Translations = {
       tts: "Szövegfelolvasás",
       stt: "Beszédfelismerés",
       logging: "Naplózás",
-      discord: "Discord",
       auxiliary: "Kiegészítő",
     },
   },

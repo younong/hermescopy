@@ -281,10 +281,9 @@ export const ga: Translations = {
     triggerNow: "Spreag anois",
     delivery: {
       local: "Áitiúil",
-      telegram: "Telegram",
-      discord: "Discord",
-      slack: "Slack",
-      email: "Email",
+      weixin_ilink: "Weixin iLink",
+      feishu: "Feishu",
+      webhook: "Webhook",
     },
   },
 
@@ -416,7 +415,6 @@ export const ga: Translations = {
       tts: "Téacs go Caint",
       stt: "Caint go Téacs",
       logging: "Logáil",
-      discord: "Discord",
       auxiliary: "Cúntach",
     },
   },

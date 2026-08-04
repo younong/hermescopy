@@ -15,9 +15,8 @@
  * running chat session adopts the change on the next `/new` or page reload;
  * we surface that hint rather than forcing a reload here.
  *
- * Profile scoping: `/api/config` is profile-scoped by `fetchJSON` via the
- * global management profile — the same scope the sidebar's `/api/model/info`
- * badge reads from — so this writes the profile the sidebar is showing.
+ * `/api/config` is scoped to the authenticated Owner, matching the model info
+ * shown elsewhere in the dashboard.
  */
 
 import { Select, SelectOption } from "@nous-research/ui/ui/components/select";

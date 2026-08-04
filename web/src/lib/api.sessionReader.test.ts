@@ -91,7 +91,6 @@ describe("fetchSessionReaderJSON", () => {
     const pending = api.getSessionMessages(
       "session-1",
       { limit: 42, signal: controller.signal },
-      "worker",
     );
     const rejection = expect(pending).rejects.toMatchObject({ name: "AbortError" });
     await vi.advanceTimersByTimeAsync(1);
@@ -100,7 +99,7 @@ describe("fetchSessionReaderJSON", () => {
     await rejection;
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(fetchMock.mock.calls[0]?.[0]).toContain(
-      "/api/sessions/session-1/messages?limit=42&profile=worker",
+      "/api/sessions/session-1/messages?limit=42",
     );
     expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ signal: controller.signal });
   });
@@ -113,7 +112,6 @@ describe("fetchSessionReaderJSON", () => {
     const pending = api.getSessionComposition(
       ["session a", "session/b"],
       { signal: controller.signal },
-      "worker",
     );
     const rejection = expect(pending).rejects.toMatchObject({ name: "AbortError" });
     await vi.advanceTimersByTimeAsync(1);
@@ -123,7 +121,7 @@ describe("fetchSessionReaderJSON", () => {
     const url = new URL(String(fetchMock.mock.calls[0]?.[0]), window.location.origin);
     expect(url.pathname).toContain("/api/sessions/composition");
     expect(url.searchParams.getAll("ids")).toEqual(["session a", "session/b"]);
-    expect(url.searchParams.get("profile")).toBe("worker");
+    expect(url.searchParams.has("profile")).toBe(false);
     expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ signal: controller.signal });
   });
 
@@ -132,11 +130,11 @@ describe("fetchSessionReaderJSON", () => {
       response(200, { sessions: [], results: [], total: 0, limit: 20, offset: 0 }),
     );
 
-    await api.getSessions(20, 0, undefined, "created", false, {
+    await api.getSessions(20, 0, "created", false, {
       active_from: 100,
       active_before: 200,
     });
-    await api.searchSessions("hello world", undefined, undefined, {
+    await api.searchSessions("hello world", undefined, {
       active_from: 100,
       active_before: 200,
     });

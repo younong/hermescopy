@@ -170,6 +170,21 @@ class OwnerWorkerGatewayClient:
             if "method" in message:
                 self._pending_events.append(message)
 
+    async def next_event(self, *, timeout: float | None = None) -> dict[str, Any]:
+        """Return the next gateway event while preserving exact OWP1 framing."""
+        if self._pending_events:
+            return self._pending_events.pop(0)
+
+        async def _receive() -> dict[str, Any]:
+            while True:
+                if self.websocket is None:
+                    raise RuntimeError("owner worker gateway is not connected")
+                message = self._decode(await self._recv_data())
+                if "method" in message:
+                    return message
+
+        return await asyncio.wait_for(_receive(), timeout=timeout) if timeout else await _receive()
+
     async def wait_for_event(
         self,
         method: str,

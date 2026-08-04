@@ -1,6 +1,6 @@
 """Tests for the WS-upgrade auth helper (Phase 5 task 5.2).
 
-The dashboard's four WS endpoints (``/api/pty``, ``/api/ws``, ``/api/pub``,
+The dashboard's four WS endpoints (``/api/ws``, ``/api/ws``, ``/api/pub``,
 ``/api/events``) share an auth gate: ``_ws_auth_ok``. In loopback mode it
 accepts ``?token=<_SESSION_TOKEN>``; in gated mode it accepts a single-use
 ``?ticket=`` minted by ``POST /api/auth/ws-ticket``.
@@ -141,7 +141,7 @@ class TestWsTicketEndpoint:
         assert me.status_code == 200
         me_body = me.json()
 
-        r = gated_app.post("/api/auth/ws-ticket", json={"audience": "browser-ws:/api/pty"})
+        r = gated_app.post("/api/auth/ws-ticket", json={"audience": "browser-ws:/api/ws"})
         assert r.status_code == 200
         body = r.json()
         assert "ticket" in body
@@ -173,7 +173,7 @@ class TestWsTicketEndpoint:
         _logged_in(gated_app)
         tickets = {
             gated_app.post(
-                "/api/auth/ws-ticket", json={"audience": "browser-ws:/api/pty"}
+                "/api/auth/ws-ticket", json={"audience": "browser-ws:/api/ws"}
             ).json()["ticket"]
             for _ in range(5)
         }
@@ -227,7 +227,7 @@ def insecure_explicit_host_app():
     web_server.app.state.auth_required = prev_required
 
 
-def _fake_ws(*, query: dict, client_host: str = "127.0.0.1", path: str = "/api/pty", app=None, cookies=None):
+def _fake_ws(*, query: dict, client_host: str = "127.0.0.1", path: str = "/api/ws", app=None, cookies=None):
     """Build a stand-in for Starlette.WebSocket good enough for WS helpers."""
 
     class _QP:
@@ -247,7 +247,7 @@ def _fake_ws(*, query: dict, client_host: str = "127.0.0.1", path: str = "/api/p
     )
 
 
-def _browser_ticket_ws(gated_app, *, path: str = "/api/pty"):
+def _browser_ticket_ws(gated_app, *, path: str = "/api/ws"):
     """Mint a browser ticket through the verified HTTP session endpoint."""
     _logged_in(gated_app)
     response = gated_app.post(
@@ -334,7 +334,7 @@ class TestWsAuthOkGated:
         ticket, ws = _browser_ticket_ws(gated_app, path="/api/ws")
 
         result = web_server._ws_auth_result(
-            _ws_from_browser_ticket(ticket, source_ws=ws, path="/api/pty")
+            _ws_from_browser_ticket(ticket, source_ws=ws, path="/api/pub")
         )
 
         assert result.reason == "ticket_invalid"
@@ -418,7 +418,7 @@ class TestWsAuthOkGated:
 
         auth_me = gated_app.get("/api/auth/me")
         ticket_response = gated_app.post(
-            "/api/auth/ws-ticket", json={"audience": "browser-ws:/api/pty"}
+            "/api/auth/ws-ticket", json={"audience": "browser-ws:/api/ws"}
         )
 
         assert auth_me.status_code == 200
@@ -459,12 +459,12 @@ class TestWsAuthOkGated:
         )
         good = mint_owner_worker_capability(
             lease, audience=AUD_OWNER_WORKER_WS, scope=SCOPE_OWNER_WORKER_WS,
-            path="/api/pty", control_home=tmp_path,
+            path="/api/ws", control_home=tmp_path,
         )
         other = _active_worker_lease(tmp_path, owner_key="ok1_other", worker_id="worker-b")
         wrong = mint_owner_worker_capability(
             other, audience=AUD_OWNER_WORKER_WS, scope=SCOPE_OWNER_WORKER_WS,
-            path="/api/pty", control_home=tmp_path,
+            path="/api/ws", control_home=tmp_path,
         )
 
         assert web_server._ws_auth_ok(_fake_ws(query={"internal_owner_token": good}, app=worker_app)) is True
@@ -801,7 +801,7 @@ class TestWsAuthOkGated:
 
         asyncio.run(
             web_server._bridge_websocket_to_owner_worker(
-                browser, path="/api/pty", auth_result=auth_result
+                browser, path="/api/ws", auth_result=auth_result
             )
         )
 
@@ -920,7 +920,7 @@ class TestWsAuthOkGated:
         async def exercise():
             bridge_task = asyncio.create_task(
                 web_server._bridge_websocket_to_owner_worker(
-                    browser, path="/api/pty", auth_result=auth_result
+                    browser, path="/api/ws", auth_result=auth_result
                 )
             )
             await asyncio.wait_for(registered.wait(), timeout=1)
@@ -1042,7 +1042,7 @@ class TestWsAuthOkGated:
         async def exercise():
             bridge_task = asyncio.create_task(
                 web_server._bridge_websocket_to_owner_worker(
-                    browser, path="/api/pty", auth_result=auth_result
+                    browser, path="/api/ws", auth_result=auth_result
                 )
             )
             await asyncio.wait_for(registered.wait(), timeout=1)
@@ -1115,7 +1115,7 @@ class TestWsAuthOkGated:
         monkeypatch.setattr("hermes_cli.owner_worker.tokens.validate_owp1_control", lambda *_args, **_kwargs: None)
         auth_result = web_server._WsAuthResult(None, "ticket", {"provider": "stub", "tenant_id": "tenant-a", "user_id": "user-a", "session_id": "session-a", "membership_revision": "v1", "epoch": 0})
 
-        asyncio.run(web_server._bridge_websocket_to_owner_worker(browser, path="/api/pty", auth_result=auth_result))
+        asyncio.run(web_server._bridge_websocket_to_owner_worker(browser, path="/api/ws", auth_result=auth_result))
 
         assert browser.accepted is True
         assert browser.closed and browser.closed[-1][0] == 4409
@@ -1193,7 +1193,7 @@ class TestWsAuthOkGated:
                 browser.app.state.revoked_ws_bridge_worker_fences.clear()
             await web_server._bridge_websocket_to_owner_worker(
                 browser,
-                path="/api/pty",
+                path="/api/ws",
                 auth_result=web_server._WsAuthResult(
                     None, "ticket", {
                         "provider": "stub", "tenant_id": "tenant-a", "user_id": "user-a",
@@ -1267,7 +1267,7 @@ class TestWsAuthOkGated:
         with caplog.at_level(logging.INFO, logger="hermes_cli.web_server"):
             asyncio.run(
                 web_server._bridge_websocket_to_owner_worker(
-                    browser, path="/api/pty", auth_result=auth_result
+                    browser, path="/api/ws", auth_result=auth_result
                 )
             )
 
@@ -1323,7 +1323,7 @@ class TestWsAuthOkGated:
         monkeypatch.setattr(web_server, "_connect_owner_worker_ws", fail_connect)
         auth_result = web_server._WsAuthResult(None, "ticket", {"provider": "stub", "tenant_id": "tenant-a", "user_id": "user-a", "session_id": "session-a", "membership_revision": "v1", "epoch": 0})
 
-        asyncio.run(web_server._bridge_websocket_to_owner_worker(browser, path="/api/pty", auth_result=auth_result))
+        asyncio.run(web_server._bridge_websocket_to_owner_worker(browser, path="/api/ws", auth_result=auth_result))
 
         assert browser.accepted is False
         assert browser.closed and browser.closed[-1][0] == 1013
@@ -1400,48 +1400,6 @@ class TestWsAuthOkGated:
         assert web_server._should_bridge_ws_to_owner_worker(worker_ws, worker_result) is False
 
 
-class TestWsUrlBuilders:
-    def test_child_urls_use_explicit_app_state_instead_of_module_global(self, monkeypatch):
-        monkeypatch.setattr(web_server.app.state, "bound_host", "global.example", raising=False)
-        monkeypatch.setattr(web_server.app.state, "bound_port", 9999, raising=False)
-        monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
-        worker_app = SimpleNamespace(
-            state=SimpleNamespace(
-                bound_host="owner-worker.local",
-                bound_port=1234,
-                auth_required=True,
-            )
-        )
-
-        gateway_url = web_server._build_gateway_ws_url(app_obj=worker_app)
-        sidecar_url = web_server._build_sidecar_url("chan1", app_obj=worker_app)
-
-        assert gateway_url is None
-        assert sidecar_url is None
-
-    def test_child_urls_return_none_when_explicit_app_has_no_bound_socket(self, monkeypatch):
-        monkeypatch.setattr(web_server.app.state, "bound_host", "global.example", raising=False)
-        monkeypatch.setattr(web_server.app.state, "bound_port", 9999, raising=False)
-        app_obj = SimpleNamespace(state=SimpleNamespace(auth_required=False))
-
-        assert web_server._build_gateway_ws_url(app_obj=app_obj) is None
-        assert web_server._build_sidecar_url("chan1", app_obj=app_obj) is None
-
-    def test_owner_workers_cannot_mint_control_plane_child_urls(self, monkeypatch, tmp_path):
-        worker_app = SimpleNamespace(
-            state=SimpleNamespace(
-                owner_worker_mode=True,
-                owner_worker_owner_key="ok1_owner_a",
-                owner_worker_control_home=tmp_path / "control-plane",
-                auth_required=False,
-            )
-        )
-        monkeypatch.setenv("HERMES_OWNER_WORKER_CONTROL_WS_BASE", "wss://control.example")
-
-        assert web_server._build_gateway_ws_url(app_obj=worker_app) is None
-        assert web_server._build_sidecar_url("chan-1", app_obj=worker_app) is None
-
-
 class TestWsRequestIsAllowedGated:
     """Bug fix: in gated mode, the WS peer-IP loopback check must be
     bypassed.
@@ -1454,8 +1412,8 @@ class TestWsRequestIsAllowedGated:
     (intended only for unauthenticated loopback dev) must not also reject
     those upgrades: the OAuth gate + single-use ticket is the auth.
 
-    Regression coverage: every WS endpoint (``/api/pty``, ``/api/ws``,
-    ``/api/pub``, ``/api/events``) calls ``_ws_request_is_allowed`` after
+    Regression coverage: every WS endpoint (``/api/ws``, ``/api/pub``,
+    ``/api/events``) calls ``_ws_request_is_allowed`` after
     ``_ws_auth_ok``. If the peer-IP check rejects gated mode, the chat
     tab + sidebar tool feed silently fail to connect even after a
     successful OAuth login.
@@ -1681,49 +1639,3 @@ class TestWsHostOriginGuardOrigins:
     def test_gated_same_host_https_origin_allowed(self, gated_app):
         ws = self._ws(origin="https://fly-app.fly.dev", host="fly-app.fly.dev")
         assert web_server._ws_host_origin_is_allowed(ws) is True
-
-
-class TestSidecarUrl:
-    def test_loopback_uses_session_token(self, loopback_app):
-        url = web_server._build_sidecar_url("ch-1")
-        assert url is not None
-        assert f"token={web_server._SESSION_TOKEN}" in url
-        assert "ticket=" not in url
-
-    def test_gated_returns_no_control_plane_sidecar_url(self, gated_app):
-        """Authenticated Control Plane children must run inside an Owner Worker."""
-        assert web_server._build_sidecar_url("ch-1") is None
-
-    def test_no_bound_host_returns_none(self, gated_app):
-        web_server.app.state.bound_host = None
-        try:
-            assert web_server._build_sidecar_url("ch") is None
-        finally:
-            web_server.app.state.bound_host = "fly-app.fly.dev"
-
-
-# ---------------------------------------------------------------------------
-# _build_gateway_ws_url — the TUI child's primary JSON-RPC backend WS.
-# Loopback uses ?token=; authenticated Control Plane mode returns no URL because
-# the owner worker creates an owner-bound internal capability instead.
-# ---------------------------------------------------------------------------
-
-
-class TestGatewayWsUrl:
-    def test_loopback_uses_session_token(self, loopback_app):
-        url = web_server._build_gateway_ws_url()
-        assert url is not None
-        assert "/api/ws?" in url
-        assert f"token={web_server._SESSION_TOKEN}" in url
-        assert "internal=" not in url
-
-    def test_gated_returns_no_control_plane_gateway_url(self, gated_app):
-        """Authenticated Control Plane children must run inside an Owner Worker."""
-        assert web_server._build_gateway_ws_url() is None
-
-    def test_no_bound_host_returns_none(self, gated_app):
-        web_server.app.state.bound_host = None
-        try:
-            assert web_server._build_gateway_ws_url() is None
-        finally:
-            web_server.app.state.bound_host = "fly-app.fly.dev"

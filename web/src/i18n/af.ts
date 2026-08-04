@@ -273,10 +273,9 @@ export const af: Translations = {
     triggerNow: "Voer nou uit",
     delivery: {
       local: "Plaaslik",
-      telegram: "Telegram",
-      discord: "Discord",
-      slack: "Slack",
-      email: "Email",
+      weixin_ilink: "Weixin iLink",
+      feishu: "Feishu",
+      webhook: "Webhook",
     },
   },
 
@@ -408,7 +407,6 @@ export const af: Translations = {
       tts: "Teks-na-Spraak",
       stt: "Spraak-na-Teks",
       logging: "Aantekening",
-      discord: "Discord",
       auxiliary: "Hulpmiddels",
     },
   },

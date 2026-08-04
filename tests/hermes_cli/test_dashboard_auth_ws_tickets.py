@@ -401,7 +401,7 @@ class TestSignedClaims:
         )
 
         with pytest.raises(TicketInvalid, match="ticket_audience_mismatch"):
-            verify_ticket(ticket, audience=browser_ws_audience("/api/pty"))
+            verify_ticket(ticket, audience=browser_ws_audience("/api/pub"))
 
 
 class TestSingleUse:

@@ -312,7 +312,7 @@ class TestTransparentRefreshOnAccessTokenEviction:
         )
         return provider, valid_rt
 
-    def test_rt_only_gui_chat_document_refreshes_and_schedules_warmup(
+    def test_rt_only_chat_document_refreshes_and_schedules_warmup(
         self, gated_app, monkeypatch
     ):
         from hermes_cli.owner_worker import readiness
@@ -328,7 +328,7 @@ class TestTransparentRefreshOnAccessTokenEviction:
         )
 
         response = gated_app.get(
-            "/chat-gui",
+            "/chat",
             headers={"Accept": "text/html", "Sec-Fetch-Dest": "document"},
             follow_redirects=False,
         )

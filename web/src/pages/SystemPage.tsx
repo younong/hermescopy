@@ -15,7 +15,6 @@ import {
   Link2,
   Play,
   Plus,
-  Power,
   RotateCw,
   Server,
   Share2,
@@ -95,7 +94,7 @@ function backupFileName(path: string | null): string {
 
 /**
  * Live action-log viewer for the spawn-based admin actions (doctor, audit,
- * backup, import, skills update, checkpoints prune, gateway start/stop).
+ * backup, import, skills update, and checkpoints prune).
  * Polls /api/actions/<name>/status until the process exits.
  */
 function ActionLogViewer({
@@ -383,26 +382,6 @@ export default function SystemPage() {
       showToast("Account updated", "success");
     } catch (error) {
       showToast(`Account update failed: ${error}`, "error");
-    }
-  };
-
-  // ── Gateway lifecycle ──────────────────────────────────────────────
-  const runGateway = async (verb: "start" | "stop" | "restart") => {
-    try {
-      if (verb === "start") {
-        await api.startGateway();
-        setActiveAction("gateway-start");
-      } else if (verb === "stop") {
-        await api.stopGateway();
-        setActiveAction("gateway-stop");
-      } else {
-        await api.restartGateway();
-        setActiveAction("gateway-restart");
-      }
-      showToast(`Gateway ${verb} started`, "success");
-      setTimeout(loadAll, 3000);
-    } catch (e) {
-      showToast(`Gateway ${verb} failed: ${e}`, "error");
     }
   };
 
@@ -738,7 +717,6 @@ export default function SystemPage() {
     );
   }
 
-  const gatewayRunning = status?.gateway_running;
   const canUpdateHermes = status?.can_update_hermes !== false;
   const validEvents = hooks?.valid_events?.length
     ? hooks.valid_events
@@ -1238,55 +1216,6 @@ export default function SystemPage() {
                 onClick={() => runOp(api.runCurator, "Curator review")}
               >
                 Run now
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
-      </section>
-
-      {/* ── Gateway ───────────────────────────────────────────────── */}
-      <section className="flex flex-col gap-3">
-        <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
-          <Power className="h-4 w-4" /> Gateway
-        </H2>
-        <Card>
-          <CardContent className="flex items-center justify-between py-4">
-            <div className="flex items-center gap-3">
-              <Badge tone={gatewayRunning ? "success" : "secondary"}>
-                {gatewayRunning ? "running" : "stopped"}
-              </Badge>
-              <span className="text-sm text-muted-foreground">
-                {status?.gateway_state ?? "—"}
-                {status?.gateway_pid ? ` · pid ${status.gateway_pid}` : ""}
-              </span>
-            </div>
-            <div className="flex items-center gap-2">
-              <Button
-                size="sm"
-                className="uppercase"
-                onClick={() => runGateway("start")}
-                disabled={gatewayRunning}
-                prefix={<Play className="h-3.5 w-3.5" />}
-              >
-                Start
-              </Button>
-              <Button
-                size="sm"
-                className="uppercase"
-                onClick={() => runGateway("restart")}
-                prefix={<RotateCw className="h-3.5 w-3.5" />}
-              >
-                Restart
-              </Button>
-              <Button
-                size="sm"
-                className="uppercase text-warning"
-                ghost
-                onClick={() => runGateway("stop")}
-                disabled={!gatewayRunning}
-                prefix={<Power className="h-3.5 w-3.5" />}
-              >
-                Stop
               </Button>
             </div>
           </CardContent>

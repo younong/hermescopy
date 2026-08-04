@@ -11,7 +11,7 @@ import {
 } from "react";
 
 /**
- * Slash-command autocomplete popover, rendered above the composer in ChatPage.
+ * Slash-command autocomplete popover, rendered above the chat composer.
  * Mirrors the completion UX of the Ink TUI — type `/`, see matching commands,
  * arrow keys or click to select, Tab to apply, Enter to submit.
  *

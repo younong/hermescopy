@@ -27,6 +27,22 @@ class TestChannelConnectorValidation:
         })
         assert any("enabled should be a boolean" in issue.message for issue in issues)
 
+    def test_webhook_is_retained_and_requires_mapping_with_boolean_enabled(self):
+        assert validate_config_structure({
+            "channel_connectors": {"webhook": {"enabled": True}},
+        }) == []
+        mapping_issues = validate_config_structure({
+            "channel_connectors": {"webhook": True},
+        })
+        assert any("webhook should be a dict" in issue.message for issue in mapping_issues)
+        boolean_issues = validate_config_structure({
+            "channel_connectors": {"webhook": {"enabled": "true"}},
+        })
+        assert any(
+            "webhook.enabled should be a boolean" in issue.message
+            for issue in boolean_issues
+        )
+
     @pytest.mark.parametrize(
         ("key", "value"),
         [

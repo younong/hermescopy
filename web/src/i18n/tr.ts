@@ -273,10 +273,9 @@ export const tr: Translations = {
     triggerNow: "Şimdi tetikle",
     delivery: {
       local: "Yerel",
-      telegram: "Telegram",
-      discord: "Discord",
-      slack: "Slack",
-      email: "Email",
+      weixin_ilink: "Weixin iLink",
+      feishu: "Feishu",
+      webhook: "Webhook",
     },
   },
 
@@ -408,7 +407,6 @@ export const tr: Translations = {
       tts: "Metinden Konuşmaya",
       stt: "Konuşmadan Metne",
       logging: "Günlükleme",
-      discord: "Discord",
       auxiliary: "Yardımcı",
     },
   },

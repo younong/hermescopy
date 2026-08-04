@@ -273,10 +273,9 @@ export const uk: Translations = {
     triggerNow: "Запустити зараз",
     delivery: {
       local: "Локально",
-      telegram: "Telegram",
-      discord: "Discord",
-      slack: "Slack",
-      email: "Email",
+      weixin_ilink: "Weixin iLink",
+      feishu: "Feishu",
+      webhook: "Webhook",
     },
   },
 
@@ -409,7 +408,6 @@ export const uk: Translations = {
       tts: "Синтез мовлення",
       stt: "Розпізнавання мовлення",
       logging: "Журналювання",
-      discord: "Discord",
       auxiliary: "Додатково",
     },
   },

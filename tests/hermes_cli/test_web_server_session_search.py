@@ -53,14 +53,18 @@ class _FakeSessionDB:
         # No compression chains in this fixture — every session is its own root.
         return {"id": session_id, "parent_session_id": None}
 
-    def get_compression_tip(self, session_id):
-        return session_id
+    def compression_lineage(self, session_ids, *, recovery_scope=None):
+        assert recovery_scope is None
+        return {
+            session_id: {"root": session_id, "tip": session_id}
+            for session_id in session_ids
+        }
 
     def close(self):
         self.closed = True
 
 
-def test_desktop_session_search_merges_id_matches_before_content_matches(monkeypatch):
+def test_session_search_merges_id_matches_before_content_matches(monkeypatch):
     monkeypatch.setattr("hermes_state.SessionDB", _FakeSessionDB)
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(auth_required=False)))
 

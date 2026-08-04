@@ -8,8 +8,8 @@ Config stored in ~/.hermes/config.yaml under:
   skills:
     disabled: [skill-a, skill-b]          # global disabled list
     platform_disabled:                    # per-platform overrides
-      telegram: [skill-c]
-      cli: []
+      feishu: [skill-c]
+      weixin_ilink: []
 """
 from typing import List, Optional, Set
 
@@ -17,10 +17,7 @@ from hermes_cli.config import cfg_get, load_config, save_config
 from hermes_cli.colors import Colors, color
 from hermes_cli.platforms import PLATFORMS as _PLATFORMS
 
-# Backward-compatible view: {key: label_string} so existing code that
-# iterates ``PLATFORMS.items()`` or calls ``PLATFORMS.get(key)`` keeps
-# working without changes to every call site.
-PLATFORMS = {k: info.label for k, info in _PLATFORMS.items() if k != "api_server"}
+PLATFORMS = {k: info.label for k, info in _PLATFORMS.items()}
 
 # ─── Config Helpers ───────────────────────────────────────────────────────────
 
