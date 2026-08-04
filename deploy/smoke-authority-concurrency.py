@@ -24,7 +24,7 @@ from hermes_cli.dashboard_auth.authority import (
 
 SCHEMA_VERSION = 1
 KIND = "hermes.authority-concurrency-smoke"
-_AUTHORITY_SCHEMA_VERSION = 6
+_AUTHORITY_SCHEMA_VERSION = 9
 _WORKERS = 8
 _WAIT_SECONDS = 15
 _REQUIRED_TABLES = frozenset({
@@ -38,6 +38,8 @@ _REQUIRED_TABLES = frozenset({
     "owner_worker_changes",
     "session_reader_generations",
     "session_reader_leases",
+    "authenticated_owners",
+    "machine_credentials",
 })
 
 
