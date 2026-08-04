@@ -12592,7 +12592,7 @@ def _write_dashboard_ready_file(actual_port: int) -> None:
 
 
 def _maybe_open_browser(
-    host: str, actual_port: int, open_browser: bool, initial_profile: str
+    host: str, actual_port: int, open_browser: bool
 ) -> None:
     """Open the dashboard URL in the user's browser if appropriate.
 
@@ -12892,7 +12892,7 @@ def start_server(
         # A forced loopback gate normally serves an SSH tunnel and must not
         # trust forwarded metadata by default. An explicit trusted-proxy mode
         # accepts it only from loopback peers and requires a declared public URL.
-        proxy_headers=public_bind_requires_auth or trust_proxy_headers,
+        proxy_headers=trust_proxy_headers,
         **(
             {"forwarded_allow_ips": "127.0.0.1,::1"}
             if trust_proxy_headers
@@ -12930,7 +12930,7 @@ def start_server(
             _write_dashboard_ready_file(actual_port)
             print(f"HERMES_DASHBOARD_READY port={actual_port}", flush=True)
             print(f"  Hermes Web UI → http://{host}:{actual_port}")
-            _maybe_open_browser(host, actual_port, open_browser, initial_profile)
+            _maybe_open_browser(host, actual_port, open_browser)
 
             # Collapse the peer-hangup teardown flood (#50005). When the Desktop
             # forcibly closes its WebSocket mid-write, asyncio logs a full
