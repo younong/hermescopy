@@ -695,7 +695,12 @@ def run_smoke(
         stage = time.monotonic()
         created = gateway.request(
             "session.create",
-            {"cols": 96, "model": MODEL, "provider": "custom"},
+            {
+                "cols": 96,
+                "model": MODEL,
+                "provider": "custom",
+                "source": "dashboard-gui",
+            },
         )
         sid = str(created.get("session_id") or "")
         stored_id = str(created.get("stored_session_id") or "")

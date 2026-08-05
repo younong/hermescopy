@@ -63,7 +63,9 @@ def test_deterministic_conversation_smoke_exercises_authenticated_web_flow():
     assert checks["prompt_stream"]["deltaCount"] >= 1
     assert checks["prompt_stream"]["attachmentRequestCount"] == 2
     assert checks["config_propagation"]["provider"] == "custom:hermes-smoke"
-    assert '"command": "rm -r /workspace/protected"' in SMOKE.read_text()
+    source = SMOKE.read_text()
+    assert '"source": "dashboard-gui"' in source
+    assert '"command": "rm -r /workspace/protected"' in source
 
 
 def test_deterministic_smoke_uses_environment_temporary_directory(monkeypatch, tmp_path):
