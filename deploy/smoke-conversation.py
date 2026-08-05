@@ -177,7 +177,7 @@ class ModelStub:
                 return self._text_chunks(["approval ", "denied safely"])
             return self._tool_chunk(
                 "terminal",
-                {"command": "rm -rf /workspace/protected", "timeout": 5},
+                {"command": "rm -r /workspace/protected", "timeout": 5},
                 "call-dangerous",
             )
 
@@ -758,7 +758,8 @@ def run_smoke(
         stage = time.monotonic()
         gateway.request("prompt.submit", {"session_id": sid, "text": "approval-deny"})
         approval = gateway.wait_event("approval.request", session_id=sid)
-        if "rm -rf" not in str(_event_payload(approval).get("command") or ""):
+        approval_command = str(_event_payload(approval).get("command") or "")
+        if "rm -r" not in approval_command or "/workspace/protected" not in approval_command:
             raise SmokeFailure("approval_contract_failed", "approval_deny", "Dangerous command did not request approval")
         resolved = gateway.request("approval.respond", {"session_id": sid, "choice": "deny"})
         if int(resolved.get("resolved") or 0) != 1:
