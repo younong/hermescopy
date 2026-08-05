@@ -14,6 +14,7 @@ import os
 import sys
 import time
 import urllib.parse
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -114,8 +115,13 @@ class CronJobUpdate(BaseModel):
     owner_key: str | None = None
 
 
+class CronTick(BaseModel):
+    tick_id: str
+
+
 class CronJobFire(BaseModel):
     job_id: str
+    fire_id: str
 
 
 class ModelRegistrationPayload(BaseModel):
@@ -362,9 +368,13 @@ def create_app(
                 None,
             )
             if runtime is not None:
-                from tui_gateway.server import force_owner_worker_gateway_drain
+                from tui_gateway.server import (
+                    _shutdown_sessions,
+                    force_owner_worker_gateway_drain,
+                )
 
                 _cleanup(lambda: force_owner_worker_gateway_drain(runtime))
+                _cleanup(lambda: _shutdown_sessions(runtime))
             os.environ.pop("HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL", None)
             if relay is not None:
                 _cleanup(relay.close)
@@ -957,6 +967,17 @@ def create_app(
             raise _files_error(exc) from exc
         return {"ok": True, "path": _visible_file_path(relative_path), "root": "", "locked_root": "", "can_change_path": False}
 
+    def _session_recovery_scope() -> dict[str, Any] | None:
+        if socket_path is None:
+            return None
+        from gateway.session import current_historical_resume_scope
+        from hermes_cli.session_sources import retained_recovery_scope
+
+        scope = current_historical_resume_scope()
+        if scope is None:
+            raise HTTPException(status_code=403, detail="owner recovery scope is unavailable")
+        return retained_recovery_scope(scope)
+
     @app.get("/api/sessions")
     def get_sessions(
         request: Request,
@@ -975,11 +996,9 @@ def create_app(
         _: None = Depends(_require_owner_token),
     ) -> dict[str, Any]:
         _reject_profile(profile)
-        from gateway.session import current_historical_resume_scope
-
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
-            scope = current_historical_resume_scope()
             return session_api.list_sessions_payload(
                 db,
                 limit=limit,
@@ -992,7 +1011,7 @@ def create_app(
                 cwd_prefix=cwd_prefix,
                 active_from=active_from,
                 active_before=active_before,
-                recovery_scope=(scope if socket_path is not None and scope is not None else None),
+                recovery_scope=recovery_scope,
                 compact=compact,
                 latency_trace_id=request.headers.get("x-request-id", ""),
             )
@@ -1006,12 +1025,7 @@ def create_app(
         _: None = Depends(_require_owner_token),
     ) -> dict[str, Any]:
         _reject_profile(profile)
-        from gateway.session import current_historical_resume_scope
-
-        scope = current_historical_resume_scope()
-        recovery_scope = scope if socket_path is not None and scope is not None else None
-        if socket_path is not None and recovery_scope is None:
-            raise HTTPException(status_code=403, detail="owner recovery scope is unavailable")
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
             return session_api.session_composition_payload(
@@ -1023,45 +1037,68 @@ def create_app(
     @app.get("/api/sessions/search")
     def search_sessions(q: str = "", limit: int = 20, profile: str | None = None, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(profile)
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
-            return session_api.search_sessions_payload(db, q=q, limit=limit)
+            return session_api.search_sessions_payload(
+                db,
+                q=q,
+                limit=limit,
+                recovery_scope=recovery_scope,
+            )
         finally:
             db.close()
 
     @app.post("/api/sessions/bulk-delete")
     def bulk_delete_sessions(body: BulkDeleteSessions, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(body.profile)
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
-            return session_api.bulk_delete_payload(db, body.ids)
+            return session_api.bulk_delete_payload(
+                db,
+                body.ids,
+                recovery_scope=recovery_scope,
+            )
         finally:
             db.close()
 
     @app.get("/api/sessions/empty/count")
     def count_empty_sessions(profile: str | None = None, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(profile)
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
-            return session_api.empty_count_payload(db)
+            return session_api.empty_count_payload(
+                db,
+                recovery_scope=recovery_scope,
+            )
         finally:
             db.close()
 
     @app.delete("/api/sessions/empty")
     def delete_empty_sessions(profile: str | None = None, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(profile)
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
-            return session_api.delete_empty_payload(db)
+            return session_api.delete_empty_payload(
+                db,
+                recovery_scope=recovery_scope,
+            )
         finally:
             db.close()
 
     @app.get("/api/sessions/stats")
     def get_session_stats(profile: str | None = None, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(profile)
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
-            return session_api.stats_payload(db)
+            return session_api.stats_payload(
+                db,
+                recovery_scope=recovery_scope,
+            )
         finally:
             db.close()
 
@@ -1087,12 +1124,6 @@ def create_app(
         finally:
             db.close()
 
-    @app.get("/api/profiles")
-    def get_profiles(_: None = Depends(_require_owner_token)) -> dict[str, Any]:
-        from hermes_cli.dashboard_owner_payloads import owner_singleton_profile_payload
-
-        return owner_singleton_profile_payload(owner_home)
-
     @app.get("/api/config")
     def get_config(profile: str | None = None, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(profile)
@@ -1101,31 +1132,194 @@ def create_app(
 
         return normalize_config_for_web(load_config())
 
+    class _CronGatewayTransport:
+        def __init__(self) -> None:
+            import queue
+
+            self.frames = queue.Queue()
+
+        def write(self, frame: dict) -> bool:
+            self.frames.put(frame)
+            return True
+
+        def close(self) -> None:
+            return None
+
+        def wait_for(self, predicate, *, timeout: float = 1800.0) -> dict:
+            import queue
+
+            deadline = time.monotonic() + timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("cron gateway dispatch timed out")
+                try:
+                    frame = self.frames.get(timeout=remaining)
+                except queue.Empty as exc:
+                    raise TimeoutError("cron gateway dispatch timed out") from exc
+                if predicate(frame):
+                    return frame
+
+    def _gateway_call(transport: _CronGatewayTransport, method: str, params: dict) -> dict:
+        from tui_gateway.server import dispatch
+
+        request_id = f"cron-{uuid.uuid4().hex}"
+        response = dispatch(
+            {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
+            transport=transport,
+            runtime=app.state.owner_worker_live_state.gateway_runtime,
+        )
+        if response is None:
+            response = transport.wait_for(lambda frame: frame.get("id") == request_id)
+        if response.get("error"):
+            raise RuntimeError(str(response["error"].get("message") or "gateway call failed"))
+        return response.get("result") or {}
+
+    def _cron_job_workdir(job: dict) -> str | None:
+        raw = str(job.get("workdir") or "").strip()
+        if not raw:
+            return None
+        candidate = Path(raw).expanduser().resolve()
+        workspace_root = runtime_paths.workspace_root.resolve()
+        try:
+            candidate.relative_to(workspace_root)
+        except ValueError as exc:
+            raise ValueError("cron workdir is outside the Owner workspace") from exc
+        if not candidate.is_dir():
+            raise ValueError("cron workdir is not a directory")
+        return str(candidate)
+
+    def _run_agent_cron_job(job: dict, fire_id: str) -> dict | None:
+        from cron.scheduler import _build_job_prompt, complete_job_run
+
+        transport = _CronGatewayTransport()
+        try:
+            prompt = _build_job_prompt(job)
+            if prompt is None:
+                return complete_job_run(
+                    job,
+                    success=True,
+                    output="",
+                    final_response="[SILENT]",
+                    fire_id=fire_id,
+                )
+            created = _gateway_call(
+                transport,
+                "session.create",
+                {
+                    "source": "cron",
+                    "title": str(job.get("name") or "Scheduled job"),
+                    "cwd": _cron_job_workdir(job),
+                    "close_on_disconnect": True,
+                    **({"model": job["model"]} if job.get("model") else {}),
+                    **({"provider": job["provider"]} if job.get("provider") else {}),
+                },
+            )
+            session_id = str(created["session_id"])
+            _gateway_call(
+                transport,
+                "prompt.submit",
+                {
+                    "session_id": session_id,
+                    "text": prompt,
+                    "idempotency_key": fire_id,
+                },
+            )
+            frame = transport.wait_for(
+                lambda item: item.get("method") == "event"
+                and (item.get("params") or {}).get("type") == "message.complete"
+                and (item.get("params") or {}).get("session_id") == session_id
+            )
+            payload = (frame.get("params") or {}).get("payload") or {}
+            text = str(payload.get("text") or "")
+            status = str(payload.get("status") or "")
+            success = status == "complete"
+            output = (
+                f"# Cron Job: {job.get('name') or job['id']}\n\n"
+                f"**Job ID:** {job['id']}\n\n{text}\n"
+            )
+            return complete_job_run(
+                job,
+                success=success,
+                output=output,
+                final_response=text,
+                error=None if success else f"Agent turn ended with status {status or 'unknown'}",
+                fire_id=fire_id,
+            )
+        finally:
+            transport.close()
+
+    def _pending_cron_deliveries() -> list[dict]:
+        from cron.jobs import CronStore, pending_deliveries, use_store
+
+        with use_store(CronStore(owner_home)):
+            return pending_deliveries()
+
+    def _fire_cron_job(job_id: str, fire_id: str) -> tuple[bool, dict | None]:
+        from cron.jobs import CronStore, claim_job_for_fire, get_job, use_store
+        from cron.scheduler import run_one_job
+
+        with use_store(CronStore(owner_home)):
+            if not claim_job_for_fire(job_id, fire_id=fire_id):
+                return False, None
+            job = get_job(job_id)
+            if job is None:
+                return False, None
+            if job.get("no_agent"):
+                executed = run_one_job(job, fire_id=fire_id, verbose=False)
+                pending = _pending_cron_deliveries()
+                delivery = next(
+                    (item for item in pending if item.get("fire_id") == fire_id),
+                    None,
+                )
+                return executed, delivery
+            return True, _run_agent_cron_job(job, fire_id)
+
     @app.post("/internal/cron/tick")
-    def tick_cron_jobs(_: None = Depends(_require_owner_token)) -> dict[str, int]:
-        from hermes_cli.cron_management import cron_home_scope
+    def tick_cron_jobs(
+        body: CronTick,
+        _: None = Depends(_require_owner_token),
+    ) -> dict[str, Any]:
+        from cron.jobs import CronStore, use_store
+        from cron.scheduler import due_jobs_for_tick
 
-        with cron_home_scope(owner_home):
-            from cron.scheduler import tick
-
-            return {"executed": tick(verbose=False, adapters=None, loop=None, sync=True)}
+        executed = 0
+        with use_store(CronStore(owner_home)):
+            due_jobs = due_jobs_for_tick()
+        for job in due_jobs:
+            scheduled_at = str(job.get("next_run_at") or body.tick_id)
+            fire_id = f"cron:{owner_key}:{job['id']}:{scheduled_at}"
+            did_execute, _ = _fire_cron_job(job["id"], fire_id)
+            executed += int(did_execute)
+        return {"executed": executed, "deliveries": _pending_cron_deliveries()}
 
     @app.post("/internal/cron/fire")
     def fire_cron_job(
         body: CronJobFire,
         _: None = Depends(_require_owner_token),
+    ) -> dict[str, Any]:
+        if not body.fire_id.strip():
+            raise HTTPException(status_code=400, detail="fire_id is required")
+        executed, delivery = _fire_cron_job(body.job_id, body.fire_id)
+        deliveries = [delivery] if delivery is not None else _pending_cron_deliveries()
+        response: dict[str, Any] = {"executed": executed}
+        if deliveries:
+            response["deliveries"] = deliveries
+        return response
+
+    @app.post("/internal/cron/delivery/{fire_id}/ack")
+    def ack_cron_delivery(
+        fire_id: str,
+        body: dict[str, Any],
+        _: None = Depends(_require_owner_token),
     ) -> dict[str, bool]:
-        from hermes_cli.cron_management import cron_home_scope
+        from cron.jobs import CronStore, record_delivery_result, use_store
 
-        with cron_home_scope(owner_home):
-            from cron.scheduler_provider import resolve_cron_scheduler
-
-            ran = resolve_cron_scheduler().fire_due(
-                body.job_id,
-                adapters=None,
-                loop=None,
-            )
-        return {"executed": bool(ran)}
+        error = body.get("error")
+        if error is not None and not isinstance(error, str):
+            raise HTTPException(status_code=400, detail="delivery error must be text")
+        with use_store(CronStore(owner_home)):
+            return {"recorded": record_delivery_result(fire_id, error=error)}
 
     @app.get("/api/cron/jobs")
     def list_cron_jobs(
@@ -1516,6 +1710,7 @@ def create_app(
     @app.post("/api/sessions/prune")
     def prune_sessions(body: SessionPrune, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(body.profile)
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
             return session_api.prune_sessions_payload(
@@ -1523,6 +1718,7 @@ def create_app(
                 older_than_days=body.older_than_days,
                 source=body.source,
                 sessions_dir=owner_home / "sessions",
+                recovery_scope=recovery_scope,
             )
         finally:
             db.close()
@@ -1533,8 +1729,6 @@ def create_app(
         session_id: str,
         _: None = Depends(_require_owner_token),
     ) -> dict[str, Any]:
-        from gateway.session import current_historical_resume_scope
-
         latency_started_at = time.monotonic()
         latency_trace_id = request.headers.get("x-request-id", "")
         log_latency_stage(
@@ -1543,21 +1737,14 @@ def create_app(
             surface="latest-descendant",
             stage="request.received",
         )
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
-            scope = current_historical_resume_scope()
-            # Direct in-process app construction is test-only and may create
-            # legacy owner-local rows before the gateway writes complete durable
-            # metadata. Production app construction receives a UDS socket from
-            # the supervisor and always enforces the historical scope.
-            if socket_path is None or scope is None:
-                payload = session_api.latest_descendant_payload(db, session_id)
-            else:
-                payload = session_api.latest_descendant_payload(
-                    db,
-                    session_id,
-                    recovery_scope=scope,
-                )
+            payload = session_api.latest_descendant_payload(
+                db,
+                session_id,
+                recovery_scope=recovery_scope,
+            )
             log_latency_stage(
                 _log,
                 trace_id=latency_trace_id,
@@ -1578,17 +1765,15 @@ def create_app(
         _: None = Depends(_require_owner_token),
     ) -> dict[str, Any]:
         _reject_profile(profile)
-        from gateway.session import current_historical_resume_scope
-
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
-            scope = current_historical_resume_scope()
             return session_api.session_messages_payload(
                 db,
                 session_id,
                 limit=limit,
                 before=before,
-                recovery_scope=(scope if socket_path is not None and scope is not None else None),
+                recovery_scope=recovery_scope,
             )
         finally:
             db.close()
@@ -1596,36 +1781,58 @@ def create_app(
     @app.get("/api/sessions/{session_id}/export")
     def export_session(session_id: str, profile: str | None = None, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(profile)
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
-            return session_api.export_session_payload(db, session_id)
+            return session_api.export_session_payload(
+                db,
+                session_id,
+                recovery_scope=recovery_scope,
+            )
         finally:
             db.close()
 
     @app.patch("/api/sessions/{session_id}")
     def rename_session(session_id: str, body: SessionRename, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(body.profile)
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
-            return session_api.rename_session_payload(db, session_id, title=body.title, archived=body.archived)
+            return session_api.rename_session_payload(
+                db,
+                session_id,
+                title=body.title,
+                archived=body.archived,
+                recovery_scope=recovery_scope,
+            )
         finally:
             db.close()
 
     @app.delete("/api/sessions/{session_id}")
     def delete_session(session_id: str, profile: str | None = None, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(profile)
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
-            return session_api.delete_session_payload(db, session_id)
+            return session_api.delete_session_payload(
+                db,
+                session_id,
+                recovery_scope=recovery_scope,
+            )
         finally:
             db.close()
 
     @app.get("/api/sessions/{session_id}")
     def get_session_detail(session_id: str, profile: str | None = None, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(profile)
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
-            return session_api.session_detail_payload(db, session_id)
+            return session_api.session_detail_payload(
+                db,
+                session_id,
+                recovery_scope=recovery_scope,
+            )
         finally:
             db.close()
 

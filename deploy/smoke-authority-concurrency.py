@@ -24,7 +24,7 @@ from hermes_cli.dashboard_auth.authority import (
 
 SCHEMA_VERSION = 1
 KIND = "hermes.authority-concurrency-smoke"
-_AUTHORITY_SCHEMA_VERSION = 6
+_AUTHORITY_SCHEMA_VERSION = 9
 _WORKERS = 8
 _WAIT_SECONDS = 15
 _REQUIRED_TABLES = frozenset({
@@ -38,6 +38,8 @@ _REQUIRED_TABLES = frozenset({
     "owner_worker_changes",
     "session_reader_generations",
     "session_reader_leases",
+    "authenticated_owners",
+    "machine_credentials",
 })
 
 
@@ -59,6 +61,14 @@ def _elapsed_ms(started_ns: int, clock_ns: Callable[[], int]) -> float:
 
 def _record(checks: list[dict[str, Any]], name: str, **details: Any) -> None:
     checks.append({"name": name, "status": "passed", **details})
+
+
+def _path_absent(path: Path) -> bool:
+    try:
+        path.stat()
+    except (FileNotFoundError, PermissionError):
+        return True
+    return False
 
 
 def _scope() -> AuthorizationScope:
@@ -447,7 +457,7 @@ def run_smoke(
         cleanup["executorStopped"] = True
         if created_root:
             shutil.rmtree(temporary_root, ignore_errors=True)
-        cleanup["temporaryRootRemoved"] = not temporary_root.exists()
+        cleanup["temporaryRootRemoved"] = _path_absent(temporary_root)
 
     if not all(cleanup.values()) and failure is None:
         failure = SmokeFailure(

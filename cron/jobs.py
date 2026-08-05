@@ -6,6 +6,7 @@ Output is saved to ~/.hermes/cron/output/{job_id}/{timestamp}.md
 """
 
 import contextlib
+import contextvars
 import copy
 import json
 import logging
@@ -29,9 +30,9 @@ try:
     import msvcrt
 except ImportError:  # pragma: no cover - non-Windows
     msvcrt = None
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from hermes_constants import get_hermes_home
 from typing import Optional, Dict, List, Any, Set, Tuple, Union
 
 logger = logging.getLogger(__name__)
@@ -49,48 +50,74 @@ except ImportError:
 # Configuration
 # =============================================================================
 
-# Cron is per-profile by design (issue #4707). Each profile owns its own cron
-# store under its own HERMES_HOME, and a profile-scoped gateway runs that
-# profile's jobs under that same HERMES_HOME — so a job authored in profile
-# `coder` lives in `~/.hermes/profiles/coder/cron/jobs.json` and executes with
-# `coder`'s `.env`, `config.yaml`, and skills. We deliberately anchor on
-# `get_hermes_home()` (the active profile home), NOT `get_default_hermes_root()`
-# (the shared root). Anchoring at the root would funnel every profile's jobs
-# into one shared `jobs.json` and run them under whatever HERMES_HOME the
-# ticker process happens to have — leaking config/credentials/skills across
-# profiles (the security boundary #4707 was filed for). Do NOT change this to
-# the default root: that re-breaks per-profile isolation. See also the dynamic
-# `_get_hermes_home()` / `_get_lock_paths()` resolution in cron/scheduler.py.
-HERMES_DIR = get_hermes_home().resolve()
-CRON_DIR = HERMES_DIR / "cron"
-JOBS_FILE = CRON_DIR / "jobs.json"
-# Heartbeat file the in-process ticker touches on every loop iteration. The
-# gateway process and the (separate) ``hermes cron status`` process share it
-# so status can tell whether the ticker THREAD is alive, not just whether the
-# gateway PROCESS exists — a ticker that dies silently inside a live gateway
-# would otherwise report healthy (#32612, #32895).
-TICKER_HEARTBEAT_FILE = CRON_DIR / "ticker_heartbeat"
-# Last tick that completed WITHOUT raising. Distinguishing this from the plain
-# heartbeat lets status detect a ticker that is alive but failing every tick.
-TICKER_SUCCESS_FILE = CRON_DIR / "ticker_last_success"
-# Default ticker loop interval (seconds). The single source of truth shared by
-# the in-process ticker (cron/scheduler_provider.py) and the staleness
-# threshold in `hermes cron status` (hermes_cli/cron.py), so the two never
-# drift apart.
+@dataclass(frozen=True)
+class CronStore:
+    """Explicit Owner-scoped cron storage paths."""
+
+    owner_home: Path
+
+    def __init__(self, owner_home: str | Path):
+        object.__setattr__(self, "owner_home", Path(owner_home).expanduser().resolve())
+
+    @property
+    def cron_dir(self) -> Path:
+        return self.owner_home / "cron"
+
+    @property
+    def jobs_file(self) -> Path:
+        return self.cron_dir / "jobs.json"
+
+    @property
+    def output_dir(self) -> Path:
+        return self.cron_dir / "output"
+
+    @property
+    def deliveries_file(self) -> Path:
+        return self.cron_dir / "deliveries.json"
+
+    @property
+    def ticker_heartbeat_file(self) -> Path:
+        return self.cron_dir / "ticker_heartbeat"
+
+    @property
+    def ticker_success_file(self) -> Path:
+        return self.cron_dir / "ticker_last_success"
+
+
+_active_store: contextvars.ContextVar[CronStore | None] = contextvars.ContextVar(
+    "cron_store", default=None
+)
+
+
+def current_store() -> CronStore:
+    """Return the explicitly bound Owner store or fail closed."""
+    store = _active_store.get()
+    if store is None:
+        raise RuntimeError("CronStore(owner_home) must be bound with use_store()")
+    return store
+
+
+@contextlib.contextmanager
+def use_store(store: CronStore):
+    token = _active_store.set(store)
+    try:
+        yield store
+    finally:
+        _active_store.reset(token)
+
+
+# Default ticker loop interval (seconds).
 TICKER_INTERVAL_SECONDS = 60
 
 # In-process lock protecting load_jobs→modify→save_jobs cycles.
-# Required when tick() runs jobs in parallel threads — without this,
-# concurrent mark_job_run / advance_next_run calls can clobber each other.
 _jobs_file_lock = threading.RLock()
 _jobs_lock_state = threading.local()
-OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
 
 def _jobs_lock_file() -> Path:
-    """Return the advisory lock path for the current cron directory."""
-    return CRON_DIR / ".jobs.lock"
+    """Return the advisory lock path for the current cron store."""
+    return current_store().cron_dir / ".jobs.lock"
 
 
 @contextlib.contextmanager
@@ -175,7 +202,7 @@ def _job_output_dir(job_id: str) -> Path:
         raise ValueError(f"Invalid cron job id for output path: {job_id!r}")
     if Path(text).is_absolute() or Path(text).drive:
         raise ValueError(f"Invalid cron job id for output path: {job_id!r}")
-    return OUTPUT_DIR / text
+    return current_store().output_dir / text
 
 
 def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = None) -> List[str]:
@@ -281,11 +308,12 @@ def _secure_file(path: Path):
 
 
 def ensure_dirs():
-    """Ensure cron directories exist with secure permissions."""
-    CRON_DIR.mkdir(parents=True, exist_ok=True)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    _secure_dir(CRON_DIR)
-    _secure_dir(OUTPUT_DIR)
+    """Ensure the active Owner's cron directories exist securely."""
+    store = current_store()
+    store.cron_dir.mkdir(parents=True, exist_ok=True)
+    store.output_dir.mkdir(parents=True, exist_ok=True)
+    _secure_dir(store.cron_dir)
+    _secure_dir(store.output_dir)
 
 
 # =============================================================================
@@ -574,7 +602,7 @@ def _atomic_write_epoch(path: Path) -> None:
     torn/truncated file. Best-effort: failures are swallowed by callers.
     """
     ensure_dirs()
-    fd, tmp_path = tempfile.mkstemp(dir=str(CRON_DIR), suffix=".tmp", prefix=".hb_")
+    fd, tmp_path = tempfile.mkstemp(dir=str(current_store().cron_dir), suffix=".tmp", prefix=".hb_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(str(time.time()))
@@ -601,13 +629,14 @@ def record_ticker_heartbeat(success: bool = False) -> None:
 
     Best-effort: a write failure must never disrupt the tick loop.
     """
+    store = current_store()
     try:
-        _atomic_write_epoch(TICKER_HEARTBEAT_FILE)
+        _atomic_write_epoch(store.ticker_heartbeat_file)
     except Exception:
         pass
     if success:
         try:
-            _atomic_write_epoch(TICKER_SUCCESS_FILE)
+            _atomic_write_epoch(store.ticker_success_file)
         except Exception:
             pass
 
@@ -626,12 +655,12 @@ def get_ticker_heartbeat_age() -> Optional[float]:
     None = heartbeat file missing/unreadable (older build, never ran, or a
     torn read). Callers treat None as "cannot determine", not "dead".
     """
-    return _epoch_file_age(TICKER_HEARTBEAT_FILE)
+    return _epoch_file_age(current_store().ticker_heartbeat_file)
 
 
 def get_ticker_success_age() -> Optional[float]:
     """Seconds since the ticker last completed a tick WITHOUT raising, or None."""
-    return _epoch_file_age(TICKER_SUCCESS_FILE)
+    return _epoch_file_age(current_store().ticker_success_file)
 
 
 # =============================================================================
@@ -639,21 +668,22 @@ def get_ticker_success_age() -> Optional[float]:
 # =============================================================================
 
 def load_jobs() -> List[Dict[str, Any]]:
-    """Load all jobs from storage."""
+    """Load all jobs from the active Owner store."""
     ensure_dirs()
-    if not JOBS_FILE.exists():
+    jobs_file = current_store().jobs_file
+    if not jobs_file.exists():
         return []
 
     _strict_retry = False  # track whether we used the strict=False fallback
 
     try:
-        with open(JOBS_FILE, 'r', encoding='utf-8') as f:
+        with open(jobs_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
     except json.JSONDecodeError:
         # Retry with strict=False to handle bare control chars in string values
         _strict_retry = True
         try:
-            with open(JOBS_FILE, 'r', encoding='utf-8') as f:
+            with open(jobs_file, 'r', encoding='utf-8') as f:
                 data = json.loads(f.read(), strict=False)
         except Exception as e:
             logger.error("Failed to auto-repair jobs.json: %s", e)
@@ -689,14 +719,15 @@ def load_jobs() -> List[Dict[str, Any]]:
 def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
     """Save all jobs to storage. Caller must hold _jobs_lock()."""
     ensure_dirs()
-    fd, tmp_path = tempfile.mkstemp(dir=str(JOBS_FILE.parent), suffix='.tmp', prefix='.jobs_')
+    jobs_file = current_store().jobs_file
+    fd, tmp_path = tempfile.mkstemp(dir=str(jobs_file.parent), suffix='.tmp', prefix='.jobs_')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump({"jobs": jobs, "updated_at": _hermes_now().isoformat()}, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        atomic_replace(tmp_path, JOBS_FILE)
-        _secure_file(JOBS_FILE)
+        atomic_replace(tmp_path, jobs_file)
+        _secure_file(jobs_file)
     except BaseException:
         try:
             os.unlink(tmp_path)
@@ -760,7 +791,7 @@ def _resolve_default_model_snapshot() -> Optional[str]:
         import yaml
         from hermes_cli.config import _expand_env_vars
 
-        cfg_path = get_hermes_home() / "config.yaml"
+        cfg_path = current_store().owner_home / "config.yaml"
         if not cfg_path.exists():
             return None
         with cfg_path.open(encoding="utf-8") as f:
@@ -896,15 +927,10 @@ def create_job(
                           When set, only tools from these toolsets are loaded, reducing
                           token overhead. When omitted, all default tools are loaded.
                           Ignored when ``no_agent=True``.
-        workdir: Optional absolute path.  When set, the job runs as if launched
-                from that directory: AGENTS.md / CLAUDE.md / .cursorrules from
-                that directory are injected into the system prompt, and the
-                terminal/file/code_exec tools use it as their working directory
-                (via TERMINAL_CWD).  When unset, the old behaviour is preserved
-                (no context files injected, tools use the scheduler's cwd).
-                With ``no_agent=True``, ``workdir`` is still applied as the
-                script's cwd so relative paths inside the script behave
-                predictably.
+        workdir: Optional controlled Owner workspace directory. Agent sessions
+                receive it through structured gateway ``session.create`` and
+                scripts receive it as their subprocess cwd. When unset, the
+                exact Owner Worker uses its default workspace root.
         no_agent: When True, skip the agent entirely — run ``script`` on schedule
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
@@ -1233,6 +1259,109 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
+def _load_deliveries_unlocked() -> List[Dict[str, Any]]:
+    path = current_store().deliveries_file
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Cron delivery database is corrupt: {exc}") from exc
+    rows = data.get("deliveries", []) if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        raise RuntimeError("Cron delivery database is corrupt")
+    return [dict(row) for row in rows if isinstance(row, dict)]
+
+
+def pending_deliveries() -> List[Dict[str, Any]]:
+    """Return bounded Worker-local delivery requests awaiting control-plane ack."""
+    with _jobs_lock():
+        return _load_deliveries_unlocked()
+
+
+def _save_deliveries_unlocked(rows: List[Dict[str, Any]]) -> None:
+    path = current_store().deliveries_file
+    ensure_dirs()
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp", prefix=".deliveries_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"deliveries": rows[-128:]}, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        atomic_replace(tmp_path, path)
+        _secure_file(path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def record_pending_delivery(
+    *, job_id: str, fire_id: str, binding_id: str, payload: str
+) -> Dict[str, Any]:
+    """Persist one stable delivery request without changing completed Agent state."""
+    text = str(payload or "")
+    payload_bytes = len(text.encode("utf-8"))
+    if not text.strip() or payload_bytes > 256_000:
+        raise ValueError("cron delivery payload must be between 1 and 256000 bytes")
+    stable_fire_id = str(fire_id or "").strip()
+    exact_binding = str(binding_id or "").strip()
+    if not stable_fire_id or not exact_binding:
+        raise ValueError("cron delivery fire_id and binding_id are required")
+    request = {
+        "job_id": str(job_id),
+        "fire_id": stable_fire_id,
+        "binding_id": exact_binding,
+        "payload": text,
+        "payload_bytes": payload_bytes,
+        "attempts": 0,
+        "last_error": None,
+    }
+    with _jobs_lock():
+        rows = _load_deliveries_unlocked()
+        for row in rows:
+            if row.get("fire_id") == stable_fire_id:
+                if row.get("binding_id") != exact_binding:
+                    raise RuntimeError("cron fire is already bound to another channel")
+                return row
+        rows.append(request)
+        _save_deliveries_unlocked(rows)
+    return request
+
+
+def record_delivery_result(fire_id: str, *, error: str | None) -> bool:
+    """Acknowledge or retain a stable pending request after control-plane enqueue."""
+    stable_fire_id = str(fire_id or "").strip()
+    with _jobs_lock():
+        rows = _load_deliveries_unlocked()
+        changed = False
+        remaining = []
+        target_job_id = None
+        for row in rows:
+            if row.get("fire_id") != stable_fire_id:
+                remaining.append(row)
+                continue
+            changed = True
+            target_job_id = str(row.get("job_id") or "")
+            if error is not None:
+                updated = dict(row)
+                updated["attempts"] = int(updated.get("attempts") or 0) + 1
+                updated["last_error"] = str(error)[:512]
+                remaining.append(updated)
+        if not changed:
+            return False
+        _save_deliveries_unlocked(remaining)
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") == target_job_id:
+                job["last_delivery_error"] = str(error)[:512] if error else None
+                _save_jobs_unlocked(jobs)
+                break
+        return True
+
+
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                  delivery_error: Optional[str] = None):
     """
@@ -1254,8 +1383,12 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
-                # Clear any external-fire claim so a re-armed recurring job can
-                # be claimed again on its next fire (Phase 4C CAS).
+                # Retain stable fire IDs so retries remain idempotent after completion.
+                fire_claim = job.get("fire_claim")
+                if isinstance(fire_claim, dict) and fire_claim.get("id"):
+                    completed = list(job.get("completed_fire_ids") or [])
+                    completed.append(str(fire_claim["id"]))
+                    job["completed_fire_ids"] = completed[-32:]
                 job["fire_claim"] = None
                 
                 # Increment completed count.  Finite one-shot jobs are
@@ -1432,7 +1565,12 @@ def _machine_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
-def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
+def claim_job_for_fire(
+    job_id: str,
+    *,
+    fire_id: str,
+    claim_ttl_seconds: int = 300,
+) -> bool:
     """Atomically claim a job for a single external 'fire' (multi-machine
     at-most-once). Returns True iff THIS caller won the claim.
 
@@ -1446,13 +1584,16 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
     ``next_run_at`` (mirrors ``advance_next_run``'s at-most-once bump so a stale
     re-delivery for the old time can't re-fire). One-shots keep ``next_run_at``
     but the fresh ``fire_claim`` blocks a duplicate retry for the same fire.
-    ``mark_job_run`` clears the claim on completion so a re-armed recurring job
-    is claimable again next fire.
+    ``mark_job_run`` retains the stable ID in a bounded completion history so an
+    acknowledged fire cannot replay, while a new stable ID remains claimable.
 
     The stale-claim TTL means a machine that crashed after claiming but before
     completing doesn't wedge the job forever — after the TTL another fire can
     reclaim it.
     """
+    stable_fire_id = str(fire_id or "").strip()
+    if not stable_fire_id:
+        raise ValueError("fire_id is required")
     with _jobs_lock():
         jobs = load_jobs()
         for job in jobs:
@@ -1460,16 +1601,24 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
                 continue
             if not job.get("enabled", True) or job.get("state") == "paused":
                 return False
+            if stable_fire_id in set(job.get("completed_fire_ids") or []):
+                return False
             now = _hermes_now()
             existing = job.get("fire_claim")
             if existing:
+                if existing.get("id") == stable_fire_id:
+                    return False
                 try:
                     claimed_at = _ensure_aware(datetime.fromisoformat(existing["at"]))
                     if (now - claimed_at).total_seconds() < claim_ttl_seconds:
-                        return False  # someone holds a fresh claim
+                        return False
                 except Exception:
-                    pass  # malformed claim → overwrite
-            job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
+                    pass
+            job["fire_claim"] = {
+                "id": stable_fire_id,
+                "at": now.isoformat(),
+                "by": _machine_id(),
+            }
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())

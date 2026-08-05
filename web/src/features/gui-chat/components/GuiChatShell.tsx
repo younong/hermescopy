@@ -21,7 +21,6 @@ import {
 } from "lucide-react";
 import { ChatSessionList } from "@/components/ChatSessionList";
 import { ConnectWeChatModal } from "@/features/ilink/ConnectWeChatModal";
-import { useProfileScope } from "@/contexts/useProfileScope";
 import { PageHeaderContext } from "@/contexts/page-header-context";
 import { GuiChatFilesPane } from "@/features/files/components/GuiChatFilesPane";
 import { useI18n } from "@/i18n";
@@ -65,16 +64,15 @@ export function GuiChatShell() {
   const { t } = useI18n();
   const location = useLocation();
   const navigate = useNavigate();
-  const { profile } = useProfileScope();
   const [searchParams, setSearchParams] = useSearchParams();
   const resumeSessionId = searchParams.get("resume");
   const mockMode = searchParams.get("mock") === "1";
   const workspacePath = location.pathname.replace(/\/$/, "");
-  const statisticsOpen = workspacePath === "/chat-gui/statistics";
-  const filesOpen = workspacePath === "/chat-gui/files";
-  const skillsOpen = workspacePath === "/chat-gui/skills";
-  const scheduledTasksOpen = workspacePath === "/chat-gui/scheduled-tasks";
-  const modelsOpen = workspacePath === "/chat-gui/models";
+  const statisticsOpen = workspacePath === "/chat/statistics";
+  const filesOpen = workspacePath === "/chat/files";
+  const skillsOpen = workspacePath === "/chat/skills";
+  const scheduledTasksOpen = workspacePath === "/chat/scheduled-tasks";
+  const modelsOpen = workspacePath === "/chat/models";
   const workspacePaneOpen = statisticsOpen || filesOpen || skillsOpen || scheduledTasksOpen || modelsOpen;
   const [state, dispatch] = useReducer(guiChatReducer, initialGuiChatState);
   const connectionRef = useRef<GuiChatConnection | null>(null);
@@ -107,6 +105,7 @@ export function GuiChatShell() {
   const attachmentRequestIdRef = useRef(0);
   const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false);
   const [sessionQuery, setSessionQuery] = useState("");
+  const [sessionListRefreshNonce, setSessionListRefreshNonce] = useState(0);
   const [activeSessionTitle, setActiveSessionTitle] = useState<string | null>(null);
   const [connectWeChatOpen, setConnectWeChatOpen] = useState(false);
   const { authMe, authRequired, ownerKey, ready: authIdentityReady } = useDashboardAuthIdentity();
@@ -182,7 +181,7 @@ export function GuiChatShell() {
     setResumeNotice(null);
     skipClearedRouteRef.current = true;
     if (workspacePaneOpenRef.current) {
-      navigateRef.current("/chat-gui", { replace: true });
+      navigateRef.current("/chat", { replace: true });
     } else {
       updateSearchParams(
         (prev) => {
@@ -203,7 +202,7 @@ export function GuiChatShell() {
   const switchScope = useMemo(() => {
     const connection = mockMode
       ? connectMockGuiChat()
-      : connectGuiChat({ ownerKey, profile });
+      : connectGuiChat({ ownerKey });
     connectionRef.current = connection;
     let coordinator: GuiChatSessionSwitchCoordinator;
     coordinator = new GuiChatSessionSwitchCoordinator(connection, {
@@ -278,7 +277,7 @@ export function GuiChatShell() {
         });
     reconnectLifecycleRef.current = reconnectLifecycle;
     return { coordinator, reconnectLifecycle };
-  }, [dispatchGatewayEvent, mockMode, ownerKey, profile, startNewGuiChat, updateSearchParams]);
+  }, [dispatchGatewayEvent, mockMode, ownerKey, startNewGuiChat, updateSearchParams]);
   const switchCoordinator = switchScope.coordinator;
   switchCoordinatorRef.current = switchCoordinator;
 
@@ -306,7 +305,6 @@ export function GuiChatShell() {
       void api.getSessionMessages(
         requestedSessionId,
         { limit: 100, signal: controller.signal },
-        profile,
       ).then((response) => {
         if (controller.signal.aborted || !switchCoordinator.isGenerationCurrent(nextGeneration)) return;
         dispatch({
@@ -361,7 +359,7 @@ export function GuiChatShell() {
           }
         : undefined,
     );
-  }, [mockMode, profile, resumeSessionId, switchCoordinator, updateSearchParams]);
+  }, [mockMode, resumeSessionId, switchCoordinator, updateSearchParams]);
 
   const retryConnection = useCallback(() => {
     setResumeNotice(null);
@@ -608,7 +606,6 @@ export function GuiChatShell() {
       const response = await api.getSessionMessages(
         sessionId,
         { before: cursor, limit: 100, signal: controller.signal },
-        profile,
       );
       if (controller.signal.aborted) return;
       dispatch({ type: "history.prepend.succeeded", generation, response });
@@ -636,7 +633,7 @@ export function GuiChatShell() {
     } finally {
       if (historyAbortRef.current === controller) historyAbortRef.current = null;
     }
-  }, [profile, state.historyCursor, state.historyLoading, state.historySessionId, state.switchGeneration]);
+  }, [state.historyCursor, state.historyLoading, state.historySessionId, state.switchGeneration]);
 
   const respondToClarify = useCallback(
     (id: string, answer: string) => {
@@ -675,9 +672,9 @@ export function GuiChatShell() {
       onNewChat={startNewGuiChat}
       onPicked={closeMobilePanel}
       onSessionPick={startSessionSwitchTrace}
-      profile={profile}
       query={sessionQuery}
-      sessionPath="/chat-gui"
+      refreshNonce={sessionListRefreshNonce}
+      sessionPath="/chat"
       variant="compact"
     />
   );
@@ -716,7 +713,7 @@ export function GuiChatShell() {
           className="gui-chat-nav-item"
           onClick={() => {
             closeMobilePanel();
-            navigate("/chat-gui/statistics");
+            navigate("/chat/statistics");
           }}
           type="button"
         >
@@ -728,7 +725,7 @@ export function GuiChatShell() {
           className="gui-chat-nav-item"
           onClick={() => {
             closeMobilePanel();
-            navigate("/chat-gui/files");
+            navigate("/chat/files");
           }}
           type="button"
         >
@@ -740,7 +737,7 @@ export function GuiChatShell() {
           className="gui-chat-nav-item"
           onClick={() => {
             closeMobilePanel();
-            navigate("/chat-gui/skills");
+            navigate("/chat/skills");
           }}
           type="button"
         >
@@ -752,7 +749,7 @@ export function GuiChatShell() {
           className="gui-chat-nav-item"
           onClick={() => {
             closeMobilePanel();
-            navigate("/chat-gui/scheduled-tasks");
+            navigate("/chat/scheduled-tasks");
           }}
           type="button"
         >
@@ -765,7 +762,7 @@ export function GuiChatShell() {
           className="gui-chat-nav-item"
           onClick={() => {
             closeMobilePanel();
-            navigate("/chat-gui/models");
+            navigate("/chat/models");
           }}
           type="button"
         >
@@ -776,8 +773,13 @@ export function GuiChatShell() {
       <div className="mt-4 flex min-h-0 flex-1 flex-col px-3">
         <div className="gui-chat-section-heading">
           <span>Recent chats</span>
-          <button aria-label={t.common.refresh} className="gui-chat-icon-button" onClick={retryConnection} type="button">
-            <RefreshCw className={cn("h-3.5 w-3.5", state.connection === "connecting" && "animate-spin")} />
+          <button
+            aria-label={t.common.refresh}
+            className="gui-chat-icon-button"
+            onClick={() => setSessionListRefreshNonce((nonce) => nonce + 1)}
+            type="button"
+          >
+            <RefreshCw className="h-3.5 w-3.5" />
           </button>
         </div>
         <div className="min-h-0 flex-1 overflow-hidden">{sessionPanel}</div>
@@ -903,9 +905,11 @@ export function GuiChatShell() {
                   <QrCode className="h-3.5 w-3.5" />
                 </button>
               ) : null}
-              <button aria-label={mockMode ? "Replay" : t.common.retry} className="gui-chat-icon-button" onClick={retryConnection} type="button">
-                <RefreshCw className={cn("h-3.5 w-3.5", state.connection === "connecting" && "animate-spin")} />
-              </button>
+              {mockMode || state.connection !== "open" ? (
+                <button aria-label={mockMode ? "Replay" : t.common.retry} className="gui-chat-icon-button" onClick={retryConnection} type="button">
+                  <RefreshCw className={cn("h-3.5 w-3.5", state.connection === "connecting" && "animate-spin")} />
+                </button>
+              ) : null}
             </div>
           ) : null}
         </header>
@@ -923,9 +927,9 @@ export function GuiChatShell() {
         ) : filesOpen ? (
           <GuiChatFilesPane />
         ) : skillsOpen ? (
-          <GuiChatSkillsPane profile={profile} />
+          <GuiChatSkillsPane />
         ) : scheduledTasksOpen ? (
-          <GuiChatScheduledTasksPane profile={profile} />
+          <GuiChatScheduledTasksPane />
         ) : modelsOpen ? (
           <GuiChatModelsPane
             busy={state.isGenerating}
@@ -933,7 +937,6 @@ export function GuiChatShell() {
             currentModel={state.model}
             currentProvider={state.provider}
             onSwitchChat={switchChatModel}
-            profile={profile}
           />
         ) : (
           <>

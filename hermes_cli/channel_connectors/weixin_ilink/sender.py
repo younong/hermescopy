@@ -7,8 +7,9 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
-from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.response_media import validate_media_delivery_path
 from gateway.weixin_ilink import (
     ILinkTransportError,
     WeixinILinkClient,
@@ -16,6 +17,15 @@ from gateway.weixin_ilink import (
     upload_media_item,
 )
 from gateway.weixin_ilink.text import format_weixin_text, split_weixin_text
+from hermes_cli.channel_connectors.contracts import OutboundDelivery
+from hermes_cli.channel_dispatch.outbox import (
+    advance_outbound,
+    claim_outbound as claim_canonical_outbound,
+    fail_outbound,
+    release_outbound_claim,
+    set_outbound_part_count,
+)
+from hermes_cli.channel_identity.owner_resolution import resolve_connector_account
 from hermes_cli.channel_identity.store import ChannelIdentityStore
 
 
@@ -39,6 +49,8 @@ class OutboundClaim:
     base_url: str
     bot_token: str
     peer_id: str
+    workspace_root: Path
+    delivery: OutboundDelivery
 
     @property
     def part(self) -> OutboundPart:
@@ -51,22 +63,29 @@ class OutboundClaim:
         digest = hashlib.sha256(
             f"{self.client_message_id}:{self.next_part_index}".encode("utf-8")
         ).hexdigest()[:32]
-        return f"hermes-ilink-{digest}"
+        prefix = self.client_message_id.rsplit("-", 1)[0]
+        return f"{prefix}-{digest}"
 
 
-def _outbound_parts(payload: str) -> tuple[OutboundPart, ...]:
+def _outbound_parts(
+    payload: str,
+    *,
+    workspace_root: Path,
+) -> tuple[OutboundPart, ...]:
     text = payload
     media: list[dict] = []
     try:
         envelope = json.loads(payload)
     except (TypeError, json.JSONDecodeError):
         envelope = None
-    if isinstance(envelope, dict) and envelope.get("v") == 1 and "media" in envelope:
-        if not isinstance(envelope.get("text"), str) or not isinstance(envelope["media"], list):
-            raise RuntimeError("outbound media payload is invalid")
+    if isinstance(envelope, dict) and envelope.get("v") == 1:
+        if not isinstance(envelope.get("text"), str):
+            raise RuntimeError("outbound envelope is invalid")
         text = envelope["text"]
-        media = envelope["media"]
-        if not media or len(media) > 16:
+        if not isinstance(envelope.get("metadata", {}), dict):
+            raise RuntimeError("outbound envelope is invalid")
+        media = envelope.get("attachments", envelope.get("media", []))
+        if not isinstance(media, list) or len(media) > 16:
             raise RuntimeError("outbound media payload is invalid")
 
     parts = [OutboundPart("text", chunk) for chunk in split_weixin_text(format_weixin_text(text))]
@@ -80,8 +99,11 @@ def _outbound_parts(payload: str) -> tuple[OutboundPart, ...]:
         ):
             raise RuntimeError("outbound media payload is invalid")
         path = entry["path"]
-        validated = BasePlatformAdapter.filter_media_delivery_paths([(path, entry.get("voice", False))])
-        if len(validated) != 1 or validated[0][0] != path:
+        validated = validate_media_delivery_path(
+            path,
+            allowed_roots=(workspace_root,),
+        )
+        if validated is None or validated != path:
             raise RuntimeError("outbound media path is invalid")
         if path in seen:
             continue
@@ -93,92 +115,101 @@ def _outbound_parts(payload: str) -> tuple[OutboundPart, ...]:
 
 
 def claim_outbound(store: ChannelIdentityStore, *, holder: str) -> OutboundClaim | None:
-    now = time.time()
-    with store.write() as conn:
-        row = conn.execute(
-            """
-            SELECT o.*, a.base_url, a.bot_token_ciphertext, a.bot_token_key_version,
-                   b.peer_ciphertext, b.peer_key_version
-            FROM outbound_messages o
-            JOIN ilink_accounts a ON a.account_id=o.account_id AND a.status='active'
-            JOIN channel_bindings b ON b.binding_id=o.binding_id AND b.status='active'
-            WHERE o.status='queued' AND o.next_attempt_at<=?
-            ORDER BY o.created_at LIMIT 1
-            """,
-            (now,),
-        ).fetchone()
-        if row is None:
-            return None
-        changed = conn.execute(
-            """
-            UPDATE outbound_messages SET status='sending', claimed_by=?, claimed_at=?,
-                attempts=attempts+1, chunk_attempts=chunk_attempts+1, updated_at=?
-            WHERE outbound_id=? AND status='queued'
-            """,
-            (holder, now, now, row["outbound_id"]),
-        ).rowcount
-        if changed != 1:
-            return None
-    payload = store.crypto.decrypt_text(
-        row["payload_ciphertext"],
-        table="outbound_messages",
-        record_id=row["outbound_id"],
-        field="payload",
-        version=row["payload_key_version"],
+    delivery = claim_canonical_outbound(
+        store,
+        provider="weixin_ilink",
+        holder=holder,
     )
-    parts = _outbound_parts(payload)
-    next_part_index = int(row["next_chunk_index"])
-    if next_part_index < 0 or next_part_index >= len(parts):
-        raise RuntimeError("outbound part progress is invalid")
-    if row["chunk_count"] is not None and int(row["chunk_count"]) != len(parts):
-        raise RuntimeError("outbound part count changed")
-    with store.write() as conn:
-        changed = conn.execute(
-            """
-            UPDATE outbound_messages SET chunk_count=?, updated_at=?
-            WHERE outbound_id=? AND status='sending' AND claimed_by=?
-              AND (chunk_count IS NULL OR chunk_count=?)
-            """,
-            (len(parts), time.time(), row["outbound_id"], holder, len(parts)),
-        ).rowcount
-        if changed != 1:
-            raise RuntimeError("outbound send claim is stale")
-    context = None
-    if row["context_ciphertext"] is not None:
-        context = store.crypto.decrypt_text(
-            row["context_ciphertext"],
-            table="outbound_messages",
-            record_id=row["outbound_id"],
-            field="context",
-            version=row["context_key_version"],
+    if delivery is None:
+        return None
+    try:
+        with store.read() as conn:
+            owner = conn.execute(
+                """
+                SELECT o.owner_key
+                FROM channel_bindings b
+                JOIN external_identities e
+                  ON e.external_identity_id=b.external_identity_id
+                JOIN owner_bindings o ON o.canonical_user_id=e.canonical_user_id
+                WHERE b.binding_id=? AND b.account_id=?
+                """,
+                (delivery.binding_id, delivery.account_id),
+            ).fetchone()
+        if owner is None:
+            raise RuntimeError("iLink channel Owner is unavailable")
+        workspace_root = (
+            store.global_home
+            / "users"
+            / owner["owner_key"]
+            / "workspaces"
+            / "default"
         )
-    bot_token = store.crypto.decrypt_text(
-        row["bot_token_ciphertext"],
-        table="ilink_accounts",
-        record_id=row["account_id"],
-        field="bot_token",
-        version=row["bot_token_key_version"],
-    )
-    peer_id = store.crypto.decrypt_text(
-        row["peer_ciphertext"],
-        table="channel_bindings",
-        record_id=row["binding_id"],
-        field="peer",
-        version=row["peer_key_version"],
-    )
+        parts = _outbound_parts(
+            delivery.payload,
+            workspace_root=workspace_root,
+        )
+        account = resolve_connector_account(
+            store,
+            provider=delivery.provider,
+            account_id=delivery.account_id,
+            credential_version=delivery.credential_version,
+        )
+        base_url = account.credentials.get("base_url")
+        bot_token = account.credentials.get("bot_token")
+        if not isinstance(base_url, str) or not isinstance(bot_token, str):
+            raise RuntimeError("iLink account credentials are unavailable")
+        set_outbound_part_count(
+            store,
+            delivery,
+            holder=holder,
+            part_count=len(parts),
+        )
+    except Exception as exc:
+        release_outbound_claim(
+            store,
+            outbound_id=delivery.outbound_id,
+            holder=holder,
+            error=f"claim_error:{type(exc).__name__}",
+        )
+        raise
     return OutboundClaim(
-        outbound_id=row["outbound_id"],
-        account_id=row["account_id"],
-        binding_id=row["binding_id"],
-        client_message_id=row["client_message_id"],
+        outbound_id=delivery.outbound_id,
+        account_id=delivery.account_id,
+        binding_id=delivery.binding_id,
+        client_message_id=delivery.client_message_id,
         parts=parts,
-        next_part_index=next_part_index,
-        part_attempts=int(row["chunk_attempts"]) + 1,
-        context_token=context,
-        base_url=row["base_url"],
+        next_part_index=delivery.next_part_index,
+        part_attempts=delivery.part_attempts,
+        context_token=delivery.context_token,
+        base_url=base_url,
         bot_token=bot_token,
-        peer_id=peer_id,
+        peer_id=delivery.conversation_id,
+        workspace_root=workspace_root,
+        delivery=delivery,
     )
+
+
+def _contained_media_path(path: str, workspace_root: Path) -> str:
+    root = workspace_root.resolve(strict=True)
+    if root.is_symlink() or not root.is_dir():
+        raise RuntimeError("outbound workspace is unavailable")
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    resolved = candidate.resolve(strict=True)
+    if not resolved.is_relative_to(root) or not resolved.is_file():
+        raise RuntimeError("outbound media path is outside Owner workspace")
+    for parent in (candidate, *candidate.parents):
+        if parent == root.parent:
+            break
+        if parent.is_symlink():
+            raise RuntimeError("outbound media path must not contain symlinks")
+        if parent == root:
+            break
+    repeated = candidate.resolve(strict=True)
+    if repeated != resolved or not repeated.is_relative_to(root):
+        raise RuntimeError("outbound media path changed during validation")
+    return str(repeated)
 
 
 class OutboundSender:
@@ -201,6 +232,32 @@ class OutboundSender:
 
     async def send_claim(self, claim: OutboundClaim, *, holder: str) -> bool:
         try:
+            resolve_connector_account(
+                self.store,
+                provider=claim.delivery.provider,
+                account_id=claim.account_id,
+                credential_version=claim.delivery.credential_version,
+            )
+            with self.store.read() as conn:
+                current = conn.execute(
+                    """
+                    SELECT 1 FROM outbound_messages o
+                    JOIN connector_accounts a ON a.account_id=o.account_id
+                    JOIN channel_bindings b ON b.binding_id=o.binding_id
+                    WHERE o.outbound_id=? AND o.status='sending' AND o.claimed_by=?
+                      AND o.next_chunk_index=? AND a.provider=? AND a.status='active'
+                      AND a.credential_version=? AND b.status='active'
+                    """,
+                    (
+                        claim.outbound_id,
+                        holder,
+                        claim.next_part_index,
+                        claim.delivery.provider,
+                        claim.delivery.credential_version,
+                    ),
+                ).fetchone()
+            if current is None:
+                raise RuntimeError("outbound send claim is stale")
             client = WeixinILinkClient(
                 self.session,
                 base_url=claim.base_url,
@@ -214,11 +271,12 @@ class OutboundSender:
                     client_id=claim.part_client_id,
                 )
             else:
+                path = _contained_media_path(claim.part.value, claim.workspace_root)
                 item = await upload_media_item(
                     self.session,
                     client,
                     to_user_id=claim.peer_id,
-                    path=claim.part.value,
+                    path=path,
                     force_file=claim.part.force_file,
                 )
                 await client.send_item(
@@ -243,85 +301,30 @@ class OutboundSender:
     def _retry(self, claim: OutboundClaim, *, holder: str, error: str) -> None:
         exponent = max(0, claim.part_attempts - 1)
         delay = min(self.retry_max_seconds, self.retry_seconds * (2**exponent))
-        now = time.time()
-        with self.store.write() as conn:
-            conn.execute(
-                """
-                UPDATE outbound_messages SET status='queued', next_attempt_at=?,
-                    claimed_by=NULL, claimed_at=NULL, last_error=?, updated_at=?
-                WHERE outbound_id=? AND status='sending' AND claimed_by=?
-                """,
-                (now + delay, error, now, claim.outbound_id, holder),
-            )
+        release_outbound_claim(
+            self.store,
+            outbound_id=claim.outbound_id,
+            holder=holder,
+            error=error,
+            next_attempt_at=time.time() + delay,
+        )
 
     def _fail(self, claim: OutboundClaim, *, holder: str, error: str) -> None:
-        now = time.time()
-        with self.store.write() as conn:
-            changed = conn.execute(
-                """
-                UPDATE outbound_messages SET status='failed', claimed_by=NULL, claimed_at=NULL,
-                    last_error=?, failed_chunk_index=?, updated_at=?
-                WHERE outbound_id=? AND status='sending' AND claimed_by=?
-                """,
-                (error, claim.next_part_index, now, claim.outbound_id, holder),
-            ).rowcount
-            if changed == 1:
-                conn.execute(
-                    """
-                    UPDATE inbound_messages SET status='failed', rejection_reason='outbound_failed',
-                        updated_at=? WHERE inbound_id=(
-                            SELECT inbound_id FROM outbound_messages WHERE outbound_id=?
-                        )
-                    """,
-                    (now, claim.outbound_id),
-                )
+        fail_outbound(
+            self.store,
+            claim.delivery,
+            holder=holder,
+            error=error,
+        )
 
     def _advance(self, claim: OutboundClaim, *, holder: str) -> bool:
-        now = time.time()
-        next_index = claim.next_part_index + 1
-        with self.store.write() as conn:
-            if next_index < len(claim.parts):
-                changed = conn.execute(
-                    """
-                    UPDATE outbound_messages SET status='queued', next_chunk_index=?,
-                        chunk_attempts=0, next_attempt_at=?, claimed_by=NULL, claimed_at=NULL,
-                        last_error=NULL, failed_chunk_index=NULL, updated_at=?
-                    WHERE outbound_id=? AND status='sending' AND claimed_by=?
-                      AND next_chunk_index=?
-                    """,
-                    (
-                        next_index,
-                        now + self.chunk_delay_seconds,
-                        now,
-                        claim.outbound_id,
-                        holder,
-                        claim.next_part_index,
-                    ),
-                ).rowcount
-                return changed == 1
-            changed = conn.execute(
-                """
-                UPDATE outbound_messages SET status='delivered', next_chunk_index=?,
-                    payload_ciphertext=NULL, payload_key_version=NULL,
-                    context_ciphertext=NULL, context_key_version=NULL,
-                    claimed_by=NULL, claimed_at=NULL, chunk_attempts=0,
-                    last_error=NULL, failed_chunk_index=NULL, updated_at=?
-                WHERE outbound_id=? AND status='sending' AND claimed_by=?
-                  AND next_chunk_index=?
-                """,
-                (next_index, now, claim.outbound_id, holder, claim.next_part_index),
-            ).rowcount
-            if changed == 1:
-                conn.execute(
-                    """
-                    UPDATE inbound_messages SET status='completed', updated_at=?
-                    WHERE inbound_id=(
-                        SELECT inbound_id FROM outbound_messages WHERE outbound_id=?
-                    )
-                    """,
-                    (now, claim.outbound_id),
-                )
-        return changed == 1
+        return advance_outbound(
+            self.store,
+            claim.delivery,
+            holder=holder,
+            part_count=len(claim.parts),
+            next_attempt_at=time.time() + self.chunk_delay_seconds,
+        )
 
 
 def _classify_error(exc: Exception) -> tuple[str, bool]:
@@ -334,6 +337,8 @@ def _classify_error(exc: Exception) -> tuple[str, bool]:
         return ":".join(parts), exc.transient
     if isinstance(exc, WeixinMediaError):
         return exc.code, exc.retryable
-    if isinstance(exc, (TimeoutError, OSError)):
+    if isinstance(exc, TimeoutError):
         return "network_error", True
+    if isinstance(exc, OSError):
+        return "filesystem_error", False
     return f"internal_error:{type(exc).__name__}", False

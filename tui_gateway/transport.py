@@ -1,23 +1,16 @@
 """Transport abstraction for the tui_gateway JSON-RPC server.
 
-Historically the gateway wrote every JSON frame directly to real stdout.  This
-module decouples the I/O sink from the handler logic so the same dispatcher
-can be driven over stdio (``tui_gateway.entry``) or WebSocket
-(``tui_gateway.ws``) without duplicating code.
+The gateway is driven over the authenticated Owner Worker WebSocket path. This
+module decouples the I/O sink from handler logic so concurrent requests and
+session events stay bound to the correct peer.
 
 A :class:`Transport` is anything that can accept a JSON-serialisable dict and
 forward it to its peer.  The active transport for the current request is
 tracked in a :class:`contextvars.ContextVar` so handlers — including those
 dispatched onto the worker pool — route their writes to the right peer.
 
-Backward compatibility
-----------------------
-``tui_gateway.server.write_json`` still works without any transport bound.
-When nothing is on the contextvar and no session-level transport is found,
-it falls back to the module-level :class:`StdioTransport`, which wraps the
-original ``_real_stdout`` + ``_stdout_lock`` pair.  Tests that monkey-patch
-``server._real_stdout`` continue to work because the stdio transport resolves
-the stream lazily through a callback.
+No ambient transport fallback exists: callers must bind the exact admitted
+Owner Worker peer before dispatching an RPC.
 """
 
 from __future__ import annotations

@@ -63,10 +63,10 @@ afterEach(async () => {
 });
 
 describe("GuiChatSkillsPane", () => {
-  it("loads, searches, and toggles skills in the selected profile", async () => {
-    const container = await renderPane("worker_alpha");
+  it("loads, searches, and toggles skills for the current owner", async () => {
+    const container = await renderPane();
 
-    expect(mocks.getSkills).toHaveBeenCalledWith("worker_alpha");
+    expect(mocks.getSkills).toHaveBeenCalledWith();
     expect(container.textContent).toContain("incident-helper");
     expect(container.textContent).toContain("release-notes");
 
@@ -80,12 +80,12 @@ describe("GuiChatSkillsPane", () => {
       await Promise.resolve();
     });
 
-    expect(mocks.toggleSkill).toHaveBeenCalledWith("incident-helper", true, "worker_alpha");
+    expect(mocks.toggleSkill).toHaveBeenCalledWith("incident-helper", true);
     expect(toggle?.getAttribute("aria-checked")).toBe("true");
   });
 
-  it("creates a skill and refreshes the profile-scoped list", async () => {
-    const container = await renderPane("worker_alpha");
+  it("creates a skill and refreshes the owner-scoped list", async () => {
+    const container = await renderPane();
 
     await act(async () => buttonNamed(container, "New skill")?.click());
     changeValue(document.body.querySelector('[aria-label="Skill name"]'), "daily-brief");
@@ -107,14 +107,13 @@ describe("GuiChatSkillsPane", () => {
         category: "writing",
         content: "---\nname: daily-brief\ndescription: Draft a daily brief.\n---\n\n# Daily brief\n",
       },
-      "worker_alpha",
     );
     expect(mocks.getSkills).toHaveBeenCalledTimes(2);
     expect(document.body.querySelector('[role="dialog"]')).toBeNull();
   });
 
   it("confirms deletion and removes only after a successful request", async () => {
-    const container = await renderPane("worker_alpha");
+    const container = await renderPane();
 
     await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Delete release-notes"]')?.click());
     expect(document.body.textContent).toContain("Delete release-notes?");
@@ -124,7 +123,7 @@ describe("GuiChatSkillsPane", () => {
       await Promise.resolve();
     });
 
-    expect(mocks.deleteSkill).toHaveBeenCalledWith("release-notes", "worker_alpha");
+    expect(mocks.deleteSkill).toHaveBeenCalledWith("release-notes");
     expect(container.textContent).not.toContain("release-notes");
     expect(container.textContent).toContain("incident-helper");
   });
@@ -139,19 +138,19 @@ describe("GuiChatSkillsPane", () => {
       await Promise.resolve();
     });
 
-    expect(mocks.deleteSkill).toHaveBeenCalledWith("release-notes", undefined);
+    expect(mocks.deleteSkill).toHaveBeenCalledWith("release-notes");
     expect(container.textContent).toContain("release-notes");
     expect(container.textContent).toContain("Pinned skills cannot be deleted");
     expect(document.body.querySelector('[role="dialog"]')).not.toBeNull();
   });
 });
 
-async function renderPane(profile?: string) {
+async function renderPane() {
   const container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
   await act(async () => {
-    root?.render(<GuiChatSkillsPane profile={profile} />);
+    root?.render(<GuiChatSkillsPane />);
     await Promise.resolve();
   });
   return container;

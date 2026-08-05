@@ -58,8 +58,10 @@ def cron_env(tmp_path, monkeypatch):
     # Return both the home dir and the scheduler module so tests use the
     # CURRENT module object (post any reload that happened in fixtures of
     # previously-executed tests in the same worker).
+    from cron.jobs import CronStore, use_store
     import cron.scheduler as _scheduler
-    return hermes_home, _scheduler
+    with use_store(CronStore(hermes_home)):
+        yield hermes_home, _scheduler
 
 
 def _plant_skill(hermes_home: Path, name: str, body: str) -> None:
@@ -416,12 +418,13 @@ class TestScriptOutputNotStrictScanned:
         assert "\u200b" not in prompt
         assert "item oneitem two" in prompt
 
-    def test_command_shapes_in_context_from_output_not_blocked(self, cron_env, monkeypatch):
+    def test_command_shapes_in_context_from_output_not_blocked(self, cron_env):
         """context_from injects a prior job's output — also runtime data."""
         hermes_home, scheduler = cron_env
-        import cron.jobs as cron_jobs
-        output_root = hermes_home / "cron" / "output"
-        monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", output_root)
+        from cron.jobs import current_store
+
+        output_root = current_store().output_dir
+        assert output_root == hermes_home / "cron" / "output"
         upstream_dir = output_root / "abcdef123456"
         upstream_dir.mkdir(parents=True)
         (upstream_dir / "20260610-000000.md").write_text(

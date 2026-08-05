@@ -21,9 +21,9 @@ def clarify_callback(cli, question, choices):
     Sets up the interactive selection UI, then blocks until the user
     responds. Returns the user's choice or a timeout message.
     """
-    from cli import CLI_CONFIG
+    from hermes_cli.config import load_config_readonly
 
-    timeout = CLI_CONFIG.get("clarify", {}).get("timeout", 120)
+    timeout = load_config_readonly().get("clarify", {}).get("timeout", 120)
     response_queue = queue.Queue()
     is_open_ended = not choices
 
@@ -200,8 +200,8 @@ def approval_callback(cli, command: str, description: str) -> str:
         lock = cli._approval_lock
 
     with lock:
-        from cli import CLI_CONFIG
-        timeout = CLI_CONFIG.get("approvals", {}).get("timeout", 60)
+        from hermes_cli.config import load_config_readonly
+        timeout = load_config_readonly().get("approvals", {}).get("timeout", 60)
         response_queue = queue.Queue()
         choices = ["once", "session", "always", "deny"]
         if len(command) > 70:

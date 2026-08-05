@@ -45,7 +45,9 @@ def store(tmp_path, monkeypatch):
         ChannelCrypto(
             lookup=Keyring(keys={1: b"l" * 32}, active_version=1),
             encryption=Keyring(keys={1: b"e" * 32}, active_version=1),
-        )
+        ),
+        tmp_path / "control-plane",
+        global_home=tmp_path,
     )
 
 
@@ -136,7 +138,7 @@ async def test_identity_stays_pending_until_owner_home_is_provisioned(store):
         with store.read() as conn:
             assert conn.execute("SELECT status FROM enrollment_attempts").fetchone()["status"] == "registering"
             assert conn.execute("SELECT status FROM canonical_users").fetchone()["status"] == "pending"
-            assert conn.execute("SELECT status FROM ilink_accounts").fetchone()["status"] == "pending"
+            assert conn.execute("SELECT status FROM connector_accounts").fetchone()["status"] == "pending"
             assert conn.execute("SELECT status FROM channel_bindings").fetchone()["status"] == "pending"
         release_provisioning.set()
         await manager._tasks.copy().pop()

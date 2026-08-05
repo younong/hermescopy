@@ -57,6 +57,7 @@ def list_sessions_payload(
     profile_name: str | None = None,
     recovery_scope: dict[str, Any] | None = None,
     compact: bool = False,
+    allowed_sources: list[str] | None = None,
     latency_trace_id: str = "",
 ) -> dict[str, Any]:
     if archived not in ("exclude", "only", "include"):
@@ -72,6 +73,7 @@ def list_sessions_payload(
     stage_started_at = time.monotonic()
     sessions, total = db.list_sessions_page(
         source=source or None,
+        source_filter=allowed_sources,
         exclude_sources=exclude_list or None,
         cwd_prefix=(cwd_prefix or None),
         limit=limit,
@@ -407,6 +409,7 @@ def search_sessions_payload(
     q: str = "",
     limit: int = 20,
     recovery_scope: dict[str, Any] | None = None,
+    allowed_sources: list[str] | None = None,
 ) -> dict[str, Any]:
     if not q or not q.strip():
         return {"results": []}
@@ -420,12 +423,14 @@ def search_sessions_payload(
         q,
         limit=safe_limit,
         include_archived=True,
+        source_filter=allowed_sources,
         **search_scope,
     )
     terms = [token if token.startswith('"') or token.endswith("*") else token + "*" for token in re.findall(r'"[^"]*"|\S+', q.strip())]
     message_rows = db.search_messages(
         query=" ".join(terms),
         limit=max(safe_limit * 5, 50),
+        source_filter=allowed_sources,
         **search_scope,
     )
     candidates: list[tuple[str, dict[str, Any]]] = []
@@ -616,37 +621,76 @@ def export_session_payload(
     return data
 
 
-def rename_session_payload(db: Any, session_id: str, *, title: str | None = None, archived: bool | None = None) -> dict[str, Any]:
-    sid = db.resolve_session_id(session_id)
+def rename_session_payload(
+    db: Any,
+    session_id: str,
+    *,
+    title: str | None = None,
+    archived: bool | None = None,
+    recovery_scope: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    sid = db.resolve_session_id(session_id, recovery_scope=recovery_scope)
     if not sid:
         raise HTTPException(status_code=404, detail="Session not found")
     if title is None and archived is None:
         raise HTTPException(status_code=400, detail="Nothing to update; provide 'title' and/or 'archived'.")
     if title is not None:
         try:
-            db.set_session_title(sid, title or "")
+            db.set_session_title(
+                sid,
+                title or "",
+                recovery_scope=recovery_scope,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     if archived is not None:
-        db.set_session_archived(sid, archived)
-    result: dict[str, Any] = {"ok": True, "title": db.get_session_title(sid) or ""}
+        db.set_session_archived(
+            sid,
+            archived,
+            recovery_scope=recovery_scope,
+        )
+    result: dict[str, Any] = {
+        "ok": True,
+        "title": (db.get_session_for_recovery(sid, recovery_scope=recovery_scope) or {}).get("title") or "",
+    }
     if archived is not None:
         result["archived"] = bool(archived)
     return result
 
 
-def delete_session_payload(db: Any, session_id: str) -> dict[str, Any]:
-    sid = db.resolve_session_id(session_id)
+def delete_session_payload(
+    db: Any,
+    session_id: str,
+    *,
+    recovery_scope: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    sid = db.resolve_session_id(session_id, recovery_scope=recovery_scope)
     if not sid:
         return {"ok": True, "already_absent": True}
-    db.delete_session(sid)
+    db.delete_session(sid, recovery_scope=recovery_scope)
     return {"ok": True}
 
 
-def bulk_delete_payload(db: Any, ids: list[str]) -> dict[str, Any]:
+def bulk_delete_payload(
+    db: Any,
+    ids: list[str],
+    *,
+    recovery_scope: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if len(ids) > 500:
         raise HTTPException(status_code=400, detail="ids must contain at most 500 entries")
-    return {"ok": True, "deleted": db.delete_sessions(ids)}
+    scoped_ids = [
+        sid
+        for raw in ids
+        if (sid := db.resolve_session_id(raw, recovery_scope=recovery_scope))
+    ]
+    return {
+        "ok": True,
+        "deleted": db.delete_sessions(
+            scoped_ids,
+            recovery_scope=recovery_scope,
+        ),
+    }
 
 
 def empty_count_payload(
@@ -659,16 +703,27 @@ def empty_count_payload(
     return {"count": db.count_empty_sessions(recovery_scope=recovery_scope)}
 
 
-def delete_empty_payload(db: Any) -> dict[str, Any]:
-    return {"ok": True, "deleted": db.delete_empty_sessions()}
+def delete_empty_payload(
+    db: Any,
+    *,
+    recovery_scope: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "deleted": db.delete_empty_sessions(recovery_scope=recovery_scope),
+    }
 
 
 def stats_payload(
     db: Any,
     *,
     recovery_scope: dict[str, Any] | None = None,
+    allowed_sources: list[str] | None = None,
 ) -> dict[str, Any]:
-    return db.session_stats(recovery_scope=recovery_scope)
+    return db.session_stats(
+        recovery_scope=recovery_scope,
+        source_filter=allowed_sources,
+    )
 
 
 def prune_sessions_payload(
@@ -677,6 +732,7 @@ def prune_sessions_payload(
     older_than_days: int = 90,
     source: str | None = None,
     sessions_dir: Path | None = None,
+    recovery_scope: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if older_than_days < 1:
         raise HTTPException(status_code=400, detail="older_than_days must be >= 1")
@@ -684,7 +740,8 @@ def prune_sessions_payload(
         "ok": True,
         "removed": db.prune_sessions(
             older_than_days=older_than_days,
-            source=(source or None),
+            source=source or None,
             sessions_dir=sessions_dir if sessions_dir is not None and sessions_dir.exists() else None,
+            recovery_scope=recovery_scope,
         ),
     }

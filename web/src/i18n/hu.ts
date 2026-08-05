@@ -57,15 +57,6 @@ export const hu: Translations = {
     footer: {
       org: "Nous Research",
     },
-    activeSessionsLabel: "Aktív munkamenetek:",
-    gatewayStatusLabel: "Átjáró állapota:",
-    gatewayStrip: {
-      failed: "Indítás sikertelen",
-      off: "Ki",
-      running: "Fut",
-      starting: "Indul",
-      stopped: "Leállítva",
-    },
     nav: {
       analytics: "Analitika",
       chat: "Csevegés",
@@ -87,7 +78,6 @@ export const hu: Translations = {
     openNavigation: "Navigáció megnyitása",
     pluginNavSection: "Bővítmények",
     sessionsActiveCount: "{count} aktív",
-    statusOverview: "Állapot áttekintése",
     system: "Rendszer",
     webUi: "Web UI",
   },
@@ -273,10 +263,9 @@ export const hu: Translations = {
     triggerNow: "Indítás most",
     delivery: {
       local: "Helyi",
-      telegram: "Telegram",
-      discord: "Discord",
-      slack: "Slack",
-      email: "Email",
+      weixin_ilink: "Weixin iLink",
+      feishu: "Feishu",
+      webhook: "Webhook",
     },
   },
 
@@ -408,7 +397,6 @@ export const hu: Translations = {
       tts: "Szövegfelolvasás",
       stt: "Beszédfelismerés",
       logging: "Naplózás",
-      discord: "Discord",
       auxiliary: "Kiegészítő",
     },
   },

@@ -10,7 +10,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from gateway.weixin_ilink.media import WeixinMediaError
+from hermes_cli.channel_connectors.weixin_ilink.dispatch_hooks import WeixinDispatchHooks, encode_weixin_outbound
 from hermes_cli.channel_connectors.weixin_ilink.poller import acquire_poll_lease, commit_update_batch
+from hermes_cli.channel_dispatch import ChannelOutbox
 from hermes_cli.channel_dispatch.dispatcher import ChannelDispatcher
 from hermes_cli.channel_identity import (
     ChannelCrypto,
@@ -28,7 +30,9 @@ def queued(tmp_path, monkeypatch):
         ChannelCrypto(
             lookup=Keyring(keys={1: b"l" * 32}, active_version=1),
             encryption=Keyring(keys={1: b"e" * 32}, active_version=1),
-        )
+        ),
+        tmp_path / "control-plane",
+        global_home=tmp_path,
     )
     registered = register_weixin_identity(
         store,
@@ -76,6 +80,101 @@ def _replace_with_voice(store, *, transcript: str | None = None):
         )
 
 
+def test_cron_outbox_enforces_owner_binding_state_idempotency_and_encryption(queued):
+    store, registered = queued
+    outbox = ChannelOutbox(store)
+
+    outbound_id = outbox.enqueue_cron_result(
+        owner_key=registered.owner_key,
+        binding_id=registered.binding_id,
+        fire_id="fire-a",
+        payload="scheduled result",
+    )
+    assert outbox.enqueue_cron_result(
+        owner_key=registered.owner_key,
+        binding_id=registered.binding_id,
+        fire_id="fire-a",
+        payload="scheduled result",
+    ) == outbound_id
+
+    with store.read() as conn:
+        row = conn.execute(
+            "SELECT * FROM outbound_messages WHERE outbound_id=?", (outbound_id,)
+        ).fetchone()
+        assert conn.execute("SELECT COUNT(*) FROM outbound_messages").fetchone()[0] == 1
+    assert row["inbound_id"] is None
+    assert row["source_kind"] == "cron"
+    assert row["source_id"] == "cron:fire-a"
+    assert row["provider"] == "weixin_ilink"
+    assert row["payload_ciphertext"] != b"scheduled result"
+    assert store.crypto.decrypt_text(
+        row["payload_ciphertext"],
+        table="outbound_messages",
+        record_id=outbound_id,
+        field="payload",
+        version=row["payload_key_version"],
+    ) == "scheduled result"
+
+    with pytest.raises(RuntimeError, match="another Owner"):
+        outbox.enqueue_cron_result(
+            owner_key="ok1_wrong",
+            binding_id=registered.binding_id,
+            fire_id="fire-b",
+            payload="wrong owner",
+        )
+    with store.write() as conn:
+        conn.execute(
+            "UPDATE channel_bindings SET status='suspended' WHERE binding_id=?",
+            (registered.binding_id,),
+        )
+    with pytest.raises(RuntimeError, match="unavailable"):
+        outbox.enqueue_cron_result(
+            owner_key=registered.owner_key,
+            binding_id=registered.binding_id,
+            fire_id="fire-c",
+            payload="disabled",
+        )
+
+
+def test_cron_outbox_preserves_per_binding_order_with_inbound_rows(queued):
+    store, registered = queued
+    outbox = ChannelOutbox(store)
+    first = outbox.enqueue_cron_result(
+        owner_key=registered.owner_key,
+        binding_id=registered.binding_id,
+        fire_id="fire-first",
+        payload="first",
+    )
+    second = outbox.enqueue_cron_result(
+        owner_key=registered.owner_key,
+        binding_id=registered.binding_id,
+        fire_id="fire-second",
+        payload="second",
+    )
+    with store.read() as conn:
+        inbound_sequence = conn.execute(
+            "SELECT binding_sequence FROM inbound_messages"
+        ).fetchone()[0]
+        rows = conn.execute(
+            "SELECT outbound_id, binding_sequence FROM outbound_messages ORDER BY binding_sequence"
+        ).fetchall()
+    assert [row["outbound_id"] for row in rows] == [first, second]
+    assert [row["binding_sequence"] for row in rows] == [inbound_sequence + 1, inbound_sequence + 2]
+
+
+def test_weixin_outbound_encoder_preserves_remote_images_as_text():
+    payload = json.loads(
+        encode_weixin_outbound(
+            "Rendered result\n![chart](https://example.com/chart.png)"
+        )
+    )
+
+    assert payload["attachments"] == []
+    assert payload["text"] == (
+        "Rendered result\n![chart](https://example.com/chart.png)"
+    )
+
+
 def _client_context(client):
     class _Context:
         async def __aenter__(self):
@@ -90,7 +189,7 @@ def _client_context(client):
 @pytest.mark.asyncio
 async def test_dispatch_creates_session_submits_idempotent_turn_and_writes_outbox(queued):
     store, registered = queued
-    dispatcher = ChannelDispatcher(store, object())
+    dispatcher = ChannelDispatcher(store, object(), provider="weixin_ilink", outbound_encoder=encode_weixin_outbound)
     claim = dispatcher.claim_next(holder="dispatcher")
     assert claim is not None
 
@@ -125,7 +224,7 @@ async def test_dispatch_creates_session_submits_idempotent_turn_and_writes_outbo
     prompt = client.call.await_args_list[1]
     assert prompt.args[0] == "prompt.submit"
     assert prompt.args[1]["text"] == "hello"
-    assert prompt.args[1]["idempotency_key"].startswith("weixin-ilink:im_")
+    assert prompt.args[1]["idempotency_key"].startswith("channel:weixin-ilink:im_")
     with store.read() as conn:
         inbound = conn.execute("SELECT status, payload_ciphertext FROM inbound_messages").fetchone()
         outbound = conn.execute(
@@ -135,12 +234,12 @@ async def test_dispatch_creates_session_submits_idempotent_turn_and_writes_outbo
     assert inbound["payload_ciphertext"] is None
     assert outbound["outbound_id"] == outbound_id
     assert outbound["status"] == "queued"
-    assert outbound["client_message_id"].startswith("hermes-ilink-")
+    assert outbound["client_message_id"].startswith("hermes-weixin-ilink-")
 
 
 def test_failed_outbound_unblocks_next_inbound_but_active_outbound_does_not(queued):
     store, registered = queued
-    dispatcher = ChannelDispatcher(store, object())
+    dispatcher = ChannelDispatcher(store, object(), provider="weixin_ilink")
     now = 1.0
     with store.write() as conn:
         first = conn.execute("SELECT inbound_id FROM inbound_messages").fetchone()["inbound_id"]
@@ -181,7 +280,8 @@ def test_failed_outbound_unblocks_next_inbound_but_active_outbound_does_not(queu
 async def test_voice_media_transcribes_checkpoints_and_submits_raw_transcript(queued):
     store, registered = queued
     _replace_with_voice(store)
-    dispatcher = ChannelDispatcher(store, object(), media_session=object())
+    hooks = WeixinDispatchHooks(object())
+    dispatcher = ChannelDispatcher(store, object(), provider="weixin_ilink", media_materializer=hooks.materialize)
     claim = dispatcher.claim_next(holder="dispatcher")
     from hermes_cli.channel_identity.owner_resolution import resolve_binding
     owner, _ = resolve_binding(store, binding_id=registered.binding_id)
@@ -209,7 +309,7 @@ async def test_voice_media_transcribes_checkpoints_and_submits_raw_transcript(qu
         "hermes_cli.channel_dispatch.dispatcher.OwnerWorkerGatewayClient",
         return_value=_client_context(client),
     ), patch(
-        "hermes_cli.channel_dispatch.dispatcher.download_and_decrypt_media",
+        "hermes_cli.channel_connectors.weixin_ilink.dispatch_hooks.download_and_decrypt_media",
         new=AsyncMock(return_value=b"#!SILK_V3 test"),
     ):
         await dispatcher.dispatch_claim(claim, holder="dispatcher")
@@ -229,11 +329,13 @@ async def test_voice_media_transcribes_checkpoints_and_submits_raw_transcript(qu
 async def test_voice_transient_failure_requeues_with_backoff_and_checkpoint_skips_stt(queued):
     store, registered = queued
     _replace_with_voice(store)
+    hooks = WeixinDispatchHooks(object())
     dispatcher = ChannelDispatcher(
         store,
         object(),
-        media_session=object(),
-        voice_config={"voice_retry_base_seconds": 5, "voice_max_retries": 2},
+        provider="weixin_ilink",
+        media_materializer=hooks.materialize,
+        media_config={"voice_retry_base_seconds": 5, "voice_max_retries": 2},
     )
     claim = dispatcher.claim_next(holder="dispatcher")
     from hermes_cli.channel_identity.owner_resolution import resolve_binding
@@ -247,7 +349,7 @@ async def test_voice_transient_failure_requeues_with_backoff_and_checkpoint_skip
         "hermes_cli.channel_dispatch.dispatcher.OwnerWorkerGatewayClient",
         return_value=_client_context(client),
     ), patch(
-        "hermes_cli.channel_dispatch.dispatcher.download_and_decrypt_media",
+        "hermes_cli.channel_connectors.weixin_ilink.dispatch_hooks.download_and_decrypt_media",
         new=AsyncMock(side_effect=WeixinMediaError("media_download_timeout", retryable=True)),
     ):
         with pytest.raises(RuntimeError, match="media_download_timeout"):
@@ -271,7 +373,7 @@ async def test_voice_checkpoint_restart_skips_media_download(queued):
             "UPDATE inbound_messages SET status='queued', claimed_by=NULL, claimed_at=NULL"
         )
 
-    dispatcher = ChannelDispatcher(store, object())
+    dispatcher = ChannelDispatcher(store, object(), provider="weixin_ilink")
     claim = dispatcher.claim_next(holder="dispatcher")
     assert claim["payload_kind"] == "voice_transcript"
     owner = __import__(
@@ -291,7 +393,7 @@ async def test_voice_checkpoint_restart_skips_media_download(queued):
         "hermes_cli.channel_dispatch.dispatcher.OwnerWorkerGatewayClient",
         return_value=_client_context(client),
     ), patch(
-        "hermes_cli.channel_dispatch.dispatcher.download_and_decrypt_media",
+        "hermes_cli.channel_connectors.weixin_ilink.dispatch_hooks.download_and_decrypt_media",
         new=AsyncMock(),
     ) as download:
         await dispatcher.dispatch_claim(claim, holder="dispatcher")
@@ -324,7 +426,8 @@ async def test_voice_terminal_failure_clears_sensitive_payload_and_unblocks_fifo
                 first["created_at"] + 1, first["updated_at"] + 1,
             ),
         )
-    dispatcher = ChannelDispatcher(store, object(), media_session=object())
+    hooks = WeixinDispatchHooks(object())
+    dispatcher = ChannelDispatcher(store, object(), provider="weixin_ilink", media_materializer=hooks.materialize)
     claim = dispatcher.claim_next(holder="dispatcher")
     owner = __import__(
         "hermes_cli.channel_identity.owner_resolution", fromlist=["resolve_binding"]
@@ -337,7 +440,7 @@ async def test_voice_terminal_failure_clears_sensitive_payload_and_unblocks_fifo
         "hermes_cli.channel_dispatch.dispatcher.OwnerWorkerGatewayClient",
         return_value=_client_context(client),
     ), patch(
-        "hermes_cli.channel_dispatch.dispatcher.download_and_decrypt_media",
+        "hermes_cli.channel_connectors.weixin_ilink.dispatch_hooks.download_and_decrypt_media",
         new=AsyncMock(side_effect=WeixinMediaError("unsafe_media_url")),
     ):
         with pytest.raises(RuntimeError, match="unsafe_media_url"):
@@ -383,7 +486,8 @@ async def test_dispatch_downloads_and_attaches_file_before_prompt(queued, tmp_pa
         cursor="cursor-file",
     )
     session = object()
-    dispatcher = ChannelDispatcher(store, object(), session=session)
+    hooks = WeixinDispatchHooks(session)
+    dispatcher = ChannelDispatcher(store, object(), provider="weixin_ilink", media_materializer=hooks.materialize)
     claim = dispatcher.claim_next(holder="dispatcher")
     assert claim is not None
 
@@ -411,8 +515,9 @@ async def test_dispatch_downloads_and_attaches_file_before_prompt(queued, tmp_pa
         async def __aexit__(self, *args):
             return None
 
-    owner.host_owner_home.mkdir(parents=True, exist_ok=True)
-    staged = owner.owner_home / "workspaces" / "default" / ".hermes" / "weixin-attachments"
+    workspace = owner.owner_home / "workspaces" / "default"
+    workspace.mkdir(parents=True, exist_ok=True)
+    staged = workspace / ".hermes" / "channel-attachments" / "weixin_ilink"
 
     async def fake_download(observed_session, *, descriptor, limits):
         assert observed_session is session
@@ -432,7 +537,7 @@ async def test_dispatch_downloads_and_attaches_file_before_prompt(queued, tmp_pa
             return_value=_Context(),
         ),
         patch(
-            "hermes_cli.channel_dispatch.dispatcher.download_and_decrypt_media",
+            "hermes_cli.channel_connectors.weixin_ilink.dispatch_hooks.download_and_decrypt_media",
             side_effect=fake_download,
         ),
     ):
@@ -447,9 +552,91 @@ async def test_dispatch_downloads_and_attaches_file_before_prompt(queued, tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_inbound_staging_rejects_symlinked_parent(queued):
+    store, registered = queued
+    with store.write() as conn:
+        conn.execute("DELETE FROM inbound_messages")
+    lease = acquire_poll_lease(store, account_id=registered.account_id, holder="file-poller")
+    commit_update_batch(
+        store,
+        lease,
+        messages=(
+            {
+                "message_id": "msg-file-symlink",
+                "from_user_id": "peer-a",
+                "item_list": [
+                    {
+                        "type": 4,
+                        "file_item": {
+                            "file_name": "report.txt",
+                            "media": {"full_url": "https://novac2c.cdn.weixin.qq.com/report"},
+                        },
+                    }
+                ],
+            },
+        ),
+        cursor="cursor-file",
+    )
+    hooks = WeixinDispatchHooks(object())
+    dispatcher = ChannelDispatcher(store, object(), provider="weixin_ilink", media_materializer=hooks.materialize)
+    claim = dispatcher.claim_next(holder="dispatcher")
+    from hermes_cli.channel_identity.owner_resolution import resolve_binding
+
+    owner, _ = resolve_binding(store, binding_id=registered.binding_id)
+    workspace = owner.owner_home / "workspaces" / "default"
+    workspace.mkdir(parents=True)
+    outside = owner.owner_home / "outside"
+    outside.mkdir()
+    (workspace / ".hermes").symlink_to(outside, target_is_directory=True)
+    client = AsyncMock()
+    client.owner = owner
+    client.handle = type("Handle", (), {"worker_generation": 1})()
+    client.call.return_value = {"session_id": "live-1", "stored_session_id": "stored-1"}
+    with patch(
+        "hermes_cli.channel_dispatch.dispatcher.OwnerWorkerGatewayClient",
+        return_value=_client_context(client),
+    ), patch(
+        "hermes_cli.channel_connectors.weixin_ilink.dispatch_hooks.download_and_decrypt_media",
+        new=AsyncMock(return_value=b"report"),
+    ):
+        with pytest.raises(RuntimeError, match="media_staging_unsafe"):
+            await dispatcher.dispatch_claim(claim, holder="dispatcher")
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_existing_binding_session_fails_closed_for_wrong_owner(queued):
+    store, registered = queued
+    dispatcher = ChannelDispatcher(store, object(), provider="weixin_ilink")
+    claim = dispatcher.claim_next(holder="dispatcher")
+    from hermes_cli.channel_identity.owner_resolution import resolve_binding
+    owner, _ = resolve_binding(store, binding_id=registered.binding_id)
+    with store.write() as conn:
+        conn.execute(
+            "INSERT INTO channel_sessions VALUES (?, 'ok1_wrong', 'stored-1', 1, 1)",
+            (registered.binding_id,),
+        )
+    client = AsyncMock()
+    client.owner = owner
+    client.handle = type("Handle", (), {"worker_generation": 2})()
+
+    with patch(
+        "hermes_cli.channel_dispatch.dispatcher.OwnerWorkerGatewayClient",
+        return_value=_client_context(client),
+    ):
+        with pytest.raises(RuntimeError, match="Owner does not match"):
+            await dispatcher.dispatch_claim(claim, holder="dispatcher")
+
+    client.call.assert_not_awaited()
+    with store.read() as conn:
+        row = conn.execute("SELECT status FROM inbound_messages").fetchone()
+    assert row["status"] == "queued"
+
+
+@pytest.mark.asyncio
 async def test_failed_agent_turn_does_not_create_outbox(queued):
     store, registered = queued
-    dispatcher = ChannelDispatcher(store, object())
+    dispatcher = ChannelDispatcher(store, object(), provider="weixin_ilink")
     claim = dispatcher.claim_next(holder="dispatcher")
     from hermes_cli.channel_identity.owner_resolution import resolve_binding
     owner, _ = resolve_binding(store, binding_id=registered.binding_id)
@@ -482,5 +669,5 @@ async def test_failed_agent_turn_does_not_create_outbox(queued):
     with store.read() as conn:
         inbound = conn.execute("SELECT status FROM inbound_messages").fetchone()
         count = conn.execute("SELECT COUNT(*) AS count FROM outbound_messages").fetchone()["count"]
-    assert inbound["status"] == "failed"
+    assert inbound["status"] == "queued"
     assert count == 0

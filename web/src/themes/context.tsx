@@ -389,7 +389,7 @@ function applyTheme(theme: DashboardTheme) {
   applyCustomCSS(theme.customCSS);
   applyLayoutVariant(theme.layoutVariant);
 
-  // Terminal colors — read by ChatPage via useTheme(); also available as CSS vars.
+  // Retain terminal color variables for themes that expose them.
   root.style.setProperty(
     "--theme-terminal-background",
     theme.terminalBackground ?? "#000000",

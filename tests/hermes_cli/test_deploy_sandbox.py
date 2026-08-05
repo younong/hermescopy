@@ -43,19 +43,24 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert 'service_user="hermes"' in source
     assert 'service_group="hermes"' in source
     assert 'chown -R "$service_user:$service_group" "$hermes_home"' in source
-    assert source.count("User=$service_user") == 2
-    assert source.count("Group=$service_group") == 2
+    assert source.count("User=$service_user") == 1
+    assert source.count("Group=$service_group") == 1
     assert "Environment=HERMES_DASHBOARD_PUBLIC_URL=$dashboard_public_url" in source
-    assert source.count("Environment=HERMES_SANDBOX_DEPLOYMENT_POLICY=") == 2
-    assert source.count("Environment=HERMES_DISABLE_LAZY_INSTALLS=1") == 2
-    assert source.count("Environment=MALLOC_ARENA_MAX=2") == 2
-    assert "--require-auth --trust-proxy-headers" in source
+    assert source.count("Environment=HERMES_SANDBOX_DEPLOYMENT_POLICY=") == 1
+    assert source.count("Environment=HERMES_DISABLE_LAZY_INSTALLS=1") == 1
+    assert source.count("Environment=MALLOC_ARENA_MAX=2") == 1
+    assert "--skip-build --trust-proxy-headers" in source
+    assert "--require-auth" not in source
     assert (
         "Environment=HERMES_SANDBOX_DEPLOYMENT_POLICY="
         "hermes_cli.owner_worker.host_sandbox:host_sandbox_deployment_policy"
     ) in source
     assert "ExecStartPre=$venv/bin/python" not in source
-    assert "Gateway does not execute authenticated tools" in source
+    assert "gateway run --replace" not in source
+    assert "staged_gateway_unit" not in source
+    assert "After=network-online.target hermes-gateway.service" not in source
+    assert "Services: hermes-gateway.service" not in source
+    assert "ui-tui" not in source
     assert "uv python install \"$python_version\" --install-dir \"$runtime_tmp/python-base\" --no-bin" in source
     assert 'const DEFAULT_PYTHON_PACKAGE_INDEX = "https://mirrors.aliyun.com/pypi/simple"' in source
     assert 'UV_DEFAULT_INDEX="$python_package_index"' in source
@@ -92,7 +97,7 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     archive_block = source[source.index('"-czf"') : source.index("export function createArchive")]
     assert '"--exclude=./node_modules"' in archive_block
     assert '"--exclude=./deploy/powerpoint-runtime/runtime-modules/.package-lock.json"' in archive_block
-    for omitted_tree in ("tests", "website", "apps", ".github", "docs"):
+    for omitted_tree in ("tests", "website", ".github", "docs"):
         assert f'"--exclude=./{omitted_tree}"' in archive_block
     assert '"--exclude=./deploy/powerpoint-runtime/runtime-modules"' not in archive_block
     build_call = source.index("buildArtifact(buildDir, { dryRun });")
@@ -192,8 +197,8 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert "NODE_PATH=\"$venv/powerpoint/node_modules\"" not in source
     assert "npm ci" not in source[source.index("function remoteDeployScript"):]
     assert source.index('deployment_committed="1"', source.index("manage_hermes_proxy.py")) > source.index("manage_hermes_proxy.py")
-    assert "restoring previous deployment state" in source
     assert "restore_deployment_state" in source
+    assert 'if [ "$deployment_committed" != "1" ] && [ -n "$rollback_dir" ]' in source
     assert "HERMES_EXECUTOR_START_GATE_FD" not in source
 
 
@@ -257,15 +262,31 @@ def test_deploy_gates_commit_on_isolated_conversation_smoke():
     auth_ready = source.index('if [ "$login_status" != "302" ] || [ "$api_status" != "401" ]')
     authority_smoke = source.index('"$release/deploy/smoke-authority-concurrency.py"', auth_ready)
     reader_smoke = source.index('"$release/deploy/smoke-session-reader.py"', authority_smoke)
-    smoke = source.index('"$release/deploy/smoke-conversation.py" --timeout 90')
+    smoke = source.index('"$release/deploy/smoke-conversation.py"', reader_smoke)
     nginx = source.index('action="reconcile"', smoke)
     commit = source.index('deployment_committed="1"', nginx)
     assert auth_ready < authority_smoke < reader_smoke < smoke < nginx < commit
-    assert 'runuser -u "$service_user" -- env -i' in source
+    assert '"$release/deploy/run-cgroup-smoke.py"' in source
+    assert '--service hermes-dashboard.service' in source
+    assert '--user "$service_user"' in source
+    assert 'mktemp -d /opt/hcs-XXXXXX' in source
     assert 'HOME="$smoke_root"' in source
     assert 'TMPDIR="$smoke_root"' in source
     assert 'PYTHONPATH="$release"' in source
-    smoke_block = source[source.index("if ! (", auth_ready) : nginx]
+    assert '--root "$smoke_root"' in source
+    assert "--sandbox-policy hermes_cli.owner_worker.host_sandbox:isolated_smoke_sandbox_deployment_policy" in source
+    host_sandbox_source = (
+        ROOT / "hermes_cli" / "owner_worker" / "host_sandbox.py"
+    ).read_text(encoding="utf-8")
+    web_server_source = (ROOT / "hermes_cli" / "web_server.py").read_text(
+        encoding="utf-8"
+    )
+    assert host_sandbox_source.count("recover_stale_resource_scopes=False") == 2
+    assert "sandbox_deployment_policy.recover_stale_resource_scopes" in web_server_source
+    smoke_block = source[source.index('if ! conversation_smoke_result="$(', reader_smoke) : nginx]
+    assert 'printf \'%s\\n\' "$conversation_smoke_result"' in smoke_block
+    assert '"hermes.conversation-smoke"' in source
+    assert "Deterministic failure: ${failure.code}/${failure.check}" in source
     assert "$env_file" not in smoke_block
     assert ". $env_file" not in smoke_block
     cleanup = source[source.index("cleanup_release_tmp"):source.index("trap cleanup_release_tmp EXIT")]
@@ -274,6 +295,7 @@ def test_deploy_gates_commit_on_isolated_conversation_smoke():
     assert 'rm -rf -- "$reader_smoke_root"' in cleanup
     authority_block = source[source.rindex("# Exercise the candidate authority", 0, authority_smoke):reader_smoke]
     assert 'runuser -u "$service_user" -- env -i' in authority_block
+    assert 'mktemp -d "$tmp_dir/hermes-authority-release-smoke.XXXXXX"' in authority_block
     assert 'HOME="$authority_smoke_root"' in authority_block
     assert 'TMPDIR="$authority_smoke_root"' in authority_block
     assert 'HERMES_HOME="$authority_smoke_root"' in authority_block
@@ -284,6 +306,7 @@ def test_deploy_gates_commit_on_isolated_conversation_smoke():
     assert authority_block.index('result.get("status")') < authority_block.index("authority_concurrency_smoke=passed")
     reader_block = source[source.rindex("# Gate Reader performance", 0, reader_smoke):smoke]
     assert 'runuser -u "$service_user" -- env -i' in reader_block
+    assert 'mktemp -d "$tmp_dir/hermes-reader-release-smoke.XXXXXX"' in reader_block
     assert 'HOME="$reader_smoke_root"' in reader_block
     assert 'TMPDIR="$reader_smoke_root"' in reader_block
     assert 'PYTHONPATH="$release"' in reader_block

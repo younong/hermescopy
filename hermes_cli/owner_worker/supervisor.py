@@ -152,6 +152,32 @@ def _mark_owner_worker_skills_synced(owner_home: Path, fingerprint: str) -> None
                 pass
 
 
+def _sync_owner_skills(
+    owner_home: Path,
+    *,
+    bundled_snapshot: Any | None = None,
+) -> dict[str, Any] | None:
+    """Synchronize bundled skills into one exact Owner home."""
+    if (owner_home / ".no-bundled-skills").exists():
+        return {
+            "copied": [],
+            "updated": [],
+            "user_modified": [],
+            "skipped_opt_out": True,
+        }
+
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.skills_sync import sync_skills
+
+    token = set_hermes_home_override(owner_home)
+    try:
+        return sync_skills(quiet=True, bundled_snapshot=bundled_snapshot)
+    except Exception:
+        return None
+    finally:
+        reset_hermes_home_override(token)
+
+
 def _seed_owner_worker_skills(
     owner_home: Path,
     *,
@@ -167,16 +193,10 @@ def _seed_owner_worker_skills(
     except OSError:
         pass
 
-    from hermes_cli.profiles import seed_profile_skills
-
-    if bundled_snapshot is None:
-        result = seed_profile_skills(owner_home, quiet=True)
-    else:
-        result = seed_profile_skills(
-            owner_home,
-            quiet=True,
-            bundled_snapshot=bundled_snapshot,
-        )
+    result = _sync_owner_skills(
+        owner_home,
+        bundled_snapshot=bundled_snapshot,
+    )
     if result is None:
         raise RuntimeError("owner bundled skill synchronization failed")
     _mark_owner_worker_skills_synced(owner_home, fingerprint)

@@ -13,9 +13,8 @@ that:
   * supports timeouts so a user who never responds does NOT hang the agent
     thread forever (which would also pin the gateway's running-agent guard).
 
-State is module-level (same shape as ``tools.approval``) so platform
-adapters can call ``resolve_gateway_clarify`` without holding a back-
-reference to the ``GatewayRunner`` instance.
+State is module-level (same shape as ``tools.approval``) so transport
+adapters can resolve a clarification without holding a runtime back-reference.
 
 Two delivery paths from the adapter:
 

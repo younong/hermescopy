@@ -21,10 +21,7 @@
 }
 
 /* ------------------------------------------------------------------ */
-/* JetBrains Mono — bundled for the embedded TUI (/chat tab).          */
-/* Gives the terminal a proper monospace font even on systems where    */
-/* the user doesn't have one installed locally; xterm.js picks it up   */
-/* via ChatPage's `fontFamily` option.                                 */
+/* JetBrains Mono — bundled for code and terminal-styled content.      */
 /* Apache-2.0.                                                         */
 /* ------------------------------------------------------------------ */
 

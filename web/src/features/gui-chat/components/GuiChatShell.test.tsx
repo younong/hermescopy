@@ -16,6 +16,7 @@ import { GuiChatShell } from "./GuiChatShell";
 
 const mocks = vi.hoisted(() => ({
   connectGuiChat: vi.fn(),
+  connectMockGuiChat: vi.fn(),
   createILinkEnrollment: vi.fn(),
   getAuthMe: vi.fn(),
   getILinkEnrollment: vi.fn(),
@@ -55,16 +56,12 @@ vi.mock("../api", () => ({
 }));
 
 vi.mock("../mock", () => ({
-  connectMockGuiChat: vi.fn(),
+  connectMockGuiChat: mocks.connectMockGuiChat,
 }));
 
 vi.mock("../latencyTrace", () => ({
   navigationStartedAt: mocks.navigationStartedAt,
   startGuiChatLatencyTrace: mocks.startGuiChatLatencyTrace,
-}));
-
-vi.mock("@/contexts/useProfileScope", () => ({
-  useProfileScope: () => ({ profile: "" }),
 }));
 
 vi.mock("@/contexts/usePageHeader", () => ({
@@ -85,7 +82,9 @@ vi.mock("@/i18n", async (importOriginal) => {
 });
 
 vi.mock("@/components/ChatSessionList", () => ({
-  ChatSessionList: () => null,
+  ChatSessionList: (props: { refreshNonce?: number }) => (
+    <span data-session-refresh-nonce={props.refreshNonce ?? 0} />
+  ),
 }));
 
 vi.mock("./Composer", () => ({
@@ -180,6 +179,7 @@ beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
     .IS_REACT_ACT_ENVIRONMENT = true;
   mocks.connectGuiChat.mockReset();
+  mocks.connectMockGuiChat.mockReset();
   mocks.createILinkEnrollment.mockReset();
   mocks.getAuthMe.mockReset();
   mocks.getILinkEnrollment.mockReset();
@@ -394,6 +394,64 @@ describe("GuiChatShell", () => {
     expect(document.body.textContent).toContain("next-model · next-provider · open");
   });
 
+  it("hides Retry while a real chat connection is healthy", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(<GuiChatShell />);
+    expect(document.querySelector('[aria-label="Retry"]')).not.toBeNull();
+
+    await act(async () => {
+      connection.emitState("open");
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector('[aria-label="Retry"]')).toBeNull();
+    expect(document.querySelector('[aria-label="Refresh"]')).not.toBeNull();
+  });
+
+  it("refreshes Recent chats without reconnecting", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(<GuiChatShell />);
+    expect(document.querySelector("[data-session-refresh-nonce]")?.getAttribute("data-session-refresh-nonce"))
+      .toBe("0");
+    expect(connection.createOrAttach).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[aria-label="Refresh"]')?.click();
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector("[data-session-refresh-nonce]")?.getAttribute("data-session-refresh-nonce"))
+      .toBe("1");
+    expect(connection.createOrAttach).toHaveBeenCalledTimes(1);
+    expect(connection.ping).not.toHaveBeenCalled();
+  });
+
+  it("keeps Replay available in mock mode", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectMockGuiChat.mockReturnValue(connection);
+
+    await renderShellAt("/chat?mock=1");
+    await act(async () => {
+      connection.emitState("open");
+      await Promise.resolve();
+    });
+
+    const replay = document.querySelector<HTMLButtonElement>('[aria-label="Replay"]');
+    expect(replay).not.toBeNull();
+    await act(async () => {
+      replay?.click();
+      await Promise.resolve();
+    });
+    expect(connection.createOrAttach).toHaveBeenCalledTimes(2);
+  });
+
   it("opens files inside the dedicated workspace and returns to chat", async () => {
     const connection = createConnection();
     mocks.getAuthMe.mockResolvedValue(authIdentity());
@@ -599,7 +657,7 @@ describe("GuiChatShell", () => {
     root = createRoot(container);
     act(() => {
       root?.render(
-        <MemoryRouter initialEntries={["/chat-gui"]}>
+        <MemoryRouter initialEntries={["/chat"]}>
           <DashboardAuthIdentityProvider>
             <ReadyProbe />
             <GuiChatShell />
@@ -620,8 +678,8 @@ describe("GuiChatShell", () => {
 
     expect(mocks.connectGuiChat).toHaveBeenCalledTimes(2);
     expect(mocks.connectGuiChat.mock.calls).toEqual([
-      [{ ownerKey: undefined, profile: "" }],
-      [{ ownerKey: "owner-a", profile: "" }],
+      [{ ownerKey: undefined }],
+      [{ ownerKey: "owner-a" }],
     ]);
     expect(document.querySelector("[data-ready]")?.outerHTML).toContain('data-ready="true"');
     expect(firstConnection.close).toHaveBeenCalledOnce();
@@ -659,7 +717,7 @@ describe("GuiChatShell", () => {
     root = createRoot(container)
     await act(async () => {
       root?.render(
-        <MemoryRouter initialEntries={["/chat-gui"]}>
+        <MemoryRouter initialEntries={["/chat"]}>
           <DashboardAuthIdentityProvider>
             <GuiChatShell />
           </DashboardAuthIdentityProvider>
@@ -687,7 +745,7 @@ describe("GuiChatShell", () => {
     root = createRoot(container);
     await act(async () => {
       root?.render(
-        <MemoryRouter initialEntries={["/chat-gui"]}>
+        <MemoryRouter initialEntries={["/chat"]}>
           <DashboardAuthIdentityProvider>
             <GuiChatShell />
           </DashboardAuthIdentityProvider>
@@ -731,7 +789,7 @@ describe("GuiChatShell", () => {
     root = createRoot(container);
     await act(async () => {
       root?.render(
-        <MemoryRouter initialEntries={["/chat-gui?resume=requested"]}>
+        <MemoryRouter initialEntries={["/chat?resume=requested"]}>
           <DashboardAuthIdentityProvider>
             <GuiChatShell />
           </DashboardAuthIdentityProvider>
@@ -753,7 +811,6 @@ describe("GuiChatShell", () => {
     expect(mocks.getSessionMessages).toHaveBeenCalledWith(
       "requested",
       expect.objectContaining({ limit: 100, signal: expect.any(AbortSignal) }),
-      "",
     );
     expect(connection.createOrAttach).toHaveBeenCalledOnce();
     expect(container.textContent).toContain("saved answer");
@@ -778,7 +835,7 @@ describe("GuiChatShell", () => {
     root = createRoot(container);
     await act(async () => {
       root?.render(
-        <MemoryRouter initialEntries={["/chat-gui?resume=requested"]}>
+        <MemoryRouter initialEntries={["/chat?resume=requested"]}>
           <DashboardAuthIdentityProvider>
             <GuiChatShell />
           </DashboardAuthIdentityProvider>
@@ -802,7 +859,7 @@ describe("GuiChatShell", () => {
     root = createRoot(container);
     await act(async () => {
       root?.render(
-        <MemoryRouter initialEntries={["/chat-gui?resume=session-a"]}>
+        <MemoryRouter initialEntries={["/chat?resume=session-a"]}>
           <DashboardAuthIdentityProvider>
             <NavigationProbe
               onReady={(nextNavigate) => {
@@ -820,7 +877,7 @@ describe("GuiChatShell", () => {
     expect(navigate).not.toBeNull();
     for (const sessionId of ["session-b", "session-c", "session-d"]) {
       await act(async () => {
-        navigate?.(`/chat-gui?resume=${sessionId}`);
+        navigate?.(`/chat?resume=${sessionId}`);
         await Promise.resolve();
         await Promise.resolve();
       });
@@ -847,12 +904,16 @@ describe("GuiChatShell", () => {
 });
 
 async function renderShell(shell: ReactNode) {
+  await renderShellAt("/chat", shell);
+}
+
+async function renderShellAt(entry: string, shell: ReactNode = <GuiChatShell />) {
   const container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
   await act(async () => {
     root?.render(
-      <MemoryRouter initialEntries={["/chat-gui"]}>
+      <MemoryRouter initialEntries={[entry]}>
         <DashboardAuthIdentityProvider>{shell}</DashboardAuthIdentityProvider>
       </MemoryRouter>,
     );

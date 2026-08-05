@@ -49,8 +49,7 @@ const ENGLISH_SCHEDULE_STRINGS = {
   ordinal: englishOrdinal,
 };
 
-export function GuiChatScheduledTasksPane({ profile }: { profile?: string }) {
-  const scopedProfile = profile || undefined;
+export function GuiChatScheduledTasksPane() {
   const [jobs, setJobs] = useState<CronJob[]>([]);
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(true);
@@ -64,14 +63,14 @@ export function GuiChatScheduledTasksPane({ profile }: { profile?: string }) {
     setLoading(true);
     setError(null);
     try {
-      const rows = await api.getCronJobs(scopedProfile);
+      const rows = await api.getCronJobs();
       setJobs(sortJobs(rows));
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
       setLoading(false);
     }
-  }, [scopedProfile]);
+  }, []);
 
   useEffect(() => {
     void load();
@@ -82,9 +81,9 @@ export function GuiChatScheduledTasksPane({ profile }: { profile?: string }) {
     if (!editorOpen) return;
     let cancelled = false;
     Promise.all([
-      api.getSkills(scopedProfile).catch(() => []),
-      api.getToolsets(scopedProfile).catch(() => []),
-      api.getModelOptions(scopedProfile).catch(() => null),
+      api.getSkills().catch(() => []),
+      api.getToolsets().catch(() => []),
+      api.getModelOptions().catch(() => null),
       api.getCronDeliveryTargets().catch(() => ({ targets: [LOCAL_DELIVERY] })),
     ]).then(([skills, toolsets, modelOptions, delivery]) => {
       if (cancelled) return;
@@ -98,7 +97,7 @@ export function GuiChatScheduledTasksPane({ profile }: { profile?: string }) {
     return () => {
       cancelled = true;
     };
-  }, [editorOpen, scopedProfile]);
+  }, [editorOpen, ]);
 
   const visibleJobs = useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -114,8 +113,8 @@ export function GuiChatScheduledTasksPane({ profile }: { profile?: string }) {
     setError(null);
     try {
       const updated = jobState(job) === "paused"
-        ? await api.resumeCronJob(job.id, scopedProfile)
-        : await api.pauseCronJob(job.id, scopedProfile);
+        ? await api.resumeCronJob(job.id, )
+        : await api.pauseCronJob(job.id, );
       setJobs((current) => current.map((row) => row.id === job.id ? updated : row));
     } catch (cause) {
       setError(errorMessage(cause));
@@ -141,10 +140,10 @@ export function GuiChatScheduledTasksPane({ profile }: { profile?: string }) {
     setError(null);
     try {
       if (editor.job) {
-        const updated = await api.updateCronJob(editor.job.id, payload, scopedProfile);
+        const updated = await api.updateCronJob(editor.job.id, payload, );
         setJobs((current) => sortJobs(current.map((row) => row.id === editor.job?.id ? updated : row)));
       } else {
-        const created = await api.createCronJob(payload, scopedProfile);
+        const created = await api.createCronJob(payload, );
         setJobs((current) => sortJobs([...current, created]));
       }
       setEditor(null);
@@ -161,7 +160,7 @@ export function GuiChatScheduledTasksPane({ profile }: { profile?: string }) {
     setBusyJob(id);
     setError(null);
     try {
-      await api.deleteCronJob(id, scopedProfile);
+      await api.deleteCronJob(id, );
       setJobs((current) => current.filter((job) => job.id !== id));
       setPendingDelete(null);
     } catch (cause) {

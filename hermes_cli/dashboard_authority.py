@@ -54,6 +54,7 @@ _REQUIRED_TABLES = frozenset({
     "owner_worker_changes",
     "session_reader_generations",
     "session_reader_leases",
+    "authenticated_owners",
 })
 _EXACT_TLS_OFFSET_5 = bytes.fromhex("17 03 03 00 13")
 _CORRUPTION_CLASSIFICATIONS = frozenset({
@@ -248,7 +249,7 @@ def _validate_candidate(path: Path) -> ReplayContinuity:
                 "SELECT key, value FROM authority_meta WHERE key IN "
                 "('schema_version', 'authority_id', 'recovery_generation', 'recovery_required', 'keyring_bound')"
             ).fetchall())
-            if int(values["schema_version"]) != 6:
+            if int(values["schema_version"]) != 8:
                 raise AuthorityRecoveryError("recovery candidate schema is unsupported")
             authority_id = str(values["authority_id"])
             generation = int(values["recovery_generation"])

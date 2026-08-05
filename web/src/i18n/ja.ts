@@ -57,15 +57,6 @@ export const ja: Translations = {
     footer: {
       org: "Nous Research",
     },
-    activeSessionsLabel: "アクティブなセッション:",
-    gatewayStatusLabel: "ゲートウェイの状態:",
-    gatewayStrip: {
-      failed: "起動に失敗しました",
-      off: "オフ",
-      running: "実行中",
-      starting: "起動中",
-      stopped: "停止",
-    },
     nav: {
       analytics: "分析",
       chat: "チャット",
@@ -87,7 +78,6 @@ export const ja: Translations = {
     openNavigation: "ナビゲーションを開く",
     pluginNavSection: "プラグイン",
     sessionsActiveCount: "{count} 件アクティブ",
-    statusOverview: "ステータス概要",
     system: "システム",
     webUi: "Web UI",
   },
@@ -272,10 +262,9 @@ export const ja: Translations = {
     triggerNow: "今すぐ実行",
     delivery: {
       local: "ローカル",
-      telegram: "Telegram",
-      discord: "Discord",
-      slack: "Slack",
-      email: "Email",
+      weixin_ilink: "Weixin iLink",
+      feishu: "Feishu",
+      webhook: "Webhook",
     },
   },
 
@@ -407,7 +396,6 @@ export const ja: Translations = {
       tts: "音声合成",
       stt: "音声認識",
       logging: "ロギング",
-      discord: "Discord",
       auxiliary: "補助",
     },
   },

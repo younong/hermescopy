@@ -1,9 +1,8 @@
 """Tests for the Chronos cron-fire webhook ON THE DASHBOARD APP (web_server).
 
 Regression guard for the relocation bug: the fire webhook MUST live on the
-dashboard FastAPI app (`hermes_cli.web_server.app`) — the agent's public HTTP
-surface on hosted deployments — not only on the aiohttp APIServerAdapter (which
-hosted agents don't expose). It must:
+dashboard FastAPI app (`hermes_cli.web_server.app`) — the authenticated Control
+Plane HTTP surface on hosted deployments. It must:
   - be a registered route on the dashboard app,
   - be in PUBLIC_API_PATHS so the dashboard cookie gate doesn't 401 it before
     the JWT verifier runs,

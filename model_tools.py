@@ -5,13 +5,13 @@ Model Tools Module
 Thin orchestration layer over the tool registry. Each tool file in tools/
 self-registers its schema, handler, and metadata via tools.registry.register().
 This module triggers discovery (by importing all tool modules), then provides
-the public API that run_agent.py, cli.py, batch_runner.py, and the RL
+the public API that run_agent.py, cli.py, and the RL
 environments consume.
 
 Public API (signatures preserved from the original 2,400-line version):
     get_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode) -> list
     handle_function_call(function_name, function_args, task_id, user_task) -> str
-    TOOL_TO_TOOLSET_MAP: dict          (for batch_runner.py)
+    TOOL_TO_TOOLSET_MAP: dict          (for runtime toolset lookup)
     TOOLSET_REQUIREMENTS: dict         (for cli.py, doctor.py)
     get_all_tool_names() -> list
     get_toolset_for_tool(name) -> str
@@ -198,7 +198,6 @@ discover_builtin_tools()
 #   - gateway/run.py            -> start_gateway() uses run_in_executor
 #   - cli.py, hermes_cli/*      -> inline on startup (no event loop)
 #   - tui_gateway/server.py     -> inline on startup (no event loop)
-#   - acp_adapter/server.py     -> asyncio.to_thread on session init
 
 # Plugin tool discovery (user/project/pip plugins)
 try:
@@ -658,6 +657,82 @@ def _resolve_active_context_length() -> int:
 # so if something slips through, the LLM sees a sensible message.
 _AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task"}
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
+
+
+def _authenticated_approval_decision(
+    function_name: str,
+    function_args: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Approve host-affecting tools before crossing into the isolated executor."""
+    if function_name == "terminal":
+        command = function_args.get("command")
+        if isinstance(command, str):
+            from tools.approval import check_all_command_guards
+
+            return check_all_command_guards(command, "local")
+
+    if function_name == "execute_code":
+        code = function_args.get("code")
+        if isinstance(code, str):
+            from tools.approval import check_execute_code_guard
+
+            return check_execute_code_guard(code, "local")
+
+    return None
+
+
+def _authenticated_approval_result(
+    function_name: str,
+    decision: Dict[str, Any],
+) -> str:
+    """Return the existing tool-facing result shape for a rejected decision."""
+    if function_name == "terminal":
+        if decision.get("status") == "pending_approval":
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": "",
+                "status": "pending_approval",
+                "approval_pending": True,
+                "command": decision.get("command", ""),
+                "description": decision.get("description", "command flagged"),
+                "pattern_key": decision.get("pattern_key", ""),
+            }, ensure_ascii=False)
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": decision.get("message") or "Command blocked by approval guard.",
+            "status": "blocked",
+        }, ensure_ascii=False)
+
+    return json.dumps({
+        "status": "error",
+        "error": decision.get("message") or "execute_code blocked by approval guard.",
+        "tool_calls_made": 0,
+        "duration_seconds": 0,
+    }, ensure_ascii=False)
+
+
+def _annotate_authenticated_terminal_result(result: Any, decision: Dict[str, Any]) -> Any:
+    """Preserve approval observability without passing authority to the child."""
+    if not (decision.get("user_approved") or decision.get("smart_approved")):
+        return result
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError):
+        return result
+    if not isinstance(payload, dict):
+        return result
+    description = decision.get("description", "flagged as dangerous")
+    if decision.get("user_approved"):
+        payload["approval"] = (
+            f"Command required approval ({description}) and was approved by the user."
+        )
+    else:
+        payload["approval"] = (
+            f"Command was flagged ({description}) and auto-approved by smart approval."
+        )
+    return json.dumps(payload, ensure_ascii=False)
 
 
 # =========================================================================
@@ -1153,20 +1228,6 @@ def handle_function_call(
                 )
                 return result
 
-        # ACP/Zed edit approval runs before any file mutation.  The requester
-        # is bound via ContextVar only for ACP sessions, so CLI/gateway paths
-        # are unaffected when it is unset.
-        try:
-            from acp_adapter.edit_approval import maybe_require_edit_approval
-
-            edit_block_message = maybe_require_edit_approval(function_name, function_args)
-            if edit_block_message is not None:
-                return edit_block_message
-        except Exception as _edit_approval_err:
-            logger.debug("ACP edit approval guard error: %s", _edit_approval_err)
-            if function_name in {"write_file", "patch"}:
-                return json.dumps({"error": "Edit approval denied: approval guard failed"}, ensure_ascii=False)
-
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).
         if function_name not in _READ_SEARCH_TOOLS:
@@ -1206,12 +1267,14 @@ def handle_function_call(
                 # process-global registry. Its executor boundary is mandatory.
                 raise RuntimeError("authenticated tool executor is unavailable")
             if _executor_supervisor is not None:
-                # All existing middleware and policy hooks run before this
-                # terminal boundary. The executor itself dispatches directly to
-                # the registry after validating a private bootstrap, preventing
-                # recursive routing back through this function.
+                # Interactive approval belongs to the exact Owner Worker. The
+                # executor receives no browser/session authority and dispatches
+                # directly to the registry after validating its private bootstrap.
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return _executor_supervisor.dispatch(
+                    approval = _authenticated_approval_decision(function_name, next_args)
+                    if approval is not None and not approval.get("approved", False):
+                        return _authenticated_approval_result(function_name, approval)
+                    dispatched = _executor_supervisor.dispatch(
                         function_name=function_name,
                         function_args=next_args,
                         task_id=task_id or "",
@@ -1220,6 +1283,9 @@ def handle_function_call(
                         turn_id=turn_id or "",
                         api_request_id=api_request_id or "",
                     )
+                    if function_name == "terminal" and approval is not None:
+                        return _annotate_authenticated_terminal_result(dispatched, approval)
+                    return dispatched
             elif function_name == "execute_code":
                 # Prefer the caller-provided list so subagents can't overwrite
                 # the parent's tool set via the process-global.

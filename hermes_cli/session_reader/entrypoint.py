@@ -15,6 +15,8 @@ from queue import Empty, Queue
 from typing import Any, Iterator
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from hermes_cli.session_sources import RETAINED_SESSION_SOURCES, retained_recovery_scope
+
 from .runtime import (
     FORBIDDEN_OWNER_WORKER_ENV_KEYS,
     session_reader_socket_path,
@@ -371,11 +373,11 @@ def _create_handler(
                     "by_source": {},
                 }
             return 404, {"detail": "Session not found"}
-        recovery_scope = {
+        recovery_scope = retained_recovery_scope({
             "owner_key": owner_key,
             "workspace_root": str((paths.owner_home / "workspaces").resolve()),
             "historical_resume": True,
-        }
+        })
         try:
             with queries.borrow() as db:
                 if route_path == "/api/sessions":
@@ -393,6 +395,7 @@ def _create_handler(
                         active_before=active_before,
                         recovery_scope=recovery_scope,
                         compact=compact,
+                        allowed_sources=sorted(RETAINED_SESSION_SOURCES),
                         latency_trace_id=headers.get("x-request-id", ""),
                     )
                 elif route_path == "/api/sessions/composition":
@@ -407,6 +410,7 @@ def _create_handler(
                         q=search_query,
                         limit=limit,
                         recovery_scope=recovery_scope,
+                        allowed_sources=sorted(RETAINED_SESSION_SOURCES),
                     )
                 elif route_path == "/api/sessions/empty/count":
                     payload = session_api.empty_count_payload(

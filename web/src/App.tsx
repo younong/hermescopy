@@ -42,15 +42,12 @@ import {
   Plug,
   Puzzle,
   Radio,
-  RotateCw,
   Settings,
   Shield,
   ShieldCheck,
   Sparkles,
   Star,
   Terminal,
-  Users,
-  Webhook,
   Wrench,
   X,
   Zap,
@@ -62,15 +59,10 @@ import { Typography } from "@nous-research/ui/ui/components/typography/index";
 import { ConfirmDialog } from "@nous-research/ui/ui/components/confirm-dialog";
 import { cn } from "@/lib/utils";
 import { SidebarFooter } from "@/components/SidebarFooter";
-import { SidebarStatusStrip, gatewayLine } from "@/components/SidebarStatusStrip";
 import { useBelowBreakpoint } from "@nous-research/ui/hooks/use-below-breakpoint";
 import { useSidebarStatus } from "@/hooks/useSidebarStatus";
 import { AuthWidget } from "@/components/AuthWidget";
 import { PageHeaderProvider } from "@/contexts/PageHeaderProvider";
-import { ProfileProvider } from "@/contexts/ProfileProvider";
-import { useProfileScope } from "@/contexts/useProfileScope";
-import { ProfileSwitcher } from "@/components/ProfileSwitcher";
-import { ProfileScopeBanner } from "@/components/ProfileScopeBanner";
 import { useSystemActions } from "@/contexts/useSystemActions";
 import type { SystemAction } from "@/contexts/system-actions-context";
 import ConfigPage from "@/pages/ConfigPage";
@@ -82,16 +74,12 @@ import LogsPage from "@/pages/LogsPage";
 import AnalyticsPage from "@/pages/AnalyticsPage";
 import ModelsPage from "@/pages/ModelsPage";
 import CronPage from "@/pages/CronPage";
-import ProfilesPage from "@/pages/ProfilesPage";
-import ProfileBuilderPage from "@/pages/ProfileBuilderPage";
 import SkillsPage from "@/pages/SkillsPage";
 import PluginsPage from "@/pages/PluginsPage";
 import McpPage from "@/pages/McpPage";
 import PairingPage from "@/pages/PairingPage";
 import ChannelsPage from "@/pages/ChannelsPage";
-import WebhooksPage from "@/pages/WebhooksPage";
 import SystemPage from "@/pages/SystemPage";
-import ChatPage from "@/pages/ChatPage";
 import GuiChatPage from "@/pages/GuiChatPage";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
@@ -100,7 +88,6 @@ import type { Translations } from "@/i18n/types";
 import { PluginPage, PluginSlot, usePlugins } from "@/plugins";
 import type { PluginManifest } from "@/plugins";
 import { useTheme } from "@/themes";
-import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
 import { api } from "@/lib/api";
 import type { StatusResponse, UpdateCheckResponse } from "@/lib/api";
 
@@ -118,25 +105,10 @@ function UnknownRouteFallback({ pluginsLoading }: { pluginsLoading: boolean }) {
 
 const CHAT_NAV_ITEM: NavItem = {
   path: "/chat",
-  label: "Chat Terminal",
-  icon: Terminal,
-};
-
-const GUI_CHAT_NAV_ITEM: NavItem = {
-  path: "/chat-gui",
-  label: "Chat GUI (beta)",
+  label: "Chat",
   icon: Sparkles,
 };
 
-/**
- * Built-in routes except /chat.  Chat is rendered persistently (outside
- * <Routes>) when embedded — see the persistent chat host block rendered
- * inline near the bottom of this file — so the PTY child, WebSocket,
- * and xterm instance survive when the user visits another tab and comes
- * back.  A `display:none` toggle hides the terminal without unmounting.
- * Routing still owns the URL so /chat deep-links, browser back/forward,
- * and nav highlight keep working.
- */
 const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/": RootRedirect,
   "/sessions": SessionsPage,
@@ -150,23 +122,12 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/mcp": McpPage,
   "/pairing": PairingPage,
   "/channels": ChannelsPage,
-  "/webhooks": WebhooksPage,
   "/system": SystemPage,
-  "/chat-gui/*": GuiChatPage,
-  "/profiles": ProfilesPage,
-  "/profiles/new": ProfileBuilderPage,
+  "/chat/*": GuiChatPage,
   "/config": ConfigPage,
   "/env": EnvPage,
   "/docs": DocsPage,
 };
-
-// Route placeholder for /chat.  The persistent ChatPage host (rendered
-// outside <Routes> when embedded chat is on) paints on top; this empty
-// element just claims the path so the `*` catch-all redirect doesn't
-// fire when the user navigates to /chat.
-function ChatRouteSink() {
-  return null;
-}
 
 const BUILTIN_NAV_REST: NavItem[] = [
   {
@@ -194,9 +155,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
   { path: "/plugins", labelKey: "plugins", label: "Plugins", icon: Puzzle },
   { path: "/mcp", label: "MCP", icon: Plug },
   { path: "/channels", label: "Channels", icon: Radio },
-  { path: "/webhooks", label: "Webhooks", icon: Webhook },
   { path: "/pairing", label: "Pairing", icon: ShieldCheck },
-  { path: "/profiles", labelKey: "profiles", label: "Profiles", icon: Users },
   { path: "/config", labelKey: "config", label: "Config", icon: Settings },
   { path: "/env", labelKey: "keys", label: "Keys", icon: KeyRound },
   { path: "/system", label: "System", icon: Wrench },
@@ -226,7 +185,6 @@ const ICON_MAP: Record<string, ComponentType<{ className?: string }>> = {
   Globe,
   Database,
   Shield,
-  Users,
   Wrench,
   Zap,
   Heart,
@@ -385,10 +343,7 @@ export default function App() {
   const sidebarStatus = useSidebarStatus();
   const isDocsRoute = pathname === "/docs" || pathname === "/docs/";
   const normalizedPath = pathname.replace(/\/$/, "") || "/";
-  const isChatRoute = normalizedPath === "/chat";
-  const isGuiChatRoute = normalizedPath === "/chat-gui" || normalizedPath.startsWith("/chat-gui/");
-  const isChatSurfaceRoute = isChatRoute;
-  const embeddedChat = isDashboardEmbeddedChatEnabled();
+  const isGuiChatRoute = normalizedPath === "/chat" || normalizedPath.startsWith("/chat/");
 
   // `dashboard.show_token_analytics` gates the Analytics nav item.  The
   // page itself remains reachable by URL (it renders an explanation when
@@ -407,44 +362,14 @@ export default function App() {
       .catch(() => setShowTokenAnalytics(false));
   }, []);
 
-  // A plugin can replace the built-in /chat page via `tab.override: "/chat"`
-  // in its manifest.  When one does, `buildRoutes` already swaps the route
-  // element for <PluginPage /> — but we also have to suppress the
-  // persistent ChatPage host below, or the plugin's page and the built-in
-  // terminal would paint on top of each other.  The override is niche
-  // (nothing ships overriding /chat today) but it's an advertised
-  // extension point, so preserve the pre-persistence contract: when a
-  // plugin owns /chat, the built-in chat UI is entirely absent.
-  //
-  // Waiting on `pluginsLoading` is load-bearing: manifests arrive
-  // asynchronously from /api/dashboard/plugins, so on initial render
-  // `chatOverriddenByPlugin` is always false.  Without the loading
-  // gate, the persistent host would mount, spawn a PTY, and THEN get
-  // yanked out from under the user when the plugin's manifest resolves
-  // — killing the session mid-paint.  Delaying host mount by the
-  // plugin-load window (typically <50ms, worst case 2s safety timeout)
-  // is the cheaper trade-off.
-  const chatOverriddenByPlugin = useMemo(
-    () => manifests.some((m) => m.tab.override === "/chat"),
-    [manifests],
-  );
-
-  const builtinRoutes = useMemo(
-    () => ({
-      ...BUILTIN_ROUTES_CORE,
-      ...(embeddedChat ? { "/chat": ChatRouteSink } : {}),
-    }),
-    [embeddedChat],
-  );
+  const builtinRoutes = BUILTIN_ROUTES_CORE;
 
   const builtinNav = useMemo(() => {
-    const base = embeddedChat
-      ? [CHAT_NAV_ITEM, GUI_CHAT_NAV_ITEM, ...BUILTIN_NAV_REST]
-      : [GUI_CHAT_NAV_ITEM, ...BUILTIN_NAV_REST];
+    const base = [CHAT_NAV_ITEM, ...BUILTIN_NAV_REST];
     return showTokenAnalytics
       ? base
       : base.filter((n) => n.path !== "/analytics");
-  }, [embeddedChat, showTokenAnalytics]);
+  }, [showTokenAnalytics]);
 
   const sidebarNav = useMemo(
     () => partitionSidebarNav(builtinNav, manifests),
@@ -492,32 +417,26 @@ export default function App() {
 
   if (isGuiChatRoute) {
     return (
-      <ProfileProvider>
-        <div className="relative flex h-dvh max-h-dvh min-h-0 overflow-hidden bg-white text-[#202124] antialiased">
-          <SelectionSwitcher />
-          <div aria-hidden className="pointer-events-none fixed inset-0 z-0">
-            <PluginSlot name="backdrop" />
-          </div>
-          <ProfileKeyedRoutes>
-            <Routes>
-              {routes.map(({ key, path, element }) => (
-                <Route key={key} path={path} element={element} />
-              ))}
-              <Route
-                path="*"
-                element={<UnknownRouteFallback pluginsLoading={pluginsLoading} />}
-              />
-            </Routes>
-          </ProfileKeyedRoutes>
-          <PluginSlot name="overlay" />
+      <div className="relative flex h-dvh max-h-dvh min-h-0 overflow-hidden bg-white text-[#202124] antialiased">
+        <SelectionSwitcher />
+        <div aria-hidden className="pointer-events-none fixed inset-0 z-0">
+          <PluginSlot name="backdrop" />
         </div>
-      </ProfileProvider>
+        <Routes>
+          {routes.map(({ key, path, element }) => (
+            <Route key={key} path={path} element={element} />
+          ))}
+          <Route
+            path="*"
+            element={<UnknownRouteFallback pluginsLoading={pluginsLoading} />}
+          />
+        </Routes>
+        <PluginSlot name="overlay" />
+      </div>
     );
   }
 
-
   return (
-    <ProfileProvider>
     <div
       data-layout-variant={layoutVariant}
       className="flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden bg-background-base text-text-primary antialiased"
@@ -574,8 +493,6 @@ export default function App() {
       )}
 
       <PluginSlot name="header-banner" />
-      <ProfileScopeBanner />
-
       <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden pt-14 lg:pt-0">
         <div className="flex min-h-0 min-w-0 flex-1">
           <aside
@@ -645,8 +562,6 @@ export default function App() {
                 )}
               </Button>
             </div>
-
-            <ProfileSwitcher collapsed={isDesktopCollapsed} />
 
             <nav
               className="min-h-0 w-full flex-1 overflow-y-auto overflow-x-hidden border-t border-current/10 py-2"
@@ -756,64 +671,29 @@ export default function App() {
             <div
               className={cn(
                 "relative z-2 flex min-w-0 min-h-0 flex-1 flex-col",
-                "px-3 sm:px-6",
-                isChatSurfaceRoute
-                  ? "pb-0 pt-1 sm:pt-2 lg:pt-4"
-                  : "pt-2 sm:pt-4 lg:pt-6",
+                "px-3 pt-2 sm:px-6 sm:pt-4 lg:pt-6",
                 isDocsRoute && "min-h-0 flex-1",
               )}
             >
               <PluginSlot name="pre-main" />
               <div
                 className={cn(
-                  "w-full min-w-0",
-                  !isChatSurfaceRoute &&
-                    "pb-[calc(2rem+env(safe-area-inset-bottom,0px))] lg:pb-8",
-                  (isDocsRoute || isChatSurfaceRoute) &&
-                    "min-h-0 flex flex-1 flex-col",
+                  "w-full min-w-0 pb-[calc(2rem+env(safe-area-inset-bottom,0px))] lg:pb-8",
+                  isDocsRoute && "min-h-0 flex flex-1 flex-col",
                 )}
               >
-                <ProfileKeyedRoutes>
-                  <Routes>
-                    {routes.map(({ key, path, element }) => (
-                      <Route key={key} path={path} element={element} />
-                    ))}
-                    <Route
-                      path="*"
-                      element={
-                        <UnknownRouteFallback pluginsLoading={pluginsLoading} />
-                      }
-                    />
-                  </Routes>
-                </ProfileKeyedRoutes>
-
-                {embeddedChat &&
-                  !chatOverriddenByPlugin &&
-                  (pluginsLoading ? (
-                    isChatRoute ? (
-                      <div
-                        className="flex min-h-0 min-w-0 flex-1 items-center justify-center"
-                        aria-busy="true"
-                        aria-live="polite"
-                      >
-                        <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                          <Spinner />
-                          <span>Loading chat…</span>
-                        </div>
-                      </div>
-                    ) : null
-                  ) : (
-                    <div
-                      data-chat-active={isChatRoute ? "true" : "false"}
-                      className={cn(
-                        "min-h-0 min-w-0",
-                        isChatRoute ? "flex flex-1 flex-col" : "hidden",
-                      )}
-                      aria-hidden={!isChatRoute}
-                    >
-                      <ChatPage isActive={isChatRoute} />
-                    </div>
+                <Routes>
+                  {routes.map(({ key, path, element }) => (
+                    <Route key={key} path={path} element={element} />
                   ))}
+                  <Route
+                    path="*"
+                    element={
+                      <UnknownRouteFallback pluginsLoading={pluginsLoading} />
+                    }
+                  />
+                </Routes>
+
               </div>
               <PluginSlot name="post-main" />
             </div>
@@ -823,23 +703,7 @@ export default function App() {
 
       <PluginSlot name="overlay" />
     </div>
-    </ProfileProvider>
   );
-}
-
-/**
- * Remounts the entire routed page tree when the global management profile
- * changes. Pages load their data on mount; without this, a page opened
- * under profile A would keep showing A's state while writes (via the
- * fetchJSON ?profile= injection) silently targeted the newly selected
- * profile B — the exact stale-target footgun the switcher exists to kill.
- * Keying by profile resets every page's local state so it refetches under
- * the new scope. The persistent ChatPage host below handles its own
- * remount (channel keyed on scopedProfile).
- */
-function ProfileKeyedRoutes({ children }: { children: ReactNode }) {
-  const { profile } = useProfileScope();
-  return <div key={profile || "__own__"} className="contents">{children}</div>;
 }
 
 function SidebarNavLink({
@@ -939,7 +803,6 @@ function SidebarSystemActions({
   const { activeAction, isBusy, isRunning, pendingAction, runAction } =
     useSystemActions();
   const canUpdateHermes = status?.can_update_hermes === true;
-  const [restartConfirmOpen, setRestartConfirmOpen] = useState(false);
   const [updateConfirmOpen, setUpdateConfirmOpen] = useState(false);
   const [updateConfirmInfo, setUpdateConfirmInfo] =
     useState<UpdateCheckResponse | null>(null);
@@ -972,24 +835,16 @@ function SidebarSystemActions({
     if (updateConfirmInfo?.behind && updateConfirmInfo.behind > 0) {
       const cmd = updateConfirmInfo.update_command;
       const n = updateConfirmInfo.behind;
-      return `This will run 'hermes update' (${cmd}) and pull ${n} new commit${n === 1 ? "" : "s"}. The gateway restarts when the update finishes; the current session keeps its prompt cache until then.`;
+      return `This will run 'hermes update' (${cmd}) and pull ${n} new commit${n === 1 ? "" : "s"}.`;
     }
     const cmd = updateConfirmInfo?.update_command ?? "hermes update";
     return (
       t.status.updateHermesConfirmMessage ??
-      `This will run 'hermes update' (${cmd}) and restart the gateway when it finishes.`
+      `This will run 'hermes update' (${cmd}).`
     );
   }, [t.status.updateHermesConfirmMessage, updateConfirmInfo]);
 
-  const items: SystemActionItem[] = [
-    {
-      action: "restart",
-      icon: RotateCw,
-      label: t.status.restartGateway,
-      runningLabel: t.status.restartingGateway,
-      spin: true,
-    },
-  ];
+  const items: SystemActionItem[] = [];
   if (canUpdateHermes) {
     items.push({
       action: "update",
@@ -1002,22 +857,11 @@ function SidebarSystemActions({
 
   const handleClick = (action: SystemAction) => {
     if (isBusy) return;
-    if (action === "restart") {
-      setRestartConfirmOpen(true);
-      return;
-    }
     if (action === "update") {
       setUpdateConfirmOpen(true);
       return;
     }
     void runAction(action);
-    navigate("/sessions");
-    onNavigate();
-  };
-
-  const confirmRestart = () => {
-    setRestartConfirmOpen(false);
-    void runAction("restart");
     navigate("/sessions");
     onNavigate();
   };
@@ -1048,12 +892,6 @@ function SidebarSystemActions({
         {t.app.system}
       </span>
 
-      <div className={cn(collapsed && "lg:hidden")}>
-        <SidebarStatusStrip status={status} />
-      </div>
-
-      <GatewayDot collapsed={collapsed} status={status} tooltipWarmRef={tooltipWarmRef} />
-
       <ul className="flex flex-col">
         {items.map((item) => (
           <SystemActionButton
@@ -1069,22 +907,6 @@ function SidebarSystemActions({
         ))}
       </ul>
     </div>
-
-    <ConfirmDialog
-      cancelLabel={t.common.cancel}
-      confirmLabel={t.status.restartGateway}
-      description={
-        t.status.restartGatewayConfirmMessage ??
-        "This restarts the Hermes gateway process. Connected channels and active sessions will reconnect afterward."
-      }
-      loading={pendingAction === "restart"}
-      onCancel={() => setRestartConfirmOpen(false)}
-      onConfirm={confirmRestart}
-      open={restartConfirmOpen}
-      title={
-        t.status.restartGatewayConfirmTitle ?? `${t.status.restartGateway}?`
-      }
-    />
 
     <ConfirmDialog
       cancelLabel={t.common.cancel}
@@ -1232,64 +1054,6 @@ function SidebarIconWithTooltip({
   );
 }
 
-function GatewayDot({ collapsed, status, tooltipWarmRef }: GatewayDotProps) {
-  const { t } = useI18n();
-  const [hovered, setHovered] = useState(false);
-  const [tooltipAnchor, setTooltipAnchor] = useState<HTMLElement | null>(null);
-
-  const toneToColor: Record<string, string> = {
-    "text-success": "bg-success",
-    "text-warning": "bg-warning",
-    "text-destructive": "bg-destructive",
-    "text-muted-foreground": "bg-muted-foreground",
-  };
-
-  let color: string;
-  let label: string;
-
-  if (!status) {
-    color = "bg-midground/20";
-    label = t.status.gateway;
-  } else {
-    const gw = gatewayLine(status, t);
-    color = toneToColor[gw.tone] ?? "bg-muted-foreground";
-    label = `${t.status.gateway} ${gw.label}`;
-  }
-  const showTooltip = (event: MouseEvent<HTMLDivElement> | FocusEvent<HTMLDivElement>) => {
-    setHovered(true);
-    setTooltipAnchor(event.currentTarget);
-  };
-  const hideTooltip = () => {
-    setHovered(false);
-    setTooltipAnchor(null);
-  };
-
-  return (
-    <div
-      className={cn(
-        "hidden lg:flex py-3 pl-[1.625rem] transition-opacity duration-300",
-        collapsed ? "lg:opacity-100" : "lg:opacity-0 lg:h-0 lg:py-0 lg:overflow-hidden",
-      )}
-      role="status"
-      aria-label={label}
-      tabIndex={collapsed ? 0 : -1}
-      onMouseEnter={collapsed ? showTooltip : undefined}
-      onMouseLeave={collapsed ? hideTooltip : undefined}
-      onFocus={collapsed ? showTooltip : undefined}
-      onBlur={collapsed ? hideTooltip : undefined}
-    >
-      <span
-        aria-hidden
-        className={cn("h-1.5 w-1.5 rounded-full", color)}
-      />
-
-      {hovered && tooltipAnchor && (
-        <SidebarTooltip anchor={tooltipAnchor} label={label} warmRef={tooltipWarmRef} />
-      )}
-    </div>
-  );
-}
-
 function SidebarTooltip({ anchor, label, warmRef }: SidebarTooltipProps) {
   const rect = anchor.getBoundingClientRect();
   const sidebar = document.getElementById("app-sidebar");
@@ -1332,12 +1096,6 @@ function SidebarTooltip({ anchor, label, warmRef }: SidebarTooltipProps) {
 }
 
 type TooltipWarmRef = React.RefObject<number>;
-
-interface GatewayDotProps {
-  collapsed: boolean;
-  status: StatusResponse | null;
-  tooltipWarmRef: TooltipWarmRef;
-}
 
 interface NavItem {
   icon: ComponentType<{ className?: string }>;

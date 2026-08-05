@@ -12,7 +12,7 @@
  *      directive: `exec` | `plugin` | `alias` | `skill` | `send`.
  *   4. Each directive is dispatched to the appropriate callback.
  *
- * Keeping the pipeline here (instead of inline in ChatPage) lets future
+ * Keeping the pipeline here (instead of inline in the chat page) lets future
  * clients (SwiftUI, Android) implement the same logic by reading the same
  * contract.
  */

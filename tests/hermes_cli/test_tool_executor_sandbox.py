@@ -335,6 +335,21 @@ def test_deployment_policy_accepts_optional_direct_resource_policy(tmp_path):
     )
 
     assert policy.resource_policy.executor_limits.file_descriptors == 64
+    assert policy.recover_stale_resource_scopes is True
+
+
+def test_deployment_policy_rejects_invalid_resource_recovery_mode(tmp_path):
+    owner, _runtime, _workspace, _dependency, _bwrap = _inputs(tmp_path)
+    global_dependency = tmp_path.parent / f"{tmp_path.name}-resource-global"
+    global_dependency.mkdir()
+
+    with pytest.raises(SandboxVerificationInvalid, match="recovery mode"):
+        SandboxDeploymentPolicy(
+            _verification_policy(), lambda *_args: None, lambda *_args: None,
+            (global_dependency,), owner.parent,
+            resource_policy=_resource_policy(tmp_path),
+            recover_stale_resource_scopes=1,
+        )
 
 
 def test_deployment_policy_loader_requires_explicit_valid_operator_factory(tmp_path, monkeypatch):

@@ -34,7 +34,7 @@ def store(tmp_path, monkeypatch):
         lookup=Keyring(keys={1: b"l" * 32}, active_version=1),
         encryption=Keyring(keys={1: b"e" * 32}, active_version=1),
     )
-    store = ChannelIdentityStore(crypto)
+    store = ChannelIdentityStore(crypto, tmp_path / "control-plane", global_home=tmp_path)
     registered = register_weixin_identity(
         store,
         subject="peer-a",
@@ -292,8 +292,13 @@ async def test_outbound_sender_retries_same_chunk_id_then_terminally_fails(store
 @pytest.mark.asyncio
 async def test_outbound_sender_delivers_text_then_media_parts(store, monkeypatch, tmp_path):
     identity_store, registered = store
-    image = tmp_path / "reply.png"
-    audio = tmp_path / "reply.mp3"
+    from hermes_cli.channel_identity.owner_resolution import resolve_binding
+
+    owner, _ = resolve_binding(identity_store, binding_id=registered.binding_id)
+    workspace = owner.owner_home / "workspaces" / "default"
+    workspace.mkdir(parents=True)
+    image = workspace / "reply.png"
+    audio = workspace / "reply.mp3"
     image.write_bytes(b"png")
     audio.write_bytes(b"mp3")
     payload = json.dumps(
@@ -355,6 +360,31 @@ async def test_outbound_sender_delivers_text_then_media_parts(store, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_outbound_sender_rejects_media_outside_exact_owner_workspace(
+    store, monkeypatch, tmp_path
+):
+    identity_store, registered = store
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"png")
+    payload = json.dumps(
+        {"v": 1, "text": "", "attachments": [{"path": str(outside), "voice": False}]}
+    )
+    _queue_outbound(identity_store, registered, text=payload)
+    upload = AsyncMock()
+    monkeypatch.setattr(
+        "hermes_cli.channel_connectors.weixin_ilink.sender.upload_media_item",
+        upload,
+    )
+    sender = OutboundSender(identity_store, object())
+    with pytest.raises(RuntimeError, match="outbound media path is invalid"):
+        claim_outbound(identity_store, holder="sender")
+    upload.assert_not_awaited()
+    with identity_store.read() as conn:
+        row = conn.execute("SELECT status, last_error FROM outbound_messages").fetchone()
+    assert tuple(row) == ("queued", "claim_error:RuntimeError")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("reason", ["stale_context", "provider_rejected"])
 async def test_outbound_sender_terminally_fails_ambiguous_provider_rejection(
     store, monkeypatch, reason
@@ -393,6 +423,57 @@ async def test_outbound_sender_terminally_fails_ambiguous_provider_rejection(
         0,
     )
     assert tuple(inbound) == ("failed", "outbound_failed")
+
+
+def test_ilink_poll_and_sender_ignore_other_provider_accounts(store):
+    identity_store, registered = store
+    with identity_store.write() as conn:
+        conn.execute(
+            "UPDATE connector_accounts SET status='suspended' WHERE account_id=?",
+            (registered.account_id,),
+        )
+        account = conn.execute(
+            "SELECT * FROM connector_accounts WHERE account_id=?",
+            (registered.account_id,),
+        ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO connector_accounts
+              (account_id, provider, provider_account_id,
+               account_lookup_hash, credentials_ciphertext, credentials_key_version,
+               credential_version, status, created_at, updated_at)
+            VALUES ('other-account', 'other_provider', 'other', 'other-bot', ?, ?,
+                    1, 'active', 1, 1)
+            """,
+            (
+                account["credentials_ciphertext"],
+                account["credentials_key_version"],
+            ),
+        )
+    with pytest.raises(RuntimeError, match="active iLink account not found"):
+        acquire_poll_lease(identity_store, account_id="other-account", holder="poller")
+    assert claim_outbound(identity_store, holder="sender") is None
+
+
+def test_claim_outbound_releases_sending_row_on_decrypt_failure(store, monkeypatch):
+    identity_store, registered = store
+    outbound_id = _queue_outbound(identity_store, registered, text="reply")
+    original = identity_store.crypto.decrypt_text
+
+    def fail_payload(ciphertext, **kwargs):
+        if kwargs["table"] == "outbound_messages" and kwargs["field"] == "payload":
+            raise RuntimeError("decrypt failed")
+        return original(ciphertext, **kwargs)
+
+    monkeypatch.setattr(identity_store.crypto, "decrypt_text", fail_payload)
+    with pytest.raises(RuntimeError, match="decrypt failed"):
+        claim_outbound(identity_store, holder="sender")
+    with identity_store.read() as conn:
+        row = conn.execute(
+            "SELECT status, claimed_by, last_error FROM outbound_messages WHERE outbound_id=?",
+            (outbound_id,),
+        ).fetchone()
+    assert tuple(row) == ("queued", None, "claim_error:RuntimeError")
 
 
 def test_new_poll_generation_fences_old_poller(store):

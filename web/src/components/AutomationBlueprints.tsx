@@ -14,7 +14,6 @@ import type { AutomationBlueprint, AutomationBlueprintField } from "@/lib/api";
 import { cn, themedBody } from "@/lib/utils";
 
 interface AutomationBlueprintsProps {
-  profile: string;
   /** Called after a blueprint is instantiated so the parent can refresh its job list. */
   onCreated?: () => void;
 }
@@ -68,12 +67,10 @@ function FieldInput({
 
 function BlueprintCard({
   blueprint,
-  profile,
   showToast,
   onCreated,
 }: {
   blueprint: AutomationBlueprint;
-  profile: string;
   showToast: (message: string, type: "error" | "success") => void;
   onCreated?: () => void;
 }) {
@@ -86,7 +83,7 @@ function BlueprintCard({
     setSubmitting(true);
     setError(null);
     try {
-      const job = await api.instantiateAutomationBlueprint({ blueprint: blueprint.key, values }, profile);
+      const job = await api.instantiateAutomationBlueprint({ blueprint: blueprint.key, values });
       const when = job.schedule_display ? ` — ${job.schedule_display}` : "";
       showToast(`${blueprint.title} scheduled${when}`, "success");
       setOpen(false);
@@ -99,7 +96,7 @@ function BlueprintCard({
     } finally {
       setSubmitting(false);
     }
-  }, [blueprint, values, profile, showToast, onCreated]);
+  }, [blueprint, values, showToast, onCreated]);
 
   return (
     <Card className={cn("overflow-hidden", themedBody)}>
@@ -170,7 +167,7 @@ function BlueprintCard({
  * to /api/cron/blueprints/instantiate which fills the blueprint and creates the job
  * via the same create_job path as everything else.
  */
-export function AutomationBlueprints({ profile, onCreated }: AutomationBlueprintsProps) {
+export function AutomationBlueprints({ onCreated }: AutomationBlueprintsProps) {
   const { toast, showToast } = useToast();
   const [blueprints, setBlueprints] = useState<AutomationBlueprint[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -212,7 +209,6 @@ export function AutomationBlueprints({ profile, onCreated }: AutomationBlueprint
           <BlueprintCard
             key={r.key}
             blueprint={r}
-            profile={profile}
             showToast={showToast}
             onCreated={onCreated}
           />

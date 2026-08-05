@@ -39,7 +39,6 @@ import type {
   SkillHubPreview,
   SkillHubScan,
 } from "@/lib/api";
-import { useProfileScope } from "@/contexts/useProfileScope";
 import { ToolsetConfigDrawer } from "@/components/ToolsetConfigDrawer";
 import { SkillEditorDialog } from "@/components/SkillEditorDialog";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
@@ -141,26 +140,11 @@ export default function SkillsPage() {
   const { t } = useI18n();
   const { setAfterTitle, setEnd } = usePageHeader();
 
-  // ── Profile scoping ──
-  // The write target comes from the GLOBAL profile switcher (sidebar) via
-  // ProfileContext — one selector for the whole dashboard, deep-linkable
-  // as ?profile=<name>. This page just consumes it: the fetchJSON layer
-  // appends the param automatically; we still pass it explicitly where the
-  // call signature supports it (clearer, and robust if a caller bypasses
-  // the auto-injection).
-  const {
-    profile: selectedProfile,
-  } = useProfileScope();
-
   useEffect(() => {
     // Promise-chain shape: setState fires only inside async callbacks so the
     // effect body stays lint-clean (react-hooks/set-state-in-effect). On a
-    // profile switch the old list stays visible until the new one arrives.
     let cancelled = false;
-    Promise.all([
-      api.getSkills(selectedProfile || undefined),
-      api.getToolsets(selectedProfile || undefined),
-    ])
+    Promise.all([api.getSkills(), api.getToolsets()])
       .then(([s, tsets]) => {
         if (cancelled) return;
         setSkills(s);
@@ -171,13 +155,13 @@ export default function SkillsPage() {
     return () => {
       cancelled = true;
     };
-  }, [selectedProfile]);
+  }, []);
 
   /* ---- Toggle skill ---- */
   const handleToggleSkill = async (skill: SkillInfo) => {
     setTogglingSkills((prev) => new Set(prev).add(skill.name));
     try {
-      await api.toggleSkill(skill.name, !skill.enabled, selectedProfile || undefined);
+      await api.toggleSkill(skill.name, !skill.enabled);
       setSkills((prev) =>
         prev.map((s) =>
           s.name === skill.name ? { ...s, enabled: !s.enabled } : s,
@@ -254,11 +238,11 @@ export default function SkillsPage() {
       // Reload the list so a newly created skill (or an edited description)
       // shows up immediately.
       api
-        .getSkills(selectedProfile || undefined)
+        .getSkills()
         .then(setSkills)
         .catch(() => {});
     },
-    [selectedProfile, showToast],
+    [showToast],
   );
 
   /* ---- Derived data ---- */
@@ -651,14 +635,13 @@ export default function SkillsPage() {
               )}
             </>
           ) : (
-            <HubBrowser showToast={showToast} profile={selectedProfile || undefined} />
+            <HubBrowser showToast={showToast} />
           )}
         </div>
       </div>
       {configToolset && (
         <ToolsetConfigDrawer
           toolset={configToolset}
-          profile={selectedProfile || undefined}
           onClose={() => setConfigToolset(null)}
           onChanged={() => void refreshToolsets()}
         />
@@ -666,7 +649,6 @@ export default function SkillsPage() {
       <SkillEditorDialog
         open={editorOpen}
         editName={editorSkill}
-        profile={selectedProfile || undefined}
         onClose={() => setEditorOpen(false)}
         onSaved={handleEditorSaved}
       />
@@ -857,11 +839,8 @@ const SEVERITY_TONE: Record<string, "destructive" | "warning" | "secondary" | "o
 
 function HubBrowser({
   showToast,
-  profile,
 }: {
   showToast: (msg: string, kind: "success" | "error") => void;
-  /** Optional profile scoping installs + installed-state badges. */
-  profile?: string;
 }) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SkillHubResult[]>([]);
@@ -891,7 +870,7 @@ function HubBrowser({
   useEffect(() => {
     let cancelled = false;
     api
-      .getSkillHubSources(profile)
+      .getSkillHubSources()
       .then((r) => {
         if (cancelled) return;
         setSources(r.sources);
@@ -907,7 +886,7 @@ function HubBrowser({
     return () => {
       cancelled = true;
     };
-  }, [profile]);
+  }, []);
 
   /* ---- Search ---- */
   const runSearch = useCallback(async () => {
@@ -917,7 +896,7 @@ function HubBrowser({
     setSearched(true);
     const t0 = performance.now();
     try {
-      const r = await api.searchSkillsHub(q, "all", 20, profile);
+      const r = await api.searchSkillsHub(q, "all", 20);
       setResults(r.results);
       setSourceCounts(r.source_counts || {});
       setTimedOut(r.timed_out || []);
@@ -931,7 +910,7 @@ function HubBrowser({
       setSearchMs(Math.round(performance.now() - t0));
       setSearching(false);
     }
-  }, [query, showToast, profile]);
+  }, [query, showToast]);
 
   /* ---- Poll a spawned action's log until it exits ---- */
   useEffect(() => {
@@ -949,7 +928,7 @@ function HubBrowser({
         } else {
           // Install finished — refresh installed-state so badges update.
           api
-            .getSkillHubSources(profile)
+            .getSkillHubSources()
             .then((r) => !cancelled && setInstalled(r.installed))
             .catch(() => {});
         }
@@ -962,12 +941,12 @@ function HubBrowser({
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [action, profile]);
+  }, [action]);
 
   const install = useCallback(
     async (identifier: string) => {
       try {
-        const res = await api.installSkillFromHub(identifier, profile);
+        const res = await api.installSkillFromHub(identifier);
         showToast(`Installing ${identifier}…`, "success");
         setActionLog([]);
         setActionRunning(true);
@@ -977,12 +956,12 @@ function HubBrowser({
         showToast(`Install failed: ${e}`, "error");
       }
     },
-    [showToast, profile],
+    [showToast],
   );
 
   const updateAll = useCallback(async () => {
     try {
-      const res = await api.updateSkillsFromHub(profile);
+      const res = await api.updateSkillsFromHub();
       showToast("Updating installed skills…", "success");
       setActionLog([]);
       setActionRunning(true);
@@ -990,7 +969,7 @@ function HubBrowser({
     } catch (e) {
       showToast(`Update failed: ${e}`, "error");
     }
-  }, [showToast, profile]);
+  }, [showToast]);
 
   const isInstalled = useCallback(
     (identifier: string) => Boolean(installed[identifier]),

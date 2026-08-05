@@ -34,7 +34,7 @@ from __future__ import annotations
 import os
 import sys
 
-_FRONTEND = ("ui-tui/", "web/", "apps/")  # TS typecheck-matrix packages
+_FRONTEND = ("web/",)
 _ROOT_NPM = {"package.json", "package-lock.json"}  # shifts every package's tree
 _DOCKER_META = ("docker/", ".hadolint.yml", "Dockerfile") # docker setup
 _SITE = ("website/", "skills/", "optional-skills/")  # docs site + skill pages

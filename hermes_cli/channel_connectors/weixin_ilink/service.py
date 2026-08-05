@@ -6,9 +6,13 @@ import asyncio
 import time
 import uuid
 
-from hermes_cli.channel_dispatch import ChannelDispatcher
+from hermes_cli.channel_dispatch import (
+    ChannelDispatcher,
+    recover_stale_outbound,
+)
 from hermes_cli.channel_identity.store import ChannelIdentityStore
 
+from .dispatch_hooks import WeixinDispatchHooks, encode_weixin_outbound
 from .enrollment import EnrollmentManager
 from .poller_supervisor import PollerSupervisor
 from .sender import OutboundSender, claim_outbound
@@ -21,12 +25,16 @@ class WeixinILinkService:
         self.holder = f"connector-{uuid.uuid4().hex}"
         self.claim_timeout = float(config.get("dispatch_claim_timeout_seconds", 1800))
         self.idle_seconds = min(float(config.get("outbound_retry_seconds", 2)), 1.0)
+        dispatch_hooks = WeixinDispatchHooks(session, config=config)
         self.dispatcher = ChannelDispatcher(
             store,
             supervisor,
+            provider="weixin_ilink",
             turn_timeout=self.claim_timeout,
-            media_session=session,
-            voice_config=config,
+            media_materializer=dispatch_hooks.materialize,
+            outbound_encoder=encode_weixin_outbound,
+            media_config=config,
+            dispatch_config=config,
         )
         self.dispatch_concurrency = max(1, int(config.get("dispatch_concurrency", 4)))
         self.enrollments = EnrollmentManager(
@@ -71,16 +79,21 @@ class WeixinILinkService:
 
     async def _dispatch_loop(self) -> None:
         while self._running:
-            while len(self._dispatch_tasks) < self.dispatch_concurrency:
-                claim = self.dispatcher.claim_next(holder=self.holder)
-                if claim is None:
-                    break
-                task = asyncio.create_task(
-                    self._dispatch_one(claim),
-                    name=f"ilink-dispatch-{claim['inbound_id']}",
-                )
-                self._dispatch_tasks.add(task)
-                task.add_done_callback(self._dispatch_tasks.discard)
+            try:
+                while len(self._dispatch_tasks) < self.dispatch_concurrency:
+                    claim = self.dispatcher.claim_next(holder=self.holder)
+                    if claim is None:
+                        break
+                    task = asyncio.create_task(
+                        self._dispatch_one(claim),
+                        name=f"ilink-dispatch-{claim['inbound_id']}",
+                    )
+                    self._dispatch_tasks.add(task)
+                    task.add_done_callback(self._dispatch_tasks.discard)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
             await asyncio.sleep(self.idle_seconds)
 
     async def _dispatch_one(self, claim: dict) -> None:
@@ -89,15 +102,22 @@ class WeixinILinkService:
         except asyncio.CancelledError:
             raise
         except Exception:
-            self.dispatcher.fail_claim(claim["inbound_id"], self.holder, "dispatch_failed")
+            # dispatch_claim owns claim recovery so decrypt/parse/Worker failures
+            # cannot be double-counted or converted into terminal failures here.
+            return
 
     async def _sender_loop(self) -> None:
         while self._running:
-            claim = claim_outbound(self.store, holder=self.holder)
-            if claim is None:
-                await asyncio.sleep(self.idle_seconds)
-                continue
-            await self.sender.send_claim(claim, holder=self.holder)
+            try:
+                claim = claim_outbound(self.store, holder=self.holder)
+                if claim is not None:
+                    await self.sender.send_claim(claim, holder=self.holder)
+                    continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            await asyncio.sleep(self.idle_seconds)
 
     async def _reconcile_loop(self) -> None:
         while self._running:
@@ -112,16 +132,18 @@ class WeixinILinkService:
                 """
                 UPDATE inbound_messages SET status='queued', claimed_by=NULL, claimed_at=NULL,
                     updated_at=? WHERE status='processing' AND claimed_at<?
+                      AND account_id IN (
+                        SELECT account_id FROM connector_accounts
+                        WHERE provider='weixin_ilink'
+                      )
                 """,
                 (now, cutoff),
             )
-            conn.execute(
-                """
-                UPDATE outbound_messages SET status='queued', claimed_by=NULL, claimed_at=NULL,
-                    next_attempt_at=?, updated_at=? WHERE status='sending' AND claimed_at<?
-                """,
-                (now, now, cutoff),
-            )
+        recover_stale_outbound(
+            self.store,
+            provider="weixin_ilink",
+            claimed_before=cutoff,
+        )
 
     def _start_task(self, coroutine, name: str) -> None:
         task = asyncio.create_task(coroutine, name=name)

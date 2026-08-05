@@ -915,11 +915,11 @@ def test_reader_real_process_reads_owner_db_without_creating_missing_db(tmp_path
         assert not (owner_home / "state.db").exists()
 
         db = SessionDB(db_path=owner_home / "state.db")
-        db.create_session("reader-session", source="cli", model="test")
+        db.create_session("reader-session", source="dashboard-gui", model="test")
         db.append_message("reader-session", "user", "owner-only history")
         db.record_gateway_session_peer(
             "reader-session",
-            source="cli",
+            source="dashboard-gui",
             session_key="reader-session",
             owner_key="ok1_a",
             workspace_root=str((owner_home / "workspaces").resolve()),
@@ -1194,6 +1194,118 @@ def test_reader_route_parser_rejects_ambiguous_or_encoded_session_paths():
         "/api/sessions//messages",
     ):
         assert _session_route(path) is None
+
+
+def test_reader_payloads_exclude_legacy_sources_inside_authenticated_owner_scope(tmp_path):
+    from starlette.exceptions import HTTPException
+
+    from hermes_cli.session_api import (
+        empty_count_payload,
+        export_session_payload,
+        latest_descendant_payload,
+        list_sessions_payload,
+        search_sessions_payload,
+        session_composition_payload,
+        session_detail_payload,
+        session_messages_payload,
+        stats_payload,
+    )
+    from hermes_cli.session_reader.db import ReadOnlySessionDB
+    from hermes_cli.session_sources import retained_recovery_scope
+    from hermes_state import SessionDB
+
+    owner_home = tmp_path / "owner"
+    workspace_root = str((owner_home / "workspaces").resolve())
+    db = SessionDB(owner_home / "state.db")
+    try:
+        for session_id, source, marker in (
+            ("retained", "dashboard-gui", "retainedmarker"),
+            ("legacy-cli", "cli", "legacyclimarker"),
+            ("legacy-tui", "tui", "legacytuimarker"),
+            ("legacy-default", "default", "legacydefaultmarker"),
+        ):
+            db.create_session(
+                session_id,
+                source=source,
+                owner_key="ok1_owned",
+                workspace_root=workspace_root,
+                worker_generation=1,
+            )
+            db.append_message(session_id, "user", marker)
+        reader_db = ReadOnlySessionDB(owner_home / "state.db")
+        try:
+            scope = retained_recovery_scope(
+                {
+                    "owner_key": "ok1_owned",
+                    "workspace_root": workspace_root,
+                    "historical_resume": True,
+                }
+            )
+            listed = list_sessions_payload(reader_db, recovery_scope=scope)
+            assert [row["id"] for row in listed["sessions"]] == ["retained"]
+            assert search_sessions_payload(
+                reader_db,
+                q="retainedmarker",
+                recovery_scope=scope,
+            )["results"]
+            assert stats_payload(reader_db, recovery_scope=scope) == {
+                "total": 1,
+                "active_store": 1,
+                "archived": 0,
+                "messages": 1,
+                "by_source": {"dashboard-gui": 1},
+            }
+            assert empty_count_payload(reader_db, recovery_scope=scope) == {"count": 0}
+            assert session_detail_payload(
+                reader_db,
+                "retained",
+                recovery_scope=scope,
+            )["id"] == "retained"
+            assert session_messages_payload(
+                reader_db,
+                "retained",
+                recovery_scope=scope,
+            )["messages"]
+            assert latest_descendant_payload(
+                reader_db,
+                "retained",
+                recovery_scope=scope,
+            )["session_id"] == "retained"
+            assert export_session_payload(
+                reader_db,
+                "retained",
+                recovery_scope=scope,
+            )["id"] == "retained"
+            assert session_composition_payload(
+                reader_db,
+                ids=["retained"],
+                recovery_scope=scope,
+            )["scope"]["canonical_tip_ids"] == ["retained"]
+
+            for session_id, marker in (
+                ("legacy-cli", "legacyclimarker"),
+                ("legacy-tui", "legacytuimarker"),
+                ("legacy-default", "legacydefaultmarker"),
+            ):
+                assert search_sessions_payload(
+                    reader_db,
+                    q=marker,
+                    recovery_scope=scope,
+                ) == {"results": []}
+                for payload in (
+                    session_detail_payload,
+                    latest_descendant_payload,
+                    session_messages_payload,
+                    export_session_payload,
+                ):
+                    with pytest.raises(HTTPException) as exc_info:
+                        payload(reader_db, session_id, recovery_scope=scope)
+                    assert exc_info.value.status_code == 404
+                assert db.get_session(session_id) is not None
+        finally:
+            reader_db.close()
+    finally:
+        db.close()
 
 
 def test_reader_payloads_exclude_rows_outside_authenticated_owner_scope(tmp_path):

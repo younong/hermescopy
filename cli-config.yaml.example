@@ -544,7 +544,6 @@ prompt_caching:
 # Two stores: MEMORY.md (agent's notes) and USER.md (user profile).
 # Character limits keep the memory small and focused. The agent manages
 # pruning -- when at the limit, it must consolidate or replace entries.
-# Disabled by default in batch_runner.
 #
 memory:
   # Agent's personal notes: environment facts, conventions, things learned

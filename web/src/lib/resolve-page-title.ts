@@ -25,7 +25,7 @@ export function resolvePageTitle(
   if (normalized === "/") {
     return t.app.nav.sessions;
   }
-  if (normalized === "/chat-gui") {
+  if (normalized === "/chat") {
     return "Chat GUI (beta)";
   }
   const plugin = pluginTabs.find((p) => p.path === normalized);

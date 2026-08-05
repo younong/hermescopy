@@ -74,37 +74,6 @@ def toolsets_payload(config: dict[str, Any] | None = None) -> list[dict[str, Any
     return result
 
 
-def owner_singleton_profile_payload(owner_home: Path) -> dict[str, Any]:
-    """Describe only the immutable owner home, never host-level sibling profiles."""
-    from hermes_cli import profiles as profiles_mod
-
-    home = Path(owner_home).expanduser().resolve()
-    if home != get_hermes_home().resolve():
-        raise RuntimeError("owner profile payload home does not match HERMES_HOME")
-    model, provider = profiles_mod._read_config_model(home)
-    distribution_name, distribution_version, distribution_source = profiles_mod._read_distribution_meta(home)
-    metadata = profiles_mod.read_profile_meta(home)
-    return {
-        "management_mode": "owner_singleton",
-        "profiles": [{
-            "name": "default",
-            "path": None,
-            "is_default": True,
-            "model": model,
-            "provider": provider,
-            "has_env": (home / ".env").is_file(),
-            "skill_count": profiles_mod._count_skills(home),
-            "gateway_running": True,
-            "description": metadata.get("description", ""),
-            "description_auto": bool(metadata.get("description_auto", False)),
-            "distribution_name": distribution_name,
-            "distribution_version": distribution_version,
-            "distribution_source": distribution_source,
-            "has_alias": False,
-        }],
-    }
-
-
 def safe_plugin_api_relpath(api_field: Any, *, dashboard_dir: Path) -> str | None:
     if not isinstance(api_field, str) or not api_field.strip():
         return None
@@ -185,7 +154,7 @@ def discover_dashboard_plugins() -> list[dict[str, Any]]:
 
 
 def active_dashboard_plugin_payload(plugins: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
-    """Filter manifests using the current owner config and plugin enablement."""
+    """Filter manifests by owner activation policy and dashboard asset readiness."""
     discovered = plugins if plugins is not None else discover_dashboard_plugins()
     hidden = cfg_get(load_config(), "dashboard", "hidden_plugins", default=[]) or []
     try:
@@ -201,7 +170,22 @@ def active_dashboard_plugin_payload(plugins: list[dict[str, Any]] | None = None)
         name = plugin.get("name", "")
         if name in hidden or name in disabled:
             return False
-        return plugin.get("source") != "user" or name in enabled
+        if plugin.get("source") == "user" and name not in enabled:
+            return False
+
+        try:
+            dashboard_dir = Path(plugin["_dir"])
+        except (KeyError, TypeError):
+            return False
+
+        def asset_exists(asset: Any) -> bool:
+            safe_asset = safe_plugin_api_relpath(asset, dashboard_dir=dashboard_dir)
+            return safe_asset is not None and (dashboard_dir / safe_asset).is_file()
+
+        if not asset_exists(plugin.get("entry")):
+            return False
+        css = plugin.get("css")
+        return css is None or asset_exists(css)
 
     return [
         {key: value for key, value in plugin.items() if not key.startswith("_")}

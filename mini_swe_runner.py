@@ -4,7 +4,7 @@ SWE Runner with Hermes Trajectory Format
 
 A runner that uses Hermes-Agent's built-in execution environments
 (local, docker, modal) and outputs trajectories in the Hermes-Agent format
-compatible with batch_runner.py and trajectory_compressor.py.
+compatible with trajectory_compressor.py.
 
 Features:
 - Uses Hermes-Agent's Docker, Modal, or Local environments for command execution
@@ -304,7 +304,7 @@ class MiniSWERunner:
         """
         Convert internal message format to Hermes trajectory format.
         
-        This produces the exact format used by batch_runner.py.
+        This produces the canonical Hermes trajectory format.
         """
         trajectory = []
         

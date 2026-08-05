@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -10,11 +11,13 @@ import pytest
 from hermes_cli.channel_connectors.weixin_ilink import bootstrap
 
 
-def _supervisor(**overrides):
+def _supervisor(*, control_home=None, **overrides):
     values = {
         "deployment_inference_policy": object(),
         "deployment_image_policy": object(),
         "resource_manager": object(),
+        "control_home": control_home or Path("/tmp/hermes-test") / "control-plane",
+        "global_home": (control_home.parent if control_home else Path("/tmp/hermes-test")),
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -88,6 +91,21 @@ async def test_prerequisites_fail_closed_without_reading_keys(
 
 
 @pytest.mark.asyncio
+async def test_incompatible_supervisor_homes_fail_closed(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_ILINK_LOOKUP_KEYS_JSON", _keys(1))
+    monkeypatch.setenv("HERMES_ILINK_ENCRYPTION_KEYS_JSON", _keys(2))
+    supervisor = _supervisor(control_home=tmp_path / "other-control")
+    supervisor.global_home = tmp_path
+
+    runtime = await bootstrap.bootstrap_weixin_ilink(
+        {"enabled": True}, auth_required=True, supervisor=supervisor
+    )
+
+    assert runtime.status.state == "startup_failed"
+    assert runtime.service is None
+
+
+@pytest.mark.asyncio
 async def test_missing_keyrings_leave_connector_unavailable(monkeypatch):
     monkeypatch.delenv("HERMES_ILINK_LOOKUP_KEYS_JSON", raising=False)
     monkeypatch.delenv("HERMES_ILINK_ENCRYPTION_KEYS_JSON", raising=False)
@@ -110,7 +128,7 @@ async def test_startup_failure_closes_partial_resources(monkeypatch, tmp_path):
     monkeypatch.setattr(bootstrap, "WeixinILinkService", lambda *args, **kwargs: service)
 
     runtime = await bootstrap.bootstrap_weixin_ilink(
-        {"enabled": True}, auth_required=True, supervisor=_supervisor()
+        {"enabled": True}, auth_required=True, supervisor=_supervisor(control_home=tmp_path / "control-plane")
     )
 
     assert runtime.status.state == "startup_failed"
@@ -141,7 +159,7 @@ async def test_connector_uses_certifi_tls_context(monkeypatch, tmp_path):
     monkeypatch.setattr(bootstrap, "WeixinILinkService", lambda *args, **kwargs: service)
 
     runtime = await bootstrap.bootstrap_weixin_ilink(
-        {"enabled": True}, auth_required=True, supervisor=_supervisor()
+        {"enabled": True}, auth_required=True, supervisor=_supervisor(control_home=tmp_path / "control-plane")
     )
 
     assert runtime.status.state == "ready"
@@ -165,7 +183,7 @@ async def test_ready_runtime_stops_once(monkeypatch, tmp_path):
     monkeypatch.setattr(bootstrap, "WeixinILinkService", lambda *args, **kwargs: service)
 
     runtime = await bootstrap.bootstrap_weixin_ilink(
-        {"enabled": True}, auth_required=True, supervisor=_supervisor()
+        {"enabled": True}, auth_required=True, supervisor=_supervisor(control_home=tmp_path / "control-plane")
     )
 
     assert runtime.status.state == "ready"

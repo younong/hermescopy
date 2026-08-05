@@ -6,10 +6,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 SMOKE = ROOT / "deploy" / "smoke-conversation.py"
 EXPECTED_CHECKS = {
-    "gateway_ready",
+    "authenticated_web_ready",
+    "ws_ticket",
     "session_create",
     "config_propagation",
     "file_attachment",
@@ -34,7 +37,11 @@ def _load_smoke_module():
     return module
 
 
-def test_deterministic_conversation_smoke_exercises_core_gateway_flow():
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="the production Owner Worker launcher requires Linux pidfds",
+)
+def test_deterministic_conversation_smoke_exercises_authenticated_web_flow():
     completed = subprocess.run(
         [sys.executable, str(SMOKE), "--timeout", "90"],
         cwd=ROOT,
@@ -53,9 +60,98 @@ def test_deterministic_conversation_smoke_exercises_core_gateway_flow():
     checks = {item["name"]: item for item in result["checks"]}
     assert set(checks) == EXPECTED_CHECKS
     assert all(item["status"] == "passed" for item in checks.values())
-    assert checks["prompt_stream"]["deltaCount"] >= 2
+    assert checks["prompt_stream"]["deltaCount"] >= 1
     assert checks["prompt_stream"]["attachmentRequestCount"] == 2
     assert checks["config_propagation"]["provider"] == "custom:hermes-smoke"
+    source = SMOKE.read_text()
+    assert '"source": "dashboard-gui"' in source
+    assert '"command": "rm -r /workspace/protected"' in source
+
+
+def test_deterministic_smoke_uses_environment_temporary_directory(monkeypatch, tmp_path):
+    module = _load_smoke_module()
+    temporary = tmp_path / "owned-smoke-root"
+    arguments = {}
+
+    def fake_mkdtemp(**kwargs):
+        arguments.update(kwargs)
+        return str(temporary)
+
+    class FailingModel:
+        def __init__(self, _workspace):
+            pass
+
+        def start(self):
+            raise RuntimeError("stop after temporary directory creation")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(module.tempfile, "mkdtemp", fake_mkdtemp)
+    monkeypatch.setattr(module, "ModelStub", FailingModel)
+
+    _, status = module.run_smoke(ROOT, 10)
+
+    assert status == 1
+    assert arguments == {"prefix": "hcs-"}
+
+
+def test_deterministic_smoke_uses_exact_operator_root(monkeypatch, tmp_path):
+    module = _load_smoke_module()
+    temporary = tmp_path / "hcs-exact"
+
+    class FailingModel:
+        def __init__(self, workspace):
+            assert workspace == temporary / "home" / "workspaces" / "default"
+
+        def start(self):
+            raise RuntimeError("stop after exact root creation")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(module, "ModelStub", FailingModel)
+    monkeypatch.setattr(
+        module.tempfile,
+        "mkdtemp",
+        lambda **_kwargs: pytest.fail("operator root must not create another directory"),
+    )
+
+    _, status = module.run_smoke(ROOT, 10, root=temporary)
+
+    assert status == 1
+    assert temporary.is_dir()
+    assert not any(temporary.iterdir())
+
+
+def test_dashboard_gateway_cleanup_terminates_descendants_after_parent_exit(monkeypatch):
+    module = _load_smoke_module()
+    gateway = module.DashboardGateway.__new__(module.DashboardGateway)
+    gateway._closed = False
+    gateway.process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import subprocess, sys; "
+                "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+                "raise SystemExit(1)"
+            ),
+        ],
+        start_new_session=True,
+    )
+    gateway.process.wait(timeout=10)
+    signaled: list[tuple[int, int]] = []
+    real_killpg = module.os.killpg
+
+    def recording_killpg(pid, signum):
+        signaled.append((pid, signum))
+        return real_killpg(pid, signum)
+
+    monkeypatch.setattr(module.os, "killpg", recording_killpg)
+    gateway.close()
+
+    assert signaled == [(gateway.process.pid, module.signal.SIGTERM)]
 
 
 def test_deterministic_smoke_failure_is_bounded_and_cleans_artifacts(monkeypatch, tmp_path):

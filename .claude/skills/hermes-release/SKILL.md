@@ -133,7 +133,6 @@ git status --short
 git branch --show-current
 git tag --list | tail -n 20
 node --check deploy/deploy.mjs
-node --check ui-tui/scripts/build.mjs
 npm run deploy -- --help
 ```
 
@@ -154,9 +153,9 @@ npm run deploy -- --help
 
 ```bash
 ssh root@106.15.186.104 'readlink /opt/hermes/current'
-ssh root@106.15.186.104 'systemctl is-active hermes-gateway hermes-dashboard'
-ssh root@106.15.186.104 'systemctl status --no-pager hermes-gateway hermes-dashboard'
-ssh root@106.15.186.104 'journalctl -u hermes-gateway -u hermes-dashboard --since "10 min ago" --no-pager -n 200'
+ssh root@106.15.186.104 'systemctl is-active hermes-dashboard && ! systemctl is-active --quiet hermes-gateway'
+ssh root@106.15.186.104 'systemctl status --no-pager hermes-dashboard'
+ssh root@106.15.186.104 'journalctl -u hermes-dashboard --since "10 min ago" --no-pager -n 200'
 ```
 
 Dashboard 默认只监听服务器本机 `127.0.0.1`。访问方式：
@@ -175,7 +174,7 @@ ssh -L 9119:localhost:9119 root@106.15.186.104
 - tag 已验证发布但部署中止：检查远端 refs；明确要部署该不可变 commit 时再使用 `--tag <tag>` 重试，不要覆盖或删除远端 tag。
 - SSH 失败：检查 SSH key、密码、端口、安全组。
 - Python 依赖/bootstrap 失败：查看部署输出中的 `uv`/系统依赖错误，按服务器缺失依赖补齐。
-- systemd 服务启动失败：查看 `systemctl status --no-pager hermes-gateway hermes-dashboard` 和 `journalctl -u hermes-gateway -u hermes-dashboard --since "10 min ago" --no-pager -n 200`。
+- systemd 服务启动失败：查看 `systemctl status --no-pager hermes-dashboard` 和 `journalctl -u hermes-dashboard --since "10 min ago" --no-pager -n 200`。
 - `rolled back before commit`：查看 deterministic smoke 的稳定 failure `code/check`；旧版本应已恢复，不要声称新版本发布成功。
 - `deployment committed but public smoke failed`：命令非零但新版本已在线；不要声称全部成功，也不要自动回滚。检查公开 auth/ticket/WebSocket/Owner Worker/model 后人工决策。
 - 发布错版本：用 `npm run deploy -- --tag <previous-tag>` 回滚。
