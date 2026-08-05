@@ -411,13 +411,13 @@ class DashboardGateway:
         if client is not None:
             client.close()
         process = getattr(self, "process", None)
-        if process is not None and process.poll() is None:
+        if process is not None:
             if os.name == "posix":
                 try:
                     os.killpg(process.pid, signal.SIGTERM)
                 except ProcessLookupError:
                     pass
-            else:
+            elif process.poll() is None:
                 process.terminate()
             try:
                 process.wait(timeout=10)
