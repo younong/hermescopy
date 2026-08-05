@@ -154,7 +154,7 @@ def discover_dashboard_plugins() -> list[dict[str, Any]]:
 
 
 def active_dashboard_plugin_payload(plugins: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
-    """Filter manifests using the current owner config and plugin enablement."""
+    """Filter manifests by owner activation policy and dashboard asset readiness."""
     discovered = plugins if plugins is not None else discover_dashboard_plugins()
     hidden = cfg_get(load_config(), "dashboard", "hidden_plugins", default=[]) or []
     try:
@@ -170,7 +170,22 @@ def active_dashboard_plugin_payload(plugins: list[dict[str, Any]] | None = None)
         name = plugin.get("name", "")
         if name in hidden or name in disabled:
             return False
-        return plugin.get("source") != "user" or name in enabled
+        if plugin.get("source") == "user" and name not in enabled:
+            return False
+
+        try:
+            dashboard_dir = Path(plugin["_dir"])
+        except (KeyError, TypeError):
+            return False
+
+        def asset_exists(asset: Any) -> bool:
+            safe_asset = safe_plugin_api_relpath(asset, dashboard_dir=dashboard_dir)
+            return safe_asset is not None and (dashboard_dir / safe_asset).is_file()
+
+        if not asset_exists(plugin.get("entry")):
+            return False
+        css = plugin.get("css")
+        return css is None or asset_exists(css)
 
     return [
         {key: value for key, value in plugin.items() if not key.startswith("_")}
