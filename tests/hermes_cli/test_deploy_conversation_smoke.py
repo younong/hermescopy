@@ -65,6 +65,36 @@ def test_deterministic_conversation_smoke_exercises_authenticated_web_flow():
     assert checks["config_propagation"]["provider"] == "custom:hermes-smoke"
 
 
+def test_dashboard_gateway_cleanup_terminates_descendants_after_parent_exit(monkeypatch):
+    module = _load_smoke_module()
+    gateway = module.DashboardGateway.__new__(module.DashboardGateway)
+    gateway._closed = False
+    gateway.process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import subprocess, sys; "
+                "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+                "raise SystemExit(1)"
+            ),
+        ],
+        start_new_session=True,
+    )
+    gateway.process.wait(timeout=10)
+    signaled: list[tuple[int, int]] = []
+    real_killpg = module.os.killpg
+
+    def recording_killpg(pid, signum):
+        signaled.append((pid, signum))
+        return real_killpg(pid, signum)
+
+    monkeypatch.setattr(module.os, "killpg", recording_killpg)
+    gateway.close()
+
+    assert signaled == [(gateway.process.pid, module.signal.SIGTERM)]
+
+
 def test_deterministic_smoke_failure_is_bounded_and_cleans_artifacts(monkeypatch, tmp_path):
     module = _load_smoke_module()
     temporary = tmp_path / "owned-smoke-root"
