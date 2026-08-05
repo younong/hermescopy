@@ -1520,7 +1520,7 @@ fi
 
 # Exercise the candidate authority implementation with isolated synthetic state.
 # This deliberately never points HOME, TMPDIR, or HERMES_HOME at shared state.
-authority_smoke_root="$(mktemp -d /tmp/hermes-authority-release-smoke.XXXXXX)"
+authority_smoke_root="$(mktemp -d "$tmp_dir/hermes-authority-release-smoke.XXXXXX")"
 chown "$service_user:$service_group" "$authority_smoke_root"
 chmod 0700 "$authority_smoke_root"
 echo "Running deterministic authority concurrency smoke before deployment commit"
@@ -1585,7 +1585,7 @@ rm -rf -- "$authority_smoke_root"
 authority_smoke_root=""
 
 # Gate Reader performance before commit using only isolated synthetic state.
-reader_smoke_root="$(mktemp -d /tmp/hermes-reader-release-smoke.XXXXXX)"
+reader_smoke_root="$(mktemp -d "$tmp_dir/hermes-reader-release-smoke.XXXXXX")"
 chown "$service_user:$service_group" "$reader_smoke_root"
 chmod 0700 "$reader_smoke_root"
 echo "Running deterministic Session Reader performance smoke before deployment commit"

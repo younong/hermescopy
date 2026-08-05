@@ -285,6 +285,7 @@ def test_deploy_gates_commit_on_isolated_conversation_smoke():
     assert 'rm -rf -- "$reader_smoke_root"' in cleanup
     authority_block = source[source.rindex("# Exercise the candidate authority", 0, authority_smoke):reader_smoke]
     assert 'runuser -u "$service_user" -- env -i' in authority_block
+    assert 'mktemp -d "$tmp_dir/hermes-authority-release-smoke.XXXXXX"' in authority_block
     assert 'HOME="$authority_smoke_root"' in authority_block
     assert 'TMPDIR="$authority_smoke_root"' in authority_block
     assert 'HERMES_HOME="$authority_smoke_root"' in authority_block
@@ -295,6 +296,7 @@ def test_deploy_gates_commit_on_isolated_conversation_smoke():
     assert authority_block.index('result.get("status")') < authority_block.index("authority_concurrency_smoke=passed")
     reader_block = source[source.rindex("# Gate Reader performance", 0, reader_smoke):smoke]
     assert 'runuser -u "$service_user" -- env -i' in reader_block
+    assert 'mktemp -d "$tmp_dir/hermes-reader-release-smoke.XXXXXX"' in reader_block
     assert 'HOME="$reader_smoke_root"' in reader_block
     assert 'TMPDIR="$reader_smoke_root"' in reader_block
     assert 'PYTHONPATH="$release"' in reader_block
