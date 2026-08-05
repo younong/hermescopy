@@ -63,6 +63,14 @@ def _record(checks: list[dict[str, Any]], name: str, **details: Any) -> None:
     checks.append({"name": name, "status": "passed", **details})
 
 
+def _path_absent(path: Path) -> bool:
+    try:
+        path.stat()
+    except (FileNotFoundError, PermissionError):
+        return True
+    return False
+
+
 def _scope() -> AuthorizationScope:
     return AuthorizationScope(
         "release-smoke",
@@ -449,7 +457,7 @@ def run_smoke(
         cleanup["executorStopped"] = True
         if created_root:
             shutil.rmtree(temporary_root, ignore_errors=True)
-        cleanup["temporaryRootRemoved"] = not temporary_root.exists()
+        cleanup["temporaryRootRemoved"] = _path_absent(temporary_root)
 
     if not all(cleanup.values()) and failure is None:
         failure = SmokeFailure(
