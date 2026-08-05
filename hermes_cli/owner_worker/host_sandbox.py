@@ -30,7 +30,6 @@ from hermes_cli.owner_worker.tool_executor_sandbox import (
 )
 
 _DEFAULT_POLICY_PATH = Path("/etc/hermes/executor-sandbox.json")
-_ISOLATED_SMOKE_PARENT = Path("/tmp")
 _MAX_POLICY_BYTES = 64 << 10
 _DIGEST_RE = "sha256:"
 
@@ -377,10 +376,14 @@ def isolated_smoke_sandbox_deployment_policy(
         "smoke control home",
     )
     smoke_root = home.parents[2] if len(home.parents) > 2 else home
+    temporary_parent = _canonical(
+        os.environ.get("TMPDIR", ""),
+        "smoke temporary parent",
+    )
     if (
         home != smoke_root / "home" / "users" / owner_key
         or control_home != smoke_root / "home" / "control-plane"
-        or smoke_root.parent != _ISOLATED_SMOKE_PARENT
+        or smoke_root.parent != temporary_parent
         or not smoke_root.name.startswith("hcs-")
     ):
         raise HostSandboxInvalid("isolated smoke Owner root is invalid")

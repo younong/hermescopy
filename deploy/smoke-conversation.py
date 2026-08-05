@@ -621,6 +621,7 @@ def _dashboard_env(
     env.update(
         {
             "HERMES_HOME": str(home),
+            "TMPDIR": str(home.parent.parent),
             "HERMES_CWD": str(workspace),
             "TERMINAL_CWD": str(workspace),
             "HERMES_TUI_TOOLSETS": "terminal",

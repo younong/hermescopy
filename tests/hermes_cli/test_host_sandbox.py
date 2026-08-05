@@ -418,10 +418,7 @@ def test_isolated_smoke_policy_rebinds_only_exact_temporary_owner_root(tmp_path,
     monkeypatch.setenv("HERMES_OWNER_KEY", owner_key)
     monkeypatch.setenv("HERMES_HOME", str(owner_home))
     monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
-    monkeypatch.setattr(
-        "hermes_cli.owner_worker.host_sandbox._ISOLATED_SMOKE_PARENT",
-        tmp_path,
-    )
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
     owner_status = owner_root.stat()
     smoke_uid = max(1, owner_status.st_uid)
     smoke_gid = max(1, owner_status.st_gid)
@@ -449,6 +446,13 @@ def test_isolated_smoke_policy_rebinds_only_exact_temporary_owner_root(tmp_path,
         assert policy.resource_policy is config.resource_policy
 
         monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_other")
+        with pytest.raises(HostSandboxInvalid, match="isolated smoke Owner root"):
+            isolated_smoke_sandbox_deployment_policy(policy_path)
+
+        monkeypatch.setenv("HERMES_OWNER_KEY", owner_key)
+        other_parent = tmp_path / "other"
+        other_parent.mkdir()
+        monkeypatch.setenv("TMPDIR", str(other_parent))
         with pytest.raises(HostSandboxInvalid, match="isolated smoke Owner root"):
             isolated_smoke_sandbox_deployment_policy(policy_path)
     finally:
