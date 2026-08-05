@@ -16,6 +16,7 @@ import { GuiChatShell } from "./GuiChatShell";
 
 const mocks = vi.hoisted(() => ({
   connectGuiChat: vi.fn(),
+  connectMockGuiChat: vi.fn(),
   createILinkEnrollment: vi.fn(),
   getAuthMe: vi.fn(),
   getILinkEnrollment: vi.fn(),
@@ -55,7 +56,7 @@ vi.mock("../api", () => ({
 }));
 
 vi.mock("../mock", () => ({
-  connectMockGuiChat: vi.fn(),
+  connectMockGuiChat: mocks.connectMockGuiChat,
 }));
 
 vi.mock("../latencyTrace", () => ({
@@ -81,7 +82,9 @@ vi.mock("@/i18n", async (importOriginal) => {
 });
 
 vi.mock("@/components/ChatSessionList", () => ({
-  ChatSessionList: () => null,
+  ChatSessionList: (props: { refreshNonce?: number }) => (
+    <span data-session-refresh-nonce={props.refreshNonce ?? 0} />
+  ),
 }));
 
 vi.mock("./Composer", () => ({
@@ -176,6 +179,7 @@ beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
     .IS_REACT_ACT_ENVIRONMENT = true;
   mocks.connectGuiChat.mockReset();
+  mocks.connectMockGuiChat.mockReset();
   mocks.createILinkEnrollment.mockReset();
   mocks.getAuthMe.mockReset();
   mocks.getILinkEnrollment.mockReset();
@@ -388,6 +392,64 @@ describe("GuiChatShell", () => {
     });
 
     expect(document.body.textContent).toContain("next-model · next-provider · open");
+  });
+
+  it("hides Retry while a real chat connection is healthy", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(<GuiChatShell />);
+    expect(document.querySelector('[aria-label="Retry"]')).not.toBeNull();
+
+    await act(async () => {
+      connection.emitState("open");
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector('[aria-label="Retry"]')).toBeNull();
+    expect(document.querySelector('[aria-label="Refresh"]')).not.toBeNull();
+  });
+
+  it("refreshes Recent chats without reconnecting", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(<GuiChatShell />);
+    expect(document.querySelector("[data-session-refresh-nonce]")?.getAttribute("data-session-refresh-nonce"))
+      .toBe("0");
+    expect(connection.createOrAttach).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[aria-label="Refresh"]')?.click();
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector("[data-session-refresh-nonce]")?.getAttribute("data-session-refresh-nonce"))
+      .toBe("1");
+    expect(connection.createOrAttach).toHaveBeenCalledTimes(1);
+    expect(connection.ping).not.toHaveBeenCalled();
+  });
+
+  it("keeps Replay available in mock mode", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectMockGuiChat.mockReturnValue(connection);
+
+    await renderShellAt("/chat?mock=1");
+    await act(async () => {
+      connection.emitState("open");
+      await Promise.resolve();
+    });
+
+    const replay = document.querySelector<HTMLButtonElement>('[aria-label="Replay"]');
+    expect(replay).not.toBeNull();
+    await act(async () => {
+      replay?.click();
+      await Promise.resolve();
+    });
+    expect(connection.createOrAttach).toHaveBeenCalledTimes(2);
   });
 
   it("opens files inside the dedicated workspace and returns to chat", async () => {
@@ -842,12 +904,16 @@ describe("GuiChatShell", () => {
 });
 
 async function renderShell(shell: ReactNode) {
+  await renderShellAt("/chat", shell);
+}
+
+async function renderShellAt(entry: string, shell: ReactNode = <GuiChatShell />) {
   const container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
   await act(async () => {
     root?.render(
-      <MemoryRouter initialEntries={["/chat"]}>
+      <MemoryRouter initialEntries={[entry]}>
         <DashboardAuthIdentityProvider>{shell}</DashboardAuthIdentityProvider>
       </MemoryRouter>,
     );

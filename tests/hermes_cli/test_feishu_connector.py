@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 
 from hermes_cli.channel_connectors.feishu import (
+    FeishuConnector,
     FeishuHTTPTransport,
     FeishuSender,
     FeishuTransportError,
@@ -302,6 +305,151 @@ async def test_sender_requeues_retryable_delivery_then_delivers(store):
     assert retry is not None
     assert await sender.send_claim(retry, holder="sender") is True
     assert _outbound_row(store)["status"] == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_connector_dispatches_inbound_through_exact_owner_worker(store):
+    registered = _register(store)
+    enqueue_verified_event(
+        store,
+        account_id=registered.account_id,
+        data=_event(),
+    )
+    supervisor = SimpleNamespace(global_home=store.global_home)
+    transport = AsyncMock()
+    connector = FeishuConnector(
+        store,
+        supervisor,
+        account_id=registered.account_id,
+        config={"dispatch_retry_seconds": 0.001},
+        transport=transport,
+    )
+    connector._running = True
+    connector._ws_client = SimpleNamespace()
+
+    client = AsyncMock()
+    client.owner = None
+    client.handle = SimpleNamespace(worker_generation=1)
+    client.call.side_effect = [
+        {"session_id": "live-1", "stored_session_id": "stored-1"},
+        {"status": "streaming"},
+        {"session_id": "live-2", "stored_session_id": "stored-1"},
+        {"status": "streaming"},
+    ]
+    client.wait_for_event.return_value = {
+        "method": "message.complete",
+        "params": {"session_id": "live-1", "status": "complete", "text": "answer"},
+    }
+
+    from hermes_cli.channel_identity.owner_resolution import resolve_binding
+
+    owner, _channel = resolve_binding(store, binding_id=registered.binding_id)
+
+    class _Context:
+        async def __aenter__(self):
+            client.owner = owner
+            return client
+
+        async def __aexit__(self, *_args):
+            return None
+
+    with patch(
+        "hermes_cli.channel_dispatch.dispatcher.OwnerWorkerGatewayClient",
+        return_value=_Context(),
+    ):
+        task = asyncio.create_task(connector._dispatch_loop())
+        for _ in range(100):
+            with store.read() as conn:
+                status = conn.execute(
+                    "SELECT status FROM inbound_messages"
+                ).fetchone()["status"]
+            if status == "outbound_pending":
+                break
+            await asyncio.sleep(0.001)
+        connector._running = False
+        await task
+
+    assert client.call.await_args_list[0].args == (
+        "session.create",
+        {
+            "source": "feishu",
+            "title": "feishu channel",
+            "close_on_disconnect": False,
+        },
+    )
+    assert client.call.await_args_list[1].args[0] == "prompt.submit"
+    assert client.call.await_args_list[1].args[1]["text"] == "hello Feishu"
+    with store.read() as conn:
+        inbound = conn.execute("SELECT status FROM inbound_messages").fetchone()
+        outbound = conn.execute(
+            "SELECT status, payload_ciphertext FROM outbound_messages"
+        ).fetchone()
+    assert inbound["status"] == "outbound_pending"
+    assert outbound["status"] == "queued"
+    assert outbound["payload_ciphertext"] is not None
+
+    with store.write() as conn:
+        conn.execute("UPDATE outbound_messages SET status='delivered'")
+        conn.execute("UPDATE inbound_messages SET status='completed'")
+    enqueue_verified_event(
+        store,
+        account_id=registered.account_id,
+        data=_event(message_id="om_second", content='{"text":"again"}'),
+    )
+    claim = connector.dispatcher.claim_next(holder=connector.holder)
+    assert claim is not None
+    with patch(
+        "hermes_cli.channel_dispatch.dispatcher.OwnerWorkerGatewayClient",
+        return_value=_Context(),
+    ):
+        await connector.dispatcher.dispatch_claim(claim, holder=connector.holder)
+
+    assert client.call.await_args_list[2].args == (
+        "session.resume",
+        {"session_id": "stored-1", "source": "feishu"},
+    )
+    assert client.call.await_args_list[3].args[0] == "prompt.submit"
+    assert client.call.await_args_list[3].args[1]["text"] == "again"
+    await connector.close()
+
+
+@pytest.mark.asyncio
+async def test_connector_recovers_stale_inbound_claim_and_cancels_dispatch(store):
+    registered = _register(store)
+    enqueue_verified_event(
+        store,
+        account_id=registered.account_id,
+        data=_event(),
+    )
+    with store.write() as conn:
+        conn.execute(
+            "UPDATE inbound_messages SET status='processing', claimed_by='dead', claimed_at=0"
+        )
+
+    class Transport:
+        async def close(self):
+            return None
+
+    connector = FeishuConnector(
+        store,
+        SimpleNamespace(global_home=store.global_home),
+        account_id=registered.account_id,
+        config={"dispatch_claim_timeout_seconds": 1},
+        transport=Transport(),
+    )
+    connector._build_ws_client = lambda **_kwargs: SimpleNamespace(start=lambda: None)
+    await connector.start()
+
+    with store.read() as conn:
+        row = conn.execute("SELECT status, claimed_by FROM inbound_messages").fetchone()
+    assert row["status"] in {"queued", "processing", "outbound_pending"}
+    assert row["claimed_by"] != "dead"
+    assert connector._dispatcher_task is not None
+
+    await connector.close()
+
+    assert connector._dispatcher_task is None
+    assert connector._dispatch_tasks == set()
 
 
 def test_claim_uses_encrypted_account_credentials_not_payload(store):

@@ -967,6 +967,17 @@ def create_app(
             raise _files_error(exc) from exc
         return {"ok": True, "path": _visible_file_path(relative_path), "root": "", "locked_root": "", "can_change_path": False}
 
+    def _session_recovery_scope() -> dict[str, Any] | None:
+        if socket_path is None:
+            return None
+        from gateway.session import current_historical_resume_scope
+        from hermes_cli.session_sources import retained_recovery_scope
+
+        scope = current_historical_resume_scope()
+        if scope is None:
+            raise HTTPException(status_code=403, detail="owner recovery scope is unavailable")
+        return retained_recovery_scope(scope)
+
     @app.get("/api/sessions")
     def get_sessions(
         request: Request,
@@ -985,11 +996,9 @@ def create_app(
         _: None = Depends(_require_owner_token),
     ) -> dict[str, Any]:
         _reject_profile(profile)
-        from gateway.session import current_historical_resume_scope
-
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
-            scope = current_historical_resume_scope()
             return session_api.list_sessions_payload(
                 db,
                 limit=limit,
@@ -1002,7 +1011,7 @@ def create_app(
                 cwd_prefix=cwd_prefix,
                 active_from=active_from,
                 active_before=active_before,
-                recovery_scope=(scope if socket_path is not None and scope is not None else None),
+                recovery_scope=recovery_scope,
                 compact=compact,
                 latency_trace_id=request.headers.get("x-request-id", ""),
             )
@@ -1016,12 +1025,7 @@ def create_app(
         _: None = Depends(_require_owner_token),
     ) -> dict[str, Any]:
         _reject_profile(profile)
-        from gateway.session import current_historical_resume_scope
-
-        scope = current_historical_resume_scope()
-        recovery_scope = scope if socket_path is not None and scope is not None else None
-        if socket_path is not None and recovery_scope is None:
-            raise HTTPException(status_code=403, detail="owner recovery scope is unavailable")
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
             return session_api.session_composition_payload(
@@ -1033,45 +1037,68 @@ def create_app(
     @app.get("/api/sessions/search")
     def search_sessions(q: str = "", limit: int = 20, profile: str | None = None, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(profile)
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
-            return session_api.search_sessions_payload(db, q=q, limit=limit)
+            return session_api.search_sessions_payload(
+                db,
+                q=q,
+                limit=limit,
+                recovery_scope=recovery_scope,
+            )
         finally:
             db.close()
 
     @app.post("/api/sessions/bulk-delete")
     def bulk_delete_sessions(body: BulkDeleteSessions, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(body.profile)
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
-            return session_api.bulk_delete_payload(db, body.ids)
+            return session_api.bulk_delete_payload(
+                db,
+                body.ids,
+                recovery_scope=recovery_scope,
+            )
         finally:
             db.close()
 
     @app.get("/api/sessions/empty/count")
     def count_empty_sessions(profile: str | None = None, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(profile)
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
-            return session_api.empty_count_payload(db)
+            return session_api.empty_count_payload(
+                db,
+                recovery_scope=recovery_scope,
+            )
         finally:
             db.close()
 
     @app.delete("/api/sessions/empty")
     def delete_empty_sessions(profile: str | None = None, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(profile)
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
-            return session_api.delete_empty_payload(db)
+            return session_api.delete_empty_payload(
+                db,
+                recovery_scope=recovery_scope,
+            )
         finally:
             db.close()
 
     @app.get("/api/sessions/stats")
     def get_session_stats(profile: str | None = None, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(profile)
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
-            return session_api.stats_payload(db)
+            return session_api.stats_payload(
+                db,
+                recovery_scope=recovery_scope,
+            )
         finally:
             db.close()
 
@@ -1683,6 +1710,7 @@ def create_app(
     @app.post("/api/sessions/prune")
     def prune_sessions(body: SessionPrune, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(body.profile)
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
             return session_api.prune_sessions_payload(
@@ -1690,6 +1718,7 @@ def create_app(
                 older_than_days=body.older_than_days,
                 source=body.source,
                 sessions_dir=owner_home / "sessions",
+                recovery_scope=recovery_scope,
             )
         finally:
             db.close()
@@ -1700,8 +1729,6 @@ def create_app(
         session_id: str,
         _: None = Depends(_require_owner_token),
     ) -> dict[str, Any]:
-        from gateway.session import current_historical_resume_scope
-
         latency_started_at = time.monotonic()
         latency_trace_id = request.headers.get("x-request-id", "")
         log_latency_stage(
@@ -1710,21 +1737,14 @@ def create_app(
             surface="latest-descendant",
             stage="request.received",
         )
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
-            scope = current_historical_resume_scope()
-            # Direct in-process app construction is test-only and may create
-            # legacy owner-local rows before the gateway writes complete durable
-            # metadata. Production app construction receives a UDS socket from
-            # the supervisor and always enforces the historical scope.
-            if socket_path is None or scope is None:
-                payload = session_api.latest_descendant_payload(db, session_id)
-            else:
-                payload = session_api.latest_descendant_payload(
-                    db,
-                    session_id,
-                    recovery_scope=scope,
-                )
+            payload = session_api.latest_descendant_payload(
+                db,
+                session_id,
+                recovery_scope=recovery_scope,
+            )
             log_latency_stage(
                 _log,
                 trace_id=latency_trace_id,
@@ -1745,17 +1765,15 @@ def create_app(
         _: None = Depends(_require_owner_token),
     ) -> dict[str, Any]:
         _reject_profile(profile)
-        from gateway.session import current_historical_resume_scope
-
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
-            scope = current_historical_resume_scope()
             return session_api.session_messages_payload(
                 db,
                 session_id,
                 limit=limit,
                 before=before,
-                recovery_scope=(scope if socket_path is not None and scope is not None else None),
+                recovery_scope=recovery_scope,
             )
         finally:
             db.close()
@@ -1763,36 +1781,58 @@ def create_app(
     @app.get("/api/sessions/{session_id}/export")
     def export_session(session_id: str, profile: str | None = None, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(profile)
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
-            return session_api.export_session_payload(db, session_id)
+            return session_api.export_session_payload(
+                db,
+                session_id,
+                recovery_scope=recovery_scope,
+            )
         finally:
             db.close()
 
     @app.patch("/api/sessions/{session_id}")
     def rename_session(session_id: str, body: SessionRename, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(body.profile)
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
-            return session_api.rename_session_payload(db, session_id, title=body.title, archived=body.archived)
+            return session_api.rename_session_payload(
+                db,
+                session_id,
+                title=body.title,
+                archived=body.archived,
+                recovery_scope=recovery_scope,
+            )
         finally:
             db.close()
 
     @app.delete("/api/sessions/{session_id}")
     def delete_session(session_id: str, profile: str | None = None, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(profile)
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
-            return session_api.delete_session_payload(db, session_id)
+            return session_api.delete_session_payload(
+                db,
+                session_id,
+                recovery_scope=recovery_scope,
+            )
         finally:
             db.close()
 
     @app.get("/api/sessions/{session_id}")
     def get_session_detail(session_id: str, profile: str | None = None, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(profile)
+        recovery_scope = _session_recovery_scope()
         db = _open_db()
         try:
-            return session_api.session_detail_payload(db, session_id)
+            return session_api.session_detail_payload(
+                db,
+                session_id,
+                recovery_scope=recovery_scope,
+            )
         finally:
             db.close()
 

@@ -57,15 +57,6 @@ export const ru: Translations = {
     footer: {
       org: "Nous Research",
     },
-    activeSessionsLabel: "Активные сессии:",
-    gatewayStatusLabel: "Статус шлюза:",
-    gatewayStrip: {
-      failed: "Ошибка запуска",
-      off: "Отключён",
-      running: "Работает",
-      starting: "Запуск",
-      stopped: "Остановлен",
-    },
     nav: {
       analytics: "Аналитика",
       chat: "Чат",
@@ -87,7 +78,6 @@ export const ru: Translations = {
     openNavigation: "Открыть навигацию",
     pluginNavSection: "Плагины",
     sessionsActiveCount: "{count} активн.",
-    statusOverview: "Обзор статуса",
     system: "Система",
     webUi: "Web UI",
   },

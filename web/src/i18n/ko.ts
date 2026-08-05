@@ -57,15 +57,6 @@ export const ko: Translations = {
     footer: {
       org: "Nous Research",
     },
-    activeSessionsLabel: "활성 세션:",
-    gatewayStatusLabel: "게이트웨이 상태:",
-    gatewayStrip: {
-      failed: "시작 실패",
-      off: "꺼짐",
-      running: "실행 중",
-      starting: "시작 중",
-      stopped: "중지됨",
-    },
     nav: {
       analytics: "분석",
       chat: "채팅",
@@ -87,7 +78,6 @@ export const ko: Translations = {
     openNavigation: "내비게이션 열기",
     pluginNavSection: "플러그인",
     sessionsActiveCount: "{count}개 활성",
-    statusOverview: "상태 개요",
     system: "시스템",
     webUi: "Web UI",
   },

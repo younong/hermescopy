@@ -95,6 +95,27 @@ describe("ChatSessionList", () => {
     expect(mocks.getSessions).toHaveBeenCalledWith(30, 0, "recent", true);
   });
 
+  it("reloads through an external compact-list refresh trigger", async () => {
+    mocks.getSessions.mockResolvedValue(sessionList([
+      session("alpha", "Release notes", "Published"),
+    ]));
+    mount();
+
+    await render(
+      <MemoryRouter>
+        <ChatSessionList activeSessionId={null} refreshNonce={0} variant="compact" />
+      </MemoryRouter>,
+    );
+    expect(mocks.getSessions).toHaveBeenCalledTimes(1);
+
+    await render(
+      <MemoryRouter>
+        <ChatSessionList activeSessionId={null} refreshNonce={1} variant="compact" />
+      </MemoryRouter>,
+    );
+    expect(mocks.getSessions).toHaveBeenCalledTimes(2);
+  });
+
   it("opens selected sessions on an optional destination route", async () => {
     mocks.getSessions.mockResolvedValue(sessionList([
       session("alpha", "Release notes", "Published"),

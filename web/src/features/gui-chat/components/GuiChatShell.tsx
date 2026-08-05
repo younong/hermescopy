@@ -105,6 +105,7 @@ export function GuiChatShell() {
   const attachmentRequestIdRef = useRef(0);
   const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false);
   const [sessionQuery, setSessionQuery] = useState("");
+  const [sessionListRefreshNonce, setSessionListRefreshNonce] = useState(0);
   const [activeSessionTitle, setActiveSessionTitle] = useState<string | null>(null);
   const [connectWeChatOpen, setConnectWeChatOpen] = useState(false);
   const { authMe, authRequired, ownerKey, ready: authIdentityReady } = useDashboardAuthIdentity();
@@ -672,6 +673,7 @@ export function GuiChatShell() {
       onPicked={closeMobilePanel}
       onSessionPick={startSessionSwitchTrace}
       query={sessionQuery}
+      refreshNonce={sessionListRefreshNonce}
       sessionPath="/chat"
       variant="compact"
     />
@@ -771,8 +773,13 @@ export function GuiChatShell() {
       <div className="mt-4 flex min-h-0 flex-1 flex-col px-3">
         <div className="gui-chat-section-heading">
           <span>Recent chats</span>
-          <button aria-label={t.common.refresh} className="gui-chat-icon-button" onClick={retryConnection} type="button">
-            <RefreshCw className={cn("h-3.5 w-3.5", state.connection === "connecting" && "animate-spin")} />
+          <button
+            aria-label={t.common.refresh}
+            className="gui-chat-icon-button"
+            onClick={() => setSessionListRefreshNonce((nonce) => nonce + 1)}
+            type="button"
+          >
+            <RefreshCw className="h-3.5 w-3.5" />
           </button>
         </div>
         <div className="min-h-0 flex-1 overflow-hidden">{sessionPanel}</div>
@@ -898,9 +905,11 @@ export function GuiChatShell() {
                   <QrCode className="h-3.5 w-3.5" />
                 </button>
               ) : null}
-              <button aria-label={mockMode ? "Replay" : t.common.retry} className="gui-chat-icon-button" onClick={retryConnection} type="button">
-                <RefreshCw className={cn("h-3.5 w-3.5", state.connection === "connecting" && "animate-spin")} />
-              </button>
+              {mockMode || state.connection !== "open" ? (
+                <button aria-label={mockMode ? "Replay" : t.common.retry} className="gui-chat-icon-button" onClick={retryConnection} type="button">
+                  <RefreshCw className={cn("h-3.5 w-3.5", state.connection === "connecting" && "animate-spin")} />
+                </button>
+              ) : null}
             </div>
           ) : null}
         </header>

@@ -59,15 +59,6 @@ export const zh: Translations = {
     footer: {
       org: "Nous Research",
     },
-    activeSessionsLabel: "活跃会话：",
-    gatewayStatusLabel: "网关状态：",
-    gatewayStrip: {
-      failed: "启动失败",
-      off: "关闭",
-      running: "运行中",
-      starting: "启动中",
-      stopped: "已停止",
-    },
     nav: {
       analytics: "分析",
       chat: "对话",
@@ -90,7 +81,6 @@ export const zh: Translations = {
     openNavigation: "打开导航",
     pluginNavSection: "插件",
     sessionsActiveCount: "{count} 个活跃",
-    statusOverview: "状态概览",
     system: "系统",
     webUi: "管理面板",
   },

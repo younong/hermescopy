@@ -1,0 +1,154 @@
+"""Owner Worker JSON-RPC session source fencing."""
+
+from __future__ import annotations
+
+import threading
+
+import pytest
+
+from hermes_state import SessionDB
+from tui_gateway import server
+
+
+@pytest.fixture()
+def owner_gateway(monkeypatch, tmp_path):
+    owner_home = tmp_path / "owner"
+    workspace_root = owner_home / "workspaces"
+    workspace_root.mkdir(parents=True)
+    db = SessionDB(db_path=owner_home / "state.db")
+    runtime = server.OwnerWorkerGatewayRuntime("owner-a", 2, "worker-a", 1, 0)
+    env = {
+        "HERMES_HOME": str(owner_home),
+        "HERMES_OWNER_KEY": "owner-a",
+        "HERMES_WORKSPACE_ROOT": str(workspace_root),
+        "HERMES_WORKER_GENERATION": "2",
+    }
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(server, "_db", db)
+    monkeypatch.setattr(server, "_db_error", None)
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda _sid: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *_args, **_kwargs: (None, None))
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_load_show_reasoning", lambda: False)
+    monkeypatch.setattr(server, "_load_tool_progress_mode", lambda: "compact")
+    monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+    monkeypatch.setattr(server, "_required_gateway_transport", lambda: object())
+
+    yield db, runtime, str(workspace_root)
+
+    db.close()
+
+
+def _create_owned(
+    db: SessionDB,
+    workspace_root: str,
+    session_id: str,
+    *,
+    source: str,
+    generation: int = 1,
+) -> None:
+    db.create_session(
+        session_id,
+        source,
+        owner_key="owner-a",
+        workspace_root=workspace_root,
+        worker_generation=generation,
+    )
+
+
+def _call(runtime: server.OwnerWorkerGatewayRuntime, method: str, params: dict | None = None):
+    with server.owner_worker_gateway_runtime(runtime):
+        return server.handle_request({"id": "request", "method": method, "params": params or {}})
+
+
+def test_owner_worker_create_rejects_legacy_source_before_live_registration(owner_gateway):
+    _db, runtime, _workspace_root = owner_gateway
+
+    response = _call(runtime, "session.create", {"source": "tui"})
+
+    assert response["error"] == {"code": 4002, "message": "session source is not available"}
+    assert runtime.mutable_state.sessions == {}
+
+
+def test_owner_worker_list_and_most_recent_hide_legacy_rows(owner_gateway):
+    db, runtime, workspace_root = owner_gateway
+    _create_owned(db, workspace_root, "legacy", source="cli")
+    _create_owned(db, workspace_root, "retained", source="dashboard-gui", generation=2)
+
+    listed = _call(runtime, "session.list")
+    recent = _call(runtime, "session.most_recent")
+
+    assert [row["id"] for row in listed["result"]["sessions"]] == ["retained"]
+    assert recent["result"]["session_id"] == "retained"
+    assert db.get_session("legacy") is not None
+
+
+def test_owner_worker_live_routes_hide_legacy_records(owner_gateway):
+    _db, runtime, _workspace_root = owner_gateway
+    runtime.mutable_state.sessions.update(
+        {
+            "legacy-live": {
+                "created_at": 1.0,
+                "history": [],
+                "session_key": "legacy",
+                "source": "tui",
+            },
+            "retained-live": {
+                "created_at": 2.0,
+                "history": [],
+                "session_key": "retained",
+                "source": "dashboard-gui",
+            },
+        }
+    )
+
+    listed = _call(runtime, "session.active_list")
+    hidden = _call(runtime, "session.activate", {"session_id": "legacy-live"})
+
+    assert [row["id"] for row in listed["result"]["sessions"]] == ["retained-live"]
+    assert hidden["error"] == {"code": 4001, "message": "session not found"}
+
+
+def test_owner_worker_resume_cannot_override_legacy_stored_source(owner_gateway):
+    db, runtime, workspace_root = owner_gateway
+    _create_owned(db, workspace_root, "legacy", source="cli")
+    db.append_message("legacy", "user", "private legacy content")
+
+    response = _call(
+        runtime,
+        "session.resume",
+        {"session_id": "legacy", "source": "dashboard-gui"},
+    )
+
+    assert response["error"] == {"code": 4007, "message": "session not found"}
+    assert db.get_session("legacy") is not None
+
+
+def test_owner_worker_resume_preserves_retained_stored_source(owner_gateway, monkeypatch):
+    db, runtime, workspace_root = owner_gateway
+    _create_owned(db, workspace_root, "retained", source="feishu")
+    db.append_message("retained", "user", "hello")
+    monkeypatch.setattr(server, "_reopen_resume_session", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        server,
+        "_resume_history",
+        lambda *_args, **_kwargs: [{"role": "user", "content": "hello"}],
+    )
+    monkeypatch.setattr(
+        server,
+        "_stored_session_runtime_overrides",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_args, **_kwargs: None)
+
+    response = _call(
+        runtime,
+        "session.resume",
+        {"session_id": "retained", "source": "dashboard-gui"},
+    )
+
+    assert "error" not in response
+    live_id = response["result"]["session_id"]
+    assert runtime.mutable_state.sessions[live_id]["source"] == "feishu"

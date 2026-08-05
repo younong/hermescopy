@@ -49,6 +49,8 @@ interface ChatSessionListProps {
   className?: string;
   /** Optional local title/preview filter used by compact chat sidebars. */
   query?: string;
+  /** External trigger for the list's existing reload mechanism. */
+  refreshNonce?: number;
   /** Keep the original rich panel by default; compact is a single-line list. */
   variant?: "default" | "compact";
   /** Reports the loaded active row so a chat shell can mirror its title. */
@@ -80,6 +82,7 @@ export function ChatSessionList({
   activeSessionId,
   className,
   query = "",
+  refreshNonce = 0,
   variant = "default",
   onActiveSessionChange,
   onPicked,
@@ -124,8 +127,9 @@ export function ChatSessionList({
     // Dashboard data surfaces fetch from an effect on mount + scope change;
     // keep this local and explicit (matches FilesPage).
     load();
-    // `reloadNonce` is a manual refetch trigger (Refresh button / row pick).
-  }, [load, reloadNonce]);
+    // The internal nonce powers this component's own retry button; the external
+    // nonce lets a compact parent expose the same list-only refresh behavior.
+  }, [load, refreshNonce, reloadNonce]);
 
   const reload = useCallback(() => setReloadNonce((n) => n + 1), []);
   const filteredSessions = useMemo(() => {

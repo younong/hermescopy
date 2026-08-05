@@ -57,15 +57,6 @@ export const af: Translations = {
     footer: {
       org: "Nous Research",
     },
-    activeSessionsLabel: "Aktiewe Sessies:",
-    gatewayStatusLabel: "Gateway-status:",
-    gatewayStrip: {
-      failed: "Begin het misluk",
-      off: "Af",
-      running: "Loop",
-      starting: "Begin",
-      stopped: "Gestop",
-    },
     nav: {
       analytics: "Analise",
       chat: "Klets",
@@ -87,7 +78,6 @@ export const af: Translations = {
     openNavigation: "Maak navigasie oop",
     pluginNavSection: "Inproppe",
     sessionsActiveCount: "{count} aktief",
-    statusOverview: "Statusoorsig",
     system: "Stelsel",
     webUi: "Web UI",
   },

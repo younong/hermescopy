@@ -190,6 +190,7 @@ async def bootstrap_channel_connectors(
             async def start_feishu() -> FeishuConnector:
                 service = FeishuConnector(
                     store,
+                    supervisor,
                     account_id=feishu_account_id,
                     config=feishu_config,
                 )

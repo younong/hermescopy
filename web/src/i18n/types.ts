@@ -107,15 +107,6 @@ export interface Translations {
     footer: {
       org: string;
     };
-    activeSessionsLabel: string;
-    gatewayStatusLabel: string;
-    gatewayStrip: {
-      failed: string;
-      off: string;
-      running: string;
-      starting: string;
-      stopped: string;
-    };
     nav: {
       analytics: string;
       chat: string;
@@ -138,7 +129,6 @@ export interface Translations {
     openNavigation: string;
     pluginNavSection: string;
     sessionsActiveCount: string;
-    statusOverview: string;
     system: string;
     webUi: string;
     /** Optional — fall back to English literals until translated. */

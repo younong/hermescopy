@@ -3189,7 +3189,7 @@ def test_worker_session_read_routes_use_owner_db_not_global_sentinel(
     monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
     owner_db = SessionDB()
     try:
-        owner_db.create_session("owner-visible", "cli")
+        owner_db.create_session("owner-visible", "dashboard-gui")
         owner_db.append_message("owner-visible", "user", "owner only")
     finally:
         owner_db.close()
@@ -3252,7 +3252,7 @@ def test_worker_session_write_routes_mutate_only_owner_db(
     monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
     owner_db = SessionDB()
     try:
-        owner_db.create_session("owner-visible", "cli")
+        owner_db.create_session("owner-visible", "dashboard-gui")
         owner_db.append_message("owner-visible", "user", "owner only")
         if request_path == "/api/sessions/empty":
             owner_db.create_session("empty-ended", "cli")
@@ -3302,6 +3302,120 @@ def test_worker_session_write_routes_mutate_only_owner_db(
             assert owner_db.get_session("owner-visible") is None
     finally:
         owner_db.close()
+
+
+def test_production_worker_session_routes_hide_and_preserve_legacy_sources(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from hermes_state import SessionDB
+    from hermes_cli.owner_worker.entrypoint import create_app
+
+    owner_key = "ok1_retained_sources"
+    owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
+    control_home = tmp_path / "control"
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", owner_key)
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+
+    # Direct construction mints the same complete authority environment the
+    # supervisor supplies. Reconstruct with the canonical socket to exercise the
+    # production-only retained-source recovery scope.
+    bootstrap_app = create_app(owner_key, owner_home)
+    generation = bootstrap_app.state.owner_worker_generation
+    worker_id = bootstrap_app.state.owner_worker_id
+    app = create_app(
+        owner_key,
+        owner_home,
+        worker_generation=generation,
+        worker_id=worker_id,
+        socket_path=owner_worker_socket_path(owner_home, generation),
+    )
+    workspace_root = str((owner_home / "workspaces").resolve())
+    db = SessionDB()
+    try:
+        for session_id, source in (
+            ("retained-visible", "dashboard-gui"),
+            ("legacy-visible", "cli"),
+            ("retained-empty", "dashboard-gui"),
+            ("legacy-empty", "tui"),
+            ("retained-old", "webhook"),
+            ("legacy-old", "cli"),
+        ):
+            db.create_session(
+                session_id,
+                source,
+                owner_key=owner_key,
+                workspace_root=workspace_root,
+                worker_generation=generation,
+            )
+        db.append_message("retained-visible", "user", "retained marker")
+        db.append_message("legacy-visible", "user", "legacy marker")
+        db.append_message("retained-old", "user", "old retained marker")
+        db.append_message("legacy-old", "user", "old legacy marker")
+        for session_id in ("retained-empty", "legacy-empty", "retained-old", "legacy-old"):
+            db.end_session(session_id, "completed")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = 0 WHERE id IN (?, ?)",
+            ("retained-old", "legacy-old"),
+        )
+        db._conn.commit()
+    finally:
+        db.close()
+
+    client = TestClient(app)
+
+    def request(method: str, path: str, *, json=None):
+        token = _capability_for(app, path=path, control_home=control_home)
+        return client.request(
+            method,
+            path,
+            json=json,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    listed = request("GET", "/api/sessions")
+    assert listed.status_code == 200
+    listed_text = str(listed.json())
+    assert "retained-visible" in listed_text
+    assert "legacy-visible" not in listed_text
+    assert "legacy-empty" not in listed_text
+    assert "legacy-old" not in listed_text
+
+    detail = request("GET", "/api/sessions/legacy-visible")
+    rename = request(
+        "PATCH",
+        "/api/sessions/legacy-visible",
+        json={"title": "must not change"},
+    )
+    delete = request("DELETE", "/api/sessions/legacy-visible")
+    assert detail.status_code == 404
+    assert rename.status_code == 404
+    assert delete.status_code == 200
+    assert delete.json() == {"ok": True, "already_absent": True}
+
+    bulk = request(
+        "POST",
+        "/api/sessions/bulk-delete",
+        json={"ids": ["retained-visible", "legacy-visible"]},
+    )
+    empty = request("DELETE", "/api/sessions/empty")
+    pruned = request(
+        "POST",
+        "/api/sessions/prune",
+        json={"older_than_days": 1},
+    )
+    assert bulk.json()["deleted"] == 1
+    assert empty.json()["deleted"] == 1
+    assert pruned.json()["removed"] == 1
+
+    db = SessionDB()
+    try:
+        for session_id in ("retained-visible", "retained-empty", "retained-old"):
+            assert db.get_session(session_id) is None
+        for session_id in ("legacy-visible", "legacy-empty", "legacy-old"):
+            assert db.get_session(session_id) is not None
+        assert db.get_session_title("legacy-visible") is None
+    finally:
+        db.close()
 
 
 def test_worker_session_identifiers_are_resolved_only_within_owner_scope(tmp_path, monkeypatch):

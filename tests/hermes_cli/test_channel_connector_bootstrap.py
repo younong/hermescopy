@@ -160,22 +160,26 @@ async def test_feishu_registers_with_shared_supervisor(monkeypatch, tmp_path):
         "ChannelIdentityStore",
         lambda *args, **kwargs: store,
     )
+    constructor = MagicMock(return_value=service)
     monkeypatch.setattr(
         connector_bootstrap,
         "FeishuConnector",
-        lambda *args, **kwargs: service,
+        constructor,
     )
+    supervisor = _Supervisor(tmp_path)
 
     runtime = await connector_bootstrap.bootstrap_channel_connectors(
         {"feishu": {"enabled": True}},
         auth_required=True,
-        supervisor=_Supervisor(tmp_path),
+        supervisor=supervisor,
     )
 
     assert isinstance(runtime.connectors, ConnectorSupervisor)
     assert runtime.get("feishu") is service
     assert runtime.status.ready is True
     assert runtime.status.states == {"feishu": "ready"}
+    assert constructor.call_args.args == (store, supervisor)
+    assert constructor.call_args.kwargs["account_id"] == "ca_feishu"
     service.start.assert_awaited_once()
     await runtime.close()
     service.close.assert_awaited_once()

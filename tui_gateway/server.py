@@ -879,7 +879,7 @@ def _owner_scoped_resume_row(db, target: str) -> tuple[dict | None, dict | None]
     prompt history, or a reopen can observe it. Local and owner-only legacy
     compatibility environments retain their existing resume contract.
     """
-    scope = current_historical_resume_scope()
+    scope = _retained_owner_recovery_scope()
     if scope is None:
         return None, None
     scope_lookup = getattr(db, "find_resume_recovery_scope", None)
@@ -1570,6 +1570,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
 def _sess_nowait(params, rid):
     s = _sessions.get(params.get("session_id") or "")
+    if s and not _live_session_is_visible(s):
+        s = None
     return (s, None) if s else (None, _err(rid, 4001, "session not found"))
 
 
@@ -1677,6 +1679,15 @@ def _normalize_completion_path(path_part: str) -> str:
 
 def _owner_worker_mode() -> bool:
     return is_owner_worker_env()
+
+
+def _retained_owner_recovery_scope() -> dict | None:
+    scope = current_historical_resume_scope()
+    if scope is None or not _owner_worker_mode():
+        return scope
+    from hermes_cli.session_sources import retained_recovery_scope
+
+    return retained_recovery_scope(scope)
 
 
 def _owner_default_cwd() -> str:
@@ -1880,6 +1891,14 @@ def _session_source(session: dict | None) -> str:
         if source:
             return source
     return "tui"
+
+
+def _live_session_is_visible(session: dict) -> bool:
+    if not _owner_worker_mode():
+        return True
+    from hermes_cli.session_sources import is_retained_session_source
+
+    return is_retained_session_source(_session_source(session))
 
 
 def _compact_gui_tool_payload(sid: str) -> bool:
@@ -5366,6 +5385,13 @@ def _inflight_snapshot(session: dict) -> dict | None:
 
 @method("session.create")
 def _session_create(rid, params: dict) -> dict:
+    source = str(params.get("source") or "tui").strip() or "tui"
+    if _owner_worker_mode():
+        from hermes_cli.session_sources import is_retained_session_source
+
+        if not is_retained_session_source(source):
+            return _err(rid, 4002, "session source is not available")
+
     dashboard_transport = None
     dashboard_generation = None
     if "switch_generation" in params:
@@ -5412,7 +5438,6 @@ def _session_create(rid, params: dict) -> dict:
     except Exception:
         explicit_cwd = False
     resolved_cwd = _completion_cwd(params)
-    source = str(params.get("source") or "tui").strip() or "tui"
     _enable_gateway_prompts()
 
     # The desktop composer owns its model/effort/fast as plain UI state and ships
@@ -5566,15 +5591,14 @@ def _(rid, params: dict) -> dict:
     if db is None:
         return _db_unavailable_error(rid, code=5006)
     try:
-        # Resume picker should surface human conversation sessions from every
-        # user-facing surface — CLI, TUI, all gateway platforms (including new
-        # ones not enumerated here), ACP adapter clients, webhook sessions,
-        # custom `HERMES_SESSION_SOURCE` values, and older installs with
-        # different source labels. We deny-list only the noisy internal
-        # sources (``tool`` sub-agent runs) rather than allow-listing a
-        # fixed set of platform names that goes stale whenever a new
-        # platform is added or a user names their own source.
         deny = frozenset({"tool"})
+        source_filter = None
+        recovery_scope = None
+        if _owner_worker_mode():
+            from hermes_cli.session_sources import RETAINED_SESSION_SOURCES
+
+            source_filter = sorted(RETAINED_SESSION_SOURCES)
+            recovery_scope = _retained_owner_recovery_scope()
 
         limit = int(params.get("limit", 200) or 200)
         # Over-fetch modestly so per-source filtering doesn't leave us
@@ -5583,7 +5607,13 @@ def _(rid, params: dict) -> dict:
         fetch_limit = max(limit * 2, 200)
         rows = [
             s
-            for s in db.list_sessions_rich(source=None, limit=fetch_limit, order_by_last_active=True)
+            for s in db.list_sessions_rich(
+                source=None,
+                source_filter=source_filter,
+                limit=fetch_limit,
+                order_by_last_active=True,
+                recovery_scope=recovery_scope,
+            )
             if (s.get("source") or "").strip().lower() not in deny
         ][:limit]
         return _ok(
@@ -5626,11 +5656,20 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"session_id": None})
     try:
         deny = frozenset({"tool"})
-        # Over-fetch by a generous bounded amount so heavy sub-agent
-        # users (lots of recent ``tool`` rows) don't get a false
-        # "no eligible session" answer.  ``session.list`` uses a
-        # similar over-fetch strategy.
-        rows = db.list_sessions_rich(source=None, limit=200, order_by_last_active=True)
+        source_filter = None
+        recovery_scope = None
+        if _owner_worker_mode():
+            from hermes_cli.session_sources import RETAINED_SESSION_SOURCES
+
+            source_filter = sorted(RETAINED_SESSION_SOURCES)
+            recovery_scope = _retained_owner_recovery_scope()
+        rows = db.list_sessions_rich(
+            source=None,
+            source_filter=source_filter,
+            limit=200,
+            order_by_last_active=True,
+            recovery_scope=recovery_scope,
+        )
         for row in rows:
             src = (row.get("source") or "").strip().lower()
             if src in deny:
@@ -5937,7 +5976,7 @@ def _session_resume(rid, params: dict) -> dict:
     if db is None:
         return _db_unavailable_error(rid, code=5000)
 
-    recovery_scope = current_historical_resume_scope()
+    recovery_scope = _retained_owner_recovery_scope()
     stage_started_at = time.monotonic()
     if recovery_scope is not None:
         # Authenticated recovery starts with the scope-only row. Do not resolve
@@ -6032,7 +6071,7 @@ def _session_resume(rid, params: dict) -> dict:
 
     def _reuse_live_payload(sid: str, session: dict) -> dict:
         source = str(params.get("source") or "").strip()
-        if source:
+        if source and not _owner_worker_mode():
             session["source"] = source
         payload = _live_session_payload(
             sid,
@@ -6098,7 +6137,11 @@ def _session_resume(rid, params: dict) -> dict:
             cwd=cwd,
             history=history,
             lease=lease,
-            source=str(params.get("source") or "tui").strip() or "tui",
+            source=(
+                str(found.get("source") or "").strip()
+                if _owner_worker_mode()
+                else str(params.get("source") or "tui").strip() or "tui"
+            ),
             close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
             lazy=True,
         )
@@ -6214,7 +6257,11 @@ def _session_resume(rid, params: dict) -> dict:
             cwd=cwd,
             history=history,
             lease=lease,
-            source=str(params.get("source") or "tui").strip() or "tui",
+            source=(
+                str(found.get("source") or "").strip()
+                if _owner_worker_mode()
+                else str(params.get("source") or "tui").strip() or "tui"
+            ),
             close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
             display_history_prefix=prefix,
             model_override=overrides.get("model_override"),
@@ -6588,7 +6635,7 @@ def _live_session_payload(
     session_key = _session_lookup_key(session, fallback=sid)
     display_page = None
     if include_display_history and display_limit is not None:
-        recovery_scope = current_historical_resume_scope()
+        recovery_scope = _retained_owner_recovery_scope()
         try:
             with _session_db(session) as db:
                 if db is not None:
@@ -6675,7 +6722,7 @@ def _(rid, params: dict) -> dict:
     rows = [
         _session_live_item(sid, session, current)
         for sid, session in snapshot
-        if not session.get("_finalized")
+        if not session.get("_finalized") and _live_session_is_visible(session)
     ]
     return _ok(rid, {"sessions": rows})
 
@@ -8392,7 +8439,7 @@ def _(rid, params: dict) -> dict:
         limit = max(1, min(int(params.get("limit", 100)), 200))
     except (TypeError, ValueError):
         return _err(rid, 4002, "limit must be an integer")
-    recovery_scope = current_historical_resume_scope()
+    recovery_scope = _retained_owner_recovery_scope()
     with _session_db(session) as db:
         if db is None:
             return _db_unavailable_error(rid, code=5000)

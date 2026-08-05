@@ -1872,6 +1872,35 @@ class TestDeleteAndExport:
 # Prune
 # =========================================================================
 
+def _retained_scope() -> dict:
+    return {
+        "owner_key": "owner-a",
+        "workspace_root": "/owners/a/workspaces",
+        "historical_resume": True,
+        "source_filter": ["dashboard-gui"],
+    }
+
+
+def _create_scoped_session(
+    db,
+    session_id: str,
+    *,
+    source: str = "dashboard-gui",
+    owner_key: str = "owner-a",
+    workspace_root: str = "/owners/a/workspaces",
+    worker_generation: int | None = 1,
+    parent_session_id: str | None = None,
+):
+    db.create_session(
+        session_id,
+        source,
+        owner_key=owner_key,
+        workspace_root=workspace_root,
+        worker_generation=worker_generation,
+        parent_session_id=parent_session_id,
+    )
+
+
 class TestPruneSessions:
     def test_prune_old_ended_sessions(self, db):
         # Create and end an "old" session
@@ -1921,6 +1950,58 @@ class TestPruneSessions:
         assert pruned == 1
         assert db.get_session("old_cli") is None
         assert db.get_session("old_tg") is not None
+
+    def test_prune_recovery_scope_preserves_legacy_and_other_owner_rows(self, db):
+        for session_id, source, owner_key, workspace_root, generation in (
+            ("retained", "dashboard-gui", "owner-a", "/owners/a/workspaces", 2),
+            ("legacy", "cli", "owner-a", "/owners/a/workspaces", 2),
+            ("other-owner", "dashboard-gui", "owner-b", "/owners/b/workspaces", 2),
+            ("unfenced", "dashboard-gui", None, None, None),
+        ):
+            _create_scoped_session(
+                db,
+                session_id,
+                source=source,
+                owner_key=owner_key,
+                workspace_root=workspace_root,
+                worker_generation=generation,
+            )
+            db.end_session(session_id, end_reason="done")
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (time.time() - 200 * 86400, session_id),
+            )
+        db._conn.commit()
+
+        assert db.prune_sessions(
+            older_than_days=90,
+            recovery_scope=_retained_scope(),
+        ) == 1
+        assert db.get_session("retained") is None
+        for session_id in ("legacy", "other-owner", "unfenced"):
+            assert db.get_session(session_id) is not None
+
+    def test_prune_scope_does_not_rewrite_out_of_scope_child(self, db):
+        _create_scoped_session(db, "retained-parent")
+        db.end_session("retained-parent", end_reason="done")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (time.time() - 200 * 86400, "retained-parent"),
+        )
+        _create_scoped_session(
+            db,
+            "legacy-child",
+            source="cli",
+            parent_session_id="retained-parent",
+        )
+        db._conn.commit()
+
+        assert db.prune_sessions(
+            older_than_days=90,
+            recovery_scope=_retained_scope(),
+        ) == 0
+        assert db.get_session("retained-parent") is not None
+        assert db.get_session("legacy-child")["parent_session_id"] == "retained-parent"
 
     def test_prune_with_multilevel_chain(self, db):
         """Pruning old sessions orphans newer children instead of crashing on FK."""
@@ -2075,6 +2156,52 @@ class TestBulkDeleteSessions:
         deleted = db.delete_sessions(["real", "real"])
         assert deleted == 1
 
+    def test_recovery_scope_deletes_only_visible_ids(self, db):
+        _create_scoped_session(db, "retained")
+        _create_scoped_session(db, "legacy", source="cli")
+
+        assert db.delete_sessions(
+            ["retained", "legacy"],
+            recovery_scope=_retained_scope(),
+        ) == 1
+        assert db.get_session("retained") is None
+        assert db.get_session("legacy") is not None
+
+    def test_recovery_scope_preserves_parent_with_out_of_scope_child(self, db):
+        _create_scoped_session(db, "retained-parent")
+        _create_scoped_session(
+            db,
+            "legacy-child",
+            source="cli",
+            parent_session_id="retained-parent",
+        )
+
+        assert db.delete_sessions(
+            ["retained-parent"],
+            recovery_scope=_retained_scope(),
+        ) == 0
+        assert db.get_session("retained-parent") is not None
+        assert db.get_session("legacy-child")["parent_session_id"] == "retained-parent"
+
+    def test_recovery_scope_does_not_cascade_out_of_scope_delegate(self, db):
+        _create_scoped_session(db, "retained-parent")
+        db.create_session(
+            "legacy-delegate",
+            "cli",
+            owner_key="owner-a",
+            workspace_root="/owners/a/workspaces",
+            worker_generation=1,
+            parent_session_id="retained-parent",
+            model_config={"_delegate_from": "retained-parent"},
+        )
+
+        assert db.delete_session(
+            "retained-parent",
+            recovery_scope=_retained_scope(),
+        ) is False
+        assert db.get_session("retained-parent") is not None
+        assert db.get_session("legacy-delegate") is not None
+
     def test_orphans_children_of_deleted_parents(self, db):
         """Bulk-deleting a parent leaves its children alive but
         re-parented to NULL. Same contract as the single-session
@@ -2161,6 +2288,33 @@ class TestDeleteEmptySessions:
         assert db.get_session("empty2") is None
         assert db.get_session("hasmsg") is not None
         assert db.count_empty_sessions() == 0
+
+    def test_recovery_scope_deletes_all_retained_empties_without_limit(self, db):
+        for index in range(501):
+            session_id = f"retained-empty-{index}"
+            _create_scoped_session(db, session_id)
+            db.end_session(session_id, end_reason="done")
+        _create_scoped_session(db, "legacy-empty", source="cli")
+        db.end_session("legacy-empty", end_reason="done")
+
+        assert db.delete_empty_sessions(recovery_scope=_retained_scope()) == 501
+        assert db.get_session("retained-empty-0") is None
+        assert db.get_session("retained-empty-500") is None
+        assert db.get_session("legacy-empty") is not None
+
+    def test_recovery_scope_preserves_parent_with_out_of_scope_child(self, db):
+        _create_scoped_session(db, "retained-empty-parent")
+        db.end_session("retained-empty-parent", end_reason="done")
+        _create_scoped_session(
+            db,
+            "legacy-child",
+            source="cli",
+            parent_session_id="retained-empty-parent",
+        )
+
+        assert db.delete_empty_sessions(recovery_scope=_retained_scope()) == 0
+        assert db.get_session("retained-empty-parent") is not None
+        assert db.get_session("legacy-child")["parent_session_id"] == "retained-empty-parent"
 
     def test_skips_active_empty_sessions(self, db):
         """A live (un-ended) empty session is what you get during the
@@ -2256,6 +2410,22 @@ class TestSessionTitle:
 
     def test_set_title_nonexistent_session(self, db):
         assert db.set_session_title("nonexistent", "Title") is False
+
+    def test_scoped_title_conflict_does_not_disclose_legacy_session_id(self, db):
+        _create_scoped_session(db, "retained")
+        _create_scoped_session(db, "legacy-private", source="cli")
+        db.set_session_title("legacy-private", "Private title")
+
+        with pytest.raises(ValueError) as exc_info:
+            db.set_session_title(
+                "retained",
+                "Private title",
+                recovery_scope=_retained_scope(),
+            )
+
+        assert "legacy-private" not in str(exc_info.value)
+        assert db.get_session("retained")["title"] is None
+        assert db.get_session("legacy-private")["title"] == "Private title"
 
     def test_title_initially_none(self, db):
         db.create_session(session_id="s1", source="cli")
@@ -3317,6 +3487,84 @@ class TestListSessionsRich:
         sessions = db.list_sessions_rich(source="cli")
         assert len(sessions) == 1
         assert sessions[0]["id"] == "s1"
+
+    def test_retained_recovery_scope_id_query_does_not_match_legacy_child(self, db):
+        _create_scoped_session(db, "retained-root")
+        _create_scoped_session(
+            db,
+            "legacy-child-marker",
+            source="cli",
+            parent_session_id="retained-root",
+        )
+
+        assert db.list_sessions_rich(
+            id_query="legacy-child-marker",
+            recovery_scope=_retained_scope(),
+        ) == []
+        assert [
+            session["id"]
+            for session in db.list_sessions_rich(
+                id_query="retained-root",
+                recovery_scope=_retained_scope(),
+            )
+        ] == ["retained-root"]
+
+    def test_retained_recovery_scope_stops_at_legacy_compression_tip(self, db):
+        _create_scoped_session(db, "retained-root")
+        db.end_session("retained-root", end_reason="compression")
+        _create_scoped_session(
+            db,
+            "legacy-tip",
+            source="cli",
+            parent_session_id="retained-root",
+        )
+        db.append_message("legacy-tip", "user", "legacy continuation")
+
+        sessions = db.list_sessions_rich(recovery_scope=_retained_scope())
+        assert [session["id"] for session in sessions] == ["retained-root"]
+        assert db.get_compression_tip(
+            "retained-root",
+            recovery_scope=_retained_scope(),
+        ) == "retained-root"
+        assert db.resolve_resume_session_id(
+            "retained-root",
+            recovery_scope=_retained_scope(),
+        ) == "retained-root"
+
+    def test_retained_recovery_scope_hides_legacy_root_with_retained_child(self, db):
+        _create_scoped_session(db, "legacy-root", source="cli")
+        db.end_session("legacy-root", end_reason="compression")
+        _create_scoped_session(
+            db,
+            "retained-tip",
+            parent_session_id="legacy-root",
+        )
+        db.append_message("retained-tip", "user", "retained continuation")
+
+        assert db.list_sessions_rich(recovery_scope=_retained_scope()) == []
+        assert db.compression_lineage(
+            ["retained-tip"],
+            recovery_scope=_retained_scope(),
+        )["retained-tip"] == {"root": "retained-tip", "tip": "retained-tip"}
+
+    def test_retained_recovery_scope_projects_retained_lineage(self, db):
+        _create_scoped_session(db, "retained-root")
+        db.end_session("retained-root", end_reason="compression")
+        _create_scoped_session(
+            db,
+            "retained-tip",
+            worker_generation=2,
+            parent_session_id="retained-root",
+        )
+        db.append_message("retained-tip", "user", "retained continuation")
+
+        sessions = db.list_sessions_rich(recovery_scope=_retained_scope())
+        assert [session["id"] for session in sessions] == ["retained-tip"]
+        assert sessions[0]["_lineage_root_id"] == "retained-root"
+        assert db.resolve_resume_session_id(
+            "retained-root",
+            recovery_scope=_retained_scope(),
+        ) == "retained-tip"
 
     def test_rich_list_cwd_prefix_filter(self, db):
         db.create_session("s1", "cli", cwd="/repo")

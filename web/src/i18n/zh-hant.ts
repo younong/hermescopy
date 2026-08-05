@@ -57,15 +57,6 @@ export const zhHant: Translations = {
     footer: {
       org: "Nous Research",
     },
-    activeSessionsLabel: "使用中工作階段：",
-    gatewayStatusLabel: "閘道狀態：",
-    gatewayStrip: {
-      failed: "啟動失敗",
-      off: "關閉",
-      running: "執行中",
-      starting: "啟動中",
-      stopped: "已停止",
-    },
     nav: {
       analytics: "分析",
       chat: "對話",
@@ -87,7 +78,6 @@ export const zhHant: Translations = {
     openNavigation: "開啟導覽",
     pluginNavSection: "外掛",
     sessionsActiveCount: "{count} 個使用中",
-    statusOverview: "狀態總覽",
     system: "系統",
     webUi: "管理面板",
   },

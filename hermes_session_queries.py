@@ -409,14 +409,24 @@ class SessionQueryMixin:
         required = ("owner_key", "workspace_root")
         if any(recovery_scope.get(key) in (None, "") for key in required):
             return " AND 1 = 0", []
+        source_filter = recovery_scope.get("source_filter")
+        source_clause = ""
+        source_params: list[str] = []
+        if source_filter is not None:
+            normalized = [str(source).strip() for source in source_filter if str(source).strip()]
+            if not normalized:
+                return " AND 1 = 0", []
+            source_clause = f" AND {alias}.source IN ({','.join('?' for _ in normalized)})"
+            source_params.extend(normalized)
         if recovery_scope.get("historical_resume") is True:
             return (
                 f" AND {alias}.owner_key = ? AND {alias}.workspace_root = ? "
                 f"AND typeof({alias}.worker_generation) = 'integer' "
-                f"AND {alias}.worker_generation > 0",
+                f"AND {alias}.worker_generation > 0{source_clause}",
                 [
                     str(recovery_scope["owner_key"]),
                     str(recovery_scope["workspace_root"]),
+                    *source_params,
                 ],
             )
         worker_generation = recovery_scope.get("worker_generation")
@@ -424,11 +434,12 @@ class SessionQueryMixin:
             return " AND 1 = 0", []
         return (
             f" AND {alias}.owner_key = ? AND {alias}.workspace_root = ? "
-            f"AND {alias}.worker_generation = ?",
+            f"AND {alias}.worker_generation = ?{source_clause}",
             [
                 str(recovery_scope["owner_key"]),
                 str(recovery_scope["workspace_root"]),
                 int(worker_generation),
+                *source_params,
             ],
         )
 
@@ -502,6 +513,7 @@ class SessionQueryMixin:
         self,
         *,
         source: str | None,
+        source_filter: list[str] | None,
         exclude_sources: list[str] | None,
         cwd_prefix: str | None,
         include_children: bool,
@@ -521,6 +533,12 @@ class SessionQueryMixin:
         if source:
             clauses.append("s.source = ?")
             params.append(source)
+        if source_filter is not None:
+            if not source_filter:
+                clauses.append("0 = 1")
+            else:
+                clauses.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
+                params.extend(source_filter)
         if exclude_sources:
             clauses.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
             params.extend(exclude_sources)
@@ -545,6 +563,7 @@ class SessionQueryMixin:
     def list_sessions_rich(
         self,
         source: str | None = None,
+        source_filter: list[str] | None = None,
         exclude_sources: list[str] | None = None,
         cwd_prefix: str | None = None,
         limit: int = 20,
@@ -562,6 +581,7 @@ class SessionQueryMixin:
     ) -> list[dict[str, Any]]:
         where_sql, params, scope_clause, scope_params = self._where(
             source=source,
+            source_filter=source_filter,
             exclude_sources=exclude_sources,
             cwd_prefix=cwd_prefix,
             include_children=include_children,
@@ -576,16 +596,18 @@ class SessionQueryMixin:
                 .replace("%", "\\%")
                 .replace("_", "\\_")
             )
+            child_scope = scope_clause.replace("s.", "child.")
             clause = (
                 "(LOWER(s.id) LIKE ? ESCAPE '\\' OR EXISTS ("
                 "WITH RECURSIVE id_chain(id) AS ("
                 "SELECT s.id UNION ALL SELECT child.id FROM sessions child "
                 "JOIN id_chain parent ON child.parent_session_id = parent.id "
-                "WHERE child.id != parent.id) "
+                f"WHERE child.id != parent.id{child_scope}) "
                 "SELECT 1 FROM id_chain WHERE LOWER(id) LIKE ? ESCAPE '\\'))"
             )
+            pattern = f"%{escaped.lower()}%"
             where_sql += (" AND " if where_sql else "WHERE ") + clause
-            params.extend((f"%{escaped.lower()}%", f"%{escaped.lower()}%"))
+            params.extend((pattern, *scope_params, pattern))
         if order_by_last_active or active_from is not None or active_before is not None:
             chain_child_scope = scope_clause.replace("s.", "child.")
             activity_clauses: list[str] = []
@@ -931,7 +953,7 @@ class SessionQueryMixin:
         count_options = {
             key: options[key]
             for key in (
-                "source", "cwd_prefix", "min_message_count", "include_archived",
+                "source", "source_filter", "cwd_prefix", "min_message_count", "include_archived",
                 "archived_only", "exclude_sources", "active_from", "active_before",
                 "recovery_scope",
             )
@@ -997,6 +1019,9 @@ class SessionQueryMixin:
         recovery_scope: dict[str, Any] | None = None,
     ) -> str | None:
         scope_clause, scope_params = self._recovery_scope_clause(recovery_scope, alias="parent")
+        child_scope, child_scope_params = self._recovery_scope_clause(
+            recovery_scope, alias="child"
+        )
         lineage_scope = (
             " AND child.owner_key = parent.owner_key AND child.workspace_root = parent.workspace_root "
             + (
@@ -1004,6 +1029,7 @@ class SessionQueryMixin:
                 if recovery_scope and recovery_scope.get("historical_resume")
                 else "AND child.worker_generation = parent.worker_generation"
             )
+            + child_scope
             if recovery_scope
             else ""
         )
@@ -1026,7 +1052,7 @@ class SessionQueryMixin:
                                child.started_at) DESC,
                       child.started_at DESC, child.id DESC LIMIT 1
                     """,
-                    (current, *scope_params),
+                    (current, *scope_params, *child_scope_params),
                 ).fetchone()
             if row is None or not row["id"] or row["id"] in seen:
                 return current
@@ -1037,6 +1063,7 @@ class SessionQueryMixin:
     def session_count(
         self,
         source: str | None = None,
+        source_filter: list[str] | None = None,
         cwd_prefix: str | None = None,
         min_message_count: int = 0,
         include_archived: bool = False,
@@ -1049,6 +1076,7 @@ class SessionQueryMixin:
     ) -> int:
         where_sql, params, _scope_clause, _scope_params = self._where(
             source=source,
+            source_filter=source_filter,
             exclude_sources=exclude_sources,
             cwd_prefix=cwd_prefix,
             include_children=not exclude_children,
@@ -1518,9 +1546,9 @@ class SessionQueryMixin:
     def search_messages(
         self,
         query: str,
-        source_filter: list[str] = None,
-        exclude_sources: list[str] = None,
-        role_filter: list[str] = None,
+        source_filter: list[str] | None = None,
+        exclude_sources: list[str] | None = None,
+        role_filter: list[str] | None = None,
         limit: int = 20,
         offset: int = 0,
         sort: str = None,
@@ -1600,9 +1628,12 @@ class SessionQueryMixin:
             where_clauses.append("(m.active = 1 OR m.compacted = 1)")
 
         if source_filter is not None:
-            source_placeholders = ",".join("?" for _ in source_filter)
-            where_clauses.append(f"s.source IN ({source_placeholders})")
-            params.extend(source_filter)
+            if source_filter:
+                source_placeholders = ",".join("?" for _ in source_filter)
+                where_clauses.append(f"s.source IN ({source_placeholders})")
+                params.extend(source_filter)
+            else:
+                where_clauses.append("0 = 1")
 
         if exclude_sources is not None:
             exclude_placeholders = ",".join("?" for _ in exclude_sources)
@@ -1684,8 +1715,11 @@ class SessionQueryMixin:
                 if not include_inactive:
                     tri_where.append("(m.active = 1 OR m.compacted = 1)")
                 if source_filter is not None:
-                    tri_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
-                    tri_params.extend(source_filter)
+                    if source_filter:
+                        tri_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
+                        tri_params.extend(source_filter)
+                    else:
+                        tri_where.append("0 = 1")
                 if exclude_sources is not None:
                     tri_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
                     tri_params.extend(exclude_sources)
@@ -1744,8 +1778,11 @@ class SessionQueryMixin:
                     like_where.append(scope_clause.removeprefix(" AND "))
                     like_params.extend(scope_params)
                 if source_filter is not None:
-                    like_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
-                    like_params.extend(source_filter)
+                    if source_filter:
+                        like_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
+                        like_params.extend(source_filter)
+                    else:
+                        like_where.append("0 = 1")
                 if exclude_sources is not None:
                     like_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
                     like_params.extend(exclude_sources)
@@ -1850,6 +1887,7 @@ class SessionQueryMixin:
         query: str,
         limit: int = 20,
         include_archived: bool = True,
+        source_filter: list[str] | None = None,
         recovery_scope: dict[str, Any] | None = None,
     ) -> List[dict[str, Any]]:
         """Search surfaced sessions by exact/prefix/substring session id.
@@ -1876,6 +1914,7 @@ class SessionQueryMixin:
             include_archived=include_archived,
             order_by_last_active=True,
             id_query=needle,
+            source_filter=source_filter,
             recovery_scope=recovery_scope,
         )
 
@@ -1959,11 +1998,21 @@ class SessionQueryMixin:
     def session_stats(
         self,
         *,
+        source_filter: list[str] | None = None,
         recovery_scope: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         scope_clause, scope_params = self._recovery_scope_clause(
             recovery_scope, alias="s"
         )
+        source_clause = ""
+        source_params: list[str] = []
+        if source_filter is not None:
+            if source_filter:
+                source_clause = f" AND s.source IN ({','.join('?' for _ in source_filter)})"
+                source_params.extend(source_filter)
+            else:
+                source_clause = " AND 0 = 1"
+        scoped_params = (*scope_params, *source_params)
         with self._lock:
             totals = self._conn.execute(
                 f"""
@@ -1972,23 +2021,23 @@ class SessionQueryMixin:
                     SUM(CASE WHEN s.archived = 0 THEN 1 ELSE 0 END) AS active_store,
                     SUM(CASE WHEN s.archived = 1 THEN 1 ELSE 0 END) AS archived
                 FROM sessions s
-                WHERE 1 = 1{scope_clause}
+                WHERE 1 = 1{scope_clause}{source_clause}
                 """,
-                scope_params,
+                scoped_params,
             ).fetchone()
             source_rows = self._conn.execute(
                 f"""
                 SELECT COALESCE(s.source, 'cli') AS source, COUNT(*) AS count
                 FROM sessions s
-                WHERE 1 = 1{scope_clause}
+                WHERE 1 = 1{scope_clause}{source_clause}
                 GROUP BY COALESCE(s.source, 'cli')
                 """,
-                scope_params,
+                scoped_params,
             ).fetchall()
             messages = self._conn.execute(
                 "SELECT COUNT(*) FROM messages m JOIN sessions s ON s.id = m.session_id "
-                f"WHERE 1 = 1{scope_clause}",
-                scope_params,
+                f"WHERE 1 = 1{scope_clause}{source_clause}",
+                scoped_params,
             ).fetchone()
         return {
             "total": int(totals["total"] or 0),

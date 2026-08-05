@@ -22,6 +22,7 @@ from hermes_cli.channel_connectors.inbox import (
     InboundCommitResult,
 )
 from hermes_cli.channel_dispatch import (
+    ChannelDispatcher,
     advance_outbound,
     claim_outbound,
     fail_outbound,
@@ -529,6 +530,7 @@ class FeishuConnector:
     def __init__(
         self,
         store: ChannelIdentityStore,
+        supervisor: Any,
         *,
         account_id: str,
         config: Mapping[str, Any],
@@ -545,8 +547,21 @@ class FeishuConnector:
         self.transport = transport or FeishuHTTPTransport(
             timeout=float(config.get("outbound_timeout_seconds", 30))
         )
+        self.dispatcher = ChannelDispatcher(
+            store,
+            supervisor,
+            provider=PROVIDER,
+            turn_timeout=self.claim_timeout,
+            dispatch_config=dict(config),
+            media_config=dict(config),
+        )
         self.sender = FeishuSender(store, self.transport, config=config)
+        self.dispatch_concurrency = max(
+            1, int(config.get("dispatch_concurrency", 4))
+        )
         self._running = False
+        self._dispatcher_task: asyncio.Task | None = None
+        self._dispatch_tasks: set[asyncio.Task] = set()
         self._sender_task: asyncio.Task | None = None
         self._ws_future: asyncio.Future | None = None
         self._ws_client: Any = None
@@ -559,10 +574,22 @@ class FeishuConnector:
             account_id=self.account_id,
         )
         app_id, app_secret, domain = _credentials(account)
+        cutoff = time.time() - self.claim_timeout
+        with self.store.write() as conn:
+            conn.execute(
+                """
+                UPDATE inbound_messages SET status='queued', claimed_by=NULL,
+                    claimed_at=NULL, updated_at=?
+                WHERE status='processing' AND claimed_at<? AND account_id IN (
+                    SELECT account_id FROM connector_accounts WHERE provider=?
+                )
+                """,
+                (time.time(), cutoff, PROVIDER),
+            )
         recover_stale_outbound(
             self.store,
             provider=PROVIDER,
-            claimed_before=time.time() - self.claim_timeout,
+            claimed_before=cutoff,
         )
         self._loop = asyncio.get_running_loop()
         self._ws_client = self._build_ws_client(
@@ -575,6 +602,9 @@ class FeishuConnector:
             ),
         )
         self._running = True
+        self._dispatcher_task = asyncio.create_task(
+            self._dispatch_loop(), name=f"feishu-dispatch-{self.account_id}"
+        )
         self._sender_task = asyncio.create_task(
             self._sender_loop(), name=f"feishu-sender-{self.account_id}"
         )
@@ -631,6 +661,33 @@ class FeishuConnector:
             data=data,
         )
 
+    async def _dispatch_loop(self) -> None:
+        while self._running:
+            try:
+                while len(self._dispatch_tasks) < self.dispatch_concurrency:
+                    claim = self.dispatcher.claim_next(holder=self.holder)
+                    if claim is None:
+                        break
+                    task = asyncio.create_task(
+                        self._dispatch_one(claim),
+                        name=f"feishu-turn-{claim['inbound_id']}",
+                    )
+                    self._dispatch_tasks.add(task)
+                    task.add_done_callback(self._dispatch_tasks.discard)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            await asyncio.sleep(self.idle_seconds)
+
+    async def _dispatch_one(self, claim: dict) -> None:
+        try:
+            await self.dispatcher.dispatch_claim(claim, holder=self.holder)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return
+
     async def _sender_loop(self) -> None:
         while self._running:
             try:
@@ -646,10 +703,17 @@ class FeishuConnector:
 
     async def close(self) -> None:
         self._running = False
-        if self._sender_task is not None:
-            self._sender_task.cancel()
-            await asyncio.gather(self._sender_task, return_exceptions=True)
-            self._sender_task = None
+        tasks = [
+            task
+            for task in (self._dispatcher_task, self._sender_task, *self._dispatch_tasks)
+            if task is not None
+        ]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._dispatcher_task = None
+        self._sender_task = None
+        self._dispatch_tasks.clear()
         if self._ws_client is not None:
             try:
                 setattr(self._ws_client, "_auto_reconnect", False)

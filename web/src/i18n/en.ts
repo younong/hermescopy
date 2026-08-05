@@ -63,15 +63,6 @@ export const en: Translations = {
     footer: {
       org: "Nous Research",
     },
-    activeSessionsLabel: "Active Sessions:",
-    gatewayStatusLabel: "Gateway Status:",
-    gatewayStrip: {
-      failed: "Start failed",
-      off: "Off",
-      running: "Running",
-      starting: "Starting",
-      stopped: "Stopped",
-    },
     nav: {
       analytics: "Analytics",
       chat: "Chat",
@@ -94,7 +85,6 @@ export const en: Translations = {
     openNavigation: "Open navigation",
     pluginNavSection: "Plugins",
     sessionsActiveCount: "{count} active",
-    statusOverview: "Status overview",
     system: "System",
     webUi: "Web UI",
     managingProfile: "Managing profile",

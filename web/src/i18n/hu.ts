@@ -57,15 +57,6 @@ export const hu: Translations = {
     footer: {
       org: "Nous Research",
     },
-    activeSessionsLabel: "Aktív munkamenetek:",
-    gatewayStatusLabel: "Átjáró állapota:",
-    gatewayStrip: {
-      failed: "Indítás sikertelen",
-      off: "Ki",
-      running: "Fut",
-      starting: "Indul",
-      stopped: "Leállítva",
-    },
     nav: {
       analytics: "Analitika",
       chat: "Csevegés",
@@ -87,7 +78,6 @@ export const hu: Translations = {
     openNavigation: "Navigáció megnyitása",
     pluginNavSection: "Bővítmények",
     sessionsActiveCount: "{count} aktív",
-    statusOverview: "Állapot áttekintése",
     system: "Rendszer",
     webUi: "Web UI",
   },
