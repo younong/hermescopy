@@ -389,6 +389,22 @@ def test_host_verification_accepts_only_tool_none(tmp_path):
         policy.verification_source(binding, mount_policy, SimpleNamespace(egress_profile="tool-public"))
 
 
+def test_isolated_smoke_policy_uses_production_policy_for_control_plane(tmp_path, monkeypatch):
+    config, _document, policy_path = _config(tmp_path)
+    monkeypatch.delenv("HERMES_OWNER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "irrelevant-control-plane-home"))
+    monkeypatch.delenv("HERMES_CONTROL_HOME", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.owner_worker.host_sandbox.load_host_sandbox_config",
+        lambda _path: config,
+    )
+
+    policy = isolated_smoke_sandbox_deployment_policy(policy_path)
+
+    assert policy.owner_root == config.owner_root
+    assert policy.resource_policy is config.resource_policy
+
+
 def test_isolated_smoke_policy_rebinds_only_exact_temporary_owner_root(tmp_path, monkeypatch):
     config, _document, policy_path = _config(tmp_path)
     smoke_root = tmp_path / f"hcs-{tmp_path.name}"

@@ -365,23 +365,27 @@ def isolated_smoke_sandbox_deployment_policy(
     """Bind the production sandbox artifacts to a deployment smoke Owner root."""
     config = load_host_sandbox_config(policy_path)
     owner_key = os.environ.get("HERMES_OWNER_KEY", "").strip()
+    if not owner_key:
+        policy = build_host_sandbox_deployment_policy(config)
+        if policy.resource_policy is None:
+            raise HostSandboxInvalid("host sandbox resource policy is required")
+        return policy
+
     home = _canonical(os.environ.get("HERMES_HOME", ""), "smoke Owner home")
     control_home = _canonical(
         os.environ.get("HERMES_CONTROL_HOME", ""),
         "smoke control home",
     )
     smoke_root = home.parents[2] if len(home.parents) > 2 else home
-    expected_home = smoke_root / "home" / "users" / owner_key
     if (
-        not owner_key
-        or home != expected_home
+        home != smoke_root / "home" / "users" / owner_key
         or control_home != smoke_root / "home" / "control-plane"
         or smoke_root.parent != _ISOLATED_SMOKE_PARENT
         or not smoke_root.name.startswith("hcs-")
     ):
         raise HostSandboxInvalid("isolated smoke Owner root is invalid")
     owner_root = _directory(
-        home.parent,
+        smoke_root / "home" / "users",
         "isolated smoke Owner root",
         require_root_owner=False,
         mode=0o750,
