@@ -705,6 +705,7 @@ authority_smoke_root=""
 authority_smoke_result=""
 reader_smoke_root=""
 reader_smoke_result=""
+conversation_smoke_result=""
 powerpoint_smoke_owner=""
 authority_snapshot=""
 
@@ -1626,26 +1627,30 @@ smoke_root="$(mktemp -d "$tmp_dir/hermes-conversation-smoke.XXXXXX")"
 chown "$service_user:$service_group" "$smoke_root"
 chmod 0700 "$smoke_root"
 echo "Running deterministic conversation smoke before deployment commit"
-if ! env -i \
-  HOME="$smoke_root" \
-  TMPDIR="$smoke_root" \
-  PATH="$venv/bin:/usr/local/bin:/usr/bin:/bin" \
-  PYTHONPATH="$release" \
-  PYTHONUNBUFFERED=1 \
-  LANG=C.UTF-8 \
-  LC_ALL=C.UTF-8 \
-  "$venv/bin/python" "$release/deploy/run-cgroup-smoke.py" \
-    --managed-root "$cgroup_root" \
-    --service hermes-dashboard.service \
-    --user "$service_user" \
-    -- \
-    "$venv/bin/python" "$release/deploy/smoke-conversation.py" \
-      --timeout 90 \
-      --sandbox-policy hermes_cli.owner_worker.host_sandbox:isolated_smoke_sandbox_deployment_policy; then
+if ! conversation_smoke_result="$(
+  env -i \
+    HOME="$smoke_root" \
+    TMPDIR="$smoke_root" \
+    PATH="$venv/bin:/usr/local/bin:/usr/bin:/bin" \
+    PYTHONPATH="$release" \
+    PYTHONUNBUFFERED=1 \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    "$venv/bin/python" "$release/deploy/run-cgroup-smoke.py" \
+      --managed-root "$cgroup_root" \
+      --service hermes-dashboard.service \
+      --user "$service_user" \
+      -- \
+      "$venv/bin/python" "$release/deploy/smoke-conversation.py" \
+        --timeout 90 \
+        --sandbox-policy hermes_cli.owner_worker.host_sandbox:isolated_smoke_sandbox_deployment_policy
+)"; then
+  printf '%s\n' "$conversation_smoke_result"
   echo "HERMES_DEPLOY_STAGE deterministic_smoke=failed" >&2
   echo "Deterministic conversation smoke failed; deployment remains uncommitted and will be rolled back" >&2
   exit 1
 fi
+printf '%s\n' "$conversation_smoke_result"
 echo "HERMES_DEPLOY_STAGE deterministic_smoke=passed"
 rm -rf -- "$smoke_root"
 smoke_root=""
