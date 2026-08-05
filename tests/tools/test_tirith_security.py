@@ -493,6 +493,67 @@ class TestFailedDownloadCaching:
 # Explicit path must not auto-download (Finding #2)
 # ---------------------------------------------------------------------------
 
+class TestLazyInstallsDisabled:
+    def test_missing_default_binary_never_installs(self, monkeypatch):
+        monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
+        _tirith_mod._resolved_path = None
+        monkeypatch.setattr(_tirith_mod.shutil, "which", lambda _name: None)
+        monkeypatch.setattr(_tirith_mod, "_hermes_bin_dir", lambda: "/nonexistent")
+        install = MagicMock(side_effect=AssertionError("lazy install must not run"))
+        monkeypatch.setattr(_tirith_mod, "_install_tirith", install)
+
+        assert _tirith_mod._resolve_tirith_path("tirith") is None
+        install.assert_not_called()
+
+    def test_installed_binary_remains_usable(self, monkeypatch):
+        monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
+        _tirith_mod._resolved_path = None
+        monkeypatch.setattr(
+            _tirith_mod.shutil,
+            "which",
+            lambda name: "/usr/local/bin/tirith" if name == "tirith" else None,
+        )
+
+        assert _tirith_mod._resolve_tirith_path("tirith") == "/usr/local/bin/tirith"
+
+    @patch("tools.tirith_security._load_security_config")
+    def test_startup_prefetch_does_not_launch_install_thread(self, mock_cfg, monkeypatch):
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5, "tirith_fail_open": True}
+        monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
+        _tirith_mod._resolved_path = None
+        monkeypatch.setattr(_tirith_mod.shutil, "which", lambda _name: None)
+        monkeypatch.setattr(_tirith_mod, "_hermes_bin_dir", lambda: "/nonexistent")
+        thread = MagicMock(side_effect=AssertionError("install thread must not start"))
+        monkeypatch.setattr(_tirith_mod.threading, "Thread", thread)
+
+        assert ensure_installed() is None
+        thread.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("fail_open", "expected_action"),
+        [(True, "allow"), (False, "block")],
+    )
+    @patch("tools.tirith_security._load_security_config")
+    def test_missing_binary_preserves_scanner_policy(
+        self, mock_cfg, fail_open, expected_action, monkeypatch,
+    ):
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5, "tirith_fail_open": fail_open}
+        monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
+        _tirith_mod._resolved_path = None
+        monkeypatch.setattr(_tirith_mod.shutil, "which", lambda _name: None)
+        monkeypatch.setattr(_tirith_mod, "_hermes_bin_dir", lambda: "/nonexistent")
+        run = MagicMock(side_effect=AssertionError("missing binary must not be spawned"))
+        monkeypatch.setattr(_tirith_mod.subprocess, "run", run)
+
+        result = check_command_security("echo hello")
+
+        assert result["action"] == expected_action
+        assert "unavailable" in result["summary"]
+        run.assert_not_called()
+
+
 class TestExplicitPathNoAutoDownload:
     @patch("tools.tirith_security._install_tirith")
     @patch("tools.tirith_security.shutil.which", return_value=None)

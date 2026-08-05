@@ -203,6 +203,53 @@ class TestHandleFunctionCall:
         }
         assert calls == []
 
+    def test_authenticated_gateway_denial_uses_real_approval_path(self, monkeypatch):
+        from tui_gateway import server
+        from tools import approval
+
+        calls = []
+        notifications = []
+        session_key = "authenticated-terminal-deny"
+
+        class _Supervisor:
+            def dispatch(self, **kwargs):
+                calls.append(kwargs)
+                return '{"exit_code":0}'
+
+        def notify(data):
+            notifications.append(dict(data))
+            approval.resolve_gateway_approval(session_key, "deny")
+
+        runtime = server.OwnerWorkerGatewayRuntime(
+            "owner-a", 1, "worker-a", 1, 0, tool_executor_supervisor=_Supervisor()
+        )
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        monkeypatch.setattr(approval, "_get_approval_mode", lambda: "manual")
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _command: {"action": "allow", "findings": [], "summary": ""},
+        )
+        approval.register_gateway_notify(session_key, notify)
+        token = approval.set_current_session_key(session_key)
+        try:
+            with server.owner_worker_gateway_runtime(runtime):
+                result = json.loads(handle_function_call(
+                    "terminal",
+                    {"command": "rm -rf /workspace/protected"},
+                    task_id="task-1",
+                    session_id="session-1",
+                ))
+        finally:
+            approval.reset_current_session_key(token)
+            approval.unregister_gateway_notify(session_key)
+
+        assert len(notifications) == 1
+        assert notifications[0]["command"] == "rm -rf /workspace/protected"
+        assert result["status"] == "blocked"
+        assert "denied by user" in result["error"]
+        assert calls == []
+
     def test_authenticated_approved_terminal_reaches_executor_once(self):
         from tui_gateway import server
 
