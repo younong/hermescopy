@@ -327,6 +327,10 @@ class ChannelIdentityStore:
 
     def _initialize(self) -> None:
         with self.connect() as conn:
+            # SQLite cannot rebuild a referenced parent table while foreign-key
+            # enforcement is enabled. Initialization uses one isolated write
+            # transaction and validates every foreign key before committing.
+            conn.execute("PRAGMA foreign_keys=OFF")
             conn.execute("BEGIN IMMEDIATE")
             try:
                 has_meta = conn.execute(
@@ -490,6 +494,11 @@ class ChannelIdentityStore:
 
     @staticmethod
     def _migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS binding_sequences ("
+            "binding_id TEXT PRIMARY KEY REFERENCES channel_bindings(binding_id), "
+            "last_sequence INTEGER NOT NULL DEFAULT 0 CHECK(last_sequence >= 0))"
+        )
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(inbound_messages)")}
         if "binding_sequence" not in existing:
             conn.execute("ALTER TABLE inbound_messages ADD COLUMN binding_sequence INTEGER")
@@ -668,21 +677,33 @@ class ChannelIdentityStore:
             migrated.append((ciphertext, version, row["account_id"]))
 
         conn.execute("DROP TRIGGER IF EXISTS connector_accounts_ownership_immutable")
-        if "account_lookup_hash" not in columns:
-            conn.execute(
-                "ALTER TABLE connector_accounts ADD COLUMN account_lookup_hash "
-                "TEXT NOT NULL DEFAULT ''"
+        conn.execute("DROP TRIGGER IF EXISTS channel_bindings_identity_consistent_insert")
+        conn.execute("DROP TRIGGER IF EXISTS inbound_messages_binding_consistent_insert")
+        conn.execute("DROP TRIGGER IF EXISTS outbound_messages_consistent_insert")
+        conn.execute("DROP INDEX IF EXISTS idx_channel_accounts_provider_account")
+        conn.execute(
+            """
+            CREATE TABLE connector_accounts_v9 (
+                account_id TEXT PRIMARY KEY,
+                provider TEXT NOT NULL CHECK(length(trim(provider)) > 0),
+                provider_account_id TEXT NOT NULL
+                    CHECK(length(trim(provider_account_id)) > 0),
+                account_lookup_hash TEXT NOT NULL,
+                credentials_ciphertext BLOB NOT NULL,
+                credentials_key_version INTEGER NOT NULL,
+                credential_version INTEGER NOT NULL,
+                status TEXT NOT NULL
+                    CHECK(status IN ('pending', 'active', 'suspended', 'revoked')),
+                cursor_ciphertext BLOB,
+                cursor_key_version INTEGER,
+                poll_holder TEXT,
+                poll_generation INTEGER NOT NULL DEFAULT 0,
+                poll_health TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
             )
-        if "credentials_ciphertext" not in columns:
-            conn.execute(
-                "ALTER TABLE connector_accounts ADD COLUMN credentials_ciphertext "
-                "BLOB NOT NULL DEFAULT X''"
-            )
-        if "credentials_key_version" not in columns:
-            conn.execute(
-                "ALTER TABLE connector_accounts ADD COLUMN credentials_key_version "
-                "INTEGER NOT NULL DEFAULT 0"
-            )
+            """
+        )
         migrated_by_id = {
             account_id: (ciphertext, version)
             for ciphertext, version, account_id in migrated
@@ -691,28 +712,34 @@ class ChannelIdentityStore:
             ciphertext, key_version = migrated_by_id[row["account_id"]]
             conn.execute(
                 """
-                UPDATE connector_accounts
-                SET account_lookup_hash=?, credentials_ciphertext=?,
-                    credentials_key_version=?
-                WHERE account_id=?
+                INSERT INTO connector_accounts_v9
+                  (account_id, provider, provider_account_id,
+                   account_lookup_hash, credentials_ciphertext,
+                   credentials_key_version, credential_version, status,
+                   cursor_ciphertext, cursor_key_version, poll_holder,
+                   poll_generation, poll_health, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    row["account_id"],
+                    row["provider"],
+                    row["provider_account_id"],
                     row["bot_id_lookup_hash"],
                     ciphertext,
                     key_version,
-                    row["account_id"],
+                    row["credential_version"],
+                    row["status"],
+                    row["cursor_ciphertext"],
+                    row["cursor_key_version"],
+                    row["poll_holder"],
+                    row["poll_generation"],
+                    row["poll_health"],
+                    row["created_at"],
+                    row["updated_at"],
                 ),
             )
-        conn.execute("DROP INDEX IF EXISTS idx_channel_accounts_provider_account")
-        for column in (
-            "bot_id_lookup_hash",
-            "bot_id_ciphertext",
-            "bot_id_key_version",
-            "bot_token_ciphertext",
-            "bot_token_key_version",
-            "base_url",
-        ):
-            conn.execute(f"ALTER TABLE connector_accounts DROP COLUMN {column}")
+        conn.execute("DROP TABLE connector_accounts")
+        conn.execute("ALTER TABLE connector_accounts_v9 RENAME TO connector_accounts")
         conn.execute(
             "CREATE UNIQUE INDEX idx_connector_accounts_lookup_hash "
             "ON connector_accounts(account_lookup_hash)"

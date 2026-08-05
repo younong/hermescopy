@@ -183,6 +183,58 @@ class _StoreCrypto:
         self.crypto = crypto
 
 
+def _rebuild_v4_account_table_with_inline_unique(path) -> None:
+    conn = sqlite3.connect(path, isolation_level=None)
+    try:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            CREATE TABLE ilink_accounts_v4 (
+                account_id TEXT PRIMARY KEY,
+                external_identity_id TEXT NOT NULL
+                    REFERENCES external_identities(external_identity_id),
+                bot_id_lookup_hash TEXT NOT NULL UNIQUE,
+                bot_id_ciphertext BLOB NOT NULL,
+                bot_id_key_version INTEGER NOT NULL,
+                bot_token_ciphertext BLOB NOT NULL,
+                bot_token_key_version INTEGER NOT NULL,
+                base_url TEXT NOT NULL,
+                credential_version INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                cursor_ciphertext BLOB,
+                cursor_key_version INTEGER,
+                poll_holder TEXT,
+                poll_generation INTEGER NOT NULL DEFAULT 0,
+                poll_health TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO ilink_accounts_v4
+            SELECT account_id, external_identity_id, bot_id_lookup_hash,
+                   bot_id_ciphertext, bot_id_key_version,
+                   bot_token_ciphertext, bot_token_key_version, base_url,
+                   credential_version, status, cursor_ciphertext,
+                   cursor_key_version, poll_holder, poll_generation,
+                   poll_health, created_at, updated_at
+            FROM ilink_accounts
+            """
+        )
+        conn.execute("DROP TABLE ilink_accounts")
+        conn.execute("ALTER TABLE ilink_accounts_v4 RENAME TO ilink_accounts")
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
 def _downgrade_inbound_messages_to_v3(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TRIGGER IF EXISTS inbound_messages_binding_consistent_insert")
     conn.execute("DROP TRIGGER IF EXISTS inbound_messages_ownership_immutable")
@@ -362,11 +414,21 @@ def test_store_migrates_v4_ilink_account_to_provider_neutral_identity(tmp_path, 
         conn.execute("DROP TRIGGER IF EXISTS outbound_messages_consistent_insert")
         conn.execute("DROP TRIGGER IF EXISTS channel_bindings_identity_consistent_insert")
         conn.execute("DROP TRIGGER IF EXISTS inbound_messages_binding_consistent_insert")
+        conn.execute("DROP TRIGGER IF EXISTS inbound_messages_assign_sequence")
+        conn.execute("DROP TABLE binding_sequences")
         _downgrade_account_table_to_v7(conn, crypto)
         conn.execute("UPDATE channel_identity_meta SET value='4'")
         conn.execute("ALTER TABLE ilink_accounts DROP COLUMN provider")
         conn.execute("ALTER TABLE ilink_accounts DROP COLUMN provider_account_id")
+        conn.execute(
+            "ALTER TABLE ilink_accounts ADD COLUMN external_identity_id TEXT"
+        )
+        conn.execute(
+            "UPDATE ilink_accounts SET external_identity_id=? WHERE account_id=?",
+            (registered.external_identity_id, registered.account_id),
+        )
 
+    _rebuild_v4_account_table_with_inline_unique(first.path)
     migrated = ChannelIdentityStore(crypto, control_home, global_home=tmp_path)
 
     with migrated.read() as conn:
@@ -378,8 +440,33 @@ def test_store_migrates_v4_ilink_account_to_provider_neutral_identity(tmp_path, 
         version = conn.execute(
             "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
         ).fetchone()["value"]
+        binding_sequence_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='binding_sequences'"
+        ).fetchone()
+        account_foreign_keys = {
+            table: {
+                foreign_key["table"]
+                for foreign_key in conn.execute(f"PRAGMA foreign_key_list({table})")
+                if foreign_key["from"] == "account_id"
+            }
+            for table in (
+                "channel_bindings",
+                "context_tokens",
+                "inbound_messages",
+                "outbound_messages",
+            )
+        }
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     assert row["provider"] == "weixin_ilink"
     assert row["provider_account_id"] == row["account_lookup_hash"]
+    assert binding_sequence_table is not None
+    assert account_foreign_keys == {
+        "channel_bindings": {"connector_accounts"},
+        "context_tokens": {"connector_accounts"},
+        "inbound_messages": {"connector_accounts"},
+        "outbound_messages": {"connector_accounts"},
+    }
     assert version == "10"
 
 
