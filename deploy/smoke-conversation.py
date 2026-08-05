@@ -647,10 +647,11 @@ def run_smoke(
     timeout: float,
     *,
     sandbox_policy: str | None = None,
+    root: Path | None = None,
 ) -> tuple[dict[str, Any], int]:
     started_all = time.monotonic()
     checks: list[dict[str, Any]] = []
-    temporary = Path(tempfile.mkdtemp(prefix="hcs-"))
+    temporary = root.resolve() if root is not None else Path(tempfile.mkdtemp(prefix="hcs-"))
     home = temporary / "home"
     workspace = home / "workspaces" / "default"
     workspace.mkdir(parents=True)
@@ -855,11 +856,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     parser.add_argument("--sandbox-policy")
+    parser.add_argument("--root", type=Path)
     args = parser.parse_args(argv)
     result, status = run_smoke(
         REPO_ROOT,
         max(10.0, args.timeout),
         sandbox_policy=str(args.sandbox_policy or "").strip() or None,
+        root=args.root,
     )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return status

@@ -269,9 +269,11 @@ def test_deploy_gates_commit_on_isolated_conversation_smoke():
     assert '"$release/deploy/run-cgroup-smoke.py"' in source
     assert '--service hermes-dashboard.service' in source
     assert '--user "$service_user"' in source
+    assert 'mktemp -d /opt/hcs-XXXXXX' in source
     assert 'HOME="$smoke_root"' in source
     assert 'TMPDIR="$smoke_root"' in source
     assert 'PYTHONPATH="$release"' in source
+    assert '--root "$smoke_root"' in source
     assert "--sandbox-policy hermes_cli.owner_worker.host_sandbox:isolated_smoke_sandbox_deployment_policy" in source
     smoke_block = source[source.index('if ! conversation_smoke_result="$(', reader_smoke) : nginx]
     assert 'printf \'%s\\n\' "$conversation_smoke_result"' in smoke_block

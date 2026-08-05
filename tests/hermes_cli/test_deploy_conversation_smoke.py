@@ -93,6 +93,33 @@ def test_deterministic_smoke_uses_environment_temporary_directory(monkeypatch, t
     assert arguments == {"prefix": "hcs-"}
 
 
+def test_deterministic_smoke_uses_exact_operator_root(monkeypatch, tmp_path):
+    module = _load_smoke_module()
+    temporary = tmp_path / "hcs-exact"
+
+    class FailingModel:
+        def __init__(self, workspace):
+            assert workspace == temporary / "home" / "workspaces" / "default"
+
+        def start(self):
+            raise RuntimeError("stop after exact root creation")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(module, "ModelStub", FailingModel)
+    monkeypatch.setattr(
+        module.tempfile,
+        "mkdtemp",
+        lambda **_kwargs: pytest.fail("operator root must not create another directory"),
+    )
+
+    _, status = module.run_smoke(ROOT, 10, root=temporary)
+
+    assert status == 1
+    assert not temporary.exists()
+
+
 def test_dashboard_gateway_cleanup_terminates_descendants_after_parent_exit(monkeypatch):
     module = _load_smoke_module()
     gateway = module.DashboardGateway.__new__(module.DashboardGateway)

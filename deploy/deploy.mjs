@@ -1635,7 +1635,7 @@ reader_smoke_root=""
 # Gate the transaction with a real gateway conversation while the previous
 # deployment is still restorable. The runner receives no production env file or
 # model credentials and enforces loopback-only network access itself.
-smoke_root="$(mktemp -d "$tmp_dir/hermes-conversation-smoke.XXXXXX")"
+smoke_root="$(mktemp -d /opt/hcs-XXXXXX)"
 chown "$service_user:$service_group" "$smoke_root"
 chmod 0700 "$smoke_root"
 echo "Running deterministic conversation smoke before deployment commit"
@@ -1655,6 +1655,7 @@ if ! conversation_smoke_result="$(
       -- \
       "$venv/bin/python" "$release/deploy/smoke-conversation.py" \
         --timeout 90 \
+        --root "$smoke_root" \
         --sandbox-policy hermes_cli.owner_worker.host_sandbox:isolated_smoke_sandbox_deployment_policy
 )"; then
   printf '%s\n' "$conversation_smoke_result"
