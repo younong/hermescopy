@@ -12722,7 +12722,12 @@ def start_server(
             sandbox_deployment_policy = load_sandbox_deployment_policy(sandbox_policy_spec)
             if sandbox_deployment_policy.resource_policy is None:
                 raise RuntimeError("sandbox deployment resource policy is unavailable")
-            resource_manager = CgroupV2Manager(sandbox_deployment_policy.resource_policy)
+            resource_manager = CgroupV2Manager(
+                sandbox_deployment_policy.resource_policy,
+                recover_stale_scopes=(
+                    sandbox_deployment_policy.recover_stale_resource_scopes
+                ),
+            )
         except Exception:
             # Authenticated chat remains available, but no resource descriptor is
             # inherited and the Owner Worker therefore refuses all tool admission.

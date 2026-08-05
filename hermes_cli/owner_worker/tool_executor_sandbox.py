@@ -312,6 +312,8 @@ class SandboxDeploymentPolicy:
     root_tmpfs_bytes: int = 64 << 20
     executor_tmpfs_bytes: int = 32 << 20
     resource_policy: SandboxResourcePolicy | None = None
+    # Only the primary Dashboard manager may recover predecessor-owned scopes.
+    recover_stale_resource_scopes: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.verification_policy, SandboxVerificationPolicy):
@@ -322,6 +324,8 @@ class SandboxDeploymentPolicy:
             raise SandboxVerificationInvalid("sandbox post-spawn verification source is invalid")
         if self.resource_policy is not None and not isinstance(self.resource_policy, SandboxResourcePolicy):
             raise SandboxVerificationInvalid("sandbox deployment resource policy is invalid")
+        if not isinstance(self.recover_stale_resource_scopes, bool):
+            raise SandboxVerificationInvalid("sandbox resource recovery mode is invalid")
         try:
             allowed_egress_profiles = tuple(
                 parse_egress_profile(value, executor_admissible=True)

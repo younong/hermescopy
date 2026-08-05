@@ -444,6 +444,7 @@ def test_isolated_smoke_policy_rebinds_only_exact_temporary_owner_root(tmp_path,
         policy = isolated_smoke_sandbox_deployment_policy(policy_path)
         assert policy.owner_root == owner_root
         assert policy.resource_policy is config.resource_policy
+        assert policy.recover_stale_resource_scopes is False
 
         monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_other")
         with pytest.raises(HostSandboxInvalid, match="isolated smoke Owner root"):

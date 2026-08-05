@@ -271,6 +271,7 @@ def build_host_sandbox_deployment_policy(
     *,
     runner: Callable[..., object] | None = None,
     clock: Callable[[], float] = time.time,
+    recover_stale_resource_scopes: bool = True,
 ) -> SandboxDeploymentPolicy:
     """Build a fail-closed bare-metal deployment policy from verified artifacts."""
     if not isinstance(config, HostSandboxConfig):
@@ -345,6 +346,7 @@ def build_host_sandbox_deployment_policy(
         root_tmpfs_bytes=config.root_tmpfs_bytes,
         executor_tmpfs_bytes=config.executor_tmpfs_bytes,
         resource_policy=config.resource_policy,
+        recover_stale_resource_scopes=recover_stale_resource_scopes,
     )
 
 
@@ -395,7 +397,10 @@ def isolated_smoke_sandbox_deployment_policy(
         owner_uid=config.uid,
         owner_gid=config.gid,
     )
-    policy = build_host_sandbox_deployment_policy(replace(config, owner_root=owner_root))
+    policy = build_host_sandbox_deployment_policy(
+        replace(config, owner_root=owner_root),
+        recover_stale_resource_scopes=False,
+    )
     if policy.resource_policy is None:
         raise HostSandboxInvalid("host sandbox resource policy is required")
     return policy
