@@ -140,6 +140,209 @@ class TestHandleFunctionCall:
             "turn_id": "", "api_request_id": "",
         }]
 
+    def test_authenticated_safe_terminal_is_approved_before_executor(self):
+        from tui_gateway import server
+
+        calls = []
+
+        class _Supervisor:
+            def dispatch(self, **kwargs):
+                calls.append(kwargs)
+                return '{"exit_code":0}'
+
+        runtime = server.OwnerWorkerGatewayRuntime(
+            "owner-a", 1, "worker-a", 1, 0, tool_executor_supervisor=_Supervisor()
+        )
+        with (
+            patch(
+                "tools.approval.check_all_command_guards",
+                return_value={"approved": True, "message": None},
+            ) as guard,
+            server.owner_worker_gateway_runtime(runtime),
+        ):
+            result = handle_function_call(
+                "terminal", {"command": "pwd"}, task_id="task-1", session_id="session-1"
+            )
+
+        assert result == '{"exit_code":0}'
+        guard.assert_called_once_with("pwd", "local")
+        assert len(calls) == 1
+
+    def test_authenticated_denied_terminal_never_reaches_executor(self):
+        from tui_gateway import server
+
+        calls = []
+
+        class _Supervisor:
+            def dispatch(self, **kwargs):
+                calls.append(kwargs)
+                return '{"exit_code":0}'
+
+        runtime = server.OwnerWorkerGatewayRuntime(
+            "owner-a", 1, "worker-a", 1, 0, tool_executor_supervisor=_Supervisor()
+        )
+        with (
+            patch(
+                "tools.approval.check_all_command_guards",
+                return_value={"approved": False, "message": "BLOCKED: denied by user"},
+            ),
+            server.owner_worker_gateway_runtime(runtime),
+        ):
+            result = json.loads(handle_function_call(
+                "terminal",
+                {"command": "rm -rf /tmp/protected"},
+                task_id="task-1",
+                session_id="session-1",
+            ))
+
+        assert result == {
+            "output": "",
+            "exit_code": -1,
+            "error": "BLOCKED: denied by user",
+            "status": "blocked",
+        }
+        assert calls == []
+
+    def test_authenticated_approved_terminal_reaches_executor_once(self):
+        from tui_gateway import server
+
+        calls = []
+
+        class _Supervisor:
+            def dispatch(self, **kwargs):
+                calls.append(kwargs)
+                return '{"exit_code":0}'
+
+        runtime = server.OwnerWorkerGatewayRuntime(
+            "owner-a", 1, "worker-a", 1, 0, tool_executor_supervisor=_Supervisor()
+        )
+        with (
+            patch(
+                "tools.approval.check_all_command_guards",
+                return_value={"approved": True, "message": None, "user_approved": True},
+            ),
+            server.owner_worker_gateway_runtime(runtime),
+        ):
+            result = handle_function_call(
+                "terminal",
+                {"command": "rm -rf /tmp/protected"},
+                task_id="task-1",
+                session_id="session-1",
+            )
+
+        assert json.loads(result) == {
+            "exit_code": 0,
+            "approval": (
+                "Command required approval (flagged as dangerous) "
+                "and was approved by the user."
+            ),
+        }
+        assert len(calls) == 1
+        assert calls[0]["function_args"] == {"command": "rm -rf /tmp/protected"}
+
+    def test_authenticated_pending_terminal_preserves_pending_contract(self):
+        from tui_gateway import server
+
+        calls = []
+
+        class _Supervisor:
+            def dispatch(self, **kwargs):
+                calls.append(kwargs)
+                return '{"exit_code":0}'
+
+        runtime = server.OwnerWorkerGatewayRuntime(
+            "owner-a", 1, "worker-a", 1, 0, tool_executor_supervisor=_Supervisor()
+        )
+        with (
+            patch(
+                "tools.approval.check_all_command_guards",
+                return_value={
+                    "approved": False,
+                    "status": "pending_approval",
+                    "command": "rm -rf /tmp/protected",
+                    "description": "recursive delete",
+                    "pattern_key": "rm_rf",
+                },
+            ),
+            server.owner_worker_gateway_runtime(runtime),
+        ):
+            result = json.loads(handle_function_call(
+                "terminal",
+                {"command": "rm -rf /tmp/protected"},
+                task_id="task-1",
+                session_id="session-1",
+            ))
+
+        assert result == {
+            "output": "",
+            "exit_code": -1,
+            "error": "",
+            "status": "pending_approval",
+            "approval_pending": True,
+            "command": "rm -rf /tmp/protected",
+            "description": "recursive delete",
+            "pattern_key": "rm_rf",
+        }
+        assert calls == []
+
+    def test_authenticated_hardline_terminal_is_blocked_before_executor(self):
+        from tui_gateway import server
+
+        calls = []
+
+        class _Supervisor:
+            def dispatch(self, **kwargs):
+                calls.append(kwargs)
+                return '{"exit_code":0}'
+
+        runtime = server.OwnerWorkerGatewayRuntime(
+            "owner-a", 1, "worker-a", 1, 0, tool_executor_supervisor=_Supervisor()
+        )
+        with server.owner_worker_gateway_runtime(runtime):
+            result = json.loads(handle_function_call(
+                "terminal", {"command": "rm -rf /"}, task_id="task-1", session_id="session-1"
+            ))
+
+        assert result["status"] == "blocked"
+        assert "unconditional blocklist" in result["error"]
+        assert calls == []
+
+    def test_authenticated_denied_execute_code_never_reaches_executor(self):
+        from tui_gateway import server
+
+        calls = []
+
+        class _Supervisor:
+            def dispatch(self, **kwargs):
+                calls.append(kwargs)
+                return '{"ok":true}'
+
+        runtime = server.OwnerWorkerGatewayRuntime(
+            "owner-a", 1, "worker-a", 1, 0, tool_executor_supervisor=_Supervisor()
+        )
+        with (
+            patch(
+                "tools.approval.check_execute_code_guard",
+                return_value={"approved": False, "message": "BLOCKED: denied by user"},
+            ) as guard,
+            server.owner_worker_gateway_runtime(runtime),
+        ):
+            result = json.loads(handle_function_call(
+                "execute_code",
+                {"code": "print('hello')"},
+                task_id="task-1",
+                session_id="session-1",
+            ))
+
+        assert result == {
+            "status": "error",
+            "error": "BLOCKED: denied by user",
+            "tool_calls_made": 0,
+            "duration_seconds": 0,
+        }
+        guard.assert_called_once_with("print('hello')", "local")
+        assert calls == []
+
     def test_tool_hooks_receive_session_and_tool_call_ids(self):
         with (
             patch("model_tools.registry.dispatch", return_value='{"ok":true}'),
@@ -560,53 +763,34 @@ class TestCoerceNumberInfNan:
         assert _coerce_number("1e3") == 1000
 
 class TestDisabledToolsetsPlatformBundle:
-    """Regression test for #33924: disabling a platform bundle (hermes-*)
-    must not remove core tools from other enabled toolsets."""
+    """Disabling a retained platform bundle must preserve unrelated core tools."""
 
     def test_disabling_platform_bundle_preserves_core_tools(self):
-        """Disabling hermes-yuanbao should not strip core tools from hermes-telegram."""
         from model_tools import get_tool_definitions
 
-        tools_telegram = get_tool_definitions(
-            enabled_toolsets=["hermes-telegram"],
+        tools_weixin = get_tool_definitions(
+            enabled_toolsets=["hermes-weixin-ilink"],
             quiet_mode=True,
         )
-        tools_telegram_no_yuanbao = get_tool_definitions(
-            enabled_toolsets=["hermes-telegram"],
-            disabled_toolsets=["hermes-yuanbao"],
+        tools_weixin_no_feishu = get_tool_definitions(
+            enabled_toolsets=["hermes-weixin-ilink"],
+            disabled_toolsets=["hermes-feishu"],
             quiet_mode=True,
         )
-        names_telegram = {t["function"]["name"] for t in tools_telegram}
-        names_no_yuanbao = {t["function"]["name"] for t in tools_telegram_no_yuanbao}
+        names_weixin = {t["function"]["name"] for t in tools_weixin}
+        names_no_feishu = {t["function"]["name"] for t in tools_weixin_no_feishu}
 
-        # Disabling a *different* platform bundle must not remove any tools
-        assert names_telegram == names_no_yuanbao, (
-            f"Tools lost after disabling hermes-yuanbao: "
-            f"{names_telegram - names_no_yuanbao}"
-        )
-
-    def test_disabling_platform_bundle_removes_own_tools(self):
-        """Disabling hermes-discord should remove discord-specific tools."""
-        from model_tools import get_tool_definitions
-
-        tools = get_tool_definitions(
-            enabled_toolsets=["hermes-discord"],
-            disabled_toolsets=["hermes-discord"],
-            quiet_mode=True,
-        )
-        names = {t["function"]["name"] for t in tools}
-        assert "discord" not in names
+        assert names_weixin == names_no_feishu
 
     def test_disabling_non_platform_toolset_still_works(self):
-        """Disabling a regular (non-hermes-) toolset still subtracts all tools."""
         from model_tools import get_tool_definitions
 
         tools_normal = get_tool_definitions(
-            enabled_toolsets=["hermes-telegram"],
+            enabled_toolsets=["hermes-weixin-ilink"],
             quiet_mode=True,
         )
         tools_no_web = get_tool_definitions(
-            enabled_toolsets=["hermes-telegram"],
+            enabled_toolsets=["hermes-weixin-ilink"],
             disabled_toolsets=["web"],
             quiet_mode=True,
         )
@@ -615,22 +799,7 @@ class TestDisabledToolsetsPlatformBundle:
 
         web_tools = {"web_search", "web_extract"}
         removed = names_normal - names_no_web
-        # web tools should be removed (if they were present)
-        present_web = web_tools & names_normal
-        assert present_web <= removed, (
-            f"Web tools not removed: {present_web - removed}"
-        )
-
-
-    def test_disabling_bundle_removes_platform_tools_but_keeps_core(self):
-        """Disabling hermes-discord (when enabled) removes discord/discord_admin
-        from the resolved delta but keeps core tools — via bundle_non_core_tools."""
-        from toolsets import bundle_non_core_tools, _HERMES_CORE_TOOLS
-
-        delta = bundle_non_core_tools("hermes-yuanbao")
-        # The delta is the bundle's platform-specific tools, NOT core.
-        assert "yb_send_dm" in delta
-        assert not (delta & set(_HERMES_CORE_TOOLS)), "core tools must not be in the removal delta"
+        assert web_tools & names_normal <= removed
 
     def test_bundle_non_core_tools_unknown_falls_back(self):
         """An unknown/garbage bundle name falls back to full resolution (best effort)."""

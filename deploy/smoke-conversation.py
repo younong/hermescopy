@@ -175,9 +175,10 @@ class ModelStub:
         if "approval-deny" in latest_user:
             if tool_messages and ("BLOCKED" in latest_tool or "denied" in latest_tool.lower()):
                 return self._text_chunks(["approval ", "denied safely"])
-            protected = self.workspace / "protected"
             return self._tool_chunk(
-                "terminal", {"command": f"rm -rf {protected}", "timeout": 5}, "call-dangerous"
+                "terminal",
+                {"command": "rm -rf /workspace/protected", "timeout": 5},
+                "call-dangerous",
             )
 
         if "resume-continuation" in latest_user:
