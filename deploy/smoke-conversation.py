@@ -530,7 +530,7 @@ def _write_owner_config(home: Path, *, owner_key: str, base_url: str) -> None:
         "display:\n"
         "  tool_progress: full\n"
         "approvals:\n"
-        "  mode: ask\n",
+        "  mode: manual\n",
         encoding="utf-8",
     )
 
