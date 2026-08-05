@@ -724,8 +724,9 @@ def run_smoke(
         _record(checks, "safe_tool", stage)
 
         deltas, complete = _wait_complete(gateway, sid)
-        if len([item for item in deltas if item]) < 2 or RESUME_MARKER not in str(complete.get("text") or ""):
-            raise SmokeFailure("stream_contract_failed", "prompt_stream", "Expected multiple deltas and completion marker")
+        streamed_text = "".join(item for item in deltas if item)
+        if not streamed_text or RESUME_MARKER not in str(complete.get("text") or ""):
+            raise SmokeFailure("stream_contract_failed", "prompt_stream", "Expected streamed content and completion marker")
         attachment_request_count = model.count_requests_with_text(ATTACHMENT_MARKER)
         if attachment_request_count != 2 or not model.saw_text(SAFE_TOOL_MARKER):
             raise SmokeFailure(

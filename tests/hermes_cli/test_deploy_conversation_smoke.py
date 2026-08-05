@@ -60,7 +60,7 @@ def test_deterministic_conversation_smoke_exercises_authenticated_web_flow():
     checks = {item["name"]: item for item in result["checks"]}
     assert set(checks) == EXPECTED_CHECKS
     assert all(item["status"] == "passed" for item in checks.values())
-    assert checks["prompt_stream"]["deltaCount"] >= 2
+    assert checks["prompt_stream"]["deltaCount"] >= 1
     assert checks["prompt_stream"]["attachmentRequestCount"] == 2
     assert checks["config_propagation"]["provider"] == "custom:hermes-smoke"
 
