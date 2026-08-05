@@ -275,6 +275,8 @@ def test_deploy_gates_commit_on_isolated_conversation_smoke():
     assert "--sandbox-policy hermes_cli.owner_worker.host_sandbox:isolated_smoke_sandbox_deployment_policy" in source
     smoke_block = source[source.index('if ! conversation_smoke_result="$(', reader_smoke) : nginx]
     assert 'printf \'%s\\n\' "$conversation_smoke_result"' in smoke_block
+    assert '"hermes.conversation-smoke"' in source
+    assert "Deterministic failure: ${failure.code}/${failure.check}" in source
     assert "$env_file" not in smoke_block
     assert ". $env_file" not in smoke_block
     cleanup = source[source.index("cleanup_release_tmp"):source.index("trap cleanup_release_tmp EXIT")]
