@@ -24,16 +24,17 @@
 
 新发布前必须人工提交代码。`--create-tag` 要求具名分支和干净工作区，fetch 最新 `origin/main`，以 `--no-autostash` rebase 当前分支，再用绑定 rebase 前远端分支精确 SHA 的 `--force-with-lease=<完整分支 ref>:<observed SHA>` 更新远端同名 PR/源分支，然后只创建并 atomic push 指定的 annotated tag。默认只允许 `main`；`--allow-non-main` 保留，但同样必须 rebase 最新 `origin/main`，且不允许 detached HEAD。远端分支在快照后发生任何变化时 lease 会失效，发布会在 tag 创建/发布前 fail closed。工具不会自动 commit/stash，也禁止无守卫的 `--force`、裸/隐式 lease、`+` refspec、覆盖 tag、tag-only 降级或用 `--tags` 推送无关 tag。
 
-工具使用 `git archive <tag>` 生成干净源码，在本机临时源码目录中安装 Node 依赖、构建 web/ui-tui，并用独立 lockfile 生成只含 PptxGenJS 的 PowerPoint payload，然后把生产运行源码 + 本机预构建产物打包上传到服务器。构建完成后，归档会省略 `tests/`、`website/`、`apps/`、`.github/` 和 `docs/` 等非运行目录。服务器只解包到 `/opt/hermes/releases/<tag>`、按 locked Python/PowerPoint 输入和架构创建或复用 root-owned immutable runtime、验证 host sandbox policy，并把 runner/unit/policy/seccomp 先写入事务 staging。切换时先让旧 Dashboard/Owner Workers 停止接收新 turn、等待或持久化在途 turn，以 `1012 Service Restart` 关闭浏览器桥，再依次停止旧 Dashboard 和 Gateway；确认旧服务退出后才原子替换 `/opt/hermes/current` 和 staged artifacts，随后启动 Gateway、Dashboard。切换前会通过真实 authenticated Bubblewrap executor 生成两页 PPTX、用 MarkItDown 校验顺序，并用 LibreOffice 转换一次 PDF。发布工具还会在远端事务前建立 authenticated 连续性会话，在候选成功或 pre-commit 回滚后用新单次 ticket 恢复同一 canonical session，再执行提交后公开真实模型冒烟。发布成功后会清理本次上传的远端 tarball 和临时冒烟数据，并按保留策略回收旧 release。
+工具使用 `git archive <tag>` 生成干净源码，在本机临时源码目录中安装 Node 依赖、构建 `web`，并用独立 lockfile 生成只含 PptxGenJS 的 PowerPoint payload，然后把生产运行源码 + 本机预构建产物打包上传到服务器。构建完成后，归档会省略 `tests/`、`website/`、`.github/` 和 `docs/` 等非运行目录。服务器只解包到 `/opt/hermes/releases/<tag>`、按 locked Python/PowerPoint 输入和架构创建或复用 root-owned immutable runtime、验证 host sandbox policy，并把 runner、Dashboard unit、policy 和 seccomp 先写入事务 staging。切换时停止旧 Dashboard，由其排空并吊销 Owner Workers；若旧版本仍有 standalone Gateway unit，则仅在迁移中停止、禁用并移除它。确认旧服务退出后才原子替换 `/opt/hermes/current` 和 staged artifacts，随后只启动 `hermes-dashboard.service`。切换前会通过真实 authenticated Bubblewrap executor 生成两页 PPTX、用 MarkItDown 校验顺序，并用 LibreOffice 转换一次 PDF。发布工具还会在远端事务前建立 authenticated 连续性会话，在候选成功或 pre-commit 回滚后用新单次 ticket 恢复同一 canonical session，再执行提交后公开真实模型冒烟。发布成功后会清理本次上传的远端 tarball 和临时冒烟数据，并按保留策略回收旧 release。
 
 ## 服务器运行方式
 
 当前阿里云生产路径为裸机/systemd，不在服务器上构建 Docker 镜像。
 
-服务名：
+唯一候选服务：
 
-- `hermes-gateway.service`
-- `hermes-dashboard.service`
+- `hermes-dashboard.service`（同时托管 authenticated Web、Owner Worker、Session Reader 和 canonical connectors）
+
+旧 `hermes-gateway.service` 仅在升级事务中被识别并退休；新版本不会安装或启动它。
 
 持久化目录：
 
@@ -62,7 +63,7 @@ SSH tunnel 仅作为紧急诊断入口：
 ssh -L 9119:localhost:9119 root@106.15.186.104
 ```
 
-然后在本机打开 `http://localhost:9119`。Dashboard 仍以 `--require-auth` 运行，因此 tunnel 不会绕过 Hermes user 登录。
+然后在本机打开 `http://localhost:9119`。Dashboard 始终启用 cookie/session 认证，因此 tunnel 不会绕过 Hermes user 登录。
 
 ## 服务器前置依赖
 
@@ -210,7 +211,7 @@ npm run deploy -- --tag v2026.7.4 --no-prune-releases
 npm run deploy -- --tag v2026.7.4 --migrate-nginx-hermes
 ```
 
-迁移流程先启动 `--require-auth --trust-proxy-headers` 的新 Hermes，并从 loopback 验证 HTML 重定向和 API 401 均由 Hermes gate 提供；随后仅在旧 Hermes locations 唯一且完全匹配时备份 vhost、原子写入 include/snippet、执行 `nginx -t`，成功后 reload。未知、重复或部分迁移状态会 fail closed。后续普通发布只 reconcile 已存在的 include。
+迁移流程先启动强制认证并启用 `--trust-proxy-headers` 的新 Hermes，从 loopback 验证 HTML 重定向和 API 401 均由 Hermes gate 提供；随后仅在旧 Hermes locations 唯一且完全匹配时备份 vhost、原子写入 include/snippet、执行 `nginx -t`，成功后 reload。未知、重复或部分迁移状态会 fail closed。后续普通发布只 reconcile 已存在的 include。
 
 仅查看状态、不修改服务器：
 
@@ -219,18 +220,18 @@ ssh root@106.15.186.104 \
   'python3 /opt/hermes/current/deploy/nginx/manage_hermes_proxy.py status --vhost /etc/nginx/conf.d/abinllm.conf'
 ```
 
-迁移前建议保存 `nginx -T` 和 vhost checksum。失败时优先恢复工具报告的 `abinllm.conf.hermes-backup-<timestamp>`，再执行 `nginx -t && systemctl reload nginx`。不要通过删除 `--require-auth`、清空 local-user SQLite、轮换 durable-store secret、重跑 bootstrap、恢复 root 服务身份或放宽 owner-home ownership 检查来回滚。旧 `.htpasswd-hermes` 只可在 `nginx -T` 确认不再引用后人工清理。
+迁移前建议保存 `nginx -T` 和 vhost checksum。失败时优先恢复工具报告的 `abinllm.conf.hermes-backup-<timestamp>`，再执行 `nginx -t && systemctl reload nginx`。不要通过修改代码绕过强制认证、清空 local-user SQLite、轮换 durable-store secret、重跑 bootstrap、恢复 root 服务身份或放宽 owner-home ownership 检查来回滚。旧 `.htpasswd-hermes` 只可在 `nginx -T` 确认不再引用后人工清理。
 
 ## 发布后检查
 
 ```bash
 ssh root@106.15.186.104 'readlink /opt/hermes/current'
-ssh root@106.15.186.104 'systemctl is-active hermes-gateway hermes-dashboard'
-ssh root@106.15.186.104 'systemctl status --no-pager hermes-gateway hermes-dashboard'
+ssh root@106.15.186.104 'systemctl is-active hermes-dashboard && ! systemctl is-active --quiet hermes-gateway'
+ssh root@106.15.186.104 'systemctl status --no-pager hermes-dashboard'
 ssh root@106.15.186.104 'nginx -t && nginx -T 2>/dev/null | grep -n -A25 -B5 hermes-dashboard.conf'
-ssh root@106.15.186.104 'journalctl -u hermes-gateway -u hermes-dashboard --since "10 min ago" --no-pager -n 200'
+ssh root@106.15.186.104 'journalctl -u hermes-dashboard --since "10 min ago" --no-pager -n 200'
 ```
 
-使用隐私窗口访问 `https://abinllm.xyz/hermes/`，应直接看到 Hermes 登录页而不是浏览器原生 Basic Auth challenge。用 active member 验证 sessions API、普通功能和 WebSocket/PTY；member 的账号管理 API 仍应为 403，admin 管理读取仍应成功。gateway、dashboard、Owner Worker 和 `/opt/hermes/shared/.hermes/users/<owner-key>` 应使用同一个稳定 `hermes` UID/GID。现有 local-user DB、stable secret 和角色都保持不变。
+使用隐私窗口访问 `https://abinllm.xyz/hermes/`，应直接看到 Hermes 登录页而不是浏览器原生 Basic Auth challenge。用 active member 验证 sessions API、普通功能和认证 WebSocket；member 的账号管理 API 仍应为 403，admin 管理读取仍应成功。Dashboard、Owner Worker 和 `/opt/hermes/shared/.hermes/users/<owner-key>` 应使用同一个稳定 `hermes` UID/GID。现有 local-user DB、stable secret 和角色都保持不变。
 
 发布脚本会执行 host sandbox preflight、systemd health、Hermes auth readiness、事务内确定性核心对话冒烟、Nginx validation，以及提交后的 authenticated 公开真实 AI 对话冒烟。APIYI 图像模型专项 smoke 仍不是必跑步骤；需要验证图像能力时再单独执行。

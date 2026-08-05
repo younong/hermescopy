@@ -92,9 +92,9 @@ afterEach(async () => {
 });
 
 describe("GuiChatScheduledTasksPane", () => {
-  it("loads without an explicit profile, searches status, and pauses a task", async () => {
+  it("loads for the current owner, searches status, and pauses a task", async () => {
     const container = await renderPane();
-    expect(mocks.getCronJobs).toHaveBeenCalledWith(undefined);
+    expect(mocks.getCronJobs).toHaveBeenCalledWith();
     expect(container.textContent).toContain("Daily brief");
     expect(container.textContent).toContain("Weekly report");
 
@@ -107,16 +107,16 @@ describe("GuiChatScheduledTasksPane", () => {
       container.querySelector<HTMLButtonElement>('[aria-label="Pause Daily brief"]')?.click();
       await Promise.resolve();
     });
-    expect(mocks.pauseCronJob).toHaveBeenCalledWith("daily-brief", undefined);
+    expect(mocks.pauseCronJob).toHaveBeenCalledWith("daily-brief");
     expect(container.textContent).toContain("paused");
   });
 
-  it("edits with the shared cron editor and preserves scoped API calls", async () => {
-    const container = await renderPane("worker_alpha");
+  it("edits with the shared cron editor and preserves owner-scoped API calls", async () => {
+    const container = await renderPane();
     await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Edit Daily brief"]')?.click());
     await flush();
 
-    expect(mocks.getSkills).toHaveBeenCalledWith("worker_alpha");
+    expect(mocks.getSkills).toHaveBeenCalledWith();
     expect(document.body.querySelector('#chat-cron-edit-prompt')).not.toBeNull();
     changeValue(document.body.querySelector('#chat-cron-edit-name'), "Updated brief");
     await act(async () => {
@@ -127,7 +127,6 @@ describe("GuiChatScheduledTasksPane", () => {
     expect(mocks.updateCronJob).toHaveBeenCalledWith(
       "daily-brief",
       expect.objectContaining({ name: "Updated brief", schedule: "0 9 * * *" }),
-      "worker_alpha",
     );
     expect(container.textContent).toContain("Updated brief");
   });
@@ -141,19 +140,19 @@ describe("GuiChatScheduledTasksPane", () => {
       await Promise.resolve();
     });
 
-    expect(mocks.deleteCronJob).toHaveBeenCalledWith("daily-brief", undefined);
+    expect(mocks.deleteCronJob).toHaveBeenCalledWith("daily-brief");
     expect(container.textContent).toContain("Task is currently running");
     expect(container.textContent).toContain("Daily brief");
     expect(document.body.querySelector('[role="dialog"]')).not.toBeNull();
   });
 });
 
-async function renderPane(profile?: string) {
+async function renderPane() {
   const container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
   await act(async () => {
-    root?.render(<GuiChatScheduledTasksPane profile={profile} />);
+    root?.render(<GuiChatScheduledTasksPane />);
     await Promise.resolve();
   });
   return container;

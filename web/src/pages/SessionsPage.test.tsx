@@ -40,7 +40,7 @@ describe("fetchSessionsOverview", () => {
 
     await fetchSessionsOverview();
 
-    expect(getSessions).toHaveBeenCalledWith(30, 0, undefined, "recent", true);
+    expect(getSessions).toHaveBeenCalledWith(30, 0, "recent", true);
   });
 });
 
@@ -189,14 +189,13 @@ describe("SessionsPage composition flow", () => {
     expect(api.getSessions).toHaveBeenCalledWith(
       20,
       0,
-      undefined,
       "created",
       false,
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
     const filteredCalls = vi.mocked(api.getSessions).mock.calls.filter(([limit]) => limit === 20);
-    expect(filteredCalls.at(-1)?.[5]).not.toHaveProperty("active_from");
-    expect(filteredCalls.at(-1)?.[5]).not.toHaveProperty("active_before");
+    expect(filteredCalls.at(-1)?.[4]).not.toHaveProperty("active_from");
+    expect(filteredCalls.at(-1)?.[4]).not.toHaveProperty("active_before");
     for (const [ids, options] of vi.mocked(api.getSessionComposition).mock.calls) {
       expect(ids).toEqual(["session-a"]);
       expect(options).not.toHaveProperty("active_from");

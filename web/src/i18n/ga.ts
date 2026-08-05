@@ -57,15 +57,6 @@ export const ga: Translations = {
     footer: {
       org: "Nous Research",
     },
-    activeSessionsLabel: "Seisiúin gníomhacha:",
-    gatewayStatusLabel: "Stádas an gateway:",
-    gatewayStrip: {
-      failed: "Theip ar an tús",
-      off: "As",
-      running: "Ag rith",
-      starting: "Ag tosú",
-      stopped: "Stoptha",
-    },
     nav: {
       analytics: "Anailís",
       chat: "Comhrá",
@@ -87,7 +78,6 @@ export const ga: Translations = {
     openNavigation: "Oscail an nascleanúint",
     pluginNavSection: "Plugins",
     sessionsActiveCount: "{count} gníomhach",
-    statusOverview: "Forbhreathnú stádais",
     system: "Córas",
     webUi: "Web UI",
   },
@@ -281,10 +271,9 @@ export const ga: Translations = {
     triggerNow: "Spreag anois",
     delivery: {
       local: "Áitiúil",
-      telegram: "Telegram",
-      discord: "Discord",
-      slack: "Slack",
-      email: "Email",
+      weixin_ilink: "Weixin iLink",
+      feishu: "Feishu",
+      webhook: "Webhook",
     },
   },
 
@@ -416,7 +405,6 @@ export const ga: Translations = {
       tts: "Téacs go Caint",
       stt: "Caint go Téacs",
       logging: "Logáil",
-      discord: "Discord",
       auxiliary: "Cúntach",
     },
   },

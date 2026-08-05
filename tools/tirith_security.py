@@ -489,7 +489,12 @@ def _is_explicit_path(configured_path: str) -> bool:
     return configured_path != "tirith"
 
 
-def _resolve_tirith_path(configured_path: str) -> str:
+def _lazy_installs_disabled() -> bool:
+    """Return whether this runtime forbids downloading missing dependencies."""
+    return os.environ.get("HERMES_DISABLE_LAZY_INSTALLS") == "1"
+
+
+def _resolve_tirith_path(configured_path: str) -> str | None:
     """Resolve the tirith binary path, auto-installing if necessary.
 
     If the user explicitly set a path (anything other than the bare "tirith"
@@ -574,6 +579,12 @@ def _resolve_tirith_path(configured_path: str) -> str:
     if _install_thread is not None and _install_thread.is_alive():
         return expanded
 
+    # Immutable and operator-controlled runtimes must never perform network I/O
+    # from this command guard. Existing PATH, owner-local, and explicitly
+    # configured binaries remain usable; only installation is disabled.
+    if _lazy_installs_disabled():
+        return None
+
     # Check disk failure marker before attempting network download.
     # Preserve the marker's real reason so in-memory retry logic can
     # detect retryable causes (e.g. cosign_missing) without restart.
@@ -616,6 +627,9 @@ def _background_install(*, log_failures: bool = True):
         if os.path.isfile(hermes_bin) and os.access(hermes_bin, os.X_OK):
             _resolved_path = hermes_bin
             _install_failure_reason = ""
+            return
+
+        if _lazy_installs_disabled():
             return
 
         installed, reason = _install_tirith(log_failures=log_failures)
@@ -688,6 +702,9 @@ def ensure_installed(*, log_failures: bool = True):
         _install_failure_reason = ""
         _clear_install_failed()
         return hermes_bin
+
+    if _lazy_installs_disabled():
+        return None
 
     # If previously failed in-memory, check if the cause is now resolved
     if _resolved_path is _INSTALL_FAILED:

@@ -107,15 +107,6 @@ export interface Translations {
     footer: {
       org: string;
     };
-    activeSessionsLabel: string;
-    gatewayStatusLabel: string;
-    gatewayStrip: {
-      failed: string;
-      off: string;
-      running: string;
-      starting: string;
-      stopped: string;
-    };
     nav: {
       analytics: string;
       chat: string;
@@ -138,7 +129,6 @@ export interface Translations {
     openNavigation: string;
     pluginNavSection: string;
     sessionsActiveCount: string;
-    statusOverview: string;
     system: string;
     webUi: string;
     /** Optional — fall back to English literals until translated. */
@@ -388,10 +378,9 @@ export interface Translations {
     triggerNow: string;
     delivery: {
       local: string;
-      telegram: string;
-      discord: string;
-      slack: string;
-      email: string;
+      weixin_ilink: string;
+      feishu: string;
+      webhook: string;
       needsHomeChannel?: string;
       noneConfigured?: string;
     };
@@ -565,7 +554,6 @@ export interface Translations {
       tts: string;
       stt: string;
       logging: string;
-      discord: string;
       auxiliary: string;
     };
   };

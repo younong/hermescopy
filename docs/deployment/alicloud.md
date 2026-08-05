@@ -1,6 +1,6 @@
 # 阿里云部署
 
-Hermes 的阿里云生产部署使用 `deploy/` 目录里的 Node.js 工具。常规发布先确定一个 Git tag，再在本机基于该 tag 构建 web/ui-tui 和 locked PptxGenJS 产物，最后把生产运行源码 + 本机预构建产物上传到服务器；测试、官网/桌面应用源码、GitHub 元数据和文档等非运行目录会在构建完成后从归档中省略。无 tag 的受限例外是 `--ref <40-hex-commit-sha>`：它只接受已推送到 `origin` 的不可变完整 commit SHA，绝不会发布当前工作区或可移动分支。服务器只负责解包、创建按 locked Python/PowerPoint 输入与架构标识的不可变 runtime、配置 authenticated Tool Executor 沙箱、切换 current symlink，并通过 systemd 直接运行 Hermes gateway 和 dashboard。
+Hermes 的阿里云生产部署使用 `deploy/` 目录里的 Node.js 工具。常规发布先确定一个 Git tag，再在本机基于该 tag 构建 `web` 和 locked PptxGenJS 产物，最后把生产运行源码 + 本机预构建产物上传到服务器；测试、官网源码、GitHub 元数据和文档等非运行目录会在构建完成后从归档中省略。无 tag 的受限例外是 `--ref <40-hex-commit-sha>`：它只接受已推送到 `origin` 的不可变完整 commit SHA，绝不会发布当前工作区或可移动分支。服务器只负责解包、创建按 locked Python/PowerPoint 输入与架构标识的不可变 runtime、配置 authenticated Tool Executor 沙箱、切换 current symlink，并通过唯一的 `hermes-dashboard.service` 运行 authenticated Web、Owner Workers、Session Reader 和 canonical connectors。
 
 服务器默认配置：
 
@@ -49,16 +49,17 @@ Dry-run 只披露 provisioning、cgroup resource smoke 和 PowerPoint runtime sm
 /etc/hermes/executor-x86_64.bpf        # root-owned seccomp cBPF artifact
 ```
 
-Systemd 服务：
+Systemd 服务与 delegated cgroup：
 
 ```text
-/etc/systemd/system/hermes-gateway.service
 /etc/systemd/system/hermes-dashboard.service
 /sys/fs/cgroup/system.slice/hermes-dashboard.service/control-plane
 /sys/fs/cgroup/system.slice/hermes-dashboard.service/authenticated-owners
 ```
 
-Dashboard unit 使用 `Delegate=cpu memory pids`、CPU/Memory/Tasks accounting 和 `KillMode=mixed`。停止服务时 systemd 先只向 Dashboard 主进程发送 `SIGTERM`，让现有 shutdown hook 最多用 120 秒排空 Owner Worker；150 秒停止期限到达后，systemd 仍会强制清理 cgroup 中的残留进程。可信 bootstrap 先把 Dashboard 进程移入 `control-plane/`，再启用 unit root controller 并建立空的 `authenticated-owners/`；应用只管理该空 subtree。生产专用首版预算为：全局 1500m CPU/2304 MiB/512 PID/最多 5 worker 和 2 executor；单 owner 1000m/896 MiB/128 PID/1 executor；单 invocation 750m/512 MiB/swap 0/64 PID/64 FD/120 秒/200,000 字节。它们只针对当前 2 vCPU、约 3.48 GiB 主机，不是跨部署默认值。
+旧 `hermes-gateway.service` 仅在升级事务中被识别并退休；候选版本不会安装、启用或启动它。
+
+Dashboard unit 使用 `Delegate=cpu memory pids`、CPU/Memory/Tasks accounting 和 `KillMode=control-group`。可信 bootstrap 先把 Dashboard 进程移入 `control-plane/`，再启用 unit root controller 并建立空的 `authenticated-owners/`；应用只管理该空 subtree。生产专用首版预算为：全局 1500m CPU/2304 MiB/512 PID/最多 5 worker 和 2 executor；单 owner 1000m/896 MiB/128 PID/1 executor；单 invocation 750m/512 MiB/swap 0/64 PID/64 FD/120 秒/200,000 字节。它们只针对当前 2 vCPU、约 3.48 GiB 主机，不是跨部署默认值。
 
 Dashboard 只监听服务器本机 `127.0.0.1:9119`，公开入口为：
 
@@ -74,7 +75,7 @@ SSH tunnel 只作为紧急诊断方式：
 ssh -L 9119:localhost:9119 root@106.15.186.104
 ```
 
-然后在本机打开 `http://localhost:9119`。服务始终保留 `--require-auth`，所以 tunnel 访问仍需 Hermes user 登录。
+然后在本机打开 `http://localhost:9119`。服务始终启用 cookie/session 认证，所以 tunnel 访问仍需 Hermes user 登录。
 
 ## Authority 损坏恢复
 
@@ -186,12 +187,12 @@ npm run deploy -- --create-tag v2026.7.4-test --allow-non-main
 随后部署会：
 
 1. 在本机基于 tag 解出干净源码。
-2. 在本机安装 Node workspace 依赖并构建 web dashboard 和 TUI。
-3. 把生产运行源码 + 本机预构建产物打包上传到服务器临时目录；归档省略 `tests/`、`website/`、`apps/`、`.github/` 和 `docs/`，再解包到 `/opt/hermes/releases/<tag>`。
+2. 在本机安装 Node workspace 依赖并构建 Web Dashboard。
+3. 把生产运行源码 + 本机预构建产物打包上传到服务器临时目录；归档省略 `tests/`、`website/`、`.github/` 和 `docs/`，再解包到 `/opt/hermes/releases/<tag>`。
 4. 成功解包后删除本次上传的 `/opt/hermes/tmp/hermes-<tag>.tar.gz`。
 5. 在服务器上按 locked Python/PowerPoint 输入与架构创建或复用不可变 runtime。
 6. 校验 Bubblewrap 能力，安装 root-owned seccomp artifact 和 `/etc/hermes/executor-sandbox.json`，执行 policy preflight。
-7. 将 candidate runner/unit/policy/seccomp 留在事务 staging；旧 Dashboard 先关闭新 turn admission，等待或持久化 Owner Worker 在途 turn，并以 `1012 Service Restart` 关闭浏览器桥。依次停止旧 Dashboard、旧 Gateway并确认退出后，才原子安装 staged artifacts 和切换 `/opt/hermes/current`，再以稳定的非 root `hermes` user/group 启动 gateway、dashboard。
+7. 将 candidate runner、Dashboard unit、policy 和 seccomp 留在事务 staging；停止旧 Dashboard，由其关闭浏览器桥并排空、吊销 Owner Workers。若旧 standalone Gateway unit 存在，则仅在迁移中停止、禁用并移除。确认旧服务退出后，才原子安装 staged artifacts 和切换 `/opt/hermes/current`，再以稳定的非 root `hermes` user/group 只启动 Dashboard。
 8. 对 delegated subtree 执行 `check-executor-cgroup-host.py --require-ready`。已迁移主机必须通过 controller、accounting、swap/freeze 和 topology 检查；未迁移主机明确保持 Tool fail closed，部署脚本不会修改 grub 或重启。
 9. 资源层 ready 时执行 `smoke-executor-resources.py` 的真实 kernel limit/event/cleanup 检查，再通过同一 cgroup manager 启动真实 authenticated executor：在高编号 FD 压力下验证 Bubblewrap 可启动、executor 内 `RLIMIT_NOFILE` 与 policy 一致，并完成 PptxGenJS、MarkItDown、单次 LibreOffice PowerPoint runtime 以及确定性的 loopback owner-relay 网络 smoke。
 10. 从 loopback 带生产代理头验证 Hermes 自己的登录 gate 已生效。
@@ -211,7 +212,7 @@ npm run deploy -- --create-tag v2026.7.4-test --allow-non-main
 npm run deploy -- --tag v2026.7.4 --migrate-nginx-hermes
 ```
 
-部署工具会先启动 loopback 上的 Hermes，配置 `HERMES_DASHBOARD_PUBLIC_URL=https://abinllm.xyz/hermes`，并要求 `--require-auth --trust-proxy-headers`。只有内部检查确认未登录 HTML 返回登录重定向、受保护 API 返回 401 后，迁移 helper 才会：
+部署工具会先启动 loopback 上的 Hermes，配置 `HERMES_DASHBOARD_PUBLIC_URL=https://abinllm.xyz/hermes`，并启用 `--trust-proxy-headers`。认证始终开启；只有内部检查确认未登录 HTML 返回登录重定向、受保护 API 返回 401 后，迁移 helper 才会：
 
 1. 识别唯一、完整的旧 Hermes locations；未知、重复或部分迁移状态立即拒绝。
 2. 备份 `/etc/nginx/conf.d/abinllm.conf`。
@@ -249,7 +250,7 @@ npm run deploy -- --tag v2026.7.3
 nginx -t && systemctl reload nginx
 ```
 
-不要通过移除 `--require-auth`、删除 local-user store、轮换 stable secret、重新 bootstrap、恢复 root 服务身份或放宽 owner-home ownership 检查来处理故障。这些操作会破坏认证或 owner 隔离，而不是安全回滚。
+不要通过修改代码绕过强制认证、删除 local-user store、轮换 stable secret、重新 bootstrap、恢复 root 服务身份或放宽 owner-home ownership 检查来处理故障。这些操作会破坏认证或 Owner 隔离，而不是安全回滚。
 
 `--tag` 模式会从 Git tag 生成源码包，不会上传当前工作区文件。构建产物随 release 上传；Python runtime 不可变，回滚不会被新版本依赖覆盖。
 
@@ -272,7 +273,7 @@ nginx -t && systemctl reload nginx
      --managed-root /sys/fs/cgroup/system.slice/hermes-dashboard.service/authenticated-owners
    ```
 
-5. 验证 PowerPoint smoke、A/B noisy-neighbor、小任务可用性、Dashboard/Gateway，以及 service 重启后没有 populated stale invocation，再记录 `cpu.stat`、`memory.events`、`pids.events` 的去敏数值。
+5. 验证 PowerPoint smoke、A/B noisy-neighbor、小任务可用性、Dashboard/Owner Worker，以及 service 重启后没有 populated stale invocation，再记录 `cpu.stat`、`memory.events`、`pids.events` 的去敏数值。
 
 任一 unified-v2、Docker/containerd、SearXNG 或 Hermes gate 失败时回滚：从控制台选择保存的旧启动项（或恢复保存的 kernel arguments），重启回 cgroup v1，复核 Docker/SearXNG 和旧 Hermes tag。不要通过删除 Tool admission、关闭 controller 检查、改回 root 服务、放宽 cgroup 路径或让应用自动写 bootloader 来“修复”。应用版本回滚与主机 cgroup 回滚是两个独立动作；都必须记录结果。
 
@@ -411,13 +412,13 @@ deterministic、continuity 和 public smoke runner 输出独立的 machine-reada
 
 ```bash
 ssh root@106.15.186.104 'readlink /opt/hermes/current'
-ssh root@106.15.186.104 'systemctl is-active hermes-gateway hermes-dashboard'
-ssh root@106.15.186.104 'systemctl status --no-pager hermes-gateway hermes-dashboard'
+ssh root@106.15.186.104 'systemctl is-active hermes-dashboard && ! systemctl is-active --quiet hermes-gateway'
+ssh root@106.15.186.104 'systemctl status --no-pager hermes-dashboard'
 ssh root@106.15.186.104 'nginx -t && nginx -T 2>/dev/null | grep -n -A25 -B5 hermes-dashboard.conf'
-ssh root@106.15.186.104 'journalctl -u hermes-gateway -u hermes-dashboard --since "10 min ago" --no-pager -n 200'
+ssh root@106.15.186.104 'journalctl -u hermes-dashboard --since "10 min ago" --no-pager -n 200'
 ```
 
-迁移后使用隐私窗口访问 `https://abinllm.xyz/hermes/`：浏览器应直接显示 Hermes 登录页，不再弹出原生 Basic Auth。用一个 active member 验证 dashboard、WebSocket/PTY、sessions API 和普通 owner 功能，确认账号管理仍返回 403；再用独立 admin 会话确认管理读取可用。验证 logout、过期/篡改 cookie 和非 Hermes 站点未回归。
+迁移后使用隐私窗口访问 `https://abinllm.xyz/hermes/`：浏览器应直接显示 Hermes 登录页，不再弹出原生 Basic Auth。用一个 active member 验证 Dashboard、authenticated WebSocket、sessions API 和普通 Owner 功能，确认账号管理仍返回 403；再用独立 admin 会话确认管理读取可用。验证 logout、过期/篡改 cookie 和非 Hermes 站点未回归。
 
 AI 执行上述生产浏览器验收时，先运行 `python3 scripts/playwright_dashboard_login.py`；它从 Git 忽略的本机 `.env.local` 读取凭据，并保留已认证的 `hermes-validation` 会话。后续统一使用 `playwright-cli -s=hermes-validation ...`，结束后运行 `playwright-cli -s=hermes-validation close`。不得读取、输出或提交 `.env.local` 内容；member/admin 分别验收时使用各自独立的本机会话和凭据。
 

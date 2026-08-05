@@ -26,13 +26,12 @@ CONTROL_PLANE_AUTH_PATHS: frozenset[str] = frozenset({
     "/api/auth/ws-ticket",
 })
 CONTROL_PLANE_AUTH_ROUTES: frozenset[tuple[str, str]] = frozenset({
-    ("GET", "/api/profiles/summary"),
+    ("POST", "/api/messaging/webhook/accounts"),
 })
 CONTROL_PLANE_AUTH_PREFIXES: tuple[str, ...] = (
     "/api/auth/",
 )
 OWNER_WORKER_ROUTES: frozenset[tuple[str, str]] = frozenset({
-    ("GET", "/api/profiles"),
     ("GET", "/api/config"),
     ("GET", "/api/dashboard/font"),
     ("GET", "/api/dashboard/plugins"),

@@ -33,7 +33,6 @@ _SIGNING_KEY_VERSION = "bwt1"
 _KEYRING_SCHEMA_VERSION = 1
 _KEYRING_NAME = "browser_ws_ticket_keyring.json"
 _PUBLIC_AUDIENCES: frozenset[str] = frozenset({
-    "browser-ws:/api/pty",
     "browser-ws:/api/ws",
     "browser-ws:/api/pub",
     "browser-ws:/api/events",
@@ -363,7 +362,7 @@ def mint_ticket(
     org_id: str = "",
     tenant_id: str = "",
     owner_key: str = "",
-    audience: str = "browser-ws:/api/pty",
+    audience: str = "browser-ws:/api/ws",
     session_id: str = "",
     membership_revision: str = "v1",
     store: AuthorityStore | None = None,

@@ -10,9 +10,8 @@ Engaged when ``app.state.auth_required is True``. The gate's job:
   3. On HTML routes, redirect missing/invalid cookies to ``/login``.
      On ``/api/*`` routes, return 401 JSON.
 
-The middleware is a no-op when ``auth_required`` is False (loopback
-mode); the legacy ``_SESSION_TOKEN`` ``auth_middleware`` handles those
-binds.
+The retained Web server always enables this middleware. The explicit state
+check remains so isolated middleware tests can construct minimal applications.
 """
 from __future__ import annotations
 
@@ -97,8 +96,7 @@ def _path_is_public(path: str, *, method: str = "GET") -> bool:
 
     Two sources of public-ness:
 
-    * :data:`PUBLIC_API_PATHS` — the shared ``/api/*`` allowlist that
-      the legacy ``_SESSION_TOKEN`` middleware also honours. Matched
+    * :data:`PUBLIC_API_PATHS` — the shared ``/api/*`` allowlist. Matched
       exactly (no prefix expansion) so adding ``/api/status`` doesn't
       accidentally expose ``/api/status/secret-extension``.
     * :data:`_GATE_PUBLIC_PREFIXES` — auth-bootstrap routes and static
@@ -417,7 +415,7 @@ def _is_gui_chat_document_request(request: Request) -> bool:
     """Return whether this authenticated request is loading GUI Chat HTML."""
     path = request.url.path
     if request.method not in {"GET", "HEAD"} or not (
-        path == "/chat-gui" or path.startswith("/chat-gui/")
+        path == "/chat" or path.startswith("/chat/")
     ):
         return False
     fetch_destination = request.headers.get("sec-fetch-dest", "").lower()
@@ -486,11 +484,7 @@ async def gated_auth_middleware(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
-    """Engaged only when ``app.state.auth_required is True``.
-
-    No-op pass-through in loopback mode so the legacy auth_middleware can
-    handle those binds via ``_SESSION_TOKEN``.
-    """
+    """Enforce authenticated Web sessions when the gate is enabled."""
     if not getattr(request.app.state, "auth_required", False):
         return await call_next(request)
 

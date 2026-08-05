@@ -57,15 +57,6 @@ export const ru: Translations = {
     footer: {
       org: "Nous Research",
     },
-    activeSessionsLabel: "Активные сессии:",
-    gatewayStatusLabel: "Статус шлюза:",
-    gatewayStrip: {
-      failed: "Ошибка запуска",
-      off: "Отключён",
-      running: "Работает",
-      starting: "Запуск",
-      stopped: "Остановлен",
-    },
     nav: {
       analytics: "Аналитика",
       chat: "Чат",
@@ -87,7 +78,6 @@ export const ru: Translations = {
     openNavigation: "Открыть навигацию",
     pluginNavSection: "Плагины",
     sessionsActiveCount: "{count} активн.",
-    statusOverview: "Обзор статуса",
     system: "Система",
     webUi: "Web UI",
   },
@@ -273,10 +263,9 @@ export const ru: Translations = {
     triggerNow: "Запустить сейчас",
     delivery: {
       local: "Локально",
-      telegram: "Telegram",
-      discord: "Discord",
-      slack: "Slack",
-      email: "Email",
+      weixin_ilink: "Weixin iLink",
+      feishu: "Feishu",
+      webhook: "Webhook",
     },
   },
 
@@ -408,7 +397,6 @@ export const ru: Translations = {
       tts: "Синтез речи",
       stt: "Распознавание речи",
       logging: "Журналирование",
-      discord: "Discord",
       auxiliary: "Вспомогательные",
     },
   },

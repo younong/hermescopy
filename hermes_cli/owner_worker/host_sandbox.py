@@ -7,7 +7,7 @@ import os
 import platform
 import stat
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping
 
@@ -271,6 +271,7 @@ def build_host_sandbox_deployment_policy(
     *,
     runner: Callable[..., object] | None = None,
     clock: Callable[[], float] = time.time,
+    recover_stale_resource_scopes: bool = True,
 ) -> SandboxDeploymentPolicy:
     """Build a fail-closed bare-metal deployment policy from verified artifacts."""
     if not isinstance(config, HostSandboxConfig):
@@ -345,6 +346,7 @@ def build_host_sandbox_deployment_policy(
         root_tmpfs_bytes=config.root_tmpfs_bytes,
         executor_tmpfs_bytes=config.executor_tmpfs_bytes,
         resource_policy=config.resource_policy,
+        recover_stale_resource_scopes=recover_stale_resource_scopes,
     )
 
 
@@ -353,6 +355,55 @@ def host_sandbox_deployment_policy(
 ) -> SandboxDeploymentPolicy:
     """Production factory requiring an operator-installed v2 resource policy."""
     policy = build_host_sandbox_deployment_policy(load_host_sandbox_config(policy_path))
+    if policy.resource_policy is None:
+        raise HostSandboxInvalid("host sandbox resource policy is required")
+    return policy
+
+
+def isolated_smoke_sandbox_deployment_policy(
+    policy_path: str | Path = _DEFAULT_POLICY_PATH,
+) -> SandboxDeploymentPolicy:
+    """Bind the production sandbox artifacts to a deployment smoke Owner root."""
+    config = load_host_sandbox_config(policy_path)
+    owner_key = os.environ.get("HERMES_OWNER_KEY", "").strip()
+    if not owner_key:
+        policy = build_host_sandbox_deployment_policy(
+            config,
+            recover_stale_resource_scopes=False,
+        )
+        if policy.resource_policy is None:
+            raise HostSandboxInvalid("host sandbox resource policy is required")
+        return policy
+
+    home = _canonical(os.environ.get("HERMES_HOME", ""), "smoke Owner home")
+    control_home = _canonical(
+        os.environ.get("HERMES_CONTROL_HOME", ""),
+        "smoke control home",
+    )
+    smoke_root = home.parents[2] if len(home.parents) > 2 else home
+    temporary_parent = _canonical(
+        os.environ.get("TMPDIR", ""),
+        "smoke temporary parent",
+    )
+    if (
+        home != smoke_root / "home" / "users" / owner_key
+        or control_home != smoke_root / "home" / "control-plane"
+        or smoke_root.parent != temporary_parent
+        or not smoke_root.name.startswith("hcs-")
+    ):
+        raise HostSandboxInvalid("isolated smoke Owner root is invalid")
+    owner_root = _directory(
+        smoke_root / "home" / "users",
+        "isolated smoke Owner root",
+        require_root_owner=False,
+        mode=0o750,
+        owner_uid=config.uid,
+        owner_gid=config.gid,
+    )
+    policy = build_host_sandbox_deployment_policy(
+        replace(config, owner_root=owner_root),
+        recover_stale_resource_scopes=False,
+    )
     if policy.resource_policy is None:
         raise HostSandboxInvalid("host sandbox resource policy is required")
     return policy

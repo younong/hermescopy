@@ -536,16 +536,6 @@ def build_session_context_prompt(
             "If the user needs a detailed answer, give the short version first "
             "and offer to elaborate."
         )
-    elif context.source.platform == Platform.YUANBAO:
-        lines.append("")
-        lines.append(
-            "**Platform notes:** You are running inside Yuanbao. "
-            "To send a private (DM) message to a user in the current group, "
-            "use the yb_send_dm tool (look up the recipient by name or pass "
-            "their user_id). Your normal reply is delivered to the group you "
-            "are responding in."
-        )
-
     # Connected platforms
     platforms_list = ["local (files on this machine)"]
     for p in context.connected_platforms:
@@ -1463,37 +1453,6 @@ class SessionStore:
                 return True
 
         return False
-
-    def is_session_finalizable(self, entry: SessionEntry) -> bool:
-        """Return True if the expiry watcher will *ever* finalize this session.
-
-        The expiry watcher (``GatewayRunner._session_expiry_watcher``) only
-        tears an agent down — and only then fires ``on_session_end`` — for
-        sessions whose reset policy eventually expires. A ``mode == "none"``
-        session never expires (``_is_session_expired`` returns ``False``
-        forever), so the watcher will never finalize it.
-
-        This distinction matters for the agent-cache idle sweep: deferring
-        idle eviction to "let the watcher finalize it later" is only correct
-        when the watcher WILL run for this session. For a ``mode == "none"``
-        session, deferring pins the cached agent in memory for the gateway's
-        entire lifetime with no finalization ever coming — the exact leak the
-        idle sweep exists to relieve. Callers use this predicate to decide
-        whether the session store owns the eviction boundary (finalizable) or
-        the idle sweep must still reap the agent itself (not finalizable).
-
-        Public wrapper so callers don't reach into policy internals. Errors
-        resolving the policy are treated as "not finalizable" (safe: the idle
-        sweep falls back to reaping the agent rather than pinning it).
-        """
-        try:
-            policy = self.config.get_reset_policy(
-                platform=entry.platform,
-                session_type=entry.chat_type,
-            )
-            return policy.mode != "none"
-        except Exception:
-            return False
 
     def _is_session_ended_in_db(self, session_id: str) -> bool:
         """Return True iff state.db has this session with a non-null end_reason.

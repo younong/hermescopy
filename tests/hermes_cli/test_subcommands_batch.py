@@ -20,7 +20,6 @@ from hermes_cli.subcommands.dashboard import build_dashboard_parser
 from hermes_cli.subcommands.debug import build_debug_parser
 from hermes_cli.subcommands.doctor import build_doctor_parser
 from hermes_cli.subcommands.dump import build_dump_parser
-from hermes_cli.subcommands.gui import build_gui_parser
 from hermes_cli.subcommands.hooks import build_hooks_parser
 from hermes_cli.subcommands.import_cmd import build_import_cmd_parser
 from hermes_cli.subcommands.login import build_login_parser
@@ -31,13 +30,10 @@ from hermes_cli.subcommands.postinstall import build_postinstall_parser
 from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
 from hermes_cli.subcommands.security import build_security_parser
 from hermes_cli.subcommands.setup import build_setup_parser
-from hermes_cli.subcommands.slack import build_slack_parser
 from hermes_cli.subcommands.status import build_status_parser
 from hermes_cli.subcommands.uninstall import build_uninstall_parser
 from hermes_cli.subcommands.update import build_update_parser
 from hermes_cli.subcommands.version import build_version_parser
-from hermes_cli.subcommands.webhook import build_webhook_parser
-from hermes_cli.subcommands.whatsapp import build_whatsapp_parser
 
 
 def _h(name):
@@ -52,13 +48,10 @@ SINGLE_HANDLER_CASES = [
     ("model", build_model_parser, "cmd_model", ["model"]),
     ("setup", build_setup_parser, "cmd_setup", ["setup"]),
     ("postinstall", build_postinstall_parser, "cmd_postinstall", ["postinstall"]),
-    ("whatsapp", build_whatsapp_parser, "cmd_whatsapp", ["whatsapp"]),
-    ("slack", build_slack_parser, "cmd_slack", ["slack"]),
     ("login", build_login_parser, "cmd_login", ["login"]),
     ("logout", build_logout_parser, "cmd_logout", ["logout"]),
     ("auth", build_auth_parser, "cmd_auth", ["auth"]),
     ("status", build_status_parser, "cmd_status", ["status"]),
-    ("webhook", build_webhook_parser, "cmd_webhook", ["webhook"]),
     ("hooks", build_hooks_parser, "cmd_hooks", ["hooks"]),
     ("doctor", build_doctor_parser, "cmd_doctor", ["doctor"]),
     ("security", build_security_parser, "cmd_security", ["security"]),
@@ -70,7 +63,6 @@ SINGLE_HANDLER_CASES = [
     ("version", build_version_parser, "cmd_version", ["version"]),
     ("update", build_update_parser, "cmd_update", ["update"]),
     ("uninstall", build_uninstall_parser, "cmd_uninstall", ["uninstall"]),
-    ("gui", build_gui_parser, "cmd_gui", ["gui"]),
     ("logs", build_logs_parser, "cmd_logs", ["logs"]),
     ("prompt-size", build_prompt_size_parser, "cmd_prompt_size", ["prompt-size"]),
 ]
@@ -104,7 +96,15 @@ def test_dashboard_builder_two_handlers():
     )
     # bare dashboard -> launch handler
     assert parser.parse_args(["dashboard"]).func is dash
-    assert parser.parse_args(["dashboard", "--require-auth"]).require_auth is True
+    runtime = parser.parse_args(
+        ["dashboard", "--host", "127.0.0.1", "--port", "0", "--skip-build"]
+    )
+    assert runtime.func is dash
+    assert runtime.port == 0
+    with pytest.raises(SystemExit):
+        parser.parse_args(["dashboard", "--require-auth"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["dashboard", "--insecure"])
     # dashboard register -> register handler
     assert parser.parse_args(["dashboard", "register"]).func is reg
     # dashboard user lifecycle operations route to the management handler.

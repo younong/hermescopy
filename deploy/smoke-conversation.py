@@ -5,10 +5,10 @@ from __future__ import annotations
 
 import argparse
 import base64
-import itertools
 import json
 import os
 import queue
+import secrets
 import shutil
 import signal
 import subprocess
@@ -19,6 +19,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -174,9 +175,10 @@ class ModelStub:
         if "approval-deny" in latest_user:
             if tool_messages and ("BLOCKED" in latest_tool or "denied" in latest_tool.lower()):
                 return self._text_chunks(["approval ", "denied safely"])
-            protected = self.workspace / "protected"
             return self._tool_chunk(
-                "terminal", {"command": f"rm -rf {protected}", "timeout": 5}, "call-dangerous"
+                "terminal",
+                {"command": "rm -r /workspace/protected", "timeout": 5},
+                "call-dangerous",
             )
 
         if "resume-continuation" in latest_user:
@@ -195,21 +197,39 @@ class ModelStub:
         return self._text_chunks(["smoke ", "ok"])
 
 
-class GatewayProcess:
-    _sequence = itertools.count(1)
+class DashboardGateway:
+    def __init__(
+        self,
+        repo_root: Path,
+        env: dict[str, str],
+        *,
+        username: str,
+        password: str,
+        model_base_url: str,
+    ):
+        import httpx
+        from websockets.sync.client import connect
 
-    def __init__(self, repo_root: Path, env: dict[str, str]):
-        self.messages: queue.Queue[dict[str, Any]] = queue.Queue()
         self.stderr: list[str] = []
         self.pending: list[dict[str, Any]] = []
         self.next_id = 1
-        launch_env = env.copy()
-        launch_env["HERMES_SMOKE_RUN_ID"] = f"{os.getpid()}-{next(self._sequence)}"
+        self._messages: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._closed = False
         self.process = subprocess.Popen(
-            [sys.executable, "-m", "tui_gateway.entry"],
+            [
+                sys.executable,
+                "-m",
+                "hermes_cli.main",
+                "dashboard",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "0",
+                "--no-open",
+                "--skip-build",
+            ],
             cwd=repo_root,
-            env=launch_env,
-            stdin=subprocess.PIPE,
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -217,20 +237,94 @@ class GatewayProcess:
             start_new_session=(os.name == "posix"),
         )
         assert self.process.stdout is not None and self.process.stderr is not None
-        self.stdout_thread = threading.Thread(target=self._read_stdout, daemon=True)
+        ready: queue.Queue[int] = queue.Queue(maxsize=1)
+
+        def read_stdout() -> None:
+            assert self.process.stdout is not None
+            for raw in self.process.stdout:
+                if raw.startswith("HERMES_DASHBOARD_READY port="):
+                    try:
+                        ready.put_nowait(int(raw.rsplit("=", 1)[1]))
+                    except (ValueError, queue.Full):
+                        pass
+
+        self.stdout_thread = threading.Thread(target=read_stdout, daemon=True)
         self.stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
         self.stdout_thread.start()
         self.stderr_thread.start()
-
-    def _read_stdout(self) -> None:
-        assert self.process.stdout is not None
-        for raw in self.process.stdout:
+        deadline = time.monotonic() + STEP_TIMEOUT
+        while True:
             try:
-                value = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict):
-                self.messages.put(value)
+                port = ready.get(timeout=min(0.2, max(0.0, deadline - time.monotonic())))
+                break
+            except queue.Empty as exc:
+                if self.process.poll() is not None or time.monotonic() >= deadline:
+                    detail = " | ".join(self.stderr[-5:]) if self.stderr else "no dashboard error output"
+                    self.close()
+                    raise SmokeFailure(
+                        "dashboard_start_failed",
+                        "authenticated_web_ready",
+                        f"Dashboard did not become ready: {detail}",
+                    ) from exc
+
+        self.client = httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=15.0)
+        login = self.client.post(
+            "/auth/password-login",
+            json={"provider": "basic", "username": username, "password": password},
+        )
+        if login.status_code != 200:
+            self.close()
+            raise SmokeFailure("login_failed", "authenticated_web_ready", f"Dashboard login returned HTTP {login.status_code}")
+
+        ticket_response = self.client.post(
+            "/api/auth/ws-ticket",
+            json={"audience": "browser-ws:/api/ws"},
+        )
+        if ticket_response.status_code != 200:
+            self.close()
+            raise SmokeFailure("ticket_failed", "ws_ticket", f"Ticket mint returned HTTP {ticket_response.status_code}")
+        ticket = str(ticket_response.json().get("ticket") or "")
+        if not ticket:
+            self.close()
+            raise SmokeFailure("ticket_missing", "ws_ticket", "Ticket response was empty")
+
+        from hermes_cli.dashboard_auth.authority import AuthorityStore
+
+        home = Path(env["HERMES_HOME"])
+        owners = AuthorityStore(home / "control-plane").list_authenticated_owners()
+        if len(owners) != 1:
+            self.close()
+            raise SmokeFailure(
+                "owner_registry_mismatch",
+                "ws_ticket",
+                "Ticket mint did not register exactly one authenticated Owner",
+            )
+        _write_owner_config(
+            home,
+            owner_key=owners[0].owner_key,
+            base_url=model_base_url,
+        )
+
+        cookie_header = "; ".join(
+            f"{cookie.name}={cookie.value}" for cookie in self.client.cookies.jar
+        )
+        try:
+            self.websocket = connect(
+                f"ws://127.0.0.1:{port}/api/ws?ticket={quote(ticket, safe='')}",
+                additional_headers={"Cookie": cookie_header},
+                open_timeout=15,
+                close_timeout=3,
+            )
+        except Exception as exc:
+            detail = " | ".join(self.stderr[-5:]) if self.stderr else "no dashboard error output"
+            self.close()
+            raise SmokeFailure(
+                "websocket_connect_failed",
+                "ws_ticket",
+                f"WebSocket upgrade failed ({type(exc).__name__}): {detail}",
+            ) from exc
+        self.reader_thread = threading.Thread(target=self._read_messages, daemon=True)
+        self.reader_thread.start()
 
     def _read_stderr(self) -> None:
         assert self.process.stderr is not None
@@ -240,11 +334,23 @@ class GatewayProcess:
             if len(self.stderr) > 80:
                 del self.stderr[0]
 
+    def _read_messages(self) -> None:
+        try:
+            for raw in self.websocket:
+                try:
+                    value = json.loads(raw)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if isinstance(value, dict):
+                    self._messages.put(value)
+        except Exception:
+            return
+
     def _next(self, deadline: float) -> dict[str, Any]:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise queue.Empty
-        return self.messages.get(timeout=remaining)
+        return self._messages.get(timeout=remaining)
 
     def wait_event(
         self,
@@ -264,31 +370,19 @@ class GatewayProcess:
                 ):
                     return self.pending.pop(index)
             try:
-                message = self._next(deadline)
+                self.pending.append(self._next(deadline))
             except queue.Empty as exc:
-                detail = " | ".join(self.stderr[-5:]) if self.stderr else "no gateway error output"
-                buffered: list[str] = []
-                for item in self.pending[-12:]:
-                    params = item.get("params") or {}
-                    label = str(params.get("type") or item.get("id") or "unknown")
-                    if label == "error":
-                        label = f"error:{_bounded(_event_payload(item).get('message'), 240)}"
-                    buffered.append(label)
+                detail = " | ".join(self.stderr[-5:]) if self.stderr else "no dashboard error output"
                 raise SmokeFailure(
                     "event_timeout",
                     event_type,
-                    f"Timed out waiting for {event_type}: {detail}; buffered={buffered}",
+                    f"Timed out waiting for {event_type}: {detail}",
                 ) from exc
-            self.pending.append(message)
 
     def request(self, method: str, params: dict[str, Any], timeout: float = STEP_TIMEOUT) -> dict[str, Any]:
         request_id = f"smoke-{self.next_id}"
         self.next_id += 1
-        payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
-        if self.process.poll() is not None or self.process.stdin is None:
-            raise SmokeFailure("gateway_exited", method, f"Gateway exited before {method}")
-        self.process.stdin.write(json.dumps(payload) + "\n")
-        self.process.stdin.flush()
+        self.websocket.send(json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}))
         deadline = time.monotonic() + timeout
         while True:
             for index, message in enumerate(self.pending):
@@ -314,35 +408,42 @@ class GatewayProcess:
             return result
 
     def close(self) -> None:
-        if self.process.poll() is None:
-            if self.process.stdin is not None:
-                try:
-                    self.process.stdin.close()
-                except OSError:
-                    pass
+        if self._closed:
+            return
+        self._closed = True
+        websocket = getattr(self, "websocket", None)
+        if websocket is not None:
             try:
-                self.process.wait(timeout=4)
+                websocket.close()
+            except Exception:
+                pass
+        client = getattr(self, "client", None)
+        if client is not None:
+            client.close()
+        process = getattr(self, "process", None)
+        if process is not None:
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            elif process.poll() is None:
+                process.terminate()
+            try:
+                process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 if os.name == "posix":
                     try:
-                        os.killpg(self.process.pid, signal.SIGTERM)
+                        os.killpg(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
                 else:
-                    self.process.terminate()
-                try:
-                    self.process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    if os.name == "posix":
-                        try:
-                            os.killpg(self.process.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                    else:
-                        self.process.kill()
-                    self.process.wait(timeout=3)
-        self.stdout_thread.join(timeout=2)
-        self.stderr_thread.join(timeout=2)
+                    process.kill()
+                process.wait(timeout=3)
+        for thread_name in ("reader_thread", "stdout_thread", "stderr_thread"):
+            thread = getattr(self, thread_name, None)
+            if thread is not None:
+                thread.join(timeout=2)
 
 
 def _event_payload(event: dict[str, Any]) -> dict[str, Any]:
@@ -361,7 +462,7 @@ def _record(checks: list[dict[str, Any]], name: str, started: float, **details: 
     checks.append(item)
 
 
-def _wait_complete(gateway: GatewayProcess, sid: str) -> tuple[list[str], dict[str, Any]]:
+def _wait_complete(gateway: DashboardGateway, sid: str) -> tuple[list[str], dict[str, Any]]:
     deltas: list[str] = []
     deadline = time.monotonic() + STEP_TIMEOUT
     while True:
@@ -393,7 +494,7 @@ def _wait_complete(gateway: GatewayProcess, sid: str) -> tuple[list[str], dict[s
             continue
 
 
-def _write_config(home: Path, base_url: str) -> None:
+def _write_config(home: Path, base_url: str, *, username: str, password: str) -> None:
     home.mkdir(parents=True, exist_ok=True)
     (home / "config.yaml").write_text(
         "model:\n"
@@ -410,7 +511,36 @@ def _write_config(home: Path, base_url: str) -> None:
         "display:\n"
         "  tool_progress: full\n"
         "approvals:\n"
-        "  mode: ask\n",
+        "  mode: ask\n"
+        "dashboard:\n"
+        "  basic_auth:\n"
+        f"    username: {username}\n"
+        f"    password: {password}\n",
+        encoding="utf-8",
+    )
+
+
+def _write_owner_config(home: Path, *, owner_key: str, base_url: str) -> None:
+    owner_root = home / "users"
+    owner_home = owner_root / owner_key
+    owner_home.mkdir(parents=True, exist_ok=True)
+    owner_root.chmod(0o750)
+    (owner_home / "config.yaml").write_text(
+        "model:\n"
+        f"  default: {MODEL}\n"
+        f"  provider: {PROVIDER}\n"
+        "  api_mode: chat_completions\n"
+        "custom_providers:\n"
+        "  - name: hermes-smoke\n"
+        f"    base_url: {base_url}\n"
+        "    api_key: smoke-local-only\n"
+        "    api_mode: chat_completions\n"
+        "agent:\n"
+        "  max_turns: 8\n"
+        "display:\n"
+        "  tool_progress: full\n"
+        "approvals:\n"
+        "  mode: manual\n",
         encoding="utf-8",
     )
 
@@ -472,7 +602,13 @@ socket.socket.connect_ex = _guarded_connect_ex
 
 
 
-def _gateway_env(home: Path, workspace: Path, network_guard: Path) -> dict[str, str]:
+def _dashboard_env(
+    home: Path,
+    workspace: Path,
+    network_guard: Path,
+    *,
+    sandbox_policy: str | None = None,
+) -> dict[str, str]:
     env = os.environ.copy()
     for key in list(env):
         if (
@@ -485,6 +621,7 @@ def _gateway_env(home: Path, workspace: Path, network_guard: Path) -> dict[str, 
     env.update(
         {
             "HERMES_HOME": str(home),
+            "TMPDIR": str(home.parent.parent),
             "HERMES_CWD": str(workspace),
             "TERMINAL_CWD": str(workspace),
             "HERMES_TUI_TOOLSETS": "terminal",
@@ -500,40 +637,71 @@ def _gateway_env(home: Path, workspace: Path, network_guard: Path) -> dict[str, 
             "PYTHONUNBUFFERED": "1",
         }
     )
+    if sandbox_policy:
+        env["HERMES_SANDBOX_DEPLOYMENT_POLICY"] = sandbox_policy
     return env
 
 
-def run_smoke(repo_root: Path, timeout: float) -> tuple[dict[str, Any], int]:
+def run_smoke(
+    repo_root: Path,
+    timeout: float,
+    *,
+    sandbox_policy: str | None = None,
+    root: Path | None = None,
+) -> tuple[dict[str, Any], int]:
     started_all = time.monotonic()
     checks: list[dict[str, Any]] = []
-    temporary = Path(tempfile.mkdtemp(prefix="hermes-conversation-smoke-"))
+    owns_temporary = root is None
+    temporary = root.resolve() if root is not None else Path(tempfile.mkdtemp(prefix="hcs-"))
     home = temporary / "home"
-    workspace = temporary / "workspace"
+    workspace = home / "workspaces" / "default"
     workspace.mkdir(parents=True)
     protected = workspace / "protected"
     protected.mkdir()
     sentinel = protected / "sentinel.txt"
     sentinel.write_text("must-survive", encoding="utf-8")
     model = ModelStub(workspace)
-    gateway: GatewayProcess | None = None
+    gateway: DashboardGateway | None = None
     stored_id = ""
     failure: SmokeFailure | None = None
+    username = f"smoke-{secrets.token_hex(8)}"
+    password = secrets.token_urlsafe(24)
 
     try:
         model.start()
-        _write_config(home, model.base_url)
+        _write_config(home, model.base_url, username=username, password=password)
         _seed_offline_caches(home)
         network_guard = _write_network_guard(temporary)
-        env = _gateway_env(home, workspace, network_guard)
+        env = _dashboard_env(
+            home,
+            workspace,
+            network_guard,
+            sandbox_policy=sandbox_policy,
+        )
         deadline = time.monotonic() + timeout
 
         stage = time.monotonic()
-        gateway = GatewayProcess(repo_root, env)
+        gateway = DashboardGateway(
+            repo_root,
+            env,
+            username=username,
+            password=password,
+            model_base_url=model.base_url,
+        )
         gateway.wait_event("gateway.ready", timeout=min(STEP_TIMEOUT, deadline - time.monotonic()))
-        _record(checks, "gateway_ready", stage)
+        _record(checks, "authenticated_web_ready", stage)
+        _record(checks, "ws_ticket", stage)
 
         stage = time.monotonic()
-        created = gateway.request("session.create", {"cols": 96, "cwd": str(workspace)})
+        created = gateway.request(
+            "session.create",
+            {
+                "cols": 96,
+                "model": MODEL,
+                "provider": "custom",
+                "source": "dashboard-gui",
+            },
+        )
         sid = str(created.get("session_id") or "")
         stored_id = str(created.get("stored_session_id") or "")
         if not sid or not stored_id:
@@ -541,8 +709,7 @@ def run_smoke(repo_root: Path, timeout: float) -> tuple[dict[str, Any], int]:
         _record(checks, "session_create", stage)
 
         stage = time.monotonic()
-        info_event = gateway.wait_event("session.info", session_id=sid)
-        info = _event_payload(info_event)
+        info = created.get("info") or {}
         if info.get("model") != MODEL or info.get("provider") != "custom":
             raise SmokeFailure("config_mismatch", "config_propagation", "Custom provider/model did not reach the live agent")
         _record(checks, "config_propagation", stage, model=MODEL, provider=PROVIDER)
@@ -575,8 +742,9 @@ def run_smoke(repo_root: Path, timeout: float) -> tuple[dict[str, Any], int]:
         _record(checks, "safe_tool", stage)
 
         deltas, complete = _wait_complete(gateway, sid)
-        if len([item for item in deltas if item]) < 2 or RESUME_MARKER not in str(complete.get("text") or ""):
-            raise SmokeFailure("stream_contract_failed", "prompt_stream", "Expected multiple deltas and completion marker")
+        streamed_text = "".join(item for item in deltas if item)
+        if not streamed_text or RESUME_MARKER not in str(complete.get("text") or ""):
+            raise SmokeFailure("stream_contract_failed", "prompt_stream", "Expected streamed content and completion marker")
         attachment_request_count = model.count_requests_with_text(ATTACHMENT_MARKER)
         if attachment_request_count != 2 or not model.saw_text(SAFE_TOOL_MARKER):
             raise SmokeFailure(
@@ -595,7 +763,8 @@ def run_smoke(repo_root: Path, timeout: float) -> tuple[dict[str, Any], int]:
         stage = time.monotonic()
         gateway.request("prompt.submit", {"session_id": sid, "text": "approval-deny"})
         approval = gateway.wait_event("approval.request", session_id=sid)
-        if "rm -rf" not in str(_event_payload(approval).get("command") or ""):
+        approval_command = str(_event_payload(approval).get("command") or "")
+        if "rm -r" not in approval_command or "/workspace/protected" not in approval_command:
             raise SmokeFailure("approval_contract_failed", "approval_deny", "Dangerous command did not request approval")
         resolved = gateway.request("approval.respond", {"session_id": sid, "choice": "deny"})
         if int(resolved.get("resolved") or 0) != 1:
@@ -608,7 +777,13 @@ def run_smoke(repo_root: Path, timeout: float) -> tuple[dict[str, Any], int]:
         stage = time.monotonic()
         gateway.request("session.close", {"session_id": sid})
         gateway.close()
-        gateway = GatewayProcess(repo_root, env)
+        gateway = DashboardGateway(
+            repo_root,
+            env,
+            username=username,
+            password=password,
+            model_base_url=model.base_url,
+        )
         gateway.wait_event("gateway.ready")
         resumed = gateway.request("session.resume", {"session_id": stored_id, "cols": 96})
         resumed_sid = str(resumed.get("session_id") or "")
@@ -658,9 +833,20 @@ def run_smoke(repo_root: Path, timeout: float) -> tuple[dict[str, Any], int]:
         if gateway is not None:
             gateway.close()
         model.close()
-        shutil.rmtree(temporary, ignore_errors=True)
+        if owns_temporary:
+            shutil.rmtree(temporary, ignore_errors=True)
+        else:
+            for child in temporary.iterdir():
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
 
-    artifacts_cleaned = not temporary.exists()
+    artifacts_cleaned = (
+        not temporary.exists()
+        if owns_temporary
+        else not any(temporary.iterdir())
+    )
     cleanup_started = time.monotonic()
     if artifacts_cleaned and failure is None:
         _record(checks, "artifact_cleanup", cleanup_started)
@@ -687,8 +873,15 @@ def run_smoke(repo_root: Path, timeout: float) -> tuple[dict[str, Any], int]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    parser.add_argument("--sandbox-policy")
+    parser.add_argument("--root", type=Path)
     args = parser.parse_args(argv)
-    result, status = run_smoke(REPO_ROOT, max(10.0, args.timeout))
+    result, status = run_smoke(
+        REPO_ROOT,
+        max(10.0, args.timeout),
+        sandbox_policy=str(args.sandbox_policy or "").strip() or None,
+        root=args.root,
+    )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return status
 

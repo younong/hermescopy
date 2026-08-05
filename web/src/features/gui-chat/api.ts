@@ -15,7 +15,6 @@ import type {
 } from "./protocol";
 
 export interface ConnectGuiChatOptions {
-  profile?: string;
   ownerKey?: string;
   timing?: GatewayConnectTiming;
 }
@@ -144,7 +143,6 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
     close_on_disconnect: false,
     source: "dashboard-gui",
     ...(timing?.traceId ? { latency_trace_id: timing.traceId } : {}),
-    ...(options.profile ? { profile: options.profile } : {}),
   });
 
   return {

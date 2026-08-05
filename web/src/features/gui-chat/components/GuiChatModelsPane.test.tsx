@@ -54,7 +54,7 @@ describe("GuiChatModelsPane", () => {
   it("renders a Skills-style list with current, default, active, search, and kind filters", async () => {
     await renderPane();
 
-    expect(api.getModelRegistrations).toHaveBeenCalledWith("profile-a");
+    expect(api.getModelRegistrations).toHaveBeenCalledWith();
     expect(document.querySelector("[data-models-pane].gui-chat-workspace-pane")).not.toBeNull();
     expect(document.body.textContent).toContain("Current conversation");
     expect(document.body.textContent).toContain("Default");
@@ -94,7 +94,7 @@ describe("GuiChatModelsPane", () => {
     expect(buttonWithin(rowFor("Default model"), "Use", true)?.disabled).toBe(true);
     await clickButton("Video", true);
     await clickWithin(rowFor("Video model"), "Activate", true);
-    expect(api.activateModelRegistration).toHaveBeenCalledWith("video-a", "profile-a");
+    expect(api.activateModelRegistration).toHaveBeenCalledWith("video-a");
 
     await clickWithin(rowFor("Video model"), "Delete Video model", true, "aria-label");
     expect(document.body.textContent).toContain("Delete Video model?");
@@ -105,7 +105,7 @@ describe("GuiChatModelsPane", () => {
   it("creates catalog models through the existing registration API", async () => {
     await renderPane();
     await clickButton("Add model", true);
-    expect(api.getModelRegistrationCatalog).toHaveBeenCalledWith("chat", "profile-a");
+    expect(api.getModelRegistrationCatalog).toHaveBeenCalledWith("chat");
 
     await setLabeledInput("Model name", "New catalog model");
     await setLabeledSelect("Model provider", "catalog-provider");
@@ -166,7 +166,6 @@ async function renderPane(overrides: Partial<Parameters<typeof GuiChatModelsPane
         currentModel="current-model"
         currentProvider="current-provider"
         onSwitchChat={vi.fn().mockResolvedValue({ confirm_required: false, value: "default-model" })}
-        profile="profile-a"
         {...overrides}
       />,
     );

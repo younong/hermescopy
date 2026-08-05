@@ -2,7 +2,7 @@
  * ChatSessionList — a ChatGPT-style conversation switcher for dashboard chat
  * surfaces.
  *
- * It lists the most recent sessions for the active management profile and
+ * It lists the authenticated Owner's most recent sessions and
  * lets the user swap between them without leaving the current chat surface.
  * Selecting a row sets the current route's `?resume=<id>` query param; the
  * mounted chat surface treats that resume target as part of its connection
@@ -46,11 +46,11 @@ const EMPTY_RENAME: RenameState = {
 interface ChatSessionListProps {
   /** Active resume target (the session currently shown by the chat surface). */
   activeSessionId: string | null;
-  /** Management profile from the dashboard switcher — scopes the listing. */
-  profile?: string;
   className?: string;
   /** Optional local title/preview filter used by compact chat sidebars. */
   query?: string;
+  /** External trigger for the list's existing reload mechanism. */
+  refreshNonce?: number;
   /** Keep the original rich panel by default; compact is a single-line list. */
   variant?: "default" | "compact";
   /** Reports the loaded active row so a chat shell can mirror its title. */
@@ -80,9 +80,9 @@ function rowLabel(session: SessionInfo, untitled: string): string {
 
 export function ChatSessionList({
   activeSessionId,
-  profile,
   className,
   query = "",
+  refreshNonce = 0,
   variant = "default",
   onActiveSessionChange,
   onPicked,
@@ -100,32 +100,16 @@ export function ChatSessionList({
   // Bumped to force a refetch (after switching, on Refresh, on mount).
   const [reloadNonce, setReloadNonce] = useState(0);
 
-  // `profile` is read inside the fetch; it's part of the scope key so a
-  // profile switch refetches. The empty-string fallback keeps the dep
-  // stable when no profile is selected (default profile).
-  const scopeKey = profile ?? "";
-
-  // Monotonic request tokens keep both list loads and title updates scoped to
-  // the profile that started them.
+  // Monotonic request tokens ignore stale list loads and title updates.
   const reqRef = useRef(0);
   const renameReqRef = useRef(0);
-
-  useEffect(() => {
-    renameReqRef.current += 1;
-    // A profile change replaces the rows beneath the editor, so discard the
-    // previous scope's draft and ignore its outstanding save response.
-    setRename(EMPTY_RENAME);
-    return () => {
-      renameReqRef.current += 1;
-    };
-  }, [scopeKey]);
 
   const load = useCallback(() => {
     const myReq = ++reqRef.current;
     setLoading(true);
     setError(null);
     api
-      .getSessions(SESSION_LIMIT, 0, scopeKey, "recent", variant === "compact")
+      .getSessions(SESSION_LIMIT, 0, "recent", variant === "compact")
       .then((res) => {
         if (reqRef.current !== myReq) return;
         setSessions(res.sessions);
@@ -137,14 +121,15 @@ export function ChatSessionList({
       .finally(() => {
         if (reqRef.current === myReq) setLoading(false);
       });
-  }, [scopeKey, variant]);
+  }, [variant]);
 
   useEffect(() => {
     // Dashboard data surfaces fetch from an effect on mount + scope change;
     // keep this local and explicit (matches FilesPage).
     load();
-    // `reloadNonce` is a manual refetch trigger (Refresh button / row pick).
-  }, [load, reloadNonce]);
+    // The internal nonce powers this component's own retry button; the external
+    // nonce lets a compact parent expose the same list-only refresh behavior.
+  }, [load, refreshNonce, reloadNonce]);
 
   const reload = useCallback(() => setReloadNonce((n) => n + 1), []);
   const filteredSessions = useMemo(() => {
@@ -218,7 +203,7 @@ export function ChatSessionList({
       const myReq = ++renameReqRef.current;
       setRename((current) => ({ ...current, error: null, saving: true }));
       try {
-        const result = await api.renameSession(session.id, title, scopeKey);
+        const result = await api.renameSession(session.id, title);
         if (renameReqRef.current !== myReq) return;
         reqRef.current += 1;
         setSessions((current) =>
@@ -242,7 +227,7 @@ export function ChatSessionList({
         }
       }
     },
-    [cancelRename, rename.saving, rename.value, scopeKey, t.sessions.failedToRename],
+    [cancelRename, rename.saving, rename.value, t.sessions.failedToRename],
   );
 
   // "New chat" prefers the owning chat surface's robust handler (clears resume

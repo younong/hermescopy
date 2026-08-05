@@ -16,11 +16,11 @@
 import {
   JsonRpcGatewayClient,
   JsonRpcGatewayError,
-  buildHermesWebSocketUrl,
   type ConnectionState,
   type GatewayEvent,
   type GatewayEventName,
-} from "@hermes/shared";
+} from "./json-rpc-gateway";
+import { buildHermesWebSocketUrl } from "./websocket-url";
 
 import { HERMES_BASE_PATH, buildWsAuthParam } from "@/lib/api";
 import { diagnosticId, emitChatDiagnostic } from "@/lib/chatDiagnostics";

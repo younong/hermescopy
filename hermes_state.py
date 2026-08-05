@@ -76,7 +76,13 @@ def _ephemeral_child_sql(alias: str = "s") -> str:
     )
 
 
-def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
+def _collect_delegate_child_ids(
+    conn,
+    parent_ids: List[str],
+    *,
+    scope_clause: str = "",
+    scope_params: list[Any] | None = None,
+) -> List[str]:
     """Delegate-subagent ids to cascade-delete with *parent_ids*.
 
     Only rows carrying the ``_delegate_from`` marker (set at creation, and
@@ -86,6 +92,7 @@ def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
     """
     df = _delegate_from_json()
     seeds = {sid for sid in parent_ids if sid}
+    scope_params = scope_params or []
     # Seed the visited set with the parents themselves. A delegation marker
     # chain can loop back onto a parent — a cycle, or a parent that is also
     # another parent's delegate child when several ids are deleted at once —
@@ -98,9 +105,10 @@ def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
     while frontier:
         ph = ",".join("?" * len(frontier))
         cursor = conn.execute(
-            f"SELECT id FROM sessions WHERE {df} IN ({ph}) "
-            f"OR (parent_session_id IN ({ph}) AND {df} IS NOT NULL)",
-            frontier + frontier,
+            f"SELECT id FROM sessions WHERE "
+            f"({df} IN ({ph}) OR (parent_session_id IN ({ph}) AND {df} IS NOT NULL))"
+            f"{scope_clause}",
+            [*frontier, *frontier, *scope_params],
         )
         frontier = [row["id"] for row in cursor.fetchall() if row["id"] not in found]
         found.update(frontier)
@@ -108,16 +116,64 @@ def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
     return [sid for sid in found if sid not in seeds]
 
 
-def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
-    ids = _collect_delegate_child_ids(conn, parent_ids)
+def _ids_without_out_of_scope_children(
+    conn,
+    session_ids: List[str],
+    *,
+    scoped_child_clause: str = "",
+    scope_params: list[Any] | None = None,
+) -> List[str]:
+    """Keep IDs whose direct children may be safely orphaned.
+
+    A scoped authenticated delete must not rewrite an out-of-scope child merely
+    to satisfy the parent foreign key. Such parents remain untouched instead.
+    """
+    if not session_ids or not scoped_child_clause:
+        return session_ids
+    placeholders = ",".join("?" * len(session_ids))
+    blocked = {
+        row["parent_session_id"]
+        for row in conn.execute(
+            f"SELECT DISTINCT child.parent_session_id FROM sessions child "
+            f"WHERE child.parent_session_id IN ({placeholders}) "
+            f"AND NOT EXISTS ("
+            f"SELECT 1 FROM sessions scoped_child "
+            f"WHERE scoped_child.id = child.id{scoped_child_clause})",
+            [*session_ids, *(scope_params or [])],
+        ).fetchall()
+    }
+    return [session_id for session_id in session_ids if session_id not in blocked]
+
+
+def _delete_delegate_children(
+    conn,
+    parent_ids: List[str],
+    *,
+    scope_clause: str = "",
+    scoped_child_clause: str = "",
+    scope_params: list[Any] | None = None,
+) -> List[str]:
+    scope_params = scope_params or []
+    ids = _collect_delegate_child_ids(
+        conn,
+        parent_ids,
+        scope_clause=scope_clause,
+        scope_params=scope_params,
+    )
+    ids = _ids_without_out_of_scope_children(
+        conn,
+        ids,
+        scoped_child_clause=scoped_child_clause,
+        scope_params=scope_params,
+    )
     if ids:
         ph = ",".join("?" * len(ids))
         conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", ids)
-        # FK safety: orphan any untagged stragglers pointing at a doomed row.
+        # FK safety: orphan any in-scope stragglers pointing at a doomed row.
         conn.execute(
             f"UPDATE sessions SET parent_session_id = NULL "
-            f"WHERE parent_session_id IN ({ph})",
-            ids,
+            f"WHERE parent_session_id IN ({ph}){scope_clause}",
+            [*ids, *scope_params],
         )
         conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", ids)
     return ids
@@ -2484,7 +2540,13 @@ class SessionDB(SessionQueryMixin):
         ).fetchone()
         return row is not None
 
-    def set_session_title(self, session_id: str, title: str) -> bool:
+    def set_session_title(
+        self,
+        session_id: str,
+        title: str,
+        *,
+        recovery_scope: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """Set or update a session's title.
 
         Returns True if session was found and title was set.
@@ -2493,12 +2555,21 @@ class SessionDB(SessionQueryMixin):
         Empty/whitespace-only strings are normalized to None (clearing the title).
         """
         title = self.sanitize_title(title)
+        scope_clause, scope_params = self._recovery_scope_clause(recovery_scope)
+
         def _do(conn):
+            if not conn.execute(
+                f"SELECT 1 FROM sessions WHERE id = ?{scope_clause}",
+                (session_id, *scope_params),
+            ).fetchone():
+                return 0
             if title:
-                # Check uniqueness (allow the same session to keep its own title)
+                # Check uniqueness (allow the same session to keep its own title).
+                # Scoped callers must not learn an inaccessible session ID from a
+                # global unique-index conflict.
                 cursor = conn.execute(
-                    "SELECT id FROM sessions WHERE title = ? AND id != ?",
-                    (title, session_id),
+                    f"SELECT id FROM sessions WHERE title = ? AND id != ?{scope_clause}",
+                    (title, session_id, *scope_params),
                 )
                 conflict = cursor.fetchone()
                 if conflict:
@@ -2507,13 +2578,8 @@ class SessionDB(SessionQueryMixin):
                     # head of its conversation; its compressed predecessors are
                     # ended and hidden from the session list (list_sessions_rich
                     # projects roots → tip). When the title that "conflicts" is
-                    # held by such a hidden ancestor, the user has no way to free
-                    # it — renaming the visible tip back to the base name would
-                    # dead-end with "already in use by <session they can't see>".
-                    # Treat this as a transfer: move the title off the ancestor
-                    # onto the continuation. Uniqueness is preserved (still only
-                    # one session carries the exact title) and the parent-link
-                    # lineage is untouched.
+                    # held by such a hidden ancestor, transfer it to the visible
+                    # continuation while preserving uniqueness and lineage.
                     if self._is_compression_ancestor(
                         conn, ancestor_id=conflict_id, descendant_id=session_id
                     ):
@@ -2525,6 +2591,11 @@ class SessionDB(SessionQueryMixin):
                         raise ValueError(
                             f"Title '{title}' is already in use by session {conflict_id}"
                         )
+                elif recovery_scope and conn.execute(
+                    "SELECT 1 FROM sessions WHERE title = ? AND id != ?",
+                    (title, session_id),
+                ).fetchone():
+                    raise ValueError(f"Title '{title}' is already in use")
             cursor = conn.execute(
                 "UPDATE sessions SET title = ? WHERE id = ?",
                 (title, session_id),
@@ -2542,7 +2613,13 @@ class SessionDB(SessionQueryMixin):
             row = cursor.fetchone()
         return row["title"] if row else None
 
-    def set_session_archived(self, session_id: str, archived: bool) -> bool:
+    def set_session_archived(
+        self,
+        session_id: str,
+        archived: bool,
+        *,
+        recovery_scope: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """Archive or unarchive a session.
 
         Archived sessions are hidden from the default session list but keep all
@@ -2552,27 +2629,31 @@ class SessionDB(SessionQueryMixin):
         displayed tip lets the still-unarchived root resurrect it on refresh.
         Returns True when at least one row was updated.
         """
+        scope_clause, scope_params = self._recovery_scope_clause(recovery_scope)
+
         def _do(conn):
             cursor = conn.execute(
-                """
+                f"""
                 WITH RECURSIVE
                   ancestors(id) AS (
-                    SELECT ?
+                    SELECT id FROM sessions WHERE id = ?{scope_clause}
                     UNION
                     SELECT parent.id
                     FROM ancestors a
                     JOIN sessions child ON child.id = a.id
                     JOIN sessions parent ON parent.id = child.parent_session_id
                     WHERE parent.end_reason = 'compression'
+                      {scope_clause.replace('sessions.', 'parent.')}
                   ),
                   descendants(id) AS (
-                    SELECT ?
+                    SELECT id FROM sessions WHERE id = ?{scope_clause}
                     UNION
                     SELECT child.id
                     FROM descendants d
                     JOIN sessions parent ON parent.id = d.id
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.end_reason = 'compression'
+                      {scope_clause.replace('sessions.', 'child.')}
                   ),
                   lineage(id) AS (
                     SELECT id FROM ancestors
@@ -2583,7 +2664,15 @@ class SessionDB(SessionQueryMixin):
                 SET archived = ?
                 WHERE id IN (SELECT id FROM lineage)
                 """,
-                (session_id, session_id, 1 if archived else 0),
+                (
+                    session_id,
+                    *scope_params,
+                    *scope_params,
+                    session_id,
+                    *scope_params,
+                    *scope_params,
+                    1 if archived else 0,
+                ),
             )
             rowcount = cursor.rowcount
             if rowcount is None or rowcount < 0:
@@ -3682,6 +3771,8 @@ class SessionDB(SessionQueryMixin):
         self,
         session_id: str,
         sessions_dir: Optional[Path] = None,
+        *,
+        recovery_scope: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Delete a session and all its messages.
 
@@ -3694,19 +3785,42 @@ class SessionDB(SessionQueryMixin):
         session. Returns True if the session was found and deleted.
         """
         removed_delegate_ids: List[str] = []
+        scope_clause, scope_params = self._recovery_scope_clause(recovery_scope)
+        child_scope_clause, _ = self._recovery_scope_clause(
+            recovery_scope, alias="child"
+        )
+        scoped_child_clause, _ = self._recovery_scope_clause(
+            recovery_scope, alias="scoped_child"
+        )
 
         def _do(conn):
             cursor = conn.execute(
-                "SELECT COUNT(*) FROM sessions WHERE id = ?", (session_id,)
+                f"SELECT COUNT(*) FROM sessions WHERE id = ?{scope_clause}",
+                (session_id, *scope_params),
             )
             if cursor.fetchone()[0] == 0:
                 return False
-            removed_delegate_ids.extend(_delete_delegate_children(conn, [session_id]))
-            # Orphan remaining child sessions (branches, etc.) so FK is satisfied.
+            if not _ids_without_out_of_scope_children(
+                conn,
+                [session_id],
+                scoped_child_clause=scoped_child_clause,
+                scope_params=scope_params,
+            ):
+                return False
+            removed_delegate_ids.extend(
+                _delete_delegate_children(
+                    conn,
+                    [session_id],
+                    scope_clause=scope_clause,
+                    scoped_child_clause=scoped_child_clause,
+                    scope_params=scope_params,
+                )
+            )
+            # Orphan remaining in-scope child sessions (branches, etc.) so FK is satisfied.
             conn.execute(
-                "UPDATE sessions SET parent_session_id = NULL "
-                "WHERE parent_session_id = ?",
-                (session_id,),
+                "UPDATE sessions AS child SET parent_session_id = NULL "
+                f"WHERE child.parent_session_id = ?{child_scope_clause}",
+                (session_id, *scope_params),
             )
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
@@ -3765,6 +3879,8 @@ class SessionDB(SessionQueryMixin):
         self,
         session_ids: List[str],
         sessions_dir: Optional[Path] = None,
+        *,
+        recovery_scope: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Delete every session in *session_ids* in a single transaction.
 
@@ -3801,30 +3917,47 @@ class SessionDB(SessionQueryMixin):
 
         removed_ids: list[str] = []
         removed_delegate_ids: list[str] = []
+        scope_clause, scope_params = self._recovery_scope_clause(recovery_scope)
+        child_scope_clause, _ = self._recovery_scope_clause(
+            recovery_scope, alias="child"
+        )
+        scoped_child_clause, _ = self._recovery_scope_clause(
+            recovery_scope, alias="scoped_child"
+        )
 
         def _do(conn):
             placeholders = ",".join("?" * len(unique_ids))
             # First, filter to IDs that actually exist — we want to
             # return the real deleted count, not the input length.
             cursor = conn.execute(
-                f"SELECT id FROM sessions WHERE id IN ({placeholders})",
-                unique_ids,
+                f"SELECT id FROM sessions WHERE id IN ({placeholders}){scope_clause}",
+                (*unique_ids, *scope_params),
             )
-            existing = [row["id"] for row in cursor.fetchall()]
+            existing = _ids_without_out_of_scope_children(
+                conn,
+                [row["id"] for row in cursor.fetchall()],
+                scoped_child_clause=scoped_child_clause,
+                scope_params=scope_params,
+            )
             if not existing:
                 return 0
 
             existing_placeholders = ",".join("?" * len(existing))
-            removed_delegate_ids.extend(_delete_delegate_children(conn, existing))
-            # Orphan remaining children whose parent is in the kill list so the
-            # FK constraint stays satisfied. Pin children whose parent
-            # is itself in the kill list rather than NULL-ing parents
-            # of survivors — the IN list on ``parent_session_id`` does
-            # exactly this.
+            removed_delegate_ids.extend(
+                _delete_delegate_children(
+                    conn,
+                    existing,
+                    scope_clause=scope_clause,
+                    scoped_child_clause=scoped_child_clause,
+                    scope_params=scope_params,
+                )
+            )
+            # Orphan remaining in-scope children whose parent is in the kill list.
             conn.execute(
-                f"UPDATE sessions SET parent_session_id = NULL "
-                f"WHERE parent_session_id IN ({existing_placeholders})",
-                existing,
+                f"UPDATE sessions AS child SET parent_session_id = NULL "
+                f"WHERE child.parent_session_id IN ({existing_placeholders})"
+                f"{child_scope_clause}",
+                [*existing, *scope_params],
             )
             conn.execute(
                 f"DELETE FROM messages WHERE session_id IN ({existing_placeholders})",
@@ -3848,6 +3981,8 @@ class SessionDB(SessionQueryMixin):
     def delete_empty_sessions(
         self,
         sessions_dir: Optional[Path] = None,
+        *,
+        recovery_scope: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Delete every empty, ended, non-archived session.
 
@@ -3875,24 +4010,38 @@ class SessionDB(SessionQueryMixin):
         Returns the number of sessions deleted.
         """
         removed_ids: list[str] = []
+        scope_clause, scope_params = self._recovery_scope_clause(recovery_scope)
+        child_scope_clause, _ = self._recovery_scope_clause(
+            recovery_scope, alias="child"
+        )
+        scoped_child_clause, _ = self._recovery_scope_clause(
+            recovery_scope, alias="scoped_child"
+        )
 
         def _do(conn):
             cursor = conn.execute(
                 "SELECT id FROM sessions "
                 "WHERE message_count = 0 "
                 "AND ended_at IS NOT NULL "
-                "AND archived = 0"
+                f"AND archived = 0{scope_clause}",
+                scope_params,
             )
-            session_ids = {row["id"] for row in cursor.fetchall()}
+            session_ids = _ids_without_out_of_scope_children(
+                conn,
+                [row["id"] for row in cursor.fetchall()],
+                scoped_child_clause=scoped_child_clause,
+                scope_params=scope_params,
+            )
 
             if not session_ids:
                 return 0
 
             placeholders = ",".join("?" * len(session_ids))
             conn.execute(
-                f"UPDATE sessions SET parent_session_id = NULL "
-                f"WHERE parent_session_id IN ({placeholders})",
-                list(session_ids),
+                f"UPDATE sessions AS child SET parent_session_id = NULL "
+                f"WHERE child.parent_session_id IN ({placeholders})"
+                f"{child_scope_clause}",
+                [*session_ids, *scope_params],
             )
 
             for sid in session_ids:
@@ -3917,6 +4066,8 @@ class SessionDB(SessionQueryMixin):
         older_than_days: int = 90,
         source: str = None,
         sessions_dir: Optional[Path] = None,
+        *,
+        recovery_scope: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Delete sessions older than N days. Returns count of deleted sessions.
 
@@ -3929,30 +4080,38 @@ class SessionDB(SessionQueryMixin):
         """
         cutoff = time.time() - (older_than_days * 86400)
         removed_ids: list[str] = []
+        scope_clause, scope_params = self._recovery_scope_clause(recovery_scope)
+        child_scope_clause, _ = self._recovery_scope_clause(
+            recovery_scope, alias="child"
+        )
+        scoped_child_clause, _ = self._recovery_scope_clause(
+            recovery_scope, alias="scoped_child"
+        )
 
         def _do(conn):
-            if source:
-                cursor = conn.execute(
-                    """SELECT id FROM sessions
-                       WHERE started_at < ? AND ended_at IS NOT NULL AND source = ?""",
-                    (cutoff, source),
-                )
-            else:
-                cursor = conn.execute(
-                    "SELECT id FROM sessions WHERE started_at < ? AND ended_at IS NOT NULL",
-                    (cutoff,),
-                )
-            session_ids = {row["id"] for row in cursor.fetchall()}
+            source_clause = " AND source = ?" if source else ""
+            cursor = conn.execute(
+                "SELECT id FROM sessions WHERE started_at < ? AND ended_at IS NOT NULL"
+                f"{source_clause}{scope_clause}",
+                [cutoff, *([source] if source else []), *scope_params],
+            )
+            session_ids = _ids_without_out_of_scope_children(
+                conn,
+                [row["id"] for row in cursor.fetchall()],
+                scoped_child_clause=scoped_child_clause,
+                scope_params=scope_params,
+            )
 
             if not session_ids:
                 return 0
 
-            # Orphan any sessions whose parent is about to be deleted
+            # Orphan any in-scope sessions whose parent is about to be deleted.
             placeholders = ",".join("?" * len(session_ids))
             conn.execute(
-                f"UPDATE sessions SET parent_session_id = NULL "
-                f"WHERE parent_session_id IN ({placeholders})",
-                list(session_ids),
+                f"UPDATE sessions AS child SET parent_session_id = NULL "
+                f"WHERE child.parent_session_id IN ({placeholders})"
+                f"{child_scope_clause}",
+                [*session_ids, *scope_params],
             )
 
             for sid in session_ids:

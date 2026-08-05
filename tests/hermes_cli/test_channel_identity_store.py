@@ -15,10 +15,14 @@ from hermes_cli.channel_identity import (
     ChannelIdentityStore,
     Keyring,
     ensure_owner_binding,
+    register_connector_binding_for_owner,
     register_weixin_identity,
     register_weixin_identity_for_owner,
     resolve_binding,
+    resolve_connector_account,
 )
+from hermes_cli.channel_identity.credentials import decrypt_account_credentials
+from hermes_cli.channel_identity.store import ACCOUNT_CREDENTIAL_AAD_TABLE
 from hermes_cli.dashboard_auth.base import Session
 from hermes_cli.dashboard_auth.owner_context import owner_context_from_session
 
@@ -54,7 +58,7 @@ def crypto() -> ChannelCrypto:
 def store(tmp_path, crypto, monkeypatch) -> ChannelIdentityStore:
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_OWNER_SECRET", "owner-secret")
-    return ChannelIdentityStore(crypto)
+    return ChannelIdentityStore(crypto, tmp_path / "control-plane", global_home=tmp_path)
 
 
 def test_crypto_from_env_requires_separate_versioned_keys(monkeypatch):
@@ -69,14 +73,14 @@ def test_crypto_from_env_requires_separate_versioned_keys(monkeypatch):
 def test_crypto_aad_rejects_cross_field_ciphertext(crypto):
     ciphertext, version = crypto.encrypt_text(
         "secret-value",
-        table="ilink_accounts",
+        table=ACCOUNT_CREDENTIAL_AAD_TABLE,
         record_id="account-1",
         field="bot_token",
     )
 
     assert crypto.decrypt_text(
         ciphertext,
-        table="ilink_accounts",
+        table=ACCOUNT_CREDENTIAL_AAD_TABLE,
         record_id="account-1",
         field="bot_token",
         version=version,
@@ -84,18 +88,29 @@ def test_crypto_aad_rejects_cross_field_ciphertext(crypto):
     with pytest.raises(RuntimeError, match="failed authentication"):
         crypto.decrypt_text(
             ciphertext,
-            table="ilink_accounts",
+            table=ACCOUNT_CREDENTIAL_AAD_TABLE,
             record_id="account-1",
             field="cursor",
             version=version,
         )
 
 
-def test_store_uses_profile_home_and_private_permissions(store, tmp_path):
+def test_store_uses_explicit_control_plane_home_and_private_permissions(store, tmp_path):
     assert store.path == tmp_path / "control-plane" / "channel_identities.sqlite3"
     if os.name != "nt":
         assert stat_mode(store.path.parent) == 0o700
         assert stat_mode(store.path) == 0o600
+
+
+def test_store_does_not_follow_ambient_hermes_home(tmp_path, crypto, monkeypatch):
+    ambient = tmp_path / "ambient"
+    explicit = tmp_path / "control"
+    monkeypatch.setenv("HERMES_HOME", str(ambient))
+
+    store = ChannelIdentityStore(crypto, explicit, global_home=tmp_path)
+
+    assert store.path == explicit / "channel_identities.sqlite3"
+    assert not ambient.exists()
 
 
 def test_store_rejects_symlink_database(tmp_path, crypto):
@@ -106,11 +121,126 @@ def test_store_rejects_symlink_database(tmp_path, crypto):
     (parent / "channel_identities.sqlite3").symlink_to(target)
 
     with pytest.raises(RuntimeError, match="regular file"):
-        ChannelIdentityStore(crypto, path=parent / "channel_identities.sqlite3")
+        ChannelIdentityStore(crypto, parent, global_home=tmp_path)
+
+
+def _downgrade_account_table_to_v7(
+    conn: sqlite3.Connection,
+    crypto: ChannelCrypto,
+) -> None:
+    rows = conn.execute("SELECT * FROM connector_accounts").fetchall()
+    conn.execute("DROP TRIGGER IF EXISTS connector_accounts_ownership_immutable")
+    conn.execute("DROP INDEX IF EXISTS idx_connector_accounts_lookup_hash")
+    for column, declaration in (
+        ("bot_id_lookup_hash", "TEXT NOT NULL DEFAULT ''"),
+        ("bot_id_ciphertext", "BLOB NOT NULL DEFAULT X''"),
+        ("bot_id_key_version", "INTEGER NOT NULL DEFAULT 0"),
+        ("bot_token_ciphertext", "BLOB NOT NULL DEFAULT X''"),
+        ("bot_token_key_version", "INTEGER NOT NULL DEFAULT 0"),
+        ("base_url", "TEXT NOT NULL DEFAULT ''"),
+    ):
+        conn.execute(f"ALTER TABLE connector_accounts ADD COLUMN {column} {declaration}")
+    for row in rows:
+        credentials = decrypt_account_credentials(
+            _StoreCrypto(crypto),
+            account_id=row["account_id"],
+            ciphertext=row["credentials_ciphertext"],
+            key_version=row["credentials_key_version"],
+        )
+        bot_id_ciphertext, bot_id_version = crypto.encrypt_text(
+            credentials["bot_id"],
+            table=ACCOUNT_CREDENTIAL_AAD_TABLE,
+            record_id=row["account_id"],
+            field="bot_id",
+        )
+        bot_token_ciphertext, bot_token_version = crypto.encrypt_text(
+            credentials["bot_token"],
+            table=ACCOUNT_CREDENTIAL_AAD_TABLE,
+            record_id=row["account_id"],
+            field="bot_token",
+        )
+        conn.execute(
+            """
+            UPDATE connector_accounts
+            SET bot_id_lookup_hash=?, bot_id_ciphertext=?, bot_id_key_version=?,
+                bot_token_ciphertext=?, bot_token_key_version=?, base_url=?
+            WHERE account_id=?
+            """,
+            (
+                row["account_lookup_hash"], bot_id_ciphertext, bot_id_version,
+                bot_token_ciphertext, bot_token_version, credentials["base_url"],
+                row["account_id"],
+            ),
+        )
+    conn.execute("ALTER TABLE connector_accounts DROP COLUMN account_lookup_hash")
+    conn.execute("ALTER TABLE connector_accounts DROP COLUMN credentials_ciphertext")
+    conn.execute("ALTER TABLE connector_accounts DROP COLUMN credentials_key_version")
+    conn.execute("ALTER TABLE connector_accounts RENAME TO ilink_accounts")
+
+
+class _StoreCrypto:
+    def __init__(self, crypto: ChannelCrypto) -> None:
+        self.crypto = crypto
+
+
+def _rebuild_v4_account_table_with_inline_unique(path) -> None:
+    conn = sqlite3.connect(path, isolation_level=None)
+    try:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            CREATE TABLE ilink_accounts_v4 (
+                account_id TEXT PRIMARY KEY,
+                external_identity_id TEXT NOT NULL
+                    REFERENCES external_identities(external_identity_id),
+                bot_id_lookup_hash TEXT NOT NULL UNIQUE,
+                bot_id_ciphertext BLOB NOT NULL,
+                bot_id_key_version INTEGER NOT NULL,
+                bot_token_ciphertext BLOB NOT NULL,
+                bot_token_key_version INTEGER NOT NULL,
+                base_url TEXT NOT NULL,
+                credential_version INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                cursor_ciphertext BLOB,
+                cursor_key_version INTEGER,
+                poll_holder TEXT,
+                poll_generation INTEGER NOT NULL DEFAULT 0,
+                poll_health TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO ilink_accounts_v4
+            SELECT account_id, external_identity_id, bot_id_lookup_hash,
+                   bot_id_ciphertext, bot_id_key_version,
+                   bot_token_ciphertext, bot_token_key_version, base_url,
+                   credential_version, status, cursor_ciphertext,
+                   cursor_key_version, poll_holder, poll_generation,
+                   poll_health, created_at, updated_at
+            FROM ilink_accounts
+            """
+        )
+        conn.execute("DROP TABLE ilink_accounts")
+        conn.execute("ALTER TABLE ilink_accounts_v4 RENAME TO ilink_accounts")
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
 
 
 def _downgrade_inbound_messages_to_v3(conn: sqlite3.Connection) -> None:
-    conn.execute("DROP INDEX idx_inbound_due")
+    conn.execute("DROP TRIGGER IF EXISTS inbound_messages_binding_consistent_insert")
+    conn.execute("DROP TRIGGER IF EXISTS inbound_messages_ownership_immutable")
+    conn.execute("DROP TRIGGER IF EXISTS outbound_messages_consistent_insert")
+    conn.execute("DROP INDEX IF EXISTS idx_inbound_due")
+    conn.execute("DROP INDEX IF EXISTS idx_inbound_binding_sequence")
     conn.execute("DROP INDEX idx_inbound_binding_status")
     conn.execute("ALTER TABLE inbound_messages RENAME TO inbound_messages_v3")
     conn.execute(
@@ -155,8 +285,9 @@ def test_store_migrates_v1_attempts_to_owner_target_schema(tmp_path, crypto, mon
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_OWNER_SECRET", "owner-secret")
     path = tmp_path / "control-plane" / "channel_identities.sqlite3"
-    first = ChannelIdentityStore(crypto, path=path)
+    first = ChannelIdentityStore(crypto, path.parent, global_home=tmp_path)
     with first.write() as conn:
+        _downgrade_account_table_to_v7(conn, crypto)
         conn.execute("UPDATE channel_identity_meta SET value='1' WHERE key='schema_version'")
         _downgrade_inbound_messages_to_v3(conn)
         conn.execute(
@@ -192,12 +323,12 @@ def test_store_migrates_v1_attempts_to_owner_target_schema(tmp_path, crypto, mon
         )
         conn.execute("DROP TABLE enrollment_attempts_v2")
 
-    migrated = ChannelIdentityStore(crypto, path=path)
+    migrated = ChannelIdentityStore(crypto, path.parent, global_home=tmp_path)
 
     with migrated.read() as conn:
         assert conn.execute(
             "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
-        ).fetchone()["value"] == "4"
+        ).fetchone()["value"] == "10"
         row = conn.execute(
             "SELECT target_canonical_user_id FROM enrollment_attempts WHERE attempt_id='enr_existing'"
         ).fetchone()
@@ -211,7 +342,7 @@ def test_store_migrates_v1_attempts_to_owner_target_schema(tmp_path, crypto, mon
 
 def test_store_migrates_v3_inbound_rows_with_retry_defaults(tmp_path, crypto):
     path = tmp_path / "control-plane" / "channel_identities.sqlite3"
-    first = ChannelIdentityStore(crypto, path=path)
+    first = ChannelIdentityStore(crypto, path.parent, global_home=tmp_path)
     with first.write() as conn:
         conn.execute(
             "INSERT INTO canonical_users VALUES ('cu', 'active', 1, 1)"
@@ -222,16 +353,22 @@ def test_store_migrates_v3_inbound_rows_with_retry_defaults(tmp_path, crypto):
             VALUES ('ei', 'weixin-ilink', 'subject', X'00', 1, 'cu', 'active', 1, 1)
             """
         )
+        credentials_ciphertext, credentials_version = crypto.encrypt_text(
+            '{"base_url":"https://ilink.example","bot_id":"bot","bot_token":"token"}',
+            table=ACCOUNT_CREDENTIAL_AAD_TABLE,
+            record_id="account",
+            field="credentials",
+        )
         conn.execute(
             """
-            INSERT INTO ilink_accounts
-              (account_id, external_identity_id, bot_id_lookup_hash,
-               bot_id_ciphertext, bot_id_key_version, bot_token_ciphertext,
-               bot_token_key_version, base_url, credential_version, status,
-               created_at, updated_at)
-            VALUES ('account', 'ei', 'bot', X'00', 1, X'00', 1,
-                    'https://ilink.example', 1, 'active', 1, 1)
-            """
+            INSERT INTO connector_accounts
+              (account_id, provider, provider_account_id,
+               account_lookup_hash, credentials_ciphertext, credentials_key_version,
+               credential_version, status, created_at, updated_at)
+            VALUES ('account', 'weixin_ilink', 'bot', 'bot', ?, ?,
+                    1, 'active', 1, 1)
+            """,
+            (credentials_ciphertext, credentials_version),
         )
         conn.execute(
             """
@@ -241,10 +378,11 @@ def test_store_migrates_v3_inbound_rows_with_retry_defaults(tmp_path, crypto):
             VALUES ('im_existing', 'account', 'msg', 'queued', 1, 1)
             """
         )
+        _downgrade_account_table_to_v7(conn, crypto)
         _downgrade_inbound_messages_to_v3(conn)
         conn.execute("UPDATE channel_identity_meta SET value='3' WHERE key='schema_version'")
 
-    migrated = ChannelIdentityStore(crypto, path=path)
+    migrated = ChannelIdentityStore(crypto, path.parent, global_home=tmp_path)
 
     with migrated.read() as conn:
         row = conn.execute(
@@ -257,12 +395,373 @@ def test_store_migrates_v3_inbound_rows_with_retry_defaults(tmp_path, crypto):
             "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
         ).fetchone()["value"]
     assert tuple(row) == ("text", 0, 0, None)
-    assert version == "4"
+    assert version == "10"
+
+
+def test_store_migrates_v4_ilink_account_to_provider_neutral_identity(tmp_path, crypto):
+    control_home = tmp_path / "control-plane"
+    first = ChannelIdentityStore(crypto, control_home, global_home=tmp_path)
+    registered = register_weixin_identity(
+        first,
+        subject="subject-a",
+        bot_id="bot-a",
+        bot_token="token-a",
+        base_url="https://ilink.example",
+        peer_id="subject-a",
+    )
+    with first.write() as conn:
+        conn.execute("DROP INDEX IF EXISTS idx_channel_accounts_provider_account")
+        conn.execute("DROP TRIGGER IF EXISTS outbound_messages_consistent_insert")
+        conn.execute("DROP TRIGGER IF EXISTS channel_bindings_identity_consistent_insert")
+        conn.execute("DROP TRIGGER IF EXISTS inbound_messages_binding_consistent_insert")
+        conn.execute("DROP TRIGGER IF EXISTS inbound_messages_assign_sequence")
+        conn.execute("DROP TABLE binding_sequences")
+        _downgrade_account_table_to_v7(conn, crypto)
+        conn.execute("UPDATE channel_identity_meta SET value='4'")
+        conn.execute("ALTER TABLE ilink_accounts DROP COLUMN provider")
+        conn.execute("ALTER TABLE ilink_accounts DROP COLUMN provider_account_id")
+        conn.execute(
+            "ALTER TABLE ilink_accounts ADD COLUMN external_identity_id TEXT"
+        )
+        conn.execute(
+            "UPDATE ilink_accounts SET external_identity_id=? WHERE account_id=?",
+            (registered.external_identity_id, registered.account_id),
+        )
+
+    _rebuild_v4_account_table_with_inline_unique(first.path)
+    migrated = ChannelIdentityStore(crypto, control_home, global_home=tmp_path)
+
+    with migrated.read() as conn:
+        row = conn.execute(
+            "SELECT provider, provider_account_id, account_lookup_hash "
+            "FROM connector_accounts WHERE account_id=?",
+            (registered.account_id,),
+        ).fetchone()
+        version = conn.execute(
+            "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
+        ).fetchone()["value"]
+        binding_sequence_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='binding_sequences'"
+        ).fetchone()
+        account_foreign_keys = {
+            table: {
+                foreign_key["table"]
+                for foreign_key in conn.execute(f"PRAGMA foreign_key_list({table})")
+                if foreign_key["from"] == "account_id"
+            }
+            for table in (
+                "channel_bindings",
+                "context_tokens",
+                "inbound_messages",
+                "outbound_messages",
+            )
+        }
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    assert row["provider"] == "weixin_ilink"
+    assert row["provider_account_id"] == row["account_lookup_hash"]
+    assert binding_sequence_table is not None
+    assert account_foreign_keys == {
+        "channel_bindings": {"connector_accounts"},
+        "context_tokens": {"connector_accounts"},
+        "inbound_messages": {"connector_accounts"},
+        "outbound_messages": {"connector_accounts"},
+    }
+    assert version == "10"
+
+
+def test_store_migrates_v7_account_table_without_reencrypting_credentials(tmp_path, crypto):
+    control_home = tmp_path / "control-plane"
+    first = ChannelIdentityStore(crypto, control_home, global_home=tmp_path)
+    registered = register_weixin_identity(
+        first,
+        subject="subject-a",
+        bot_id="bot-a",
+        bot_token="token-a",
+        base_url="https://ilink.example",
+        peer_id="subject-a",
+    )
+    with first.write() as conn:
+        _downgrade_account_table_to_v7(conn, crypto)
+        conn.execute("UPDATE channel_identity_meta SET value='7' WHERE key='schema_version'")
+
+    migrated = ChannelIdentityStore(crypto, control_home, global_home=tmp_path)
+
+    with migrated.read() as conn:
+        tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        version = conn.execute(
+            "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
+        ).fetchone()["value"]
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    owner, resolved = resolve_binding(migrated, binding_id=registered.binding_id)
+    assert "connector_accounts" in tables
+    assert "ilink_accounts" not in tables
+    assert version == "10"
+    assert owner.owner_key == registered.owner_key
+    assert resolve_connector_account(
+        migrated,
+        provider="weixin_ilink",
+        account_id=resolved.account_id,
+        credential_version=resolved.credential_version,
+    ).credentials["bot_id"] == "bot-a"
+    assert resolve_connector_account(
+        migrated,
+        provider="weixin_ilink",
+        account_id=resolved.account_id,
+        credential_version=resolved.credential_version,
+    ).credentials["bot_token"] == "token-a"
+
+
+def test_store_rolls_back_v7_account_rename_when_validation_fails(
+    tmp_path, crypto, monkeypatch
+):
+    control_home = tmp_path / "control-plane"
+    first = ChannelIdentityStore(crypto, control_home, global_home=tmp_path)
+    register_weixin_identity(
+        first,
+        subject="subject-a",
+        bot_id="bot-a",
+        bot_token="token-a",
+        base_url="https://ilink.example",
+        peer_id="subject-a",
+    )
+    with first.write() as conn:
+        _downgrade_account_table_to_v7(conn, crypto)
+        conn.execute("UPDATE channel_identity_meta SET value='7' WHERE key='schema_version'")
+
+    original = ChannelIdentityStore._validate_schema
+
+    def fail_validation(conn):
+        original(conn)
+        raise RuntimeError("forced validation failure")
+
+    fail_validation = staticmethod(fail_validation)
+
+    monkeypatch.setattr(ChannelIdentityStore, "_validate_schema", fail_validation)
+    with pytest.raises(RuntimeError, match="forced validation failure"):
+        ChannelIdentityStore(crypto, control_home, global_home=tmp_path)
+
+    conn = sqlite3.connect(first.path)
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        version = conn.execute(
+            "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert "ilink_accounts" in tables
+    assert "connector_accounts" not in tables
+    assert version == "7"
+
+
+def test_store_migrates_v8_credentials_to_provider_neutral_envelope(tmp_path, crypto):
+    control_home = tmp_path / "control-plane"
+    first = ChannelIdentityStore(crypto, control_home, global_home=tmp_path)
+    registered = register_weixin_identity(
+        first,
+        subject="subject-a",
+        bot_id="bot-a",
+        bot_token="token-a",
+        base_url="https://ilink.example",
+        peer_id="subject-a",
+    )
+    with first.write() as conn:
+        _downgrade_account_table_to_v7(conn, crypto)
+        conn.execute("ALTER TABLE ilink_accounts RENAME TO connector_accounts")
+        conn.execute("UPDATE channel_identity_meta SET value='8' WHERE key='schema_version'")
+
+    migrated = ChannelIdentityStore(crypto, control_home, global_home=tmp_path)
+
+    with migrated.read() as conn:
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(connector_accounts)")
+        }
+        version = conn.execute(
+            "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
+        ).fetchone()["value"]
+    _, resolved = resolve_binding(migrated, binding_id=registered.binding_id)
+    account = resolve_connector_account(
+        migrated,
+        provider="weixin_ilink",
+        account_id=resolved.account_id,
+        credential_version=resolved.credential_version,
+    )
+    assert {
+        "account_lookup_hash",
+        "credentials_ciphertext",
+        "credentials_key_version",
+    } <= columns
+    assert not {
+        "bot_id_ciphertext",
+        "bot_token_ciphertext",
+        "base_url",
+    } & columns
+    assert version == "10"
+    assert resolve_connector_account(
+        migrated,
+        provider="weixin_ilink",
+        account_id=resolved.account_id,
+        credential_version=resolved.credential_version,
+    ).credentials["bot_id"] == "bot-a"
+    assert account.credentials["bot_token"] == "token-a"
+    assert account.credentials["base_url"] == "https://ilink.example"
+
+
+def test_store_migrates_v9_shared_account_schema_without_reencrypting(tmp_path, crypto):
+    control_home = tmp_path / "control-plane"
+    first = ChannelIdentityStore(crypto, control_home, global_home=tmp_path)
+    registered = register_weixin_identity(
+        first,
+        subject="subject-a",
+        bot_id="bot-a",
+        bot_token="token-a",
+        base_url="https://ilink.example",
+        peer_id="subject-a",
+    )
+    with first.write() as conn:
+        credentials = conn.execute(
+            "SELECT credentials_ciphertext, credentials_key_version "
+            "FROM connector_accounts WHERE account_id=?",
+            (registered.account_id,),
+        ).fetchone()
+        conn.execute("DROP TRIGGER IF EXISTS connector_accounts_ownership_immutable")
+        conn.execute(
+            "ALTER TABLE connector_accounts ADD COLUMN external_identity_id TEXT"
+        )
+        conn.execute(
+            "UPDATE connector_accounts SET external_identity_id=? WHERE account_id=?",
+            (registered.external_identity_id, registered.account_id),
+        )
+        conn.execute(
+            "UPDATE channel_identity_meta SET value='9' WHERE key='schema_version'"
+        )
+
+    migrated = ChannelIdentityStore(crypto, control_home, global_home=tmp_path)
+
+    with migrated.read() as conn:
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(connector_accounts)")
+        }
+        row = conn.execute(
+            "SELECT credentials_ciphertext, credentials_key_version "
+            "FROM connector_accounts WHERE account_id=?",
+            (registered.account_id,),
+        ).fetchone()
+        version = conn.execute(
+            "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
+        ).fetchone()["value"]
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert "external_identity_id" not in columns
+    assert row["credentials_ciphertext"] == credentials["credentials_ciphertext"]
+    assert row["credentials_key_version"] == credentials["credentials_key_version"]
+    assert version == "10"
+
+
+def test_store_rolls_back_v9_shared_account_migration_on_validation_failure(
+    tmp_path, crypto, monkeypatch
+):
+    control_home = tmp_path / "control-plane"
+    first = ChannelIdentityStore(crypto, control_home, global_home=tmp_path)
+    register_weixin_identity(
+        first,
+        subject="subject-a",
+        bot_id="bot-a",
+        bot_token="token-a",
+        base_url="https://ilink.example",
+        peer_id="subject-a",
+    )
+    with first.write() as conn:
+        conn.execute("DROP TRIGGER IF EXISTS connector_accounts_ownership_immutable")
+        conn.execute(
+            "ALTER TABLE connector_accounts ADD COLUMN external_identity_id TEXT"
+        )
+        conn.execute(
+            "UPDATE channel_identity_meta SET value='9' WHERE key='schema_version'"
+        )
+
+    original = ChannelIdentityStore._validate_schema
+
+    def fail_validation(conn):
+        original(conn)
+        raise RuntimeError("forced v10 validation failure")
+
+    monkeypatch.setattr(
+        ChannelIdentityStore,
+        "_validate_schema",
+        staticmethod(fail_validation),
+    )
+    with pytest.raises(RuntimeError, match="forced v10 validation failure"):
+        ChannelIdentityStore(crypto, control_home, global_home=tmp_path)
+
+    conn = sqlite3.connect(first.path)
+    try:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(connector_accounts)")
+        }
+        version = conn.execute(
+            "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert "external_identity_id" in columns
+    assert version == "9"
+
+
+def test_store_rolls_back_v8_credential_migration_on_authentication_failure(
+    tmp_path, crypto
+):
+    control_home = tmp_path / "control-plane"
+    first = ChannelIdentityStore(crypto, control_home, global_home=tmp_path)
+    register_weixin_identity(
+        first,
+        subject="subject-a",
+        bot_id="bot-a",
+        bot_token="token-a",
+        base_url="https://ilink.example",
+        peer_id="subject-a",
+    )
+    with first.write() as conn:
+        _downgrade_account_table_to_v7(conn, crypto)
+        conn.execute("ALTER TABLE ilink_accounts RENAME TO connector_accounts")
+        conn.execute(
+            "UPDATE connector_accounts SET bot_token_ciphertext=X'00'"
+        )
+        conn.execute("UPDATE channel_identity_meta SET value='8' WHERE key='schema_version'")
+
+    with pytest.raises(RuntimeError, match="malformed|failed authentication"):
+        ChannelIdentityStore(crypto, control_home, global_home=tmp_path)
+
+    conn = sqlite3.connect(first.path)
+    try:
+        version = conn.execute(
+            "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
+        ).fetchone()[0]
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(connector_accounts)")
+        }
+    finally:
+        conn.close()
+    assert version == "8"
+    assert "bot_token_ciphertext" in columns
+    assert "credentials_ciphertext" not in columns
 
 
 def test_store_migrates_v2_outbound_with_fresh_chunk_attempts(tmp_path, crypto):
     path = tmp_path / "control-plane" / "channel_identities.sqlite3"
-    first = ChannelIdentityStore(crypto, path=path)
+    first = ChannelIdentityStore(crypto, path.parent, global_home=tmp_path)
     registered = register_weixin_identity(
         first,
         subject="subject-a",
@@ -292,6 +791,7 @@ def test_store_migrates_v2_outbound_with_fresh_chunk_attempts(tmp_path, crypto):
             """,
             (registered.account_id, registered.binding_id, now, now),
         )
+        _downgrade_account_table_to_v7(conn, crypto)
         conn.execute("UPDATE channel_identity_meta SET value='2' WHERE key='schema_version'")
         conn.execute("ALTER TABLE outbound_messages RENAME TO outbound_messages_v3")
         conn.execute(
@@ -306,29 +806,40 @@ def test_store_migrates_v2_outbound_with_fresh_chunk_attempts(tmp_path, crypto):
         )
         conn.execute("DROP TABLE outbound_messages_v3")
 
-    migrated = ChannelIdentityStore(crypto, path=path)
+    migrated = ChannelIdentityStore(crypto, path.parent, global_home=tmp_path)
 
     with migrated.read() as conn:
         row = conn.execute(
             """
             SELECT attempts, chunk_count, next_chunk_index, chunk_attempts,
-                   failed_chunk_index FROM outbound_messages
+                   failed_chunk_index, provider, source_kind, source_id,
+                   binding_sequence FROM outbound_messages
             WHERE outbound_id='outbound-existing'
             """
         ).fetchone()
-    assert tuple(row) == (20700, None, 0, 0, None)
+    assert tuple(row) == (
+        20700,
+        None,
+        0,
+        0,
+        None,
+        "weixin_ilink",
+        "inbound",
+        "inbound:inbound-existing",
+        1,
+    )
 
 
 def test_store_rejects_unknown_newer_schema(tmp_path, crypto):
     path = tmp_path / "control-plane" / "channel_identities.sqlite3"
-    first = ChannelIdentityStore(crypto, path=path)
+    first = ChannelIdentityStore(crypto, path.parent, global_home=tmp_path)
     with first.write() as conn:
         conn.execute(
             "UPDATE channel_identity_meta SET value='999' WHERE key='schema_version'"
         )
 
     with pytest.raises(RuntimeError, match="newer"):
-        ChannelIdentityStore(crypto, path=path)
+        ChannelIdentityStore(crypto, path.parent, global_home=tmp_path)
 
 
 def test_dashboard_owner_binding_uses_random_registry_identity(store):
@@ -379,8 +890,14 @@ def test_owner_linked_registration_resolves_dashboard_owner_and_rotates_credenti
     assert second.canonical_user_id == target
     assert second.owner_key == dashboard_owner.owner_key
     owner, resolved = resolve_binding(store, binding_id=first.binding_id)
+    account = resolve_connector_account(
+        store,
+        provider="weixin_ilink",
+        account_id=resolved.account_id,
+        credential_version=resolved.credential_version,
+    )
     assert owner == dashboard_owner
-    assert resolved.bot_token == "token-two"
+    assert account.credentials["bot_token"] == "token-two"
     assert resolved.credential_version == 2
 
 
@@ -411,9 +928,15 @@ def test_owner_linked_registration_conflict_does_not_rotate_credentials(store):
         )
 
     owner, resolved = resolve_binding(store, binding_id=registered.binding_id)
+    account = resolve_connector_account(
+        store,
+        provider="weixin_ilink",
+        account_id=resolved.account_id,
+        credential_version=resolved.credential_version,
+    )
     assert owner.owner_key == first_owner.owner_key
-    assert resolved.bot_token == "token-one"
-    assert resolved.account_base_url == "https://ilink.example"
+    assert account.credentials["bot_token"] == "token-one"
+    assert account.credentials["base_url"] == "https://ilink.example"
     assert resolved.credential_version == 1
 
 
@@ -440,9 +963,92 @@ def test_repeated_registration_restores_same_owner_and_rotates_credentials(store
     assert second.canonical_user_id == first.canonical_user_id
     assert second.owner_key == first.owner_key
     owner, resolved = resolve_binding(store, binding_id=first.binding_id)
+    account = resolve_connector_account(
+        store,
+        provider="weixin_ilink",
+        account_id=resolved.account_id,
+        credential_version=resolved.credential_version,
+    )
     assert owner.owner_key == first.owner_key
-    assert resolved.bot_token == "token-two"
+    assert account.credentials["bot_token"] == "token-two"
     assert resolved.credential_version == 2
+
+
+def test_generic_shared_account_binds_distinct_owners_without_rotating_identity(store):
+    first_owner = _owner(user_id="owner-a")
+    second_owner = _owner(user_id="owner-b")
+
+    first = register_connector_binding_for_owner(
+        store,
+        owner=first_owner,
+        provider="fake_provider",
+        provider_account_id="shared-bot",
+        external_subject="subject-a",
+        conversation_id="conversation-a",
+        credentials={"token": "token-one"},
+    )
+    second = register_connector_binding_for_owner(
+        store,
+        owner=second_owner,
+        provider="fake_provider",
+        provider_account_id="shared-bot",
+        external_subject="subject-b",
+        conversation_id="conversation-b",
+        credentials={"token": "token-two"},
+    )
+
+    assert first.account_id == second.account_id
+    assert first.external_identity_id != second.external_identity_id
+    assert first.binding_id != second.binding_id
+    first_resolved_owner, first_channel = resolve_binding(
+        store, binding_id=first.binding_id
+    )
+    second_resolved_owner, second_channel = resolve_binding(
+        store, binding_id=second.binding_id
+    )
+    account = resolve_connector_account(
+        store,
+        provider="fake_provider",
+        account_id=first.account_id,
+        credential_version=second_channel.credential_version,
+    )
+    assert first_resolved_owner == first_owner
+    assert second_resolved_owner == second_owner
+    assert first_channel.conversation_id == "conversation-a"
+    assert second_channel.conversation_id == "conversation-b"
+    assert account.credentials == {"token": "token-two"}
+
+
+def test_generic_registration_rejects_cross_owner_subject_rebinding(store):
+    first_owner = _owner(user_id="owner-a")
+    second_owner = _owner(user_id="owner-b")
+    register_connector_binding_for_owner(
+        store,
+        owner=first_owner,
+        provider="fake_provider",
+        provider_account_id="shared-bot",
+        external_subject="subject-a",
+        conversation_id="conversation-a",
+        credentials={"token": "token-one"},
+    )
+
+    with pytest.raises(ChannelIdentityOwnershipConflict):
+        register_connector_binding_for_owner(
+            store,
+            owner=second_owner,
+            provider="fake_provider",
+            provider_account_id="shared-bot",
+            external_subject="subject-a",
+            conversation_id="conversation-b",
+            credentials={"token": "attacker-token"},
+        )
+
+    with pytest.raises(RuntimeError, match="unavailable"):
+        resolve_connector_account(
+            store,
+            provider="fake_provider",
+            account_id="missing",
+        )
 
 
 def test_different_subjects_receive_distinct_owners(store):
@@ -465,6 +1071,102 @@ def test_different_subjects_receive_distinct_owners(store):
 
     assert first.canonical_user_id != second.canonical_user_id
     assert first.owner_key != second.owner_key
+
+
+def test_initialization_rolls_back_schema_and_version_when_key_validation_fails(
+    tmp_path, crypto, monkeypatch
+):
+    control_home = tmp_path / "control-plane"
+    original = ChannelIdentityStore._validate_referenced_key_versions
+
+    def fail_validation(self, conn):
+        raise RuntimeError("missing key")
+
+    monkeypatch.setattr(
+        ChannelIdentityStore,
+        "_validate_referenced_key_versions",
+        fail_validation,
+    )
+    with pytest.raises(RuntimeError, match="missing key"):
+        ChannelIdentityStore(crypto, control_home, global_home=tmp_path)
+
+    path = control_home / "channel_identities.sqlite3"
+    conn = sqlite3.connect(path)
+    try:
+        tables = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert tables == []
+
+    monkeypatch.setattr(
+        ChannelIdentityStore,
+        "_validate_referenced_key_versions",
+        original,
+    )
+    store = ChannelIdentityStore(crypto, control_home, global_home=tmp_path)
+    with store.read() as conn:
+        assert conn.execute(
+            "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
+        ).fetchone()["value"] == "10"
+
+
+def test_store_allows_shared_account_across_owner_bound_identities(store):
+    first = register_weixin_identity(
+        store,
+        subject="subject-a",
+        bot_id="bot-a",
+        bot_token="token-a",
+        base_url="https://ilink.example",
+        peer_id="subject-a",
+    )
+    second = register_weixin_identity(
+        store,
+        subject="subject-b",
+        bot_id="bot-b",
+        bot_token="token-b",
+        base_url="https://ilink.example",
+        peer_id="subject-b",
+    )
+    with store.read() as conn:
+        peer = conn.execute(
+            "SELECT peer_lookup_hash, peer_ciphertext, peer_key_version "
+            "FROM channel_bindings WHERE binding_id=?",
+            (first.binding_id,),
+        ).fetchone()
+    with store.write() as conn:
+        conn.execute(
+            "INSERT INTO channel_bindings VALUES (?, ?, ?, ?, ?, ?, 'active', 1, 1)",
+            (
+                "cb_shared",
+                first.external_identity_id,
+                second.account_id,
+                "shared-conversation",
+                peer["peer_ciphertext"],
+                peer["peer_key_version"],
+            ),
+        )
+    with store.read() as conn:
+        row = conn.execute(
+            "SELECT account_id, external_identity_id FROM channel_bindings "
+            "WHERE binding_id='cb_shared'"
+        ).fetchone()
+    assert tuple(row) == (second.account_id, first.external_identity_id)
+
+    with pytest.raises(sqlite3.IntegrityError, match="identity mismatch"):
+        with store.write() as conn:
+            conn.execute(
+                "INSERT INTO channel_bindings VALUES (?, ?, ?, ?, ?, ?, 'active', 1, 1)",
+                (
+                    "cb_provider_mismatch",
+                    first.external_identity_id,
+                    "other-provider-account",
+                    "other-conversation",
+                    peer["peer_ciphertext"],
+                    peer["peer_key_version"],
+                ),
+            )
 
 
 def test_owner_binding_trigger_is_immutable(store):

@@ -10,9 +10,11 @@ import pytest
 
 
 @pytest.fixture
-def temp_home(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    yield tmp_path
+def temp_home(tmp_path):
+    from cron.jobs import CronStore, use_store
+
+    with use_store(CronStore(tmp_path)):
+        yield tmp_path
 
 
 def test_notify_helper_calls_provider_on_jobs_changed(monkeypatch):

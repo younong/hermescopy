@@ -57,15 +57,6 @@ export const tr: Translations = {
     footer: {
       org: "Nous Research",
     },
-    activeSessionsLabel: "Aktif Oturumlar:",
-    gatewayStatusLabel: "Ağ Geçidi Durumu:",
-    gatewayStrip: {
-      failed: "Başlatma başarısız",
-      off: "Kapalı",
-      running: "Çalışıyor",
-      starting: "Başlatılıyor",
-      stopped: "Durduruldu",
-    },
     nav: {
       analytics: "Analiz",
       chat: "Sohbet",
@@ -87,7 +78,6 @@ export const tr: Translations = {
     openNavigation: "Gezintiyi aç",
     pluginNavSection: "Eklentiler",
     sessionsActiveCount: "{count} aktif",
-    statusOverview: "Durum özeti",
     system: "Sistem",
     webUi: "Web UI",
   },
@@ -273,10 +263,9 @@ export const tr: Translations = {
     triggerNow: "Şimdi tetikle",
     delivery: {
       local: "Yerel",
-      telegram: "Telegram",
-      discord: "Discord",
-      slack: "Slack",
-      email: "Email",
+      weixin_ilink: "Weixin iLink",
+      feishu: "Feishu",
+      webhook: "Webhook",
     },
   },
 
@@ -408,7 +397,6 @@ export const tr: Translations = {
       tts: "Metinden Konuşmaya",
       stt: "Konuşmadan Metne",
       logging: "Günlükleme",
-      discord: "Discord",
       auxiliary: "Yardımcı",
     },
   },

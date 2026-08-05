@@ -92,35 +92,29 @@ class _Codex401ThenSuccessAgent(run_agent.AIAgent):
         return super().run_conversation(user_message, conversation_history=conversation_history, task_id=task_id)
 
 
-def test_cron_run_job_codex_path_handles_internal_401_refresh(monkeypatch):
-    _patch_agent_bootstrap(monkeypatch)
-    monkeypatch.setattr(run_agent, "OpenAI", _FakeOpenAI)
-    monkeypatch.setattr(run_agent, "AIAgent", _Codex401ThenSuccessAgent)
+def test_cron_codex_job_cannot_construct_agent_directly(monkeypatch):
+    constructed = []
     monkeypatch.setattr(
-        "hermes_cli.runtime_provider.resolve_runtime_provider",
-        lambda requested=None: {
-            "provider": "openai-codex",
-            "api_mode": "codex_responses",
-            "base_url": "https://chatgpt.com/backend-api/codex",
-            "api_key": "codex-token",
-        },
-    )
-    monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
-
-    _Codex401ThenSuccessAgent.refresh_attempts = 0
-    _Codex401ThenSuccessAgent.last_init = {}
-
-    success, output, final_response, error = cron_scheduler.run_job(
-        {"id": "job-1", "name": "Codex Refresh Test", "prompt": "ping", "model": "gpt-5.3-codex"}
+        run_agent,
+        "AIAgent",
+        lambda *_args, **_kwargs: constructed.append(True),
     )
 
-    assert success is True
-    assert error is None
-    assert final_response == "Recovered via refresh"
-    assert "Recovered via refresh" in output
-    assert _Codex401ThenSuccessAgent.refresh_attempts == 1
-    assert _Codex401ThenSuccessAgent.last_init["provider"] == "openai-codex"
-    assert _Codex401ThenSuccessAgent.last_init["api_mode"] == "codex_responses"
+    try:
+        cron_scheduler.run_job(
+            {
+                "id": "job-1",
+                "name": "Codex Refresh Test",
+                "prompt": "ping",
+                "model": "gpt-5.3-codex",
+                "provider": "openai-codex",
+            }
+        )
+    except RuntimeError as exc:
+        assert "structured gateway dispatcher" in str(exc)
+    else:
+        raise AssertionError("Agent cron job did not fail closed")
+    assert constructed == []
 
 
 def test_gateway_run_agent_codex_path_handles_internal_401_refresh(monkeypatch):

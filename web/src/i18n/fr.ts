@@ -57,15 +57,6 @@ export const fr: Translations = {
     footer: {
       org: "Nous Research",
     },
-    activeSessionsLabel: "Sessions actives:",
-    gatewayStatusLabel: "État de la passerelle:",
-    gatewayStrip: {
-      failed: "Échec du démarrage",
-      off: "Désactivé",
-      running: "En cours",
-      starting: "Démarrage",
-      stopped: "Arrêté",
-    },
     nav: {
       analytics: "Analyses",
       chat: "Chat",
@@ -87,7 +78,6 @@ export const fr: Translations = {
     openNavigation: "Ouvrir la navigation",
     pluginNavSection: "Plugins",
     sessionsActiveCount: "{count} actives",
-    statusOverview: "Aperçu de l'état",
     system: "Système",
     webUi: "Web UI",
   },
@@ -273,10 +263,9 @@ export const fr: Translations = {
     triggerNow: "Déclencher maintenant",
     delivery: {
       local: "Local",
-      telegram: "Telegram",
-      discord: "Discord",
-      slack: "Slack",
-      email: "Email",
+      weixin_ilink: "Weixin iLink",
+      feishu: "Feishu",
+      webhook: "Webhook",
     },
   },
 
@@ -409,7 +398,6 @@ export const fr: Translations = {
       tts: "Synthèse vocale",
       stt: "Reconnaissance vocale",
       logging: "Journalisation",
-      discord: "Discord",
       auxiliary: "Auxiliaire",
     },
   },

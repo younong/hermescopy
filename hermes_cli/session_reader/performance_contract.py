@@ -78,7 +78,7 @@ def populate_large_session_history(
             sessions.append(
                 (
                     session_id,
-                    "gui",
+                    "dashboard-gui",
                     parent_id,
                     started_at,
                     started_at + 0.5 if compressed else None,

@@ -57,15 +57,6 @@ export const af: Translations = {
     footer: {
       org: "Nous Research",
     },
-    activeSessionsLabel: "Aktiewe Sessies:",
-    gatewayStatusLabel: "Gateway-status:",
-    gatewayStrip: {
-      failed: "Begin het misluk",
-      off: "Af",
-      running: "Loop",
-      starting: "Begin",
-      stopped: "Gestop",
-    },
     nav: {
       analytics: "Analise",
       chat: "Klets",
@@ -87,7 +78,6 @@ export const af: Translations = {
     openNavigation: "Maak navigasie oop",
     pluginNavSection: "Inproppe",
     sessionsActiveCount: "{count} aktief",
-    statusOverview: "Statusoorsig",
     system: "Stelsel",
     webUi: "Web UI",
   },
@@ -273,10 +263,9 @@ export const af: Translations = {
     triggerNow: "Voer nou uit",
     delivery: {
       local: "Plaaslik",
-      telegram: "Telegram",
-      discord: "Discord",
-      slack: "Slack",
-      email: "Email",
+      weixin_ilink: "Weixin iLink",
+      feishu: "Feishu",
+      webhook: "Webhook",
     },
   },
 
@@ -408,7 +397,6 @@ export const af: Translations = {
       tts: "Teks-na-Spraak",
       stt: "Spraak-na-Teks",
       logging: "Aantekening",
-      discord: "Discord",
       auxiliary: "Hulpmiddels",
     },
   },

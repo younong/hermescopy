@@ -74,7 +74,7 @@ def test_authority_concurrency_smoke_passes_with_complete_contract(tmp_path):
     assert observations["workerTransitions"] == 3  # type: ignore[index]
     assert observations["checkpoint"]["busy"] == 0  # type: ignore[index]
     assert observations["integrity"] == "ok"  # type: ignore[index]
-    assert observations["schemaVersion"] == 6  # type: ignore[index]
+    assert observations["schemaVersion"] == 9  # type: ignore[index]
     assert observations["recoveryRequired"] == 0  # type: ignore[index]
     assert observations["recoveryArtifacts"] == 0  # type: ignore[index]
     assert payload["cleanup"] == {

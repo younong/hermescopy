@@ -64,7 +64,6 @@ import { useToast } from "@nous-research/ui/hooks/use-toast";
 import { sessionCompositionTranslations, useI18n } from "@/i18n";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { PluginSlot } from "@/plugins";
-import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
 import { useLoadEarlierOnScroll } from "@/hooks/useLoadEarlierOnScroll";
 
 const SOURCE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> =
@@ -761,7 +760,7 @@ export function sessionDateFilter(range: SessionDateRange) {
 }
 
 export function fetchSessionsOverview() {
-  return api.getSessions(OVERVIEW_SESSION_LIMIT, 0, undefined, "recent", true);
+  return api.getSessions(OVERVIEW_SESSION_LIMIT, 0, "recent", true);
 }
 
 export function scheduleSessionsOverviewPoll(
@@ -884,7 +883,6 @@ export default function SessionsPage() {
   const compositionText = sessionCompositionTranslations(t);
   const { setAfterTitle, setEnd } = usePageHeader();
   const { activeAction, actionStatus, dismissLog } = useSystemActions();
-  const resumeInChatEnabled = isDashboardEmbeddedChatEnabled();
 
   const refreshEmptyCount = useCallback(() => {
     api
@@ -941,7 +939,6 @@ export default function SessionsPage() {
       .getSessions(
         PAGE_SIZE,
         p * PAGE_SIZE,
-        undefined,
         "created",
         false,
         { ...sessionDateFilter(dateRange), signal: controller.signal },
@@ -1082,7 +1079,6 @@ export default function SessionsPage() {
       api
         .searchSessions(
           search.trim(),
-          undefined,
           controller.signal,
           sessionDateFilter(dateRange),
         )
@@ -1308,11 +1304,6 @@ export default function SessionsPage() {
       try {
         const res = await fetch(api.exportSessionUrl(id), {
           credentials: "include",
-          headers: {
-            "X-Hermes-Session-Token":
-              (window as unknown as { __HERMES_SESSION_TOKEN__?: string })
-                .__HERMES_SESSION_TOKEN__ ?? "",
-          },
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const blob = await res.blob();
@@ -1620,9 +1611,7 @@ export default function SessionsPage() {
               )}
 
               <span className="text-xs font-mondwest tracking-[0.12em] truncate">
-                {activeAction === "restart"
-                  ? t.status.restartGateway
-                  : t.status.updateHermes}
+                {t.status.updateHermes}
               </span>
 
               <Badge
@@ -1889,7 +1878,7 @@ export default function SessionsPage() {
                   onDelete={() => sessionDelete.requestDelete(s.id)}
                   onRename={handleRename}
                   onExport={handleExport}
-                  resumeInChatEnabled={resumeInChatEnabled}
+                  resumeInChatEnabled
                 />
               ))}
             </div>

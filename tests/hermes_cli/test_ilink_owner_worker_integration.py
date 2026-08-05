@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import shutil
 import tempfile
 import threading
@@ -15,6 +14,10 @@ from pathlib import Path
 import pytest
 
 from gateway.weixin_ilink import ILinkCredentials
+from hermes_cli.channel_connectors.weixin_ilink.dispatch_hooks import (
+    WeixinDispatchHooks,
+    encode_weixin_outbound,
+)
 from hermes_cli.channel_connectors.weixin_ilink.enrollment import EnrollmentManager
 from hermes_cli.channel_connectors.weixin_ilink.poller import (
     AccountPoller,
@@ -128,7 +131,7 @@ class _FakeILinkSession:
 
 
 @contextmanager
-def _inference_server():
+def _inference_server(*, outbound_media_root: Path):
     requests: list[dict] = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -139,8 +142,8 @@ def _inference_server():
             if len(requests) == 1:
                 reply = "long integration reply " + "word " * 900
             elif len(requests) == 4:
-                media_path = Path(os.environ["HERMES_HOME"]) / "media" / "outbound.png"
-                media_path.parent.mkdir(parents=True, exist_ok=True)
+                outbound_media_root.mkdir(parents=True, exist_ok=True)
+                media_path = outbound_media_root / "outbound.png"
                 media_path.write_bytes(b"outbound image")
                 reply = f"media reply\nMEDIA:{media_path}"
             else:
@@ -245,7 +248,11 @@ async def _enroll(
             JOIN external_identities e ON e.external_identity_id=b.external_identity_id
             WHERE e.subject_lookup_hash=?
             """,
-            (manager.store.crypto.lookup_hash("external-subject", user_id),),
+            (
+                manager.store.crypto.lookup_hash(
+                    "external-subject:weixin_ilink", user_id
+                ),
+            ),
         ).fetchone()
     assert row is not None
     return resolve_binding(manager.store, binding_id=row["binding_id"])
@@ -256,7 +263,7 @@ async def test_ilink_enrollment_poll_dispatch_send_and_generation_resume(monkeyp
     import hermes_cli.controlled_roots as controlled_roots
     import hermes_cli.owner_worker.supervisor as supervisor_module
 
-    root = Path(tempfile.mkdtemp(prefix="hi", dir="/tmp"))
+    root = Path(tempfile.mkdtemp(prefix="hi", dir="/tmp")).resolve()
     monkeypatch.setenv("HERMES_HOME", str(root))
     monkeypatch.setenv("HERMES_OWNER_SECRET", "ilink-integration-owner-secret")
     child_shim = root / "child-shim"
@@ -280,13 +287,29 @@ async def test_ilink_enrollment_poll_dispatch_send_and_generation_resume(monkeyp
         ChannelCrypto(
             lookup=Keyring(keys={1: b"l" * 32}, active_version=1),
             encryption=Keyring(keys={1: b"e" * 32}, active_version=1),
-        )
+        ),
+        root / "control-plane",
+        global_home=root,
     )
     ilink = _FakeILinkSession()
     enrollments = EnrollmentManager(store, ilink, poll_interval_seconds=0.01)
+    dashboard_owner = owner_context_from_session(
+        Session(
+            user_id="dashboard-user-a",
+            email="dashboard-user-a@example.test",
+            display_name="Dashboard User A",
+            org_id="org-a",
+            provider="stub",
+            expires_at=9_999_999_999,
+            access_token="access",
+            refresh_token="refresh",
+        )
+    )
+    ensure_owner_home(dashboard_owner)
     supervisor = None
     try:
-        with _inference_server() as (inference, model_requests):
+        outbound_media_root = root / "users" / dashboard_owner.owner_key / "workspaces" / "default"
+        with _inference_server(outbound_media_root=outbound_media_root) as (inference, model_requests):
             policy = DeploymentInferencePolicy(
                 provider="custom:deployment",
                 model="gpt-safe",
@@ -305,11 +328,14 @@ async def test_ilink_enrollment_poll_dispatch_send_and_generation_resume(monkeyp
                 startup_cooldown=0,
                 deployment_inference_policy=policy,
             )
+            dispatch_hooks = WeixinDispatchHooks(ilink)
             dispatcher = ChannelDispatcher(
                 store,
                 supervisor,
+                provider="weixin_ilink",
                 turn_timeout=30,
-                media_session=ilink,
+                media_materializer=dispatch_hooks.materialize,
+                outbound_encoder=encode_weixin_outbound,
             )
             sender = OutboundSender(
                 store,
@@ -318,19 +344,6 @@ async def test_ilink_enrollment_poll_dispatch_send_and_generation_resume(monkeyp
                 chunk_delay_seconds=0,
             )
 
-            dashboard_owner = owner_context_from_session(
-                Session(
-                    user_id="dashboard-user-a",
-                    email="dashboard-user-a@example.test",
-                    display_name="Dashboard User A",
-                    org_id="org-a",
-                    provider="stub",
-                    expires_at=9_999_999_999,
-                    access_token="access",
-                    refresh_token="refresh",
-                )
-            )
-            ensure_owner_home(dashboard_owner)
             owner_homes_before = set((root / "users").iterdir())
             owner_a, channel_a = await _enroll(
                 enrollments,
