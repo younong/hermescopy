@@ -640,7 +640,7 @@ def run_smoke(
 ) -> tuple[dict[str, Any], int]:
     started_all = time.monotonic()
     checks: list[dict[str, Any]] = []
-    temporary = Path(tempfile.mkdtemp(prefix="hcs-", dir="/tmp"))
+    temporary = Path(tempfile.mkdtemp(prefix="hcs-"))
     home = temporary / "home"
     workspace = home / "workspaces" / "default"
     workspace.mkdir(parents=True)

@@ -65,6 +65,34 @@ def test_deterministic_conversation_smoke_exercises_authenticated_web_flow():
     assert checks["config_propagation"]["provider"] == "custom:hermes-smoke"
 
 
+def test_deterministic_smoke_uses_environment_temporary_directory(monkeypatch, tmp_path):
+    module = _load_smoke_module()
+    temporary = tmp_path / "owned-smoke-root"
+    arguments = {}
+
+    def fake_mkdtemp(**kwargs):
+        arguments.update(kwargs)
+        return str(temporary)
+
+    class FailingModel:
+        def __init__(self, _workspace):
+            pass
+
+        def start(self):
+            raise RuntimeError("stop after temporary directory creation")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(module.tempfile, "mkdtemp", fake_mkdtemp)
+    monkeypatch.setattr(module, "ModelStub", FailingModel)
+
+    _, status = module.run_smoke(ROOT, 10)
+
+    assert status == 1
+    assert arguments == {"prefix": "hcs-"}
+
+
 def test_dashboard_gateway_cleanup_terminates_descendants_after_parent_exit(monkeypatch):
     module = _load_smoke_module()
     gateway = module.DashboardGateway.__new__(module.DashboardGateway)
