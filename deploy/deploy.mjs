@@ -749,33 +749,37 @@ restore_deployment_state() {
 }
 
 snapshot_authority() {
+  local authority_source="$hermes_home/control-plane/authority.sqlite3"
+  if [ ! -f "$authority_source" ]; then
+    authority_snapshot=""
+    return 0
+  fi
   authority_snapshot="$rollback_dir/authority/authority.sqlite3"
   install -d -o "$service_user" -g "$service_group" -m 0700 "$(dirname "$authority_snapshot")"
   runuser -u "$service_user" -- env -i \
-    HOME="$shared" HERMES_HOME="$hermes_home" PYTHONPATH="$release" \
-    "$venv/bin/python" - "$authority_snapshot" <<'PY'
+    HOME="$shared" HERMES_HOME="$hermes_home" \
+    "$venv/bin/python" - "$authority_source" "$authority_snapshot" <<'PY'
 import os
 import sqlite3
 import sys
 from pathlib import Path
 
-from hermes_cli.dashboard_auth.authority import AuthorityStore, control_plane_home
-from hermes_cli.dashboard_auth.lifecycle import authority_lifecycle_lock
-
-store = AuthorityStore(control_plane_home())
-destination = Path(sys.argv[1])
-with authority_lifecycle_lock(store.control_home, exclusive=True, blocking=True):
-    store._validate_path()
-    source = sqlite3.connect(store.path, timeout=30)
-    target = sqlite3.connect(destination, timeout=30)
-    try:
-        source.backup(target)
-        integrity = target.execute("PRAGMA integrity_check").fetchone()
-        if not integrity or str(integrity[0]).lower() != "ok":
-            raise RuntimeError("authority snapshot integrity check failed")
-    finally:
-        target.close()
-        source.close()
+source_path = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+source = sqlite3.connect(
+    f"file:{source_path.resolve().as_posix()}?mode=ro",
+    uri=True,
+    timeout=30,
+)
+target = sqlite3.connect(destination, timeout=30)
+try:
+    source.backup(target)
+    integrity = target.execute("PRAGMA integrity_check").fetchone()
+    if not integrity or str(integrity[0]).lower() != "ok":
+        raise RuntimeError("authority snapshot integrity check failed")
+finally:
+    target.close()
+    source.close()
 os.chmod(destination, 0o600)
 PY
   chown -R root:"$service_group" "$(dirname "$authority_snapshot")"
@@ -785,40 +789,45 @@ PY
 
 restore_authority_snapshot() {
   [ -n "$authority_snapshot" ] && [ -f "$authority_snapshot" ] || return 0
+  local authority_target="$hermes_home/control-plane/authority.sqlite3"
   runuser -u "$service_user" -- env -i \
-    HOME="$shared" HERMES_HOME="$hermes_home" PYTHONPATH="$release" \
-    "$venv/bin/python" - "$authority_snapshot" <<'PY'
+    HOME="$shared" HERMES_HOME="$hermes_home" \
+    "$venv/bin/python" - "$authority_snapshot" "$authority_target" <<'PY'
 import os
 import sqlite3
 import sys
 from pathlib import Path
 
-from hermes_cli.dashboard_auth.authority import AuthorityStore, control_plane_home
-from hermes_cli.dashboard_auth.lifecycle import authority_lifecycle_lock
-
 source_path = Path(sys.argv[1])
-store = AuthorityStore(control_plane_home())
-with authority_lifecycle_lock(store.control_home, exclusive=True, blocking=True):
-    source = sqlite3.connect(
-        f"file:{source_path.resolve().as_posix()}?mode=ro&immutable=1",
-        uri=True,
-        timeout=30,
-    )
-    target = sqlite3.connect(store.path, timeout=30)
+target_path = Path(sys.argv[2])
+restore_path = Path(str(target_path) + ".rollback")
+for path in (restore_path, Path(str(restore_path) + "-wal"), Path(str(restore_path) + "-shm")):
     try:
-        source.backup(target)
-        integrity = target.execute("PRAGMA integrity_check").fetchone()
-        if not integrity or str(integrity[0]).lower() != "ok":
-            raise RuntimeError("restored authority integrity check failed")
-        target.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    finally:
-        target.close()
-        source.close()
-os.chmod(store.path, 0o600)
+        path.unlink()
+    except FileNotFoundError:
+        pass
+source = sqlite3.connect(
+    f"file:{source_path.resolve().as_posix()}?mode=ro&immutable=1",
+    uri=True,
+    timeout=30,
+)
+target = sqlite3.connect(restore_path, timeout=30)
+try:
+    source.backup(target)
+    integrity = target.execute("PRAGMA integrity_check").fetchone()
+    if not integrity or str(integrity[0]).lower() != "ok":
+        raise RuntimeError("restored authority integrity check failed")
+finally:
+    target.close()
+    source.close()
+os.chmod(restore_path, 0o600)
+os.replace(restore_path, target_path)
 for suffix in ("-wal", "-shm"):
-    sidecar = Path(str(store.path) + suffix)
-    if sidecar.exists():
+    sidecar = Path(str(target_path) + suffix)
+    try:
         sidecar.unlink()
+    except FileNotFoundError:
+        pass
 PY
 }
 
