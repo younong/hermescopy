@@ -1877,6 +1877,10 @@ function printSummary(args, result) {
     }
   }
   console.log(`Deterministic conversation smoke: ${result.deterministicSmoke}`);
+  if (result.deterministicSmokeResult?.failure) {
+    const failure = result.deterministicSmokeResult.failure;
+    console.log(`Deterministic failure: ${failure.code}/${failure.check}`);
+  }
   console.log(`Cross-release conversation continuity: ${result.continuitySmoke}`);
   console.log(`Public real-AI conversation smoke: ${result.publicSmoke}`);
   const publicLatency = publicReaderLatency(result.publicSmokeResult);
@@ -1986,6 +1990,10 @@ function main() {
             : "failed or not reached",
         readerPerformanceResult,
         deterministicSmoke: "failed or not reached",
+        deterministicSmokeResult: parseSmokeResult(
+          error?.commandResult?.stdout,
+          "hermes.conversation-smoke",
+        ),
         continuitySmoke:
           args.initialContinuityTransition || args.dryRun || continuityPrepare?.status !== "passed"
             ? continuityPrepare?.status || "not run"
