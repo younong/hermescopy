@@ -403,6 +403,7 @@ def test_isolated_smoke_policy_uses_production_policy_for_control_plane(tmp_path
 
     assert policy.owner_root == config.owner_root
     assert policy.resource_policy is config.resource_policy
+    assert policy.recover_stale_resource_scopes is False
 
 
 def test_isolated_smoke_policy_rebinds_only_exact_temporary_owner_root(tmp_path, monkeypatch):

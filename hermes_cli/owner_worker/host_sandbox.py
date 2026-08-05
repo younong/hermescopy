@@ -367,7 +367,10 @@ def isolated_smoke_sandbox_deployment_policy(
     config = load_host_sandbox_config(policy_path)
     owner_key = os.environ.get("HERMES_OWNER_KEY", "").strip()
     if not owner_key:
-        policy = build_host_sandbox_deployment_policy(config)
+        policy = build_host_sandbox_deployment_policy(
+            config,
+            recover_stale_resource_scopes=False,
+        )
         if policy.resource_policy is None:
             raise HostSandboxInvalid("host sandbox resource policy is required")
         return policy

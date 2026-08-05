@@ -281,7 +281,7 @@ def test_deploy_gates_commit_on_isolated_conversation_smoke():
     web_server_source = (ROOT / "hermes_cli" / "web_server.py").read_text(
         encoding="utf-8"
     )
-    assert "recover_stale_resource_scopes=False" in host_sandbox_source
+    assert host_sandbox_source.count("recover_stale_resource_scopes=False") == 2
     assert "sandbox_deployment_policy.recover_stale_resource_scopes" in web_server_source
     smoke_block = source[source.index('if ! conversation_smoke_result="$(', reader_smoke) : nginx]
     assert 'printf \'%s\\n\' "$conversation_smoke_result"' in smoke_block
