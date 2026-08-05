@@ -651,6 +651,7 @@ def run_smoke(
 ) -> tuple[dict[str, Any], int]:
     started_all = time.monotonic()
     checks: list[dict[str, Any]] = []
+    owns_temporary = root is None
     temporary = root.resolve() if root is not None else Path(tempfile.mkdtemp(prefix="hcs-"))
     home = temporary / "home"
     workspace = home / "workspaces" / "default"
@@ -826,9 +827,20 @@ def run_smoke(
         if gateway is not None:
             gateway.close()
         model.close()
-        shutil.rmtree(temporary, ignore_errors=True)
+        if owns_temporary:
+            shutil.rmtree(temporary, ignore_errors=True)
+        else:
+            for child in temporary.iterdir():
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
 
-    artifacts_cleaned = not temporary.exists()
+    artifacts_cleaned = (
+        not temporary.exists()
+        if owns_temporary
+        else not any(temporary.iterdir())
+    )
     cleanup_started = time.monotonic()
     if artifacts_cleaned and failure is None:
         _record(checks, "artifact_cleanup", cleanup_started)

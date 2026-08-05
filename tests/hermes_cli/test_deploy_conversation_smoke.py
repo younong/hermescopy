@@ -117,7 +117,8 @@ def test_deterministic_smoke_uses_exact_operator_root(monkeypatch, tmp_path):
     _, status = module.run_smoke(ROOT, 10, root=temporary)
 
     assert status == 1
-    assert not temporary.exists()
+    assert temporary.is_dir()
+    assert not any(temporary.iterdir())
 
 
 def test_dashboard_gateway_cleanup_terminates_descendants_after_parent_exit(monkeypatch):
