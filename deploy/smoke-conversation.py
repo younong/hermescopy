@@ -308,12 +308,21 @@ class DashboardGateway:
         cookie_header = "; ".join(
             f"{cookie.name}={cookie.value}" for cookie in self.client.cookies.jar
         )
-        self.websocket = connect(
-            f"ws://127.0.0.1:{port}/api/ws?ticket={quote(ticket, safe='')}",
-            additional_headers={"Cookie": cookie_header},
-            open_timeout=15,
-            close_timeout=3,
-        )
+        try:
+            self.websocket = connect(
+                f"ws://127.0.0.1:{port}/api/ws?ticket={quote(ticket, safe='')}",
+                additional_headers={"Cookie": cookie_header},
+                open_timeout=15,
+                close_timeout=3,
+            )
+        except Exception as exc:
+            detail = " | ".join(self.stderr[-5:]) if self.stderr else "no dashboard error output"
+            self.close()
+            raise SmokeFailure(
+                "websocket_connect_failed",
+                "ws_ticket",
+                f"WebSocket upgrade failed ({type(exc).__name__}): {detail}",
+            ) from exc
         self.reader_thread = threading.Thread(target=self._read_messages, daemon=True)
         self.reader_thread.start()
 
