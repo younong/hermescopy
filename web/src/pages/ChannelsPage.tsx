@@ -26,10 +26,28 @@ import type {
   FeishuLifecycleStatus,
   MessagingPlatform,
   MessagingPlatformEnvVar,
+  MessagingPlatformsResponse,
   MessagingPlatformUpdate,
 } from "@/lib/api";
 import { useModalBehavior } from "@/hooks/useModalBehavior";
+import { useDashboardAuthIdentity } from "@/lib/useDashboardAuthIdentity";
 import { cn, themedBody } from "@/lib/utils";
+
+const MANAGED_FEISHU_PLATFORM: MessagingPlatform = {
+  id: "feishu",
+  name: "Feishu / Lark",
+  description: "Managed Feishu and Lark AI employees",
+  docs_url: "",
+  enabled: true,
+  configured: true,
+  gateway_running: true,
+  state: "managed",
+  error_code: null,
+  error_message: null,
+  updated_at: null,
+  home_channel: null,
+  env_vars: [],
+};
 
 const STATE_BADGE: Record<
   string,
@@ -79,6 +97,7 @@ type EmployeeEditor =
   | { mode: "profile" | "credentials"; employee: FeishuEmployee };
 
 export default function ChannelsPage() {
+  const { authRequired } = useDashboardAuthIdentity();
   const [platforms, setPlatforms] = useState<MessagingPlatform[]>([]);
   const [envPath, setEnvPath] = useState("~/.hermes/.env");
   const [employees, setEmployees] = useState<FeishuEmployee[]>([]);
@@ -114,8 +133,15 @@ export default function ChannelsPage() {
   const [employeeBusy, setEmployeeBusy] = useState<string | null>(null);
 
   const load = useCallback(() => {
+    const platformsRequest = authRequired
+      ? Promise.resolve<MessagingPlatformsResponse>({
+          env_path: "",
+          gateway_start_command: "",
+          platforms: [],
+        })
+      : api.getMessagingPlatforms();
     return Promise.all([
-      api.getMessagingPlatforms(),
+      platformsRequest,
       api.getFeishuEmployees().catch(() => ({ employees: [] })),
       api.getFeishuEmployeeCatalog().catch(() => null),
     ])
@@ -126,7 +152,7 @@ export default function ChannelsPage() {
         setCatalog(catalogResponse);
       })
       .catch((e) => showToast(`Error: ${e}`, "error"));
-  }, [showToast]);
+  }, [authRequired, showToast]);
 
   useEffect(() => {
     load().finally(() => setLoading(false));
@@ -306,7 +332,14 @@ export default function ChannelsPage() {
     }
   };
 
-  const configured = useMemo(() => platforms.filter((item) => item.configured).length, [platforms]);
+  const displayedPlatforms = useMemo(
+    () => authRequired ? [MANAGED_FEISHU_PLATFORM] : platforms,
+    [authRequired, platforms],
+  );
+  const configured = useMemo(
+    () => displayedPlatforms.filter((item) => item.configured).length,
+    [displayedPlatforms],
+  );
 
   if (loading) {
     return <div className="flex items-center justify-center py-24"><Spinner className="text-2xl text-primary" /></div>;
@@ -316,8 +349,11 @@ export default function ChannelsPage() {
     <div className="flex flex-col gap-6">
       <Toast toast={toast} />
       <p className="text-xs text-muted-foreground">
-        {configured} of {platforms.length} channels configured. Legacy credentials are written to{" "}
-        <code className="font-courier">{envPath}</code>. Managed Feishu App Secrets are encrypted in the control plane.
+        {authRequired ? (
+          <>Managed Feishu App Secrets are encrypted in the control plane.</>
+        ) : (
+          <>{configured} of {displayedPlatforms.length} channels configured. Legacy credentials are written to{" "}<code className="font-courier">{envPath}</code>.</>
+        )}
       </p>
 
       {editing && (
@@ -374,7 +410,7 @@ export default function ChannelsPage() {
       )}
 
       <div className="grid gap-3">
-        {platforms.map((platform) => {
+        {displayedPlatforms.map((platform) => {
           const badge = stateBadge(platform.state);
           const StateIcon = platform.state === "connected" ? CheckCircle2 : platform.state === "fatal" || platform.state === "startup_failed" ? AlertTriangle : Radio;
           return (
