@@ -456,6 +456,7 @@ class SandboxMountPolicy:
     control_home: Path | None
     owner_root: Path | None = None
     readonly_mounts: tuple[SandboxReadonlyMount, ...] = ()
+    knowledge_mounts: tuple[PurePosixPath | str, ...] = ()
     python_executable: PurePosixPath | str | None = None
     root_tmpfs_bytes: int = 64 << 20
     executor_tmpfs_bytes: int = 32 << 20
@@ -515,8 +516,28 @@ class SandboxMountPolicy:
             _posix_contains(mount.destination, python_executable) for mount in mounts
         ):
             raise ExecutorIsolationUnavailable("sandbox Python executable is outside readonly mounts")
+        knowledge_mounts = tuple(
+            PurePosixPath(str(path)) for path in self.knowledge_mounts
+        )
+        knowledge_root = PurePosixPath("/knowledge")
+        if any(
+            not path.is_absolute()
+            or not _posix_contains(knowledge_root, path)
+            or path == knowledge_root
+            or ".." in path.parts
+            or "\x00" in str(path)
+            for path in knowledge_mounts
+        ) or len(set(knowledge_mounts)) != len(knowledge_mounts):
+            raise ExecutorIsolationUnavailable("sandbox knowledge mounts are invalid")
+        if any(
+            _posix_overlaps(first, second)
+            for index, first in enumerate(knowledge_mounts)
+            for second in knowledge_mounts[index + 1 :]
+        ):
+            raise ExecutorIsolationUnavailable("sandbox knowledge mounts overlap")
         object.__setattr__(self, "readonly_mounts", mounts)
         object.__setattr__(self, "readonly_global_roots", tuple(mount.source for mount in mounts))
+        object.__setattr__(self, "knowledge_mounts", knowledge_mounts)
         object.__setattr__(self, "python_executable", python_executable)
         object.__setattr__(self, "workspace_root", workspace)
         object.__setattr__(self, "control_home", control)
@@ -529,6 +550,7 @@ class SandboxMountPolicy:
             ],
             "python_executable": str(python_executable),
             "workspace": self.binding.workspace_mount,
+            "knowledge": [str(path) for path in knowledge_mounts],
             "runtime": self.binding.runtime_mount,
             "tmp": self.binding.tmp_mount,
             "root_tmpfs_bytes": self.root_tmpfs_bytes,
@@ -830,6 +852,7 @@ def build_bubblewrap_launch_spec(
     *,
     environment: Mapping[str, str],
     workspace_fd: int,
+    knowledge_fds: Sequence[int] = (),
     binding: SandboxLaunchBinding,
     mount_policy: SandboxMountPolicy,
     security_policy: SandboxSecurityPolicy,
@@ -851,6 +874,12 @@ def build_bubblewrap_launch_spec(
         raise ExecutorIsolationUnavailable("authenticated executor isolation requires Linux Bubblewrap")
     if not isinstance(workspace_fd, int) or workspace_fd < 0:
         raise ExecutorIsolationUnavailable("workspace descriptor is invalid")
+    knowledge_fds = tuple(knowledge_fds)
+    if (
+        len(knowledge_fds) != len(mount_policy.knowledge_mounts)
+        or any(not isinstance(fd, int) or fd < 0 for fd in knowledge_fds)
+    ):
+        raise ExecutorIsolationUnavailable("knowledge descriptors are invalid")
     if info_fd is not None and (not isinstance(info_fd, int) or info_fd < 0):
         raise ExecutorIsolationUnavailable("Bubblewrap info descriptor is invalid")
 
@@ -898,7 +927,12 @@ def build_bubblewrap_launch_spec(
         argv.extend(("--setenv", key, value))
     sandbox_runtime = Path("/executor")
     destinations = tuple(Path(str(mount.destination)) for mount in readonly_mounts)
-    for directory in _sandbox_destination_dirs((*destinations, sandbox_runtime)):
+    knowledge_destinations = tuple(
+        Path(str(destination)) for destination in mount_policy.knowledge_mounts
+    )
+    for directory in _sandbox_destination_dirs(
+        (*destinations, *knowledge_destinations, sandbox_runtime)
+    ):
         argv.extend(("--dir", str(directory)))
     mount_fds: list[int] = []
     try:
@@ -916,6 +950,10 @@ def build_bubblewrap_launch_spec(
         raise
     # `--bind-fd` consumes only the descriptor passed through Popen.pass_fds;
     # the workspace host path is never an argv or environment authority input.
+    for knowledge_fd, destination in zip(
+        knowledge_fds, mount_policy.knowledge_mounts, strict=True
+    ):
+        argv.extend(("--ro-bind-fd", str(knowledge_fd), str(destination)))
     argv.extend((
         # LibreOffice's Unix launcher requires a writable literal /tmp or
         # /var/tmp for its startup pipe and ignores TMPDIR for that check.

@@ -24,6 +24,9 @@ class NormalizedInboundEnvelope:
     context_token: str | None = None
     rejection_reason: str | None = None
     metadata: Mapping[str, Any] | None = None
+    dispatch_scope: str | None = None
+    profile_revision: int | None = None
+    group_admission_token: str | None = None
 
 
 @dataclass(frozen=True)

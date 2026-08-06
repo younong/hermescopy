@@ -519,6 +519,31 @@ class TestDelegateTask(unittest.TestCase):
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["api_mode"], parent.api_mode)
 
+    def test_child_inherits_employee_policy(self):
+        parent = _make_mock_parent(depth=0)
+        parent.employee_policy = {
+            "workspace_relative_path": "employees/analyst",
+            "knowledge_relative_paths": ["knowledge/reference"],
+        }
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Stay inside the employee capability",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertIs(
+            MockAgent.call_args.kwargs["employee_policy"],
+            parent.employee_policy,
+        )
+
     def test_child_inherits_parent_print_fn(self):
         parent = _make_mock_parent(depth=0)
         sink = MagicMock()

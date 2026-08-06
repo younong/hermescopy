@@ -1579,6 +1579,14 @@ def create_app(
 
         return toolsets_payload()
 
+    @app.get("/api/messaging/feishu/catalog")
+    def get_feishu_employee_catalog(
+        _: None = Depends(_require_owner_token),
+    ) -> dict[str, Any]:
+        from hermes_cli.employee_catalog import employee_catalog_payload
+
+        return employee_catalog_payload(owner_home)
+
     @app.get("/api/model/info")
     def get_model_info(profile: str | None = None, _: None = Depends(_require_owner_token)) -> dict[str, Any]:
         _reject_profile(profile)

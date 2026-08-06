@@ -316,6 +316,29 @@ def test_resource_capacity_is_reserved_before_runtime_workspace_or_spawn(tmp_pat
     assert spawned == []
 
 
+def test_executor_session_capability_is_immutable(tmp_path):
+    roots, supervisor = _supervisor(tmp_path, _successful_factory())
+    try:
+        identity = supervisor.identity_for(
+            task_id="task-a",
+            session_id="session-a",
+            workspace_prefix="default/employees/analyst",
+            knowledge_prefixes=("default/knowledge/reference",),
+        )
+        assert identity.workspace_prefix == "default/employees/analyst"
+        assert identity.knowledge_prefixes == ("default/knowledge/reference",)
+
+        with pytest.raises(PermissionError, match="capability is immutable"):
+            supervisor.identity_for(
+                task_id="task-a",
+                session_id="session-a",
+                workspace_prefix="default/employees/other",
+                knowledge_prefixes=("default/knowledge/other",),
+            )
+    finally:
+        roots.close()
+
+
 def test_membership_mismatch_never_releases_sandbox_start_gate(tmp_path):
     events = []
     controller = _ResourceController(events)

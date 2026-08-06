@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -15,6 +16,7 @@ from hermes_cli.channel_connectors.contracts import (
 from hermes_cli.channel_identity.owner_resolution import resolve_binding
 from hermes_cli.channel_identity.store import ChannelIdentityStore
 from hermes_cli.owner_worker.gateway_client import OwnerWorkerGatewayClient
+from hermes_cli.owner_worker.tokens import CONNECTION_PURPOSE_RETAINED_CHANNEL
 
 from .session_router import open_binding_session
 
@@ -37,6 +39,7 @@ class ChannelDispatcher:
         supervisor,
         *,
         provider: str,
+        account_id: str | None = None,
         turn_timeout: float = 1800,
         media_materializer: MediaMaterializer | None = None,
         outbound_encoder: OutboundEncoder | None = None,
@@ -48,6 +51,7 @@ class ChannelDispatcher:
         self.provider = str(provider or "").strip()
         if not self.provider:
             raise ValueError("provider is required")
+        self.account_id = str(account_id or "").strip() or None
         expected_global_home = store.global_home
         supervisor_global_home = getattr(supervisor, "global_home", expected_global_home)
         if Path(supervisor_global_home).resolve() != expected_global_home:
@@ -81,21 +85,24 @@ class ChannelDispatcher:
                                           AND e.provider=a.provider
                 WHERE i.status='queued' AND i.binding_id IS NOT NULL
                   AND i.binding_sequence IS NOT NULL AND i.next_attempt_at<=?
-                  AND a.provider=?
+                  AND a.provider=? AND (? IS NULL OR i.account_id=?)
                   AND b.status='active' AND a.status='active' AND e.status='active'
                   AND NOT EXISTS (
                     SELECT 1 FROM inbound_messages earlier
                     WHERE earlier.binding_id=i.binding_id
+                      AND earlier.dispatch_scope=i.dispatch_scope
                       AND earlier.binding_sequence<i.binding_sequence
                       AND earlier.status IN ('queued','processing','outbound_pending')
                   )
                   AND NOT EXISTS (
                     SELECT 1 FROM outbound_messages o
-                    WHERE o.binding_id=i.binding_id AND o.status IN ('queued','sending')
+                    WHERE o.binding_id=i.binding_id
+                      AND o.dispatch_scope=i.dispatch_scope
+                      AND o.status IN ('queued','sending')
                   )
                 ORDER BY i.created_at, i.binding_sequence LIMIT 1
                 """,
-                (now, self.provider),
+                (now, self.provider, self.account_id, self.account_id),
             ).fetchone()
             if row is None:
                 return None
@@ -110,7 +117,9 @@ class ChannelDispatcher:
 
     async def dispatch_claim(self, claim: dict, *, holder: str) -> str:
         owner, channel = resolve_binding(self.store, binding_id=claim["binding_id"])
-        if channel.provider != self.provider:
+        if channel.provider != self.provider or (
+            self.account_id is not None and channel.account_id != self.account_id
+        ):
             self.fail_claim(
                 claim["inbound_id"], holder, "provider_mismatch", retryable=False
             )
@@ -170,11 +179,17 @@ class ChannelDispatcher:
         provider_slug = channel.provider.replace("_", "-")
         turn_key = f"channel:{provider_slug}:{claim['inbound_id']}"
         try:
-            async with OwnerWorkerGatewayClient(self.supervisor, owner) as client:
+            async with OwnerWorkerGatewayClient(
+                self.supervisor,
+                owner,
+                connection_purpose=CONNECTION_PURPOSE_RETAINED_CHANNEL,
+            ) as client:
                 live_session_id, _ = await open_binding_session(
                     client,
                     self.store,
                     binding_id=claim["binding_id"],
+                    dispatch_scope=str(claim.get("dispatch_scope") or ""),
+                    profile_revision=claim.get("profile_revision"),
                     source=provider_slug,
                     title=f"{channel.provider} channel",
                 )
@@ -194,19 +209,31 @@ class ChannelDispatcher:
                     if payload_kind == "voice_media":
                         self._checkpoint_transcript(claim, holder, text)
                         claim["payload_kind"] = "voice_transcript"
-                await client.call(
-                    "prompt.submit",
-                    {
-                        "session_id": live_session_id,
-                        "text": text,
-                        "idempotency_key": turn_key,
-                    },
-                )
-                event = await client.wait_for_event(
-                    "message.complete",
-                    session_id=live_session_id,
-                    timeout=self.turn_timeout,
-                )
+                try:
+                    await client.call(
+                        "prompt.submit",
+                        {
+                            "session_id": live_session_id,
+                            "text": text,
+                            "idempotency_key": turn_key,
+                        },
+                    )
+                    event = await client.wait_for_event(
+                        "message.complete",
+                        session_id=live_session_id,
+                        timeout=self.turn_timeout,
+                    )
+                except asyncio.CancelledError:
+                    try:
+                        await asyncio.shield(
+                            client.call(
+                                "session.interrupt",
+                                {"session_id": live_session_id},
+                            )
+                        )
+                    except Exception:
+                        pass
+                    raise
         except MediaDispatchError as exc:
             self.fail_media_claim(claim, holder, exc.code, retryable=exc.retryable)
             raise
@@ -255,10 +282,11 @@ class ChannelDispatcher:
                 """
                 INSERT INTO outbound_messages
                   (outbound_id, inbound_id, account_id, binding_id, provider,
-                   source_kind, source_id, binding_sequence, client_message_id,
-                   payload_ciphertext, payload_key_version, context_ciphertext,
-                   context_key_version, status, next_attempt_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, 'inbound', ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+                   source_kind, source_id, binding_sequence, dispatch_scope,
+                   client_message_id, payload_ciphertext, payload_key_version,
+                   context_ciphertext, context_key_version, status,
+                   next_attempt_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'inbound', ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
                 """,
                 (
                     outbound_id,
@@ -268,6 +296,7 @@ class ChannelDispatcher:
                     channel.provider,
                     f"inbound:{claim['inbound_id']}",
                     claim["binding_sequence"],
+                    str(claim.get("dispatch_scope") or ""),
                     client_message_id,
                     response_ciphertext,
                     response_version,
@@ -344,6 +373,30 @@ class ChannelDispatcher:
             ).rowcount
         if changed != 1:
             raise MediaDispatchError("media_claim_stale", retryable=True)
+
+    def release_claim(self, inbound_id: str, holder: str, *, reason: str) -> bool:
+        """Return one exact in-flight claim to its account queue unchanged."""
+        now = time.time()
+        with self.store.write() as conn:
+            changed = conn.execute(
+                """
+                UPDATE inbound_messages
+                SET status='queued', next_attempt_at=?, last_error=?,
+                    claimed_by=NULL, claimed_at=NULL, updated_at=?
+                WHERE inbound_id=? AND status='processing' AND claimed_by=?
+                  AND (? IS NULL OR account_id=?)
+                """,
+                (
+                    now,
+                    reason,
+                    now,
+                    inbound_id,
+                    holder,
+                    self.account_id,
+                    self.account_id,
+                ),
+            ).rowcount
+        return changed == 1
 
     def fail_claim(
         self,

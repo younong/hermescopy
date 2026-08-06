@@ -23,6 +23,7 @@ class AuthenticatedWorkspaceContext:
 
     roots: ControlledRoots
     workspace_prefix: str = "default"
+    readonly_prefixes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         prefix = self.workspace_prefix
@@ -31,6 +32,22 @@ class AuthenticatedWorkspaceContext:
         components = tuple(prefix.split("/"))
         if any(component in {"", ".", ".."} for component in components):
             raise ValueError("workspace_prefix must not contain empty, dot, or parent components")
+        readonly_prefixes = tuple(self.readonly_prefixes)
+        for readonly_prefix in readonly_prefixes:
+            if (
+                not isinstance(readonly_prefix, str)
+                or not readonly_prefix
+                or readonly_prefix.startswith("/")
+                or "\x00" in readonly_prefix
+                or any(
+                    component in {"", ".", ".."}
+                    for component in readonly_prefix.split("/")
+                )
+            ):
+                raise ValueError("readonly_prefixes must contain controlled relative paths")
+        if len(set(readonly_prefixes)) != len(readonly_prefixes):
+            raise ValueError("readonly_prefixes must be unique")
+        object.__setattr__(self, "readonly_prefixes", readonly_prefixes)
 
     def controlled_workspace_path(
         self,

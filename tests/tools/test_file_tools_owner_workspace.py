@@ -487,6 +487,52 @@ def test_authenticated_search_stays_under_workspace_and_supports_modes(owner_a_w
         _gateway_runtime.reset(token)
 
 
+def test_employee_workspace_and_knowledge_capabilities_are_narrowed_and_read_only(
+    owner_a_workspace,
+):
+    owner_a_workspace.replace_bytes(
+        RootKind.WORKSPACE,
+        "default/employees/analyst/note.txt",
+        b"workspace\n",
+    )
+    owner_a_workspace.replace_bytes(
+        RootKind.WORKSPACE,
+        "default/employees/sibling/secret.txt",
+        b"secret\n",
+    )
+    owner_a_workspace.replace_bytes(
+        RootKind.WORKSPACE,
+        "default/knowledge/reference/facts.txt",
+        b"verified fact\n",
+    )
+    operations = ControlledWorkspaceFileOperations(
+        AuthenticatedWorkspaceContext(
+            owner_a_workspace,
+            workspace_prefix="default/employees/analyst",
+            readonly_prefixes=("default/knowledge/reference",),
+        )
+    )
+
+    assert operations.read_file_raw("note.txt").content == "workspace\n"
+    assert operations.read_file_raw("../sibling/secret.txt").error is not None
+    assert operations.read_file_raw("/knowledge/0/facts.txt").content == "verified fact\n"
+
+    searched = operations.search("verified", path="/knowledge/0")
+    assert searched.matches[0].path == "/knowledge/0/facts.txt"
+    nested = operations.search("*.txt", path="/knowledge/0", target="files")
+    assert nested.files == ["/knowledge/0/facts.txt"]
+
+    assert operations.write_file("/knowledge/0/facts.txt", "changed\n").error is not None
+    assert operations.patch_replace(
+        "/knowledge/0/facts.txt", "verified", "changed"
+    ).error is not None
+    assert operations.delete_file("/knowledge/0/facts.txt").error is not None
+    assert operations.move_file(
+        "/knowledge/0/facts.txt", "copied.txt"
+    ).error is not None
+    assert operations.read_file_raw("/knowledge/0/facts.txt").content == "verified fact\n"
+
+
 def test_authenticated_missing_capability_fails_closed(monkeypatch):
     runtime = OwnerWorkerGatewayRuntime(
         owner_key="owner-a",

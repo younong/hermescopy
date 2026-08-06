@@ -15,10 +15,12 @@ def claim_outbound(
     *,
     provider: str,
     holder: str,
+    account_id: str | None = None,
 ) -> OutboundDelivery | None:
     """Claim and decrypt the next ordered delivery for one exact provider."""
     exact_provider = str(provider or "").strip()
     exact_holder = str(holder or "").strip()
+    exact_account = str(account_id or "").strip() or None
     if not exact_provider or not exact_holder:
         raise ValueError("provider and holder are required")
     now = time.time()
@@ -39,23 +41,33 @@ def claim_outbound(
             JOIN external_identities e ON e.external_identity_id=b.external_identity_id
                                       AND e.provider=a.provider AND e.status='active'
             WHERE (o.provider=? OR (o.provider IS NULL AND a.provider=?))
+              AND (? IS NULL OR o.account_id=?)
               AND o.status='queued' AND o.next_attempt_at<=?
               AND NOT EXISTS (
                 SELECT 1 FROM inbound_messages earlier
                 WHERE earlier.binding_id=o.binding_id
+                  AND earlier.dispatch_scope=o.dispatch_scope
                   AND earlier.binding_sequence<o.binding_sequence
                   AND earlier.status IN ('queued','processing')
               )
               AND NOT EXISTS (
                 SELECT 1 FROM outbound_messages earlier_out
                 WHERE earlier_out.binding_id=o.binding_id
+                  AND earlier_out.dispatch_scope=o.dispatch_scope
                   AND earlier_out.binding_sequence<COALESCE(o.binding_sequence, i.binding_sequence)
                   AND earlier_out.status IN ('queued','sending')
               )
             ORDER BY COALESCE(o.binding_sequence, i.binding_sequence), o.created_at
             LIMIT 1
             """,
-            (exact_provider, exact_provider, exact_provider, now),
+            (
+                exact_provider,
+                exact_provider,
+                exact_provider,
+                exact_account,
+                exact_account,
+                now,
+            ),
         ).fetchone()
         if row is None:
             return None
@@ -220,9 +232,11 @@ def advance_outbound(
     *,
     holder: str,
     part_count: int,
+    provider_message_id: str | None = None,
     next_attempt_at: float | None = None,
 ) -> bool:
     next_index = delivery.next_part_index + 1
+    exact_receipt = str(provider_message_id or "").strip()
     now = time.time()
     with store.write() as conn:
         if next_index < part_count:
@@ -246,39 +260,62 @@ def advance_outbound(
                     part_count,
                 ),
             ).rowcount
-            return changed == 1
-        changed = conn.execute(
-            """
-            UPDATE outbound_messages
-            SET status='delivered', next_chunk_index=?, payload_ciphertext=NULL,
-                payload_key_version=NULL, context_ciphertext=NULL,
-                context_key_version=NULL, claimed_by=NULL, claimed_at=NULL,
-                chunk_attempts=0, last_error=NULL, failed_chunk_index=NULL,
-                updated_at=?
-            WHERE outbound_id=? AND (provider=? OR provider IS NULL) AND status='sending'
-              AND claimed_by=? AND next_chunk_index=? AND chunk_count=?
-            """,
-            (
-                next_index,
-                now,
-                delivery.outbound_id,
-                delivery.provider,
-                holder,
-                delivery.next_part_index,
-                part_count,
-            ),
-        ).rowcount
-        if changed == 1:
+        else:
+            changed = conn.execute(
+                """
+                UPDATE outbound_messages
+                SET status='delivered', next_chunk_index=?, payload_ciphertext=NULL,
+                    payload_key_version=NULL, context_ciphertext=NULL,
+                    context_key_version=NULL, claimed_by=NULL, claimed_at=NULL,
+                    chunk_attempts=0, last_error=NULL, failed_chunk_index=NULL,
+                    updated_at=?
+                WHERE outbound_id=? AND (provider=? OR provider IS NULL) AND status='sending'
+                  AND claimed_by=? AND next_chunk_index=? AND chunk_count=?
+                """,
+                (
+                    next_index,
+                    now,
+                    delivery.outbound_id,
+                    delivery.provider,
+                    holder,
+                    delivery.next_part_index,
+                    part_count,
+                ),
+            ).rowcount
+            if changed == 1:
+                conn.execute(
+                    """
+                    UPDATE inbound_messages SET status='completed', updated_at=?
+                    WHERE inbound_id=(
+                        SELECT inbound_id FROM outbound_messages WHERE outbound_id=?
+                    )
+                    """,
+                    (now, delivery.outbound_id),
+                )
+        if changed != 1:
+            return False
+        if exact_receipt:
+            receipt_hash = store.crypto.lookup_hash(
+                f"provider-message:{delivery.provider}:{delivery.account_id}",
+                exact_receipt,
+            )
             conn.execute(
                 """
-                UPDATE inbound_messages SET status='completed', updated_at=?
-                WHERE inbound_id=(
-                    SELECT inbound_id FROM outbound_messages WHERE outbound_id=?
-                )
+                INSERT INTO outbound_receipts
+                  (account_id, binding_id, outbound_id, part_index,
+                   provider_message_lookup_hash, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (now, delivery.outbound_id),
+                (
+                    delivery.account_id,
+                    delivery.binding_id,
+                    delivery.outbound_id,
+                    delivery.next_part_index,
+                    receipt_hash,
+                    now,
+                ),
             )
-    return changed == 1
+    return True
 
 
 def recover_stale_outbound(
@@ -286,7 +323,9 @@ def recover_stale_outbound(
     *,
     provider: str,
     claimed_before: float,
+    account_id: str | None = None,
 ) -> int:
+    exact_account = str(account_id or "").strip() or None
     now = time.time()
     with store.write() as conn:
         return conn.execute(
@@ -295,11 +334,19 @@ def recover_stale_outbound(
             SET status='queued', claimed_by=NULL, claimed_at=NULL,
                 next_attempt_at=?, updated_at=?
             WHERE status='sending' AND claimed_at<?
+              AND (? IS NULL OR account_id=?)
               AND account_id IN (
                 SELECT account_id FROM connector_accounts WHERE provider=?
               )
             """,
-            (now, now, claimed_before, provider),
+            (
+                now,
+                now,
+                claimed_before,
+                exact_account,
+                exact_account,
+                provider,
+            ),
         ).rowcount
 
 
@@ -372,15 +419,17 @@ class ChannelOutbox:
                 return str(existing["outbound_id"])
             conn.execute(
                 """
-                INSERT INTO binding_sequences(binding_id, last_sequence)
-                VALUES (?, 1)
-                ON CONFLICT(binding_id) DO UPDATE SET last_sequence=last_sequence + 1
+                INSERT INTO binding_sequences(binding_id, dispatch_scope, last_sequence)
+                VALUES (?, '', 1)
+                ON CONFLICT(binding_id, dispatch_scope)
+                DO UPDATE SET last_sequence=last_sequence + 1
                 """,
                 (exact_binding,),
             )
             sequence = int(
                 conn.execute(
-                    "SELECT last_sequence FROM binding_sequences WHERE binding_id=?",
+                    "SELECT last_sequence FROM binding_sequences "
+                    "WHERE binding_id=? AND dispatch_scope=''",
                     (exact_binding,),
                 ).fetchone()[0]
             )
@@ -403,10 +452,11 @@ class ChannelOutbox:
                 """
                 INSERT INTO outbound_messages
                   (outbound_id, inbound_id, account_id, binding_id, provider,
-                   source_kind, source_id, binding_sequence, client_message_id,
-                   payload_ciphertext, payload_key_version, context_ciphertext,
-                   context_key_version, status, next_attempt_at, created_at, updated_at)
-                VALUES (?, NULL, ?, ?, ?, 'cron', ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+                   source_kind, source_id, binding_sequence, dispatch_scope,
+                   client_message_id, payload_ciphertext, payload_key_version,
+                   context_ciphertext, context_key_version, status,
+                   next_attempt_at, created_at, updated_at)
+                VALUES (?, NULL, ?, ?, ?, 'cron', ?, ?, '', ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
                 """,
                 (
                     outbound_id,

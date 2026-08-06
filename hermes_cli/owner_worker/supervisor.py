@@ -330,15 +330,21 @@ class OwnerWorkerSupervisor:
             resource_manager.policy.global_limits.max_owner_workers
             if resource_manager is not None else None
         )
-        if resource_manager is not None and max_workers is not None and int(max_workers) != policy_max_workers:
-            raise ValueError("owner worker limit must match the resource policy")
         configured_max_workers = (
-            policy_max_workers
-            if policy_max_workers is not None
-            else max_workers if max_workers is not None
-            else os.environ.get("HERMES_OWNER_WORKER_MAX", "16") or 16
+            max_workers
+            if max_workers is not None
+            else os.environ.get("HERMES_OWNER_WORKER_MAX")
+            or policy_max_workers
+            or 16
         )
-        self.max_workers = max(1, int(configured_max_workers))
+        try:
+            self.max_workers = int(configured_max_workers)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("owner worker limit is invalid") from exc
+        if self.max_workers < 1:
+            raise ValueError("owner worker limit is invalid")
+        if policy_max_workers is not None and self.max_workers > policy_max_workers:
+            raise ValueError("owner worker limit exceeds the resource policy")
         self.startup_cooldown = max(
             0.0,
             float(startup_cooldown if startup_cooldown is not None else os.environ.get("HERMES_OWNER_WORKER_STARTUP_COOLDOWN", "1") or 1),

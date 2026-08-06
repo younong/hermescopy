@@ -33,6 +33,8 @@ from hermes_cli.channel_dispatch import (
 from hermes_cli.channel_identity import ChannelIdentityStore, resolve_connector_account
 from hermes_cli.channel_identity.models import ResolvedConnectorAccount
 
+from .feishu_ws import FeishuWebSocketSession
+
 PROVIDER = "feishu"
 _FEISHU_API_BASE = "https://open.feishu.cn"
 _LARK_API_BASE = "https://open.larksuite.com"
@@ -125,6 +127,47 @@ def _walk_post_text(value: Any) -> list[str]:
     return result
 
 
+def _mention_identities(mention: Any) -> frozenset[str]:
+    identity = _field(mention, "id") or _field(mention, "user_id")
+    return frozenset(
+        value.strip()
+        for value in (
+            str(_field(identity, "union_id") or ""),
+            str(_field(identity, "open_id") or ""),
+            str(_field(identity, "user_id") or ""),
+            identity if isinstance(identity, str) else "",
+        )
+        if value.strip()
+    )
+
+
+def _verified_mentions(
+    message: Any,
+) -> tuple[tuple[frozenset[str], str], ...]:
+    raw = _field(message, "mentions", ())
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    mentions: list[tuple[frozenset[str], str]] = []
+    for mention in raw:
+        identities = _mention_identities(mention)
+        key = _first_text(_field(mention, "key"))
+        if identities:
+            mentions.append((identities, key))
+    return tuple(mentions)
+
+
+def _strip_current_bot_mention(
+    payload: str,
+    mentions: tuple[tuple[frozenset[str], str], ...],
+    bot_identities: frozenset[str],
+) -> str:
+    text = payload
+    for identities, key in mentions:
+        if not identities.isdisjoint(bot_identities) and key:
+            text = text.replace(key, "")
+    return text.strip()
+
+
 def _normalize_text(message_type: str, raw_content: Any) -> tuple[str, str | None]:
     content = _load_content(raw_content)
     if message_type == "text":
@@ -176,12 +219,12 @@ def normalize_verified_event(data: Any) -> NormalizedInboundEnvelope | None:
 
     chat_type = str(_field(message, "chat_type") or "p2p").strip().lower()
     root_id = str(_field(message, "root_id") or "").strip()
-    thread_id = str(_field(message, "thread_id") or root_id).strip() or None
-    reply_to = _first_text(
-        _field(message, "parent_id"),
-        _field(message, "upper_message_id"),
-        root_id,
-    ) or None
+    thread_id = (
+        str(_field(message, "thread_id") or root_id).strip() or None
+        if chat_type != "p2p"
+        else None
+    )
+    reply_to = _first_text(_field(message, "parent_id")) or None
     metadata = {
         "message_type": message_type,
         "sender_type": str(_field(sender, "sender_type") or "").strip() or None,
@@ -219,10 +262,140 @@ def enqueue_verified_event(
     account_id: str,
     data: Any,
 ) -> InboundCommitResult | None:
-    """Commit a verified event through the canonical encrypted inbox service."""
+    """Admit and commit one verified Feishu event for an exact managed account."""
     envelope = normalize_verified_event(data)
     if envelope is None:
         return None
+    event = _field(data, "event")
+    message = _field(event, "message")
+    metadata = envelope.metadata or {}
+    sender_type = str(metadata.get("sender_type") or "").strip().lower()
+    if sender_type != "user":
+        envelope = replace(envelope, rejection_reason="sender_not_human")
+
+    with store.read() as conn:
+        account = conn.execute(
+            """
+            SELECT p.revision, a.provider_account_id
+            FROM connector_accounts a
+            JOIN managed_feishu_accounts m ON m.account_id=a.account_id
+                                              AND m.lifecycle_status='active'
+            JOIN feishu_employee_profiles p ON p.account_id=a.account_id
+                                             AND p.lifecycle_status='active'
+            WHERE a.account_id=? AND a.provider='feishu' AND a.status='active'
+            """,
+            (account_id,),
+        ).fetchone()
+    if account is None:
+        envelope = replace(envelope, rejection_reason="managed_account_unavailable")
+    else:
+        resolved = resolve_connector_account(
+            store,
+            provider=PROVIDER,
+            account_id=account_id,
+            require_managed_feishu=True,
+        )
+        bot_identities = frozenset(
+            value.strip()
+            for value in (
+                str(resolved.provider_account_id or ""),
+                str(resolved.credentials.get("bot_open_id") or ""),
+                str(resolved.credentials.get("bot_union_id") or ""),
+                str(resolved.credentials.get("bot_user_id") or ""),
+            )
+            if value.strip()
+        )
+        mentions = _verified_mentions(message)
+        exact_mention = any(
+            not identities.isdisjoint(bot_identities)
+            for identities, _ in mentions
+        )
+        reply_receipt = None
+        reply_to = str(envelope.reply_to_message_id or "").strip()
+        if reply_to:
+            receipt_hash = store.crypto.lookup_hash(
+                f"provider-message:{PROVIDER}:{account_id}",
+                reply_to,
+            )
+            peer_hash = store.crypto.lookup_hash(
+                f"conversation:{PROVIDER}", envelope.conversation_id
+            )
+            with store.read() as conn:
+                reply_receipt = conn.execute(
+                    """
+                    SELECT o.dispatch_scope FROM outbound_receipts r
+                    JOIN channel_bindings b ON b.binding_id=r.binding_id
+                    JOIN outbound_messages o ON o.outbound_id=r.outbound_id
+                    WHERE r.account_id=? AND r.provider_message_lookup_hash=?
+                      AND b.account_id=? AND b.peer_lookup_hash=?
+                      AND b.status='active'
+                    """,
+                    (account_id, receipt_hash, account_id, peer_hash),
+                ).fetchone()
+        exact_reply = reply_receipt is not None
+        if envelope.conversation_kind == "group":
+            if not exact_mention and not exact_reply:
+                envelope = replace(
+                    envelope,
+                    rejection_reason="group_not_addressed_to_bot",
+                )
+            else:
+                envelope = replace(
+                    envelope,
+                    payload=_strip_current_bot_mention(
+                        envelope.payload,
+                        mentions,
+                        bot_identities,
+                    ),
+                    group_admission_token=store.crypto.lookup_hash(
+                        f"group-admission:{PROVIDER}:{account_id}",
+                        f"{envelope.provider_message_id}:{envelope.actor_id}",
+                    ),
+                )
+        scope_seed = str(envelope.thread_id or "").strip()
+        if envelope.conversation_kind == "group" and exact_reply:
+            dispatch_scope = str(reply_receipt["dispatch_scope"] or "")
+        else:
+            dispatch_scope = (
+                store.crypto.lookup_hash(
+                    f"dispatch-scope:{PROVIDER}:{account_id}",
+                    scope_seed,
+                )
+                if scope_seed
+                else ""
+            )
+        profile_revision = int(account["revision"])
+        peer_hash = store.crypto.lookup_hash(
+            f"conversation:{PROVIDER}", envelope.conversation_id
+        )
+        with store.read() as conn:
+            session = conn.execute(
+                """
+                SELECT s.profile_revision FROM channel_bindings b
+                JOIN channel_sessions s ON s.binding_id=b.binding_id
+                                       AND s.dispatch_scope=?
+                WHERE b.account_id=? AND b.peer_lookup_hash=?
+                  AND b.status='active'
+                """,
+                (dispatch_scope, account_id, peer_hash),
+            ).fetchone()
+        if session is not None and session["profile_revision"] is not None:
+            profile_revision = int(session["profile_revision"])
+        envelope = replace(
+            envelope,
+            dispatch_scope=dispatch_scope,
+            profile_revision=profile_revision,
+        )
+    if envelope.rejection_reason is None:
+        from hermes_cli.channel_identity import ensure_managed_feishu_conversation_binding
+
+        ensure_managed_feishu_conversation_binding(
+            store,
+            account_id=account_id,
+            conversation_id=envelope.conversation_id,
+            actor_id=envelope.actor_id,
+            conversation_kind=envelope.conversation_kind,
+        )
     inbox = InboundQueueService(store, provider=PROVIDER)
     with store.write() as conn:
         return inbox.commit(
@@ -286,8 +459,14 @@ def claim_feishu_outbound(
     store: ChannelIdentityStore,
     *,
     holder: str,
+    account_id: str | None = None,
 ) -> FeishuOutboundClaim | None:
-    delivery = claim_outbound(store, provider=PROVIDER, holder=holder)
+    delivery = claim_outbound(
+        store,
+        provider=PROVIDER,
+        holder=holder,
+        account_id=account_id,
+    )
     if delivery is None:
         return None
     try:
@@ -296,6 +475,7 @@ def claim_feishu_outbound(
             provider=PROVIDER,
             account_id=delivery.account_id,
             credential_version=delivery.credential_version,
+            require_managed_feishu=True,
         )
         _credentials(account)
         parts = _split_text(delivery.payload)
@@ -337,6 +517,43 @@ class FeishuHTTPTransport:
     async def close(self) -> None:
         if self._owns_client:
             await self._client.aclose()
+
+    async def verify_account(
+        self,
+        account: ResolvedConnectorAccount,
+    ) -> dict[str, str]:
+        """Validate credentials and resolve non-secret immutable bot identity."""
+        app_id, app_secret, domain = _credentials(account)
+        base_url = _LARK_API_BASE if domain == "lark" else _FEISHU_API_BASE
+        token = await self._access_token(
+            account,
+            app_id=app_id,
+            app_secret=app_secret,
+            base_url=base_url,
+        )
+        result = await self._get_json(
+            f"{base_url}/open-apis/bot/v3/info",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        bot = result.get("bot")
+        if not isinstance(bot, Mapping):
+            data = result.get("data")
+            bot = data.get("bot") if isinstance(data, Mapping) else None
+        if not isinstance(bot, Mapping):
+            raise FeishuTransportError("bot_identity_missing", retryable=False)
+        open_id = str(bot.get("open_id") or "").strip()
+        user_id = str(bot.get("user_id") or "").strip()
+        union_id = str(bot.get("union_id") or "").strip()
+        if not any((open_id, user_id, union_id)):
+            raise FeishuTransportError("bot_identity_missing", retryable=False)
+        return {
+            "app_id": app_id,
+            "domain": domain,
+            "bot_open_id": open_id,
+            "bot_user_id": user_id,
+            "bot_union_id": union_id,
+            "bot_name": str(bot.get("app_name") or bot.get("name") or "").strip(),
+        }
 
     async def send(
         self,
@@ -402,6 +619,20 @@ class FeishuHTTPTransport:
         self._tokens = {key: (token, now + expires_in)}
         return token
 
+    async def _get_json(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+    ) -> Mapping[str, Any]:
+        try:
+            response = await self._client.get(url, headers=headers)
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise FeishuTransportError("network_error", retryable=True) from exc
+        except httpx.HTTPError as exc:
+            raise FeishuTransportError("http_error", retryable=True) from exc
+        return self._validated_response(response)
+
     async def _post_json(
         self,
         url: str,
@@ -421,6 +652,10 @@ class FeishuHTTPTransport:
             raise FeishuTransportError("network_error", retryable=True) from exc
         except httpx.HTTPError as exc:
             raise FeishuTransportError("http_error", retryable=True) from exc
+        return self._validated_response(response)
+
+    @staticmethod
+    def _validated_response(response: httpx.Response) -> Mapping[str, Any]:
         retryable_http = response.status_code in {408, 409, 425, 429} or response.status_code >= 500
         if response.status_code < 200 or response.status_code >= 300:
             raise FeishuTransportError(
@@ -445,6 +680,28 @@ class FeishuHTTPTransport:
         return result
 
 
+async def verify_feishu_credentials(
+    credentials: Mapping[str, Any],
+    *,
+    transport: FeishuHTTPTransport | None = None,
+) -> dict[str, str]:
+    """Verify candidate credentials without persisting secrets or provider bodies."""
+    app_id = str(credentials.get("app_id") or "").strip()
+    account = ResolvedConnectorAccount(
+        provider=PROVIDER,
+        account_id="candidate",
+        provider_account_id=app_id,
+        credentials=dict(credentials),
+        credential_version=1,
+    )
+    client = transport or FeishuHTTPTransport()
+    try:
+        return await client.verify_account(account)
+    finally:
+        if transport is None:
+            await client.close()
+
+
 class FeishuSender:
     def __init__(
         self,
@@ -460,12 +717,14 @@ class FeishuSender:
         self.max_attempts = int(config.get("outbound_max_attempts", 8))
 
     async def send_claim(self, claim: FeishuOutboundClaim, *, holder: str) -> bool:
+        receipt = None
         try:
             account = resolve_connector_account(
                 self.store,
                 provider=PROVIDER,
                 account_id=claim.delivery.account_id,
                 credential_version=claim.delivery.credential_version,
+                require_managed_feishu=True,
             )
             with self.store.read() as conn:
                 current = conn.execute(
@@ -488,8 +747,14 @@ class FeishuSender:
             if current is None:
                 raise RuntimeError("outbound send claim is stale")
             part_delivery = replace(claim.delivery, payload=claim.part)
-            await self.transport.send(account, part_delivery)
+            receipt = await self.transport.send(account, part_delivery)
         except asyncio.CancelledError:
+            release_outbound_claim(
+                self.store,
+                outbound_id=claim.delivery.outbound_id,
+                holder=holder,
+                error="connector_stopped",
+            )
             raise
         except Exception as exc:
             retryable = isinstance(exc, FeishuTransportError) and exc.retryable
@@ -519,6 +784,9 @@ class FeishuSender:
             claim.delivery,
             holder=holder,
             part_count=len(claim.parts),
+            provider_message_id=(
+                receipt.provider_message_id if receipt is not None else None
+            ),
         )
 
 
@@ -551,6 +819,7 @@ class FeishuConnector:
             store,
             supervisor,
             provider=PROVIDER,
+            account_id=self.account_id,
             turn_timeout=self.claim_timeout,
             dispatch_config=dict(config),
             media_config=dict(config),
@@ -563,8 +832,7 @@ class FeishuConnector:
         self._dispatcher_task: asyncio.Task | None = None
         self._dispatch_tasks: set[asyncio.Task] = set()
         self._sender_task: asyncio.Task | None = None
-        self._ws_future: asyncio.Future | None = None
-        self._ws_client: Any = None
+        self._ws_session: FeishuWebSocketSession | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
 
     async def start(self) -> None:
@@ -572,6 +840,7 @@ class FeishuConnector:
             self.store,
             provider=PROVIDER,
             account_id=self.account_id,
+            require_managed_feishu=True,
         )
         app_id, app_secret, domain = _credentials(account)
         cutoff = time.time() - self.claim_timeout
@@ -580,27 +849,29 @@ class FeishuConnector:
                 """
                 UPDATE inbound_messages SET status='queued', claimed_by=NULL,
                     claimed_at=NULL, updated_at=?
-                WHERE status='processing' AND claimed_at<? AND account_id IN (
-                    SELECT account_id FROM connector_accounts WHERE provider=?
-                )
+                WHERE status='processing' AND claimed_at<? AND account_id=?
                 """,
-                (time.time(), cutoff, PROVIDER),
+                (time.time(), cutoff, self.account_id),
             )
         recover_stale_outbound(
             self.store,
             provider=PROVIDER,
             claimed_before=cutoff,
+            account_id=self.account_id,
         )
         self._loop = asyncio.get_running_loop()
-        self._ws_client = self._build_ws_client(
-            app_id=app_id,
-            app_secret=app_secret,
-            domain=domain,
-            encrypt_key=str(account.credentials.get("encrypt_key") or ""),
-            verification_token=str(
-                account.credentials.get("verification_token") or ""
-            ),
+        self._ws_session = FeishuWebSocketSession(
+            self._build_ws_client(
+                app_id=app_id,
+                app_secret=app_secret,
+                domain=domain,
+                encrypt_key=str(account.credentials.get("encrypt_key") or ""),
+                verification_token=str(
+                    account.credentials.get("verification_token") or ""
+                ),
+            )
         )
+        await self._ws_session.start()
         self._running = True
         self._dispatcher_task = asyncio.create_task(
             self._dispatch_loop(), name=f"feishu-dispatch-{self.account_id}"
@@ -608,7 +879,6 @@ class FeishuConnector:
         self._sender_task = asyncio.create_task(
             self._sender_loop(), name=f"feishu-sender-{self.account_id}"
         )
-        self._ws_future = self._loop.run_in_executor(None, self._ws_client.start)
 
     def _build_ws_client(
         self,
@@ -684,6 +954,11 @@ class FeishuConnector:
         try:
             await self.dispatcher.dispatch_claim(claim, holder=self.holder)
         except asyncio.CancelledError:
+            self.dispatcher.release_claim(
+                claim["inbound_id"],
+                self.holder,
+                reason="connector_stopped",
+            )
             raise
         except Exception:
             return
@@ -691,7 +966,11 @@ class FeishuConnector:
     async def _sender_loop(self) -> None:
         while self._running:
             try:
-                claim = claim_feishu_outbound(self.store, holder=self.holder)
+                claim = claim_feishu_outbound(
+                    self.store,
+                    holder=self.holder,
+                    account_id=self.account_id,
+                )
                 if claim is not None:
                     await self.sender.send_claim(claim, holder=self.holder)
                     continue
@@ -714,15 +993,8 @@ class FeishuConnector:
         self._dispatcher_task = None
         self._sender_task = None
         self._dispatch_tasks.clear()
-        if self._ws_client is not None:
-            try:
-                setattr(self._ws_client, "_auto_reconnect", False)
-            except Exception:
-                pass
-            self._ws_client = None
-        if self._ws_future is not None:
-            self._ws_future.cancel()
-            await asyncio.gather(self._ws_future, return_exceptions=True)
-            self._ws_future = None
+        if self._ws_session is not None:
+            await self._ws_session.close()
+            self._ws_session = None
         self._loop = None
         await self.transport.close()

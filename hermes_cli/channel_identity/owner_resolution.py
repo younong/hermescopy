@@ -71,26 +71,42 @@ def resolve_connector_account(
     provider: str,
     account_id: str,
     credential_version: int | None = None,
+    require_managed_feishu: bool = False,
 ) -> ResolvedConnectorAccount:
     """Resolve one active account through an exact provider/version fence."""
     exact_provider = str(provider or "").strip()
     exact_account = str(account_id or "").strip()
     if not exact_provider or not exact_account:
         raise ValueError("provider and account_id are required")
+    if require_managed_feishu and exact_provider != "feishu":
+        raise ValueError("managed Feishu resolution requires provider feishu")
+    management_clause = (
+        "AND EXISTS ("
+        "SELECT 1 FROM managed_feishu_accounts m "
+        "JOIN feishu_employee_profiles p ON p.account_id=m.account_id "
+        "AND p.lifecycle_status='active' "
+        "WHERE m.account_id=a.account_id AND m.lifecycle_status='active')"
+        if require_managed_feishu
+        else ""
+    )
     with store.read() as conn:
         row = conn.execute(
-            """
-            SELECT provider, account_id, provider_account_id,
-                   credentials_ciphertext, credentials_key_version,
-                   credential_version
-            FROM connector_accounts
-            WHERE provider=? AND account_id=? AND status='active'
+            f"""
+            SELECT a.provider, a.account_id, a.provider_account_id,
+                   a.credentials_ciphertext, a.credentials_key_version,
+                   a.credential_version
+            FROM connector_accounts a
+            WHERE a.provider=? AND a.account_id=? AND a.status='active'
+              {management_clause}
             """,
             (exact_provider, exact_account),
         ).fetchone()
-    if row is None or (
-        credential_version is not None
-        and int(row["credential_version"]) != int(credential_version)
+    if (
+        row is None
+        or (
+            credential_version is not None
+            and int(row["credential_version"]) != int(credential_version)
+        )
     ):
         raise RuntimeError("connector account is unavailable")
     credentials = decrypt_account_credentials(

@@ -57,6 +57,30 @@ async def test_connector_supervisor_starts_once_and_closes_services():
 
 
 @pytest.mark.asyncio
+async def test_connector_supervisor_stops_one_account_without_affecting_another():
+    supervisor = ConnectorSupervisor()
+    first = _Service()
+    second = _Service()
+
+    async def first_factory():
+        return first
+
+    async def second_factory():
+        return second
+
+    supervisor.register("feishu", first_factory, account_id="first")
+    supervisor.register("feishu", second_factory, account_id="second")
+    await supervisor.start_provider("feishu", account_id="first")
+    await supervisor.start_provider("feishu", account_id="second")
+
+    assert await supervisor.stop_provider("feishu", account_id="first") is True
+    assert first.closed is True
+    assert second.closed is False
+    assert supervisor.get("feishu", "first") is None
+    assert supervisor.get("feishu", "second") is second
+
+
+@pytest.mark.asyncio
 async def test_connector_supervisor_rolls_back_partial_startup():
     supervisor = ConnectorSupervisor()
     service = _Service()

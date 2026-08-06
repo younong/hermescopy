@@ -192,9 +192,12 @@ def register_connector_binding_for_owner(
 
         account = conn.execute(
             """
-            SELECT account_id, credential_version
-            FROM connector_accounts
-            WHERE provider=? AND provider_account_id=? AND account_lookup_hash=?
+            SELECT a.account_id, a.credential_version,
+                   m.canonical_user_id AS managed_canonical_user_id
+            FROM connector_accounts a
+            LEFT JOIN managed_feishu_accounts m ON m.account_id=a.account_id
+            WHERE a.provider=? AND a.provider_account_id=?
+              AND a.account_lookup_hash=?
             """,
             (provider, provider_account_id, account_hash),
         ).fetchone()
@@ -230,6 +233,13 @@ def register_connector_binding_for_owner(
             )
         else:
             account_id = str(account["account_id"])
+            managed_owner = account["managed_canonical_user_id"]
+            if managed_owner is not None and not hmac.compare_digest(
+                str(managed_owner), canonical_user_id
+            ):
+                raise ChannelIdentityOwnershipConflict(
+                    "managed Feishu account belongs to another Owner"
+                )
             existing_binding = conn.execute(
                 """
                 SELECT e.canonical_user_id

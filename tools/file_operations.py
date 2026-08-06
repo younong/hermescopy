@@ -511,6 +511,37 @@ class ControlledWorkspaceFileOperations(FileOperations):
     def _relative_path(self, path: str) -> str:
         return self._context.controlled_workspace_path(path)
 
+    def _read_path(
+        self, path: str, *, allow_root: bool = False
+    ) -> tuple[str, str]:
+        if isinstance(path, str) and path.startswith("/knowledge/"):
+            parts = path.split("/")
+            if len(parts) < 3 or not parts[2].isdigit():
+                raise ValueError("knowledge path is invalid")
+            index = int(parts[2])
+            if index >= len(self._context.readonly_prefixes):
+                raise ValueError("knowledge path is not available")
+            suffix = parts[3:]
+            if not suffix and not allow_root:
+                raise ValueError("knowledge path must identify an entry")
+            if any(part in {"", ".", ".."} for part in suffix):
+                raise ValueError("knowledge path is invalid")
+            prefix = self._context.readonly_prefixes[index]
+            return (
+                "/".join((prefix, *suffix)) if suffix else prefix,
+                "/".join((f"/knowledge/{index}", *suffix)),
+            )
+        controlled_path = self._context.controlled_workspace_path(
+            path,
+            allow_workspace_root=allow_root,
+        )
+        display_path = (
+            ""
+            if path in {".", "/workspace"}
+            else path.removeprefix("/workspace/")
+        )
+        return controlled_path, display_path
+
     def diagnostic_path(self, path: str) -> str:
         """Return a display-only path after validating the relative input."""
         relative_path = self._relative_path(path)
@@ -584,9 +615,10 @@ class ControlledWorkspaceFileOperations(FileOperations):
         )
 
     def _read_text(self, path: str) -> tuple[str, os.stat_result]:
+        controlled_path, _display_root = self._read_path(path)
         fd = self._context.roots.open_relative(
             RootKind.WORKSPACE,
-            self._relative_path(path),
+            controlled_path,
             expected_type=ExpectedType.REGULAR_FILE,
         )
         try:
@@ -719,10 +751,10 @@ class ControlledWorkspaceFileOperations(FileOperations):
         except (OSError, RuntimeError, ValueError) as exc:
             return WriteResult(error=str(exc))
 
-    def _search_root(self, path: str) -> str:
+    def _search_root(self, path: str) -> tuple[str, str]:
         if path == ".":
-            return self._context.workspace_prefix
-        return self._context.controlled_workspace_path(path, allow_workspace_root=True)
+            return self._context.workspace_prefix, ""
+        return self._read_path(path, allow_root=True)
 
     def _walk_regular_files(self, relative_directory: str) -> list[str]:
         files: list[str] = []
@@ -738,9 +770,14 @@ class ControlledWorkspaceFileOperations(FileOperations):
                     files.append(entry.relative_path)
         return sorted(files)
 
-    def _display_path(self, workspace_relative_path: str) -> str:
-        prefix = f"{self._context.workspace_prefix}/"
-        return workspace_relative_path.removeprefix(prefix)
+    @staticmethod
+    def _display_path(
+        workspace_relative_path: str,
+        controlled_root: str,
+        display_root: str,
+    ) -> str:
+        suffix = workspace_relative_path.removeprefix(f"{controlled_root}/")
+        return f"{display_root}/{suffix}" if display_root else suffix
 
     def search(
         self, pattern: str, path: str = ".", target: str = "content",
@@ -752,14 +789,18 @@ class ControlledWorkspaceFileOperations(FileOperations):
         if output_mode not in {"content", "files_only", "count"}:
             return SearchResult(error=f"Unknown search output mode: {output_mode}")
         try:
-            files = self._walk_regular_files(self._search_root(path))
+            controlled_root, display_root = self._search_root(path)
+            files = self._walk_regular_files(controlled_root)
         except (OSError, RuntimeError, ValueError) as exc:
             return SearchResult(error=str(exc))
         if target == "files":
             matched = [
-                self._display_path(item)
+                self._display_path(item, controlled_root, display_root)
                 for item in files
-                if fnmatch.fnmatch(self._display_path(item), pattern)
+                if fnmatch.fnmatch(
+                    self._display_path(item, controlled_root, display_root),
+                    pattern,
+                )
             ]
             return SearchResult(
                 files=matched[offset:offset + limit],
@@ -773,7 +814,9 @@ class ControlledWorkspaceFileOperations(FileOperations):
         matches: list[SearchMatch] = []
         counts: Dict[str, int] = {}
         for workspace_path in files:
-            display_path = self._display_path(workspace_path)
+            display_path = self._display_path(
+                workspace_path, controlled_root, display_root
+            )
             if file_glob and not fnmatch.fnmatch(display_path, file_glob):
                 continue
             result = self.read_file_raw(display_path)

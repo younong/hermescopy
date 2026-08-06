@@ -85,6 +85,7 @@ class ExecutorIdentity:
     session_id: str
     executor_id: str
     executor_generation: int
+    knowledge_prefixes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _required(self.owner_key, "owner_key")
@@ -99,6 +100,18 @@ class ExecutorIdentity:
         _nonnegative(self.lease_version, "lease_version", minimum=1)
         _nonnegative(self.recovery_generation, "recovery_generation")
         _nonnegative(self.executor_generation, "executor_generation", minimum=1)
+        prefixes = tuple(self.knowledge_prefixes)
+        for knowledge_prefix in prefixes:
+            prefix = _required(knowledge_prefix, "knowledge_prefix")
+            if prefix.startswith("/") or any(
+                part in {"", ".", ".."} for part in prefix.split("/")
+            ):
+                raise ExecutorIdentityInvalid(
+                    "knowledge_prefix must be a relative controlled path"
+                )
+        if len(set(prefixes)) != len(prefixes):
+            raise ExecutorIdentityInvalid("knowledge_prefixes must be unique")
+        object.__setattr__(self, "knowledge_prefixes", prefixes)
 
     @classmethod
     def for_task(
@@ -110,6 +123,7 @@ class ExecutorIdentity:
         session_id: str,
         executor_id: str | None = None,
         executor_generation: int = 1,
+        knowledge_prefixes: tuple[str, ...] = (),
     ) -> "ExecutorIdentity":
         return cls(
             owner_key=lease.owner_key,
@@ -122,6 +136,7 @@ class ExecutorIdentity:
             session_id=session_id,
             executor_id=executor_id or secrets.token_urlsafe(18),
             executor_generation=executor_generation,
+            knowledge_prefixes=knowledge_prefixes,
         )
 
     @property
@@ -129,10 +144,11 @@ class ExecutorIdentity:
         return hashlib.sha256(self.owner_key.encode("utf-8")).hexdigest()
 
     @property
-    def stable_key(self) -> tuple[str, str, str, int, int, int, str, str, int]:
+    def stable_key(self) -> tuple[Any, ...]:
         return (
             self.owner_key,
             self.workspace_prefix,
+            self.knowledge_prefixes,
             self.worker_id,
             self.worker_generation,
             self.lease_version,
@@ -170,6 +186,7 @@ class ExecutorIdentity:
             "session_id": self.session_id,
             "executor_id": self.executor_id,
             "executor_generation": self.executor_generation,
+            "knowledge_prefixes": list(self.knowledge_prefixes),
         }
 
     @classmethod
@@ -177,6 +194,11 @@ class ExecutorIdentity:
         if not isinstance(value, Mapping):
             raise ExecutorIdentityInvalid("executor identity payload is invalid")
         try:
+            knowledge_prefixes = value.get("knowledge_prefixes", ())
+            if not isinstance(knowledge_prefixes, (list, tuple)):
+                raise ExecutorIdentityInvalid(
+                    "executor identity knowledge prefixes are invalid"
+                )
             return cls(
                 owner_key=value["owner_key"],
                 workspace_prefix=value["workspace_prefix"],
@@ -188,6 +210,7 @@ class ExecutorIdentity:
                 session_id=value["session_id"],
                 executor_id=value["executor_id"],
                 executor_generation=value["executor_generation"],
+                knowledge_prefixes=tuple(knowledge_prefixes),
             )
         except KeyError as exc:
             raise ExecutorIdentityInvalid("executor identity payload is incomplete") from exc

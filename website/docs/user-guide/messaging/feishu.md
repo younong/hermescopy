@@ -1,590 +1,145 @@
 ---
 sidebar_position: 11
 title: "Feishu / Lark"
-description: "Set up Hermes Agent as a Feishu or Lark bot"
+description: "Connect multiple Feishu or Lark bots as independently configured AI employees"
 ---
 
-# Feishu / Lark Setup
+# Feishu / Lark
 
-Hermes Agent integrates with Feishu and Lark as a full-featured bot. Once connected, you can chat with the agent in direct messages or group chats, receive cron job results in a home chat, and send text, images, audio, and file attachments through the normal gateway flow.
+Hermes can run multiple Feishu or Lark self-built applications at the same time. Each connected bot is an independent **AI employee** with its own system prompt, model registration, tool/Skill/MCP allowlists, workspace scope, knowledge paths, and execution limits.
 
-The integration supports both connection modes:
+Hermes manages the local connection and employee policy. It does **not** create, publish, suspend, or delete the external application in Feishu or Lark. Perform those actions in the corresponding Developer Console.
 
-- `websocket` — recommended; Hermes opens the outbound connection and you do not need a public webhook endpoint
-- `webhook` — useful when you want Feishu/Lark to push events into your gateway over HTTP
+## Supported behavior
 
-## How Hermes Behaves
+- One Hermes deployment can keep multiple managed bot accounts connected concurrently.
+- Direct messages from human users are accepted.
+- In group chats, a bot responds only when the message contains a structural mention of that exact bot or directly replies to a message previously sent by that exact bot.
+- Text that merely contains a display name is not treated as a mention.
+- Bot, application, and system-authored messages are rejected.
+- Replies to another bot, another chat, a human message, or an unknown message do not trigger the bot.
+- Separate chats and Feishu thread roots use separate retained sessions.
 
-| Context | Behavior |
-|---------|----------|
-| Direct messages | Hermes responds to every message. |
-| Group chats | Hermes responds only when the bot is @mentioned in the chat. |
-| Shared group chats | By default, session history is isolated per user inside a shared chat. |
+The current retained-channel implementation uses the official Feishu/Lark SDK WebSocket connection. A public webhook endpoint is not required.
 
-This shared-chat behavior is controlled by `config.yaml`:
+## 1. Create and configure each external app
 
-```yaml
-group_sessions_per_user: true
-```
+Repeat these steps for every bot you want Hermes to run.
 
-Set it to `false` only if you explicitly want one shared conversation per chat.
-
-## Step 1: Create a Feishu / Lark App
-
-### Recommended: Scan-to-Create (one command)
-
-```bash
-hermes gateway setup
-```
-
-Select **Feishu / Lark** and scan the QR code with your Feishu or Lark mobile app. Hermes will automatically create a bot application with the correct permissions and save the credentials.
-
-### Alternative: Manual Setup
-
-If scan-to-create is not available, the wizard falls back to manual input:
-
-1. Open the Feishu or Lark developer console:
+1. Open the Developer Console:
    - Feishu: [https://open.feishu.cn/](https://open.feishu.cn/)
    - Lark: [https://open.larksuite.com/](https://open.larksuite.com/)
-2. Create a new app.
-3. In **Credentials & Basic Info**, copy the **App ID** and **App Secret**.
-4. Enable the **Bot** capability for the app.
-5. Run `hermes gateway setup`, select **Feishu / Lark**, and enter the credentials when prompted.
+2. Create a self-built application.
+3. Enable the **Bot** capability.
+4. In **Permissions**, grant the permissions needed to receive and send messages. At minimum, enable the permissions presented by the console for receiving messages and sending messages as the bot.
+5. In **Events and Callbacks**, select **Long Connection / WebSocket** and subscribe to `im.message.receive_v1`.
+6. Create and publish an application version. Enterprise installations may require administrator approval.
+7. Copy the App ID and App Secret from **Credentials & Basic Info**.
 
 :::warning
-Keep the App Secret private. Anyone with it can impersonate your app.
+Treat App Secret, Encrypt Key, and Verification Token as secrets. Do not paste them into chat messages, source files, or documentation.
 :::
 
-### Configure Permissions
+## 2. Enable the Feishu provider
 
-In the Feishu developer console, go to **Permission Management** and add the following scopes. You can bulk-import them in the permissions page.
+Open **Dashboard → Channels** and enable the Feishu / Lark provider. The provider switch controls whether managed account connectors are allowed to run.
 
-**Required permissions:**
+## 3. Add an AI employee
 
-| Scope | Purpose |
-|-------|---------|
-| `im:message` | Receive and read messages |
-| `im:message:send_as_bot` | Send messages as the bot |
-| `im:resource` | Access images, files, and audio sent by users |
-| `im:chat` | Access chat/group metadata |
-| `im:chat:readonly` | Read chat list and membership |
+On the Feishu channel card, select **Add employee** and enter:
 
-**Recommended permissions (for full functionality):**
+- App ID
+- App Secret
+- `feishu` or `lark` domain
+- optional Encrypt Key and Verification Token
+- employee name and role
+- system prompt
+- chat model registration
+- toolset, Skill, and MCP server allowlists
+- Owner-relative workspace and knowledge paths
+- execution limits
 
-| Scope | Purpose |
-|-------|---------|
-| `im:message.reactions:readonly` | Receive emoji reaction events |
-| `admin:app.info:readonly` | Auto-detect bot identity for @mention gating |
-| `contact:user.id:readonly` | Resolve user IDs for allowlist matching |
+Hermes verifies the App ID and App Secret with the real provider and resolves the bot identity before saving. Credentials and employee profiles are encrypted in the control-plane database. API responses never return stored secrets or ciphertext.
 
-### Configure Events
+A managed account belongs immutably to the authenticated Hermes Owner who created it. Another Owner cannot list, inspect, rotate, start, or roll over that account.
 
-In **Events and Callbacks**:
+## AI employee policy
 
-1. Set the connection mode to **Long Connection (WebSocket)** (recommended) or configure a webhook URL
-2. In the **Event Configuration** section, subscribe to:
-   - `im.message.receive_v1` — required for receiving messages
+Policy is configured per bot account. The first version does not support group-specific prompt overrides.
 
-### Publish the App
+The policy controls:
 
-After configuring permissions and events, go to **Version Management** and publish a new version of the app. The permissions won't take effect until a version is published and approved (for enterprise apps, this may require admin approval).
+| Field | Meaning |
+|---|---|
+| Name / role | Human-readable employee identity |
+| System prompt | Stable instructions for the employee |
+| Model registration | Exact configured chat model |
+| Toolsets | Concrete tool groups; wildcard `all`/`*` is rejected |
+| Skills | Skills exposed to this employee |
+| MCP servers | Named MCP servers exposed to this employee |
+| Workspace path | Relative path inside this Owner's workspace |
+| Knowledge paths | Relative paths inside this Owner's permitted roots |
+| Limits | Maximum iterations and optional token limit |
 
-## Step 2: Choose a Connection Mode
+Paths must be relative and remain inside the authenticated Owner's runtime roots. Absolute paths, `..` traversal, escaping symlinks, and cross-Owner paths are rejected.
 
-### Recommended: WebSocket mode
+## Immutable conversation snapshots
 
-Use WebSocket mode when Hermes runs on your laptop, workstation, or a private server. No public URL is required. The official Lark SDK opens and maintains a persistent outbound WebSocket connection with automatic reconnection.
+When a Feishu chat or thread creates a retained Hermes session, Hermes pins the employee profile revision and fingerprint to that conversation. Editing the employee later does not mutate an active conversation.
 
-```bash
-FEISHU_CONNECTION_MODE=websocket
-```
+This behavior preserves conversation semantics, safe cold resume, and prompt caching:
 
-**Requirements:** The `websockets` Python package must be installed. The SDK handles connection lifecycle, heartbeats, and auto-reconnection internally.
+- existing conversations continue using their original prompt, model, tools, Skills, MCP scope, paths, and limits;
+- new conversations use the latest profile revision;
+- select **Roll over sessions** to retire this bot's idle channel mappings so subsequent messages create sessions with the latest revision;
+- rollover is rejected while the selected account has messages actively processing.
 
-**How it works:** The adapter runs the Lark SDK's WebSocket client in a background executor thread. Inbound events (messages, reactions, card actions) are dispatched to the main asyncio loop. On disconnect, the SDK will attempt to reconnect automatically.
+Rollover affects only the selected managed account. Other bots and their sessions are unchanged.
 
-### Optional: Webhook mode
+## Account lifecycle
 
-Use webhook mode only when you already run Hermes behind a reachable HTTP endpoint.
+Each employee has independent lifecycle controls:
 
-```bash
-FEISHU_CONNECTION_MODE=webhook
-```
+- **Test** — verifies the currently encrypted credentials and bot identity.
+- **Suspend** — stops only this bot's connector while retaining encrypted configuration and audit/session data.
+- **Resume** — starts only this bot's connector.
+- **Rotate secret** — verifies the candidate secret before persisting it and requires that it resolve to the same immutable bot identity.
+- **Revoke** — terminally stops local use of the account while preserving required audit/session records.
 
-In webhook mode, Hermes starts an HTTP server (via `aiohttp`) and serves a Feishu endpoint at:
+Suspending or revoking one employee does not stop other Feishu employees. Revoking in Hermes does not delete or disable the external Feishu/Lark application; manage the external application separately in the Developer Console.
 
-```text
-/feishu/webhook
-```
+Secret inputs are never refilled in the Dashboard. When rotating App Secret, leaving optional Encrypt Key and Verification Token fields blank preserves their existing encrypted values.
 
-**Requirements:** The `aiohttp` Python package must be installed.
+## Group-chat admission
 
-You can customize the webhook server bind address and path:
+Hermes uses provider-verified structure rather than display text:
 
-```bash
-FEISHU_WEBHOOK_HOST=127.0.0.1   # default: 127.0.0.1
-FEISHU_WEBHOOK_PORT=8765         # default: 8765
-FEISHU_WEBHOOK_PATH=/feishu/webhook  # default: /feishu/webhook
-```
+1. The sender must be a human user.
+2. A structural mention must match an immutable identity of the current bot account, or the direct parent message must match a persisted outbound receipt from this bot in this chat.
+3. Only the current bot's verified mention placeholder is removed from the prompt; mentions of other people or bots remain.
+4. A verified reply inherits the exact conversation/thread scope of the persisted outbound message.
 
-When Feishu sends a URL verification challenge (`type: url_verification`), the webhook responds automatically so you can complete the subscription setup in the Feishu developer console. The challenge response is gated on `FEISHU_VERIFICATION_TOKEN` when set — challenge requests with a missing or mismatched token are rejected so an unauthenticated remote cannot prove endpoint control by echoing attacker-controlled challenge data.
-
-## Step 3: Configure Hermes
-
-### Option A: Interactive Setup
-
-```bash
-hermes gateway setup
-```
-
-Select **Feishu / Lark** and fill in the prompts.
-
-### Option B: Manual Configuration
-
-Add the following to `~/.hermes/.env`:
-
-```bash
-FEISHU_APP_ID=cli_xxx
-FEISHU_APP_SECRET=secret_xxx
-FEISHU_DOMAIN=feishu
-FEISHU_CONNECTION_MODE=websocket
-
-# Optional but strongly recommended
-FEISHU_ALLOWED_USERS=ou_xxx,ou_yyy
-FEISHU_HOME_CHANNEL=oc_xxx
-```
-
-`FEISHU_DOMAIN` accepts:
-
-- `feishu` for Feishu China
-- `lark` for Lark international
-
-## Step 4: Start the Gateway
-
-```bash
-hermes gateway
-```
-
-Then message the bot from Feishu/Lark to confirm that the connection is live.
-
-## Home Chat
-
-Use `/set-home` in a Feishu/Lark chat to mark it as the home channel for cron job results and cross-platform notifications.
-
-You can also preconfigure it:
-
-```bash
-FEISHU_HOME_CHANNEL=oc_xxx
-```
-
-## Security
-
-### User Allowlist
-
-For production use, set an allowlist of Feishu Open IDs:
-
-```bash
-FEISHU_ALLOWED_USERS=ou_xxx,ou_yyy
-```
-
-If you leave the allowlist empty, anyone who can reach the bot may be able to use it. In group chats, the allowlist is checked against the sender's open_id before the message is processed.
-
-### Webhook Encryption Key
-
-When running in webhook mode, set an encryption key to enable signature verification of inbound webhook payloads:
-
-```bash
-FEISHU_ENCRYPT_KEY=your-encrypt-key
-```
-
-This key is found in the **Event Subscriptions** section of your Feishu app configuration. When set, the adapter verifies every webhook request using the signature algorithm:
-
-```
-SHA256(timestamp + nonce + encrypt_key + body)
-```
-
-The computed hash is compared against the `x-lark-signature` header using timing-safe comparison. Requests with invalid or missing signatures are rejected with HTTP 401.
-
-:::tip
-In WebSocket mode, signature verification is handled by the SDK itself, so `FEISHU_ENCRYPT_KEY` is optional. In webhook mode, it is strongly recommended for production.
-:::
-
-### Verification Token
-
-An additional layer of authentication that checks the `token` field inside webhook payloads:
-
-```bash
-FEISHU_VERIFICATION_TOKEN=your-verification-token
-```
-
-This token is also found in the **Event Subscriptions** section of your Feishu app. When set, every inbound webhook payload must contain a matching `token` in its `header` object. Mismatched tokens are rejected with HTTP 401.
-
-Both `FEISHU_ENCRYPT_KEY` and `FEISHU_VERIFICATION_TOKEN` can be used together for defense in depth.
-
-## Group Message Policy
-
-The `FEISHU_GROUP_POLICY` environment variable controls whether and how Hermes responds in group chats:
-
-```bash
-FEISHU_GROUP_POLICY=allowlist   # default
-```
-
-| Value | Behavior |
-|-------|----------|
-| `open` | Hermes responds to @mentions from any user in any group. |
-| `allowlist` | Hermes only responds to @mentions from users listed in `FEISHU_ALLOWED_USERS`. |
-| `disabled` | Hermes ignores all group messages entirely. |
-
-In all modes, the bot must be explicitly @mentioned (or @all) in the group before the message is processed. Direct messages always bypass this gate.
-
-Set `FEISHU_REQUIRE_MENTION=false` to let Hermes read all group traffic without requiring an @mention:
-
-```bash
-FEISHU_REQUIRE_MENTION=false
-```
-
-For per-chat control, set `require_mention` on a `group_rules` entry — see [Per-Group Access Control](#per-group-access-control) below.
-
-### Bot Identity
-
-Hermes auto-detects the bot's `open_id` and display name on startup. You only need to set these manually when auto-detection cannot reach the Feishu API, or when your app uses tenant-scoped user IDs:
-
-```bash
-FEISHU_BOT_OPEN_ID=ou_xxx     # only when auto-detection fails
-FEISHU_BOT_USER_ID=xxx        # required if your app uses sender_id_type=user_id
-FEISHU_BOT_NAME=MyBot         # only when auto-detection fails
-```
-
-## Bot-to-Bot Messaging
-
-By default Hermes ignores messages sent by other bots. Enable bot-to-bot messaging when you want Hermes to participate in A2A orchestration or receive notifications from other bots in the same group.
-
-```bash
-FEISHU_ALLOW_BOTS=mentions   # default: none
-```
-
-| Value | Behavior |
-|-------|----------|
-| `none` | Ignore all messages from other bots (default). |
-| `mentions` | Accept only when the peer bot @mentions Hermes. |
-| `all` | Accept every peer bot message. |
-
-Also configurable as `feishu.allow_bots` in `config.yaml` (env wins when both are set).
-
-Peer bots do not need to be added to `FEISHU_ALLOWED_USERS` — that allowlist applies to human senders only.
-
-Grant the `application:bot.basic_info:read` scope to display peer bot names; without it, peer bots still route correctly but appear as their `open_id`.
-
-## Interactive Card Actions
-
-When users click buttons or interact with interactive cards sent by the bot, the adapter routes these as synthetic `/card` command events:
-
-- Button clicks become: `/card button {"key": "value", ...}`
-- The action's `value` payload from the card definition is included as JSON.
-- Card actions are deduplicated with a 15-minute window to prevent double processing.
-
-Gateway-driven update prompts use a native Feishu `Yes` / `No` card instead of falling back to plain text replies. When `hermes update --gateway` needs confirmation, the adapter records the selected answer in Hermes's `.update_response` file and replaces the card inline with a resolved state.
-
-Card action events are dispatched with `MessageType.COMMAND`, so they flow through the normal command processing pipeline.
-
-This is also how **command approval** works — when the agent needs to run a dangerous command, it sends an interactive card with Allow Once / Session / Always / Deny buttons. The user clicks a button, and the card action callback delivers the approval decision back to the agent.
-
-### Required Feishu App Configuration
-
-Interactive cards require **three** configuration steps in the Feishu Developer Console. Missing any of them causes error **200340** when users click card buttons.
-
-1. **Subscribe to the card action event:**
-   In **Event Subscriptions**, add `card.action.trigger` to your subscribed events.
-
-2. **Enable the Interactive Card capability:**
-   In **App Features > Bot**, ensure the **Interactive Card** toggle is enabled. This tells Feishu that your app can receive card action callbacks.
-
-3. **Configure the Card Request URL (webhook mode only):**
-   In **App Features > Bot > Message Card Request URL**, set the URL to the same endpoint as your event webhook (e.g. `https://your-server:8765/feishu/webhook`). In WebSocket mode this is handled automatically by the SDK.
-
-:::warning
-Without all three steps, Feishu will successfully *send* interactive cards (sending only requires `im:message:send` permission), but clicking any button will return error 200340. The card appears to work — the error only surfaces when a user interacts with it.
-:::
-
-## Document Comment Intelligent Reply
-
-Beyond chat, the adapter can also answer `@`-mentions left on **Feishu/Lark documents**. When a user comments on a document (local text selection or whole-doc comment) and @-mentions the bot, Hermes reads the document plus the surrounding comment thread and posts an LLM reply inline on the thread.
-
-Powered by the `drive.notice.comment_add_v1` event, the handler:
-
-- Fetches the document content and comment timeline in parallel (20 messages for whole-doc threads, 12 for local-selection threads).
-- Runs the agent with the `feishu_doc` + `feishu_drive` toolsets scoped to that single comment session.
-- Chunks replies at 4000 chars and posts them back as threaded replies.
-- Caches per-document sessions for 1 hour with a 50-message cap so follow-up comments on the same doc keep context.
-
-### 3-Tier Access Control
-
-Document-comment replies are **explicit-grant only** — there is no implicit allow-all mode. Permissions resolve in this order (first match wins, per field):
-
-1. **Exact doc** — rule scoped to a specific document token.
-2. **Wildcard** — rule that matches a pattern of docs.
-3. **Top-level** — default rule for the workspace.
-
-Two policies are available per rule:
-
-- **`allowlist`** — a static list of users / tenants.
-- **`pairing`** — static list ∪ runtime-approved store. Useful for rollouts where moderators can grant access live.
-
-Rules live in `~/.hermes/feishu_comment_rules.json` (pairing grants in `~/.hermes/feishu_comment_pairing.json`) with mtime-cached hot-reload — edits take effect on the next comment event without restarting the gateway.
-
-CLI:
-
-```bash
-# Inspect current rules and pairing state
-python -m gateway.platforms.feishu_comment_rules status
-
-# Simulate an access check for a specific doc + user
-python -m gateway.platforms.feishu_comment_rules check <fileType:fileToken> <user_open_id>
-
-# Manage pairing grants at runtime
-python -m gateway.platforms.feishu_comment_rules pairing list
-python -m gateway.platforms.feishu_comment_rules pairing add <user_open_id>
-python -m gateway.platforms.feishu_comment_rules pairing remove <user_open_id>
-```
-
-### Required Feishu App Configuration
-
-On top of the chat/card permissions already granted, add the drive comment event:
-
-- Subscribe to `drive.notice.comment_add_v1` in **Event Subscriptions**.
-- Grant the `docs:doc:readonly` and `drive:drive:readonly` scopes so the handler can read document content.
-
-## Meeting Invitation Events
-
-You can invite the Hermes Feishu/Lark bot into a video meeting the same way you invite a human participant. When the bot receives the meeting invitation event, Hermes can automatically start an agent turn that attempts to join the meeting.
-
-Powered by the `vc.bot.meeting_invited_v1` event, the flow is:
-
-- A user invites the bot to a Feishu/Lark video meeting.
-- Feishu/Lark sends Hermes the meeting invitation event.
-- Hermes extracts the inviter, meeting topic, and meeting number.
-- If the inviter is authorized by the normal gateway allowlist or pairing policy, the agent receives the meeting number and tries to join automatically.
-- If the invite is malformed, or the agent cannot join, Hermes drops the event or replies to the inviter with a concise explanation.
-
-Malformed invitations that do not include both an inviter and a `meeting_no` are ignored.
-
-### Required Feishu App Configuration
-
-On top of the chat/card permissions already granted, add the video-meeting invitation event:
-
-- Subscribe to `vc.bot.meeting_invited_v1` in **Event Subscriptions**.
-- Enable the Video Conferencing permission scope prompted by the Feishu/Lark developer console for that event.
-- Keep `im:message` and `im:message:send_as_bot` enabled so Hermes can reply to the inviter.
-- Ensure the gateway user allowlist or pairing policy authorizes the inviter. Meeting invitations do not bypass normal gateway access checks.
-
-## Media Support
-
-### Inbound (receiving)
-
-The adapter receives and caches the following media types from users:
-
-| Type | Extensions | How it's processed |
-|------|-----------|-------------------|
-| **Images** | .jpg, .jpeg, .png, .gif, .webp, .bmp | Downloaded via Feishu API and cached locally |
-| **Audio** | .ogg, .mp3, .wav, .m4a, .aac, .flac, .opus, .webm | Downloaded and cached; small text files are auto-extracted |
-| **Video** | .mp4, .mov, .avi, .mkv, .webm, .m4v, .3gp | Downloaded and cached as documents |
-| **Files** | .pdf, .doc, .docx, .xls, .xlsx, .ppt, .pptx, and more | Downloaded and cached as documents |
-
-Media from rich-text (post) messages, including inline images and file attachments, is also extracted and cached.
-
-For small text-based documents (.txt, .md), the file content is automatically injected into the message text so the agent can read it directly without needing tools.
-
-### Outbound (sending)
-
-| Method | What it sends |
-|--------|--------------|
-| `send` | Text or rich post messages (auto-detected based on markdown content) |
-| `send_image` / `send_image_file` | Uploads image to Feishu, then sends as native image bubble (with optional caption) |
-| `send_document` | Uploads file to Feishu API, then sends as file attachment |
-| `send_voice` | Uploads audio file as a Feishu file attachment |
-| `send_video` | Uploads video and sends as native media message |
-| `send_animation` | GIFs are downgraded to file attachments (Feishu has no native GIF bubble) |
-
-File upload routing is automatic based on extension:
-
-- `.ogg`, `.opus` → uploaded as `opus` audio
-- `.mp4`, `.mov`, `.avi`, `.m4v` → uploaded as `mp4` media
-- `.pdf`, `.doc(x)`, `.xls(x)`, `.ppt(x)` → uploaded with their document type
-- Everything else → uploaded as a generic stream file
-
-## Markdown Rendering and Post Fallback
-
-When outbound text contains markdown formatting (headings, bold, lists, code blocks, links, etc.), the adapter automatically sends it as a Feishu **post** message with an embedded `md` tag rather than as plain text. This enables rich rendering in the Feishu client.
-
-If the Feishu API rejects the post payload (e.g., due to unsupported markdown constructs), the adapter automatically falls back to sending as plain text with markdown stripped. This two-stage fallback ensures messages are always delivered.
-
-Plain text messages (no markdown detected) are sent as the simple `text` message type.
-
-## Processing Status Reactions
-
-While the agent is working, the bot shows a `Typing` reaction on your message. It's cleared when the reply arrives, or replaced with `CrossMark` if processing failed.
-
-Set `FEISHU_REACTIONS=false` to turn it off.
-
-## Burst Protection and Batching
-
-The adapter includes debouncing for rapid message bursts to avoid overwhelming the agent:
-
-### Text Batching
-
-When a user sends multiple text messages in quick succession, they are merged into a single event before being dispatched:
-
-| Setting | Env Var | Default |
-|---------|---------|---------|
-| Quiet period | `HERMES_FEISHU_TEXT_BATCH_DELAY_SECONDS` | 0.6s |
-| Max messages per batch | `HERMES_FEISHU_TEXT_BATCH_MAX_MESSAGES` | 8 |
-| Max characters per batch | `HERMES_FEISHU_TEXT_BATCH_MAX_CHARS` | 4000 |
-
-### Media Batching
-
-Multiple media attachments sent in quick succession (e.g., dragging several images) are merged into a single event:
-
-| Setting | Env Var | Default |
-|---------|---------|---------|
-| Quiet period | `HERMES_FEISHU_MEDIA_BATCH_DELAY_SECONDS` | 0.8s |
-
-### Per-Chat Serialization
-
-Messages within the same chat are processed serially (one at a time) to maintain conversation coherence. Each chat has its own lock, so messages in different chats are processed concurrently.
-
-## Rate Limiting (Webhook Mode)
-
-In webhook mode, the adapter enforces per-IP rate limiting to protect against abuse:
-
-- **Window:** 60-second sliding window
-- **Limit:** 120 requests per window per (app_id, path, IP) triple
-- **Tracking cap:** Up to 4096 unique keys tracked (prevents unbounded memory growth)
-
-Requests that exceed the limit receive HTTP 429 (Too Many Requests).
-
-### Webhook Anomaly Tracking
-
-The adapter tracks consecutive error responses per IP address. After 25 consecutive errors from the same IP within a 6-hour window, a warning is logged. This helps detect misconfigured clients or probing attempts.
-
-Additional webhook protections:
-- **Body size limit:** 1 MB maximum
-- **Body read timeout:** 30 seconds
-- **Content-Type enforcement:** Only `application/json` is accepted
-
-## WebSocket Tuning
-
-When using `websocket` mode, you can customize reconnect and ping behavior:
-
-```yaml
-platforms:
-  feishu:
-    extra:
-      ws_reconnect_interval: 120   # Seconds between reconnect attempts (default: 120)
-      ws_ping_interval: 30         # Seconds between WebSocket pings (optional; SDK default if unset)
-```
-
-| Setting | Config key | Default | Description |
-|---------|-----------|---------|-------------|
-| Reconnect interval | `ws_reconnect_interval` | 120s | How long to wait between reconnection attempts |
-| Ping interval | `ws_ping_interval` | _(SDK default)_ | Frequency of WebSocket keepalive pings |
-
-## Per-Group Access Control
-
-Beyond the global `FEISHU_GROUP_POLICY`, you can set fine-grained rules per group chat using `group_rules` in config.yaml:
-
-```yaml
-platforms:
-  feishu:
-    extra:
-      default_group_policy: "open"     # Default for groups not in group_rules
-      admins:                          # Users who can manage bot settings
-        - "ou_admin_open_id"
-      group_rules:
-        "oc_group_chat_id_1":
-          policy: "allowlist"          # open | allowlist | blacklist | admin_only | disabled
-          allowlist:
-            - "ou_user_open_id_1"
-            - "ou_user_open_id_2"
-        "oc_group_chat_id_2":
-          policy: "admin_only"
-        "oc_group_chat_id_3":
-          policy: "blacklist"
-          blacklist:
-            - "ou_blocked_user"
-        "oc_free_chat":
-          policy: "open"
-          require_mention: false       # overrides FEISHU_REQUIRE_MENTION for this chat
-```
-
-| Policy | Description |
-|--------|-------------|
-| `open` | Anyone in the group can use the bot |
-| `allowlist` | Only users in the group's `allowlist` can use the bot |
-| `blacklist` | Everyone except users in the group's `blacklist` can use the bot |
-| `admin_only` | Only users in the global `admins` list can use the bot in this group |
-| `disabled` | Bot ignores all messages in this group |
-
-Set `require_mention: false` on a `group_rules` entry to skip the @-mention requirement for that specific chat. When omitted, the chat inherits the global `FEISHU_REQUIRE_MENTION` value.
-
-Groups not listed in `group_rules` fall back to `default_group_policy` (defaults to the value of `FEISHU_GROUP_POLICY`).
-
-## Deduplication
-
-Inbound messages are deduplicated using message IDs with a 24-hour TTL. The dedup state is persisted across restarts to `~/.hermes/feishu_seen_message_ids.json`.
-
-| Setting | Env Var | Default |
-|---------|---------|---------|
-| Cache size | `HERMES_FEISHU_DEDUP_CACHE_SIZE` | 2048 entries |
-
-## All Environment Variables
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `FEISHU_APP_ID` | ✅ | — | Feishu/Lark App ID |
-| `FEISHU_APP_SECRET` | ✅ | — | Feishu/Lark App Secret |
-| `FEISHU_DOMAIN` | — | `feishu` | `feishu` (China) or `lark` (international) |
-| `FEISHU_CONNECTION_MODE` | — | `websocket` | `websocket` or `webhook` |
-| `FEISHU_ALLOWED_USERS` | — | _(empty)_ | Comma-separated open_id list for user allowlist |
-| `FEISHU_ALLOW_BOTS` | — | `none` | Accept messages from other bots: `none`, `mentions`, or `all` |
-| `FEISHU_REQUIRE_MENTION` | — | `true` | Whether group messages must @mention the bot |
-| `FEISHU_HOME_CHANNEL` | — | — | Chat ID for cron/notification output |
-| `FEISHU_ENCRYPT_KEY` | — | _(empty)_ | Encrypt key for webhook signature verification |
-| `FEISHU_VERIFICATION_TOKEN` | — | _(empty)_ | Verification token for webhook payload auth |
-| `FEISHU_GROUP_POLICY` | — | `allowlist` | Group message policy: `open`, `allowlist`, `disabled` |
-| `FEISHU_BOT_OPEN_ID` | — | _(empty)_ | Bot's open_id (for @mention detection) |
-| `FEISHU_BOT_USER_ID` | — | _(empty)_ | Bot's user_id (for @mention detection) |
-| `FEISHU_BOT_NAME` | — | _(empty)_ | Bot's display name (for @mention detection) |
-| `FEISHU_WEBHOOK_HOST` | — | `127.0.0.1` | Webhook server bind address |
-| `FEISHU_WEBHOOK_PORT` | — | `8765` | Webhook server port |
-| `FEISHU_WEBHOOK_PATH` | — | `/feishu/webhook` | Webhook endpoint path |
-| `HERMES_FEISHU_DEDUP_CACHE_SIZE` | — | `2048` | Max deduplicated message IDs to track |
-| `HERMES_FEISHU_TEXT_BATCH_DELAY_SECONDS` | — | `0.6` | Text burst debounce quiet period |
-| `HERMES_FEISHU_TEXT_BATCH_MAX_MESSAGES` | — | `8` | Max messages merged per text batch |
-| `HERMES_FEISHU_TEXT_BATCH_MAX_CHARS` | — | `4000` | Max characters merged per text batch |
-| `HERMES_FEISHU_MEDIA_BATCH_DELAY_SECONDS` | — | `0.8` | Media burst debounce quiet period |
-
-WebSocket and per-group ACL settings are configured via `config.yaml` under `platforms.feishu.extra` (see [WebSocket Tuning](#websocket-tuning) and [Per-Group Access Control](#per-group-access-control) above).
+The first valid message in a direct chat or group creates an Owner-bound local chat binding for that managed account. Different human members of the same admitted group can then participate in that group's retained conversation.
 
 ## Troubleshooting
 
-| Problem | Fix |
-|---------|-----|
-| `lark-oapi not installed` | Install the SDK: `pip install lark-oapi` |
-| `websockets not installed; websocket mode unavailable` | Install websockets: `pip install websockets` |
-| `aiohttp not installed; webhook mode unavailable` | Install aiohttp: `pip install aiohttp` |
-| `FEISHU_APP_ID or FEISHU_APP_SECRET not set` | Set both env vars or configure via `hermes gateway setup` |
-| `Another local Hermes gateway is already using this Feishu app_id` | Only one Hermes instance can use the same app_id at a time. Stop the other gateway first. |
-| Bot doesn't respond in groups | Ensure the bot is @mentioned, check `FEISHU_GROUP_POLICY`, and verify the sender is in `FEISHU_ALLOWED_USERS` if policy is `allowlist` |
-| `Webhook rejected: invalid verification token` | Ensure `FEISHU_VERIFICATION_TOKEN` matches the token in your Feishu app's Event Subscriptions config |
-| `Webhook rejected: invalid signature` | Ensure `FEISHU_ENCRYPT_KEY` matches the encrypt key in your Feishu app config |
-| Post messages show as plain text | The Feishu API rejected the post payload; this is normal fallback behavior. Check logs for details. |
-| Images/files not received by bot | Grant `im:message` and `im:resource` permission scopes to your Feishu app |
-| Bot identity not auto-detected | Usually a transient network issue reaching Feishu's bot info endpoint. Set `FEISHU_BOT_OPEN_ID` and `FEISHU_BOT_NAME` manually as a workaround. |
-| Peer bot messages still ignored after enabling `FEISHU_ALLOW_BOTS` | Hermes can't identify itself yet — set `FEISHU_BOT_OPEN_ID` (and `FEISHU_BOT_USER_ID` if your app uses `sender_id_type=user_id`). |
-| Peer bots show as `ou_xxxxxx` instead of by name | Grant the `application:bot.basic_info:read` scope. |
-| Error 200340 when clicking approval buttons | Enable **Interactive Card** capability and configure **Card Request URL** in the Feishu Developer Console. See [Required Feishu App Configuration](#required-feishu-app-configuration) above. |
-| `Webhook rate limit exceeded` | More than 120 requests/minute from the same IP. This is usually a misconfiguration or loop. |
+### The account fails its connection test
 
-## Toolset
+- Confirm that the App ID and App Secret belong to the same application.
+- Confirm the selected domain is `feishu` for Feishu China or `lark` for Lark international.
+- Confirm the app is published and installed for the intended tenant.
+- Rotate the App Secret in Hermes after changing it in the Developer Console.
 
-Feishu / Lark uses the `hermes-feishu` platform preset, which includes the same core tools as Telegram and other gateway-based messaging platforms.
+Provider response bodies and access tokens are deliberately redacted. Use the stable Dashboard status and server logs without copying secrets into support messages.
+
+### Direct messages do not arrive
+
+Confirm that the bot capability is enabled, the app version is published/approved, Long Connection is selected, and `im.message.receive_v1` is subscribed.
+
+### Group messages do not trigger
+
+Use the client's real `@` picker to mention the exact bot, or directly reply to a message that bot sent in the same chat. Typing the bot's name as plain text, using `@all`, replying to a human, or replying to another bot is intentionally ignored.
+
+### A profile edit does not affect an existing chat
+
+This is expected. Existing retained conversations use an immutable policy snapshot. Use **Roll over sessions** after ensuring no message is processing, or start a new chat/thread.

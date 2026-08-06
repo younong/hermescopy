@@ -8,6 +8,7 @@ leases exposed here and release them during worker or invocation teardown.
 from __future__ import annotations
 
 import ctypes
+import fcntl
 import hashlib
 import os
 import re
@@ -72,6 +73,8 @@ class CgroupV2IO(Protocol):
     def move_process(self, relative: tuple[str, ...], pid: int) -> None: ...
     def remove_dir(self, relative: tuple[str, ...]) -> None: ...
     def kill_process(self, pid: int) -> None: ...
+    def acquire_admission_lock(self) -> object: ...
+    def release_admission_lock(self, token: object) -> None: ...
 
 
 class DirectoryFdCgroupV2IO:
@@ -100,6 +103,24 @@ class DirectoryFdCgroupV2IO:
         if fd >= 0:
             os.close(fd)
             self._root_fd = -1
+
+    def acquire_admission_lock(self) -> object:
+        try:
+            token = os.open(".", os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY, dir_fd=self._root_fd)
+            fcntl.flock(token, fcntl.LOCK_EX)
+            return token
+        except OSError as exc:
+            if "token" in locals():
+                os.close(token)
+            raise CgroupV2Unavailable("cgroup admission lock is unavailable") from exc
+
+    def release_admission_lock(self, token: object) -> None:
+        if isinstance(token, bool) or not isinstance(token, int) or token < 0:
+            raise CgroupV2Unavailable("cgroup admission lock is invalid")
+        try:
+            fcntl.flock(token, fcntl.LOCK_UN)
+        finally:
+            os.close(token)
 
     def validate_unified_v2(self) -> None:
         if sys.platform != "linux":
@@ -379,12 +400,17 @@ class CgroupV2Manager:
         )
         owner = self._pool + (f"owner-{owner_digest}",)
         worker = owner + (f"worker-{worker_digest}",)
-        with self._lock:
-            self._inspect_hierarchy()
-            if self._count_workers() >= self.policy.global_limits.max_owner_workers:
-                raise CgroupAdmissionRejected("global owner worker admission limit reached")
-            self._ensure_owner(owner)
-            return self._reserve_leaf(worker, "worker", self.policy.owner_limits)
+        token = self._io.acquire_admission_lock()
+        try:
+            with self._lock:
+                self._inspect_hierarchy()
+                self._cleanup_stale_empty_scopes_locked()
+                if self._count_workers() >= self.policy.global_limits.max_owner_workers:
+                    raise CgroupAdmissionRejected("global owner worker admission limit reached")
+                self._ensure_owner(owner)
+                return self._reserve_leaf(worker, "worker", self.policy.owner_limits)
+        finally:
+            self._io.release_admission_lock(token)
 
     def admit_reader(self, lease: SessionReaderAuthorityLease) -> CgroupScopeLease:
         if not isinstance(lease, SessionReaderAuthorityLease) or lease.state not in {
@@ -443,22 +469,30 @@ class CgroupV2Manager:
                     self._active.pop(relative, None)
 
     def cleanup_stale_empty_scopes(self) -> int:
-        """Remove unreserved empty leaves and then empty owner aggregates."""
+        """Remove cross-process-unreserved empty leaves and owner aggregates."""
+        token = self._io.acquire_admission_lock()
+        try:
+            with self._lock:
+                self._inspect_hierarchy()
+                return self._cleanup_stale_empty_scopes_locked()
+        finally:
+            self._io.release_admission_lock(token)
+
+    def _cleanup_stale_empty_scopes_locked(self) -> int:
         removed = 0
-        with self._lock:
-            self._inspect_hierarchy()
-            for owner_name in self._io.list_dirs(self._pool):
-                owner = self._pool + (owner_name,)
-                for leaf_name in self._io.list_dirs(owner):
-                    leaf = owner + (leaf_name,)
-                    if leaf in self._active:
-                        continue
-                    if self._is_unpopulated(leaf) and not self._io.list_dirs(leaf):
-                        self._io.remove_dir(leaf)
-                        removed += 1
-                if not self._io.list_dirs(owner) and self._is_unpopulated(owner):
-                    self._io.remove_dir(owner)
+        for owner_name in self._io.list_dirs(self._pool):
+            owner = self._pool + (owner_name,)
+            for leaf_name in self._io.list_dirs(owner):
+                leaf = owner + (leaf_name,)
+                if leaf in self._active:
+                    continue
+                events = _parse_event_file(self._io.read_text(leaf, "cgroup.events"))
+                if events.get("populated") == 0 and not self._io.list_dirs(leaf):
+                    self._io.remove_dir(leaf)
                     removed += 1
+            if not self._io.list_dirs(owner) and self._is_unpopulated(owner):
+                self._io.remove_dir(owner)
+                removed += 1
         return removed
 
     def cleanup_stale_scopes(self) -> int:
@@ -609,10 +643,16 @@ class CgroupV2Manager:
     def _attach(self, relative: tuple[str, ...], pid: int) -> None:
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
             raise CgroupAdmissionRejected("cgroup process id is invalid")
-        with self._lock:
-            self._io.move_process(relative, pid)
-            if not self._verify_membership(relative, pid):
-                raise CgroupAdmissionRejected("cgroup process membership could not be verified")
+        token = self._io.acquire_admission_lock()
+        try:
+            with self._lock:
+                if relative not in self._active:
+                    raise CgroupAdmissionRejected("cgroup scope is not reserved")
+                self._io.move_process(relative, pid)
+                if not self._verify_membership(relative, pid):
+                    raise CgroupAdmissionRejected("cgroup process membership could not be verified")
+        finally:
+            self._io.release_admission_lock(token)
 
     def _verify_membership(self, relative: tuple[str, ...], pid: int) -> bool:
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:

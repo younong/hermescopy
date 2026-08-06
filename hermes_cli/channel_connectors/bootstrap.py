@@ -31,7 +31,11 @@ class ConnectorRuntimeStatus:
 
     @property
     def ready(self) -> bool:
-        return all(state == "ready" for state in self.states.values())
+        return all(
+            state == "ready"
+            for connector, state in self.states.items()
+            if ":" not in connector
+        )
 
 
 class CanonicalConnectorRuntime:
@@ -40,10 +44,48 @@ class CanonicalConnectorRuntime:
         self.connectors = ConnectorSupervisor()
         self.store: ChannelIdentityStore | None = None
         self.session: aiohttp.ClientSession | None = None
+        self.feishu_config: dict[str, Any] | None = None
+        self.owner_worker_supervisor: Any = None
         self._closed = False
 
-    def get(self, provider: str) -> object | None:
-        return self.connectors.get(provider)
+    def get(self, provider: str, account_id: str | None = None) -> object | None:
+        return self.connectors.get(provider, account_id)
+
+    def register_feishu_account(self, account_id: str) -> None:
+        if self.store is None or self.owner_worker_supervisor is None or self.feishu_config is None:
+            raise RuntimeError("Feishu connector runtime is unavailable")
+        store = self.store
+        supervisor = self.owner_worker_supervisor
+        config = dict(self.feishu_config)
+
+        async def start_feishu() -> FeishuConnector:
+            service = FeishuConnector(
+                store,
+                supervisor,
+                account_id=account_id,
+                config=config,
+            )
+            await service.start()
+            return service
+
+        self.connectors.register("feishu", start_feishu, account_id=account_id)
+
+    async def start_account(self, provider: str, account_id: str) -> object:
+        service = await self.connectors.start_provider(provider, account_id=account_id)
+        self.status.states[f"{provider}:{account_id}"] = "ready"
+        if provider == "feishu":
+            self.status.states[provider] = "ready"
+        return service
+
+    async def stop_account(self, provider: str, account_id: str) -> bool:
+        stopped = await self.connectors.stop_provider(provider, account_id=account_id)
+        self.status.states[f"{provider}:{account_id}"] = "stopped"
+        if provider == "feishu" and not any(
+            self.connectors.get(provider, candidate) is not None
+            for candidate in self.connectors.accounts(provider)
+        ):
+            self.status.states[provider] = "account_unavailable"
+        return stopped
 
     async def close(self) -> None:
         if self._closed:
@@ -54,7 +96,10 @@ class CanonicalConnectorRuntime:
             await self.session.close()
 
 
-def _active_accounts(store: ChannelIdentityStore, provider: str) -> tuple[str, ...]:
+def _active_accounts(
+    store: ChannelIdentityStore,
+    provider: str,
+) -> tuple[str, ...]:
     with store.read() as conn:
         rows = conn.execute(
             """
@@ -63,6 +108,24 @@ def _active_accounts(store: ChannelIdentityStore, provider: str) -> tuple[str, .
             ORDER BY account_id
             """,
             (provider,),
+        ).fetchall()
+    return tuple(str(row["account_id"]) for row in rows)
+
+
+def _active_managed_feishu_accounts(
+    store: ChannelIdentityStore,
+) -> tuple[str, ...]:
+    with store.read() as conn:
+        rows = conn.execute(
+            """
+            SELECT a.account_id FROM connector_accounts a
+            JOIN managed_feishu_accounts m ON m.account_id=a.account_id
+                                             AND m.lifecycle_status='active'
+            JOIN feishu_employee_profiles p ON p.account_id=a.account_id
+                                            AND p.lifecycle_status='active'
+            WHERE a.provider='feishu' AND a.status='active'
+            ORDER BY a.account_id
+            """
         ).fetchall()
     return tuple(str(row["account_id"]) for row in rows)
 
@@ -152,6 +215,7 @@ async def bootstrap_channel_connectors(
         ConnectorRuntimeStatus({provider: "startup_failed" for provider in configured})
     )
     runtime.store = store
+    runtime.owner_worker_supervisor = supervisor
     if not enabled:
         runtime.status = ConnectorRuntimeStatus(unsupported)
         return runtime
@@ -181,23 +245,13 @@ async def bootstrap_channel_connectors(
 
         runtime.connectors.register("weixin_ilink", start_ilink)
 
+    feishu_accounts: tuple[str, ...] = ()
     if "feishu" in enabled:
         feishu_config = enabled["feishu"]
-        accounts = _active_accounts(store, "feishu")
-        if len(accounts) == 1:
-            feishu_account_id = accounts[0]
-
-            async def start_feishu() -> FeishuConnector:
-                service = FeishuConnector(
-                    store,
-                    supervisor,
-                    account_id=feishu_account_id,
-                    config=feishu_config,
-                )
-                await service.start()
-                return service
-
-            runtime.connectors.register("feishu", start_feishu)
+        runtime.feishu_config = dict(feishu_config)
+        feishu_accounts = _active_managed_feishu_accounts(store)
+        for feishu_account_id in feishu_accounts:
+            runtime.register_feishu_account(feishu_account_id)
 
     if "webhook" in enabled:
         webhook_config = enabled["webhook"]
@@ -226,6 +280,27 @@ async def bootstrap_channel_connectors(
                 if provider in {"feishu", "webhook"}
                 else "unsupported"
             )
+            continue
+        if provider == "feishu":
+            started = 0
+            for account_id in feishu_accounts:
+                try:
+                    await runtime.connectors.start_provider(
+                        provider,
+                        account_id=account_id,
+                    )
+                except Exception as exc:
+                    _log.warning(
+                        "connector startup failed provider=%s account_id=%s error_type=%s",
+                        provider,
+                        account_id,
+                        type(exc).__name__,
+                    )
+                    states[f"{provider}:{account_id}"] = "startup_failed"
+                else:
+                    started += 1
+                    states[f"{provider}:{account_id}"] = "ready"
+            states[provider] = "ready" if started else "startup_failed"
             continue
         try:
             await runtime.connectors.start_provider(provider)

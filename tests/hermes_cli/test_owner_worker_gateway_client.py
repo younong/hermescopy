@@ -70,7 +70,7 @@ async def test_client_uses_exact_socket_correlates_rpc_and_releases_once():
     with patch(
         "hermes_cli.owner_worker.gateway_client.mint_owner_worker_bootstrap",
         return_value="bootstrap-claim",
-    ), patch(
+    ) as mint_bootstrap, patch(
         "hermes_cli.owner_worker.gateway_client.owp1_data",
         side_effect=lambda _claims, **kwargs: kwargs["text"],
     ), patch(
@@ -95,7 +95,7 @@ async def test_client_uses_exact_socket_correlates_rpc_and_releases_once():
         "hermes_cli.owner_worker.gateway_client.connect_owner_worker_ws",
         new=AsyncMock(return_value=socket),
     ) as connect:
-        client = OwnerWorkerGatewayClient(supervisor, owner)
+        client = OwnerWorkerGatewayClient(supervisor, owner, connection_purpose="retained-channel")
         await client.connect()
         response = await client.call("session.create", {})
         event = await client.wait_for_event("message.complete", session_id="s")
@@ -107,6 +107,7 @@ async def test_client_uses_exact_socket_correlates_rpc_and_releases_once():
     assert connect.await_args.args[0] == "/tmp/exact-worker.sock"
     assert "internal_owner_bootstrap=bootstrap-claim" in connect.await_args.args[1]
     assert socket.sent[0] == "hello-frame"
+    assert mint_bootstrap.call_args.kwargs["connection_purpose"] == "retained-channel"
     request = json.loads(socket.sent[1])
     assert request["method"] == "session.create"
     use_lease.release.assert_called_once()
@@ -115,7 +116,9 @@ async def test_client_uses_exact_socket_correlates_rpc_and_releases_once():
 
 @pytest.mark.asyncio
 async def test_next_event_decodes_pending_and_live_events():
-    client = OwnerWorkerGatewayClient(SimpleNamespace(), SimpleNamespace())
+    client = OwnerWorkerGatewayClient(
+        SimpleNamespace(), SimpleNamespace(), connection_purpose="retained-channel"
+    )
     client.websocket = SimpleNamespace()
     client._bootstrap = "bootstrap"
     client._pending_events.append(
@@ -187,7 +190,7 @@ async def test_failed_handshake_releases_lease():
         new=AsyncMock(return_value=socket),
     ):
         with pytest.raises(RuntimeError, match="stale"):
-            await OwnerWorkerGatewayClient(supervisor, owner).connect()
+            await OwnerWorkerGatewayClient(supervisor, owner, connection_purpose="retained-channel").connect()
 
     use_lease.release.assert_called_once()
     socket.close.assert_awaited_once()
