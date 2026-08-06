@@ -5472,46 +5472,10 @@ async def get_feishu_employee_catalog(request: Request):
     if _authenticated_owner_request(request):
         _managed_feishu_context(request)
         return await _proxy_authenticated_owner_http(request)
-    owner_home = Path(os.environ.get("HERMES_OWNER_HOME") or Path.home()).resolve()
-    from hermes_cli.model_registrations import get_model_registrations_payload
-    from hermes_cli.owner_runtime import owner_worker_runtime_paths
-    from hermes_cli.skills_config import _list_all_skills, get_disabled_skills
-    from hermes_cli.tools_config import enabled_mcp_server_names
-    from toolsets import get_all_toolsets
+    from hermes_cli.employee_catalog import employee_catalog_payload
 
-    config = load_config()
-    disabled_skills = get_disabled_skills(config, "feishu")
-    registrations = [
-        item
-        for item in get_model_registrations_payload()["registrations"]
-        if item.get("kind") == "chat"
-    ]
-    toolsets = [
-        {"name": name, "description": str(item.get("description") or "")}
-        for name, item in sorted(get_all_toolsets().items())
-        if name not in {"all", "*"} and not name.startswith("mcp-")
-    ]
-    skills = [
-        {
-            "name": str(item.get("name") or ""),
-            "description": str(item.get("description") or ""),
-        }
-        for item in _list_all_skills()
-        if str(item.get("name") or "") not in disabled_skills
-    ]
-    paths = owner_worker_runtime_paths(owner_home=owner_home, worker_generation=1)
-    return {
-        "model_registrations": registrations,
-        "toolsets": toolsets,
-        "skills": skills,
-        "mcp_servers": sorted(enabled_mcp_server_names(config)),
-        "workspace": {"root": "", "default": "default"},
-        "knowledge_roots": [
-            {"id": "default", "relative_path": "default"}
-            for path in (paths.default_workspace,)
-            if path.exists() and path.is_dir()
-        ],
-    }
+    owner_home = Path(os.environ.get("HERMES_OWNER_HOME") or Path.home())
+    return employee_catalog_payload(owner_home)
 
 
 @app.get("/api/messaging/feishu/employees")

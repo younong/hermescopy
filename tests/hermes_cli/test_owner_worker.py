@@ -3571,6 +3571,7 @@ def test_worker_analytics_and_model_info_routes_require_owner_token(tmp_path, mo
     assert client.get("/api/dashboard/font").status_code == 401
     assert client.get("/api/dashboard/plugins").status_code == 401
     assert client.get("/api/tools/toolsets").status_code == 401
+    assert client.get("/api/messaging/feishu/catalog").status_code == 401
 
 
 def test_worker_owner_startup_routes_return_owner_local_payloads(tmp_path, monkeypatch):
@@ -3602,6 +3603,7 @@ def test_worker_owner_startup_routes_return_owner_local_payloads(tmp_path, monke
     font = get("/api/dashboard/font")
     plugins = get("/api/dashboard/plugins")
     toolsets = get("/api/tools/toolsets")
+    employee_catalog = get("/api/messaging/feishu/catalog")
 
     assert config.status_code == 200
     assert config.json()["model"] == "owner-model"
@@ -3613,6 +3615,14 @@ def test_worker_owner_startup_routes_return_owner_local_payloads(tmp_path, monke
     toolsets_by_name = {item["name"]: item for item in toolsets.json()}
     assert toolsets_by_name["x_search"]["enabled"] is True
     assert toolsets_by_name["x_search"]["available"] is True
+    assert employee_catalog.status_code == 200
+    assert employee_catalog.json()["workspace"] == {
+        "default": "default",
+        "root": "",
+    }
+    assert "owner-skill" in {
+        item["name"] for item in employee_catalog.json()["skills"]
+    }
 
 
 def test_worker_analytics_routes_return_owner_local_data(tmp_path, monkeypatch):
