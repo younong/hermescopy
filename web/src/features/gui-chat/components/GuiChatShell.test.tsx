@@ -2,7 +2,7 @@
 
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { MemoryRouter, useNavigate } from "react-router-dom";
+import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { GuiChatConnection } from "../api";
@@ -328,9 +328,29 @@ describe("GuiChatShell", () => {
     const sidebar = document.querySelector('aside[aria-label="Chat workspace"]');
     expect(sidebar).not.toBeNull();
     expect(sidebar?.querySelector('[aria-label="Manage models"]')?.textContent).toContain("Models");
+    expect(sidebar?.querySelector('[aria-label="Manage messaging robots"]')?.textContent).toContain("Robots");
     expect(sidebar?.querySelector('[aria-label="Message composition statistics"]')?.textContent).toContain("Message statistics");
     expect(document.querySelector('main header [aria-label="Manage models"]')).toBeNull();
     expect(document.querySelector('[aria-label="Log out"]')).not.toBeNull();
+  });
+
+  it("opens robot management from the dedicated workspace", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(
+      <>
+        <LocationProbe />
+        <GuiChatShell />
+      </>,
+    );
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[aria-label="Manage messaging robots"]')?.click();
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector("[data-location]")?.textContent).toBe("/channels");
   });
 
   it("opens message statistics inside the dedicated workspace", async () => {
@@ -925,6 +945,11 @@ async function renderShellAt(entry: string, shell: ReactNode = <GuiChatShell />)
 function ReadyProbe() {
   const { ready } = useDashboardAuthIdentity();
   return <span data-ready={ready} />;
+}
+
+function LocationProbe() {
+  const location = useLocation();
+  return <span data-location>{location.pathname}</span>;
 }
 
 function NavigationProbe({

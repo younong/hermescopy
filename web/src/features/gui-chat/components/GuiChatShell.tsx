@@ -14,6 +14,7 @@ import {
   RefreshCw,
   Search,
   QrCode,
+  Radio,
   Settings2,
   SlidersHorizontal,
   Sparkles,
@@ -755,6 +756,18 @@ export function GuiChatShell() {
         >
           <CalendarClock />
           <span>Scheduled Tasks</span>
+        </button>
+        <button
+          aria-label="Manage messaging robots"
+          className="gui-chat-nav-item"
+          onClick={() => {
+            closeMobilePanel();
+            navigate("/channels");
+          }}
+          type="button"
+        >
+          <Radio />
+          <span>Robots</span>
         </button>
         <button
           aria-current={modelsOpen ? "page" : undefined}
