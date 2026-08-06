@@ -61,6 +61,8 @@ class FakeCgroupV2IO:
         self.kill_cgroup_succeeds = True
         self.freeze_succeeds = True
         self.process_kill_succeeds = True
+        self.admission_lock_depth = 0
+        self.admission_lock_acquisitions = 0
 
     def _node(self, controllers=("cpu", "memory", "pids")):
         return {
@@ -83,6 +85,16 @@ class FakeCgroupV2IO:
     def validate_unified_v2(self):
         if not self.unified:
             raise CgroupV2Unavailable("not unified")
+
+    def acquire_admission_lock(self):
+        assert self.admission_lock_depth == 0
+        self.admission_lock_depth = 1
+        self.admission_lock_acquisitions += 1
+        return object()
+
+    def release_admission_lock(self, _token):
+        assert self.admission_lock_depth == 1
+        self.admission_lock_depth = 0
 
     def mkdir(self, relative):
         assert relative not in self.nodes
@@ -319,6 +331,48 @@ def test_enforces_exact_global_worker_and_global_owner_executor_admission(tmp_pa
     manager.admit_executor(_identity("owner-b", executor="executor-c"), "inv-c")
     with pytest.raises(CgroupAdmissionRejected, match="global executor"):
         manager.admit_executor(_identity("owner-c", executor="executor-d"), "inv-d")
+
+
+def test_worker_admission_reclaims_stale_empty_worker_before_capacity_count(tmp_path):
+    manager, io = _manager(tmp_path, global_workers=1)
+    stale = manager.admit_worker(_lease("owner-a", "worker-a"))
+    stale.attach(301)
+    io._set_pids(stale._relative, ())
+    manager._active.pop(stale._relative)
+
+    replacement = manager.admit_worker(_lease("owner-b", "worker-b"))
+
+    assert stale._relative not in io.nodes
+    assert replacement._relative in io.nodes
+    assert io.admission_lock_acquisitions == 3
+    assert io.admission_lock_depth == 0
+
+
+def test_worker_admission_preserves_active_empty_reservation(tmp_path):
+    manager, io = _manager(tmp_path, global_workers=1)
+    active = manager.admit_worker(_lease("owner-a", "worker-a"))
+
+    with pytest.raises(CgroupAdmissionRejected, match="worker"):
+        manager.admit_worker(_lease("owner-b", "worker-b"))
+
+    assert active._relative in io.nodes
+
+
+def test_worker_admission_preserves_populated_or_ambiguous_stale_scope(tmp_path):
+    for events in (None, "frozen 0\n"):
+        policy = _policy(tmp_path, global_workers=1)
+        io = FakeCgroupV2IO(policy.cgroup_root)
+        manager = CgroupV2Manager(policy, io=io)
+        stale = manager.admit_worker(_lease("owner-a", "worker-a"))
+        stale.attach(302)
+        manager._active.pop(stale._relative)
+        if events is not None:
+            io.nodes[stale._relative]["cgroup.events"] = events
+
+        with pytest.raises(CgroupAdmissionRejected, match="worker"):
+            manager.admit_worker(_lease("owner-b", "worker-b"))
+
+        assert stale._relative in io.nodes
 
 
 def test_membership_attach_is_verified_across_all_managed_leaves(tmp_path):

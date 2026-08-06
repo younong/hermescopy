@@ -96,6 +96,16 @@ def test_deterministic_smoke_uses_environment_temporary_directory(monkeypatch, t
     assert arguments == {"prefix": "hcs-"}
 
 
+def test_deterministic_smoke_sets_bounded_owner_worker_drain_timeout(tmp_path):
+    module = _load_smoke_module()
+    env = module._dashboard_env(tmp_path / "home", tmp_path / "workspace", tmp_path / "guard")
+
+    assert env["HERMES_OWNER_WORKER_DRAIN_TIMEOUT"] == str(
+        module.OWNER_WORKER_DRAIN_TIMEOUT
+    )
+    assert module.OWNER_WORKER_DRAIN_TIMEOUT < module.DEFAULT_TIMEOUT
+
+
 def test_deterministic_smoke_uses_exact_operator_root(monkeypatch, tmp_path):
     module = _load_smoke_module()
     temporary = tmp_path / "hcs-exact"
@@ -152,6 +162,35 @@ def test_dashboard_gateway_cleanup_terminates_descendants_after_parent_exit(monk
     gateway.close()
 
     assert signaled == [(gateway.process.pid, module.signal.SIGTERM)]
+
+
+def test_dashboard_gateway_waits_for_worker_drain_before_force_kill(monkeypatch):
+    module = _load_smoke_module()
+    gateway = module.DashboardGateway.__new__(module.DashboardGateway)
+    gateway._closed = False
+
+    class Process:
+        pid = 4123
+
+        def poll(self):
+            return None
+
+        def wait(self, *, timeout):
+            if timeout == module.OWNER_WORKER_DRAIN_TIMEOUT + module.DASHBOARD_SHUTDOWN_GRACE:
+                raise subprocess.TimeoutExpired("dashboard", timeout)
+            assert timeout == 3
+            return 0
+
+    gateway.process = Process()
+    signaled = []
+    monkeypatch.setattr(module.os, "killpg", lambda pid, signum: signaled.append((pid, signum)))
+
+    gateway.close()
+
+    assert signaled == [
+        (gateway.process.pid, module.signal.SIGTERM),
+        (gateway.process.pid, module.signal.SIGKILL),
+    ]
 
 
 def test_deterministic_smoke_failure_is_bounded_and_cleans_artifacts(monkeypatch, tmp_path):

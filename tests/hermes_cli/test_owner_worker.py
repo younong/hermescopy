@@ -941,7 +941,7 @@ def test_supervisor_resource_policy_controls_capacity_and_gates_worker_before_he
         Path(argv[argv.index("--socket") + 1]).touch()
         return _FakeProcess()
 
-    monkeypatch.setenv("HERMES_OWNER_WORKER_MAX", "99")
+    monkeypatch.delenv("HERMES_OWNER_WORKER_MAX", raising=False)
     supervisor = OwnerWorkerSupervisor(
         control_home=tmp_path / "control", client_cls=_FakeClient,
         process_factory=fake_process_factory, startup_timeout=0.1,
@@ -962,6 +962,46 @@ def test_supervisor_resource_policy_controls_capacity_and_gates_worker_before_he
     assert operations[-1] == ("cleanup",)
     for fd in (*child_gate_fds, *child_resource_fds):
         os.close(fd)
+
+
+def test_supervisor_accepts_runtime_limit_below_resource_policy(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    manager = SimpleNamespace(
+        policy=SimpleNamespace(global_limits=SimpleNamespace(max_owner_workers=5)),
+        admit_executor=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setenv("HERMES_OWNER_WORKER_MAX", "4")
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError),
+        resource_manager=manager,
+    )
+
+    assert supervisor.max_workers == 4
+
+
+@pytest.mark.parametrize("configured", ["0", "6", "invalid"])
+def test_supervisor_rejects_invalid_or_excessive_resource_limit(
+    tmp_path, monkeypatch, configured,
+):
+    from types import SimpleNamespace
+
+    manager = SimpleNamespace(
+        policy=SimpleNamespace(global_limits=SimpleNamespace(max_owner_workers=5)),
+        admit_executor=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setenv("HERMES_OWNER_WORKER_MAX", configured)
+
+    with pytest.raises(ValueError, match="owner worker limit"):
+        OwnerWorkerSupervisor(
+            control_home=tmp_path / "control",
+            client_cls=_FakeClient,
+            process_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError),
+            resource_manager=manager,
+        )
 
 
 def test_supervisor_resource_setup_failure_closes_child_descriptor_and_reservation(tmp_path, monkeypatch):

@@ -147,7 +147,9 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert "MemoryAccounting=yes" in source
     assert "TasksAccounting=yes" in source
     assert "owner_worker_drain_timeout=120" in source
+    assert "owner_worker_runtime_limit=4" in source
     assert 'dashboard_stop_timeout="$((owner_worker_drain_timeout + 30))"' in source
+    assert "Environment=HERMES_OWNER_WORKER_MAX=$owner_worker_runtime_limit" in source
     assert "Environment=HERMES_OWNER_WORKER_DRAIN_TIMEOUT=$owner_worker_drain_timeout" in source
     assert "KillMode=mixed" in source
     assert "TimeoutStopSec=$dashboard_stop_timeout" in source

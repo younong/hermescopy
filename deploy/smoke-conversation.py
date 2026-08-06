@@ -36,6 +36,8 @@ SAFE_TOOL_MARKER = "safe-tool-ok-419"
 RESUME_MARKER = "resume-context-marker-587"
 DEFAULT_TIMEOUT = 90.0
 STEP_TIMEOUT = 60.0
+OWNER_WORKER_DRAIN_TIMEOUT = 12.0
+DASHBOARD_SHUTDOWN_GRACE = 5.0
 
 
 class SmokeFailure(RuntimeError):
@@ -430,7 +432,7 @@ class DashboardGateway:
             elif process.poll() is None:
                 process.terminate()
             try:
-                process.wait(timeout=10)
+                process.wait(timeout=OWNER_WORKER_DRAIN_TIMEOUT + DASHBOARD_SHUTDOWN_GRACE)
             except subprocess.TimeoutExpired:
                 if os.name == "posix":
                     try:
@@ -625,6 +627,7 @@ def _dashboard_env(
             "HERMES_CWD": str(workspace),
             "TERMINAL_CWD": str(workspace),
             "HERMES_TUI_TOOLSETS": "terminal",
+            "HERMES_OWNER_WORKER_DRAIN_TIMEOUT": str(OWNER_WORKER_DRAIN_TIMEOUT),
             "NO_PROXY": "127.0.0.1,localhost",
             "no_proxy": "127.0.0.1,localhost",
             "TERMINAL_ENV": "local",

@@ -693,6 +693,7 @@ owner_root="$hermes_home/users"
 service_user="hermes"
 service_group="hermes"
 owner_worker_drain_timeout=120
+owner_worker_runtime_limit=4
 dashboard_stop_timeout="$((owner_worker_drain_timeout + 30))"
 old_current_target=""
 new_current_target=""
@@ -1381,6 +1382,7 @@ Environment=MALLOC_ARENA_MAX=2
 Environment=HERMES_DASHBOARD_PUBLIC_URL=$dashboard_public_url
 Environment=HERMES_SANDBOX_DEPLOYMENT_POLICY=hermes_cli.owner_worker.host_sandbox:host_sandbox_deployment_policy
 Environment=HERMES_DISABLE_LAZY_INSTALLS=1
+Environment=HERMES_OWNER_WORKER_MAX=$owner_worker_runtime_limit
 Environment=HERMES_OWNER_WORKER_DRAIN_TIMEOUT=$owner_worker_drain_timeout
 WorkingDirectory=$current
 ExecStart=$venv/bin/python -m hermes_cli.owner_worker.cgroup_bootstrap --managed-root $cgroup_root -- $runner dashboard --host 127.0.0.1 --port 9119 --no-open --skip-build --trust-proxy-headers
