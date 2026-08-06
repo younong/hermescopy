@@ -29,6 +29,9 @@ const mocks = vi.hoisted(() => ({
   getSessions: vi.fn(),
   getEmptySessionsCount: vi.fn(),
   getSessionStats: vi.fn(),
+  getMessagingPlatforms: vi.fn(),
+  getFeishuEmployees: vi.fn(),
+  getFeishuEmployeeCatalog: vi.fn(),
 }));
 
 vi.mock("@/lib/api", async (importOriginal) => {
@@ -46,6 +49,9 @@ vi.mock("@/lib/api", async (importOriginal) => {
       getSessions: mocks.getSessions,
       getEmptySessionsCount: mocks.getEmptySessionsCount,
       getSessionStats: mocks.getSessionStats,
+      getMessagingPlatforms: mocks.getMessagingPlatforms,
+      getFeishuEmployees: mocks.getFeishuEmployees,
+      getFeishuEmployeeCatalog: mocks.getFeishuEmployeeCatalog,
       logout: mocks.logout,
     },
   };
@@ -269,6 +275,18 @@ beforeEach(() => {
     expires_at: 123,
     next_action: "continue_in_wechat",
   });
+  mocks.getMessagingPlatforms.mockReset();
+  mocks.getFeishuEmployees.mockReset();
+  mocks.getFeishuEmployees.mockResolvedValue({ employees: [] });
+  mocks.getFeishuEmployeeCatalog.mockReset();
+  mocks.getFeishuEmployeeCatalog.mockResolvedValue({
+    knowledge_roots: [],
+    mcp_servers: [],
+    model_registrations: [],
+    skills: [],
+    toolsets: [],
+    workspace: { default: "default", root: "" },
+  });
   window.__HERMES_AUTH_REQUIRED__ = true;
   window.matchMedia = vi.fn().mockImplementation((query: string) => ({
     addEventListener: vi.fn(),
@@ -328,13 +346,13 @@ describe("GuiChatShell", () => {
     const sidebar = document.querySelector('aside[aria-label="Chat workspace"]');
     expect(sidebar).not.toBeNull();
     expect(sidebar?.querySelector('[aria-label="Manage models"]')?.textContent).toContain("Models");
-    expect(sidebar?.querySelector('[aria-label="Manage messaging robots"]')?.textContent).toContain("Robots");
+    expect(sidebar?.querySelector('[aria-label="员工管理"]')?.textContent).toContain("员工管理");
     expect(sidebar?.querySelector('[aria-label="Message composition statistics"]')?.textContent).toContain("Message statistics");
     expect(document.querySelector('main header [aria-label="Manage models"]')).toBeNull();
     expect(document.querySelector('[aria-label="Log out"]')).not.toBeNull();
   });
 
-  it("opens robot management from the dedicated workspace", async () => {
+  it("opens employee management inside the dedicated workspace", async () => {
     const connection = createConnection();
     mocks.getAuthMe.mockResolvedValue(authIdentity());
     mocks.connectGuiChat.mockReturnValue(connection);
@@ -346,11 +364,21 @@ describe("GuiChatShell", () => {
       </>,
     );
     await act(async () => {
-      document.querySelector<HTMLButtonElement>('[aria-label="Manage messaging robots"]')?.click();
+      document.querySelector<HTMLButtonElement>('[aria-label="员工管理"]')?.click();
       await Promise.resolve();
     });
 
-    expect(document.querySelector("[data-location]")?.textContent).toBe("/channels");
+    expect(document.querySelector("[data-location]")?.textContent).toBe("/chat/robots");
+    const robotsPane = document.querySelector("[data-robots-pane]");
+    expect(robotsPane).not.toBeNull();
+    expect(robotsPane?.getAttribute("data-theme")).toBe("chat-workspace");
+    expect(document.body.textContent).toContain("AI employees");
+    expect(document.querySelector("[data-composer-send]")).toBeNull();
+    expect(
+      document.querySelector<HTMLButtonElement>('[aria-label="员工管理"]')
+        ?.getAttribute("aria-current"),
+    ).toBe("page");
+    expect(mocks.getMessagingPlatforms).not.toHaveBeenCalled();
   });
 
   it("opens message statistics inside the dedicated workspace", async () => {
