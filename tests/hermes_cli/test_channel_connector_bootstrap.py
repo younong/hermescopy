@@ -177,12 +177,68 @@ async def test_feishu_registers_with_shared_supervisor(monkeypatch, tmp_path):
     assert isinstance(runtime.connectors, ConnectorSupervisor)
     assert runtime.get("feishu") is service
     assert runtime.status.ready is True
-    assert runtime.status.states == {"feishu": "ready"}
+    assert runtime.status.states == {
+        "feishu": "ready",
+        "feishu:ca_feishu": "ready",
+    }
     assert constructor.call_args.args == (store, supervisor)
     assert constructor.call_args.kwargs["account_id"] == "ca_feishu"
     service.start.assert_awaited_once()
     await runtime.close()
     service.close.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_feishu_starts_every_managed_account_with_partial_failure(
+    monkeypatch, tmp_path
+):
+    services = {"ca_one": AsyncMock(), "ca_two": AsyncMock()}
+    services["ca_one"].start = AsyncMock()
+    services["ca_one"].close = AsyncMock()
+    services["ca_two"].start = AsyncMock(side_effect=RuntimeError("unavailable"))
+    services["ca_two"].close = AsyncMock()
+    monkeypatch.setattr(
+        connector_bootstrap.ChannelCrypto,
+        "from_env",
+        lambda **kwargs: object(),
+    )
+    store = MagicMock()
+    read_context = MagicMock()
+    connection = MagicMock()
+    connection.execute.return_value.fetchall.return_value = [
+        {"account_id": "ca_one"},
+        {"account_id": "ca_two"},
+    ]
+    read_context.__enter__.return_value = connection
+    read_context.__exit__.return_value = False
+    store.read.return_value = read_context
+    monkeypatch.setattr(
+        connector_bootstrap,
+        "ChannelIdentityStore",
+        lambda *args, **kwargs: store,
+    )
+    monkeypatch.setattr(
+        connector_bootstrap,
+        "FeishuConnector",
+        lambda *args, account_id, **kwargs: services[account_id],
+    )
+
+    runtime = await connector_bootstrap.bootstrap_channel_connectors(
+        {"feishu": {"enabled": True}},
+        auth_required=True,
+        supervisor=_Supervisor(tmp_path),
+    )
+
+    assert runtime.get("feishu") is services["ca_one"]
+    assert runtime.get("feishu", "ca_one") is services["ca_one"]
+    assert runtime.get("feishu", "ca_two") is None
+    assert runtime.status.states == {
+        "feishu": "ready",
+        "feishu:ca_one": "ready",
+        "feishu:ca_two": "startup_failed",
+    }
+    await runtime.close()
+    services["ca_one"].close.assert_awaited_once()
 
 
 @pytest.mark.anyio

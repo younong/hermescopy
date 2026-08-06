@@ -27,6 +27,8 @@ CONTROL_PLANE_AUTH_PATHS: frozenset[str] = frozenset({
 })
 CONTROL_PLANE_AUTH_ROUTES: frozenset[tuple[str, str]] = frozenset({
     ("POST", "/api/messaging/webhook/accounts"),
+    ("GET", "/api/messaging/feishu/employees"),
+    ("POST", "/api/messaging/feishu/employees"),
 })
 CONTROL_PLANE_AUTH_PREFIXES: tuple[str, ...] = (
     "/api/auth/",
@@ -63,6 +65,7 @@ OWNER_WORKER_ROUTES: frozenset[tuple[str, str]] = frozenset({
     ("POST", "/api/files/upload"),
     ("POST", "/api/files/upload-stream"),
     ("POST", "/api/files/mkdir"),
+    ("GET", "/api/messaging/feishu/catalog"),
 })
 # Compatibility export for callers that only need the known path inventory.
 OWNER_WORKER_PATHS: frozenset[str] = frozenset(path for _method, path in OWNER_WORKER_ROUTES)
@@ -103,6 +106,19 @@ def _session_item_path(path: str) -> bool:
         and parts[:3] == ["", "api", "sessions"]
         and bool(parts[3])
         and parts[4] in _SESSION_ITEM_SUFFIXES
+    )
+
+
+def _managed_feishu_route(path: str, method: str) -> bool:
+    parts = path.split("/")
+    if len(parts) == 6 and parts[:5] == ["", "api", "messaging", "feishu", "employees"]:
+        return bool(parts[5]) and method == "GET"
+    return (
+        len(parts) == 7
+        and parts[:5] == ["", "api", "messaging", "feishu", "employees"]
+        and bool(parts[5])
+        and parts[6] in {"profile", "credentials", "lifecycle", "test", "rollover"}
+        and method in {"PUT", "POST"}
     )
 
 
@@ -148,6 +164,7 @@ def classify_authenticated_api(
         return AuthenticatedApiDecision(bucket, True, bucket.value)
     if (
         (method, path) in CONTROL_PLANE_AUTH_ROUTES
+        or _managed_feishu_route(path, method)
         or path in CONTROL_PLANE_AUTH_PATHS
         or any(path.startswith(prefix) for prefix in CONTROL_PLANE_AUTH_PREFIXES)
     ):

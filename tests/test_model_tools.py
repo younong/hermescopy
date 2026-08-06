@@ -137,7 +137,8 @@ class TestHandleFunctionCall:
         assert calls == [{
             "function_name": "web_search", "function_args": {"q": "test"},
             "task_id": "task-1", "session_id": "session-1", "tool_call_id": "",
-            "turn_id": "", "api_request_id": "",
+            "turn_id": "", "api_request_id": "", "workspace_prefix": None,
+            "knowledge_prefixes": (),
         }]
 
     def test_authenticated_safe_terminal_is_approved_before_executor(self):

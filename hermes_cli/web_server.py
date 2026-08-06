@@ -95,6 +95,7 @@ try:
         FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
         WebSocket, WebSocketDisconnect,
     )
+    from fastapi.exceptions import RequestValidationError
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
     from fastapi.staticfiles import StaticFiles
@@ -110,6 +111,7 @@ except ImportError:
             FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
             WebSocket, WebSocketDisconnect,
         )
+        from fastapi.exceptions import RequestValidationError
         from fastapi.middleware.cors import CORSMiddleware
         from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
         from fastapi.staticfiles import StaticFiles
@@ -330,6 +332,19 @@ def _get_event_state(app: "FastAPI"):
 
 
 app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
+
+_FEISHU_SECRET_BODY_PATHS = {
+    "/api/messaging/feishu/employees",
+}
+
+
+@app.exception_handler(RequestValidationError)
+async def _request_validation_error(request: Request, exc: RequestValidationError):
+    path = request.url.path.rstrip("/")
+    if path in _FEISHU_SECRET_BODY_PATHS or path.endswith("/credentials"):
+        return JSONResponse(status_code=422, content={"detail": "invalid_request"})
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
 
 # Memory-provider OAuth connect routes live in the memory layer, not here.
 from hermes_cli.memory_oauth import router as _memory_oauth_router  # noqa: E402
@@ -1257,6 +1272,32 @@ class MessagingPlatformUpdate(BaseModel):
     # Explicit body profile beats the query param injected by the global
     # dashboard profile switcher (same precedence as other scoped writes).
     profile: Optional[str] = None
+
+
+class FeishuEmployeeCreate(BaseModel):
+    app_id: str
+    app_secret: str
+    domain: str = "feishu"
+    encrypt_key: str = ""
+    verification_token: str = ""
+    profile: Dict[str, Any]
+    activate: bool = True
+
+
+class FeishuEmployeeProfileUpdate(BaseModel):
+    expected_revision: int
+    profile: Dict[str, Any]
+
+
+class FeishuEmployeeCredentialRotate(BaseModel):
+    expected_credential_version: int
+    app_secret: str
+    encrypt_key: Optional[str] = None
+    verification_token: Optional[str] = None
+
+
+class FeishuEmployeeLifecycleUpdate(BaseModel):
+    status: str
 
 
 class AudioTranscriptionRequest(BaseModel):
@@ -5321,6 +5362,21 @@ class WebhookConnectorCreate(BaseModel):
     allowed_events: list[str] = []
 
 
+def _managed_feishu_context(request: Request):
+    if not bool(getattr(request.app.state, "auth_required", False)):
+        raise HTTPException(status_code=403, detail="authentication_required")
+    session = getattr(request.state, "session", None)
+    if session is None:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    runtime = getattr(request.app.state, "channel_connector_runtime", None)
+    store = getattr(runtime, "store", None)
+    if store is None:
+        raise HTTPException(status_code=503, detail="connector_runtime_unavailable")
+    from hermes_cli.dashboard_auth.owner_context import owner_context_from_session
+
+    return runtime, store, owner_context_from_session(session)
+
+
 @app.post("/api/messaging/webhook/accounts", status_code=201)
 async def create_webhook_connector_account(
     request: Request,
@@ -5371,6 +5427,338 @@ async def create_webhook_connector_account(
         "hmac_secret": hmac_secret,
         "response_hmac_secret": response_hmac_secret,
     }
+
+
+def _feishu_employee_payload(runtime, account, profile) -> dict[str, Any]:
+    states = getattr(getattr(runtime, "status", None), "states", {})
+    runtime_state = states.get(f"feishu:{account.account_id}") if isinstance(states, dict) else None
+    return {
+        "account_id": account.account_id,
+        "app_id": account.provider_account_id,
+        "credential_version": account.credential_version,
+        "lifecycle_status": account.lifecycle_status,
+        "runtime_state": runtime_state or "stopped",
+        "profile_revision": profile.revision if profile is not None else None,
+        "profile_fingerprint": profile.fingerprint if profile is not None else None,
+        "profile": profile.profile if profile is not None else None,
+    }
+
+
+def _feishu_employee_or_404(store, owner, account_id: str):
+    from hermes_cli.channel_identity import (
+        resolve_employee_profile,
+        resolve_managed_feishu_account,
+    )
+
+    try:
+        account = resolve_managed_feishu_account(
+            store, owner=owner, account_id=account_id
+        )
+        profile = None
+        if account.profile_revision is not None:
+            profile = resolve_employee_profile(
+                store,
+                owner=owner,
+                account_id=account_id,
+                revision=account.profile_revision,
+            )
+        return account, profile
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail="Feishu employee not found") from exc
+
+
+@app.get("/api/messaging/feishu/catalog")
+async def get_feishu_employee_catalog(request: Request):
+    if _authenticated_owner_request(request):
+        _managed_feishu_context(request)
+        return await _proxy_authenticated_owner_http(request)
+    from hermes_cli.employee_catalog import employee_catalog_payload
+
+    owner_home = Path(os.environ.get("HERMES_OWNER_HOME") or Path.home())
+    return employee_catalog_payload(owner_home)
+
+
+@app.get("/api/messaging/feishu/employees")
+async def list_feishu_employees(request: Request):
+    runtime, store, owner = _managed_feishu_context(request)
+    from hermes_cli.channel_identity import (
+        list_managed_feishu_accounts,
+        resolve_employee_profile,
+    )
+
+    employees = []
+    for account in list_managed_feishu_accounts(store, owner=owner):
+        profile = None
+        if account.profile_revision is not None:
+            profile = resolve_employee_profile(
+                store,
+                owner=owner,
+                account_id=account.account_id,
+                revision=account.profile_revision,
+            )
+        employees.append(_feishu_employee_payload(runtime, account, profile))
+    return {"employees": employees}
+
+
+@app.get("/api/messaging/feishu/employees/{account_id}")
+async def get_feishu_employee(request: Request, account_id: str):
+    runtime, store, owner = _managed_feishu_context(request)
+    account, profile = _feishu_employee_or_404(store, owner, account_id)
+    return _feishu_employee_payload(runtime, account, profile)
+
+
+@app.post("/api/messaging/feishu/employees", status_code=201)
+async def create_feishu_employee(request: Request, body: FeishuEmployeeCreate):
+    runtime, store, owner = _managed_feishu_context(request)
+    from hermes_cli.channel_connectors.feishu import verify_feishu_credentials
+    from hermes_cli.channel_identity import (
+        register_managed_feishu_account_for_owner,
+        resolve_employee_profile,
+        resolve_managed_feishu_account,
+    )
+    from hermes_cli.employee_policy import normalize_employee_source_policy
+
+    try:
+        profile = normalize_employee_source_policy(body.profile)
+        verified = await verify_feishu_credentials({
+            "app_id": body.app_id,
+            "app_secret": body.app_secret,
+            "domain": body.domain,
+            "encrypt_key": body.encrypt_key,
+            "verification_token": body.verification_token,
+        })
+        credentials = {
+            **verified,
+            "app_secret": body.app_secret,
+            "encrypt_key": body.encrypt_key,
+            "verification_token": body.verification_token,
+        }
+        registered = register_managed_feishu_account_for_owner(
+            store,
+            owner=owner,
+            provider_account_id=verified["app_id"],
+            external_subject=verified.get("bot_open_id") or verified.get("bot_user_id") or verified["app_id"],
+            conversation_id=None,
+            credentials=credentials,
+            employee_profile=profile,
+            activate=body.activate,
+        )
+        account = resolve_managed_feishu_account(
+            store, owner=owner, account_id=registered.account_id
+        )
+        employee = resolve_employee_profile(
+            store, owner=owner, account_id=registered.account_id
+        )
+        if body.activate:
+            runtime.register_feishu_account(registered.account_id)
+            try:
+                await runtime.start_account("feishu", registered.account_id)
+            except Exception as exc:
+                _log.warning(
+                    "managed Feishu employee startup failed account_id=%s error_type=%s",
+                    registered.account_id,
+                    type(exc).__name__,
+                )
+        return _feishu_employee_payload(runtime, account, employee)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _log.warning("managed Feishu employee creation failed error_type=%s", type(exc).__name__)
+        raise HTTPException(status_code=400, detail="feishu_employee_setup_failed") from exc
+
+
+@app.put("/api/messaging/feishu/employees/{account_id}/profile")
+async def update_feishu_employee_profile(
+    request: Request,
+    account_id: str,
+    body: FeishuEmployeeProfileUpdate,
+):
+    runtime, store, owner = _managed_feishu_context(request)
+    _feishu_employee_or_404(store, owner, account_id)
+    from hermes_cli.channel_identity import EmployeeProfileRevisionConflict, update_employee_profile
+    from hermes_cli.employee_policy import normalize_employee_source_policy
+
+    try:
+        profile = update_employee_profile(
+            store,
+            owner=owner,
+            account_id=account_id,
+            profile=normalize_employee_source_policy(body.profile),
+            expected_revision=body.expected_revision,
+        )
+        account, _ = _feishu_employee_or_404(store, owner, account_id)
+        return _feishu_employee_payload(runtime, account, profile)
+    except EmployeeProfileRevisionConflict as exc:
+        raise HTTPException(status_code=409, detail="employee_profile_revision_conflict") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.put("/api/messaging/feishu/employees/{account_id}/credentials")
+async def rotate_feishu_employee_credentials(
+    request: Request,
+    account_id: str,
+    body: FeishuEmployeeCredentialRotate,
+):
+    runtime, store, owner = _managed_feishu_context(request)
+    account, profile = _feishu_employee_or_404(store, owner, account_id)
+    from hermes_cli.channel_connectors.feishu import verify_feishu_credentials
+    from hermes_cli.channel_identity import (
+        FeishuCredentialRevisionConflict,
+        resolve_managed_feishu_credentials,
+        rotate_managed_feishu_credentials,
+    )
+
+    current, _ = resolve_managed_feishu_credentials(
+        store, owner=owner, account_id=account_id
+    )
+    candidate = {
+        "app_id": account.provider_account_id,
+        "app_secret": body.app_secret,
+        "domain": str(current.get("domain") or "feishu"),
+        "encrypt_key": (
+            body.encrypt_key
+            if body.encrypt_key is not None
+            else str(current.get("encrypt_key") or "")
+        ),
+        "verification_token": (
+            body.verification_token
+            if body.verification_token is not None
+            else str(current.get("verification_token") or "")
+        ),
+    }
+    try:
+        verified = await verify_feishu_credentials(candidate)
+        current_identity = {
+            str(current.get(key) or "").strip()
+            for key in ("bot_open_id", "bot_user_id", "bot_union_id")
+            if str(current.get(key) or "").strip()
+        }
+        next_identity = {
+            str(verified.get(key) or "").strip()
+            for key in ("bot_open_id", "bot_user_id", "bot_union_id")
+            if str(verified.get(key) or "").strip()
+        }
+        if not current_identity or current_identity.isdisjoint(next_identity):
+            raise HTTPException(status_code=409, detail="feishu_bot_identity_changed")
+        updated = rotate_managed_feishu_credentials(
+            store,
+            owner=owner,
+            account_id=account_id,
+            credentials={**candidate, **verified},
+            expected_credential_version=body.expected_credential_version,
+        )
+        if updated.lifecycle_status == "active":
+            await runtime.stop_account("feishu", account_id)
+            try:
+                await runtime.start_account("feishu", account_id)
+            except Exception:
+                return JSONResponse(
+                    status_code=202,
+                    content={
+                        **_feishu_employee_payload(runtime, updated, profile),
+                        "operation_state": "credentials_saved_startup_failed",
+                    },
+                )
+        return _feishu_employee_payload(runtime, updated, profile)
+    except FeishuCredentialRevisionConflict as exc:
+        raise HTTPException(status_code=409, detail="feishu_credential_revision_conflict") from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _log.warning(
+            "managed Feishu credential rotation failed account_id=%s error_type=%s",
+            account_id,
+            type(exc).__name__,
+        )
+        raise HTTPException(status_code=400, detail="feishu_credential_rotation_failed") from exc
+
+
+@app.post("/api/messaging/feishu/employees/{account_id}/test")
+async def test_feishu_employee(request: Request, account_id: str):
+    _runtime, store, owner = _managed_feishu_context(request)
+    _feishu_employee_or_404(store, owner, account_id)
+    from hermes_cli.channel_connectors.feishu import verify_feishu_credentials
+    from hermes_cli.channel_identity import resolve_managed_feishu_credentials
+
+    credentials, _ = resolve_managed_feishu_credentials(
+        store, owner=owner, account_id=account_id
+    )
+    try:
+        identity = await verify_feishu_credentials(credentials)
+        return {"ok": True, "state": "connected", "bot_name": identity.get("bot_name") or None}
+    except Exception:
+        return {"ok": False, "state": "connection_failed", "error_code": "feishu_connection_failed"}
+
+
+@app.put("/api/messaging/feishu/employees/{account_id}/lifecycle")
+async def update_feishu_employee_lifecycle(
+    request: Request,
+    account_id: str,
+    body: FeishuEmployeeLifecycleUpdate,
+):
+    runtime, store, owner = _managed_feishu_context(request)
+    _feishu_employee_or_404(store, owner, account_id)
+    from hermes_cli.channel_identity import set_managed_feishu_account_status
+
+    status = str(body.status or "").strip().lower()
+    try:
+        if status in {"suspended", "revoked"}:
+            await runtime.stop_account("feishu", account_id)
+        account = set_managed_feishu_account_status(
+            store, owner=owner, account_id=account_id, status=status
+        )
+        startup_failed = False
+        if status == "active":
+            if account_id not in runtime.connectors.accounts("feishu"):
+                runtime.register_feishu_account(account_id)
+            try:
+                await runtime.start_account("feishu", account_id)
+            except Exception:
+                startup_failed = True
+        profile = None
+        if account.profile_revision is not None and status == "active":
+            _, profile = _feishu_employee_or_404(store, owner, account_id)
+        payload = _feishu_employee_payload(runtime, account, profile)
+        if startup_failed:
+            return JSONResponse(
+                status_code=202,
+                content={
+                    **payload,
+                    "operation_state": "lifecycle_saved_startup_failed",
+                },
+            )
+        return payload
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        if "cannot be reactivated" in str(exc):
+            raise HTTPException(status_code=409, detail="feishu_account_revoked") from exc
+        raise HTTPException(status_code=503, detail="feishu_lifecycle_update_failed") from exc
+    except Exception as exc:
+        _log.warning(
+            "managed Feishu lifecycle update failed account_id=%s error_type=%s",
+            account_id,
+            type(exc).__name__,
+        )
+        raise HTTPException(status_code=503, detail="feishu_lifecycle_update_failed") from exc
+
+
+@app.post("/api/messaging/feishu/employees/{account_id}/rollover")
+async def rollover_feishu_employee_sessions(request: Request, account_id: str):
+    _runtime, store, owner = _managed_feishu_context(request)
+    _feishu_employee_or_404(store, owner, account_id)
+    from hermes_cli.channel_identity import rollover_managed_feishu_sessions
+
+    try:
+        retired = rollover_managed_feishu_sessions(
+            store, owner=owner, account_id=account_id
+        )
+        return {"ok": True, "retired_sessions": retired}
+    except RuntimeError as exc:
+        if "active conversations" in str(exc):
+            raise HTTPException(status_code=409, detail="feishu_conversations_active") from exc
+        raise
 
 
 def _connector_runtime_states() -> dict[str, str]:
@@ -10894,6 +11282,7 @@ async def _bridge_websocket_to_owner_worker(
 
     from hermes_cli.dashboard_auth.owner_context import ensure_owner_home
     from hermes_cli.owner_worker.tokens import (
+        CONNECTION_PURPOSE_INTERACTIVE,
         mint_owner_worker_bootstrap,
         owner_worker_capability_public_config,
         owp1_data,
@@ -10941,6 +11330,7 @@ async def _bridge_websocket_to_owner_worker(
         path=path,
         connection_id=connection_id,
         nonce=nonce,
+        connection_purpose=CONNECTION_PURPOSE_INTERACTIVE,
         control_home=getattr(supervisor, "control_home", None),
     )
     verifier = owner_worker_capability_public_config(getattr(supervisor, "control_home", None))

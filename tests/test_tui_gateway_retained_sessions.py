@@ -6,17 +6,38 @@ import threading
 
 import pytest
 
+from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
+from hermes_cli.controlled_roots import controlled_roots_for
+from hermes_cli.owner_runtime import ensure_owner_runtime_dirs, owner_worker_runtime_paths
 from hermes_state import SessionDB
 from tui_gateway import server
 
 
 @pytest.fixture()
 def owner_gateway(monkeypatch, tmp_path):
+    import hermes_cli.controlled_roots as controlled_roots
+
+    monkeypatch.setattr(controlled_roots.sys, "platform", "linux")
+    monkeypatch.setattr(controlled_roots, "_openat2", lambda *_args: None)
     owner_home = tmp_path / "owner"
     workspace_root = owner_home / "workspaces"
     workspace_root.mkdir(parents=True)
+    paths = owner_worker_runtime_paths(
+        owner_home=ensure_owner_runtime_dirs(owner_home),
+        worker_generation=2,
+    )
+    paths.default_workspace.mkdir(parents=True, exist_ok=True)
+    (paths.default_workspace / "employees" / "analyst").mkdir(parents=True)
+    roots = controlled_roots_for(paths)
     db = SessionDB(db_path=owner_home / "state.db")
-    runtime = server.OwnerWorkerGatewayRuntime("owner-a", 2, "worker-a", 1, 0)
+    runtime = server.OwnerWorkerGatewayRuntime(
+        "owner-a",
+        2,
+        "worker-a",
+        1,
+        0,
+        filesystem_context=AuthenticatedWorkspaceContext(roots),
+    )
     env = {
         "HERMES_HOME": str(owner_home),
         "HERMES_OWNER_KEY": "owner-a",
@@ -39,6 +60,7 @@ def owner_gateway(monkeypatch, tmp_path):
     yield db, runtime, str(workspace_root)
 
     db.close()
+    roots.close()
 
 
 def _create_owned(
@@ -58,9 +80,28 @@ def _create_owned(
     )
 
 
+class _Transport:
+    def __init__(self, purpose: str):
+        self.connection_purpose = purpose
+
+    def write(self, _obj):
+        return True
+
+    def close(self):
+        return None
+
+
 def _call(runtime: server.OwnerWorkerGatewayRuntime, method: str, params: dict | None = None):
     with server.owner_worker_gateway_runtime(runtime):
         return server.handle_request({"id": "request", "method": method, "params": params or {}})
+
+
+def _dispatch(runtime: server.OwnerWorkerGatewayRuntime, method: str, params: dict, *, purpose: str):
+    return server.dispatch(
+        {"id": "request", "method": method, "params": params},
+        transport=_Transport(purpose),
+        runtime=runtime,
+    )
 
 
 def test_owner_worker_create_rejects_legacy_source_before_live_registration(owner_gateway):
@@ -70,6 +111,71 @@ def test_owner_worker_create_rejects_legacy_source_before_live_registration(owne
 
     assert response["error"] == {"code": 4002, "message": "session source is not available"}
     assert runtime.mutable_state.sessions == {}
+
+
+def test_employee_policy_rejects_interactive_source_spoof(owner_gateway):
+    _db, runtime, _workspace_root = owner_gateway
+
+    response = _dispatch(
+        runtime,
+        "session.create",
+        {"source": "feishu", "employee_policy": {}},
+        purpose="interactive",
+    )
+
+    assert response["error"] == {
+        "code": 4002,
+        "message": "employee policy requires a retained channel connection",
+    }
+    assert runtime.mutable_state.sessions == {}
+
+
+def test_employee_policy_accepts_only_retained_channel_and_rejects_runtime_overrides(
+    owner_gateway, monkeypatch
+):
+    _db, runtime, _workspace_root = owner_gateway
+    source_policy = {
+        "schema_version": 1,
+        "model_registration_id": "registration-a",
+        "system_prompt": "You are an analyst.",
+        "toolsets": [],
+        "skills": [],
+        "mcp_servers": [],
+        "workspace_relative_path": "employees/analyst",
+        "knowledge_relative_paths": [],
+        "max_iterations": 20,
+        "max_tokens": 2000,
+    }
+    monkeypatch.setattr(
+        "hermes_cli.model_registrations.resolve_chat_model_registration",
+        lambda _registration_id: {
+            "registration_id": "registration-a",
+            "provider": "openai",
+            "model": "gpt-test",
+            "source": "catalog",
+        },
+    )
+
+    response = _dispatch(
+        runtime,
+        "session.create",
+        {
+            "source": "feishu",
+            "employee_policy": {
+                "account_id": "ca_employee",
+                "profile_revision": 3,
+                "profile_fingerprint": "sha256:" + "a" * 64,
+                "source_policy": source_policy,
+            },
+            "model": "caller-model",
+        },
+        purpose="retained-channel",
+    )
+
+    assert response["error"] == {
+        "code": 4002,
+        "message": "employee policy cannot be combined with runtime overrides",
+    }
 
 
 def test_owner_worker_list_and_most_recent_hide_legacy_rows(owner_gateway):

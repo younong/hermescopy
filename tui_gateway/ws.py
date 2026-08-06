@@ -223,12 +223,16 @@ class WSTransport:
         loop: asyncio.AbstractEventLoop,
         *,
         peer: str = "unknown",
+        connection_purpose: str | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         jitter_config: _JitterConfig = _DEFAULT_JITTER_CONFIG,
     ) -> None:
         self._ws = ws
         self._loop = loop
         self._peer = peer
+        self._connection_purpose = (
+            str(connection_purpose).strip() if connection_purpose is not None else None
+        )
         self._monotonic = monotonic
         self._jitter_config = jitter_config
         self._closed = False
@@ -288,6 +292,11 @@ class WSTransport:
             "jitter_wait_hist": fixed_histogram(_JITTER_TIMING_BUCKETS_MS),
         }
         self._metrics_snapshot: dict[str, Any] | None = None
+
+    @property
+    def connection_purpose(self) -> str | None:
+        """Return the immutable purpose admitted for this exact connection."""
+        return self._connection_purpose
 
     @staticmethod
     def _is_streaming_frame(obj: dict) -> bool:
@@ -1013,7 +1022,13 @@ async def handle_ws(
         _disable_nagle(ws)
         _log.info("ws accepted peer=%s", peer)
 
-        transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer)
+        admitted_claims = getattr(ws, "claims", None)
+        transport = WSTransport(
+            ws,
+            asyncio.get_running_loop(),
+            peer=peer,
+            connection_purpose=getattr(admitted_claims, "connection_purpose", None),
+        )
 
         # The desktop app and dashboard chat reach the agent through this WS
         # sidecar, NOT through tui_gateway.entry.main() (the stdio TUI path that

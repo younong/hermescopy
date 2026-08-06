@@ -618,13 +618,20 @@ def _dispatch_owner_tool(
         from tools import file_tools
         from tui_gateway.server import OwnerWorkerGatewayRuntime, owner_worker_gateway_runtime
 
+        from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
+
+        invocation_context = AuthenticatedWorkspaceContext(
+            workspace_context.roots,
+            workspace_prefix=invocation.identity.workspace_prefix,
+            readonly_prefixes=invocation.identity.knowledge_prefixes,
+        )
         runtime = OwnerWorkerGatewayRuntime(
             owner_key=invocation.identity.owner_key,
             worker_generation=invocation.identity.worker_generation,
             worker_id=invocation.identity.worker_id,
             lease_version=invocation.identity.lease_version,
             recovery_generation=invocation.identity.recovery_generation,
-            filesystem_context=workspace_context,
+            filesystem_context=invocation_context,
         )
         with owner_worker_gateway_runtime(runtime):
             entry = file_tools.registry.get_entry(tool_name)

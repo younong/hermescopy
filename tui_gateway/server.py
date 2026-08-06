@@ -25,6 +25,7 @@ from hermes_cli.display_transcript import format_display_transcript
 from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_cli.latency_trace import clean_latency_trace_id, log_latency_stage
 from hermes_cli.owner_runtime import is_owner_worker_env, resolve_workspace_cwd
+from hermes_cli.owner_worker.tokens import CONNECTION_PURPOSE_RETAINED_CHANNEL
 from gateway.session import (
     current_historical_resume_scope,
     current_recovery_scope,
@@ -1480,6 +1481,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     # them directly (no global config, no build-then-switch).
                     if override := current.get("model_override"):
                         kw["model_override"] = override
+                    if policy := current.get("employee_policy"):
+                        kw["employee_policy"] = policy
                     if (reasoning := current.get("create_reasoning_override")) is not None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
@@ -2020,6 +2023,8 @@ def _ensure_session_db_row(session: dict) -> None:
         model_config["reasoning_config"] = reasoning
     if tier := session.get("create_service_tier_override"):
         model_config["service_tier"] = tier
+    if employee_policy := session.get("employee_policy"):
+        model_config[_EMPLOYEE_POLICY_CONFIG_KEY] = employee_policy
     # Branch lineage: stamp the same ``_branched_from`` marker the TUI /branch
     # uses so list_sessions_rich keeps the branch listed and the desktop sidebar
     # can nest it under its parent.
@@ -2535,6 +2540,9 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         overrides["reasoning_config_override"] = reasoning_config
     if service_tier:
         overrides["service_tier_override"] = service_tier
+    employee_policy = model_config.get(_EMPLOYEE_POLICY_CONFIG_KEY)
+    if isinstance(employee_policy, dict):
+        overrides["employee_policy"] = employee_policy
 
     return overrides
 
@@ -4701,6 +4709,7 @@ def _make_agent(
     provider_override: str | None = None,
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
+    employee_policy: dict | None = None,
 ):
     from run_agent import AIAgent
 
@@ -4717,8 +4726,29 @@ def _make_agent(
 
     cfg = _load_cfg()
     agent_cfg = cfg.get("agent") or {}
-    system_prompt = _prompt_text(agent_cfg.get("system_prompt", ""))
-    startup_skills = _parse_tui_skills_env()
+    system_prompt = (
+        str(employee_policy["system_prompt"])
+        if employee_policy is not None
+        else _prompt_text(agent_cfg.get("system_prompt", ""))
+    )
+    if employee_policy is not None:
+        capability_lines = [
+            "Employee workspace (read-write): /workspace",
+            *(
+                f"Employee knowledge directory (read-only): /knowledge/{index}"
+                for index, _path in enumerate(
+                    employee_policy["knowledge_relative_paths"]
+                )
+            ),
+        ]
+        system_prompt = "\n\n".join(
+            part for part in (system_prompt, "\n".join(capability_lines)) if part
+        ).strip()
+    startup_skills = (
+        list(employee_policy["skills"])
+        if employee_policy is not None
+        else _parse_tui_skills_env()
+    )
     if startup_skills:
         from agent.skill_commands import build_preloaded_skills_prompt
 
@@ -4728,6 +4758,8 @@ def _make_agent(
         )
         if missing_skills:
             missing_display = ", ".join(missing_skills)
+            if employee_policy is not None:
+                raise ValueError(f"Unknown employee skill(s): {missing_display}")
             # Degrade gracefully when some skills loaded; only hard-fail when
             # every requested skill is missing. Mirrors cli.py — a typo'd skill
             # name should not crash the worker and auto-block the Kanban task.
@@ -4803,9 +4835,21 @@ def _make_agent(
         })
     model = str(model or runtime.get("model") or "").strip()
     _pr = _load_provider_routing()
-    return AIAgent(
+    enabled_toolsets = (
+        [
+            *employee_policy["toolsets"],
+            *(f"mcp-{name}" for name in employee_policy["mcp_servers"]),
+        ]
+        if employee_policy is not None
+        else _load_enabled_toolsets()
+    )
+    agent = AIAgent(
         model=model,
-        max_iterations=_cfg_max_turns(cfg, 90),
+        max_iterations=(
+            int(employee_policy["max_iterations"])
+            if employee_policy is not None
+            else _cfg_max_turns(cfg, 90)
+        ),
         provider=runtime.get("provider"),
         base_url=runtime.get("base_url"),
         api_key=runtime.get("api_key"),
@@ -4834,7 +4878,12 @@ def _make_agent(
             if service_tier_override is not None
             else _load_service_tier()
         ),
-        enabled_toolsets=_load_enabled_toolsets(),
+        enabled_toolsets=enabled_toolsets,
+        max_tokens=(
+            employee_policy.get("max_tokens")
+            if employee_policy is not None
+            else None
+        ),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.
@@ -4852,9 +4901,26 @@ def _make_agent(
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
         skip_context_files=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
         skip_memory=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
-        fallback_model=_load_fallback_model(),
+        fallback_model=(
+            None if employee_policy is not None else _load_fallback_model()
+        ),
+        employee_policy=employee_policy,
         **_agent_cbs(sid),
     )
+    if employee_policy is not None:
+        _restrict_employee_agent_tools(agent)
+    return agent
+
+
+def _restrict_employee_agent_tools(agent) -> None:
+    """Remove unrestricted Skill discovery/mutation from policy-pinned agents."""
+    blocked = {"skills_list", "skill_view", "skill_manage"}
+    agent.tools = [
+        tool
+        for tool in (getattr(agent, "tools", None) or [])
+        if tool.get("function", {}).get("name") not in blocked
+    ]
+    agent.valid_tool_names = set(getattr(agent, "valid_tool_names", set())) - blocked
 
 
 def _init_session(
@@ -4865,6 +4931,7 @@ def _init_session(
     cols: int = 80,
     cwd: str | None = None,
     session_db=None,
+    employee_policy: dict | None = None,
 ):
     now = time.time()
     with _sessions_lock:
@@ -4891,6 +4958,7 @@ def _init_session(
             # Honored on rebuild (/new, resume) so a switch in THIS session
             # never leaks into siblings via process-global env vars.
             "model_override": None,
+            "employee_policy": employee_policy,
             # Pin async event emissions to whichever transport created the
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": _required_gateway_transport(),
@@ -5383,9 +5451,94 @@ def _inflight_snapshot(session: dict) -> dict | None:
 # ── Methods: session ─────────────────────────────────────────────────
 
 
+_EMPLOYEE_POLICY_CONFIG_KEY = "hermes_employee_policy"
+
+
+def _trusted_employee_policy(params: dict) -> tuple[dict | None, str | None]:
+    raw = params.get("employee_policy")
+    if raw is None:
+        return None, None
+    transport = current_transport()
+    if getattr(transport, "connection_purpose", None) != CONNECTION_PURPOSE_RETAINED_CHANNEL:
+        return None, "employee policy requires a retained channel connection"
+    if current_owner_worker_gateway_runtime() is None:
+        return None, "employee policy requires an owner worker runtime"
+    if str(params.get("source") or "").strip() != "feishu":
+        return None, "employee policy requires the Feishu retained source"
+    if not isinstance(raw, dict) or set(raw) != {
+        "account_id", "profile_revision", "profile_fingerprint", "source_policy"
+    }:
+        return None, "employee policy is invalid"
+    try:
+        from hermes_cli.controlled_roots import ExpectedType, RootKind
+        from hermes_cli.employee_policy import normalize_employee_source_policy
+        from hermes_cli.model_registrations import resolve_chat_model_registration
+        from toolsets import validate_toolset
+
+        account_id = str(raw.get("account_id") or "").strip()
+        fingerprint = str(raw.get("profile_fingerprint") or "").strip()
+        revision = int(raw.get("profile_revision"))
+        source_policy = normalize_employee_source_policy(raw.get("source_policy"))
+        if not account_id or not fingerprint.startswith("sha256:") or revision < 1:
+            raise ValueError("identity is invalid")
+        for name in source_policy["toolsets"]:
+            if not validate_toolset(name):
+                raise ValueError(f"unknown toolset: {name}")
+        from tools.mcp_tool import _load_mcp_config
+
+        configured_mcp = _load_mcp_config()
+        if any(name not in configured_mcp for name in source_policy["mcp_servers"]):
+            raise ValueError("configured MCP server is unavailable")
+        runtime = current_owner_worker_gateway_runtime()
+        context = runtime.filesystem_context
+        controlled_paths = [
+            source_policy["workspace_relative_path"],
+            *source_policy["knowledge_relative_paths"],
+        ]
+        for path in controlled_paths:
+            if path:
+                controlled = context.controlled_workspace_path(path)
+                fd = context.roots.open_relative(
+                    RootKind.WORKSPACE,
+                    controlled,
+                    expected_type=ExpectedType.DIRECTORY,
+                )
+                os.close(fd)
+        model = resolve_chat_model_registration(source_policy["model_registration_id"])
+        snapshot = {
+            "schema_version": source_policy["schema_version"],
+            "account_id": account_id,
+            "profile_revision": revision,
+            "source_profile_fingerprint": fingerprint,
+            "system_prompt": source_policy["system_prompt"],
+            "model": model,
+            "toolsets": source_policy["toolsets"],
+            "skills": source_policy["skills"],
+            "mcp_servers": source_policy["mcp_servers"],
+            "workspace_relative_path": source_policy["workspace_relative_path"],
+            "knowledge_relative_paths": source_policy["knowledge_relative_paths"],
+            "max_iterations": source_policy["max_iterations"],
+            "max_tokens": source_policy["max_tokens"],
+        }
+        from hermes_cli.employee_policy import canonical_employee_snapshot
+
+        snapshot, _ = canonical_employee_snapshot(snapshot)
+        return snapshot, None
+    except Exception:
+        logger.warning("trusted employee policy rejected", exc_info=True)
+        return None, "employee policy is invalid"
+
+
 @method("session.create")
 def _session_create(rid, params: dict) -> dict:
     source = str(params.get("source") or "tui").strip() or "tui"
+    employee_policy, employee_error = _trusted_employee_policy(params)
+    if employee_error is not None:
+        return _err(rid, 4002, employee_error)
+    if employee_policy is not None and any(
+        key in params for key in ("model", "provider", "reasoning_effort", "fast", "cwd")
+    ):
+        return _err(rid, 4002, "employee policy cannot be combined with runtime overrides")
     if _owner_worker_mode():
         from hermes_cli.session_sources import is_retained_session_source
 
@@ -5447,9 +5600,18 @@ def _session_create(rid, params: dict) -> dict:
     # (resolved at build).
     create_model = str(params.get("model") or "").strip()
     session_model_override = (
-        {"model": create_model, "provider": str(params.get("provider") or "").strip() or None}
-        if create_model
-        else None
+        {
+            "model": employee_policy["model"]["model"],
+            "provider": employee_policy["model"]["provider"],
+            "base_url": employee_policy["model"].get("base_url") or None,
+            "api_mode": employee_policy["model"].get("api_mode") or None,
+        }
+        if employee_policy is not None
+        else (
+            {"model": create_model, "provider": str(params.get("provider") or "").strip() or None}
+            if create_model
+            else None
+        )
     )
     create_reasoning_override = None
     if effort := str(params.get("reasoning_effort") or "").strip():
@@ -5491,6 +5653,7 @@ def _session_create(rid, params: dict) -> dict:
             "inflight_turn": None,
             "last_active": now,
             "model_override": session_model_override,
+            "employee_policy": employee_policy,
             "create_reasoning_override": create_reasoning_override,
             "create_service_tier_override": create_service_tier_override,
             "parent_session_id": parent_session_id,
@@ -5788,6 +5951,11 @@ def _deferred_session_record(
         "last_active": now,
         "lazy": lazy,
         "model_override": model_override,
+        "employee_policy": (
+            resume_runtime_overrides.get("employee_policy")
+            if isinstance(resume_runtime_overrides, dict)
+            else None
+        ),
         "pending_title": None,
         "resume_runtime_overrides": resume_runtime_overrides,
         "resume_session_id": session_key,
@@ -6423,6 +6591,7 @@ def _session_resume(rid, params: dict) -> dict:
                 cols=cols,
                 cwd=resume_cwd,
                 session_db=db,
+                employee_policy=stored_runtime_overrides.get("employee_policy"),
             )
             if sid in _sessions:
                 if stored_runtime_overrides.get("model_override") is not None:
@@ -11372,6 +11541,8 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     key, value = params.get("key", ""), params.get("value", "")
     session = _sessions.get(params.get("session_id", ""))
+    if session and session.get("employee_policy") is not None:
+        return _err(rid, 4032, "configuration is pinned for this employee session")
 
     if key == "model":
         try:
@@ -12961,6 +13132,12 @@ def _(rid, params: dict) -> dict:
     if resolved != name:
         name = resolved
     session = _sessions.get(params.get("session_id", ""))
+
+    policy = session.get("employee_policy") if session else None
+    if policy is not None:
+        allowed_skills = frozenset(str(item) for item in policy.get("skills", []))
+        if f"/{name}" not in {f"/{item.lstrip('/')}" for item in allowed_skills}:
+            return _err(rid, 4032, "command is unavailable in this employee session")
 
     qcmds = _load_cfg().get("quick_commands", {})
     if name in qcmds:
@@ -14816,6 +14993,9 @@ def _(rid, params: dict) -> dict:
 
 @method("tools.configure")
 def _(rid, params: dict) -> dict:
+    session = _sessions.get(params.get("session_id", ""))
+    if session and session.get("employee_policy") is not None:
+        return _err(rid, 4032, "tools are pinned for this employee session")
     action = str(params.get("action", "") or "").strip().lower()
     targets = [
         str(name).strip() for name in params.get("names", []) or [] if str(name).strip()

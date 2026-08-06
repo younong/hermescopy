@@ -12,8 +12,9 @@ from typing import Iterator
 
 from .crypto import ChannelCrypto
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 12
 ACCOUNT_CREDENTIAL_AAD_TABLE = "ilink_accounts"
+EMPLOYEE_PROFILE_AAD_TABLE = "feishu_employee_profiles"
 _DB_FILENAME = "channel_identities.sqlite3"
 
 _SCHEMA = """
@@ -109,6 +110,51 @@ ON connector_accounts
 BEGIN
     SELECT RAISE(ABORT, 'channel account ownership is immutable');
 END;
+CREATE TABLE IF NOT EXISTS managed_feishu_accounts (
+    account_id TEXT PRIMARY KEY REFERENCES connector_accounts(account_id),
+    canonical_user_id TEXT NOT NULL REFERENCES canonical_users(canonical_user_id),
+    lifecycle_status TEXT NOT NULL
+        CHECK(lifecycle_status IN ('active', 'suspended', 'revoked')),
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_managed_feishu_owner
+ON managed_feishu_accounts(canonical_user_id, lifecycle_status);
+CREATE TRIGGER IF NOT EXISTS managed_feishu_accounts_owner_immutable
+BEFORE UPDATE OF account_id, canonical_user_id ON managed_feishu_accounts
+BEGIN
+    SELECT RAISE(ABORT, 'managed Feishu account Owner is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS managed_feishu_accounts_provider_insert
+BEFORE INSERT ON managed_feishu_accounts
+WHEN NOT EXISTS (
+    SELECT 1 FROM connector_accounts a
+    WHERE a.account_id=NEW.account_id AND a.provider='feishu'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'managed Feishu account provider mismatch');
+END;
+CREATE TABLE IF NOT EXISTS feishu_employee_profiles (
+    account_id TEXT NOT NULL REFERENCES managed_feishu_accounts(account_id),
+    revision INTEGER NOT NULL CHECK(revision >= 1),
+    profile_ciphertext BLOB NOT NULL,
+    profile_key_version INTEGER NOT NULL,
+    profile_fingerprint TEXT NOT NULL,
+    lifecycle_status TEXT NOT NULL
+        CHECK(lifecycle_status IN ('active', 'superseded', 'revoked')),
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY(account_id, revision)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_feishu_employee_current
+ON feishu_employee_profiles(account_id) WHERE lifecycle_status='active';
+CREATE TRIGGER IF NOT EXISTS feishu_employee_profiles_identity_immutable
+BEFORE UPDATE OF account_id, revision, profile_ciphertext, profile_key_version,
+                 profile_fingerprint, created_at
+ON feishu_employee_profiles
+BEGIN
+    SELECT RAISE(ABORT, 'Feishu employee profile revision is immutable');
+END;
 CREATE TABLE IF NOT EXISTS channel_bindings (
     binding_id TEXT PRIMARY KEY,
     external_identity_id TEXT NOT NULL REFERENCES external_identities(external_identity_id),
@@ -146,15 +192,20 @@ CREATE TABLE IF NOT EXISTS context_tokens (
     PRIMARY KEY(account_id, peer_lookup_hash)
 );
 CREATE TABLE IF NOT EXISTS channel_sessions (
-    binding_id TEXT PRIMARY KEY REFERENCES channel_bindings(binding_id),
+    binding_id TEXT NOT NULL REFERENCES channel_bindings(binding_id),
+    dispatch_scope TEXT NOT NULL DEFAULT '',
     owner_key TEXT NOT NULL,
     stored_session_id TEXT NOT NULL,
     worker_generation INTEGER,
-    updated_at REAL NOT NULL
+    profile_revision INTEGER,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY(binding_id, dispatch_scope)
 );
 CREATE TABLE IF NOT EXISTS binding_sequences (
-    binding_id TEXT PRIMARY KEY REFERENCES channel_bindings(binding_id),
-    last_sequence INTEGER NOT NULL DEFAULT 0 CHECK(last_sequence >= 0)
+    binding_id TEXT NOT NULL REFERENCES channel_bindings(binding_id),
+    dispatch_scope TEXT NOT NULL DEFAULT '',
+    last_sequence INTEGER NOT NULL DEFAULT 0 CHECK(last_sequence >= 0),
+    PRIMARY KEY(binding_id, dispatch_scope)
 );
 CREATE TABLE IF NOT EXISTS inbound_messages (
     inbound_id TEXT PRIMARY KEY,
@@ -171,6 +222,8 @@ CREATE TABLE IF NOT EXISTS inbound_messages (
     rejection_reason TEXT,
     payload_kind TEXT NOT NULL DEFAULT 'text',
     binding_sequence INTEGER,
+    dispatch_scope TEXT NOT NULL DEFAULT '',
+    profile_revision INTEGER,
     attempts INTEGER NOT NULL DEFAULT 0,
     next_attempt_at REAL NOT NULL DEFAULT 0,
     last_error TEXT,
@@ -180,7 +233,8 @@ CREATE TABLE IF NOT EXISTS inbound_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_inbound_binding_status ON inbound_messages(binding_id, status, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_inbound_binding_sequence
-ON inbound_messages(binding_id, binding_sequence) WHERE binding_id IS NOT NULL;
+ON inbound_messages(binding_id, dispatch_scope, binding_sequence)
+WHERE binding_id IS NOT NULL;
 CREATE TRIGGER IF NOT EXISTS inbound_messages_binding_consistent_insert
 BEFORE INSERT ON inbound_messages
 WHEN NEW.binding_id IS NOT NULL AND NOT EXISTS (
@@ -197,17 +251,19 @@ CREATE TRIGGER IF NOT EXISTS inbound_messages_assign_sequence
 AFTER INSERT ON inbound_messages
 WHEN NEW.binding_id IS NOT NULL AND NEW.binding_sequence IS NULL
 BEGIN
-    INSERT INTO binding_sequences(binding_id, last_sequence)
-    VALUES (NEW.binding_id, 1)
-    ON CONFLICT(binding_id) DO UPDATE SET last_sequence=last_sequence + 1;
+    INSERT INTO binding_sequences(binding_id, dispatch_scope, last_sequence)
+    VALUES (NEW.binding_id, NEW.dispatch_scope, 1)
+    ON CONFLICT(binding_id, dispatch_scope)
+    DO UPDATE SET last_sequence=last_sequence + 1;
     UPDATE inbound_messages
     SET binding_sequence=(
-        SELECT last_sequence FROM binding_sequences WHERE binding_id=NEW.binding_id
+        SELECT last_sequence FROM binding_sequences
+        WHERE binding_id=NEW.binding_id AND dispatch_scope=NEW.dispatch_scope
     )
     WHERE inbound_id=NEW.inbound_id;
 END;
 CREATE TRIGGER IF NOT EXISTS inbound_messages_ownership_immutable
-BEFORE UPDATE OF account_id, binding_id ON inbound_messages
+BEFORE UPDATE OF account_id, binding_id, dispatch_scope, profile_revision ON inbound_messages
 BEGIN
     SELECT RAISE(ABORT, 'inbound ownership is immutable');
 END;
@@ -226,6 +282,7 @@ CREATE TABLE IF NOT EXISTS outbound_messages (
     source_kind TEXT CHECK(source_kind IS NULL OR source_kind IN ('inbound', 'cron')),
     source_id TEXT UNIQUE,
     binding_sequence INTEGER,
+    dispatch_scope TEXT NOT NULL DEFAULT '',
     client_message_id TEXT NOT NULL UNIQUE,
     payload_ciphertext BLOB,
     payload_key_version INTEGER,
@@ -246,8 +303,20 @@ CREATE TABLE IF NOT EXISTS outbound_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_outbound_status_time ON outbound_messages(status, next_attempt_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_binding_sequence
-ON outbound_messages(binding_id, binding_sequence)
+ON outbound_messages(binding_id, dispatch_scope, binding_sequence)
 WHERE binding_sequence IS NOT NULL;
+CREATE TABLE IF NOT EXISTS outbound_receipts (
+    account_id TEXT NOT NULL REFERENCES connector_accounts(account_id),
+    binding_id TEXT NOT NULL REFERENCES channel_bindings(binding_id),
+    outbound_id TEXT NOT NULL REFERENCES outbound_messages(outbound_id),
+    part_index INTEGER NOT NULL CHECK(part_index >= 0),
+    provider_message_lookup_hash TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY(outbound_id, part_index),
+    UNIQUE(account_id, provider_message_lookup_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_outbound_receipts_reply
+ON outbound_receipts(account_id, binding_id, provider_message_lookup_hash);
 CREATE TRIGGER IF NOT EXISTS outbound_messages_consistent_insert
 BEFORE INSERT ON outbound_messages
 WHEN NOT EXISTS (
@@ -273,7 +342,7 @@ BEGIN
 END;
 CREATE TRIGGER IF NOT EXISTS outbound_messages_ownership_immutable
 BEFORE UPDATE OF inbound_id, account_id, binding_id, provider, source_kind,
-                 source_id, binding_sequence
+                 source_id, binding_sequence, dispatch_scope
 ON outbound_messages
 BEGIN
     SELECT RAISE(ABORT, 'outbound ownership is immutable');
@@ -385,6 +454,12 @@ class ChannelIdentityStore:
                         elif version == 9:
                             self._migrate_v9_to_v10(conn)
                             version = 10
+                        elif version == 10:
+                            self._migrate_v10_to_v11(conn)
+                            version = 11
+                        elif version == 11:
+                            self._migrate_v11_to_v12(conn)
+                            version = 12
                         else:
                             raise RuntimeError(
                                 "channel identity database schema is older than supported"
@@ -588,16 +663,28 @@ class ChannelIdentityStore:
             """
         )
         conn.execute("DROP TABLE outbound_messages_v6")
+        sequence_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(binding_sequences)")
+        }
+        if "dispatch_scope" not in sequence_columns:
+            conn.execute(
+                "ALTER TABLE binding_sequences ADD COLUMN dispatch_scope "
+                "TEXT NOT NULL DEFAULT ''"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_binding_sequences_scope "
+                "ON binding_sequences(binding_id, dispatch_scope)"
+            )
         conn.execute(
             """
-            INSERT INTO binding_sequences(binding_id, last_sequence)
-            SELECT binding_id, MAX(sequence) FROM (
+            INSERT INTO binding_sequences(binding_id, dispatch_scope, last_sequence)
+            SELECT binding_id, '', MAX(sequence) FROM (
                 SELECT binding_id, binding_sequence AS sequence FROM inbound_messages
                 WHERE binding_id IS NOT NULL
                 UNION ALL
                 SELECT binding_id, binding_sequence AS sequence FROM outbound_messages
             ) GROUP BY binding_id
-            ON CONFLICT(binding_id) DO UPDATE SET
+            ON CONFLICT(binding_id, dispatch_scope) DO UPDATE SET
                 last_sequence=MAX(binding_sequences.last_sequence, excluded.last_sequence)
             """
         )
@@ -677,6 +764,7 @@ class ChannelIdentityStore:
             migrated.append((ciphertext, version, row["account_id"]))
 
         conn.execute("DROP TRIGGER IF EXISTS connector_accounts_ownership_immutable")
+        conn.execute("DROP TRIGGER IF EXISTS managed_feishu_accounts_provider_insert")
         conn.execute("DROP TRIGGER IF EXISTS channel_bindings_identity_consistent_insert")
         conn.execute("DROP TRIGGER IF EXISTS inbound_messages_binding_consistent_insert")
         conn.execute("DROP TRIGGER IF EXISTS outbound_messages_consistent_insert")
@@ -767,6 +855,7 @@ class ChannelIdentityStore:
         if not required <= columns:
             raise RuntimeError("connector account schema is inconsistent")
         conn.execute("DROP TRIGGER IF EXISTS connector_accounts_ownership_immutable")
+        conn.execute("DROP TRIGGER IF EXISTS managed_feishu_accounts_provider_insert")
         conn.execute("DROP TRIGGER IF EXISTS channel_bindings_identity_consistent_insert")
         conn.execute("DROP TRIGGER IF EXISTS outbound_messages_consistent_insert")
         if "external_identity_id" in columns:
@@ -781,6 +870,100 @@ class ChannelIdentityStore:
                 raise RuntimeError("connector account migration lost rows")
         conn.execute(
             "UPDATE channel_identity_meta SET value='10' WHERE key='schema_version'"
+        )
+
+    @staticmethod
+    def _migrate_v10_to_v11(conn: sqlite3.Connection) -> None:
+        # Existing Feishu accounts predate account-level Owner attribution. They
+        # remain generic and therefore cannot be selected as managed employees
+        # until an authenticated Owner explicitly claims an unambiguous account.
+        conn.execute(
+            "UPDATE channel_identity_meta SET value='11' WHERE key='schema_version'"
+        )
+
+    @staticmethod
+    def _migrate_v11_to_v12(conn: sqlite3.Connection) -> None:
+        conn.execute("DROP TRIGGER IF EXISTS inbound_messages_assign_sequence")
+        conn.execute("DROP TRIGGER IF EXISTS inbound_messages_ownership_immutable")
+        conn.execute("DROP TRIGGER IF EXISTS outbound_messages_ownership_immutable")
+        inbound_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(inbound_messages)")
+        }
+        if "dispatch_scope" not in inbound_columns:
+            conn.execute(
+                "ALTER TABLE inbound_messages ADD COLUMN dispatch_scope "
+                "TEXT NOT NULL DEFAULT ''"
+            )
+        if "profile_revision" not in inbound_columns:
+            conn.execute(
+                "ALTER TABLE inbound_messages ADD COLUMN profile_revision INTEGER"
+            )
+        conn.execute("DROP INDEX IF EXISTS idx_inbound_binding_sequence")
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_inbound_binding_sequence "
+            "ON inbound_messages(binding_id, dispatch_scope, binding_sequence) "
+            "WHERE binding_id IS NOT NULL"
+        )
+        outbound_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(outbound_messages)")
+        }
+        if "dispatch_scope" not in outbound_columns:
+            conn.execute(
+                "ALTER TABLE outbound_messages ADD COLUMN dispatch_scope "
+                "TEXT NOT NULL DEFAULT ''"
+            )
+        conn.execute("DROP INDEX IF EXISTS idx_outbound_binding_sequence")
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_outbound_binding_sequence "
+            "ON outbound_messages(binding_id, dispatch_scope, binding_sequence) "
+            "WHERE binding_sequence IS NOT NULL"
+        )
+
+        conn.execute("ALTER TABLE channel_sessions RENAME TO channel_sessions_v11")
+        conn.execute(
+            """
+            CREATE TABLE channel_sessions (
+                binding_id TEXT NOT NULL REFERENCES channel_bindings(binding_id),
+                dispatch_scope TEXT NOT NULL DEFAULT '',
+                owner_key TEXT NOT NULL,
+                stored_session_id TEXT NOT NULL,
+                worker_generation INTEGER,
+                profile_revision INTEGER,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(binding_id, dispatch_scope)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO channel_sessions
+              (binding_id, dispatch_scope, owner_key, stored_session_id,
+               worker_generation, profile_revision, updated_at)
+            SELECT binding_id, '', owner_key, stored_session_id,
+                   worker_generation, NULL, updated_at
+            FROM channel_sessions_v11
+            """
+        )
+        conn.execute("DROP TABLE channel_sessions_v11")
+
+        conn.execute("ALTER TABLE binding_sequences RENAME TO binding_sequences_v11")
+        conn.execute(
+            """
+            CREATE TABLE binding_sequences (
+                binding_id TEXT NOT NULL REFERENCES channel_bindings(binding_id),
+                dispatch_scope TEXT NOT NULL DEFAULT '',
+                last_sequence INTEGER NOT NULL DEFAULT 0 CHECK(last_sequence >= 0),
+                PRIMARY KEY(binding_id, dispatch_scope)
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO binding_sequences(binding_id, dispatch_scope, last_sequence) "
+            "SELECT binding_id, '', last_sequence FROM binding_sequences_v11"
+        )
+        conn.execute("DROP TABLE binding_sequences_v11")
+        conn.execute(
+            "UPDATE channel_identity_meta SET value='12' WHERE key='schema_version'"
         )
 
     @staticmethod
@@ -839,6 +1022,7 @@ class ChannelIdentityStore:
             ("external_identities", "subject_key_version"),
             ("connector_accounts", "credentials_key_version"),
             ("connector_accounts", "cursor_key_version"),
+            ("feishu_employee_profiles", "profile_key_version"),
             ("channel_bindings", "peer_key_version"),
             ("context_tokens", "token_key_version"),
             ("inbound_messages", "payload_key_version"),

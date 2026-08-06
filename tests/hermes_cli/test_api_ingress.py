@@ -19,9 +19,10 @@ from hermes_cli.dashboard_auth.token_auth import token_auth_middleware
 class _GatewayClient:
     instances = []
 
-    def __init__(self, supervisor, owner):
+    def __init__(self, supervisor, owner, *, connection_purpose):
         self.supervisor = supervisor
         self.owner = owner
+        self.connection_purpose = connection_purpose
         self.calls = []
         self.close = AsyncMock()
         self.instances.append(self)

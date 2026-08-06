@@ -14,6 +14,7 @@ import {
   RefreshCw,
   Search,
   QrCode,
+  Radio,
   Settings2,
   SlidersHorizontal,
   Sparkles,
@@ -24,6 +25,7 @@ import { ConnectWeChatModal } from "@/features/ilink/ConnectWeChatModal";
 import { PageHeaderContext } from "@/contexts/page-header-context";
 import { GuiChatFilesPane } from "@/features/files/components/GuiChatFilesPane";
 import { useI18n } from "@/i18n";
+import ChannelsPage from "@/pages/ChannelsPage";
 import SessionsPage from "@/pages/SessionsPage";
 import { api } from "@/lib/api";
 import { JsonRpcGatewayError, type GatewayEvent } from "@/lib/gatewayClient";
@@ -72,8 +74,9 @@ export function GuiChatShell() {
   const filesOpen = workspacePath === "/chat/files";
   const skillsOpen = workspacePath === "/chat/skills";
   const scheduledTasksOpen = workspacePath === "/chat/scheduled-tasks";
+  const robotsOpen = workspacePath === "/chat/robots";
   const modelsOpen = workspacePath === "/chat/models";
-  const workspacePaneOpen = statisticsOpen || filesOpen || skillsOpen || scheduledTasksOpen || modelsOpen;
+  const workspacePaneOpen = statisticsOpen || filesOpen || skillsOpen || scheduledTasksOpen || robotsOpen || modelsOpen;
   const [state, dispatch] = useReducer(guiChatReducer, initialGuiChatState);
   const connectionRef = useRef<GuiChatConnection | null>(null);
   const historyAbortRef = useRef<AbortController | null>(null);
@@ -757,6 +760,19 @@ export function GuiChatShell() {
           <span>Scheduled Tasks</span>
         </button>
         <button
+          aria-current={robotsOpen ? "page" : undefined}
+          aria-label="员工管理"
+          className="gui-chat-nav-item"
+          onClick={() => {
+            closeMobilePanel();
+            navigate("/chat/robots");
+          }}
+          type="button"
+        >
+          <Radio />
+          <span>员工管理</span>
+        </button>
+        <button
           aria-current={modelsOpen ? "page" : undefined}
           aria-label="Manage models"
           className="gui-chat-nav-item"
@@ -882,9 +898,11 @@ export function GuiChatShell() {
                   ? "Skills"
                   : scheduledTasksOpen
                     ? "Scheduled Tasks"
-                    : modelsOpen
-                      ? "Models"
-                      : conversationTitle}
+                    : robotsOpen
+                      ? "员工管理"
+                      : modelsOpen
+                        ? "Models"
+                        : conversationTitle}
             </h1>
             <p className="truncate text-[0.625rem] text-[#969aa1]">
               {workspacePaneOpen
@@ -930,6 +948,16 @@ export function GuiChatShell() {
           <GuiChatSkillsPane />
         ) : scheduledTasksOpen ? (
           <GuiChatScheduledTasksPane />
+        ) : robotsOpen ? (
+          <PageHeaderContext.Provider value={EMBEDDED_PAGE_HEADER}>
+            <div
+              data-robots-pane
+              data-theme="chat-workspace"
+              className="gui-chat-statistics-pane min-h-0 flex-1 overflow-auto"
+            >
+              <ChannelsPage />
+            </div>
+          </PageHeaderContext.Provider>
         ) : modelsOpen ? (
           <GuiChatModelsPane
             busy={state.isGenerating}

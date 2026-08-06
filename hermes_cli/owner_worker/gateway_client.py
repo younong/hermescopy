@@ -11,6 +11,7 @@ from typing import Any
 from hermes_cli.dashboard_auth.authority import OwnerWorkerAuthorityLease, WorkerLeaseState
 from hermes_cli.owner_worker.tokens import (
     mint_owner_worker_bootstrap,
+    normalize_connection_purpose,
     owner_worker_capability_public_config,
     owp1_data,
     owp1_hello,
@@ -55,9 +56,11 @@ def authority_lease_for_handle(handle: Any) -> OwnerWorkerAuthorityLease:
 class OwnerWorkerGatewayClient:
     """Owns one exact Worker use lease and OWP1-authenticated `/api/ws`."""
 
-    def __init__(self, supervisor: Any, owner: Any) -> None:
+    def __init__(self, supervisor: Any, owner: Any, *, connection_purpose: str) -> None:
+        purpose = normalize_connection_purpose(connection_purpose)
         self.supervisor = supervisor
         self.owner = owner
+        self.connection_purpose = purpose
         self.handle: Any | None = None
         self.lease: Any | None = None
         self.websocket: Any | None = None
@@ -88,6 +91,7 @@ class OwnerWorkerGatewayClient:
             path="/api/ws",
             connection_id=connection_id,
             nonce=nonce,
+            connection_purpose=self.connection_purpose,
             control_home=getattr(self.supervisor, "control_home", None),
         )
         verifier = owner_worker_capability_public_config(

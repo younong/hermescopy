@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from pathlib import Path
@@ -14,6 +15,7 @@ from hermes_cli.channel_connectors.weixin_ilink.dispatch_hooks import WeixinDisp
 from hermes_cli.channel_connectors.weixin_ilink.poller import acquire_poll_lease, commit_update_batch
 from hermes_cli.channel_dispatch import ChannelOutbox
 from hermes_cli.channel_dispatch.dispatcher import ChannelDispatcher
+from hermes_cli.channel_dispatch.session_router import open_binding_session
 from hermes_cli.channel_identity import (
     ChannelCrypto,
     ChannelIdentityStore,
@@ -235,6 +237,39 @@ async def test_dispatch_creates_session_submits_idempotent_turn_and_writes_outbo
     assert outbound["outbound_id"] == outbound_id
     assert outbound["status"] == "queued"
     assert outbound["client_message_id"].startswith("hermes-weixin-ilink-")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_dispatch_interrupts_the_exact_retained_session(queued):
+    store, registered = queued
+    dispatcher = ChannelDispatcher(store, object(), provider="weixin_ilink")
+    claim = dispatcher.claim_next(holder="dispatcher")
+    assert claim is not None
+
+    from hermes_cli.channel_identity.owner_resolution import resolve_binding
+
+    owner, _ = resolve_binding(store, binding_id=registered.binding_id)
+    client = AsyncMock()
+    client.owner = owner
+    client.handle = type("Handle", (), {"worker_generation": 1})()
+    client.call.side_effect = [
+        {"session_id": "live-1", "stored_session_id": "stored-1"},
+        {"status": "streaming"},
+        {"status": "interrupted"},
+    ]
+    client.wait_for_event.side_effect = asyncio.CancelledError
+
+    with patch(
+        "hermes_cli.channel_dispatch.dispatcher.OwnerWorkerGatewayClient",
+        return_value=_client_context(client),
+    ), pytest.raises(asyncio.CancelledError):
+        await dispatcher.dispatch_claim(claim, holder="dispatcher")
+
+    interrupt = client.call.await_args_list[-1]
+    assert interrupt.args == (
+        "session.interrupt",
+        {"session_id": "live-1"},
+    )
 
 
 def test_failed_outbound_unblocks_next_inbound_but_active_outbound_does_not(queued):
@@ -604,6 +639,132 @@ async def test_inbound_staging_rejects_symlinked_parent(queued):
     assert list(outside.iterdir()) == []
 
 
+def test_dispatch_ordering_is_thread_scoped_within_one_binding(queued):
+    store, _registered = queued
+    with store.write() as conn:
+        first = conn.execute("SELECT * FROM inbound_messages").fetchone()
+        conn.execute("DELETE FROM inbound_messages")
+        conn.execute(
+            """
+            INSERT INTO inbound_messages
+              (inbound_id, account_id, binding_id, provider_message_id,
+               payload_ciphertext, payload_key_version, payload_kind, status,
+               dispatch_scope, binding_sequence, claimed_by, claimed_at,
+               next_attempt_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'text', 'processing', 'thread:a', 1,
+                    'first', 1, 0, 1, 1)
+            """,
+            (
+                first["inbound_id"],
+                first["account_id"],
+                first["binding_id"],
+                first["provider_message_id"],
+                first["payload_ciphertext"],
+                first["payload_key_version"],
+            ),
+        )
+        ciphertext, version = store.crypto.encrypt_text(
+            "other thread",
+            table="inbound_messages",
+            record_id="msg-thread-b",
+            field="payload",
+        )
+        conn.execute(
+            """
+            INSERT INTO inbound_messages
+              (inbound_id, account_id, binding_id, provider_message_id,
+               payload_ciphertext, payload_key_version, payload_kind, status,
+               dispatch_scope, binding_sequence, next_attempt_at, created_at, updated_at)
+            VALUES ('im-thread-b', ?, ?, 'msg-thread-b', ?, ?, 'text', 'queued',
+                    'thread:b', 1, 0, 2, 2)
+            """,
+            (
+                first["account_id"],
+                first["binding_id"],
+                ciphertext,
+                version,
+            ),
+        )
+
+    claim = ChannelDispatcher(
+        store,
+        object(),
+        provider="weixin_ilink",
+    ).claim_next(holder="second")
+
+    assert claim is not None
+    assert claim["provider_message_id"] == "msg-thread-b"
+
+
+@pytest.mark.asyncio
+async def test_channel_sessions_are_scoped_and_pin_profile_revision(queued):
+    store, registered = queued
+    owner = __import__(
+        "hermes_cli.channel_identity.owner_resolution", fromlist=["resolve_binding"]
+    ).resolve_binding(store, binding_id=registered.binding_id)[0]
+    client = AsyncMock()
+    client.owner = owner
+    client.handle = type("Handle", (), {"worker_generation": 1})()
+    client.call.side_effect = [
+        {"session_id": "live-a", "stored_session_id": "stored-a"},
+        {"session_id": "live-b", "stored_session_id": "stored-b"},
+        {"session_id": "live-a2", "stored_session_id": "stored-a"},
+    ]
+
+    assert await open_binding_session(
+        client,
+        store,
+        binding_id=registered.binding_id,
+        source="weixin-ilink",
+        title="channel",
+        dispatch_scope="thread:a",
+        profile_revision=3,
+    ) == ("live-a", "stored-a")
+    assert await open_binding_session(
+        client,
+        store,
+        binding_id=registered.binding_id,
+        source="weixin-ilink",
+        title="channel",
+        dispatch_scope="thread:b",
+        profile_revision=3,
+    ) == ("live-b", "stored-b")
+    assert await open_binding_session(
+        client,
+        store,
+        binding_id=registered.binding_id,
+        source="weixin-ilink",
+        title="channel",
+        dispatch_scope="thread:a",
+        profile_revision=3,
+    ) == ("live-a2", "stored-a")
+    with pytest.raises(RuntimeError, match="profile revision"):
+        await open_binding_session(
+            client,
+            store,
+            binding_id=registered.binding_id,
+            source="feishu",
+            title="feishu channel",
+            dispatch_scope="thread:a",
+            profile_revision=4,
+        )
+
+    assert [entry.args[0] for entry in client.call.await_args_list] == [
+        "session.create",
+        "session.create",
+        "session.resume",
+    ]
+    with store.read() as conn:
+        rows = conn.execute(
+            "SELECT dispatch_scope, stored_session_id, profile_revision "
+            "FROM channel_sessions ORDER BY dispatch_scope"
+        ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        ("thread:a", "stored-a", 3),
+        ("thread:b", "stored-b", 3),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_existing_binding_session_fails_closed_for_wrong_owner(queued):
     store, registered = queued
@@ -613,7 +774,12 @@ async def test_existing_binding_session_fails_closed_for_wrong_owner(queued):
     owner, _ = resolve_binding(store, binding_id=registered.binding_id)
     with store.write() as conn:
         conn.execute(
-            "INSERT INTO channel_sessions VALUES (?, 'ok1_wrong', 'stored-1', 1, 1)",
+            """
+            INSERT INTO channel_sessions
+              (binding_id, dispatch_scope, owner_key, stored_session_id,
+               worker_generation, profile_revision, updated_at)
+            VALUES (?, '', 'ok1_wrong', 'stored-1', 1, NULL, 1)
+            """,
             (registered.binding_id,),
         )
     client = AsyncMock()

@@ -304,20 +304,35 @@ class ToolExecutorSupervisor:
             raise ExecutorIdentityInvalid("authenticated network egress is not configured")
         return egress_profile
 
-    def identity_for(self, *, task_id: str, session_id: str) -> ExecutorIdentity:
+    def identity_for(
+        self,
+        *,
+        task_id: str,
+        session_id: str,
+        workspace_prefix: str | None = None,
+        knowledge_prefixes: tuple[str, ...] = (),
+    ) -> ExecutorIdentity:
         key = (str(task_id or ""), str(session_id or ""))
         if not all(key):
             raise ValueError("authenticated executor requires task_id and session_id")
+        workspace_prefix = workspace_prefix or self.workspace_context.workspace_prefix
+        knowledge_prefixes = tuple(knowledge_prefixes)
         with self._lock:
             identity = self._identities.get(key)
             if identity is None:
                 identity = ExecutorIdentity.for_task(
                     self.lease,
-                    workspace_prefix=self.workspace_context.workspace_prefix,
+                    workspace_prefix=workspace_prefix,
                     task_id=key[0],
                     session_id=key[1],
+                    knowledge_prefixes=knowledge_prefixes,
                 )
                 self._identities[key] = identity
+            elif (
+                identity.workspace_prefix != workspace_prefix
+                or identity.knowledge_prefixes != knowledge_prefixes
+            ):
+                raise PermissionError("executor session capability is immutable")
             if identity.stable_key in self._revoked:
                 raise PermissionError("executor generation is revoked")
             return identity
@@ -332,8 +347,15 @@ class ToolExecutorSupervisor:
         tool_call_id: str,
         turn_id: str,
         api_request_id: str,
+        workspace_prefix: str | None = None,
+        knowledge_prefixes: tuple[str, ...] = (),
     ) -> str:
-        identity = self.identity_for(task_id=task_id, session_id=session_id)
+        identity = self.identity_for(
+            task_id=task_id,
+            session_id=session_id,
+            workspace_prefix=workspace_prefix,
+            knowledge_prefixes=knowledge_prefixes,
+        )
         try:
             egress_profile = self.admitted_egress_profile_for(function_name)
         except ExecutorIdentityInvalid:
@@ -483,6 +505,10 @@ class ToolExecutorSupervisor:
             control_home=self.control_home,
             owner_root=self.owner_root,
             readonly_mounts=tuple(self.readonly_mounts),
+            knowledge_mounts=tuple(
+                f"/knowledge/{index}"
+                for index, _prefix in enumerate(binding.identity.knowledge_prefixes)
+            ),
             python_executable=self.python_executable,
             root_tmpfs_bytes=self.root_tmpfs_bytes,
             executor_tmpfs_bytes=self.executor_tmpfs_bytes,
@@ -637,11 +663,11 @@ class ToolExecutorSupervisor:
             now=int(self._clock()),
         )
 
-    def _workspace_fd(self) -> int:
+    def _workspace_fd(self, identity: ExecutorIdentity) -> int:
         try:
             return self.workspace_context.roots.open_relative(
                 RootKind.WORKSPACE,
-                self.workspace_context.workspace_prefix,
+                identity.workspace_prefix,
                 expected_type=ExpectedType.DIRECTORY,
             )
         except RuntimeError as exc:
@@ -649,7 +675,29 @@ class ToolExecutorSupervisor:
             # supports injected unit-test launchers on development platforms.
             if "require Linux" not in str(exc):
                 raise
-            return os.dup(self.workspace_context.roots.get(RootKind.WORKSPACE).directory_fd)
+            root_fd = self.workspace_context.roots.get(RootKind.WORKSPACE).directory_fd
+            return os.open(
+                identity.workspace_prefix,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                dir_fd=root_fd,
+            )
+
+    def _knowledge_fds(self, identity: ExecutorIdentity) -> tuple[int, ...]:
+        descriptors: list[int] = []
+        try:
+            for prefix in identity.knowledge_prefixes:
+                descriptors.append(
+                    self.workspace_context.roots.open_relative(
+                        RootKind.WORKSPACE,
+                        prefix,
+                        expected_type=ExpectedType.DIRECTORY,
+                    )
+                )
+        except BaseException:
+            for descriptor in descriptors:
+                os.close(descriptor)
+            raise
+        return tuple(descriptors)
 
     def _production_resource_limits(self, invocation: ExecutorInvocation) -> tuple[int, int, int]:
         quota = invocation.resource_decision.quota
@@ -716,6 +764,8 @@ class ToolExecutorSupervisor:
         inherited_security_fd = -1
         runtime_home: Path | None = None
         workspace_fd = inherited_workspace_fd = request_read = request_write = response_read = response_write = -1
+        knowledge_fds: tuple[int, ...] = ()
+        inherited_knowledge_fds: tuple[int, ...] = ()
         sandbox_gate_read = sandbox_gate_write = info_read = info_write = -1
         launcher_gate_read = launcher_gate_write = owner_relay_fd = -1
         process: Any | None = None
@@ -746,15 +796,18 @@ class ToolExecutorSupervisor:
             runtime_home.mkdir(parents=True, exist_ok=True)
             if os.name != "nt":
                 runtime_home.chmod(stat.S_IRWXU)
-            workspace_fd = self._workspace_fd()
+            workspace_fd = self._workspace_fd(identity)
             inherited_workspace_fd = os.dup(workspace_fd)
+            knowledge_fds = self._knowledge_fds(identity)
+            inherited_knowledge_fds = tuple(os.dup(fd) for fd in knowledge_fds)
             request_read, request_write = os.pipe()
             response_read, response_write = os.pipe()
             sandbox_gate_read, sandbox_gate_write = os.pipe()
             info_read, info_write = os.pipe()
             launcher_gate_read, launcher_gate_write = os.pipe()
             for fd in (
-                inherited_workspace_fd, request_read, response_write, sandbox_gate_read,
+                inherited_workspace_fd, *inherited_knowledge_fds,
+                request_read, response_write, sandbox_gate_read,
                 info_write, launcher_gate_read,
             ):
                 os.set_inheritable(fd, True)
@@ -793,6 +846,7 @@ class ToolExecutorSupervisor:
             spec = self.sandbox_builder(
                 environment=environment,
                 workspace_fd=inherited_workspace_fd,
+                knowledge_fds=inherited_knowledge_fds,
                 binding=binding,
                 mount_policy=mount_policy,
                 security_policy=self.sandbox_verification_policy.security_policy,
@@ -805,7 +859,8 @@ class ToolExecutorSupervisor:
                 info_fd=info_write,
             )
             pass_fds = tuple(dict.fromkeys((
-                inherited_workspace_fd, request_read, response_write, sandbox_gate_read,
+                inherited_workspace_fd, *inherited_knowledge_fds,
+                request_read, response_write, sandbox_gate_read,
                 info_write, launcher_gate_read, inherited_security_fd,
                 *((owner_relay_fd,) if owner_relay_fd >= 0 else ()),
                 *spec.inherited_security_fds,
@@ -958,7 +1013,9 @@ class ToolExecutorSupervisor:
                 )
             )
             for fd in (
-                workspace_fd, inherited_workspace_fd, request_read, request_write,
+                workspace_fd, inherited_workspace_fd,
+                *knowledge_fds, *inherited_knowledge_fds,
+                request_read, request_write,
                 response_read, response_write, sandbox_gate_read, sandbox_gate_write,
                 info_read, info_write, launcher_gate_read, launcher_gate_write,
                 owner_relay_fd, inherited_security_fd, *extra_spec_fds,

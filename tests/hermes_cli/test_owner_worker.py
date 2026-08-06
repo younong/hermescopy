@@ -36,6 +36,8 @@ from hermes_cli.owner_worker.tokens import (
     AUD_OWNER_WORKER_WS,
     SCOPE_OWNER_WORKER_HTTP,
     SCOPE_OWNER_WORKER_WS,
+    CONNECTION_PURPOSE_INTERACTIVE,
+    CONNECTION_PURPOSE_RETAINED_CHANNEL,
     OwnerWorkerCapabilityInvalid,
     child_token_ttl_seconds,
     admit_owner_worker_bootstrap,
@@ -230,6 +232,7 @@ def test_bootstrap_is_exact_lease_bound_and_consumed_once(tmp_path):
         path="/api/ws",
         connection_id="connection_identifier_1234",
         nonce="control_nonce_identifier_1234",
+        connection_purpose=CONNECTION_PURPOSE_INTERACTIVE,
         control_home=control_home,
     )
     kwargs = {
@@ -242,6 +245,7 @@ def test_bootstrap_is_exact_lease_bound_and_consumed_once(tmp_path):
     claims = admit_owner_worker_bootstrap(token, **kwargs)
     assert claims.connection_id == "connection_identifier_1234"
     assert claims.nonce == "control_nonce_identifier_1234"
+    assert claims.connection_purpose == CONNECTION_PURPOSE_INTERACTIVE
     with pytest.raises(OwnerWorkerCapabilityInvalid, match="replay"):
         admit_owner_worker_bootstrap(token, **kwargs)
     with pytest.raises(OwnerWorkerCapabilityInvalid, match="binding_mismatch"):
@@ -252,6 +256,35 @@ def test_bootstrap_is_exact_lease_bound_and_consumed_once(tmp_path):
             public_key=kwargs["public_key"],
             issuer_key_version=kwargs["issuer_key_version"],
         )
+
+
+def test_bootstrap_requires_a_known_signed_connection_purpose(tmp_path):
+    _store, lease = _active_lease(tmp_path)
+    common = {
+        "path": "/api/ws",
+        "connection_id": "connection_identifier_1234",
+        "nonce": "control_nonce_identifier_1234",
+        "control_home": tmp_path / "control",
+    }
+
+    with pytest.raises(ValueError, match="connection_purpose"):
+        mint_owner_worker_bootstrap(
+            lease,
+            connection_purpose="dashboard-claimed-retained-channel",
+            **common,
+        )
+    retained = mint_owner_worker_bootstrap(
+        lease,
+        connection_purpose=CONNECTION_PURPOSE_RETAINED_CHANNEL,
+        **common,
+    )
+    interactive = mint_owner_worker_bootstrap(
+        lease,
+        connection_purpose=CONNECTION_PURPOSE_INTERACTIVE,
+        **common,
+    )
+
+    assert retained != interactive
 
 
 def test_worker_ws_bootstrap_resolves_active_durable_lease_from_starting_config(tmp_path):
@@ -308,6 +341,7 @@ def test_worker_ws_bootstrap_resolves_active_durable_lease_from_starting_config(
         path="/api/events",
         connection_id="connection_identifier_1234",
         nonce="control_nonce_identifier_1234",
+        connection_purpose=CONNECTION_PURPOSE_INTERACTIVE,
         control_home=control_home,
     )
     claims = parse_owner_worker_bootstrap(
@@ -413,6 +447,7 @@ def test_owp1_data_requires_exact_peer_and_monotonic_sequence(tmp_path):
             path="/api/ws",
             connection_id="connection_identifier_1234",
             nonce="control_nonce_identifier_1234",
+            connection_purpose=CONNECTION_PURPOSE_INTERACTIVE,
             control_home=tmp_path / "control",
         ),
         expected_lease=lease,
@@ -906,7 +941,7 @@ def test_supervisor_resource_policy_controls_capacity_and_gates_worker_before_he
         Path(argv[argv.index("--socket") + 1]).touch()
         return _FakeProcess()
 
-    monkeypatch.setenv("HERMES_OWNER_WORKER_MAX", "99")
+    monkeypatch.delenv("HERMES_OWNER_WORKER_MAX", raising=False)
     supervisor = OwnerWorkerSupervisor(
         control_home=tmp_path / "control", client_cls=_FakeClient,
         process_factory=fake_process_factory, startup_timeout=0.1,
@@ -927,6 +962,46 @@ def test_supervisor_resource_policy_controls_capacity_and_gates_worker_before_he
     assert operations[-1] == ("cleanup",)
     for fd in (*child_gate_fds, *child_resource_fds):
         os.close(fd)
+
+
+def test_supervisor_accepts_runtime_limit_below_resource_policy(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    manager = SimpleNamespace(
+        policy=SimpleNamespace(global_limits=SimpleNamespace(max_owner_workers=5)),
+        admit_executor=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setenv("HERMES_OWNER_WORKER_MAX", "4")
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError),
+        resource_manager=manager,
+    )
+
+    assert supervisor.max_workers == 4
+
+
+@pytest.mark.parametrize("configured", ["0", "6", "invalid"])
+def test_supervisor_rejects_invalid_or_excessive_resource_limit(
+    tmp_path, monkeypatch, configured,
+):
+    from types import SimpleNamespace
+
+    manager = SimpleNamespace(
+        policy=SimpleNamespace(global_limits=SimpleNamespace(max_owner_workers=5)),
+        admit_executor=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setenv("HERMES_OWNER_WORKER_MAX", configured)
+
+    with pytest.raises(ValueError, match="owner worker limit"):
+        OwnerWorkerSupervisor(
+            control_home=tmp_path / "control",
+            client_cls=_FakeClient,
+            process_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError),
+            resource_manager=manager,
+        )
 
 
 def test_supervisor_resource_setup_failure_closes_child_descriptor_and_reservation(tmp_path, monkeypatch):
@@ -3496,6 +3571,7 @@ def test_worker_analytics_and_model_info_routes_require_owner_token(tmp_path, mo
     assert client.get("/api/dashboard/font").status_code == 401
     assert client.get("/api/dashboard/plugins").status_code == 401
     assert client.get("/api/tools/toolsets").status_code == 401
+    assert client.get("/api/messaging/feishu/catalog").status_code == 401
 
 
 def test_worker_owner_startup_routes_return_owner_local_payloads(tmp_path, monkeypatch):
@@ -3527,6 +3603,7 @@ def test_worker_owner_startup_routes_return_owner_local_payloads(tmp_path, monke
     font = get("/api/dashboard/font")
     plugins = get("/api/dashboard/plugins")
     toolsets = get("/api/tools/toolsets")
+    employee_catalog = get("/api/messaging/feishu/catalog")
 
     assert config.status_code == 200
     assert config.json()["model"] == "owner-model"
@@ -3538,6 +3615,14 @@ def test_worker_owner_startup_routes_return_owner_local_payloads(tmp_path, monke
     toolsets_by_name = {item["name"]: item for item in toolsets.json()}
     assert toolsets_by_name["x_search"]["enabled"] is True
     assert toolsets_by_name["x_search"]["available"] is True
+    assert employee_catalog.status_code == 200
+    assert employee_catalog.json()["workspace"] == {
+        "default": "default",
+        "root": "",
+    }
+    assert "owner-skill" in {
+        item["name"] for item in employee_catalog.json()["skills"]
+    }
 
 
 def test_worker_analytics_routes_return_owner_local_data(tmp_path, monkeypatch):
