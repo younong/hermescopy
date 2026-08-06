@@ -298,6 +298,38 @@ def _active(config: dict[str, Any], registrations: dict[str, dict[str, Any]]) ->
     return result
 
 
+def resolve_chat_model_registration(registration_id: str) -> dict[str, str]:
+    """Resolve one stable chat registration to non-secret runtime identity."""
+    registration_id = str(registration_id or "").strip()
+    if not _ID_RE.fullmatch(registration_id):
+        raise ModelRegistrationNotFound("Model registration not found")
+    with _LOCK:
+        config = load_config()
+        item = _registrations(config).get(registration_id)
+        if not isinstance(item, dict) or item.get("kind") != "chat":
+            raise ModelRegistrationNotFound("Model registration not found")
+        provider = _text(item.get("provider"), "provider")
+        model = _text(item.get("model"), "model")
+        source = str(item.get("source") or "catalog").strip().lower()
+        result = {
+            "registration_id": registration_id,
+            "provider": provider,
+            "model": model,
+            "source": source,
+        }
+        if source == "custom":
+            providers = config.get("providers")
+            provider_config = providers.get(provider) if isinstance(providers, dict) else None
+            if not isinstance(provider_config, dict):
+                raise ModelRegistrationError("Custom provider configuration is invalid")
+            normalized = _normalize_custom_provider_entry(provider_config, provider_key=provider)
+            if normalized is None:
+                raise ModelRegistrationError("Custom provider configuration is invalid")
+            result["base_url"] = str(normalized.get("base_url") or "")
+            result["api_mode"] = str(normalized.get("api_mode") or "")
+        return result
+
+
 def get_model_registrations_payload() -> dict[str, Any]:
     """Return public registrations and active selections without loading catalogs."""
     with _LOCK:

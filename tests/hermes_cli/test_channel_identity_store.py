@@ -13,13 +13,25 @@ from hermes_cli.channel_identity import (
     ChannelCrypto,
     ChannelIdentityOwnershipConflict,
     ChannelIdentityStore,
+    EmployeeProfileRevisionConflict,
+    FeishuCredentialRevisionConflict,
     Keyring,
+    claim_existing_feishu_account_for_owner,
+    employee_profile_fingerprint,
     ensure_owner_binding,
     register_connector_binding_for_owner,
+    register_managed_feishu_account_for_owner,
     register_weixin_identity,
     register_weixin_identity_for_owner,
     resolve_binding,
     resolve_connector_account,
+    resolve_employee_profile,
+    resolve_managed_feishu_account,
+    resolve_managed_feishu_credentials,
+    rollover_managed_feishu_sessions,
+    rotate_managed_feishu_credentials,
+    set_managed_feishu_account_status,
+    update_employee_profile,
 )
 from hermes_cli.channel_identity.credentials import decrypt_account_credentials
 from hermes_cli.channel_identity.store import ACCOUNT_CREDENTIAL_AAD_TABLE
@@ -328,7 +340,7 @@ def test_store_migrates_v1_attempts_to_owner_target_schema(tmp_path, crypto, mon
     with migrated.read() as conn:
         assert conn.execute(
             "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
-        ).fetchone()["value"] == "10"
+        ).fetchone()["value"] == "12"
         row = conn.execute(
             "SELECT target_canonical_user_id FROM enrollment_attempts WHERE attempt_id='enr_existing'"
         ).fetchone()
@@ -395,7 +407,7 @@ def test_store_migrates_v3_inbound_rows_with_retry_defaults(tmp_path, crypto):
             "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
         ).fetchone()["value"]
     assert tuple(row) == ("text", 0, 0, None)
-    assert version == "10"
+    assert version == "12"
 
 
 def test_store_migrates_v4_ilink_account_to_provider_neutral_identity(tmp_path, crypto):
@@ -415,6 +427,7 @@ def test_store_migrates_v4_ilink_account_to_provider_neutral_identity(tmp_path, 
         conn.execute("DROP TRIGGER IF EXISTS channel_bindings_identity_consistent_insert")
         conn.execute("DROP TRIGGER IF EXISTS inbound_messages_binding_consistent_insert")
         conn.execute("DROP TRIGGER IF EXISTS inbound_messages_assign_sequence")
+        conn.execute("DROP TRIGGER IF EXISTS managed_feishu_accounts_provider_insert")
         conn.execute("DROP TABLE binding_sequences")
         _downgrade_account_table_to_v7(conn, crypto)
         conn.execute("UPDATE channel_identity_meta SET value='4'")
@@ -467,7 +480,7 @@ def test_store_migrates_v4_ilink_account_to_provider_neutral_identity(tmp_path, 
         "inbound_messages": {"connector_accounts"},
         "outbound_messages": {"connector_accounts"},
     }
-    assert version == "10"
+    assert version == "12"
 
 
 def test_store_migrates_v7_account_table_without_reencrypting_credentials(tmp_path, crypto):
@@ -501,7 +514,7 @@ def test_store_migrates_v7_account_table_without_reencrypting_credentials(tmp_pa
     owner, resolved = resolve_binding(migrated, binding_id=registered.binding_id)
     assert "connector_accounts" in tables
     assert "ilink_accounts" not in tables
-    assert version == "10"
+    assert version == "12"
     assert owner.owner_key == registered.owner_key
     assert resolve_connector_account(
         migrated,
@@ -607,7 +620,7 @@ def test_store_migrates_v8_credentials_to_provider_neutral_envelope(tmp_path, cr
         "bot_token_ciphertext",
         "base_url",
     } & columns
-    assert version == "10"
+    assert version == "12"
     assert resolve_connector_account(
         migrated,
         provider="weixin_ilink",
@@ -666,7 +679,7 @@ def test_store_migrates_v9_shared_account_schema_without_reencrypting(tmp_path, 
     assert "external_identity_id" not in columns
     assert row["credentials_ciphertext"] == credentials["credentials_ciphertext"]
     assert row["credentials_key_version"] == credentials["credentials_key_version"]
-    assert version == "10"
+    assert version == "12"
 
 
 def test_store_rolls_back_v9_shared_account_migration_on_validation_failure(
@@ -1109,7 +1122,7 @@ def test_initialization_rolls_back_schema_and_version_when_key_validation_fails(
     with store.read() as conn:
         assert conn.execute(
             "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
-        ).fetchone()["value"] == "10"
+        ).fetchone()["value"] == "12"
 
 
 def test_store_allows_shared_account_across_owner_bound_identities(store):
@@ -1225,6 +1238,395 @@ def test_registration_rejects_conflicting_bot_for_existing_subject(store):
             base_url="https://ilink.example",
             peer_id="subject-a",
         )
+
+
+def test_v10_migration_adds_empty_feishu_management_tables_without_guessing_owner(
+    tmp_path, crypto
+):
+    control_home = tmp_path / "control-plane"
+    first = ChannelIdentityStore(crypto, control_home, global_home=tmp_path)
+    registered = register_connector_binding_for_owner(
+        first,
+        owner=_owner(user_id="owner-a"),
+        provider="feishu",
+        provider_account_id="cli-app",
+        external_subject="actor-a",
+        conversation_id="chat-a",
+        credentials={"app_id": "cli-app", "app_secret": "secret"},
+    )
+    with first.write() as conn:
+        conn.execute("DROP TABLE feishu_employee_profiles")
+        conn.execute("DROP TABLE managed_feishu_accounts")
+        conn.execute(
+            "UPDATE channel_identity_meta SET value='10' WHERE key='schema_version'"
+        )
+
+    migrated = ChannelIdentityStore(crypto, control_home, global_home=tmp_path)
+
+    with migrated.read() as conn:
+        version = conn.execute(
+            "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
+        ).fetchone()["value"]
+        managed = conn.execute(
+            "SELECT * FROM managed_feishu_accounts WHERE account_id=?",
+            (registered.account_id,),
+        ).fetchone()
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert version == "12"
+    assert managed is None
+    with pytest.raises(RuntimeError, match="unavailable"):
+        resolve_connector_account(
+            migrated,
+            provider="feishu",
+            account_id=registered.account_id,
+            require_managed_feishu=True,
+        )
+
+
+def test_managed_feishu_registration_is_atomic_when_profile_encryption_fails(
+    store, monkeypatch
+):
+    owner = _owner(user_id="owner-a")
+    original = store.crypto.encrypt_text
+
+    def fail_profile(value, *, table, record_id, field):
+        if table == "feishu_employee_profiles":
+            raise RuntimeError("profile encryption failed")
+        return original(
+            value,
+            table=table,
+            record_id=record_id,
+            field=field,
+        )
+
+    monkeypatch.setattr(store.crypto, "encrypt_text", fail_profile)
+    with pytest.raises(RuntimeError, match="profile encryption failed"):
+        register_managed_feishu_account_for_owner(
+            store,
+            owner=owner,
+            provider_account_id="cli-app",
+            external_subject="actor-a",
+            conversation_id="chat-a",
+            credentials={"app_id": "cli-app", "app_secret": "secret"},
+            employee_profile={"name": "Researcher"},
+        )
+
+    with store.read() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM connector_accounts WHERE provider='feishu'"
+        ).fetchone() is None
+        assert conn.execute("SELECT 1 FROM managed_feishu_accounts").fetchone() is None
+        assert conn.execute("SELECT 1 FROM channel_bindings").fetchone() is None
+
+
+def test_managed_feishu_account_can_start_without_a_fake_conversation_binding(store):
+    owner = _owner(user_id="owner-a")
+    registered = register_managed_feishu_account_for_owner(
+        store,
+        owner=owner,
+        provider_account_id="cli-app",
+        external_subject="bot-a",
+        conversation_id=None,
+        credentials={"app_id": "cli-app", "app_secret": "secret"},
+        employee_profile={"name": "Researcher"},
+    )
+
+    assert registered.binding_id == ""
+    with store.read() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM channel_bindings WHERE account_id=?",
+            (registered.account_id,),
+        ).fetchone() is None
+    assert resolve_employee_profile(
+        store, owner=owner, account_id=registered.account_id
+    ).profile == {"name": "Researcher"}
+
+
+def test_managed_feishu_account_has_immutable_owner_and_one_current_profile(store):
+    owner = _owner(user_id="owner-a")
+    registered = register_managed_feishu_account_for_owner(
+        store,
+        owner=owner,
+        provider_account_id="cli-app",
+        external_subject="actor-a",
+        conversation_id="chat-a",
+        credentials={"app_id": "cli-app", "app_secret": "secret"},
+        employee_profile={"name": "Researcher", "tools": ["web", "file"]},
+    )
+
+    managed = resolve_managed_feishu_account(
+        store, owner=owner, account_id=registered.account_id
+    )
+    profile = resolve_employee_profile(
+        store, owner=owner, account_id=registered.account_id
+    )
+
+    assert managed.canonical_user_id == registered.canonical_user_id
+    assert managed.profile_revision == 1
+    assert managed.profile_fingerprint == profile.fingerprint
+    assert profile.profile == {"name": "Researcher", "tools": ["web", "file"]}
+    resolve_connector_account(
+        store,
+        provider="feishu",
+        account_id=registered.account_id,
+        require_managed_feishu=True,
+    )
+    second_owner_id = ensure_owner_binding(store, _owner(user_id="owner-b"))
+    with pytest.raises(sqlite3.IntegrityError, match="Owner is immutable"):
+        with store.write() as conn:
+            conn.execute(
+                "UPDATE managed_feishu_accounts SET canonical_user_id=? "
+                "WHERE account_id=?",
+                (second_owner_id, registered.account_id),
+            )
+
+
+def test_employee_profiles_are_encrypted_canonical_and_revision_fenced(store):
+    owner = _owner(user_id="owner-a")
+    registered = register_managed_feishu_account_for_owner(
+        store,
+        owner=owner,
+        provider_account_id="cli-app",
+        external_subject="actor-a",
+        conversation_id="chat-a",
+        credentials={"app_id": "cli-app", "app_secret": "secret"},
+        employee_profile={"name": "Analyst", "policy": {"model": "fast"}},
+    )
+    expected_fingerprint = employee_profile_fingerprint(
+        {"policy": {"model": "fast"}, "name": "Analyst"}
+    )
+    with store.read() as conn:
+        stored = conn.execute(
+            "SELECT profile_ciphertext, profile_fingerprint "
+            "FROM feishu_employee_profiles WHERE account_id=? AND revision=1",
+            (registered.account_id,),
+        ).fetchone()
+    assert stored["profile_fingerprint"] == expected_fingerprint
+    assert b"Analyst" not in stored["profile_ciphertext"]
+
+    updated = update_employee_profile(
+        store,
+        owner=owner,
+        account_id=registered.account_id,
+        profile={"name": "Analyst", "policy": {"model": "strong"}},
+        expected_revision=1,
+    )
+    assert updated.revision == 2
+    with pytest.raises(EmployeeProfileRevisionConflict, match="changed from 1 to 2"):
+        update_employee_profile(
+            store,
+            owner=owner,
+            account_id=registered.account_id,
+            profile={"name": "stale"},
+            expected_revision=1,
+        )
+    assert resolve_employee_profile(
+        store,
+        owner=owner,
+        account_id=registered.account_id,
+        revision=1,
+    ).lifecycle_status == "superseded"
+    with store.read() as conn:
+        current_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM feishu_employee_profiles "
+            "WHERE account_id=? AND lifecycle_status='active'",
+            (registered.account_id,),
+        ).fetchone()["count"]
+    assert current_count == 1
+
+
+def test_managed_feishu_credentials_rotate_and_sessions_roll_over_by_account(store):
+    owner = _owner(user_id="owner-a")
+    first = register_managed_feishu_account_for_owner(
+        store,
+        owner=owner,
+        provider_account_id="first-app",
+        external_subject="actor-a",
+        conversation_id="chat-a",
+        credentials={"app_id": "first-app", "app_secret": "old"},
+        employee_profile={"name": "Analyst"},
+    )
+    second = register_managed_feishu_account_for_owner(
+        store,
+        owner=owner,
+        provider_account_id="second-app",
+        external_subject="actor-b",
+        conversation_id="chat-b",
+        credentials={"app_id": "second-app", "app_secret": "other"},
+        employee_profile={"name": "Researcher"},
+    )
+    with store.write() as conn:
+        conn.execute(
+            "INSERT INTO channel_sessions VALUES (?, '', ?, 'stored-a', 1, 1, 1)",
+            (first.binding_id, owner.owner_key),
+        )
+        conn.execute(
+            "INSERT INTO channel_sessions VALUES (?, '', ?, 'stored-b', 1, 1, 1)",
+            (second.binding_id, owner.owner_key),
+        )
+
+    updated = rotate_managed_feishu_credentials(
+        store,
+        owner=owner,
+        account_id=first.account_id,
+        credentials={"app_id": "first-app", "app_secret": "new"},
+        expected_credential_version=1,
+    )
+    assert updated.credential_version == 2
+    credentials, version = resolve_managed_feishu_credentials(
+        store, owner=owner, account_id=first.account_id
+    )
+    assert credentials["app_secret"] == "new"
+    assert version == 2
+    with pytest.raises(FeishuCredentialRevisionConflict):
+        rotate_managed_feishu_credentials(
+            store,
+            owner=owner,
+            account_id=first.account_id,
+            credentials={"app_id": "first-app", "app_secret": "stale"},
+            expected_credential_version=1,
+        )
+
+    with store.write() as conn:
+        conn.execute(
+            """
+            INSERT INTO inbound_messages(
+                inbound_id, account_id, binding_id, provider_message_id,
+                payload_ciphertext, payload_key_version, status,
+                payload_kind, binding_sequence, dispatch_scope,
+                profile_revision, attempts, next_attempt_at,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 1, 'queued', 'text', 2, '', 1, 0, 0, 1, 1)
+            """,
+            ("queued-rollover", first.account_id, first.binding_id, "queued-message", b"payload"),
+        )
+    with pytest.raises(RuntimeError, match="active conversations"):
+        rollover_managed_feishu_sessions(
+            store, owner=owner, account_id=first.account_id
+        )
+    with store.write() as conn:
+        conn.execute("DELETE FROM inbound_messages WHERE inbound_id='queued-rollover'")
+
+    assert rollover_managed_feishu_sessions(
+        store, owner=owner, account_id=first.account_id
+    ) == 1
+    with store.read() as conn:
+        rows = conn.execute(
+            "SELECT stored_session_id FROM channel_sessions"
+        ).fetchall()
+    assert [row["stored_session_id"] for row in rows] == ["stored-b"]
+
+
+def test_managed_feishu_owner_fences_registration_profile_and_lifecycle(store):
+    first_owner = _owner(user_id="owner-a")
+    second_owner = _owner(user_id="owner-b")
+    registered = register_managed_feishu_account_for_owner(
+        store,
+        owner=first_owner,
+        provider_account_id="cli-app",
+        external_subject="actor-a",
+        conversation_id="chat-a",
+        credentials={"app_id": "cli-app", "app_secret": "secret"},
+        employee_profile={"name": "Analyst"},
+    )
+
+    with pytest.raises(ChannelIdentityOwnershipConflict, match="another Owner"):
+        register_connector_binding_for_owner(
+            store,
+            owner=second_owner,
+            provider="feishu",
+            provider_account_id="cli-app",
+            external_subject="actor-b",
+            conversation_id="chat-b",
+            credentials={"app_id": "cli-app", "app_secret": "attacker"},
+        )
+    with pytest.raises(RuntimeError, match="unavailable"):
+        resolve_employee_profile(
+            store, owner=second_owner, account_id=registered.account_id
+        )
+
+    suspended = set_managed_feishu_account_status(
+        store,
+        owner=first_owner,
+        account_id=registered.account_id,
+        status="suspended",
+    )
+    assert suspended.lifecycle_status == "suspended"
+    with pytest.raises(RuntimeError, match="unavailable"):
+        resolve_connector_account(
+            store,
+            provider="feishu",
+            account_id=registered.account_id,
+            require_managed_feishu=True,
+        )
+
+
+def test_legacy_feishu_claim_rejects_ambiguous_existing_account(store):
+    first_owner = _owner(user_id="owner-a")
+    second_owner = _owner(user_id="owner-b")
+    first = register_connector_binding_for_owner(
+        store,
+        owner=first_owner,
+        provider="feishu",
+        provider_account_id="shared-app",
+        external_subject="actor-a",
+        conversation_id="chat-a",
+        credentials={"app_id": "shared-app", "app_secret": "secret"},
+    )
+    register_connector_binding_for_owner(
+        store,
+        owner=second_owner,
+        provider="feishu",
+        provider_account_id="shared-app",
+        external_subject="actor-b",
+        conversation_id="chat-b",
+        credentials={"app_id": "shared-app", "app_secret": "secret"},
+    )
+
+    with pytest.raises(RuntimeError, match="ambiguous"):
+        claim_existing_feishu_account_for_owner(
+            store,
+            owner=first_owner,
+            account_id=first.account_id,
+            employee_profile={"name": "Analyst"},
+        )
+    with store.read() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM managed_feishu_accounts WHERE account_id=?",
+            (first.account_id,),
+        ).fetchone() is None
+
+
+def test_generic_weixin_and_webhook_registration_remain_unmanaged(store):
+    owner = _owner(user_id="owner-a")
+    webhook = register_connector_binding_for_owner(
+        store,
+        owner=owner,
+        provider="webhook",
+        provider_account_id="route",
+        external_subject="route",
+        conversation_id="route",
+        credentials={"token": "secret"},
+    )
+    weixin = register_weixin_identity(
+        store,
+        subject="subject-a",
+        bot_id="bot-a",
+        bot_token="token-a",
+        base_url="https://ilink.example",
+        peer_id="subject-a",
+    )
+    assert resolve_connector_account(
+        store, provider="webhook", account_id=webhook.account_id
+    ).credentials == {"token": "secret"}
+    assert resolve_connector_account(
+        store, provider="weixin_ilink", account_id=weixin.account_id
+    ).credentials["bot_id"] == "bot-a"
+    with store.read() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) AS count FROM managed_feishu_accounts"
+        ).fetchone()["count"]
+    assert count == 0
 
 
 def stat_mode(path) -> int:

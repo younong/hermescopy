@@ -36,3 +36,25 @@ class ResolvedConnectorAccount:
     provider_account_id: str
     credentials: dict[str, Any]
     credential_version: int
+
+
+@dataclass(frozen=True)
+class ManagedFeishuAccount:
+    account_id: str
+    canonical_user_id: str
+    owner_key: str
+    provider_account_id: str
+    credential_version: int
+    account_status: str
+    lifecycle_status: str
+    profile_revision: int | None
+    profile_fingerprint: str | None
+
+
+@dataclass(frozen=True)
+class EmployeeProfile:
+    account_id: str
+    revision: int
+    fingerprint: str
+    lifecycle_status: str
+    profile: dict[str, Any]

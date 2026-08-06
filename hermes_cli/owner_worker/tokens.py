@@ -50,6 +50,15 @@ _BOOTSTRAP_PROTOCOL_VERSION = "owp1"
 _DEFAULT_BOOTSTRAP_TTL_SECONDS = 20
 _MAX_BOOTSTRAP_TTL_SECONDS = 60
 
+CONNECTION_PURPOSE_RETAINED_CHANNEL = "retained-channel"
+CONNECTION_PURPOSE_API_INGRESS = "api-ingress"
+CONNECTION_PURPOSE_INTERACTIVE = "interactive"
+OWNER_WORKER_CONNECTION_PURPOSES = frozenset({
+    CONNECTION_PURPOSE_RETAINED_CHANNEL,
+    CONNECTION_PURPOSE_API_INGRESS,
+    CONNECTION_PURPOSE_INTERACTIVE,
+})
+
 
 class OwnerWorkerCapabilityInvalid(ValueError):
     """Capability is malformed, expired, unauthentic, or fenced out."""
@@ -89,6 +98,7 @@ class OwnerWorkerBootstrapClaims(OwnerWorkerCapabilityClaims):
 
     connection_id: str
     nonce: str
+    connection_purpose: str
 
 
 def _b64url(data: bytes) -> str:
@@ -111,6 +121,13 @@ def _opaque_peer_identifier(value: str, *, field: str) -> str:
     if not 16 <= len(identifier) <= 128 or not all(char.isascii() and (char.isalnum() or char in "-_") for char in identifier):
         raise ValueError(f"{field} must be a URL-safe opaque identifier")
     return identifier
+
+
+def normalize_connection_purpose(value: str) -> str:
+    purpose = str(value or "").strip()
+    if purpose not in OWNER_WORKER_CONNECTION_PURPOSES:
+        raise ValueError("connection_purpose is invalid")
+    return purpose
 
 
 def _safe_control_home(control_home: str | Path | None) -> Path:
@@ -380,6 +397,7 @@ def mint_owner_worker_bootstrap(
     path: str,
     connection_id: str,
     nonce: str,
+    connection_purpose: str,
     ttl_seconds: int = _DEFAULT_BOOTSTRAP_TTL_SECONDS,
     control_home: str | Path | None = None,
     now: int | None = None,
@@ -410,6 +428,7 @@ def mint_owner_worker_bootstrap(
         "jti": secrets.token_urlsafe(18),
         "connection_id": _opaque_peer_identifier(connection_id, field="connection_id"),
         "nonce": _opaque_peer_identifier(nonce, field="nonce"),
+        "connection_purpose": normalize_connection_purpose(connection_purpose),
     }
     header = {"v": _TOKEN_VERSION, "alg": "Ed25519", "kid": record["version"]}
     encoded_header = _b64url(json.dumps(header, sort_keys=True, separators=(",", ":")).encode("utf-8"))
@@ -544,6 +563,7 @@ def parse_owner_worker_bootstrap(
             jti=str(payload["jti"]),
             connection_id=_opaque_peer_identifier(str(payload["connection_id"]), field="connection_id"),
             nonce=_opaque_peer_identifier(str(payload["nonce"]), field="nonce"),
+            connection_purpose=normalize_connection_purpose(str(payload["connection_purpose"])),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise OwnerWorkerCapabilityInvalid("bootstrap_claims_invalid") from exc

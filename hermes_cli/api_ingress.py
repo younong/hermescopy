@@ -22,6 +22,7 @@ from hermes_cli.dashboard_auth.authority import AuthorityStore, MachineCredentia
 from hermes_cli.dashboard_auth.owner_context import owner_context_from_registry
 from hermes_cli.dashboard_auth.token_auth import register_token_route
 from hermes_cli.owner_worker.gateway_client import OwnerWorkerGatewayClient
+from hermes_cli.owner_worker.tokens import CONNECTION_PURPOSE_API_INGRESS
 
 router = APIRouter()
 
@@ -356,7 +357,11 @@ async def _run_turn(
     if chat.model:
         create_params["model"] = chat.model
 
-    client = OwnerWorkerGatewayClient(supervisor, owner)
+    client = OwnerWorkerGatewayClient(
+        supervisor,
+        owner,
+        connection_purpose=CONNECTION_PURPOSE_API_INGRESS,
+    )
     await client.connect()
     try:
         created = await client.call("session.create", create_params)

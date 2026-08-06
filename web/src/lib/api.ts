@@ -781,6 +781,59 @@ export const api = {
       `/api/messaging/platforms/${encodeURIComponent(id)}/test`,
       { method: "POST" },
     ),
+  getFeishuEmployeeCatalog: () =>
+    fetchJSON<FeishuEmployeeCatalog>("/api/messaging/feishu/catalog"),
+  getFeishuEmployees: () =>
+    fetchJSON<{ employees: FeishuEmployee[] }>("/api/messaging/feishu/employees"),
+  createFeishuEmployee: (body: FeishuEmployeeCreate) =>
+    fetchJSON<FeishuEmployee>("/api/messaging/feishu/employees", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  updateFeishuEmployeeProfile: (
+    accountId: string,
+    body: { expected_revision: number; profile: FeishuEmployeePolicy },
+  ) =>
+    fetchJSON<FeishuEmployee>(
+      `/api/messaging/feishu/employees/${encodeURIComponent(accountId)}/profile`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
+  rotateFeishuEmployeeCredentials: (
+    accountId: string,
+    body: FeishuCredentialRotate,
+  ) =>
+    fetchJSON<FeishuEmployee>(
+      `/api/messaging/feishu/employees/${encodeURIComponent(accountId)}/credentials`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
+  testFeishuEmployee: (accountId: string) =>
+    fetchJSON<FeishuEmployeeTestResult>(
+      `/api/messaging/feishu/employees/${encodeURIComponent(accountId)}/test`,
+      { method: "POST" },
+    ),
+  updateFeishuEmployeeLifecycle: (accountId: string, status: FeishuLifecycleStatus) =>
+    fetchJSON<FeishuEmployee>(
+      `/api/messaging/feishu/employees/${encodeURIComponent(accountId)}/lifecycle`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status }),
+      },
+    ),
+  rolloverFeishuEmployeeSessions: (accountId: string) =>
+    fetchJSON<{ ok: boolean; retired_sessions: number }>(
+      `/api/messaging/feishu/employees/${encodeURIComponent(accountId)}/rollover`,
+      { method: "POST" },
+    ),
   // Update actions
   updateHermes: () =>
     fetchJSON<ActionResponse>("/api/hermes/update", { method: "POST" }),
@@ -1427,6 +1480,67 @@ export interface MessagingPlatformTestResult {
   ok: boolean;
   state: string;
   message: string;
+}
+
+export type FeishuLifecycleStatus = "active" | "suspended" | "revoked";
+
+export interface FeishuEmployeePolicy {
+  schema_version: 1;
+  name?: string;
+  role?: string;
+  model_registration_id: string;
+  system_prompt: string;
+  toolsets: string[];
+  skills: string[];
+  mcp_servers: string[];
+  workspace_relative_path: string;
+  knowledge_relative_paths: string[];
+  max_iterations: number;
+  max_tokens?: number;
+}
+
+export interface FeishuEmployee {
+  account_id: string;
+  app_id: string;
+  credential_version: number;
+  lifecycle_status: FeishuLifecycleStatus;
+  runtime_state: string;
+  profile_revision: number | null;
+  profile_fingerprint: string | null;
+  profile: FeishuEmployeePolicy | null;
+}
+
+export interface FeishuEmployeeCatalog {
+  model_registrations: Array<{ id: string; name: string; provider?: string; model?: string }>;
+  toolsets: Array<{ name: string; description: string }>;
+  skills: Array<{ name: string; description: string }>;
+  mcp_servers: string[];
+  workspace: { root: string; default: string };
+  knowledge_roots: Array<{ id: string; relative_path: string }>;
+}
+
+export interface FeishuEmployeeCreate {
+  app_id: string;
+  app_secret: string;
+  domain: "feishu" | "lark";
+  encrypt_key?: string;
+  verification_token?: string;
+  profile: FeishuEmployeePolicy;
+  activate: boolean;
+}
+
+export interface FeishuCredentialRotate {
+  expected_credential_version: number;
+  app_secret: string;
+  encrypt_key?: string;
+  verification_token?: string;
+}
+
+export interface FeishuEmployeeTestResult {
+  ok: boolean;
+  state: string;
+  bot_name?: string | null;
+  error_code?: string;
 }
 
 export interface PairingUser {

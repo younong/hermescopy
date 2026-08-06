@@ -1053,6 +1053,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    employee_policy: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1157,6 +1158,7 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                employee_policy=employee_policy,
             )
 
     _tool_original_args = dict(function_args)
@@ -1267,6 +1269,24 @@ def handle_function_call(
                 # process-global registry. Its executor boundary is mandatory.
                 raise RuntimeError("authenticated tool executor is unavailable")
             if _executor_supervisor is not None:
+                workspace_prefix = None
+                knowledge_prefixes: tuple[str, ...] = ()
+                if employee_policy is not None:
+                    context = _owner_runtime.filesystem_context
+                    workspace_path = str(
+                        employee_policy.get("workspace_relative_path") or ""
+                    )
+                    workspace_prefix = (
+                        context.controlled_workspace_path(workspace_path)
+                        if workspace_path
+                        else context.workspace_prefix
+                    )
+                    knowledge_prefixes = tuple(
+                        context.controlled_workspace_path(path)
+                        for path in employee_policy.get(
+                            "knowledge_relative_paths", ()
+                        )
+                    )
                 # Interactive approval belongs to the exact Owner Worker. The
                 # executor receives no browser/session authority and dispatches
                 # directly to the registry after validating its private bootstrap.
@@ -1282,6 +1302,8 @@ def handle_function_call(
                         tool_call_id=tool_call_id or "",
                         turn_id=turn_id or "",
                         api_request_id=api_request_id or "",
+                        workspace_prefix=workspace_prefix,
+                        knowledge_prefixes=knowledge_prefixes,
                     )
                     if function_name == "terminal" and approval is not None:
                         return _annotate_authenticated_terminal_result(dispatched, approval)

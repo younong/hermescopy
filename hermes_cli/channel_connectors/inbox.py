@@ -48,11 +48,14 @@ class CanonicalInbox:
         binding = (
             conn.execute(
                 """
-                SELECT b.binding_id, e.subject_lookup_hash
+                SELECT b.binding_id, e.subject_lookup_hash,
+                       CASE WHEN m.account_id IS NULL THEN 0 ELSE 1 END AS managed_feishu
                 FROM channel_bindings b
                 JOIN connector_accounts a ON a.account_id=b.account_id
                 JOIN external_identities e ON e.external_identity_id=b.external_identity_id
                                           AND e.provider=a.provider
+                LEFT JOIN managed_feishu_accounts m ON m.account_id=a.account_id
+                                                  AND m.lifecycle_status='active'
                 WHERE b.account_id=? AND b.peer_lookup_hash=? AND a.provider=?
                   AND b.status='active' AND a.status='active' AND e.status='active'
                 """,
@@ -69,6 +72,19 @@ class CanonicalInbox:
             reason = "unknown_peer"
         elif not envelope.actor_id.strip():
             reason = "missing_actor_id"
+        elif envelope.conversation_kind == "group":
+            expected_admission = self.store.crypto.lookup_hash(
+                f"group-admission:{self.provider}:{account_id}",
+                f"{provider_message_id}:{envelope.actor_id.strip()}",
+            )
+            if not binding["managed_feishu"]:
+                reason = "group_binding_unmanaged"
+            elif envelope.rejection_reason is not None:
+                reason = envelope.rejection_reason
+            elif envelope.group_admission_token != expected_admission:
+                reason = "group_admission_unverified"
+            else:
+                reason = None
         elif binding["subject_lookup_hash"] != self.store.crypto.lookup_hash(
             f"external-subject:{self.provider}", envelope.actor_id.strip()
         ):
@@ -112,8 +128,9 @@ class CanonicalInbox:
                   (inbound_id, account_id, binding_id, provider_message_id,
                    payload_ciphertext, payload_key_version, context_ciphertext,
                    context_key_version, status, rejection_reason, payload_kind,
-                   next_attempt_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   dispatch_scope, profile_revision, next_attempt_at, created_at,
+                   updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     f"im_{uuid.uuid4().hex}",
@@ -127,6 +144,8 @@ class CanonicalInbox:
                     status,
                     reason,
                     envelope.payload_kind if status == "queued" else "text",
+                    str(envelope.dispatch_scope or "") if status == "queued" else "",
+                    envelope.profile_revision if status == "queued" else None,
                     now,
                     now,
                     now,

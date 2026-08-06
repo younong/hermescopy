@@ -36,6 +36,8 @@ from hermes_cli.owner_worker.tokens import (
     AUD_OWNER_WORKER_WS,
     SCOPE_OWNER_WORKER_HTTP,
     SCOPE_OWNER_WORKER_WS,
+    CONNECTION_PURPOSE_INTERACTIVE,
+    CONNECTION_PURPOSE_RETAINED_CHANNEL,
     OwnerWorkerCapabilityInvalid,
     child_token_ttl_seconds,
     admit_owner_worker_bootstrap,
@@ -230,6 +232,7 @@ def test_bootstrap_is_exact_lease_bound_and_consumed_once(tmp_path):
         path="/api/ws",
         connection_id="connection_identifier_1234",
         nonce="control_nonce_identifier_1234",
+        connection_purpose=CONNECTION_PURPOSE_INTERACTIVE,
         control_home=control_home,
     )
     kwargs = {
@@ -242,6 +245,7 @@ def test_bootstrap_is_exact_lease_bound_and_consumed_once(tmp_path):
     claims = admit_owner_worker_bootstrap(token, **kwargs)
     assert claims.connection_id == "connection_identifier_1234"
     assert claims.nonce == "control_nonce_identifier_1234"
+    assert claims.connection_purpose == CONNECTION_PURPOSE_INTERACTIVE
     with pytest.raises(OwnerWorkerCapabilityInvalid, match="replay"):
         admit_owner_worker_bootstrap(token, **kwargs)
     with pytest.raises(OwnerWorkerCapabilityInvalid, match="binding_mismatch"):
@@ -252,6 +256,35 @@ def test_bootstrap_is_exact_lease_bound_and_consumed_once(tmp_path):
             public_key=kwargs["public_key"],
             issuer_key_version=kwargs["issuer_key_version"],
         )
+
+
+def test_bootstrap_requires_a_known_signed_connection_purpose(tmp_path):
+    _store, lease = _active_lease(tmp_path)
+    common = {
+        "path": "/api/ws",
+        "connection_id": "connection_identifier_1234",
+        "nonce": "control_nonce_identifier_1234",
+        "control_home": tmp_path / "control",
+    }
+
+    with pytest.raises(ValueError, match="connection_purpose"):
+        mint_owner_worker_bootstrap(
+            lease,
+            connection_purpose="dashboard-claimed-retained-channel",
+            **common,
+        )
+    retained = mint_owner_worker_bootstrap(
+        lease,
+        connection_purpose=CONNECTION_PURPOSE_RETAINED_CHANNEL,
+        **common,
+    )
+    interactive = mint_owner_worker_bootstrap(
+        lease,
+        connection_purpose=CONNECTION_PURPOSE_INTERACTIVE,
+        **common,
+    )
+
+    assert retained != interactive
 
 
 def test_worker_ws_bootstrap_resolves_active_durable_lease_from_starting_config(tmp_path):
@@ -308,6 +341,7 @@ def test_worker_ws_bootstrap_resolves_active_durable_lease_from_starting_config(
         path="/api/events",
         connection_id="connection_identifier_1234",
         nonce="control_nonce_identifier_1234",
+        connection_purpose=CONNECTION_PURPOSE_INTERACTIVE,
         control_home=control_home,
     )
     claims = parse_owner_worker_bootstrap(
@@ -413,6 +447,7 @@ def test_owp1_data_requires_exact_peer_and_monotonic_sequence(tmp_path):
             path="/api/ws",
             connection_id="connection_identifier_1234",
             nonce="control_nonce_identifier_1234",
+            connection_purpose=CONNECTION_PURPOSE_INTERACTIVE,
             control_home=tmp_path / "control",
         ),
         expected_lease=lease,
