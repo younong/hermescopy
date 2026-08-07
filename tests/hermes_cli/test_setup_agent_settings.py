@@ -3,14 +3,14 @@
 from hermes_cli.setup import _apply_default_agent_settings, setup_agent_settings
 
 
-def test_apply_default_agent_settings_uses_65_percent_threshold(monkeypatch):
+def test_apply_default_agent_settings_uses_50_percent_threshold(monkeypatch):
     config = {}
     monkeypatch.setattr("hermes_cli.setup.remove_env_value", lambda *args, **kwargs: None)
     monkeypatch.setattr("hermes_cli.setup.save_config", lambda *args, **kwargs: None)
 
     _apply_default_agent_settings(config)
 
-    assert config["compression"] == {"enabled": True, "threshold": 0.65}
+    assert config["compression"] == {"enabled": True, "threshold": 0.50}
 
 
 def test_setup_agent_settings_uses_displayed_max_iterations_value(tmp_path, monkeypatch, capsys):

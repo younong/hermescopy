@@ -10,10 +10,10 @@ session, their JSON schemas can consume a substantial fraction of the
 context window on every turn — even when only a few of them are relevant
 to what the user actually asked for.
 
-**Tool Search** is Hermes' opt-in progressive-disclosure layer for that
-problem. When activated, MCP and plugin tools are replaced in the
-model-visible tools array by three bridge tools, and the model loads each
-specific tool's schema on demand.
+**Tool Search** is Hermes' progressive-disclosure layer for that problem.
+By default, MCP and plugin tools are replaced in the model-visible tools
+array by three bridge tools, and the model loads each specific tool's schema
+on demand.
 
 :::info Built-in Hermes tools never defer
 The tools that make up Hermes' core capability set (`terminal`,
@@ -55,26 +55,21 @@ see the underlying tool, not the bridge.
 
 ## When does it activate?
 
-By default Tool Search runs in `auto` mode: it activates only when the
-deferrable tool schemas would consume at least 10% of the active model's
-context window. Below that, the tools-array assembly is a pure
-pass-through and you pay no overhead.
+By default Tool Search runs in `on` mode: it activates whenever at least
+one deferrable MCP or plugin tool is available. Set `enabled: auto` to gate
+activation on the deferrable schemas consuming at least `threshold_pct`
+of the active model's context window. Set `enabled: off` to expose eligible
+tools directly.
 
-This decision is re-evaluated every time the tools array is built, so:
-
-- A session with just a few MCP tools and a long context model never
-  activates Tool Search.
-- A session with many MCP servers attached (15+ tools typically) starts
-  activating it.
-- Removing MCP servers mid-session correctly returns to direct exposure
-  on the next assembly.
+The selected policy is applied every time the tools array is built, so the
+catalog always reflects the session's current toolsets and executor policy.
 
 ## Configuration
 
 ```yaml
 tools:
   tool_search:
-    enabled: auto       # auto (default), on, or off
+    enabled: on         # on (default), auto, or off
     threshold_pct: 10   # percentage of context — only used in auto mode
     search_default_limit: 5
     max_search_limit: 20
@@ -82,7 +77,7 @@ tools:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | `auto` | `auto` activates above threshold; `on` always activates if there's at least one deferrable tool; `off` disables entirely. |
+| `enabled` | `on` | `on` activates when at least one deferrable tool exists; `auto` activates above threshold; `off` disables entirely. |
 | `threshold_pct` | `10` | Percentage of context length at which `auto` mode kicks in. Range 0–100. |
 | `search_default_limit` | `5` | Hits returned when the model calls `tool_search` without a `limit`. |
 | `max_search_limit` | `20` | Hard upper bound the model can request via `limit`. Range 1–50. |
@@ -91,7 +86,7 @@ You can also flip the legacy boolean shape:
 
 ```yaml
 tools:
-  tool_search: true   # equivalent to {enabled: auto}
+  tool_search: true   # equivalent to {enabled: on}
 ```
 
 ## When NOT to use it
@@ -102,8 +97,9 @@ describe → call) for the savings on the deferred schemas. It's a clear
 win when you have many tools and use few per turn; it's overhead when
 you have few tools total.
 
-The `auto` default handles this for you. If you set `enabled: on`
-unconditionally, expect a slight per-turn cost on small toolsets.
+If that extra round trip outweighs schema savings for a small toolset, use
+`enabled: auto` for threshold-gated activation or `enabled: off` to expose
+eligible tools directly.
 
 ## Trade-offs that don't go away
 

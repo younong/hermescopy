@@ -17,6 +17,13 @@ def test_coding_guidance_advertises_persistent_terminal_state():
     assert "instead of re-sourcing it before every test command" in cc.CODING_AGENT_GUIDANCE
 
 
+def test_coding_guidance_keeps_local_edits_patch_first():
+    assert "For localized edits to existing files, use `patch`" in cc.CODING_AGENT_GUIDANCE
+    assert "don't repeat a stale patch" in cc.CODING_AGENT_GUIDANCE
+    assert "full-file rewrite" in cc.CODING_AGENT_GUIDANCE
+    assert "fails twice" not in cc.CODING_AGENT_GUIDANCE
+
+
 def _git_init(path):
     env = {
         "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
@@ -92,14 +99,28 @@ class TestCodingSelection:
         assert out is not None
         assert out[0] == cc.CODING_TOOLSET
 
-    def test_auto_is_prompt_only(self, tmp_path):
-        # Default posture must never override the user's configured toolsets —
-        # off-by-default toolsets are already off, and explicit opt-ins
-        # (image-gen, spotify, …) survive entering a code workspace.
+    def test_keeps_enabled_mcp_servers_from_supplied_config(self, tmp_path):
+        _git_init(tmp_path)
+        cfg = {
+            "agent": {"coding_context": "auto"},
+            "mcp_servers": {
+                "github": {"enabled": True},
+                "disabled": {"enabled": False},
+            },
+        }
+        assert cc.coding_selection(platform="cli", cwd=tmp_path, config=cfg) == [
+            cc.CODING_TOOLSET,
+            "github",
+        ]
+
+    def test_auto_selects_coding_in_workspace(self, tmp_path):
+        # The default workspace posture narrows model-visible core schemas. The
+        # caller still gives an explicit runtime toolset pin precedence.
         _git_init(tmp_path)
         cfg = {"agent": {"coding_context": "auto"}}
-        assert cc.coding_selection(platform="cli", cwd=tmp_path, config=cfg) is None
-        # …while the prompt posture is still active.
+        selection = cc.coding_selection(platform="cli", cwd=tmp_path, config=cfg)
+        assert selection is not None
+        assert selection[0] == cc.CODING_TOOLSET
         assert cc.is_coding_context(platform="cli", cwd=tmp_path, config=cfg) is True
 
     def test_on_is_prompt_only(self, tmp_path):
@@ -403,16 +424,23 @@ class TestRuntimeMode:
         mode = cc.resolve_runtime_mode(platform="cli", cwd=tmp_path, config={"agent": {"coding_context": "on"}})
         assert not any("Operator instructions" in b for b in mode.system_blocks())
 
-    def test_toolset_selection_gated_on_focus(self, tmp_path):
+    def test_toolset_selection_uses_workspace_modes_only(self, tmp_path):
         _git_init(tmp_path)
-        focus = cc.resolve_runtime_mode(platform="cli", cwd=tmp_path, config={"agent": {"coding_context": "focus"}})
-        sel = focus.toolset_selection()
-        assert sel and sel[0] == cc.CODING_TOOLSET
-        # auto/on resolve the coding profile but stay prompt-only.
-        for raw in ("auto", "on"):
-            mode = cc.resolve_runtime_mode(platform="cli", cwd=tmp_path, config={"agent": {"coding_context": raw}})
-            assert mode.is_coding is True
-            assert mode.toolset_selection() is None
+        for raw in ("auto", "focus"):
+            mode = cc.resolve_runtime_mode(
+                platform="cli", cwd=tmp_path,
+                config={"agent": {"coding_context": raw}},
+            )
+            sel = mode.toolset_selection()
+            assert sel and sel[0] == cc.CODING_TOOLSET
+
+        # Forced on can activate outside a workspace, so it remains prompt-only.
+        on = cc.resolve_runtime_mode(
+            platform="cli", cwd=tmp_path,
+            config={"agent": {"coding_context": "on"}},
+        )
+        assert on.is_coding is True
+        assert on.toolset_selection() is None
 
 
 # ── edit-format steering (per-model harness tuning) ──────────────────────────
@@ -444,7 +472,8 @@ class TestEditFormatSteering:
         brief = mode.system_blocks()[0]
         assert "mode='patch'" in brief
         assert "V4A" in brief
-        assert "write_file" in brief  # new files authored, not patched
+        assert "write_file" in brief
+        assert "only for new files or genuine near-total replacements" in brief
         # Codex-family harnesses ship apply_patch (V4A) as the ONLY editor and
         # instruct it even for single-file edits — never nudge replace mode.
         assert "single-file" in brief
@@ -459,7 +488,8 @@ class TestEditFormatSteering:
         )
         brief = mode.system_blocks()[0]
         assert "mode='replace'" in brief
-        assert "write_file" in brief  # new files authored, not patched
+        assert "write_file" in brief
+        assert "only for new files or genuine near-total replacements" in brief
 
     def test_unknown_model_keeps_neutral_brief(self, tmp_path):
         # No edit-format line appended — brief equals the bare profile guidance.

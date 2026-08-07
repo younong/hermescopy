@@ -1052,14 +1052,12 @@ DEFAULT_CONFIG = {
         # app, ACP) in a code workspace, Hermes adds a coding operating brief
         # + a live git/workspace snapshot to the system prompt. See
         # agent/coding_context.py.
-        #   "auto" (default) — prompt-only posture when the surface is
-        #                      interactive AND cwd is a code workspace.
-        #                      Toolsets are never touched; messaging platforms
-        #                      unaffected.
-        #   "focus"          — auto + collapse the toolset to the lean coding
-        #                      set (+ enabled MCP servers) + demote non-coding
-        #                      skill categories to names-only in the prompt's
-        #                      skill index. Explicit opt-in.
+        #   "auto" (default) — posture when the surface is interactive AND cwd
+        #                      is a code workspace; unless explicitly pinned,
+        #                      select the lean coding toolset (+ enabled MCP).
+        #                      Messaging platforms are unaffected.
+        #   "focus"          — auto + demote non-coding skill categories to
+        #                      names-only in the prompt's skill index.
         #   "on"             — force the prompt posture everywhere.
         #   "off"            — disable entirely.
         "coding_context": "auto",
@@ -1392,7 +1390,7 @@ DEFAULT_CONFIG = {
 
     "compression": {
         "enabled": True,
-        "threshold": 0.65,            # synchronously compress before the next model request
+        "threshold": 0.50,            # synchronously compress before the next model request
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
         "protect_first_n": 3,         # non-system head messages always preserved
@@ -1410,10 +1408,10 @@ DEFAULT_CONFIG = {
         "codex_gpt55_autoraise": True,  # When True, gpt-5.5 on the ChatGPT Codex OAuth
                                       # route raises its compaction trigger to 85% (vs the
                                       # global `threshold` above). Codex hard-caps gpt-5.5
-                                      # at a 272K window, so the global 65% trigger would
-                                      # still compact before Codex's tuned 85% point. Set to
-                                      # False to opt back down to the global threshold
-                                      # (e.g. 0.65) for Codex gpt-5.5 sessions. Only this
+                                      # at a 272K window, so the global trigger would still
+                                      # compact before Codex's tuned 85% point. Set to False
+                                      # to opt back down to the global threshold (e.g. 0.50)
+                                      # for Codex gpt-5.5 sessions. Only this
                                       # exact route is affected — gpt-5.5 on OpenAI's
                                       # direct API, OpenRouter, and Copilot keep the
                                       # global threshold regardless.
@@ -2584,14 +2582,12 @@ DEFAULT_CONFIG = {
     # openclaw-tool-search-report PDF in this PR for the rationale.
     "tools": {
         "tool_search": {
-            # "auto" (default) — activate only when deferrable tool schemas
-            #   exceed ``threshold_pct`` of the active model's context length,
-            #   so small toolsets pay no overhead.
-            # "on"  — always activate when there is at least one deferrable
-            #   tool. Use when you have many MCP servers and want maximum
-            #   token reduction unconditionally.
+            # "on" (default) — always activate when there is at least one
+            #   deferrable tool, minimizing repeated plugin/MCP schemas.
+            # "auto" — activate only when deferrable tool schemas exceed
+            #   ``threshold_pct`` of the active model's context length.
             # "off" — disable entirely. Tools-array assembly is a pass-through.
-            "enabled": "auto",
+            "enabled": "on",
             # Percentage of context length at which "auto" mode kicks in.
             # 10 matches the Claude Code default. Range 0..100.
             "threshold_pct": 10,

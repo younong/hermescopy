@@ -89,7 +89,7 @@ class TestIgnoreUserConfigEnvGate:
 
         # User-set "system_prompt: from user config" MUST NOT leak through
         assert cfg["agent"].get("system_prompt", "") != "from user config"
-        assert cfg["compression"]["threshold"] == 0.65
+        assert cfg["compression"]["threshold"] == 0.50
 
         # User-set model.default MUST NOT leak through — either the built-in
         # default ("" or unset) or a project-level fallback, but never the

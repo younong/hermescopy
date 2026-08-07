@@ -9,9 +9,10 @@ for the full rationale):
 
 * Core tools defined in ``toolsets._HERMES_CORE_TOOLS`` are *never* deferred.
   Always-load means always-load. No exceptions.
-* The threshold gate runs every assembly: when deferrable tools would consume
-  less than ``threshold_pct`` of the model's context window (default 10%),
-  tool search is a no-op and the tools array passes through unchanged.
+* Tool Search defaults to ``on`` and defers any non-empty eligible surface.
+  Explicit ``auto`` mode applies the threshold gate on every assembly: when
+  deferrable tools consume less than ``threshold_pct`` of the model's context
+  window (default 10%), the tools array passes through unchanged.
 * The catalog is stateless across turns and tools-array assemblies. It is
   rebuilt from the current tool-defs list every time. This is the lesson
   from OpenClaw's cron regression (openclaw/openclaw#84141): a session-keyed
@@ -80,16 +81,16 @@ class ToolSearchConfig:
         break the agent.
         """
         if raw is True:
-            return cls(enabled="auto", threshold_pct=10.0,
+            return cls(enabled="on", threshold_pct=10.0,
                        search_default_limit=5, max_search_limit=20)
         if raw is False:
             return cls(enabled="off", threshold_pct=10.0,
                        search_default_limit=5, max_search_limit=20)
         if not isinstance(raw, dict):
-            return cls(enabled="auto", threshold_pct=10.0,
+            return cls(enabled="on", threshold_pct=10.0,
                        search_default_limit=5, max_search_limit=20)
 
-        enabled_raw = str(raw.get("enabled", "auto")).strip().lower()
+        enabled_raw = str(raw.get("enabled", "on")).strip().lower()
         if enabled_raw in ("true", "1", "yes"):
             enabled = "on"
         elif enabled_raw in ("false", "0", "no"):
@@ -97,7 +98,7 @@ class ToolSearchConfig:
         elif enabled_raw in ("auto", "on", "off"):
             enabled = enabled_raw
         else:
-            enabled = "auto"
+            enabled = "on"
 
         threshold_pct = _safe_float(raw.get("threshold_pct"), 10.0)
         threshold_pct = max(0.0, min(100.0, threshold_pct))

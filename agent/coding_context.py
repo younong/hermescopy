@@ -16,11 +16,10 @@ domain reads the same resolved object instead of probing git/config itself:
   * **System prompt** — ``RuntimeMode.system_blocks()`` → the operating brief +
     a live git/workspace snapshot (``agent/system_prompt.py``).
   * **Toolset** — ``RuntimeMode.toolset_selection()`` → the ``coding`` toolset
-    plus the user's enabled MCP servers (``cli.py`` / ``tui_gateway``). Only
-    under the opt-in ``focus`` mode: the default posture is prompt-only and
-    never touches the user's configured toolsets (toolsets like messaging /
-    smart-home / music are off-by-default anyway, and someone who explicitly
-    enabled image-gen or Spotify shouldn't lose it for being in a git repo).
+    plus the user's enabled MCP servers (``cli.py`` / ``tui_gateway``) under
+    workspace-detected ``auto`` and opt-in ``focus`` modes. Explicit runtime
+    toolset pins still win at the caller. Forced ``on`` remains prompt-only
+    because it can activate outside a code workspace.
   * **Delegation** — subagents inherit the parent's toolset and run through the
     same prompt builder, so the coding posture propagates to children for free.
   * **Model / memory / compression** — declared on the profile
@@ -39,12 +38,11 @@ session (deferred), the same contract as ``/skills install`` vs ``--now``.
 Activation (config ``agent.coding_context``):
 
   * ``auto`` (default) — posture (brief + snapshot) on an interactive coding
-    surface sitting in a code workspace (git repo or recognised project root).
-    Prompt-only; toolsets and the skill index untouched.
-  * ``focus`` — like ``auto``, but additionally collapses the toolset to the
-    ``coding`` set + enabled MCP servers and demotes non-coding skill
-    categories to names-only in the prompt's skill index (no skill is ever
-    hidden). Explicit opt-in for a lean schema.
+    surface sitting in a code workspace (git repo or recognised project root),
+    with the ``coding`` toolset + enabled MCP servers selected unless the caller
+    explicitly pinned toolsets. The skill index remains untouched.
+  * ``focus`` — like ``auto``, and also demotes non-coding skill categories to
+    names-only in the prompt's skill index (no skill is ever hidden).
   * ``on`` — force the posture anywhere (incl. non-workspaces). Prompt-only.
   * ``off`` — disable entirely.
 """
@@ -171,18 +169,20 @@ _GIT_TIMEOUT = 2.5
 _EDIT_FORMAT_GUIDANCE: dict[str, tuple[tuple[str, ...], str]] = {
     "patch": (
         ("gpt", "codex"),
-        "- Edit format: author new files with `write_file`; for edits to "
-        "existing code use `patch` with `mode='patch'` (V4A diff) — including "
-        "single-file edits. It's the edit format you handle most reliably.",
+        "- Edit format: use `write_file` only for new files or genuine "
+        "near-total replacements. For edits to existing code use `patch` with "
+        "`mode='patch'` (V4A diff) — including single-file edits. It's the edit "
+        "format you handle most reliably.",
     ),
     "replace": (
         ("claude", "sonnet", "opus", "haiku",
          "gemini", "gemma", "deepseek", "qwen", "kimi", "glm", "grok",
          "hermes", "llama", "mistral", "devstral", "minimax"),
-        "- Edit format: author new files with `write_file`; for edits to "
-        "existing code prefer `patch` in `mode='replace'` — match a unique "
-        "snippet and swap it. Reach for `mode='patch'` (V4A) only when an edit "
-        "genuinely spans several files at once.",
+        "- Edit format: use `write_file` only for new files or genuine "
+        "near-total replacements. For edits to existing code prefer `patch` in "
+        "`mode='replace'` — match a unique snippet and swap it. Reach for "
+        "`mode='patch'` (V4A) only when an edit genuinely spans several files "
+        "at once.",
     ),
 }
 
@@ -249,10 +249,10 @@ CODING_AGENT_GUIDANCE = (
     "CLAUDE.md / .cursorrules already in context win over your defaults. Touch "
     "only what the task needs — no drive-by refactors, renames, or reformatting "
     "— and add any imports/dependencies your code requires.\n"
-    "- If an edit fails to apply, re-read the file to get the current exact "
-    "contents before retrying — don't repeat a stale patch. If the same region "
-    "fails twice, rewrite the enclosing function or file with `write_file` "
-    "instead of attempting a third patch.\n"
+    "- For localized edits to existing files, use `patch`; reserve `write_file` "
+    "for new files or genuine near-total replacements. If an edit fails to "
+    "apply, re-read the current exact contents, then narrow or correct the patch "
+    "— don't repeat a stale patch or turn a local edit into a full-file rewrite.\n"
     "\n"
     "Verify, and know when to stop:\n"
     "- Use `terminal` for git, builds, tests, and inspection. Run the relevant "
@@ -488,7 +488,7 @@ class RuntimeMode:
     surface: str
     cwd: Path
     # The normalized ``agent.coding_context`` mode this posture was resolved
-    # under (auto/focus/on/off). Toolset collapse is gated on ``focus``.
+    # under (auto/focus/on/off). Workspace-gated auto/focus select coding tools.
     config_mode: str = "auto"
     # The model id this session runs (e.g. "anthropic/claude-opus-4.8"). Used
     # only to steer edit-format guidance toward the model's family — see
@@ -509,16 +509,15 @@ class RuntimeMode:
     def toolset_selection(self, config: Optional[dict[str, Any]] = None) -> Optional[list[str]]:
         """Toolset list for this posture, or ``None`` to keep the platform default.
 
-        Non-``None`` only under the opt-in ``focus`` mode. The default posture
-        is prompt-only: most strippable toolsets are off-by-default anyway, and
-        a user who explicitly enabled one (image-gen for frontend/game assets,
-        messaging for build notifications, …) keeps it while coding.
+        Non-``None`` under workspace-detected ``auto`` and ``focus`` modes. The
+        forced ``on`` mode stays prompt-only because it can activate outside a
+        code workspace.
 
         Callers apply this only when the user hasn't pinned an explicit
         selection (``--toolsets``, ``HERMES_TUI_TOOLSETS``, …); they never
         override a pin. Returns the profile's toolset plus enabled MCP servers.
         """
-        if self.config_mode != "focus":
+        if self.config_mode not in {"auto", "focus"}:
             return None
         if self.profile.toolset is None:
             return None
@@ -552,9 +551,9 @@ class RuntimeMode:
     def compact_skill_categories(self) -> frozenset[str]:
         """Skill categories to demote to names-only in the prompt's skill index.
 
-        Gated on the opt-in ``focus`` mode, like the toolset collapse: the
-        default posture leaves the skill index untouched. Users who didn't ask
-        for a lean prompt keep full entries for every category — index changes
+        Gated on the opt-in ``focus`` mode. The default posture may narrow the
+        toolset but leaves the skill index untouched. Users who didn't ask for
+        a compact index keep full entries for every category — index changes
         under ``auto`` proved too surprising in practice, even names-only ones
         (a demoted description is information the model no longer weighs when
         deciding what to load).
@@ -624,8 +623,8 @@ def coding_selection(
 ) -> Optional[list[str]]:
     """Toolset selection for the coding posture.
 
-    ``None`` unless the user opted into ``focus`` mode AND the posture is
-    active — the default coding posture never overrides configured toolsets.
+    ``None`` unless a workspace-gated ``auto``/``focus`` posture is active.
+    Callers retain precedence for an explicit runtime toolset pin.
     """
     return resolve_runtime_mode(
         platform=platform, cwd=cwd, config=config
@@ -670,14 +669,15 @@ def coding_compact_skill_categories(
 def _enabled_mcp_servers(config: Optional[dict[str, Any]]) -> list[str]:
     """Names of MCP servers the user has enabled — kept in the coding posture.
 
-    MCP servers (figma, browser, tophat, …) are explicitly configured and part
-    of the coding workflow, not noise to strip.
+    MCP servers (figma, browser, tophat, …) remain granted to the coding
+    session. Their schemas may still be progressively disclosed by tool search.
     """
     try:
         from hermes_cli.config import read_raw_config
         from hermes_cli.tools_config import _parse_enabled_flag
 
-        servers = read_raw_config().get("mcp_servers") or {}
+        resolved = config if config is not None else read_raw_config()
+        servers = (resolved or {}).get("mcp_servers") or {}
         return [
             str(name)
             for name, cfg in servers.items()

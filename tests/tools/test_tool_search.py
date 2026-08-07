@@ -43,13 +43,13 @@ class TestConfigParsing:
     def test_default_when_missing(self):
         from tools.tool_search import ToolSearchConfig
         cfg = ToolSearchConfig.from_raw(None)
-        assert cfg.enabled == "auto"
+        assert cfg.enabled == "on"
         assert cfg.threshold_pct == 10.0
 
-    def test_bool_true_maps_to_auto(self):
+    def test_bool_true_maps_to_on(self):
         from tools.tool_search import ToolSearchConfig
         cfg = ToolSearchConfig.from_raw(True)
-        assert cfg.enabled == "auto"
+        assert cfg.enabled == "on"
 
     def test_bool_false_maps_to_off(self):
         from tools.tool_search import ToolSearchConfig
@@ -61,9 +61,14 @@ class TestConfigParsing:
         cfg = ToolSearchConfig.from_raw({"enabled": "on"})
         assert cfg.enabled == "on"
 
-    def test_invalid_enabled_falls_back_to_auto(self):
+    def test_invalid_enabled_falls_back_to_on(self):
         from tools.tool_search import ToolSearchConfig
         cfg = ToolSearchConfig.from_raw({"enabled": "maybe"})
+        assert cfg.enabled == "on"
+
+    def test_explicit_auto_is_preserved(self):
+        from tools.tool_search import ToolSearchConfig
+        cfg = ToolSearchConfig.from_raw({"enabled": "auto"})
         assert cfg.enabled == "auto"
 
     def test_threshold_clamped(self):

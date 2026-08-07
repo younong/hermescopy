@@ -63,6 +63,63 @@ def owner_gateway(monkeypatch, tmp_path):
     roots.close()
 
 
+def test_tui_default_toolsets_use_coding_posture(monkeypatch):
+    monkeypatch.delenv("HERMES_TUI_TOOLSETS", raising=False)
+    monkeypatch.setattr(
+        "agent.coding_context.coding_selection",
+        lambda **_kwargs: ["coding", "mcp-github"],
+    )
+
+    assert server._load_enabled_toolsets() == ["coding", "mcp-github", "project"]
+
+
+def test_tui_explicit_toolset_pin_precedes_coding_posture(monkeypatch):
+    monkeypatch.setenv("HERMES_TUI_TOOLSETS", "terminal")
+    monkeypatch.setattr(
+        "agent.coding_context.coding_selection",
+        lambda **_kwargs: pytest.fail("coding posture must not override an explicit pin"),
+    )
+
+    assert server._load_enabled_toolsets() == ["terminal"]
+
+
+def test_tui_coding_posture_preserves_disabled_toolsets(monkeypatch):
+    cfg = {"agent": {"disabled_toolsets": ["browser", "memory"]}}
+    monkeypatch.setattr(server, "_load_cfg", lambda: cfg)
+
+    assert server._load_disabled_toolsets() == ["browser", "memory"]
+
+    class ExistingAgent:
+        enabled_toolsets = ["coding"]
+        disabled_toolsets = ["browser", "memory"]
+        model = "test-model"
+
+    kwargs = server._background_agent_kwargs(ExistingAgent(), "task-a")
+    assert kwargs["enabled_toolsets"] == ["coding"]
+    assert kwargs["disabled_toolsets"] == ["browser", "memory"]
+
+    class FreshAgent:
+        enabled_toolsets = ["coding"]
+        disabled_toolsets = None
+        model = "test-model"
+
+    fresh_kwargs = server._background_agent_kwargs(FreshAgent(), "task-b")
+    assert fresh_kwargs["disabled_toolsets"] == ["browser", "memory"]
+
+    from model_tools import get_tool_definitions
+
+    tools = get_tool_definitions(
+        enabled_toolsets=kwargs["enabled_toolsets"],
+        disabled_toolsets=kwargs["disabled_toolsets"],
+        quiet_mode=True,
+        skip_tool_search_assembly=True,
+    )
+    names = {tool["function"]["name"] for tool in tools}
+    assert "browser_navigate" not in names
+    assert "memory" not in names
+    assert "patch" in names
+
+
 def _create_owned(
     db: SessionDB,
     workspace_root: str,

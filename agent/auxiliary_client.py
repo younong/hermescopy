@@ -369,7 +369,7 @@ def _is_arcee_trinity_thinking(model: Optional[str]) -> bool:
 # Codex backend hard-caps at 272K (verified live: a ~330K-token request to
 # chatgpt.com/backend-api/codex/responses is rejected with
 # ``context_length_exceeded`` while ~250K succeeds). With a 272K ceiling the
-# global 65% compaction trigger still fires before the route-specific 85% point.
+# global 50% compaction trigger still fires before the route-specific 85% point.
 # We raise the trigger to 85% (~231K) on this exact route so Codex gpt-5.5
 # sessions use the window they actually have.
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
@@ -446,7 +446,7 @@ def _compression_threshold_for_model(
     Per-model/route overrides:
       - Arcee Trinity Large Thinking → 0.75 (preserve reasoning context).
       - gpt-5.5 on the Codex OAuth route → 0.85, because Codex caps the window
-        at 272K and benefits from delaying the global 65% trigger. Gated by
+        at 272K and benefits from delaying the global 50% trigger. Gated by
         ``allow_codex_gpt55_autoraise`` so the user can opt back down to the
         global default (the caller passes the config flag through here).
 
