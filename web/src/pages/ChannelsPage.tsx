@@ -73,6 +73,10 @@ function stateBadge(state: string) {
   return STATE_BADGE[state] ?? { tone: "outline" as const, label: state };
 }
 
+function allToolsets(catalog: FeishuEmployeeCatalog | null) {
+  return catalog?.toolsets.map((item) => item.name) ?? [];
+}
+
 function emptyPolicy(catalog: FeishuEmployeeCatalog | null): FeishuEmployeePolicy {
   return {
     schema_version: 1,
@@ -80,7 +84,7 @@ function emptyPolicy(catalog: FeishuEmployeeCatalog | null): FeishuEmployeePolic
     role: "",
     model_registration_id: catalog?.model_registrations[0]?.id ?? "",
     system_prompt: "",
-    toolsets: [],
+    toolsets: allToolsets(catalog),
     skills: [],
     mcp_servers: [],
     workspace_relative_path: "employees/new-employee",
@@ -190,7 +194,9 @@ export default function ChannelsPage() {
       appSecret: "",
       encryptKey: "",
       verificationToken: "",
-      policy: employee.profile ?? emptyPolicy(catalog),
+      policy: employee.profile
+        ? { ...employee.profile, toolsets: allToolsets(catalog) }
+        : emptyPolicy(catalog),
     }));
     setEmployeeEditor({ mode, employee });
   };
@@ -450,7 +456,6 @@ function PolicyEditor({ catalog, policy, onChange }: { catalog: FeishuEmployeeCa
       <div className="grid gap-1"><Label>Role</Label><Input value={policy.role ?? ""} onChange={(event) => onChange({ ...policy, role: event.target.value })} /></div>
       <div className="grid gap-1"><Label>Model registration</Label><select className="h-9 border border-border bg-background px-3 text-sm" value={policy.model_registration_id} onChange={(event) => onChange({ ...policy, model_registration_id: event.target.value })}><option value="">Select a model</option>{catalog?.model_registrations.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></div>
       <div className="grid gap-1"><Label>System prompt</Label><textarea className="min-h-32 border border-border bg-background p-3 text-sm" value={policy.system_prompt} onChange={(event) => onChange({ ...policy, system_prompt: event.target.value })} /></div>
-      <div className="grid gap-1"><Label htmlFor="employee-toolsets">Toolsets</Label><NameCheckboxPicker id="employee-toolsets" available={catalog?.toolsets ?? []} selected={policy.toolsets} onChange={(toolsets) => onChange({ ...policy, toolsets })} emptyLabel="No toolsets available." /></div>
       <div className="grid gap-1"><Label htmlFor="employee-skills">Skills</Label><NameCheckboxPicker id="employee-skills" available={catalog?.skills ?? []} selected={policy.skills} onChange={(skills) => onChange({ ...policy, skills })} emptyLabel="No skills available." /></div>
       <div className="grid gap-1"><Label>Max iterations</Label><Input type="number" min={1} value={policy.max_iterations} onChange={(event) => onChange({ ...policy, max_iterations: Number(event.target.value) || 1 })} /></div>
     </div>

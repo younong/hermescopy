@@ -24,6 +24,18 @@ async function renderChannelsPage() {
   });
 }
 
+function changeValue(element: HTMLInputElement | HTMLTextAreaElement | null, value: string) {
+  if (!element) throw new Error("Expected form control");
+  const prototype = element instanceof HTMLTextAreaElement
+    ? HTMLTextAreaElement.prototype
+    : HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+  act(() => {
+    setter?.call(element, value);
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
 beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
     .IS_REACT_ACT_ENVIRONMENT = true;
@@ -67,6 +79,7 @@ describe("ChannelsPage", () => {
 
   it("uses catalog options and puts credentials last in the employee form", async () => {
     vi.spyOn(api, "getFeishuEmployees").mockResolvedValue({ employees: [] });
+    const createFeishuEmployee = vi.spyOn(api, "createFeishuEmployee");
     vi.spyOn(api, "getFeishuEmployeeCatalog").mockResolvedValue({
       knowledge_roots: [],
       mcp_servers: ["unused-server"],
@@ -86,14 +99,31 @@ describe("ChannelsPage", () => {
     const dialog = document.querySelector('[role="dialog"]');
     const formText = dialog?.textContent ?? "";
     expect(formText).toContain("existing-skill");
-    expect(formText).toContain("terminal");
-    expect(dialog?.querySelectorAll('input[type="checkbox"]')).toHaveLength(2);
+    expect(formText).not.toContain("Toolsets");
+    expect(dialog?.querySelectorAll('input[type="checkbox"]')).toHaveLength(1);
     expect(formText).not.toContain("Workspace relative path");
     expect(formText).not.toContain("Knowledge relative paths");
     expect(formText).not.toContain("MCP servers");
 
     expect(formText.indexOf("Feishu / Lark app credentials")).toBeGreaterThan(
       formText.indexOf("Max iterations"),
+    );
+
+    const credentialInputs = dialog?.querySelector("fieldset")?.querySelectorAll("input") ?? [];
+    const appId = [...credentialInputs].find((input) => input.type === "text") ?? null;
+    const appSecret = [...credentialInputs].find((input) => input.type === "password") ?? null;
+    changeValue(appId, "cli_test");
+    changeValue(appSecret, "secret");
+    changeValue(dialog?.querySelector("textarea") ?? null, "Help users.");
+    const saveButton = [...(dialog?.querySelectorAll("button") ?? [])].find(
+      (button) => button.textContent === "Save",
+    );
+    await act(async () => saveButton?.click());
+
+    expect(createFeishuEmployee).toHaveBeenCalledWith(
+      expect.objectContaining({
+        profile: expect.objectContaining({ toolsets: ["terminal"] }),
+      }),
     );
   });
 });
