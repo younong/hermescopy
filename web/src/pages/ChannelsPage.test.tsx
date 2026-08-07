@@ -59,9 +59,5 @@ describe("ChannelsPage", () => {
     );
     expect(addEmployee?.className).toContain("bg-midground");
     expect(addEmployee?.className).toContain("text-background-base");
-
-    const platformSwitch = document.querySelector('[role="switch"]');
-    expect(platformSwitch?.className).toContain("bg-primary/15");
-    expect(platformSwitch?.className).toContain("[&>span]:bg-primary");
   });
 });

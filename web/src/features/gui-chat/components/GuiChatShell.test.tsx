@@ -373,6 +373,12 @@ describe("GuiChatShell", () => {
     expect(robotsPane).not.toBeNull();
     expect(robotsPane?.getAttribute("data-theme")).toBe("chat-workspace");
     expect(document.body.textContent).toContain("AI employees");
+    expect(
+      robotsPane?.querySelector("button.gui-chat-workspace-primary-button")
+        ?.textContent,
+    ).toBe("Add employee");
+    expect(robotsPane?.querySelector(".gui-chat-skill-switch")?.getAttribute("role"))
+      .toBe("switch");
     expect(document.querySelector("[data-composer-send]")).toBeNull();
     expect(
       document.querySelector<HTMLButtonElement>('[aria-label="员工管理"]')
