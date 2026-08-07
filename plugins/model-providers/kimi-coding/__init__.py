@@ -57,6 +57,7 @@ class KimiProfile(ProviderProfile):
 kimi = KimiProfile(
     name="kimi-coding",
     aliases=("kimi", "moonshot", "kimi-for-coding"),
+    api_mode_changes_with_base_url=True,
     env_vars=("KIMI_API_KEY", "KIMI_CODING_API_KEY"),
     base_url="https://api.moonshot.ai/v1",
     fixed_temperature=OMIT_TEMPERATURE,
@@ -68,6 +69,7 @@ kimi = KimiProfile(
 kimi_cn = KimiProfile(
     name="kimi-coding-cn",
     aliases=("kimi-cn", "moonshot-cn"),
+    api_mode_changes_with_base_url=True,
     env_vars=("KIMI_CN_API_KEY",),
     base_url="https://api.moonshot.cn/v1",
     fixed_temperature=OMIT_TEMPERATURE,

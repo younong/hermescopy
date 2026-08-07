@@ -42,6 +42,10 @@ class ProviderProfile:
     # ── Identity ─────────────────────────────────────────────
     name: str
     api_mode: str = "chat_completions"
+    # True when changing base_url can also change the wire protocol. Most
+    # providers have one fixed protocol even behind a proxy; MiniMax is the
+    # concrete exception because its /anthropic and /v1 surfaces differ.
+    api_mode_changes_with_base_url: bool = False
     aliases: tuple = ()
 
     # ── Human-readable metadata ───────────────────────────────
@@ -54,6 +58,7 @@ class ProviderProfile:
     base_url: str = ""
     models_url: str = ""  # explicit models endpoint; falls back to {base_url}/models
     auth_type: str = "api_key"   # api_key|oauth_device_code|oauth_external|copilot|aws_sdk
+    supports_model_listing: bool = True  # False → picker uses fallback_models only
     supports_health_check: bool = True  # False → doctor skips /models probe for this provider
 
     # ── Vision support ────────────────────────────────────────
@@ -92,6 +97,22 @@ class ProviderProfile:
         ""  # cheap model for auxiliary tasks (compression, vision, etc.)
     )
     # empty = use main model
+
+    # Optional provider-owned media capabilities. These remain declarative so a
+    # first-class inference backend can expose related APIs without adding a
+    # second vendor plugin that duplicates its identity and credentials.
+    image_generation_model: str = ""
+    image_generation_path: str = ""
+    embedding_model: str = ""
+    embedding_path: str = ""
+    embedding_dimensions: tuple[int, ...] = ()
+    tts_model: str = ""
+    tts_url: str = ""
+    tts_resource_id: str = ""
+    tts_default_voice: str = ""
+    transcription_model: str = ""
+    transcription_url: str = ""
+    transcription_resource_id: str = ""
 
     # ── Hooks (override in subclass for complex providers) ───
 

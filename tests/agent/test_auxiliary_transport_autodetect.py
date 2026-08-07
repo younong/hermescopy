@@ -212,6 +212,41 @@ def test_maybe_wrap_anthropic_sdk_missing_falls_back():
 # Integration: resolve_provider_client for named kimi-coding provider
 # ---------------------------------------------------------------------------
 
+def test_resolve_provider_client_volcengine_uses_responses(monkeypatch, tmp_path):
+    from agent.auxiliary_client import CodexAuxiliaryClient, resolve_provider_client
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("VOLCENGINE_AGENT_PLAN_API_KEY", "fake-plan-key")
+
+    client, model = resolve_provider_client(
+        "volcengine-agent-plan", "doubao-seed-2.0-mini"
+    )
+
+    assert isinstance(client, CodexAuxiliaryClient)
+    assert model == "doubao-seed-2.0-mini"
+    assert str(client.base_url).rstrip("/") == (
+        "https://ark.cn-beijing.volces.com/api/plan/v3"
+    )
+
+
+def test_resolve_provider_client_volcengine_explicit_chat_mode_wins(
+    monkeypatch, tmp_path
+):
+    from agent.auxiliary_client import CodexAuxiliaryClient, resolve_provider_client
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("VOLCENGINE_AGENT_PLAN_API_KEY", "fake-plan-key")
+
+    client, _ = resolve_provider_client(
+        "volcengine-agent-plan",
+        "doubao-seed-2.0-mini",
+        api_mode="chat_completions",
+    )
+
+    assert client is not None
+    assert not isinstance(client, CodexAuxiliaryClient)
+
+
 def test_resolve_provider_client_kimi_coding_wraps_anthropic(monkeypatch, tmp_path):
     """End-to-end: resolve_provider_client('kimi-coding', 'kimi-for-coding')
     must return AnthropicAuxiliaryClient because /coding speaks Anthropic.

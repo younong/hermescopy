@@ -1465,6 +1465,73 @@ def test_api_key_provider_explicit_api_mode_config(monkeypatch):
     assert resolved["api_mode"] == "anthropic_messages"
 
 
+def test_volcengine_agent_plan_uses_profile_responses_mode(monkeypatch):
+    monkeypatch.setattr(
+        rp, "resolve_provider", lambda *a, **k: "volcengine-agent-plan"
+    )
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "volcengine-agent-plan",
+            "default": "doubao-seed-2.0-mini",
+        },
+    )
+    monkeypatch.setenv("VOLCENGINE_AGENT_PLAN_API_KEY", "fake-plan-key")
+    monkeypatch.setenv("ARK_API_KEY", "ordinary-ark-key-must-not-be-used")
+
+    resolved = rp.resolve_runtime_provider(requested="volcengine-agent-plan")
+
+    assert resolved["provider"] == "volcengine-agent-plan"
+    assert resolved["api_mode"] == "codex_responses"
+    assert resolved["base_url"] == "https://ark.cn-beijing.volces.com/api/plan/v3"
+    assert resolved["api_key"] == "fake-plan-key"
+
+
+def test_volcengine_agent_plan_explicit_mode_overrides_profile(monkeypatch):
+    monkeypatch.setattr(
+        rp, "resolve_provider", lambda *a, **k: "volcengine-agent-plan"
+    )
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "volcengine-agent-plan",
+            "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setenv("VOLCENGINE_AGENT_PLAN_API_KEY", "fake-plan-key")
+
+    resolved = rp.resolve_runtime_provider(requested="volcengine-agent-plan")
+
+    assert resolved["api_mode"] == "chat_completions"
+
+
+def test_volcengine_agent_plan_pool_uses_profile_mode(monkeypatch):
+    class _Entry:
+        access_token = "pool-plan-key"
+        source = "manual"
+        base_url = "https://ark.cn-beijing.volces.com/api/plan/v3"
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return _Entry()
+
+    monkeypatch.setattr(
+        rp, "resolve_provider", lambda *a, **k: "volcengine-agent-plan"
+    )
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+
+    resolved = rp.resolve_runtime_provider(requested="volcengine-agent-plan")
+
+    assert resolved["api_mode"] == "codex_responses"
+    assert resolved["api_key"] == "pool-plan-key"
+
+
 def test_minimax_default_url_uses_anthropic_messages(monkeypatch):
     """MiniMax with default /anthropic URL should auto-detect anthropic_messages mode."""
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "minimax")

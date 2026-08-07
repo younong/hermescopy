@@ -530,43 +530,68 @@ def is_routing_aggregator(provider: str) -> bool:
     return is_aggregator(provider_norm)
 
 
-def determine_api_mode(provider: str, base_url: str = "") -> str:
+def determine_api_mode(
+    provider: str,
+    base_url: str = "",
+    explicit_api_mode: str = "",
+) -> str:
     """Determine the API mode (wire protocol) for a provider/endpoint.
 
     Resolution order:
-      1. Known provider → transport → TRANSPORT_TO_API_MODE.
-      2. URL heuristics for unknown / custom providers.
-      3. Default: 'chat_completions'.
+      1. Explicit caller configuration.
+      2. Declarative ProviderProfile metadata.
+      3. Known provider → transport → TRANSPORT_TO_API_MODE.
+      4. URL heuristics for unknown / custom providers.
+      5. Default: 'chat_completions'.
     """
+    if explicit_api_mode:
+        return explicit_api_mode
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(provider)
+    except Exception:
+        profile = None
+
+    url_mode = ""
+    if base_url:
+        url_lower = base_url.rstrip("/").lower()
+        hostname = base_url_hostname(base_url)
+        if url_lower.endswith("/anthropic") or url_lower.endswith("/anthropic/v1"):
+            url_mode = "anthropic_messages"
+        elif hostname == "api.anthropic.com":
+            url_mode = "anthropic_messages"
+        elif hostname == "api.kimi.com" and "/coding" in url_lower:
+            url_mode = "anthropic_messages"
+        elif hostname == "api.openai.com":
+            url_mode = "codex_responses"
+
+    if profile is not None:
+        if profile.api_mode_changes_with_base_url:
+            if base_url:
+                return url_mode or "chat_completions"
+            return profile.api_mode or "chat_completions"
+        if profile.api_mode and profile.api_mode != "chat_completions":
+            return profile.api_mode
+
     pdef = get_provider(provider)
     if pdef is not None:
-        # Even for known providers, check URL heuristics for special endpoints
-        # (e.g. kimi /coding endpoint needs anthropic_messages even on 'custom')
-        if base_url:
-            url_lower = base_url.rstrip("/").lower()
-            if "api.kimi.com/coding" in url_lower:
-                return "anthropic_messages"
-            if url_lower.endswith("/anthropic") or "api.anthropic.com" in url_lower:
-                return "anthropic_messages"
-            if "api.openai.com" in url_lower:
-                return "codex_responses"
-        return TRANSPORT_TO_API_MODE.get(pdef.transport, "chat_completions")
+        return url_mode or TRANSPORT_TO_API_MODE.get(
+            pdef.transport, "chat_completions"
+        )
 
     # Direct provider checks for providers not in HERMES_OVERLAYS
     if provider == "bedrock":
         return "bedrock_converse"
 
     # URL-based heuristics for custom / unknown providers
+    if url_mode:
+        return url_mode
     if base_url:
-        url_lower = base_url.rstrip("/").lower()
         hostname = base_url_hostname(base_url)
-        if url_lower.endswith("/anthropic") or hostname == "api.anthropic.com":
-            return "anthropic_messages"
-        if hostname == "api.kimi.com" and "/coding" in url_lower:
-            return "anthropic_messages"
-        if hostname == "api.openai.com":
-            return "codex_responses"
-        if hostname.startswith("bedrock-runtime.") and base_url_host_matches(base_url, "amazonaws.com"):
+        if hostname.startswith("bedrock-runtime.") and base_url_host_matches(
+            base_url, "amazonaws.com"
+        ):
             return "bedrock_converse"
 
     return "chat_completions"

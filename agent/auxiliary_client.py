@@ -476,6 +476,33 @@ def _get_aux_model_for_provider(provider_id: str) -> str:
     return _API_KEY_PROVIDER_AUX_MODELS_FALLBACK.get(provider_id, "")
 
 
+def _provider_profile_api_mode(
+    provider_id: str,
+    explicit_api_mode: Optional[str] = None,
+    base_url: str = "",
+) -> Optional[str]:
+    """Return a provider's effective protocol without duplicating its policy."""
+    try:
+        from hermes_cli.providers import determine_api_mode
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(provider_id)
+        if (
+            not explicit_api_mode
+            and not base_url
+            and profile is not None
+            and profile.api_mode_changes_with_base_url
+        ):
+            return None
+        return determine_api_mode(
+            provider_id,
+            base_url,
+            explicit_api_mode or "",
+        )
+    except Exception:
+        return explicit_api_mode
+
+
 # Fallback for providers not yet migrated to ProviderProfile.default_aux_model,
 # plus providers we intentionally keep pinned here (e.g. Anthropic predates
 # profiles). New providers should set default_aux_model on their profile instead.
@@ -1808,7 +1835,13 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
             if _merged_aux:
                 extra["default_headers"] = _merged_aux
             _client = _create_openai_client(api_key=api_key, base_url=base_url, **extra)
-            _client = _maybe_wrap_anthropic(_client, model, api_key, raw_base_url)
+            profile_mode = _provider_profile_api_mode(provider_id, base_url=raw_base_url)
+            if profile_mode == "codex_responses":
+                _client = CodexAuxiliaryClient(_client, model)
+            else:
+                _client = _maybe_wrap_anthropic(
+                    _client, model, api_key, raw_base_url, profile_mode
+                )
             return _client, model
 
         creds = resolve_api_key_provider_credentials(provider_id)
@@ -1848,7 +1881,13 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
         if _merged_aux2:
             extra["default_headers"] = _merged_aux2
         _client = _create_openai_client(api_key=api_key, base_url=base_url, **extra)
-        _client = _maybe_wrap_anthropic(_client, model, api_key, raw_base_url)
+        profile_mode = _provider_profile_api_mode(provider_id, base_url=raw_base_url)
+        if profile_mode == "codex_responses":
+            _client = CodexAuxiliaryClient(_client, model)
+        else:
+            _client = _maybe_wrap_anthropic(
+                _client, model, api_key, raw_base_url, profile_mode
+            )
         return _client, model
 
     return None, None
@@ -4192,6 +4231,11 @@ def resolve_provider_client(
     original_provider = (provider or "").strip().lower()
     # Normalise aliases
     provider = _normalize_aux_provider(provider)
+    api_mode = _provider_profile_api_mode(
+        provider,
+        api_mode,
+        explicit_base_url or "",
+    )
 
     # Universal model-resolution fallback chain.  Callers (notably title
     # generation, vision, session search, and other auxiliary tasks) can
