@@ -1561,7 +1561,7 @@ code { font-size: 0.875rem; }
   box-shadow: none;
 }
 
-[data-gui-chat] .gui-chat-statistics-pane button:not([role="checkbox"]):not([role="radio"]):hover {
+[data-gui-chat] .gui-chat-statistics-pane button:not([role="checkbox"]):not([role="radio"]):not(.gui-chat-workspace-primary-button):hover {
   background-color: #f0f2f4;
 }
 

@@ -53,5 +53,11 @@ describe("ChannelsPage", () => {
     expect(document.body.textContent).toContain("AI employees");
     expect(document.body.textContent).toContain("No managed Feishu employees yet.");
     expect(document.body.textContent).not.toContain("0 of 0 channels configured");
+
+    const addEmployee = Array.from(document.querySelectorAll("button")).find(
+      (button) => button.textContent === "Add employee",
+    );
+    expect(addEmployee?.className).toContain("bg-midground");
+    expect(addEmployee?.className).toContain("text-background-base");
   });
 });
