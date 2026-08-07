@@ -2188,6 +2188,34 @@ def get_pre_verify_continue_message(
     return None
 
 
+_provider_media_registered = False
+
+
+def _register_provider_media_capabilities(*, force: bool = False) -> None:
+    """Register media adapters declared by first-class model providers."""
+    global _provider_media_registered
+    if _provider_media_registered and not force:
+        return
+    from agent.image_gen_registry import register_provider as register_image_provider
+    from agent.profile_image_gen_provider import ProfileImageGenProvider
+    from agent.profile_transcription_provider import ProfileTranscriptionProvider
+    from agent.profile_tts_provider import ProfileTTSProvider
+    from agent.transcription_registry import (
+        register_provider as register_transcription_provider,
+    )
+    from agent.tts_registry import register_provider as register_tts_provider
+    from providers import list_providers
+
+    for profile in list_providers():
+        if profile.image_generation_model:
+            register_image_provider(ProfileImageGenProvider(profile))
+        if profile.tts_model:
+            register_tts_provider(ProfileTTSProvider(profile))
+        if profile.transcription_model:
+            register_transcription_provider(ProfileTranscriptionProvider(profile))
+    _provider_media_registered = True
+
+
 def _ensure_plugins_discovered(force: bool = False) -> PluginManager:
     """Return the global manager after ensuring plugin discovery has run.
 
@@ -2195,6 +2223,7 @@ def _ensure_plugins_discovered(force: bool = False) -> PluginManager:
     """
     manager = get_plugin_manager()
     manager.discover_and_load(force=force)
+    _register_provider_media_capabilities(force=force)
     return manager
 
 

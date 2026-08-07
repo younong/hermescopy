@@ -2446,7 +2446,7 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                 api_key, base_url = "", _p.base_url
             if not base_url:
                 base_url = _p.base_url
-            if api_key:
+            if api_key and _p.supports_model_listing:
                 live = _p.fetch_models(api_key=api_key, base_url=base_url or None)
                 if live:
                     # Merge static curated list with live API results so
@@ -2459,7 +2459,10 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                     # live API is the authoritative catalog, so they merge
                     # live-first — live entries lead and stale curated entries
                     # no longer pollute the top of the picker. (#49129)
-                    curated = list(_PROVIDER_MODELS.get(normalized, []))
+                    curated = list(
+                        _p.fallback_models
+                        or _PROVIDER_MODELS.get(normalized, [])
+                    )
                     if curated:
                         if normalized in _LIVE_FIRST_PICKER_PROVIDERS:
                             primary, secondary = live, curated

@@ -353,6 +353,31 @@ def _parse_api_mode(raw: Any) -> Optional[str]:
     return None
 
 
+def _resolve_api_key_provider_api_mode(
+    provider: str,
+    model_cfg: Dict[str, Any],
+    base_url: str,
+) -> str:
+    """Resolve a declarative API-key provider's wire protocol.
+
+    Same-provider user config wins over the profile declaration. Profiles are
+    otherwise authoritative, except for providers that explicitly declare that
+    changing their base URL changes protocol (MiniMax's /anthropic vs /v1
+    surfaces). URL detection remains the fallback for profiles that use the
+    default chat-completions mode.
+    """
+    configured_provider = str(model_cfg.get("provider") or "").strip().lower()
+    configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
+    if configured_mode and _provider_supports_explicit_api_mode(
+        provider, configured_provider
+    ):
+        return configured_mode
+
+    from hermes_cli.providers import determine_api_mode
+
+    return determine_api_mode(provider, base_url)
+
+
 def _nous_inference_base_url_override() -> str:
     """Return the trusted Nous runtime base URL override, if configured.
 
@@ -484,24 +509,17 @@ def _resolve_runtime_from_pool_entry(
             cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
             if cfg_base_url:
                 base_url = cfg_base_url
-        configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
         if provider in {"opencode-zen", "opencode-go"}:
             # Re-derive api_mode from the effective model rather than the
-            # persisted api_mode: the opencode providers serve both
-            # anthropic_messages and chat_completions models, so the previous
-            # session's mode must not leak across /model switches.
-            # Refs #16878.
+            # persisted api_mode: the opencode providers serve multiple wire
+            # protocols and must not inherit the previous model's mode.
             from hermes_cli.models import opencode_model_api_mode
+
             api_mode = opencode_model_api_mode(provider, effective_model)
-        elif configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
-            api_mode = configured_mode
         else:
-            # Auto-detect Anthropic-compatible endpoints (/anthropic suffix,
-            # Kimi /coding, api.openai.com → codex_responses, api.x.ai →
-            # codex_responses).
-            detected = _detect_api_mode_for_url(base_url)
-            if detected:
-                api_mode = detected
+            api_mode = _resolve_api_key_provider_api_mode(
+                provider, model_cfg, base_url
+            )
 
     # OpenCode base URLs end with /v1 for OpenAI-compatible models, but the
     # Anthropic SDK prepends its own /v1/messages to the base_url.  Strip the
@@ -1480,21 +1498,12 @@ def _resolve_explicit_runtime(
             if not base_url:
                 base_url = creds.get("base_url", "").rstrip("/")
 
-        api_mode = "chat_completions"
         if provider == "copilot":
             api_mode = _copilot_runtime_api_mode(model_cfg, api_key)
-        elif provider == "xai":
-            api_mode = "codex_responses"
         else:
-            configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
-            if configured_mode:
-                api_mode = configured_mode
-            else:
-                # Auto-detect from URL (Anthropic /anthropic suffix,
-                # api.openai.com → Responses, Kimi /coding, etc.).
-                detected = _detect_api_mode_for_url(base_url)
-                if detected:
-                    api_mode = detected
+            api_mode = _resolve_api_key_provider_api_mode(
+                provider, model_cfg, base_url
+            )
 
         return {
             "provider": provider,
@@ -2100,36 +2109,19 @@ def resolve_runtime_provider(
         if cfg_provider == provider:
             cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
         base_url = cfg_base_url or creds.get("base_url", "").rstrip("/")
-        api_mode = "chat_completions"
         if provider == "copilot":
             api_mode = _copilot_runtime_api_mode(model_cfg, creds.get("api_key", ""))
-        elif provider == "xai":
-            api_mode = "codex_responses"
+        elif provider in {"opencode-zen", "opencode-go"}:
+            # opencode-zen/go must always re-derive api_mode from the target
+            # model because the same provider serves multiple wire protocols.
+            from hermes_cli.models import opencode_model_api_mode
+
+            _effective = target_model or model_cfg.get("default", "")
+            api_mode = opencode_model_api_mode(provider, _effective)
         else:
-            configured_provider = str(model_cfg.get("provider") or "").strip().lower()
-            # Only honor persisted api_mode when it belongs to the same provider family.
-            configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
-            if provider in {"opencode-zen", "opencode-go"}:
-                # opencode-zen/go must always re-derive api_mode from the
-                # target model (not the stale persisted api_mode), because
-                # the same provider serves both anthropic_messages
-                # (e.g. minimax-m2.7) and chat_completions (e.g.
-                # deepseek-v4-flash) and switching models via /model would
-                # otherwise carry the previous mode forward, stripping /v1
-                # from base_url for chat_completions models and 404'ing.
-                # Refs #16878.
-                from hermes_cli.models import opencode_model_api_mode
-                _effective = target_model or model_cfg.get("default", "")
-                api_mode = opencode_model_api_mode(provider, _effective)
-            elif configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
-                api_mode = configured_mode
-            else:
-                # Auto-detect Anthropic-compatible endpoints by URL convention
-                # (e.g. https://api.minimax.io/anthropic, https://dashscope.../anthropic)
-                # plus api.openai.com → codex_responses and api.x.ai → codex_responses.
-                detected = _detect_api_mode_for_url(base_url)
-                if detected:
-                    api_mode = detected
+            api_mode = _resolve_api_key_provider_api_mode(
+                provider, model_cfg, base_url
+            )
         # Strip trailing /v1 for OpenCode Anthropic models (see comment above).
         if api_mode == "anthropic_messages" and provider in {"opencode-zen", "opencode-go"}:
             base_url = re.sub(r"/v1/?$", "", base_url)

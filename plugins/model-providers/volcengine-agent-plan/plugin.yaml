@@ -1,0 +1,5 @@
+name: volcengine-agent-plan
+kind: model-provider
+version: 1.0.0
+description: Volcengine Ark Agent Plan subscription models
+author: Nous Research
