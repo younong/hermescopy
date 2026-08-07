@@ -16,6 +16,8 @@ const payload: ModelRegistrationsResponse = {
     chat: { model: "default-model", provider: "default-provider", registration_id: "chat-default" },
     image: { model: "image-v1", provider: "image-provider", registration_id: "image-a" },
     video: { model: "", provider: "", registration_id: null },
+    voice: { model: "", provider: "", registration_id: null },
+    vector: { model: "", provider: "", registration_id: null },
   },
   registrations: [
     registration("chat-current", "Current model", "chat", "current-provider", "current-model"),
