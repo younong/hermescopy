@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import io
+import os
+import stat
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -154,6 +157,99 @@ def test_list_and_detail_are_owner_scoped_and_never_return_secrets(authenticated
     for secret in ("private-secret", "encrypt-secret", "verification-secret"):
         assert secret not in serialized
     assert "ciphertext" not in serialized
+
+
+def _image_bytes(format="PNG", color="red"):
+    from PIL import Image
+
+    output = io.BytesIO()
+    Image.new("RGB", (24, 18), color).save(output, format=format)
+    return output.getvalue()
+
+
+def test_employee_avatar_is_owner_scoped_validated_and_replaceable(authenticated_client, store):
+    client, session, _runtime = authenticated_client
+    registered = _register(store, session)
+    avatar_path = f"/api/messaging/feishu/employees/{registered.account_id}/avatar"
+
+    initial = client.get(f"/api/messaging/feishu/employees/{registered.account_id}")
+    initial_payload = initial.json()
+    assert initial_payload["avatar_url"] is None
+    assert client.get(avatar_path).status_code == 404
+
+    invalid = client.put(
+        avatar_path,
+        files={"file": ("avatar.png", b"not-an-image", "image/png")},
+    )
+    assert invalid.status_code == 400
+    assert invalid.json() == {"detail": "Employee avatar is invalid"}
+
+    uploaded = client.put(
+        avatar_path,
+        files={"file": ("avatar.png", _image_bytes(), "image/png")},
+    )
+    assert uploaded.status_code == 200
+    assert uploaded.json() == {"avatar_url": avatar_path}
+    if os.name != "nt":
+        from hermes_cli.channel_identity.employee_avatars import employee_avatar_path
+
+        stored_avatar = employee_avatar_path(store, registered.account_id)
+        assert stat.S_IMODE(stored_avatar.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(stored_avatar.stat().st_mode) == 0o600
+
+    fetched = client.get(avatar_path)
+    assert fetched.status_code == 200
+    assert fetched.headers["content-type"] == "image/webp"
+    assert fetched.headers["cache-control"] == "private, no-cache"
+    first_bytes = fetched.content
+    detail_with_avatar = client.get(
+        f"/api/messaging/feishu/employees/{registered.account_id}"
+    ).json()
+    assert detail_with_avatar["avatar_url"] == avatar_path
+    assert detail_with_avatar["profile_revision"] == initial_payload["profile_revision"]
+    assert detail_with_avatar["profile_fingerprint"] == initial_payload["profile_fingerprint"]
+
+    replaced = client.put(
+        avatar_path,
+        files={"file": ("avatar.jpg", _image_bytes("JPEG", "blue"), "image/jpeg")},
+    )
+    assert replaced.status_code == 200
+    assert client.get(avatar_path).content != first_bytes
+
+    other_session = Session(
+        user_id="owner-b",
+        email="b@example.test",
+        display_name="Owner B",
+        org_id="org-a",
+        provider="test",
+        expires_at=9_999_999_999,
+        access_token="other",
+        refresh_token="other",
+    )
+    other = _register(store, other_session, app_id="other")
+    assert client.get(
+        f"/api/messaging/feishu/employees/{other.account_id}/avatar"
+    ).status_code == 404
+    assert client.put(
+        f"/api/messaging/feishu/employees/{other.account_id}/avatar",
+        files={"file": ("avatar.png", _image_bytes(), "image/png")},
+    ).status_code == 404
+
+    removed = client.delete(avatar_path)
+    assert removed.json() == {"ok": True, "deleted": True}
+    assert client.get(avatar_path).status_code == 404
+    assert client.delete(avatar_path).json() == {"ok": True, "deleted": False}
+
+
+def test_employee_avatar_upload_has_a_hard_size_limit(authenticated_client, store):
+    client, session, _runtime = authenticated_client
+    registered = _register(store, session)
+    response = client.put(
+        f"/api/messaging/feishu/employees/{registered.account_id}/avatar",
+        files={"file": ("avatar.png", b"x" * (5 * 1024 * 1024 + 1), "image/png")},
+    )
+    assert response.status_code == 413
+    assert response.json() == {"detail": "Employee avatar is too large"}
 
 
 def test_cross_owner_lookup_returns_404(authenticated_client, store):

@@ -5430,11 +5430,18 @@ async def create_webhook_connector_account(
 
 
 def _feishu_employee_payload(runtime, account, profile) -> dict[str, Any]:
+    from hermes_cli.channel_identity.employee_avatars import employee_avatar_exists
+
     states = getattr(getattr(runtime, "status", None), "states", {})
     runtime_state = states.get(f"feishu:{account.account_id}") if isinstance(states, dict) else None
+    avatar_url = None
+    store = getattr(runtime, "store", None)
+    if store is not None and employee_avatar_exists(store, account.account_id):
+        avatar_url = f"/api/messaging/feishu/employees/{account.account_id}/avatar"
     return {
         "account_id": account.account_id,
         "app_id": account.provider_account_id,
+        "avatar_url": avatar_url,
         "credential_version": account.credential_version,
         "lifecycle_status": account.lifecycle_status,
         "runtime_state": runtime_state or "stopped",
@@ -5565,6 +5572,63 @@ async def create_feishu_employee(request: Request, body: FeishuEmployeeCreate):
     except Exception as exc:
         _log.warning("managed Feishu employee creation failed error_type=%s", type(exc).__name__)
         raise HTTPException(status_code=400, detail="feishu_employee_setup_failed") from exc
+
+
+@app.get("/api/messaging/feishu/employees/{account_id}/avatar")
+async def get_feishu_employee_avatar(request: Request, account_id: str):
+    _runtime, store, owner = _managed_feishu_context(request)
+    _feishu_employee_or_404(store, owner, account_id)
+    from hermes_cli.channel_identity.employee_avatars import employee_avatar_path
+
+    target = employee_avatar_path(store, account_id)
+    if target.is_symlink() or not target.is_file():
+        raise HTTPException(status_code=404, detail="Employee avatar not found")
+    return FileResponse(
+        target,
+        media_type="image/webp",
+        content_disposition_type="inline",
+        headers={"Cache-Control": "private, no-cache"},
+    )
+
+
+@app.put("/api/messaging/feishu/employees/{account_id}/avatar")
+async def update_feishu_employee_avatar(request: Request, account_id: str):
+    _runtime, store, owner = _managed_feishu_context(request)
+    _feishu_employee_or_404(store, owner, account_id)
+    from hermes_cli.channel_identity.employee_avatars import (
+        MAX_AVATAR_UPLOAD_BYTES,
+        EmployeeAvatarInvalid,
+        save_employee_avatar,
+    )
+
+    form = await request.form()
+    file = form.get("file")
+    if not callable(getattr(file, "read", None)) or not callable(getattr(file, "close", None)):
+        raise HTTPException(status_code=422, detail="Invalid avatar upload")
+    data = bytearray()
+    try:
+        while chunk := await file.read(1024 * 1024):
+            data.extend(chunk)
+            if len(data) > MAX_AVATAR_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail="Employee avatar is too large")
+    finally:
+        await file.close()
+    try:
+        save_employee_avatar(store, account_id, bytes(data))
+    except EmployeeAvatarInvalid as exc:
+        raise HTTPException(status_code=400, detail="Employee avatar is invalid") from exc
+    return {
+        "avatar_url": f"/api/messaging/feishu/employees/{account_id}/avatar"
+    }
+
+
+@app.delete("/api/messaging/feishu/employees/{account_id}/avatar")
+async def delete_feishu_employee_avatar(request: Request, account_id: str):
+    _runtime, store, owner = _managed_feishu_context(request)
+    _feishu_employee_or_404(store, owner, account_id)
+    from hermes_cli.channel_identity.employee_avatars import delete_employee_avatar
+
+    return {"ok": True, "deleted": delete_employee_avatar(store, account_id)}
 
 
 @app.put("/api/messaging/feishu/employees/{account_id}/profile")

@@ -113,11 +113,16 @@ def _managed_feishu_route(path: str, method: str) -> bool:
     parts = path.split("/")
     if len(parts) == 6 and parts[:5] == ["", "api", "messaging", "feishu", "employees"]:
         return bool(parts[5]) and method == "GET"
+    if (
+        len(parts) != 7
+        or parts[:5] != ["", "api", "messaging", "feishu", "employees"]
+        or not parts[5]
+    ):
+        return False
+    if parts[6] == "avatar":
+        return method in {"GET", "PUT", "DELETE"}
     return (
-        len(parts) == 7
-        and parts[:5] == ["", "api", "messaging", "feishu", "employees"]
-        and bool(parts[5])
-        and parts[6] in {"profile", "credentials", "lifecycle", "test", "rollover"}
+        parts[6] in {"profile", "credentials", "lifecycle", "test", "rollover"}
         and method in {"PUT", "POST"}
     )
 
