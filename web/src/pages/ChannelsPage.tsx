@@ -119,6 +119,9 @@ export default function ChannelsPage() {
   const editModalRef = useModalBehavior({ open: editing !== null, onClose: closeEdit });
 
   const [employeeEditor, setEmployeeEditor] = useState<EmployeeEditor | null>(null);
+  const [employeeAvatarFile, setEmployeeAvatarFile] = useState<File | null>(null);
+  const [employeeAvatarPreview, setEmployeeAvatarPreview] = useState<string | null>(null);
+  const [employeeAvatarRemoved, setEmployeeAvatarRemoved] = useState(false);
   const [employeeDraft, setEmployeeDraft] = useState({
     appId: "",
     appSecret: "",
@@ -132,6 +135,19 @@ export default function ChannelsPage() {
     open: employeeEditor !== null,
     onClose: closeEmployeeEditor,
   });
+
+  useEffect(() => {
+    if (!employeeAvatarFile) return;
+    const preview = URL.createObjectURL(employeeAvatarFile);
+    setEmployeeAvatarPreview(preview);
+    return () => URL.revokeObjectURL(preview);
+  }, [employeeAvatarFile]);
+
+  const resetEmployeeAvatar = (preview: string | null = null) => {
+    setEmployeeAvatarFile(null);
+    setEmployeeAvatarPreview(preview);
+    setEmployeeAvatarRemoved(false);
+  };
 
   const [togglingId, setTogglingId] = useState<string | null>(null);
   const [testingId, setTestingId] = useState<string | null>(null);
@@ -173,6 +189,7 @@ export default function ChannelsPage() {
   };
 
   const openCreateEmployee = () => {
+    resetEmployeeAvatar();
     setEmployeeDraft({
       appId: "",
       appSecret: "",
@@ -188,6 +205,7 @@ export default function ChannelsPage() {
     mode: "profile" | "credentials",
     employee: FeishuEmployee,
   ) => {
+    resetEmployeeAvatar(employee.avatar_url);
     setEmployeeDraft((previous) => ({
       ...previous,
       appId: employee.app_id,
@@ -248,11 +266,12 @@ export default function ChannelsPage() {
     }
     setSaving(true);
     try {
+      let savedEmployee: FeishuEmployee | null = null;
       if (employeeEditor.mode === "create") {
         if (!employeeDraft.appId.trim() || !employeeDraft.appSecret) {
           throw new Error("App ID and App Secret are required");
         }
-        await api.createFeishuEmployee({
+        savedEmployee = await api.createFeishuEmployee({
           app_id: employeeDraft.appId.trim(),
           app_secret: employeeDraft.appSecret,
           domain: employeeDraft.domain,
@@ -262,7 +281,7 @@ export default function ChannelsPage() {
           activate: true,
         });
       } else if (employeeEditor.mode === "profile") {
-        await api.updateFeishuEmployeeProfile(employeeEditor.employee.account_id, {
+        savedEmployee = await api.updateFeishuEmployeeProfile(employeeEditor.employee.account_id, {
           expected_revision: employeeEditor.employee.profile_revision ?? 0,
           profile: policy,
         });
@@ -276,6 +295,30 @@ export default function ChannelsPage() {
             ? { verification_token: employeeDraft.verificationToken }
             : {}),
         });
+      }
+      if (savedEmployee && employeeAvatarFile) {
+        try {
+          await api.uploadFeishuEmployeeAvatar(savedEmployee.account_id, employeeAvatarFile);
+        } catch (e) {
+          showToast(`Employee saved, but avatar upload failed: ${e}`, "error");
+          closeEmployeeEditor();
+          await load();
+          return;
+        }
+      } else if (
+        savedEmployee
+        && employeeEditor.mode === "profile"
+        && employeeAvatarRemoved
+        && employeeEditor.employee.avatar_url
+      ) {
+        try {
+          await api.deleteFeishuEmployeeAvatar(savedEmployee.account_id);
+        } catch (e) {
+          showToast(`Employee saved, but avatar removal failed: ${e}`, "error");
+          closeEmployeeEditor();
+          await load();
+          return;
+        }
       }
       showToast("Feishu AI employee saved", "success");
       closeEmployeeEditor();
@@ -401,7 +444,7 @@ export default function ChannelsPage() {
                 </>
               ) : (
                 <>
-                  <PolicyEditor catalog={catalog} policy={employeeDraft.policy} onChange={(policy) => setEmployeeDraft((previous) => ({ ...previous, policy }))} />
+                  <PolicyEditor catalog={catalog} policy={employeeDraft.policy} onChange={(policy) => setEmployeeDraft((previous) => ({ ...previous, policy }))} avatarPreview={employeeAvatarPreview} onAvatarChange={(file) => { setEmployeeAvatarRemoved(false); setEmployeeAvatarFile(file); }} onAvatarRemove={() => { setEmployeeAvatarFile(null); setEmployeeAvatarPreview(null); setEmployeeAvatarRemoved(true); }} />
                   {employeeEditor.mode === "create" && (
                     <fieldset className="grid gap-3 border border-border bg-background/40 p-4">
                       <legend className="px-1 text-xs font-medium">Feishu / Lark app credentials</legend>
@@ -449,9 +492,11 @@ export default function ChannelsPage() {
   );
 }
 
-function PolicyEditor({ catalog, policy, onChange }: { catalog: FeishuEmployeeCatalog | null; policy: FeishuEmployeePolicy; onChange: (policy: FeishuEmployeePolicy) => void }) {
+function PolicyEditor({ catalog, policy, onChange, avatarPreview, onAvatarChange, onAvatarRemove }: { catalog: FeishuEmployeeCatalog | null; policy: FeishuEmployeePolicy; onChange: (policy: FeishuEmployeePolicy) => void; avatarPreview: string | null; onAvatarChange: (file: File) => void; onAvatarRemove: () => void }) {
+  const fallback = (policy.name || "E").trim().charAt(0).toUpperCase() || "E";
   return (
     <div className="grid gap-4">
+      <div className="grid gap-1"><Label>Avatar</Label><div className="flex items-center gap-3"><AvatarImage src={avatarPreview} fallback={fallback} className="h-14 w-14" /><div className="flex flex-wrap gap-2"><label className="inline-flex h-8 cursor-pointer items-center border border-border px-3 text-xs hover:bg-muted/40"><input type="file" accept="image/png,image/jpeg,image/webp" className="hidden" onChange={(event) => { const file = event.currentTarget.files?.[0]; if (file) onAvatarChange(file); event.currentTarget.value = ""; }} />Choose image</label>{avatarPreview && <Button ghost size="sm" onClick={onAvatarRemove}>Remove</Button>}</div></div><p className="text-xs text-muted-foreground">PNG, JPEG, or WebP up to 5 MB.</p></div>
       <div className="grid gap-1"><Label>Name</Label><Input value={policy.name ?? ""} onChange={(event) => onChange({ ...policy, name: event.target.value })} /></div>
       <div className="grid gap-1"><Label>Role</Label><Input value={policy.role ?? ""} onChange={(event) => onChange({ ...policy, role: event.target.value })} /></div>
       <div className="grid gap-1"><Label>Model registration</Label><select className="h-9 border border-border bg-background px-3 text-sm" value={policy.model_registration_id} onChange={(event) => onChange({ ...policy, model_registration_id: event.target.value })}><option value="">Select a model</option>{catalog?.model_registrations.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></div>
@@ -462,13 +507,23 @@ function PolicyEditor({ catalog, policy, onChange }: { catalog: FeishuEmployeeCa
   );
 }
 
+function AvatarImage({ src, fallback, className }: { src: string | null; fallback: string; className: string }) {
+  const [failed, setFailed] = useState(false);
+  useEffect(() => setFailed(false), [src]);
+  return src && !failed
+    ? <img src={src} alt="" className={cn("shrink-0 rounded-full border border-border object-cover", className)} onError={() => setFailed(true)} />
+    : <span className={cn("flex shrink-0 items-center justify-center rounded-full border border-border bg-muted font-mondwest text-sm", className)} aria-hidden="true">{fallback}</span>;
+}
+
 function EmployeeRow({ employee, busy, onProfile, onCredentials, onAction }: { employee: FeishuEmployee; busy: string | null; onProfile: () => void; onCredentials: () => void; onAction: (action: string) => void }) {
   const lifecycle = stateBadge(employee.lifecycle_status);
   const runtime = stateBadge(employee.runtime_state);
   const disabled = busy?.startsWith(`${employee.account_id}:`) ?? false;
+  const label = employee.profile?.name || employee.app_id;
+  const fallback = label.trim().charAt(0).toUpperCase() || "E";
   return (
     <div className="grid gap-3 border border-border p-3">
-      <div className="flex flex-wrap items-start justify-between gap-3"><div><div className="flex flex-wrap items-center gap-2"><span className="text-sm font-medium">{employee.profile?.name || employee.app_id}</span><Badge tone={lifecycle.tone}>{lifecycle.label}</Badge><Badge tone={runtime.tone}>{runtime.label}</Badge></div><p className="text-xs text-muted-foreground">{employee.profile?.role || "AI employee"} · profile r{employee.profile_revision ?? "—"} · credentials v{employee.credential_version}</p></div><div className="flex flex-wrap gap-2"><Button ghost size="sm" disabled={disabled || employee.lifecycle_status === "revoked"} onClick={() => onAction("test")}>Test</Button><Button ghost size="sm" disabled={disabled || employee.lifecycle_status === "revoked"} onClick={onProfile}>Edit policy</Button><Button ghost size="sm" disabled={disabled || employee.lifecycle_status === "revoked"} onClick={onCredentials}>Rotate secret</Button><Button ghost size="sm" disabled={disabled || employee.lifecycle_status !== "active"} onClick={() => onAction("rollover")}>Roll over sessions</Button>{employee.lifecycle_status === "active" ? <Button ghost size="sm" disabled={disabled} onClick={() => onAction("suspended")}>Suspend</Button> : employee.lifecycle_status === "suspended" ? <Button ghost size="sm" disabled={disabled} onClick={() => onAction("active")}>Resume</Button> : null}<Button ghost size="sm" disabled={disabled || employee.lifecycle_status === "revoked"} onClick={() => onAction("revoked")}>Revoke</Button></div></div>
+      <div className="flex flex-wrap items-start justify-between gap-3"><div className="flex min-w-0 items-start gap-3"><AvatarImage src={employee.avatar_url} fallback={fallback} className="h-10 w-10" /><div><div className="flex flex-wrap items-center gap-2"><span className="text-sm font-medium">{label}</span><Badge tone={lifecycle.tone}>{lifecycle.label}</Badge><Badge tone={runtime.tone}>{runtime.label}</Badge></div><p className="text-xs text-muted-foreground">{employee.profile?.role || "AI employee"} · profile r{employee.profile_revision ?? "—"} · credentials v{employee.credential_version}</p></div></div><div className="flex flex-wrap gap-2"><Button ghost size="sm" disabled={disabled || employee.lifecycle_status === "revoked"} onClick={() => onAction("test")}>Test</Button><Button ghost size="sm" disabled={disabled || employee.lifecycle_status === "revoked"} onClick={onProfile}>Edit policy</Button><Button ghost size="sm" disabled={disabled || employee.lifecycle_status === "revoked"} onClick={onCredentials}>Rotate secret</Button><Button ghost size="sm" disabled={disabled || employee.lifecycle_status !== "active"} onClick={() => onAction("rollover")}>Roll over sessions</Button>{employee.lifecycle_status === "active" ? <Button ghost size="sm" disabled={disabled} onClick={() => onAction("suspended")}>Suspend</Button> : employee.lifecycle_status === "suspended" ? <Button ghost size="sm" disabled={disabled} onClick={() => onAction("active")}>Resume</Button> : null}<Button ghost size="sm" disabled={disabled || employee.lifecycle_status === "revoked"} onClick={() => onAction("revoked")}>Revoke</Button></div></div>
       {employee.profile?.system_prompt && <p className="text-xs text-muted-foreground line-clamp-2"><Info className="mr-1 inline h-3 w-3" />{employee.profile.system_prompt}</p>}
     </div>
   );

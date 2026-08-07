@@ -785,6 +785,19 @@ export const api = {
     fetchJSON<FeishuEmployeeCatalog>("/api/messaging/feishu/catalog"),
   getFeishuEmployees: () =>
     fetchJSON<{ employees: FeishuEmployee[] }>("/api/messaging/feishu/employees"),
+  uploadFeishuEmployeeAvatar: (accountId: string, file: File) => {
+    const form = new FormData();
+    form.append("file", file, file.name);
+    return fetchJSON<{ avatar_url: string }>(
+      `/api/messaging/feishu/employees/${encodeURIComponent(accountId)}/avatar`,
+      { method: "PUT", body: form },
+    );
+  },
+  deleteFeishuEmployeeAvatar: (accountId: string) =>
+    fetchJSON<{ ok: boolean; deleted: boolean }>(
+      `/api/messaging/feishu/employees/${encodeURIComponent(accountId)}/avatar`,
+      { method: "DELETE" },
+    ),
   createFeishuEmployee: (body: FeishuEmployeeCreate) =>
     fetchJSON<FeishuEmployee>("/api/messaging/feishu/employees", {
       method: "POST",
@@ -1502,6 +1515,7 @@ export interface FeishuEmployeePolicy {
 export interface FeishuEmployee {
   account_id: string;
   app_id: string;
+  avatar_url: string | null;
   credential_version: number;
   lifecycle_status: FeishuLifecycleStatus;
   runtime_state: string;

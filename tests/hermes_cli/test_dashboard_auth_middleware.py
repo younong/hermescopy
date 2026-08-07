@@ -395,6 +395,36 @@ def test_authenticated_api_availability_requires_explicit_owner_worker_routes(pa
     assert authenticated_owner_worker_api_allowed(path) is allowed
 
 
+@pytest.mark.parametrize("method", ["GET", "PUT", "DELETE"])
+def test_authenticated_employee_avatar_routes_are_control_plane_routes(method):
+    from hermes_cli.dashboard_auth.api_availability import (
+        AuthenticatedApiBucket,
+        classify_authenticated_api,
+    )
+
+    decision = classify_authenticated_api(
+        "/api/messaging/feishu/employees/account-id/avatar",
+        method=method,
+    )
+    assert decision.allowed is True
+    assert decision.bucket == AuthenticatedApiBucket.CONTROL_PLANE_AUTH
+
+
+def test_authenticated_employee_avatar_routes_are_method_and_path_exact():
+    from hermes_cli.dashboard_auth.api_availability import (
+        AuthenticatedApiBucket,
+        classify_authenticated_api,
+    )
+
+    for method, path in (
+        ("POST", "/api/messaging/feishu/employees/account-id/avatar"),
+        ("GET", "/api/messaging/feishu/employees/account-id/avatar/private"),
+    ):
+        decision = classify_authenticated_api(path, method=method)
+        assert decision.allowed is False
+        assert decision.bucket == AuthenticatedApiBucket.LOCAL_ONLY_OR_UNAVAILABLE
+
+
 def test_authenticated_webhook_provisioning_is_exact_control_plane_route():
     from hermes_cli.dashboard_auth.api_availability import (
         AuthenticatedApiBucket,
