@@ -419,14 +419,14 @@ export default function ChannelsPage() {
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <div className="flex items-start gap-3 min-w-0"><StateIcon className="h-5 w-5 shrink-0 mt-0.5 text-muted-foreground" /><div><div className="flex items-center gap-2"><span className="font-mondwest normal-case text-sm font-medium">{platform.name}</span><Badge tone={badge.tone}>{badge.label}</Badge></div><span className="text-xs text-muted-foreground">{platform.description}</span></div></div>
                   <div className="flex items-center gap-2">
-                    {togglingId === platform.id ? <Spinner /> : <Switch checked={platform.enabled} onCheckedChange={() => void handleToggle(platform)} aria-label={`Enable ${platform.name}`} />}
+                    {togglingId === platform.id ? <Spinner /> : <Switch checked={platform.enabled} onCheckedChange={() => void handleToggle(platform)} aria-label={`Enable ${platform.name}`} className={platform.enabled ? "border-primary/40 bg-primary/15 [&>span]:bg-primary" : "border-primary/20 bg-background [&>span]:bg-primary/40"} />}
                     {platform.id !== "feishu" && <Button ghost size="sm" onClick={() => handleTest(platform)} disabled={testingId === platform.id} prefix={<PlugZap className="h-4 w-4" />}>Test</Button>}
                     {platform.id !== "feishu" && <Button size="sm" onClick={() => openConfig(platform)} prefix={<Settings2 className="h-4 w-4" />}>Configure</Button>}
                   </div>
                 </div>
                 {platform.id === "feishu" && (
                   <div className="border-t border-border pt-4 grid gap-3">
-                    <div className="flex items-center justify-between gap-3"><div><h3 className="text-sm font-medium">AI employees</h3><p className="text-xs text-muted-foreground">Group messages trigger only on an exact @mention of this bot or a verified direct reply to it.</p></div><Button size="sm" onClick={openCreateEmployee} prefix={<UserRoundPlus className="h-4 w-4" />}>Add employee</Button></div>
+                    <div className="flex items-center justify-between gap-3"><div><h3 className="text-sm font-medium">AI employees</h3><p className="text-xs text-muted-foreground">Group messages trigger only on an exact @mention of this bot or a verified direct reply to it.</p></div><Button size="sm" outlined className="border border-primary/40 bg-primary/10 text-primary shadow-none hover:bg-primary/20" onClick={openCreateEmployee} prefix={<UserRoundPlus className="h-4 w-4" />}>Add employee</Button></div>
                     {employees.length === 0 ? <p className="text-xs text-muted-foreground border border-dashed border-border p-4">No managed Feishu employees yet.</p> : employees.map((employee) => <EmployeeRow key={employee.account_id} employee={employee} busy={employeeBusy} onProfile={() => openManagedEmployeeEditor("profile", employee)} onCredentials={() => openManagedEmployeeEditor("credentials", employee)} onAction={(action) => runEmployeeAction(employee, action)} />)}
                   </div>
                 )}
