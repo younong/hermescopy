@@ -29,6 +29,7 @@ import type {
   MessagingPlatformsResponse,
   MessagingPlatformUpdate,
 } from "@/lib/api";
+import { NameCheckboxPicker } from "@/components/NameCheckboxPicker";
 import { useModalBehavior } from "@/hooks/useModalBehavior";
 import { useDashboardAuthIdentity } from "@/lib/useDashboardAuthIdentity";
 import { cn, themedBody } from "@/lib/utils";
@@ -385,14 +386,6 @@ export default function ChannelsPage() {
               <p className="mt-1 text-xs text-muted-foreground">Existing conversations keep their immutable policy snapshot. Use session rollover after saving to apply the new profile to subsequent messages.</p>
             </header>
             <div className="p-5 grid gap-4 overflow-y-auto">
-              {employeeEditor.mode === "create" && (
-                <>
-                  <p className="text-xs text-muted-foreground">Create, authorize, subscribe, and publish the app in the Feishu/Lark Developer Console first. Hermes connects the app but does not create or delete it.</p>
-                  <div className="grid gap-1"><Label>App ID</Label><Input value={employeeDraft.appId} onChange={(event) => setEmployeeDraft((previous) => ({ ...previous, appId: event.target.value }))} /></div>
-                  <div className="grid gap-1"><Label>App Secret</Label><Input type="password" value={employeeDraft.appSecret} onChange={(event) => setEmployeeDraft((previous) => ({ ...previous, appSecret: event.target.value }))} /></div>
-                  <div className="grid gap-1"><Label>Domain</Label><select className="h-9 border border-border bg-background px-3 text-sm" value={employeeDraft.domain} onChange={(event) => setEmployeeDraft((previous) => ({ ...previous, domain: event.target.value as "feishu" | "lark" }))}><option value="feishu">Feishu</option><option value="lark">Lark</option></select></div>
-                </>
-              )}
               {employeeEditor.mode === "credentials" ? (
                 <>
                   <p className="text-xs text-muted-foreground">Secret fields are never refilled. Leaving optional fields blank preserves their current encrypted value.</p>
@@ -401,7 +394,18 @@ export default function ChannelsPage() {
                   <div className="grid gap-1"><Label>New Verification Token (optional)</Label><Input type="password" value={employeeDraft.verificationToken} onChange={(event) => setEmployeeDraft((previous) => ({ ...previous, verificationToken: event.target.value }))} /></div>
                 </>
               ) : (
-                <PolicyEditor catalog={catalog} policy={employeeDraft.policy} onChange={(policy) => setEmployeeDraft((previous) => ({ ...previous, policy }))} />
+                <>
+                  <PolicyEditor catalog={catalog} policy={employeeDraft.policy} onChange={(policy) => setEmployeeDraft((previous) => ({ ...previous, policy }))} />
+                  {employeeEditor.mode === "create" && (
+                    <fieldset className="grid gap-3 border border-border bg-background/40 p-4">
+                      <legend className="px-1 text-xs font-medium">Feishu / Lark app credentials</legend>
+                      <p className="text-xs text-muted-foreground">Create, authorize, subscribe, and publish the app in the Feishu/Lark Developer Console first. Hermes connects the app but does not create or delete it.</p>
+                      <div className="grid gap-1"><Label>App ID</Label><Input value={employeeDraft.appId} onChange={(event) => setEmployeeDraft((previous) => ({ ...previous, appId: event.target.value }))} /></div>
+                      <div className="grid gap-1"><Label>App Secret</Label><Input type="password" value={employeeDraft.appSecret} onChange={(event) => setEmployeeDraft((previous) => ({ ...previous, appSecret: event.target.value }))} /></div>
+                      <div className="grid gap-1"><Label>Domain</Label><select className="h-9 border border-border bg-background px-3 text-sm" value={employeeDraft.domain} onChange={(event) => setEmployeeDraft((previous) => ({ ...previous, domain: event.target.value as "feishu" | "lark" }))}><option value="feishu">Feishu</option><option value="lark">Lark</option></select></div>
+                    </fieldset>
+                  )}
+                </>
               )}
               <div className="flex justify-end gap-2"><Button ghost size="sm" onClick={closeEmployeeEditor}>Cancel</Button><Button size="sm" onClick={handleEmployeeSave} disabled={saving}>{saving ? "Saving…" : "Save"}</Button></div>
             </div>
@@ -440,18 +444,14 @@ export default function ChannelsPage() {
 }
 
 function PolicyEditor({ catalog, policy, onChange }: { catalog: FeishuEmployeeCatalog | null; policy: FeishuEmployeePolicy; onChange: (policy: FeishuEmployeePolicy) => void }) {
-  const updateList = (field: "toolsets" | "skills" | "mcp_servers", value: string) => onChange({ ...policy, [field]: value.split(",").map((item) => item.trim()).filter(Boolean) });
   return (
     <div className="grid gap-4">
       <div className="grid gap-1"><Label>Name</Label><Input value={policy.name ?? ""} onChange={(event) => onChange({ ...policy, name: event.target.value })} /></div>
       <div className="grid gap-1"><Label>Role</Label><Input value={policy.role ?? ""} onChange={(event) => onChange({ ...policy, role: event.target.value })} /></div>
       <div className="grid gap-1"><Label>Model registration</Label><select className="h-9 border border-border bg-background px-3 text-sm" value={policy.model_registration_id} onChange={(event) => onChange({ ...policy, model_registration_id: event.target.value })}><option value="">Select a model</option>{catalog?.model_registrations.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></div>
       <div className="grid gap-1"><Label>System prompt</Label><textarea className="min-h-32 border border-border bg-background p-3 text-sm" value={policy.system_prompt} onChange={(event) => onChange({ ...policy, system_prompt: event.target.value })} /></div>
-      <div className="grid gap-1"><Label>Toolsets</Label><Input placeholder={catalog?.toolsets.map((item) => item.name).join(", ")} value={policy.toolsets.join(", ")} onChange={(event) => updateList("toolsets", event.target.value)} /></div>
-      <div className="grid gap-1"><Label>Skills</Label><Input placeholder={catalog?.skills.map((item) => item.name).join(", ")} value={policy.skills.join(", ")} onChange={(event) => updateList("skills", event.target.value)} /></div>
-      <div className="grid gap-1"><Label>MCP servers</Label><Input placeholder={catalog?.mcp_servers.join(", ")} value={policy.mcp_servers.join(", ")} onChange={(event) => updateList("mcp_servers", event.target.value)} /></div>
-      <div className="grid gap-1"><Label>Workspace relative path</Label><Input value={policy.workspace_relative_path} onChange={(event) => onChange({ ...policy, workspace_relative_path: event.target.value })} /></div>
-      <div className="grid gap-1"><Label>Knowledge relative paths</Label><Input value={policy.knowledge_relative_paths.join(", ")} onChange={(event) => onChange({ ...policy, knowledge_relative_paths: event.target.value.split(",").map((item) => item.trim()).filter(Boolean) })} /></div>
+      <div className="grid gap-1"><Label htmlFor="employee-toolsets">Toolsets</Label><NameCheckboxPicker id="employee-toolsets" available={catalog?.toolsets ?? []} selected={policy.toolsets} onChange={(toolsets) => onChange({ ...policy, toolsets })} emptyLabel="No toolsets available." /></div>
+      <div className="grid gap-1"><Label htmlFor="employee-skills">Skills</Label><NameCheckboxPicker id="employee-skills" available={catalog?.skills ?? []} selected={policy.skills} onChange={(skills) => onChange({ ...policy, skills })} emptyLabel="No skills available." /></div>
       <div className="grid gap-1"><Label>Max iterations</Label><Input type="number" min={1} value={policy.max_iterations} onChange={(event) => onChange({ ...policy, max_iterations: Number(event.target.value) || 1 })} /></div>
     </div>
   );

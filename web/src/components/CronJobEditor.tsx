@@ -1,6 +1,7 @@
 import { Input } from "@nous-research/ui/ui/components/input";
 import { Label } from "@nous-research/ui/ui/components/label";
 import { Select, SelectOption } from "@nous-research/ui/ui/components/select";
+import { NameCheckboxPicker } from "@/components/NameCheckboxPicker";
 import { ScheduleBuilder } from "@/components/ScheduleBuilder";
 import { useI18n } from "@/i18n";
 import type {
@@ -16,52 +17,6 @@ export interface CronJobFormResources {
   availableToolsets: ToolsetInfo[];
   modelOptions: ModelOptionsResponse | null;
   deliveryTargets: CronDeliveryTarget[];
-}
-
-function NameCheckboxPicker({
-  id,
-  available,
-  selected,
-  onChange,
-  emptyLabel,
-}: {
-  id: string;
-  available: Array<{ name: string; description?: string | null }>;
-  selected: string[];
-  onChange: (names: string[]) => void;
-  emptyLabel: string;
-}) {
-  const names = available.map((item) => item.name);
-  const orphaned = selected.filter((name) => !names.includes(name));
-  const all = [...orphaned.map((name) => ({ name, description: "" })), ...available];
-
-  if (all.length === 0) {
-    return <p className="text-xs text-muted-foreground">{emptyLabel}</p>;
-  }
-
-  const toggle = (name: string, checked: boolean) => {
-    onChange(checked ? [...selected, name] : selected.filter((item) => item !== name));
-  };
-
-  return (
-    <div id={id} className="max-h-36 overflow-y-auto border border-border bg-background/40 p-1">
-      {all.map((item) => (
-        <label
-          key={item.name}
-          className="flex cursor-pointer items-center gap-2 px-2 py-1 text-xs hover:bg-muted/40"
-          title={item.description || undefined}
-        >
-          <input
-            type="checkbox"
-            className="accent-foreground"
-            checked={selected.includes(item.name)}
-            onChange={(event) => toggle(item.name, event.target.checked)}
-          />
-          <span className="font-mono-ui truncate">{item.name}</span>
-        </label>
-      ))}
-    </div>
-  );
 }
 
 function selectOptions(
