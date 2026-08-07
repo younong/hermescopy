@@ -1,6 +1,7 @@
 """Profile-scoped registered chat and media model configuration."""
 from __future__ import annotations
 
+import hashlib
 import re
 import threading
 import uuid
@@ -11,12 +12,16 @@ from hermes_cli.config import (
     _normalize_custom_provider_entry,
     load_config,
     load_env,
+    read_raw_config,
     remove_env_value,
     save_config,
     save_env_value,
 )
 
 _KINDS = frozenset({"chat", "image", "video"})
+_SERVER_MANAGED_FIELDS = frozenset({
+    "mutable", "owner", "owner_home", "owner_id", "owner_key", "scope",
+})
 _ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$")
 _LOCK = threading.RLock()
 
@@ -31,6 +36,10 @@ class ModelRegistrationNotFound(ModelRegistrationError):
 
 class ModelRegistrationConflict(ModelRegistrationError):
     """The request conflicts with another registration or active selection."""
+
+
+class ModelRegistrationImmutable(ModelRegistrationError):
+    """An administrator registration cannot be changed by its consumers."""
 
 
 def _text(value: Any, field: str) -> str:
@@ -48,6 +57,77 @@ def _registrations(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
     if not isinstance(value, dict):
         raise ModelRegistrationError("model_registrations must be a mapping")
     return value
+
+
+def _admin_registration_id(kind: str, provider: str, model: str) -> str:
+    identity = "\0".join((kind, provider.casefold(), model.casefold())).encode()
+    return f"admin-{kind}-{hashlib.sha256(identity).hexdigest()[:24]}"
+
+
+def _admin_registrations() -> dict[str, dict[str, Any]]:
+    from hermes_cli.deployment_image import deployment_image_descriptor_from_environment
+    from hermes_cli.deployment_inference import route_descriptors_from_control_plane
+
+    registrations: dict[str, dict[str, Any]] = {}
+    for route in route_descriptors_from_control_plane():
+        registration_id = _admin_registration_id("chat", route.provider, route.model)
+        registrations[registration_id] = {
+            "name": route.name or route.model,
+            "kind": "chat",
+            "provider": route.provider,
+            "model": route.model,
+            "source": "catalog",
+            "scope": "admin",
+        }
+
+    descriptor = deployment_image_descriptor_from_environment()
+    if descriptor is not None:
+        for model in descriptor.allowed_models:
+            registration_id = _admin_registration_id("image", descriptor.provider, model)
+            registrations[registration_id] = {
+                "name": f"{descriptor.provider.upper()} · {model}",
+                "kind": "image",
+                "provider": descriptor.provider,
+                "model": model,
+                "source": "catalog",
+                "scope": "admin",
+                "use_gateway": False,
+            }
+    return registrations
+
+
+def _effective_registrations(
+    user_registrations: dict[str, dict[str, Any]],
+    admin_registrations: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    effective = {
+        registration_id: {**item, "scope": "user"}
+        for registration_id, item in user_registrations.items()
+        if isinstance(item, dict)
+    }
+    effective.update(
+        admin_registrations
+        if admin_registrations is not None
+        else _admin_registrations()
+    )
+    return effective
+
+
+def _mutable_config() -> dict[str, Any]:
+    raw = read_raw_config()
+    raw["model_registrations"] = dict(_registrations(raw))
+    raw["providers"] = dict(raw.get("providers") or {})
+    return raw
+
+
+def _reject_server_managed_fields(data: dict[str, Any]) -> None:
+    if _SERVER_MANAGED_FIELDS.intersection(data):
+        raise ModelRegistrationError("Registration authority is server-managed")
+
+
+def _reject_admin_registration(registration_id: str) -> None:
+    if registration_id.startswith("admin-"):
+        raise ModelRegistrationImmutable("Administrator registrations are read-only")
 
 
 def _chat_catalog() -> list[dict[str, Any]]:
@@ -249,6 +329,7 @@ def _assert_unique(
 
 
 def _public_registration(registration_id: str, item: dict[str, Any], env: dict[str, str]) -> dict[str, Any]:
+    scope = "admin" if item.get("scope") == "admin" else "user"
     result = {
         "id": registration_id,
         "name": item.get("name", ""),
@@ -256,6 +337,8 @@ def _public_registration(registration_id: str, item: dict[str, Any], env: dict[s
         "provider": item.get("provider", ""),
         "model": item.get("model", ""),
         "source": item.get("source", "catalog"),
+        "scope": scope,
+        "mutable": scope == "user",
         "use_gateway": bool(item.get("use_gateway", False)),
     }
     if item.get("source") == "custom":
@@ -305,7 +388,9 @@ def resolve_chat_model_registration(registration_id: str) -> dict[str, str]:
         raise ModelRegistrationNotFound("Model registration not found")
     with _LOCK:
         config = load_config()
-        item = _registrations(config).get(registration_id)
+        item = _effective_registrations(dict(_registrations(read_raw_config()))).get(
+            registration_id
+        )
         if not isinstance(item, dict) or item.get("kind") != "chat":
             raise ModelRegistrationNotFound("Model registration not found")
         provider = _text(item.get("provider"), "provider")
@@ -317,7 +402,9 @@ def resolve_chat_model_registration(registration_id: str) -> dict[str, str]:
             "model": model,
             "source": source,
         }
-        if source == "custom":
+        if item.get("scope") == "admin":
+            result["selection_source"] = "deployment"
+        elif source == "custom":
             providers = config.get("providers")
             provider_config = providers.get(provider) if isinstance(providers, dict) else None
             if not isinstance(provider_config, dict):
@@ -334,7 +421,9 @@ def get_model_registrations_payload() -> dict[str, Any]:
     """Return public registrations and active selections without loading catalogs."""
     with _LOCK:
         config = load_config()
-        registrations = dict(_registrations(config))
+        registrations = _effective_registrations(
+            dict(_registrations(read_raw_config()))
+        )
         env = load_env()
     return {
         "registrations": [
@@ -356,6 +445,7 @@ def get_model_registration_catalog(kind: str) -> dict[str, Any]:
 
 
 def create_model_registration(data: dict[str, Any]) -> dict[str, Any]:
+    _reject_server_managed_fields(data)
     registration_id = uuid.uuid4().hex
     kind = str(data.get("kind") or "").strip().lower()
     source = str(data.get("source") or "catalog").strip().lower()
@@ -368,10 +458,15 @@ def create_model_registration(data: dict[str, Any]) -> dict[str, Any]:
         chat_catalog=chat,
         media_catalog=media,
     )
+    admin_registrations = _admin_registrations()
     with _LOCK:
-        config = load_config()
+        config = _mutable_config()
         registrations = _registrations(config)
-        _assert_unique(registrations, registration_id, candidate)
+        _assert_unique(
+            _effective_registrations(registrations, admin_registrations),
+            registration_id,
+            candidate,
+        )
         if provider_config is not None:
             providers = config.setdefault("providers", {})
             if not isinstance(providers, dict):
@@ -386,10 +481,12 @@ def create_model_registration(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def update_model_registration(registration_id: str, data: dict[str, Any]) -> dict[str, Any]:
-    if not _ID_RE.match(str(registration_id or "")):
+    _reject_server_managed_fields(data)
+    if not _ID_RE.fullmatch(str(registration_id or "")):
         raise ModelRegistrationNotFound("Registration not found")
+    _reject_admin_registration(registration_id)
     with _LOCK:
-        initial = load_config()
+        initial = _mutable_config()
         existing = _registrations(initial).get(registration_id)
         if not isinstance(existing, dict):
             raise ModelRegistrationNotFound("Registration not found")
@@ -407,15 +504,20 @@ def update_model_registration(registration_id: str, data: dict[str, Any]) -> dic
         chat_catalog=chat,
         media_catalog=media,
     )
+    admin_registrations = _admin_registrations()
     with _LOCK:
-        config = load_config()
+        config = _mutable_config()
         registrations = _registrations(config)
         current = registrations.get(registration_id)
         if not isinstance(current, dict):
             raise ModelRegistrationNotFound("Registration not found")
         if current.get("kind") != existing.get("kind"):
             raise ModelRegistrationConflict("Registration changed concurrently")
-        _assert_unique(registrations, registration_id, candidate)
+        _assert_unique(
+            _effective_registrations(registrations, admin_registrations),
+            registration_id,
+            candidate,
+        )
         if provider_config is not None:
             providers = config.setdefault("providers", {})
             if not isinstance(providers, dict):
@@ -430,8 +532,9 @@ def update_model_registration(registration_id: str, data: dict[str, Any]) -> dic
 
 
 def delete_model_registration(registration_id: str) -> dict[str, Any]:
+    _reject_admin_registration(str(registration_id or ""))
     with _LOCK:
-        config = load_config()
+        config = _mutable_config()
         registrations = _registrations(config)
         item = registrations.get(registration_id)
         if not isinstance(item, dict):
@@ -455,8 +558,8 @@ def delete_model_registration(registration_id: str) -> dict[str, Any]:
 
 def activate_model_registration(registration_id: str) -> dict[str, Any]:
     with _LOCK:
-        config = load_config()
-        registrations = _registrations(config)
+        config = _mutable_config()
+        registrations = _effective_registrations(_registrations(config))
         item = registrations.get(registration_id)
         if not isinstance(item, dict):
             raise ModelRegistrationNotFound("Registration not found")
@@ -465,12 +568,23 @@ def activate_model_registration(registration_id: str) -> dict[str, Any]:
             raise ModelRegistrationError("Chat registrations must be activated through the session gateway")
         from hermes_cli.tools_config import select_media_model
 
+        catalog = None
+        if item.get("scope") == "admin":
+            catalog = {
+                candidate["model"]: {}
+                for candidate in registrations.values()
+                if candidate.get("scope") == "admin"
+                and candidate.get("kind") == kind
+                and candidate.get("provider") == item.get("provider")
+            }
+
         select_media_model(
             config,
             kind=kind,
             provider_name=str(item.get("provider") or ""),
             model=str(item.get("model") or ""),
             use_gateway=bool(item.get("use_gateway", False)),
+            catalog=catalog,
         )
         save_config(config, preserve_keys={(f"{kind}_gen",)})
         return {

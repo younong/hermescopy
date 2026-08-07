@@ -435,6 +435,7 @@ export function GuiChatModelsPane({
                 <div className="gui-chat-workspace-title">
                   <span>{registration.name}</span>
                   <ModelBadge>{KIND_LABELS[registration.kind]}</ModelBadge>
+                  <ModelBadge>{registration.scope === "admin" ? "Admin" : "Mine"}</ModelBadge>
                   <ModelBadge>{registration.source === "custom" ? "Custom" : "Catalog"}</ModelBadge>
                   {current ? <ModelBadge active>Current conversation</ModelBadge> : null}
                   {registration.kind === "chat" && configured ? <ModelBadge active>Default</ModelBadge> : null}
@@ -446,6 +447,7 @@ export function GuiChatModelsPane({
                   ) : null}
                 </div>
                 <p>{registration.provider} · {registration.model}</p>
+                {!registration.mutable ? <p>Managed by your administrator.</p> : null}
               </div>
               <div className="gui-chat-workspace-actions gui-chat-model-actions">
                 {registration.kind === "chat" ? (
@@ -479,25 +481,29 @@ export function GuiChatModelsPane({
                     {working ? "Activating…" : "Activate"}
                   </button>
                 ) : null}
-                <button
-                  aria-label={`Edit ${registration.name}`}
-                  className="gui-chat-workspace-icon-button"
-                  disabled={working}
-                  onClick={() => openEdit(registration)}
-                  type="button"
-                >
-                  <Pencil aria-hidden />
-                </button>
-                <button
-                  aria-label={`Delete ${registration.name}`}
-                  className="gui-chat-workspace-icon-button is-destructive"
-                  disabled={working || configured}
-                  onClick={() => setPendingDelete(registration)}
-                  title={configured ? "Switch the active model before deleting this registration." : undefined}
-                  type="button"
-                >
-                  <Trash2 aria-hidden />
-                </button>
+                {registration.mutable ? (
+                  <>
+                    <button
+                      aria-label={`Edit ${registration.name}`}
+                      className="gui-chat-workspace-icon-button"
+                      disabled={working}
+                      onClick={() => openEdit(registration)}
+                      type="button"
+                    >
+                      <Pencil aria-hidden />
+                    </button>
+                    <button
+                      aria-label={`Delete ${registration.name}`}
+                      className="gui-chat-workspace-icon-button is-destructive"
+                      disabled={working || configured}
+                      onClick={() => setPendingDelete(registration)}
+                      title={configured ? "Switch the active model before deleting this registration." : undefined}
+                      type="button"
+                    >
+                      <Trash2 aria-hidden />
+                    </button>
+                  </>
+                ) : null}
               </div>
             </article>
           );

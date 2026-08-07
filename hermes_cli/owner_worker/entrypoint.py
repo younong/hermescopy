@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from starlette.requests import Request
 from starlette.responses import StreamingResponse
 
@@ -138,10 +138,14 @@ class ModelRegistrationPayload(BaseModel):
     use_gateway: bool = False
     profile: str | None = None
 
+    model_config = ConfigDict(extra="forbid")
+
 
 class ModelRegistrationMutation(BaseModel):
     id: str
     profile: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
 
 
 from hermes_cli.dashboard_auth.authority import (
@@ -1602,11 +1606,14 @@ def create_app(
     def _registration_error(exc: Exception) -> HTTPException:
         from hermes_cli.model_registrations import (
             ModelRegistrationConflict,
+            ModelRegistrationImmutable,
             ModelRegistrationNotFound,
         )
 
         if isinstance(exc, ModelRegistrationNotFound):
             return HTTPException(status_code=404, detail=str(exc))
+        if isinstance(exc, ModelRegistrationImmutable):
+            return HTTPException(status_code=403, detail=str(exc))
         if isinstance(exc, ModelRegistrationConflict):
             return HTTPException(status_code=409, detail=str(exc))
         if isinstance(exc, ValueError):

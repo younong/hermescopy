@@ -3771,7 +3771,32 @@ def test_worker_model_registration_routes_use_owner_home_and_reject_selectors(tm
 
     listed = client.get(path, headers=headers)
     assert listed.status_code == 200
-    assert listed.json()["registrations"][0]["id"] == registration_id
+    assert listed.json()["registrations"][0] == {
+        "id": registration_id,
+        "name": "Owner chat",
+        "kind": "chat",
+        "provider": "anthropic",
+        "model": "claude-owner",
+        "source": "catalog",
+        "scope": "user",
+        "mutable": True,
+        "use_gateway": False,
+        "credential_configured": None,
+    }
+    assert client.post(path, headers=headers, json={
+        "name": "Forged admin",
+        "kind": "chat",
+        "provider": "anthropic",
+        "model": "claude-owner",
+        "scope": "admin",
+    }).status_code == 422
+    assert client.post(path, headers=headers, json={
+        "name": "Forged owner",
+        "kind": "chat",
+        "provider": "anthropic",
+        "model": "claude-owner",
+        "owner_id": "other",
+    }).status_code == 422
 
     catalog_path = f"{path}/catalog"
     catalog_headers = {"Authorization": f"Bearer {token(catalog_path)}"}
@@ -3785,6 +3810,67 @@ def test_worker_model_registration_routes_use_owner_home_and_reject_selectors(tm
 
     assert client.get(f"{path}?profile=other", headers=headers).status_code == 400
     assert client.get(f"{path}?owner=other", headers=headers).status_code == 400
+
+
+def test_worker_admin_registration_is_visible_and_immutable(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    owner_home = tmp_path / "owner"
+    control_home = tmp_path / "control"
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_admin_registration")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+    from hermes_cli import model_registrations
+    from hermes_cli.deployment_inference import DeploymentInferenceRouteDescriptor
+    from hermes_cli.owner_worker.entrypoint import create_app
+
+    ensure_owner_runtime_dirs(owner_home)
+    monkeypatch.setattr(
+        "hermes_cli.deployment_inference.route_descriptors_from_control_plane",
+        lambda: (
+            DeploymentInferenceRouteDescriptor(
+                provider="kimi-coding",
+                model="kimi-k2.5",
+                api_mode="anthropic_messages",
+                name="Kimi Code",
+            ),
+        ),
+    )
+    app = create_app("ok1_admin_registration", owner_home)
+    client = TestClient(app)
+    path = "/api/model/registrations"
+
+    def headers(route=path):
+        token = _capability_for(
+            app,
+            audience=AUD_OWNER_WORKER_HTTP,
+            path=route,
+            control_home=control_home,
+        )
+        return {"Authorization": f"Bearer {token}"}
+
+    listed = client.get(path, headers=headers())
+    assert listed.status_code == 200
+    admin = listed.json()["registrations"][0]
+    assert admin == {
+        "id": model_registrations._admin_registration_id(
+            "chat", "kimi-coding", "kimi-k2.5"
+        ),
+        "name": "Kimi Code",
+        "kind": "chat",
+        "provider": "kimi-coding",
+        "model": "kimi-k2.5",
+        "source": "catalog",
+        "scope": "admin",
+        "mutable": False,
+        "use_gateway": False,
+        "credential_configured": None,
+    }
+    assert "api_key" not in repr(admin)
+    assert client.request(
+        "DELETE", path, headers=headers(), json={"id": admin["id"]}
+    ).status_code == 403
+    assert not (owner_home / "config.yaml").exists()
 
 
 def test_worker_analytics_routes_reject_legacy_profile_selection(tmp_path, monkeypatch):

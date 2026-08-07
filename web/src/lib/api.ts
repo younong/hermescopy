@@ -2256,6 +2256,8 @@ export type ModelRegistrationKind = "chat" | "image" | "video";
 
 export type ModelRegistrationSource = "catalog" | "custom";
 
+export type ModelRegistrationScope = "admin" | "user";
+
 export interface ModelRegistration {
   id: string;
   name: string;
@@ -2263,6 +2265,8 @@ export interface ModelRegistration {
   provider: string;
   model: string;
   source: ModelRegistrationSource;
+  scope: ModelRegistrationScope;
+  mutable: boolean;
   use_gateway: boolean;
   credential_configured: boolean | null;
 }

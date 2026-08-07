@@ -9,6 +9,8 @@ from agent.image_gen_provider import ImageGenProvider
 from agent.video_gen_provider import VideoGenProvider
 from hermes_cli import model_registrations
 from hermes_cli.config import DEFAULT_CONFIG, load_config, load_env, save_config
+from hermes_cli.deployment_image import DeploymentImageDescriptor
+from hermes_cli.deployment_inference import DeploymentInferenceRouteDescriptor
 
 
 class _ImageProvider(ImageGenProvider):
@@ -71,6 +73,129 @@ def _chat_catalog() -> list[dict[str, Any]]:
 
 def test_default_config_has_optional_registration_mapping():
     assert DEFAULT_CONFIG["model_registrations"] == {}
+
+
+def _deployment_registrations(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.deployment_inference.route_descriptors_from_control_plane",
+        lambda: (
+            DeploymentInferenceRouteDescriptor(
+                provider="openai-codex",
+                model="gpt-5.3-codex",
+                api_mode="chat_completions",
+                name="ChatGPT Codex",
+            ),
+            DeploymentInferenceRouteDescriptor(
+                provider="kimi-coding",
+                model="kimi-k2.5",
+                api_mode="anthropic_messages",
+                name="Kimi Code",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.deployment_image.deployment_image_descriptor_from_environment",
+        lambda: DeploymentImageDescriptor(
+            provider="apiyi",
+            model="gpt-image-2-medium",
+            policy_id="deployment-image",
+            allowed_models=("gpt-image-2-medium", "nano-banana-2"),
+        ),
+    )
+
+
+def test_payload_merges_admin_descriptors_with_legacy_user_registrations(monkeypatch):
+    _deployment_registrations(monkeypatch)
+    config = load_config()
+    config["model_registrations"] = {
+        "mine-a": {
+            "name": "Mine",
+            "kind": "chat",
+            "provider": "anthropic",
+            "model": "claude-test",
+            "source": "catalog",
+        },
+    }
+    save_config(config, preserve_keys={("model_registrations",)})
+
+    payload = model_registrations.get_model_registrations_payload()
+    by_name = {item["name"]: item for item in payload["registrations"]}
+
+    assert by_name["Mine"] == {
+        "id": "mine-a",
+        "name": "Mine",
+        "kind": "chat",
+        "provider": "anthropic",
+        "model": "claude-test",
+        "source": "catalog",
+        "scope": "user",
+        "mutable": True,
+        "use_gateway": False,
+        "credential_configured": None,
+    }
+    assert by_name["ChatGPT Codex"]["scope"] == "admin"
+    assert by_name["ChatGPT Codex"]["mutable"] is False
+    assert by_name["Kimi Code"]["provider"] == "kimi-coding"
+    assert by_name["APIYI · nano-banana-2"]["kind"] == "image"
+    assert all("owner" not in item for item in payload["registrations"])
+    assert all("api_key" not in item for item in payload["registrations"])
+
+
+def test_admin_registrations_are_stable_resolvable_and_immutable(monkeypatch):
+    _deployment_registrations(monkeypatch)
+    payload = model_registrations.get_model_registrations_payload()
+    chat = next(item for item in payload["registrations"] if item["name"] == "Kimi Code")
+    image = next(item for item in payload["registrations"] if item["name"] == "APIYI · nano-banana-2")
+
+    assert chat["id"] == model_registrations._admin_registration_id(
+        "chat", "kimi-coding", "kimi-k2.5"
+    )
+    assert model_registrations.resolve_chat_model_registration(chat["id"]) == {
+        "registration_id": chat["id"],
+        "provider": "kimi-coding",
+        "model": "kimi-k2.5",
+        "source": "catalog",
+        "selection_source": "deployment",
+    }
+    with pytest.raises(model_registrations.ModelRegistrationImmutable):
+        model_registrations.update_model_registration(chat["id"], {})
+    with pytest.raises(model_registrations.ModelRegistrationImmutable):
+        model_registrations.delete_model_registration(image["id"])
+
+    activated = model_registrations.activate_model_registration(image["id"])
+    assert activated["provider"] == "apiyi"
+    assert activated["model"] == "nano-banana-2"
+    assert load_config()["image_gen"] == {
+        "provider": "apiyi",
+        "model": "nano-banana-2",
+        "use_gateway": False,
+    }
+
+
+def test_catalog_registration_cannot_duplicate_admin_target(monkeypatch):
+    _deployment_registrations(monkeypatch)
+    monkeypatch.setattr(model_registrations, "_chat_catalog", lambda: [{
+        "slug": "kimi-coding",
+        "name": "Kimi",
+        "models": ["kimi-k2.5"],
+        "authenticated": True,
+    }])
+
+    with pytest.raises(model_registrations.ModelRegistrationConflict):
+        model_registrations.create_model_registration({
+            "name": "Duplicate Kimi",
+            "kind": "chat",
+            "provider": "kimi-coding",
+            "model": "kimi-k2.5",
+        })
+    with pytest.raises(model_registrations.ModelRegistrationError, match="server-managed"):
+        model_registrations.create_model_registration({
+            "name": "Forged admin",
+            "kind": "chat",
+            "provider": "kimi-coding",
+            "model": "kimi-k2.5",
+            "scope": "admin",
+        })
 
 
 def test_catalog_media_crud_activation_and_active_delete_guard():

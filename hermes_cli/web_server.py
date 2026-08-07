@@ -99,7 +99,7 @@ try:
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
     from fastapi.staticfiles import StaticFiles
-    from pydantic import BaseModel
+    from pydantic import BaseModel, ConfigDict
 except ImportError:
     # First try lazy-installing the dashboard extras. Only the user actually
     # running `hermes dashboard` needs fastapi+uvicorn; lazy install keeps
@@ -115,7 +115,7 @@ except ImportError:
         from fastapi.middleware.cors import CORSMiddleware
         from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
         from fastapi.staticfiles import StaticFiles
-        from pydantic import BaseModel
+        from pydantic import BaseModel, ConfigDict
     except Exception:
         raise SystemExit(
             "Web UI requires fastapi and uvicorn.\n"
@@ -1357,10 +1357,14 @@ class ModelRegistrationPayload(BaseModel):
     use_gateway: bool = False
     profile: Optional[str] = None
 
+    model_config = ConfigDict(extra="forbid")
+
 
 class ModelRegistrationMutation(BaseModel):
     id: str
     profile: Optional[str] = None
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class ModelAssignment(BaseModel):
@@ -4183,11 +4187,14 @@ async def get_model_info(request: Request, profile: Optional[str] = None):
 def _model_registration_http_error(exc: Exception) -> HTTPException:
     from hermes_cli.model_registrations import (
         ModelRegistrationConflict,
+        ModelRegistrationImmutable,
         ModelRegistrationNotFound,
     )
 
     if isinstance(exc, ModelRegistrationNotFound):
         return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, ModelRegistrationImmutable):
+        return HTTPException(status_code=403, detail=str(exc))
     if isinstance(exc, ModelRegistrationConflict):
         return HTTPException(status_code=409, detail=str(exc))
     if isinstance(exc, ValueError):
