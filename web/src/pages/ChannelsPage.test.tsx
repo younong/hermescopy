@@ -57,8 +57,8 @@ describe("ChannelsPage", () => {
     const addEmployee = Array.from(document.querySelectorAll("button")).find(
       (button) => button.textContent === "Add employee",
     );
-    expect(addEmployee?.className).toContain("bg-primary/10");
-    expect(addEmployee?.className).toContain("hover:bg-primary/20");
+    expect(addEmployee?.className).toContain("bg-midground");
+    expect(addEmployee?.className).toContain("text-background-base");
 
     const platformSwitch = document.querySelector('[role="switch"]');
     expect(platformSwitch?.className).toContain("bg-primary/15");
