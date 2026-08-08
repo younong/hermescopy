@@ -29,8 +29,12 @@ from hermes_cli.config import (
 )
 
 
-def test_compression_threshold_defaults_to_65_percent():
-    assert DEFAULT_CONFIG["compression"]["threshold"] == 0.65
+def test_compression_threshold_defaults_to_50_percent():
+    assert DEFAULT_CONFIG["compression"]["threshold"] == 0.50
+
+
+def test_tool_search_is_enabled_by_default():
+    assert DEFAULT_CONFIG["tools"]["tool_search"]["enabled"] == "on"
 
 
 def test_ilink_connector_is_enabled_by_default_and_can_be_disabled(monkeypatch, tmp_path):

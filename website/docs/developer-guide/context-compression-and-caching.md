@@ -56,7 +56,7 @@ All compression settings are read from `config.yaml` under the `compression` key
 ```yaml
 compression:
   enabled: true              # Enable/disable compression (default: true)
-  threshold: 0.65            # Fraction of effective input budget (default: 0.65 = 65%)
+  threshold: 0.50            # Fraction of effective input budget (default: 0.50 = 50%)
   target_ratio: 0.20         # How much of threshold to keep as tail (default: 0.20)
   protect_last_n: 20         # Minimum protected tail messages (default: 20)
   in_place: true             # Keep one session ID and archive original rows
@@ -74,7 +74,7 @@ auxiliary:
 
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
-| `threshold` | `0.65` | 0.0-1.0 | Compression triggers when prompt tokens ≥ `threshold × effective_input_budget` |
+| `threshold` | `0.50` | 0.0-1.0 | Compression triggers when prompt tokens ≥ `threshold × effective_input_budget` |
 | `target_ratio` | `0.20` | 0.10-0.80 | Controls tail protection token budget: `threshold_tokens × target_ratio` |
 | `protect_last_n` | `20` | ≥1 | Minimum number of recent messages always preserved |
 | `protect_first_n` | `3` | (hardcoded) | System prompt + first exchange always preserved |
@@ -86,7 +86,7 @@ auxiliary:
 The ChatGPT Codex OAuth backend hard-caps gpt-5.5 at a **272K** context window
 (the same slug exposes 1.05M on OpenAI's direct API and OpenRouter, and 400K on
 GitHub Copilot). The route-specific 85% trigger lets Codex use more of that
-window than the global 65% default. When the active route is Codex
+window than the global 50% default. When the active route is Codex
 OAuth (`provider: openai-codex`) and the model is gpt-5.5, Hermes raises the
 trigger to **85%** (~231K) and prints a one-time notice with the opt-out
 command. Only this exact route is affected; gpt-5.5 on any other provider keeps
@@ -102,8 +102,8 @@ hermes config set compression.codex_gpt55_autoraise false
 context_length         = 200,000
 explicit max_tokens    = 0
 input_budget           = 200,000
-threshold_tokens       = 200,000 × 0.65 = 130,000
-tail_token_budget      = 130,000 × 0.20 = 26,000
+threshold_tokens       = 200,000 × 0.50 = 100,000
+tail_token_budget      = 100,000 × 0.20 = 20,000
 max_summary_tokens     = min(200,000 × 0.05, 12,000) = 10,000
 ```
 
@@ -112,7 +112,7 @@ max_summary_tokens     = min(200,000 × 0.05, 12,000) = 10,000
 input budget is the **main agent model's** context window minus an explicitly
 configured `model.max_tokens` reservation — never the auxiliary/summary model's
 window. On a 262,144-token model with no explicit reservation, the default
-threshold is `262,144 × 0.65 ≈ 170,393`. The auxiliary model's context window is
+threshold is `262,144 × 0.50 = 131,072`. The auxiliary model's context window is
 a separate concern — see
 the "Summary model context length" warning below for how it affects whether a
 summary can be produced, not when compression fires.
@@ -370,4 +370,4 @@ The CLI shows caching status at startup:
 
 ## Context Pressure Warnings
 
-Intermediate context-pressure warnings have been removed (see the iteration-budget block in `run_agent.py`, which notes: "No intermediate pressure warnings — they caused models to 'give up' prematurely on complex tasks"). Compression fires when the canonical prepared request reaches the configured `compression.threshold` (default 65% of the effective input budget) with no prior warning step. Provider overflow recovery runs the same canonical candidate-preparation gate.
+Intermediate context-pressure warnings have been removed (see the iteration-budget block in `run_agent.py`, which notes: "No intermediate pressure warnings — they caused models to 'give up' prematurely on complex tasks"). Compression fires when the canonical prepared request reaches the configured `compression.threshold` (default 50% of the effective input budget) with no prior warning step. Provider overflow recovery runs the same canonical candidate-preparation gate.

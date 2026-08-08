@@ -416,8 +416,8 @@ tool_loop_guardrails:
 # 6. Inserts summary as a user message, continues conversation seamlessly
 #
 # Post-compression tail budget is target_ratio × threshold × effective input budget:
-#   200K input budget, threshold 0.65, ratio 0.20 → 26K tokens of recent tail preserved
-#   1M   input budget, threshold 0.65, ratio 0.20 → 130K tokens of recent tail preserved
+#   200K input budget, threshold 0.50, ratio 0.20 → 20K tokens of recent tail preserved
+#   1M   input budget, threshold 0.50, ratio 0.20 → 100K tokens of recent tail preserved
 #
 compression:
   # Enable automatic context compression (default: true)
@@ -426,11 +426,11 @@ compression:
 
   # Trigger compression at this fraction of the effective input budget
   # (context_length minus an explicitly configured model.max_tokens reservation).
-  # Default: 0.65 = 65%. Lower values compress sooner; higher values compress later.
-  threshold: 0.65
+  # Default: 0.50 = 50%. Lower values compress sooner; higher values compress later.
+  threshold: 0.50
 
   # Fraction of the threshold to preserve as recent tail (default: 0.20 = 20%)
-  # e.g. 20% of a 65% threshold = 13% of the effective input budget.
+  # e.g. 20% of a 50% threshold = 10% of the effective input budget.
   # Summary output is separately capped at 12K tokens (Gemini output limit).
   # Range: 0.10 - 0.80
   target_ratio: 0.20

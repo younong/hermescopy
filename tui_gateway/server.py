@@ -2855,6 +2855,12 @@ def _load_tool_progress_mode() -> str:
     return mode if mode in {"off", "new", "all", "verbose"} else "all"
 
 
+def _load_disabled_toolsets(cfg: dict | None = None) -> list[str] | None:
+    agent_cfg = ((cfg if cfg is not None else _load_cfg()).get("agent") or {})
+    disabled = agent_cfg.get("disabled_toolsets") or []
+    return [str(name) for name in disabled if str(name).strip()] or None
+
+
 def _load_enabled_toolsets() -> list[str] | None:
     explicit = [
         item.strip()
@@ -2877,8 +2883,8 @@ def _load_enabled_toolsets() -> list[str] | None:
             selection = coding_selection(platform="tui")
             if selection is not None:
                 # Fold in `project` here too: this is a GUI-only resolver, and
-                # the focus-mode coding posture returns before the fallback path
-                # that normally adds it — without this the desktop loses the
+                # the coding posture returns before the fallback path that
+                # normally adds it — without this the desktop loses the
                 # project tools exactly when sitting in a repo (see below).
                 return sorted({*selection, "project"})
         except Exception:
@@ -4384,6 +4390,8 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "max_iterations": _cfg_max_turns(cfg, 25),
         "enabled_toolsets": getattr(agent, "enabled_toolsets", None)
         or _load_enabled_toolsets(),
+        "disabled_toolsets": getattr(agent, "disabled_toolsets", None)
+        or _load_disabled_toolsets(cfg),
         "quiet_mode": True,
         "verbose_logging": False,
         "ephemeral_system_prompt": getattr(agent, "ephemeral_system_prompt", None)
@@ -4879,6 +4887,9 @@ def _make_agent(
             else _load_service_tier()
         ),
         enabled_toolsets=enabled_toolsets,
+        disabled_toolsets=(
+            None if employee_policy is not None else _load_disabled_toolsets(cfg)
+        ),
         max_tokens=(
             employee_policy.get("max_tokens")
             if employee_policy is not None
@@ -14962,7 +14973,16 @@ def _(rid, params: dict) -> dict:
             if session
             else _load_enabled_toolsets()
         )
-        tools = get_tool_definitions(enabled_toolsets=enabled, quiet_mode=True)
+        disabled = (
+            getattr(session["agent"], "disabled_toolsets", None)
+            if session
+            else _load_disabled_toolsets()
+        )
+        tools = get_tool_definitions(
+            enabled_toolsets=enabled,
+            disabled_toolsets=disabled,
+            quiet_mode=True,
+        )
         sections = {}
 
         for tool in sorted(tools, key=lambda t: t["function"]["name"]):
