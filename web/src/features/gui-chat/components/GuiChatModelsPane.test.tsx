@@ -20,6 +20,7 @@ const payload: ModelRegistrationsResponse = {
   registrations: [
     registration("chat-current", "Current model", "chat", "current-provider", "current-model"),
     registration("chat-default", "Default model", "chat", "default-provider", "default-model"),
+    registration("admin-chat", "Admin model", "chat", "admin-provider", "admin-model", "admin"),
     registration("image-a", "Image model", "image", "image-provider", "image-v1"),
     registration("video-a", "Video model", "video", "video-provider", "video-v1"),
   ],
@@ -69,6 +70,23 @@ describe("GuiChatModelsPane", () => {
       setInput(search, "missing");
     });
     expect(document.body.textContent).toContain("No matching models");
+  });
+
+  it("shows Admin and Mine models while keeping administrator models immutable", async () => {
+    const onSwitchChat = vi.fn().mockResolvedValue({ confirm_required: false, value: "admin-model" });
+    await renderPane({ onSwitchChat });
+
+    const adminRow = rowFor("Admin model");
+    expect(adminRow.textContent).toContain("Admin");
+    expect(adminRow.textContent).toContain("Managed by your administrator.");
+    expect(buttonWithin(adminRow, "Edit Admin model", true, "aria-label")).toBeUndefined();
+    expect(buttonWithin(adminRow, "Delete Admin model", true, "aria-label")).toBeUndefined();
+    await clickWithin(adminRow, "Use", true);
+    expect(onSwitchChat).toHaveBeenCalledWith(expect.objectContaining({ id: "admin-chat" }), false, false);
+
+    const mineRow = rowFor("Current model");
+    expect(mineRow.textContent).toContain("Mine");
+    expect(buttonWithin(mineRow, "Edit Current model", true, "aria-label")).toBeDefined();
   });
 
   it("switches chat models for the session or global default and confirms expensive models", async () => {
@@ -174,8 +192,26 @@ async function renderPane(overrides: Partial<Parameters<typeof GuiChatModelsPane
   });
 }
 
-function registration(id: string, name: string, kind: ModelRegistration["kind"], provider: string, model: string): ModelRegistration {
-  return { credential_configured: null, id, kind, model, name, provider, source: "catalog", use_gateway: false };
+function registration(
+  id: string,
+  name: string,
+  kind: ModelRegistration["kind"],
+  provider: string,
+  model: string,
+  scope: ModelRegistration["scope"] = "user",
+): ModelRegistration {
+  return {
+    credential_configured: null,
+    id,
+    kind,
+    model,
+    mutable: scope === "user",
+    name,
+    provider,
+    scope,
+    source: "catalog",
+    use_gateway: false,
+  };
 }
 
 function rowFor(text: string): HTMLElement {

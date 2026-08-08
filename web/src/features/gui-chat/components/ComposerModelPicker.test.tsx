@@ -169,7 +169,7 @@ async function renderPicker(overrides: Partial<Parameters<typeof ComposerModelPi
 }
 
 function registration(id: string, name: string, kind: ModelRegistration["kind"], provider: string, model: string): ModelRegistration {
-  return { credential_configured: null, id, kind, model, name, provider, source: "catalog", use_gateway: false };
+  return { credential_configured: null, id, kind, model, mutable: true, name, provider, scope: "user", source: "catalog", use_gateway: false };
 }
 
 function trigger(): HTMLButtonElement {
