@@ -3812,6 +3812,53 @@ def test_worker_model_registration_routes_use_owner_home_and_reject_selectors(tm
     assert client.get(f"{path}?owner=other", headers=headers).status_code == 400
 
 
+def test_worker_voice_registration_defaults_manual_and_rejects_catalog(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    owner_home = tmp_path / "owner"
+    control_home = tmp_path / "control"
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_voice_registration")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+    from hermes_cli.owner_worker.entrypoint import create_app
+
+    ensure_owner_runtime_dirs(owner_home)
+    app = create_app("ok1_voice_registration", owner_home)
+    client = TestClient(app)
+
+    path = "/api/model/registrations"
+    token = _capability_for(
+        app,
+        audience=AUD_OWNER_WORKER_HTTP,
+        path=path,
+        control_home=control_home,
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+
+    rejected = client.post(path, headers=headers, json={
+        "name": "Voice catalog",
+        "kind": "voice",
+        "source": "catalog",
+        "provider": "openai",
+        "model": "gpt-4o-mini-tts",
+    })
+    assert rejected.status_code == 400
+    assert "manual source" in rejected.json()["detail"]
+
+    created = client.post(path, headers=headers, json={
+        "name": "Voice default",
+        "kind": "voice",
+        "provider": "openai",
+        "model": "gpt-4o-mini-tts",
+    })
+    assert created.status_code == 200
+    assert created.json()["source"] == "manual"
+    registration_id = created.json()["id"]
+
+    deleted = client.request("DELETE", path, headers=headers, json={"id": registration_id})
+    assert deleted.status_code == 200
+
+
 def test_worker_admin_registration_is_visible_and_immutable(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 
