@@ -78,7 +78,17 @@ const KIND_LABELS: Record<ModelRegistrationKind, string> = {
   chat: "Chat",
   image: "Image",
   video: "Video",
+  voice: "Voice",
+  vector: "Vector",
 };
+
+function hasCatalog(kind: ModelRegistrationKind): boolean {
+  return kind === "chat" || kind === "image" || kind === "video";
+}
+
+function isActivatable(kind: ModelRegistrationKind): kind is "image" | "video" {
+  return kind === "image" || kind === "video";
+}
 
 function registrationRequestFromForm(
   form: RegistrationFormState,
@@ -87,7 +97,7 @@ function registrationRequestFromForm(
     kind: form.kind,
     model: form.model.trim(),
     name: form.name.trim(),
-    source: form.source,
+    source: hasCatalog(form.kind) ? form.source : "manual",
   };
   if (form.kind === "chat" && form.source === "custom") {
     request.api_key = form.apiKey.trim();
@@ -99,7 +109,9 @@ function registrationRequestFromForm(
     }
   } else {
     request.provider = form.provider;
-    if (form.kind !== "chat") request.use_gateway = form.useGateway;
+    if (isActivatable(form.kind)) {
+      request.use_gateway = form.useGateway;
+    }
   }
   return request;
 }
@@ -174,7 +186,7 @@ export function GuiChatModelsPane({
   }, [busy]);
 
   const loadCatalog = useCallback(async (kind: ModelRegistrationKind) => {
-    if (catalogs[kind] || catalogsLoading[kind]) return;
+    if (!hasCatalog(kind) || catalogs[kind] || catalogsLoading[kind]) return;
     setCatalogsLoading((current) => ({ ...current, [kind]: true }));
     try {
       const response = await api.getModelRegistrationCatalog(kind, );
@@ -199,7 +211,7 @@ export function GuiChatModelsPane({
 
   const providers = catalogs[form.kind] ?? [];
   const models = useMemo(() => {
-    if (form.source === "custom") return [];
+    if (form.source === "custom" || !hasCatalog(form.kind)) return [];
     if (form.kind === "chat") {
       const provider = (providers as ModelRegistrationChatCatalogProvider[]).find(
         (item) => item.slug === form.provider,
@@ -217,7 +229,11 @@ export function GuiChatModelsPane({
 
   const openCreate = () => {
     setEditing(null);
-    setForm({ ...EMPTY_FORM, kind: selectedKind, source: "catalog" });
+    setForm({
+      ...EMPTY_FORM,
+      kind: selectedKind,
+      source: hasCatalog(selectedKind) ? "catalog" : "manual",
+    });
     setFormOpen(true);
     void loadCatalog(selectedKind);
   };
@@ -229,7 +245,7 @@ export function GuiChatModelsPane({
       kind: registration.kind,
       model: registration.model,
       name: registration.name,
-      provider: registration.source === "catalog" ? registration.provider : "",
+      provider: registration.source === "custom" ? "" : registration.provider,
       source: registration.source,
       useGateway: registration.use_gateway,
     });
@@ -251,7 +267,7 @@ export function GuiChatModelsPane({
       kind,
       model: "",
       provider: "",
-      source: kind === "chat" ? current.source : "catalog",
+      source: kind === "chat" ? current.source : hasCatalog(kind) ? "catalog" : "manual",
       useGateway: false,
     }));
   };
@@ -263,7 +279,7 @@ export function GuiChatModelsPane({
 
   const updateProvider = (provider: string) => {
     let model = "";
-    if (form.kind !== "chat") {
+    if (isActivatable(form.kind)) {
       const selected = (providers as ModelRegistrationMediaCatalogProvider[]).find(
         (item) => item.provider === provider,
       );
@@ -427,7 +443,7 @@ export function GuiChatModelsPane({
             && registration.provider === currentProvider
             && registration.model === currentModel;
           const configured = data?.active[registration.kind]?.registration_id === registration.id;
-          const active = registration.kind === "chat" ? current : configured;
+          const activatable = isActivatable(registration.kind);
           const working = workingId === registration.id;
           return (
             <article className="gui-chat-workspace-row gui-chat-model-row" key={registration.id}>
@@ -436,10 +452,10 @@ export function GuiChatModelsPane({
                   <span>{registration.name}</span>
                   <ModelBadge>{KIND_LABELS[registration.kind]}</ModelBadge>
                   <ModelBadge>{registration.scope === "admin" ? "Admin" : "Mine"}</ModelBadge>
-                  <ModelBadge>{registration.source === "custom" ? "Custom" : "Catalog"}</ModelBadge>
+                  <ModelBadge>{registration.source === "custom" ? "Custom" : registration.source === "manual" ? "Manual" : "Catalog"}</ModelBadge>
                   {current ? <ModelBadge active>Current conversation</ModelBadge> : null}
                   {registration.kind === "chat" && configured ? <ModelBadge active>Default</ModelBadge> : null}
-                  {registration.kind !== "chat" && active ? <ModelBadge active>Active</ModelBadge> : null}
+                  {activatable && configured ? <ModelBadge active>Active</ModelBadge> : null}
                   {registration.source === "custom" ? (
                     <ModelBadge warning={!registration.credential_configured}>
                       {registration.credential_configured ? "Credential ready" : "Credential missing"}
@@ -471,7 +487,7 @@ export function GuiChatModelsPane({
                       {configured ? "Default" : "Use as default"}
                     </button>
                   </>
-                ) : !active ? (
+                ) : activatable && !configured ? (
                   <button
                     className="gui-chat-model-action"
                     disabled={working}
@@ -622,7 +638,7 @@ function RegistrationDialog({
   return (
     <GuiChatWorkspaceDialog
       busy={saving}
-      description={editing ? "Update this registered model." : "Register a model for chat, image, or video generation."}
+      description={editing ? "Update this registered model." : "Register a chat, image, video, voice, or vector model."}
       onClose={onClose}
       title={editing ? "Edit model" : "Add model"}
       wide
@@ -662,35 +678,48 @@ function RegistrationDialog({
           </FormField>
         </div>
 
-        {form.source === "catalog" ? (
+        {form.source !== "custom" ? (
           <>
-            {catalogLoading ? <div className="gui-chat-model-form-note">Loading providers…</div> : null}
-            <FormField label="Provider">
-              <select
-                aria-label="Model provider"
-                disabled={saving || catalogLoading}
-                onChange={(event) => onProviderChange(event.target.value)}
-                value={form.provider}
-              >
-                <option value="">Select a provider</option>
-                {providers.map((provider) => {
-                  const id = "slug" in provider ? provider.slug : provider.provider;
-                  return <option key={id} value={id}>{provider.name}</option>;
-                })}
-              </select>
-            </FormField>
-            <FormField label="Model">
-              <select
-                aria-label="Model"
-                disabled={saving || !form.provider}
-                onChange={(event) => setForm((current) => ({ ...current, model: event.target.value }))}
-                value={form.model}
-              >
-                <option value="">Select a model</option>
-                {models.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
-              </select>
-            </FormField>
-            {form.kind !== "chat" ? (
+            {!hasCatalog(form.kind) ? (
+              <>
+                <FormField label="Provider">
+                  <input aria-label="Model provider" disabled={saving} onChange={(event) => setForm((current) => ({ ...current, provider: event.target.value }))} placeholder="openai" value={form.provider} />
+                </FormField>
+                <FormField label="Model">
+                  <input aria-label="Model" disabled={saving} onChange={(event) => setForm((current) => ({ ...current, model: event.target.value }))} placeholder={form.kind === "voice" ? "gpt-4o-mini-tts" : "text-embedding-3-small"} value={form.model} />
+                </FormField>
+              </>
+            ) : (
+              <>
+                {catalogLoading ? <div className="gui-chat-model-form-note">Loading providers…</div> : null}
+                <FormField label="Provider">
+                  <select
+                    aria-label="Model provider"
+                    disabled={saving || catalogLoading}
+                    onChange={(event) => onProviderChange(event.target.value)}
+                    value={form.provider}
+                  >
+                    <option value="">Select a provider</option>
+                    {providers.map((provider) => {
+                      const id = "slug" in provider ? provider.slug : provider.provider;
+                      return <option key={id} value={id}>{provider.name}</option>;
+                    })}
+                  </select>
+                </FormField>
+                <FormField label="Model">
+                  <select
+                    aria-label="Model"
+                    disabled={saving || !form.provider}
+                    onChange={(event) => setForm((current) => ({ ...current, model: event.target.value }))}
+                    value={form.model}
+                  >
+                    <option value="">Select a model</option>
+                    {models.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
+                  </select>
+                </FormField>
+              </>
+            )}
+            {isActivatable(form.kind) ? (
               <label className="gui-chat-model-checkbox">
                 <input
                   checked={form.useGateway}
@@ -762,6 +791,8 @@ function emptyActive(): ModelRegistrationsResponse["active"] {
     chat: { model: "", provider: "", registration_id: null },
     image: { model: "", provider: "", registration_id: null },
     video: { model: "", provider: "", registration_id: null },
+    voice: { model: "", provider: "", registration_id: null },
+    vector: { model: "", provider: "", registration_id: null },
   };
 }
 

@@ -1,4 +1,4 @@
-"""Profile-scoped registered chat and media model configuration."""
+"""Profile-scoped registered model configuration."""
 from __future__ import annotations
 
 import hashlib
@@ -18,7 +18,10 @@ from hermes_cli.config import (
     save_env_value,
 )
 
-_KINDS = frozenset({"chat", "image", "video"})
+_KINDS = frozenset({"chat", "image", "video", "voice", "vector"})
+_ACTIVATABLE_KINDS = frozenset({"image", "video"})
+_CATALOG_KINDS = _ACTIVATABLE_KINDS | {"chat"}
+_MANUAL_KINDS = _KINDS - _CATALOG_KINDS
 _SERVER_MANAGED_FIELDS = frozenset({
     "mutable", "owner", "owner_home", "owner_id", "owner_key", "scope",
 })
@@ -241,16 +244,26 @@ def _normalize_request(
     name = _text(data.get("name"), "name")
     kind = _text(data.get("kind", existing.get("kind") if existing else None), "kind").lower()
     if kind not in _KINDS:
-        raise ModelRegistrationError("kind must be chat, image, or video")
+        raise ModelRegistrationError("kind must be chat, image, video, voice, or vector")
     if existing is not None and kind != existing.get("kind"):
         raise ModelRegistrationError("kind cannot be changed")
 
     model = _text(data.get("model"), "model")
-    source = str(data.get("source") or (existing or {}).get("source") or "catalog").strip().lower()
+    default_source = "manual" if kind in _MANUAL_KINDS else "catalog"
+    source = str(data.get("source") or (existing or {}).get("source") or default_source).strip().lower()
     api_key = str(data.get("api_key") or "").strip()
     provider_config: dict[str, Any] | None = None
 
-    if kind == "chat" and source == "custom":
+    if kind in _MANUAL_KINDS and source == "manual":
+        provider = _text(data.get("provider"), "provider")
+        registration = {
+            "name": name,
+            "kind": kind,
+            "provider": provider,
+            "model": model,
+            "source": "manual",
+        }
+    elif kind == "chat" and source == "custom":
         provider = str((existing or {}).get("provider") or _custom_provider_key(registration_id))
         base_url = _text(data.get("base_url"), "base_url")
         api_mode = _text(data.get("api_mode") or "openai", "api_mode")
@@ -287,13 +300,14 @@ def _normalize_request(
         }
     else:
         if source != "catalog":
-            raise ModelRegistrationError("Only chat registrations may use a custom source")
+            raise ModelRegistrationError("Registration source is not supported for this model type")
         provider = _text(data.get("provider"), "provider")
-        catalog = chat_catalog if kind == "chat" else media_catalog
-        if catalog is None:
-            raise ModelRegistrationError("Provider catalog is unavailable")
-        row = _find_provider(catalog, provider, media=kind != "chat")
-        _validate_catalog_model(row, model)
+        if kind in _CATALOG_KINDS:
+            catalog = chat_catalog if kind == "chat" else media_catalog
+            if catalog is None:
+                raise ModelRegistrationError("Provider catalog is unavailable")
+            row = _find_provider(catalog, provider, media=kind != "chat")
+            _validate_catalog_model(row, model)
         registration = {
             "name": name,
             "kind": kind,
@@ -301,7 +315,7 @@ def _normalize_request(
             "model": model,
             "source": "catalog",
         }
-        if kind in {"image", "video"}:
+        if kind in _ACTIVATABLE_KINDS:
             registration["use_gateway"] = bool(data.get("use_gateway", (existing or {}).get("use_gateway", False)))
 
     return registration, provider_config, api_key
@@ -357,13 +371,12 @@ def _active(config: dict[str, Any], registrations: dict[str, dict[str, Any]]) ->
         }
     else:
         selections = {"chat": (None, model_cfg)}
-    for kind in ("image", "video"):
+    for kind in _ACTIVATABLE_KINDS:
         section = config.get(f"{kind}_gen")
         selections[kind] = (
             section.get("provider") if isinstance(section, dict) else None,
             section.get("model") if isinstance(section, dict) else None,
         )
-
     result: dict[str, Any] = {}
     for kind, (provider, model) in selections.items():
         registration_id = next((
@@ -377,6 +390,12 @@ def _active(config: dict[str, Any], registrations: dict[str, dict[str, Any]]) ->
             "registration_id": registration_id,
             "provider": provider or "",
             "model": model or "",
+        }
+    for kind in _KINDS - selections.keys():
+        result[kind] = {
+            "registration_id": None,
+            "provider": "",
+            "model": "",
         }
     return result
 
@@ -439,8 +458,14 @@ def get_model_registration_catalog(kind: str) -> dict[str, Any]:
     """Return the selectable catalog for one registration kind."""
     normalized = str(kind or "").strip().lower()
     if normalized not in _KINDS:
-        raise ModelRegistrationError("kind must be chat, image, or video")
-    providers = _chat_catalog() if normalized == "chat" else _media_catalog(normalized)
+        raise ModelRegistrationError("kind must be chat, image, video, voice, or vector")
+    if normalized == "chat":
+        providers = _chat_catalog()
+    elif normalized in _ACTIVATABLE_KINDS:
+        providers = _media_catalog(normalized)
+    else:
+        assert normalized in _MANUAL_KINDS
+        providers = []
     return {"kind": normalized, "providers": providers}
 
 
@@ -448,9 +473,10 @@ def create_model_registration(data: dict[str, Any]) -> dict[str, Any]:
     _reject_server_managed_fields(data)
     registration_id = uuid.uuid4().hex
     kind = str(data.get("kind") or "").strip().lower()
-    source = str(data.get("source") or "catalog").strip().lower()
+    default_source = "manual" if kind in _MANUAL_KINDS else "catalog"
+    source = str(data.get("source") or default_source).strip().lower()
     chat = _chat_catalog() if kind == "chat" and source != "custom" else None
-    media = _media_catalog(kind) if kind in {"image", "video"} else None
+    media = _media_catalog(kind) if kind in _ACTIVATABLE_KINDS else None
     candidate, provider_config, api_key = _normalize_request(
         data,
         registration_id=registration_id,
@@ -494,7 +520,7 @@ def update_model_registration(registration_id: str, data: dict[str, Any]) -> dic
     kind = existing.get("kind")
     source = str(data.get("source") or existing.get("source") or "catalog").strip().lower()
     chat = _chat_catalog() if kind == "chat" and source != "custom" else None
-    media = _media_catalog(str(kind)) if kind in {"image", "video"} else None
+    media = _media_catalog(str(kind)) if kind in _ACTIVATABLE_KINDS else None
     merged = dict(existing)
     merged.update(data)
     candidate, provider_config, api_key = _normalize_request(
@@ -564,8 +590,8 @@ def activate_model_registration(registration_id: str) -> dict[str, Any]:
         if not isinstance(item, dict):
             raise ModelRegistrationNotFound("Registration not found")
         kind = item.get("kind")
-        if kind not in {"image", "video"}:
-            raise ModelRegistrationError("Chat registrations must be activated through the session gateway")
+        if kind not in _ACTIVATABLE_KINDS:
+            raise ModelRegistrationError("Only image and video registrations can be activated")
         from hermes_cli.tools_config import select_media_model
 
         catalog = None

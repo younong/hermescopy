@@ -2252,9 +2252,9 @@ export interface ModelInfoResponse {
 
 // ── Model options / assignment types ──────────────────────────────────
 
-export type ModelRegistrationKind = "chat" | "image" | "video";
+export type ModelRegistrationKind = "chat" | "image" | "video" | "voice" | "vector";
 
-export type ModelRegistrationSource = "catalog" | "custom";
+export type ModelRegistrationSource = "catalog" | "custom" | "manual";
 
 export type ModelRegistrationScope = "admin" | "user";
 

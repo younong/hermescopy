@@ -228,6 +228,57 @@ def test_catalog_media_crud_activation_and_active_delete_guard():
         model_registrations.delete_model_registration(created["id"])
 
 
+def test_voice_and_vector_registration_crud_without_activation(monkeypatch):
+    monkeypatch.setattr(
+        model_registrations,
+        "_media_catalog",
+        lambda kind: pytest.fail(f"unexpected {kind} catalog load"),
+    )
+
+    voice = model_registrations.create_model_registration({
+        "name": "Narrator",
+        "kind": "voice",
+        "provider": "openai",
+        "model": "gpt-4o-mini-tts",
+    })
+    vector = model_registrations.create_model_registration({
+        "name": "Memory vectors",
+        "kind": "vector",
+        "provider": "openai",
+        "model": "text-embedding-3-small",
+    })
+
+    assert voice["kind"] == "voice"
+    assert voice["source"] == "manual"
+    assert vector["kind"] == "vector"
+    assert vector["source"] == "manual"
+    payload = model_registrations.get_model_registrations_payload()
+    assert payload["active"]["voice"] == {
+        "registration_id": None,
+        "provider": "",
+        "model": "",
+    }
+    assert payload["active"]["vector"] == {
+        "registration_id": None,
+        "provider": "",
+        "model": "",
+    }
+    with pytest.raises(model_registrations.ModelRegistrationError, match="Only image and video"):
+        model_registrations.activate_model_registration(voice["id"])
+
+    updated = model_registrations.update_model_registration(vector["id"], {
+        "name": "Large memory vectors",
+        "kind": "vector",
+        "provider": "openai",
+        "model": "text-embedding-3-large",
+    })
+    assert updated["model"] == "text-embedding-3-large"
+    assert model_registrations.delete_model_registration(voice["id"]) == {
+        "ok": True,
+        "id": voice["id"],
+    }
+
+
 def test_custom_chat_secret_is_env_only_and_empty_update_preserves():
     created = model_registrations.create_model_registration({
         "name": "Private endpoint",
@@ -428,5 +479,13 @@ def test_payload_is_lightweight_and_catalog_is_safe(monkeypatch):
     }
     with pytest.raises(model_registrations.ModelRegistrationError, match="kind must be"):
         model_registrations.get_model_registration_catalog("audio")
-    with pytest.raises(model_registrations.ModelRegistrationError, match="session gateway"):
+    assert model_registrations.get_model_registration_catalog("voice") == {
+        "kind": "voice",
+        "providers": [],
+    }
+    assert model_registrations.get_model_registration_catalog("vector") == {
+        "kind": "vector",
+        "providers": [],
+    }
+    with pytest.raises(model_registrations.ModelRegistrationError, match="Only image and video"):
         model_registrations.activate_model_registration(chat["id"])

@@ -16,6 +16,8 @@ const payload: ModelRegistrationsResponse = {
     chat: { model: "default-model", provider: "default-provider", registration_id: "chat-default" },
     image: { model: "image-v1", provider: "image-provider", registration_id: "image-a" },
     video: { model: "", provider: "", registration_id: null },
+    voice: { model: "", provider: "", registration_id: null },
+    vector: { model: "", provider: "", registration_id: null },
   },
   registrations: [
     registration("chat-current", "Current model", "chat", "current-provider", "current-model"),
@@ -23,6 +25,8 @@ const payload: ModelRegistrationsResponse = {
     registration("admin-chat", "Admin model", "chat", "admin-provider", "admin-model", "admin"),
     registration("image-a", "Image model", "image", "image-provider", "image-v1"),
     registration("video-a", "Video model", "video", "video-provider", "video-v1"),
+    registration("voice-a", "Voice model", "voice", "openai", "gpt-4o-mini-tts"),
+    registration("vector-a", "Vector model", "vector", "openai", "text-embedding-3-small"),
   ],
 };
 
@@ -120,6 +124,31 @@ describe("GuiChatModelsPane", () => {
     expect(api.deleteModelRegistration).toHaveBeenCalledWith("video-a");
   });
 
+  it("creates voice and vector registrations without activation controls", async () => {
+    await renderPane();
+
+    await clickButton("Voice", true);
+    expect(document.body.textContent).toContain("Voice model");
+    expect(buttonWithin(rowFor("Voice model"), "Activate", true)).toBeUndefined();
+    await clickButton("Add model", true);
+    await setLabeledInput("Model name", "New voice model");
+    await setLabeledInput("Model provider", "openai");
+    await setLabeledInput("Model", "gpt-4o-mini-tts");
+    await clickButton("Save model", true);
+    expect(api.getModelRegistrationCatalog).not.toHaveBeenCalledWith("voice");
+    expect(api.createModelRegistration).toHaveBeenCalledWith({
+      kind: "voice",
+      model: "gpt-4o-mini-tts",
+      name: "New voice model",
+      provider: "openai",
+      source: "manual",
+    });
+
+    await clickButton("Vector", true);
+    expect(document.body.textContent).toContain("Vector model");
+    expect(buttonWithin(rowFor("Vector model"), "Activate", true)).toBeUndefined();
+  });
+
   it("creates catalog models through the existing registration API", async () => {
     await renderPane();
     await clickButton("Add model", true);
@@ -200,6 +229,7 @@ function registration(
   model: string,
   scope: ModelRegistration["scope"] = "user",
 ): ModelRegistration {
+  const source = kind === "voice" || kind === "vector" ? "manual" : "catalog";
   return {
     credential_configured: null,
     id,
@@ -209,7 +239,7 @@ function registration(
     name,
     provider,
     scope,
-    source: "catalog",
+    source,
     use_gateway: false,
   };
 }

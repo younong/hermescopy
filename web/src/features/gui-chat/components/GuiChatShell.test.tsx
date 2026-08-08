@@ -217,6 +217,8 @@ beforeEach(() => {
       chat: { model: "test-model", provider: "test-provider", registration_id: "chat-a" },
       image: { model: "image-old", provider: "image-provider", registration_id: null },
       video: { model: "", provider: "", registration_id: null },
+      voice: { model: "", provider: "", registration_id: null },
+      vector: { model: "", provider: "", registration_id: null },
     },
     registrations: [
       {
