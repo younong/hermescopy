@@ -64,3 +64,35 @@ def test_catalog_does_not_probe_unsupported_models_endpoint():
 
     assert result == list(profile.fallback_models)
     fetch_models.assert_not_called()
+
+
+def test_no_network_cache_miss_returns_plugin_static_catalog(monkeypatch):
+    """Latency-bounded paths (allow_network=False) must still see the
+    plugin-declared catalog even with an empty disk cache — this is what
+    the model-registrations catalog relies on."""
+    from hermes_cli import models as models_mod
+    from providers import get_provider_profile
+
+    monkeypatch.setattr(models_mod, "_load_provider_models_cache", lambda: {})
+    monkeypatch.setattr(models_mod, "_credential_fingerprint", lambda provider: "fp")
+
+    result = models_mod.cached_provider_model_ids(PROVIDER, allow_network=False)
+
+    assert result == list(get_provider_profile(PROVIDER).fallback_models)
+
+
+def test_no_network_stale_cache_entry_wins_over_static_catalog(monkeypatch):
+    """A previously live-fetched cache entry (even stale, same credentials)
+    beats the static catalog — account-specific listings stay visible."""
+    from hermes_cli import models as models_mod
+
+    monkeypatch.setattr(
+        models_mod,
+        "_load_provider_models_cache",
+        lambda: {PROVIDER: {"fp": "fp", "at": 1, "models": ["cached-model"]}},
+    )
+    monkeypatch.setattr(models_mod, "_credential_fingerprint", lambda provider: "fp")
+
+    result = models_mod.cached_provider_model_ids(PROVIDER, allow_network=False)
+
+    assert result == ["cached-model"]
