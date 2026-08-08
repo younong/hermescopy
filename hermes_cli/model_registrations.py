@@ -254,7 +254,11 @@ def _normalize_request(
     api_key = str(data.get("api_key") or "").strip()
     provider_config: dict[str, Any] | None = None
 
-    if kind in _MANUAL_KINDS and source == "manual":
+    if kind in _MANUAL_KINDS:
+        if source != "manual":
+            raise ModelRegistrationError(
+                "Voice and vector registrations must use a manual source"
+            )
         provider = _text(data.get("provider"), "provider")
         registration = {
             "name": name,
