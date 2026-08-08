@@ -2459,10 +2459,7 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                     # live API is the authoritative catalog, so they merge
                     # live-first — live entries lead and stale curated entries
                     # no longer pollute the top of the picker. (#49129)
-                    curated = list(
-                        _p.fallback_models
-                        or _PROVIDER_MODELS.get(normalized, [])
-                    )
+                    curated = static_provider_model_ids(normalized)
                     if curated:
                         if normalized in _LIVE_FIRST_PICKER_PROVIDERS:
                             primary, secondary = live, curated
@@ -2476,16 +2473,56 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                                 merged_lower.add(m.lower())
                         return merged
                     return live
-            # Use profile's fallback_models if defined
+            # Fall back to the shared static chain (plugin fallback_models
+            # merged onto the curated table) when live listing is
+            # unsupported or no credentials are available.
             if _p.fallback_models:
-                return list(_p.fallback_models)
+                return static_provider_model_ids(normalized)
     except Exception:
         pass
 
-    curated_static = list(_PROVIDER_MODELS.get(normalized, []))
+    static = static_provider_model_ids(normalized)
     if normalized in _MODELS_DEV_PREFERRED:
-        return _merge_with_models_dev(normalized, curated_static)
-    return curated_static
+        return _merge_with_models_dev(normalized, static)
+    return static
+
+
+def static_provider_model_ids(provider: Optional[str]) -> list[str]:
+    """Best-known model catalog obtainable WITHOUT any network I/O.
+
+    Single static resolution chain shared by every consumer (live or
+    latency-bounded):
+
+      1. The in-repo curated table (``_PROVIDER_MODELS``; for openrouter,
+         ``OPENROUTER_MODELS``) — the actively maintained picker curation.
+      2. The provider plugin's declared ``fallback_models``
+         (``plugins/model-providers/<name>/``), appended after the curated
+         entries. Plugins are the long-term home for static catalogs; some
+         providers (e.g. volcengine-agent-plan) declare their list ONLY
+         there.
+
+    Live discovery results reach no-network request paths only through
+    :func:`cached_provider_model_ids`' disk cache — never from here.
+    """
+    normalized = normalize_provider(provider) or (provider or "")
+    if not normalized:
+        return []
+    if normalized == "openrouter":
+        return [mid for mid, _ in OPENROUTER_MODELS]
+    merged = list(_PROVIDER_MODELS.get(normalized, []))
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(normalized)
+        plugin_models = list(profile.fallback_models) if profile is not None else []
+    except Exception:
+        plugin_models = []
+    seen = {m.lower() for m in merged}
+    for mid in plugin_models:
+        if mid.lower() not in seen:
+            seen.add(mid.lower())
+            merged.append(mid)
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -2623,8 +2660,12 @@ def cached_provider_model_ids(
 
     Hits the cache when fresh; otherwise calls the live function and
     persists a non-empty result. When ``allow_network`` is false, a matching
-    stale cache entry is returned without refreshing it. Always returns a list
-    (never None).
+    stale cache entry is returned without refreshing it, and when no cache
+    entry matches, the shared static catalog (:func:`static_provider_model_ids`
+    — curated table + plugin-declared ``fallback_models``) is returned:
+    static data needs no network, so latency-bounded request paths (e.g. the
+    model-registrations catalog) still see every provider's known models.
+    Always returns a list (never None).
     """
     normalized = normalize_provider(provider) or (provider or "")
     if not normalized:
@@ -2653,7 +2694,7 @@ def cached_provider_model_ids(
             and entry["models"]
         ):
             return list(entry["models"])
-        return []
+        return static_provider_model_ids(normalized)
 
     # Cache miss / stale / forced refresh — call the live path.
     live = provider_model_ids(normalized, force_refresh=force_refresh)
