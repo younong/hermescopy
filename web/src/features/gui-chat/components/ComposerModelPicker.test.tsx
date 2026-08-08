@@ -58,6 +58,17 @@ describe("ComposerModelPicker", () => {
     expect(current.disabled).toBe(true);
   });
 
+  it("marks the current model when the gateway reports a raw provider name", async () => {
+    // Live gateways report the agent provider (bare "custom"), not the
+    // registration slug ("current-provider"), for custom endpoints.
+    await renderPicker({ currentProvider: "custom" });
+    await openPicker();
+
+    const current = optionFor("Current model");
+    expect(current.getAttribute("aria-selected")).toBe("true");
+    expect(current.disabled).toBe(true);
+  });
+
   it("falls back to a placeholder when no model is active", async () => {
     await renderPicker({ currentModel: undefined, currentProvider: undefined });
     expect(trigger().textContent).toContain("Select model");

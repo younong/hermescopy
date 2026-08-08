@@ -173,9 +173,16 @@ export function ComposerModelPicker({
           ) : null}
 
           {registrations?.map((registration) => {
+            // The gateway reports the active provider as the raw agent
+            // provider (e.g. bare "custom"), which need not equal the
+            // registration's slug ("custom:kimi-code"). When the model id is
+            // unique across registrations, a model match alone is enough.
+            const modelIsUnique = !registrations.some(
+              (other) => other !== registration && other.model === currentModel,
+            );
             const isCurrent =
               registration.model === currentModel &&
-              registration.provider === currentProvider;
+              (registration.provider === currentProvider || modelIsUnique);
             const switching = switchingId === registration.id;
             return (
               <button
