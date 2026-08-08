@@ -131,6 +131,10 @@ describe("GuiChatModelsPane", () => {
     expect(document.body.textContent).toContain("Voice model");
     expect(buttonWithin(rowFor("Voice model"), "Activate", true)).toBeUndefined();
     await clickButton("Add model", true);
+    const sourceSelect = document.querySelector<HTMLSelectElement>('select[aria-label="Model source"]');
+    expect(sourceSelect?.disabled).toBe(true);
+    expect(sourceSelect?.value).toBe("manual");
+    expect(sourceSelect?.selectedOptions[0]?.textContent).toBe("Manual");
     await setLabeledInput("Model name", "New voice model");
     await setLabeledInput("Model provider", "openai");
     await setLabeledInput("Model", "gpt-4o-mini-tts");

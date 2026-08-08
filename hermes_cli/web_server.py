@@ -1349,7 +1349,9 @@ class ModelRegistrationPayload(BaseModel):
     kind: str
     provider: str = ""
     model: str
-    source: str = "catalog"
+    # None lets model_registrations apply its per-kind default (catalog for
+    # chat/image/video, manual for voice/vector).
+    source: Optional[str] = None
     base_url: str = ""
     api_mode: str = "openai"
     api_key: str = ""

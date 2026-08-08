@@ -279,6 +279,44 @@ def test_voice_and_vector_registration_crud_without_activation(monkeypatch):
     }
 
 
+def test_voice_and_vector_reject_non_manual_source(monkeypatch):
+    monkeypatch.setattr(
+        model_registrations,
+        "_media_catalog",
+        lambda kind: pytest.fail(f"unexpected {kind} catalog load"),
+    )
+
+    for kind in ("voice", "vector"):
+        for source in ("catalog", "custom"):
+            with pytest.raises(
+                model_registrations.ModelRegistrationError,
+                match="must use a manual source",
+            ):
+                model_registrations.create_model_registration({
+                    "name": f"{kind} {source}",
+                    "kind": kind,
+                    "source": source,
+                    "provider": "openai",
+                    "model": "some-model",
+                })
+
+    created = model_registrations.create_model_registration({
+        "name": "Narrator",
+        "kind": "voice",
+        "provider": "openai",
+        "model": "gpt-4o-mini-tts",
+    })
+    with pytest.raises(
+        model_registrations.ModelRegistrationError,
+        match="must use a manual source",
+    ):
+        model_registrations.update_model_registration(created["id"], {
+            "source": "catalog",
+            "provider": "openai",
+            "model": "gpt-4o-mini-tts",
+        })
+
+
 def test_custom_chat_secret_is_env_only_and_empty_update_preserves():
     created = model_registrations.create_model_registration({
         "name": "Private endpoint",

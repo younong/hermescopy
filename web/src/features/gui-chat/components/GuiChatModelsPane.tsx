@@ -672,7 +672,7 @@ function RegistrationDialog({
               onChange={(event) => onSourceChange(event.target.value as ModelRegistrationSource)}
               value={form.source}
             >
-              <option value="catalog">Catalog</option>
+              {hasCatalog(form.kind) ? <option value="catalog">Catalog</option> : <option value="manual">Manual</option>}
               {form.kind === "chat" ? <option value="custom">Custom endpoint</option> : null}
             </select>
           </FormField>
