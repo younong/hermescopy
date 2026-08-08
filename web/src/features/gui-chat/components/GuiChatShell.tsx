@@ -51,6 +51,7 @@ import {
   type MessageAttachmentState,
 } from "../types";
 import { Composer } from "./Composer";
+import { ComposerModelPicker } from "./ComposerModelPicker";
 import { GuiChatModelsPane } from "./GuiChatModelsPane";
 import { GuiChatScheduledTasksPane } from "./GuiChatScheduledTasksPane";
 import { GuiChatSkillsPane } from "./GuiChatSkillsPane";
@@ -996,6 +997,18 @@ export function GuiChatShell() {
                 attachmentToQueue={attachmentsToQueue[0]}
                 disabled={disabled}
                 isGenerating={state.isGenerating}
+                modelPicker={
+                  <ComposerModelPicker
+                    busy={state.isGenerating}
+                    canSwitch={Boolean(state.sessionId && state.connection === "open")}
+                    currentModel={state.model}
+                    currentProvider={state.provider}
+                    onManageModels={() => navigate("/chat/models")}
+                    onSwitchChat={(registration, confirmExpensiveModel) =>
+                      switchChatModel(registration, confirmExpensiveModel)
+                    }
+                  />
+                }
                 onAttachmentQueued={(requestId) => {
                   setAttachmentsToQueue((current) =>
                     current.filter((request) => request.requestId !== requestId)

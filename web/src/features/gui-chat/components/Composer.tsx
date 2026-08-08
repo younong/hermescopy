@@ -7,6 +7,7 @@ import {
   type ClipboardEvent,
   type DragEvent,
   type KeyboardEvent,
+  type ReactNode,
 } from "react";
 import { ArrowUp, Plus, Square } from "lucide-react";
 
@@ -24,6 +25,7 @@ export function Composer({
   isGenerating,
   allowSendWhileGenerating = false,
   attachmentToQueue,
+  modelPicker,
   onAttachmentQueued,
   onSend,
   onStop,
@@ -32,6 +34,7 @@ export function Composer({
   isGenerating: boolean;
   allowSendWhileGenerating?: boolean;
   attachmentToQueue?: { file: File; requestId: number };
+  modelPicker?: ReactNode;
   onAttachmentQueued?: (requestId: number) => void;
   onSend: (
     text: string,
@@ -286,6 +289,7 @@ export function Composer({
           </div>
 
           <div className="flex items-center gap-2">
+            {modelPicker}
             {isGenerating ? (
               <button
                 type="button"
