@@ -565,10 +565,15 @@ _TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 def _deployment_relay_headers(
     api_key: object,
     main_runtime: Optional[Dict[str, Any]],
+    *,
+    model: Optional[str] = None,
 ) -> dict[str, str]:
-    """Return the route selector required by the owner-local inference relay."""
+    """Return the exact model route selector required by the owner relay."""
     try:
-        from hermes_cli.deployment_inference import is_deployment_inference_relay
+        from hermes_cli.deployment_inference import (
+            is_deployment_inference_relay,
+            route_descriptors_from_control_plane,
+        )
 
         if not is_deployment_inference_relay(api_key):
             return {}
@@ -576,6 +581,21 @@ def _deployment_relay_headers(
         return {}
     runtime = _normalize_main_runtime(main_runtime)
     provider = str(runtime.get("provider") or "").strip().lower()
+    selected_model = str(model or "").strip()
+    if selected_model:
+        try:
+            route = next(
+                (
+                    candidate
+                    for candidate in route_descriptors_from_control_plane()
+                    if candidate.model == selected_model
+                ),
+                None,
+            )
+        except Exception:
+            route = None
+        if route is not None:
+            provider = route.provider
     if not provider:
         return {}
     return {"x-hermes-deployment-provider": provider}
@@ -4436,7 +4456,11 @@ def resolve_provider_client(
                 provider,
             )
             extra = {}
-            relay_headers = _deployment_relay_headers(custom_key, main_runtime)
+            relay_headers = _deployment_relay_headers(
+                custom_key,
+                main_runtime,
+                model=final_model,
+            )
             if relay_headers:
                 extra["default_headers"] = relay_headers
             _clean_base, _dq = _extract_url_query_params(custom_base)
