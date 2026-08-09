@@ -3034,16 +3034,17 @@ def _persist_model_switch(result) -> None:
     from hermes_cli.config import set_config_value
 
     set_config_value("model.default", result.new_model)
-    save_config_value("model.provider", result.target_provider)
+    set_config_value("model.provider", result.target_provider)
     if result.base_url:
-        save_config_value("model.base_url", result.base_url)
+        set_config_value("model.base_url", result.base_url)
     else:
         # Clear any stale base_url when switching to a provider that doesn't use
-        # one (e.g. custom endpoint -> native provider). Reads coalesce null to
-        # absent (`model_cfg.get("base_url") or ""`), so a null is equivalent to
-        # removal without needing a key-delete. Leaving the old value would
-        # route the new model at the previous custom host (#48305).
-        save_config_value("model.base_url", None)
+        # one (e.g. custom endpoint -> native provider). Reads coalesce an empty
+        # string to absent (`model_cfg.get("base_url") or ""`), so writing an
+        # empty value is equivalent to removal without needing a key-delete.
+        # Leaving the old value would route the new model at the previous custom
+        # host (#48305).
+        set_config_value("model.base_url", "")
 
 
 def _apply_model_switch(
