@@ -1357,6 +1357,7 @@ dependencies = [
 
 [package.optional-dependencies]
 all = [
+    { name = "aiohttp" },
     { name = "fastapi" },
     { name = "google-api-python-client" },
     { name = "google-auth-httplib2" },
@@ -1464,6 +1465,7 @@ termux = [
     { name = "starlette" },
 ]
 termux-all = [
+    { name = "aiohttp" },
     { name = "fastapi" },
     { name = "google-api-python-client" },
     { name = "google-auth-httplib2" },
@@ -1487,6 +1489,7 @@ voice = [
     { name = "sounddevice" },
 ]
 web = [
+    { name = "aiohttp" },
     { name = "fastapi" },
     { name = "python-multipart" },
     { name = "starlette" },
@@ -1499,6 +1502,7 @@ youtube = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", marker = "extra == 'messaging'", specifier = "==3.14.1" },
+    { name = "aiohttp", marker = "extra == 'web'", specifier = "==3.14.1" },
     { name = "anthropic", marker = "extra == 'anthropic'", specifier = "==0.87.0" },
     { name = "azure-identity", marker = "extra == 'azure-identity'", specifier = "==1.25.3" },
     { name = "boto3", marker = "extra == 'bedrock'", specifier = "==1.42.89" },
