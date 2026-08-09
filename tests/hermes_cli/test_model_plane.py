@@ -370,3 +370,64 @@ def test_capability_model_catalog_shape_and_unknown_provider():
         catalog_module.capability_model_catalog("voice", "missing")
     with pytest.raises(ValueError, match="kind must be"):
         catalog_module.capability_model_catalog("chat", "voice-double")
+
+
+def _patch_voice_gen_config(monkeypatch, section):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"voice_gen": section} if section is not None else {},
+    )
+
+
+def test_resolve_voice_tool_selection_reads_voice_gen(monkeypatch):
+    capability_module.register_voice_provider("tts", _TTSDouble())
+    _patch_voice_gen_config(
+        monkeypatch, {"provider": " Voice-Double ", "model": "tts-x"}
+    )
+
+    assert capability_module.resolve_voice_tool_selection("tts") == (
+        "voice-double",
+        "tts-x",
+    )
+
+
+def test_resolve_voice_tool_selection_matches_the_requested_capability(monkeypatch):
+    capability_module.register_voice_provider("tts", _TTSDouble())
+    capability_module.register_voice_provider("asr", _ASRDouble())
+    # The activated model is the ASR one: TTS dispatch must not pick it
+    # up, and ASR dispatch must.
+    _patch_voice_gen_config(monkeypatch, {"provider": "voice-double", "model": "asr-x"})
+
+    assert capability_module.resolve_voice_tool_selection("tts") is None
+    assert capability_module.resolve_voice_tool_selection("asr") == (
+        "voice-double",
+        "asr-x",
+    )
+
+
+def test_resolve_voice_tool_selection_falls_back_without_usable_selection(monkeypatch):
+    capability_module.register_voice_provider("tts", _TTSDouble())
+
+    _patch_voice_gen_config(monkeypatch, None)
+    assert capability_module.resolve_voice_tool_selection("tts") is None
+    _patch_voice_gen_config(monkeypatch, {"provider": "", "model": "tts-x"})
+    assert capability_module.resolve_voice_tool_selection("tts") is None
+    _patch_voice_gen_config(monkeypatch, {"provider": "voice-double", "model": ""})
+    assert capability_module.resolve_voice_tool_selection("tts") is None
+    _patch_voice_gen_config(monkeypatch, {"provider": "missing", "model": "tts-x"})
+    assert capability_module.resolve_voice_tool_selection("tts") is None
+    _patch_voice_gen_config(
+        monkeypatch, {"provider": "voice-double", "model": "unknown-model"}
+    )
+    assert capability_module.resolve_voice_tool_selection("tts") is None
+
+    # An unreadable config also means "no selection" — never blocks the
+    # legacy tool path.
+    def _boom():
+        raise RuntimeError("config unreadable")
+
+    monkeypatch.setattr("hermes_cli.config.load_config", _boom)
+    assert capability_module.resolve_voice_tool_selection("tts") is None
+
+    with pytest.raises(ValueError, match="voice capability"):
+        capability_module.resolve_voice_tool_selection("embed")

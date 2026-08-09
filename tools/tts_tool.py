@@ -350,6 +350,32 @@ def _get_provider(tts_config: Dict[str, Any]) -> str:
     return (tts_config.get("provider") or DEFAULT_PROVIDER).lower().strip()
 
 
+def _apply_voice_tool_selection(
+    provider: str,
+    tts_config: Dict[str, Any],
+) -> tuple[str, Dict[str, Any]]:
+    """Overlay the unified ``voice_gen`` model-plane selection.
+
+    When the activated voice registration names a plugin-registered TTS
+    provider whose TTS catalog includes the activated model, that
+    selection wins over the legacy ``tts.provider`` / ``tts.model`` tool
+    config (same rule as the image tool's ``image_gen`` selection).
+    Otherwise the legacy values apply unchanged.
+    """
+    try:
+        from hermes_cli.model_plane.capability import resolve_voice_tool_selection
+
+        selection = resolve_voice_tool_selection("tts")
+    except Exception:  # noqa: BLE001 — selection is additive, never blocks
+        return provider, tts_config
+    if selection is None:
+        return provider, tts_config
+    name, model = selection
+    overlaid = dict(tts_config) if isinstance(tts_config, dict) else {}
+    overlaid["model"] = model
+    return name, overlaid
+
+
 # ===========================================================================
 # Custom command providers (type: command under tts.providers.<name>)
 # ===========================================================================
@@ -2149,6 +2175,7 @@ def text_to_speech_tool(
 
     tts_config = _load_tts_config()
     provider = _get_provider(tts_config)
+    provider, tts_config = _apply_voice_tool_selection(provider, tts_config)
 
     # User-declared command provider (type: command under tts.providers.<name>)
     # resolves BEFORE the built-in dispatch. Built-in names short-circuit here

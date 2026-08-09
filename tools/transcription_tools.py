@@ -739,6 +739,31 @@ def _transcribe_command_stt(
     }
 
 
+def _apply_voice_tool_selection(
+    provider: str,
+    model: Optional[str],
+) -> tuple[str, Optional[str]]:
+    """Overlay the unified ``voice_gen`` model-plane selection.
+
+    When the activated voice registration names a plugin-registered ASR
+    provider whose ASR catalog includes the activated model, that
+    selection wins over the legacy ``stt.provider`` tool config (same
+    rule as the image tool's ``image_gen`` selection); the activated
+    model fills the model argument when the caller did not pass one.
+    Otherwise the legacy values apply unchanged.
+    """
+    try:
+        from hermes_cli.model_plane.capability import resolve_voice_tool_selection
+
+        selection = resolve_voice_tool_selection("asr")
+    except Exception:  # noqa: BLE001 — selection is additive, never blocks
+        return provider, model
+    if selection is None:
+        return provider, model
+    name, selected_model = selection
+    return name, (model or selected_model)
+
+
 def _get_provider(stt_config: dict) -> str:
     """Determine which STT provider to use.
 
@@ -1729,6 +1754,7 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         }
 
     provider = _get_provider(stt_config)
+    provider, model = _apply_voice_tool_selection(provider, model)
 
     if provider == "local":
         local_cfg = stt_config.get("local", {})

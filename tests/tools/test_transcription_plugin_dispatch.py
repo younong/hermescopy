@@ -460,3 +460,75 @@ class TestLanguageForwardingFromConfig:
         assert result["success"] is True
         assert provider.last_call["kwargs"]["language"] is None
         assert provider.last_call["kwargs"]["model"] is None
+
+
+class TestVoiceToolSelectionOverlay:
+    """The unified ``voice_gen`` model-plane selection wins over the
+    legacy ``stt.provider`` config on the ``transcribe_audio`` path and
+    supplies the activated model (mirrors the image tool's ``image_gen``
+    selection rule)."""
+
+    def _run_transcribe(self, stt_config, model=None):
+        from unittest.mock import patch
+        with patch("tools.transcription_tools._validate_audio_file", return_value=None), \
+             patch("tools.transcription_tools._load_stt_config", return_value=stt_config), \
+             patch("tools.transcription_tools.is_stt_enabled", return_value=True), \
+             patch("tools.transcription_tools._get_provider",
+                   return_value=stt_config.get("provider", "local")):
+            return transcription_tools.transcribe_audio("/tmp/audio.mp3", model=model)
+
+    def test_selection_wins_and_supplies_model(self, monkeypatch):
+        provider = _FakeProvider(name="openrouter")
+        capability_module.register_voice_provider("asr", provider)
+        monkeypatch.setattr(
+            "hermes_cli.model_plane.capability.resolve_voice_tool_selection",
+            lambda capability: ("openrouter", "whisper-x"),
+        )
+
+        result = self._run_transcribe({"provider": "openai"})
+
+        assert result["success"] is True
+        assert provider.last_call["kwargs"]["model"] == "whisper-x"
+
+    def test_caller_model_argument_wins_over_selection(self, monkeypatch):
+        provider = _FakeProvider(name="openrouter")
+        capability_module.register_voice_provider("asr", provider)
+        monkeypatch.setattr(
+            "hermes_cli.model_plane.capability.resolve_voice_tool_selection",
+            lambda capability: ("openrouter", "whisper-x"),
+        )
+
+        result = self._run_transcribe({"provider": "openai"}, model="explicit-model")
+
+        assert result["success"] is True
+        assert provider.last_call["kwargs"]["model"] == "explicit-model"
+
+    def test_no_selection_keeps_legacy_provider(self, monkeypatch):
+        provider = _FakeProvider(name="openrouter")
+        capability_module.register_voice_provider("asr", provider)
+        monkeypatch.setattr(
+            "hermes_cli.model_plane.capability.resolve_voice_tool_selection",
+            lambda capability: None,
+        )
+
+        result = self._run_transcribe({"provider": "openrouter"})
+
+        assert result["success"] is True
+        assert provider.last_call["kwargs"]["model"] is None
+
+    def test_resolution_failure_never_blocks_legacy_path(self, monkeypatch):
+        provider = _FakeProvider(name="openrouter")
+        capability_module.register_voice_provider("asr", provider)
+
+        def _boom(capability):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(
+            "hermes_cli.model_plane.capability.resolve_voice_tool_selection",
+            _boom,
+        )
+
+        result = self._run_transcribe({"provider": "openrouter"})
+
+        assert result["success"] is True
+        assert provider.last_call["kwargs"]["model"] is None

@@ -478,6 +478,55 @@ def get_voice_delegate(name: str, capability: str) -> Optional[VoiceCapabilityAd
     return None
 
 
+def resolve_voice_tool_selection(capability: str) -> Optional[tuple[str, str]]:
+    """Return ``(provider_name, model)`` from the unified ``voice_gen`` selection.
+
+    The selection applies only when it names a plugin-registered voice
+    provider serving *capability* whose catalog includes the activated
+    model — an activated ASR model must not steer TTS dispatch, and vice
+    versa. Returns ``None`` when no usable selection exists so callers
+    fall back to their legacy tool config (``tts.provider`` /
+    ``stt.provider``). Provider availability is deliberately NOT checked
+    here: the tool dispatch surfaces an unavailable explicitly-selected
+    plugin with its own actionable error.
+    """
+    if capability not in VOICE_CAPABILITIES:
+        raise ValueError(
+            f"voice capability must be one of {VOICE_CAPABILITIES}, got {capability!r}"
+        )
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception:  # noqa: BLE001 — unreadable config means no selection
+        return None
+    section = cfg.get("voice_gen") if isinstance(cfg, dict) else None
+    if not isinstance(section, dict):
+        return None
+    raw_name = section.get("provider")
+    raw_model = section.get("model")
+    if not (isinstance(raw_name, str) and raw_name.strip()):
+        return None
+    if not (isinstance(raw_model, str) and raw_model.strip()):
+        return None
+    from hermes_cli.plugins import _ensure_plugins_discovered
+
+    _ensure_plugins_discovered()
+    delegate = get_voice_delegate(raw_name, capability)
+    if delegate is None:
+        return None
+    model = raw_model.strip()
+    models = delegate.list_models()
+    if models:
+        catalog_ids = {
+            entry.get("id") if isinstance(entry, dict) else getattr(entry, "id", None)
+            for entry in models
+        }
+        if model not in catalog_ids:
+            return None
+    return delegate.name, model
+
+
 class ProfileEmbeddingError(RuntimeError):
     """A profile-backed embedding request failed without exposing credentials."""
 

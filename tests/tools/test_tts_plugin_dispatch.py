@@ -321,3 +321,47 @@ class TestVoiceCompatibleHelper:
 
         capability_module.register_voice_provider("tts", _ExplodingProvider(name="cartesia"))
         assert tts_tool._plugin_provider_is_voice_compatible("cartesia") is False
+
+
+class TestVoiceToolSelectionOverlay:
+    """``_apply_voice_tool_selection`` — the unified ``voice_gen``
+    model-plane selection wins over the legacy ``tts.provider`` /
+    ``tts.model`` tool config when it names a plugin TTS provider
+    (mirrors the image tool's ``image_gen`` selection rule)."""
+
+    def test_selection_wins_over_legacy_config(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.model_plane.capability.resolve_voice_tool_selection",
+            lambda capability: ("cartesia", "sonic-2"),
+        )
+        provider, config = tts_tool._apply_voice_tool_selection(
+            "edge", {"provider": "edge", "voice": "aria"}
+        )
+        assert provider == "cartesia"
+        assert config["model"] == "sonic-2"
+        assert config["voice"] == "aria"
+
+    def test_no_selection_keeps_legacy_values(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.model_plane.capability.resolve_voice_tool_selection",
+            lambda capability: None,
+        )
+        provider, config = tts_tool._apply_voice_tool_selection(
+            "edge", {"provider": "edge"}
+        )
+        assert provider == "edge"
+        assert "model" not in config
+
+    def test_resolution_failure_never_blocks_legacy_path(self, monkeypatch):
+        def _boom(capability):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(
+            "hermes_cli.model_plane.capability.resolve_voice_tool_selection",
+            _boom,
+        )
+        provider, config = tts_tool._apply_voice_tool_selection(
+            "edge", {"provider": "edge"}
+        )
+        assert provider == "edge"
+        assert config == {"provider": "edge"}
