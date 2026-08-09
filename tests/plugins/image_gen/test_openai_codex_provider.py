@@ -119,7 +119,7 @@ class TestGenerate:
 
         saved = Path(result["image"])
         assert saved.exists()
-        assert saved.parent == tmp_path / "cache" / "images"
+        assert saved.parent == tmp_path / "images"
         # Filename prefix differs from the API-key plugin so cache audits can
         # tell the two backends apart.
         assert saved.name.startswith("openai_codex_")

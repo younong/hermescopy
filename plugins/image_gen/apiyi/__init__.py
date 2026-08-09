@@ -24,6 +24,7 @@ from agent.image_gen_provider import (
     ImageGenProvider,
     error_response,
     normalize_reference_images,
+    nearest_aspect_ratio,
     resolve_aspect_ratio,
     save_b64_image,
     save_url_image,
@@ -72,16 +73,23 @@ _MODELS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# APIYI's regular GPT-Image-2 endpoint exposes these practical sizes. When
+# the requested exact ratio is not available, select the closest supported
+# ratio and return both requested/effective values in the result metadata.
 _SIZES = {
-    "landscape": "1536x1024",
-    "square": "1024x1024",
-    "portrait": "1024x1536",
+    "3:2": "1536x1024",
+    "1:1": "1024x1024",
+    "2:3": "1024x1536",
 }
 
 _GEMINI_ASPECT_RATIOS = {
-    "landscape": "16:9",
-    "square": "1:1",
-    "portrait": "9:16",
+    "16:9": "16:9",
+    "1:1": "1:1",
+    "2:3": "2:3",
+    "3:4": "3:4",
+    "4:3": "4:3",
+    "3:2": "3:2",
+    "9:16": "9:16",
 }
 
 
@@ -280,15 +288,18 @@ def generate_apiyi_image_bytes(
     import requests
 
     model_id, meta = _resolve_model(model)
-    aspect = resolve_aspect_ratio(aspect_ratio)
+    requested_aspect = resolve_aspect_ratio(aspect_ratio)
     if model_id == _NANO_MODEL:
         if references:
             raise ValueError("nano-banana-2 does not accept reference images")
+        effective_aspect = nearest_aspect_ratio(
+            requested_aspect, tuple(_GEMINI_ASPECT_RATIOS)
+        )
         payload = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
                 "responseModalities": ["IMAGE", "TEXT"],
-                "imageConfig": {"aspectRatio": _GEMINI_ASPECT_RATIOS.get(aspect, "1:1")},
+                "imageConfig": {"aspectRatio": _GEMINI_ASPECT_RATIOS[effective_aspect]},
             },
         }
         response = requests.post(
@@ -311,8 +322,17 @@ def generate_apiyi_image_bytes(
             downloaded.raise_for_status()
             mime_type = downloaded.headers.get("Content-Type", "image/png").split(";", 1)[0].lower()
             image_bytes = downloaded.content
-        return {"image_bytes": image_bytes, "mime_type": mime_type, "metadata": {"upstream_model": _upstream_model(model_id)}}
-    size = _SIZES.get(aspect, _SIZES["square"])
+        return {
+            "image_bytes": image_bytes,
+            "mime_type": mime_type,
+            "metadata": {
+                "upstream_model": _upstream_model(model_id),
+                "requested_aspect_ratio": requested_aspect,
+                "effective_aspect_ratio": effective_aspect,
+            },
+        }
+    effective_aspect = nearest_aspect_ratio(requested_aspect, tuple(_SIZES))
+    size = _SIZES[effective_aspect]
     headers = {"Authorization": f"Bearer {api_key}"}
     if references:
         files = [("image", (item["name"], item["data"], item["mime_type"])) for item in references]
@@ -332,7 +352,13 @@ def generate_apiyi_image_bytes(
     payload = response.json()
     image_bytes, mime_type = _decode_apiyi_image_payload(payload)
     _, _, revised_prompt = _extract_openai_image(payload)
-    metadata: Dict[str, Any] = {"size": size, "quality": meta["quality"], "upstream_model": _upstream_model(model_id)}
+    metadata: Dict[str, Any] = {
+        "size": size,
+        "quality": meta["quality"],
+        "upstream_model": _upstream_model(model_id),
+        "requested_aspect_ratio": requested_aspect,
+        "effective_aspect_ratio": effective_aspect,
+    }
     if revised_prompt:
         metadata["revised_prompt"] = revised_prompt
     return {"image_bytes": image_bytes, "mime_type": mime_type, "metadata": metadata}
@@ -452,7 +478,9 @@ class ApiyiImageGenProvider(ImageGenProvider):
 
         upstream = _upstream_model(model_id)
         base_url = _openai_base_url()
-        size = _SIZES.get(aspect, _SIZES["square"])
+        requested_aspect = resolve_aspect_ratio(aspect)
+        effective_aspect = nearest_aspect_ratio(requested_aspect, tuple(_SIZES))
+        size = _SIZES[effective_aspect]
         sources = _collect_sources(image_url, reference_image_urls)[:_MAX_GPT_REFERENCE_IMAGES]
         is_edit = bool(sources)
         headers = {"Authorization": f"Bearer {api_key}"}
@@ -559,6 +587,8 @@ class ApiyiImageGenProvider(ImageGenProvider):
             "upstream_model": upstream,
             "size": size,
             "quality": meta["quality"],
+            "requested_aspect_ratio": aspect,
+            "effective_aspect_ratio": effective_aspect,
         }
         if revised_prompt:
             extra["revised_prompt"] = revised_prompt
@@ -586,6 +616,10 @@ class ApiyiImageGenProvider(ImageGenProvider):
 
         upstream = _upstream_model(model_id)
         base_url = _gemini_base_url()
+        requested_aspect = resolve_aspect_ratio(aspect)
+        effective_aspect = nearest_aspect_ratio(
+            requested_aspect, tuple(_GEMINI_ASPECT_RATIOS)
+        )
         parts: List[Dict[str, Any]] = [{"text": prompt}]
         references = _collect_sources(image_url, reference_image_urls)[:_MAX_NANO_REFERENCE_IMAGES]
         for ref in references:
@@ -606,7 +640,7 @@ class ApiyiImageGenProvider(ImageGenProvider):
             "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {
                 "responseModalities": ["IMAGE", "TEXT"],
-                "imageConfig": {"aspectRatio": _GEMINI_ASPECT_RATIOS.get(aspect, "1:1")},
+                "imageConfig": {"aspectRatio": _GEMINI_ASPECT_RATIOS[effective_aspect]},
             },
         }
         headers = {
@@ -689,7 +723,9 @@ class ApiyiImageGenProvider(ImageGenProvider):
             modality="image" if references else "text",
             extra={
                 "upstream_model": upstream,
-                "aspect_ratio_native": _GEMINI_ASPECT_RATIOS.get(aspect, "1:1"),
+                "aspect_ratio_native": _GEMINI_ASPECT_RATIOS[effective_aspect],
+                "requested_aspect_ratio": requested_aspect,
+                "effective_aspect_ratio": effective_aspect,
             },
         )
 

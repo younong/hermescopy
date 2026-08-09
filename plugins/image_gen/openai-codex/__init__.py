@@ -31,6 +31,7 @@ from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
     ImageGenProvider,
     error_response,
+    nearest_aspect_ratio,
     normalize_reference_images,
     resolve_aspect_ratio,
     save_b64_image,
@@ -70,9 +71,9 @@ _MODELS: Dict[str, Dict[str, Any]] = {
 DEFAULT_MODEL = "gpt-image-2-medium"
 
 _SIZES = {
-    "landscape": "1536x1024",
-    "square": "1024x1024",
-    "portrait": "1024x1536",
+    "3:2": "1536x1024",
+    "1:1": "1024x1024",
+    "2:3": "1024x1536",
 }
 
 # Codex Responses surface used for the request. The chat model itself is only
@@ -506,7 +507,8 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
             )
 
         tier_id, meta = _resolve_model()
-        size = _SIZES.get(aspect, _SIZES["square"])
+        effective_aspect = nearest_aspect_ratio(aspect, tuple(_SIZES))
+        size = _SIZES[effective_aspect]
 
         token = _read_codex_access_token()
         if not token:
@@ -582,7 +584,13 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
             aspect_ratio=aspect,
             provider="openai-codex",
             modality="image" if input_images else "text",
-            extra={"size": size, "quality": meta["quality"], "input_image_count": len(input_images)},
+            extra={
+                "size": size,
+                "quality": meta["quality"],
+                "input_image_count": len(input_images),
+                "requested_aspect_ratio": aspect,
+                "effective_aspect_ratio": effective_aspect,
+            },
         )
 
 

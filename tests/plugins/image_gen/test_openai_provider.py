@@ -146,13 +146,15 @@ class TestGenerate:
 
         assert result["success"] is True
         assert result["model"] == "gpt-image-2-medium"
-        assert result["aspect_ratio"] == "landscape"
+        assert result["aspect_ratio"] == "16:9"
+        assert result["requested_aspect_ratio"] == "16:9"
+        assert result["effective_aspect_ratio"] == "3:2"
         assert result["provider"] == "openai"
         assert result["quality"] == "medium"
 
         saved = Path(result["image"])
         assert saved.exists()
-        assert saved.parent == tmp_path / "cache" / "images"
+        assert saved.parent == tmp_path / "images"
         assert saved.read_bytes() == png_bytes
 
         call_kwargs = fake_client.images.generate.call_args.kwargs
@@ -183,9 +185,9 @@ class TestGenerate:
         assert fake_client.images.generate.call_args.kwargs["model"] == "gpt-image-2"
 
     @pytest.mark.parametrize("aspect,expected_size", [
-        ("landscape", "1536x1024"),
-        ("square", "1024x1024"),
-        ("portrait", "1024x1536"),
+        ("3:2", "1536x1024"),
+        ("1:1", "1024x1024"),
+        ("2:3", "1024x1536"),
     ])
     def test_aspect_ratio_mapping(self, provider, aspect, expected_size):
         fake_client = MagicMock()

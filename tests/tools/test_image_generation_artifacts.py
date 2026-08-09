@@ -56,6 +56,34 @@ def test_postprocess_reads_dimensions_from_final_image_bytes(monkeypatch, tmp_pa
 
     assert result["width"] == 17
     assert result["height"] == 9
+    assert result["actual_aspect_ratio"] == "17:9"
+
+
+def test_postprocess_marks_effective_ratio_mismatch(monkeypatch, tmp_path):
+    from tools import image_generation_tool
+
+    image_path = tmp_path / "generated.png"
+    Image.new("RGB", (17, 9)).save(image_path)
+    monkeypatch.setattr(image_generation_tool, "_active_terminal_env", lambda task_id: None)
+    monkeypatch.setattr(image_generation_tool, "_agent_visible_cache_path", lambda *_args: None)
+
+    result = json.loads(
+        image_generation_tool._postprocess_image_generate_result(
+            json.dumps({
+                "success": True,
+                "image": str(image_path),
+                "aspect_ratio": "1:1",
+                "requested_aspect_ratio": "1:1",
+                "effective_aspect_ratio": "1:1",
+            })
+        )
+    )
+
+    assert result["success"] is False
+    assert result["error_type"] == "aspect_ratio_mismatch"
+    assert result["actual_aspect_ratio"] == "17:9"
+    assert result["width"] == 17
+    assert result["height"] == 9
 
 
 def test_postprocess_maps_docker_cache_path_without_active_env(monkeypatch, tmp_path):

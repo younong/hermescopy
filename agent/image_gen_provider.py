@@ -32,8 +32,11 @@ produce. The tool wrapper JSON-serializes it. Keys:
     image          str | None       URL or absolute file path
     model          str              provider-specific model identifier
     prompt         str              echoed prompt
-    aspect_ratio   str              "landscape" | "square" | "portrait"
+    aspect_ratio   str              canonical exact ratio, e.g. "3:4"
     modality       str              "text" | "image" (which mode was used)
+    width          int              actual output width when verified
+    height         int              actual output height when verified
+    actual_aspect_ratio str          measured output ratio when verified
     provider       str              provider name (for diagnostics)
     error          str              only when success=False
     error_type     str              only when success=False
@@ -45,6 +48,7 @@ import abc
 import base64
 import datetime
 import logging
+import math
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -52,8 +56,17 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
-VALID_ASPECT_RATIOS: Tuple[str, ...] = ("landscape", "square", "portrait")
-DEFAULT_ASPECT_RATIO = "landscape"
+# Canonical ratios are exact strings so a user request can survive provider
+# routing without being confused with a provider-specific "portrait" preset.
+VALID_ASPECT_RATIOS: Tuple[str, ...] = (
+    "1:1", "3:4", "2:3", "4:3", "3:2", "16:9", "9:16",
+)
+DEFAULT_ASPECT_RATIO = "16:9"
+_LEGACY_ASPECT_RATIO_ALIASES = {
+    "landscape": "16:9",
+    "square": "1:1",
+    "portrait": "3:4",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -194,17 +207,50 @@ class ImageGenProvider(abc.ABC):
 
 
 def resolve_aspect_ratio(value: Optional[str]) -> str:
-    """Clamp an aspect_ratio value to the valid set, defaulting to landscape.
+    """Return a canonical exact ratio, accepting legacy directional aliases.
 
-    Invalid values are coerced rather than rejected so the tool surface is
-    forgiving of agent mistakes.
+    Invalid values are coerced rather than rejected so the tool surface remains
+    forgiving of agent mistakes. Providers decide whether an exact ratio is
+    supported; this function must not silently replace one valid ratio with a
+    different valid ratio.
     """
     if not isinstance(value, str):
         return DEFAULT_ASPECT_RATIO
     v = value.strip().lower()
+    if v in _LEGACY_ASPECT_RATIO_ALIASES:
+        return _LEGACY_ASPECT_RATIO_ALIASES[v]
     if v in VALID_ASPECT_RATIOS:
         return v
     return DEFAULT_ASPECT_RATIO
+
+
+def aspect_ratio_value(value: str) -> float:
+    """Return a ratio's numeric width/height value for nearest-ratio selection."""
+    width, separator, height = value.partition(":")
+    if not separator or not width.isdigit() or not height.isdigit() or int(height) <= 0:
+        raise ValueError(f"Invalid aspect ratio: {value!r}")
+    return int(width) / int(height)
+
+
+def nearest_aspect_ratio(value: str, supported: Tuple[str, ...]) -> str:
+    """Choose the mathematically nearest supported canonical ratio."""
+    if not supported:
+        raise ValueError("At least one supported aspect ratio is required")
+    requested = resolve_aspect_ratio(value)
+    return min(
+        supported,
+        key=lambda candidate: abs(
+            aspect_ratio_value(requested) - aspect_ratio_value(candidate)
+        ),
+    )
+
+
+def aspect_ratio_from_dimensions(width: int, height: int) -> str:
+    """Return the reduced width:height ratio for a raster image."""
+    if width <= 0 or height <= 0:
+        raise ValueError("Image dimensions must be positive")
+    divisor = math.gcd(width, height)
+    return f"{width // divisor}:{height // divisor}"
 
 
 def normalize_reference_images(value: Any) -> Optional[List[str]]:

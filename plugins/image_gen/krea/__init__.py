@@ -34,6 +34,7 @@ from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
     ImageGenProvider,
     error_response,
+    nearest_aspect_ratio,
     normalize_reference_images,
     resolve_aspect_ratio,
     save_url_image,
@@ -75,12 +76,15 @@ _MODELS: Dict[str, Dict[str, Any]] = {
 
 DEFAULT_MODEL = "krea-2-medium"
 
-# Hermes uses 3 abstract aspect ratios. Map to Krea's enum (which is wider).
-# Krea accepts: 1:1, 4:3, 3:2, 16:9, 2.35:1, 4:5, 2:3, 9:16
+# Krea accepts a wider set of exact ratios than the common image contract.
 _ASPECT_MAP = {
-    "landscape": "16:9",
-    "square": "1:1",
-    "portrait": "9:16",
+    "1:1": "1:1",
+    "4:3": "4:3",
+    "3:2": "3:2",
+    "16:9": "16:9",
+    "2:3": "2:3",
+    "3:4": "3:4",
+    "9:16": "9:16",
 }
 
 # Only resolution Krea currently supports.
@@ -284,7 +288,8 @@ class KreaImageGenProvider(ImageGenProvider):
     ) -> Dict[str, Any]:
         prompt = (prompt or "").strip()
         aspect = resolve_aspect_ratio(aspect_ratio)
-        krea_ar = _ASPECT_MAP.get(aspect, "1:1")
+        effective_aspect = nearest_aspect_ratio(aspect, tuple(_ASPECT_MAP))
+        krea_ar = _ASPECT_MAP[effective_aspect]
 
         # Collect reference images for reference-guided generation (image-to-
         # image style transfer). Sources, in order:
@@ -715,6 +720,8 @@ class KreaImageGenProvider(ImageGenProvider):
 
         extra: Dict[str, Any] = {
             "krea_aspect_ratio": krea_ar,
+            "requested_aspect_ratio": aspect,
+            "effective_aspect_ratio": effective_aspect,
             "resolution": DEFAULT_RESOLUTION,
             "creativity": creativity,
             "job_id": job_id,

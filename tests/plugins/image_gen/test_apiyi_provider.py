@@ -148,6 +148,8 @@ class TestGenerate:
         assert result["model"] == "gpt-image-2-medium"
         assert result["quality"] == "medium"
         assert result["upstream_model"] == "gpt-image-2"
+        assert result["requested_aspect_ratio"] == "16:9"
+        assert result["effective_aspect_ratio"] == "3:2"
         saved = Path(result["image"])
         assert saved.exists()
         assert saved.parent == tmp_path / "images"
@@ -162,6 +164,22 @@ class TestGenerate:
             "n": 1,
             "quality": "medium",
         }
+
+    def test_gpt_3_4_uses_nearest_supported_size(self, provider, monkeypatch):
+        calls = []
+
+        def fake_post(url, **kwargs):
+            calls.append((url, kwargs))
+            return _Response({"data": [{"b64_json": _b64_png()}]})
+
+        monkeypatch.setattr(requests, "post", fake_post)
+
+        result = provider.generate("a portrait cat", aspect_ratio="3:4")
+
+        assert result["success"] is True
+        assert result["requested_aspect_ratio"] == "3:4"
+        assert result["effective_aspect_ratio"] == "2:3"
+        assert calls[0][1]["json"]["size"] == "1024x1536"
 
     def test_gpt_edit_payload(self, provider, monkeypatch):
         calls = []
@@ -217,7 +235,10 @@ class TestGenerate:
         assert result["success"] is True
         assert result["model"] == "nano-banana-2"
         assert result["upstream_model"] == "gemini-3.1-flash-image-preview"
-        assert result["aspect_ratio_native"] == "9:16"
+        assert result["aspect_ratio"] == "3:4"
+        assert result["requested_aspect_ratio"] == "3:4"
+        assert result["effective_aspect_ratio"] == "3:4"
+        assert result["aspect_ratio_native"] == "3:4"
 
         url, kwargs = calls[0]
         assert url == (
@@ -228,7 +249,7 @@ class TestGenerate:
         payload = kwargs["json"]
         assert payload["contents"][0]["parts"][0] == {"text": "a banana astronaut"}
         assert payload["generationConfig"]["responseModalities"] == ["IMAGE", "TEXT"]
-        assert payload["generationConfig"]["imageConfig"]["aspectRatio"] == "9:16"
+        assert payload["generationConfig"]["imageConfig"]["aspectRatio"] == "3:4"
 
     def test_custom_base_urls_and_model_map(self, provider, monkeypatch, tmp_path):
         import yaml
