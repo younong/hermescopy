@@ -22,7 +22,7 @@ _PROTOCOL_VERSION = 1
 _MAX_PACKET_BYTES = 128 * 1024
 _MAX_FDS = 8
 _RESPONSE_TIMEOUT = 10.0
-_FD_NAMES = ("cwd", "stdout", "stderr", "start", "inference", "image", "resource")
+_FD_NAMES = ("cwd", "stdout", "stderr", "start", "inference", "media", "resource")
 _PIDFD_SYSCALLS = {
     "aarch64": (434, 424),
     "ppc64le": (434, 424),
