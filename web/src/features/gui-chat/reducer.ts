@@ -747,10 +747,23 @@ function extractGeneratedFileReferences(text: string): ExtractedFileReference[] 
   for (const match of text.matchAll(markdownLinkPattern)) {
     candidates.push({ index: match.index ?? 0, path: match[1].trim().replace(/^<|>$/g, "") });
   }
-  const labeledInlinePathPattern = /(?:文件路径|文件地址|file\s*path|saved\s*(?:file\s*)?(?:at|to))\s*[：:]\s*(?:\*{1,2})?\s*`([^`\n]+)`/gi;
-  for (const match of text.matchAll(labeledInlinePathPattern)) {
-    candidates.push({ index: match.index ?? 0, path: match[1].trim() });
-  }
+  const collectPathMatches = (pattern: RegExp) => {
+    for (const match of text.matchAll(pattern)) {
+      const path = match[1] ?? match[2];
+      if (path) candidates.push({ index: match.index ?? 0, path: path.trim() });
+    }
+  };
+  collectPathMatches(
+    /(?:文件路径|文件地址|生成文件|生成路径|下载地址|输出文件|file\s*path|output\s*file|generated\s*file|saved\s*(?:file\s*)?(?:at|to))\s*[：:]\s*(?:\*{1,2})?\s*(?:`([^`\n]+)`|([^\s`]+))/gi,
+  );
+  // Some tools return a contextual label or the generated path on its own
+  // line. Keep both forms line-oriented so ordinary inline code remains prose.
+  collectPathMatches(
+    /^(?=[^\n]*(?:html?|文件|file))(?=[^\n]*(?:生成|下载|创建|保存|写入|完成|created|ready|saved|written|exported))[^\n]*?[：:]\s*(?:\*{1,2})?\s*(?:`([^`\n]+)`|([^\s`\n]+))\s*$/gim,
+  );
+  collectPathMatches(
+    /^\s*`?((?:sandbox:|file:|\/|\.\.?\/)[^`\s]+\.html?)`?\s*$/gim,
+  );
 
   const seen = new Set<string>();
   const refs: ExtractedFileReference[] = [];

@@ -2,7 +2,12 @@ import { describe, expect, it, vi } from "vitest";
 
 import { buildSessionFileDownloadUrl } from "./files";
 import { guiChatReducer } from "./reducer";
-import { initialGuiChatState, type GuiChatState, type ImageArtifactState } from "./types";
+import {
+  initialGuiChatState,
+  type FileArtifactState,
+  type GuiChatState,
+  type ImageArtifactState,
+} from "./types";
 
 const RENDERED_TEXT_TRUNCATION_NOTICE =
   "\n\n[… output truncated in Chat GUI to keep the browser responsive …]";
@@ -21,6 +26,12 @@ function restoreWithMessage(text: string, info?: { cwd?: string; model?: string 
 function imageArtifact(state: GuiChatState, id: string): ImageArtifactState {
   const artifact = state.artifacts[id];
   if (!artifact || artifact.kind === "file") throw new Error(`Expected image artifact ${id}`);
+  return artifact;
+}
+
+function fileArtifact(state: GuiChatState, id: string): FileArtifactState {
+  const artifact = state.artifacts[id];
+  if (!artifact || artifact.kind !== "file") throw new Error(`Expected file artifact ${id}`);
   return artifact;
 }
 
@@ -814,6 +825,34 @@ describe("guiChatReducer history image restoration", () => {
       mimeType: "text/html",
       name: "crow-drinks-water.html",
       sourcePath: "/workspace/crow-drinks-water.html",
+    });
+  });
+
+  it("recognizes generated HTML paths returned on a labeled or standalone line", () => {
+    const labeled = restoreWithMessage(
+      "HTML 文件已生成：\n\n/workspace/user3/generated/report.html",
+      { cwd: "/workspace" },
+    );
+    const labeledArtifact = fileArtifact(labeled, labeled.messages[0].artifactIds[0]);
+    expect(labeledArtifact).toMatchObject({
+      downloadUrl:
+        "/api/files/download?path=%2Fworkspace%2Fuser3%2Fgenerated%2Freport.html&cwd=%2Fworkspace&filename=report.html",
+      kind: "file",
+      mimeType: "text/html",
+      name: "report.html",
+      sourcePath: "/workspace/user3/generated/report.html",
+    });
+
+    const standalone = restoreWithMessage(
+      "文件已生成，下载路径如下：\n`/workspace/user3/generated/standalone.html`",
+      { cwd: "/workspace" },
+    );
+    expect(standalone.messages[0].artifactIds).toHaveLength(1);
+    expect(fileArtifact(standalone, standalone.messages[0].artifactIds[0])).toMatchObject({
+      kind: "file",
+      mimeType: "text/html",
+      name: "standalone.html",
+      sourcePath: "/workspace/user3/generated/standalone.html",
     });
   });
 
