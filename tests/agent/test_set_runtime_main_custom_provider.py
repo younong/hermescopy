@@ -10,6 +10,8 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
+from hermes_cli.deployment_inference import DeploymentInferenceRouteDescriptor
+
 
 def _get_globals(mod):
     """Read runtime globals without triggering redaction."""
@@ -152,6 +154,29 @@ class TestResolveAutoCustomEndToEnd:
             except AttributeError:
                 continue
         return None
+
+    def test_relay_header_follows_selected_model_route(self, monkeypatch):
+        import agent.auxiliary_client as mod
+        from hermes_cli.deployment_inference import DEPLOYMENT_INFERENCE_RELAY_MARKER
+
+        monkeypatch.setattr(
+            "hermes_cli.deployment_inference.route_descriptors_from_control_plane",
+            lambda: (
+                DeploymentInferenceRouteDescriptor(
+                    provider="custom:volcengine-ark",
+                    model="deepseek-v4-pro",
+                    api_mode="chat_completions",
+                ),
+            ),
+        )
+
+        headers = mod._deployment_relay_headers(
+            DEPLOYMENT_INFERENCE_RELAY_MARKER,
+            {"provider": "custom:kimi-code"},
+            model="deepseek-v4-pro",
+        )
+
+        assert headers == {"x-hermes-deployment-provider": "custom:volcengine-ark"}
 
     def test_config_less_custom_endpoint_routes_via_global(self, tmp_path, monkeypatch):
         """custom:<name> with NO config entry: the live base_url carried by

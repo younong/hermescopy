@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import queue
+import re
 import socket
 import struct
 import threading
@@ -45,6 +46,7 @@ _MAX_CONCURRENT_WORKER_REQUESTS = 8
 _MAX_IN_FLIGHT_RESPONSE_FRAMES = 16
 _ALLOWED_PATHS = frozenset({"/v1/chat/completions", "/v1/messages"})
 _PROVIDER_HEADER = "x-hermes-deployment-provider"
+_VERSION_SEGMENT_RE = re.compile(r"^v\d+(?:\.\d+)*$")
 _HOP_BY_HOP_HEADERS = frozenset({
     "authorization",
     "connection",
@@ -543,9 +545,19 @@ class DeploymentInferenceBroker:
             headers["Authorization"] = f"Bearer {runtime['api_key']}"
         headers.setdefault("Content-Type", "application/json")
         upstream_base_url = str(runtime["base_url"]).rstrip("/")
-        if upstream_base_url.endswith("/v1"):
-            upstream_base_url = upstream_base_url[:-3]
-        return upstream_base_url + path, body, headers
+        upstream_path = path
+        base_path = urlparse(upstream_base_url).path.rstrip("/")
+        if base_path and path.startswith("/v1/"):
+            base_segment = base_path.rsplit("/", 1)[-1]
+            if base_segment == "v1":
+                upstream_base_url = upstream_base_url[:-3]
+            elif _VERSION_SEGMENT_RE.fullmatch(base_segment):
+                # Some OpenAI-compatible APIs expose a versioned service root
+                # (for example /api/plan/v3) but omit /v1 from the operation
+                # path.  The relay's worker-facing path is always /v1/*;
+                # don't duplicate that marker upstream.
+                upstream_path = path[3:]
+        return upstream_base_url + upstream_path, body, headers
 
     def _handle_request(
         self,
