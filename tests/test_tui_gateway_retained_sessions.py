@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import threading
 
 import pytest
@@ -91,6 +92,26 @@ class _Transport:
         return None
 
 
+class _CollaborationTransport(_Transport):
+    def __init__(
+        self,
+        mutation_error: str | None = None,
+        *,
+        purpose: str = "interactive",
+    ):
+        super().__init__(purpose)
+        self.mutation_error = mutation_error
+        self.frames = []
+        self.attached = True
+
+    def dashboard_owner_mutation_error(self):
+        return self.mutation_error if self.attached else "dashboard mutation requires an active session"
+
+    def write(self, obj):
+        self.frames.append(obj)
+        return True
+
+
 def _call(runtime: server.OwnerWorkerGatewayRuntime, method: str, params: dict | None = None):
     with server.owner_worker_gateway_runtime(runtime):
         return server.handle_request({"id": "request", "method": method, "params": params or {}})
@@ -178,6 +199,295 @@ def test_employee_policy_accepts_only_retained_channel_and_rejects_runtime_overr
     }
 
 
+def test_web_direct_employee_selection_is_server_resolved_and_context_bound(
+    owner_gateway, monkeypatch
+):
+    _db, runtime, _workspace_root = owner_gateway
+    from hermes_cli.collaboration.models import CollaborationMemberProfile
+    from hermes_cli.collaboration.resolver import ResolvedCollaborationEmployee
+
+    policy = {
+        "schema_version": 1,
+        "account_id": "employee-a",
+        "profile_revision": 3,
+        "source_profile_fingerprint": "sha256:" + "a" * 64,
+        "system_prompt": "Server-authoritative policy",
+        "model": {"provider": "openai", "model": "test-model"},
+        "toolsets": [],
+        "skills": [],
+        "mcp_servers": [],
+        "workspace_relative_path": "employees/analyst",
+        "knowledge_relative_paths": [],
+        "max_iterations": 20,
+        "max_tokens": 2000,
+    }
+
+    class _Resolver:
+        def resolve_current(self, account_id):
+            assert account_id == "employee-a"
+            return ResolvedCollaborationEmployee(
+                member=CollaborationMemberProfile(
+                    "employee-a", 3, "sha256:" + "a" * 64
+                ),
+                employee_policy=policy,
+                may_participate=True,
+                may_create_groups=True,
+                invite_quota=5,
+            )
+
+    class _Service:
+        resolver = _Resolver()
+
+        def source_agent_context(self, **kwargs):
+            from hermes_cli.collaboration.agent_tools import CollaborationAgentContext
+
+            assert kwargs["creator_account_id"] == "employee-a"
+            assert kwargs["source_kind"] == "web_direct"
+            return CollaborationAgentContext(
+                service=self,
+                creator_account_id="employee-a",
+                source_kind="web_direct",
+                source_conversation_id=kwargs["source_conversation_id"],
+                may_create_authorized=True,
+            )
+
+    class _DashboardTransport:
+        def begin_dashboard_attach(self, _generation, **_kwargs):
+            return None
+
+        def commit_dashboard_attach(self, _generation, _sid, *, on_commit):
+            return on_commit()
+
+        def write(self, _payload):
+            return None
+
+    server.bind_collaboration_service(runtime, _Service())
+    monkeypatch.setattr(
+        server, "_dashboard_attach_transport", lambda: _DashboardTransport()
+    )
+    override = _call(
+        runtime,
+        "session.create",
+        {
+            "source": "dashboard-gui",
+            "employee_account_id": "employee-a",
+            "model": "forged-model",
+            "switch_generation": 0,
+        },
+    )
+    assert override["error"] == {
+        "code": 4002,
+        "message": "employee policy cannot be combined with runtime overrides",
+    }
+    assert runtime.mutable_state.sessions == {}
+
+    response = _call(
+        runtime,
+        "session.create",
+        {
+            "source": "dashboard-gui",
+            "employee_account_id": "employee-a",
+            "switch_generation": 1,
+        },
+    )
+
+    assert "error" not in response
+    session = runtime.mutable_state.sessions[response["result"]["session_id"]]
+    assert session["employee_policy"] == policy
+    context = session["collaboration_context"]
+    assert context.creator_account_id == "employee-a"
+    assert context.source_kind == "web_direct"
+    assert context.source_conversation_id == response["result"]["stored_session_id"]
+    assert context.source_depth == 0
+    assert context.may_create_authorized is True
+
+    built = []
+
+    def _capture_build(*_args, **kwargs):
+        built.append(kwargs)
+        raise RuntimeError("stop after trusted build arguments are captured")
+
+    monkeypatch.setattr(server, "_make_agent", _capture_build)
+    with server.owner_worker_gateway_runtime(runtime):
+        server._start_agent_build(response["result"]["session_id"], session)
+    assert session["agent_ready"].wait(timeout=2)
+    assert built == [
+        {
+            "collaboration_context": context,
+            "employee_policy": policy,
+            "model_override": session["model_override"],
+        }
+    ]
+
+
+def test_feishu_direct_context_requires_exact_managed_origin_and_group_gets_no_tool(
+    owner_gateway,
+):
+    _db, runtime, _workspace_root = owner_gateway
+    from hermes_cli.collaboration.agent_tools import CollaborationAgentContext
+
+    policy = {"account_id": "employee-a"}
+
+    class _Resolver:
+        def validate_feishu_origin(self, **kwargs):
+            assert kwargs["account_id"] == "employee-a"
+            assert kwargs["binding_id"] == "binding-a"
+            assert kwargs["conversation_id"] == "oc_direct"
+            if kwargs["account_id"] != "employee-a":
+                raise RuntimeError("forged account")
+
+    class _Service:
+        resolver = _Resolver()
+
+        def source_agent_context(self, **kwargs):
+            return CollaborationAgentContext(
+                service=self,
+                creator_account_id=kwargs["creator_account_id"],
+                source_kind=kwargs["source_kind"],
+                source_conversation_id=kwargs["source_conversation_id"],
+                source_provider=kwargs["source_provider"],
+                source_account_id=kwargs["source_account_id"],
+                source_binding_id=kwargs["source_binding_id"],
+                source_session_id=kwargs["source_session_id"],
+                may_create_authorized=True,
+            )
+
+    service = _Service()
+    server.bind_collaboration_service(runtime, service)
+    direct = {
+        "provider": "feishu",
+        "source_kind": "feishu_direct",
+        "account_id": "employee-a",
+        "binding_id": "binding-a",
+        "conversation_id": "oc_direct",
+        "thread_id": "",
+        "dispatch_scope": "",
+    }
+    with server.owner_worker_gateway_runtime(runtime):
+        token = server.bind_transport(_Transport("retained-channel"))
+        try:
+            context, error = server._trusted_retained_collaboration_context(
+                {"retained_source_context": direct},
+                employee_policy=policy,
+                session_key="session-a",
+            )
+            assert error is None
+            assert context.source_kind == "feishu_direct"
+            assert context.source_binding_id == "binding-a"
+            assert context.allowed_origin_attachment_ids == ()
+
+            group_context, error = server._trusted_retained_collaboration_context(
+                {
+                    "retained_source_context": {
+                        **direct,
+                        "source_kind": "feishu_group",
+                    }
+                },
+                employee_policy=policy,
+                session_key="session-group",
+            )
+            assert error is None
+            assert group_context is None
+
+            forged, error = server._trusted_retained_collaboration_context(
+                {
+                    "retained_source_context": {
+                        **direct,
+                        "account_id": "employee-b",
+                    }
+                },
+                employee_policy=policy,
+                session_key="session-forged",
+            )
+            assert forged is None
+            assert "inconsistent" in error
+        finally:
+            server.reset_transport(token)
+
+
+def test_collaboration_tool_injection_requires_trusted_role_and_creation_authority():
+    from hermes_cli.collaboration.agent_tools import CollaborationAgentContext
+
+    class _Agent:
+        def __init__(self):
+            self.tools = []
+            self.valid_tool_names = set()
+
+    def names(context):
+        agent = _Agent()
+        server._inject_collaboration_agent_tools(agent, context)
+        return agent.valid_tool_names
+
+    base = {
+        "service": object(),
+        "creator_account_id": "employee-a",
+        "source_kind": "web_direct",
+        "source_conversation_id": "session-a",
+    }
+    assert names(CollaborationAgentContext(**base, may_create_authorized=True)) == {
+        "create_internal_group"
+    }
+    assert names(CollaborationAgentContext(**base, may_create_authorized=False)) == set()
+    assert names(
+        CollaborationAgentContext(
+            **base,
+            source_depth=1,
+            may_create_authorized=True,
+        )
+    ) == set()
+    assert names(
+        CollaborationAgentContext(
+            **base,
+            role="member",
+            may_create_authorized=True,
+        )
+    ) == set()
+
+
+def test_web_direct_employee_selection_rejects_policy_and_runtime_forgery(
+    owner_gateway, monkeypatch
+):
+    _db, runtime, _workspace_root = owner_gateway
+    monkeypatch.setattr(server, "_dashboard_attach_transport", lambda: object())
+
+    policy = _call(
+        runtime,
+        "session.create",
+        {
+            "source": "dashboard-gui",
+            "employee_account_id": "employee-a",
+            "employee_policy": {},
+            "switch_generation": 1,
+        },
+    )
+
+    assert policy["error"] == {
+        "code": 4002,
+        "message": "employee policy requires a retained channel connection",
+    }
+    assert runtime.mutable_state.sessions == {}
+
+
+def test_web_direct_employee_selection_requires_dashboard_transport(owner_gateway):
+    _db, runtime, _workspace_root = owner_gateway
+
+    response = _call(
+        runtime,
+        "session.create",
+        {
+            "source": "dashboard-gui",
+            "employee_account_id": "employee-a",
+            "switch_generation": 1,
+        },
+    )
+
+    assert response["error"] == {
+        "code": 4002,
+        "message": "employee direct chat requires a dashboard WebSocket",
+    }
+    assert runtime.mutable_state.sessions == {}
+
+
 def test_owner_worker_list_and_most_recent_hide_legacy_rows(owner_gateway):
     db, runtime, workspace_root = owner_gateway
     _create_owned(db, workspace_root, "legacy", source="cli")
@@ -232,6 +542,87 @@ def test_owner_worker_resume_cannot_override_legacy_stored_source(owner_gateway)
     assert db.get_session("legacy") is not None
 
 
+def test_web_direct_resume_rebuilds_live_authority_and_rejects_identity_mismatch(
+    owner_gateway,
+):
+    _db, runtime, _workspace_root = owner_gateway
+    from hermes_cli.collaboration.models import CollaborationMemberProfile
+    from hermes_cli.collaboration.resolver import ResolvedCollaborationEmployee
+
+    policy = {
+        "account_id": "employee-a",
+        "system_prompt": "Pinned policy",
+    }
+
+    class _Resolver:
+        may_create_groups = False
+        may_participate = True
+
+        def resolve_current(self, account_id):
+            assert account_id == "employee-a"
+            return ResolvedCollaborationEmployee(
+                member=CollaborationMemberProfile(
+                    "employee-a", 1, "sha256:" + "a" * 64
+                ),
+                employee_policy=policy,
+                may_participate=self.may_participate,
+                may_create_groups=self.may_create_groups,
+                invite_quota=5,
+            )
+
+    class _Service:
+        resolver = _Resolver()
+
+        def source_agent_context(self, **kwargs):
+            from hermes_cli.collaboration.agent_tools import CollaborationAgentContext
+
+            resolved = self.resolver.resolve_current(kwargs["creator_account_id"])
+            if not resolved.may_participate:
+                raise RuntimeError("collaboration participation is revoked")
+            return CollaborationAgentContext(
+                service=self,
+                creator_account_id=resolved.member.account_id,
+                source_kind=kwargs["source_kind"],
+                source_conversation_id=kwargs["source_conversation_id"],
+                may_create_authorized=resolved.may_create_groups,
+            )
+
+    service = _Service()
+    server.bind_collaboration_service(runtime, service)
+    row = {
+        "id": "session-a",
+        "model_config": {
+            server._EMPLOYEE_POLICY_CONFIG_KEY: policy,
+            server._WEB_DIRECT_EMPLOYEE_ACCOUNT_CONFIG_KEY: "employee-a",
+        },
+    }
+
+    with server.owner_worker_gateway_runtime(runtime):
+        denied = server._stored_session_runtime_overrides(row)
+        assert denied["employee_policy"] == policy
+        assert denied["collaboration_context"].may_create_authorized is False
+
+        service.resolver.may_create_groups = True
+        allowed = server._stored_session_runtime_overrides(row)
+        assert allowed["collaboration_context"].may_create_authorized is True
+
+        service.resolver.may_participate = False
+        with pytest.raises(RuntimeError, match="participation is revoked"):
+            server._stored_session_runtime_overrides(row)
+        service.resolver.may_participate = True
+
+        with pytest.raises(RuntimeError, match="identity is inconsistent"):
+            server._stored_session_runtime_overrides(
+                {
+                    **row,
+                    "model_config": {
+                        **row["model_config"],
+                        server._WEB_DIRECT_EMPLOYEE_ACCOUNT_CONFIG_KEY: "employee-b",
+                    },
+                }
+            )
+
+
 def test_owner_worker_resume_preserves_retained_stored_source(owner_gateway, monkeypatch):
     db, runtime, workspace_root = owner_gateway
     _create_owned(db, workspace_root, "retained", source="feishu")
@@ -258,3 +649,570 @@ def test_owner_worker_resume_preserves_retained_stored_source(owner_gateway, mon
     assert "error" not in response
     live_id = response["result"]["session_id"]
     assert runtime.mutable_state.sessions[live_id]["source"] == "feishu"
+
+
+def test_collaboration_runner_rebuilds_from_matching_persisted_policy(
+    owner_gateway, monkeypatch
+):
+    db, runtime, _workspace_root = owner_gateway
+    from hermes_cli.collaboration.models import CollaborationMembership
+
+    membership = CollaborationMembership(
+        membership_id="membership-a",
+        group_id="group-a",
+        account_id="employee-a",
+        profile_revision=1,
+        profile_fingerprint="fingerprint-a",
+        hidden_session_id="hidden-a",
+        stored_session_id="stored-a",
+        role="member",
+        join_sequence=1,
+        leave_sequence=None,
+        created_at=1.0,
+        left_at=None,
+    )
+    policy = {
+        "system_prompt": "Pinned policy",
+        "model": {"provider": "openai", "model": "test-model"},
+        "workspace_relative_path": "employees/analyst",
+        "knowledge_relative_paths": ["collaboration-attachments/membership-a"],
+    }
+    runner = server.CollaborationAgentRunner(db, runtime)
+    runner.ensure_member_session(membership=membership, employee_policy=policy)
+    built = []
+
+    class _Agent:
+        def run_conversation(self, *_args, **_kwargs):
+            return {"final_response": "done"}
+
+        def close(self):
+            return None
+
+        def interrupt(self):
+            return None
+
+    def _make_agent(*_args, **kwargs):
+        built.append(kwargs["employee_policy"])
+        return _Agent()
+
+    monkeypatch.setattr(server, "_make_agent", _make_agent)
+    first = runner.run(
+        stored_session_id="stored-a",
+        hidden_session_id="hidden-a",
+        employee_policy=policy,
+        prompt="hello",
+        target_id="target-a",
+        external_receipt_key="receipt-a",
+        on_delta=lambda _text: None,
+        on_approval=lambda _data: None,
+    )
+    runner._agents.clear()
+    second = runner.run(
+        stored_session_id="stored-a",
+        hidden_session_id="hidden-a",
+        employee_policy=policy,
+        prompt="again",
+        target_id="target-b",
+        external_receipt_key="receipt-b",
+        on_delta=lambda _text: None,
+        on_approval=lambda _data: None,
+    )
+
+    assert first["status"] == second["status"] == "complete"
+    assert built == [policy, policy]
+    with pytest.raises(RuntimeError, match="snapshot is inconsistent"):
+        runner.run(
+            stored_session_id="stored-a",
+            hidden_session_id="other-hidden",
+            employee_policy={**policy, "system_prompt": "Browser override"},
+            prompt="unsafe",
+            target_id="target-c",
+            external_receipt_key="receipt-c",
+            on_delta=lambda _text: None,
+            on_approval=lambda _data: None,
+        )
+    runner.close()
+
+
+def test_collaboration_rpc_uses_bound_owner_service_and_redacts_internal_ids(owner_gateway):
+    _db, runtime, _workspace_root = owner_gateway
+
+    class _Service:
+        def get_group(self, group_id, *, after_sequence=None):
+            assert group_id == "group-a"
+            assert after_sequence is None
+            return {
+                "group": {"group_id": group_id},
+                "memberships": [{"membership_id": "member-a"}],
+            }
+
+    server.bind_collaboration_service(runtime, _Service())
+    response = server.dispatch(
+        {
+            "id": "request",
+            "method": "collaboration.group.get",
+            "params": {"group_id": "group-a"},
+        },
+        transport=_CollaborationTransport(),
+        runtime=runtime,
+    )
+
+    assert "error" not in response, response
+    assert response["result"]["memberships"] == [{"membership_id": "member-a"}]
+
+
+def test_direct_collaboration_origin_persists_and_emits_typed_card(owner_gateway, monkeypatch):
+    from hermes_cli.display_transcript import format_display_transcript
+
+    db, runtime, _workspace_root = owner_gateway
+    db.create_session("direct-origin", source="dashboard-gui")
+    session = {
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "session_key": "direct-origin",
+    }
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload: emitted.append((event, sid, payload)),
+    )
+    with server.owner_worker_gateway_runtime(runtime):
+        server._sessions["live-origin"] = session
+        try:
+            server.deliver_web_collaboration_origin(
+                runtime,
+                db,
+                task={
+                    "conversation_id": "direct-origin",
+                    "description": "Review safely",
+                    "group_id": "group-a",
+                    "source_kind": "web_direct",
+                    "summary_text": None,
+                    "task_id": "task-a",
+                    "title": "Safety review",
+                },
+                completion=False,
+            )
+        finally:
+            server._sessions.pop("live-origin", None)
+
+    assert db.get_messages_as_conversation(
+        "direct-origin", include_ancestors=False
+    ) == []
+    display = format_display_transcript(
+        db.get_display_messages("direct-origin", include_ancestors=False)
+    )
+    assert display[0]["collaboration_card"] == {
+        "brief": "Review safely",
+        "group_id": "group-a",
+        "status": "created",
+        "summary": "",
+        "task_id": "task-a",
+        "title": "Safety review",
+    }
+    assert session["history"] == []
+    card_id = display[0]["id"]
+    assert emitted == [
+        (
+            "collaboration.origin.card",
+            "live-origin",
+            {
+                "brief": "Review safely",
+                "card_id": card_id,
+                "group_id": "group-a",
+                "status": "created",
+                "summary": "",
+                "task_id": "task-a",
+                "title": "Safety review",
+            },
+        )
+    ]
+
+
+def test_group_collaboration_origin_persists_typed_card_without_targets(owner_gateway):
+    db, runtime, _workspace_root = owner_gateway
+    from hermes_cli.collaboration.models import CollaborationMemberProfile
+    from hermes_cli.collaboration.store import CollaborationStore
+
+    store = CollaborationStore(db, owner_key="owner-a")
+    source = store.create_group(
+        "Source group",
+        members=[
+            CollaborationMemberProfile(
+                "source-employee", 1, "fingerprint-source-employee-r1"
+            )
+        ],
+    )
+    emitted = []
+
+    class _Service:
+        def __init__(self):
+            self.store = store
+
+        def emit(self, event, payload):
+            emitted.append((event, payload))
+
+    server.bind_collaboration_service(runtime, _Service())
+    task = {
+        "conversation_id": source.group_id,
+        "description": "Review safely",
+        "group_id": "ai-group-a",
+        "source_group_id": source.group_id,
+        "source_kind": "web_group",
+        "summary_text": "Completed; @source-employee is plain summary text.",
+        "task_id": "task-a",
+        "title": "Safety review",
+    }
+    server.deliver_web_collaboration_origin(runtime, db, task=task, completion=False)
+    server.deliver_web_collaboration_origin(runtime, db, task=task, completion=False)
+    server.deliver_web_collaboration_origin(runtime, db, task=task, completion=True)
+    server.deliver_web_collaboration_origin(runtime, db, task=task, completion=True)
+
+    snapshot = store.snapshot_payload(source.group_id)
+    cards = [
+        event for event in snapshot["events"]
+        if event["event_kind"] == "collaboration.origin.card"
+    ]
+    assert len(cards) == 2
+    assert [card["body"] for card in cards] == [
+        {
+            "group_id": "ai-group-a",
+            "status": "created",
+            "task_id": "task-a",
+            "text": "Review safely",
+            "title": "Safety review",
+        },
+        {
+            "group_id": "ai-group-a",
+            "status": "completed",
+            "task_id": "task-a",
+            "text": "Completed; @source-employee is plain summary text.",
+            "title": "Safety review",
+        },
+    ]
+    assert snapshot["turns"] == []
+    assert snapshot["targets"] == []
+    assert len(emitted) == 2
+
+
+def test_collaboration_events_use_gateway_payload_shape(owner_gateway):
+    _db, runtime, _workspace_root = owner_gateway
+    transport = _CollaborationTransport()
+
+    class _Service:
+        def list_groups(self, *, include_archived=False):
+            assert include_archived is False
+            return {"groups": []}
+
+    server.bind_collaboration_service(runtime, _Service())
+    response = server.dispatch(
+        {
+            "id": "request",
+            "method": "collaboration.groups.list",
+            "params": {},
+        },
+        transport=transport,
+        runtime=runtime,
+    )
+    assert response["result"] == {"groups": []}
+    runtime.mutable_state.collaboration_transports.add(transport)
+
+    server.emit_collaboration_event(
+        runtime,
+        "collaboration.execution.delta",
+        {
+            "group_id": "group-a",
+            "target_id": "target-a",
+            "execution_id": "execution-a",
+            "text": "chunk",
+        },
+    )
+
+    assert transport.frames == [
+        {
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {
+                "type": "collaboration.execution.delta",
+                "payload": {
+                    "group_id": "group-a",
+                    "target_id": "target-a",
+                    "execution_id": "execution-a",
+                    "text": "chunk",
+                },
+            },
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("method", "params", "service_method", "expected_args", "expected_kwargs"),
+    [
+        (
+            "collaboration.group.create",
+            {"name": "Group", "account_ids": ["employee-a"], "client_idempotency_key": "create-a"},
+            "create_group",
+            (),
+            {"name": "Group", "account_ids": ["employee-a"], "client_idempotency_key": "create-a"},
+        ),
+        (
+            "collaboration.group.archive",
+            {"group_id": "group-a"},
+            "archive_group",
+            ("group-a",),
+            {},
+        ),
+        (
+            "collaboration.members.update",
+            {"group_id": "group-a", "account_ids": ["employee-a"]},
+            "update_members",
+            ("group-a",),
+            {"account_ids": ["employee-a"]},
+        ),
+    ],
+)
+def test_collaboration_mutations_succeed_from_attached_dashboard(
+    owner_gateway, monkeypatch, method, params, service_method, expected_args, expected_kwargs
+):
+    _db, runtime, _workspace_root = owner_gateway
+    calls = []
+
+    class _Service:
+        def __getattr__(self, name):
+            assert name == service_method
+            return lambda *args, **kwargs: calls.append((args, kwargs)) or {"ok": True}
+
+    transport = _CollaborationTransport()
+    monkeypatch.setattr(server, "_required_gateway_transport", lambda: transport)
+    server.bind_collaboration_service(runtime, _Service())
+    response = server.dispatch(
+        {"id": "request", "method": method, "params": params},
+        transport=transport,
+        runtime=runtime,
+    )
+
+    assert response["result"] == {"ok": True}
+    assert calls == [(expected_args, expected_kwargs)]
+    assert transport in runtime.mutable_state.collaboration_transports
+
+
+def test_collaboration_rpc_rejects_interactive_socket_without_dashboard_scope(owner_gateway):
+    _db, runtime, _workspace_root = owner_gateway
+
+    class _Service:
+        def list_groups(self, **_kwargs):
+            pytest.fail("unattached interactive collaboration RPC must not reach service")
+
+    transport = _CollaborationTransport()
+    transport.attached = False
+    server.bind_collaboration_service(runtime, _Service())
+    response = server.dispatch(
+        {"id": "request", "method": "collaboration.groups.list", "params": {}},
+        transport=transport,
+        runtime=runtime,
+    )
+
+    assert response["error"] == {
+        "code": 4092,
+        "message": "dashboard mutation requires an active session",
+    }
+    assert transport not in runtime.mutable_state.collaboration_transports
+
+
+def test_collaboration_mutation_uses_dashboard_owner_authorization(owner_gateway):
+    _db, runtime, _workspace_root = owner_gateway
+
+    class _Service:
+        def archive_group(self, _group_id):
+            pytest.fail("unauthorized collaboration mutation must not reach service")
+
+    server.bind_collaboration_service(runtime, _Service())
+    response = server.dispatch(
+        {
+            "id": "request",
+            "method": "collaboration.group.archive",
+            "params": {"group_id": "group-a"},
+        },
+        transport=_CollaborationTransport("dashboard session switch in progress"),
+        runtime=runtime,
+    )
+
+    assert response["error"] == {
+        "code": 4092,
+        "message": "dashboard session switch in progress",
+    }
+
+
+@pytest.mark.parametrize(
+    ("method", "params"),
+    [
+        ("collaboration.groups.list", {}),
+        ("collaboration.group.get", {"group_id": "group-a"}),
+        (
+            "collaboration.group.create",
+            {"name": "Group", "account_ids": [], "client_idempotency_key": "create-a"},
+        ),
+        ("collaboration.group.archive", {"group_id": "group-a"}),
+        ("collaboration.members.update", {"group_id": "group-a", "account_ids": []}),
+    ],
+)
+def test_browser_collaboration_rpcs_reject_retained_channel(
+    owner_gateway, method, params
+):
+    _db, runtime, _workspace_root = owner_gateway
+
+    class _Service:
+        def __getattr__(self, _name):
+            return lambda *_args, **_kwargs: pytest.fail(
+                "retained collaboration RPC must not reach service"
+            )
+
+    transport = _CollaborationTransport(purpose="retained-channel")
+    server.bind_collaboration_service(runtime, _Service())
+    response = server.dispatch(
+        {"id": "request", "method": method, "params": params},
+        transport=transport,
+        runtime=runtime,
+    )
+
+    assert response["error"] == {
+        "code": 4092,
+        "message": "browser collaboration requires an interactive connection",
+    }
+    assert transport not in runtime.mutable_state.collaboration_transports
+
+
+def test_collaboration_group_get_forwards_incremental_sequence(owner_gateway):
+    _db, runtime, _workspace_root = owner_gateway
+
+    class _Service:
+        def get_group(self, group_id, *, after_sequence=None):
+            assert group_id == "group-a"
+            assert after_sequence == 7
+            return {"events": [], "reconciliation": {"after_sequence": 7}}
+
+    server.bind_collaboration_service(runtime, _Service())
+    response = server.dispatch(
+        {
+            "id": "request",
+            "method": "collaboration.group.get",
+            "params": {"group_id": "group-a", "after_sequence": 7},
+        },
+        transport=_CollaborationTransport(),
+        runtime=runtime,
+    )
+
+    assert response["result"]["reconciliation"]["after_sequence"] == 7
+
+
+def test_collaboration_byte_upload_and_approval_rpc(owner_gateway):
+    _db, runtime, _workspace_root = owner_gateway
+    calls = []
+
+    class _Service:
+        def attach(self, group_id, **kwargs):
+            calls.append(("attach", group_id, kwargs))
+            return {"attachment": {"attachment_id": "attachment-a"}}
+
+        def respond_approval(self, approval_id, choice):
+            calls.append(("approval", approval_id, choice))
+            return {"approval": {"approval_id": approval_id, "status": "approved"}}
+
+    server.bind_collaboration_service(runtime, _Service())
+    content = base64.b64encode(b"hello").decode("ascii")
+    upload = server.dispatch(
+        {
+            "id": "request",
+            "method": "collaboration.file.attach",
+            "params": {
+                "group_id": "group-a",
+                "filename": "note.txt",
+                "content_base64": content,
+                "media_type": "text/plain",
+            },
+        },
+        transport=_CollaborationTransport(),
+        runtime=runtime,
+    )
+    approval = server.dispatch(
+        {
+            "id": "request",
+            "method": "collaboration.approval.respond",
+            "params": {"approval_id": "approval-a", "choice": "once"},
+        },
+        transport=_CollaborationTransport(),
+        runtime=runtime,
+    )
+
+    assert upload["result"]["attachment"]["attachment_id"] == "attachment-a"
+    assert approval["result"]["approval"]["status"] == "approved"
+    assert calls == [
+        (
+            "attach",
+            "group-a",
+            {
+                "kind": "file",
+                "filename": "note.txt",
+                "content_base64": content,
+                "media_type": "text/plain",
+            },
+        ),
+        ("approval", "approval-a", "once"),
+    ]
+
+
+def test_collaboration_browser_methods_reject_policy_input(owner_gateway):
+    _db, runtime, _workspace_root = owner_gateway
+
+    class _Service:
+        def get_group(self, *_args, **_kwargs):
+            pytest.fail("policy-bearing collaboration input must fail before service")
+
+    server.bind_collaboration_service(runtime, _Service())
+    response = server.dispatch(
+        {
+            "id": "request",
+            "method": "collaboration.group.get",
+            "params": {
+                "group_id": "group-a",
+                "employee_policy": {"system_prompt": "unsafe"},
+            },
+        },
+        transport=_CollaborationTransport(),
+        runtime=runtime,
+    )
+
+    assert response["error"] == {
+        "code": -32602,
+        "message": "collaboration group get params are invalid",
+    }
+
+
+def test_collaboration_message_rejects_browser_attachment_paths(owner_gateway):
+    _db, runtime, _workspace_root = owner_gateway
+
+    class _Service:
+        def submit_message(self, *_args, **_kwargs):
+            pytest.fail("browser attachment input must fail before service")
+
+    server.bind_collaboration_service(runtime, _Service())
+    response = server.dispatch(
+        {
+            "id": "request",
+            "method": "collaboration.message.submit",
+            "params": {
+                "group_id": "group-a",
+                "text": "hello",
+                "attachments": [{"source_path": "/tmp/unsafe"}],
+            },
+        },
+        transport=_CollaborationTransport(),
+        runtime=runtime,
+    )
+
+    assert response["error"] == {
+        "code": -32602,
+        "message": "collaboration message params are invalid",
+    }

@@ -62,6 +62,32 @@ beforeEach(() => {
 });
 
 describe("connectGuiChat", () => {
+  it("sends only the selected employee account ID for a new direct chat", async () => {
+    const connection = connectGuiChat({ ownerKey: "owner-a" });
+
+    await connection.createOrAttach(
+      null,
+      1,
+      undefined,
+      undefined,
+      { employeeAccountId: "employee-a" },
+    );
+
+    expect(mocks.gatewayInstances[0].request).toHaveBeenCalledWith(
+      "session.create",
+      expect.objectContaining({
+        employee_account_id: "employee-a",
+        source: "dashboard-gui",
+        switch_generation: 1,
+      }),
+      undefined,
+      undefined,
+    );
+    expect(mocks.gatewayInstances[0].request.mock.calls[0]?.[1]).not.toHaveProperty(
+      "employee_policy",
+    );
+  });
+
   it("reuses one connection for repeated warm session attaches", async () => {
     const connection = connectGuiChat({ ownerKey: "owner-a" });
     const firstStages: string[] = [];

@@ -381,6 +381,17 @@ class WSTransport:
                 return "dashboard mutation targets an inactive session"
             return None
 
+    def dashboard_owner_mutation_error(self) -> str | None:
+        """Authorize owner-scoped mutations without inventing a chat session ID."""
+        with self._dashboard_lock:
+            if self._dashboard_scope is None:
+                return "dashboard mutation requires an attached WebSocket"
+            if self._dashboard_pending_generation is not None:
+                return "dashboard session switch in progress"
+            if self._dashboard_active_session_id is None:
+                return "dashboard mutation requires an active session"
+            return None
+
     def dashboard_attach_is_current(self, generation: int) -> bool:
         with self._dashboard_lock:
             return (

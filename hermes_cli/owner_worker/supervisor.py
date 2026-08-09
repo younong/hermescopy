@@ -252,6 +252,11 @@ if os.name == "nt":
 
 _OWNER_WORKER_ENV_EXPLICIT_KEEP: frozenset[str] = frozenset({
     "HERMES_DISABLE_LAZY_INSTALLS",
+    # The trusted collaboration resolver reads the same Control Plane store as
+    # connector bootstrap, so the worker needs the two separated keyrings. They
+    # remain process authority and are never passed to the tool executor.
+    "HERMES_ILINK_LOOKUP_KEYS_JSON",
+    "HERMES_ILINK_ENCRYPTION_KEYS_JSON",
     # Operator-owned factory specification, passed to the authenticated worker
     # only so its startup can construct the mandatory deployment policy.
     "HERMES_SANDBOX_DEPLOYMENT_POLICY",

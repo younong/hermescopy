@@ -263,22 +263,27 @@ class TestSessionKeyContext:
         finally:
             approval_module.reset_current_session_key(token)
 
-    def test_gateway_runner_binds_session_key_to_context_before_agent_run(self):
-        run_py = Path(__file__).resolve().parents[2] / "gateway" / "run.py"
-        module = ast.parse(run_py.read_text(encoding="utf-8"))
+    def test_owner_worker_collaboration_runner_binds_session_key_context(self):
+        server_py = Path(__file__).resolve().parents[2] / "tui_gateway" / "server.py"
+        module = ast.parse(server_py.read_text(encoding="utf-8"))
 
-        run_sync = None
-        for node in ast.walk(module):
-            if isinstance(node, ast.FunctionDef) and node.name == "run_sync":
-                run_sync = node
-                break
-
-        assert run_sync is not None, "gateway.run.run_sync not found"
-
-        called_names = set()
-        for node in ast.walk(run_sync):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                called_names.add(node.func.id)
+        run_method = next(
+            node
+            for node in ast.walk(module)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "run"
+            and any(
+                isinstance(parent, ast.ClassDef)
+                and parent.name == "CollaborationAgentRunner"
+                and node in parent.body
+                for parent in ast.walk(module)
+            )
+        )
+        called_names = {
+            call.func.id
+            for call in ast.walk(run_method)
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+        }
 
         assert "set_current_session_key" in called_names
         assert "reset_current_session_key" in called_names

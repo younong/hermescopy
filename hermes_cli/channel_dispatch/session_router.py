@@ -18,6 +18,9 @@ async def open_binding_session(
     title: str,
     dispatch_scope: str = "",
     profile_revision: int | None = None,
+    conversation_kind: str | None = None,
+    conversation_id: str | None = None,
+    thread_id: str = "",
 ) -> tuple[str, str]:
     generation = int(client.handle.worker_generation)
     if client.owner is None:
@@ -38,15 +41,25 @@ async def open_binding_session(
         if source == "feishu":
             if profile_revision is None:
                 raise RuntimeError("managed Feishu session requires a profile revision")
+            exact_kind = str(conversation_kind or "").strip()
+            exact_conversation = str(conversation_id or "").strip()
+            exact_thread = str(thread_id or "")
+            if exact_kind not in {"direct", "group"} or not exact_conversation:
+                raise RuntimeError("verified Feishu conversation metadata is required")
             with store.read() as conn:
                 account = conn.execute(
-                    "SELECT b.account_id FROM channel_bindings b "
+                    "SELECT b.account_id, b.peer_lookup_hash FROM channel_bindings b "
                     "JOIN managed_feishu_accounts m ON m.account_id=b.account_id "
-                    "WHERE b.binding_id=? AND m.lifecycle_status='active'",
+                    "JOIN connector_accounts a ON a.account_id=b.account_id "
+                    "WHERE b.binding_id=? AND b.status='active' AND a.status='active' "
+                    "AND a.provider='feishu' AND m.lifecycle_status='active'",
                     (binding_id,),
                 ).fetchone()
             if account is None:
                 raise RuntimeError("managed Feishu binding is unavailable")
+            expected_peer = store.crypto.lookup_hash("conversation:feishu", exact_conversation)
+            if account["peer_lookup_hash"] != expected_peer:
+                raise RuntimeError("Feishu conversation does not match binding")
             employee = resolve_employee_profile(
                 store,
                 owner=client.owner,
@@ -58,6 +71,17 @@ async def open_binding_session(
                 "profile_revision": employee.revision,
                 "profile_fingerprint": employee.fingerprint,
                 "source_policy": normalize_employee_source_policy(employee.profile),
+            }
+            create_params["retained_source_context"] = {
+                "provider": "feishu",
+                "source_kind": (
+                    "feishu_direct" if exact_kind == "direct" else "feishu_group"
+                ),
+                "account_id": employee.account_id,
+                "binding_id": binding_id,
+                "conversation_id": exact_conversation,
+                "thread_id": exact_thread,
+                "dispatch_scope": exact_scope,
             }
         result = await client.call("session.create", create_params)
         live_id = str(result["session_id"])

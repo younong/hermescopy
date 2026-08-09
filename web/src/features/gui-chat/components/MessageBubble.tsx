@@ -1,4 +1,6 @@
+import { CheckCircle2, ExternalLink, UsersRound } from "lucide-react";
 import { useDeferredValue, useMemo } from "react";
+import { Link } from "react-router-dom";
 
 import { Markdown, type MarkdownFileLink } from "@/components/Markdown";
 import { cn } from "@/lib/utils";
@@ -18,6 +20,33 @@ export function MessageBubble({
   onUseAttachmentAgain?: (attachment: MessageAttachmentState) => void;
 }) {
   const isUser = message.role === "user";
+
+  if (message.collaborationCard) {
+    const card = message.collaborationCard;
+    const completed = card.status === "completed";
+    const Icon = completed ? CheckCircle2 : UsersRound;
+    return (
+      <article className="flex w-full min-w-0 justify-start">
+        <div className="w-full rounded-2xl border border-[#dce4f7] bg-[#f7f9ff] p-4 text-[#283f79]">
+          <div className="flex items-start gap-3">
+            <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[#e6edff] text-[#3867ed]">
+              <Icon className="h-4 w-4" />
+            </span>
+            <div className="min-w-0 flex-1">
+              <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#6f7fa8]">
+                Internal collaboration {card.status}
+              </p>
+              <h3 className="mt-1 text-sm font-semibold text-[#252f4a]">{card.title}</h3>
+              {card.text ? <div className="mt-2 text-xs leading-5 text-[#53617f]"><Markdown content={card.text} /></div> : null}
+              <Link className="mt-3 inline-flex items-center gap-1 text-xs font-semibold text-[#3867ed] hover:text-[#2852c7]" to={`?group=${encodeURIComponent(card.groupId)}`}>
+                Open group <ExternalLink className="h-3 w-3" />
+              </Link>
+            </div>
+          </div>
+        </div>
+      </article>
+    );
+  }
 
   if (isUser) {
     return (

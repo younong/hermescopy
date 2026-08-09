@@ -64,6 +64,62 @@ def store(tmp_path, monkeypatch):
     )
 
 
+def test_collaboration_origin_uses_exact_encrypted_feishu_outbox(store):
+    registered = _register(store, chat_id="oc_direct")
+    outbox = ChannelOutbox(store)
+
+    outbound_id = outbox.enqueue_collaboration_origin(
+        owner_key=registered.owner_key,
+        account_id=registered.account_id,
+        binding_id=registered.binding_id,
+        conversation_id="oc_direct",
+        thread_id="",
+        delivery_key="collaboration:task-a:creation",
+        payload="[Internal collaboration created] Group: Review (cg_a)",
+    )
+    assert outbox.enqueue_collaboration_origin(
+        owner_key=registered.owner_key,
+        account_id=registered.account_id,
+        binding_id=registered.binding_id,
+        conversation_id="oc_direct",
+        thread_id="",
+        delivery_key="collaboration:task-a:creation",
+        payload="[Internal collaboration created] Group: Review (cg_a)",
+    ) == outbound_id
+
+    with store.read() as conn:
+        row = conn.execute(
+            "SELECT * FROM outbound_messages WHERE outbound_id=?", (outbound_id,)
+        ).fetchone()
+        assert conn.execute("SELECT COUNT(*) FROM outbound_messages").fetchone()[0] == 1
+    assert row["source_kind"] == "collaboration"
+    assert row["provider"] == "feishu"
+    assert row["account_id"] == registered.account_id
+    assert row["binding_id"] == registered.binding_id
+    assert row["payload_ciphertext"] != b"[Internal collaboration created] Group: Review (cg_a)"
+
+    with pytest.raises(RuntimeError, match="binding is unavailable"):
+        outbox.enqueue_collaboration_origin(
+            owner_key=registered.owner_key,
+            account_id=registered.account_id,
+            binding_id=registered.binding_id,
+            conversation_id="forged-chat",
+            thread_id="",
+            delivery_key="collaboration:task-a:completion",
+            payload="complete",
+        )
+    with pytest.raises(RuntimeError, match="thread must be empty"):
+        outbox.enqueue_collaboration_origin(
+            owner_key=registered.owner_key,
+            account_id=registered.account_id,
+            binding_id=registered.binding_id,
+            conversation_id="oc_direct",
+            thread_id="forged-thread",
+            delivery_key="collaboration:task-a:completion",
+            payload="complete",
+        )
+
+
 def _register(
     store,
     *,
@@ -784,6 +840,85 @@ async def test_http_transport_classifies_retryable_failures(response, code, retr
             )
     assert str(caught.value) == code
     assert caught.value.retryable is retryable
+    assert caught.value.acceptance_uncertain is False
+
+
+@pytest.mark.asyncio
+async def test_token_transport_failure_is_retryable_but_not_acceptance_uncertain():
+    async def fail_token(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("token timeout")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(fail_token)) as client:
+        transport = FeishuHTTPTransport(client)
+        with pytest.raises(FeishuTransportError) as caught:
+            await transport._access_token(
+                SimpleNamespace(account_id="account-a", credential_version=1),
+                app_id="app-a",
+                app_secret="secret-a",
+                base_url="https://open.feishu.cn",
+            )
+
+    assert caught.value.retryable is True
+    assert caught.value.acceptance_uncertain is False
+
+
+@pytest.mark.asyncio
+async def test_message_transport_failure_is_acceptance_uncertain():
+    async def fail_message(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("message timeout")
+
+    account = SimpleNamespace(
+        account_id="account-a",
+        credential_version=1,
+        credentials={"app_id": "app-a", "app_secret": "secret-a", "domain": "feishu"},
+    )
+    delivery = SimpleNamespace(
+        payload="hello",
+        client_message_id="message-a",
+        context_token=None,
+        next_part_index=0,
+        conversation_id="oc_chat",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(fail_message)) as client:
+        transport = FeishuHTTPTransport(client)
+        transport._tokens[(account.account_id, account.credential_version)] = (
+            "cached-token",
+            9_999_999_999,
+        )
+        with pytest.raises(FeishuTransportError) as caught:
+            await transport.send(account, delivery)
+
+    assert caught.value.retryable is True
+    assert caught.value.acceptance_uncertain is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_code", ["feishu_http_429", "feishu_code_99991400"])
+async def test_sender_requeues_explicit_retryable_collaboration_rejection(store, error_code):
+    registered = _register(store)
+    outbox = ChannelOutbox(store)
+    outbound_id = outbox.enqueue_collaboration_origin(
+        owner_key=_owner("owner-a").owner_key,
+        account_id=registered.account_id,
+        binding_id=registered.binding_id,
+        conversation_id="oc_chat",
+        thread_id="",
+        delivery_key=f"collaboration:{error_code}",
+        payload="completed",
+    )
+    claim = claim_feishu_outbound(store, holder="sender")
+    assert claim is not None
+
+    class Transport:
+        async def send(self, account, delivery):
+            raise FeishuTransportError(error_code, retryable=True)
+
+    sender = FeishuSender(store, Transport(), config={"outbound_max_attempts": 3})
+    assert await sender.send_claim(claim, holder="sender") is False
+    assert outbox.collaboration_delivery_status(outbound_id) == {
+        "status": "queued",
+        "error": error_code,
+    }
 
 
 @pytest.mark.asyncio
@@ -822,6 +957,44 @@ async def test_sender_requeues_retryable_delivery_then_delivers(store):
     assert retry is not None
     assert await sender.send_claim(retry, holder="sender") is True
     assert _outbound_row(store)["status"] == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_sender_marks_uncertain_collaboration_delivery_ambiguous(store):
+    registered = _register(store)
+    outbox = ChannelOutbox(store)
+    outbound_id = outbox.enqueue_collaboration_origin(
+        owner_key=_owner("owner-a").owner_key,
+        account_id=registered.account_id,
+        binding_id=registered.binding_id,
+        conversation_id="oc_chat",
+        thread_id="",
+        delivery_key="collaboration:task-a:completion",
+        payload="completed",
+    )
+    claim = claim_feishu_outbound(store, holder="sender")
+    assert claim is not None and claim.delivery.source_kind == "collaboration"
+
+    class Transport:
+        async def send(self, account, delivery):
+            raise FeishuTransportError(
+                "network_error",
+                retryable=True,
+                acceptance_uncertain=True,
+            )
+
+    sender = FeishuSender(
+        store,
+        Transport(),
+        config={"outbound_max_attempts": 3},
+    )
+    assert await sender.send_claim(claim, holder="sender") is False
+    state = outbox.collaboration_delivery_status(outbound_id)
+    assert state == {
+        "status": "ambiguous",
+        "error": "provider_outcome_uncertain:network_error",
+    }
+    assert claim_feishu_outbound(store, holder="sender") is None
 
 
 @pytest.mark.asyncio

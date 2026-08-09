@@ -124,6 +124,12 @@ class CronJobFire(BaseModel):
     fire_id: str
 
 
+class CollaborationDeliveryAck(BaseModel):
+    outbound_id: str | None = None
+    status: str | None = None
+    error: str | None = None
+
+
 class ModelRegistrationPayload(BaseModel):
     id: str = ""
     name: str
@@ -333,6 +339,8 @@ def create_app(
     async def _lifespan(_: FastAPI):
         relay = None
         media_relay = None
+        collaboration_db = None
+        collaboration_runtime = None
         try:
             relay_fd = os.environ.pop("HERMES_DEPLOYMENT_INFERENCE_RELAY_FD", "").strip()
             if relay_fd:
@@ -357,6 +365,7 @@ def create_app(
                     app.state.deployment_media_relay = media_relay
                 except Exception as exc:
                     raise RuntimeError("deployment media relay startup failed") from exc
+            collaboration_db, collaboration_runtime = _start_collaboration_runtime()
             yield
         finally:
             cleanup_error = None
@@ -373,14 +382,22 @@ def create_app(
                 "gateway_runtime",
                 None,
             )
+            if collaboration_runtime is not None:
+                _cleanup(collaboration_runtime.close)
             if runtime is not None:
                 from tui_gateway.server import (
                     _shutdown_sessions,
+                    bind_collaboration_service,
                     force_owner_worker_gateway_drain,
+                    unbind_gateway_session_db,
                 )
 
+                bind_collaboration_service(runtime, None)
                 _cleanup(lambda: force_owner_worker_gateway_drain(runtime))
                 _cleanup(lambda: _shutdown_sessions(runtime))
+                if collaboration_db is not None:
+                    unbind_gateway_session_db(collaboration_db)
+                    _cleanup(collaboration_db.close)
             os.environ.pop("HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL", None)
             if relay is not None:
                 _cleanup(relay.close)
@@ -517,6 +534,58 @@ def create_app(
         filesystem_context=workspace_context,
         tool_executor_supervisor=app.state.tool_executor_supervisor,
     )
+    gateway_runtime = app.state.owner_worker_live_state.gateway_runtime
+
+    def _start_collaboration_runtime():
+        from hermes_cli.collaboration import (
+            CollaborationEmployeeResolver,
+            CollaborationRuntime,
+        )
+        from hermes_cli.config import load_config
+        from tui_gateway.server import (
+            CollaborationAgentRunner,
+            bind_collaboration_service,
+            bind_gateway_session_db,
+            deliver_web_collaboration_origin,
+            emit_collaboration_event,
+        )
+
+        collaboration_db = SessionDB()
+        try:
+            bind_gateway_session_db(collaboration_db)
+            control_home = Path(
+                str(app.state.owner_worker_control_home)
+            ).expanduser().resolve()
+            collaboration_resolver = CollaborationEmployeeResolver(
+                owner_key=lease.owner_key,
+                control_home=control_home,
+                global_home=control_home.parent,
+                connector_config=load_config().get("channel_connectors") or {},
+            )
+            collaboration_runtime = CollaborationRuntime(
+                collaboration_db,
+                runtime=gateway_runtime,
+                resolver=collaboration_resolver,
+                runner=CollaborationAgentRunner(collaboration_db, gateway_runtime),
+                emit=lambda event, payload: emit_collaboration_event(
+                    gateway_runtime, event, payload
+                ),
+                deliver_web_origin=lambda **kwargs: deliver_web_collaboration_origin(
+                    gateway_runtime, collaboration_db, **kwargs
+                ),
+            )
+            bind_collaboration_service(
+                gateway_runtime, collaboration_runtime.service
+            )
+            collaboration_runtime.start()
+            app.state.collaboration_runtime = collaboration_runtime
+            return collaboration_db, collaboration_runtime
+        except Exception:
+            from tui_gateway.server import unbind_gateway_session_db
+
+            unbind_gateway_session_db(collaboration_db)
+            collaboration_db.close()
+            raise
 
     def _reject_profile(profile: str | None) -> None:
         if profile and str(profile).strip().lower() not in {"default"}:
@@ -1293,6 +1362,55 @@ def create_app(
                 )
                 return executed, delivery
             return True, _run_agent_cron_job(job, fire_id)
+
+    @app.post("/internal/collaboration/deliveries")
+    def pending_collaboration_deliveries(
+        _: None = Depends(_require_owner_token),
+    ) -> dict[str, Any]:
+        runtime = getattr(app.state, "collaboration_runtime", None)
+        if runtime is None:
+            return {"deliveries": []}
+        deliveries = runtime.service.store.pending_origin_deliveries(
+            worker_owner_key=runtime.service.owner_key,
+            worker_id=runtime.service.worker_id,
+            worker_generation=runtime.service.worker_generation,
+            lease_version=runtime.service.lease_version,
+            recovery_generation=runtime.service.recovery_generation,
+        )
+        return {
+            "deliveries": [
+                {
+                    key: item.get(key)
+                    for key in (
+                        "delivery_key", "delivery_kind", "payload_text", "provider",
+                        "account_id", "binding_id", "conversation_id", "thread_id",
+                        "source_session_id", "outbound_id", "worker_owner_key", "worker_id",
+                        "worker_generation", "lease_version", "recovery_generation",
+                    )
+                }
+                for item in deliveries
+            ]
+        }
+
+    @app.post("/internal/collaboration/delivery/{delivery_key}/ack")
+    def ack_collaboration_delivery(
+        delivery_key: str,
+        body: CollaborationDeliveryAck,
+        _: None = Depends(_require_owner_token),
+    ) -> dict[str, bool]:
+        runtime = getattr(app.state, "collaboration_runtime", None)
+        if runtime is None:
+            return {"recorded": False}
+        if body.status not in {None, "delivered", "failed", "ambiguous"}:
+            raise HTTPException(status_code=400, detail="delivery status is invalid")
+        return {
+            "recorded": runtime.service.store.record_origin_delivery_result(
+                delivery_key,
+                outbound_id=body.outbound_id,
+                result_status=body.status,
+                error=body.error,
+            )
+        }
 
     @app.post("/internal/cron/tick")
     def tick_cron_jobs(

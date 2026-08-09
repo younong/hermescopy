@@ -153,6 +153,11 @@ def test_list_and_detail_are_owner_scoped_and_never_return_secrets(authenticated
     payload = detail.json()
     assert payload["app_id"] == "cli_app"
     assert payload["profile"] == _policy()
+    assert payload["collaboration_policy"] == {
+        "may_participate": True,
+        "may_create_groups": False,
+        "invite_quota": 5,
+    }
     serialized = detail.text + listing.text
     for secret in ("private-secret", "encrypt-secret", "verification-secret"):
         assert secret not in serialized
@@ -250,6 +255,69 @@ def test_employee_avatar_upload_has_a_hard_size_limit(authenticated_client, stor
     )
     assert response.status_code == 413
     assert response.json() == {"detail": "Employee avatar is too large"}
+
+
+def test_collaboration_policy_update_is_owner_scoped_and_supports_unlimited(
+    authenticated_client, store
+):
+    client, session, _runtime = authenticated_client
+    registered = _register(store, session)
+
+    response = client.put(
+        f"/api/messaging/feishu/employees/{registered.account_id}/collaboration-policy",
+        json={
+            "may_participate": False,
+            "may_create_groups": True,
+            "invite_quota": None,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["collaboration_policy"] == {
+        "may_participate": False,
+        "may_create_groups": True,
+        "invite_quota": None,
+    }
+    assert client.get(
+        f"/api/messaging/feishu/employees/{registered.account_id}"
+    ).json()["collaboration_policy"] == response.json()["collaboration_policy"]
+
+    other_session = Session(
+        user_id="owner-b",
+        email="b@example.test",
+        display_name="Owner B",
+        org_id="org-a",
+        provider="test",
+        expires_at=9_999_999_999,
+        access_token="other",
+        refresh_token="other",
+    )
+    other = _register(store, other_session, app_id="other_app")
+    assert client.put(
+        f"/api/messaging/feishu/employees/{other.account_id}/collaboration-policy",
+        json={
+            "may_participate": True,
+            "may_create_groups": False,
+            "invite_quota": 1,
+        },
+    ).status_code == 404
+
+
+def test_collaboration_policy_update_rejects_negative_quota(authenticated_client, store):
+    client, session, _runtime = authenticated_client
+    registered = _register(store, session)
+
+    response = client.put(
+        f"/api/messaging/feishu/employees/{registered.account_id}/collaboration-policy",
+        json={
+            "may_participate": True,
+            "may_create_groups": False,
+            "invite_quota": -1,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "invite quota must be a non-negative integer or null"
 
 
 def test_cross_owner_lookup_returns_404(authenticated_client, store):

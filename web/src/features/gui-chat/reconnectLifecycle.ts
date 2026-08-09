@@ -9,7 +9,7 @@ interface ReconnectLifecycleOptions {
   heartbeatIntervalMs?: number;
   ping?(): Promise<void>;
   random?: () => number;
-  reconnect(): number | Promise<number>;
+  reconnect(): number | null | Promise<number | null>;
 }
 
 export class WebSocketReconnectLifecycle {
@@ -144,10 +144,16 @@ export class WebSocketReconnectLifecycle {
         this.reconnectGeneration = reconnect;
         return;
       }
+      if (reconnect === null) {
+        this.scheduleHeartbeat();
+        return;
+      }
       this.reconnectInFlight = true;
       let failed = false;
       void reconnect.then((generation) => {
-        if (!this.disposed) this.reconnectGeneration = generation;
+        if (this.disposed) return;
+        this.reconnectGeneration = generation;
+        if (generation === null && this.connectionState === "open") this.scheduleHeartbeat();
       }).catch(() => {
         failed = true;
       }).finally(() => {

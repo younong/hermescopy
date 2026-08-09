@@ -1403,7 +1403,8 @@ def unregister_gateway_notify(session_key: str) -> None:
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
-                             resolve_all: bool = False) -> int:
+                             resolve_all: bool = False,
+                             tool_call_id: str | None = None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
@@ -1417,7 +1418,19 @@ def resolve_gateway_approval(session_key: str, choice: str,
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
-        if resolve_all:
+        if tool_call_id is not None:
+            target_index = next(
+                (
+                    index
+                    for index, entry in enumerate(queue)
+                    if str(entry.data.get("tool_call_id") or "") == str(tool_call_id)
+                ),
+                None,
+            )
+            if target_index is None:
+                return 0
+            targets = [queue.pop(target_index)]
+        elif resolve_all:
             targets = list(queue)
             queue.clear()
         else:
@@ -2456,6 +2469,8 @@ def check_all_command_guards(command: str, env_type: str,
             from agent.redact import redact_sensitive_text
             approval_data = {
                 "command": redact_sensitive_text(command),
+                "tool_name": "terminal",
+                "tool_call_id": _approval_tool_call_id.get(),
                 "pattern_key": primary_key,
                 "pattern_keys": all_keys,
                 "description": redact_sensitive_text(combined_desc),
@@ -2748,6 +2763,8 @@ def check_execute_code_guard(code: str, env_type: str,
 
     approval_data = {
         "command": display_command,
+        "tool_name": "execute_code",
+        "tool_call_id": _approval_tool_call_id.get(),
         "pattern_key": pattern_key,
         "pattern_keys": [pattern_key],
         "description": display_description,

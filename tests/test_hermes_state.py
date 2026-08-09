@@ -3725,6 +3725,184 @@ class TestListSessionsRich:
         ] == [{"role": "user", "content": "preserve me"}]
         migrated.close()
 
+    def test_v21_migration_rebuilds_collaboration_constraints_and_reopens(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        conn = db._conn
+        now = time.time()
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("DROP TABLE collaboration_origins")
+        conn.execute("DROP TABLE collaboration_tasks")
+        conn.executescript(
+            """
+            CREATE TABLE collaboration_tasks (
+                task_id TEXT PRIMARY KEY,
+                group_id TEXT NOT NULL REFERENCES collaboration_groups(group_id),
+                created_event_id TEXT NOT NULL REFERENCES collaboration_events(event_id),
+                assigned_account_id TEXT,
+                title TEXT NOT NULL CHECK(length(trim(title)) > 0),
+                description TEXT,
+                source_kind TEXT NOT NULL DEFAULT 'owner'
+                    CHECK(source_kind IN ('owner', 'employee', 'ai_collaboration')),
+                status TEXT NOT NULL DEFAULT 'open'
+                    CHECK(status IN ('open', 'claimed', 'completed', 'cancelled', 'ambiguous')),
+                worker_owner_key TEXT, worker_id TEXT, worker_generation INTEGER,
+                lease_version INTEGER, recovery_generation INTEGER,
+                created_at REAL NOT NULL, updated_at REAL NOT NULL, completed_at REAL
+            );
+            CREATE TABLE collaboration_origins (
+                origin_id TEXT PRIMARY KEY,
+                group_id TEXT NOT NULL REFERENCES collaboration_groups(group_id),
+                provider TEXT NOT NULL CHECK(length(trim(provider)) > 0),
+                account_id TEXT,
+                conversation_id TEXT NOT NULL CHECK(length(trim(conversation_id)) > 0),
+                thread_id TEXT NOT NULL DEFAULT '',
+                source_kind TEXT NOT NULL DEFAULT 'external'
+                    CHECK(source_kind IN ('external', 'owner', 'employee', 'ai_collaboration')),
+                created_at REAL NOT NULL,
+                UNIQUE(group_id, provider, account_id, conversation_id, thread_id)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO collaboration_groups "
+            "(group_id, owner_key, name, creator_kind, status, created_at, updated_at) "
+            "VALUES ('legacy-group', 'owner-a', 'Legacy group', 'owner', 'active', ?, ?)",
+            (now, now),
+        )
+        conn.execute(
+            "INSERT INTO collaboration_events "
+            "(event_id, group_id, sequence, event_kind, actor_kind, body_json, created_at) "
+            "VALUES ('legacy-event', 'legacy-group', 1, 'group.created', 'system', '{}', ?)",
+            (now,),
+        )
+        conn.execute(
+            "INSERT INTO collaboration_tasks "
+            "(task_id, group_id, created_event_id, title, description, source_kind, "
+            "status, created_at, updated_at) VALUES "
+            "('legacy-task', 'legacy-group', 'legacy-event', 'Legacy task', "
+            "'Keep this task', 'owner', 'open', ?, ?)",
+            (now, now),
+        )
+        conn.execute(
+            "INSERT INTO collaboration_origins "
+            "(origin_id, group_id, provider, conversation_id, source_kind, created_at) "
+            "VALUES ('legacy-origin', 'legacy-group', 'web', 'conversation-a', "
+            "'owner', ?)",
+            (now,),
+        )
+        conn.execute("UPDATE schema_version SET version = 20")
+        conn.commit()
+        db.close()
+
+        migrated = SessionDB(db_path=db_path)
+        task = migrated._conn.execute(
+            "SELECT title, description, max_rounds, depth, allowed_attachment_ids_json "
+            "FROM collaboration_tasks WHERE task_id='legacy-task'"
+        ).fetchone()
+        assert tuple(task) == ("Legacy task", "Keep this task", 3, 0, "[]")
+        origin = migrated._conn.execute(
+            "SELECT conversation_id, round, depth FROM collaboration_origins "
+            "WHERE origin_id='legacy-origin'"
+        ).fetchone()
+        assert tuple(origin) == ("conversation-a", 0, 0)
+        migrated._conn.execute(
+            "INSERT INTO collaboration_tasks "
+            "(task_id, group_id, created_event_id, title, source_kind, depth, "
+            "created_at, updated_at) VALUES "
+            "('web-task', 'legacy-group', 'legacy-event', 'Web task', 'web_direct', 1, ?, ?)",
+            (now, now),
+        )
+        migrated._conn.execute(
+            "INSERT INTO collaboration_origins "
+            "(origin_id, group_id, provider, conversation_id, source_kind, depth, created_at) "
+            "VALUES ('web-origin', 'legacy-group', 'web', 'group-a', 'web_group', 1, ?)",
+            (now,),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+            migrated._conn.execute(
+                "INSERT INTO collaboration_tasks "
+                "(task_id, group_id, created_event_id, title, source_kind, depth, "
+                "created_at, updated_at) VALUES "
+                "('nested-task', 'legacy-group', 'legacy-event', 'Nested', "
+                "'web_direct', 2, ?, ?)",
+                (now, now),
+            )
+        migrated.close()
+
+        reopened = SessionDB(db_path=db_path)
+        assert tuple(reopened._conn.execute(
+            "SELECT source_kind, depth FROM collaboration_tasks WHERE task_id='web-task'"
+        ).fetchone()) == ("web_direct", 1)
+        assert tuple(reopened._conn.execute(
+            "SELECT source_kind, depth FROM collaboration_origins WHERE origin_id='web-origin'"
+        ).fetchone()) == ("web_group", 1)
+        reopened.close()
+
+    def test_v22_migration_removes_legacy_model_visible_origin_markers(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        db.create_session("legacy-card", "dashboard-gui")
+        db.append_message("legacy-card", "user", "Keep me")
+        db.append_message(
+            "legacy-card",
+            "system",
+            "[Internal collaboration created] Review\n\nBrief\n\nGroup: group-a",
+        )
+        db._conn.execute("UPDATE schema_version SET version = 21")
+        db._conn.commit()
+        db.close()
+
+        migrated = SessionDB(db_path=db_path)
+        assert [
+            (message["role"], message["content"])
+            for message in migrated.get_messages_as_conversation("legacy-card")
+        ] == [("user", "Keep me")]
+        migrated.close()
+
+    def test_session_display_card_is_idempotent_and_excluded_from_model_replay(self, db):
+        db.create_session("card-session", "dashboard-gui")
+        db.append_message("card-session", "user", "Keep this model context")
+        payload = {
+            "task_id": "task-a",
+            "group_id": "group-a",
+            "title": "Review",
+            "brief": "Check safely",
+            "summary": "",
+            "status": "created",
+        }
+        first = db.append_session_display_card(
+            "card-session",
+            card_kind="collaboration_origin",
+            source_id="task-a",
+            status="created",
+            payload=payload,
+        )
+        replay = db.append_session_display_card(
+            "card-session",
+            card_kind="collaboration_origin",
+            source_id="task-a",
+            status="created",
+            payload=payload,
+        )
+
+        assert first["card_id"] == replay["card_id"]
+        model_history = db.get_messages_as_conversation("card-session")
+        assert len(model_history) == 1
+        assert model_history[0]["role"] == "user"
+        assert model_history[0]["content"] == "Keep this model context"
+        display = db.get_display_messages("card-session", include_ancestors=False)
+        assert len(display) == 2
+        assert display[1]["_display_card"] == payload
+        with pytest.raises(RuntimeError, match="replay is inconsistent"):
+            db.append_session_display_card(
+                "card-session",
+                card_kind="collaboration_origin",
+                source_id="task-a",
+                status="created",
+                payload={**payload, "title": "Forged replay"},
+            )
+
     def test_branch_session_visible_after_parent_reopen_and_reend(self, db):
         """Branch sessions stay visible after the parent is reopened and re-ended.
 

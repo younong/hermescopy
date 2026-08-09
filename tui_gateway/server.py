@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator, MutableMapping
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -25,7 +25,10 @@ from hermes_cli.display_transcript import format_display_transcript
 from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_cli.latency_trace import clean_latency_trace_id, log_latency_stage
 from hermes_cli.owner_runtime import is_owner_worker_env, resolve_workspace_cwd
-from hermes_cli.owner_worker.tokens import CONNECTION_PURPOSE_RETAINED_CHANNEL
+from hermes_cli.owner_worker.tokens import (
+    CONNECTION_PURPOSE_INTERACTIVE,
+    CONNECTION_PURPOSE_RETAINED_CHANNEL,
+)
 from gateway.session import (
     current_historical_resume_scope,
     current_recovery_scope,
@@ -160,6 +163,9 @@ class _GatewayMutableState:
     child_mirrors: dict[str, dict] = field(default_factory=dict)
     active_child_runs: dict[str, float] = field(default_factory=dict)
     voice_uploads: dict[str, Any] = field(default_factory=dict)
+    collaboration_service: Any | None = None
+    collaboration_transports: set[Any] = field(default_factory=set)
+    collaboration_lock: threading.RLock = field(default_factory=threading.RLock)
     sessions_lock: threading.RLock = field(default_factory=threading.RLock)
     prompt_lock: threading.Lock = field(default_factory=threading.Lock)
     session_resume_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -293,6 +299,16 @@ _DASHBOARD_MUTATION_METHODS = frozenset(
         "channel.voice.begin",
         "channel.voice.chunk",
         "channel.voice.finish",
+        "collaboration.approval.respond",
+        "collaboration.attachment.upload",
+        "collaboration.file.attach",
+        "collaboration.group.archive",
+        "collaboration.group.create",
+        "collaboration.image.attach",
+        "collaboration.members.update",
+        "collaboration.message.submit",
+        "collaboration.pdf.attach",
+        "collaboration.target.interrupt",
         "image.attach_bytes",
         "pdf.attach",
         "prompt.submit",
@@ -867,6 +883,29 @@ def _get_db():
     return _db
 
 
+def bind_gateway_session_db(db) -> None:
+    """Bind the Owner Worker's one SessionDB before Gateway or collaboration use."""
+    global _db, _db_error
+    if _db is not None and _db is not db:
+        try:
+            same_path = Path(_db.db_path).resolve() == Path(db.db_path).resolve()
+        except Exception:
+            same_path = False
+        if not same_path:
+            # Production has one app per process; this replacement exists for
+            # isolated in-process app tests that construct successive owners.
+            _db.close()
+    _db = db
+    _db_error = None
+
+
+def unbind_gateway_session_db(db) -> None:
+    """Clear the canonical DB only when it still belongs to this worker app."""
+    global _db
+    if _db is db:
+        _db = None
+
+
 def _db_unavailable_error(rid, *, code: int):
     detail = _db_error or "state.db unavailable"
     return _err(rid, code, f"state.db unavailable: {detail}")
@@ -1303,18 +1342,143 @@ def handle_request(req: dict) -> dict | None:
     fn = _methods.get(method)
     if not fn:
         return _err(rid, -32601, f"unknown method: {method}")
-    if method in _DASHBOARD_MUTATION_METHODS:
-        mutation_error = getattr(current_transport(), "dashboard_mutation_error", None)
-        if callable(mutation_error):
-            message = mutation_error(str(params.get("session_id") or "").strip())
-            if message is not None:
-                return _err(rid, 4092, message)
+    transport = current_transport()
+    if method.startswith("collaboration."):
+        if getattr(transport, "connection_purpose", None) != CONNECTION_PURPOSE_INTERACTIVE:
+            return _err(rid, 4092, "browser collaboration requires an interactive connection")
+        owner_scope_error = getattr(transport, "dashboard_owner_mutation_error", None)
+        if not callable(owner_scope_error):
+            return _err(
+                rid,
+                4092,
+                "browser collaboration requires an attached dashboard WebSocket",
+            )
+        message = owner_scope_error()
+        if message is not None:
+            return _err(rid, 4092, message)
+    elif method in _DASHBOARD_MUTATION_METHODS:
+        mutation_error = getattr(transport, "dashboard_mutation_error", None)
+        message = (
+            mutation_error(str(params.get("session_id") or "").strip())
+            if callable(mutation_error)
+            else None
+        )
+        if message is not None:
+            return _err(rid, 4092, message)
     return fn(rid, params)
 
 
 def current_owner_worker_gateway_runtime() -> OwnerWorkerGatewayRuntime | None:
     """Return the authenticated worker fence bound to this dispatch, if any."""
     return _gateway_runtime.get()
+
+
+def bind_collaboration_service(
+    runtime: OwnerWorkerGatewayRuntime,
+    service: Any | None,
+) -> None:
+    """Bind the one Owner Worker collaboration service to the exact runtime."""
+    with runtime.mutable_state.collaboration_lock:
+        runtime.mutable_state.collaboration_service = service
+        if service is None:
+            runtime.mutable_state.collaboration_transports.clear()
+
+
+def _collaboration_service(*, subscribe: bool = False):
+    runtime = current_owner_worker_gateway_runtime()
+    if runtime is None:
+        raise RuntimeError("owner worker gateway runtime is required")
+    service = runtime.mutable_state.collaboration_service
+    if service is None:
+        raise RuntimeError("collaboration runtime is unavailable")
+    if subscribe:
+        # Browser collaboration RPCs are authorized once, before handler dispatch,
+        # so this path only records the already-authorized current transport.
+        transport = _required_gateway_transport()
+        with runtime.mutable_state.collaboration_lock:
+            runtime.mutable_state.collaboration_transports.add(transport)
+    return service
+
+
+def deliver_web_collaboration_origin(
+    runtime: OwnerWorkerGatewayRuntime,
+    db,
+    *,
+    task: dict[str, Any],
+    completion: bool,
+) -> None:
+    """Persist and live-deliver one durable card without scheduling origin targets."""
+    source_kind = str(task.get("source_kind") or "")
+    conversation_id = str(task.get("conversation_id") or "")
+    if source_kind == "web_direct":
+        if db.get_session(conversation_id) is None:
+            raise RuntimeError("web direct collaboration origin is unavailable")
+        payload = {
+            "task_id": str(task["task_id"]),
+            "group_id": str(task["group_id"]),
+            "title": str(task["title"]),
+            "brief": str(task.get("description") or ""),
+            "summary": str(task.get("summary_text") or ""),
+            "status": "completed" if completion else "created",
+        }
+        card = db.append_session_display_card(
+            conversation_id,
+            card_kind="collaboration_origin",
+            source_id=str(task["task_id"]),
+            status=payload["status"],
+            payload=payload,
+        )
+        live = _find_live_session_by_key(conversation_id)
+        if live is not None:
+            sid, _session = live
+            _emit(
+                "collaboration.origin.card",
+                sid,
+                {**payload, "card_id": str(card["card_id"])},
+            )
+        return
+    if source_kind == "web_group":
+        service = runtime.mutable_state.collaboration_service
+        if service is None:
+            raise RuntimeError("collaboration runtime is unavailable")
+        source_group_id = str(task.get("source_group_id") or "")
+        event, created = service.store.append_origin_card(
+            source_group_id,
+            task_id=str(task["task_id"]),
+            collaboration_group_id=str(task["group_id"]),
+            title=str(task["title"]),
+            text=str(task.get("summary_text") or "") if completion else str(task.get("description") or ""),
+            status="completed" if completion else "created",
+        )
+        if created:
+            service.emit("collaboration.event.appended", asdict(event))
+        return
+    raise RuntimeError("web collaboration origin is invalid")
+
+
+def emit_collaboration_event(
+    runtime: OwnerWorkerGatewayRuntime,
+    event: str,
+    payload: dict[str, Any],
+) -> None:
+    """Broadcast one collaboration event to admitted transports for this owner."""
+    frame = {
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {"type": event, "payload": dict(payload)},
+    }
+    with runtime.mutable_state.collaboration_lock:
+        transports = tuple(runtime.mutable_state.collaboration_transports)
+    dead = []
+    for transport in transports:
+        try:
+            if transport.write(frame) is False:
+                dead.append(transport)
+        except Exception:
+            dead.append(transport)
+    if dead:
+        with runtime.mutable_state.collaboration_lock:
+            runtime.mutable_state.collaboration_transports.difference_update(dead)
 
 
 @contextlib.contextmanager
@@ -1483,6 +1647,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["model_override"] = override
                     if policy := current.get("employee_policy"):
                         kw["employee_policy"] = policy
+                    if collaboration_context := current.get("collaboration_context"):
+                        kw["collaboration_context"] = collaboration_context
                     if (reasoning := current.get("create_reasoning_override")) is not None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
@@ -2025,6 +2191,29 @@ def _ensure_session_db_row(session: dict) -> None:
         model_config["service_tier"] = tier
     if employee_policy := session.get("employee_policy"):
         model_config[_EMPLOYEE_POLICY_CONFIG_KEY] = employee_policy
+    collaboration_context = session.get("collaboration_context")
+    if (
+        employee_policy
+        and collaboration_context is not None
+        and getattr(collaboration_context, "source_kind", None) == "web_direct"
+    ):
+        model_config[_WEB_DIRECT_EMPLOYEE_ACCOUNT_CONFIG_KEY] = str(
+            employee_policy["account_id"]
+        )
+    elif (
+        employee_policy
+        and collaboration_context is not None
+        and getattr(collaboration_context, "source_kind", None) == "feishu_direct"
+    ):
+        model_config[_FEISHU_DIRECT_SOURCE_CONFIG_KEY] = {
+            "provider": "feishu",
+            "source_kind": "feishu_direct",
+            "account_id": collaboration_context.source_account_id,
+            "binding_id": collaboration_context.source_binding_id,
+            "conversation_id": collaboration_context.source_conversation_id,
+            "thread_id": collaboration_context.source_thread_id,
+            "source_session_id": collaboration_context.source_session_id,
+        }
     # Branch lineage: stamp the same ``_branched_from`` marker the TUI /branch
     # uses so list_sessions_rich keeps the branch listed and the desktop sidebar
     # can nest it under its parent.
@@ -2543,6 +2732,65 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     employee_policy = model_config.get(_EMPLOYEE_POLICY_CONFIG_KEY)
     if isinstance(employee_policy, dict):
         overrides["employee_policy"] = employee_policy
+    direct_employee_account_id = str(
+        model_config.get(_WEB_DIRECT_EMPLOYEE_ACCOUNT_CONFIG_KEY) or ""
+    ).strip()
+    if direct_employee_account_id:
+        if (
+            not isinstance(employee_policy, dict)
+            or str(employee_policy.get("account_id") or "").strip()
+            != direct_employee_account_id
+        ):
+            raise RuntimeError("web direct employee session identity is inconsistent")
+        session_key = str(row.get("id") or "").strip()
+        if not session_key:
+            raise RuntimeError("web direct employee session identity is invalid")
+        overrides["collaboration_context"] = _web_direct_collaboration_context(
+            service=_collaboration_service(),
+            employee_policy=employee_policy,
+            session_key=session_key,
+        )
+    retained_source = model_config.get(_FEISHU_DIRECT_SOURCE_CONFIG_KEY)
+    if retained_source is not None:
+        if direct_employee_account_id or not isinstance(employee_policy, dict):
+            raise RuntimeError("retained Feishu employee session identity is inconsistent")
+        if not isinstance(retained_source, dict) or set(retained_source) != {
+            "provider", "source_kind", "account_id", "binding_id",
+            "conversation_id", "thread_id", "source_session_id",
+        }:
+            raise RuntimeError("retained Feishu source identity is invalid")
+        service = _collaboration_service()
+        account_id = str(retained_source["account_id"] or "").strip()
+        binding_id = str(retained_source["binding_id"] or "").strip()
+        conversation_id = str(retained_source["conversation_id"] or "").strip()
+        thread_id = str(retained_source["thread_id"] or "")
+        source_session_id = str(retained_source["source_session_id"] or "").strip()
+        if (
+            retained_source["provider"] != "feishu"
+            or retained_source["source_kind"] != "feishu_direct"
+            or account_id != str(employee_policy.get("account_id") or "").strip()
+            or source_session_id != str(row.get("id") or "").strip()
+        ):
+            raise RuntimeError("retained Feishu source identity is inconsistent")
+        service.resolver.validate_feishu_origin(
+            account_id=account_id,
+            binding_id=binding_id,
+            conversation_id=conversation_id,
+            source_kind="feishu_direct",
+            thread_id=thread_id,
+            dispatch_scope="",
+        )
+        overrides["collaboration_context"] = service.source_agent_context(
+            creator_account_id=account_id,
+            source_kind="feishu_direct",
+            source_provider="feishu",
+            source_account_id=account_id,
+            source_binding_id=binding_id,
+            source_conversation_id=conversation_id,
+            source_thread_id=thread_id,
+            source_session_id=source_session_id,
+            allowed_origin_attachment_ids=(),
+        )
 
     return overrides
 
@@ -4711,6 +4959,10 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     employee_policy: dict | None = None,
+    collaboration_context: Any = None,
+    session_kind: str = "conversation",
+    session_visibility: str = "visible",
+    agent_callbacks: dict[str, Any] | None = None,
 ):
     from run_agent import AIAgent
 
@@ -4906,10 +5158,15 @@ def _make_agent(
             None if employee_policy is not None else _load_fallback_model()
         ),
         employee_policy=employee_policy,
-        **_agent_cbs(sid),
+        collaboration_context=collaboration_context,
+        session_kind=session_kind,
+        session_visibility=session_visibility,
+        **(agent_callbacks if agent_callbacks is not None else _agent_cbs(sid)),
     )
     if employee_policy is not None:
         _restrict_employee_agent_tools(agent)
+    if collaboration_context is not None and collaboration_context.role != "member":
+        _inject_collaboration_agent_tools(agent, collaboration_context)
     return agent
 
 
@@ -4924,6 +5181,214 @@ def _restrict_employee_agent_tools(agent) -> None:
     agent.valid_tool_names = set(getattr(agent, "valid_tool_names", set())) - blocked
 
 
+def _inject_collaboration_agent_tools(agent, context) -> None:
+    """Attach only server-bound collaboration capabilities to one eligible Agent."""
+    from hermes_cli.collaboration.agent_tools import tool_definitions
+
+    may_create = (
+        context.role == "source"
+        and int(context.source_depth) == 0
+        and bool(context.may_create_authorized)
+    )
+    schemas = tool_definitions(role=context.role, may_create=may_create)
+    existing = set(getattr(agent, "valid_tool_names", set()))
+    for schema in schemas:
+        name = schema["function"]["name"]
+        if name not in existing:
+            agent.tools.append(schema)
+            agent.valid_tool_names.add(name)
+            existing.add(name)
+
+
+class CollaborationAgentRunner:
+    """Internal-only adapter over the trusted Gateway employee Agent builder."""
+
+    def __init__(self, session_db, runtime: OwnerWorkerGatewayRuntime) -> None:
+        self.session_db = session_db
+        self.runtime = runtime
+        self.service = None
+        self._lock = threading.RLock()
+        self._agents: dict[str, Any] = {}
+
+    def bind_service(self, service) -> None:
+        if self.service is not None:
+            raise RuntimeError("collaboration runner service is already bound")
+        self.service = service
+
+    def ensure_member_session(self, *, membership, employee_policy: dict) -> None:
+        self._ensure_session(
+            stored_session_id=membership.stored_session_id,
+            employee_policy=employee_policy,
+            session_kind="internal_collaboration_member",
+        )
+
+    def provision_member_session(self, membership, employee_policy: dict) -> None:
+        """Insert the durable hidden session on the caller's open transaction."""
+        model = employee_policy["model"]
+        self.session_db._insert_session_row(
+            membership.stored_session_id,
+            source="internal_collaboration",
+            model=str(model["model"]),
+            model_config={
+                "model": model["model"],
+                "provider": model["provider"],
+                **({"base_url": model["base_url"]} if model.get("base_url") else {}),
+                **({"api_mode": model["api_mode"]} if model.get("api_mode") else {}),
+                _EMPLOYEE_POLICY_CONFIG_KEY: employee_policy,
+            },
+            system_prompt=str(employee_policy["system_prompt"]),
+            owner_key=self.runtime.owner_key,
+            worker_generation=self.runtime.worker_generation,
+            session_kind="internal_collaboration_member",
+            visibility="internal",
+            conn=self.session_db._conn,
+        )
+
+    def ensure_coordinator_session(
+        self, *, task_id: str, employee_policy: dict[str, Any]
+    ) -> tuple[str, str]:
+        task_id = str(task_id or "").strip()
+        if not task_id:
+            raise ValueError("collaboration task ID is required")
+        digest = hashlib.sha256(
+            f"{self.runtime.owner_key}\x00{task_id}".encode("utf-8")
+        ).hexdigest()
+        stored_session_id = f"collab_coordinator_{digest}"
+        hidden_session_id = f"collab_coordinator_hidden_{digest}"
+        self._ensure_session(
+            stored_session_id=stored_session_id,
+            employee_policy=employee_policy,
+            session_kind="internal_collaboration_coordinator",
+        )
+        return stored_session_id, hidden_session_id
+
+    def _ensure_session(
+        self,
+        *,
+        stored_session_id: str,
+        employee_policy: dict[str, Any],
+        session_kind: str,
+    ) -> None:
+        model = employee_policy["model"]
+        self.session_db.create_session(
+            stored_session_id,
+            source="internal_collaboration",
+            model=str(model["model"]),
+            model_config={
+                "model": model["model"],
+                "provider": model["provider"],
+                **({"base_url": model["base_url"]} if model.get("base_url") else {}),
+                **({"api_mode": model["api_mode"]} if model.get("api_mode") else {}),
+                _EMPLOYEE_POLICY_CONFIG_KEY: employee_policy,
+            },
+            system_prompt=str(employee_policy["system_prompt"]),
+            owner_key=self.runtime.owner_key,
+            worker_generation=self.runtime.worker_generation,
+            session_kind=session_kind,
+            visibility="internal",
+        )
+
+    def run(
+        self,
+        *,
+        stored_session_id: str,
+        hidden_session_id: str,
+        employee_policy: dict[str, Any],
+        prompt: str,
+        target_id: str,
+        external_receipt_key: str,
+        on_delta,
+        on_approval,
+        collaboration_context=None,
+    ) -> dict[str, Any]:
+        del external_receipt_key
+        stored = self.session_db.get_session(stored_session_id)
+        expected_kind = (
+            "internal_collaboration_coordinator"
+            if getattr(collaboration_context, "role", None) == "coordinator"
+            else "internal_collaboration_member"
+        )
+        if stored is None or stored.get("session_kind") != expected_kind:
+            raise RuntimeError("collaboration Agent session is unavailable")
+        raw_config = stored.get("model_config")
+        try:
+            model_config = (
+                dict(raw_config)
+                if isinstance(raw_config, dict)
+                else json.loads(str(raw_config or "{}"))
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("collaboration member policy is invalid") from exc
+        persisted_policy = model_config.get(_EMPLOYEE_POLICY_CONFIG_KEY)
+        if not isinstance(persisted_policy, dict) or persisted_policy != employee_policy:
+            raise RuntimeError("collaboration member policy snapshot is inconsistent")
+        with self._lock:
+            agent = self._agents.get(hidden_session_id)
+            if agent is None:
+                with owner_worker_gateway_runtime(self.runtime):
+                    agent = _make_agent(
+                        hidden_session_id,
+                        stored_session_id,
+                        session_id=stored_session_id,
+                        session_db=self.session_db,
+                        model_override=persisted_policy["model"],
+                        employee_policy=persisted_policy,
+                        collaboration_context=collaboration_context,
+                        session_kind="internal_collaboration_member",
+                        session_visibility="internal",
+                        agent_callbacks={},
+                    )
+                self._agents[hidden_session_id] = agent
+            elif getattr(agent, "collaboration_context", None) != collaboration_context:
+                raise RuntimeError("collaboration Agent context is inconsistent")
+        from tools.approval import (
+            register_gateway_notify,
+            set_current_session_key,
+            reset_current_session_key,
+            unregister_gateway_notify,
+        )
+
+        approval_token = set_current_session_key(stored_session_id)
+        register_gateway_notify(stored_session_id, on_approval)
+        session_tokens = _set_session_context(stored_session_id)
+        try:
+            with owner_worker_gateway_runtime(self.runtime):
+                result = agent.run_conversation(
+                    prompt,
+                    task_id=stored_session_id,
+                    stream_callback=_bind_owner_runtime_callback(on_delta, self.runtime),
+                    persist_user_message=prompt,
+                )
+        finally:
+            _clear_session_context(session_tokens)
+            unregister_gateway_notify(stored_session_id)
+            reset_current_session_key(approval_token)
+        if isinstance(result, dict):
+            failed = bool(result.get("failed") or result.get("partial") or result.get("error"))
+            status = "interrupted" if result.get("interrupted") else "error" if failed else "complete"
+            text = str(result.get("final_response") or result.get("error") or "")
+            return {"status": status, "text": text}
+        return {"status": "complete", "text": str(result)}
+
+    def interrupt(self, hidden_session_id: str) -> bool:
+        with self._lock:
+            agent = self._agents.get(hidden_session_id)
+        if agent is None:
+            return False
+        agent.interrupt()
+        return True
+
+    def close(self) -> None:
+        with self._lock:
+            agents = tuple(self._agents.values())
+            self._agents.clear()
+        for agent in agents:
+            try:
+                agent.close()
+            except Exception:
+                logger.debug("collaboration agent close failed", exc_info=True)
+
+
 def _init_session(
     sid: str,
     key: str,
@@ -4933,6 +5398,7 @@ def _init_session(
     cwd: str | None = None,
     session_db=None,
     employee_policy: dict | None = None,
+    collaboration_context: Any = None,
 ):
     now = time.time()
     with _sessions_lock:
@@ -4960,6 +5426,7 @@ def _init_session(
             # never leaks into siblings via process-global env vars.
             "model_override": None,
             "employee_policy": employee_policy,
+            "collaboration_context": collaboration_context,
             # Pin async event emissions to whichever transport created the
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": _required_gateway_transport(),
@@ -5453,6 +5920,8 @@ def _inflight_snapshot(session: dict) -> dict | None:
 
 
 _EMPLOYEE_POLICY_CONFIG_KEY = "hermes_employee_policy"
+_WEB_DIRECT_EMPLOYEE_ACCOUNT_CONFIG_KEY = "hermes_web_direct_employee_account_id"
+_FEISHU_DIRECT_SOURCE_CONFIG_KEY = "hermes_feishu_direct_source"
 
 
 def _trusted_employee_policy(params: dict) -> tuple[dict | None, str | None]:
@@ -5530,12 +5999,302 @@ def _trusted_employee_policy(params: dict) -> tuple[dict | None, str | None]:
         return None, "employee policy is invalid"
 
 
+def _trusted_retained_collaboration_context(
+    params: dict,
+    *,
+    employee_policy: dict | None,
+    session_key: str,
+) -> tuple[Any | None, str | None]:
+    raw = params.get("retained_source_context")
+    if raw is None:
+        return None, None
+    if employee_policy is None:
+        return None, "retained collaboration source requires employee policy"
+    transport = current_transport()
+    if getattr(transport, "connection_purpose", None) != CONNECTION_PURPOSE_RETAINED_CHANNEL:
+        return None, "retained collaboration source requires a retained channel connection"
+    runtime = current_owner_worker_gateway_runtime()
+    if runtime is None:
+        return None, "retained collaboration source requires an owner worker runtime"
+    required = {
+        "provider", "source_kind", "account_id", "binding_id",
+        "conversation_id", "thread_id", "dispatch_scope",
+    }
+    if not isinstance(raw, dict) or set(raw) != required:
+        return None, "retained collaboration source is invalid"
+    try:
+        provider = str(raw["provider"] or "").strip()
+        source_kind = str(raw["source_kind"] or "").strip()
+        account_id = str(raw["account_id"] or "").strip()
+        binding_id = str(raw["binding_id"] or "").strip()
+        conversation_id = str(raw["conversation_id"] or "").strip()
+        thread_id = str(raw["thread_id"] or "")
+        dispatch_scope = str(raw["dispatch_scope"] or "")
+        if provider != "feishu" or account_id != str(employee_policy["account_id"]):
+            raise RuntimeError("retained Feishu account is inconsistent")
+        service = _collaboration_service()
+        service.resolver.validate_feishu_origin(
+            account_id=account_id,
+            binding_id=binding_id,
+            conversation_id=conversation_id,
+            source_kind=source_kind,
+            thread_id=thread_id,
+            dispatch_scope=dispatch_scope,
+        )
+        if source_kind == "feishu_group":
+            return None, None
+        if source_kind != "feishu_direct":
+            raise RuntimeError("retained Feishu source kind is invalid")
+        return service.source_agent_context(
+            creator_account_id=account_id,
+            source_kind="feishu_direct",
+            source_provider="feishu",
+            source_account_id=account_id,
+            source_binding_id=binding_id,
+            source_conversation_id=conversation_id,
+            source_thread_id=thread_id,
+            source_session_id=session_key,
+            allowed_origin_attachment_ids=(),
+        ), None
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        return None, str(exc)
+
+
+def _web_direct_employee(
+    params: dict,
+    *,
+    source: str,
+) -> tuple[dict | None, Any | None, str | None]:
+    """Resolve one browser-selected employee from Owner Worker authority."""
+    raw_account_id = params.get("employee_account_id")
+    if raw_account_id is None:
+        return None, None, None
+    account_id = str(raw_account_id or "").strip()
+    if not account_id:
+        return None, None, "employee account ID is required"
+    if source != "dashboard-gui":
+        return None, None, "employee direct chat requires the dashboard GUI source"
+    if _dashboard_attach_transport() is None:
+        return None, None, "employee direct chat requires a dashboard WebSocket"
+    if current_owner_worker_gateway_runtime() is None:
+        return None, None, "employee direct chat requires an owner worker runtime"
+    try:
+        service = _collaboration_service()
+        resolved = service.resolver.resolve_current(account_id)
+        if not resolved.may_participate:
+            raise RuntimeError("collaboration participation is revoked")
+        return resolved.employee_policy, service, None
+    except (TypeError, ValueError, RuntimeError) as exc:
+        return None, None, str(exc)
+
+
+def _web_direct_collaboration_context(
+    *,
+    service: Any,
+    employee_policy: dict[str, Any],
+    session_key: str,
+):
+    return service.source_agent_context(
+        creator_account_id=str(employee_policy["account_id"]),
+        source_kind="web_direct",
+        source_conversation_id=session_key,
+    )
+
+
+def _collaboration_call(rid, callback) -> dict:
+    try:
+        result = callback(_collaboration_service(subscribe=True))
+    except (TypeError, ValueError) as exc:
+        return _err(rid, -32602, str(exc))
+    except RuntimeError as exc:
+        return _err(rid, 4044, str(exc))
+    return _ok(rid, result)
+
+
+@method("collaboration.groups.list")
+def _collaboration_groups_list(rid, params: dict) -> dict:
+    allowed = {"include_archived"}
+    if set(params) - allowed:
+        return _err(rid, -32602, "collaboration groups list params are invalid")
+    return _collaboration_call(
+        rid,
+        lambda service: service.list_groups(
+            include_archived=bool(params.get("include_archived", False))
+        ),
+    )
+
+
+@method("collaboration.group.get")
+def _collaboration_group_get(rid, params: dict) -> dict:
+    if set(params) - {"group_id", "after_sequence"} or "group_id" not in params:
+        return _err(rid, -32602, "collaboration group get params are invalid")
+    after_sequence = params.get("after_sequence")
+    if after_sequence is not None and (isinstance(after_sequence, bool) or not isinstance(after_sequence, int)):
+        return _err(rid, -32602, "after_sequence must be an integer")
+    return _collaboration_call(
+        rid,
+        lambda service: service.get_group(
+            str(params.get("group_id") or ""), after_sequence=after_sequence
+        ),
+    )
+
+
+@method("collaboration.group.create")
+def _collaboration_group_create(rid, params: dict) -> dict:
+    required = {"name", "account_ids", "client_idempotency_key"}
+    if set(params) != required:
+        return _err(rid, -32602, "collaboration group create params are invalid")
+    account_ids = params.get("account_ids", [])
+    if not isinstance(account_ids, list):
+        return _err(rid, -32602, "account_ids must be an array")
+    return _collaboration_call(
+        rid,
+        lambda service: service.create_group(
+            name=str(params.get("name") or ""),
+            account_ids=account_ids,
+            client_idempotency_key=str(params.get("client_idempotency_key") or ""),
+        ),
+    )
+
+
+@method("collaboration.group.archive")
+def _collaboration_group_archive(rid, params: dict) -> dict:
+    if set(params) != {"group_id"}:
+        return _err(rid, -32602, "collaboration group archive params are invalid")
+    return _collaboration_call(
+        rid, lambda service: service.archive_group(str(params.get("group_id") or ""))
+    )
+
+
+@method("collaboration.members.update")
+def _collaboration_members_update(rid, params: dict) -> dict:
+    if set(params) != {"group_id", "account_ids"}:
+        return _err(rid, -32602, "collaboration member update params are invalid")
+    account_ids = params.get("account_ids")
+    if not isinstance(account_ids, list):
+        return _err(rid, -32602, "account_ids must be an array")
+    return _collaboration_call(
+        rid,
+        lambda service: service.update_members(
+            str(params.get("group_id") or ""), account_ids=account_ids
+        ),
+    )
+
+
+def _collaboration_attachment_upload(rid, params: dict, *, kind: str | None = None) -> dict:
+    allowed = {"group_id", "kind", "filename", "name", "content_base64", "data", "data_url", "media_type", "mime_type"}
+    if set(params) - allowed:
+        return _err(rid, -32602, "collaboration attachment params are invalid")
+    resolved_kind = kind or str(params.get("kind") or "file")
+    content = params.get("content_base64") or params.get("data_url") or params.get("data")
+    if not isinstance(content, str) or not content.strip():
+        return _err(rid, -32602, "attachment content is required")
+    return _collaboration_call(
+        rid,
+        lambda service: service.attach(
+            str(params.get("group_id") or ""),
+            kind=resolved_kind,
+            filename=str(params.get("filename") or params.get("name") or "attachment"),
+            content_base64=content,
+            media_type=(
+                str(params.get("media_type") or params.get("mime_type") or "") or None
+            ),
+        ),
+    )
+
+
+@method("collaboration.attachment.upload")
+def _collaboration_attachment_upload_rpc(rid, params: dict) -> dict:
+    return _collaboration_attachment_upload(rid, params)
+
+
+@method("collaboration.image.attach")
+def _collaboration_image_attach(rid, params: dict) -> dict:
+    return _collaboration_attachment_upload(rid, params, kind="image")
+
+
+@method("collaboration.pdf.attach")
+def _collaboration_pdf_attach(rid, params: dict) -> dict:
+    return _collaboration_attachment_upload(rid, params, kind="pdf")
+
+
+@method("collaboration.file.attach")
+def _collaboration_file_attach(rid, params: dict) -> dict:
+    return _collaboration_attachment_upload(rid, params, kind="file")
+
+
+@method("collaboration.message.submit")
+def _collaboration_message_submit(rid, params: dict) -> dict:
+    allowed = {
+        "group_id",
+        "text",
+        "mentioned_membership_ids",
+        "mention_all",
+        "client_idempotency_key",
+        "attachment_ids",
+    }
+    if set(params) - allowed:
+        return _err(rid, -32602, "collaboration message params are invalid")
+    mentions = params.get("mentioned_membership_ids", [])
+    if not isinstance(mentions, list):
+        return _err(rid, -32602, "mentioned_membership_ids must be an array")
+    attachment_ids = params.get("attachment_ids", [])
+    if not isinstance(attachment_ids, list):
+        return _err(rid, -32602, "attachment_ids must be an array")
+    return _collaboration_call(
+        rid,
+        lambda service: service.submit_message(
+            str(params.get("group_id") or ""),
+            text=str(params.get("text") or ""),
+            mentioned_membership_ids=mentions,
+            mention_all=bool(params.get("mention_all", False)),
+            attachment_ids=attachment_ids,
+            client_idempotency_key=(
+                str(params["client_idempotency_key"])
+                if params.get("client_idempotency_key") is not None
+                else None
+            ),
+        ),
+    )
+
+
+@method("collaboration.approval.respond")
+def _collaboration_approval_respond(rid, params: dict) -> dict:
+    if set(params) != {"approval_id", "choice"}:
+        return _err(rid, -32602, "collaboration approval params are invalid")
+    return _collaboration_call(
+        rid,
+        lambda service: service.respond_approval(
+            str(params.get("approval_id") or ""), str(params.get("choice") or "")
+        ),
+    )
+
+
+@method("collaboration.target.interrupt")
+def _collaboration_target_interrupt(rid, params: dict) -> dict:
+    if set(params) != {"target_id"}:
+        return _err(rid, -32602, "collaboration target interrupt params are invalid")
+    return _collaboration_call(
+        rid,
+        lambda service: service.interrupt_target(str(params.get("target_id") or "")),
+    )
+
+
 @method("session.create")
 def _session_create(rid, params: dict) -> dict:
     source = str(params.get("source") or "tui").strip() or "tui"
     employee_policy, employee_error = _trusted_employee_policy(params)
     if employee_error is not None:
         return _err(rid, 4002, employee_error)
+    direct_employee_policy, collaboration_service, employee_error = _web_direct_employee(
+        params,
+        source=source,
+    )
+    if employee_error is not None:
+        return _err(rid, 4002, employee_error)
+    if employee_policy is not None and direct_employee_policy is not None:
+        return _err(rid, 4002, "employee session identity is ambiguous")
+    employee_policy = employee_policy or direct_employee_policy
     if employee_policy is not None and any(
         key in params for key in ("model", "provider", "reasoning_effort", "fast", "cwd")
     ):
@@ -5575,6 +6334,25 @@ def _session_create(rid, params: dict) -> dict:
         key = requested_stored_id
     else:
         key = _new_session_key()
+    collaboration_context = (
+        _web_direct_collaboration_context(
+            service=collaboration_service,
+            employee_policy=employee_policy,
+            session_key=key,
+        )
+        if collaboration_service is not None and employee_policy is not None
+        else None
+    )
+    retained_context, retained_error = _trusted_retained_collaboration_context(
+        params,
+        employee_policy=employee_policy,
+        session_key=key,
+    )
+    if retained_error is not None:
+        return _err(rid, 4002, retained_error)
+    if collaboration_context is not None and retained_context is not None:
+        return _err(rid, 4002, "employee collaboration source is ambiguous")
+    collaboration_context = collaboration_context or retained_context
     cols = int(params.get("cols", 80))
     history = _coerce_seed_history(params.get("messages"))
     title = str(params.get("title") or "").strip()
@@ -5655,6 +6433,7 @@ def _session_create(rid, params: dict) -> dict:
             "last_active": now,
             "model_override": session_model_override,
             "employee_policy": employee_policy,
+            "collaboration_context": collaboration_context,
             "create_reasoning_override": create_reasoning_override,
             "create_service_tier_override": create_service_tier_override,
             "parent_session_id": parent_session_id,
@@ -5954,6 +6733,11 @@ def _deferred_session_record(
         "model_override": model_override,
         "employee_policy": (
             resume_runtime_overrides.get("employee_policy")
+            if isinstance(resume_runtime_overrides, dict)
+            else None
+        ),
+        "collaboration_context": (
+            resume_runtime_overrides.get("collaboration_context")
             if isinstance(resume_runtime_overrides, dict)
             else None
         ),
@@ -6391,8 +7175,10 @@ def _session_resume(rid, params: dict) -> dict:
                     )
                     display_history = display_page["messages"]
                 else:
-                    display_history = _resume_history(
-                        db, target, include_ancestors=True, recovery_scope=recovery_scope
+                    display_history = db.get_display_messages(
+                        target,
+                        include_ancestors=True,
+                        recovery_scope=recovery_scope,
                     )
                 log_latency_stage(
                     logger,
@@ -6515,8 +7301,10 @@ def _session_resume(rid, params: dict) -> dict:
                 )
                 display_history = display_page["messages"]
             else:
-                display_history = _resume_history(
-                    db, target, include_ancestors=True, recovery_scope=recovery_scope
+                display_history = db.get_display_messages(
+                    target,
+                    include_ancestors=True,
+                    recovery_scope=recovery_scope,
                 )
         # The display transcript keeps every row so the user still sees their
         # full history.  The model-fed history is sanitized: a session whose
@@ -6593,6 +7381,9 @@ def _session_resume(rid, params: dict) -> dict:
                 cwd=resume_cwd,
                 session_db=db,
                 employee_policy=stored_runtime_overrides.get("employee_policy"),
+                collaboration_context=stored_runtime_overrides.get(
+                    "collaboration_context"
+                ),
             )
             if sid in _sessions:
                 if stored_runtime_overrides.get("model_override") is not None:
@@ -8628,8 +9419,7 @@ def _(rid, params: dict) -> dict:
                 )
                 history = page["messages"]
             else:
-                history = _resume_history(
-                    db,
+                history = db.get_display_messages(
                     target,
                     include_ancestors=True,
                     recovery_scope=recovery_scope,
@@ -10407,11 +11197,14 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5027, str(e))
 
 
-# Byte-upload attach caps. 25 MB matches Anthropic's per-image limit; 50 MB / 25
-# pages bounds a single PDF drop so it can't blow the context budget.
-_ATTACH_BYTES_MAX_BYTES = 25 * 1024 * 1024
-_PDF_ATTACH_MAX_BYTES = 50 * 1024 * 1024
-_PDF_ATTACH_MAX_PAGES = 25
+# Byte-upload attach caps share the authenticated upload validation limits.
+from hermes_cli.attachment_uploads import (
+    IMAGE_MAX_BYTES as _ATTACH_BYTES_MAX_BYTES,
+    PDF_MAX_BYTES as _PDF_ATTACH_MAX_BYTES,
+    PDF_MAX_PAGES as _PDF_ATTACH_MAX_PAGES,
+    decode_base64_upload as _decode_base64_upload,
+    sanitize_upload_name as _sanitize_upload_name,
+)
 
 # Leading magic bytes → file extension, for filename-less uploads.
 _IMAGE_MAGIC: tuple[tuple[bytes, str], ...] = (
@@ -10424,27 +11217,14 @@ _IMAGE_MAGIC: tuple[tuple[bytes, str], ...] = (
 
 
 def _decode_attach_base64(raw: str, *, mime_prefix: str) -> bytes | None:
-    """Decode a base64 (optionally data-URL-wrapped) payload.
-
-    Accepts ``data:<mime_prefix>...;base64,<b64>`` plus embedded whitespace.
-    Returns the decoded bytes, or ``None`` when the input isn't valid base64.
-    """
-    import base64 as _base64
-    import re as _re
-
-    cleaned = raw.strip()
-    m = _re.match(
-        rf"^data:{_re.escape(mime_prefix)}[a-zA-Z0-9.+-]*;base64,(.*)$",
-        cleaned,
-        _re.DOTALL,
-    )
-    if m:
-        cleaned = m.group(1)
-    cleaned = _re.sub(r"\s+", "", cleaned)
+    """Decode an authenticated base64 upload with the expected media prefix."""
     try:
-        return _base64.b64decode(cleaned, validate=True)
-    except Exception:
+        data, declared = _decode_base64_upload(raw)
+    except ValueError:
         return None
+    if declared is not None and not declared.startswith(mime_prefix):
+        return None
+    return data
 
 
 def _sniff_image_ext(img_bytes: bytes, filename: str = "") -> str:
@@ -10862,12 +11642,7 @@ def _desktop_attachment_dir(session: dict) -> Path:
 
 
 def _sanitize_attachment_name(name: str) -> str:
-    import re as _re
-
-    candidate = Path(str(name or "").strip()).name
-    candidate = _re.sub(r"[\x00-\x1f]+", "_", candidate)
-    candidate = candidate.strip().strip(".")
-    return candidate or "attachment"
+    return _sanitize_upload_name(name)
 
 
 def _unique_attachment_path(root: Path, filename: str) -> Path:

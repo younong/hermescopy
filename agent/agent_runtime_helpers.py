@@ -2210,6 +2210,38 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     elif function_name == "delegate_task":
         def _execute(next_args: dict) -> Any:
             return _finish_agent_tool(agent._dispatch_delegate_task(next_args), next_args)
+    elif getattr(agent, "collaboration_context", None) is not None:
+        from hermes_cli.collaboration.agent_tools import is_collaboration_tool
+
+        if is_collaboration_tool(function_name):
+            def _execute(next_args: dict) -> Any:
+                from hermes_cli.collaboration.agent_tools import invoke
+
+                return _finish_agent_tool(
+                    invoke(
+                        agent.collaboration_context,
+                        function_name,
+                        next_args,
+                        tool_call_id=tool_call_id,
+                    ),
+                    next_args,
+                )
+        else:
+            def _execute(next_args: dict) -> Any:
+                return _ra().handle_function_call(
+                    function_name, next_args, effective_task_id,
+                    tool_call_id=tool_call_id,
+                    session_id=agent.session_id or "",
+                    turn_id=getattr(agent, "_current_turn_id", "") or "",
+                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                    enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                    skip_pre_tool_call_hook=True,
+                    skip_tool_request_middleware=True,
+                    enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                    disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    employee_policy=getattr(agent, "employee_policy", None),
+                    tool_request_middleware_trace=list(_tool_middleware_trace),
+                )
     else:
         def _execute(next_args: dict) -> Any:
             return _ra().handle_function_call(

@@ -522,7 +522,7 @@ class SessionQueryMixin:
         archived_only: bool,
         recovery_scope: dict[str, Any] | None,
     ) -> tuple[str, list[Any], str, list[Any]]:
-        clauses: list[str] = []
+        clauses: list[str] = ["s.visibility = 'visible'"]
         params: list[Any] = []
         scope_clause, scope_params = self._recovery_scope_clause(recovery_scope, alias="s")
         if scope_clause:
@@ -716,6 +716,7 @@ class SessionQueryMixin:
                 JOIN sessions parent ON parent.id = child.parent_session_id
                 WHERE ancestry.depth < 100
                   AND parent.end_reason = 'compression'
+                  AND parent.visibility = child.visibility
                   AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
                   AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
                   AND COALESCE(child.source, '') != 'tool'
@@ -756,6 +757,7 @@ class SessionQueryMixin:
                     SELECT candidate.id
                     FROM sessions candidate
                     WHERE candidate.parent_session_id = chain.id
+                      AND candidate.visibility = parent.visibility
                       AND json_extract(COALESCE(candidate.model_config, '{{}}'), '$._branched_from') IS NULL
                       AND json_extract(COALESCE(candidate.model_config, '{{}}'), '$._delegate_from') IS NULL
                       AND COALESCE(candidate.source, '') != 'tool'
@@ -840,7 +842,8 @@ class SessionQueryMixin:
         )
         with self._lock:
             rows = self._conn.execute(
-                f"SELECT s.id FROM sessions s WHERE s.id IN ({placeholders}){scope_clause}",
+                f"SELECT s.id FROM sessions s WHERE s.id IN ({placeholders}) "
+                f"AND s.visibility = 'visible'{scope_clause}",
                 (*requested, *scope_params),
             ).fetchall()
         visible = {str(row["id"]) for row in rows}
@@ -1042,6 +1045,8 @@ class SessionQueryMixin:
                     SELECT child.id FROM sessions parent
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.id = ? AND parent.end_reason = 'compression'
+                      AND parent.visibility = 'visible'
+                      AND child.visibility = 'visible'
                       {scope_clause} {lineage_scope}
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
@@ -1151,7 +1156,7 @@ class SessionQueryMixin:
         scope_clause, scope_params = self._recovery_scope_clause(recovery_scope)
         with self._lock:
             row = self._conn.execute(
-                f"SELECT * FROM sessions WHERE id = ?{scope_clause}",
+                f"SELECT * FROM sessions WHERE id = ? AND visibility = 'visible'{scope_clause}",
                 (session_id, *scope_params),
             ).fetchone()
         return dict(row) if row else None
@@ -1165,7 +1170,7 @@ class SessionQueryMixin:
         scope_clause, scope_params = self._recovery_scope_clause(recovery_scope)
         with self._lock:
             exact = self._conn.execute(
-                f"SELECT id FROM sessions WHERE id = ?{scope_clause}",
+                f"SELECT id FROM sessions WHERE id = ? AND visibility = 'visible'{scope_clause}",
                 (session_id_or_prefix, *scope_params),
             ).fetchone()
         if exact:
@@ -1177,7 +1182,8 @@ class SessionQueryMixin:
         )
         with self._lock:
             rows = self._conn.execute(
-                f"SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\'{scope_clause} "
+                f"SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' "
+                f"AND visibility = 'visible'{scope_clause} "
                 "ORDER BY started_at DESC LIMIT 2",
                 (f"{escaped}%", *scope_params),
             ).fetchall()
@@ -1213,6 +1219,15 @@ class SessionQueryMixin:
         """
         if not session_id:
             return session_id
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT visibility FROM sessions WHERE id=?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return session_id
+        if row["visibility"] != "visible":
+            return ""
 
         # Follow the compression-continuation chain forward to the live tip
         # FIRST. Auto-compression ends the current session and forks a
@@ -1256,7 +1271,7 @@ class SessionQueryMixin:
                 # predicate rather than trusting lineage IDs from a previous hop.
                 try:
                     row = self._conn.execute(
-                        f"SELECT 1 FROM sessions WHERE id = ?{scope_clause} "
+                        f"SELECT 1 FROM sessions WHERE id = ? AND visibility = 'visible'{scope_clause} "
                         "AND EXISTS (SELECT 1 FROM messages WHERE session_id = sessions.id LIMIT 1)",
                         (current, *scope_params),
                     ).fetchone()
@@ -1276,6 +1291,7 @@ class SessionQueryMixin:
                         f"SELECT child.id FROM sessions child "
                         "JOIN sessions parent ON parent.id = child.parent_session_id "
                         "WHERE child.parent_session_id = ? "
+                        "  AND parent.visibility = 'visible' AND child.visibility = 'visible' "
                         f"  {scope_clause.replace('sessions.', 'child.')} "
                         f"{lineage_scope_clause}"
                         "  AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL "
@@ -1487,6 +1503,11 @@ class SessionQueryMixin:
                 msg["_display_tool_name"], msg["_display_tool_args"] = tool_calls[call_id]
 
         filtered_count = len(page_rows) - len(messages)
+        newest_page = before_cursor is None
+        if newest_page:
+            messages = self._merge_display_rows(
+                messages, self.get_session_display_cards(session_ids)
+            )
         messages, budget_omitted_count = self._bound_conversation_page_messages(messages)
         filtered_count += budget_omitted_count
         raw_has_more = len(rows_desc) > safe_limit
@@ -1536,12 +1557,35 @@ class SessionQueryMixin:
                 recovery_scope=recovery_scope,
             )
             messages = page["messages"] + messages
-            if not page["has_more"]:
+            if not page["has_more"] or not page["next_cursor"]:
                 return messages
             cursor = page["next_cursor"]
-            if not cursor:
-                return messages
 
+    @staticmethod
+    def _merge_display_rows(
+        messages: List[dict[str, Any]], cards: List[dict[str, Any]]
+    ) -> List[dict[str, Any]]:
+        merged = list(messages)
+        for card in cards:
+            payload = card.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            merged.append(
+                {
+                    "role": "system",
+                    "content": "",
+                    "timestamp": card["created_at"],
+                    "_display_card_id": card["card_id"],
+                    "_display_card": payload,
+                }
+            )
+        merged.sort(
+            key=lambda item: (
+                float(item.get("timestamp") or 0),
+                str(item.get("_display_card_id") or ""),
+            )
+        )
+        return merged
 
     def search_messages(
         self,
@@ -1616,7 +1660,7 @@ class SessionQueryMixin:
         scope_clause, scope_params = self._recovery_scope_clause(
             recovery_scope, alias="s"
         )
-        where_clauses = ["messages_fts MATCH ?"]
+        where_clauses = ["messages_fts MATCH ?", "s.visibility = 'visible'"]
         params: list = [query]
         if scope_clause:
             where_clauses.append(scope_clause.removeprefix(" AND "))
@@ -1707,7 +1751,7 @@ class SessionQueryMixin:
                     else:
                         parts.append('"' + tok.replace('"', '""') + '"')
                 trigram_query = " ".join(parts)
-                tri_where = ["messages_fts_trigram MATCH ?"]
+                tri_where = ["messages_fts_trigram MATCH ?", "s.visibility = 'visible'"]
                 tri_params: list = [trigram_query]
                 if scope_clause:
                     tri_where.append(scope_clause.removeprefix(" AND "))
@@ -1773,7 +1817,7 @@ class SessionQueryMixin:
                         "(m.content LIKE ? ESCAPE '\\' OR m.tool_name LIKE ? ESCAPE '\\' OR m.tool_calls LIKE ? ESCAPE '\\')"
                     )
                     like_params += [f"%{esc}%", f"%{esc}%", f"%{esc}%"]
-                like_where = [f"({' OR '.join(token_clauses)})"]
+                like_where = [f"({' OR '.join(token_clauses)})", "s.visibility = 'visible'"]
                 if scope_clause:
                     like_where.append(scope_clause.removeprefix(" AND "))
                     like_params.extend(scope_params)
@@ -1989,7 +2033,8 @@ class SessionQueryMixin:
         with self._lock:
             row = self._conn.execute(
                 "SELECT COUNT(*) FROM sessions s "
-                "WHERE s.message_count = 0 AND s.ended_at IS NOT NULL AND s.archived = 0"
+                "WHERE s.message_count = 0 AND s.ended_at IS NOT NULL "
+                "AND s.archived = 0 AND s.visibility = 'visible'"
                 f"{scope_clause}",
                 scope_params,
             ).fetchone()
@@ -2060,18 +2105,27 @@ class SessionQueryMixin:
         current = session_id
         seen: set[str] = set()
         with self._lock:
+            first = self._conn.execute(
+                f"SELECT parent_session_id, visibility FROM sessions "
+                f"WHERE id = ?{scope_clause}",
+                (current, *scope_params),
+            ).fetchone()
+            if first is None:
+                return [session_id]
+            lineage_visibility = str(first["visibility"])
+            row = first
             for _ in range(100):
-                if not current or current in seen:
-                    break
-                row = self._conn.execute(
-                    f"SELECT parent_session_id FROM sessions WHERE id = ?{scope_clause}",
-                    (current, *scope_params),
-                ).fetchone()
-                if row is None:
+                if not current or current in seen or row is None:
                     break
                 seen.add(current)
                 chain.append(current)
                 current = row["parent_session_id"]
+                if current:
+                    row = self._conn.execute(
+                        f"SELECT parent_session_id, visibility FROM sessions "
+                        f"WHERE id = ? AND visibility = ?{scope_clause}",
+                        (current, lineage_visibility, *scope_params),
+                    ).fetchone()
         return list(reversed(chain)) or [session_id]
 
     def display_message_count(

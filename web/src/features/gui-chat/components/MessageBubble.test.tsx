@@ -2,6 +2,7 @@
 
 import { act } from "react";
 import { createRoot } from "react-dom/client";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ChatMessage, FileArtifactState } from "../types";
@@ -13,6 +14,40 @@ afterEach(() => {
 });
 
 describe("MessageBubble", () => {
+  it("routes collaboration cards within the configured dashboard base path", async () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(
+        <MemoryRouter basename="/hermes" initialEntries={["/hermes/chat?resume=session-a"]}>
+          <MessageBubble
+            artifacts={[]}
+            message={{
+              artifactIds: [],
+              collaborationCard: {
+                groupId: "group-a",
+                status: "created",
+                taskId: "task-a",
+                title: "Review",
+                text: "Started",
+              },
+              id: "card-a",
+              role: "system",
+              text: "",
+            }}
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    expect(container.querySelector("a")?.getAttribute("href")).toBe(
+      "/hermes/chat?group=group-a",
+    );
+    await act(async () => root.unmount());
+  });
+
   it("renders user messages as the quiet right-aligned bubble", async () => {
     const container = document.createElement("div");
     document.body.appendChild(container);

@@ -25,6 +25,46 @@ _log = logging.getLogger(__name__)
 _RETAINED_PROVIDERS = frozenset({"weixin_ilink", "feishu", "webhook"})
 
 
+def build_channel_identity_store(
+    config: dict[str, Any],
+    *,
+    control_home: str | Path,
+    global_home: str | Path,
+) -> ChannelIdentityStore:
+    """Construct the authoritative channel store for one Control Plane home."""
+    resolved_control_home = Path(control_home).expanduser().resolve()
+    resolved_global_home = Path(global_home).expanduser().resolve()
+    expected_control_home = resolved_global_home / "control-plane"
+    if resolved_control_home != expected_control_home:
+        raise RuntimeError("Owner Worker supervisor homes are incompatible")
+    retained = {
+        provider: settings
+        for provider, settings in config.items()
+        if provider in _RETAINED_PROVIDERS and isinstance(settings, dict)
+    }
+    key_versions = {
+        (
+            int(settings.get("active_lookup_key_version", 1)),
+            int(settings.get("active_encryption_key_version", 1)),
+        )
+        for settings in retained.values()
+    }
+    if len(key_versions) > 1:
+        raise RuntimeError("connector keyring versions disagree")
+    lookup_version, encryption_version = (
+        next(iter(key_versions)) if key_versions else (1, 1)
+    )
+    crypto = ChannelCrypto.from_env(
+        lookup_version=lookup_version,
+        encryption_version=encryption_version,
+    )
+    return ChannelIdentityStore(
+        crypto,
+        resolved_control_home,
+        global_home=resolved_global_home,
+    )
+
+
 @dataclass(frozen=True)
 class ConnectorRuntimeStatus:
     states: dict[str, str]
@@ -186,25 +226,11 @@ async def bootstrap_channel_connectors(
         return CanonicalConnectorRuntime(ConnectorRuntimeStatus(states))
 
     try:
-        control_home = Path(supervisor.control_home).resolve()
-        global_home = Path(supervisor.global_home).resolve()
-        if control_home != global_home / "control-plane":
-            raise RuntimeError("Owner Worker supervisor homes are incompatible")
-        key_versions = {
-            (
-                int(settings.get("active_lookup_key_version", 1)),
-                int(settings.get("active_encryption_key_version", 1)),
-            )
-            for settings in retained.values()
-        }
-        if len(key_versions) != 1:
-            raise RuntimeError("connector keyring versions disagree")
-        lookup_version, encryption_version = key_versions.pop()
-        crypto = ChannelCrypto.from_env(
-            lookup_version=lookup_version,
-            encryption_version=encryption_version,
+        store = build_channel_identity_store(
+            retained,
+            control_home=supervisor.control_home,
+            global_home=supervisor.global_home,
         )
-        store = ChannelIdentityStore(crypto, control_home, global_home=global_home)
     except Exception as exc:
         _log.warning("connector startup unavailable error_type=%s", type(exc).__name__)
         states = {provider: "control_plane_unavailable" for provider in enabled}

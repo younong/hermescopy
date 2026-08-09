@@ -804,6 +804,18 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
+  updateFeishuEmployeeCollaborationPolicy: (
+    accountId: string,
+    body: FeishuEmployeeCollaborationPolicy,
+  ) =>
+    fetchJSON<FeishuEmployee>(
+      `/api/messaging/feishu/employees/${encodeURIComponent(accountId)}/collaboration-policy`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
   updateFeishuEmployeeProfile: (
     accountId: string,
     body: { expected_revision: number; profile: FeishuEmployeePolicy },
@@ -1512,6 +1524,12 @@ export interface FeishuEmployeePolicy {
   max_tokens?: number;
 }
 
+export interface FeishuEmployeeCollaborationPolicy {
+  may_participate: boolean;
+  may_create_groups: boolean;
+  invite_quota: number | null;
+}
+
 export interface FeishuEmployee {
   account_id: string;
   app_id: string;
@@ -1522,6 +1540,7 @@ export interface FeishuEmployee {
   profile_revision: number | null;
   profile_fingerprint: string | null;
   profile: FeishuEmployeePolicy | null;
+  collaboration_policy: FeishuEmployeeCollaborationPolicy;
 }
 
 export interface FeishuEmployeeCatalog {

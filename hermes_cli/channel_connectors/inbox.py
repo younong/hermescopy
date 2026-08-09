@@ -128,9 +128,9 @@ class CanonicalInbox:
                   (inbound_id, account_id, binding_id, provider_message_id,
                    payload_ciphertext, payload_key_version, context_ciphertext,
                    context_key_version, status, rejection_reason, payload_kind,
-                   dispatch_scope, profile_revision, next_attempt_at, created_at,
-                   updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   dispatch_scope, profile_revision, conversation_kind, thread_id,
+                   next_attempt_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     f"im_{uuid.uuid4().hex}",
@@ -146,6 +146,8 @@ class CanonicalInbox:
                     envelope.payload_kind if status == "queued" else "text",
                     str(envelope.dispatch_scope or "") if status == "queued" else "",
                     envelope.profile_revision if status == "queued" else None,
+                    envelope.conversation_kind if status == "queued" else None,
+                    str(envelope.thread_id or "") if status == "queued" else "",
                     now,
                     now,
                     now,

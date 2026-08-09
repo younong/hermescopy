@@ -37,6 +37,18 @@ export function connectMockGuiChat(): GuiChatConnection {
   };
 
   return {
+    collaboration: {
+      archiveGroup: async () => { throw new Error("Group chat is unavailable in mock mode"); },
+      createGroup: async () => { throw new Error("Group chat is unavailable in mock mode"); },
+      getGroup: async () => { throw new Error("Group chat is unavailable in mock mode"); },
+      interruptTarget: async () => { throw new Error("Group chat is unavailable in mock mode"); },
+      listGroups: async () => ({ groups: [] }),
+      onEvent: () => () => undefined,
+      respondToApproval: async () => { throw new Error("Group chat is unavailable in mock mode"); },
+      submitMessage: async () => { throw new Error("Group chat is unavailable in mock mode"); },
+      updateMembers: async () => { throw new Error("Group chat is unavailable in mock mode"); },
+      uploadAttachment: async () => { throw new Error("Group chat is unavailable in mock mode"); },
+    },
     client: {
       onEvent(handler) {
         eventHandlers.add(handler);
@@ -55,6 +67,9 @@ export function connectMockGuiChat(): GuiChatConnection {
       eventHandlers.clear();
       emitState("closed");
       stateHandlers.clear();
+    },
+    async ensureConnected() {
+      if (!closed) emitState("open");
     },
     async createOrAttach(): Promise<SessionCreateResponse> {
       closed = false;

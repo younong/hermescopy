@@ -20,12 +20,24 @@ export interface GatewayTranscriptAttachment {
   height?: unknown;
 }
 
+export interface CollaborationOriginCardPayload {
+  card_id?: string;
+  brief?: string;
+  group_id: string;
+  status: "completed" | "created";
+  summary?: string;
+  task_id?: string;
+  text?: string;
+  title: string;
+}
+
 export interface GatewayTranscriptMessage {
   id?: string;
   role: "assistant" | "system" | "tool" | "user";
   text?: string;
   content?: unknown;
   attachments?: GatewayTranscriptAttachment[];
+  collaboration_card?: CollaborationOriginCardPayload;
   name?: string;
   context?: string;
   tool_call_id?: string;

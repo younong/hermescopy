@@ -122,7 +122,15 @@ def _managed_feishu_route(path: str, method: str) -> bool:
     if parts[6] == "avatar":
         return method in {"GET", "PUT", "DELETE"}
     return (
-        parts[6] in {"profile", "credentials", "lifecycle", "test", "rollover"}
+        parts[6]
+        in {
+            "profile",
+            "collaboration-policy",
+            "credentials",
+            "lifecycle",
+            "test",
+            "rollover",
+        }
         and method in {"PUT", "POST"}
     )
 

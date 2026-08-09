@@ -12,7 +12,7 @@ from typing import Iterator
 
 from .crypto import ChannelCrypto
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 14
 ACCOUNT_CREDENTIAL_AAD_TABLE = "ilink_accounts"
 EMPLOYEE_PROFILE_AAD_TABLE = "feishu_employee_profiles"
 _DB_FILENAME = "channel_identities.sqlite3"
@@ -120,6 +120,23 @@ CREATE TABLE IF NOT EXISTS managed_feishu_accounts (
 );
 CREATE INDEX IF NOT EXISTS idx_managed_feishu_owner
 ON managed_feishu_accounts(canonical_user_id, lifecycle_status);
+CREATE TABLE IF NOT EXISTS feishu_employee_collaboration_policies (
+    account_id TEXT PRIMARY KEY REFERENCES managed_feishu_accounts(account_id),
+    may_participate INTEGER NOT NULL DEFAULT 1
+        CHECK(may_participate IN (0, 1)),
+    may_create_groups INTEGER NOT NULL DEFAULT 0
+        CHECK(may_create_groups IN (0, 1)),
+    invite_quota INTEGER DEFAULT 5
+        CHECK(invite_quota IS NULL OR invite_quota >= 0),
+    updated_by_owner_key TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS feishu_employee_collaboration_policy_identity_immutable
+BEFORE UPDATE OF account_id, created_at ON feishu_employee_collaboration_policies
+BEGIN
+    SELECT RAISE(ABORT, 'Feishu employee collaboration policy identity is immutable');
+END;
 CREATE TRIGGER IF NOT EXISTS managed_feishu_accounts_owner_immutable
 BEFORE UPDATE OF account_id, canonical_user_id ON managed_feishu_accounts
 BEGIN
@@ -224,6 +241,9 @@ CREATE TABLE IF NOT EXISTS inbound_messages (
     binding_sequence INTEGER,
     dispatch_scope TEXT NOT NULL DEFAULT '',
     profile_revision INTEGER,
+    conversation_kind TEXT
+        CHECK(conversation_kind IS NULL OR conversation_kind IN ('direct', 'group')),
+    thread_id TEXT NOT NULL DEFAULT '',
     attempts INTEGER NOT NULL DEFAULT 0,
     next_attempt_at REAL NOT NULL DEFAULT 0,
     last_error TEXT,
@@ -279,7 +299,7 @@ CREATE TABLE IF NOT EXISTS outbound_messages (
     account_id TEXT NOT NULL REFERENCES connector_accounts(account_id),
     binding_id TEXT NOT NULL REFERENCES channel_bindings(binding_id),
     provider TEXT CHECK(provider IS NULL OR length(trim(provider)) > 0),
-    source_kind TEXT CHECK(source_kind IS NULL OR source_kind IN ('inbound', 'cron')),
+    source_kind TEXT CHECK(source_kind IS NULL OR source_kind IN ('inbound', 'cron', 'collaboration')),
     source_id TEXT UNIQUE,
     binding_sequence INTEGER,
     dispatch_scope TEXT NOT NULL DEFAULT '',
@@ -336,7 +356,7 @@ WHEN NOT EXISTS (
               AND i.binding_id=NEW.binding_id
         )
     )
-) OR (NEW.source_kind='cron' AND NEW.inbound_id IS NOT NULL)
+) OR (NEW.source_kind IN ('cron', 'collaboration') AND NEW.inbound_id IS NOT NULL)
 BEGIN
     SELECT RAISE(ABORT, 'outbound account binding mismatch');
 END;
@@ -460,6 +480,12 @@ class ChannelIdentityStore:
                         elif version == 11:
                             self._migrate_v11_to_v12(conn)
                             version = 12
+                        elif version == 12:
+                            self._migrate_v12_to_v13(conn)
+                            version = 13
+                        elif version == 13:
+                            self._migrate_v13_to_v14(conn)
+                            version = 14
                         else:
                             raise RuntimeError(
                                 "channel identity database schema is older than supported"
@@ -616,7 +642,7 @@ class ChannelIdentityStore:
                 account_id TEXT NOT NULL REFERENCES ilink_accounts(account_id),
                 binding_id TEXT NOT NULL REFERENCES channel_bindings(binding_id),
                 provider TEXT CHECK(provider IS NULL OR length(trim(provider)) > 0),
-                source_kind TEXT CHECK(source_kind IS NULL OR source_kind IN ('inbound', 'cron')),
+                source_kind TEXT CHECK(source_kind IS NULL OR source_kind IN ('inbound', 'cron', 'collaboration')),
                 source_id TEXT UNIQUE,
                 binding_sequence INTEGER,
                 client_message_id TEXT NOT NULL UNIQUE,
@@ -964,6 +990,106 @@ class ChannelIdentityStore:
         conn.execute("DROP TABLE binding_sequences_v11")
         conn.execute(
             "UPDATE channel_identity_meta SET value='12' WHERE key='schema_version'"
+        )
+
+    @staticmethod
+    def _migrate_v12_to_v13(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feishu_employee_collaboration_policies (
+                account_id TEXT PRIMARY KEY
+                    REFERENCES managed_feishu_accounts(account_id),
+                may_participate INTEGER NOT NULL DEFAULT 1
+                    CHECK(may_participate IN (0, 1)),
+                may_create_groups INTEGER NOT NULL DEFAULT 0
+                    CHECK(may_create_groups IN (0, 1)),
+                invite_quota INTEGER DEFAULT 5
+                    CHECK(invite_quota IS NULL OR invite_quota >= 0),
+                updated_by_owner_key TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "UPDATE channel_identity_meta SET value='13' WHERE key='schema_version'"
+        )
+
+    @staticmethod
+    def _migrate_v13_to_v14(conn: sqlite3.Connection) -> None:
+        inbound_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(inbound_messages)")
+        }
+        if "conversation_kind" not in inbound_columns:
+            conn.execute(
+                "ALTER TABLE inbound_messages ADD COLUMN conversation_kind TEXT "
+                "CHECK(conversation_kind IS NULL OR conversation_kind IN ('direct', 'group'))"
+            )
+        if "thread_id" not in inbound_columns:
+            conn.execute(
+                "ALTER TABLE inbound_messages ADD COLUMN thread_id TEXT NOT NULL DEFAULT ''"
+            )
+        conn.execute("DROP TRIGGER IF EXISTS inbound_messages_ownership_immutable")
+        conn.execute("DROP TRIGGER IF EXISTS outbound_messages_consistent_insert")
+        conn.execute("DROP TRIGGER IF EXISTS outbound_messages_ownership_immutable")
+        conn.execute("DROP INDEX IF EXISTS idx_outbound_status_time")
+        conn.execute("DROP INDEX IF EXISTS idx_outbound_binding_sequence")
+        conn.execute("ALTER TABLE outbound_messages RENAME TO outbound_messages_v13")
+        conn.execute(
+            """
+            CREATE TABLE outbound_messages (
+                outbound_id TEXT PRIMARY KEY,
+                inbound_id TEXT UNIQUE REFERENCES inbound_messages(inbound_id),
+                account_id TEXT NOT NULL REFERENCES connector_accounts(account_id),
+                binding_id TEXT NOT NULL REFERENCES channel_bindings(binding_id),
+                provider TEXT CHECK(provider IS NULL OR length(trim(provider)) > 0),
+                source_kind TEXT CHECK(source_kind IS NULL OR source_kind IN ('inbound', 'cron', 'collaboration')),
+                source_id TEXT UNIQUE,
+                binding_sequence INTEGER,
+                dispatch_scope TEXT NOT NULL DEFAULT '',
+                client_message_id TEXT NOT NULL UNIQUE,
+                payload_ciphertext BLOB,
+                payload_key_version INTEGER,
+                context_ciphertext BLOB,
+                context_key_version INTEGER,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                chunk_count INTEGER,
+                next_chunk_index INTEGER NOT NULL DEFAULT 0,
+                chunk_attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL NOT NULL,
+                claimed_by TEXT,
+                claimed_at REAL,
+                last_error TEXT,
+                failed_chunk_index INTEGER,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO outbound_messages
+              (outbound_id, inbound_id, account_id, binding_id, provider,
+               source_kind, source_id, binding_sequence, dispatch_scope,
+               client_message_id, payload_ciphertext, payload_key_version,
+               context_ciphertext, context_key_version, status, attempts,
+               chunk_count, next_chunk_index, chunk_attempts, next_attempt_at,
+               claimed_by, claimed_at, last_error, failed_chunk_index,
+               created_at, updated_at)
+            SELECT outbound_id, inbound_id, account_id, binding_id, provider,
+                   source_kind, source_id, binding_sequence, dispatch_scope,
+                   client_message_id, payload_ciphertext, payload_key_version,
+                   context_ciphertext, context_key_version, status, attempts,
+                   chunk_count, next_chunk_index, chunk_attempts, next_attempt_at,
+                   claimed_by, claimed_at, last_error, failed_chunk_index,
+                   created_at, updated_at
+            FROM outbound_messages_v13
+            """
+        )
+        conn.execute("DROP TABLE outbound_messages_v13")
+        conn.execute(
+            "UPDATE channel_identity_meta SET value='14' WHERE key='schema_version'"
         )
 
     @staticmethod

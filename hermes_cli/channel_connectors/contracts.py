@@ -64,6 +64,7 @@ class OutboundDelivery:
     next_part_index: int
     part_attempts: int
     context_token: str | None = None
+    source_kind: str | None = None
 
 
 @dataclass(frozen=True)

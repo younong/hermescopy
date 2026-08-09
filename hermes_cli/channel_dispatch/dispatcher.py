@@ -190,6 +190,9 @@ class ChannelDispatcher:
                     binding_id=claim["binding_id"],
                     dispatch_scope=str(claim.get("dispatch_scope") or ""),
                     profile_revision=claim.get("profile_revision"),
+                    conversation_kind=claim.get("conversation_kind"),
+                    conversation_id=channel.conversation_id,
+                    thread_id=str(claim.get("thread_id") or ""),
                     source=provider_slug,
                     title=f"{channel.provider} channel",
                 )
