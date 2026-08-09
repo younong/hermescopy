@@ -29,11 +29,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
+    DEFAULT_RESOLUTION,
     ImageGenProvider,
     error_response,
     normalize_reference_images,
     nearest_aspect_ratio,
     resolve_aspect_ratio,
+    resolve_resolution,
     save_b64_image,
     save_url_image,
     success_response,
@@ -220,10 +222,12 @@ class OpenAIImageGenProvider(ImageGenProvider):
         *,
         image_url: Optional[str] = None,
         reference_image_urls: Optional[List[str]] = None,
+        resolution: str = DEFAULT_RESOLUTION,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         prompt = (prompt or "").strip()
         aspect = resolve_aspect_ratio(aspect_ratio)
+        requested_resolution = resolve_resolution(resolution)
 
         if not prompt:
             return error_response(
@@ -396,6 +400,9 @@ class OpenAIImageGenProvider(ImageGenProvider):
             "quality": meta["quality"],
             "requested_aspect_ratio": aspect,
             "effective_aspect_ratio": effective_aspect,
+            "requested_resolution": requested_resolution,
+            "effective_resolution": "1K",
+            "resolution_mode": "mapped",
         }
         if revised_prompt:
             extra["revised_prompt"] = revised_prompt

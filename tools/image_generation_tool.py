@@ -72,7 +72,10 @@ from tools.tool_backend_helpers import (
 )
 from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
+    DEFAULT_RESOLUTION,
     VALID_ASPECT_RATIOS,
+    VALID_RESOLUTIONS,
+    resolve_resolution,
     aspect_ratio_from_dimensions,
     aspect_ratio_value,
     nearest_aspect_ratio,
@@ -846,6 +849,7 @@ def _postprocess_image_generate_result(raw: str, task_id: str | None = None) -> 
             payload["width"] = int(width)
             payload["height"] = int(height)
             payload["actual_aspect_ratio"] = actual_aspect
+            payload["actual_dimensions"] = {"width": int(width), "height": int(height)}
             expected_value = payload.get("effective_aspect_ratio") or payload.get(
                 "requested_aspect_ratio"
             ) or payload.get("aspect_ratio")
@@ -899,6 +903,8 @@ def image_generate_tool(
     seed: Optional[int] = None,
     image_url: Optional[str] = None,
     reference_image_urls: Optional[list] = None,
+    *,
+    resolution: str = DEFAULT_RESOLUTION,
 ) -> str:
     """Generate an image from a text prompt, or edit a source image, via FAL.
 
@@ -916,6 +922,7 @@ def image_generate_tool(
     "modality": "text" | "image", "error": str, "error_type": str}``.
     """
     model_id, meta = _resolve_fal_model()
+    requested_resolution = resolve_resolution(resolution)
 
     # Collect any source images (primary + references) into one ordered list.
     source_images: list = []
@@ -935,6 +942,7 @@ def image_generate_tool(
         "parameters": {
             "prompt": prompt,
             "aspect_ratio": aspect_ratio,
+            "resolution": requested_resolution,
             "num_inference_steps": num_inference_steps,
             "guidance_scale": guidance_scale,
             "num_images": num_images,
@@ -980,6 +988,7 @@ def image_generate_tool(
             overrides["num_images"] = num_images
         if output_format is not None:
             overrides["output_format"] = output_format
+        overrides["resolution"] = requested_resolution
 
         if use_edit:
             # Clamp reference count to the model's declared cap.
@@ -1061,6 +1070,9 @@ def image_generate_tool(
             "image": formatted_images[0]["url"] if formatted_images else None,
             "modality": modality,
             "aspect_ratio": aspect_lc,
+            "requested_resolution": requested_resolution,
+            "effective_resolution": requested_resolution if "resolution" in arguments else DEFAULT_RESOLUTION,
+            "resolution_mode": "native" if "resolution" in arguments else "mapped",
             "requested_aspect_ratio": aspect_lc,
             "effective_aspect_ratio": effective_aspect,
             "model": model_id,
@@ -1274,6 +1286,12 @@ IMAGE_GENERATE_SCHEMA = {
                 ),
                 "default": DEFAULT_ASPECT_RATIO,
             },
+            "resolution": {
+                "type": "string",
+                "enum": list(VALID_RESOLUTIONS),
+                "description": "Requested output resolution tier. Use 1K, 2K, or 4K; unsupported backends report a mapped effective tier.",
+                "default": DEFAULT_RESOLUTION,
+            },
             "image_url": {
                 "type": "string",
                 "description": (
@@ -1344,6 +1362,7 @@ def _read_configured_image_provider():
 def _dispatch_to_plugin_provider(
     prompt: str,
     aspect_ratio: str,
+    resolution: str = DEFAULT_RESOLUTION,
     image_url: Optional[str] = None,
     reference_image_urls: Optional[list] = None,
 ):
@@ -1384,7 +1403,11 @@ def _dispatch_to_plugin_provider(
             "provider": provider.name,
         })
 
-    kwargs: Dict[str, Any] = {"prompt": prompt, "aspect_ratio": aspect_ratio}
+    kwargs: Dict[str, Any] = {
+        "prompt": prompt,
+        "aspect_ratio": aspect_ratio,
+        "resolution": resolve_resolution(resolution),
+    }
     try:
         if configured_model:
             kwargs["model"] = configured_model
@@ -1482,6 +1505,7 @@ def is_krea_model(model_id: Optional[str]) -> bool:
 def _maybe_route_managed_krea(
     prompt: str,
     aspect_ratio: str,
+    resolution: str = DEFAULT_RESOLUTION,
     image_url: Optional[str] = None,
     reference_image_urls: Optional[list] = None,
 ) -> Optional[str]:
@@ -1530,6 +1554,7 @@ def _maybe_route_managed_krea(
     kwargs: Dict[str, Any] = {
         "prompt": prompt,
         "aspect_ratio": aspect_ratio,
+        "resolution": resolve_resolution(resolution),
         "model": normalized,
     }
     try:
@@ -1566,6 +1591,7 @@ def _handle_image_generate(args, **kw):
     if not prompt:
         return tool_error("prompt is required for image generation")
     aspect_ratio = args.get("aspect_ratio", DEFAULT_ASPECT_RATIO)
+    resolution = resolve_resolution(args.get("resolution", DEFAULT_RESOLUTION))
     image_url = args.get("image_url")
     reference_image_urls = args.get("reference_image_urls")
     task_id = kw.get("task_id")
@@ -1574,7 +1600,7 @@ def _handle_image_generate(args, **kw):
     # not the in-tree FAL path). When ``image_gen.provider == "krea"`` this
     # already reaches the Krea plugin's managed gateway path.
     dispatched = _dispatch_to_plugin_provider(
-        prompt, aspect_ratio,
+        prompt, aspect_ratio, resolution,
         image_url=image_url,
         reference_image_urls=reference_image_urls,
     )
@@ -1587,7 +1613,7 @@ def _handle_image_generate(args, **kw):
     # FAL path below. Runs after plugin dispatch (which returns None when no
     # provider is set) so the BYO/direct FAL path stays untouched.
     krea_routed = _maybe_route_managed_krea(
-        prompt, aspect_ratio,
+        prompt, aspect_ratio, resolution,
         image_url=image_url,
         reference_image_urls=reference_image_urls,
     )
@@ -1597,6 +1623,7 @@ def _handle_image_generate(args, **kw):
     raw = image_generate_tool(
         prompt=prompt,
         aspect_ratio=aspect_ratio,
+        resolution=resolution,
         image_url=image_url,
         reference_image_urls=reference_image_urls,
     )
