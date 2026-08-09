@@ -11,6 +11,8 @@ from hermes_cli import model_registrations
 from hermes_cli.config import DEFAULT_CONFIG, load_config, load_env, save_config
 from hermes_cli.deployment_image import DeploymentImageDescriptor
 from hermes_cli.deployment_inference import DeploymentInferenceRouteDescriptor
+from hermes_cli.model_plane import capability as capability_module
+from hermes_cli.model_plane.capability import CapabilityModel
 
 
 class _ImageProvider(ImageGenProvider):
@@ -49,16 +51,94 @@ class _VideoProvider(VideoGenProvider):
         return {"success": True}
 
 
+class _VoiceCapability:
+    kind = "voice"
+    name = "voice-test"
+    display_name = "Voice Test"
+    capability = "tts"
+
+    def is_available(self):
+        return False
+
+    def list_models(self):
+        return [
+            CapabilityModel(id="voice-v1", display="Voice V1", capability="tts"),
+            CapabilityModel(id="voice-v2", display="Voice V2", capability="tts"),
+        ]
+
+    def default_model(self):
+        return "voice-v1"
+
+    def get_setup_schema(self):
+        return {
+            "name": "Voice Test",
+            "env_vars": [{"key": "VOICE_TEST_API_KEY", "prompt": "Secret"}],
+        }
+
+    def capabilities(self):
+        return {}
+
+
+class _VectorCapability:
+    kind = "vector"
+    name = "vector-test"
+    display_name = "Vector Test"
+    capability = ""
+
+    def is_available(self):
+        return False
+
+    def list_models(self):
+        return [
+            CapabilityModel(id="vector-v1", display="Vector V1"),
+            CapabilityModel(id="vector-v2", display="Vector V2"),
+        ]
+
+    def default_model(self):
+        return "vector-v1"
+
+    def get_setup_schema(self):
+        return {
+            "name": "Vector Test",
+            "env_vars": [{"key": "VECTOR_TEST_API_KEY", "prompt": "Secret"}],
+        }
+
+    def capabilities(self):
+        return {"dimensions": [1024]}
+
+
+def _legacy_media_bridge():
+    """Adapt only the legacy image/video registries for catalog tests.
+
+    Keeps the model-plane catalog hermetic: real plugin discovery, TTS/STT
+    registries, and profile embedding declarations stay out of this file.
+    """
+    for provider in image_gen_registry.list_providers():
+        capability_module.register_capability_provider(
+            capability_module._LegacyMediaAdapter("image", provider)
+        )
+    for provider in video_gen_registry.list_providers():
+        capability_module.register_capability_provider(
+            capability_module._LegacyMediaAdapter("video", provider)
+        )
+
+
 @pytest.fixture(autouse=True)
 def _registries(monkeypatch):
     image_gen_registry._reset_for_tests()
     video_gen_registry._reset_for_tests()
+    capability_module._reset_for_tests()
     image_gen_registry.register_provider(_ImageProvider())
     video_gen_registry.register_provider(_VideoProvider())
     monkeypatch.setattr("hermes_cli.plugins._ensure_plugins_discovered", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_plane.catalog.ensure_capability_providers",
+        _legacy_media_bridge,
+    )
     yield
     image_gen_registry._reset_for_tests()
     video_gen_registry._reset_for_tests()
+    capability_module._reset_for_tests()
 
 
 def _chat_catalog() -> list[dict[str, Any]]:
@@ -228,92 +308,124 @@ def test_catalog_media_crud_activation_and_active_delete_guard():
         model_registrations.delete_model_registration(created["id"])
 
 
-def test_voice_and_vector_registration_crud_without_activation(monkeypatch):
-    monkeypatch.setattr(
-        model_registrations,
-        "_media_catalog",
-        lambda kind: pytest.fail(f"unexpected {kind} catalog load"),
-    )
+def test_voice_and_vector_catalog_registration_crud_and_activation():
+    capability_module.register_capability_provider(_VoiceCapability())
+    capability_module.register_capability_provider(_VectorCapability())
 
     voice = model_registrations.create_model_registration({
         "name": "Narrator",
         "kind": "voice",
-        "provider": "openai",
-        "model": "gpt-4o-mini-tts",
+        "provider": "voice-test",
+        "model": "voice-v1",
     })
     vector = model_registrations.create_model_registration({
         "name": "Memory vectors",
         "kind": "vector",
-        "provider": "openai",
-        "model": "text-embedding-3-small",
+        "provider": "vector-test",
+        "model": "vector-v1",
     })
 
     assert voice["kind"] == "voice"
-    assert voice["source"] == "manual"
+    assert voice["source"] == "catalog"
+    assert voice["use_gateway"] is False
     assert vector["kind"] == "vector"
-    assert vector["source"] == "manual"
+    assert vector["source"] == "catalog"
+
+    voice_catalog = model_registrations.get_model_registration_catalog("voice")
+    voice_row = next(
+        row for row in voice_catalog["providers"] if row["provider"] == "voice-test"
+    )
+    assert voice_row["models"][0] == {
+        "id": "voice-v1",
+        "display": "Voice V1",
+        "capability": "tts",
+    }
+
+    activated = model_registrations.activate_model_registration(voice["id"])
+    assert activated["model"] == "voice-v1"
+    assert load_config()["voice_gen"] == {
+        "provider": "voice-test",
+        "model": "voice-v1",
+        "use_gateway": False,
+    }
     payload = model_registrations.get_model_registrations_payload()
     assert payload["active"]["voice"] == {
-        "registration_id": None,
-        "provider": "",
-        "model": "",
+        "registration_id": voice["id"],
+        "provider": "voice-test",
+        "model": "voice-v1",
     }
-    assert payload["active"]["vector"] == {
-        "registration_id": None,
-        "provider": "",
-        "model": "",
-    }
-    with pytest.raises(model_registrations.ModelRegistrationError, match="Only image and video"):
-        model_registrations.activate_model_registration(voice["id"])
+    with pytest.raises(model_registrations.ModelRegistrationConflict):
+        model_registrations.delete_model_registration(voice["id"])
 
     updated = model_registrations.update_model_registration(vector["id"], {
         "name": "Large memory vectors",
         "kind": "vector",
-        "provider": "openai",
-        "model": "text-embedding-3-large",
+        "provider": "vector-test",
+        "model": "vector-v2",
     })
-    assert updated["model"] == "text-embedding-3-large"
-    assert model_registrations.delete_model_registration(voice["id"]) == {
+    assert updated["model"] == "vector-v2"
+    assert model_registrations.delete_model_registration(vector["id"]) == {
         "ok": True,
-        "id": voice["id"],
+        "id": vector["id"],
     }
 
 
-def test_voice_and_vector_reject_non_manual_source(monkeypatch):
-    monkeypatch.setattr(
-        model_registrations,
-        "_media_catalog",
-        lambda kind: pytest.fail(f"unexpected {kind} catalog load"),
-    )
-
-    for kind in ("voice", "vector"):
-        for source in ("catalog", "custom"):
-            with pytest.raises(
-                model_registrations.ModelRegistrationError,
-                match="must use a manual source",
-            ):
-                model_registrations.create_model_registration({
-                    "name": f"{kind} {source}",
-                    "kind": kind,
-                    "source": source,
-                    "provider": "openai",
-                    "model": "some-model",
-                })
-
+def test_voice_and_vector_legacy_manual_registrations_remain_editable():
     created = model_registrations.create_model_registration({
         "name": "Narrator",
         "kind": "voice",
+        "source": "manual",
         "provider": "openai",
         "model": "gpt-4o-mini-tts",
     })
+    assert created["source"] == "manual"
+
+    updated = model_registrations.update_model_registration(created["id"], {
+        "name": "Narrator large",
+        "provider": "openai",
+        "model": "gpt-4o-tts",
+    })
+    assert updated["source"] == "manual"
+    assert updated["model"] == "gpt-4o-tts"
+    assert model_registrations.delete_model_registration(created["id"]) == {
+        "ok": True,
+        "id": created["id"],
+    }
+
+
+def test_registration_source_boundaries():
+    capability_module.register_capability_provider(_VoiceCapability())
+
+    with pytest.raises(model_registrations.ModelRegistrationError, match="not available"):
+        model_registrations.create_model_registration({
+            "name": "Unknown voice",
+            "kind": "voice",
+            "provider": "voice-test",
+            "model": "missing-model",
+        })
+    for kind in ("image", "voice", "vector"):
+        with pytest.raises(
+            model_registrations.ModelRegistrationError,
+            match="source is not supported",
+        ):
+            model_registrations.create_model_registration({
+                "name": f"{kind} custom",
+                "kind": kind,
+                "source": "custom",
+                "provider": "voice-test",
+                "model": "voice-v1",
+            })
+    # ``manual`` is a legacy escape hatch that only voice/vector keep.
     with pytest.raises(
         model_registrations.ModelRegistrationError,
-        match="must use a manual source",
+        match="source is not supported",
     ):
-        model_registrations.update_model_registration(created["id"], {
-            "source": "catalog",
-            "provider": "openai",
-            "model": "gpt-4o-mini-tts",
+        model_registrations.create_model_registration({
+            "name": "image manual",
+            "kind": "image",
+            "source": "manual",
+            "provider": "image-test",
+            "model": "image-v1",
         })
 
 
@@ -505,6 +617,7 @@ def test_payload_is_lightweight_and_catalog_is_safe(monkeypatch):
     payload = model_registrations.get_model_registrations_payload()
     assert "catalogs" not in payload
     assert payload["registrations"][0]["id"] == chat["id"]
+    monkeypatch.setattr(model_registrations, "_media_catalog", media_catalog)
 
     image = media_catalog("image")[0]
     assert image["available"] is False
@@ -525,5 +638,8 @@ def test_payload_is_lightweight_and_catalog_is_safe(monkeypatch):
         "kind": "vector",
         "providers": [],
     }
-    with pytest.raises(model_registrations.ModelRegistrationError, match="Only image and video"):
+    with pytest.raises(
+        model_registrations.ModelRegistrationError,
+        match="Only image, video, voice, and vector",
+    ):
         model_registrations.activate_model_registration(chat["id"])

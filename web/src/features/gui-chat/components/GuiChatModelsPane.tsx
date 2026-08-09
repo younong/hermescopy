@@ -83,10 +83,14 @@ const KIND_LABELS: Record<ModelRegistrationKind, string> = {
 };
 
 function hasCatalog(kind: ModelRegistrationKind): boolean {
-  return kind === "chat" || kind === "image" || kind === "video";
+  return kind in KIND_LABELS;
 }
 
-function isActivatable(kind: ModelRegistrationKind): kind is "image" | "video" {
+function isActivatable(kind: ModelRegistrationKind): kind is "image" | "video" | "voice" | "vector" {
+  return kind !== "chat";
+}
+
+function supportsGateway(kind: ModelRegistrationKind): kind is "image" | "video" {
   return kind === "image" || kind === "video";
 }
 
@@ -97,7 +101,7 @@ function registrationRequestFromForm(
     kind: form.kind,
     model: form.model.trim(),
     name: form.name.trim(),
-    source: hasCatalog(form.kind) ? form.source : "manual",
+    source: form.source,
   };
   if (form.kind === "chat" && form.source === "custom") {
     request.api_key = form.apiKey.trim();
@@ -109,7 +113,7 @@ function registrationRequestFromForm(
     }
   } else {
     request.provider = form.provider;
-    if (isActivatable(form.kind)) {
+    if (supportsGateway(form.kind)) {
       request.use_gateway = form.useGateway;
     }
   }
@@ -211,7 +215,7 @@ export function GuiChatModelsPane({
 
   const providers = catalogs[form.kind] ?? [];
   const models = useMemo(() => {
-    if (form.source === "custom" || !hasCatalog(form.kind)) return [];
+    if (form.source !== "catalog") return [];
     if (form.kind === "chat") {
       const provider = (providers as ModelRegistrationChatCatalogProvider[]).find(
         (item) => item.slug === form.provider,
@@ -223,7 +227,7 @@ export function GuiChatModelsPane({
     );
     return provider?.models.map((item) => ({
       id: item.id,
-      label: item.display || item.id,
+      label: `${item.display || item.id}${item.capability ? ` · ${String(item.capability).toUpperCase()}` : ""}`,
     })) ?? [];
   }, [form.kind, form.provider, form.source, providers]);
 
@@ -232,7 +236,7 @@ export function GuiChatModelsPane({
     setForm({
       ...EMPTY_FORM,
       kind: selectedKind,
-      source: hasCatalog(selectedKind) ? "catalog" : "manual",
+      source: "catalog",
     });
     setFormOpen(true);
     void loadCatalog(selectedKind);
@@ -267,7 +271,7 @@ export function GuiChatModelsPane({
       kind,
       model: "",
       provider: "",
-      source: kind === "chat" ? current.source : hasCatalog(kind) ? "catalog" : "manual",
+      source: kind === "chat" ? current.source : "catalog",
       useGateway: false,
     }));
   };
@@ -672,7 +676,8 @@ function RegistrationDialog({
               onChange={(event) => onSourceChange(event.target.value as ModelRegistrationSource)}
               value={form.source}
             >
-              {hasCatalog(form.kind) ? <option value="catalog">Catalog</option> : <option value="manual">Manual</option>}
+              {hasCatalog(form.kind) ? <option value="catalog">Catalog</option> : null}
+              {form.source === "manual" ? <option value="manual">Manual (legacy)</option> : null}
               {form.kind === "chat" ? <option value="custom">Custom endpoint</option> : null}
             </select>
           </FormField>
@@ -680,7 +685,7 @@ function RegistrationDialog({
 
         {form.source !== "custom" ? (
           <>
-            {!hasCatalog(form.kind) ? (
+            {form.source === "manual" ? (
               <>
                 <FormField label="Provider">
                   <input aria-label="Model provider" disabled={saving} onChange={(event) => setForm((current) => ({ ...current, provider: event.target.value }))} placeholder="openai" value={form.provider} />
@@ -719,7 +724,7 @@ function RegistrationDialog({
                 </FormField>
               </>
             )}
-            {isActivatable(form.kind) ? (
+            {supportsGateway(form.kind) ? (
               <label className="gui-chat-model-checkbox">
                 <input
                   checked={form.useGateway}

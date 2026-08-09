@@ -18,10 +18,20 @@ from hermes_cli.config import (
     save_env_value,
 )
 
-_KINDS = frozenset({"chat", "image", "video", "voice", "vector"})
-_ACTIVATABLE_KINDS = frozenset({"image", "video"})
-_CATALOG_KINDS = _ACTIVATABLE_KINDS | {"chat"}
-_MANUAL_KINDS = _KINDS - _CATALOG_KINDS
+from hermes_cli.model_plane.kinds import (
+    ACTIVATABLE_KINDS,
+    GATEWAY_KINDS,
+    KINDS,
+    selection_section,
+)
+
+_KINDS = frozenset(KINDS)
+_ACTIVATABLE_KINDS = frozenset(ACTIVATABLE_KINDS)
+_GATEWAY_KINDS = frozenset(GATEWAY_KINDS)
+# ``manual`` remains accepted for voice/vector so legacy records created
+# before the catalog-covered kinds stay editable; new registrations default
+# to the catalog for every kind.
+_LEGACY_MANUAL_KINDS = frozenset({"voice", "vector"})
 _SERVER_MANAGED_FIELDS = frozenset({
     "mutable", "owner", "owner_home", "owner_id", "owner_key", "scope",
 })
@@ -134,77 +144,15 @@ def _reject_admin_registration(registration_id: str) -> None:
 
 
 def _chat_catalog() -> list[dict[str, Any]]:
-    from hermes_cli.inventory import build_models_payload, load_picker_context
+    from hermes_cli.model_plane.catalog import chat_catalog
 
-    payload = build_models_payload(
-        load_picker_context(),
-        include_unconfigured=True,
-        picker_hints=True,
-        canonical_order=True,
-        allow_network=False,
-    )
-    result: list[dict[str, Any]] = []
-    for item in payload.get("providers") or []:
-        if not isinstance(item, dict):
-            continue
-        result.append({
-            "slug": item.get("slug", ""),
-            "name": item.get("name", item.get("slug", "")),
-            "models": [str(model) for model in item.get("models") or []],
-            "authenticated": bool(item.get("authenticated", False)),
-            "credential_configured": bool(item.get("authenticated", False)),
-            "auth_type": item.get("auth_type", ""),
-            "warning": item.get("warning", ""),
-        })
-    return result
+    return chat_catalog()
 
 
 def _media_catalog(kind: str) -> list[dict[str, Any]]:
-    from hermes_cli.plugins import _ensure_plugins_discovered
+    from hermes_cli.model_plane.catalog import capability_catalog
 
-    _ensure_plugins_discovered()
-    if kind == "image":
-        from agent.image_gen_registry import list_providers
-    else:
-        from agent.video_gen_registry import list_providers
-
-    result: list[dict[str, Any]] = []
-    for provider in list_providers():
-        try:
-            raw_models = provider.list_models() or []
-            models = [dict(item) for item in raw_models if isinstance(item, dict) and item.get("id")]
-            setup = provider.get_setup_schema()
-            capabilities = provider.capabilities()
-            available = bool(provider.is_available())
-            default_model = provider.default_model()
-        except Exception:
-            continue
-        setup = setup if isinstance(setup, dict) else {}
-        safe_setup = {
-            key: setup.get(key)
-            for key in ("name", "badge", "tag")
-            if setup.get(key) is not None
-        }
-        env_fields = []
-        for item in setup.get("env_vars") or []:
-            if isinstance(item, dict):
-                env_fields.append({
-                    key: item.get(key)
-                    for key in ("key", "prompt", "url")
-                    if item.get(key) is not None
-                })
-        safe_setup["env_vars"] = env_fields
-        result.append({
-            "provider": provider.name,
-            "name": provider.display_name,
-            "available": available,
-            "credential_configured": available,
-            "models": models,
-            "default_model": default_model,
-            "capabilities": capabilities if isinstance(capabilities, dict) else {},
-            "setup": safe_setup,
-        })
-    return result
+    return capability_catalog(kind)
 
 
 def _find_provider(catalog: list[dict[str, Any]], provider: str, *, media: bool) -> dict[str, Any]:
@@ -249,15 +197,15 @@ def _normalize_request(
         raise ModelRegistrationError("kind cannot be changed")
 
     model = _text(data.get("model"), "model")
-    default_source = "manual" if kind in _MANUAL_KINDS else "catalog"
+    default_source = "catalog"
     source = str(data.get("source") or (existing or {}).get("source") or default_source).strip().lower()
     api_key = str(data.get("api_key") or "").strip()
     provider_config: dict[str, Any] | None = None
 
-    if kind in _MANUAL_KINDS:
-        if source != "manual":
+    if source == "manual":
+        if kind not in _LEGACY_MANUAL_KINDS:
             raise ModelRegistrationError(
-                "Voice and vector registrations must use a manual source"
+                "Registration source is not supported for this model type"
             )
         provider = _text(data.get("provider"), "provider")
         registration = {
@@ -306,12 +254,11 @@ def _normalize_request(
         if source != "catalog":
             raise ModelRegistrationError("Registration source is not supported for this model type")
         provider = _text(data.get("provider"), "provider")
-        if kind in _CATALOG_KINDS:
-            catalog = chat_catalog if kind == "chat" else media_catalog
-            if catalog is None:
-                raise ModelRegistrationError("Provider catalog is unavailable")
-            row = _find_provider(catalog, provider, media=kind != "chat")
-            _validate_catalog_model(row, model)
+        catalog = chat_catalog if kind == "chat" else media_catalog
+        if catalog is None:
+            raise ModelRegistrationError("Provider catalog is unavailable")
+        row = _find_provider(catalog, provider, media=kind != "chat")
+        _validate_catalog_model(row, model)
         registration = {
             "name": name,
             "kind": kind,
@@ -319,7 +266,7 @@ def _normalize_request(
             "model": model,
             "source": "catalog",
         }
-        if kind in _ACTIVATABLE_KINDS:
+        if kind in _GATEWAY_KINDS:
             registration["use_gateway"] = bool(data.get("use_gateway", (existing or {}).get("use_gateway", False)))
 
     return registration, provider_config, api_key
@@ -376,7 +323,7 @@ def _active(config: dict[str, Any], registrations: dict[str, dict[str, Any]]) ->
     else:
         selections = {"chat": (None, model_cfg)}
     for kind in _ACTIVATABLE_KINDS:
-        section = config.get(f"{kind}_gen")
+        section = config.get(selection_section(kind))
         selections[kind] = (
             section.get("provider") if isinstance(section, dict) else None,
             section.get("model") if isinstance(section, dict) else None,
@@ -463,13 +410,7 @@ def get_model_registration_catalog(kind: str) -> dict[str, Any]:
     normalized = str(kind or "").strip().lower()
     if normalized not in _KINDS:
         raise ModelRegistrationError("kind must be chat, image, video, voice, or vector")
-    if normalized == "chat":
-        providers = _chat_catalog()
-    elif normalized in _ACTIVATABLE_KINDS:
-        providers = _media_catalog(normalized)
-    else:
-        assert normalized in _MANUAL_KINDS
-        providers = []
+    providers = _chat_catalog() if normalized == "chat" else _media_catalog(normalized)
     return {"kind": normalized, "providers": providers}
 
 
@@ -477,10 +418,9 @@ def create_model_registration(data: dict[str, Any]) -> dict[str, Any]:
     _reject_server_managed_fields(data)
     registration_id = uuid.uuid4().hex
     kind = str(data.get("kind") or "").strip().lower()
-    default_source = "manual" if kind in _MANUAL_KINDS else "catalog"
-    source = str(data.get("source") or default_source).strip().lower()
+    source = str(data.get("source") or "catalog").strip().lower()
     chat = _chat_catalog() if kind == "chat" and source != "custom" else None
-    media = _media_catalog(kind) if kind in _ACTIVATABLE_KINDS else None
+    media = _media_catalog(kind) if kind in _ACTIVATABLE_KINDS and source != "manual" else None
     candidate, provider_config, api_key = _normalize_request(
         data,
         registration_id=registration_id,
@@ -524,7 +464,7 @@ def update_model_registration(registration_id: str, data: dict[str, Any]) -> dic
     kind = existing.get("kind")
     source = str(data.get("source") or existing.get("source") or "catalog").strip().lower()
     chat = _chat_catalog() if kind == "chat" and source != "custom" else None
-    media = _media_catalog(str(kind)) if kind in _ACTIVATABLE_KINDS else None
+    media = _media_catalog(str(kind)) if kind in _ACTIVATABLE_KINDS and source != "manual" else None
     merged = dict(existing)
     merged.update(data)
     candidate, provider_config, api_key = _normalize_request(
@@ -595,7 +535,9 @@ def activate_model_registration(registration_id: str) -> dict[str, Any]:
             raise ModelRegistrationNotFound("Registration not found")
         kind = item.get("kind")
         if kind not in _ACTIVATABLE_KINDS:
-            raise ModelRegistrationError("Only image and video registrations can be activated")
+            raise ModelRegistrationError(
+                "Only image, video, voice, and vector registrations can be activated"
+            )
         from hermes_cli.tools_config import select_media_model
 
         catalog = None
@@ -616,7 +558,7 @@ def activate_model_registration(registration_id: str) -> dict[str, Any]:
             use_gateway=bool(item.get("use_gateway", False)),
             catalog=catalog,
         )
-        save_config(config, preserve_keys={(f"{kind}_gen",)})
+        save_config(config, preserve_keys={(selection_section(kind),)})
         return {
             "ok": True,
             "registration_id": registration_id,

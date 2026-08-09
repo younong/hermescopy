@@ -160,6 +160,7 @@ client surface.
 
 | Change area | Start with | Focused validation |
 | --- | --- | --- |
+| Model catalog, registration, activation (all five kinds) | `hermes_cli/model_plane/`, then `hermes_cli/model_registrations.py`; extension rules in `docs/model-plane.md` | `tests/hermes_cli/test_model_plane.py`, `tests/hermes_cli/test_model_registrations.py` |
 | Owner-worker lifecycle, leases, startup | `hermes_cli/owner_worker/supervisor.py` | `tests/hermes_cli/test_owner_worker.py` |
 | Owner-worker WebSocket and PTY routing | `hermes_cli/owner_worker/ws_routes.py` | `tests/hermes_cli/test_owner_worker_ws_bridge.py` |
 | Owner runtime paths and environment isolation | `hermes_cli/owner_runtime.py` | `tests/hermes_cli/test_owner_runtime.py` |

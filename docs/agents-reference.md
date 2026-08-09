@@ -593,6 +593,26 @@ Reference: #2810 (bounds pass), #9801 (SHA pinning + audit CI).
 
 ---
 
+## Model Plane
+
+All five model kinds (`chat`, `image`, `video`, `voice`, `vector`) share one
+architecture in `hermes_cli/model_plane/`: one catalog
+(`model_plane/catalog.py`), one registration store
+(`hermes_cli/model_registrations.py`), one activation mechanism
+(`tools_config.select_media_model` into `{kind}_gen` sections; chat via
+`model.default`), and two credential paths (per-user key; deployment-managed
+relay through the Control Plane).
+
+Ownership: chat models belong to providers (`ProviderProfile`/custom
+providers); media kinds belong to capability plugins implementing
+`model_plane/capability.py::CapabilityProvider`. Per-kind differences live
+only in `model_plane/kinds.py`.
+
+The binding extension rules — no parallel registries, brokers, catalogs, or
+credential paths — are legislated in [`docs/model-plane.md`](model-plane.md).
+Read it before changing any model catalog, registration, activation, or
+credential flow.
+
 ## Adding Configuration
 
 ### config.yaml options:
