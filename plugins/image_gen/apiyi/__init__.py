@@ -73,13 +73,13 @@ _MODELS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-# APIYI's regular GPT-Image-2 endpoint exposes these practical sizes. When
-# the requested exact ratio is not available, select the closest supported
-# ratio and return both requested/effective values in the result metadata.
+# APIYI's regular GPT-Image-2 endpoint accepts these practical sizes. The
+# custom 768x1024 size is an exact 3:4 ratio and uses 16-pixel dimensions.
 _SIZES = {
     "3:2": "1536x1024",
     "1:1": "1024x1024",
     "2:3": "1024x1536",
+    "3:4": "768x1024",
 }
 
 _GEMINI_ASPECT_RATIOS = {
