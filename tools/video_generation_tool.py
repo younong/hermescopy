@@ -7,8 +7,8 @@ Single ``video_generate`` tool that dispatches to a plugin-registered
 video generation provider. Mirrors the ``image_generate`` design:
 
 - ``agent/video_gen_provider.py`` defines the :class:`VideoGenProvider` ABC.
-- ``agent/video_gen_registry.py`` holds the active providers (populated by
-  plugins at import time).
+- ``hermes_cli/model_plane/capability.py`` holds the active providers
+  (populated by plugins at import time via the model plane).
 - Each provider lives under ``plugins/video_gen/<name>/``.
 
 The tool itself is intentionally backend-agnostic and ships **no in-tree
@@ -197,17 +197,28 @@ def _read_configured_video_model() -> Optional[str]:
 
 
 def check_video_generation_requirements() -> bool:
-    """Return True when at least one registered provider reports available.
+    """True when a deployment route matches or a provider reports available.
 
     Triggers plugin discovery (idempotent) so user-installed plugins are
     visible to the toolset gate.
     """
     try:
-        from agent.video_gen_registry import list_providers
+        from hermes_cli.deployment_media import deployment_media_route_from_environment
+
+        if deployment_media_route_from_environment(
+            "video",
+            provider=_read_configured_video_provider() or "",
+            model=_read_configured_video_model() or "",
+        ) is not None:
+            return True
+    except Exception:
+        pass
+    try:
+        from hermes_cli.model_plane.capability import list_capability_providers
         from hermes_cli.plugins import _ensure_plugins_discovered
 
         _ensure_plugins_discovered()
-        for provider in list_providers():
+        for provider in list_capability_providers("video"):
             try:
                 if provider.is_available():
                     return True
@@ -230,14 +241,14 @@ def _resolve_active_provider():
     where a long-lived session was started before a plugin was installed.
     """
     try:
-        from agent.video_gen_registry import get_active_provider
+        from hermes_cli.model_plane.capability import resolve_capability_provider
         from hermes_cli.plugins import _ensure_plugins_discovered
 
         _ensure_plugins_discovered()
-        provider = get_active_provider()
+        provider = resolve_capability_provider("video").provider
         if provider is None:
             _ensure_plugins_discovered(force=True)
-            provider = get_active_provider()
+            provider = resolve_capability_provider("video").provider
         return provider
     except Exception as exc:
         logger.debug("video_gen provider resolution failed: %s", exc)
@@ -483,11 +494,11 @@ def _build_dynamic_video_schema() -> Dict[str, Any]:
         return {"description": "\n".join(parts)}
 
     try:
-        from agent.video_gen_registry import get_provider
+        from hermes_cli.model_plane.capability import get_capability_provider
         from hermes_cli.plugins import _ensure_plugins_discovered
 
         _ensure_plugins_discovered()
-        provider = get_provider(configured)
+        provider = get_capability_provider("video", configured)
     except Exception:
         provider = None
 
@@ -503,7 +514,8 @@ def _build_dynamic_video_schema() -> Dict[str, Any]:
     except Exception:
         caps = {}
     try:
-        models = provider.list_models() or []
+        model_entries = getattr(provider, "model_entries", None)
+        models = model_entries() if callable(model_entries) else provider.list_models() or []
     except Exception:
         models = []
 

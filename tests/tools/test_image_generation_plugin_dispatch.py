@@ -3,15 +3,15 @@ from __future__ import annotations
 import json
 import pytest
 
-from agent import image_gen_registry
+from hermes_cli.model_plane import capability as capability_module
 from agent.image_gen_provider import ImageGenProvider
 
 
 @pytest.fixture(autouse=True)
 def _reset_registry():
-    image_gen_registry._reset_for_tests()
+    capability_module._reset_for_tests()
     yield
-    image_gen_registry._reset_for_tests()
+    capability_module._reset_for_tests()
 
 
 class _FakeCodexProvider(ImageGenProvider):
@@ -33,12 +33,12 @@ class _FakeCodexProvider(ImageGenProvider):
 class TestPluginDispatch:
     def test_dispatch_routes_to_codex_provider(self, monkeypatch, tmp_path):
         from tools import image_generation_tool
-        from agent import image_gen_registry as registry_module
+        from hermes_cli.model_plane import capability as capability_module
         from hermes_cli import plugins as plugins_module
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         (tmp_path / "config.yaml").write_text("image_gen:\n  provider: codex\n")
-        image_gen_registry.register_provider(_FakeCodexProvider())
+        capability_module.register_media_generation_provider("image", _FakeCodexProvider())
 
         monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", lambda: None)
 
@@ -71,7 +71,7 @@ class TestPluginDispatch:
         from hermes_cli import plugins as plugins_module
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        image_gen_registry.register_provider(_FakeCodexProvider())
+        capability_module.register_media_generation_provider("image", _FakeCodexProvider())
         monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", lambda force=False: None)
 
         assert image_generation_tool.check_image_generation_requirements() is True
@@ -101,7 +101,7 @@ class TestPluginDispatch:
             "aspect_ratio": aspect_ratio,
             "provider": "apiyi",
         }
-        image_gen_registry.register_provider(provider)
+        capability_module.register_media_generation_provider("image", provider)
         monkeypatch.setattr(
             plugins_module, "_ensure_plugins_discovered", lambda force=False: None
         )
@@ -130,7 +130,7 @@ class TestPluginDispatch:
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         (tmp_path / "config.yaml").write_text("image_gen:\n  provider: codex\n")
-        image_gen_registry.register_provider(OfflineProvider())
+        capability_module.register_media_generation_provider("image", OfflineProvider())
         monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", lambda force=False: None)
 
         assert image_generation_tool.check_image_generation_requirements() is False

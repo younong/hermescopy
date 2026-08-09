@@ -71,17 +71,30 @@ No third path. No broker, side channel, or kind-specific credential store.
 
 ## Migration status
 
-- **PR1 (this change)** — model plane skeleton: kinds, capability protocol,
+- **PR1 (merged #185)** — model plane skeleton: kinds, capability protocol,
   unified catalog with adapters bridging the legacy media registries
   (`agent/image_gen_registry.py`, `agent/video_gen_registry.py`,
   `agent/tts_registry.py`, `agent/transcription_registry.py`) and profile
   embedding declarations; registrations generalized to all five kinds.
-- **PR2** — image/video migration: all generation providers become capability
-  plugins, the image broker generalizes into the media relay, and the legacy
-  registries plus `deployment_image.py` are deleted.
+- **PR2 (this change)** — image/video migration done: every generation
+  provider registers through
+  `capability.register_media_generation_provider(kind, provider)`
+  (`MediaGenerationAdapter` normalizes the catalog surface and delegates
+  `generate()` to the plugin); `deployment_media.py` replaces
+  `deployment_image.py` with declarative `(kind, provider, models, key_env,
+  executor)` routes (no hardcoded provider; the existing APIYI deployment
+  auto-activates as the default image route when `APIYI_API_KEY` is present);
+  the image broker is generalized into
+  `owner_worker/media_relay.py` (`image_generate`/`video_generate`
+  operations routed by `(kind, provider, model)`). Tool dispatch checks the
+  deployment route first, then falls back to the local plugin with the user
+  key. Deleted: `deployment_image.py`, `owner_worker/image_relay.py`,
+  `owner_worker/image_dispatch.py`, `agent/image_gen_registry.py`,
+  `agent/video_gen_registry.py`, and their tests.
 - **PR3** — voice/vector completion: TTS/ASR/embedding capability plugins,
   relay operations, and real consumers wired to the unified selection.
 
-Until the migration PRs land, the adapters in
+Until PR3 lands, the voice adapters in
 `hermes_cli/model_plane/capability.py` are the only sanctioned bridge to the
-legacy registries. Do not add new code against the legacy registries directly.
+legacy tts/transcription registries. Do not add new code against the legacy
+registries directly.

@@ -6,24 +6,31 @@ import pytest
 
 from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
 from hermes_cli.controlled_roots import controlled_roots_for
-from hermes_cli.deployment_image import DeploymentImageDescriptor
+from hermes_cli.deployment_media import DeploymentMediaRouteDescriptor
 from hermes_cli.owner_runtime import ensure_owner_runtime_dirs, owner_worker_runtime_paths
-from hermes_cli.owner_worker.image_dispatch import dispatch_deployment_image
+from hermes_cli.owner_worker.media_dispatch import (
+    active_media_selection,
+    dispatch_deployment_media,
+)
 from hermes_cli.owner_worker.user_files import migrate_legacy_user_files
 
 
 class Relay:
-    def generate(self, **kwargs):
+    def execute(self, operation, **kwargs):
+        self.operation = operation
         self.kwargs = kwargs
-        return {
-            "image_bytes": b"generated",
-            "mime_type": "image/png",
-            "provider": "apiyi",
-            "model": "gpt-image-2-medium",
+        result = {
+            "provider": kwargs["provider"],
+            "model": kwargs["model"],
             "aspect_ratio": kwargs["aspect_ratio"],
-            "modality": "image" if kwargs["references"] else "text",
+            "modality": "image" if kwargs.get("references") else "text",
             "metadata": {"size": "1024x1024"},
         }
+        if operation == "image_generate":
+            result.update({"image_bytes": b"generated", "mime_type": "image/png"})
+        else:
+            result["video_url"] = "https://cdn.example.com/video.mp4"
+        return result
 
 
 def _fixture(tmp_path):
@@ -31,18 +38,29 @@ def _fixture(tmp_path):
     ensure_owner_runtime_dirs(owner)
     paths = owner_worker_runtime_paths(owner_home=owner, worker_generation=1)
     roots = controlled_roots_for(paths)
-    descriptor = DeploymentImageDescriptor(
+    descriptor = DeploymentMediaRouteDescriptor(
+        kind="image",
         provider="apiyi",
-        model="gpt-image-2-medium",
-        policy_id="p",
-        allowed_models=("gpt-image-2-medium",),
+        models=("gpt-image-2-medium",),
+        default_model="gpt-image-2-medium",
     )
     return owner, paths, roots, descriptor
 
 
-def _dispatch(arguments, *, relay, descriptor, context, owner):
-    return dispatch_deployment_image(
+def _video_descriptor():
+    return DeploymentMediaRouteDescriptor(
+        kind="video",
+        provider="fal",
+        models=("fal-video-1",),
+        default_model="fal-video-1",
+    )
+
+
+def _dispatch(arguments, *, relay, descriptor, context, owner, kind="image"):
+    return dispatch_deployment_media(
         arguments,
+        kind=kind,
+        model=descriptor.default_model,
         relay_client=relay,
         descriptor=descriptor,
         workspace_context=context,
@@ -74,6 +92,7 @@ def test_dispatch_reads_and_writes_selected_workspace(tmp_path, monkeypatch):
             context=context,
             owner=owner,
         ))
+        assert relay.operation == "image_generate"
         assert relay.kwargs["references"][0] == {
             "name": "source.png", "mime_type": "image/png", "data": b"reference",
         }
@@ -83,6 +102,89 @@ def test_dispatch_reads_and_writes_selected_workspace(tmp_path, monkeypatch):
         assert payload["size"] == "1024x1024"
         assert "api_key" not in payload
         assert "base_url" not in payload
+    finally:
+        roots.close()
+
+
+def test_dispatch_forwards_resolution_tier_as_params(tmp_path, monkeypatch):
+    _linux(monkeypatch)
+    owner, _paths, roots, descriptor = _fixture(tmp_path)
+    context = AuthenticatedWorkspaceContext(roots)
+    relay = Relay()
+    try:
+        _dispatch(
+            {"prompt": "draw", "aspect_ratio": "landscape", "resolution": "4K"},
+            relay=relay,
+            descriptor=descriptor,
+            context=context,
+            owner=owner,
+        )
+        assert relay.kwargs["params"] == {"resolution": "4K"}
+        _dispatch(
+            {"prompt": "draw", "aspect_ratio": "landscape"},
+            relay=relay,
+            descriptor=descriptor,
+            context=context,
+            owner=owner,
+        )
+        assert relay.kwargs["params"] == {}
+    finally:
+        roots.close()
+
+
+def test_dispatch_video_returns_url_passthrough(tmp_path, monkeypatch):
+    _linux(monkeypatch)
+    owner, paths, roots, _descriptor = _fixture(tmp_path)
+    context = AuthenticatedWorkspaceContext(roots)
+    relay = Relay()
+    try:
+        payload = json.loads(_dispatch(
+            {"prompt": "animate", "duration": 6, "resolution": "720p"},
+            relay=relay,
+            descriptor=_video_descriptor(),
+            context=context,
+            owner=owner,
+            kind="video",
+        ))
+        assert relay.operation == "video_generate"
+        assert relay.kwargs["params"] == {"duration": 6, "resolution": "720p"}
+        assert payload["video"] == "https://cdn.example.com/video.mp4"
+        assert payload["success"] is True
+    finally:
+        roots.close()
+
+
+def test_dispatch_video_publishes_returned_bytes(tmp_path, monkeypatch):
+    class BytesRelay(Relay):
+        def execute(self, operation, **kwargs):
+            super().execute(operation, **kwargs)
+            return {
+                "provider": kwargs["provider"],
+                "model": kwargs["model"],
+                "aspect_ratio": kwargs["aspect_ratio"],
+                "modality": "text",
+                "metadata": {},
+                "video_bytes": b"video-bytes",
+                "mime_type": "video/mp4",
+            }
+
+    _linux(monkeypatch)
+    owner, paths, roots, _descriptor = _fixture(tmp_path)
+    context = AuthenticatedWorkspaceContext(roots)
+    relay = BytesRelay()
+    try:
+        payload = json.loads(_dispatch(
+            {"prompt": "animate"},
+            relay=relay,
+            descriptor=_video_descriptor(),
+            context=context,
+            owner=owner,
+            kind="video",
+        ))
+        output = Path(payload["video"])
+        assert output.parent == paths.default_workspace / "generated" / "videos"
+        assert output.read_bytes() == b"video-bytes"
+        assert payload["mime_type"] == "video/mp4"
     finally:
         roots.close()
 
@@ -263,3 +365,25 @@ def test_dispatch_rejects_per_file_and_total_limits(tmp_path, monkeypatch):
             )
     finally:
         roots.close()
+
+
+def test_active_media_selection_reads_kind_section(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "image_gen": {"provider": "apiyi", "model": "gpt-image-2-medium"},
+            "video_gen": {"provider": "fal", "model": "fal-video-1"},
+        },
+    )
+    assert active_media_selection("image") == ("apiyi", "gpt-image-2-medium")
+    assert active_media_selection("video") == ("fal", "fal-video-1")
+
+
+def test_active_media_selection_defaults_to_empty(monkeypatch):
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    assert active_media_selection("image") == ("", "")
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: (_ for _ in ()).throw(RuntimeError("no config")),
+    )
+    assert active_media_selection("video") == ("", "")

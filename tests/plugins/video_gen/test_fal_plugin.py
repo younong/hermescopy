@@ -4,23 +4,25 @@ from __future__ import annotations
 
 import pytest
 
-from agent import video_gen_registry
+from hermes_cli.model_plane import capability as capability_module
 
 
 @pytest.fixture(autouse=True)
 def _reset_registry():
-    video_gen_registry._reset_for_tests()
+    capability_module._reset_for_tests()
     yield
-    video_gen_registry._reset_for_tests()
+    capability_module._reset_for_tests()
 
 
 def test_fal_provider_registers():
     from plugins.video_gen.fal import FALVideoGenProvider, DEFAULT_MODEL
 
     provider = FALVideoGenProvider()
-    video_gen_registry.register_provider(provider)
+    capability_module.register_media_generation_provider("video", provider)
 
-    assert video_gen_registry.get_provider("fal") is provider
+    registered = capability_module.get_capability_provider("video", "fal")
+    assert registered is not None
+    assert registered._provider is provider  # adapter wraps the raw plugin
     assert provider.display_name == "FAL"
     # DEFAULT_MODEL is the cheap-tier default
     assert provider.default_model() == DEFAULT_MODEL

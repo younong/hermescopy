@@ -14,7 +14,7 @@ from hermes_cli.channel_connectors.weixin_ilink import bootstrap
 def _supervisor(*, control_home=None, **overrides):
     values = {
         "deployment_inference_policy": object(),
-        "deployment_image_policy": object(),
+        "deployment_media_policy": object(),
         "resource_manager": object(),
         "control_home": control_home or Path("/tmp/hermes-test") / "control-plane",
         "global_home": (control_home.parent if control_home else Path("/tmp/hermes-test")),
@@ -68,7 +68,7 @@ async def test_malformed_enablement_fails_closed(monkeypatch):
         ),
         (
             True,
-            _supervisor(deployment_image_policy=None),
+            _supervisor(deployment_media_policy=None),
             "deployment_policy_unavailable",
         ),
         (True, _supervisor(resource_manager=None), "resource_governance_unavailable"),

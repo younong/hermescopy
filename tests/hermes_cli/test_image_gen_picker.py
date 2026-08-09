@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent import image_gen_registry
+from hermes_cli.model_plane import capability as capability_module
 from agent.image_gen_provider import ImageGenProvider
 
 
@@ -51,16 +51,16 @@ class _FakeProvider(ImageGenProvider):
 
 @pytest.fixture(autouse=True)
 def _reset_registry():
-    image_gen_registry._reset_for_tests()
+    capability_module._reset_for_tests()
     yield
-    image_gen_registry._reset_for_tests()
+    capability_module._reset_for_tests()
 
 
 class TestPluginPickerInjection:
     def test_plugin_providers_returns_registered(self, monkeypatch):
         from hermes_cli import tools_config
 
-        image_gen_registry.register_provider(_FakeProvider("myimg"))
+        capability_module.register_media_generation_provider("image", _FakeProvider("myimg"))
 
         rows = tools_config._plugin_image_gen_providers()
         names = [r["name"] for r in rows]
@@ -76,8 +76,8 @@ class TestPluginPickerInjection:
         # and the hardcoded `TOOL_CATEGORIES["image_gen"]` FAL row is
         # gone. The plugin-row builder therefore surfaces it like any
         # other backend — no deduplication step needed.
-        image_gen_registry.register_provider(_FakeProvider("fal"))
-        image_gen_registry.register_provider(_FakeProvider("openai"))
+        capability_module.register_media_generation_provider("image", _FakeProvider("fal"))
+        capability_module.register_media_generation_provider("image", _FakeProvider("openai"))
 
         rows = tools_config._plugin_image_gen_providers()
         names = [r.get("image_gen_plugin_name") for r in rows]
@@ -87,7 +87,7 @@ class TestPluginPickerInjection:
     def test_visible_providers_includes_plugins_for_image_gen(self, monkeypatch):
         from hermes_cli import tools_config
 
-        image_gen_registry.register_provider(_FakeProvider("someimg"))
+        capability_module.register_media_generation_provider("image", _FakeProvider("someimg"))
 
         cat = tools_config.TOOL_CATEGORIES["image_gen"]
         visible = tools_config._visible_providers(cat, {})
@@ -97,7 +97,7 @@ class TestPluginPickerInjection:
     def test_visible_providers_does_not_inject_into_other_categories(self, monkeypatch):
         from hermes_cli import tools_config
 
-        image_gen_registry.register_provider(_FakeProvider("someimg"))
+        capability_module.register_media_generation_provider("image", _FakeProvider("someimg"))
 
         # Browser category must NOT see image_gen plugins.
         browser = tools_config.TOOL_CATEGORIES["browser"]
@@ -107,7 +107,7 @@ class TestPluginPickerInjection:
     def test_post_setup_propagated_when_declared(self, monkeypatch):
         from hermes_cli import tools_config
 
-        image_gen_registry.register_provider(_FakeProvider(
+        capability_module.register_media_generation_provider("image", _FakeProvider(
             "xai_img",
             schema={
                 "name": "xAI Grok Imagine",
@@ -125,7 +125,7 @@ class TestPluginPickerInjection:
     def test_post_setup_omitted_when_not_declared(self, monkeypatch):
         from hermes_cli import tools_config
 
-        image_gen_registry.register_provider(_FakeProvider("plain_img"))
+        capability_module.register_media_generation_provider("image", _FakeProvider("plain_img"))
 
         rows = tools_config._plugin_image_gen_providers()
         match = next(r for r in rows if r.get("image_gen_plugin_name") == "plain_img")
@@ -136,7 +136,7 @@ class TestPluginCatalog:
     def test_plugin_catalog_returns_models(self):
         from hermes_cli import tools_config
 
-        image_gen_registry.register_provider(_FakeProvider("catimg"))
+        capability_module.register_media_generation_provider("image", _FakeProvider("catimg"))
 
         catalog, default = tools_config._plugin_image_gen_catalog("catimg")
         assert "catimg-model-v1" in catalog
@@ -159,7 +159,7 @@ class TestConfigPrompt:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.delenv("FAL_KEY", raising=False)
 
-        image_gen_registry.register_provider(_FakeProvider("avail-img", available=True))
+        capability_module.register_media_generation_provider("image", _FakeProvider("avail-img", available=True))
 
         assert tools_config._toolset_needs_configuration_prompt("image_gen", {}) is False
 
@@ -169,7 +169,7 @@ class TestConfigPrompt:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.delenv("FAL_KEY", raising=False)
 
-        image_gen_registry.register_provider(_FakeProvider("unavail-img", available=False))
+        capability_module.register_media_generation_provider("image", _FakeProvider("unavail-img", available=False))
 
         assert tools_config._toolset_needs_configuration_prompt("image_gen", {}) is True
 
@@ -182,7 +182,7 @@ class TestConfigWriting:
         from hermes_cli import tools_config
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        image_gen_registry.register_provider(_FakeProvider("noenv", schema={
+        capability_module.register_media_generation_provider("image", _FakeProvider("noenv", schema={
             "name": "NoEnv",
             "badge": "free",
             "tag": "",
@@ -209,7 +209,7 @@ class TestConfigWriting:
         from hermes_cli import tools_config
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        image_gen_registry.register_provider(_FakeProvider("testopenai"))
+        capability_module.register_media_generation_provider("image", _FakeProvider("testopenai"))
         monkeypatch.setattr(tools_config, "_prompt_choice", lambda *a, **kw: 0)
         monkeypatch.setattr(tools_config, "_prompt", lambda *a, **kw: "")
         monkeypatch.setattr(

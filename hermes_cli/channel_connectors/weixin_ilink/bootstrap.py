@@ -96,7 +96,7 @@ async def bootstrap_weixin_ilink(
         )
     if (
         getattr(supervisor, "deployment_inference_policy", None) is None
-        or getattr(supervisor, "deployment_image_policy", None) is None
+        or getattr(supervisor, "deployment_media_policy", None) is None
     ):
         return WeixinILinkRuntime(
             WeixinILinkStatus.create("deployment_policy_unavailable")

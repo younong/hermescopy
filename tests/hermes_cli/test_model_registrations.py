@@ -4,13 +4,15 @@ from typing import Any
 
 import pytest
 
-from agent import image_gen_registry, video_gen_registry
 from agent.image_gen_provider import ImageGenProvider
 from agent.video_gen_provider import VideoGenProvider
 from hermes_cli import model_registrations
 from hermes_cli.config import DEFAULT_CONFIG, load_config, load_env, save_config
-from hermes_cli.deployment_image import DeploymentImageDescriptor
 from hermes_cli.deployment_inference import DeploymentInferenceRouteDescriptor
+from hermes_cli.deployment_media import (
+    DeploymentMediaDescriptor,
+    DeploymentMediaRouteDescriptor,
+)
 from hermes_cli.model_plane import capability as capability_module
 from hermes_cli.model_plane.capability import CapabilityModel
 
@@ -107,37 +109,19 @@ class _VectorCapability:
         return {"dimensions": [1024]}
 
 
-def _legacy_media_bridge():
-    """Adapt only the legacy image/video registries for catalog tests.
-
-    Keeps the model-plane catalog hermetic: real plugin discovery, TTS/STT
-    registries, and profile embedding declarations stay out of this file.
-    """
-    for provider in image_gen_registry.list_providers():
-        capability_module.register_capability_provider(
-            capability_module._LegacyMediaAdapter("image", provider)
-        )
-    for provider in video_gen_registry.list_providers():
-        capability_module.register_capability_provider(
-            capability_module._LegacyMediaAdapter("video", provider)
-        )
-
-
 @pytest.fixture(autouse=True)
 def _registries(monkeypatch):
-    image_gen_registry._reset_for_tests()
-    video_gen_registry._reset_for_tests()
     capability_module._reset_for_tests()
-    image_gen_registry.register_provider(_ImageProvider())
-    video_gen_registry.register_provider(_VideoProvider())
+    capability_module.register_media_generation_provider("image", _ImageProvider())
+    capability_module.register_media_generation_provider("video", _VideoProvider())
     monkeypatch.setattr("hermes_cli.plugins._ensure_plugins_discovered", lambda *args, **kwargs: None)
+    # Keep the catalog hermetic: real plugin discovery, TTS/STT registries,
+    # and profile embedding declarations stay out of this file.
     monkeypatch.setattr(
         "hermes_cli.model_plane.catalog.ensure_capability_providers",
-        _legacy_media_bridge,
+        lambda: None,
     )
     yield
-    image_gen_registry._reset_for_tests()
-    video_gen_registry._reset_for_tests()
     capability_module._reset_for_tests()
 
 
@@ -174,12 +158,17 @@ def _deployment_registrations(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        "hermes_cli.deployment_image.deployment_image_descriptor_from_environment",
-        lambda: DeploymentImageDescriptor(
-            provider="apiyi",
-            model="gpt-image-2-medium",
-            policy_id="deployment-image",
-            allowed_models=("gpt-image-2-medium", "nano-banana-2"),
+        "hermes_cli.deployment_media.deployment_media_descriptor_from_environment",
+        lambda: DeploymentMediaDescriptor(
+            policy_id="deployment-media",
+            routes=(
+                DeploymentMediaRouteDescriptor(
+                    kind="image",
+                    provider="apiyi",
+                    models=("gpt-image-2-medium", "nano-banana-2"),
+                    default_model="gpt-image-2-medium",
+                ),
+            ),
         ),
     )
 

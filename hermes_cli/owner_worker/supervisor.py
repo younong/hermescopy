@@ -34,12 +34,12 @@ from hermes_cli.dashboard_auth.authority import (
     WorkerLeaseState,
 )
 from hermes_cli.controlled_roots import ControlledRoots, ExpectedType, RootKind, controlled_roots_for
-from hermes_cli.deployment_image import DeploymentImagePolicy
 from hermes_cli.deployment_inference import DeploymentInferencePolicy
+from hermes_cli.deployment_media import DeploymentMediaPolicy
 from hermes_cli.latency_trace import observe_latency_stage, observed_latency_stage
 from hermes_cli.local_socket import canonical_unix_peer_is_absent
 from hermes_cli.owner_worker.cgroup_v2 import CgroupScopeLease
-from hermes_cli.owner_worker.image_relay import DeploymentImageBroker
+from hermes_cli.owner_worker.media_relay import DeploymentMediaBroker
 from hermes_cli.owner_worker.inference_relay import DeploymentInferenceBroker
 from hermes_cli.owner_worker.preloaded_launcher import OwnerWorkerLauncher
 from hermes_cli.owner_worker.resource_broker import DeploymentResourceBroker
@@ -295,7 +295,7 @@ class OwnerWorkerSupervisor:
         generation_bridge_revoker: Callable[..., None] | None = None,
         deployment_inference_policy: DeploymentInferencePolicy | None = None,
         deployment_inference_policy_resolver: Callable[[], DeploymentInferencePolicy] | None = None,
-        deployment_image_policy: DeploymentImagePolicy | None = None,
+        deployment_media_policy: DeploymentMediaPolicy | None = None,
         resource_manager: Any | None = None,
         launcher: Any | None = None,
     ) -> None:
@@ -378,10 +378,10 @@ class OwnerWorkerSupervisor:
             if deployment_inference_policy is not None
             else None
         )
-        self.deployment_image_policy = deployment_image_policy
-        self.deployment_image_broker = (
-            DeploymentImageBroker(policy=deployment_image_policy, authority_store=self.authority_store)
-            if deployment_image_policy is not None else None
+        self.deployment_media_policy = deployment_media_policy
+        self.deployment_media_broker = (
+            DeploymentMediaBroker(policy=deployment_media_policy, authority_store=self.authority_store)
+            if deployment_media_policy is not None else None
         )
         self.deployment_resource_broker = (
             DeploymentResourceBroker(manager=resource_manager, authority_store=self.authority_store)
@@ -609,7 +609,7 @@ class OwnerWorkerSupervisor:
         socket_path = self.socket_path_for(owner, generation.worker_generation)
         env = self._env_for(owner, generation, claim.lease)
         relay_fd = None
-        image_relay_fd = None
+        media_relay_fd = None
         resource_broker_fd = None
         worker_resource_scope = None
         resource_started_at = time.monotonic()
@@ -619,9 +619,9 @@ class OwnerWorkerSupervisor:
             if self.deployment_inference_broker is not None:
                 relay_fd = self.deployment_inference_broker.register(claim.lease)
                 env["HERMES_DEPLOYMENT_INFERENCE_RELAY_FD"] = str(relay_fd)
-            if self.deployment_image_broker is not None:
-                image_relay_fd = self.deployment_image_broker.register(claim.lease)
-                env["HERMES_DEPLOYMENT_IMAGE_RELAY_FD"] = str(image_relay_fd)
+            if self.deployment_media_broker is not None:
+                media_relay_fd = self.deployment_media_broker.register(claim.lease)
+                env["HERMES_DEPLOYMENT_MEDIA_RELAY_FD"] = str(media_relay_fd)
             if self.deployment_resource_broker is not None:
                 resource_broker_fd = self.deployment_resource_broker.register(claim.lease)
                 env["HERMES_DEPLOYMENT_RESOURCE_BROKER_FD"] = str(resource_broker_fd)
@@ -637,7 +637,7 @@ class OwnerWorkerSupervisor:
                 outcome="error",
                 path=readiness_path,
             )
-            for fd in (relay_fd, image_relay_fd, resource_broker_fd):
+            for fd in (relay_fd, media_relay_fd, resource_broker_fd):
                 if fd is not None:
                     try:
                         os.close(fd)
@@ -645,8 +645,8 @@ class OwnerWorkerSupervisor:
                         pass
             if self.deployment_inference_broker is not None:
                 self.deployment_inference_broker.revoke(claim.lease)
-            if self.deployment_image_broker is not None:
-                self.deployment_image_broker.revoke(claim.lease)
+            if self.deployment_media_broker is not None:
+                self.deployment_media_broker.revoke(claim.lease)
             if self.deployment_resource_broker is not None:
                 self.deployment_resource_broker.revoke(claim.lease)
             if worker_resource_scope is not None:
@@ -678,7 +678,7 @@ class OwnerWorkerSupervisor:
                 path=readiness_path,
             )
             controlled_roots.close()
-            for fd in (relay_fd, image_relay_fd, resource_broker_fd):
+            for fd in (relay_fd, media_relay_fd, resource_broker_fd):
                 if fd is not None:
                     try:
                         os.close(fd)
@@ -686,8 +686,8 @@ class OwnerWorkerSupervisor:
                         pass
             if self.deployment_inference_broker is not None:
                 self.deployment_inference_broker.revoke(claim.lease)
-            if self.deployment_image_broker is not None:
-                self.deployment_image_broker.revoke(claim.lease)
+            if self.deployment_media_broker is not None:
+                self.deployment_media_broker.revoke(claim.lease)
             if self.deployment_resource_broker is not None:
                 self.deployment_resource_broker.revoke(claim.lease)
             if worker_resource_scope is not None:
@@ -742,7 +742,7 @@ class OwnerWorkerSupervisor:
                         name: fd
                         for name, fd in (
                             ("inference", relay_fd),
-                            ("image", image_relay_fd),
+                            ("media", media_relay_fd),
                             ("resource", resource_broker_fd),
                         )
                         if fd is not None
@@ -780,7 +780,7 @@ class OwnerWorkerSupervisor:
                                 inherited_cwd_fd,
                                 start_read,
                                 relay_fd,
-                                image_relay_fd,
+                                media_relay_fd,
                                 resource_broker_fd,
                             )
                             if fd is not None
@@ -808,7 +808,7 @@ class OwnerWorkerSupervisor:
                         **process_kwargs,
                         preexec_fn=_set_descriptor_cwd,
                         pass_fds=tuple(
-                            fd for fd in (inherited_cwd_fd, relay_fd, image_relay_fd)
+                            fd for fd in (inherited_cwd_fd, relay_fd, media_relay_fd)
                             if fd is not None
                         ),
                     )
@@ -817,9 +817,9 @@ class OwnerWorkerSupervisor:
                 if relay_fd is not None:
                     os.close(relay_fd)
                     relay_fd = None
-                if image_relay_fd is not None:
-                    os.close(image_relay_fd)
-                    image_relay_fd = None
+                if media_relay_fd is not None:
+                    os.close(media_relay_fd)
+                    media_relay_fd = None
                 if resource_broker_fd is not None:
                     os.close(resource_broker_fd)
                     resource_broker_fd = None
@@ -848,8 +848,8 @@ class OwnerWorkerSupervisor:
                         pass
             if self.deployment_inference_broker is not None:
                 self.deployment_inference_broker.revoke(claim.lease)
-            if self.deployment_image_broker is not None:
-                self.deployment_image_broker.revoke(claim.lease)
+            if self.deployment_media_broker is not None:
+                self.deployment_media_broker.revoke(claim.lease)
             if self.deployment_resource_broker is not None:
                 self.deployment_resource_broker.revoke(claim.lease)
             if worker_resource_scope is not None:
@@ -918,8 +918,8 @@ class OwnerWorkerSupervisor:
             )
             if self.deployment_inference_broker is not None:
                 self.deployment_inference_broker.revoke(claim.lease)
-            if self.deployment_image_broker is not None:
-                self.deployment_image_broker.revoke(claim.lease)
+            if self.deployment_media_broker is not None:
+                self.deployment_media_broker.revoke(claim.lease)
             if self.deployment_resource_broker is not None:
                 self.deployment_resource_broker.revoke(claim.lease)
             if worker_resource_scope is not None:
@@ -972,8 +972,8 @@ class OwnerWorkerSupervisor:
         try:
             if self.deployment_inference_broker is not None:
                 self.deployment_inference_broker.activate(active_lease)
-            if self.deployment_image_broker is not None:
-                self.deployment_image_broker.activate(active_lease)
+            if self.deployment_media_broker is not None:
+                self.deployment_media_broker.activate(active_lease)
             if self.deployment_resource_broker is not None:
                 self.deployment_resource_broker.activate(active_lease)
         except Exception as exc:
@@ -985,8 +985,8 @@ class OwnerWorkerSupervisor:
             )
             if self.deployment_inference_broker is not None:
                 self.deployment_inference_broker.revoke(active_lease)
-            if self.deployment_image_broker is not None:
-                self.deployment_image_broker.revoke(active_lease)
+            if self.deployment_media_broker is not None:
+                self.deployment_media_broker.revoke(active_lease)
             if self.deployment_resource_broker is not None:
                 self.deployment_resource_broker.revoke(active_lease)
             self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, active_lease)
@@ -1143,7 +1143,7 @@ class OwnerWorkerSupervisor:
                 first_error = first_error or exc
         for broker in (
             self.deployment_inference_broker,
-            self.deployment_image_broker,
+            self.deployment_media_broker,
             self.deployment_resource_broker,
         ):
             if broker is None:
@@ -1514,7 +1514,7 @@ class OwnerWorkerSupervisor:
             # no broker endpoint, process, or cgroup reservation is leaked.
             for broker in (
                 self.deployment_inference_broker,
-                self.deployment_image_broker,
+                self.deployment_media_broker,
                 self.deployment_resource_broker,
             ):
                 if broker is not None:
@@ -1699,9 +1699,9 @@ class OwnerWorkerSupervisor:
                     self.deployment_inference_policy.descriptor()
                     if self.deployment_inference_policy is not None else None
                 ),
-                deployment_image_descriptor=(
-                    self.deployment_image_policy.descriptor()
-                    if self.deployment_image_policy is not None else None
+                deployment_media_descriptor=(
+                    self.deployment_media_policy.descriptor()
+                    if self.deployment_media_policy is not None else None
                 ),
             )
         )

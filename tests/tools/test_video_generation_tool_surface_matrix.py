@@ -24,10 +24,10 @@ import yaml
 
 @pytest.fixture(autouse=True)
 def _reset_registry():
-    from agent import video_gen_registry
-    video_gen_registry._reset_for_tests()
+    from hermes_cli.model_plane import capability as capability_module
+    capability_module._reset_for_tests()
     yield
-    video_gen_registry._reset_for_tests()
+    capability_module._reset_for_tests()
 
 
 @pytest.fixture

@@ -19,15 +19,15 @@ from typing import Any, Dict, List, Optional
 import pytest
 import yaml
 
-from agent import image_gen_registry
+from hermes_cli.model_plane import capability as capability_module
 from agent.image_gen_provider import ImageGenProvider
 
 
 @pytest.fixture(autouse=True)
 def _reset_registry():
-    image_gen_registry._reset_for_tests()
+    capability_module._reset_for_tests()
     yield
-    image_gen_registry._reset_for_tests()
+    capability_module._reset_for_tests()
 
 
 @pytest.fixture
@@ -261,13 +261,12 @@ class TestPluginDispatchImageToImage:
     def test_dispatch_forwards_image_url(self, cfg_home, monkeypatch):
         import tools.image_generation_tool as image_tool
         from hermes_cli import plugins as plugins_module
-        from agent import image_gen_registry as reg
+        from hermes_cli.model_plane import capability as capability_module
 
         provider = _EditCapableProvider()
-        reg.register_provider(provider)
-        monkeypatch.setattr(image_tool, "_read_configured_image_provider", lambda: "editcap")
+        capability_module.register_media_generation_provider("image", provider)
         monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", lambda *a, **k: None)
-        monkeypatch.setattr(reg, "get_provider", lambda n: provider if n == "editcap" else None)
+        _write_cfg(cfg_home, {"image_gen": {"provider": "editcap"}})
 
         raw = image_tool._dispatch_to_plugin_provider(
             "make night", "square",
@@ -283,13 +282,12 @@ class TestPluginDispatchImageToImage:
     def test_dispatch_text_only_when_no_image(self, cfg_home, monkeypatch):
         import tools.image_generation_tool as image_tool
         from hermes_cli import plugins as plugins_module
-        from agent import image_gen_registry as reg
+        from hermes_cli.model_plane import capability as capability_module
 
         provider = _EditCapableProvider()
-        reg.register_provider(provider)
-        monkeypatch.setattr(image_tool, "_read_configured_image_provider", lambda: "editcap")
+        capability_module.register_media_generation_provider("image", provider)
         monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", lambda *a, **k: None)
-        monkeypatch.setattr(reg, "get_provider", lambda n: provider if n == "editcap" else None)
+        _write_cfg(cfg_home, {"image_gen": {"provider": "editcap"}})
 
         raw = image_tool._dispatch_to_plugin_provider("a dog", "landscape")
         out = json.loads(raw)
@@ -300,13 +298,12 @@ class TestPluginDispatchImageToImage:
     def test_legacy_provider_edit_request_surfaces_clear_error(self, cfg_home, monkeypatch):
         import tools.image_generation_tool as image_tool
         from hermes_cli import plugins as plugins_module
-        from agent import image_gen_registry as reg
+        from hermes_cli.model_plane import capability as capability_module
 
         provider = _LegacyProvider()
-        reg.register_provider(provider)
-        monkeypatch.setattr(image_tool, "_read_configured_image_provider", lambda: "legacy")
+        capability_module.register_media_generation_provider("image", provider)
         monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", lambda *a, **k: None)
-        monkeypatch.setattr(reg, "get_provider", lambda n: provider if n == "legacy" else None)
+        _write_cfg(cfg_home, {"image_gen": {"provider": "legacy"}})
 
         raw = image_tool._dispatch_to_plugin_provider(
             "edit it", "square", image_url="https://in/src.png",
@@ -363,10 +360,10 @@ class TestDynamicSchema:
 
     def test_plugin_both_provider_advertises_refs(self, cfg_home, monkeypatch):
         from tools.image_generation_tool import _build_dynamic_image_schema
-        from agent import image_gen_registry as reg
+        from hermes_cli.model_plane import capability as capability_module
 
         _write_cfg(cfg_home, {"image_gen": {"provider": "both"}})
-        reg.register_provider(_PluginBothProvider())
+        capability_module.register_media_generation_provider("image", _PluginBothProvider())
         self._no_discovery(monkeypatch)
 
         desc = _build_dynamic_image_schema()["description"]

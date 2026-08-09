@@ -236,7 +236,7 @@ def _run_child(
         os.environ.update(env)
         relay_names = {
             "inference": "HERMES_DEPLOYMENT_INFERENCE_RELAY_FD",
-            "image": "HERMES_DEPLOYMENT_IMAGE_RELAY_FD",
+            "media": "HERMES_DEPLOYMENT_MEDIA_RELAY_FD",
             "resource": "HERMES_DEPLOYMENT_RESOURCE_BROKER_FD",
         }
         for name, env_key in relay_names.items():

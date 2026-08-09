@@ -83,7 +83,7 @@ def test_lifespan_warmup_is_nonblocking():
 def test_lifespan_isolates_enabled_ilink_without_deployment_policies(monkeypatch):
     class _Supervisor:
         deployment_inference_policy = None
-        deployment_image_policy = None
+        deployment_media_policy = None
         resource_manager = None
 
         def shutdown(self):

@@ -293,10 +293,10 @@ class TestBundledBackendAutoLoad:
 
 class TestRegisterImageGenProvider:
     def test_accepts_valid_provider(self, tmp_path, monkeypatch):
-        from agent import image_gen_registry
+        from hermes_cli.model_plane import capability as capability_module
         from agent.image_gen_provider import ImageGenProvider
 
-        image_gen_registry._reset_for_tests()
+        capability_module._reset_for_tests()
 
         class FakeProvider(ImageGenProvider):
             @property
@@ -327,14 +327,14 @@ class TestRegisterImageGenProvider:
         mgr.discover_and_load()
 
         assert mgr._plugins["my-img-plugin"].enabled is True
-        assert image_gen_registry.get_provider("fake-ctx") is not None
+        assert capability_module.get_capability_provider("image", "fake-ctx") is not None
 
-        image_gen_registry._reset_for_tests()
+        capability_module._reset_for_tests()
 
     def test_rejects_non_provider(self, tmp_path, monkeypatch, caplog):
-        from agent import image_gen_registry
+        from hermes_cli.model_plane import capability as capability_module
 
-        image_gen_registry._reset_for_tests()
+        capability_module._reset_for_tests()
 
         import os
         hermes_home = Path(os.environ["HERMES_HOME"])  # set by hermetic conftest fixture
@@ -352,6 +352,6 @@ class TestRegisterImageGenProvider:
         # Plugin loaded (register returned normally) but nothing was
         # registered in the provider registry.
         assert mgr._plugins["bad-img-plugin"].enabled is True
-        assert image_gen_registry.get_provider("not a provider") is None
+        assert capability_module.get_capability_provider("image", "not a provider") is None
 
-        image_gen_registry._reset_for_tests()
+        capability_module._reset_for_tests()

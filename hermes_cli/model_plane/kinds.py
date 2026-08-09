@@ -36,6 +36,11 @@ GATEWAY_KINDS = (IMAGE, VIDEO)
 # Voice models are tagged with the sub-capability they serve.
 VOICE_CAPABILITIES = ("tts", "asr")
 
+# Default provider per kind when nothing is configured and availability alone
+# cannot decide (zero or multiple available providers). Kinds without an entry
+# have no implicit default.
+FALLBACK_CAPABILITY_PROVIDERS = {"image": "fal"}
+
 
 def selection_section(kind: str) -> str:
     """Config section holding the active selection for a media kind."""

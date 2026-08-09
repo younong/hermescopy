@@ -1153,12 +1153,15 @@ def _build_no_backend_setup_message() -> str:
 
 
 def _resolve_image_provider():
-    """Discover plugins and return the registry's single selection result."""
-    from agent.image_gen_registry import register_provider, resolve_active_provider
+    """Discover plugins and return the model plane's single selection result."""
+    from hermes_cli.model_plane.capability import (
+        register_media_generation_provider,
+        resolve_capability_provider,
+    )
     from hermes_cli.plugins import _ensure_plugins_discovered
 
     _ensure_plugins_discovered()
-    resolution = resolve_active_provider()
+    resolution = resolve_capability_provider("image")
     if resolution.provider is None and not resolution.explicit:
         # Direct imports and isolated tests can legitimately reach this module
         # before plugin discovery has registered the in-tree legacy adapter.
@@ -1168,26 +1171,30 @@ def _resolve_image_provider():
 
             fal = FalImageGenProvider()
             if fal.is_available():
-                register_provider(fal)
-                resolution = resolve_active_provider()
+                register_media_generation_provider("image", fal)
+                resolution = resolve_capability_provider("image")
         except Exception:
             pass
     return resolution
 
 
-def _deployment_image_descriptor():
+def _deployment_image_route():
+    """Return the deployment media route matching the active image selection."""
     try:
-        from hermes_cli.deployment_image import deployment_image_descriptor_from_environment
-        from hermes_cli.owner_runtime import is_owner_worker_env
+        from hermes_cli.deployment_media import deployment_media_route_from_environment
 
-        return deployment_image_descriptor_from_environment() if is_owner_worker_env() else None
+        return deployment_media_route_from_environment(
+            "image",
+            provider=_read_configured_image_provider() or "",
+            model=_read_configured_image_model() or "",
+        )
     except Exception:
         return None
 
 
 def check_image_generation_requirements() -> bool:
     """True when the selected image backend or deployment relay is available."""
-    if _deployment_image_descriptor() is not None:
+    if _deployment_image_route() is not None:
         return True
     try:
         resolution = _resolve_image_provider()
@@ -1540,11 +1547,11 @@ def _maybe_route_managed_krea(
         return None
 
     try:
-        from agent.image_gen_registry import get_provider
+        from hermes_cli.model_plane.capability import get_capability_provider
         from hermes_cli.plugins import _ensure_plugins_discovered
 
         _ensure_plugins_discovered()
-        provider = get_provider("krea")
+        provider = get_capability_provider("image", "krea")
     except Exception as exc:  # noqa: BLE001
         logger.debug("Managed Krea routing: provider unavailable: %s", exc)
         return None
@@ -1649,9 +1656,9 @@ def _active_image_capabilities() -> Dict[str, Any]:
     """Return capabilities for the same provider runtime dispatch will use."""
     info: Dict[str, Any] = {"modalities": ["text"], "max_reference_images": 0}
     try:
-        descriptor = _deployment_image_descriptor()
-        if descriptor is not None:
-            return descriptor.capabilities_for()
+        route = _deployment_image_route()
+        if route is not None:
+            return route.capabilities_for(_read_configured_image_model())
         resolution = _resolve_image_provider()
         provider = resolution.provider
         if provider is None:

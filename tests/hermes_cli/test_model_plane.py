@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent import image_gen_registry, tts_registry, transcription_registry
+from agent import tts_registry, transcription_registry
 from agent.image_gen_provider import ImageGenProvider
 from agent.tts_provider import TTSProvider
 from agent.transcription_provider import TranscriptionProvider
@@ -11,8 +11,8 @@ from hermes_cli.model_plane import catalog as catalog_module
 from hermes_cli.model_plane import kinds
 from hermes_cli.model_plane.capability import (
     CapabilityModel,
+    MediaGenerationAdapter,
     ProfileEmbeddingCapability,
-    _LegacyMediaAdapter,
     _LegacyVoiceAdapter,
 )
 
@@ -26,7 +26,7 @@ class _ImageDouble(ImageGenProvider):
         return True
 
     def list_models(self):
-        return [{"id": "image-x", "display": "Image X"}]
+        return [{"id": "image-x", "display": "Image X", "speed": "fast"}]
 
     def get_setup_schema(self):
         return {
@@ -38,7 +38,16 @@ class _ImageDouble(ImageGenProvider):
         return {"modalities": ["text", "image"]}
 
     def generate(self, prompt, aspect_ratio="landscape", **kwargs):
-        return {"success": True}
+        return {"success": True, "prompt": prompt}
+
+
+class _UnavailableImageDouble(_ImageDouble):
+    @property
+    def name(self) -> str:
+        return "image-unavailable"
+
+    def is_available(self) -> bool:
+        return False
 
 
 class _TTSDouble(TTSProvider):
@@ -77,14 +86,12 @@ class _ASRDouble(TranscriptionProvider):
 
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
-    image_gen_registry._reset_for_tests()
     tts_registry._reset_for_tests()
     transcription_registry._reset_for_tests()
     capability_module._reset_for_tests()
     monkeypatch.setattr("hermes_cli.plugins._ensure_plugins_discovered", lambda *a, **k: None)
     monkeypatch.setattr("providers.list_providers", lambda: [])
     yield
-    image_gen_registry._reset_for_tests()
     tts_registry._reset_for_tests()
     transcription_registry._reset_for_tests()
     capability_module._reset_for_tests()
@@ -96,6 +103,7 @@ def test_kind_contract_is_single_source():
     assert kinds.ACTIVATABLE_KINDS == kinds.MEDIA_KINDS
     assert kinds.GATEWAY_KINDS == ("image", "video")
     assert kinds.VOICE_CAPABILITIES == ("tts", "asr")
+    assert kinds.FALLBACK_CAPABILITY_PROVIDERS == {"image": "fal"}
     assert kinds.selection_section("voice") == "voice_gen"
     assert kinds.selection_section("vector") == "vector_gen"
     with pytest.raises(ValueError):
@@ -130,17 +138,117 @@ def test_registry_rejects_invalid_provider():
         capability_module.register_capability_provider(_Bad())
 
 
-def test_legacy_media_adapter_exposes_gen_media_contract():
-    adapter = _LegacyMediaAdapter("image", _ImageDouble())
+def test_media_generation_adapter_exposes_gen_media_contract():
+    adapter = MediaGenerationAdapter("image", _ImageDouble())
     assert adapter.name == "image-double"
     assert adapter.capability == ""
     assert adapter.is_available() is True
-    assert adapter.list_models() == [CapabilityModel(id="image-x", display="Image X")]
+    assert adapter.list_models() == [
+        CapabilityModel(id="image-x", display="Image X")
+    ]
+    assert adapter.model_entries() == [
+        {"id": "image-x", "display": "Image X", "speed": "fast"}
+    ]
     assert adapter.default_model() == "image-x"
     assert adapter.get_setup_schema()["env_vars"] == [
         {"key": "IMAGE_DOUBLE_API_KEY", "prompt": "Key prompt"}
     ]
     assert adapter.capabilities() == {"modalities": ["text", "image"]}
+    # Execution attributes delegate to the wrapped plugin.
+    assert adapter.generate(prompt="hi") == {"success": True, "prompt": "hi"}
+
+
+def test_media_generation_registration_rejects_non_gateway_kind():
+    with pytest.raises(ValueError, match="media generation kind"):
+        capability_module.register_media_generation_provider("voice", _ImageDouble())
+
+
+def test_media_generation_registration_flows_into_catalog():
+    capability_module.register_media_generation_provider("image", _ImageDouble())
+
+    provider = capability_module.get_capability_provider("image", "image-double")
+    assert provider is not None
+    assert provider.name == "image-double"
+    assert [p.name for p in capability_module.list_capability_providers("image")] == [
+        "image-double"
+    ]
+
+
+def test_resolve_capability_provider_semantics():
+    capability_module.register_media_generation_provider("image", _ImageDouble())
+
+    # Explicit configuration never falls back and reports availability.
+    resolution = capability_module.resolve_capability_provider(
+        "image", "image-double", read_config=False
+    )
+    assert resolution.provider is not None
+    assert resolution.provider.name == "image-double"
+    assert resolution.explicit is True
+    assert resolution.available is True
+    assert resolution.error_type is None
+
+    # An explicit unknown name errors without falling back.
+    resolution = capability_module.resolve_capability_provider(
+        "image", "missing", read_config=False
+    )
+    assert resolution.provider is None
+    assert resolution.explicit is True
+    assert resolution.error_type == "provider_not_registered"
+
+    # An explicit but unavailable provider is reported, not replaced.
+    capability_module.register_media_generation_provider("image", _UnavailableImageDouble())
+    resolution = capability_module.resolve_capability_provider(
+        "image", "image-unavailable", read_config=False
+    )
+    assert resolution.provider is not None
+    assert resolution.available is False
+    assert resolution.error_type == "provider_unavailable"
+
+    # No configuration: exactly one available provider wins.
+    resolution = capability_module.resolve_capability_provider(
+        "image", None, read_config=False
+    )
+    assert resolution.provider is not None
+    assert resolution.provider.name == "image-double"
+    assert resolution.explicit is False
+
+
+def test_resolve_capability_provider_fallback_default(monkeypatch):
+    class _FalDouble(_ImageDouble):
+        @property
+        def name(self) -> str:
+            return "fal"
+
+    class _OtherDouble(_ImageDouble):
+        @property
+        def name(self) -> str:
+            return "other"
+
+    capability_module.register_media_generation_provider("image", _FalDouble())
+    capability_module.register_media_generation_provider("image", _OtherDouble())
+
+    # Multiple available providers: the kind's fallback provider wins.
+    resolution = capability_module.resolve_capability_provider(
+        "image", None, read_config=False
+    )
+    assert resolution.provider is not None
+    assert resolution.provider.name == "fal"
+
+    # Without an available fallback, multiple available providers are ambiguous.
+    capability_module._reset_for_tests()
+    capability_module.register_media_generation_provider("image", _OtherDouble())
+    capability_module.register_media_generation_provider("video", _OtherDouble())
+    resolution = capability_module.resolve_capability_provider(
+        "video", None, read_config=False
+    )
+    assert resolution.provider is not None  # single available provider still wins
+
+    capability_module.register_media_generation_provider("image", _ImageDouble())
+    resolution = capability_module.resolve_capability_provider(
+        "image", None, read_config=False
+    )
+    assert resolution.provider is None
+    assert resolution.error_type == "provider_ambiguous"
 
 
 def test_profile_embedding_capability_exposes_vector_contract(monkeypatch):
@@ -175,10 +283,9 @@ def test_profile_embedding_capability_exposes_vector_contract(monkeypatch):
     assert capability.is_available() is False
 
 
-def test_ensure_bridges_legacy_registries_and_profiles(monkeypatch):
+def test_ensure_bridges_voice_registries_and_profiles(monkeypatch):
     from providers.base import ProviderProfile
 
-    image_gen_registry.register_provider(_ImageDouble())
     tts_registry.register_provider(_TTSDouble())
     transcription_registry.register_provider(_ASRDouble())
     profile = ProviderProfile(
@@ -191,9 +298,6 @@ def test_ensure_bridges_legacy_registries_and_profiles(monkeypatch):
 
     capability_module.ensure_capability_providers()
 
-    assert [p.name for p in capability_module.list_capability_providers("image")] == [
-        "image-double"
-    ]
     voice = capability_module.get_capability_provider("voice", "voice-double")
     assert sorted(m.id for m in voice.list_models()) == ["asr-x", "tts-x"]
     vector = capability_module.get_capability_provider("vector", "embed-double")
@@ -205,7 +309,7 @@ def test_ensure_bridges_legacy_registries_and_profiles(monkeypatch):
 
 
 def test_capability_catalog_rows_are_credential_safe():
-    image_gen_registry.register_provider(_ImageDouble())
+    capability_module.register_media_generation_provider("image", _ImageDouble())
     capability_module.ensure_capability_providers()
 
     rows = catalog_module.capability_catalog("image")

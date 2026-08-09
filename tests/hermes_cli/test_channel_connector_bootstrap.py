@@ -15,7 +15,7 @@ class _Supervisor:
         self.global_home = tmp_path
         self.control_home = tmp_path / "control-plane"
         self.deployment_inference_policy = object()
-        self.deployment_image_policy = object()
+        self.deployment_media_policy = object()
         self.resource_manager = object()
 
 
