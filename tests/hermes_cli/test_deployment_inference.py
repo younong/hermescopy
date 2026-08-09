@@ -1320,6 +1320,42 @@ def test_owner_relay_streams_sse_and_injects_control_plane_credential(tmp_path, 
             relay.close()
 
 
+@pytest.mark.parametrize(
+    ("base_path", "expected_path"),
+    [
+        ("/api/plan/v3", "/api/plan/v3/chat/completions"),
+        ("/api/plan/v3/v1", "/api/plan/v3/v1/chat/completions"),
+        ("/api/plan/v3/v2.1", "/api/plan/v3/v2.1/chat/completions"),
+    ],
+)
+def test_owner_relay_preserves_versioned_service_root(tmp_path, base_path, expected_path):
+    with _upstream_server() as (server, received):
+        policy = DeploymentInferencePolicy(
+            provider="custom:deployment",
+            model="gpt-safe",
+            api_mode="chat_completions",
+            runtime_resolver=lambda: {
+                "provider": "custom:deployment",
+                "api_mode": "chat_completions",
+                "base_url": f"http://127.0.0.1:{server.server_port}{base_path}",
+                "api_key": "control-plane-secret",
+            },
+        )
+        broker, active, relay = _activate_relay(AuthorityStore(tmp_path / "control"), policy)
+        try:
+            response = httpx.post(
+                f"{relay.base_url}/chat/completions",
+                headers={"x-hermes-deployment-provider": "custom:deployment"},
+                json={"model": "gpt-safe", "messages": []},
+                timeout=5,
+            )
+            assert response.status_code == 200
+            assert received[0]["path"] == expected_path
+        finally:
+            broker.revoke(active)
+            relay.close()
+
+
 def test_compression_auxiliary_smoke_through_owner_relay(tmp_path, monkeypatch):
     """Compression reaches the upstream model through the real relay stack."""
     from agent import auxiliary_client
