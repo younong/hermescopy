@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import pytest
 
-from agent import tts_registry, transcription_registry
 from agent.image_gen_provider import ImageGenProvider
 from agent.tts_provider import TTSProvider
 from agent.transcription_provider import TranscriptionProvider
@@ -13,7 +12,6 @@ from hermes_cli.model_plane.capability import (
     CapabilityModel,
     MediaGenerationAdapter,
     ProfileEmbeddingCapability,
-    _LegacyVoiceAdapter,
 )
 
 
@@ -86,14 +84,9 @@ class _ASRDouble(TranscriptionProvider):
 
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
-    tts_registry._reset_for_tests()
-    transcription_registry._reset_for_tests()
     capability_module._reset_for_tests()
     monkeypatch.setattr("hermes_cli.plugins._ensure_plugins_discovered", lambda *a, **k: None)
-    monkeypatch.setattr("providers.list_providers", lambda: [])
     yield
-    tts_registry._reset_for_tests()
-    transcription_registry._reset_for_tests()
     capability_module._reset_for_tests()
 
 
@@ -111,8 +104,8 @@ def test_kind_contract_is_single_source():
 
 
 def test_registry_merges_same_name_voice_delegates():
-    capability_module.register_capability_provider(_LegacyVoiceAdapter("tts", _TTSDouble()))
-    capability_module.register_capability_provider(_LegacyVoiceAdapter("asr", _ASRDouble()))
+    capability_module.register_voice_provider("tts", _TTSDouble())
+    capability_module.register_voice_provider("asr", _ASRDouble())
 
     provider = capability_module.get_capability_provider("voice", "voice-double")
     assert provider is not None
@@ -283,29 +276,52 @@ def test_profile_embedding_capability_exposes_vector_contract(monkeypatch):
     assert capability.is_available() is False
 
 
-def test_ensure_bridges_voice_registries_and_profiles(monkeypatch):
-    from providers.base import ProviderProfile
+def test_voice_registration_validates_abc_and_builtin_names(caplog):
+    # Wrong ABC for the capability raises TypeError.
+    with pytest.raises(TypeError, match="TTSProvider"):
+        capability_module.register_voice_provider("tts", _ASRDouble())
+    with pytest.raises(TypeError, match="TranscriptionProvider"):
+        capability_module.register_voice_provider("asr", _TTSDouble())
+    with pytest.raises(ValueError, match="voice capability"):
+        capability_module.register_voice_provider("embed", _TTSDouble())
 
-    tts_registry.register_provider(_TTSDouble())
-    transcription_registry.register_provider(_ASRDouble())
-    profile = ProviderProfile(
-        name="embed-double",
-        env_vars=(),
-        embedding_model="embed-x",
-        embedding_path="embeddings",
+    # Built-in shadowing is a warning, not an exception — and the
+    # registration is ignored (built-ins always win).
+    class _EdgeDouble(_TTSDouble):
+        @property
+        def name(self) -> str:
+            return "edge"
+
+    with caplog.at_level("WARNING"):
+        capability_module.register_voice_provider("tts", _EdgeDouble())
+    assert capability_module.get_voice_delegate("edge", "tts") is None
+    assert "shadows a built-in name" in caplog.text
+
+
+def test_voice_delegate_dispatch_lookup_is_case_insensitive():
+    capability_module.register_voice_provider("tts", _TTSDouble())
+    capability_module.register_voice_provider("asr", _ASRDouble())
+
+    tts = capability_module.get_voice_delegate(" Voice-Double ", "tts")
+    assert tts is not None
+    assert tts.name == "voice-double"
+    # Execution attributes delegate to the wrapped plugin.
+    assert tts.synthesize("hi", "/tmp/out.mp3") == "/tmp/out.mp3"
+    assert capability_module.get_voice_delegate("voice-double", "asr") is not None
+    assert capability_module.get_voice_delegate("voice-double", "embed") is None
+    assert capability_module.get_voice_delegate("missing", "tts") is None
+
+
+def test_ensure_capability_providers_triggers_discovery(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "hermes_cli.plugins._ensure_plugins_discovered",
+        lambda *a, **k: calls.append((a, k)),
     )
-    monkeypatch.setattr("providers.list_providers", lambda: [profile])
 
     capability_module.ensure_capability_providers()
-
-    voice = capability_module.get_capability_provider("voice", "voice-double")
-    assert sorted(m.id for m in voice.list_models()) == ["asr-x", "tts-x"]
-    vector = capability_module.get_capability_provider("vector", "embed-double")
-    assert vector.list_models() == [CapabilityModel(id="embed-x", display="embed-x")]
-
-    # Idempotent: a second call does not duplicate providers.
     capability_module.ensure_capability_providers()
-    assert len(capability_module.list_capability_providers("voice")) == 1
+    assert len(calls) == 2
 
 
 def test_capability_catalog_rows_are_credential_safe():
@@ -332,8 +348,8 @@ def test_capability_catalog_rows_are_credential_safe():
 
 
 def test_capability_catalog_voice_rows_carry_capability_tags():
-    capability_module.register_capability_provider(_LegacyVoiceAdapter("tts", _TTSDouble()))
-    capability_module.register_capability_provider(_LegacyVoiceAdapter("asr", _ASRDouble()))
+    capability_module.register_voice_provider("tts", _TTSDouble())
+    capability_module.register_voice_provider("asr", _ASRDouble())
 
     rows = catalog_module.capability_catalog("voice")
     assert len(rows) == 1
@@ -345,7 +361,7 @@ def test_capability_catalog_voice_rows_carry_capability_tags():
 
 
 def test_capability_model_catalog_shape_and_unknown_provider():
-    capability_module.register_capability_provider(_LegacyVoiceAdapter("tts", _TTSDouble()))
+    capability_module.register_voice_provider("tts", _TTSDouble())
 
     catalog, default_model = catalog_module.capability_model_catalog("voice", "voice-double")
     assert catalog == {"tts-x": {}}

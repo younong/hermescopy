@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent import transcription_registry
+from hermes_cli.model_plane import capability as capability_module
 from agent.transcription_provider import TranscriptionProvider
 from tools import transcription_tools
 
@@ -61,9 +61,9 @@ class _FakeProvider(TranscriptionProvider):
 
 @pytest.fixture(autouse=True)
 def _reset_registry():
-    transcription_registry._reset_for_tests()
+    capability_module._reset_for_tests()
     yield
-    transcription_registry._reset_for_tests()
+    capability_module._reset_for_tests()
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +121,7 @@ class TestBuiltinAlwaysWins:
 class TestPluginDispatch:
     def test_registered_plugin_called(self):
         provider = _FakeProvider(name="openrouter")
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         result = transcription_tools._dispatch_to_plugin_provider(
             "/tmp/audio.mp3", "openrouter",
@@ -143,7 +143,7 @@ class TestPluginDispatch:
 
     def test_model_kwarg_forwarded(self):
         provider = _FakeProvider(name="openrouter")
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         transcription_tools._dispatch_to_plugin_provider(
             "/tmp/audio.mp3", "openrouter", model="whisper-large-v3",
@@ -152,7 +152,7 @@ class TestPluginDispatch:
 
     def test_language_kwarg_forwarded(self):
         provider = _FakeProvider(name="openrouter")
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         transcription_tools._dispatch_to_plugin_provider(
             "/tmp/audio.mp3", "openrouter", language="en",
@@ -161,7 +161,7 @@ class TestPluginDispatch:
 
     def test_provider_exception_converted_to_error_envelope(self):
         provider = _FakeProvider(name="openrouter", raise_exc=RuntimeError("network down"))
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         result = transcription_tools._dispatch_to_plugin_provider(
             "/tmp/audio.mp3", "openrouter",
@@ -174,7 +174,7 @@ class TestPluginDispatch:
 
     def test_provider_non_dict_result_converted_to_error(self):
         provider = _FakeProvider(name="openrouter", result="weird string")  # type: ignore[arg-type]
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         result = transcription_tools._dispatch_to_plugin_provider(
             "/tmp/audio.mp3", "openrouter",
@@ -191,7 +191,7 @@ class TestPluginDispatch:
             name="openrouter",
             result={"success": True, "transcript": "hi"},  # no provider key
         )
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         result = transcription_tools._dispatch_to_plugin_provider(
             "/tmp/audio.mp3", "openrouter",
@@ -217,7 +217,7 @@ class TestTranscribeAudioE2E:
     def test_unknown_name_with_plugin_dispatches(self):
         from unittest.mock import patch
         provider = _FakeProvider(name="openrouter")
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         with patch("tools.transcription_tools._validate_audio_file", return_value=None), \
              patch("tools.transcription_tools._load_stt_config", return_value={"provider": "openrouter"}), \
@@ -253,7 +253,7 @@ class TestTranscribeAudioE2E:
         # Register a plugin that WOULD respond to 'openrouter' — but
         # we're asking for 'groq', so it shouldn't be called.
         provider = _FakeProvider(name="openrouter")
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         with patch("tools.transcription_tools._validate_audio_file", return_value=None), \
              patch("tools.transcription_tools._load_stt_config", return_value={"provider": "groq"}), \
@@ -286,7 +286,7 @@ class TestAvailabilityGate:
 
     def test_unavailable_plugin_returns_envelope_not_none(self):
         provider = _FakeProvider(name="openrouter", available=False)
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         result = transcription_tools._dispatch_to_plugin_provider(
             "/tmp/audio.mp3", "openrouter",
@@ -304,7 +304,7 @@ class TestAvailabilityGate:
 
     def test_available_plugin_dispatches_normally(self):
         provider = _FakeProvider(name="openrouter", available=True)
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         result = transcription_tools._dispatch_to_plugin_provider(
             "/tmp/audio.mp3", "openrouter",
@@ -319,7 +319,7 @@ class TestAvailabilityGate:
             name="openrouter",
             available_raises=RuntimeError("creds check exploded"),
         )
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         result = transcription_tools._dispatch_to_plugin_provider(
             "/tmp/audio.mp3", "openrouter",
@@ -337,7 +337,7 @@ class TestAvailabilityGate:
         """
         from unittest.mock import patch
         provider = _FakeProvider(name="openrouter", available=False)
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         with patch("tools.transcription_tools._validate_audio_file", return_value=None), \
              patch("tools.transcription_tools._load_stt_config", return_value={"provider": "openrouter"}), \
@@ -369,7 +369,7 @@ class TestLanguageForwardingFromConfig:
         transcribe() call as language='ja'."""
         from unittest.mock import patch
         provider = _FakeProvider(name="openrouter")
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         stt_config = {
             "provider": "openrouter",
@@ -390,7 +390,7 @@ class TestLanguageForwardingFromConfig:
         override."""
         from unittest.mock import patch
         provider = _FakeProvider(name="openrouter")
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         stt_config = {
             "provider": "openrouter",
@@ -409,7 +409,7 @@ class TestLanguageForwardingFromConfig:
         ``stt.<provider>.model`` in config."""
         from unittest.mock import patch
         provider = _FakeProvider(name="openrouter")
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         stt_config = {
             "provider": "openrouter",
@@ -430,7 +430,7 @@ class TestLanguageForwardingFromConfig:
         model falls back to caller arg or None. No crash."""
         from unittest.mock import patch
         provider = _FakeProvider(name="openrouter")
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         with patch("tools.transcription_tools._validate_audio_file", return_value=None), \
              patch("tools.transcription_tools._load_stt_config", return_value={"provider": "openrouter"}), \
@@ -447,7 +447,7 @@ class TestLanguageForwardingFromConfig:
         empty config."""
         from unittest.mock import patch
         provider = _FakeProvider(name="openrouter")
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         stt_config = {"provider": "openrouter", "openrouter": "garbage"}
         with patch("tools.transcription_tools._validate_audio_file", return_value=None), \

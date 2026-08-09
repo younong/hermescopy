@@ -380,19 +380,12 @@ def _get_provider(tts_config: Dict[str, Any]) -> str:
 # (bare / single / double quote), so paths with spaces work transparently.
 
 # Built-in provider names. Any ``tts.provider`` value NOT in this set is
-# interpreted as a reference to ``tts.providers.<name>``.
-BUILTIN_TTS_PROVIDERS = frozenset({
-    "edge",
-    "elevenlabs",
-    "openai",
-    "minimax",
-    "xai",
-    "mistral",
-    "gemini",
-    "neutts",
-    "kittentts",
-    "piper",
-})
+# interpreted as a reference to ``tts.providers.<name>``. The canonical set
+# lives in the model plane (``hermes_cli.model_plane.kinds``) so voice
+# capability registration rejects shadowing names against the same source.
+from hermes_cli.model_plane.kinds import (
+    BUILTIN_TTS_PROVIDER_NAMES as BUILTIN_TTS_PROVIDERS,
+)
 
 DEFAULT_COMMAND_TTS_TIMEOUT_SECONDS = 120
 DEFAULT_COMMAND_TTS_OUTPUT_FORMAT = "mp3"
@@ -506,11 +499,11 @@ def _dispatch_to_plugin_provider(
     if _is_command_provider_config(_get_named_provider_config(tts_config, key)):
         return None
     try:
-        from agent.tts_registry import get_provider
+        from hermes_cli.model_plane.capability import get_voice_delegate
         from hermes_cli.plugins import _ensure_plugins_discovered
 
         _ensure_plugins_discovered()
-        plugin_provider = get_provider(key)
+        plugin_provider = get_voice_delegate(key, "tts")
         if plugin_provider is None:
             # Long-lived sessions may have discovered plugins before the
             # bundled backend was patched in or before config changed.
@@ -518,7 +511,7 @@ def _dispatch_to_plugin_provider(
             # through. Mirrors the image_gen / browser dispatcher
             # recovery pattern.
             _ensure_plugins_discovered(force=True)
-            plugin_provider = get_provider(key)
+            plugin_provider = get_voice_delegate(key, "tts")
     except Exception as exc:  # noqa: BLE001 — discovery failure is non-fatal
         logger.debug("tts plugin dispatch skipped (discovery failed): %s", exc)
         return None
@@ -568,9 +561,9 @@ def _plugin_provider_is_voice_compatible(provider: str) -> bool:
     if key in BUILTIN_TTS_PROVIDERS:
         return False
     try:
-        from agent.tts_registry import get_provider
+        from hermes_cli.model_plane.capability import get_voice_delegate
 
-        plugin_provider = get_provider(key)
+        plugin_provider = get_voice_delegate(key, "tts")
         if plugin_provider is None:
             return False
         return bool(plugin_provider.voice_compatible)

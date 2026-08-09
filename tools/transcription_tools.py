@@ -232,19 +232,13 @@ def _try_lazy_install_stt() -> bool:
 
 
 # Names of the 6 STT providers with native handlers in this module.
-# Kept in sync with ``agent.transcription_registry._BUILTIN_NAMES`` —
-# a regression test fails if they drift. The plugin hook from
-# issue #30398-style follow-up rejects plugins registering under any
-# of these names; the dispatcher in ``transcribe_audio`` short-circuits
-# them defensively as well.
-BUILTIN_STT_PROVIDERS = frozenset({
-    "local",
-    "local_command",
-    "groq",
-    "openai",
-    "mistral",
-    "xai",
-})
+# The canonical set lives in the model plane
+# (``hermes_cli.model_plane.kinds``) so voice capability registration
+# rejects shadowing names against the same source; the dispatcher in
+# ``transcribe_audio`` short-circuits them defensively as well.
+from hermes_cli.model_plane.kinds import (
+    BUILTIN_STT_PROVIDER_NAMES as BUILTIN_STT_PROVIDERS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -930,11 +924,11 @@ def _dispatch_to_plugin_provider(
     ):
         return None
     try:
-        from agent.transcription_registry import get_provider
+        from hermes_cli.model_plane.capability import get_voice_delegate
         from hermes_cli.plugins import _ensure_plugins_discovered
 
         _ensure_plugins_discovered()
-        plugin_provider = get_provider(key)
+        plugin_provider = get_voice_delegate(key, "asr")
         if plugin_provider is None:
             # Long-lived sessions may have discovered plugins before a
             # bundled backend was patched in or before config changed.
@@ -942,7 +936,7 @@ def _dispatch_to_plugin_provider(
             # through. Mirrors the image_gen / browser dispatcher
             # recovery pattern.
             _ensure_plugins_discovered(force=True)
-            plugin_provider = get_provider(key)
+            plugin_provider = get_voice_delegate(key, "asr")
     except Exception as exc:  # noqa: BLE001 — discovery failure is non-fatal
         logger.debug("STT plugin dispatch skipped (discovery failed): %s", exc)
         return None

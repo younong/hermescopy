@@ -7,7 +7,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.profile_embedding_client import ProfileEmbeddingError, embed
+from hermes_cli.model_plane.capability import (
+    ProfileEmbeddingCapability,
+    ProfileEmbeddingError,
+)
 from agent.profile_image_gen_provider import ProfileImageGenProvider
 from agent.profile_transcription_provider import ProfileTranscriptionProvider
 from agent.profile_tts_provider import ProfileTTSProvider
@@ -127,9 +130,9 @@ def test_embedding_uses_multimodal_plan_schema():
         "data": {"embedding": [0.1, 0.2, 0.3]},
         "usage": {"total_tokens": 9},
     })
-    with patch("agent.profile_embedding_client.requests.post", return_value=response) as post:
-        result = embed(
-            PROVIDER,
+    capability = ProfileEmbeddingCapability(get_provider_profile(PROVIDER))
+    with patch("requests.post", return_value=response) as post:
+        result = capability.embed(
             text="find this",
             image_url="https://example.test/image.png",
             dimensions=1024,
@@ -161,21 +164,23 @@ def test_embedding_uses_multimodal_plan_schema():
 
 
 def test_embedding_failure_does_not_expose_key():
+    capability = ProfileEmbeddingCapability(get_provider_profile(PROVIDER))
     with patch(
-        "agent.profile_embedding_client.requests.post",
+        "requests.post",
         return_value=_response({"error": "fake-plan-key"}, status_code=401),
     ):
         with pytest.raises(ProfileEmbeddingError) as exc_info:
-            embed(PROVIDER, text="test")
+            capability.embed(text="test")
 
     assert "fake-plan-key" not in str(exc_info.value)
 
 
 def test_embedding_requires_input_and_supported_dimensions():
+    capability = ProfileEmbeddingCapability(get_provider_profile(PROVIDER))
     with pytest.raises(ValueError, match="At least one"):
-        embed(PROVIDER)
+        capability.embed()
     with pytest.raises(ValueError, match="1024, 2048"):
-        embed(PROVIDER, text="test", dimensions=7)
+        capability.embed(text="test", dimensions=7)
 
 
 def test_tts_uses_agent_plan_chunked_protocol(tmp_path):

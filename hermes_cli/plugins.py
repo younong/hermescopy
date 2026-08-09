@@ -816,9 +816,11 @@ class PluginContext:
 
         Coexists with the command-provider registry rather than
         replacing it — see issue #30398 for the full design rationale.
+        Registration lands in the model-plane capability registry as
+        the ``tts`` voice delegate.
         """
         from agent.tts_provider import TTSProvider
-        from agent.tts_registry import register_provider as _register_tts_provider
+        from hermes_cli.model_plane.capability import register_voice_provider
 
         if not isinstance(provider, TTSProvider):
             logger.warning(
@@ -827,7 +829,7 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        _register_tts_provider(provider)
+        register_voice_provider("tts", provider)
         logger.info(
             "Plugin '%s' registered TTS provider: %s",
             self.manifest.name, provider.name,
@@ -859,10 +861,11 @@ class PluginContext:
         built-in STT backends keep their native implementations in
         ``tools/transcription_tools.py``; this hook is for *new* Python
         engines (OpenRouter, SenseAudio, Gemini-STT, custom proprietary
-        backends).
+        backends). Registration lands in the model-plane capability
+        registry as the ``asr`` voice delegate.
         """
         from agent.transcription_provider import TranscriptionProvider
-        from agent.transcription_registry import register_provider as _register_stt_provider
+        from hermes_cli.model_plane.capability import register_voice_provider
 
         if not isinstance(provider, TranscriptionProvider):
             logger.warning(
@@ -871,7 +874,7 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        _register_stt_provider(provider)
+        register_voice_provider("asr", provider)
         logger.info(
             "Plugin '%s' registered transcription provider: %s",
             self.manifest.name, provider.name,
@@ -2199,20 +2202,23 @@ def _register_provider_media_capabilities(*, force: bool = False) -> None:
     from agent.profile_image_gen_provider import ProfileImageGenProvider
     from agent.profile_transcription_provider import ProfileTranscriptionProvider
     from agent.profile_tts_provider import ProfileTTSProvider
-    from agent.transcription_registry import (
-        register_provider as register_transcription_provider,
+    from hermes_cli.model_plane.capability import (
+        ProfileEmbeddingCapability,
+        register_capability_provider,
+        register_media_generation_provider,
+        register_voice_provider,
     )
-    from agent.tts_registry import register_provider as register_tts_provider
-    from hermes_cli.model_plane.capability import register_media_generation_provider
     from providers import list_providers
 
     for profile in list_providers():
         if profile.image_generation_model:
             register_media_generation_provider("image", ProfileImageGenProvider(profile))
         if profile.tts_model:
-            register_tts_provider(ProfileTTSProvider(profile))
+            register_voice_provider("tts", ProfileTTSProvider(profile))
         if profile.transcription_model:
-            register_transcription_provider(ProfileTranscriptionProvider(profile))
+            register_voice_provider("asr", ProfileTranscriptionProvider(profile))
+        if profile.embedding_model and profile.embedding_path:
+            register_capability_provider(ProfileEmbeddingCapability(profile))
     _provider_media_registered = True
 
 

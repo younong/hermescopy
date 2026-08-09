@@ -25,8 +25,9 @@ Two coexisting STT extension surfaces — in resolution order:
    ``tools/transcription_tools.py``.
 
 Built-ins-always-win is enforced at registration time
-(:func:`agent.transcription_registry.register_provider` rejects names
-in ``BUILTIN_STT_PROVIDERS`` with a warning) AND at dispatch time
+(:func:`hermes_cli.model_plane.capability.register_voice_provider`
+rejects names in ``BUILTIN_STT_PROVIDER_NAMES`` with a warning) AND at
+dispatch time
 (:func:`tools.transcription_tools._dispatch_to_plugin_provider`
 re-checks defensively).
 

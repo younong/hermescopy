@@ -59,8 +59,8 @@ class TestRegisterTranscriptionProvider:
     def test_accepts_valid_provider(self):
         from hermes_cli.plugins import PluginManager
 
-        from agent import transcription_registry
-        transcription_registry._reset_for_tests()
+        from hermes_cli.model_plane import capability as capability_module
+        capability_module._reset_for_tests()
 
         hermes_home = Path(os.environ["HERMES_HOME"])
         _write_plugin(
@@ -84,15 +84,15 @@ class TestRegisterTranscriptionProvider:
         assert mgr._plugins["my-stt-plugin"].enabled is True, (
             f"Plugin failed to load: {mgr._plugins['my-stt-plugin'].error}"
         )
-        assert transcription_registry.get_provider("fake-stt") is not None
+        assert capability_module.get_voice_delegate("fake-stt", "asr") is not None
 
-        transcription_registry._reset_for_tests()
+        capability_module._reset_for_tests()
 
     def test_rejects_non_provider(self, caplog):
         from hermes_cli.plugins import PluginManager
 
-        from agent import transcription_registry
-        transcription_registry._reset_for_tests()
+        from hermes_cli.model_plane import capability as capability_module
+        capability_module._reset_for_tests()
 
         hermes_home = Path(os.environ["HERMES_HOME"])
         _write_plugin(
@@ -107,17 +107,17 @@ class TestRegisterTranscriptionProvider:
             mgr.discover_and_load()
 
         assert mgr._plugins["bad-stt-plugin"].enabled is True
-        assert transcription_registry.get_provider("not a provider") is None
-        assert transcription_registry.list_providers() == []
+        assert capability_module.get_voice_delegate("not a provider", "asr") is None
+        assert capability_module.list_capability_providers("voice") == []
         assert "does not inherit from TranscriptionProvider" in caplog.text
 
-        transcription_registry._reset_for_tests()
+        capability_module._reset_for_tests()
 
     def test_rejects_builtin_shadow(self, caplog):
         from hermes_cli.plugins import PluginManager
 
-        from agent import transcription_registry
-        transcription_registry._reset_for_tests()
+        from hermes_cli.model_plane import capability as capability_module
+        capability_module._reset_for_tests()
 
         hermes_home = Path(os.environ["HERMES_HOME"])
         _write_plugin(
@@ -142,7 +142,7 @@ class TestRegisterTranscriptionProvider:
         # Plugin still loaded normally — built-in shadowing is a warning,
         # not an exception. The registry rejects the entry though.
         assert mgr._plugins["shadow-stt-plugin"].enabled is True
-        assert transcription_registry.get_provider("openai") is None
+        assert capability_module.get_voice_delegate("openai", "asr") is None
         assert "shadows a built-in name" in caplog.text
 
-        transcription_registry._reset_for_tests()
+        capability_module._reset_for_tests()

@@ -32,7 +32,7 @@ from typing import Optional
 
 import pytest
 
-from agent import tts_registry
+from hermes_cli.model_plane import capability as capability_module
 from agent.tts_provider import TTSProvider
 from tools import tts_tool
 
@@ -73,9 +73,9 @@ class _FakeTTSProvider(TTSProvider):
 
 @pytest.fixture(autouse=True)
 def _reset_registry():
-    tts_registry._reset_for_tests()
+    capability_module._reset_for_tests()
     yield
-    tts_registry._reset_for_tests()
+    capability_module._reset_for_tests()
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +128,7 @@ class TestCommandProviderWins:
     """
 
     def test_command_config_beats_plugin(self):
-        tts_registry.register_provider(_FakeTTSProvider(name="my-tts"))
+        capability_module.register_voice_provider("tts", _FakeTTSProvider(name="my-tts"))
 
         result = tts_tool._dispatch_to_plugin_provider(
             text="hello",
@@ -154,7 +154,7 @@ class TestPluginDispatch:
 
     def test_registered_plugin_called(self):
         provider = _FakeTTSProvider(name="cartesia")
-        tts_registry.register_provider(provider)
+        capability_module.register_voice_provider("tts", provider)
 
         result = tts_tool._dispatch_to_plugin_provider(
             text="hello world",
@@ -178,7 +178,7 @@ class TestPluginDispatch:
 
     def test_voice_model_speed_format_forwarded(self):
         provider = _FakeTTSProvider(name="cartesia")
-        tts_registry.register_provider(provider)
+        capability_module.register_voice_provider("tts", provider)
 
         result = tts_tool._dispatch_to_plugin_provider(
             text="hello",
@@ -202,7 +202,7 @@ class TestPluginDispatch:
         """Empty-string config values are normalized to None so providers can
         fall back to their own defaults (matches the ABC contract)."""
         provider = _FakeTTSProvider(name="cartesia")
-        tts_registry.register_provider(provider)
+        capability_module.register_voice_provider("tts", provider)
 
         tts_tool._dispatch_to_plugin_provider(
             text="hello",
@@ -218,7 +218,7 @@ class TestPluginDispatch:
         """If a provider rewrites the output path (e.g. format-driven extension
         change), the dispatcher returns the new path."""
         provider = _FakeTTSProvider(name="cartesia", return_path="/tmp/rewritten.opus")
-        tts_registry.register_provider(provider)
+        capability_module.register_voice_provider("tts", provider)
 
         result = tts_tool._dispatch_to_plugin_provider(
             text="hi",
@@ -241,7 +241,7 @@ class TestPluginDispatch:
                 return None  # type: ignore[return-value]
 
         provider2 = _ReturnsNone(name="weird")
-        tts_registry.register_provider(provider2)
+        capability_module.register_voice_provider("tts", provider2)
 
         result = tts_tool._dispatch_to_plugin_provider(
             text="hi",
@@ -260,7 +260,7 @@ class TestPluginDispatch:
             name="cartesia",
             raise_exc=RuntimeError("network down"),
         )
-        tts_registry.register_provider(provider)
+        capability_module.register_voice_provider("tts", provider)
 
         with pytest.raises(RuntimeError, match="network down"):
             tts_tool._dispatch_to_plugin_provider(
@@ -278,13 +278,13 @@ class TestPluginDispatch:
 
 class TestVoiceCompatibleHelper:
     def test_voice_compatible_true(self):
-        tts_registry.register_provider(
+        capability_module.register_voice_provider("tts", 
             _FakeTTSProvider(name="cartesia", voice_compat=True)
         )
         assert tts_tool._plugin_provider_is_voice_compatible("cartesia") is True
 
     def test_voice_compatible_false_by_default(self):
-        tts_registry.register_provider(_FakeTTSProvider(name="cartesia"))
+        capability_module.register_voice_provider("tts", _FakeTTSProvider(name="cartesia"))
         assert tts_tool._plugin_provider_is_voice_compatible("cartesia") is False
 
     def test_unregistered_provider_returns_false(self):
@@ -304,7 +304,7 @@ class TestVoiceCompatibleHelper:
         assert tts_tool._plugin_provider_is_voice_compatible(builtin) is False
 
     def test_voice_compatible_case_insensitive(self):
-        tts_registry.register_provider(
+        capability_module.register_voice_provider("tts", 
             _FakeTTSProvider(name="cartesia", voice_compat=True)
         )
         assert tts_tool._plugin_provider_is_voice_compatible("CARTESIA") is True
@@ -319,5 +319,5 @@ class TestVoiceCompatibleHelper:
             def voice_compatible(self) -> bool:
                 raise RuntimeError("boom")
 
-        tts_registry.register_provider(_ExplodingProvider(name="cartesia"))
+        capability_module.register_voice_provider("tts", _ExplodingProvider(name="cartesia"))
         assert tts_tool._plugin_provider_is_voice_compatible("cartesia") is False

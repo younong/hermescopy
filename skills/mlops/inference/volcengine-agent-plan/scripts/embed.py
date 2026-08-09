@@ -7,7 +7,10 @@ import argparse
 import json
 from pathlib import Path
 
-from agent.profile_embedding_client import embed
+from hermes_cli.model_plane.capability import (
+    ensure_capability_providers,
+    resolve_embedding_capability,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -25,8 +28,8 @@ def main() -> int:
     if not args.text and not args.image_url:
         raise SystemExit("at least one of --text or --image-url is required")
 
-    result = embed(
-        "volcengine-agent-plan",
+    ensure_capability_providers()
+    result = resolve_embedding_capability("volcengine-agent-plan").embed(
         text=args.text,
         image_url=args.image_url,
         dimensions=args.dimensions,

@@ -23,8 +23,9 @@ Three coexisting TTS extension surfaces — in resolution order:
    the shell-template grammar can't reasonably express.
 
 Built-ins-always-win is enforced at registration time
-(:func:`agent.tts_registry.register_provider` rejects names in
-``BUILTIN_TTS_PROVIDERS`` with a warning) AND at dispatch time
+(:func:`hermes_cli.model_plane.capability.register_voice_provider`
+rejects names in ``BUILTIN_TTS_PROVIDER_NAMES`` with a warning) AND at
+dispatch time
 (:func:`tools.tts_tool._dispatch_to_plugin_provider` re-checks
 defensively). The dispatcher also rejects plugin dispatch when a same-
 name command provider is configured.

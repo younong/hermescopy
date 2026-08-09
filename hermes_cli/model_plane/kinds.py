@@ -36,6 +36,33 @@ GATEWAY_KINDS = (IMAGE, VIDEO)
 # Voice models are tagged with the sub-capability they serve.
 VOICE_CAPABILITIES = ("tts", "asr")
 
+# Names reserved for the native built-in voice backends. The built-in TTS
+# handlers live in ``tools/tts_tool.py`` and the built-in STT handlers in
+# ``tools/transcription_tools.py``; both alias these sets. Voice capability
+# plugins may not register under any of these names — built-ins always win
+# at dispatch time, so a colliding registration would be dead weight.
+BUILTIN_TTS_PROVIDER_NAMES = frozenset({
+    "edge",
+    "elevenlabs",
+    "openai",
+    "minimax",
+    "xai",
+    "mistral",
+    "gemini",
+    "neutts",
+    "kittentts",
+    "piper",
+})
+
+BUILTIN_STT_PROVIDER_NAMES = frozenset({
+    "local",
+    "local_command",
+    "groq",
+    "openai",
+    "mistral",
+    "xai",
+})
+
 # Default provider per kind when nothing is configured and availability alone
 # cannot decide (zero or multiple available providers). Kinds without an entry
 # have no implicit default.
