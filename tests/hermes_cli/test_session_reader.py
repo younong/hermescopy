@@ -993,6 +993,13 @@ def test_reader_read_only_adapter_matches_session_db_payloads(tmp_path):
             worker_generation=2,
         )
         db.append_message("tip", "assistant", "after compression")
+        db.append_session_display_card(
+            "tip",
+            card_kind="collaboration_origin",
+            source_id="group-parity",
+            status="completed",
+            payload={"group_id": "group-parity", "name": "Parity group"},
+        )
         db.create_session(
             "archived",
             source="cli",

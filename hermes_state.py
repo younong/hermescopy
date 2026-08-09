@@ -33,7 +33,7 @@ from hermes_session_queries import (
     is_network_continuation_prompt,
     strip_legacy_synthetic_messages,
 )
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -3759,28 +3759,6 @@ class SessionDB(SessionQueryMixin):
             )
 
         return self._execute_write(_do)
-
-    def get_session_display_cards(
-        self, session_ids: Iterable[str]
-    ) -> list[dict[str, Any]]:
-        """Load display-only cards for one validated session lineage."""
-        ids = tuple(dict.fromkeys(str(value or "").strip() for value in session_ids))
-        ids = tuple(value for value in ids if value)
-        if not ids:
-            return []
-        placeholders = ",".join("?" for _ in ids)
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM session_display_cards "
-                f"WHERE session_id IN ({placeholders}) ORDER BY created_at, card_id",
-                ids,
-            ).fetchall()
-        result = []
-        for row in rows:
-            item = dict(row)
-            item["payload"] = json.loads(str(item.pop("payload_json")))
-            result.append(item)
-        return result
 
     def _insert_message_rows(
         self,

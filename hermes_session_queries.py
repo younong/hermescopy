@@ -7,7 +7,7 @@ import json
 import logging
 import re
 import sqlite3
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
 
 logger = logging.getLogger(__name__)
@@ -1319,6 +1319,28 @@ class SessionQueryMixin:
     _CONVERSATION_PAGE_MAX_TEXT_CHARS = 120_000
     _CONVERSATION_PAGE_MAX_ATTACHMENTS = 64
     _CONVERSATION_PAGE_MAX_SERIALIZED_BYTES = 2 * 1024 * 1024
+
+    def get_session_display_cards(
+        self, session_ids: Iterable[str]
+    ) -> List[Dict[str, Any]]:
+        """Load display-only cards for one validated session lineage."""
+        ids = tuple(dict.fromkeys(str(value or "").strip() for value in session_ids))
+        ids = tuple(value for value in ids if value)
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM session_display_cards "
+                f"WHERE session_id IN ({placeholders}) ORDER BY created_at, card_id",
+                ids,
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(str(item.pop("payload_json")))
+            result.append(item)
+        return result
 
     def get_messages_as_conversation(
         self,
