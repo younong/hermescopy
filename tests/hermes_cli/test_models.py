@@ -969,3 +969,44 @@ class TestCodexSoftAcceptPlausibilityGate:
         r = validate_requested_model("gpt-5.5", "openai-codex")
         assert r["accepted"] is True
         assert r["recognized"] is True
+
+
+class TestStaticProviderModelIds:
+    """static_provider_model_ids: the single no-network catalog chain —
+    curated table first, plugin-declared fallback_models appended."""
+
+    def test_openrouter_uses_curated_openrouter_list(self):
+        from hermes_cli.models import static_provider_model_ids
+        assert static_provider_model_ids("openrouter") == [
+            mid for mid, _ in OPENROUTER_MODELS
+        ]
+
+    def test_curated_table_first_plugin_extras_appended(self, monkeypatch):
+        import hermes_cli.models as m
+
+        class _Profile:
+            fallback_models = ("b", "c", "B")
+
+        monkeypatch.setitem(m._PROVIDER_MODELS, "fake-prov", ["a", "b"])
+        monkeypatch.setattr(
+            "providers.get_provider_profile",
+            lambda name: _Profile() if name == "fake-prov" else None,
+        )
+        assert m.static_provider_model_ids("fake-prov") == ["a", "b", "c"]
+
+    def test_plugin_only_provider_returns_plugin_list(self, monkeypatch):
+        import hermes_cli.models as m
+
+        class _Profile:
+            fallback_models = ("x-1", "x-2")
+
+        monkeypatch.setattr(
+            "providers.get_provider_profile",
+            lambda name: _Profile() if name == "fake-plugin-only" else None,
+        )
+        assert "fake-plugin-only" not in m._PROVIDER_MODELS
+        assert m.static_provider_model_ids("fake-plugin-only") == ["x-1", "x-2"]
+
+    def test_unknown_provider_returns_empty(self):
+        from hermes_cli.models import static_provider_model_ids
+        assert static_provider_model_ids("definitely-not-a-provider") == []

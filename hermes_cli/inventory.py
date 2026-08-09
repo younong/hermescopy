@@ -322,8 +322,19 @@ def _merge_deployment_routes(rows: list[dict], ctx: ConfigContext) -> list[dict]
 
 
 def _append_unconfigured_rows(rows: list[dict], ctx: ConfigContext) -> list[dict]:
-    """Build skeleton rows for canonical providers missing from ``rows``."""
-    from hermes_cli.models import CANONICAL_PROVIDERS, _PROVIDER_LABELS
+    """Build skeleton rows for canonical providers missing from ``rows``.
+
+    Skeleton rows carry the provider's static catalog
+    (:func:`static_provider_model_ids` — curated table + plugin-declared
+    ``fallback_models``) so pickers and the model-management catalog can
+    show every known model before credentials are pasted; providers whose
+    catalog exists only as a live probe (lmstudio, ollama-cloud) still get
+    an empty list. ``authenticated`` is preset False so
+    :func:`_apply_picker_hints` keeps attaching the setup hint.
+    """
+    from hermes_cli.models import (
+        CANONICAL_PROVIDERS, _PROVIDER_LABELS, static_provider_model_ids,
+    )
 
     seen = {r["slug"].lower() for r in rows}
     cur = (ctx.current_provider or "").lower()
@@ -331,14 +342,16 @@ def _append_unconfigured_rows(rows: list[dict], ctx: ConfigContext) -> list[dict
     for entry in CANONICAL_PROVIDERS:
         if entry.slug.lower() in seen:
             continue
+        models = static_provider_model_ids(entry.slug)
         extras.append(
             {
                 "slug": entry.slug,
                 "name": _PROVIDER_LABELS.get(entry.slug, entry.label),
                 "is_current": entry.slug.lower() == cur,
                 "is_user_defined": False,
-                "models": [],
-                "total_models": 0,
+                "authenticated": False,
+                "models": models,
+                "total_models": len(models),
                 "source": "canonical",
             }
         )
@@ -348,23 +361,22 @@ def _append_unconfigured_rows(rows: list[dict], ctx: ConfigContext) -> list[dict
 def _apply_picker_hints(rows: list[dict]) -> None:
     """Add ``authenticated``/``auth_type``/``key_env``/``warning`` per row.
 
-    Mutates ``rows`` in-place. Rows already from
-    ``list_authenticated_providers`` are marked ``authenticated=True``;
-    the unconfigured skeleton rows from ``_append_unconfigured_rows`` get
-    the picker's setup-hint shape.
+    Mutates ``rows`` in-place. Rows from
+    ``list_authenticated_providers`` carry no ``authenticated`` key and are
+    marked ``authenticated=True``; the unconfigured skeleton rows from
+    ``_append_unconfigured_rows`` arrive with ``authenticated=False``
+    preset and get the picker's setup-hint shape.
     """
     from hermes_cli.auth import PROVIDER_REGISTRY
 
     for row in rows:
-        if "authenticated" in row:
-            continue
+        if "authenticated" not in row:
+            row["authenticated"] = True
         # Distinguish authenticated rows (returned by
         # list_authenticated_providers) from skeleton rows (from
-        # _append_unconfigured_rows). The skeleton rows have empty
-        # `models` AND source="canonical"; authenticated rows have
-        # populated `models` OR a non-canonical source.
-        is_skeleton = row.get("source") == "canonical" and not row.get("models")
-        row["authenticated"] = not is_skeleton
+        # _append_unconfigured_rows, authenticated=False preset). Only
+        # skeleton rows use source="canonical" without is_user_defined.
+        is_skeleton = row.get("source") == "canonical" and row["authenticated"] is False
         if not is_skeleton or row.get("is_user_defined"):
             continue
         cfg = PROVIDER_REGISTRY.get(row["slug"])

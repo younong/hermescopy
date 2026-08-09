@@ -318,8 +318,10 @@ def test_pricing_can_force_fresh_nous_tier():
 
 def test_include_unconfigured_appends_canonical_skeletons():
     """include_unconfigured=True adds CANONICAL_PROVIDERS rows that
-    list_authenticated_providers didn't emit. Skeleton rows have empty
-    models and source='canonical'."""
+    list_authenticated_providers didn't emit. Skeleton rows have
+    source='canonical', authenticated=False, and carry the provider's
+    static catalog (curated table + plugin fallback_models); providers
+    with live-only catalogs stay empty."""
     rows = [
         {"slug": "openrouter", "name": "OpenRouter", "models": ["m1"],
          "total_models": 1, "is_current": True, "is_user_defined": False,
@@ -330,16 +332,20 @@ def test_include_unconfigured_appends_canonical_skeletons():
         payload = build_models_payload(ctx, include_unconfigured=True)
     # All canonical providers other than openrouter should appear as
     # skeleton rows.
-    from hermes_cli.models import CANONICAL_PROVIDERS
+    from hermes_cli.models import CANONICAL_PROVIDERS, static_provider_model_ids
 
     seen_slugs = {r["slug"] for r in payload["providers"]}
     for entry in CANONICAL_PROVIDERS:
         assert entry.slug in seen_slugs, f"missing {entry.slug}"
-    # Skeletons have empty models and source='canonical'.
-    skeletons = [r for r in payload["providers"]
-                 if r.get("source") == "canonical"]
-    assert all(r["models"] == [] for r in skeletons)
-    assert all(r["total_models"] == 0 for r in skeletons)
+    skeletons = {r["slug"]: r for r in payload["providers"]
+                 if r.get("source") == "canonical"}
+    # Skeletons mirror the shared static chain: volcengine-agent-plan
+    # declares its catalog only in the plugin, lmstudio is live-only.
+    assert skeletons["volcengine-agent-plan"]["models"] == static_provider_model_ids("volcengine-agent-plan")
+    assert len(skeletons["volcengine-agent-plan"]["models"]) > 0
+    assert skeletons["volcengine-agent-plan"]["total_models"] == len(skeletons["volcengine-agent-plan"]["models"])
+    assert skeletons["lmstudio"]["models"] == []
+    assert all(r["authenticated"] is False for r in skeletons.values())
 
 
 def test_include_unconfigured_skips_already_present_slugs():

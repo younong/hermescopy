@@ -545,13 +545,13 @@ def resolve_alias(
 
     vendor, family = identity
 
-    # Build catalog from models.dev, then merge in static _PROVIDER_MODELS
-    # entries that models.dev may be missing (e.g. newly added models not
-    # yet synced to the registry).
+    # Build catalog from models.dev, then merge in the shared static chain
+    # (curated table + plugin fallback_models) entries that models.dev may
+    # be missing (e.g. newly added models not yet synced to the registry).
     catalog = list_provider_models(current_provider)
     try:
-        from hermes_cli.models import _PROVIDER_MODELS
-        static = _PROVIDER_MODELS.get(current_provider, [])
+        from hermes_cli.models import static_provider_model_ids
+        static = static_provider_model_ids(current_provider)
         if static:
             seen = {m.lower() for m in catalog}
             for m in static:
@@ -1528,9 +1528,10 @@ def list_authenticated_providers(
     )
     from hermes_cli.auth import PROVIDER_REGISTRY
     from hermes_cli.models import (
-        OPENROUTER_MODELS, _PROVIDER_LABELS, _PROVIDER_MODELS,
+        _PROVIDER_LABELS,
         _MODELS_DEV_PREFERRED, _merge_with_models_dev, cached_provider_model_ids,
         clear_provider_models_cache, get_curated_nous_model_ids,
+        static_provider_model_ids,
     )
 
     # Explicit refresh: drop every provider's cached model-id list so the
@@ -1636,12 +1637,13 @@ def list_authenticated_providers(
         else fetch_models_dev(allow_network=False)
     )
 
-    # Build curated model lists keyed by hermes provider ID
-    curated: dict[str, list[str]] = {
-        provider: list(models)
-        for provider, models in _PROVIDER_MODELS.items()
-    }
-    curated["openrouter"] = [mid for mid, _ in OPENROUTER_MODELS]
+    # Live-only catalog overlays, keyed by hermes provider ID. Every provider
+    # with static coverage (curated table, OPENROUTER_MODELS, or plugin
+    # fallback_models) is resolved per-section by cached_provider_model_ids()
+    # falling back to the shared static chain (static_provider_model_ids) —
+    # only providers whose catalog exists EXCLUSIVELY as a live probe (nous
+    # manifest, ollama-cloud, lmstudio) need a fallback entry here.
+    curated: dict[str, list[str]] = {}
     # "nous" pulls from the remote model-catalog manifest published at
     # https://hermes-agent.nousresearch.com/docs/api/model-catalog.json so
     # newly added Portal models surface in the /model picker without
@@ -1650,7 +1652,7 @@ def list_authenticated_providers(
     if allow_network:
         curated["nous"] = get_curated_nous_model_ids()
     # Ollama Cloud uses dynamic discovery (no static curated list)
-    if allow_network and "ollama-cloud" not in curated:
+    if allow_network:
         from hermes_cli.models import fetch_ollama_cloud_models
         curated["ollama-cloud"] = fetch_ollama_cloud_models()
     # LM Studio has no static catalog — probe its native /api/v1/models
@@ -1659,7 +1661,7 @@ def list_authenticated_providers(
     # (when current provider is lmstudio) > 127.0.0.1 default.
     # On auth rejection or unreachable server, fall back to the caller-supplied
     # current model so the picker still shows something when offline / mis-keyed.
-    if allow_network and "lmstudio" not in curated and (
+    if allow_network and (
         os.environ.get("LM_API_KEY") or os.environ.get("LM_BASE_URL") or current_provider.strip().lower() == "lmstudio"
     ):
         from hermes_cli.models import fetch_lmstudio_models
@@ -2061,7 +2063,7 @@ def list_authenticated_providers(
             if not models_list:
                 url_lower = str(api_url).strip().lower()
                 if "api.openai.com" in url_lower:
-                    fb = curated.get("openai") or []
+                    fb = static_provider_model_ids("openai")
                     if fb:
                         models_list = list(fb)
 
