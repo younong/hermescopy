@@ -101,6 +101,10 @@ def format_display_transcript(
                 "name": name,
                 "context": tool_context(name, args) if tool_context is not None else "",
             }
+            if content_text:
+                message["text"] = content_text
+            if tool_call_id:
+                message["tool_call_id"] = tool_call_id
             _add_stable_id(message, row)
             if row.get("timestamp") is not None:
                 message["timestamp"] = row["timestamp"]

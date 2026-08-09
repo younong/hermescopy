@@ -2,7 +2,12 @@ import { describe, expect, it, vi } from "vitest";
 
 import { buildSessionFileDownloadUrl } from "./files";
 import { guiChatReducer } from "./reducer";
-import { initialGuiChatState, type GuiChatState, type ImageArtifactState } from "./types";
+import {
+  initialGuiChatState,
+  type FileArtifactState,
+  type GuiChatState,
+  type ImageArtifactState,
+} from "./types";
 
 const RENDERED_TEXT_TRUNCATION_NOTICE =
   "\n\n[… output truncated in Chat GUI to keep the browser responsive …]";
@@ -18,9 +23,26 @@ function restoreWithMessage(text: string, info?: { cwd?: string; model?: string 
   });
 }
 
+function restoreWithTool(text: string, info?: { cwd?: string }) {
+  return guiChatReducer(initialGuiChatState, {
+    type: "session.created",
+    response: {
+      info,
+      messages: [{ role: "tool", name: "write_file", text, tool_call_id: "tool-history-1" }],
+      session_id: "sid",
+    },
+  });
+}
+
 function imageArtifact(state: GuiChatState, id: string): ImageArtifactState {
   const artifact = state.artifacts[id];
   if (!artifact || artifact.kind === "file") throw new Error(`Expected image artifact ${id}`);
+  return artifact;
+}
+
+function fileArtifact(state: GuiChatState, id: string): FileArtifactState {
+  const artifact = state.artifacts[id];
+  if (!artifact || artifact.kind !== "file") throw new Error(`Expected file artifact ${id}`);
   return artifact;
 }
 
@@ -688,6 +710,57 @@ describe("guiChatReducer history image restoration", () => {
     expect(state.historyLoading).toBe(false);
   });
 
+  it("keeps tool-owned HTML artifacts when prepending an earlier history page", () => {
+    const selected = guiChatReducer(initialGuiChatState, {
+      type: "session.selected",
+      generation: 1,
+      sessionId: "stored",
+    });
+    const current = guiChatReducer(selected, {
+      type: "history.initial.succeeded",
+      generation: 1,
+      requestedSessionId: "stored",
+      response: {
+        history_page: { cursor: "cursor-2", has_more: true, returned_count: 1 },
+        messages: [{ id: "db-s-2", role: "assistant", text: "current" }],
+        session_id: "stored",
+      },
+    });
+    const state = guiChatReducer(
+      guiChatReducer(current, {
+        type: "history.prepend.started",
+        generation: 1,
+        sessionId: "stored",
+      }),
+      {
+        type: "history.prepend.succeeded",
+        generation: 1,
+        response: {
+          history_page: { cursor: null, has_more: false, returned_count: 2 },
+          messages: [
+            {
+              id: "db-tool-1",
+              name: "write_file",
+              role: "tool",
+              text: "Full output saved to: /workspace/older/report.html",
+              tool_call_id: "tool-older",
+            },
+            { id: "db-s-2", role: "assistant", text: "current" },
+          ],
+          session_id: "stored",
+        },
+      },
+    );
+
+    expect(state.messages.map((message) => message.id)).toEqual(["db-s-2"]);
+    expect(state.toolOrder).toEqual(["db-tool-1"]);
+    expect(state.toolCalls["db-tool-1"].artifactIds).toEqual(["db-tool-1-file-0"]);
+    expect(fileArtifact(state, "db-tool-1-file-0")).toMatchObject({
+      name: "report.html",
+      toolCallId: "db-tool-1",
+    });
+  });
+
   it("ignores a stale earlier-history response for another durable session", () => {
     const selected = guiChatReducer(initialGuiChatState, {
       type: "session.selected",
@@ -815,6 +888,94 @@ describe("guiChatReducer history image restoration", () => {
       name: "crow-drinks-water.html",
       sourcePath: "/workspace/crow-drinks-water.html",
     });
+  });
+
+  it("recognizes generated HTML paths returned on a labeled or standalone line", () => {
+    const labeled = restoreWithMessage(
+      "HTML 文件已生成：\n\n/workspace/user3/generated/report.html",
+      { cwd: "/workspace" },
+    );
+    const labeledArtifact = fileArtifact(labeled, labeled.messages[0].artifactIds[0]);
+    expect(labeledArtifact).toMatchObject({
+      downloadUrl:
+        "/api/files/download?path=%2Fworkspace%2Fuser3%2Fgenerated%2Freport.html&cwd=%2Fworkspace&filename=report.html",
+      kind: "file",
+      mimeType: "text/html",
+      name: "report.html",
+      sourcePath: "/workspace/user3/generated/report.html",
+    });
+
+    const standalone = restoreWithMessage(
+      "文件已生成，下载路径如下：\n`/workspace/user3/generated/standalone.html`",
+      { cwd: "/workspace" },
+    );
+    expect(standalone.messages[0].artifactIds).toHaveLength(1);
+    expect(fileArtifact(standalone, standalone.messages[0].artifactIds[0])).toMatchObject({
+      kind: "file",
+      mimeType: "text/html",
+      name: "standalone.html",
+      sourcePath: "/workspace/user3/generated/standalone.html",
+    });
+  });
+
+  it("restores HTML artifacts from persisted tool output without a visible tool message", () => {
+    const state = restoreWithTool(
+      "Full output saved to: /workspace/user3/generated/report.html\n/workspace/user3/generated/report.html\n/workspace/user3/generated/standalone.html",
+      { cwd: "/workspace" },
+    );
+
+    expect(state.messages).toEqual([]);
+    expect(state.toolOrder).toEqual(["tool-history-1"]);
+    expect(state.toolCalls["tool-history-1"]).toMatchObject({
+      artifactIds: ["tool-history-1-file-0", "tool-history-1-file-1"],
+      name: "write_file",
+      status: "succeeded",
+    });
+    expect(fileArtifact(state, "tool-history-1-file-0")).toMatchObject({
+      downloadUrl:
+        "/api/files/download?path=%2Fworkspace%2Fuser3%2Fgenerated%2Freport.html&cwd=%2Fworkspace&filename=report.html",
+      kind: "file",
+      mimeType: "text/html",
+      name: "report.html",
+      sourcePath: "/workspace/user3/generated/report.html",
+      toolCallId: "tool-history-1",
+    });
+    expect(fileArtifact(state, "tool-history-1-file-1")).toMatchObject({
+      name: "standalone.html",
+      sourcePath: "/workspace/user3/generated/standalone.html",
+      toolCallId: "tool-history-1",
+    });
+  });
+
+  it("restores HTML paths from structured write-file tool output", () => {
+    const state = restoreWithTool(
+      '{"bytes_written":19822,"resolved_path":"/workspace/user3/generated/report.html","files_modified":["/workspace/user3/generated/report.html"]}',
+      { cwd: "/workspace" },
+    );
+
+    expect(state.messages).toEqual([]);
+    expect(state.toolCalls["tool-history-1"].artifactIds).toEqual(["tool-history-1-file-0"]);
+    expect(fileArtifact(state, "tool-history-1-file-0")).toMatchObject({
+      name: "report.html",
+      mimeType: "text/html",
+      sourcePath: "/workspace/user3/generated/report.html",
+    });
+  });
+
+  it("only restores saved HTML paths from historical tool output", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        messages: [
+          { role: "tool", text: "Full output saved to: /workspace/report.txt", tool_call_id: "text-tool" },
+          { role: "tool", text: "Inline /workspace/example.html\n```\n/workspace/fenced.html\n```\nhttps://example.com/remote.html", tool_call_id: "other-tool" },
+        ],
+        session_id: "sid",
+      },
+    });
+
+    expect(state.artifacts).toEqual({});
+    expect(state.messages).toEqual([]);
   });
 
   it("does not treat unlabeled inline code, code blocks, or remote links as generated files", () => {
