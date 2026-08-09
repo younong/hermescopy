@@ -2835,7 +2835,11 @@ def media_model_catalog(kind: str, provider_name: str) -> tuple[dict, str | None
         return _plugin_image_gen_catalog(provider_name)
     if kind == "video":
         return _plugin_video_gen_catalog(provider_name)
-    raise ValueError("Media kind must be 'image' or 'video'")
+    if kind in ("voice", "vector"):
+        from hermes_cli.model_plane.catalog import capability_model_catalog
+
+        return capability_model_catalog(kind, provider_name)
+    raise ValueError("Media kind must be 'image', 'video', 'voice', or 'vector'")
 
 
 def select_media_model(

@@ -3812,7 +3812,7 @@ def test_worker_model_registration_routes_use_owner_home_and_reject_selectors(tm
     assert client.get(f"{path}?owner=other", headers=headers).status_code == 400
 
 
-def test_worker_voice_registration_defaults_manual_and_rejects_catalog(tmp_path, monkeypatch):
+def test_worker_voice_registration_uses_catalog_and_keeps_legacy_manual(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 
     owner_home = tmp_path / "owner"
@@ -3820,43 +3820,99 @@ def test_worker_voice_registration_defaults_manual_and_rejects_catalog(tmp_path,
     monkeypatch.setenv("HERMES_HOME", str(owner_home))
     monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_voice_registration")
     monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+    from hermes_cli.model_plane import capability as capability_module
+    from hermes_cli.model_plane.capability import CapabilityModel
     from hermes_cli.owner_worker.entrypoint import create_app
 
-    ensure_owner_runtime_dirs(owner_home)
-    app = create_app("ok1_voice_registration", owner_home)
-    client = TestClient(app)
+    class _VoiceCapability:
+        kind = "voice"
+        name = "voice-test"
+        display_name = "Voice Test"
+        capability = "tts"
 
-    path = "/api/model/registrations"
-    token = _capability_for(
-        app,
-        audience=AUD_OWNER_WORKER_HTTP,
-        path=path,
-        control_home=control_home,
+        def is_available(self):
+            return False
+
+        def list_models(self):
+            return [CapabilityModel(id="voice-v1", display="Voice V1", capability="tts")]
+
+        def default_model(self):
+            return "voice-v1"
+
+        def get_setup_schema(self):
+            return {"name": "Voice Test", "env_vars": []}
+
+        def capabilities(self):
+            return {}
+
+    capability_module._reset_for_tests()
+    capability_module.register_capability_provider(_VoiceCapability())
+    monkeypatch.setattr(
+        "hermes_cli.model_plane.catalog.ensure_capability_providers", lambda: None
     )
-    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        ensure_owner_runtime_dirs(owner_home)
+        app = create_app("ok1_voice_registration", owner_home)
+        client = TestClient(app)
 
-    rejected = client.post(path, headers=headers, json={
-        "name": "Voice catalog",
-        "kind": "voice",
-        "source": "catalog",
-        "provider": "openai",
-        "model": "gpt-4o-mini-tts",
-    })
-    assert rejected.status_code == 400
-    assert "manual source" in rejected.json()["detail"]
+        path = "/api/model/registrations"
+        token = _capability_for(
+            app,
+            audience=AUD_OWNER_WORKER_HTTP,
+            path=path,
+            control_home=control_home,
+        )
+        headers = {"Authorization": f"Bearer {token}"}
 
-    created = client.post(path, headers=headers, json={
-        "name": "Voice default",
-        "kind": "voice",
-        "provider": "openai",
-        "model": "gpt-4o-mini-tts",
-    })
-    assert created.status_code == 200
-    assert created.json()["source"] == "manual"
-    registration_id = created.json()["id"]
+        created = client.post(path, headers=headers, json={
+            "name": "Voice catalog",
+            "kind": "voice",
+            "provider": "voice-test",
+            "model": "voice-v1",
+        })
+        assert created.status_code == 200
+        assert created.json()["source"] == "catalog"
+        registration_id = created.json()["id"]
 
-    deleted = client.request("DELETE", path, headers=headers, json={"id": registration_id})
-    assert deleted.status_code == 200
+        rejected = client.post(path, headers=headers, json={
+            "name": "Voice unknown model",
+            "kind": "voice",
+            "provider": "voice-test",
+            "model": "missing-model",
+        })
+        assert rejected.status_code == 400
+
+        catalog_path = f"{path}/catalog"
+        catalog_token = _capability_for(
+            app,
+            audience=AUD_OWNER_WORKER_HTTP,
+            path=catalog_path,
+            control_home=control_home,
+        )
+        catalog = client.get(
+            f"{catalog_path}?kind=voice",
+            headers={"Authorization": f"Bearer {catalog_token}"},
+        )
+        assert catalog.status_code == 200
+        assert catalog.json()["providers"][0]["provider"] == "voice-test"
+        assert catalog.json()["providers"][0]["models"] == [
+            {"id": "voice-v1", "display": "Voice V1", "capability": "tts"}
+        ]
+
+        legacy = client.post(path, headers=headers, json={
+            "name": "Voice legacy",
+            "kind": "voice",
+            "source": "manual",
+            "provider": "openai",
+            "model": "gpt-4o-mini-tts",
+        })
+        assert legacy.status_code == 200
+        assert legacy.json()["source"] == "manual"
+
+        deleted = client.request("DELETE", path, headers=headers, json={"id": registration_id})
+        assert deleted.status_code == 200
+    finally:
+        capability_module._reset_for_tests()
 
 
 def test_worker_admin_registration_is_visible_and_immutable(tmp_path, monkeypatch):

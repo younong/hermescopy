@@ -78,6 +78,9 @@ If several contributions target the same category, design one shared interface/o
 ## Important Architecture Pointers
 
 - `run_agent.py` — `AIAgent`, core conversation loop.
+- `hermes_cli/model_plane/` — unified model access (all five kinds). Read
+  `docs/model-plane.md` before touching model catalog, registration,
+  activation, or credential flow; ad-hoc extension is not permitted.
 - `model_tools.py` — tool orchestration and builtin tool discovery.
 - `toolsets.py` — toolset definitions and core tool list.
 - `cli.py` / `hermes_cli/commands.py` — CLI and slash command surfaces.
@@ -105,6 +108,9 @@ and tests do not provide the needed implementation detail or rationale.
 
 - User-facing behavioral config belongs in `config.yaml`.
 - `.env` is only for secrets: API keys, tokens, passwords.
+- Model access of every kind (chat/image/video/voice/vector) goes through
+  `hermes_cli/model_plane/`; see `docs/model-plane.md`. Do not add parallel
+  model registries, brokers, catalogs, or credential paths.
 - Do not hardcode `~/.hermes`; use profile-aware helpers such as `get_hermes_home()` and related utilities.
 - Profile-scoped code must bind reads/writes to the selected profile's home/state.
 - Tests must not write to the real `~/.hermes`; use temp `HERMES_HOME`.

@@ -1,0 +1,252 @@
+from __future__ import annotations
+
+import pytest
+
+from agent import image_gen_registry, tts_registry, transcription_registry
+from agent.image_gen_provider import ImageGenProvider
+from agent.tts_provider import TTSProvider
+from agent.transcription_provider import TranscriptionProvider
+from hermes_cli.model_plane import capability as capability_module
+from hermes_cli.model_plane import catalog as catalog_module
+from hermes_cli.model_plane import kinds
+from hermes_cli.model_plane.capability import (
+    CapabilityModel,
+    ProfileEmbeddingCapability,
+    _LegacyMediaAdapter,
+    _LegacyVoiceAdapter,
+)
+
+
+class _ImageDouble(ImageGenProvider):
+    @property
+    def name(self) -> str:
+        return "image-double"
+
+    def is_available(self) -> bool:
+        return True
+
+    def list_models(self):
+        return [{"id": "image-x", "display": "Image X"}]
+
+    def get_setup_schema(self):
+        return {
+            "name": "Image Double",
+            "env_vars": [{"key": "IMAGE_DOUBLE_API_KEY", "prompt": "Key prompt"}],
+        }
+
+    def capabilities(self):
+        return {"modalities": ["text", "image"]}
+
+    def generate(self, prompt, aspect_ratio="landscape", **kwargs):
+        return {"success": True}
+
+
+class _TTSDouble(TTSProvider):
+    @property
+    def name(self) -> str:
+        return "voice-double"
+
+    @property
+    def display_name(self) -> str:
+        return "Voice Double"
+
+    def is_available(self) -> bool:
+        return True
+
+    def list_models(self):
+        return [{"id": "tts-x", "display": "TTS X"}]
+
+    def synthesize(self, text, output_path, **kwargs):
+        return output_path
+
+
+class _ASRDouble(TranscriptionProvider):
+    @property
+    def name(self) -> str:
+        return "voice-double"
+
+    def is_available(self) -> bool:
+        return False
+
+    def list_models(self):
+        return [{"id": "asr-x", "display": "ASR X"}]
+
+    def transcribe(self, file_path, **kwargs):
+        return {"success": True, "transcript": "", "provider": self.name}
+
+
+@pytest.fixture(autouse=True)
+def _clean(monkeypatch):
+    image_gen_registry._reset_for_tests()
+    tts_registry._reset_for_tests()
+    transcription_registry._reset_for_tests()
+    capability_module._reset_for_tests()
+    monkeypatch.setattr("hermes_cli.plugins._ensure_plugins_discovered", lambda *a, **k: None)
+    monkeypatch.setattr("providers.list_providers", lambda: [])
+    yield
+    image_gen_registry._reset_for_tests()
+    tts_registry._reset_for_tests()
+    transcription_registry._reset_for_tests()
+    capability_module._reset_for_tests()
+
+
+def test_kind_contract_is_single_source():
+    assert kinds.KINDS == ("chat", "image", "video", "voice", "vector")
+    assert kinds.MEDIA_KINDS == ("image", "video", "voice", "vector")
+    assert kinds.ACTIVATABLE_KINDS == kinds.MEDIA_KINDS
+    assert kinds.GATEWAY_KINDS == ("image", "video")
+    assert kinds.VOICE_CAPABILITIES == ("tts", "asr")
+    assert kinds.selection_section("voice") == "voice_gen"
+    assert kinds.selection_section("vector") == "vector_gen"
+    with pytest.raises(ValueError):
+        kinds.selection_section("chat")
+
+
+def test_registry_merges_same_name_voice_delegates():
+    capability_module.register_capability_provider(_LegacyVoiceAdapter("tts", _TTSDouble()))
+    capability_module.register_capability_provider(_LegacyVoiceAdapter("asr", _ASRDouble()))
+
+    provider = capability_module.get_capability_provider("voice", "voice-double")
+    assert provider is not None
+    assert provider.name == "voice-double"
+    assert provider.display_name == "Voice Double"
+    assert provider.is_available() is True  # tts delegate is available
+    models = provider.list_models()
+    assert [(m.id, m.capability) for m in models] == [("tts-x", "tts"), ("asr-x", "asr")]
+    assert provider.default_model() == "tts-x"
+    assert [p.name for p in capability_module.list_capability_providers("voice")] == [
+        "voice-double"
+    ]
+    assert capability_module.get_capability_provider("image", "voice-double") is None
+    assert capability_module.get_capability_provider("voice", "missing") is None
+
+
+def test_registry_rejects_invalid_provider():
+    class _Bad:
+        kind = "chat"
+        name = "nope"
+
+    with pytest.raises(ValueError, match="capability kind"):
+        capability_module.register_capability_provider(_Bad())
+
+
+def test_legacy_media_adapter_exposes_gen_media_contract():
+    adapter = _LegacyMediaAdapter("image", _ImageDouble())
+    assert adapter.name == "image-double"
+    assert adapter.capability == ""
+    assert adapter.is_available() is True
+    assert adapter.list_models() == [CapabilityModel(id="image-x", display="Image X")]
+    assert adapter.default_model() == "image-x"
+    assert adapter.get_setup_schema()["env_vars"] == [
+        {"key": "IMAGE_DOUBLE_API_KEY", "prompt": "Key prompt"}
+    ]
+    assert adapter.capabilities() == {"modalities": ["text", "image"]}
+
+
+def test_profile_embedding_capability_exposes_vector_contract(monkeypatch):
+    from providers.base import ProviderProfile
+
+    profile = ProviderProfile(
+        name="embed-double",
+        display_name="Embed Double",
+        env_vars=("EMBED_DOUBLE_API_KEY",),
+        base_url="https://embed.example/v1",
+        embedding_model="embed-x",
+        embedding_path="embeddings",
+        embedding_dimensions=(512, 1024),
+    )
+    monkeypatch.setenv("EMBED_DOUBLE_API_KEY", "secret")
+    monkeypatch.setattr(
+        "agent.profile_provider_credentials.resolve_profile_api_key",
+        lambda p: __import__("os").environ.get(p.env_vars[0], "") if p.env_vars else "",
+    )
+
+    capability = ProfileEmbeddingCapability(profile)
+    assert capability.kind == "vector"
+    assert capability.name == "embed-double"
+    assert capability.display_name == "Embed Double"
+    assert capability.is_available() is True
+    assert capability.list_models() == [CapabilityModel(id="embed-x", display="embed-x")]
+    assert capability.default_model() == "embed-x"
+    assert capability.get_setup_schema()["env_vars"] == [{"key": "EMBED_DOUBLE_API_KEY"}]
+    assert capability.capabilities() == {"dimensions": [512, 1024]}
+
+    monkeypatch.delenv("EMBED_DOUBLE_API_KEY")
+    assert capability.is_available() is False
+
+
+def test_ensure_bridges_legacy_registries_and_profiles(monkeypatch):
+    from providers.base import ProviderProfile
+
+    image_gen_registry.register_provider(_ImageDouble())
+    tts_registry.register_provider(_TTSDouble())
+    transcription_registry.register_provider(_ASRDouble())
+    profile = ProviderProfile(
+        name="embed-double",
+        env_vars=(),
+        embedding_model="embed-x",
+        embedding_path="embeddings",
+    )
+    monkeypatch.setattr("providers.list_providers", lambda: [profile])
+
+    capability_module.ensure_capability_providers()
+
+    assert [p.name for p in capability_module.list_capability_providers("image")] == [
+        "image-double"
+    ]
+    voice = capability_module.get_capability_provider("voice", "voice-double")
+    assert sorted(m.id for m in voice.list_models()) == ["asr-x", "tts-x"]
+    vector = capability_module.get_capability_provider("vector", "embed-double")
+    assert vector.list_models() == [CapabilityModel(id="embed-x", display="embed-x")]
+
+    # Idempotent: a second call does not duplicate providers.
+    capability_module.ensure_capability_providers()
+    assert len(capability_module.list_capability_providers("voice")) == 1
+
+
+def test_capability_catalog_rows_are_credential_safe():
+    image_gen_registry.register_provider(_ImageDouble())
+    capability_module.ensure_capability_providers()
+
+    rows = catalog_module.capability_catalog("image")
+    assert rows == [{
+        "provider": "image-double",
+        "name": "Image-Double",
+        "available": True,
+        "credential_configured": True,
+        "models": [{"id": "image-x", "display": "Image X"}],
+        "default_model": "image-x",
+        "capabilities": {"modalities": ["text", "image"]},
+        "setup": {
+            "name": "Image Double",
+            "env_vars": [{"key": "IMAGE_DOUBLE_API_KEY", "prompt": "Key prompt"}],
+        },
+    }]
+    assert "secret" not in repr(rows).lower()
+    with pytest.raises(ValueError, match="kind must be"):
+        catalog_module.capability_catalog("chat")
+
+
+def test_capability_catalog_voice_rows_carry_capability_tags():
+    capability_module.register_capability_provider(_LegacyVoiceAdapter("tts", _TTSDouble()))
+    capability_module.register_capability_provider(_LegacyVoiceAdapter("asr", _ASRDouble()))
+
+    rows = catalog_module.capability_catalog("voice")
+    assert len(rows) == 1
+    assert rows[0]["models"] == [
+        {"id": "tts-x", "display": "TTS X", "capability": "tts"},
+        {"id": "asr-x", "display": "ASR X", "capability": "asr"},
+    ]
+    assert rows[0]["available"] is True
+
+
+def test_capability_model_catalog_shape_and_unknown_provider():
+    capability_module.register_capability_provider(_LegacyVoiceAdapter("tts", _TTSDouble()))
+
+    catalog, default_model = catalog_module.capability_model_catalog("voice", "voice-double")
+    assert catalog == {"tts-x": {}}
+    assert default_model == "tts-x"
+    with pytest.raises(KeyError, match="Unknown voice capability provider"):
+        catalog_module.capability_model_catalog("voice", "missing")
+    with pytest.raises(ValueError, match="kind must be"):
+        catalog_module.capability_model_catalog("chat", "voice-double")
