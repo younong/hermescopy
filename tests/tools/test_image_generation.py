@@ -370,8 +370,10 @@ class TestRegistryIntegration:
         config choice, never an agent-level arg."""
         props = image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["properties"]
         assert set(props.keys()) == {
-            "prompt", "aspect_ratio", "image_url", "reference_image_urls",
+            "prompt", "aspect_ratio", "resolution", "image_url", "reference_image_urls",
         }
+        assert props["resolution"]["enum"] == ["1K", "2K", "4K"]
+        assert props["resolution"]["default"] == "2K"
         assert image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["required"] == ["prompt"]
 
     def test_aspect_ratio_enum_is_canonical(self, image_tool):

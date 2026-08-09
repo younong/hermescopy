@@ -152,7 +152,7 @@ class TestGenerate:
         assert result["effective_aspect_ratio"] == "3:2"
         saved = Path(result["image"])
         assert saved.exists()
-        assert saved.parent == tmp_path / "images"
+        assert saved.parent == tmp_path / "cache" / "images"
 
         url, kwargs = calls[0]
         assert url == "https://api.apiyi.com/v1/images/generations"
