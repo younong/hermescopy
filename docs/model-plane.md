@@ -76,7 +76,7 @@ No third path. No broker, side channel, or kind-specific credential store.
   (`agent/image_gen_registry.py`, `agent/video_gen_registry.py`,
   `agent/tts_registry.py`, `agent/transcription_registry.py`) and profile
   embedding declarations; registrations generalized to all five kinds.
-- **PR2 (this change)** — image/video migration done: every generation
+- **PR2 (merged #192)** — image/video migration done: every generation
   provider registers through
   `capability.register_media_generation_provider(kind, provider)`
   (`MediaGenerationAdapter` normalizes the catalog surface and delegates
@@ -91,10 +91,47 @@ No third path. No broker, side channel, or kind-specific credential store.
   key. Deleted: `deployment_image.py`, `owner_worker/image_relay.py`,
   `owner_worker/image_dispatch.py`, `agent/image_gen_registry.py`,
   `agent/video_gen_registry.py`, and their tests.
-- **PR3** — voice/vector completion: TTS/ASR/embedding capability plugins,
-  relay operations, and real consumers wired to the unified selection.
+- **PR3 (this change)** — voice/vector completion. Registration converged
+  into the capability registry (`register_voice_provider`,
+  `resolve_embedding_capability`; the legacy tts/transcription registries
+  and `agent/profile_embedding_client.py` are deleted). Consumers read the
+  unified `voice_gen`/`vector_gen` selection: `tools/tts_tool.py`,
+  `tools/transcription_tools.py`, voice mode, and the volcengine embedding
+  skill script. The media relay carries five operations —
+  `image_generate`, `video_generate`, `tts_synthesize`, `transcribe`,
+  `embed` — and deployment routes now cover all four relay kinds
+  (`RELAY_KINDS` in `model_plane/kinds.py`).
 
-Until PR3 lands, the voice adapters in
-`hermes_cli/model_plane/capability.py` are the only sanctioned bridge to the
-legacy tts/transcription registries. Do not add new code against the legacy
-registries directly.
+## Deployment media routes
+
+`HERMES_DEPLOYMENT_MEDIA_ROUTES` declares one route per `(kind, provider)`:
+
+- **image/video** routes declare an `executor` (`module:attribute`) plus
+  optional `base_urls`/`executor_params`; the Control Plane runs the
+  executor with the route's credential.
+- **voice/vector** routes declare no executor — `executor`, `base_urls`,
+  and `executor_params` are rejected. The Control Plane executes through
+  the registered capability delegate for the route's provider
+  (`get_voice_delegate(provider, "tts"|"asr")` /
+  `resolve_embedding_capability(provider)`), so deployment execution stays
+  decoupled from plugin wiring. A voice route's `models` is the union of
+  its TTS and ASR model ids; the operation (`tts_synthesize` vs
+  `transcribe`) plus the selected model choose the capability.
+
+Relay operation contract (all inside the unchanged 96MB frame fence):
+
+| Operation | Kind | Prompt | References | Params | Result |
+| --- | --- | --- | --- | --- | --- |
+| `image_generate` | image | required | image references per route limits | route executor params | `image` bytes + `mime_type` |
+| `video_generate` | video | required | per route limits | route executor params | `video` bytes or `video_url` |
+| `tts_synthesize` | voice | required (text) | none | `voice`, `speed`, `format` (`mp3`/`ogg`/`opus`) | `audio` bytes + `mime_type` |
+| `transcribe` | voice | may be empty | exactly one audio sample | `language` | `text` transcript |
+| `embed` | vector | required (text) | none | `dimensions`, `instructions` | `embedding` + `dimensions` |
+
+Worker-side routing is selection-driven: `tools/tts_tool.py`,
+`tools/transcription_tools.py`, and the embedding skill script use the
+deployment route only when the active unified selection matches a declared
+`(kind, provider, model)`; unmatched selections fall through to the local
+capability plugin with the user's own key. The worker reaches the relay
+through the process-level `worker_media_relay()` handle registered by the
+owner-worker entrypoint.
