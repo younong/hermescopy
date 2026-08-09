@@ -250,6 +250,17 @@ def test_validate_launch_requires_exact_version_and_core_descriptor_order():
         _validate_launch(_launch_payload(), 3)
 
 
+def test_validate_launch_accepts_supervisor_relay_descriptor_set():
+    # The supervisor passes one fd per relay channel
+    # (inference/media/resource); the allowlist must accept them all.
+    names = ["cwd", "stdout", "stderr", "start", "inference", "media", "resource"]
+    _argv, _env, validated = _validate_launch(
+        _launch_payload(fdNames=names),
+        len(names),
+    )
+    assert validated == names
+
+
 def test_recv_packet_rejects_invalid_json_and_excess_descriptors(tmp_path):
     sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
     try:
