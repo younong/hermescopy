@@ -1948,22 +1948,22 @@ def _configure_toolset(
         _configure_simple_requirements(ts_key)
 
 
-def _plugin_image_gen_providers() -> list[dict]:
-    """Build picker-row dicts from plugin-registered image gen providers.
+def _plugin_media_gen_providers(kind: str) -> list[dict]:
+    """Build picker-row dicts from plugin-registered media gen providers.
 
     Each returned dict looks like a regular ``TOOL_CATEGORIES`` provider
-    row but carries an ``image_gen_plugin_name`` marker so downstream
-    code (config writing, model picker) knows to route through the
-    plugin registry. Every image-gen backend is a plugin now — there
-    are no hardcoded rows left in ``TOOL_CATEGORIES["image_gen"]`` for
-    this function to dedupe against (see issue #26241).
+    row but carries a ``{kind}_gen_plugin_name`` marker so downstream code
+    (config writing, model picker) knows to route through the model
+    plane. Every media-gen backend is a capability plugin now — there
+    are no hardcoded rows left in ``TOOL_CATEGORIES`` for these
+    categories (see issue #26241).
     """
     try:
-        from agent.image_gen_registry import list_providers
+        from hermes_cli.model_plane.capability import list_capability_providers
         from hermes_cli.plugins import _ensure_plugins_discovered
 
         _ensure_plugins_discovered()
-        providers = list_providers()
+        providers = list_capability_providers(kind)
     except Exception:
         return []
 
@@ -1980,50 +1980,20 @@ def _plugin_image_gen_providers() -> list[dict]:
             "badge": schema.get("badge", ""),
             "tag": schema.get("tag", ""),
             "env_vars": schema.get("env_vars", []),
-            "image_gen_plugin_name": provider.name,
+            f"{kind}_gen_plugin_name": provider.name,
         }
         if schema.get("post_setup"):
             row["post_setup"] = schema["post_setup"]
         rows.append(row)
     return rows
+
+
+def _plugin_image_gen_providers() -> list[dict]:
+    return _plugin_media_gen_providers("image")
 
 
 def _plugin_video_gen_providers() -> list[dict]:
-    """Build picker-row dicts from plugin-registered video gen providers.
-
-    Mirrors ``_plugin_image_gen_providers`` exactly — every video backend
-    is a plugin, so this function is the *only* source of provider rows
-    for the Video Generation category. The hardcoded ``TOOL_CATEGORIES``
-    entry for ``video_gen`` keeps an empty providers list.
-    """
-    try:
-        from agent.video_gen_registry import list_providers
-        from hermes_cli.plugins import _ensure_plugins_discovered
-
-        _ensure_plugins_discovered()
-        providers = list_providers()
-    except Exception:
-        return []
-
-    rows: list[dict] = []
-    for provider in providers:
-        try:
-            schema = provider.get_setup_schema()
-        except Exception:
-            continue
-        if not isinstance(schema, dict):
-            continue
-        row = {
-            "name": schema.get("name", provider.display_name),
-            "badge": schema.get("badge", ""),
-            "tag": schema.get("tag", ""),
-            "env_vars": schema.get("env_vars", []),
-            "video_gen_plugin_name": provider.name,
-        }
-        if schema.get("post_setup"):
-            row["post_setup"] = schema["post_setup"]
-        rows.append(row)
-    return rows
+    return _plugin_media_gen_providers("video")
 
 
 # Mirror of _plugin_image_gen_providers for web search backends. Surfaces
@@ -2363,39 +2333,31 @@ def _toolset_needs_configuration_prompt(
         # plugin-registered image gen provider is available.
         if fal_key_is_configured():
             return False
-        try:
-            from agent.image_gen_registry import list_providers
-            from hermes_cli.plugins import _ensure_plugins_discovered
-
-            _ensure_plugins_discovered()
-            for provider in list_providers():
-                try:
-                    if provider.is_available():
-                        return False
-                except Exception:
-                    continue
-        except Exception:
-            pass
-        return True
+        return not _any_media_gen_provider_available("image")
     if ts_key == "video_gen":
         # Satisfied when any plugin-registered video gen provider reports
         # available — no in-tree fallback (every backend is a plugin).
-        try:
-            from agent.video_gen_registry import list_providers
-            from hermes_cli.plugins import _ensure_plugins_discovered
-
-            _ensure_plugins_discovered()
-            for provider in list_providers():
-                try:
-                    if provider.is_available():
-                        return False
-                except Exception:
-                    continue
-        except Exception:
-            pass
-        return True
+        return not _any_media_gen_provider_available("video")
 
     return not _toolset_has_keys(ts_key, config, force_fresh=force_fresh)
+
+
+def _any_media_gen_provider_available(kind: str) -> bool:
+    """True when any capability plugin for *kind* reports available."""
+    try:
+        from hermes_cli.model_plane.capability import list_capability_providers
+        from hermes_cli.plugins import _ensure_plugins_discovered
+
+        _ensure_plugins_discovered()
+        for provider in list_capability_providers(kind):
+            try:
+                if provider.is_available():
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
 
 
 def _configure_tool_category(
@@ -2704,7 +2666,7 @@ def _configure_imagegen_model(backend_name: str, config: dict) -> None:
     _print_success(f"  Model set to: {chosen}")
 
 
-def _plugin_image_gen_catalog(plugin_name: str):
+def _plugin_media_gen_catalog(kind: str, plugin_name: str):
     """Return ``(catalog_dict, default_model_id)`` for a plugin provider.
 
     ``catalog_dict`` is shaped like the legacy ``FAL_MODELS`` table —
@@ -2713,22 +2675,27 @@ def _plugin_image_gen_catalog(plugin_name: str):
     ``({}, None)`` if the provider isn't registered or has no models.
     """
     try:
-        from agent.image_gen_registry import get_provider
+        from hermes_cli.model_plane.capability import get_capability_provider
         from hermes_cli.plugins import _ensure_plugins_discovered
 
         _ensure_plugins_discovered()
-        provider = get_provider(plugin_name)
+        provider = get_capability_provider(kind, plugin_name)
     except Exception:
         return {}, None
     if provider is None:
         return {}, None
     try:
-        models = provider.list_models() or []
+        model_entries = getattr(provider, "model_entries", None)
+        models = model_entries() if callable(model_entries) else provider.list_models() or []
         default = provider.default_model()
     except Exception:
         return {}, None
     catalog = {m["id"]: m for m in models if isinstance(m, dict) and "id" in m}
     return catalog, default
+
+
+def _plugin_image_gen_catalog(plugin_name: str):
+    return _plugin_media_gen_catalog("image", plugin_name)
 
 
 def _configure_imagegen_model_for_plugin(plugin_name: str, config: dict) -> None:
@@ -2906,28 +2873,7 @@ def _select_plugin_image_gen_provider(plugin_name: str, config: dict) -> None:
 
 
 def _plugin_video_gen_catalog(plugin_name: str):
-    """Return ``(catalog_dict, default_model_id)`` for a video gen plugin.
-
-    Mirrors :func:`_plugin_image_gen_catalog`. Returns ``({}, None)`` when
-    the plugin isn't registered or has no models.
-    """
-    try:
-        from agent.video_gen_registry import get_provider
-        from hermes_cli.plugins import _ensure_plugins_discovered
-
-        _ensure_plugins_discovered()
-        provider = get_provider(plugin_name)
-    except Exception:
-        return {}, None
-    if provider is None:
-        return {}, None
-    try:
-        models = provider.list_models() or []
-        default = provider.default_model()
-    except Exception:
-        return {}, None
-    catalog = {m["id"]: m for m in models if isinstance(m, dict) and "id" in m}
-    return catalog, default
+    return _plugin_media_gen_catalog("video", plugin_name)
 
 
 def _configure_videogen_model_for_plugin(plugin_name: str, config: dict) -> None:

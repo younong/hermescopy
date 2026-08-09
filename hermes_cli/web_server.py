@@ -13149,9 +13149,9 @@ def start_server(
     app.state.authority_store = None
     app.state.authority_lifecycle_lock = None
     if app.state.auth_required:
-        from hermes_cli.deployment_image import (
-            DeploymentImagePolicyInvalid,
-            load_deployment_image_policy,
+        from hermes_cli.deployment_media import (
+            DeploymentMediaPolicyInvalid,
+            policy_from_control_plane_environment as media_policy_from_environment,
         )
         from hermes_cli.deployment_inference import (
             DeploymentInferencePolicyInvalid,
@@ -13175,11 +13175,10 @@ def start_server(
             )
         except DeploymentInferencePolicyInvalid as exc:
             raise RuntimeError("deployment inference policy is invalid") from exc
-        image_policy_spec = os.environ.get("HERMES_DEPLOYMENT_IMAGE_POLICY", "")
         try:
-            deployment_image_policy = load_deployment_image_policy(image_policy_spec)
-        except DeploymentImagePolicyInvalid as exc:
-            raise RuntimeError("deployment image policy is invalid") from exc
+            deployment_media_policy = media_policy_from_environment()
+        except DeploymentMediaPolicyInvalid as exc:
+            raise RuntimeError("deployment media policy is invalid") from exc
         sandbox_policy_spec = os.environ.get("HERMES_SANDBOX_DEPLOYMENT_POLICY", "")
         try:
             sandbox_deployment_policy = load_sandbox_deployment_policy(sandbox_policy_spec)
@@ -13253,7 +13252,7 @@ def start_server(
                 generation_bridge_revoker=revoke_generation_bridges,
                 deployment_inference_policy=deployment_inference_policy,
                 deployment_inference_policy_resolver=deployment_inference_policy_resolver,
-                deployment_image_policy=deployment_image_policy,
+                deployment_media_policy=deployment_media_policy,
                 resource_manager=resource_manager,
             )
         except Exception:

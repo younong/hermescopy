@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -29,12 +30,136 @@ _SIZES = {
     "portrait": "2048x3072",
 }
 
+# ``resolve_aspect_ratio`` returns canonical ratios ("16:9", "1:1", ...);
+# the seedream endpoint accepts only the three legacy tiers.
+_CANONICAL_ASPECT_TIERS = {
+    "16:9": "landscape", "4:3": "landscape", "3:2": "landscape",
+    "1:1": "square",
+    "9:16": "portrait", "3:4": "portrait", "2:3": "portrait",
+}
+
+
+def _size_for_aspect(aspect: str) -> str:
+    return _SIZES[_CANONICAL_ASPECT_TIERS.get(aspect, "landscape")]
+
 
 def _safe_error(exc: BaseException, api_key: str = "") -> str:
     message = str(exc)
     if api_key:
         message = message.replace(api_key, "«redacted-secret»")
     return redact_sensitive_text(message, force=True)
+
+
+def _call_profile_image_endpoint(
+    profile: ProviderProfile,
+    *,
+    api_key: str,
+    model: str,
+    prompt: str,
+    aspect: str,
+    sources: List[str],
+) -> Dict[str, Any]:
+    """POST one OpenAI-compatible image request and return the first data entry."""
+    payload: Dict[str, Any] = {
+        "model": model,
+        "prompt": prompt,
+        "size": _size_for_aspect(aspect),
+        "response_format": "url",
+        "output_format": "png",
+        "watermark": False,
+    }
+    if sources:
+        payload["image"] = sources
+
+    endpoint = (
+        f"{profile.base_url.rstrip('/')}"
+        f"/{profile.image_generation_path.lstrip('/')}"
+    )
+    response = requests.post(
+        endpoint,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=300,
+    )
+    response.raise_for_status()
+    body = response.json()
+    data = body.get("data") if isinstance(body, dict) else None
+    first = data[0] if isinstance(data, list) and data else None
+    if not isinstance(first, dict):
+        raise ValueError("Image endpoint returned no image data")
+    first.setdefault("size", payload["size"])
+    first.setdefault("output_format", payload["output_format"])
+    return first
+
+
+def generate_profile_image_bytes(
+    *,
+    profile: str,
+    api_key: str,
+    model: str,
+    prompt: str,
+    aspect_ratio: str,
+    references: List[Dict[str, Any]],
+    params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Deployment-media executor: profile image generation without filesystem writes.
+
+    ``profile`` names the registered ``ProviderProfile``; references arrive as
+    relay frame entries (``name``/``mime_type``/``data`` bytes) and are sent as
+    data URIs. Returns ``image_bytes``/``mime_type``/``metadata``.
+    """
+    from providers import get_provider_profile
+
+    del params  # profile image generation has no relay extras
+    prompt = (prompt or "").strip()
+    if not prompt:
+        raise ValueError("prompt is required")
+    profile_obj = get_provider_profile(str(profile or "").strip())
+    if profile_obj is None or not profile_obj.image_generation_model:
+        raise ValueError("profile image generation is unavailable")
+    aspect = resolve_aspect_ratio(aspect_ratio)
+    model_id = str(model or "").strip() or profile_obj.image_generation_model
+    sources = [
+        f"data:{item['mime_type']};base64,{base64.b64encode(item['data']).decode('ascii')}"
+        for item in references[:14]
+    ]
+    first = _call_profile_image_endpoint(
+        profile_obj,
+        api_key=api_key,
+        model=model_id,
+        prompt=prompt,
+        aspect=aspect,
+        sources=sources,
+    )
+    b64 = first.get("b64_json")
+    url = first.get("url")
+    if isinstance(b64, str) and b64:
+        image_bytes = base64.b64decode(b64)
+        mime_type = "image/png"
+    elif isinstance(url, str) and url:
+        downloaded = requests.get(url, timeout=60)
+        downloaded.raise_for_status()
+        mime_type = (
+            downloaded.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        )
+        if not mime_type.startswith("image/"):
+            mime_type = "image/png"
+        image_bytes = downloaded.content
+    else:
+        raise ValueError("response contained neither b64_json nor URL")
+    if not image_bytes:
+        raise ValueError("response contained no image bytes")
+    return {
+        "image_bytes": image_bytes,
+        "mime_type": mime_type,
+        "metadata": {
+            "size": first.get("size"),
+            "output_format": first.get("output_format"),
+        },
+    }
 
 
 class ProfileImageGenProvider(ImageGenProvider):
@@ -123,50 +248,20 @@ class ProfileImageGenProvider(ImageGenProvider):
         sources = sources[:14]
         modality = "image" if sources else "text"
 
-        payload: Dict[str, Any] = {
-            "model": model,
-            "prompt": prompt,
-            "size": _SIZES[aspect],
-            "response_format": "url",
-            "output_format": "png",
-            "watermark": False,
-        }
-        if sources:
-            payload["image"] = sources
-
-        endpoint = (
-            f"{self.profile.base_url.rstrip('/')}"
-            f"/{self.profile.image_generation_path.lstrip('/')}"
-        )
         try:
-            response = requests.post(
-                endpoint,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=300,
+            first = _call_profile_image_endpoint(
+                self.profile,
+                api_key=api_key,
+                model=model,
+                prompt=prompt,
+                aspect=aspect,
+                sources=sources,
             )
-            response.raise_for_status()
-            body = response.json()
         except Exception as exc:
             logger.debug("Profile image generation failed", exc_info=True)
             return error_response(
                 error=f"Image generation failed: {_safe_error(exc, api_key)}",
                 error_type="api_error",
-                provider=self.name,
-                model=model,
-                prompt=prompt,
-                aspect_ratio=aspect,
-            )
-
-        data = body.get("data") if isinstance(body, dict) else None
-        first = data[0] if isinstance(data, list) and data else None
-        if not isinstance(first, dict):
-            return error_response(
-                error="Image endpoint returned no image data",
-                error_type="empty_response",
                 provider=self.name,
                 model=model,
                 prompt=prompt,
@@ -200,7 +295,7 @@ class ProfileImageGenProvider(ImageGenProvider):
             provider=self.name,
             modality=modality,
             extra={
-                "size": first.get("size") or payload["size"],
-                "output_format": first.get("output_format") or payload["output_format"],
+                "size": first.get("size"),
+                "output_format": first.get("output_format"),
             },
         )

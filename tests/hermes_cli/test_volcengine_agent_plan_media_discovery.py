@@ -7,11 +7,12 @@ def test_model_provider_media_capabilities_register_with_catalogs(
     tmp_path, monkeypatch
 ):
     import hermes_cli.plugins as plugin_mod
-    from agent import image_gen_registry, transcription_registry, tts_registry
+    from agent import transcription_registry, tts_registry
+    from hermes_cli.model_plane import capability as capability_module
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("VOLCENGINE_AGENT_PLAN_API_KEY", "fake-plan-key")
-    image_gen_registry._reset_for_tests()
+    capability_module._reset_for_tests()
     tts_registry._reset_for_tests()
     transcription_registry._reset_for_tests()
     plugin_mod._plugin_manager = None
@@ -19,7 +20,7 @@ def test_model_provider_media_capabilities_register_with_catalogs(
 
     plugin_mod._ensure_plugins_discovered()
 
-    image = image_gen_registry.get_provider("volcengine-agent-plan")
+    image = capability_module.get_capability_provider("image", "volcengine-agent-plan")
     assert image is not None
     assert image.is_available() is True
     assert image.default_model() == "doubao-seedream-5.0-lite"
@@ -35,7 +36,7 @@ def test_model_provider_media_capabilities_register_with_catalogs(
     assert transcription.is_available() is True
     assert transcription.default_model() == "doubao-seed-asr-2.0"
 
-    image_gen_registry._reset_for_tests()
+    capability_module._reset_for_tests()
     tts_registry._reset_for_tests()
     transcription_registry._reset_for_tests()
     plugin_mod._plugin_manager = None

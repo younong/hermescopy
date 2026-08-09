@@ -466,11 +466,11 @@ def _print_setup_summary(config: dict, hermes_home):
         # setups don't show as "missing FAL_KEY".
         _img_backend = None
         try:
-            from agent.image_gen_registry import list_providers
+            from hermes_cli.model_plane.capability import list_capability_providers
             from hermes_cli.plugins import _ensure_plugins_discovered
 
             _ensure_plugins_discovered()
-            for _p in list_providers():
+            for _p in list_capability_providers("image"):
                 if _p.name == "fal":
                     continue
                 try:
@@ -493,11 +493,11 @@ def _print_setup_summary(config: dict, hermes_home):
         tool_status.append(("Video Generation (FAL via Nous subscription)", True, None))
     else:
         try:
-            from agent.video_gen_registry import list_providers as _list_video_providers
+            from hermes_cli.model_plane.capability import list_capability_providers
             from hermes_cli.plugins import _ensure_plugins_discovered as _ensure_plugins
             _ensure_plugins()
             _video_backend = None
-            for _vp in _list_video_providers():
+            for _vp in list_capability_providers("video"):
                 try:
                     if _vp.is_available():
                         _video_backend = _vp.display_name

@@ -463,7 +463,7 @@ def test_owner_relay_dispatches_canonical_image_generation():
     seen = []
     broker = OwnerToolRelayBroker(
         identity_validator=lambda _identity: None,
-        image_dispatcher=lambda name, args, invocation, materializer: (
+        media_dispatcher=lambda name, args, invocation, materializer: (
             seen.append((name, args, invocation.invocation_id, materializer))
             or '{"success":true}'
         ),
@@ -487,6 +487,7 @@ def test_owner_relay_dispatches_canonical_image_generation():
         {
             "prompt": "Draw a poster",
             "aspect_ratio": "portrait",
+            "resolution": "2K",
             "image_url": "/owner/images/source.png",
             "reference_image_urls": ["/owner/workspaces/default/reference.webp"],
         },
@@ -495,17 +496,32 @@ def test_owner_relay_dispatches_canonical_image_generation():
     )]
 
 
-def test_owner_relay_rejects_image_without_dispatcher():
-    broker = OwnerToolRelayBroker(identity_validator=lambda _identity: None)
+def test_owner_relay_falls_back_to_local_dispatcher_without_media_dispatcher():
+    """No media dispatcher: image_generate rides the local plugin path."""
+    seen = []
+    broker = OwnerToolRelayBroker(
+        identity_validator=lambda _identity: None,
+        dispatcher=lambda name, args, invocation, materializer, workspace: (
+            seen.append((name, args, invocation.invocation_id, workspace))
+            or '{"success":true}'
+        ),
+    )
     try:
-        with pytest.raises(OwnerToolRelayError, match="image dispatcher"):
-            broker.register(_invocation(
-                "image_generate",
-                {"prompt": "draw", "aspect_ratio": "square"},
-                invocation_id="image-generate",
-            ))
+        invocation = _invocation(
+            "image_generate",
+            {"prompt": "draw", "aspect_ratio": "square"},
+            invocation_id="image-generate",
+        )
+        relay_fd = broker.register(invocation)
+        assert dispatch_owner_tool_over_relay(relay_fd, invocation) == '{"success":true}'
     finally:
         broker.close()
+    assert seen == [(
+        "image_generate",
+        {"prompt": "draw", "aspect_ratio": "square", "resolution": "2K"},
+        "image-generate",
+        None,
+    )]
 
 
 @pytest.mark.parametrize(
@@ -521,7 +537,7 @@ def test_owner_relay_rejects_image_without_dispatcher():
 def test_owner_relay_rejects_noncanonical_image_arguments(arguments):
     broker = OwnerToolRelayBroker(
         identity_validator=lambda _identity: None,
-        image_dispatcher=lambda *_args: '{"success":true}',
+        media_dispatcher=lambda *_args: '{"success":true}',
     )
     try:
         with pytest.raises(OwnerToolRelayError):

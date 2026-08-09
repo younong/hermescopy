@@ -13,14 +13,14 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-from agent import video_gen_registry
+from hermes_cli.model_plane import capability as capability_module
 
 
 @pytest.fixture(autouse=True)
 def _reset_registry():
-    video_gen_registry._reset_for_tests()
+    capability_module._reset_for_tests()
     yield
-    video_gen_registry._reset_for_tests()
+    capability_module._reset_for_tests()
 
 
 class _FakeResponse:

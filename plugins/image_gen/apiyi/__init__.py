@@ -283,8 +283,13 @@ def generate_apiyi_image_bytes(
     api_key: str,
     openai_base_url: str,
     gemini_base_url: str,
+    params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Call APIYI using trusted explicit runtime inputs without filesystem writes."""
+    """Call APIYI using trusted explicit runtime inputs without filesystem writes.
+
+    ``params`` carries deployment-media relay extras; APIYI has none and
+    ignores it.
+    """
     import requests
 
     model_id, meta = _resolve_model(model)

@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-from agent import video_gen_registry
+from hermes_cli.model_plane import capability as capability_module
 from agent.video_gen_provider import VideoGenProvider
 
 
@@ -64,9 +64,9 @@ class _FakeVideoProvider(VideoGenProvider):
 
 @pytest.fixture(autouse=True)
 def _reset_registry():
-    video_gen_registry._reset_for_tests()
+    capability_module._reset_for_tests()
     yield
-    video_gen_registry._reset_for_tests()
+    capability_module._reset_for_tests()
 
 
 class TestReconfigureWritesProvider:
@@ -88,7 +88,7 @@ class TestReconfigureWritesProvider:
         from hermes_cli import tools_config
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        video_gen_registry.register_provider(_FakeVideoProvider("xai_fake"))
+        capability_module.register_media_generation_provider("video", _FakeVideoProvider("xai_fake"))
 
         # Picker prompts replaced — no TTY in tests.
         monkeypatch.setattr(tools_config, "_prompt_choice", lambda *a, **kw: 0)
@@ -123,7 +123,7 @@ class TestReconfigureWritesProvider:
         from hermes_cli import tools_config
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        video_gen_registry.register_provider(_FakeVideoProvider(
+        capability_module.register_media_generation_provider("video", _FakeVideoProvider(
             "noenv_video",
             schema={
                 "name": "NoEnvVideo",
@@ -154,7 +154,7 @@ class TestPluginVideoProvidersRow:
     def test_post_setup_propagated_when_declared(self, monkeypatch):
         from hermes_cli import tools_config
 
-        video_gen_registry.register_provider(_FakeVideoProvider(
+        capability_module.register_media_generation_provider("video", _FakeVideoProvider(
             "xai_video",
             schema={
                 "name": "xAI Grok Imagine",
@@ -172,7 +172,7 @@ class TestPluginVideoProvidersRow:
     def test_post_setup_omitted_when_not_declared(self, monkeypatch):
         from hermes_cli import tools_config
 
-        video_gen_registry.register_provider(_FakeVideoProvider("plain_video"))
+        capability_module.register_media_generation_provider("video", _FakeVideoProvider("plain_video"))
 
         rows = tools_config._plugin_video_gen_providers()
         match = next(r for r in rows if r.get("video_gen_plugin_name") == "plain_video")

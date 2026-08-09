@@ -283,8 +283,11 @@ def test_deployment_descriptor_rejects_unallowed_compression_model():
         )
 
 
-def test_owner_worker_environment_serializes_only_safe_image_descriptor(tmp_path):
-    from hermes_cli.deployment_image import DeploymentImageDescriptor
+def test_owner_worker_environment_serializes_only_safe_media_descriptor(tmp_path):
+    from hermes_cli.deployment_media import (
+        DeploymentMediaDescriptor,
+        DeploymentMediaRouteDescriptor,
+    )
 
     owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
     env = owner_worker_env_for(
@@ -298,34 +301,51 @@ def test_owner_worker_environment_serializes_only_safe_image_descriptor(tmp_path
         capability_issuer="owc1-1",
         capability_public_key="public-key",
         capability_retained_public_keys="{}",
-        deployment_image_descriptor=DeploymentImageDescriptor(
-            provider="apiyi",
-            model="gpt-image-2-medium",
-            policy_id="image-policy-v1",
-            allowed_models=("gpt-image-2-medium",),
-            max_reference_images=8,
-            max_reference_bytes=1024,
-            max_total_reference_bytes=4096,
-            max_output_bytes=8192,
+        deployment_media_descriptor=DeploymentMediaDescriptor(
+            policy_id="media-policy-v1",
+            routes=(
+                DeploymentMediaRouteDescriptor(
+                    kind="image",
+                    provider="apiyi",
+                    models=("gpt-image-2-medium",),
+                    default_model="gpt-image-2-medium",
+                    max_reference_images=8,
+                    max_reference_bytes=1024,
+                    max_total_reference_bytes=4096,
+                    max_output_bytes=8192,
+                ),
+                DeploymentMediaRouteDescriptor(
+                    kind="video",
+                    provider="fal",
+                    models=("fal-video-1",),
+                    default_model="fal-video-1",
+                ),
+            ),
         ),
     )
 
-    assert env["HERMES_DEPLOYMENT_IMAGE_PROVIDER"] == "apiyi"
-    assert env["HERMES_DEPLOYMENT_IMAGE_MODEL"] == "gpt-image-2-medium"
-    assert env["HERMES_DEPLOYMENT_IMAGE_MAX_REFERENCES"] == "8"
+    assert env["HERMES_DEPLOYMENT_MEDIA_POLICY_ID"] == "media-policy-v1"
+    import json
+
+    routes = json.loads(env["HERMES_DEPLOYMENT_MEDIA_ROUTES"])
+    assert [route["provider"] for route in routes] == ["apiyi", "fal"]
+    assert routes[0]["kind"] == "image"
+    assert routes[0]["models"] == ["gpt-image-2-medium"]
+    assert routes[0]["max_reference_images"] == 8
+    assert routes[1]["kind"] == "video"
     serialized = " ".join(f"{key}={value}" for key, value in env.items())
     for forbidden in ("APIYI_API_KEY", "BASE_URL", "api.example", "control-plane-secret"):
         assert forbidden not in serialized
     validate_owner_worker_runtime_environment(owner_home=owner_home, source=env)
 
 
-def test_owner_worker_environment_rejects_invalid_image_descriptor(tmp_path):
+def test_owner_worker_environment_rejects_invalid_media_descriptor(tmp_path):
     owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
-    with pytest.raises(ValueError, match="image descriptor"):
+    with pytest.raises(ValueError, match="media descriptor"):
         owner_worker_env_for(
             owner_key="ok_owner",
             owner_home=owner_home,
-            deployment_image_descriptor=object(),
+            deployment_media_descriptor=object(),
         )
 
 

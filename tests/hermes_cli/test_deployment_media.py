@@ -1,0 +1,378 @@
+import json
+
+import pytest
+
+from hermes_cli.deployment_media import (
+    DEFAULT_POLICY_ID,
+    POLICY_ID_ENV,
+    ROUTES_ENV,
+    DeploymentMediaDescriptor,
+    DeploymentMediaPolicy,
+    DeploymentMediaPolicyInvalid,
+    DeploymentMediaRoute,
+    DeploymentMediaRouteDescriptor,
+    DeploymentMediaSelectionRejected,
+    deployment_media_descriptor_from_environment,
+    deployment_media_route_from_environment,
+    policy_from_control_plane_environment,
+)
+
+
+def _image_route_payload(**overrides):
+    """Control-plane route declaration (secret-bearing fields included)."""
+    payload = {
+        "kind": "image",
+        "provider": "apiyi",
+        "models": ["gpt-image-2-medium", "nano-banana-2"],
+        "default_model": "gpt-image-2-medium",
+        "key_env": "APIYI_API_KEY",
+        "executor": "plugins.image_gen.apiyi:generate_apiyi_image_bytes",
+        "base_urls": {"openai_base_url": "https://api.example.com/v1"},
+        "text_only_models": ["nano-banana-2"],
+        "limits": {"max_reference_images": 8, "max_output_bytes": 8192},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _video_route_payload(**overrides):
+    payload = {
+        "kind": "video",
+        "provider": "fal",
+        "models": ["fal-video-1"],
+        "default_model": "fal-video-1",
+        "key_env": "FAL_KEY",
+        "executor": "plugins.video_gen.fal:generate_fal_video",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _image_descriptor_payload(**overrides):
+    """Worker-safe descriptor payload (no secret/executor fields)."""
+    payload = {
+        "kind": "image",
+        "provider": "apiyi",
+        "models": ["gpt-image-2-medium", "nano-banana-2"],
+        "default_model": "gpt-image-2-medium",
+        "text_only_models": ["nano-banana-2"],
+        "max_reference_images": 8,
+        "max_reference_bytes": 1024,
+        "max_total_reference_bytes": 4096,
+        "max_output_bytes": 8192,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _video_descriptor_payload(**overrides):
+    payload = {
+        "kind": "video",
+        "provider": "fal",
+        "models": ["fal-video-1"],
+        "default_model": "fal-video-1",
+        "text_only_models": [],
+        "max_reference_images": 16,
+        "max_reference_bytes": 1024,
+        "max_total_reference_bytes": 4096,
+        "max_output_bytes": 8192,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_descriptor_round_trip_is_secret_free():
+    descriptor = deployment_media_descriptor_from_environment({
+        POLICY_ID_ENV: "policy-v1",
+        ROUTES_ENV: json.dumps([_image_descriptor_payload(), _video_descriptor_payload()]),
+    })
+    assert descriptor is not None
+    assert descriptor.policy_id == "policy-v1"
+    assert [route.provider for route in descriptor.routes] == ["apiyi", "fal"]
+    image = descriptor.routes[0]
+    assert image.kind == "image"
+    assert image.models == ("gpt-image-2-medium", "nano-banana-2")
+    assert image.max_reference_images == 8
+    assert image.max_output_bytes == 8192
+    assert image.text_only_models == ("nano-banana-2",)
+    round_trip = DeploymentMediaDescriptor.from_payload(descriptor.payload())
+    assert round_trip == descriptor
+    assert "APIYI_API_KEY" not in json.dumps(descriptor.payload())
+    assert "executor" not in json.dumps(descriptor.payload())
+
+
+def test_descriptor_requires_complete_environment():
+    with pytest.raises(DeploymentMediaPolicyInvalid):
+        deployment_media_descriptor_from_environment({POLICY_ID_ENV: "policy-v1"})
+    with pytest.raises(DeploymentMediaPolicyInvalid):
+        deployment_media_descriptor_from_environment(
+            {ROUTES_ENV: json.dumps([_image_descriptor_payload()])}
+        )
+    assert deployment_media_descriptor_from_environment({}) is None
+
+
+def test_route_descriptor_validation():
+    with pytest.raises(DeploymentMediaPolicyInvalid):
+        DeploymentMediaRouteDescriptor(
+            kind="voice", provider="x", models=("m",), default_model="m"
+        )
+    with pytest.raises(DeploymentMediaPolicyInvalid):
+        DeploymentMediaRouteDescriptor(
+            kind="image", provider="x", models=("m",), default_model="other"
+        )
+    with pytest.raises(DeploymentMediaPolicyInvalid):
+        DeploymentMediaRouteDescriptor(
+            kind="image", provider="x", models=("m",), default_model="m",
+            max_output_bytes=0,
+        )
+
+
+def test_descriptor_rejects_duplicate_route_identity():
+    route = DeploymentMediaRouteDescriptor(
+        kind="image", provider="apiyi", models=("m",), default_model="m"
+    )
+    with pytest.raises(DeploymentMediaPolicyInvalid):
+        DeploymentMediaDescriptor(policy_id="p", routes=(route, route))
+
+
+def test_route_for_matches_selection_and_defaults():
+    descriptor = deployment_media_descriptor_from_environment({
+        POLICY_ID_ENV: "policy-v1",
+        ROUTES_ENV: json.dumps([_image_descriptor_payload(), _video_descriptor_payload()]),
+    })
+    # Explicit selection matches only its (kind, provider, model).
+    route = descriptor.route_for("image", "apiyi", "nano-banana-2")
+    assert route is not None and route.provider == "apiyi"
+    assert descriptor.route_for("image", "apiyi", "unknown-model") is None
+    assert descriptor.route_for("image", "openai", "gpt-image-2-medium") is None
+    assert descriptor.route_for("video", "fal", "fal-video-1") is not None
+    # Empty provider matches the first route of the kind (worker default).
+    assert descriptor.route_for("image", "", "").provider == "apiyi"
+    # Kind mismatch never matches.
+    assert descriptor.route_for("voice", "", "") is None
+
+
+def test_route_declaration_validation():
+    with pytest.raises(DeploymentMediaPolicyInvalid):
+        DeploymentMediaRoute(
+            descriptor=DeploymentMediaRouteDescriptor(
+                kind="image", provider="x", models=("m",), default_model="m"
+            ),
+            key_env="",
+            executor="mod:func",
+        )
+    with pytest.raises(DeploymentMediaPolicyInvalid):
+        DeploymentMediaRoute(
+            descriptor=DeploymentMediaRouteDescriptor(
+                kind="image", provider="x", models=("m",), default_model="m"
+            ),
+            key_env="SOME_KEY",
+            executor="no-separator",
+        )
+    with pytest.raises(DeploymentMediaPolicyInvalid):
+        DeploymentMediaRoute(
+            descriptor=DeploymentMediaRouteDescriptor(
+                kind="image", provider="x", models=("m",), default_model="m"
+            ),
+            key_env="SOME_KEY",
+            executor="mod:func",
+            base_urls={"openai_base_url": "http://insecure.example.com"},
+        )
+
+
+def test_control_plane_policy_auto_activates_apiyi_route(monkeypatch):
+    monkeypatch.delenv(ROUTES_ENV, raising=False)
+    monkeypatch.delenv(POLICY_ID_ENV, raising=False)
+    monkeypatch.setenv("APIYI_API_KEY", "secret-value")
+    policy = policy_from_control_plane_environment()
+    assert policy is not None
+    assert policy.policy_id == DEFAULT_POLICY_ID
+    assert len(policy.routes) == 1
+    route = policy.routes[0]
+    assert route.descriptor.kind == "image"
+    assert route.descriptor.provider == "apiyi"
+    assert set(route.descriptor.models) == {
+        "gpt-image-2-low", "gpt-image-2-medium", "gpt-image-2-high", "nano-banana-2",
+    }
+    assert route.descriptor.default_model == "gpt-image-2-medium"
+    assert route.descriptor.text_only_models == ("nano-banana-2",)
+    assert route.key_env == "APIYI_API_KEY"
+    assert route.executor == "plugins.image_gen.apiyi:generate_apiyi_image_bytes"
+    assert "secret-value" not in repr(policy.descriptor())
+
+
+def test_control_plane_policy_absent_without_routes_or_key(monkeypatch):
+    monkeypatch.delenv(ROUTES_ENV, raising=False)
+    monkeypatch.delenv("APIYI_API_KEY", raising=False)
+    assert policy_from_control_plane_environment() is None
+
+
+def test_control_plane_policy_explicit_routes(monkeypatch):
+    monkeypatch.setenv(
+        ROUTES_ENV, json.dumps([_image_route_payload(), _video_route_payload()])
+    )
+    monkeypatch.setenv(POLICY_ID_ENV, "policy-v2")
+    policy = policy_from_control_plane_environment()
+    assert policy is not None
+    assert policy.policy_id == "policy-v2"
+    assert [route.descriptor.kind for route in policy.routes] == ["image", "video"]
+
+
+def test_policy_execute_image_normalizes_bounded_response(monkeypatch):
+    route = DeploymentMediaRoute(
+        descriptor=DeploymentMediaRouteDescriptor(
+            kind="image", provider="apiyi",
+            models=("gpt-image-2-medium",), default_model="gpt-image-2-medium",
+            max_output_bytes=8192,
+        ),
+        key_env="TEST_MEDIA_KEY",
+        executor="plugins.image_gen.apiyi:generate_apiyi_image_bytes",
+        base_urls={"openai_base_url": "https://api.example.com/v1"},
+        executor_params={"quality": "high"},
+    )
+    policy = DeploymentMediaPolicy(routes=(route,), policy_id="p")
+    monkeypatch.setenv("TEST_MEDIA_KEY", "secret")
+    captured = {}
+
+    def fake_executor(**kwargs):
+        captured.update(kwargs)
+        return {
+            "image_bytes": b"png",
+            "mime_type": "image/png",
+            "metadata": {"size": "1024x1024"},
+        }
+
+    monkeypatch.setattr(DeploymentMediaRoute, "load_executor", lambda self: fake_executor)
+    result = policy.execute(
+        "image_generate",
+        provider="apiyi",
+        model="gpt-image-2-medium",
+        prompt="draw",
+        aspect_ratio="square",
+    )
+    assert result["image_bytes"] == b"png"
+    assert result["mime_type"] == "image/png"
+    assert result["provider"] == "apiyi"
+    assert result["modality"] == "text"
+    assert result["metadata"] == {"size": "1024x1024"}
+    assert captured["api_key"] == "secret"
+    assert captured["openai_base_url"] == "https://api.example.com/v1"
+    assert captured["quality"] == "high"
+    assert captured["params"] == {}
+
+
+def test_policy_execute_video_accepts_url_or_bytes(monkeypatch):
+    route = DeploymentMediaRoute(
+        descriptor=DeploymentMediaRouteDescriptor(
+            kind="video", provider="fal",
+            models=("fal-video-1",), default_model="fal-video-1",
+        ),
+        key_env="TEST_MEDIA_KEY",
+        executor="plugins.video_gen.fal:generate_fal_video",
+    )
+    policy = DeploymentMediaPolicy(routes=(route,), policy_id="p")
+    monkeypatch.setenv("TEST_MEDIA_KEY", "secret")
+
+    monkeypatch.setattr(
+        DeploymentMediaRoute,
+        "load_executor",
+        lambda self: lambda **kwargs: {"video_url": "https://cdn.example.com/v.mp4"},
+    )
+    result = policy.execute(
+        "video_generate", provider="fal", model="fal-video-1", prompt="animate"
+    )
+    assert result["video_url"] == "https://cdn.example.com/v.mp4"
+
+    monkeypatch.setattr(
+        DeploymentMediaRoute,
+        "load_executor",
+        lambda self: lambda **kwargs: {"video_bytes": b"mp4", "mime_type": "video/mp4"},
+    )
+    result = policy.execute(
+        "video_generate", provider="fal", model="fal-video-1", prompt="animate"
+    )
+    assert result["video_bytes"] == b"mp4"
+    assert result["mime_type"] == "video/mp4"
+
+
+def test_policy_execute_rejects_out_of_policy_requests(monkeypatch):
+    route = DeploymentMediaRoute(
+        descriptor=DeploymentMediaRouteDescriptor(
+            kind="image", provider="apiyi",
+            models=("nano-banana-2",), default_model="nano-banana-2",
+            text_only_models=("nano-banana-2",),
+        ),
+        key_env="TEST_MEDIA_KEY",
+        executor="plugins.image_gen.apiyi:generate_apiyi_image_bytes",
+    )
+    policy = DeploymentMediaPolicy(routes=(route,), policy_id="p")
+    monkeypatch.setenv("TEST_MEDIA_KEY", "secret")
+
+    with pytest.raises(DeploymentMediaSelectionRejected):
+        policy.execute("chat_completion", provider="apiyi", model="nano-banana-2", prompt="x")
+    with pytest.raises(DeploymentMediaSelectionRejected):
+        policy.execute(
+            "image_generate", provider="other", model="nano-banana-2", prompt="x"
+        )
+    with pytest.raises(DeploymentMediaSelectionRejected):
+        policy.execute(
+            "image_generate",
+            provider="apiyi",
+            model="nano-banana-2",
+            prompt="x",
+            references=({"name": "a.png", "mime_type": "image/png", "data": b"x"},),
+        )
+
+
+def test_policy_execute_rejects_invalid_executor_response(monkeypatch):
+    route = DeploymentMediaRoute(
+        descriptor=DeploymentMediaRouteDescriptor(
+            kind="image", provider="apiyi",
+            models=("m",), default_model="m", max_output_bytes=4,
+        ),
+        key_env="TEST_MEDIA_KEY",
+        executor="plugins.image_gen.apiyi:generate_apiyi_image_bytes",
+    )
+    policy = DeploymentMediaPolicy(routes=(route,), policy_id="p")
+    monkeypatch.setenv("TEST_MEDIA_KEY", "secret")
+
+    monkeypatch.setattr(
+        DeploymentMediaRoute,
+        "load_executor",
+        lambda self: lambda **kwargs: {"image_bytes": b"too-large", "mime_type": "image/png"},
+    )
+    with pytest.raises(DeploymentMediaPolicyInvalid):
+        policy.execute("image_generate", provider="apiyi", model="m", prompt="x")
+
+    monkeypatch.setattr(
+        DeploymentMediaRoute,
+        "load_executor",
+        lambda self: lambda **kwargs: {"image_bytes": b"gif", "mime_type": "image/gif"},
+    )
+    with pytest.raises(DeploymentMediaPolicyInvalid):
+        policy.execute("image_generate", provider="apiyi", model="m", prompt="x")
+
+
+def test_route_from_environment_mirrors_worker_routing(monkeypatch):
+    worker_env = {
+        "HERMES_OWNER_KEY": "owner-key",
+        POLICY_ID_ENV: "policy-v1",
+        ROUTES_ENV: json.dumps([_image_descriptor_payload(), _video_descriptor_payload()]),
+    }
+    # Unconfigured users match the first route of the kind.
+    route = deployment_media_route_from_environment("image", source=worker_env)
+    assert route is not None and route.provider == "apiyi"
+    # Explicit selection matching a declared route.
+    route = deployment_media_route_from_environment(
+        "video", provider="fal", model="fal-video-1", source=worker_env
+    )
+    assert route is not None and route.provider == "fal"
+    # Explicit selection outside the deployment falls back to local plugins.
+    assert (
+        deployment_media_route_from_environment(
+            "image", provider="openai", model="gpt-image-1", source=worker_env
+        )
+        is None
+    )
+    # Outside an owner worker there is no deployment route.
+    assert deployment_media_route_from_environment("image", source={}) is None

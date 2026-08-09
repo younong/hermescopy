@@ -49,15 +49,9 @@ OWNER_WORKER_DEPLOYMENT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     "HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL",
     "HERMES_DEPLOYMENT_INFERENCE_RELAY_FD",
     "HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL",
-    "HERMES_DEPLOYMENT_IMAGE_PROVIDER",
-    "HERMES_DEPLOYMENT_IMAGE_MODEL",
-    "HERMES_DEPLOYMENT_IMAGE_POLICY_ID",
-    "HERMES_DEPLOYMENT_IMAGE_ALLOWED_MODELS",
-    "HERMES_DEPLOYMENT_IMAGE_MAX_REFERENCES",
-    "HERMES_DEPLOYMENT_IMAGE_MAX_REFERENCE_BYTES",
-    "HERMES_DEPLOYMENT_IMAGE_MAX_TOTAL_REFERENCE_BYTES",
-    "HERMES_DEPLOYMENT_IMAGE_MAX_OUTPUT_BYTES",
-    "HERMES_DEPLOYMENT_IMAGE_RELAY_FD",
+    "HERMES_DEPLOYMENT_MEDIA_POLICY_ID",
+    "HERMES_DEPLOYMENT_MEDIA_ROUTES",
+    "HERMES_DEPLOYMENT_MEDIA_RELAY_FD",
     "HERMES_DEPLOYMENT_RESOURCE_BROKER_FD",
 )
 
@@ -203,7 +197,7 @@ def owner_worker_env_for(
     capability_public_key: str = "",
     capability_retained_public_keys: str = "",
     deployment_inference_descriptor: object | None = None,
-    deployment_image_descriptor: object | None = None,
+    deployment_media_descriptor: object | None = None,
 ) -> dict[str, str]:
     """Return the canonical owner-worker environment values."""
     home = Path(owner_home).expanduser().resolve()
@@ -265,20 +259,19 @@ def owner_worker_env_for(
             env["HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL"] = (
                 deployment_inference_descriptor.compression_model
             )
-    if deployment_image_descriptor is not None:
-        from hermes_cli.deployment_image import DeploymentImageDescriptor
+    if deployment_media_descriptor is not None:
+        import json
 
-        if not isinstance(deployment_image_descriptor, DeploymentImageDescriptor):
-            raise ValueError("deployment image descriptor is invalid")
+        from hermes_cli.deployment_media import DeploymentMediaDescriptor
+
+        if not isinstance(deployment_media_descriptor, DeploymentMediaDescriptor):
+            raise ValueError("deployment media descriptor is invalid")
         env.update({
-            "HERMES_DEPLOYMENT_IMAGE_PROVIDER": deployment_image_descriptor.provider,
-            "HERMES_DEPLOYMENT_IMAGE_MODEL": deployment_image_descriptor.model,
-            "HERMES_DEPLOYMENT_IMAGE_POLICY_ID": deployment_image_descriptor.policy_id,
-            "HERMES_DEPLOYMENT_IMAGE_ALLOWED_MODELS": ",".join(deployment_image_descriptor.allowed_models),
-            "HERMES_DEPLOYMENT_IMAGE_MAX_REFERENCES": str(deployment_image_descriptor.max_reference_images),
-            "HERMES_DEPLOYMENT_IMAGE_MAX_REFERENCE_BYTES": str(deployment_image_descriptor.max_reference_bytes),
-            "HERMES_DEPLOYMENT_IMAGE_MAX_TOTAL_REFERENCE_BYTES": str(deployment_image_descriptor.max_total_reference_bytes),
-            "HERMES_DEPLOYMENT_IMAGE_MAX_OUTPUT_BYTES": str(deployment_image_descriptor.max_output_bytes),
+            "HERMES_DEPLOYMENT_MEDIA_POLICY_ID": deployment_media_descriptor.policy_id,
+            "HERMES_DEPLOYMENT_MEDIA_ROUTES": json.dumps(
+                [route.payload() for route in deployment_media_descriptor.routes],
+                separators=(",", ":"),
+            ),
         })
     return env
 

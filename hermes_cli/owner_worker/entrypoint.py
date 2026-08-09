@@ -332,7 +332,7 @@ def create_app(
     @asynccontextmanager
     async def _lifespan(_: FastAPI):
         relay = None
-        image_relay = None
+        media_relay = None
         try:
             relay_fd = os.environ.pop("HERMES_DEPLOYMENT_INFERENCE_RELAY_FD", "").strip()
             if relay_fd:
@@ -344,19 +344,19 @@ def create_app(
                     os.environ["HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL"] = relay.base_url
                 except Exception as exc:
                     raise RuntimeError("deployment inference relay startup failed") from exc
-            image_relay_fd = os.environ.pop("HERMES_DEPLOYMENT_IMAGE_RELAY_FD", "").strip()
-            if image_relay_fd:
+            media_relay_fd = os.environ.pop("HERMES_DEPLOYMENT_MEDIA_RELAY_FD", "").strip()
+            if media_relay_fd:
                 try:
-                    from hermes_cli.deployment_image import deployment_image_descriptor_from_environment
-                    from hermes_cli.owner_worker.image_relay import OwnerImageRelayClient
+                    from hermes_cli.deployment_media import deployment_media_descriptor_from_environment
+                    from hermes_cli.owner_worker.media_relay import OwnerMediaRelayClient
 
-                    descriptor = deployment_image_descriptor_from_environment()
+                    descriptor = deployment_media_descriptor_from_environment()
                     if descriptor is None:
-                        raise RuntimeError("deployment image descriptor is unavailable")
-                    image_relay = OwnerImageRelayClient(int(image_relay_fd), descriptor)
-                    app.state.deployment_image_relay = image_relay
+                        raise RuntimeError("deployment media descriptor is unavailable")
+                    media_relay = OwnerMediaRelayClient(int(media_relay_fd), descriptor)
+                    app.state.deployment_media_relay = media_relay
                 except Exception as exc:
-                    raise RuntimeError("deployment image relay startup failed") from exc
+                    raise RuntimeError("deployment media relay startup failed") from exc
             yield
         finally:
             cleanup_error = None
@@ -384,8 +384,8 @@ def create_app(
             os.environ.pop("HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL", None)
             if relay is not None:
                 _cleanup(relay.close)
-            if image_relay is not None:
-                _cleanup(image_relay.close)
+            if media_relay is not None:
+                _cleanup(media_relay.close)
             supervisor = getattr(app.state, "tool_executor_supervisor", None)
             if supervisor is not None:
                 _cleanup(supervisor.stop_generation)
@@ -473,24 +473,37 @@ def create_app(
             app.state.tool_executor_supervisor = None
             app.state.tool_executor_startup_error = "resource broker unavailable"
         else:
-            def _dispatch_image(_tool_name, arguments, _invocation, _materializer):
-                from hermes_cli.owner_worker.image_dispatch import dispatch_deployment_image
+            def _dispatch_media(tool_name, arguments, _invocation, _materializer):
+                from hermes_cli.owner_worker.media_dispatch import (
+                    active_media_selection, dispatch_deployment_media,
+                )
+                from hermes_cli.owner_worker.owner_tool_relay import (
+                    _dispatch_owner_media_tool,
+                )
 
-                relay_client = getattr(app.state, "deployment_image_relay", None)
-                if relay_client is None:
-                    raise RuntimeError("deployment image relay is unavailable")
-                return dispatch_deployment_image(
-                    arguments,
-                    relay_client=relay_client,
-                    descriptor=relay_client.descriptor,
-                    workspace_context=workspace_context,
-                    owner_home=owner_home,
+                kind = "image" if tool_name == "image_generate" else "video"
+                relay_client = getattr(app.state, "deployment_media_relay", None)
+                if relay_client is not None:
+                    provider, model = active_media_selection(kind)
+                    route = relay_client.descriptor.route_for(kind, provider, model)
+                    if route is not None:
+                        return dispatch_deployment_media(
+                            arguments,
+                            kind=kind,
+                            model=model or route.default_model,
+                            relay_client=relay_client,
+                            descriptor=route,
+                            workspace_context=workspace_context,
+                            owner_home=owner_home,
+                        )
+                return _dispatch_owner_media_tool(
+                    tool_name, arguments, workspace_context
                 )
 
             app.state.tool_executor_supervisor = ToolExecutorSupervisor(
                 owner_home=owner_home, workspace_context=workspace_context, lease=lease,
                 credential_broker=app.state.tool_executor_credential_broker,
-                image_dispatcher=_dispatch_image, deployment_policy=deployment_policy,
+                media_dispatcher=_dispatch_media, deployment_policy=deployment_policy,
                 resource_controller=controller,
                 control_home=app.state.owner_worker_control_home,
                 audit_reporter=report_executor_authority_decision,

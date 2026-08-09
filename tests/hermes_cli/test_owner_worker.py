@@ -843,8 +843,14 @@ def test_supervisor_passes_only_safe_deployment_descriptor(tmp_path):
     supervisor.shutdown()
 
 
-def test_supervisor_passes_only_safe_deployment_image_descriptor(tmp_path, monkeypatch):
-    from hermes_cli.deployment_image import DeploymentImagePolicy
+def test_supervisor_passes_only_safe_deployment_media_descriptor(tmp_path, monkeypatch):
+    import json as _json
+
+    from hermes_cli.deployment_media import (
+        DeploymentMediaPolicy,
+        DeploymentMediaRoute,
+        DeploymentMediaRouteDescriptor,
+    )
 
     monkeypatch.setenv("APIYI_API_KEY", "ambient-control-plane-image-secret")
     owner = _Owner("ok1_image_deployment", tmp_path / "owner")
@@ -853,41 +859,60 @@ def test_supervisor_passes_only_safe_deployment_image_descriptor(tmp_path, monke
 
     def fake_process_factory(*args, **kwargs):
         spawned.append({"args": args, "kwargs": kwargs})
-        child_relay_fds.append(os.dup(int(kwargs["env"]["HERMES_DEPLOYMENT_IMAGE_RELAY_FD"])))
+        child_relay_fds.append(os.dup(int(kwargs["env"]["HERMES_DEPLOYMENT_MEDIA_RELAY_FD"])))
         argv = args[0]
         Path(argv[argv.index("--socket") + 1]).touch()
         return _FakeProcess()
 
-    policy = DeploymentImagePolicy(
-        runtime_resolver=lambda: {
-            "api_key": "control-plane-image-secret",
-            "openai_base_url": "https://api.example.test/v1",
-            "gemini_base_url": "https://api.example.test/v1beta",
-        },
-        image_generator=lambda **_kwargs: {"image_bytes": b"png", "mime_type": "image/png"},
-        allowed_models=("gpt-image-2-medium",),
+    policy = DeploymentMediaPolicy(
+        routes=(
+            DeploymentMediaRoute(
+                descriptor=DeploymentMediaRouteDescriptor(
+                    kind="image",
+                    provider="apiyi",
+                    models=("gpt-image-2-medium",),
+                    default_model="gpt-image-2-medium",
+                ),
+                key_env="TEST_OWNER_WORKER_MEDIA_KEY",
+                executor="plugins.image_gen.apiyi:generate_apiyi_image_bytes",
+                base_urls={"openai_base_url": "https://api.example.test/v1"},
+            ),
+        ),
+        policy_id="media-policy-v1",
     )
     supervisor = OwnerWorkerSupervisor(
         control_home=tmp_path / "control",
         client_cls=_FakeClient,
         process_factory=fake_process_factory,
         startup_timeout=0.1,
-        deployment_image_policy=policy,
+        deployment_media_policy=policy,
     )
 
     supervisor.get_or_start(owner)
 
     child_env = spawned[0]["kwargs"]["env"]
-    assert child_env["HERMES_DEPLOYMENT_IMAGE_PROVIDER"] == "apiyi"
-    assert child_env["HERMES_DEPLOYMENT_IMAGE_MODEL"] == "gpt-image-2-medium"
-    assert "HERMES_DEPLOYMENT_IMAGE_RELAY_FD" in child_env
-    assert int(child_env["HERMES_DEPLOYMENT_IMAGE_RELAY_FD"]) in spawned[0]["kwargs"]["pass_fds"]
+    assert child_env["HERMES_DEPLOYMENT_MEDIA_POLICY_ID"] == "media-policy-v1"
+    routes = _json.loads(child_env["HERMES_DEPLOYMENT_MEDIA_ROUTES"])
+    assert routes == [{
+        "kind": "image",
+        "provider": "apiyi",
+        "models": ["gpt-image-2-medium"],
+        "default_model": "gpt-image-2-medium",
+        "text_only_models": [],
+        "max_reference_images": 16,
+        "max_reference_bytes": 16 * 1024 * 1024,
+        "max_total_reference_bytes": 48 * 1024 * 1024,
+        "max_output_bytes": 32 * 1024 * 1024,
+    }]
+    assert "HERMES_DEPLOYMENT_MEDIA_RELAY_FD" in child_env
+    assert int(child_env["HERMES_DEPLOYMENT_MEDIA_RELAY_FD"]) in spawned[0]["kwargs"]["pass_fds"]
     serialized = repr({"argv": spawned[0]["args"][0], "env": child_env})
     for forbidden in (
-        "control-plane-image-secret",
         "ambient-control-plane-image-secret",
         "https://api.example.test",
         "APIYI_API_KEY",
+        "TEST_OWNER_WORKER_MEDIA_KEY",
+        "generate_apiyi_image_bytes",
     ):
         assert forbidden not in serialized
     supervisor.shutdown()
@@ -2052,26 +2077,36 @@ def test_supervisor_process_launch_failure_reclaims_generation_runtime(tmp_path)
 
 
 def test_supervisor_relay_activation_failure_revokes_active_worker(tmp_path, monkeypatch):
-    from hermes_cli.deployment_image import DeploymentImagePolicy
+    from hermes_cli.deployment_media import (
+        DeploymentMediaPolicy,
+        DeploymentMediaRoute,
+        DeploymentMediaRouteDescriptor,
+    )
 
     owner = _Owner("ok1_relay_activation", tmp_path / "owner")
     process = _FakeProcess()
     child_relay_fds = []
 
     def fake_process_factory(*args, **kwargs):
-        child_relay_fds.append(os.dup(int(kwargs["env"]["HERMES_DEPLOYMENT_IMAGE_RELAY_FD"])))
+        child_relay_fds.append(os.dup(int(kwargs["env"]["HERMES_DEPLOYMENT_MEDIA_RELAY_FD"])))
         argv = args[0]
         Path(argv[argv.index("--socket") + 1]).touch()
         return process
 
-    policy = DeploymentImagePolicy(
-        runtime_resolver=lambda: {
-            "api_key": "secret",
-            "openai_base_url": "https://api.example.test/v1",
-            "gemini_base_url": "https://api.example.test/v1beta",
-        },
-        image_generator=lambda **_kwargs: {"image_bytes": b"png", "mime_type": "image/png"},
-        allowed_models=("gpt-image-2-medium",),
+    policy = DeploymentMediaPolicy(
+        routes=(
+            DeploymentMediaRoute(
+                descriptor=DeploymentMediaRouteDescriptor(
+                    kind="image",
+                    provider="apiyi",
+                    models=("gpt-image-2-medium",),
+                    default_model="gpt-image-2-medium",
+                ),
+                key_env="TEST_OWNER_WORKER_MEDIA_KEY",
+                executor="plugins.image_gen.apiyi:generate_apiyi_image_bytes",
+            ),
+        ),
+        policy_id="media-policy-v1",
     )
     supervisor = OwnerWorkerSupervisor(
         control_home=tmp_path / "control",
@@ -2079,10 +2114,10 @@ def test_supervisor_relay_activation_failure_revokes_active_worker(tmp_path, mon
         process_factory=fake_process_factory,
         startup_timeout=0.1,
         startup_cooldown=0,
-        deployment_image_policy=policy,
+        deployment_media_policy=policy,
     )
     monkeypatch.setattr(
-        supervisor.deployment_image_broker,
+        supervisor.deployment_media_broker,
         "activate",
         lambda _lease: (_ for _ in ()).throw(RuntimeError("activation failed")),
     )

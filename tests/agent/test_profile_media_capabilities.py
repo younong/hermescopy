@@ -223,6 +223,6 @@ def test_tts_failure_redacts_key_and_removes_partial_output(tmp_path):
 
 
 def test_plan_has_no_video_provider():
-    from agent.video_gen_registry import get_provider
+    from hermes_cli.model_plane.capability import get_capability_provider
 
-    assert get_provider(PROVIDER) is None
+    assert get_capability_provider("video", PROVIDER) is None

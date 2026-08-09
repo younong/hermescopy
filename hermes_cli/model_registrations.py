@@ -78,8 +78,10 @@ def _admin_registration_id(kind: str, provider: str, model: str) -> str:
 
 
 def _admin_registrations() -> dict[str, dict[str, Any]]:
-    from hermes_cli.deployment_image import deployment_image_descriptor_from_environment
     from hermes_cli.deployment_inference import route_descriptors_from_control_plane
+    from hermes_cli.deployment_media import (
+        deployment_media_descriptor_from_environment,
+    )
 
     registrations: dict[str, dict[str, Any]] = {}
     for route in route_descriptors_from_control_plane():
@@ -93,19 +95,20 @@ def _admin_registrations() -> dict[str, dict[str, Any]]:
             "scope": "admin",
         }
 
-    descriptor = deployment_image_descriptor_from_environment()
+    descriptor = deployment_media_descriptor_from_environment()
     if descriptor is not None:
-        for model in descriptor.allowed_models:
-            registration_id = _admin_registration_id("image", descriptor.provider, model)
-            registrations[registration_id] = {
-                "name": f"{descriptor.provider.upper()} · {model}",
-                "kind": "image",
-                "provider": descriptor.provider,
-                "model": model,
-                "source": "catalog",
-                "scope": "admin",
-                "use_gateway": False,
-            }
+        for route in descriptor.routes:
+            for model in route.models:
+                registration_id = _admin_registration_id(route.kind, route.provider, model)
+                registrations[registration_id] = {
+                    "name": f"{route.provider.upper()} · {model}",
+                    "kind": route.kind,
+                    "provider": route.provider,
+                    "model": model,
+                    "source": "catalog",
+                    "scope": "admin",
+                    "use_gateway": False,
+                }
     return registrations
 
 

@@ -613,7 +613,8 @@ class TestManagedKreaRouting:
         fake_provider = MagicMock()
         fake_provider.generate.return_value = {"success": True, "image": "/tmp/x.png"}
         monkeypatch.setattr(
-            "agent.image_gen_registry.get_provider", lambda name: fake_provider
+            "hermes_cli.model_plane.capability.get_capability_provider",
+            lambda kind, name: fake_provider,
         )
         monkeypatch.setattr(
             "hermes_cli.plugins._ensure_plugins_discovered", lambda *a, **k: None

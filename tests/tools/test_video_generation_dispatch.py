@@ -7,15 +7,15 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-from agent import video_gen_registry
+from hermes_cli.model_plane import capability as capability_module
 from agent.video_gen_provider import VideoGenProvider
 
 
 @pytest.fixture(autouse=True)
 def _reset_registry():
-    video_gen_registry._reset_for_tests()
+    capability_module._reset_for_tests()
     yield
-    video_gen_registry._reset_for_tests()
+    capability_module._reset_for_tests()
 
 
 class _RecordingProvider(VideoGenProvider):
@@ -90,7 +90,7 @@ class TestUnifiedDispatch:
 
     def test_text_to_video_routes_without_image_url(self):
         provider = _RecordingProvider("rec")
-        video_gen_registry.register_provider(provider)
+        capability_module.register_media_generation_provider("video", provider)
         result = self._run({"prompt": "a happy dog"})
         assert result["success"] is True
         assert result["modality"] == "text"
@@ -100,7 +100,7 @@ class TestUnifiedDispatch:
 
     def test_image_to_video_routes_with_image_url(self):
         provider = _RecordingProvider("rec")
-        video_gen_registry.register_provider(provider)
+        capability_module.register_media_generation_provider("video", provider)
         result = self._run({
             "prompt": "animate this",
             "image_url": "https://example.com/img.png",
@@ -111,14 +111,14 @@ class TestUnifiedDispatch:
 
     def test_prompt_required(self):
         provider = _RecordingProvider("rec")
-        video_gen_registry.register_provider(provider)
+        capability_module.register_media_generation_provider("video", provider)
         result = self._run({"prompt": "", "image_url": "https://example.com/i.png"})
         assert "error" in result
         assert "prompt" in result["error"].lower()
 
     def test_edit_extend_args_are_rejected_by_generate_tool(self):
         provider = _RecordingProvider("rec")
-        video_gen_registry.register_provider(provider)
+        capability_module.register_media_generation_provider("video", provider)
         result = self._run({
             "prompt": "make it rain",
             "operation": "edit",
@@ -128,7 +128,7 @@ class TestUnifiedDispatch:
         assert "provider-specific tool" in result["error"]
 
     def test_provider_exception_caught(self):
-        video_gen_registry.register_provider(_RaisingProvider())
+        capability_module.register_media_generation_provider("video", _RaisingProvider())
         result = self._run({"prompt": "x"})
         assert result["success"] is False
         assert result["error_type"] == "provider_exception"

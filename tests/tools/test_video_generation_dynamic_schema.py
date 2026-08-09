@@ -7,15 +7,15 @@ from typing import Any, Dict, List, Optional
 import pytest
 import yaml
 
-from agent import video_gen_registry
+from hermes_cli.model_plane import capability as capability_module
 from agent.video_gen_provider import VideoGenProvider
 
 
 @pytest.fixture(autouse=True)
 def _reset_registry():
-    video_gen_registry._reset_for_tests()
+    capability_module._reset_for_tests()
     yield
-    video_gen_registry._reset_for_tests()
+    capability_module._reset_for_tests()
 
 
 @pytest.fixture
@@ -103,7 +103,7 @@ class TestDynamicSchemaBuilder:
         from tools.video_generation_tool import _build_dynamic_video_schema
 
         _write_cfg(cfg_home, {"video_gen": {"provider": "both"}})
-        video_gen_registry.register_provider(_BothModalitiesProvider())
+        capability_module.register_media_generation_provider("video", _BothModalitiesProvider())
 
         import hermes_cli.plugins as plugins_module
         saved = plugins_module._ensure_plugins_discovered
@@ -122,7 +122,7 @@ class TestDynamicSchemaBuilder:
         from tools.video_generation_tool import _build_dynamic_video_schema
 
         _write_cfg(cfg_home, {"video_gen": {"provider": "img-only"}})
-        video_gen_registry.register_provider(_ImageOnlyProvider())
+        capability_module.register_media_generation_provider("video", _ImageOnlyProvider())
 
         import hermes_cli.plugins as plugins_module
         saved = plugins_module._ensure_plugins_discovered

@@ -8,6 +8,7 @@ exercised hermetically.
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -514,8 +515,14 @@ def test_resolve_provider_errors_without_backend(monkeypatch):
     from agent.pet.generate import imagegen
 
     monkeypatch.setattr(imagegen, "_discover", lambda: None)
-    monkeypatch.setattr("agent.image_gen_registry.get_active_provider", lambda: None)
-    monkeypatch.setattr("agent.image_gen_registry.get_provider", lambda name: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_plane.capability.get_capability_provider",
+        lambda kind, name: None,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_plane.capability.resolve_capability_provider",
+        lambda kind: SimpleNamespace(provider=None),
+    )
 
     with pytest.raises(imagegen.GenerationError):
         imagegen.resolve_provider(require_references=True)
@@ -536,8 +543,14 @@ def test_resolve_provider_honors_available_preference(monkeypatch):
 
     registry = {"openai": _FakeImgProvider("openai"), "openrouter": _FakeImgProvider("openrouter")}
     monkeypatch.setattr(imagegen, "_discover", lambda: None)
-    monkeypatch.setattr("agent.image_gen_registry.get_active_provider", lambda: registry["openai"])
-    monkeypatch.setattr("agent.image_gen_registry.get_provider", lambda name: registry.get(name))
+    monkeypatch.setattr(
+        "hermes_cli.model_plane.capability.get_capability_provider",
+        lambda kind, name: registry.get(name),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_plane.capability.resolve_capability_provider",
+        lambda kind: SimpleNamespace(provider=registry["openai"]),
+    )
 
     assert imagegen.resolve_provider(prefer="openrouter").name == "openrouter"
     # An unavailable / unknown preference is ignored — fall back to the active one.
@@ -552,8 +565,14 @@ def test_list_sprite_providers_marks_default(monkeypatch):
 
     registry = {"openai": _FakeImgProvider("openai"), "nous": _FakeImgProvider("nous")}
     monkeypatch.setattr(imagegen, "_discover", lambda: None)
-    monkeypatch.setattr("agent.image_gen_registry.get_active_provider", lambda: registry["openai"])
-    monkeypatch.setattr("agent.image_gen_registry.get_provider", lambda name: registry.get(name))
+    monkeypatch.setattr(
+        "hermes_cli.model_plane.capability.get_capability_provider",
+        lambda kind, name: registry.get(name),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_plane.capability.resolve_capability_provider",
+        lambda kind: SimpleNamespace(provider=registry["openai"]),
+    )
 
     listed = imagegen.list_sprite_providers()
     names = {p["name"] for p in listed}

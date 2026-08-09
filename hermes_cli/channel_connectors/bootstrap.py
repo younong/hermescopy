@@ -175,7 +175,7 @@ async def bootstrap_channel_connectors(
     blocked_states: dict[str, str] = {}
     if "weixin_ilink" in enabled and (
         getattr(supervisor, "deployment_inference_policy", None) is None
-        or getattr(supervisor, "deployment_image_policy", None) is None
+        or getattr(supervisor, "deployment_media_policy", None) is None
     ):
         blocked_states["weixin_ilink"] = "deployment_policy_unavailable"
     elif "weixin_ilink" in enabled and getattr(supervisor, "resource_manager", None) is None:

@@ -653,7 +653,7 @@ class PluginContext:
         tool calls.
         """
         from agent.image_gen_provider import ImageGenProvider
-        from agent.image_gen_registry import register_provider
+        from hermes_cli.model_plane.capability import register_media_generation_provider
 
         if not isinstance(provider, ImageGenProvider):
             logger.warning(
@@ -662,7 +662,7 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        register_provider(provider)
+        register_media_generation_provider("image", provider)
         logger.info(
             "Plugin '%s' registered image_gen provider: %s",
             self.manifest.name, provider.name,
@@ -720,7 +720,7 @@ class PluginContext:
         tool calls.
         """
         from agent.video_gen_provider import VideoGenProvider
-        from agent.video_gen_registry import register_provider as _register_video_provider
+        from hermes_cli.model_plane.capability import register_media_generation_provider
 
         if not isinstance(provider, VideoGenProvider):
             logger.warning(
@@ -729,7 +729,7 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        _register_video_provider(provider)
+        register_media_generation_provider("video", provider)
         logger.info(
             "Plugin '%s' registered video_gen provider: %s",
             self.manifest.name, provider.name,
@@ -2196,7 +2196,6 @@ def _register_provider_media_capabilities(*, force: bool = False) -> None:
     global _provider_media_registered
     if _provider_media_registered and not force:
         return
-    from agent.image_gen_registry import register_provider as register_image_provider
     from agent.profile_image_gen_provider import ProfileImageGenProvider
     from agent.profile_transcription_provider import ProfileTranscriptionProvider
     from agent.profile_tts_provider import ProfileTTSProvider
@@ -2204,11 +2203,12 @@ def _register_provider_media_capabilities(*, force: bool = False) -> None:
         register_provider as register_transcription_provider,
     )
     from agent.tts_registry import register_provider as register_tts_provider
+    from hermes_cli.model_plane.capability import register_media_generation_provider
     from providers import list_providers
 
     for profile in list_providers():
         if profile.image_generation_model:
-            register_image_provider(ProfileImageGenProvider(profile))
+            register_media_generation_provider("image", ProfileImageGenProvider(profile))
         if profile.tts_model:
             register_tts_provider(ProfileTTSProvider(profile))
         if profile.transcription_model:

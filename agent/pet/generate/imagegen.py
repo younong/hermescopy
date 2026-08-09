@@ -80,27 +80,30 @@ def resolve_provider(*, require_references: bool = True, prefer: str | None = No
     prompt-only base drafts).
     """
     _discover()
-    from agent.image_gen_registry import get_active_provider, get_provider
+    from hermes_cli.model_plane.capability import (
+        get_capability_provider,
+        resolve_capability_provider,
+    )
 
     # QA override: force one provider for pet-gen iteration regardless of the
     # globally active image_gen backend.
     forced = _forced_provider_from_env()
     if forced:
-        chosen = get_provider(forced)
+        chosen = get_capability_provider("image", forced)
         if chosen is not None and chosen.is_available():
             return SpriteProvider(name=forced, provider=chosen, supports_references=True)
 
     # An explicit user pick wins when it's reference-capable and has credentials;
     # otherwise we ignore it and fall through to the normal resolution.
     if prefer:
-        chosen = get_provider(prefer)
+        chosen = get_capability_provider("image", prefer)
         if prefer in _REF_CAPABLE and chosen is not None and chosen.is_available():
             return SpriteProvider(name=prefer, provider=chosen, supports_references=True)
 
     # Configured / active provider first.
     active = None
     try:
-        active = get_active_provider()
+        active = resolve_capability_provider("image").provider
     except Exception:  # noqa: BLE001
         active = None
     if active is not None:
@@ -110,7 +113,7 @@ def resolve_provider(*, require_references: bool = True, prefer: str | None = No
 
     # Any available reference-capable provider.
     for name in _REF_CAPABLE:
-        provider = get_provider(name)
+        provider = get_capability_provider("image", name)
         if provider is not None and provider.is_available():
             return SpriteProvider(name=name, provider=provider, supports_references=True)
 
@@ -136,7 +139,7 @@ def list_sprite_providers() -> list[dict]:
     yield an empty list.
     """
     _discover()
-    from agent.image_gen_registry import get_provider
+    from hermes_cli.model_plane.capability import get_capability_provider
 
     try:
         default_name = resolve_provider(require_references=True).name
@@ -145,7 +148,7 @@ def list_sprite_providers() -> list[dict]:
 
     out: list[dict] = []
     for name in _REF_CAPABLE:
-        provider = get_provider(name)
+        provider = get_capability_provider("image", name)
         if provider is None or not provider.is_available():
             continue
         out.append(
