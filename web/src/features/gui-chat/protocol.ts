@@ -28,6 +28,7 @@ export interface GatewayTranscriptMessage {
   attachments?: GatewayTranscriptAttachment[];
   name?: string;
   context?: string;
+  tool_call_id?: string;
 }
 
 export interface HistoryPagePayload {

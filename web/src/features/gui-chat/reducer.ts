@@ -148,6 +148,8 @@ function applyInitialHistory(
   return {
     ...state,
     artifacts: { ...history.artifacts, ...state.artifacts },
+    toolCalls: { ...history.toolCalls, ...state.toolCalls },
+    toolOrder: [...history.toolOrder, ...state.toolOrder.filter((id) => !history.toolOrder.includes(id))],
     historyCursor: action.response.history_page?.cursor ?? undefined,
     historyError: undefined,
     historyHasMore: !!action.response.history_page?.has_more,
@@ -219,6 +221,8 @@ function applySessionResponse(
   const next = {
     ...state,
     artifacts: history && !state.historySessionId ? history.artifacts : state.artifacts,
+    toolCalls: history && !state.historySessionId ? history.toolCalls : state.toolCalls,
+    toolOrder: history && !state.historySessionId ? history.toolOrder : state.toolOrder,
     ...clarificationsFromSnapshot(response.pending_prompts),
     cwd,
     error: undefined,
@@ -259,6 +263,11 @@ function prependHistoryPage(
   });
   const acceptedIds = new Set(older.map((message) => message.id));
   const artifacts = { ...state.artifacts };
+  const toolCalls = { ...state.toolCalls, ...history.toolCalls };
+  const toolOrder = [
+    ...history.toolOrder.filter((id) => !state.toolOrder.includes(id)),
+    ...state.toolOrder,
+  ];
   let remainingArtifacts = Math.max(
     0,
     MAX_DISPLAY_ARTIFACTS - countDisplayArtifacts(state.messages, state.artifacts),
@@ -279,6 +288,8 @@ function prependHistoryPage(
     ...state,
     artifacts,
     historyCursor: safeguardReached ? undefined : response.history_page?.cursor ?? undefined,
+    toolCalls,
+    toolOrder,
     historyError: undefined,
     historyHasMore: !safeguardReached && !!response.history_page?.has_more,
     historyLoading: false,
@@ -355,29 +366,56 @@ function applyGatewayEvent(state: GuiChatState, event: GatewayEvent): GuiChatSta
 function transcriptToHistoryState(
   transcript: GatewayTranscriptMessage[],
   cwd?: string,
-): { artifacts: Record<string, ArtifactState>; messages: ChatMessage[] } {
+): {
+  artifacts: Record<string, ArtifactState>;
+  messages: ChatMessage[];
+  toolCalls: Record<string, ToolCallState>;
+  toolOrder: string[];
+} {
   const artifacts: Record<string, ArtifactState> = {};
   const messages: ChatMessage[] = [];
+  const toolCalls: Record<string, ToolCallState> = {};
+  const toolOrder: string[] = [];
 
   for (const [index, entry] of transcript.entries()) {
     const converted = transcriptToMessageWithArtifacts(entry, index, cwd);
     if (!converted) continue;
-    messages.push(converted.message);
+    if (converted.tool) {
+      toolCalls[converted.tool.id] = converted.tool;
+      toolOrder.push(converted.tool.id);
+    } else if (converted.message) {
+      messages.push(converted.message);
+    }
     for (const artifact of converted.artifacts) {
       artifacts[artifact.id] = artifact;
     }
   }
 
-  return { artifacts, messages };
+  return { artifacts, messages, toolCalls, toolOrder };
 }
 
 function transcriptToMessageWithArtifacts(
   message: GatewayTranscriptMessage,
   index: number,
   cwd?: string,
-): { artifacts: ArtifactState[]; message: ChatMessage } | null {
+): {
+  artifacts: ArtifactState[];
+  message?: ChatMessage;
+  tool?: ToolCallState;
+} | null {
   if (message.role === "tool") {
-    return null;
+    const id = message.id || message.tool_call_id || `history-tool-${index}`;
+    const output = textFromTranscriptMessage(message);
+    const tool: ToolCallState = {
+      artifactIds: [],
+      id,
+      name: message.name || "Tool",
+      output: clampRenderedText(output),
+      status: "succeeded",
+    };
+    const artifacts = extractHistoricalToolFileArtifacts(output, id, cwd);
+    tool.artifactIds = artifacts.map((artifact) => artifact.id);
+    return { artifacts, tool };
   }
 
   const id = message.id || `history-${index}`;
@@ -1544,6 +1582,47 @@ function addAssistantImageArtifacts(
     ownedImageUrls.add(url);
   }
   return next;
+}
+
+function extractHistoricalToolFileReferences(text: string): ExtractedFileReference[] {
+  const codeRanges = rangesForFencedCodeBlocks(text);
+  const candidates: Array<{ index: number; path: string }> = [];
+  const savedPattern = /(?:Full output saved to:|Full text saved to:)\s*([^\n]+)/gi;
+  for (const match of text.matchAll(savedPattern)) {
+    candidates.push({ index: match.index ?? 0, path: match[1].trim() });
+  }
+  const standalonePattern = /^\s*`?((?:sandbox:|file:|\/|\.\.?\/)[^`\s]+\.html?)`?\s*$/gim;
+  for (const match of text.matchAll(standalonePattern)) {
+    candidates.push({ index: match.index ?? 0, path: match[1].trim() });
+  }
+
+  const refs: ExtractedFileReference[] = [];
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    if (isIndexInRanges(candidate.index, codeRanges)) continue;
+    const path = normalizeSessionFileReference(candidate.path);
+    const name = path ? filenameFromPath(path) : "";
+    if (!path || !name || !/\.html?$/i.test(name) || seen.has(path)) continue;
+    seen.add(path);
+    refs.push({ name, path });
+  }
+  return refs;
+}
+
+function extractHistoricalToolFileArtifacts(
+  text: string,
+  toolCallId: string,
+  cwd?: string,
+): ArtifactState[] {
+  return extractHistoricalToolFileReferences(text).map((ref, index) => ({
+    downloadUrl: buildSessionFileDownloadUrl(ref.path, cwd, ref.name),
+    id: `${toolCallId}-file-${index}`,
+    kind: "file" as const,
+    mimeType: mimeTypeForFileName(ref.name),
+    name: ref.name,
+    sourcePath: ref.path,
+    toolCallId,
+  }));
 }
 
 function addGeneratedFileArtifacts(

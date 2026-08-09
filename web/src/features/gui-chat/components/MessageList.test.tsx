@@ -132,8 +132,9 @@ describe("MessageList", () => {
     expect(container.textContent).not.toContain("write_file");
     expect(container.textContent).not.toContain("Created /workspace/report.html");
     expect(container.textContent).toContain("report.html");
+    expect(container.querySelector('[data-file-type="html"]')).not.toBeNull();
     expect(
-      container.querySelector('a[href="/api/files/download?path=%2Fworkspace%2Freport.html"]'),
+      container.querySelector('a[aria-label="Download report.html"][href="/api/files/download?path=%2Fworkspace%2Freport.html"]'),
     ).not.toBeNull();
 
     await act(async () => root.unmount());

@@ -1928,6 +1928,7 @@ export interface SessionMessage {
   name?: string;
   context?: string;
   timestamp?: number;
+  tool_call_id?: string;
 }
 
 export interface SessionMessagesResponse {
