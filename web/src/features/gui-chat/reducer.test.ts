@@ -947,6 +947,21 @@ describe("guiChatReducer history image restoration", () => {
     });
   });
 
+  it("restores HTML paths from structured write-file tool output", () => {
+    const state = restoreWithTool(
+      '{"bytes_written":19822,"resolved_path":"/workspace/user3/generated/report.html","files_modified":["/workspace/user3/generated/report.html"]}',
+      { cwd: "/workspace" },
+    );
+
+    expect(state.messages).toEqual([]);
+    expect(state.toolCalls["tool-history-1"].artifactIds).toEqual(["tool-history-1-file-0"]);
+    expect(fileArtifact(state, "tool-history-1-file-0")).toMatchObject({
+      name: "report.html",
+      mimeType: "text/html",
+      sourcePath: "/workspace/user3/generated/report.html",
+    });
+  });
+
   it("only restores saved HTML paths from historical tool output", () => {
     const state = guiChatReducer(initialGuiChatState, {
       type: "session.created",

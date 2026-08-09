@@ -1591,6 +1591,9 @@ function extractHistoricalToolFileReferences(text: string): ExtractedFileReferen
   for (const match of text.matchAll(savedPattern)) {
     candidates.push({ index: match.index ?? 0, path: match[1].trim() });
   }
+  for (const path of parseHistoricalToolFileResult(text)) {
+    candidates.push({ index: 0, path });
+  }
   const standalonePattern = /^\s*`?((?:sandbox:|file:|\/|\.\.?\/)[^`\s]+\.html?)`?\s*$/gim;
   for (const match of text.matchAll(standalonePattern)) {
     candidates.push({ index: match.index ?? 0, path: match[1].trim() });
@@ -1607,6 +1610,18 @@ function extractHistoricalToolFileReferences(text: string): ExtractedFileReferen
     refs.push({ name, path });
   }
   return refs;
+}
+
+function parseHistoricalToolFileResult(text: string): string[] {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return [];
+  try {
+    const value = JSON.parse(trimmed) as Record<string, unknown>;
+    const paths = [value.resolved_path, ...(Array.isArray(value.files_modified) ? value.files_modified : [])];
+    return paths.filter((path): path is string => typeof path === "string" && /\.html?$/i.test(path));
+  } catch {
+    return [];
+  }
 }
 
 function extractHistoricalToolFileArtifacts(
