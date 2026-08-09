@@ -30,8 +30,10 @@ from typing import Any, Dict, List, Optional
 
 from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
+    DEFAULT_RESOLUTION,
     ImageGenProvider,
     resolve_aspect_ratio,
+    resolve_resolution,
 )
 
 logger = logging.getLogger(__name__)
@@ -120,6 +122,7 @@ class FalImageGenProvider(ImageGenProvider):
         prompt: str,
         aspect_ratio: str = DEFAULT_ASPECT_RATIO,
         *,
+        resolution: str = DEFAULT_RESOLUTION,
         image_url: Optional[str] = None,
         reference_image_urls: Optional[List[str]] = None,
         **kwargs: Any,
@@ -146,6 +149,8 @@ class FalImageGenProvider(ImageGenProvider):
             )
             if key in kwargs and kwargs[key] is not None
         }
+        if resolution != DEFAULT_RESOLUTION:
+            passthrough["resolution"] = resolve_resolution(resolution)
         # Only forward the image-to-image inputs when actually supplied, so a
         # plain text-to-image call delegates exactly as it did before (no
         # noisy None kwargs).

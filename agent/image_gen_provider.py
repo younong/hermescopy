@@ -62,6 +62,8 @@ VALID_ASPECT_RATIOS: Tuple[str, ...] = (
     "1:1", "3:4", "2:3", "4:3", "3:2", "16:9", "9:16",
 )
 DEFAULT_ASPECT_RATIO = "16:9"
+VALID_RESOLUTIONS: Tuple[str, ...] = ("1K", "2K", "4K")
+DEFAULT_RESOLUTION = "2K"
 _LEGACY_ASPECT_RATIO_ALIASES = {
     "landscape": "16:9",
     "square": "1:1",
@@ -183,6 +185,7 @@ class ImageGenProvider(abc.ABC):
         *,
         image_url: Optional[str] = None,
         reference_image_urls: Optional[List[str]] = None,
+        resolution: str = DEFAULT_RESOLUTION,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Generate an image from a text prompt, or edit/transform a source image.
@@ -253,6 +256,14 @@ def aspect_ratio_from_dimensions(width: int, height: int) -> str:
     return f"{width // divisor}:{height // divisor}"
 
 
+def resolve_resolution(value: Optional[str]) -> str:
+    """Clamp a resolution value to the supported unified levels."""
+    if not isinstance(value, str):
+        return DEFAULT_RESOLUTION
+    normalized = value.strip().upper()
+    return normalized if normalized in VALID_RESOLUTIONS else DEFAULT_RESOLUTION
+
+
 def normalize_reference_images(value: Any) -> Optional[List[str]]:
     """Coerce a reference-image argument into a clean list of URL/path strings.
 
@@ -277,7 +288,7 @@ def _images_cache_dir() -> Path:
     """Return the persistent generated-images directory, creating parents as needed."""
     from hermes_constants import get_hermes_home
 
-    path = get_hermes_home() / "images"
+    path = get_hermes_home() / "cache" / "images"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -288,7 +299,7 @@ def save_b64_image(
     prefix: str = "image",
     extension: str = "png",
 ) -> Path:
-    """Decode base64 image data and write it under ``$HERMES_HOME/images/``.
+    """Decode base64 image data and write it under ``$HERMES_HOME/cache/images/``.
 
     Returns the absolute :class:`Path` to the saved file.
 
@@ -322,7 +333,7 @@ def save_url_image(
     timeout: float = 60.0,
     max_bytes: int = 25 * 1024 * 1024,
 ) -> Path:
-    """Download an image URL and write it under ``$HERMES_HOME/images/``.
+    """Download an image URL and write it under ``$HERMES_HOME/cache/images/``.
 
     Used by providers (xAI, fallback OpenAI) whose API returns an *ephemeral*
     URL instead of inline base64 — those URLs frequently expire before a
