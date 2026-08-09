@@ -532,3 +532,140 @@ class TestVoiceToolSelectionOverlay:
 
         assert result["success"] is True
         assert provider.last_call["kwargs"]["model"] is None
+
+
+class TestDeploymentTranscription:
+    """``_transcribe_via_deployment`` — a deployment voice route matching
+    the active selection transcribes through the worker media relay;
+    without a route (or without the relay client) the call falls through
+    to local dispatch (mirrors the image tool's deployment-route rule)."""
+
+    class _Route:
+        provider = "volcengine-agent-plan"
+        max_reference_bytes = 16
+
+    class _Relay:
+        def __init__(self, result=None, raise_exc=None):
+            self.last_call = None
+            self._result = result or {
+                "text": "relay transcript",
+                "provider": "volcengine-agent-plan",
+                "model": "doubao-seed-asr-2.0",
+            }
+            self._raise_exc = raise_exc
+
+        def execute(self, operation, **kwargs):
+            self.last_call = {"operation": operation, **kwargs}
+            if self._raise_exc is not None:
+                raise self._raise_exc
+            return self._result
+
+    def _patch_route(self, monkeypatch, route, relay):
+        monkeypatch.setattr(
+            transcription_tools, "_deployment_voice_route", lambda p, m: route
+        )
+        monkeypatch.setattr(
+            "hermes_cli.owner_worker.media_dispatch.worker_media_relay",
+            lambda: relay,
+        )
+
+    def test_no_route_falls_through(self, monkeypatch):
+        self._patch_route(monkeypatch, None, self._Relay())
+        assert transcription_tools._transcribe_via_deployment(
+            "/tmp/audio.mp3", "volcengine-agent-plan", "m", {},
+        ) is None
+
+    def test_route_without_relay_falls_through(self, monkeypatch):
+        self._patch_route(monkeypatch, self._Route(), None)
+        assert transcription_tools._transcribe_via_deployment(
+            "/tmp/audio.mp3", "volcengine-agent-plan", "m", {},
+        ) is None
+
+    def test_relay_sends_audio_and_returns_envelope(self, monkeypatch, tmp_path):
+        sample = tmp_path / "voice.mp3"
+        sample.write_bytes(b"mp3-bytes")
+        relay = self._Relay()
+        self._patch_route(monkeypatch, self._Route(), relay)
+
+        result = transcription_tools._transcribe_via_deployment(
+            str(sample),
+            "volcengine-agent-plan",
+            "doubao-seed-asr-2.0",
+            {"volcengine-agent-plan": {"language": "zh"}},
+        )
+
+        assert result == {
+            "success": True,
+            "transcript": "relay transcript",
+            "provider": "volcengine-agent-plan",
+            "model": "doubao-seed-asr-2.0",
+        }
+        call = relay.last_call
+        assert call["operation"] == "transcribe"
+        assert call["provider"] == "volcengine-agent-plan"
+        assert call["model"] == "doubao-seed-asr-2.0"
+        assert call["references"] == [{
+            "name": "voice.mp3", "mime_type": "audio/mpeg", "data": b"mp3-bytes",
+        }]
+        assert call["params"] == {"language": "zh"}
+
+    def test_oversized_audio_returns_error_envelope(self, monkeypatch, tmp_path):
+        sample = tmp_path / "big.wav"
+        sample.write_bytes(b"x" * 17)
+        relay = self._Relay()
+        self._patch_route(monkeypatch, self._Route(), relay)
+
+        result = transcription_tools._transcribe_via_deployment(
+            str(sample), "volcengine-agent-plan", "m", {},
+        )
+
+        assert result["success"] is False
+        assert "too large" in result["error"]
+        assert relay.last_call is None
+
+    def test_relay_failure_returns_error_envelope(self, monkeypatch, tmp_path):
+        sample = tmp_path / "voice.wav"
+        sample.write_bytes(b"wav")
+        relay = self._Relay(raise_exc=RuntimeError("relay rejected"))
+        self._patch_route(monkeypatch, self._Route(), relay)
+
+        result = transcription_tools._transcribe_via_deployment(
+            str(sample), "volcengine-agent-plan", "m", {},
+        )
+
+        assert result["success"] is False
+        assert "Deployment transcription failed" in result["error"]
+        assert result["provider"] == "volcengine-agent-plan"
+
+
+class TestDeploymentTranscriptionE2E:
+    """``transcribe_audio`` prefers the deployment route when the unified
+    voice selection matches one (PR3 deployment-managed ASR)."""
+
+    def test_selection_matching_route_uses_relay(self, monkeypatch, tmp_path):
+        from unittest.mock import patch
+        sample = tmp_path / "voice.wav"
+        sample.write_bytes(b"wav")
+        relay = TestDeploymentTranscription._Relay()
+        monkeypatch.setattr(
+            "hermes_cli.model_plane.capability.resolve_voice_tool_selection",
+            lambda capability: ("volcengine-agent-plan", "doubao-seed-asr-2.0"),
+        )
+        monkeypatch.setattr(
+            transcription_tools,
+            "_deployment_voice_route",
+            lambda p, m: TestDeploymentTranscription._Route(),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.owner_worker.media_dispatch.worker_media_relay",
+            lambda: relay,
+        )
+        with patch("tools.transcription_tools._validate_audio_file", return_value=None), \
+             patch("tools.transcription_tools._load_stt_config", return_value={"provider": "local"}), \
+             patch("tools.transcription_tools.is_stt_enabled", return_value=True), \
+             patch("tools.transcription_tools._get_provider", return_value="local"):
+            result = transcription_tools.transcribe_audio(str(sample))
+
+        assert result["success"] is True
+        assert result["transcript"] == "relay transcript"
+        assert relay.last_call["operation"] == "transcribe"

@@ -365,3 +365,83 @@ class TestVoiceToolSelectionOverlay:
         )
         assert provider == "edge"
         assert config == {"provider": "edge"}
+
+
+class TestDeploymentVoiceSynthesis:
+    """``_synthesize_via_deployment`` — a deployment voice route matching
+    the active selection executes through the worker media relay; without
+    a route (or without the relay client) the call falls through to local
+    dispatch (mirrors the image tool's deployment-route rule)."""
+
+    class _Route:
+        provider = "volcengine-agent-plan"
+
+    class _Relay:
+        def __init__(self, result=None, raise_exc=None):
+            self.last_call = None
+            self._result = result or {"audio_bytes": b"relay-audio"}
+            self._raise_exc = raise_exc
+
+        def execute(self, operation, **kwargs):
+            self.last_call = {"operation": operation, **kwargs}
+            if self._raise_exc is not None:
+                raise self._raise_exc
+            return self._result
+
+    def test_no_route_falls_through(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(tts_tool, "_deployment_voice_route", lambda p, m: None)
+        assert tts_tool._synthesize_via_deployment(
+            "hi", str(tmp_path / "out.mp3"), "volcengine-agent-plan", {"model": "m"},
+        ) is None
+
+    def test_route_without_relay_falls_through(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            tts_tool, "_deployment_voice_route", lambda p, m: self._Route()
+        )
+        monkeypatch.setattr(
+            "hermes_cli.owner_worker.media_dispatch.worker_media_relay",
+            lambda: None,
+        )
+        assert tts_tool._synthesize_via_deployment(
+            "hi", str(tmp_path / "out.mp3"), "volcengine-agent-plan", {"model": "m"},
+        ) is None
+
+    def test_relay_writes_audio_and_forwards_params(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            tts_tool, "_deployment_voice_route", lambda p, m: self._Route()
+        )
+        relay = self._Relay()
+        monkeypatch.setattr(
+            "hermes_cli.owner_worker.media_dispatch.worker_media_relay",
+            lambda: relay,
+        )
+        output = tmp_path / "speech.mp3"
+        written = tts_tool._synthesize_via_deployment(
+            "hello world",
+            str(output),
+            "volcengine-agent-plan",
+            {"model": "doubao-seed-tts-2.0", "voice": "v1", "speed": 1.5},
+        )
+        assert written == str(output)
+        assert output.read_bytes() == b"relay-audio"
+        assert relay.last_call["operation"] == "tts_synthesize"
+        assert relay.last_call["provider"] == "volcengine-agent-plan"
+        assert relay.last_call["model"] == "doubao-seed-tts-2.0"
+        assert relay.last_call["prompt"] == "hello world"
+        assert relay.last_call["params"] == {
+            "voice": "v1", "speed": 1.5, "format": "mp3",
+        }
+
+    def test_relay_failure_raises_for_error_envelope(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            tts_tool, "_deployment_voice_route", lambda p, m: self._Route()
+        )
+        relay = self._Relay(raise_exc=RuntimeError("relay rejected"))
+        monkeypatch.setattr(
+            "hermes_cli.owner_worker.media_dispatch.worker_media_relay",
+            lambda: relay,
+        )
+        with pytest.raises(RuntimeError, match="relay rejected"):
+            tts_tool._synthesize_via_deployment(
+                "hi", str(tmp_path / "out.mp3"), "volcengine-agent-plan", {"model": "m"},
+            )

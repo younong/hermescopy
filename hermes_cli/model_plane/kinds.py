@@ -33,6 +33,13 @@ ACTIVATABLE_KINDS = MEDIA_KINDS
 # direct provider call) is meaningful only for generation media.
 GATEWAY_KINDS = (IMAGE, VIDEO)
 
+# Kinds routable through the deployment media relay: the Control Plane holds
+# the credential and executes on behalf of the worker. Generation media run
+# the route's declared executor; voice/vector run the registered capability
+# delegate for the route's provider. Chat has its own inference relay and is
+# not part of the media relay.
+RELAY_KINDS = (IMAGE, VIDEO, VOICE, VECTOR)
+
 # Voice models are tagged with the sub-capability they serve.
 VOICE_CAPABILITIES = ("tts", "asr")
 

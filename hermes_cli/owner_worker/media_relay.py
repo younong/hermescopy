@@ -2,8 +2,10 @@
 
 Generalizes the retired image-only relay: one socketpair per worker lease,
 one framed JSON protocol, and operations (``image_generate``,
-``video_generate``) routed by ``(kind, provider, model)`` against the
-deployment media policy. See ``docs/model-plane.md``.
+``video_generate``, ``tts_synthesize``, ``transcribe``, ``embed``) routed by
+``(kind, provider, model)`` against the deployment media policy. Audio bytes
+and embedding vectors travel inside the same 96MB-fenced frames. See
+``docs/model-plane.md``.
 """
 from __future__ import annotations
 
@@ -20,12 +22,17 @@ from hermes_cli.dashboard_auth.authority import (
     AuthorityStore, AuthorizationRejected, OwnerWorkerAuthorityLease, WorkerLeaseState,
 )
 from hermes_cli.deployment_media import (
+    AUDIO_MIME_TYPES,
     IMAGE_MIME_TYPES,
+    MAX_EMBEDDING_DIMENSIONS,
+    MAX_TRANSCRIPT_CHARS,
+    TTS_OUTPUT_MIME_TYPES,
     VIDEO_MIME_TYPES,
     DeploymentMediaDescriptor,
     DeploymentMediaPolicy,
     DeploymentMediaPolicyInvalid,
     DeploymentMediaSelectionRejected,
+    OPERATION_KINDS,
 )
 
 _MAX_FRAME_BYTES = 96 * 1024 * 1024
@@ -227,15 +234,14 @@ class DeploymentMediaBroker:
         aspect_ratio = request["aspect_ratio"]
         raw_references = request["references"]
         params = _safe_params(request["params"])
-        if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 32_768 or "\x00" in prompt:
+        kind = OPERATION_KINDS.get(operation if isinstance(operation, str) else "", "")
+        if not isinstance(prompt, str) or len(prompt) > 32_768 or "\x00" in prompt:
+            raise DeploymentMediaRelayError("deployment media prompt is invalid")
+        if operation != "transcribe" and not prompt.strip():
             raise DeploymentMediaRelayError("deployment media prompt is invalid")
         if not isinstance(provider, str) or not isinstance(model, str):
             raise DeploymentMediaRelayError("deployment media selection is invalid")
-        route = self._policy.route_for(
-            "video" if operation == "video_generate" else "image" if operation == "image_generate" else "",
-            provider,
-            model,
-        )
+        route = self._policy.route_for(kind, provider, model)
         if route is None:
             raise DeploymentMediaRelayError("deployment media selection is invalid")
         descriptor = route.descriptor
@@ -243,7 +249,23 @@ class DeploymentMediaBroker:
             raise DeploymentMediaRelayError("deployment media selection is invalid")
         if not isinstance(aspect_ratio, str) or len(aspect_ratio) > 64:
             raise DeploymentMediaRelayError("deployment media selection is invalid")
-        if not isinstance(raw_references, list) or len(raw_references) > descriptor.max_reference_images:
+        if kind == "voice":
+            # tts_synthesize carries no input; transcribe carries exactly one
+            # audio sample as its single reference.
+            expected = 0 if operation == "tts_synthesize" else 1
+            allowed_mime_types = AUDIO_MIME_TYPES
+            reference_cap = 1
+        elif kind == "vector":
+            expected = 0
+            allowed_mime_types = frozenset()
+            reference_cap = 0
+        else:
+            expected = None
+            allowed_mime_types = _ALLOWED_MIME_TYPES
+            reference_cap = descriptor.max_reference_images
+        if not isinstance(raw_references, list) or len(raw_references) > reference_cap:
+            raise DeploymentMediaRelayError("deployment media references are invalid")
+        if expected is not None and len(raw_references) != expected:
             raise DeploymentMediaRelayError("deployment media references are invalid")
         references: list[dict[str, Any]] = []
         total = 0
@@ -254,7 +276,7 @@ class DeploymentMediaBroker:
             mime_type = item["mime_type"]
             if not isinstance(name, str) or not name or len(name) > 255 or any(ch in name for ch in "/\\\x00"):
                 raise DeploymentMediaRelayError("deployment media reference name is invalid")
-            if mime_type not in _ALLOWED_MIME_TYPES:
+            if mime_type not in allowed_mime_types:
                 raise DeploymentMediaRelayError("deployment media reference type is invalid")
             try:
                 data = base64.b64decode(item["data"], validate=True)
@@ -268,7 +290,7 @@ class DeploymentMediaBroker:
             operation,
             provider=descriptor.provider,
             model=model,
-            prompt=prompt.strip(),
+            prompt=prompt.strip() if operation != "transcribe" else prompt,
             aspect_ratio=aspect_ratio,
             references=tuple(references),
             params=params,
@@ -287,6 +309,14 @@ class DeploymentMediaBroker:
         elif "video_bytes" in result:
             response["video"] = base64.b64encode(result["video_bytes"]).decode("ascii")
             response["mime_type"] = result["mime_type"]
+        elif "audio_bytes" in result:
+            response["audio"] = base64.b64encode(result["audio_bytes"]).decode("ascii")
+            response["mime_type"] = result["mime_type"]
+        elif "text" in result:
+            response["text"] = result["text"]
+        elif "embedding" in result:
+            response["embedding"] = result["embedding"]
+            response["dimensions"] = result["dimensions"]
         else:
             response["video_url"] = result["video_url"]
         return response
@@ -314,7 +344,7 @@ class OwnerMediaRelayClient:
         references: list[dict[str, Any]] | None = None,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        kind = "video" if operation == "video_generate" else "image" if operation == "image_generate" else ""
+        kind = OPERATION_KINDS.get(operation, "")
         route = self.descriptor.route_for(kind, provider, model)
         if route is None:
             raise DeploymentMediaRelayError("deployment media selection is not allowed")
@@ -345,15 +375,40 @@ class OwnerMediaRelayClient:
             if not isinstance(url, str) or not url.startswith("https://"):
                 raise DeploymentMediaRelayError("deployment media response is invalid")
             return {**response, "video_url": url}
-        field = "image" if kind == "image" else "video"
+        if kind == "vector":
+            embedding = response.get("embedding")
+            if (
+                not isinstance(embedding, list)
+                or not embedding
+                or len(embedding) > MAX_EMBEDDING_DIMENSIONS
+                or any(
+                    isinstance(value, bool) or not isinstance(value, (int, float))
+                    for value in embedding
+                )
+            ):
+                raise DeploymentMediaRelayError("deployment media response is invalid")
+            dimensions = response.get("dimensions")
+            if dimensions != len(embedding):
+                raise DeploymentMediaRelayError("deployment media response is invalid")
+            return {**response, "embedding": [float(value) for value in embedding]}
+        if "text" in response:
+            text = response["text"]
+            if not isinstance(text, str) or len(text) > MAX_TRANSCRIPT_CHARS:
+                raise DeploymentMediaRelayError("deployment media response is invalid")
+            return {**response, "text": text}
+        field = {"image": "image", "voice": "audio"}.get(kind, "video")
         try:
             data = base64.b64decode(response[field], validate=True)
         except (KeyError, TypeError, ValueError) as exc:
             raise DeploymentMediaRelayError("deployment media response is invalid") from exc
-        allowed = IMAGE_MIME_TYPES if kind == "image" else VIDEO_MIME_TYPES
+        allowed = (
+            IMAGE_MIME_TYPES if kind == "image"
+            else TTS_OUTPUT_MIME_TYPES if kind == "voice"
+            else VIDEO_MIME_TYPES
+        )
         if not data or len(data) > route.max_output_bytes or response.get("mime_type") not in allowed:
             raise DeploymentMediaRelayError("deployment media response is invalid")
-        key = "image_bytes" if kind == "image" else "video_bytes"
+        key = {"image": "image_bytes", "voice": "audio_bytes"}.get(kind, "video_bytes")
         return {**response, key: data}
 
     def close(self) -> None:

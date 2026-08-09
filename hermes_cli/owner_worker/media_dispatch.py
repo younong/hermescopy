@@ -21,6 +21,24 @@ _IMAGE_SUFFIXES = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"
 _VIDEO_SUFFIXES = {"video/mp4": "mp4", "video/webm": "webm", "video/quicktime": "mov"}
 _VIDEO_PARAM_KEYS = ("duration", "resolution", "negative_prompt", "audio", "seed")
 
+# The worker-process media relay client, registered by the owner-worker
+# entrypoint at startup. Tool-layer deployment checks (TTS synthesis,
+# transcription, embeddings) run inside the worker process but outside the
+# FastAPI app-state scope, so they reach the lease-bound relay through this
+# module-level handle. The fd itself stays private to the client.
+_WORKER_MEDIA_RELAY: OwnerMediaRelayClient | None = None
+
+
+def set_worker_media_relay(client: OwnerMediaRelayClient | None) -> None:
+    """Register (or clear) the worker-process deployment media relay client."""
+    global _WORKER_MEDIA_RELAY
+    _WORKER_MEDIA_RELAY = client
+
+
+def worker_media_relay() -> OwnerMediaRelayClient | None:
+    """Return the worker-process deployment media relay client, if started."""
+    return _WORKER_MEDIA_RELAY
+
 
 def active_media_selection(kind: str) -> tuple[str, str]:
     """Return the owner's active ``(provider, model)`` selection for one media kind."""

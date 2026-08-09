@@ -764,6 +764,106 @@ def _apply_voice_tool_selection(
     return name, (model or selected_model)
 
 
+def _deployment_voice_route(provider: str, model: Optional[str]):
+    """Return the deployment voice route matching this provider/model pair."""
+    if not isinstance(provider, str) or not provider.strip():
+        return None
+    if not isinstance(model, str) or not model.strip():
+        return None
+    try:
+        from hermes_cli.deployment_media import deployment_media_route_from_environment
+
+        return deployment_media_route_from_environment(
+            "voice", provider=provider, model=model,
+        )
+    except Exception:  # noqa: BLE001 — deployment routing is additive
+        return None
+
+
+_DEPLOYMENT_AUDIO_MIME_BY_SUFFIX = {
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/opus",
+    ".pcm": "audio/pcm",
+}
+
+
+def _transcribe_via_deployment(
+    file_path: str,
+    provider: str,
+    model: Optional[str],
+    stt_config: dict,
+) -> Optional[Dict[str, Any]]:
+    """Execute transcription through the deployment media relay, or None.
+
+    Returns None when the active selection matches no deployment voice
+    route or the worker relay client is unavailable — the caller falls
+    through to local dispatch with the user's own credentials. Relay
+    failures surface as the standard error envelope (matching the plugin
+    dispatch convention).
+    """
+    route = _deployment_voice_route(provider, model)
+    if route is None:
+        return None
+    from hermes_cli.owner_worker.media_dispatch import worker_media_relay
+
+    relay = worker_media_relay()
+    if relay is None:
+        return None
+    try:
+        data = Path(file_path).read_bytes()
+    except OSError as exc:
+        return {
+            "success": False,
+            "transcript": "",
+            "error": f"Could not read audio file: {exc}",
+            "provider": provider,
+        }
+    if not data or len(data) > route.max_reference_bytes:
+        return {
+            "success": False,
+            "transcript": "",
+            "error": "Audio file is too large for the deployment transcription route",
+            "provider": provider,
+        }
+    provider_cfg = stt_config.get(provider, {})
+    if not isinstance(provider_cfg, dict):
+        provider_cfg = {}
+    language = provider_cfg.get("language")
+    sample = Path(file_path)
+    try:
+        result = relay.execute(
+            "transcribe",
+            provider=route.provider,
+            model=model.strip(),
+            prompt="",
+            references=[{
+                "name": sample.name or "sample.wav",
+                "mime_type": _DEPLOYMENT_AUDIO_MIME_BY_SUFFIX.get(
+                    sample.suffix.lower(), "audio/wav",
+                ),
+                "data": data,
+            }],
+            params={
+                "language": language if isinstance(language, str) and language else None,
+            },
+        )
+    except Exception as exc:
+        return {
+            "success": False,
+            "transcript": "",
+            "error": f"Deployment transcription failed: {exc}",
+            "provider": provider,
+        }
+    return {
+        "success": True,
+        "transcript": result["text"],
+        "provider": result.get("provider") or provider,
+        "model": result.get("model") or model,
+    }
+
+
 def _get_provider(stt_config: dict) -> str:
     """Determine which STT provider to use.
 
@@ -1755,6 +1855,14 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
 
     provider = _get_provider(stt_config)
     provider, model = _apply_voice_tool_selection(provider, model)
+
+    # Deployment-managed voice route (PR3): when the active voice
+    # selection matches a deployment media route, the Control Plane holds
+    # the credential and transcribes on the worker's behalf via the media
+    # relay (same deployment-route rule as the image tool).
+    deployment_result = _transcribe_via_deployment(file_path, provider, model, stt_config)
+    if deployment_result is not None:
+        return deployment_result
 
     if provider == "local":
         local_cfg = stt_config.get("local", {})

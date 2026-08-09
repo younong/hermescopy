@@ -376,6 +376,64 @@ def _apply_voice_tool_selection(
     return name, overlaid
 
 
+def _deployment_voice_route(provider: str, model: Any):
+    """Return the deployment voice route matching this provider/model pair."""
+    if not isinstance(provider, str) or not provider.strip():
+        return None
+    if not isinstance(model, str) or not model.strip():
+        return None
+    try:
+        from hermes_cli.deployment_media import deployment_media_route_from_environment
+
+        return deployment_media_route_from_environment(
+            "voice", provider=provider, model=model,
+        )
+    except Exception:  # noqa: BLE001 — deployment routing is additive
+        return None
+
+
+def _synthesize_via_deployment(
+    text: str,
+    output_path: str,
+    provider: str,
+    tts_config: Dict[str, Any],
+) -> Optional[str]:
+    """Execute TTS through the deployment media relay, or return None.
+
+    Returns None when the active selection matches no deployment voice
+    route or the worker relay client is unavailable — the caller falls
+    through to local plugin/built-in dispatch with the user's own key.
+    Relay failures raise so the outer ``text_to_speech_tool`` error
+    envelope reports them (matching plugin dispatch behavior).
+    """
+    model = tts_config.get("model") if isinstance(tts_config, dict) else None
+    route = _deployment_voice_route(provider, model)
+    if route is None:
+        return None
+    from hermes_cli.owner_worker.media_dispatch import worker_media_relay
+
+    relay = worker_media_relay()
+    if relay is None:
+        return None
+    voice = tts_config.get("voice")
+    speed = tts_config.get("speed")
+    fmt = tts_config.get("output_format", DEFAULT_COMMAND_TTS_OUTPUT_FORMAT)
+    result = relay.execute(
+        "tts_synthesize",
+        provider=route.provider,
+        model=model.strip(),
+        prompt=text,
+        params={
+            "voice": voice if isinstance(voice, str) and voice else None,
+            "speed": float(speed) if isinstance(speed, (int, float)) else None,
+            "format": str(fmt).lower() if fmt else "mp3",
+        },
+    )
+    with open(output_path, "wb") as destination:
+        destination.write(result["audio_bytes"])
+    return output_path
+
+
 # ===========================================================================
 # Custom command providers (type: command under tts.providers.<name>)
 # ===========================================================================
@@ -2256,6 +2314,18 @@ def text_to_speech_tool(
             file_str = _generate_command_tts(
                 text, file_str, provider, command_provider_config, tts_config,
             )
+
+        # Deployment-managed voice route (PR3): when the active voice
+        # selection matches a deployment media route, the Control Plane
+        # holds the credential and synthesizes on the worker's behalf via
+        # the media relay. Mirrors the image tool's deployment-route rule:
+        # a matching route wins over the local plugin/built-in dispatch.
+        elif provider not in BUILTIN_TTS_PROVIDERS and (
+            _deployment_path := _synthesize_via_deployment(
+                text, file_str, provider, tts_config,
+            )
+        ) is not None:
+            file_str = _deployment_path
 
         # Plugin-registered TTS backend (issue #30398). Fires when the
         # configured provider is neither a built-in nor a command-type
