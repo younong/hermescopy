@@ -28,6 +28,7 @@ from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
     ImageGenProvider,
     error_response,
+    nearest_aspect_ratio,
     normalize_reference_images,
     resolve_aspect_ratio,
     save_b64_image,
@@ -66,9 +67,9 @@ DEFAULT_MODEL = "grok-imagine-image"
 
 # xAI aspect ratios (more options than FAL/OpenAI)
 _XAI_ASPECT_RATIOS = {
-    "landscape": "16:9",
-    "square": "1:1",
-    "portrait": "9:16",
+    "16:9": "16:9",
+    "1:1": "1:1",
+    "9:16": "9:16",
     "4:3": "4:3",
     "3:4": "3:4",
     "3:2": "3:2",
@@ -236,7 +237,8 @@ class XAIImageGenProvider(ImageGenProvider):
 
         model_id, meta = _resolve_model()
         aspect = resolve_aspect_ratio(aspect_ratio)
-        xai_ar = _XAI_ASPECT_RATIOS.get(aspect, "1:1")
+        effective_aspect = nearest_aspect_ratio(aspect, tuple(_XAI_ASPECT_RATIOS))
+        xai_ar = _XAI_ASPECT_RATIOS[effective_aspect]
         resolution = _resolve_resolution()
         xai_res = resolution if resolution in _XAI_RESOLUTIONS else DEFAULT_RESOLUTION
 
@@ -448,6 +450,8 @@ class XAIImageGenProvider(ImageGenProvider):
 
         extra: Dict[str, Any] = {
             "storage_enabled": bool(storage_cfg["enabled"]),
+            "requested_aspect_ratio": aspect,
+            "effective_aspect_ratio": effective_aspect,
         }
         if not is_edit:
             extra["resolution"] = xai_res

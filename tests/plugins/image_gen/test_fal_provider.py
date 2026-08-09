@@ -123,14 +123,14 @@ class TestFalImageGenProviderGenerate:
         )
 
         assert captured["prompt"] == "a serene mountain landscape"
-        assert captured["aspect_ratio"] == "square"
+        assert captured["aspect_ratio"] == "1:1"
         assert captured["kwargs"] == {"seed": 42}
         assert result["success"] is True
         assert result["image"] == "https://fake/image.png"
         # Stamped fields for the unified response shape
         assert result["provider"] == "fal"
         assert result["prompt"] == "a serene mountain landscape"
-        assert result["aspect_ratio"] == "square"
+        assert result["aspect_ratio"] == "1:1"
         assert result["model"] == "fal-ai/flux-2/klein/9b"
 
     def test_generate_invalid_aspect_ratio_is_coerced(self, monkeypatch):
@@ -148,8 +148,8 @@ class TestFalImageGenProviderGenerate:
                             lambda: ("fal-ai/flux-2/klein/9b", {}))
 
         FalImageGenProvider().generate("p", aspect_ratio="not-a-real-ratio")
-        # ``resolve_aspect_ratio`` clamps to landscape.
-        assert seen_aspect["v"] == "landscape"
+        # ``resolve_aspect_ratio`` clamps to the canonical default.
+        assert seen_aspect["v"] == "16:9"
 
     def test_generate_passthrough_drops_none_kwargs(self, monkeypatch):
         import tools.image_generation_tool as image_tool

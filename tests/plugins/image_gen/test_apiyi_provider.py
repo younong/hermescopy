@@ -148,6 +148,8 @@ class TestGenerate:
         assert result["model"] == "gpt-image-2-medium"
         assert result["quality"] == "medium"
         assert result["upstream_model"] == "gpt-image-2"
+        assert result["requested_aspect_ratio"] == "16:9"
+        assert result["effective_aspect_ratio"] == "3:2"
         saved = Path(result["image"])
         assert saved.exists()
         assert saved.parent == tmp_path / "images"
@@ -162,6 +164,45 @@ class TestGenerate:
             "n": 1,
             "quality": "medium",
         }
+
+    def test_gpt_3_4_uses_exact_custom_size(self, provider, monkeypatch):
+        calls = []
+
+        def fake_post(url, **kwargs):
+            calls.append((url, kwargs))
+            return _Response({"data": [{"b64_json": _b64_png()}]})
+
+        monkeypatch.setattr(requests, "post", fake_post)
+
+        result = provider.generate("a portrait cat", aspect_ratio="3:4")
+
+        assert result["success"] is True
+        assert result["requested_aspect_ratio"] == "3:4"
+        assert result["effective_aspect_ratio"] == "3:4"
+        assert result["size"] == "768x1024"
+        assert calls[0][1]["json"]["size"] == "768x1024"
+
+    def test_gpt_edit_3_4_uses_exact_custom_size(self, provider, monkeypatch):
+        calls = []
+        data_url = f"data:image/png;base64,{_b64_png()}"
+
+        def fake_post(url, **kwargs):
+            calls.append((url, kwargs))
+            return _Response({"data": [{"b64_json": _b64_png()}]})
+
+        monkeypatch.setattr(requests, "post", fake_post)
+
+        result = provider.generate(
+            "make it portrait",
+            image_url=data_url,
+            aspect_ratio="3:4",
+        )
+
+        assert result["success"] is True
+        assert result["requested_aspect_ratio"] == "3:4"
+        assert result["effective_aspect_ratio"] == "3:4"
+        assert result["size"] == "768x1024"
+        assert calls[0][1]["data"]["size"] == "768x1024"
 
     def test_gpt_edit_payload(self, provider, monkeypatch):
         calls = []
@@ -217,7 +258,10 @@ class TestGenerate:
         assert result["success"] is True
         assert result["model"] == "nano-banana-2"
         assert result["upstream_model"] == "gemini-3.1-flash-image-preview"
-        assert result["aspect_ratio_native"] == "9:16"
+        assert result["aspect_ratio"] == "3:4"
+        assert result["requested_aspect_ratio"] == "3:4"
+        assert result["effective_aspect_ratio"] == "3:4"
+        assert result["aspect_ratio_native"] == "3:4"
 
         url, kwargs = calls[0]
         assert url == (
@@ -228,7 +272,7 @@ class TestGenerate:
         payload = kwargs["json"]
         assert payload["contents"][0]["parts"][0] == {"text": "a banana astronaut"}
         assert payload["generationConfig"]["responseModalities"] == ["IMAGE", "TEXT"]
-        assert payload["generationConfig"]["imageConfig"]["aspectRatio"] == "9:16"
+        assert payload["generationConfig"]["imageConfig"]["aspectRatio"] == "3:4"
 
     def test_custom_base_urls_and_model_map(self, provider, monkeypatch, tmp_path):
         import yaml
@@ -292,18 +336,29 @@ class TestGenerate:
         assert "bad model" in result["error"]
 
 
-def test_explicit_transport_does_not_mutate_environment(monkeypatch):
+def test_explicit_transport_uses_exact_gpt_3_4_size(monkeypatch):
     from plugins.image_gen import apiyi
 
-    monkeypatch.delenv("APIYI_API_KEY", raising=False)
+    captured = {}
+
     class Response:
         headers = {}
         def raise_for_status(self): pass
         def json(self): return {"data": [{"b64_json": "cG5n"}]}
-    monkeypatch.setattr("requests.post", lambda *args, **kwargs: Response())
+
+    def fake_post(url, **kwargs):
+        captured.update({"url": url, "kwargs": kwargs})
+        return Response()
+
+    monkeypatch.setattr("requests.post", fake_post)
     result = apiyi.generate_apiyi_image_bytes(
-        prompt="draw", aspect_ratio="square", model="gpt-image-2-medium", references=[],
+        prompt="draw", aspect_ratio="3:4", model="gpt-image-2-medium", references=[],
         api_key="trusted", openai_base_url="https://api.example/v1", gemini_base_url="https://api.example/v1beta",
     )
+
     assert result["image_bytes"] == b"png"
+    assert result["metadata"]["requested_aspect_ratio"] == "3:4"
+    assert result["metadata"]["effective_aspect_ratio"] == "3:4"
+    assert result["metadata"]["size"] == "768x1024"
+    assert captured["kwargs"]["json"]["size"] == "768x1024"
     assert "APIYI_API_KEY" not in os.environ

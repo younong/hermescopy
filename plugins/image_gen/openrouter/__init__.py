@@ -32,6 +32,7 @@ from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
     ImageGenProvider,
     error_response,
+    nearest_aspect_ratio,
     resolve_aspect_ratio,
     save_b64_image,
     save_url_image,
@@ -56,9 +57,13 @@ _DEFAULT_MODEL_CHAIN = (DEFAULT_MODEL, _FALLBACK_MODEL)
 # Semantic aspect ratio (the image_gen contract) → OpenRouter's image_config
 # aspect_ratio strings.
 _ASPECT_RATIOS = {
-    "square": "1:1",
-    "landscape": "16:9",
-    "portrait": "9:16",
+    "1:1": "1:1",
+    "16:9": "16:9",
+    "3:4": "3:4",
+    "2:3": "2:3",
+    "4:3": "4:3",
+    "3:2": "3:2",
+    "9:16": "9:16",
 }
 
 # Gemini Flash Image accepts up to 3 input images per prompt; clamp references
@@ -310,7 +315,8 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
 
         model_chain = self._resolve_model_chain(kwargs.get("model"))
         aspect = resolve_aspect_ratio(aspect_ratio)
-        or_aspect = _ASPECT_RATIOS.get(aspect, "1:1")
+        effective_aspect = nearest_aspect_ratio(aspect, tuple(_ASPECT_RATIOS))
+        or_aspect = _ASPECT_RATIOS[effective_aspect]
 
         # Collect every reference: the pet generator passes local paths via the
         # ``reference_images`` kwarg; the generic tool surface uses ``image_url``
@@ -466,6 +472,10 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
                 prompt=prompt,
                 aspect_ratio=aspect,
                 provider=self._name,
+                extra={
+                    "requested_aspect_ratio": aspect,
+                    "effective_aspect_ratio": effective_aspect,
+                },
             )
 
         return last_error or error_response(

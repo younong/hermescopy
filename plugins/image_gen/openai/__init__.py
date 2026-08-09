@@ -32,6 +32,7 @@ from agent.image_gen_provider import (
     ImageGenProvider,
     error_response,
     normalize_reference_images,
+    nearest_aspect_ratio,
     resolve_aspect_ratio,
     save_b64_image,
     save_url_image,
@@ -75,9 +76,9 @@ _MODELS: Dict[str, Dict[str, Any]] = {
 DEFAULT_MODEL = "gpt-image-2-medium"
 
 _SIZES = {
-    "landscape": "1536x1024",
-    "square": "1024x1024",
-    "portrait": "1024x1536",
+    "3:2": "1536x1024",
+    "1:1": "1024x1024",
+    "2:3": "1024x1536",
 }
 
 
@@ -255,7 +256,8 @@ class OpenAIImageGenProvider(ImageGenProvider):
             )
 
         tier_id, meta = _resolve_model()
-        size = _SIZES.get(aspect, _SIZES["square"])
+        effective_aspect = nearest_aspect_ratio(aspect, tuple(_SIZES))
+        size = _SIZES[effective_aspect]
 
         # Collect source images (primary + references) for image-to-image.
         sources: List[str] = []
@@ -389,7 +391,12 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
-        extra: Dict[str, Any] = {"size": size, "quality": meta["quality"]}
+        extra: Dict[str, Any] = {
+            "size": size,
+            "quality": meta["quality"],
+            "requested_aspect_ratio": aspect,
+            "effective_aspect_ratio": effective_aspect,
+        }
         if revised_prompt:
             extra["revised_prompt"] = revised_prompt
 

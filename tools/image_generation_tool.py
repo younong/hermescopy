@@ -70,6 +70,14 @@ from tools.tool_backend_helpers import (
     nous_tool_gateway_unavailable_message,
     prefers_gateway,
 )
+from agent.image_gen_provider import (
+    DEFAULT_ASPECT_RATIO,
+    VALID_ASPECT_RATIOS,
+    aspect_ratio_from_dimensions,
+    aspect_ratio_value,
+    nearest_aspect_ratio,
+    resolve_aspect_ratio,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,9 +111,9 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
         "price": "$0.006/MP",
         "size_style": "image_size_preset",
         "sizes": {
-            "landscape": "landscape_16_9",
-            "square": "square_hd",
-            "portrait": "portrait_16_9",
+            "16:9": "landscape_16_9",
+            "1:1": "square_hd",
+            "9:16": "portrait_16_9",
         },
         "defaults": {
             "num_inference_steps": 4,
@@ -133,9 +141,9 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
         "price": "$0.03/MP",
         "size_style": "image_size_preset",
         "sizes": {
-            "landscape": "landscape_16_9",
-            "square": "square_hd",
-            "portrait": "portrait_16_9",
+            "16:9": "landscape_16_9",
+            "1:1": "square_hd",
+            "9:16": "portrait_16_9",
         },
         "defaults": {
             "num_inference_steps": 50,
@@ -168,9 +176,9 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
         "price": "$0.005/MP",
         "size_style": "image_size_preset",
         "sizes": {
-            "landscape": "landscape_16_9",
-            "square": "square_hd",
-            "portrait": "portrait_16_9",
+            "16:9": "landscape_16_9",
+            "1:1": "square_hd",
+            "9:16": "portrait_16_9",
         },
         "defaults": {
             "num_inference_steps": 8,
@@ -193,9 +201,9 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
         "price": "$0.15/image (1K)",
         "size_style": "aspect_ratio",
         "sizes": {
-            "landscape": "16:9",
-            "square": "1:1",
-            "portrait": "9:16",
+            "16:9": "16:9",
+            "1:1": "1:1",
+            "9:16": "9:16",
         },
         "defaults": {
             "num_images": 1,
@@ -228,9 +236,9 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
         "price": "$0.034/image",
         "size_style": "gpt_literal",
         "sizes": {
-            "landscape": "1536x1024",
-            "square": "1024x1024",
-            "portrait": "1024x1536",
+            "3:2": "1536x1024",
+            "1:1": "1024x1024",
+            "2:3": "1024x1536",
         },
         "defaults": {
             # Quality is pinned to medium to keep portal billing predictable
@@ -264,9 +272,9 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
         # three aspect ratios.
         "size_style": "image_size_preset",
         "sizes": {
-            "landscape": "landscape_4_3",   # 1024x768
-            "square": "square_hd",            # 1024x1024
-            "portrait": "portrait_4_3",       # 768x1024
+            "4:3": "landscape_4_3",   # 1024x768
+            "1:1": "square_hd",        # 1024x1024
+            "3:4": "portrait_4_3",     # 768x1024
         },
         "defaults": {
             # Same quality pinning as gpt-image-1.5: medium keeps Nous
@@ -300,9 +308,9 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
         "price": "$0.03-0.09/image",
         "size_style": "image_size_preset",
         "sizes": {
-            "landscape": "landscape_16_9",
-            "square": "square_hd",
-            "portrait": "portrait_16_9",
+            "16:9": "landscape_16_9",
+            "1:1": "square_hd",
+            "9:16": "portrait_16_9",
         },
         "defaults": {
             "rendering_speed": "BALANCED",
@@ -329,9 +337,9 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
         "price": "$0.25/image",
         "size_style": "image_size_preset",
         "sizes": {
-            "landscape": "landscape_16_9",
-            "square": "square_hd",
-            "portrait": "portrait_16_9",
+            "16:9": "landscape_16_9",
+            "1:1": "square_hd",
+            "9:16": "portrait_16_9",
         },
         "defaults": {
             # V4 Pro dropped V3's required `style` enum — defaults handle taste now.
@@ -350,9 +358,9 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
         "price": "$0.02/MP",
         "size_style": "image_size_preset",
         "sizes": {
-            "landscape": "landscape_16_9",
-            "square": "square_hd",
-            "portrait": "portrait_16_9",
+            "16:9": "landscape_16_9",
+            "1:1": "square_hd",
+            "9:16": "portrait_16_9",
         },
         "defaults": {
             "num_inference_steps": 30,
@@ -385,9 +393,9 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
         "price": "$0.030 (text) / $0.035 (style refs)",
         "size_style": "aspect_ratio",
         "sizes": {
-            "landscape": "16:9",
-            "square": "1:1",
-            "portrait": "9:16",
+            "16:9": "16:9",
+            "1:1": "1:1",
+            "9:16": "9:16",
         },
         "defaults": {
             "creativity": "medium",
@@ -405,9 +413,9 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
         "price": "$0.060 (text) / $0.065 (style refs)",
         "size_style": "aspect_ratio",
         "sizes": {
-            "landscape": "16:9",
-            "square": "1:1",
-            "portrait": "9:16",
+            "16:9": "16:9",
+            "1:1": "1:1",
+            "9:16": "9:16",
         },
         "defaults": {
             "creativity": "medium",
@@ -423,8 +431,6 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
 # Default model is the fastest reasonable option. Kept cheap and sub-1s.
 DEFAULT_MODEL = "fal-ai/flux-2/klein/9b"
 
-DEFAULT_ASPECT_RATIO = "landscape"
-VALID_ASPECT_RATIOS = ("landscape", "square", "portrait")
 
 
 # ---------------------------------------------------------------------------
@@ -580,17 +586,20 @@ def _build_fal_payload(
     size_style = meta["size_style"]
     sizes = meta["sizes"]
 
-    aspect = (aspect_ratio or DEFAULT_ASPECT_RATIO).lower().strip()
-    if aspect not in sizes:
-        aspect = DEFAULT_ASPECT_RATIO
+    requested_aspect = resolve_aspect_ratio(aspect_ratio)
+    effective_aspect = (
+        requested_aspect
+        if requested_aspect in sizes
+        else nearest_aspect_ratio(requested_aspect, tuple(sizes))
+    )
 
     payload: Dict[str, Any] = dict(meta.get("defaults", {}))
     payload["prompt"] = (prompt or "").strip()
 
     if size_style in {"image_size_preset", "gpt_literal"}:
-        payload["image_size"] = sizes[aspect]
+        payload["image_size"] = sizes[effective_aspect]
     elif size_style == "aspect_ratio":
-        payload["aspect_ratio"] = sizes[aspect]
+        payload["aspect_ratio"] = sizes[effective_aspect]
     else:
         raise ValueError(f"Unknown size_style: {size_style!r}")
 
@@ -634,9 +643,12 @@ def _build_fal_edit_payload(
     size_style = meta["size_style"]
     sizes = meta["sizes"]
 
-    aspect = (aspect_ratio or DEFAULT_ASPECT_RATIO).lower().strip()
-    if aspect not in sizes:
-        aspect = DEFAULT_ASPECT_RATIO
+    requested_aspect = resolve_aspect_ratio(aspect_ratio)
+    effective_aspect = (
+        requested_aspect
+        if requested_aspect in sizes
+        else nearest_aspect_ratio(requested_aspect, tuple(sizes))
+    )
 
     payload: Dict[str, Any] = dict(meta.get("defaults", {}))
     payload["prompt"] = (prompt or "").strip()
@@ -646,9 +658,9 @@ def _build_fal_edit_payload(
     # gpt-image-2 edit auto-infers size from the input, so `image_size` is
     # intentionally absent from its edit_supports whitelist.
     if size_style in {"image_size_preset", "gpt_literal"} and "image_size" in edit_supports:
-        payload["image_size"] = sizes[aspect]
+        payload["image_size"] = sizes[effective_aspect]
     elif size_style == "aspect_ratio" and "aspect_ratio" in edit_supports:
-        payload["aspect_ratio"] = sizes[aspect]
+        payload["aspect_ratio"] = sizes[effective_aspect]
 
     if seed is not None and isinstance(seed, int):
         payload["seed"] = seed
@@ -830,8 +842,37 @@ def _postprocess_image_generate_result(raw: str, task_id: str | None = None) -> 
         with Image.open(Path(image)) as generated:
             width, height = generated.size
         if width > 0 and height > 0:
+            actual_aspect = aspect_ratio_from_dimensions(int(width), int(height))
             payload["width"] = int(width)
             payload["height"] = int(height)
+            payload["actual_aspect_ratio"] = actual_aspect
+            expected_value = payload.get("effective_aspect_ratio") or payload.get(
+                "requested_aspect_ratio"
+            ) or payload.get("aspect_ratio")
+            if expected_value:
+                requested_aspect = resolve_aspect_ratio(
+                    payload.get("requested_aspect_ratio") or expected_value
+                )
+                effective_aspect = resolve_aspect_ratio(
+                    payload.get("effective_aspect_ratio") or expected_value
+                )
+                payload.setdefault("requested_aspect_ratio", requested_aspect)
+                payload.setdefault("effective_aspect_ratio", effective_aspect)
+            else:
+                effective_aspect = None
+            if effective_aspect and abs(
+                aspect_ratio_value(actual_aspect)
+                - aspect_ratio_value(effective_aspect)
+            ) > 0.01:
+                payload.update({
+                    "success": False,
+                    "image": None,
+                    "error": (
+                        f"Generated image has aspect ratio {actual_aspect}, "
+                        f"but the effective requested ratio was {effective_aspect}."
+                    ),
+                    "error_type": "aspect_ratio_mismatch",
+                })
             changed = True
     except Exception as exc:  # noqa: BLE001 - image generation still succeeded
         logger.debug("Could not inspect generated image dimensions: %s", exc)
@@ -928,13 +969,7 @@ def image_generate_tool(
                 f"via `hermes tools` → Image Generation."
             )
 
-        aspect_lc = (aspect_ratio or DEFAULT_ASPECT_RATIO).lower().strip()
-        if aspect_lc not in VALID_ASPECT_RATIOS:
-            logger.warning(
-                "Invalid aspect_ratio '%s', defaulting to '%s'",
-                aspect_ratio, DEFAULT_ASPECT_RATIO,
-            )
-            aspect_lc = DEFAULT_ASPECT_RATIO
+        aspect_lc = resolve_aspect_ratio(aspect_ratio)
 
         overrides: Dict[str, Any] = {}
         if num_inference_steps is not None:
@@ -1016,10 +1051,19 @@ def image_generate_tool(
             modality,
         )
 
+        effective_aspect = (
+            aspect_lc
+            if aspect_lc in meta["sizes"]
+            else nearest_aspect_ratio(aspect_lc, tuple(meta["sizes"]))
+        )
         response_data = {
             "success": True,
             "image": formatted_images[0]["url"] if formatted_images else None,
             "modality": modality,
+            "aspect_ratio": aspect_lc,
+            "requested_aspect_ratio": aspect_lc,
+            "effective_aspect_ratio": effective_aspect,
+            "model": model_id,
         }
 
         debug_call_data["success"] = True
@@ -1220,7 +1264,14 @@ IMAGE_GENERATE_SCHEMA = {
             "aspect_ratio": {
                 "type": "string",
                 "enum": list(VALID_ASPECT_RATIOS),
-                "description": "The aspect ratio of the generated image. 'landscape' is 16:9 wide, 'portrait' is 16:9 tall, 'square' is 1:1.",
+                "description": (
+                    "Exact output width:height ratio. If the user requests a ratio "
+                    "such as 3:4 or 2:3, pass that exact value. Do not replace it "
+                    "with portrait or another approximation; if the active model "
+                    "cannot express it, the backend uses the nearest supported "
+                    "ratio and reports the effective ratio. Legacy portrait, square, "
+                    "and landscape inputs are accepted by compatibility code only."
+                ),
                 "default": DEFAULT_ASPECT_RATIO,
             },
             "image_url": {

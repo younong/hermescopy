@@ -56,8 +56,8 @@ class TestFalCatalog:
 
     def test_sizes_cover_all_aspect_ratios(self, image_tool):
         for mid, meta in image_tool.FAL_MODELS.items():
-            assert set(meta["sizes"].keys()) >= {"landscape", "square", "portrait"}, \
-                f"{mid} missing a required aspect_ratio key"
+            assert set(meta["sizes"]).issubset(set(image_tool.VALID_ASPECT_RATIOS)), \
+                f"{mid} has a non-canonical aspect_ratio key"
 
     def test_supports_is_a_set(self, image_tool):
         for mid, meta in image_tool.FAL_MODELS.items():
@@ -90,7 +90,7 @@ class TestImageSizePresetFamily:
     """Flux, z-image, qwen, recraft, ideogram all use preset enum sizes."""
 
     def test_klein_landscape_uses_preset(self, image_tool):
-        p = image_tool._build_fal_payload("fal-ai/flux-2/klein/9b", "hello", "landscape")
+        p = image_tool._build_fal_payload("fal-ai/flux-2/klein/9b", "hello", "16:9")
         assert p["image_size"] == "landscape_16_9"
         assert "aspect_ratio" not in p
 
@@ -107,7 +107,7 @@ class TestAspectRatioFamily:
     """Nano-banana uses aspect_ratio enum, NOT image_size."""
 
     def test_nano_banana_landscape_uses_aspect_ratio(self, image_tool):
-        p = image_tool._build_fal_payload("fal-ai/nano-banana-pro", "hello", "landscape")
+        p = image_tool._build_fal_payload("fal-ai/nano-banana-pro", "hello", "16:9")
         assert p["aspect_ratio"] == "16:9"
         assert "image_size" not in p
 
@@ -124,7 +124,7 @@ class TestGptLiteralFamily:
     """GPT-Image 1.5 uses literal size strings."""
 
     def test_gpt_landscape_is_literal(self, image_tool):
-        p = image_tool._build_fal_payload("fal-ai/gpt-image-1.5", "hello", "landscape")
+        p = image_tool._build_fal_payload("fal-ai/gpt-image-1.5", "hello", "16:9")
         assert p["image_size"] == "1536x1024"
 
     def test_gpt_square_is_literal(self, image_tool):
@@ -142,7 +142,7 @@ class TestGptImage2Presets:
     (16:9 presets at 1024x576 = 589,824 would be rejected)."""
 
     def test_gpt2_landscape_uses_4_3_preset(self, image_tool):
-        p = image_tool._build_fal_payload("fal-ai/gpt-image-2", "hello", "landscape")
+        p = image_tool._build_fal_payload("fal-ai/gpt-image-2", "hello", "16:9")
         assert p["image_size"] == "landscape_4_3"
 
     def test_gpt2_square_uses_square_hd(self, image_tool):
@@ -188,7 +188,7 @@ class TestSupportsFilter:
 
     def test_payload_keys_are_subset_of_supports_for_all_models(self, image_tool):
         for mid, meta in image_tool.FAL_MODELS.items():
-            payload = image_tool._build_fal_payload(mid, "test", "landscape", seed=42)
+            payload = image_tool._build_fal_payload(mid, "test", "16:9", seed=42)
             unsupported = set(payload.keys()) - meta["supports"]
             assert not unsupported, \
                 f"{mid} payload has unsupported keys: {unsupported}"
@@ -209,7 +209,7 @@ class TestSupportsFilter:
     def test_recraft_has_minimal_payload(self, image_tool):
         # Recraft V4 Pro supports prompt, image_size, enable_safety_checker,
         # colors, background_color (no seed, no style — V4 dropped V3's style enum).
-        p = image_tool._build_fal_payload("fal-ai/recraft/v4/pro/text-to-image", "hi", "landscape")
+        p = image_tool._build_fal_payload("fal-ai/recraft/v4/pro/text-to-image", "hi", "16:9")
         assert set(p.keys()) <= {
             "prompt", "image_size", "enable_safety_checker",
             "colors", "background_color",
@@ -217,7 +217,7 @@ class TestSupportsFilter:
 
     def test_nano_banana_never_gets_image_size(self, image_tool):
         # Common bug: translator accidentally setting both image_size and aspect_ratio.
-        p = image_tool._build_fal_payload("fal-ai/nano-banana-pro", "hi", "landscape", seed=1)
+        p = image_tool._build_fal_payload("fal-ai/nano-banana-pro", "hi", "16:9", seed=1)
         assert "image_size" not in p
         assert p["aspect_ratio"] == "16:9"
 
@@ -374,9 +374,9 @@ class TestRegistryIntegration:
         }
         assert image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["required"] == ["prompt"]
 
-    def test_aspect_ratio_enum_is_three_values(self, image_tool):
+    def test_aspect_ratio_enum_is_canonical(self, image_tool):
         enum = image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["properties"]["aspect_ratio"]["enum"]
-        assert set(enum) == {"landscape", "square", "portrait"}
+        assert set(enum) == set(image_tool.VALID_ASPECT_RATIOS)
 
 
 # ---------------------------------------------------------------------------

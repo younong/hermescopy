@@ -21,9 +21,11 @@ import os
 import sys
 from typing import Any, Dict, Iterable
 
+from agent.image_gen_provider import VALID_ASPECT_RATIOS
 from plugins.image_gen.apiyi import ApiyiImageGenProvider
 
 DEFAULT_MODELS = ("gpt-image-2-medium", "nano-banana-2")
+_LEGACY_ASPECT_RATIOS = ("landscape", "square", "portrait")
 
 
 def _redact_error(value: Any) -> str:
@@ -36,14 +38,28 @@ def _redact_error(value: Any) -> str:
 
 def _run_model(provider: ApiyiImageGenProvider, model: str, prompt: str, aspect_ratio: str) -> Dict[str, Any]:
     result = provider.generate(prompt, aspect_ratio=aspect_ratio, model=model)
-    return {
+    item = {
         "model": model,
         "success": bool(result.get("success")),
         "provider": result.get("provider"),
         "image": result.get("image"),
+        "requested_aspect_ratio": result.get("requested_aspect_ratio"),
+        "effective_aspect_ratio": result.get("effective_aspect_ratio"),
+        "size": result.get("size"),
         "error_type": result.get("error_type"),
         "error": _redact_error(result.get("error")),
     }
+    if model.startswith("gpt-image-2") and aspect_ratio == "3:4":
+        if (
+            not item["success"]
+            or item["requested_aspect_ratio"] != "3:4"
+            or item["effective_aspect_ratio"] != "3:4"
+            or item["size"] != "768x1024"
+        ):
+            item["success"] = False
+            item["error_type"] = "aspect_ratio_validation"
+            item["error"] = "GPT-Image-2 3:4 validation failed"
+    return item
 
 
 def _parse_models(raw: str) -> Iterable[str]:
@@ -68,8 +84,8 @@ def main() -> int:
     parser.add_argument(
         "--aspect-ratio",
         default="square",
-        choices=("landscape", "square", "portrait"),
-        help="Hermes image aspect ratio.",
+        choices=(*VALID_ASPECT_RATIOS, *_LEGACY_ASPECT_RATIOS),
+        help="Hermes image aspect ratio (canonical ratio or legacy alias).",
     )
     args = parser.parse_args()
 
