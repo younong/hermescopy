@@ -29,6 +29,27 @@ follow the implementation and its closest focused tests.
    deploy, tag, rollback, or production-status operation, first invoke the
    project `hermes-release` skill.
 
+## Chat GUI UI Boundary
+
+When working on the Chat GUI, do not use the Admin Dashboard as a visual or
+layout reference. Prefer the existing Chat GUI patterns in
+`web/src/pages/GuiChatPage.tsx`, `web/src/features/gui-chat/**`, and
+`web/src/components/ChatSessionList.tsx`.
+
+For Chat GUI changes:
+
+- Treat Chat GUI as a conversation-first product surface.
+- Preserve the visual priority of the conversation stream and message composer.
+- Do not copy or infer UI patterns from Admin Dashboard pages or components.
+- Do not use Dashboard page headers, metric cards, dense settings forms,
+  analytics layouts, admin tables, or other dashboard-specific visual patterns
+  unless the task explicitly requests it.
+- If a suitable Chat GUI pattern does not exist, create a Chat GUI-specific
+  pattern instead of adapting a Dashboard pattern.
+
+Before finishing a Chat GUI change, verify that the result still looks and
+behaves like a chat workspace rather than an administration console.
+
 ## Replacement and Cleanup Policy
 
 - Prefer modifying or reusing existing implementations over adding parallel
