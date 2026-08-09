@@ -1186,7 +1186,10 @@ async def handle_ws(
             # connection.
             try:
                 reaped_sessions, detached_sessions = await asyncio.to_thread(
-                    server._close_sessions_for_transport,
+                    server._bind_owner_runtime_callback(
+                        server._close_sessions_for_transport,
+                        runtime,
+                    ),
                     transport,
                     end_reason="ws_disconnect",
                 )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import threading
 
@@ -112,9 +113,18 @@ class _CollaborationTransport(_Transport):
         return True
 
 
-def _call(runtime: server.OwnerWorkerGatewayRuntime, method: str, params: dict | None = None):
+def _call(
+    runtime: server.OwnerWorkerGatewayRuntime,
+    method: str,
+    params: dict | None = None,
+    *,
+    transport=None,
+):
+    request = {"id": "request", "method": method, "params": params or {}}
+    if transport is not None:
+        return server.dispatch(request, transport=transport, runtime=runtime)
     with server.owner_worker_gateway_runtime(runtime):
-        return server.handle_request({"id": "request", "method": method, "params": params or {}})
+        return server.handle_request(request)
 
 
 def _dispatch(runtime: server.OwnerWorkerGatewayRuntime, method: str, params: dict, *, purpose: str):
@@ -649,6 +659,187 @@ def test_owner_worker_resume_preserves_retained_stored_source(owner_gateway, mon
     assert "error" not in response
     live_id = response["result"]["session_id"]
     assert runtime.mutable_state.sessions[live_id]["source"] == "feishu"
+
+
+def test_queued_prompt_retains_owner_runtime_for_approval(
+    owner_gateway, monkeypatch
+):
+    from hermes_cli.controlled_roots import RootKind
+    from tools import approval
+
+    _db, runtime, _workspace_root = owner_gateway
+    transport = _CollaborationTransport()
+    first_started = threading.Event()
+    release_first = threading.Event()
+    approval_requested = threading.Event()
+    protected = {"exists": True}
+
+    class _Agent:
+        model = "test-model"
+        provider = "test-provider"
+        session_id = "stored-a"
+
+        def clear_interrupt(self):
+            return None
+
+        def interrupt(self):
+            return None
+
+        def run_conversation(self, message, **_kwargs):
+            if message == "safe":
+                first_started.set()
+                assert release_first.wait(timeout=2)
+                text = "safe complete"
+            else:
+                decision = approval.check_all_command_guards(
+                    "rm -r /workspace/protected",
+                    "local",
+                )
+                if decision.get("approved"):
+                    protected["exists"] = False
+                    text = "unsafe"
+                else:
+                    text = decision.get("message") or "denied"
+            return {
+                "final_response": text,
+                "messages": [{"role": "assistant", "content": text}],
+            }
+
+    agent = _Agent()
+    session = {
+        "agent": agent,
+        "agent_ready": threading.Event(),
+        "session_key": "stored-a",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "inflight_turn": None,
+        "running": False,
+        "attached_images": [],
+        "pending_attachments": [],
+        "cwd": str(
+            runtime.filesystem_context.roots.get(RootKind.WORKSPACE).canonical_path
+            / runtime.filesystem_context.workspace_prefix
+        ),
+        "cols": 80,
+        "transport": transport,
+        "source": "dashboard-gui",
+    }
+    session["agent_ready"].set()
+    runtime.mutable_state.sessions["live-a"] = session
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_args: None)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *_args: None)
+    monkeypatch.setattr(server, "_complete_prompt_turn_receipt", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    monkeypatch.setattr(server, "_get_usage", lambda *_args: {})
+    monkeypatch.setattr(server, "render_message", lambda *_args: "")
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(server, "_voice_tts_enabled", lambda: False)
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry.drain_notifications",
+        lambda: [],
+    )
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+    monkeypatch.setattr(approval, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(
+        "tools.tirith_security.check_command_security",
+        lambda _command: {"action": "allow", "findings": [], "summary": ""},
+    )
+
+    def notify(data):
+        server._emit_approval_request("live-a", data)
+        approval_requested.set()
+
+    approval.register_gateway_notify("stored-a", notify)
+    try:
+        first = _call(
+            runtime,
+            "prompt.submit",
+            {"session_id": "live-a", "text": "safe"},
+            transport=transport,
+        )
+        assert first["result"] == {"status": "streaming"}
+        assert first_started.wait(timeout=2)
+
+        second = _call(
+            runtime,
+            "prompt.submit",
+            {"session_id": "live-a", "text": "approval-deny"},
+            transport=transport,
+        )
+        assert second["result"] == {"status": "queued"}
+        release_first.set()
+
+        assert approval_requested.wait(timeout=2)
+        approval_response = _call(
+            runtime,
+            "approval.respond",
+            {"session_id": "live-a", "choice": "deny"},
+            transport=transport,
+        )
+        assert approval_response["result"] == {"resolved": 1}
+        session["_run_thread"].join(timeout=2)
+        assert not session["_run_thread"].is_alive()
+    finally:
+        release_first.set()
+        approval.resolve_gateway_approval("stored-a", "deny", resolve_all=True)
+        approval.unregister_gateway_notify("stored-a")
+        runtime.mutable_state.sessions.pop("live-a", None)
+
+    events = [frame["params"] for frame in transport.frames if frame.get("method") == "event"]
+    approval_events = [event for event in events if event.get("type") == "approval.request"]
+    assert len(approval_events) == 1
+    assert approval_events[0]["session_id"] == "live-a"
+    assert protected == {"exists": True}
+    completed = [event["payload"] for event in events if event.get("type") == "message.complete"]
+    assert completed[-1]["status"] == "complete"
+    assert "denied" in completed[-1]["text"].lower()
+
+
+def test_websocket_teardown_binds_owner_runtime(owner_gateway, monkeypatch):
+    from tui_gateway import ws as gateway_ws
+
+    _db, runtime, _workspace_root = owner_gateway
+    observed = []
+
+    class _WebSocket:
+        query_params = {}
+        claims = None
+        scope = {}
+
+        async def accept(self):
+            return None
+
+        async def send_text(self, _value):
+            return None
+
+        async def receive_text(self):
+            raise gateway_ws._WebSocketDisconnect(code=1000)
+
+        async def close(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr(
+        "hermes_cli.mcp_startup.start_background_mcp_discovery",
+        lambda **_kwargs: None,
+    )
+
+    def close_sessions(_transport, *, end_reason):
+        observed.append(
+            (
+                server.current_owner_worker_gateway_runtime(),
+                end_reason,
+            )
+        )
+        return 0, 0
+
+    monkeypatch.setattr(server, "_close_sessions_for_transport", close_sessions)
+
+    asyncio.run(gateway_ws.handle_ws(_WebSocket(), runtime=runtime))
+
+    assert observed == [(runtime, "ws_disconnect")]
 
 
 def test_collaboration_runner_rebuilds_from_matching_persisted_policy(

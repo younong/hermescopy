@@ -10538,7 +10538,6 @@ def _run_prompt_submit(
     runtime = current_owner_worker_gateway_runtime()
 
     def run():
-        runtime_token = _gateway_runtime.set(runtime)
         approval_token = None
         session_tokens = []
         goal_followup = None  # set by the post-turn goal hook below
@@ -10975,16 +10974,13 @@ def _run_prompt_submit(
             except Exception:
                 pass
             _clear_session_context(session_tokens)
-            try:
-                with session["history_lock"]:
-                    owns_turn = session.get("_active_turn_generation") == generation
-                    if owns_turn:
-                        session["running"] = False
-                        session["last_active"] = time.time()
-                        _clear_inflight_turn(session, generation)
-                _emit("session.info", sid, _session_info(agent, session))
-            finally:
-                _gateway_runtime.reset(runtime_token)
+            with session["history_lock"]:
+                owns_turn = session.get("_active_turn_generation") == generation
+                if owns_turn:
+                    session["running"] = False
+                    session["last_active"] = time.time()
+                    _clear_inflight_turn(session, generation)
+            _emit("session.info", sid, _session_info(agent, session))
 
         if not owns_turn:
             return
@@ -11074,7 +11070,10 @@ def _run_prompt_submit(
                 file=sys.stderr,
             )
 
-    run_thread = threading.Thread(target=run, daemon=True)
+    run_thread = threading.Thread(
+        target=_bind_owner_runtime_callback(run, runtime),
+        daemon=True,
+    )
     session["_run_thread"] = run_thread
     run_thread.start()
 
