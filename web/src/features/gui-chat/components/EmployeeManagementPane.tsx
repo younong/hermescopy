@@ -35,10 +35,23 @@ interface BindingDraft {
 }
 
 const LIFECYCLE_LABELS: Record<EmployeeLifecycleStatus, string> = {
-  active: "Active",
-  revoked: "Revoked",
-  suspended: "Suspended",
+  active: "启用",
+  revoked: "已撤销",
+  suspended: "已暂停",
 };
+
+const BINDING_RUNTIME_LABELS: Record<string, string> = {
+  connected: "已连接",
+  connecting: "连接中",
+  error: "异常",
+  failed: "失败",
+  running: "运行中",
+  stopped: "已停止",
+};
+
+function bindingRuntimeLabel(runtimeState: string) {
+  return BINDING_RUNTIME_LABELS[runtimeState.toLowerCase()] ?? "状态未知";
+}
 
 function allToolsets(catalog: EmployeeCatalog | null) {
   return catalog?.toolsets.map((item) => item.name) ?? [];
@@ -107,7 +120,7 @@ export function EmployeeManagementPane() {
 
   useEffect(() => {
     void Promise.all([refreshEmployees(), api.getEmployeeCatalog().then(setCatalog)])
-      .catch((error: unknown) => showToast(`Could not load employees: ${String(error)}`, "error"))
+      .catch((error: unknown) => showToast(`无法加载员工：${String(error)}`, "error"))
       .finally(() => setLoading(false));
   }, [refreshEmployees, showToast]);
 
@@ -143,7 +156,7 @@ export function EmployeeManagementPane() {
     if (!editor) return;
     const policy = employeeDraft.policy;
     if (!policy.name?.trim() || !policy.model_registration_id || !policy.system_prompt.trim()) {
-      showToast("Enter a name, select a model, and add a system prompt.", "error");
+      showToast("请输入名称、选择模型并填写系统提示词。", "error");
       return;
     }
     setBusy("employee:save");
@@ -163,11 +176,11 @@ export function EmployeeManagementPane() {
       ) {
         await api.deleteEmployeeAvatar(saved.employee_id);
       }
-      showToast(editor.mode === "create" ? "Employee created" : "Employee profile saved", "success");
+      showToast(editor.mode === "create" ? "员工已创建" : "员工资料已保存", "success");
       closeEditor();
       await refreshEmployees();
     } catch (error) {
-      showToast(`Could not save employee: ${String(error)}`, "error");
+      showToast(`无法保存员工：${String(error)}`, "error");
     } finally {
       setBusy(null);
     }
@@ -175,14 +188,14 @@ export function EmployeeManagementPane() {
 
   const saveBinding = async () => {
     if (!bindingEditor || !bindingDraft.appSecret) {
-      showToast("App Secret is required.", "error");
+      showToast("请输入应用密钥。", "error");
       return;
     }
     setBusy("binding:save");
     try {
       const { employee, mode } = bindingEditor;
       if (mode === "create") {
-        if (!bindingDraft.appId.trim()) throw new Error("App ID is required");
+        if (!bindingDraft.appId.trim()) throw new Error("请输入应用标识");
         await api.createEmployeeFeishuBinding(employee.employee_id, {
           activate: true,
           app_id: bindingDraft.appId.trim(),
@@ -193,7 +206,7 @@ export function EmployeeManagementPane() {
         });
       } else {
         const binding = employee.channels.feishu;
-        if (!binding) throw new Error("Feishu binding is no longer available");
+        if (!binding) throw new Error("飞书或 Lark 绑定已不可用");
         await api.updateEmployeeFeishuBinding(employee.employee_id, {
           app_secret: bindingDraft.appSecret,
           encrypt_key: bindingDraft.encryptKey || undefined,
@@ -201,11 +214,11 @@ export function EmployeeManagementPane() {
           verification_token: bindingDraft.verificationToken || undefined,
         });
       }
-      showToast(mode === "create" ? "Feishu / Lark connected" : "Binding credentials updated", "success");
+      showToast(mode === "create" ? "飞书 / Lark 已连接" : "绑定凭据已更新", "success");
       closeBindingEditor();
       await refreshEmployees();
     } catch (error) {
-      showToast(`Could not save binding: ${String(error)}`, "error");
+      showToast(`无法保存绑定：${String(error)}`, "error");
     } finally {
       setBusy(null);
     }
@@ -216,10 +229,10 @@ export function EmployeeManagementPane() {
     setBusy(`${employee.employee_id}:collaboration`);
     try {
       await api.updateEmployeeCollaborationPolicy(employee.employee_id, draft);
-      showToast("Collaboration policy saved", "success");
+      showToast("协作权限已保存", "success");
       await refreshEmployees();
     } catch (error) {
-      showToast(`Could not save collaboration policy: ${String(error)}`, "error");
+      showToast(`无法保存协作权限：${String(error)}`, "error");
     } finally {
       setBusy(null);
     }
@@ -233,14 +246,14 @@ export function EmployeeManagementPane() {
     try {
       if (action === "rollover") {
         const result = await api.rolloverEmployeeSessions(employee.employee_id);
-        showToast(`${result.retired_sessions} conversation session(s) rolled over`, "success");
+        showToast(`已更新 ${result.retired_sessions} 个对话会话`, "success");
       } else {
         await api.updateEmployeeLifecycle(employee.employee_id, action);
-        showToast(`Employee ${action}`, "success");
+        showToast(`员工状态已更新为“${LIFECYCLE_LABELS[action]}”`, "success");
       }
       await refreshEmployees();
     } catch (error) {
-      showToast(`Employee action failed: ${String(error)}`, "error");
+      showToast(`员工操作失败：${String(error)}`, "error");
     } finally {
       setBusy(null);
     }
@@ -255,16 +268,16 @@ export function EmployeeManagementPane() {
       if (action === "test") {
         const result = await api.testEmployeeFeishuBinding(employee.employee_id);
         showToast(
-          result.ok ? `Connected${result.bot_name ? ` as ${result.bot_name}` : ""}` : "Connection test failed",
+          result.ok ? `连接成功${result.bot_name ? `：${result.bot_name}` : ""}` : "连接测试失败",
           result.ok ? "success" : "error",
         );
       } else {
         await api.updateEmployeeFeishuBindingLifecycle(employee.employee_id, action);
-        showToast(`Feishu / Lark binding ${action}`, "success");
+        showToast(`飞书 / Lark 绑定状态已更新为“${LIFECYCLE_LABELS[action]}”`, "success");
       }
       await refreshEmployees();
     } catch (error) {
-      showToast(`Binding action failed: ${String(error)}`, "error");
+      showToast(`绑定操作失败：${String(error)}`, "error");
     } finally {
       setBusy(null);
     }
@@ -279,20 +292,20 @@ export function EmployeeManagementPane() {
       <Toast toast={toast} />
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h2 className="text-[15px] font-semibold text-[#25282d]">Employees</h2>
-          <p className="mt-1 text-xs text-[#777c84]">Create focused assistants for direct chats and collaboration.</p>
+          <h2 className="text-[15px] font-semibold text-[#25282d]">员工</h2>
+          <p className="mt-1 text-xs text-[#777c84]">创建专注的 AI 员工，用于直接对话和内部协作。</p>
         </div>
-        <Button className="gui-chat-workspace-primary-button" onClick={openCreate} size="sm" prefix={<Plus className="h-4 w-4" />}>Add employee</Button>
+        <Button className="gui-chat-workspace-primary-button" onClick={openCreate} size="sm" prefix={<Plus className="h-4 w-4" />}>添加员工</Button>
       </div>
 
       {employees.length === 0 ? (
         <div className="rounded-xl border border-dashed border-[#dfe2e7] px-5 py-10 text-center">
           <Bot className="mx-auto h-6 w-6 text-[#969aa1]" />
-          <p className="mt-2 text-sm font-medium">No employees yet</p>
-          <p className="mt-1 text-xs text-[#969aa1]">Add one without connecting a messaging channel.</p>
+          <p className="mt-2 text-sm font-medium">暂无员工</p>
+          <p className="mt-1 text-xs text-[#969aa1]">无需连接消息渠道即可添加员工。</p>
         </div>
       ) : (
-        <div className="space-y-3">
+        <ul aria-label="员工列表" className="divide-y divide-[#e8eaed] border-y border-[#e1e3e7]" role="list">
           {employees.map((employee) => (
             <EmployeeRow
               busy={busy}
@@ -310,16 +323,16 @@ export function EmployeeManagementPane() {
               onProfile={() => openProfile(employee)}
             />
           ))}
-        </div>
+        </ul>
       )}
 
       {editor ? (
-        <div aria-label={editor.mode === "create" ? "Add employee" : "Edit employee"} aria-modal="true" className="fixed inset-0 z-[100] flex items-center justify-center bg-black/35 p-4" ref={editorRef} role="dialog">
+        <div aria-label={editor.mode === "create" ? "添加员工" : "编辑员工"} aria-modal="true" className="fixed inset-0 z-[100] flex items-center justify-center bg-black/35 p-4" ref={editorRef} role="dialog">
           <div className="relative flex max-h-[92vh] w-full max-w-2xl flex-col rounded-xl border border-[#e1e3e7] bg-white shadow-2xl">
-            <button aria-label="Close" className="gui-chat-icon-button absolute right-3 top-3" onClick={closeEditor} type="button"><X /></button>
+            <button aria-label="关闭" className="gui-chat-icon-button absolute right-3 top-3" onClick={closeEditor} type="button"><X /></button>
             <div className="border-b border-[#ebecef] px-5 py-4">
-              <h3 className="text-[15px] font-semibold">{editor.mode === "create" ? "Add employee" : "Edit employee"}</h3>
-              <p className="mt-1 text-[11px] text-[#969aa1]">Profile updates apply to new sessions. Roll over existing sessions when you want them to use the latest revision.</p>
+              <h3 className="text-[15px] font-semibold">{editor.mode === "create" ? "添加员工" : "编辑员工"}</h3>
+              <p className="mt-1 text-[11px] text-[#969aa1]">资料更新仅应用于新会话。如需让现有会话使用最新版本，请更新会话。</p>
             </div>
             <div className="min-h-0 overflow-y-auto p-5">
               <PolicyEditor
@@ -331,8 +344,8 @@ export function EmployeeManagementPane() {
                 policy={employeeDraft.policy}
               />
               <div className="mt-5 flex justify-end gap-2">
-                <Button ghost onClick={closeEditor} size="sm">Cancel</Button>
-                <Button disabled={busy === "employee:save"} onClick={() => void saveEmployee()} size="sm">{busy === "employee:save" ? "Saving…" : "Save"}</Button>
+                <Button ghost onClick={closeEditor} size="sm">取消</Button>
+                <Button disabled={busy === "employee:save"} onClick={() => void saveEmployee()} size="sm">{busy === "employee:save" ? "保存中…" : "保存"}</Button>
               </div>
             </div>
           </div>
@@ -340,25 +353,25 @@ export function EmployeeManagementPane() {
       ) : null}
 
       {bindingEditor ? (
-        <div aria-label="Feishu / Lark binding" aria-modal="true" className="fixed inset-0 z-[100] flex items-center justify-center bg-black/35 p-4" ref={bindingEditorRef} role="dialog">
+        <div aria-label="飞书 / Lark 绑定" aria-modal="true" className="fixed inset-0 z-[100] flex items-center justify-center bg-black/35 p-4" ref={bindingEditorRef} role="dialog">
           <div className="relative w-full max-w-lg rounded-xl border border-[#e1e3e7] bg-white p-5 shadow-2xl">
-            <button aria-label="Close" className="gui-chat-icon-button absolute right-3 top-3" onClick={closeBindingEditor} type="button"><X /></button>
-            <h3 className="text-[15px] font-semibold">{bindingEditor.mode === "create" ? "Connect Feishu / Lark" : "Update Feishu / Lark credentials"}</h3>
-            <p className="mt-1 text-[11px] text-[#969aa1]">Optional. Hermes supports one Feishu or Lark app binding per employee.</p>
+            <button aria-label="关闭" className="gui-chat-icon-button absolute right-3 top-3" onClick={closeBindingEditor} type="button"><X /></button>
+            <h3 className="text-[15px] font-semibold">{bindingEditor.mode === "create" ? "连接飞书 / Lark" : "更新飞书 / Lark 凭据"}</h3>
+            <p className="mt-1 text-[11px] text-[#969aa1]">此项可选。每位员工最多绑定一个飞书或 Lark 应用。</p>
             <div className="mt-4 grid gap-3">
               {bindingEditor.mode === "create" ? (
                 <>
-                  <Field label="App ID"><Input value={bindingDraft.appId} onChange={(event) => setBindingDraft((current) => ({ ...current, appId: event.target.value }))} /></Field>
-                  <Field label="Domain"><select className="h-9 rounded-md border border-[#dfe2e7] bg-white px-3 text-sm" value={bindingDraft.domain} onChange={(event) => setBindingDraft((current) => ({ ...current, domain: event.target.value as "feishu" | "lark" }))}><option value="feishu">Feishu</option><option value="lark">Lark</option></select></Field>
+                  <Field label="应用标识"><Input value={bindingDraft.appId} onChange={(event) => setBindingDraft((current) => ({ ...current, appId: event.target.value }))} /></Field>
+                  <Field label="平台"><select className="h-9 rounded-md border border-[#dfe2e7] bg-white px-3 text-sm" value={bindingDraft.domain} onChange={(event) => setBindingDraft((current) => ({ ...current, domain: event.target.value as "feishu" | "lark" }))}><option value="feishu">飞书</option><option value="lark">Lark</option></select></Field>
                 </>
               ) : null}
-              <Field label={bindingEditor.mode === "create" ? "App Secret" : "New App Secret"}><Input type="password" value={bindingDraft.appSecret} onChange={(event) => setBindingDraft((current) => ({ ...current, appSecret: event.target.value }))} /></Field>
-              <Field label="Encrypt Key (optional)"><Input type="password" value={bindingDraft.encryptKey} onChange={(event) => setBindingDraft((current) => ({ ...current, encryptKey: event.target.value }))} /></Field>
-              <Field label="Verification Token (optional)"><Input type="password" value={bindingDraft.verificationToken} onChange={(event) => setBindingDraft((current) => ({ ...current, verificationToken: event.target.value }))} /></Field>
+              <Field label={bindingEditor.mode === "create" ? "应用密钥" : "新应用密钥"}><Input type="password" value={bindingDraft.appSecret} onChange={(event) => setBindingDraft((current) => ({ ...current, appSecret: event.target.value }))} /></Field>
+              <Field label="加密密钥（可选）"><Input type="password" value={bindingDraft.encryptKey} onChange={(event) => setBindingDraft((current) => ({ ...current, encryptKey: event.target.value }))} /></Field>
+              <Field label="验证令牌（可选）"><Input type="password" value={bindingDraft.verificationToken} onChange={(event) => setBindingDraft((current) => ({ ...current, verificationToken: event.target.value }))} /></Field>
             </div>
             <div className="mt-5 flex justify-end gap-2">
-              <Button ghost onClick={closeBindingEditor} size="sm">Cancel</Button>
-              <Button disabled={busy === "binding:save"} onClick={() => void saveBinding()} size="sm">{busy === "binding:save" ? "Saving…" : "Save"}</Button>
+              <Button ghost onClick={closeBindingEditor} size="sm">取消</Button>
+              <Button disabled={busy === "binding:save"} onClick={() => void saveBinding()} size="sm">{busy === "binding:save" ? "保存中…" : "保存"}</Button>
             </div>
           </div>
         </div>
@@ -388,23 +401,23 @@ function PolicyEditor({
 }) {
   return (
     <div className="grid gap-4">
-      <Field label="Avatar">
+      <Field label="头像">
         <div className="flex items-center gap-3">
           <EmployeeAvatar employee={{ avatar_url: avatarPreview, profile: policy }} large />
           <div className="flex gap-2">
-            <label className="inline-flex h-8 cursor-pointer items-center rounded-md border border-[#dfe2e7] px-3 text-xs hover:bg-[#f6f7f9]"><input accept="image/jpeg,image/png,image/webp" className="hidden" onChange={(event) => { const file = event.currentTarget.files?.[0]; if (file) onAvatarChange(file); event.currentTarget.value = ""; }} type="file" />Choose image</label>
-            {avatarPreview ? <Button ghost onClick={onAvatarRemove} size="sm">Remove</Button> : null}
+            <label className="inline-flex h-8 cursor-pointer items-center rounded-md border border-[#dfe2e7] px-3 text-xs hover:bg-[#f6f7f9]"><input accept="image/jpeg,image/png,image/webp" className="hidden" onChange={(event) => { const file = event.currentTarget.files?.[0]; if (file) onAvatarChange(file); event.currentTarget.value = ""; }} type="file" />选择图片</label>
+            {avatarPreview ? <Button ghost onClick={onAvatarRemove} size="sm">移除</Button> : null}
           </div>
         </div>
       </Field>
       <div className="grid gap-3 sm:grid-cols-2">
-        <Field label="Name"><Input value={policy.name ?? ""} onChange={(event) => onChange({ ...policy, name: event.target.value })} /></Field>
-        <Field label="Role"><Input value={policy.role ?? ""} onChange={(event) => onChange({ ...policy, role: event.target.value })} /></Field>
+        <Field label="名称"><Input value={policy.name ?? ""} onChange={(event) => onChange({ ...policy, name: event.target.value })} /></Field>
+        <Field label="角色"><Input value={policy.role ?? ""} onChange={(event) => onChange({ ...policy, role: event.target.value })} /></Field>
       </div>
-      <Field label="Model registration"><select className="h-9 rounded-md border border-[#dfe2e7] bg-white px-3 text-sm" value={policy.model_registration_id} onChange={(event) => onChange({ ...policy, model_registration_id: event.target.value })}><option value="">Select a model</option>{catalog?.model_registrations.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field>
-      <Field label="System prompt"><textarea className="min-h-28 rounded-md border border-[#dfe2e7] bg-white p-3 text-sm" value={policy.system_prompt} onChange={(event) => onChange({ ...policy, system_prompt: event.target.value })} /></Field>
-      <Field label="Skills"><NameCheckboxPicker available={catalog?.skills ?? []} emptyLabel="No skills available." id="employee-skills" onChange={(skills) => onChange({ ...policy, skills })} selected={policy.skills} /></Field>
-      <Field label="Max iterations"><Input min={1} onChange={(event) => onChange({ ...policy, max_iterations: Number(event.target.value) || 1 })} type="number" value={policy.max_iterations} /></Field>
+      <Field label="模型"><select className="h-9 rounded-md border border-[#dfe2e7] bg-white px-3 text-sm" value={policy.model_registration_id} onChange={(event) => onChange({ ...policy, model_registration_id: event.target.value })}><option value="">选择模型</option>{catalog?.model_registrations.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field>
+      <Field label="系统提示词"><textarea className="min-h-28 rounded-md border border-[#dfe2e7] bg-white p-3 text-sm" value={policy.system_prompt} onChange={(event) => onChange({ ...policy, system_prompt: event.target.value })} /></Field>
+      <Field label="技能"><NameCheckboxPicker available={catalog?.skills ?? []} emptyLabel="暂无可用技能。" id="employee-skills" onChange={(skills) => onChange({ ...policy, skills })} selected={policy.skills} /></Field>
+      <Field label="最大迭代次数"><Input min={1} onChange={(event) => onChange({ ...policy, max_iterations: Number(event.target.value) || 1 })} type="number" value={policy.max_iterations} /></Field>
     </div>
   );
 }
@@ -434,37 +447,37 @@ function EmployeeRow({
   const disabled = busy?.startsWith(`${employee.employee_id}:`) ?? false;
   const unlimited = collaborationPolicy.invite_quota === null;
   return (
-    <article className="rounded-xl border border-[#e1e3e7] bg-white p-4">
+    <li className="py-4" role="listitem">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="flex min-w-0 items-center gap-3">
           <EmployeeAvatar employee={employee} />
           <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-2"><h3 className="truncate text-sm font-semibold">{employee.profile?.name || "Unnamed employee"}</h3><StatusPill status={employee.lifecycle_status} /></div>
-            <p className="truncate text-[11px] text-[#969aa1]">{employee.profile?.role || "AI employee"} · profile r{employee.profile_revision ?? "—"}</p>
+            <div className="flex flex-wrap items-center gap-2"><h3 className="truncate text-sm font-semibold">{employee.profile?.name || "未命名员工"}</h3><StatusPill status={employee.lifecycle_status} /></div>
+            <p className="truncate text-[11px] text-[#969aa1]">{employee.profile?.role || "AI 员工"} · 资料版本 {employee.profile_revision ?? "—"}</p>
           </div>
         </div>
         <div className="flex flex-wrap gap-1.5">
-          <Button disabled={disabled || employee.lifecycle_status === "revoked"} ghost onClick={onProfile} size="sm">Edit profile</Button>
-          <Button disabled={disabled || employee.lifecycle_status !== "active"} ghost onClick={() => onEmployeeAction("rollover")} size="sm">Roll over sessions</Button>
-          {employee.lifecycle_status === "active" ? <Button disabled={disabled} ghost onClick={() => onEmployeeAction("suspended")} size="sm">Suspend</Button> : employee.lifecycle_status === "suspended" ? <Button disabled={disabled} ghost onClick={() => onEmployeeAction("active")} size="sm">Resume</Button> : null}
-          <Button disabled={disabled || employee.lifecycle_status === "revoked"} ghost onClick={() => onEmployeeAction("revoked")} size="sm">Revoke</Button>
+          <Button disabled={disabled || employee.lifecycle_status === "revoked"} ghost onClick={onProfile} size="sm">编辑资料</Button>
+          <Button disabled={disabled || employee.lifecycle_status !== "active"} ghost onClick={() => onEmployeeAction("rollover")} size="sm">更新会话</Button>
+          {employee.lifecycle_status === "active" ? <Button disabled={disabled} ghost onClick={() => onEmployeeAction("suspended")} size="sm">暂停</Button> : employee.lifecycle_status === "suspended" ? <Button disabled={disabled} ghost onClick={() => onEmployeeAction("active")} size="sm">恢复</Button> : null}
+          <Button disabled={disabled || employee.lifecycle_status === "revoked"} ghost onClick={() => onEmployeeAction("revoked")} size="sm">撤销</Button>
         </div>
       </div>
 
-      <div className="mt-4 grid gap-3 rounded-lg bg-[#f8f9fa] p-3 sm:grid-cols-2">
-        <label className="flex items-center justify-between gap-3 text-xs"><span><span className="block font-medium">May participate</span><span className="text-[#969aa1]">Can join internal groups</span></span><Switch checked={collaborationPolicy.may_participate} className="gui-chat-skill-switch" onCheckedChange={(checked) => onCollaborationChange({ ...collaborationPolicy, may_participate: checked })} /></label>
-        <label className="flex items-center justify-between gap-3 text-xs"><span><span className="block font-medium">May create groups</span><span className="text-[#969aa1]">Can invite other employees</span></span><Switch checked={collaborationPolicy.may_create_groups} className="gui-chat-skill-switch" onCheckedChange={(checked) => onCollaborationChange({ ...collaborationPolicy, may_create_groups: checked })} /></label>
-        <Field label="Invite quota"><Input aria-label={`Invite quota for ${employee.profile?.name || employee.employee_id}`} disabled={unlimited} min={0} onChange={(event) => onCollaborationChange({ ...collaborationPolicy, invite_quota: Math.max(0, Number(event.target.value) || 0) })} type="number" value={collaborationPolicy.invite_quota ?? ""} /></Field>
-        <div className="flex items-end justify-between gap-3"><label className="flex items-center gap-2 pb-2 text-xs"><input checked={unlimited} onChange={(event) => onCollaborationChange({ ...collaborationPolicy, invite_quota: event.target.checked ? null : 5 })} type="checkbox" />Unlimited</label><Button disabled={disabled} onClick={onCollaborationSave} size="sm">{busy === `${employee.employee_id}:collaboration` ? "Saving…" : "Save policy"}</Button></div>
+      <div className="mt-4 grid gap-3 border-l-2 border-[#e8eaed] pl-3 sm:grid-cols-2">
+        <label className="flex items-center justify-between gap-3 text-xs"><span><span className="block font-medium">允许参与协作</span><span className="text-[#969aa1]">可加入内部群组</span></span><Switch checked={collaborationPolicy.may_participate} className="gui-chat-skill-switch" onCheckedChange={(checked) => onCollaborationChange({ ...collaborationPolicy, may_participate: checked })} /></label>
+        <label className="flex items-center justify-between gap-3 text-xs"><span><span className="block font-medium">允许创建群组</span><span className="text-[#969aa1]">可邀请其他员工</span></span><Switch checked={collaborationPolicy.may_create_groups} className="gui-chat-skill-switch" onCheckedChange={(checked) => onCollaborationChange({ ...collaborationPolicy, may_create_groups: checked })} /></label>
+        <Field label="邀请名额"><Input aria-label={`${employee.profile?.name || employee.employee_id}的邀请名额`} disabled={unlimited} min={0} onChange={(event) => onCollaborationChange({ ...collaborationPolicy, invite_quota: Math.max(0, Number(event.target.value) || 0) })} type="number" value={collaborationPolicy.invite_quota ?? ""} /></Field>
+        <div className="flex items-end justify-between gap-3"><label className="flex items-center gap-2 pb-2 text-xs"><input checked={unlimited} onChange={(event) => onCollaborationChange({ ...collaborationPolicy, invite_quota: event.target.checked ? null : 5 })} type="checkbox" />不限制</label><Button disabled={disabled} onClick={onCollaborationSave} size="sm">{busy === `${employee.employee_id}:collaboration` ? "保存中…" : "保存权限"}</Button></div>
       </div>
 
       <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-[#ebecef] pt-3">
-        <div className="flex items-center gap-2 text-xs"><Link2 className="h-3.5 w-3.5 text-[#777c84]" /><span className="font-medium">Feishu / Lark</span>{binding ? <><StatusPill status={binding.lifecycle_status} /><span className="text-[#969aa1]">{binding.runtime_state}</span></> : <span className="text-[#969aa1]">Not connected</span>}</div>
+        <div className="flex items-center gap-2 text-xs"><Link2 className="h-3.5 w-3.5 text-[#777c84]" /><span className="font-medium">飞书 / Lark</span>{binding ? <><StatusPill status={binding.lifecycle_status} /><span className="text-[#969aa1]">{bindingRuntimeLabel(binding.runtime_state)}</span></> : <span className="text-[#969aa1]">未连接</span>}</div>
         <div className="flex flex-wrap gap-1.5">
-          {binding ? <><Button disabled={disabled || binding.lifecycle_status === "revoked"} ghost onClick={() => onBindingAction("test")} size="sm">Test</Button><Button disabled={disabled || binding.lifecycle_status === "revoked"} ghost onClick={onBinding} size="sm">Update credentials</Button>{binding.lifecycle_status === "active" ? <Button disabled={disabled} ghost onClick={() => onBindingAction("suspended")} size="sm">Suspend binding</Button> : binding.lifecycle_status === "suspended" ? <Button disabled={disabled} ghost onClick={() => onBindingAction("active")} size="sm">Resume binding</Button> : null}<Button disabled={disabled || binding.lifecycle_status === "revoked"} ghost onClick={() => onBindingAction("revoked")} size="sm">Revoke binding</Button></> : <Button disabled={employee.lifecycle_status === "revoked"} ghost onClick={onBinding} size="sm">Connect</Button>}
+          {binding ? <><Button disabled={disabled || binding.lifecycle_status === "revoked"} ghost onClick={() => onBindingAction("test")} size="sm">测试连接</Button><Button disabled={disabled || binding.lifecycle_status === "revoked"} ghost onClick={onBinding} size="sm">更新凭据</Button>{binding.lifecycle_status === "active" ? <Button disabled={disabled} ghost onClick={() => onBindingAction("suspended")} size="sm">暂停绑定</Button> : binding.lifecycle_status === "suspended" ? <Button disabled={disabled} ghost onClick={() => onBindingAction("active")} size="sm">恢复绑定</Button> : null}<Button disabled={disabled || binding.lifecycle_status === "revoked"} ghost onClick={() => onBindingAction("revoked")} size="sm">撤销绑定</Button></> : <Button disabled={employee.lifecycle_status === "revoked"} ghost onClick={onBinding} size="sm">连接</Button>}
         </div>
       </div>
-    </article>
+    </li>
   );
 }
 
