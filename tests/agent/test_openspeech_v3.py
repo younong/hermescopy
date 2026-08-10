@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import ssl
 import struct
 from pathlib import Path
 from unittest.mock import patch
@@ -80,6 +81,8 @@ def test_transcription_uses_plan_headers_and_extracts_result(tmp_path, monkeypat
         "volc.seedasr.sauc.duration"
     )
     assert connect.kwargs["additional_headers"]["X-Api-Sequence"] == "-1"
+    # WSS verification goes through an explicit certifi-backed context.
+    assert isinstance(connect.kwargs["ssl"], ssl.SSLContext)
     request = parse_frame(websocket.sent[0])
     assert request.message_type == FULL_CLIENT_REQUEST
     body = json.loads(request.payload)
