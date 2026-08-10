@@ -30,6 +30,7 @@ from hermes_cli.owner_worker.executor_identity import (
     default_executor_resource_decision,
 )
 from hermes_cli.owner_worker.executor_tokens import AUD_PROCESS_REGISTRY, ExecutorCapabilityInvalid
+from hermes_cli.owner_worker.resource_broker import ResourceBrokerError, ResourceBrokerReason
 from hermes_cli.owner_worker.tool_executor_supervisor import (
     ExecutorCleanupFailed,
     ExecutorDeadlineExceeded,
@@ -248,7 +249,7 @@ def _supervisor(
         sandbox_syscall_filter_source=_syscall_filter,
         egress_policy=egress_policy,
         audit_reporter=audit_reporter,
-        image_dispatcher=image_dispatcher,
+        media_dispatcher=image_dispatcher,
         resource_controller=resource_controller,
         clock=clock,
         **kwargs,
@@ -291,6 +292,37 @@ def _successful_factory(*, result="ok", keep_response_open=False, extra=b""):
         return _FakeProcess()
 
     return factory
+
+
+@pytest.mark.parametrize(
+    ("reason", "message"),
+    [
+        (ResourceBrokerReason.ADMISSION_REJECTED, "admission was rejected"),
+        (ResourceBrokerReason.CGROUP_UNAVAILABLE, "cgroup is unavailable"),
+        (ResourceBrokerReason.LEASE_INACTIVE, "worker lease is not active"),
+        (ResourceBrokerReason.BROKER_UNAVAILABLE, "broker is unavailable"),
+    ],
+)
+def test_resource_broker_reason_is_preserved_without_raw_error(tmp_path, reason, message):
+    events = []
+    controller = _ResourceController(events)
+    controller.reserve_error = ResourceBrokerError(
+        "mock private path /tmp/secret", reason=reason,
+    )
+    spawned = []
+    roots, supervisor = _supervisor(
+        tmp_path, lambda *args, **kwargs: spawned.append((args, kwargs)),
+        resource_controller=controller,
+    )
+    try:
+        with pytest.raises(ExecutorResourceRejected, match=message) as raised:
+            _dispatch(supervisor)
+        assert "secret" not in str(raised.value)
+        assert not (supervisor.owner_home / "runtime").exists()
+    finally:
+        roots.close()
+    assert events == [("reserve",)]
+    assert spawned == []
 
 
 def test_resource_capacity_is_reserved_before_runtime_workspace_or_spawn(tmp_path):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from pathlib import Path
 import threading
 
 import pytest
@@ -133,6 +134,62 @@ def _dispatch(runtime: server.OwnerWorkerGatewayRuntime, method: str, params: di
         transport=_Transport(purpose),
         runtime=runtime,
     )
+
+
+def test_authenticated_image_attach_materializes_durable_upload(owner_gateway, monkeypatch):
+    from hermes_cli.controlled_roots import RootKind
+
+    _db, runtime, workspace_root = owner_gateway
+    source = Path(workspace_root) / "default" / "incoming.png"
+    payload = b"\x89PNG\r\n\x1a\nvalid-test-image"
+    runtime.filesystem_context.roots.replace_bytes(
+        RootKind.WORKSPACE, "default/incoming.png", payload
+    )
+    session = {"attached_images": [], "pending_attachments": []}
+    monkeypatch.setenv("TERMINAL_CWD", str(Path(workspace_root) / "default"))
+    monkeypatch.setattr(server, "_sess", lambda _params, _rid: (session, None))
+
+    with server.owner_worker_gateway_runtime(runtime):
+        response = server._methods["image.attach"](
+            "request", {"path": str(source)}
+        )
+
+    assert "error" not in response
+    assert response["result"]["path"] == "uploads/incoming.png"
+    assert session["attached_images"] == [
+        str(Path(workspace_root) / "default" / "uploads" / "incoming.png")
+    ]
+    assert Path(session["attached_images"][0]).read_bytes() == payload
+    assert session["pending_attachments"][0]["path"] == session["attached_images"][0]
+
+
+def test_authenticated_image_attach_rejects_stale_workspace_path(owner_gateway, monkeypatch):
+    _db, runtime, workspace_root = owner_gateway
+    session = {"attached_images": [], "pending_attachments": []}
+    stale = Path(workspace_root) / "default" / "old" / "missing.png"
+    monkeypatch.setenv("TERMINAL_CWD", str(Path(workspace_root) / "default"))
+    monkeypatch.setattr(server, "_sess", lambda _params, _rid: (session, None))
+
+    with server.owner_worker_gateway_runtime(runtime):
+        response = server._methods["image.attach"](
+            "request", {"path": str(stale)}
+        )
+
+    assert response["error"] == {
+        "code": 4016,
+        "message": "authenticated image is unavailable",
+    }
+    assert str(stale) not in str(response)
+    assert session["attached_images"] == []
+
+
+def test_attachment_ref_rejects_external_path_in_non_authenticated_mode(monkeypatch, tmp_path):
+    session = {"cwd": str(tmp_path)}
+    target = tmp_path.parent / "outside.txt"
+    monkeypatch.setattr(server, "_authenticated_workspace_context", lambda: None)
+
+    with pytest.raises(ValueError, match="attachment path is unavailable"):
+        server._attachment_ref_path(session, target)
 
 
 def test_owner_worker_create_rejects_legacy_source_before_live_registration(owner_gateway):

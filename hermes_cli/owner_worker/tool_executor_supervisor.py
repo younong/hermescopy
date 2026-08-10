@@ -49,6 +49,8 @@ from hermes_cli.owner_worker.cgroup_v2 import CgroupResourceEvents
 from hermes_cli.owner_worker.resource_broker import (
     ExecutorResourceController,
     ExecutorResourceScope,
+    ResourceBrokerError,
+    ResourceBrokerReason,
 )
 from hermes_cli.owner_worker.owner_tool_relay import (
     OWNER_FILE_TOOL_NAMES,
@@ -755,6 +757,15 @@ class ToolExecutorSupervisor:
             raise ExecutorResourceRejected("executor resource controller is unavailable")
         try:
             resource_scope = self.resource_controller.reserve_executor(identity, invocation.invocation_id)
+        except ResourceBrokerError as exc:
+            messages = {
+                ResourceBrokerReason.ADMISSION_REJECTED: "executor resource admission was rejected",
+                ResourceBrokerReason.CGROUP_UNAVAILABLE: "executor resource cgroup is unavailable",
+                ResourceBrokerReason.LEASE_INACTIVE: "executor resource worker lease is not active",
+                ResourceBrokerReason.BROKER_UNAVAILABLE: "executor resource broker is unavailable",
+            }
+            message = messages.get(exc.reason, "executor resource admission was rejected")
+            raise ExecutorResourceRejected(message) from exc
         except Exception as exc:
             raise ExecutorResourceRejected("executor resource admission was rejected") from exc
         deadline = self._monotonic() + duration_seconds

@@ -7,6 +7,7 @@ never cgroup paths or raw owner identifiers.
 """
 from __future__ import annotations
 
+from enum import StrEnum
 import errno
 import json
 import os
@@ -23,7 +24,13 @@ from hermes_cli.dashboard_auth.authority import (
     OwnerWorkerAuthorityLease,
     WorkerLeaseState,
 )
-from hermes_cli.owner_worker.cgroup_v2 import CgroupResourceEvents, CgroupScopeLease
+from hermes_cli.owner_worker.cgroup_v2 import (
+    CgroupAdmissionRejected,
+    CgroupCleanupFailed,
+    CgroupResourceEvents,
+    CgroupScopeLease,
+    CgroupV2Unavailable,
+)
 from hermes_cli.owner_worker.executor_identity import ExecutorIdentity, ExecutorIdentityInvalid
 
 _MAX_FRAME_BYTES = 64 * 1024
@@ -31,8 +38,62 @@ _MAX_PIDS = 64
 _MAX_TEXT = 512
 
 
+class ResourceBrokerReason(StrEnum):
+    """Allowlisted, de-identified reasons that may cross the broker socket."""
+
+    ADMISSION_REJECTED = "admission_rejected"
+    CGROUP_UNAVAILABLE = "cgroup_unavailable"
+    LEASE_INACTIVE = "lease_inactive"
+    BROKER_UNAVAILABLE = "broker_unavailable"
+    REQUEST_REJECTED = "request_rejected"
+    INTERNAL_REJECTION = "internal_rejection"
+
+
+_RESOURCE_BROKER_REASONS = frozenset({
+    ResourceBrokerReason.ADMISSION_REJECTED,
+    ResourceBrokerReason.CGROUP_UNAVAILABLE,
+    ResourceBrokerReason.LEASE_INACTIVE,
+    ResourceBrokerReason.BROKER_UNAVAILABLE,
+    ResourceBrokerReason.REQUEST_REJECTED,
+    ResourceBrokerReason.INTERNAL_REJECTION,
+})
+
+
 class ResourceBrokerError(RuntimeError):
     """The private resource authority rejected or could not serve a request."""
+
+    def __init__(self, message: str, *, reason: str = ResourceBrokerReason.REQUEST_REJECTED) -> None:
+        if not isinstance(reason, str) or reason not in _RESOURCE_BROKER_REASONS:
+            reason = ResourceBrokerReason.INTERNAL_REJECTION
+        self.reason = reason
+        super().__init__(message)
+
+
+def _resource_broker_reason(exc: BaseException) -> str:
+    if isinstance(exc, ResourceBrokerError):
+        return exc.reason
+    if isinstance(exc, CgroupAdmissionRejected):
+        return ResourceBrokerReason.ADMISSION_REJECTED
+    if isinstance(exc, (CgroupV2Unavailable, CgroupCleanupFailed)):
+        return ResourceBrokerReason.CGROUP_UNAVAILABLE
+    return ResourceBrokerReason.INTERNAL_REJECTION
+
+
+def _resource_broker_error(reason: object) -> ResourceBrokerError:
+    messages = {
+        ResourceBrokerReason.ADMISSION_REJECTED: "resource executor admission was rejected",
+        ResourceBrokerReason.CGROUP_UNAVAILABLE: "resource cgroup is unavailable",
+        ResourceBrokerReason.LEASE_INACTIVE: "resource worker lease is not active",
+        ResourceBrokerReason.BROKER_UNAVAILABLE: "resource broker is unavailable",
+        ResourceBrokerReason.REQUEST_REJECTED: "resource request was rejected",
+        ResourceBrokerReason.INTERNAL_REJECTION: "resource request was rejected",
+    }
+    safe_reason = (
+        reason
+        if isinstance(reason, str) and reason in _RESOURCE_BROKER_REASONS
+        else ResourceBrokerReason.INTERNAL_REJECTION
+    )
+    return ResourceBrokerError(messages[safe_reason], reason=safe_reason)
 
 
 class ExecutorResourceScope(Protocol):
@@ -253,8 +314,12 @@ class DeploymentResourceBroker:
                         if peer.closed:
                             raise ResourceBrokerError("resource broker peer is unavailable")
                         response = self._handle_request(peer, request)
-                except Exception:
-                    response = {"ok": False, "error": "resource request rejected"}
+                except Exception as exc:
+                    response = {
+                        "ok": False,
+                        "error": "resource request rejected",
+                        "reason": _resource_broker_reason(exc),
+                    }
                 _send_frame(peer.connection, response)
         except (OSError, ResourceBrokerError):
             pass
@@ -275,7 +340,10 @@ class DeploymentResourceBroker:
                 peer.lease, states=frozenset({WorkerLeaseState.ACTIVE})
             )
         except AuthorizationRejected as exc:
-            raise ResourceBrokerError("resource worker lease is not active") from exc
+            raise ResourceBrokerError(
+                "resource worker lease is not active",
+                reason=ResourceBrokerReason.LEASE_INACTIVE,
+            ) from exc
 
     @staticmethod
     def _identity(lease: OwnerWorkerAuthorityLease, value: object) -> ExecutorIdentity:
@@ -430,7 +498,7 @@ class OwnerResourceBrokerClient:
         except OSError as exc:
             raise ResourceBrokerError("resource broker is unavailable") from exc
         if response.get("ok") is not True:
-            raise ResourceBrokerError("resource request was rejected")
+            raise _resource_broker_error(response.get("reason"))
         return response
 
     def reserve_executor(self, identity: ExecutorIdentity, invocation_id: str) -> "OwnerResourceScopeClient":
