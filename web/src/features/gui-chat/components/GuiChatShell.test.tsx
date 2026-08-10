@@ -360,6 +360,41 @@ describe("GuiChatShell", () => {
     expect(document.querySelector('[aria-label="Log out"]')).not.toBeNull();
   });
 
+  it("explains how to make an unavailable employee chat available", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(<GuiChatShell />);
+    const employeeChatButton = document.querySelector<HTMLButtonElement>(
+      '[aria-label="Start employee chat"]',
+    );
+
+    expect(employeeChatButton?.disabled).toBe(true);
+    expect(employeeChatButton?.getAttribute("aria-describedby")).toBe("employee-chat-notice");
+    expect(document.querySelector('[role="status"]')?.textContent).toContain(
+      "No available AI employees",
+    );
+    expect(document.querySelector('[role="status"]')?.textContent).toContain("员工管理");
+    expect(document.querySelector('[role="status"]')?.className).toContain("text-red-600");
+  });
+
+  it("explains when the employee list could not be loaded", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+    mocks.getFeishuEmployees.mockRejectedValue(new Error("Unavailable"));
+
+    await renderShell(<GuiChatShell />);
+
+    expect(
+      document.querySelector<HTMLButtonElement>('[aria-label="Start employee chat"]')?.disabled,
+    ).toBe(true);
+    expect(document.querySelector('[role="status"]')?.textContent).toContain(
+      "AI employees could not be loaded",
+    );
+  });
+
   it("starts a managed employee direct chat with only its account identifier", async () => {
     const connection = createConnection();
     mocks.getAuthMe.mockResolvedValue(authIdentity());
