@@ -370,16 +370,13 @@ describe("GuiChatShell", () => {
       '[aria-label="Start employee chat"]',
     );
 
-    expect(employeeChatButton?.disabled).toBe(false);
-    await act(async () => {
-      employeeChatButton?.click();
-      await Promise.resolve();
-    });
-
+    expect(employeeChatButton?.disabled).toBe(true);
+    expect(employeeChatButton?.getAttribute("aria-describedby")).toBe("employee-chat-notice");
     expect(document.querySelector('[role="status"]')?.textContent).toContain(
-      "No AI employees are available for chat",
+      "No available AI employees",
     );
     expect(document.querySelector('[role="status"]')?.textContent).toContain("员工管理");
+    expect(document.querySelector('[role="status"]')?.className).toContain("text-red-600");
   });
 
   it("explains when the employee list could not be loaded", async () => {
@@ -389,11 +386,10 @@ describe("GuiChatShell", () => {
     mocks.getFeishuEmployees.mockRejectedValue(new Error("Unavailable"));
 
     await renderShell(<GuiChatShell />);
-    await act(async () => {
-      document.querySelector<HTMLButtonElement>('[aria-label="Start employee chat"]')?.click();
-      await Promise.resolve();
-    });
 
+    expect(
+      document.querySelector<HTMLButtonElement>('[aria-label="Start employee chat"]')?.disabled,
+    ).toBe(true);
     expect(document.querySelector('[role="status"]')?.textContent).toContain(
       "AI employees could not be loaded",
     );

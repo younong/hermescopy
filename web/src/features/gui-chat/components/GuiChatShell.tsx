@@ -831,13 +831,12 @@ export function GuiChatShell() {
       && employee.collaboration_policy.may_participate,
   );
   const employeeChatNotice = employeeLoadStatus === "loading"
-    ? "AI employees are still loading. Please try again shortly."
+    ? "AI employees are loading."
     : employeeLoadStatus === "error"
-      ? "AI employees could not be loaded. Please refresh the page and try again."
+      ? "AI employees could not be loaded. Please refresh the page."
       : availableDirectEmployees.length === 0
-        ? "No AI employees are available for chat. Activate an employee, add its profile, and allow collaboration in 员工管理."
+        ? "No available AI employees. Please configure one in 员工管理."
         : null;
-  const toggleEmployeeChat = () => setEmployeeChatOpen((open) => !open);
   const handleLogout = () => {
     dashboardAuthTransition.reset();
     void api.logout();
@@ -866,21 +865,23 @@ export function GuiChatShell() {
           <span>New chat</span>
         </button>
         <button
+          aria-describedby={employeeChatNotice ? "employee-chat-notice" : undefined}
           aria-expanded={employeeChatOpen}
           aria-label="Start employee chat"
-          className="gui-chat-nav-item"
-          onClick={toggleEmployeeChat}
+          className="gui-chat-nav-item disabled:cursor-not-allowed disabled:opacity-45"
+          disabled={employeeChatNotice !== null}
+          onClick={() => setEmployeeChatOpen((open) => !open)}
           type="button"
         >
           <Bot />
           <span>Chat with employee</span>
         </button>
-        {employeeChatOpen && employeeChatNotice ? (
-          <div className="ml-6 border-l border-[#e4e6ea] px-3 py-2 text-xs leading-5 text-black/55" role="status">
+        {employeeChatNotice ? (
+          <p className="ml-6 px-3 pb-1 text-xs leading-5 text-red-600" id="employee-chat-notice" role="status">
             {employeeChatNotice}
-          </div>
+          </p>
         ) : null}
-        {employeeChatOpen && !employeeChatNotice ? (
+        {employeeChatOpen ? (
           <div className="ml-6 space-y-[3px] border-l border-[#e4e6ea] pl-2">
             {availableDirectEmployees.map((employee) => (
               <button
