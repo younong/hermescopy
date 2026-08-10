@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import ssl
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -34,6 +35,21 @@ def _safe_error(exc: BaseException, api_key: str = "") -> str:
     if api_key:
         message = message.replace(api_key, "«redacted-secret»")
     return redact_sensitive_text(message, force=True)
+
+
+def _websocket_ssl_context() -> ssl.SSLContext:
+    """Return the WSS verification context, preferring the certifi bundle.
+
+    ``websockets`` verifies against OpenSSL's default paths while the TTS
+    and embedding endpoints go through ``requests``/certifi. Hosts whose
+    system CA store lags certifi (minimal server images) otherwise fail
+    with ``CERTIFICATE_VERIFY_FAILED`` for the very same endpoint.
+    """
+    try:
+        import certifi
+    except ImportError:
+        return ssl.create_default_context()
+    return ssl.create_default_context(cafile=certifi.where())
 
 
 def _transcript(payload: dict[str, Any]) -> str:
@@ -99,8 +115,7 @@ class ProfileTranscriptionProvider(TranscriptionProvider):
     def _transcribe(self, path: Path, api_key: str) -> str:
         from websockets.sync.client import connect
 
-        audio_format = _FORMATS.get(path.suffix.lower(), "wav")
-        request = {
+        audio_format = _FORMATS.get(path.suffix.lower(), "wav")        request = {
             "user": {"uid": "hermes"},
             "audio": {
                 "format": audio_format,
@@ -128,6 +143,7 @@ class ProfileTranscriptionProvider(TranscriptionProvider):
         final_text = ""
         with connect(
             self.profile.transcription_url,
+            ssl=_websocket_ssl_context(),
             additional_headers=headers,
             max_size=20 * 1024 * 1024,
             open_timeout=30,
