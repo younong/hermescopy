@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -10,7 +11,10 @@ from hermes_cli import model_registrations
 from hermes_cli.config import DEFAULT_CONFIG, load_config, load_env, save_config
 from hermes_cli.deployment_inference import DeploymentInferenceRouteDescriptor
 from hermes_cli.deployment_media import (
-    DeploymentMediaDescriptor,
+    POLICY_ID_ENV,
+    ROUTES_ENV,
+    DeploymentMediaPolicy,
+    DeploymentMediaRoute,
     DeploymentMediaRouteDescriptor,
 )
 from hermes_cli.model_plane import capability as capability_module
@@ -158,19 +162,61 @@ def _deployment_registrations(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        "hermes_cli.deployment_media.deployment_media_descriptor_from_environment",
-        lambda: DeploymentMediaDescriptor(
-            policy_id="deployment-media",
+        "hermes_cli.deployment_media.policy_from_control_plane_environment",
+        lambda: DeploymentMediaPolicy(
             routes=(
-                DeploymentMediaRouteDescriptor(
-                    kind="image",
-                    provider="apiyi",
-                    models=("gpt-image-2-medium", "nano-banana-2"),
-                    default_model="gpt-image-2-medium",
+                DeploymentMediaRoute(
+                    descriptor=DeploymentMediaRouteDescriptor(
+                        kind="image",
+                        provider="apiyi",
+                        models=("gpt-image-2-medium", "nano-banana-2"),
+                        default_model="gpt-image-2-medium",
+                    ),
+                    key_env="TEST_ADMIN_MEDIA_KEY",
+                    executor="plugins.image_gen.apiyi:generate_apiyi_image_bytes",
                 ),
             ),
+            policy_id="deployment-media",
         ),
     )
+
+
+def test_admin_registrations_control_plane_derives_media_from_policy(monkeypatch):
+    """The Control Plane needs no policy-id env to surface media routes."""
+    monkeypatch.setenv(
+        ROUTES_ENV,
+        json.dumps([
+            {
+                "kind": "voice",
+                "provider": "volcengine-agent-plan",
+                "models": ["doubao-seed-tts-2.0", "doubao-seed-asr-2.0"],
+                "default_model": "doubao-seed-tts-2.0",
+                "key_env": "VOLCENGINE_AGENT_PLAN_API_KEY",
+            },
+            {
+                "kind": "vector",
+                "provider": "volcengine-agent-plan",
+                "models": ["doubao-embedding-vision"],
+                "default_model": "doubao-embedding-vision",
+                "key_env": "VOLCENGINE_AGENT_PLAN_API_KEY",
+            },
+        ]),
+    )
+    monkeypatch.delenv(POLICY_ID_ENV, raising=False)
+    monkeypatch.delenv("APIYI_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.deployment_inference.route_descriptors_from_control_plane",
+        lambda: (),
+    )
+
+    registrations = model_registrations._admin_registrations()
+    media = {
+        (item["kind"], item["provider"], item["model"])
+        for item in registrations.values()
+    }
+    assert ("voice", "volcengine-agent-plan", "doubao-seed-tts-2.0") in media
+    assert ("voice", "volcengine-agent-plan", "doubao-seed-asr-2.0") in media
+    assert ("vector", "volcengine-agent-plan", "doubao-embedding-vision") in media
 
 
 def test_payload_merges_admin_descriptors_with_legacy_user_registrations(monkeypatch):
