@@ -20,6 +20,12 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
+from agent.image_gen_provider import (
+    DEFAULT_ASPECT_RATIO,
+    DEFAULT_RESOLUTION,
+    VALID_RESOLUTIONS,
+    canonical_aspect_ratio,
+)
 from hermes_cli.controlled_roots import ExpectedType, RootKind
 from hermes_cli.owner_worker.executor_identity import (
     EgressProfile,
@@ -292,15 +298,16 @@ def _validated_arguments(tool_name: str, arguments: object) -> dict[str, Any]:
         if set(arguments) - {"prompt", "aspect_ratio", "resolution", "image_url", "reference_image_urls"}:
             raise OwnerToolRelayError("owner tool relay arguments are invalid")
         prompt = arguments.get("prompt")
-        aspect_ratio = arguments.get("aspect_ratio", "landscape")
-        resolution = arguments.get("resolution", "2K")
+        aspect_ratio = arguments.get("aspect_ratio", DEFAULT_ASPECT_RATIO)
+        resolution = arguments.get("resolution", DEFAULT_RESOLUTION)
         image_url = arguments.get("image_url")
         references = arguments.get("reference_image_urls")
         if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 32_768 or "\x00" in prompt:
             raise OwnerToolRelayError("owner tool relay arguments are invalid")
-        if aspect_ratio not in {"landscape", "square", "portrait"}:
+        aspect_ratio = canonical_aspect_ratio(aspect_ratio)
+        if aspect_ratio is None:
             raise OwnerToolRelayError("owner tool relay arguments are invalid")
-        if resolution not in {"1K", "2K", "4K"}:
+        if resolution not in VALID_RESOLUTIONS:
             raise OwnerToolRelayError("owner tool relay arguments are invalid")
         if image_url is not None and (not isinstance(image_url, str) or not image_url.strip() or len(image_url) > 4096 or "\x00" in image_url):
             raise OwnerToolRelayError("owner tool relay arguments are invalid")

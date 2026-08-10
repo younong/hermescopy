@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from agent.image_gen_provider import VALID_ASPECT_RATIOS
 from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
 from hermes_cli.controlled_roots import controlled_roots_for
 from hermes_cli.dashboard_auth.authority import OwnerWorkerAuthorityLease, WorkerLeaseState
@@ -472,7 +473,7 @@ def test_owner_relay_dispatches_canonical_image_generation():
         "image_generate",
         {
             "prompt": "  Draw a poster  ",
-            "aspect_ratio": "portrait",
+            "aspect_ratio": "3:4",
             "image_url": " /owner/images/source.png ",
             "reference_image_urls": [" /owner/workspaces/default/reference.webp "],
         },
@@ -486,7 +487,7 @@ def test_owner_relay_dispatches_canonical_image_generation():
         "image_generate",
         {
             "prompt": "Draw a poster",
-            "aspect_ratio": "portrait",
+            "aspect_ratio": "3:4",
             "resolution": "2K",
             "image_url": "/owner/images/source.png",
             "reference_image_urls": ["/owner/workspaces/default/reference.webp"],
@@ -494,6 +495,27 @@ def test_owner_relay_dispatches_canonical_image_generation():
         "image-generate",
         None,
     )]
+
+
+@pytest.mark.parametrize(
+    "aspect_ratio",
+    [*VALID_ASPECT_RATIOS, "landscape", "square", "portrait"],
+)
+def test_owner_relay_accepts_supported_image_aspect_ratios(aspect_ratio):
+    broker = OwnerToolRelayBroker(
+        identity_validator=lambda _identity: None,
+        media_dispatcher=lambda *_args: '{"success":true}',
+    )
+    try:
+        invocation = _invocation(
+            "image_generate",
+            {"prompt": "draw", "aspect_ratio": aspect_ratio},
+            invocation_id=f"image-{aspect_ratio}",
+        )
+        relay_fd = broker.register(invocation)
+        assert dispatch_owner_tool_over_relay(relay_fd, invocation) == '{"success":true}'
+    finally:
+        broker.close()
 
 
 def test_owner_relay_falls_back_to_local_dispatcher_without_media_dispatcher():
@@ -509,7 +531,7 @@ def test_owner_relay_falls_back_to_local_dispatcher_without_media_dispatcher():
     try:
         invocation = _invocation(
             "image_generate",
-            {"prompt": "draw", "aspect_ratio": "square"},
+            {"prompt": "draw", "aspect_ratio": "1:1"},
             invocation_id="image-generate",
         )
         relay_fd = broker.register(invocation)
@@ -518,7 +540,7 @@ def test_owner_relay_falls_back_to_local_dispatcher_without_media_dispatcher():
         broker.close()
     assert seen == [(
         "image_generate",
-        {"prompt": "draw", "aspect_ratio": "square", "resolution": "2K"},
+        {"prompt": "draw", "aspect_ratio": "1:1", "resolution": "2K"},
         "image-generate",
         None,
     )]
