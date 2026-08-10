@@ -101,9 +101,16 @@ def test_transcription_uses_plan_headers_and_extracts_result(tmp_path, monkeypat
         "show_utterances": True,
         "enable_nonstream": True,
     }
+    # Audio chunks are positive sequences from 2 (the full client request
+    # occupies sequence 1); the stream ends with a separate empty packet
+    # whose wire sequence is the negative of the next number.
+    data_audio = parse_frame(websocket.sent[1])
+    assert data_audio.message_type == AUDIO_ONLY_CLIENT
+    assert data_audio.sequence == 2
     final_audio = parse_frame(websocket.sent[-1])
     assert final_audio.message_type == AUDIO_ONLY_CLIENT
-    assert final_audio.sequence == -1
+    assert final_audio.sequence == -3
+    assert gzip.decompress(final_audio.payload) == b""
 
 
 def test_transcription_failure_redacts_key(tmp_path, monkeypatch):
