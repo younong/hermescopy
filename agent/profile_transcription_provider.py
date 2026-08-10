@@ -151,21 +151,14 @@ class ProfileTranscriptionProvider(TranscriptionProvider):
         ) as websocket:
             websocket.send(full_client_request(request))
             with path.open("rb") as source:
-                chunk = source.read(16 * 1024)
-                sequence = 1
-                if not chunk:
-                    websocket.send(audio_only_request(b"", sequence, final=True))
-                while chunk:
-                    next_chunk = source.read(16 * 1024)
-                    websocket.send(
-                        audio_only_request(
-                            chunk,
-                            sequence,
-                            final=not next_chunk,
-                        )
-                    )
-                    chunk = next_chunk
+                # The full client request occupies sequence 1; audio chunks
+                # are positive sequences from 2, and the stream ends with a
+                # separate empty final packet (sent negative on the wire).
+                sequence = 2
+                while chunk := source.read(16 * 1024):
+                    websocket.send(audio_only_request(chunk, sequence))
                     sequence += 1
+                websocket.send(audio_only_request(b"", sequence, final=True))
 
             while True:
                 raw = websocket.recv(timeout=60)
