@@ -208,14 +208,16 @@ from agent.tool_dispatch_helpers import (
     _extract_error_preview,
     _trajectory_normalize_msg,  # noqa: F401  # re-exported for tests that `from run_agent import _trajectory_normalize_msg`
 )
+from hermes_session_queries import DB_PERSISTED_MARKER
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
 
 
 _MAX_TOOL_WORKERS = 8
 
 # Intrinsic marker stamped on a message dict once it has been written to the
-# SQLite session store.  Used by ``_flush_messages_to_session_db`` to decide
-# what is already durable.  An object-identity (``id(msg)``) dedup set cannot be
+# SQLite session store, or rehydrated when that durable row is loaded for model
+# replay.  Used by ``_flush_messages_to_session_db`` to decide what is already
+# durable.  An object-identity (``id(msg)``) dedup set cannot be
 # trusted across turns: once a flushed message dict is dropped from the live
 # list (e.g. by scaffolding rewind or in-place compaction) and garbage-
 # collected, CPython is free to hand its address to a brand-new assistant/tool
@@ -225,7 +227,7 @@ _MAX_TOOL_WORKERS = 8
 # (agent/transports/chat_completions.py, agent/chat_completion_helpers.py) strip
 # every top-level ``_``-prefixed key before the request leaves the process, so
 # this never reaches a strict OpenAI-compatible gateway.
-_DB_PERSISTED_MARKER = "_db_persisted"
+_DB_PERSISTED_MARKER = DB_PERSISTED_MARKER
 
 
 # Guard so the OpenRouter metadata pre-warm thread is only spawned once per
@@ -1771,10 +1773,12 @@ class AIAgent:
         ``_flushed_db_message_ids`` attribute is now only a one-shot seed
         (translated to markers, then cleared each flush), not a persisted set.
 
-        Note: the marker is stamped on the live/shared conversation dict, which
-        correctly makes re-persistence idempotent across turns. No code path
-        edits a persisted message's content/role in place expecting a re-write
-        (in-place compaction resets the seed and re-diffs by identity).
+        The marker is stamped after a successful append and rehydrated by
+        ``get_messages_as_conversation`` when durable rows are reconstructed.
+        That keeps persistence idempotent across process restarts as well as
+        repeated flushes of the same live dictionaries. No code path edits a
+        persisted message's content/role in place expecting a re-write (in-place
+        compaction resets the seed and re-diffs by identity).
         """
         # Persistence-isolated agents (e.g. the background skill/memory review
         # fork) must NEVER write into the canonical session store. The fork
