@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from hermes_cli.model_plane.capability import register_code_provider
 from providers import register_provider
 from providers.base import ProviderProfile
 
@@ -112,6 +113,7 @@ opencode_zen = ProviderProfile(
     env_vars=("OPENCODE_ZEN_API_KEY",),
     base_url="https://opencode.ai/zen/v1",
     default_aux_model="gemini-3-flash",
+    chat_enabled=False,
 )
 
 opencode_go = OpenCodeGoProfile(
@@ -120,7 +122,10 @@ opencode_go = OpenCodeGoProfile(
     env_vars=("OPENCODE_GO_API_KEY",),
     base_url="https://opencode.ai/zen/go/v1",
     default_aux_model="glm-5",
+    chat_enabled=False,
 )
 
 register_provider(opencode_zen)
 register_provider(opencode_go)
+register_code_provider(opencode_zen)
+register_code_provider(opencode_go)

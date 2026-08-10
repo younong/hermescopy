@@ -20,6 +20,7 @@ from hermes_cli.config import (
 
 from hermes_cli.model_plane.kinds import (
     ACTIVATABLE_KINDS,
+    CODE,
     GATEWAY_KINDS,
     KINDS,
     selection_section,
@@ -129,12 +130,54 @@ def _admin_registrations() -> dict[str, dict[str, Any]]:
     return registrations
 
 
+def _migrate_legacy_code_registration(item: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the old Chat/category=code record at the model-plane boundary."""
+    if item.get("kind") != "chat" or str(item.get("category") or "").strip().lower() != "code":
+        return item
+    migrated = dict(item)
+    migrated["kind"] = CODE
+    migrated.pop("category", None)
+    if str(migrated.get("source") or "catalog").strip().lower() == "catalog":
+        try:
+            provider = str(migrated.get("provider") or "").strip()
+            model = str(migrated.get("model") or "").strip()
+            row = next(
+                (
+                    candidate
+                    for candidate in _capability_catalog()
+                    if str(candidate.get("provider") or "") == provider
+                ),
+                None,
+            )
+            if row is None:
+                raise ModelRegistrationError(
+                    f"Code provider '{provider}' is no longer available"
+                )
+            _validate_catalog_model(row, model)
+        except Exception as exc:  # noqa: BLE001
+            migrated["migration_error"] = str(exc)
+    return migrated
+
+
+def _migrate_persisted_registrations(config: dict[str, Any]) -> bool:
+    registrations = _registrations(config)
+    changed = False
+    for registration_id, item in list(registrations.items()):
+        if not isinstance(item, dict):
+            continue
+        migrated = _migrate_legacy_code_registration(item)
+        if migrated != item:
+            registrations[registration_id] = migrated
+            changed = True
+    return changed
+
+
 def _effective_registrations(
     user_registrations: dict[str, dict[str, Any]],
     admin_registrations: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     effective = {
-        registration_id: {**item, "scope": "user"}
+        registration_id: {**_migrate_legacy_code_registration(item), "scope": "user"}
         for registration_id, item in user_registrations.items()
         if isinstance(item, dict)
     }
@@ -167,6 +210,12 @@ def _chat_catalog() -> list[dict[str, Any]]:
     from hermes_cli.model_plane.catalog import chat_catalog
 
     return chat_catalog()
+
+
+def _capability_catalog() -> list[dict[str, Any]]:
+    from hermes_cli.model_plane.catalog import capability_catalog
+
+    return capability_catalog(CODE)
 
 
 def _media_catalog(kind: str) -> list[dict[str, Any]]:
@@ -207,12 +256,13 @@ def _normalize_request(
     registration_id: str,
     existing: dict[str, Any] | None,
     chat_catalog: list[dict[str, Any]] | None,
+    capability_catalog: list[dict[str, Any]] | None,
     media_catalog: list[dict[str, Any]] | None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None, str]:
     name = _text(data.get("name"), "name")
     kind = _text(data.get("kind", existing.get("kind") if existing else None), "kind").lower()
     if kind not in _KINDS:
-        raise ModelRegistrationError("kind must be chat, image, video, voice, or vector")
+        raise ModelRegistrationError("kind must be chat, code, image, video, voice, or vector")
     if existing is not None and kind != existing.get("kind"):
         raise ModelRegistrationError("kind cannot be changed")
 
@@ -274,7 +324,12 @@ def _normalize_request(
         if source != "catalog":
             raise ModelRegistrationError("Registration source is not supported for this model type")
         provider = _text(data.get("provider"), "provider")
-        catalog = chat_catalog if kind == "chat" else media_catalog
+        if kind == "chat":
+            catalog = chat_catalog
+        elif kind == CODE:
+            catalog = capability_catalog
+        else:
+            catalog = media_catalog
         if catalog is None:
             raise ModelRegistrationError("Provider catalog is unavailable")
         row = _find_provider(catalog, provider, media=kind != "chat")
@@ -312,7 +367,6 @@ def _assert_unique(
         if other_target == target:
             raise ModelRegistrationConflict("This provider model is already registered")
 
-
 def _public_registration(registration_id: str, item: dict[str, Any], env: dict[str, str]) -> dict[str, Any]:
     scope = "admin" if item.get("scope") == "admin" else "user"
     result = {
@@ -326,6 +380,8 @@ def _public_registration(registration_id: str, item: dict[str, Any], env: dict[s
         "mutable": scope == "user",
         "use_gateway": bool(item.get("use_gateway", False)),
     }
+    if item.get("migration_error"):
+        result["migration_error"] = str(item["migration_error"])
     if item.get("source") == "custom":
         key_env = str(item.get("key_env") or "")
         result["credential_configured"] = bool(key_env and env.get(key_env))
@@ -342,6 +398,11 @@ def _active(config: dict[str, Any], registrations: dict[str, dict[str, Any]]) ->
         }
     else:
         selections = {"chat": (None, model_cfg)}
+    code_section = config.get(selection_section(CODE))
+    selections[CODE] = (
+        code_section.get("provider") if isinstance(code_section, dict) else None,
+        code_section.get("model") if isinstance(code_section, dict) else None,
+    )
     for kind in _ACTIVATABLE_KINDS:
         section = config.get(selection_section(kind))
         selections[kind] = (
@@ -371,8 +432,8 @@ def _active(config: dict[str, Any], registrations: dict[str, dict[str, Any]]) ->
     return result
 
 
-def resolve_chat_model_registration(registration_id: str) -> dict[str, str]:
-    """Resolve one stable chat registration to non-secret runtime identity."""
+def _resolve_registered_model(registration_id: str, *, kind: str) -> dict[str, str]:
+    """Resolve a registration for one explicit model-plane kind."""
     registration_id = str(registration_id or "").strip()
     if not _ID_RE.fullmatch(registration_id):
         raise ModelRegistrationNotFound("Model registration not found")
@@ -381,8 +442,10 @@ def resolve_chat_model_registration(registration_id: str) -> dict[str, str]:
         item = _effective_registrations(dict(_registrations(read_raw_config()))).get(
             registration_id
         )
-        if not isinstance(item, dict) or item.get("kind") != "chat":
+        if not isinstance(item, dict) or item.get("kind") != kind:
             raise ModelRegistrationNotFound("Model registration not found")
+        if item.get("migration_error"):
+            raise ModelRegistrationError(str(item["migration_error"]))
         provider = _text(item.get("provider"), "provider")
         model = _text(item.get("model"), "model")
         source = str(item.get("source") or "catalog").strip().lower()
@@ -407,13 +470,28 @@ def resolve_chat_model_registration(registration_id: str) -> dict[str, str]:
         return result
 
 
+def resolve_chat_model_registration(registration_id: str) -> dict[str, str]:
+    """Resolve one stable Chat registration to non-secret runtime identity."""
+    return _resolve_registered_model(registration_id, kind="chat")
+
+
+def resolve_code_model_registration(registration_id: str) -> dict[str, str]:
+    """Resolve one stable Code registration to non-secret runtime identity."""
+    result = _resolve_registered_model(registration_id, kind=CODE)
+    result["profile"] = "coding"
+    result["toolset"] = "coding"
+    return result
+
+
 def get_model_registrations_payload() -> dict[str, Any]:
     """Return public registrations and active selections without loading catalogs."""
     with _LOCK:
         config = load_config()
-        registrations = _effective_registrations(
-            dict(_registrations(read_raw_config()))
-        )
+        raw = read_raw_config()
+        if _migrate_persisted_registrations(raw):
+            save_config(raw, preserve_keys={("model_registrations",)})
+            config = load_config()
+        registrations = _effective_registrations(dict(_registrations(raw)))
         env = load_env()
     return {
         "registrations": [
@@ -429,8 +507,13 @@ def get_model_registration_catalog(kind: str) -> dict[str, Any]:
     """Return the selectable catalog for one registration kind."""
     normalized = str(kind or "").strip().lower()
     if normalized not in _KINDS:
-        raise ModelRegistrationError("kind must be chat, image, video, voice, or vector")
-    providers = _chat_catalog() if normalized == "chat" else _media_catalog(normalized)
+        raise ModelRegistrationError("kind must be chat, code, image, video, voice, or vector")
+    if normalized == "chat":
+        providers = _chat_catalog()
+    elif normalized == CODE:
+        providers = _capability_catalog()
+    else:
+        providers = _media_catalog(normalized)
     return {"kind": normalized, "providers": providers}
 
 
@@ -440,12 +523,14 @@ def create_model_registration(data: dict[str, Any]) -> dict[str, Any]:
     kind = str(data.get("kind") or "").strip().lower()
     source = str(data.get("source") or "catalog").strip().lower()
     chat = _chat_catalog() if kind == "chat" and source != "custom" else None
+    code = _capability_catalog() if kind == CODE and source != "manual" else None
     media = _media_catalog(kind) if kind in _ACTIVATABLE_KINDS and source != "manual" else None
     candidate, provider_config, api_key = _normalize_request(
         data,
         registration_id=registration_id,
         existing=None,
         chat_catalog=chat,
+        capability_catalog=code,
         media_catalog=media,
     )
     admin_registrations = _admin_registrations()
@@ -484,6 +569,7 @@ def update_model_registration(registration_id: str, data: dict[str, Any]) -> dic
     kind = existing.get("kind")
     source = str(data.get("source") or existing.get("source") or "catalog").strip().lower()
     chat = _chat_catalog() if kind == "chat" and source != "custom" else None
+    code = _capability_catalog() if kind == CODE and source != "manual" else None
     media = _media_catalog(str(kind)) if kind in _ACTIVATABLE_KINDS and source != "manual" else None
     merged = dict(existing)
     merged.update(data)
@@ -492,6 +578,7 @@ def update_model_registration(registration_id: str, data: dict[str, Any]) -> dic
         registration_id=registration_id,
         existing=existing,
         chat_catalog=chat,
+        capability_catalog=code,
         media_catalog=media,
     )
     admin_registrations = _admin_registrations()
@@ -533,7 +620,7 @@ def delete_model_registration(registration_id: str) -> dict[str, Any]:
         if active.get("registration_id") == registration_id:
             raise ModelRegistrationConflict("Active registration must be switched before deletion")
         preserve_keys = {("model_registrations",)}
-        if item.get("kind") == "chat" and item.get("source") == "custom":
+        if item.get("kind") in {"chat", CODE} and item.get("source") == "custom":
             providers = config.get("providers")
             if isinstance(providers, dict):
                 providers.pop(str(item.get("provider") or ""), None)
@@ -554,9 +641,26 @@ def activate_model_registration(registration_id: str) -> dict[str, Any]:
         if not isinstance(item, dict):
             raise ModelRegistrationNotFound("Registration not found")
         kind = item.get("kind")
+        if kind == CODE:
+            section = config.setdefault(selection_section(CODE), {})
+            if not isinstance(section, dict):
+                section = {}
+                config[selection_section(CODE)] = section
+            section.update({
+                "provider": str(item.get("provider") or ""),
+                "model": str(item.get("model") or ""),
+            })
+            save_config(config, preserve_keys={(selection_section(CODE),)})
+            return {
+                "ok": True,
+                "registration_id": registration_id,
+                "kind": kind,
+                "provider": item["provider"],
+                "model": item["model"],
+            }
         if kind not in _ACTIVATABLE_KINDS:
             raise ModelRegistrationError(
-                "Only image, video, voice, and vector registrations can be activated"
+                "Only code, image, video, voice, and vector registrations can be activated"
             )
         from hermes_cli.tools_config import select_media_model
 

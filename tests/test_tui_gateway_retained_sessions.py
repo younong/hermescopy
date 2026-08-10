@@ -202,6 +202,46 @@ def test_owner_worker_create_rejects_legacy_source_before_live_registration(owne
     assert runtime.mutable_state.sessions == {}
 
 
+def test_owner_worker_code_session_isolated_from_chat_config(owner_gateway, monkeypatch):
+    from hermes_cli.controlled_roots import RootKind
+
+    _db, runtime, _workspace_root = owner_gateway
+    monkeypatch.setattr(
+        server,
+        "_resolve_code_startup_runtime",
+        lambda params=None: (
+            str((params or {}).get("model") or "code-default"),
+            str((params or {}).get("provider") or "code-provider"),
+        ),
+    )
+
+    response = _call(
+        runtime,
+        "session.create",
+        {
+            "source": "dashboard-gui",
+            "kind": "code",
+            "model": "code-model",
+            "provider": "code-provider",
+            "cwd": None,
+        },
+    )
+
+    assert "error" not in response
+    result = response["result"]
+    assert result["info"]["model_kind"] == "code"
+    assert result["info"]["runtime_profile"] == "coding"
+    assert result["info"]["runtime_toolset"] == "coding"
+    session = runtime.mutable_state.sessions[result["session_id"]]
+    assert session["model_kind"] == "code"
+    assert session["runtime_profile"] == "coding"
+    assert session["runtime_toolset"] == "coding"
+    assert session["model_override"] == {
+        "model": "code-model",
+        "provider": "code-provider",
+    }
+
+
 def test_employee_policy_rejects_interactive_source_spoof(owner_gateway):
     _db, runtime, _workspace_root = owner_gateway
 

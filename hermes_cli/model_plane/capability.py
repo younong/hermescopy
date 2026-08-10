@@ -1,8 +1,8 @@
-"""Capability provider protocol — the plugin contract for media model kinds.
+"""Capability provider protocol — the plugin contract for capability kinds.
 
 Chat models belong to **providers** (:class:`providers.base.ProviderProfile`);
-image/video/voice/vector models belong to **capability plugins** implementing
-this protocol. The model plane consumes media access exclusively through
+code/image/video/voice/vector models belong to **capability plugins** implementing
+this protocol. The model plane consumes capability access through
 :class:`CapabilityProvider` and never imports a plugin implementation.
 
 Image/video generation plugins keep their execution ABCs
@@ -27,12 +27,13 @@ from typing import Any, Optional, Protocol, runtime_checkable
 from hermes_cli.model_plane.kinds import (
     BUILTIN_STT_PROVIDER_NAMES,
     BUILTIN_TTS_PROVIDER_NAMES,
+    CAPABILITY_KINDS,
     FALLBACK_CAPABILITY_PROVIDERS,
     GATEWAY_KINDS,
-    MEDIA_KINDS,
     VECTOR,
     VOICE,
     VOICE_CAPABILITIES,
+    CODE,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,9 +52,9 @@ class CapabilityModel:
 
 @runtime_checkable
 class CapabilityProvider(Protocol):
-    """The narrow media-plugin contract consumed by the model plane."""
+    """The narrow capability-plugin contract consumed by the model plane."""
 
-    kind: str  # one of MEDIA_KINDS
+    kind: str  # one of CAPABILITY_KINDS
     name: str  # stable provider identifier used in registrations
     display_name: str
     capability: str  # "" except voice delegates ("tts" / "asr")
@@ -79,8 +80,8 @@ _LOCK = threading.Lock()
 def register_capability_provider(provider: CapabilityProvider) -> None:
     """Register a capability provider. Re-registration overwrites."""
     kind = str(getattr(provider, "kind", "") or "")
-    if kind not in MEDIA_KINDS:
-        raise ValueError(f"capability kind must be one of {MEDIA_KINDS}, got {kind!r}")
+    if kind not in CAPABILITY_KINDS:
+        raise ValueError(f"capability kind must be one of {CAPABILITY_KINDS}, got {kind!r}")
     name = str(getattr(provider, "name", "") or "").strip()
     if not name:
         raise ValueError("capability provider name must be a non-empty string")
@@ -160,14 +161,14 @@ def _merged(kind: str, name: str) -> Optional[CapabilityProvider]:
 
 def get_capability_provider(kind: str, name: str) -> Optional[CapabilityProvider]:
     """Return the (merged) provider for (kind, name), or None."""
-    if kind not in MEDIA_KINDS:
+    if kind not in CAPABILITY_KINDS:
         return None
     return _merged(kind, str(name or "").strip())
 
 
 def list_capability_providers(kind: str) -> list[CapabilityProvider]:
-    """Return all providers for a media kind, sorted by name."""
-    if kind not in MEDIA_KINDS:
+    """Return all providers for a capability kind, sorted by name."""
+    if kind not in CAPABILITY_KINDS:
         return []
     with _LOCK:
         names = sorted({name for (k, name, _c) in _PROVIDERS if k == kind})
@@ -263,9 +264,116 @@ def register_media_generation_provider(kind: str, provider: Any) -> None:
     register_capability_provider(MediaGenerationAdapter(kind, provider))
 
 
+class CodeCapabilityAdapter:
+    """Expose a provider profile as a coding capability.
+
+    A coding provider may reuse the normal provider transport, but its catalog
+    ownership and runtime posture are explicit here. This adapter deliberately
+    has no media execution method; callers use its ``profile`` and runtime
+    metadata to construct a Code agent in the owning worker.
+    """
+
+    kind = CODE
+    capability = ""
+    runtime_profile = "coding"
+    runtime_toolset = "coding"
+
+    def __init__(self, profile: Any) -> None:
+        from providers.base import ProviderProfile
+
+        if not isinstance(profile, ProviderProfile):
+            raise TypeError(
+                "Code capability providers must wrap ProviderProfile instances"
+            )
+        self.profile = profile
+
+    @property
+    def name(self) -> str:
+        return self.profile.name
+
+    @property
+    def display_name(self) -> str:
+        return self.profile.display_name or self.profile.name
+
+    @property
+    def api_mode(self) -> str:
+        return self.profile.api_mode
+
+    def __getattr__(self, attribute: str) -> Any:
+        return getattr(self.profile, attribute)
+
+    def is_available(self) -> bool:
+        try:
+            if self.profile.auth_type == "api_key":
+                from agent.profile_provider_credentials import resolve_profile_api_key
+
+                return bool(resolve_profile_api_key(self.profile))
+            from hermes_cli.auth import get_auth_status
+
+            status = get_auth_status(self.profile.name)
+            return bool(status.get("logged_in") or status.get("configured"))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("code capability %s availability raised %s", self.name, exc)
+            return False
+
+    def list_models(self) -> list[CapabilityModel]:
+        from hermes_cli.models import static_provider_model_ids
+
+        model_ids = list(static_provider_model_ids(self.profile.name))
+        seen = {model.casefold() for model in model_ids}
+        for model in self.profile.fallback_models:
+            if model and model.casefold() not in seen:
+                seen.add(model.casefold())
+                model_ids.append(model)
+        return [
+            CapabilityModel(id=model, display=model)
+            for model in model_ids
+            if model
+        ]
+
+    def model_entries(self) -> list[dict[str, Any]]:
+        """Return the static capability catalog in the provider's native shape."""
+        return [
+            {"id": model.id, "display": model.display or model.id}
+            for model in self.list_models()
+        ]
+
+    def default_model(self) -> Optional[str]:
+        models = self.list_models()
+        return models[0].id if models else None
+
+    def get_setup_schema(self) -> dict[str, Any]:
+        return {
+            "name": self.display_name,
+            "badge": "code",
+            "tag": "Coding agent provider",
+            "env_vars": [
+                {
+                    "key": key,
+                    "prompt": f"{self.display_name} API key",
+                    "url": self.profile.signup_url,
+                }
+                for key in self.profile.env_vars
+            ],
+            "auth_type": self.profile.auth_type,
+        }
+
+    def capabilities(self) -> dict[str, Any]:
+        return {
+            "api_mode": self.profile.api_mode,
+            "profile": self.runtime_profile,
+            "toolset": self.runtime_toolset,
+        }
+
+
+def register_code_provider(profile: Any) -> None:
+    """Register a provider profile as an explicit Code capability."""
+    register_capability_provider(CodeCapabilityAdapter(profile))
+
+
 @dataclass(frozen=True)
 class CapabilityResolution:
-    """One media-selection result shared by tool checks and dispatch."""
+    """One capability-selection result shared by checks and dispatch."""
 
     provider: Optional[CapabilityProvider]
     configured_name: Optional[str]
@@ -279,13 +387,15 @@ def _configured_provider_name(kind: str) -> Optional[str]:
         from hermes_cli.config import load_config
 
         cfg = load_config()
-        section = cfg.get(f"{kind}_gen") if isinstance(cfg, dict) else None
+        from hermes_cli.model_plane.kinds import selection_section
+
+        section = cfg.get(selection_section(kind)) if isinstance(cfg, dict) else None
         if isinstance(section, dict):
             raw = section.get("provider")
             if isinstance(raw, str) and raw.strip():
                 return raw.strip()
     except Exception as exc:  # noqa: BLE001
-        logger.debug("Could not read %s_gen.provider from config: %s", kind, exc)
+        logger.debug("Could not read %s provider selection from config: %s", kind, exc)
     return None
 
 
@@ -687,8 +797,9 @@ def resolve_embedding_capability(
 def ensure_capability_providers() -> None:
     """Ensure plugin discovery (and with it capability registration) has run.
 
-    Image/video/voice plugins and profile media bridges register natively
-    during plugin discovery — image/video through
+    Code/image/video/voice plugins and profile capability bridges register
+    natively during plugin discovery — Code through the shared capability
+    adapter, image/video through
     :func:`register_media_generation_provider`, voice through
     :func:`register_voice_provider`, vector through
     :class:`ProfileEmbeddingCapability`. Idempotent: re-registration

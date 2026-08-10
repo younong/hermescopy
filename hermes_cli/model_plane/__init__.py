@@ -1,7 +1,7 @@
 """Unified model plane — the ONLY entry point for model access.
 
-Five model kinds (chat/image/video/voice/vector) share one catalog, one
-registration store, one activation mechanism, and two credential paths
+Six model kinds (chat/code/image/video/voice/vector) share one catalog,
+one registration store, one activation mechanism, and two credential paths
 (user-supplied key vs deployment-managed relay). Chat models are owned by
 **providers**; media kinds (image/video/voice/vector) are owned by
 **capability plugins**. This package consumes both through the narrow
@@ -16,9 +16,15 @@ Extension rules (enforced by review, documented in ``docs/model-plane.md``):
   key, or a deployment-managed route resolved by the Control Plane.
 """
 
+from hermes_cli.model_plane.capability import (
+    CodeCapabilityAdapter,
+    register_code_provider,
+)
 from hermes_cli.model_plane.kinds import (
     ACTIVATABLE_KINDS,
+    CAPABILITY_KINDS,
     CHAT,
+    CODE,
     GATEWAY_KINDS,
     IMAGE,
     KINDS,
@@ -33,7 +39,11 @@ from hermes_cli.model_plane.kinds import (
 
 __all__ = [
     "ACTIVATABLE_KINDS",
+    "CAPABILITY_KINDS",
+    "CodeCapabilityAdapter",
+    "register_code_provider",
     "CHAT",
+    "CODE",
     "GATEWAY_KINDS",
     "IMAGE",
     "KINDS",

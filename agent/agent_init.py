@@ -237,6 +237,9 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    model_kind: str = "chat",
+    runtime_profile: str | None = None,
+    runtime_toolset: str | None = None,
 ):
     """
     Initialize the AI Agent.
@@ -289,6 +292,16 @@ def init_agent(
     """
     _install_safe_stdio()
 
+    normalized_kind = str(model_kind or "chat").strip().lower()
+    if normalized_kind not in {"chat", "code"}:
+        raise ValueError(f"unsupported model kind: {model_kind!r}")
+    if normalized_kind == "code":
+        runtime_profile = "coding"
+        runtime_toolset = "coding"
+        enabled_toolsets = [runtime_toolset]
+    agent.model_kind = normalized_kind
+    agent.runtime_profile = runtime_profile
+    agent.runtime_toolset = runtime_toolset
     agent.model = model
     agent.relay_provider = str(relay_provider or "").strip().lower()
     agent.max_iterations = max_iterations
