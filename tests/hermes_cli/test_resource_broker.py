@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from types import MappingProxyType
 
@@ -8,10 +9,17 @@ import pytest
 from hermes_cli.dashboard_auth.authority import (
     AuthorityStore, WorkerGenerationState, WorkerLeaseState,
 )
-from hermes_cli.owner_worker.cgroup_v2 import CgroupResourceEvents
+from hermes_cli.owner_worker.cgroup_v2 import (
+    CgroupAdmissionRejected,
+    CgroupResourceEvents,
+    CgroupV2Unavailable,
+)
 from hermes_cli.owner_worker.executor_identity import ExecutorIdentity
 from hermes_cli.owner_worker.resource_broker import (
-    DeploymentResourceBroker, OwnerResourceBrokerClient, ResourceBrokerError,
+    DeploymentResourceBroker,
+    OwnerResourceBrokerClient,
+    ResourceBrokerError,
+    ResourceBrokerReason,
 )
 
 
@@ -39,10 +47,13 @@ class _Scope:
 
 
 class _Manager:
-    def __init__(self):
+    def __init__(self, *, admission_error=None):
         self.admissions = []
+        self.admission_error = admission_error
 
     def admit_executor(self, identity, invocation_id):
+        if self.admission_error is not None:
+            raise self.admission_error
         scope = _Scope()
         self.admissions.append((identity, invocation_id, scope))
         return scope
@@ -95,6 +106,54 @@ def test_private_resource_broker_round_trip_is_lease_bound_and_deidentified(tmp_
     broker.close()
 
 
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        (CgroupAdmissionRejected("capacity secret /owner/private"), ResourceBrokerReason.ADMISSION_REJECTED),
+        (CgroupV2Unavailable("cgroup path /sys/fs/cgroup/private"), ResourceBrokerReason.CGROUP_UNAVAILABLE),
+        (RuntimeError("unexpected secret /tmp/private"), ResourceBrokerReason.INTERNAL_REJECTION),
+    ],
+)
+def test_resource_broker_redacts_admission_failure_reason(tmp_path, error, reason):
+    store, starting = _starting_lease(tmp_path)
+    broker = DeploymentResourceBroker(
+        manager=_Manager(admission_error=error), authority_store=store,
+    )
+    client = OwnerResourceBrokerClient(broker.register(starting))
+    active = _activate(store, starting)
+    broker.activate(active)
+
+    with pytest.raises(ResourceBrokerError) as raised:
+        client.reserve_executor(_identity(active), "invocation-secret")
+
+    assert raised.value.reason == reason
+    assert "secret" not in str(raised.value)
+    assert "/" not in str(raised.value)
+    client.close()
+    broker.close()
+
+
+def test_resource_broker_rejects_unknown_response_reason(monkeypatch):
+    from hermes_cli.owner_worker import resource_broker
+
+    class _Connection:
+        def sendall(self, value):
+            del value
+
+    client = object.__new__(OwnerResourceBrokerClient)
+    client._connection = _Connection()
+    client._lock = threading.Lock()
+    client._closed = False
+    monkeypatch.setattr(resource_broker, "_recv_frame", lambda connection: {"ok": False, "reason": "raw-secret"})
+    monkeypatch.setattr(resource_broker, "_send_frame", lambda connection, request: None)
+
+    with pytest.raises(ResourceBrokerError) as raised:
+        client._request({"operation": "test"})
+
+    assert raised.value.reason == ResourceBrokerReason.INTERNAL_REJECTION
+    assert "raw-secret" not in str(raised.value)
+
+
 def test_resource_broker_rejects_requests_after_durable_lease_revocation(tmp_path):
     store, starting = _starting_lease(tmp_path)
     manager = _Manager()
@@ -108,8 +167,9 @@ def test_resource_broker_rejects_requests_after_durable_lease_revocation(tmp_pat
         generation_state=WorkerGenerationState.DRAINING,
     )
 
-    with pytest.raises(ResourceBrokerError, match="rejected"):
+    with pytest.raises(ResourceBrokerError, match="lease is not active") as raised:
         client.reserve_executor(_identity(active), "invocation-a")
+    assert raised.value.reason == ResourceBrokerReason.LEASE_INACTIVE
 
     broker.revoke(draining)
     client.close()
@@ -151,8 +211,9 @@ def test_resource_broker_generation_shutdown_preserves_protocol_rejection(tmp_pa
         generation_state=WorkerGenerationState.DRAINING,
     )
 
-    with pytest.raises(ResourceBrokerError, match="rejected"):
+    with pytest.raises(ResourceBrokerError, match="lease is not active") as raised:
         client.shutdown_generation()
+    assert raised.value.reason == ResourceBrokerReason.LEASE_INACTIVE
     broker.close()
 
 
