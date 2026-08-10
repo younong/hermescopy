@@ -11194,13 +11194,15 @@ def _(rid, params: dict) -> dict:
             path_token, remainder = split_path_input(raw)
             image_path = resolve_attachment_path(path_token)
             if image_path is None:
-                return _err(rid, 4016, f"image not found: {path_token}")
+                return _err(rid, 4016, "authenticated image is unavailable")
         if image_path.suffix.lower() not in IMAGE_EXTENSIONS:
             return _err(rid, 4016, f"unsupported image: {image_path.name}")
         try:
-            image_path = _authenticated_diagnostic_path(image_path)
+            image_path = _materialize_authenticated_image(image_path)
         except ValueError:
-            return _err(rid, 4016, "authenticated image path is outside the workspace")
+            return _err(rid, 4016, "authenticated image is unavailable")
+        except OSError:
+            return _err(rid, 4016, "authenticated image is unavailable")
         session.setdefault("attached_images", []).append(str(image_path))
         _queue_attachment_metadata(session, _image_attachment_metadata(image_path))
         visible_path = _authenticated_visible_path(image_path)
@@ -11310,14 +11312,54 @@ def _authenticated_visible_path(path: Path) -> str | None:
         raise ValueError("authenticated attachment path is outside the workspace") from None
 
 
-def _authenticated_diagnostic_path(path: Path) -> Path:
+def _materialize_authenticated_image(path: Path) -> Path:
+    """Copy a workspace image into durable user upload storage before queuing it."""
     context = _authenticated_workspace_context()
     if context is None:
         return path
+    from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
+    from hermes_cli.controlled_roots import ExpectedType, RootKind
+    from hermes_cli.owner_worker.user_files import publish_unique_user_bytes
+
+    if not isinstance(context, AuthenticatedWorkspaceContext):
+        raise RuntimeError("authenticated owner worker lacks filesystem capability")
     try:
-        return context.diagnostic_path(context.controlled_api_path(str(path)))
+        controlled = context.controlled_api_path(str(path))
     except (AttributeError, ValueError):
-        raise ValueError("authenticated attachment path is outside the workspace") from None
+        raise ValueError("authenticated image is unavailable") from None
+    source_fd = context.roots.open_relative(
+        RootKind.WORKSPACE,
+        controlled,
+        expected_type=ExpectedType.REGULAR_FILE,
+    )
+    try:
+        size = os.fstat(source_fd).st_size
+        if size <= 0 or size > _ATTACH_BYTES_MAX_BYTES:
+            raise ValueError("authenticated image is unavailable")
+        chunks: list[bytes] = []
+        while chunk := os.read(source_fd, 1024 * 1024):
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        valid_image = (
+            data.startswith((
+                b"\x89PNG\r\n\x1a\n",
+                b"\xff\xd8\xff",
+                b"GIF87a",
+                b"GIF89a",
+                b"BM",
+            ))
+            or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")
+            or (
+                path.suffix.lower() == ".svg"
+                and b"<svg" in data[:4096].lower()
+            )
+        )
+        if not valid_image:
+            raise ValueError("authenticated image is unavailable")
+    finally:
+        os.close(source_fd)
+    published = publish_unique_user_bytes(context, "upload", path.name, data)
+    return published.diagnostic_path
 
 
 def _authenticated_temporary_directory() -> tuple[Path, str] | None:
@@ -11645,16 +11687,16 @@ def _format_ref_value(value: str) -> str:
 
 
 def _attachment_ref_path(session: dict, target: Path) -> str:
-    """Workspace-relative path for an attachment, or the absolute path if outside."""
+    """Return a worker-safe workspace-relative attachment reference."""
     authenticated = _authenticated_visible_path(target)
     if authenticated is not None:
         return authenticated
     workspace = Path(_session_cwd(session)).resolve()
     try:
         rel = target.resolve().relative_to(workspace)
-        return str(rel).replace(os.sep, "/")
     except ValueError:
-        return str(target.resolve())
+        raise ValueError("attachment path is unavailable") from None
+    return str(rel).replace(os.sep, "/")
 
 
 def _desktop_attachment_dir(session: dict) -> Path:
@@ -12045,22 +12087,19 @@ def _(rid, params: dict) -> dict:
         remainder = dropped["remainder"]
         if dropped["is_image"]:
             try:
-                drop_path = _authenticated_diagnostic_path(drop_path)
-            except ValueError:
-                return _err(
-                    rid,
-                    4016,
-                    "authenticated image path is outside the workspace",
-                )
+                drop_path = _materialize_authenticated_image(drop_path)
+            except (OSError, ValueError):
+                return _err(rid, 4016, "authenticated image is unavailable")
             session.setdefault("attached_images", []).append(str(drop_path))
             _queue_attachment_metadata(session, _image_attachment_metadata(drop_path))
+            visible_path = _authenticated_visible_path(drop_path)
             text = remainder or f"[User attached image: {drop_path.name}]"
             return _ok(
                 rid,
                 {
                     "matched": True,
                     "is_image": True,
-                    "path": str(drop_path),
+                    "path": visible_path or str(drop_path),
                     "count": len(session["attached_images"]),
                     "text": text,
                     **_image_meta(drop_path),
