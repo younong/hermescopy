@@ -24,6 +24,7 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
@@ -187,7 +188,7 @@ def get_default_db_path() -> Path:
 
 DEFAULT_DB_PATH = get_default_db_path()
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 23
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -755,7 +756,22 @@ CREATE TABLE IF NOT EXISTS sessions (
     context_usage_calibration_samples INTEGER NOT NULL DEFAULT 0,
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
-    FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
+    session_kind TEXT NOT NULL DEFAULT 'conversation'
+        CHECK(session_kind IN (
+            'conversation',
+            'internal_collaboration_member',
+            'internal_collaboration_coordinator'
+        )),
+    visibility TEXT NOT NULL DEFAULT 'visible'
+        CHECK(visibility IN ('visible', 'internal')),
+    FOREIGN KEY (parent_session_id) REFERENCES sessions(id),
+    CHECK(
+        (session_kind = 'conversation' AND visibility = 'visible') OR
+        (session_kind IN (
+            'internal_collaboration_member',
+            'internal_collaboration_coordinator'
+        ) AND visibility = 'internal')
+    )
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -781,6 +797,18 @@ CREATE TABLE IF NOT EXISTS messages (
     compacted INTEGER NOT NULL DEFAULT 0,
     context_projection INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS session_display_cards (
+    card_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    card_kind TEXT NOT NULL CHECK(card_kind = 'collaboration_origin'),
+    source_id TEXT NOT NULL CHECK(length(trim(source_id)) > 0),
+    status TEXT NOT NULL CHECK(status IN ('created', 'completed')),
+    payload_json TEXT NOT NULL
+        CHECK(json_valid(payload_json) AND json_type(payload_json) = 'object'),
+    created_at REAL NOT NULL,
+    UNIQUE(session_id, card_kind, source_id, status),
+    UNIQUE(card_id, session_id)
+);
 
 CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
@@ -802,8 +830,320 @@ CREATE TABLE IF NOT EXISTS external_turn_receipts (
     worker_generation INTEGER NOT NULL,
     result_text TEXT,
     result_status TEXT,
+    collaboration_target_id TEXT UNIQUE,
+    collaboration_event_id TEXT UNIQUE REFERENCES collaboration_events(event_id),
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS collaboration_groups (
+    group_id TEXT PRIMARY KEY,
+    owner_key TEXT NOT NULL,
+    name TEXT NOT NULL CHECK(length(trim(name)) > 0),
+    creator_kind TEXT NOT NULL CHECK(creator_kind IN ('owner', 'employee')),
+    creator_account_id TEXT,
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK(status IN ('active', 'archived')),
+    last_sequence INTEGER NOT NULL DEFAULT 0 CHECK(last_sequence >= 0),
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    archived_at REAL,
+    CHECK(
+        (creator_kind = 'owner' AND creator_account_id IS NULL) OR
+        (creator_kind = 'employee' AND length(trim(creator_account_id)) > 0)
+    )
+);
+CREATE TABLE IF NOT EXISTS collaboration_events (
+    event_id TEXT PRIMARY KEY,
+    group_id TEXT NOT NULL REFERENCES collaboration_groups(group_id),
+    sequence INTEGER NOT NULL CHECK(sequence >= 1),
+    event_kind TEXT NOT NULL CHECK(length(trim(event_kind)) > 0),
+    actor_kind TEXT NOT NULL CHECK(actor_kind IN ('owner', 'employee', 'system')),
+    actor_account_id TEXT,
+    actor_membership_id TEXT REFERENCES collaboration_memberships(membership_id),
+    body_json TEXT NOT NULL DEFAULT '{}'
+        CHECK(json_valid(body_json) AND json_type(body_json) = 'object'),
+    created_at REAL NOT NULL,
+    UNIQUE(group_id, sequence),
+    CHECK(
+        (actor_kind = 'employee' AND actor_account_id IS NOT NULL
+                                 AND actor_membership_id IS NOT NULL) OR
+        (actor_kind IN ('owner', 'system') AND actor_membership_id IS NULL)
+    )
+);
+CREATE TRIGGER IF NOT EXISTS collaboration_events_append_only_update
+BEFORE UPDATE ON collaboration_events
+BEGIN
+    SELECT RAISE(ABORT, 'collaboration events are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS collaboration_events_append_only_delete
+BEFORE DELETE ON collaboration_events
+BEGIN
+    SELECT RAISE(ABORT, 'collaboration events are append-only');
+END;
+CREATE TABLE IF NOT EXISTS collaboration_group_receipts (
+    owner_key TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL CHECK(length(trim(idempotency_key)) > 0),
+    request_fingerprint TEXT NOT NULL CHECK(length(request_fingerprint) = 64),
+    group_id TEXT NOT NULL UNIQUE REFERENCES collaboration_groups(group_id),
+    created_at REAL NOT NULL,
+    PRIMARY KEY(owner_key, idempotency_key)
+);
+CREATE TABLE IF NOT EXISTS collaboration_message_receipts (
+    owner_key TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL CHECK(length(trim(idempotency_key)) > 0),
+    request_fingerprint TEXT NOT NULL CHECK(length(request_fingerprint) = 64),
+    group_id TEXT NOT NULL REFERENCES collaboration_groups(group_id),
+    event_id TEXT NOT NULL UNIQUE REFERENCES collaboration_events(event_id),
+    created_at REAL NOT NULL,
+    PRIMARY KEY(owner_key, idempotency_key)
+);
+CREATE TABLE IF NOT EXISTS collaboration_memberships (
+    membership_id TEXT PRIMARY KEY,
+    group_id TEXT NOT NULL REFERENCES collaboration_groups(group_id),
+    account_id TEXT NOT NULL,
+    profile_revision INTEGER NOT NULL CHECK(profile_revision >= 1),
+    profile_fingerprint TEXT NOT NULL CHECK(length(trim(profile_fingerprint)) > 0),
+    hidden_session_id TEXT NOT NULL UNIQUE CHECK(length(trim(hidden_session_id)) > 0),
+    stored_session_id TEXT NOT NULL UNIQUE CHECK(length(trim(stored_session_id)) > 0),
+    role TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('member', 'owner')),
+    join_sequence INTEGER NOT NULL CHECK(join_sequence >= 1),
+    leave_sequence INTEGER CHECK(leave_sequence IS NULL OR leave_sequence > join_sequence),
+    created_at REAL NOT NULL,
+    left_at REAL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_collaboration_membership_active
+ON collaboration_memberships(group_id, account_id) WHERE leave_sequence IS NULL;
+CREATE TABLE IF NOT EXISTS collaboration_tasks (
+    task_id TEXT PRIMARY KEY,
+    group_id TEXT NOT NULL REFERENCES collaboration_groups(group_id),
+    created_event_id TEXT NOT NULL REFERENCES collaboration_events(event_id),
+    assigned_account_id TEXT,
+    creator_account_id TEXT,
+    creator_membership_id TEXT REFERENCES collaboration_memberships(membership_id),
+    creator_profile_revision INTEGER CHECK(creator_profile_revision IS NULL OR creator_profile_revision >= 1),
+    creator_profile_fingerprint TEXT,
+    title TEXT NOT NULL CHECK(length(trim(title)) > 0),
+    description TEXT,
+    source_kind TEXT NOT NULL DEFAULT 'owner'
+        CHECK(source_kind IN ('owner', 'employee', 'ai_collaboration', 'web_direct', 'web_group', 'feishu_direct')),
+    round INTEGER NOT NULL DEFAULT 0 CHECK(round >= 0),
+    max_rounds INTEGER NOT NULL DEFAULT 3 CHECK(max_rounds BETWEEN 1 AND 3),
+    depth INTEGER NOT NULL DEFAULT 0 CHECK(depth BETWEEN 0 AND 1),
+    source_event_id TEXT REFERENCES collaboration_events(event_id),
+    source_task_id TEXT REFERENCES collaboration_tasks(task_id),
+    allowed_attachment_ids_json TEXT NOT NULL DEFAULT '[]'
+        CHECK(json_valid(allowed_attachment_ids_json) AND json_type(allowed_attachment_ids_json) = 'array'),
+    summary_text TEXT,
+    status TEXT NOT NULL DEFAULT 'open'
+        CHECK(status IN ('open', 'claimed', 'completed', 'cancelled', 'ambiguous')),
+    worker_owner_key TEXT,
+    worker_id TEXT,
+    worker_generation INTEGER,
+    lease_version INTEGER,
+    recovery_generation INTEGER,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    completed_at REAL,
+    CHECK(worker_generation IS NULL OR worker_generation >= 1),
+    CHECK(lease_version IS NULL OR lease_version >= 1),
+    CHECK(recovery_generation IS NULL OR recovery_generation >= 0)
+);
+CREATE TABLE IF NOT EXISTS collaboration_turns (
+    turn_id TEXT PRIMARY KEY,
+    group_id TEXT NOT NULL REFERENCES collaboration_groups(group_id),
+    event_id TEXT NOT NULL UNIQUE REFERENCES collaboration_events(event_id),
+    snapshot_sequence INTEGER NOT NULL CHECK(snapshot_sequence >= 1),
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK(status IN (
+            'queued', 'running', 'completed', 'partial', 'failed',
+            'ambiguous', 'cancelled'
+        )),
+    worker_owner_key TEXT,
+    worker_id TEXT,
+    worker_generation INTEGER,
+    lease_version INTEGER,
+    recovery_generation INTEGER,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    completed_at REAL,
+    CHECK(worker_generation IS NULL OR worker_generation >= 1),
+    CHECK(lease_version IS NULL OR lease_version >= 1),
+    CHECK(recovery_generation IS NULL OR recovery_generation >= 0)
+);
+CREATE TABLE IF NOT EXISTS collaboration_turn_targets (
+    target_id TEXT PRIMARY KEY,
+    execution_id TEXT NOT NULL UNIQUE CHECK(length(trim(execution_id)) > 0),
+    turn_id TEXT NOT NULL REFERENCES collaboration_turns(turn_id),
+    account_id TEXT NOT NULL,
+    membership_id TEXT NOT NULL REFERENCES collaboration_memberships(membership_id),
+    join_sequence INTEGER NOT NULL CHECK(join_sequence >= 1),
+    snapshot_sequence INTEGER NOT NULL CHECK(snapshot_sequence >= join_sequence),
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK(status IN (
+            'queued', 'running', 'waiting_approval', 'completed', 'failed',
+            'timed_out', 'ambiguous', 'cancelled'
+        )),
+    error TEXT,
+    result_json TEXT CHECK(result_json IS NULL OR json_valid(result_json)),
+    last_delivered_sequence INTEGER NOT NULL DEFAULT 0
+        CHECK(last_delivered_sequence >= 0),
+    active_seconds REAL NOT NULL DEFAULT 0 CHECK(active_seconds >= 0),
+    active_started_at REAL,
+    attempt INTEGER NOT NULL DEFAULT 0 CHECK(attempt >= 0),
+    worker_owner_key TEXT,
+    worker_id TEXT,
+    worker_generation INTEGER,
+    lease_version INTEGER,
+    recovery_generation INTEGER,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    completed_at REAL,
+    UNIQUE(turn_id, account_id),
+    CHECK(worker_generation IS NULL OR worker_generation >= 1),
+    CHECK(lease_version IS NULL OR lease_version >= 1),
+    CHECK(recovery_generation IS NULL OR recovery_generation >= 0)
+);
+CREATE TABLE IF NOT EXISTS collaboration_attachments (
+    attachment_id TEXT PRIMARY KEY,
+    group_id TEXT NOT NULL REFERENCES collaboration_groups(group_id),
+    event_id TEXT REFERENCES collaboration_events(event_id),
+    owner_key TEXT NOT NULL,
+    filename TEXT NOT NULL CHECK(length(trim(filename)) > 0),
+    media_type TEXT,
+    size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+    storage_key TEXT NOT NULL CHECK(length(trim(storage_key)) > 0),
+    content_sha256 TEXT,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS collaboration_attachment_grants (
+    grant_id TEXT PRIMARY KEY,
+    attachment_id TEXT NOT NULL REFERENCES collaboration_attachments(attachment_id),
+    target_id TEXT NOT NULL REFERENCES collaboration_turn_targets(target_id),
+    granted_sequence INTEGER NOT NULL CHECK(granted_sequence >= 1),
+    created_at REAL NOT NULL,
+    UNIQUE(attachment_id, target_id)
+);
+CREATE TABLE IF NOT EXISTS collaboration_attachment_materializations (
+    materialization_id TEXT PRIMARY KEY,
+    grant_id TEXT NOT NULL REFERENCES collaboration_attachment_grants(grant_id),
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending', 'running', 'completed', 'failed', 'ambiguous')),
+    materialized_path TEXT,
+    worker_owner_key TEXT,
+    worker_id TEXT,
+    worker_generation INTEGER,
+    lease_version INTEGER,
+    recovery_generation INTEGER,
+    error TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    completed_at REAL,
+    CHECK(worker_generation IS NULL OR worker_generation >= 1),
+    CHECK(lease_version IS NULL OR lease_version >= 1),
+    CHECK(recovery_generation IS NULL OR recovery_generation >= 0)
+);
+CREATE TABLE IF NOT EXISTS collaboration_approvals (
+    approval_id TEXT PRIMARY KEY,
+    target_id TEXT NOT NULL REFERENCES collaboration_turn_targets(target_id),
+    tool_call_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    request_json TEXT NOT NULL DEFAULT '{}'
+        CHECK(json_valid(request_json) AND json_type(request_json) = 'object'),
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending', 'approved', 'denied', 'expired', 'ambiguous')),
+    decision_event_id TEXT REFERENCES collaboration_events(event_id),
+    worker_owner_key TEXT,
+    worker_id TEXT,
+    worker_generation INTEGER,
+    lease_version INTEGER,
+    recovery_generation INTEGER,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    decided_at REAL,
+    UNIQUE(target_id, tool_call_id),
+    CHECK(worker_generation IS NULL OR worker_generation >= 1),
+    CHECK(lease_version IS NULL OR lease_version >= 1),
+    CHECK(recovery_generation IS NULL OR recovery_generation >= 0)
+);
+CREATE TABLE IF NOT EXISTS collaboration_tool_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    target_id TEXT NOT NULL REFERENCES collaboration_turn_targets(target_id),
+    tool_call_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    status TEXT NOT NULL
+        CHECK(status IN ('processing', 'completed', 'failed', 'ambiguous')),
+    request_json TEXT NOT NULL DEFAULT '{}'
+        CHECK(json_valid(request_json) AND json_type(request_json) = 'object'),
+    result_json TEXT CHECK(result_json IS NULL OR json_valid(result_json)),
+    worker_owner_key TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    worker_generation INTEGER NOT NULL CHECK(worker_generation >= 1),
+    lease_version INTEGER NOT NULL CHECK(lease_version >= 1),
+    recovery_generation INTEGER NOT NULL CHECK(recovery_generation >= 0),
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(target_id, tool_call_id)
+);
+CREATE TABLE IF NOT EXISTS collaboration_agent_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    owner_key TEXT NOT NULL,
+    operation TEXT NOT NULL CHECK(operation IN ('create', 'dispatch', 'finish')),
+    idempotency_key TEXT NOT NULL CHECK(length(trim(idempotency_key)) > 0),
+    request_json TEXT NOT NULL CHECK(json_valid(request_json) AND json_type(request_json) = 'object'),
+    result_json TEXT NOT NULL CHECK(json_valid(result_json) AND json_type(result_json) = 'object'),
+    created_at REAL NOT NULL,
+    UNIQUE(owner_key, operation, idempotency_key)
+);
+CREATE TABLE IF NOT EXISTS collaboration_origins (
+    origin_id TEXT PRIMARY KEY,
+    group_id TEXT NOT NULL REFERENCES collaboration_groups(group_id),
+    provider TEXT NOT NULL CHECK(length(trim(provider)) > 0),
+    account_id TEXT,
+    binding_id TEXT,
+    conversation_id TEXT NOT NULL CHECK(length(trim(conversation_id)) > 0),
+    thread_id TEXT NOT NULL DEFAULT '',
+    source_kind TEXT NOT NULL DEFAULT 'external'
+        CHECK(source_kind IN ('external', 'owner', 'employee', 'ai_collaboration', 'web_direct', 'web_group', 'feishu_direct')),
+    source_session_id TEXT,
+    creation_delivery_key TEXT UNIQUE,
+    completion_delivery_key TEXT UNIQUE,
+    source_group_id TEXT REFERENCES collaboration_groups(group_id),
+    source_event_id TEXT REFERENCES collaboration_events(event_id),
+    source_task_id TEXT REFERENCES collaboration_tasks(task_id),
+    round INTEGER NOT NULL DEFAULT 0 CHECK(round >= 0),
+    depth INTEGER NOT NULL DEFAULT 0 CHECK(depth BETWEEN 0 AND 1),
+    creation_delivered_at REAL,
+    completion_delivered_at REAL,
+    created_at REAL NOT NULL,
+    UNIQUE(group_id, provider, account_id, conversation_id, thread_id)
+);
+CREATE TABLE IF NOT EXISTS collaboration_delivery_state (
+    delivery_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL REFERENCES collaboration_events(event_id),
+    origin_id TEXT NOT NULL REFERENCES collaboration_origins(origin_id),
+    delivery_kind TEXT NOT NULL CHECK(delivery_kind IN ('creation', 'completion')),
+    delivery_key TEXT NOT NULL UNIQUE CHECK(length(trim(delivery_key)) > 0),
+    payload_text TEXT NOT NULL CHECK(length(trim(payload_text)) > 0),
+    outbound_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending', 'claimed', 'delivered', 'failed', 'ambiguous')),
+    provider_message_id TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+    next_attempt_at REAL NOT NULL DEFAULT 0,
+    last_error TEXT,
+    worker_owner_key TEXT,
+    worker_id TEXT,
+    worker_generation INTEGER,
+    lease_version INTEGER,
+    recovery_generation INTEGER,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    delivered_at REAL,
+    UNIQUE(event_id, origin_id, delivery_kind),
+    CHECK(worker_generation IS NULL OR worker_generation >= 1),
+    CHECK(lease_version IS NULL OR lease_version >= 1),
+    CHECK(recovery_generation IS NULL OR recovery_generation >= 0)
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
@@ -812,6 +1152,42 @@ CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_collaboration_groups_owner
+    ON collaboration_groups(owner_key, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_collaboration_events_group
+    ON collaboration_events(group_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_collaboration_memberships_group
+    ON collaboration_memberships(group_id, join_sequence, leave_sequence);
+CREATE INDEX IF NOT EXISTS idx_collaboration_tasks_group
+    ON collaboration_tasks(group_id, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_collaboration_targets_account
+    ON collaboration_turn_targets(account_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_collaboration_delivery_due
+    ON collaboration_delivery_state(status, next_attempt_at);
+CREATE TRIGGER IF NOT EXISTS sessions_kind_visibility_insert
+BEFORE INSERT ON sessions
+WHEN NOT (
+    (NEW.session_kind = 'conversation' AND NEW.visibility = 'visible') OR
+    (NEW.session_kind IN (
+        'internal_collaboration_member',
+        'internal_collaboration_coordinator'
+    ) AND NEW.visibility = 'internal')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'session kind and visibility are inconsistent');
+END;
+CREATE TRIGGER IF NOT EXISTS sessions_kind_visibility_update
+BEFORE UPDATE OF session_kind, visibility ON sessions
+WHEN NOT (
+    (NEW.session_kind = 'conversation' AND NEW.visibility = 'visible') OR
+    (NEW.session_kind IN (
+        'internal_collaboration_member',
+        'internal_collaboration_coordinator'
+    ) AND NEW.visibility = 'internal')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'session kind and visibility are inconsistent');
+END;
 """
 
 # Indexes that reference columns added in later schema versions must be
@@ -825,6 +1201,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_session_active_id
     ON messages(session_id, active, id);
 CREATE INDEX IF NOT EXISTS idx_messages_session_display_id
     ON messages(session_id, context_projection, active, compacted, id);
+CREATE INDEX IF NOT EXISTS idx_session_display_cards_session
+    ON session_display_cards(session_id, created_at, card_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_session_key
     ON sessions(session_key, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
@@ -1308,6 +1686,79 @@ class SessionDB(SessionQueryMixin):
 
         self._execute_write(_write)
 
+    def complete_collaboration_external_turn(
+        self,
+        *,
+        turn_key: str,
+        target_id: str,
+        worker_id: str,
+        worker_generation: int,
+        result_text: str,
+        result_status: str,
+        commit_target,
+    ) -> dict[str, Any]:
+        """Commit receipt and its fenced public collaboration outcome atomically."""
+        now = time.time()
+
+        def _write(conn: sqlite3.Connection) -> dict[str, Any]:
+            receipt = conn.execute(
+                "SELECT * FROM external_turn_receipts WHERE turn_key=?",
+                (turn_key,),
+            ).fetchone()
+            if receipt is None or receipt["stored_session_id"] is None:
+                raise RuntimeError("external turn receipt is unavailable")
+            if receipt["status"] == "completed":
+                if receipt["collaboration_target_id"] not in (None, target_id):
+                    raise RuntimeError("external turn receipt target mismatch")
+                outcome = commit_target(
+                    conn,
+                    result_text=str(receipt["result_text"] or ""),
+                    result_status=str(receipt["result_status"] or "complete"),
+                    now=now,
+                    reconcile=True,
+                )
+                if outcome.get("event_id") and receipt["collaboration_event_id"] is None:
+                    conn.execute(
+                        "UPDATE external_turn_receipts SET collaboration_target_id=?, "
+                        "collaboration_event_id=?, updated_at=? WHERE turn_key=?",
+                        (target_id, outcome["event_id"], now, turn_key),
+                    )
+                return outcome
+            if (
+                receipt["status"] != "processing"
+                or receipt["worker_id"] != worker_id
+                or int(receipt["worker_generation"]) != int(worker_generation)
+            ):
+                raise RuntimeError("external turn receipt claim is no longer valid")
+            outcome = commit_target(
+                conn,
+                result_text=result_text,
+                result_status=result_status,
+                now=now,
+                reconcile=False,
+            )
+            changed = conn.execute(
+                "UPDATE external_turn_receipts SET status='completed', result_text=?, "
+                "result_status=?, collaboration_target_id=?, collaboration_event_id=?, "
+                "updated_at=? WHERE turn_key=? AND status='processing' AND worker_id=? "
+                "AND worker_generation=?",
+                (
+                    result_text,
+                    result_status,
+                    target_id,
+                    outcome.get("event_id"),
+                    now,
+                    turn_key,
+                    worker_id,
+                    worker_generation,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("external turn receipt claim is no longer valid")
+            return outcome
+
+        return self._execute_write(_write)
+
     def _try_wal_checkpoint(self) -> None:
         """Best-effort TRUNCATE WAL checkpoint.  Never raises.
 
@@ -1457,6 +1908,200 @@ class SessionDB(SessionQueryMixin):
                             "reconcile %s.%s: %s", table_name, col_name, exc,
                         )
 
+    @staticmethod
+    def _rebuild_collaboration_phase2_tables(cursor: sqlite3.Cursor) -> None:
+        """Rebuild constrained Phase 2 tables so legacy databases accept web origins."""
+        task_sql = """
+            CREATE TABLE collaboration_tasks__v21 (
+                task_id TEXT PRIMARY KEY,
+                group_id TEXT NOT NULL REFERENCES collaboration_groups(group_id),
+                created_event_id TEXT NOT NULL REFERENCES collaboration_events(event_id),
+                assigned_account_id TEXT,
+                creator_account_id TEXT,
+                creator_membership_id TEXT REFERENCES collaboration_memberships(membership_id),
+                creator_profile_revision INTEGER CHECK(creator_profile_revision IS NULL OR creator_profile_revision >= 1),
+                creator_profile_fingerprint TEXT,
+                title TEXT NOT NULL CHECK(length(trim(title)) > 0),
+                description TEXT,
+                source_kind TEXT NOT NULL DEFAULT 'owner' CHECK(source_kind IN ('owner','employee','ai_collaboration','web_direct','web_group','feishu_direct')),
+                round INTEGER NOT NULL DEFAULT 0 CHECK(round >= 0),
+                max_rounds INTEGER NOT NULL DEFAULT 3 CHECK(max_rounds BETWEEN 1 AND 3),
+                depth INTEGER NOT NULL DEFAULT 0 CHECK(depth BETWEEN 0 AND 1),
+                source_event_id TEXT REFERENCES collaboration_events(event_id),
+                source_task_id TEXT REFERENCES collaboration_tasks__v21(task_id),
+                allowed_attachment_ids_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(allowed_attachment_ids_json) AND json_type(allowed_attachment_ids_json)='array'),
+                summary_text TEXT,
+                status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','claimed','completed','cancelled','ambiguous')),
+                worker_owner_key TEXT, worker_id TEXT, worker_generation INTEGER,
+                lease_version INTEGER, recovery_generation INTEGER,
+                created_at REAL NOT NULL, updated_at REAL NOT NULL, completed_at REAL,
+                CHECK(worker_generation IS NULL OR worker_generation >= 1),
+                CHECK(lease_version IS NULL OR lease_version >= 1),
+                CHECK(recovery_generation IS NULL OR recovery_generation >= 0)
+            )
+        """
+        origin_sql = """
+            CREATE TABLE collaboration_origins__v21 (
+                origin_id TEXT PRIMARY KEY,
+                group_id TEXT NOT NULL REFERENCES collaboration_groups(group_id),
+                provider TEXT NOT NULL CHECK(length(trim(provider)) > 0),
+                account_id TEXT,
+                conversation_id TEXT NOT NULL CHECK(length(trim(conversation_id)) > 0),
+                thread_id TEXT NOT NULL DEFAULT '',
+                source_kind TEXT NOT NULL DEFAULT 'external' CHECK(source_kind IN ('external','owner','employee','ai_collaboration','web_direct','web_group','feishu_direct')),
+                source_group_id TEXT REFERENCES collaboration_groups(group_id),
+                source_event_id TEXT REFERENCES collaboration_events(event_id),
+                source_task_id TEXT REFERENCES collaboration_tasks__v21(task_id),
+                round INTEGER NOT NULL DEFAULT 0 CHECK(round >= 0),
+                depth INTEGER NOT NULL DEFAULT 0 CHECK(depth BETWEEN 0 AND 1),
+                creation_delivered_at REAL, completion_delivered_at REAL,
+                created_at REAL NOT NULL,
+                UNIQUE(group_id, provider, account_id, conversation_id, thread_id)
+            )
+        """
+        cursor.execute("PRAGMA foreign_keys=OFF")
+        cursor.execute(task_sql)
+        task_columns = [
+            "task_id", "group_id", "created_event_id", "assigned_account_id",
+            "creator_account_id", "creator_membership_id", "creator_profile_revision",
+            "creator_profile_fingerprint", "title", "description", "source_kind",
+            "round", "max_rounds", "depth", "source_event_id", "source_task_id",
+            "allowed_attachment_ids_json", "summary_text", "status", "worker_owner_key",
+            "worker_id", "worker_generation", "lease_version", "recovery_generation",
+            "created_at", "updated_at", "completed_at",
+        ]
+        live_task_columns = {
+            row[1] if isinstance(row, (tuple, list)) else row["name"]
+            for row in cursor.execute("PRAGMA table_info(collaboration_tasks)").fetchall()
+        }
+        select_task = [
+            name if name in live_task_columns else (
+                "3 AS max_rounds" if name == "max_rounds" else
+                "'[]' AS allowed_attachment_ids_json" if name == "allowed_attachment_ids_json" else
+                f"NULL AS {name}"
+            )
+            for name in task_columns
+        ]
+        cursor.execute(
+            f"INSERT INTO collaboration_tasks__v21 ({','.join(task_columns)}) "
+            f"SELECT {','.join(select_task)} FROM collaboration_tasks"
+        )
+        cursor.execute(origin_sql)
+        origin_columns = [
+            "origin_id", "group_id", "provider", "account_id", "conversation_id",
+            "thread_id", "source_kind", "source_group_id", "source_event_id",
+            "source_task_id", "round", "depth", "creation_delivered_at",
+            "completion_delivered_at", "created_at",
+        ]
+        live_origin_columns = {
+            row[1] if isinstance(row, (tuple, list)) else row["name"]
+            for row in cursor.execute("PRAGMA table_info(collaboration_origins)").fetchall()
+        }
+        select_origin = [
+            name if name in live_origin_columns else f"NULL AS {name}"
+            for name in origin_columns
+        ]
+        cursor.execute(
+            f"INSERT INTO collaboration_origins__v21 ({','.join(origin_columns)}) "
+            f"SELECT {','.join(select_origin)} FROM collaboration_origins"
+        )
+        cursor.execute("DROP TABLE collaboration_origins")
+        cursor.execute("DROP TABLE collaboration_tasks")
+        cursor.execute("ALTER TABLE collaboration_tasks__v21 RENAME TO collaboration_tasks")
+        cursor.execute("ALTER TABLE collaboration_origins__v21 RENAME TO collaboration_origins")
+        cursor.execute("PRAGMA foreign_keys=ON")
+
+    @staticmethod
+    def _rebuild_collaboration_phase3_tables(cursor: sqlite3.Cursor) -> None:
+        """Rebuild constrained origin tables for exact Feishu direct delivery."""
+        cursor.execute("PRAGMA foreign_keys=OFF")
+        cursor.execute("DROP INDEX IF EXISTS idx_collaboration_delivery_due")
+        cursor.execute("ALTER TABLE collaboration_delivery_state RENAME TO collaboration_delivery_state__v22")
+        cursor.execute("ALTER TABLE collaboration_origins RENAME TO collaboration_origins__v22")
+        cursor.execute(
+            """
+            CREATE TABLE collaboration_origins (
+                origin_id TEXT PRIMARY KEY,
+                group_id TEXT NOT NULL REFERENCES collaboration_groups(group_id),
+                provider TEXT NOT NULL CHECK(length(trim(provider)) > 0),
+                account_id TEXT,
+                binding_id TEXT,
+                conversation_id TEXT NOT NULL CHECK(length(trim(conversation_id)) > 0),
+                thread_id TEXT NOT NULL DEFAULT '',
+                source_kind TEXT NOT NULL DEFAULT 'external'
+                    CHECK(source_kind IN ('external','owner','employee','ai_collaboration','web_direct','web_group','feishu_direct')),
+                source_session_id TEXT,
+                creation_delivery_key TEXT UNIQUE,
+                completion_delivery_key TEXT UNIQUE,
+                source_group_id TEXT REFERENCES collaboration_groups(group_id),
+                source_event_id TEXT REFERENCES collaboration_events(event_id),
+                source_task_id TEXT REFERENCES collaboration_tasks(task_id),
+                round INTEGER NOT NULL DEFAULT 0 CHECK(round >= 0),
+                depth INTEGER NOT NULL DEFAULT 0 CHECK(depth BETWEEN 0 AND 1),
+                creation_delivered_at REAL,
+                completion_delivered_at REAL,
+                created_at REAL NOT NULL,
+                UNIQUE(group_id, provider, account_id, conversation_id, thread_id)
+            )
+            """
+        )
+        cursor.execute(
+            """
+            INSERT INTO collaboration_origins
+              (origin_id, group_id, provider, account_id, binding_id,
+               conversation_id, thread_id, source_kind, source_session_id,
+               creation_delivery_key, completion_delivery_key, source_group_id,
+               source_event_id, source_task_id, round, depth,
+               creation_delivered_at, completion_delivered_at, created_at)
+            SELECT origin_id, group_id, provider, account_id, NULL,
+                   conversation_id, thread_id, source_kind, NULL,
+                   NULL, NULL, source_group_id, source_event_id, source_task_id,
+                   round, depth, creation_delivered_at,
+                   completion_delivered_at, created_at
+            FROM collaboration_origins__v22
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE collaboration_delivery_state (
+                delivery_id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL REFERENCES collaboration_events(event_id),
+                origin_id TEXT NOT NULL REFERENCES collaboration_origins(origin_id),
+                delivery_kind TEXT NOT NULL CHECK(delivery_kind IN ('creation','completion')),
+                delivery_key TEXT NOT NULL UNIQUE CHECK(length(trim(delivery_key)) > 0),
+                payload_text TEXT NOT NULL CHECK(length(trim(payload_text)) > 0),
+                outbound_id TEXT,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending','claimed','delivered','failed','ambiguous')),
+                provider_message_id TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+                next_attempt_at REAL NOT NULL DEFAULT 0,
+                last_error TEXT,
+                worker_owner_key TEXT,
+                worker_id TEXT,
+                worker_generation INTEGER,
+                lease_version INTEGER,
+                recovery_generation INTEGER,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                delivered_at REAL,
+                UNIQUE(event_id, origin_id, delivery_kind),
+                CHECK(worker_generation IS NULL OR worker_generation >= 1),
+                CHECK(lease_version IS NULL OR lease_version >= 1),
+                CHECK(recovery_generation IS NULL OR recovery_generation >= 0)
+            )
+            """
+        )
+        # Phase 2 never wrote delivery-state rows; fail closed if an unexpected
+        # producer did rather than guessing a delivery kind or replaying it.
+        if cursor.execute(
+            "SELECT 1 FROM collaboration_delivery_state__v22 LIMIT 1"
+        ).fetchone() is not None:
+            raise RuntimeError("legacy collaboration delivery state is not migratable")
+        cursor.execute("DROP TABLE collaboration_delivery_state__v22")
+        cursor.execute("DROP TABLE collaboration_origins__v22")
+        cursor.execute("PRAGMA foreign_keys=ON")
+
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
 
@@ -1528,6 +2173,18 @@ class SessionDB(SessionQueryMixin):
             # backfills, index changes tied to a specific version step) stay
             # in a version-gated chain. Column additions are handled by
             # _reconcile_columns() above and no longer need entries here.
+            if current_version < 23:
+                # Rebuild both constrained task and origin tables so Phase 3 can
+                # admit feishu_direct without retaining an incompatible CHECK.
+                self._rebuild_collaboration_phase2_tables(cursor)
+            if current_version < 22:
+                cursor.execute(
+                    "DELETE FROM messages WHERE role='system' AND "
+                    "(content LIKE '[Internal collaboration created] %' OR "
+                    "content LIKE '[Internal collaboration completed] %')"
+                )
+            if current_version < 23:
+                self._rebuild_collaboration_phase3_tables(cursor)
             if current_version < 10 and SCHEMA_VERSION == 10:
                 # v10: trigram FTS5 table for CJK/substring search. The
                 # virtual table + triggers are created unconditionally via
@@ -1713,6 +2370,9 @@ class SessionDB(SessionQueryMixin):
         worker_generation: int = None,
         parent_session_id: str = None,
         cwd: str = None,
+        session_kind: str = "conversation",
+        visibility: str = "visible",
+        conn=None,
     ) -> None:
         """Insert a session row, enriching NULL metadata on conflict.
 
@@ -1732,14 +2392,35 @@ class SessionDB(SessionQueryMixin):
         switching to it (IDOR scoping — without them the ``sessions`` table has
         no chat/thread to compare).
         """
+        internal_session_kinds = {
+            "internal_collaboration_member",
+            "internal_collaboration_coordinator",
+        }
+        if session_kind not in {"conversation", *internal_session_kinds}:
+            raise ValueError("session kind is invalid")
+        if visibility not in {"visible", "internal"}:
+            raise ValueError("session visibility is invalid")
+        if (session_kind in internal_session_kinds) != (visibility == "internal"):
+            raise ValueError("session kind and visibility are inconsistent")
+
         def _do(conn):
+            existing = conn.execute(
+                "SELECT session_kind, visibility FROM sessions WHERE id=?",
+                (session_id,),
+            ).fetchone()
+            if existing is not None and (
+                existing["session_kind"] != session_kind
+                or existing["visibility"] != visibility
+            ):
+                raise RuntimeError("session kind or visibility mismatch")
             conn.execute(
                 """INSERT INTO sessions (
                    id, source, user_id, session_key, chat_id, chat_type, thread_id,
                    owner_key, workspace_root, worker_generation,
-                   model, model_config, system_prompt, parent_session_id, cwd, started_at
+                   model, model_config, system_prompt, parent_session_id, cwd,
+                   session_kind, visibility, started_at
                 )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        model = COALESCE(sessions.model, excluded.model),
                        model_config = COALESCE(sessions.model_config, excluded.model_config),
@@ -1769,10 +2450,15 @@ class SessionDB(SessionQueryMixin):
                     system_prompt,
                     parent_session_id,
                     cwd,
+                    session_kind,
+                    visibility,
                     time.time(),
                 ),
             )
-        self._execute_write(_do)
+        if conn is None:
+            self._execute_write(_do)
+        else:
+            _do(conn)
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
         """Create a new session record. Returns the session_id."""
@@ -1834,7 +2520,8 @@ class SessionDB(SessionQueryMixin):
         with self._lock:
             row = self._conn.execute(
                 """SELECT id, owner_key, workspace_root, worker_generation
-                   FROM sessions WHERE id = ? OR title = ?
+                   FROM sessions
+                   WHERE visibility = 'visible' AND (id = ? OR title = ?)
                    ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END LIMIT 1""",
                 (session_id_or_title, session_id_or_title, session_id_or_title),
             ).fetchone()
@@ -1870,6 +2557,7 @@ class SessionDB(SessionQueryMixin):
                 SELECT * FROM sessions
                 WHERE session_key = ?
                   AND source = ?
+                  AND visibility = 'visible'
                   AND (ended_at IS NULL OR end_reason = 'agent_close')
                   AND (COALESCE(message_count, 0) > 0 OR EXISTS (
                       SELECT 1 FROM messages WHERE messages.session_id = sessions.id LIMIT 1
@@ -1892,6 +2580,7 @@ class SessionDB(SessionQueryMixin):
                 f"""
                 SELECT * FROM sessions
                 WHERE source = ?
+                  AND visibility = 'visible'
                   AND COALESCE(user_id, '') = COALESCE(?, '')
                   AND COALESCE(chat_id, '') = COALESCE(?, '')
                   AND COALESCE(chat_type, '') = COALESCE(?, '')
@@ -3009,6 +3698,68 @@ class SessionDB(SessionQueryMixin):
 
         return self._execute_write(_do)
 
+    def append_session_display_card(
+        self,
+        session_id: str,
+        *,
+        card_kind: str,
+        source_id: str,
+        status: str,
+        payload: dict[str, Any],
+        card_id: str | None = None,
+        timestamp: float | None = None,
+    ) -> dict[str, Any]:
+        """Append one idempotent display-only card outside provider replay history."""
+        if card_kind != "collaboration_origin":
+            raise ValueError("session display card kind is invalid")
+        source_id = str(source_id or "").strip()
+        if not source_id:
+            raise ValueError("session display card source ID is required")
+        if status not in {"created", "completed"}:
+            raise ValueError("session display card status is invalid")
+        if not isinstance(payload, dict):
+            raise ValueError("session display card payload must be an object")
+        payload_json = json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        )
+        created_at = time.time() if timestamp is None else float(timestamp)
+        resolved_card_id = str(card_id or "").strip() or f"sdc_{uuid.uuid4().hex}"
+
+        def _do(conn):
+            if conn.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone() is None:
+                raise RuntimeError("session display card session is unavailable")
+            existing = conn.execute(
+                "SELECT * FROM session_display_cards WHERE session_id=? AND card_kind=? "
+                "AND source_id=? AND status=?",
+                (session_id, card_kind, source_id, status),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["payload_json"]) != payload_json:
+                    raise RuntimeError("session display card replay is inconsistent")
+                return dict(existing)
+            conn.execute(
+                "INSERT INTO session_display_cards "
+                "(card_id, session_id, card_kind, source_id, status, payload_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    resolved_card_id,
+                    session_id,
+                    card_kind,
+                    source_id,
+                    status,
+                    payload_json,
+                    created_at,
+                ),
+            )
+            return dict(
+                conn.execute(
+                    "SELECT * FROM session_display_cards WHERE card_id=?",
+                    (resolved_card_id,),
+                ).fetchone()
+            )
+
+        return self._execute_write(_do)
+
     def _insert_message_rows(
         self,
         conn,
@@ -4023,6 +4774,7 @@ class SessionDB(SessionQueryMixin):
                 "SELECT id FROM sessions "
                 "WHERE message_count = 0 "
                 "AND ended_at IS NOT NULL "
+                "AND visibility = 'visible' "
                 f"AND archived = 0{scope_clause}",
                 scope_params,
             )

@@ -88,6 +88,11 @@ describe("ChannelsPage", () => {
       runtime_state: "ready",
       profile_revision: 1,
       profile_fingerprint: "sha256:test",
+      collaboration_policy: {
+        may_participate: true,
+        may_create_groups: false,
+        invite_quota: 5,
+      },
       profile: null,
     };
     const createFeishuEmployee = vi.spyOn(api, "createFeishuEmployee").mockResolvedValue(createdEmployee);
@@ -154,6 +159,11 @@ describe("ChannelsPage", () => {
       runtime_state: "ready",
       profile_revision: 2,
       profile_fingerprint: "sha256:test",
+      collaboration_policy: {
+        may_participate: true,
+        may_create_groups: false,
+        invite_quota: 5,
+      },
       profile: {
         schema_version: 1,
         name: "Ada",

@@ -69,6 +69,79 @@ describe("guiChatReducer model identity", () => {
   });
 });
 
+describe("guiChatReducer collaboration origin cards", () => {
+  it("hydrates durable cards and appends live cards without creating assistant output", () => {
+    const hydrated = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        messages: [{
+          collaboration_card: {
+            group_id: "group-a",
+            status: "created",
+            text: "Review the launch",
+            title: "Launch review",
+          },
+          role: "system",
+          text: "persisted card",
+        }],
+        session_id: "runtime-a",
+      },
+    });
+    const live = guiChatReducer(hydrated, {
+      type: "event",
+      event: {
+        payload: {
+          card_id: "card-completed-a",
+          group_id: "group-a",
+          status: "completed",
+          summary: "Approved",
+          task_id: "task-a",
+          title: "Launch review",
+        },
+        session_id: "runtime-a",
+        type: "collaboration.origin.card",
+      },
+    });
+
+    expect(live.messages).toHaveLength(2);
+    expect(live.messages[0].collaborationCard).toEqual({
+      groupId: "group-a",
+      status: "created",
+      text: "Review the launch",
+      title: "Launch review",
+    });
+    expect(live.messages[1]).toMatchObject({
+      id: "card-completed-a",
+      collaborationCard: {
+        groupId: "group-a",
+        status: "completed",
+        taskId: "task-a",
+        text: "Approved",
+        title: "Launch review",
+      },
+      role: "system",
+      text: "Approved",
+    });
+    const replayed = guiChatReducer(live, {
+      type: "event",
+      event: {
+        payload: {
+          card_id: "card-completed-a",
+          group_id: "group-a",
+          status: "completed",
+          summary: "Approved",
+          task_id: "task-a",
+          title: "Launch review",
+        },
+        session_id: "runtime-a",
+        type: "collaboration.origin.card",
+      },
+    });
+    expect(replayed.messages).toHaveLength(2);
+    expect(live.isGenerating).toBe(false);
+  });
+});
+
 describe("guiChatReducer live attach restoration", () => {
   it("restores an in-flight user prompt and partial assistant response", () => {
     const state = guiChatReducer(initialGuiChatState, {

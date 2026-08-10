@@ -4,6 +4,14 @@ export type GuiChatConnectionState = ConnectionState;
 
 export type ChatMessageRole = "user" | "assistant" | "system";
 
+export interface CollaborationOriginCardState {
+  groupId: string;
+  status: "completed" | "created";
+  taskId?: string;
+  text: string;
+  title: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: ChatMessageRole;
@@ -12,6 +20,7 @@ export interface ChatMessage {
   status?: "complete" | "error" | "interrupted";
   artifactIds: string[];
   attachments?: MessageAttachmentState[];
+  collaborationCard?: CollaborationOriginCardState;
 }
 
 export interface MessageAttachmentState {

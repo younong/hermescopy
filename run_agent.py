@@ -465,6 +465,9 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         employee_policy: Dict[str, Any] | None = None,
+        collaboration_context: Any = None,
+        session_kind: str = "conversation",
+        session_visibility: str = "visible",
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -543,6 +546,9 @@ class AIAgent:
             pass_session_id=pass_session_id,
         )
         self.employee_policy = employee_policy
+        self.collaboration_context = collaboration_context
+        self._session_kind = str(session_kind)
+        self._session_visibility = str(session_visibility)
 
     def _get_session_db_for_recall(self):
         """Return a SessionDB for recall, lazily creating it if an entrypoint forgot.
@@ -586,6 +592,8 @@ class AIAgent:
                 user_id=None,
                 parent_session_id=self._parent_session_id,
                 cwd=_launch_cwd_for_session(source),
+                session_kind=self._session_kind,
+                visibility=self._session_visibility,
             )
             self._session_db_created = True
         except Exception as e:

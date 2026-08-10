@@ -126,6 +126,7 @@ def claim_outbound(
         next_part_index=int(row["next_chunk_index"]),
         part_attempts=int(row["chunk_attempts"]) + 1,
         context_token=context,
+        source_kind=str(row["source_kind"] or "") or None,
     )
 
 
@@ -183,19 +184,22 @@ def release_outbound_claim(
     return changed == 1
 
 
-def fail_outbound(
+def _finish_outbound_failure(
     store: ChannelIdentityStore,
     delivery: OutboundDelivery,
     *,
     holder: str,
     error: str,
+    status: str,
 ) -> bool:
+    if status not in {"failed", "ambiguous"}:
+        raise ValueError("outbound failure status is invalid")
     now = time.time()
     with store.write() as conn:
         changed = conn.execute(
             """
             UPDATE outbound_messages
-            SET status='failed', claimed_by=NULL, claimed_at=NULL, last_error=?,
+            SET status=?, claimed_by=NULL, claimed_at=NULL, last_error=?,
                 failed_chunk_index=?, payload_ciphertext=NULL,
                 payload_key_version=NULL, context_ciphertext=NULL,
                 context_key_version=NULL, updated_at=?
@@ -203,6 +207,7 @@ def fail_outbound(
               AND next_chunk_index=?
             """,
             (
+                status,
                 error,
                 delivery.next_part_index,
                 now,
@@ -215,15 +220,43 @@ def fail_outbound(
         if changed == 1:
             conn.execute(
                 """
-                UPDATE inbound_messages SET status='failed',
-                    rejection_reason='outbound_failed', updated_at=?
+                UPDATE inbound_messages SET status='failed', rejection_reason=?, updated_at=?
                 WHERE inbound_id=(
                     SELECT inbound_id FROM outbound_messages WHERE outbound_id=?
                 )
                 """,
-                (now, delivery.outbound_id),
+                (
+                    "outbound_ambiguous" if status == "ambiguous" else "outbound_failed",
+                    now,
+                    delivery.outbound_id,
+                ),
             )
     return changed == 1
+
+
+def fail_outbound(
+    store: ChannelIdentityStore,
+    delivery: OutboundDelivery,
+    *,
+    holder: str,
+    error: str,
+) -> bool:
+    return _finish_outbound_failure(
+        store, delivery, holder=holder, error=error, status="failed"
+    )
+
+
+def mark_outbound_ambiguous(
+    store: ChannelIdentityStore,
+    delivery: OutboundDelivery,
+    *,
+    holder: str,
+    error: str,
+) -> bool:
+    """Terminally stop replay when a provider side effect may have occurred."""
+    return _finish_outbound_failure(
+        store, delivery, holder=holder, error=error, status="ambiguous"
+    )
 
 
 def advance_outbound(
@@ -473,6 +506,139 @@ class ChannelOutbox:
                     now,
                     now,
                     now,
+                ),
+            )
+        return outbound_id
+
+    def collaboration_delivery_status(
+        self, outbound_id: str
+    ) -> dict[str, str | None] | None:
+        """Read the terminal or in-flight state of one collaboration outbox row."""
+        exact_outbound = str(outbound_id or "").strip()
+        if not exact_outbound:
+            raise ValueError("collaboration outbound ID is required")
+        with self.store.read() as conn:
+            row = conn.execute(
+                "SELECT status, last_error FROM outbound_messages "
+                "WHERE outbound_id=? AND source_kind='collaboration'",
+                (exact_outbound,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"status": str(row["status"]), "error": row["last_error"]}
+
+    def enqueue_collaboration_origin(
+        self,
+        *,
+        owner_key: str,
+        account_id: str,
+        binding_id: str,
+        conversation_id: str,
+        thread_id: str,
+        delivery_key: str,
+        payload: str,
+    ) -> str:
+        """Idempotently encrypt one exact Feishu direct origin notification."""
+        exact_owner = str(owner_key or "").strip()
+        exact_account = str(account_id or "").strip()
+        exact_binding = str(binding_id or "").strip()
+        exact_conversation = str(conversation_id or "").strip()
+        exact_thread = str(thread_id or "")
+        stable_key = str(delivery_key or "").strip()
+        text = str(payload or "")
+        if not all((exact_owner, exact_account, exact_binding, exact_conversation, stable_key)):
+            raise ValueError("collaboration delivery identity is incomplete")
+        if exact_thread:
+            raise RuntimeError("Feishu direct collaboration thread must be empty")
+        if not text.strip() or len(text.encode("utf-8")) > 256_000:
+            raise ValueError("collaboration delivery payload is invalid")
+        if not stable_key.startswith("collaboration:"):
+            raise ValueError("collaboration delivery key is invalid")
+        source_id = stable_key
+        digest = hashlib.sha256(source_id.encode("utf-8")).hexdigest()
+        outbound_id = f"om_collab_{digest[:32]}"
+        client_message_id = f"hermes-collaboration-{digest}"
+        ciphertext, key_version = self.store.crypto.encrypt_text(
+            text,
+            table="outbound_messages",
+            record_id=outbound_id,
+            field="payload",
+        )
+        expected_peer = self.store.crypto.lookup_hash(
+            "conversation:feishu", exact_conversation
+        )
+        now = time.time()
+        with self.store.write() as conn:
+            binding = conn.execute(
+                "SELECT b.account_id, b.peer_lookup_hash, o.owner_key, "
+                "ct.token_ciphertext, ct.token_key_version "
+                "FROM channel_bindings b "
+                "JOIN connector_accounts a ON a.account_id=b.account_id "
+                "JOIN external_identities e ON e.external_identity_id=b.external_identity_id "
+                "JOIN canonical_users u ON u.canonical_user_id=e.canonical_user_id "
+                "JOIN owner_bindings o ON o.canonical_user_id=u.canonical_user_id "
+                "JOIN managed_feishu_accounts m ON m.account_id=a.account_id "
+                "LEFT JOIN context_tokens ct ON ct.account_id=b.account_id "
+                "AND ct.peer_lookup_hash=b.peer_lookup_hash "
+                "WHERE b.binding_id=? AND b.account_id=? AND b.peer_lookup_hash=? "
+                "AND b.status='active' AND a.provider='feishu' AND a.status='active' "
+                "AND e.status='active' AND u.status='active' AND m.lifecycle_status='active'",
+                (exact_binding, exact_account, expected_peer),
+            ).fetchone()
+            if binding is None:
+                raise RuntimeError("Feishu collaboration binding is unavailable")
+            if not hmac.compare_digest(str(binding["owner_key"]), exact_owner):
+                raise RuntimeError("Feishu collaboration binding belongs to another Owner")
+            existing = conn.execute(
+                "SELECT outbound_id, account_id, binding_id FROM outbound_messages "
+                "WHERE source_id=?",
+                (source_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    not hmac.compare_digest(str(existing["account_id"]), exact_account)
+                    or not hmac.compare_digest(str(existing["binding_id"]), exact_binding)
+                ):
+                    raise RuntimeError("collaboration delivery key is bound elsewhere")
+                return str(existing["outbound_id"])
+            conn.execute(
+                "INSERT INTO binding_sequences(binding_id, dispatch_scope, last_sequence) "
+                "VALUES (?, '', 1) ON CONFLICT(binding_id, dispatch_scope) "
+                "DO UPDATE SET last_sequence=last_sequence + 1",
+                (exact_binding,),
+            )
+            sequence = int(conn.execute(
+                "SELECT last_sequence FROM binding_sequences "
+                "WHERE binding_id=? AND dispatch_scope=''",
+                (exact_binding,),
+            ).fetchone()[0])
+            context_ciphertext = context_version = None
+            if binding["token_ciphertext"] is not None:
+                context = self.store.crypto.decrypt_text(
+                    binding["token_ciphertext"],
+                    table="context_tokens",
+                    record_id=f"{exact_account}:{binding['peer_lookup_hash']}",
+                    field="token",
+                    version=binding["token_key_version"],
+                )
+                context_ciphertext, context_version = self.store.crypto.encrypt_text(
+                    context,
+                    table="outbound_messages",
+                    record_id=outbound_id,
+                    field="context",
+                )
+            conn.execute(
+                "INSERT INTO outbound_messages "
+                "(outbound_id, inbound_id, account_id, binding_id, provider, source_kind, "
+                "source_id, binding_sequence, dispatch_scope, client_message_id, "
+                "payload_ciphertext, payload_key_version, context_ciphertext, "
+                "context_key_version, status, next_attempt_at, created_at, updated_at) "
+                "VALUES (?, NULL, ?, ?, 'feishu', 'collaboration', ?, ?, '', ?, ?, ?, ?, ?, "
+                "'queued', ?, ?, ?)",
+                (
+                    outbound_id, exact_account, exact_binding, source_id, sequence,
+                    client_message_id, ciphertext, key_version, context_ciphertext,
+                    context_version, now, now, now,
                 ),
             )
         return outbound_id

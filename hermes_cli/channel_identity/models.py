@@ -39,6 +39,14 @@ class ResolvedConnectorAccount:
 
 
 @dataclass(frozen=True)
+class EmployeeCollaborationPolicy:
+    account_id: str
+    may_participate: bool = True
+    may_create_groups: bool = False
+    invite_quota: int | None = 5
+
+
+@dataclass(frozen=True)
 class ManagedFeishuAccount:
     account_id: str
     canonical_user_id: str
@@ -49,6 +57,7 @@ class ManagedFeishuAccount:
     lifecycle_status: str
     profile_revision: int | None
     profile_fingerprint: str | None
+    collaboration_policy: EmployeeCollaborationPolicy
 
 
 @dataclass(frozen=True)

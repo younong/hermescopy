@@ -360,6 +360,60 @@ describe("GuiChatShell", () => {
     expect(document.querySelector('[aria-label="Log out"]')).not.toBeNull();
   });
 
+  it("starts a managed employee direct chat with only its account identifier", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+    mocks.getFeishuEmployees.mockResolvedValue({
+      employees: [
+        {
+          account_id: "employee-a",
+          app_id: "app-a",
+          collaboration_policy: {
+            invite_quota: 5,
+            may_create_groups: true,
+            may_participate: true,
+          },
+          credential_version: 1,
+          lifecycle_status: "active",
+          profile: {
+            knowledge_relative_paths: [],
+            max_iterations: 20,
+            mcp_servers: [],
+            model_registration_id: "chat-a",
+            name: "Researcher",
+            schema_version: 1,
+            skills: [],
+            system_prompt: "Server policy",
+            toolsets: [],
+            workspace_relative_path: "employees/researcher",
+          },
+          profile_fingerprint: "sha256:pinned",
+          profile_revision: 3,
+          runtime_state: "running",
+        },
+      ],
+    });
+
+    await renderShell(<GuiChatShell />);
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[aria-label="Start employee chat"]')?.click();
+      await Promise.resolve();
+      const employeeButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
+        .find((button) => button.textContent?.trim() === "Researcher");
+      employeeButton?.click();
+      await Promise.resolve();
+    });
+
+    expect(connection.createOrAttach).toHaveBeenLastCalledWith(
+      null,
+      expect.any(Number),
+      expect.any(AbortSignal),
+      undefined,
+      { employeeAccountId: "employee-a" },
+    );
+  });
+
   it("opens employee management inside the dedicated workspace", async () => {
     const connection = createConnection();
     mocks.getAuthMe.mockResolvedValue(authIdentity());
@@ -702,7 +756,23 @@ describe("GuiChatShell", () => {
       expect.any(Number),
       expect.any(AbortSignal),
       expect.objectContaining({ traceId: "trace-initial-123" }),
+      undefined,
     );
+  });
+
+  it("opens a group route on the shared gateway without creating a direct session", async () => {
+    const connection = createConnection();
+    vi.mocked(connection.collaboration.getGroup).mockImplementation(() => new Promise(() => undefined));
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShellAt("/chat?group=group-a");
+
+    expect(new Set(mocks.connectGuiChat.mock.results.map((result) => result.value))).toEqual(new Set([connection]));
+    expect(connection.attachOwner).toHaveBeenCalledOnce();
+    expect(connection.attachOwner).toHaveBeenCalledWith();
+    expect(connection.createOrAttach).not.toHaveBeenCalled();
+    expect(connection.collaboration.listGroups).toHaveBeenCalledOnce();
   });
 
   it("connects automatically when the authenticated owner becomes ready", async () => {
@@ -754,6 +824,7 @@ describe("GuiChatShell", () => {
       expect.any(Number),
       expect.any(AbortSignal),
       expect.objectContaining({ traceId: "trace-initial-123" }),
+      undefined,
     );
   });
 
@@ -828,6 +899,7 @@ describe("GuiChatShell", () => {
       "stored-a",
       expect.any(Number),
       expect.any(AbortSignal),
+      undefined,
       undefined,
     );
     vi.useRealTimers();
@@ -1019,10 +1091,27 @@ function createConnection(): TestGuiChatConnection {
     session_id: "runtime-a",
     stored_session_id: "stored-a",
   });
+  const collaborationEventHandlers = new Set<(event: never) => void>();
   const connection = {
     attachFile: vi.fn(),
     attachImage: vi.fn(),
+    attachOwner: vi.fn().mockResolvedValue(undefined),
     attachPdf: vi.fn(),
+    collaboration: {
+      archiveGroup: vi.fn(),
+      createGroup: vi.fn(),
+      getGroup: vi.fn(),
+      interruptTarget: vi.fn(),
+      listGroups: vi.fn().mockResolvedValue({ groups: [] }),
+      onEvent: vi.fn((handler: (event: never) => void) => {
+        collaborationEventHandlers.add(handler);
+        return () => collaborationEventHandlers.delete(handler);
+      }),
+      respondToApproval: vi.fn(),
+      submitMessage: vi.fn(),
+      updateMembers: vi.fn(),
+      uploadAttachment: vi.fn(),
+    },
     client: {
       onEvent: (handler: (event: never) => void) => {
         eventHandlers.add(handler);
@@ -1036,6 +1125,7 @@ function createConnection(): TestGuiChatConnection {
     },
     close: vi.fn(),
     createOrAttach: createOrAttachMock,
+    ensureConnected: vi.fn().mockResolvedValue(undefined),
     createOrAttachMock,
     emitEvent: (event: Parameters<Parameters<GuiChatConnection["client"]["onEvent"]>[0]>[0]) => {
       for (const handler of eventHandlers) handler(event as never);

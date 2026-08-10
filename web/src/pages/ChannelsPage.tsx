@@ -22,6 +22,7 @@ import { api } from "@/lib/api";
 import type {
   FeishuEmployee,
   FeishuEmployeeCatalog,
+  FeishuEmployeeCollaborationPolicy,
   FeishuEmployeePolicy,
   FeishuLifecycleStatus,
   MessagingPlatform,
@@ -152,6 +153,7 @@ export default function ChannelsPage() {
   const [togglingId, setTogglingId] = useState<string | null>(null);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [employeeBusy, setEmployeeBusy] = useState<string | null>(null);
+  const [collaborationDrafts, setCollaborationDrafts] = useState<Record<string, FeishuEmployeeCollaborationPolicy>>({});
 
   const load = useCallback(() => {
     const platformsRequest = authRequired
@@ -170,6 +172,9 @@ export default function ChannelsPage() {
         setPlatforms(platformResponse.platforms);
         setEnvPath(platformResponse.env_path || "~/.hermes/.env");
         setEmployees(employeeResponse.employees);
+        setCollaborationDrafts(Object.fromEntries(
+          employeeResponse.employees.map((employee) => [employee.account_id, employee.collaboration_policy]),
+        ));
         setCatalog(catalogResponse);
       })
       .catch((e) => showToast(`Error: ${e}`, "error"));
@@ -355,6 +360,20 @@ export default function ChannelsPage() {
     }
   };
 
+  const saveCollaborationPolicy = async (employee: FeishuEmployee) => {
+    const draft = collaborationDrafts[employee.account_id] ?? employee.collaboration_policy;
+    setEmployeeBusy(`${employee.account_id}:collaboration`);
+    try {
+      await api.updateFeishuEmployeeCollaborationPolicy(employee.account_id, draft);
+      showToast("Collaboration policy saved", "success");
+      await load();
+    } catch (e) {
+      showToast(`Failed to save collaboration policy: ${e}`, "error");
+    } finally {
+      setEmployeeBusy(null);
+    }
+  };
+
   const runEmployeeAction = async (employee: FeishuEmployee, action: string) => {
     setEmployeeBusy(`${employee.account_id}:${action}`);
     try {
@@ -480,7 +499,7 @@ export default function ChannelsPage() {
                 {platform.id === "feishu" && (
                   <div className="border-t border-border pt-4 grid gap-3">
                     <div className="flex items-center justify-between gap-3"><div><h3 className="text-sm font-medium">AI employees</h3><p className="text-xs text-muted-foreground">Group messages trigger only on an exact @mention of this bot or a verified direct reply to it.</p></div><Button size="sm" className="gui-chat-workspace-primary-button" onClick={openCreateEmployee} prefix={<UserRoundPlus className="h-4 w-4" />}>Add employee</Button></div>
-                    {employees.length === 0 ? <p className="text-xs text-muted-foreground border border-dashed border-border p-4">No managed Feishu employees yet.</p> : employees.map((employee) => <EmployeeRow key={employee.account_id} employee={employee} busy={employeeBusy} onProfile={() => openManagedEmployeeEditor("profile", employee)} onCredentials={() => openManagedEmployeeEditor("credentials", employee)} onAction={(action) => runEmployeeAction(employee, action)} />)}
+                    {employees.length === 0 ? <p className="text-xs text-muted-foreground border border-dashed border-border p-4">No managed Feishu employees yet.</p> : employees.map((employee) => <EmployeeRow key={employee.account_id} employee={employee} busy={employeeBusy} collaborationPolicy={collaborationDrafts[employee.account_id] ?? employee.collaboration_policy} onCollaborationPolicyChange={(policy) => setCollaborationDrafts((current) => ({ ...current, [employee.account_id]: policy }))} onCollaborationPolicySave={() => void saveCollaborationPolicy(employee)} onProfile={() => openManagedEmployeeEditor("profile", employee)} onCredentials={() => openManagedEmployeeEditor("credentials", employee)} onAction={(action) => runEmployeeAction(employee, action)} />)}
                   </div>
                 )}
               </CardContent>
@@ -515,16 +534,23 @@ function AvatarImage({ src, fallback, className }: { src: string | null; fallbac
     : <span className={cn("flex shrink-0 items-center justify-center rounded-full border border-border bg-muted font-mondwest text-sm", className)} aria-hidden="true">{fallback}</span>;
 }
 
-function EmployeeRow({ employee, busy, onProfile, onCredentials, onAction }: { employee: FeishuEmployee; busy: string | null; onProfile: () => void; onCredentials: () => void; onAction: (action: string) => void }) {
+function EmployeeRow({ employee, busy, collaborationPolicy, onCollaborationPolicyChange, onCollaborationPolicySave, onProfile, onCredentials, onAction }: { employee: FeishuEmployee; busy: string | null; collaborationPolicy: FeishuEmployeeCollaborationPolicy; onCollaborationPolicyChange: (policy: FeishuEmployeeCollaborationPolicy) => void; onCollaborationPolicySave: () => void; onProfile: () => void; onCredentials: () => void; onAction: (action: string) => void }) {
   const lifecycle = stateBadge(employee.lifecycle_status);
   const runtime = stateBadge(employee.runtime_state);
   const disabled = busy?.startsWith(`${employee.account_id}:`) ?? false;
   const label = employee.profile?.name || employee.app_id;
   const fallback = label.trim().charAt(0).toUpperCase() || "E";
+  const unlimited = collaborationPolicy.invite_quota === null;
   return (
     <div className="grid gap-3 border border-border p-3">
       <div className="flex flex-wrap items-start justify-between gap-3"><div className="flex min-w-0 items-start gap-3"><AvatarImage src={employee.avatar_url} fallback={fallback} className="h-10 w-10" /><div><div className="flex flex-wrap items-center gap-2"><span className="text-sm font-medium">{label}</span><Badge tone={lifecycle.tone}>{lifecycle.label}</Badge><Badge tone={runtime.tone}>{runtime.label}</Badge></div><p className="text-xs text-muted-foreground">{employee.profile?.role || "AI employee"} · profile r{employee.profile_revision ?? "—"} · credentials v{employee.credential_version}</p></div></div><div className="flex flex-wrap gap-2"><Button ghost size="sm" disabled={disabled || employee.lifecycle_status === "revoked"} onClick={() => onAction("test")}>Test</Button><Button ghost size="sm" disabled={disabled || employee.lifecycle_status === "revoked"} onClick={onProfile}>Edit policy</Button><Button ghost size="sm" disabled={disabled || employee.lifecycle_status === "revoked"} onClick={onCredentials}>Rotate secret</Button><Button ghost size="sm" disabled={disabled || employee.lifecycle_status !== "active"} onClick={() => onAction("rollover")}>Roll over sessions</Button>{employee.lifecycle_status === "active" ? <Button ghost size="sm" disabled={disabled} onClick={() => onAction("suspended")}>Suspend</Button> : employee.lifecycle_status === "suspended" ? <Button ghost size="sm" disabled={disabled} onClick={() => onAction("active")}>Resume</Button> : null}<Button ghost size="sm" disabled={disabled || employee.lifecycle_status === "revoked"} onClick={() => onAction("revoked")}>Revoke</Button></div></div>
       {employee.profile?.system_prompt && <p className="text-xs text-muted-foreground line-clamp-2"><Info className="mr-1 inline h-3 w-3" />{employee.profile.system_prompt}</p>}
+      <div className="grid gap-3 rounded border border-border bg-background/50 p-3 sm:grid-cols-2">
+        <label className="flex items-center justify-between gap-3 text-xs"><span><span className="block font-medium">May participate</span><span className="text-muted-foreground">Can be added to internal groups</span></span><Switch checked={collaborationPolicy.may_participate} onCheckedChange={(checked) => onCollaborationPolicyChange({ ...collaborationPolicy, may_participate: checked })} /></label>
+        <label className="flex items-center justify-between gap-3 text-xs"><span><span className="block font-medium">May create groups</span><span className="text-muted-foreground">Employee-initiated group permission</span></span><Switch checked={collaborationPolicy.may_create_groups} onCheckedChange={(checked) => onCollaborationPolicyChange({ ...collaborationPolicy, may_create_groups: checked })} /></label>
+        <div className="grid gap-1"><Label>Invite quota</Label><Input aria-label={`Invite quota for ${employee.profile?.name || employee.app_id}`} disabled={unlimited} min={0} type="number" value={collaborationPolicy.invite_quota ?? ""} onChange={(event) => onCollaborationPolicyChange({ ...collaborationPolicy, invite_quota: Math.max(0, Number(event.target.value) || 0) })} /></div>
+        <div className="flex items-end justify-between gap-3"><label className="flex items-center gap-2 pb-2 text-xs"><input checked={unlimited} onChange={(event) => onCollaborationPolicyChange({ ...collaborationPolicy, invite_quota: event.target.checked ? null : 5 })} type="checkbox" />Unlimited</label><Button size="sm" disabled={disabled} onClick={onCollaborationPolicySave}>{busy === `${employee.account_id}:collaboration` ? "Saving…" : "Save collaboration"}</Button></div>
+      </div>
     </div>
   );
 }

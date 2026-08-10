@@ -7,6 +7,7 @@ import {
 } from "@/lib/gatewayClient";
 import { getHermesBrowserId } from "@/lib/browserIdentity";
 import type { GuiFrameQueueDiagnostic } from "@/lib/chatDiagnostics";
+import { createCollaborationApi, type CollaborationApi } from "@/features/collaboration/api";
 import { base64FromDataUrl, readFileAsDataUrl } from "./attachments";
 import type {
   SessionAttachResponse,
@@ -17,6 +18,10 @@ import type {
 export interface ConnectGuiChatOptions {
   ownerKey?: string;
   timing?: GatewayConnectTiming;
+}
+
+export interface GuiChatCreateOptions {
+  employeeAccountId?: string;
 }
 
 export interface GuiChatSwitchTiming extends GatewayConnectTiming {
@@ -88,12 +93,16 @@ export interface GuiChatModelSwitchResponse {
 
 export interface GuiChatConnection {
   client: GuiChatEventSource;
+  collaboration: CollaborationApi;
   close(): void;
+  ensureConnected(signal?: AbortSignal): Promise<void>;
+  attachOwner(signal?: AbortSignal): Promise<void>;
   createOrAttach(
     targetSessionId: string | null,
     generation: number,
     signal?: AbortSignal,
     timing?: GuiChatSwitchTiming,
+    createOptions?: GuiChatCreateOptions,
   ): Promise<SessionCreateResponse | SessionResumeResponse>;
   attachImage(sessionId: string, file: File): Promise<ImageAttachResponse>;
   attachPdf(sessionId: string, file: File): Promise<PdfAttachResponse>;
@@ -117,7 +126,13 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
   const client = new GatewayClient();
   const browserId = getHermesBrowserId(options.ownerKey);
   let connectPromise: Promise<void> | null = null;
+  let ownerAttachPromise: Promise<void> | null = null;
+  let ownerAttached = false;
   let attachSupported = true;
+
+  client.onState((state) => {
+    if (state !== "open") ownerAttached = false;
+  });
 
   const ensureConnected = async (
     signal?: AbortSignal,
@@ -147,8 +162,27 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
 
   return {
     client,
+    collaboration: createCollaborationApi(client, ensureConnected),
     close: () => client.close(),
-    createOrAttach: async (targetSessionId, generation, signal, timing) => {
+    ensureConnected,
+    attachOwner: async (signal) => {
+      await ensureConnected(signal);
+      if (ownerAttached) return;
+      if (!ownerAttachPromise) {
+        ownerAttachPromise = client.request(
+          "session.owner_attach",
+          { browser_id: browserId },
+          undefined,
+          signal,
+        ).then(() => {
+          ownerAttached = true;
+        }).finally(() => {
+          ownerAttachPromise = null;
+        });
+      }
+      await ownerAttachPromise;
+    },
+    createOrAttach: async (targetSessionId, generation, signal, timing, createOptions) => {
       const reused = client.connectionState === "open";
       await ensureConnected(signal, timing);
       if (reused) timing?.onSwitchStage?.("connection.reused");
@@ -200,6 +234,9 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
         {
           ...baseParams(timing),
           switch_generation: generation,
+          ...(createOptions?.employeeAccountId
+            ? { employee_account_id: createOptions.employeeAccountId }
+            : {}),
         },
         undefined,
         signal,

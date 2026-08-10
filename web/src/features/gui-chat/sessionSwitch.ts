@@ -1,5 +1,5 @@
 import type { ConnectionState, GatewayEvent } from "@/lib/gatewayClient";
-import type { GuiChatConnection, GuiChatSwitchTiming } from "./api";
+import type { GuiChatConnection, GuiChatCreateOptions, GuiChatSwitchTiming } from "./api";
 import type { SessionCreateResponse, SessionResumeResponse } from "./protocol";
 
 export type GuiChatSessionResponse = SessionCreateResponse | SessionResumeResponse;
@@ -56,7 +56,15 @@ export class GuiChatSessionSwitchCoordinator {
     return this.committedTargetSessionId;
   }
 
-  start(targetSessionId: string | null, timing?: GuiChatSwitchTiming): number {
+  get collaboration(): GuiChatConnection["collaboration"] {
+    return this.connection.collaboration;
+  }
+
+  start(
+    targetSessionId: string | null,
+    timing?: GuiChatSwitchTiming,
+    createOptions?: GuiChatCreateOptions,
+  ): number {
     const generation = ++this.generation;
     this.cancelPending();
     this.committedRuntimeSessionId = null;
@@ -71,7 +79,13 @@ export class GuiChatSessionSwitchCoordinator {
     this.pending = pending;
 
     void this.connection
-      .createOrAttach(targetSessionId, generation, pending.abortController.signal, timing)
+      .createOrAttach(
+        targetSessionId,
+        generation,
+        pending.abortController.signal,
+        timing,
+        createOptions,
+      )
       .then((response) => this.commit(pending, response))
       .catch((error: unknown) => this.fail(pending, error));
     return generation;

@@ -1,6 +1,17 @@
+import sqlite3
 import time
 
-from hermes_cli.session_api import list_sessions_payload
+import pytest
+from starlette.exceptions import HTTPException
+
+from hermes_cli.session_api import (
+    delete_session_payload,
+    latest_descendant_payload,
+    list_sessions_payload,
+    rename_session_payload,
+    session_detail_payload,
+    session_messages_payload,
+)
 from hermes_state import SessionDB
 
 
@@ -155,6 +166,84 @@ def test_compact_recent_listing_stays_below_300ms_with_compression_chains(tmp_pa
         assert len(payload["sessions"]) == STANDARDS.page_size
         assert payload["sessions"][0]["id"] == expected_latest_session_id()
         assert elapsed * 1000 < STANDARDS.local_list_max_ms
+    finally:
+        db.close()
+
+
+def test_internal_collaboration_sessions_are_hidden_from_ordinary_session_api(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        db.create_session("ordinary", source="gui")
+        db.append_message("ordinary", "user", "visible")
+        db.create_session(
+            "collaboration-internal",
+            source="gui",
+            session_kind="internal_collaboration_member",
+            visibility="internal",
+        )
+        db.append_message("collaboration-internal", "user", "private")
+        db.create_session(
+            "collaboration-empty",
+            source="gui",
+            session_kind="internal_collaboration_coordinator",
+            visibility="internal",
+        )
+        db.end_session("collaboration-empty", "completed")
+        with pytest.raises(ValueError, match="inconsistent"):
+            db.create_session(
+                "internal-visible",
+                source="gui",
+                session_kind="internal_collaboration_member",
+                visibility="visible",
+            )
+        with pytest.raises(ValueError, match="inconsistent"):
+            db.create_session(
+                "ordinary-internal",
+                source="gui",
+                session_kind="conversation",
+                visibility="internal",
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="inconsistent"):
+            db._conn.execute(
+                "UPDATE sessions SET visibility='visible' WHERE id=?",
+                ("collaboration-internal",),
+            )
+
+        payload = list_sessions_payload(db, archived="include")
+        assert [session["id"] for session in payload["sessions"]] == ["ordinary"]
+        assert payload["total"] == 1
+        assert db.resolve_session_id("collaboration-internal") is None
+        assert db.resolve_resume_session_id("collaboration-internal") == ""
+        assert db.find_resume_recovery_scope("collaboration-internal") is None
+        assert db.get_session_for_recovery("collaboration-internal") is None
+        assert db.search_messages("private") == []
+
+        for operation in (
+            lambda: session_detail_payload(db, "collaboration-internal"),
+            lambda: session_messages_payload(db, "collaboration-internal"),
+            lambda: latest_descendant_payload(db, "collaboration-internal"),
+            lambda: rename_session_payload(
+                db, "collaboration-internal", title="should-not-change"
+            ),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                operation()
+            assert exc.value.status_code == 404
+        assert delete_session_payload(db, "collaboration-internal") == {
+            "ok": True,
+            "already_absent": True,
+        }
+        assert db.count_empty_sessions() == 0
+        assert db.delete_empty_sessions() == 0
+        assert db.get_session("collaboration-empty")["session_kind"] == (
+            "internal_collaboration_coordinator"
+        )
+        assert db.get_session("collaboration-internal")["session_kind"] == (
+            "internal_collaboration_member"
+        )
+        assert db.get_session("collaboration-internal")["title"] is None
+        with pytest.raises(RuntimeError, match="mismatch"):
+            db.ensure_session("collaboration-internal", source="unknown")
     finally:
         db.close()
 

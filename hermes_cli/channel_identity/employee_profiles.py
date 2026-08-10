@@ -12,7 +12,12 @@ from typing import Any
 from hermes_cli.dashboard_auth.owner_context import OwnerContext
 
 from .credentials import decrypt_account_credentials, encrypt_account_credentials
-from .models import EmployeeProfile, ManagedFeishuAccount, RegisteredChannel
+from .models import (
+    EmployeeCollaborationPolicy,
+    EmployeeProfile,
+    ManagedFeishuAccount,
+    RegisteredChannel,
+)
 from .registration import ChannelIdentityOwnershipConflict, ensure_owner_binding
 from .store import EMPLOYEE_PROFILE_AAD_TABLE, ChannelIdentityStore
 
@@ -535,13 +540,19 @@ def list_managed_feishu_accounts(
             SELECT a.account_id, a.provider_account_id, a.credential_version,
                    a.status AS account_status, m.canonical_user_id,
                    m.lifecycle_status, o.owner_key, p.revision,
-                   p.profile_fingerprint
+                   p.profile_fingerprint,
+                   COALESCE(cp.may_participate, 1) AS may_participate,
+                   COALESCE(cp.may_create_groups, 0) AS may_create_groups,
+                   CASE WHEN cp.account_id IS NULL THEN 5
+                        ELSE cp.invite_quota END AS invite_quota
             FROM managed_feishu_accounts m
             JOIN connector_accounts a ON a.account_id=m.account_id
                                       AND a.provider='feishu'
             JOIN owner_bindings o ON o.canonical_user_id=m.canonical_user_id
             LEFT JOIN feishu_employee_profiles p ON p.account_id=m.account_id
                                                AND p.lifecycle_status='active'
+            LEFT JOIN feishu_employee_collaboration_policies cp
+              ON cp.account_id=m.account_id
             WHERE o.owner_key=?
             ORDER BY m.created_at, a.account_id
             """,
@@ -564,13 +575,19 @@ def resolve_managed_feishu_account(
             SELECT a.account_id, a.provider_account_id, a.credential_version,
                    a.status AS account_status, m.canonical_user_id,
                    m.lifecycle_status, o.owner_key, p.revision,
-                   p.profile_fingerprint
+                   p.profile_fingerprint,
+                   COALESCE(cp.may_participate, 1) AS may_participate,
+                   COALESCE(cp.may_create_groups, 0) AS may_create_groups,
+                   CASE WHEN cp.account_id IS NULL THEN 5
+                        ELSE cp.invite_quota END AS invite_quota
             FROM managed_feishu_accounts m
             JOIN connector_accounts a ON a.account_id=m.account_id
                                       AND a.provider='feishu'
             JOIN owner_bindings o ON o.canonical_user_id=m.canonical_user_id
             LEFT JOIN feishu_employee_profiles p ON p.account_id=m.account_id
                                                AND p.lifecycle_status='active'
+            LEFT JOIN feishu_employee_collaboration_policies cp
+              ON cp.account_id=m.account_id
             WHERE m.account_id=? AND o.owner_key=?
             """,
             (account_id, owner.owner_key),
@@ -578,6 +595,71 @@ def resolve_managed_feishu_account(
     if row is None:
         raise RuntimeError("managed Feishu account is unavailable")
     return _managed_account_from_row(row)
+
+
+def resolve_employee_collaboration_policy(
+    store: ChannelIdentityStore,
+    *,
+    owner: OwnerContext,
+    account_id: str,
+) -> EmployeeCollaborationPolicy:
+    """Resolve collaboration permissions after exact Owner authorization."""
+    return resolve_managed_feishu_account(
+        store, owner=owner, account_id=account_id
+    ).collaboration_policy
+
+
+def update_employee_collaboration_policy(
+    store: ChannelIdentityStore,
+    *,
+    owner: OwnerContext,
+    account_id: str,
+    may_participate: bool,
+    may_create_groups: bool,
+    invite_quota: int | None,
+) -> EmployeeCollaborationPolicy:
+    """Replace collaboration permissions for one Owner-scoped employee."""
+    account_id = _account_id(account_id)
+    if not isinstance(may_participate, bool) or not isinstance(may_create_groups, bool):
+        raise ValueError("collaboration policy flags must be booleans")
+    if invite_quota is not None:
+        if isinstance(invite_quota, bool) or not isinstance(invite_quota, int):
+            raise ValueError("invite quota must be a non-negative integer or null")
+        if invite_quota < 0:
+            raise ValueError("invite quota must be a non-negative integer or null")
+    now = time.time()
+    with store.write() as conn:
+        if _owned_account_row(conn, owner=owner, account_id=account_id) is None:
+            raise RuntimeError("managed Feishu account is unavailable")
+        conn.execute(
+            """
+            INSERT INTO feishu_employee_collaboration_policies
+              (account_id, may_participate, may_create_groups, invite_quota,
+               updated_by_owner_key, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(account_id) DO UPDATE SET
+                may_participate=excluded.may_participate,
+                may_create_groups=excluded.may_create_groups,
+                invite_quota=excluded.invite_quota,
+                updated_by_owner_key=excluded.updated_by_owner_key,
+                updated_at=excluded.updated_at
+            """,
+            (
+                account_id,
+                1 if may_participate else 0,
+                1 if may_create_groups else 0,
+                invite_quota,
+                owner.owner_key,
+                now,
+                now,
+            ),
+        )
+    return EmployeeCollaborationPolicy(
+        account_id=account_id,
+        may_participate=may_participate,
+        may_create_groups=may_create_groups,
+        invite_quota=invite_quota,
+    )
 
 
 def resolve_managed_feishu_credentials(
@@ -741,6 +823,16 @@ def _managed_account_from_row(row) -> ManagedFeishuAccount:
         lifecycle_status=row["lifecycle_status"],
         profile_revision=int(row["revision"]) if row["revision"] is not None else None,
         profile_fingerprint=row["profile_fingerprint"],
+        collaboration_policy=EmployeeCollaborationPolicy(
+            account_id=row["account_id"],
+            may_participate=bool(row["may_participate"]),
+            may_create_groups=bool(row["may_create_groups"]),
+            invite_quota=(
+                int(row["invite_quota"])
+                if row["invite_quota"] is not None
+                else None
+            ),
+        ),
     )
 
 

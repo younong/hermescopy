@@ -2504,9 +2504,13 @@ def test_worker_app_owns_and_closes_controlled_roots(tmp_path, monkeypatch):
     assert app.state.owner_worker_socket_path == owner_worker_socket_path(
         owner_home, app.state.owner_worker_generation
     )
+    assert not hasattr(app.state, "collaboration_runtime")
     with TestClient(app):
         assert os.fstat(workspace_fd)
+        assert app.state.collaboration_runtime.scheduler._thread is not None
+        assert app.state.collaboration_runtime.scheduler._thread.is_alive()
 
+    assert app.state.collaboration_runtime.scheduler._closed is True
     with pytest.raises(OSError):
         os.fstat(workspace_fd)
 
@@ -2632,6 +2636,41 @@ def test_worker_session_routes_require_owner_token(tmp_path, monkeypatch):
         control_home=tmp_path / "control",
     )
     assert client.get("/api/sessions", headers={"Authorization": f"Bearer {wrong}"}).status_code == 401
+
+
+def test_worker_collaboration_delivery_routes_are_capability_bound(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    owner_home = ensure_owner_runtime_dirs(tmp_path / "owner")
+    control_home = tmp_path / "control"
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_worker_collaboration")
+    monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
+    from hermes_cli.owner_worker.entrypoint import create_app
+
+    app = create_app("ok1_worker_collaboration", owner_home)
+    client = TestClient(app)
+    path = "/internal/collaboration/deliveries"
+    assert client.post(path, json={}).status_code == 401
+
+    token = _capability_for(app, path=path, control_home=control_home)
+    response = client.post(
+        path,
+        json={},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"deliveries": []}
+
+    ack_path = "/internal/collaboration/delivery/unknown-delivery/ack"
+    ack_token = _capability_for(app, path=ack_path, control_home=control_home)
+    ack = client.post(
+        ack_path,
+        json={"outbound_id": "om_missing", "status": "delivered"},
+        headers={"Authorization": f"Bearer {ack_token}"},
+    )
+    assert ack.status_code == 200
+    assert ack.json() == {"recorded": False}
 
 
 def test_worker_skill_routes_are_capability_bound_and_owner_local(tmp_path, monkeypatch):

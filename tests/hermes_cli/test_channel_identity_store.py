@@ -30,7 +30,9 @@ from hermes_cli.channel_identity import (
     resolve_managed_feishu_credentials,
     rollover_managed_feishu_sessions,
     rotate_managed_feishu_credentials,
+    resolve_employee_collaboration_policy,
     set_managed_feishu_account_status,
+    update_employee_collaboration_policy,
     update_employee_profile,
 )
 from hermes_cli.channel_identity.credentials import decrypt_account_credentials
@@ -340,7 +342,7 @@ def test_store_migrates_v1_attempts_to_owner_target_schema(tmp_path, crypto, mon
     with migrated.read() as conn:
         assert conn.execute(
             "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
-        ).fetchone()["value"] == "12"
+        ).fetchone()["value"] == "14"
         row = conn.execute(
             "SELECT target_canonical_user_id FROM enrollment_attempts WHERE attempt_id='enr_existing'"
         ).fetchone()
@@ -407,7 +409,7 @@ def test_store_migrates_v3_inbound_rows_with_retry_defaults(tmp_path, crypto):
             "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
         ).fetchone()["value"]
     assert tuple(row) == ("text", 0, 0, None)
-    assert version == "12"
+    assert version == "14"
 
 
 def test_store_migrates_v4_ilink_account_to_provider_neutral_identity(tmp_path, crypto):
@@ -480,7 +482,7 @@ def test_store_migrates_v4_ilink_account_to_provider_neutral_identity(tmp_path, 
         "inbound_messages": {"connector_accounts"},
         "outbound_messages": {"connector_accounts"},
     }
-    assert version == "12"
+    assert version == "14"
 
 
 def test_store_migrates_v7_account_table_without_reencrypting_credentials(tmp_path, crypto):
@@ -514,7 +516,7 @@ def test_store_migrates_v7_account_table_without_reencrypting_credentials(tmp_pa
     owner, resolved = resolve_binding(migrated, binding_id=registered.binding_id)
     assert "connector_accounts" in tables
     assert "ilink_accounts" not in tables
-    assert version == "12"
+    assert version == "14"
     assert owner.owner_key == registered.owner_key
     assert resolve_connector_account(
         migrated,
@@ -620,7 +622,7 @@ def test_store_migrates_v8_credentials_to_provider_neutral_envelope(tmp_path, cr
         "bot_token_ciphertext",
         "base_url",
     } & columns
-    assert version == "12"
+    assert version == "14"
     assert resolve_connector_account(
         migrated,
         provider="weixin_ilink",
@@ -679,7 +681,7 @@ def test_store_migrates_v9_shared_account_schema_without_reencrypting(tmp_path, 
     assert "external_identity_id" not in columns
     assert row["credentials_ciphertext"] == credentials["credentials_ciphertext"]
     assert row["credentials_key_version"] == credentials["credentials_key_version"]
-    assert version == "12"
+    assert version == "14"
 
 
 def test_store_rolls_back_v9_shared_account_migration_on_validation_failure(
@@ -1122,7 +1124,7 @@ def test_initialization_rolls_back_schema_and_version_when_key_validation_fails(
     with store.read() as conn:
         assert conn.execute(
             "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
-        ).fetchone()["value"] == "12"
+        ).fetchone()["value"] == "14"
 
 
 def test_store_allows_shared_account_across_owner_bound_identities(store):
@@ -1272,7 +1274,7 @@ def test_v10_migration_adds_empty_feishu_management_tables_without_guessing_owne
             (registered.account_id,),
         ).fetchone()
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
-    assert version == "12"
+    assert version == "14"
     assert managed is None
     with pytest.raises(RuntimeError, match="unavailable"):
         resolve_connector_account(
@@ -1381,6 +1383,112 @@ def test_managed_feishu_account_has_immutable_owner_and_one_current_profile(stor
             )
 
 
+def test_employee_collaboration_policy_defaults_and_is_owner_scoped(store):
+    owner = _owner(user_id="owner-a")
+    other_owner = _owner(user_id="owner-b")
+    registered = register_managed_feishu_account_for_owner(
+        store,
+        owner=owner,
+        provider_account_id="policy-app",
+        external_subject="policy-actor",
+        conversation_id=None,
+        credentials={"app_id": "policy-app", "app_secret": "secret"},
+        employee_profile={"name": "Researcher"},
+    )
+
+    policy = resolve_employee_collaboration_policy(
+        store, owner=owner, account_id=registered.account_id
+    )
+    assert policy.may_participate is True
+    assert policy.may_create_groups is False
+    assert policy.invite_quota == 5
+    with store.read() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM feishu_employee_collaboration_policies WHERE account_id=?",
+            (registered.account_id,),
+        ).fetchone() is None
+    assert resolve_managed_feishu_account(
+        store, owner=owner, account_id=registered.account_id
+    ).collaboration_policy == policy
+
+    unlimited = update_employee_collaboration_policy(
+        store,
+        owner=owner,
+        account_id=registered.account_id,
+        may_participate=False,
+        may_create_groups=True,
+        invite_quota=None,
+    )
+    assert unlimited.may_participate is False
+    assert unlimited.may_create_groups is True
+    assert unlimited.invite_quota is None
+    with store.read() as conn:
+        stored_policy = conn.execute(
+            "SELECT updated_by_owner_key FROM feishu_employee_collaboration_policies "
+            "WHERE account_id=?",
+            (registered.account_id,),
+        ).fetchone()
+    assert stored_policy["updated_by_owner_key"] == owner.owner_key
+    with pytest.raises(RuntimeError, match="unavailable"):
+        resolve_employee_collaboration_policy(
+            store, owner=other_owner, account_id=registered.account_id
+        )
+    with pytest.raises(RuntimeError, match="unavailable"):
+        update_employee_collaboration_policy(
+            store,
+            owner=other_owner,
+            account_id=registered.account_id,
+            may_participate=True,
+            may_create_groups=False,
+            invite_quota=5,
+        )
+    for invalid_quota in (-1, 1.5, True):
+        with pytest.raises(ValueError, match="non-negative"):
+            update_employee_collaboration_policy(
+                store,
+                owner=owner,
+                account_id=registered.account_id,
+                may_participate=True,
+                may_create_groups=False,
+                invite_quota=invalid_quota,
+            )
+
+
+def test_v13_policy_migration_keeps_old_employee_defaults_lazy(store):
+    owner = _owner(user_id="owner-a")
+    registered = register_managed_feishu_account_for_owner(
+        store,
+        owner=owner,
+        provider_account_id="legacy-policy-app",
+        external_subject="legacy-policy-actor",
+        conversation_id=None,
+        credentials={"app_id": "legacy-policy-app", "app_secret": "secret"},
+        employee_profile={"name": "Legacy Researcher"},
+    )
+    with store.write() as conn:
+        conn.execute("DROP TABLE feishu_employee_collaboration_policies")
+        conn.execute(
+            "UPDATE channel_identity_meta SET value='12' WHERE key='schema_version'"
+        )
+
+    migrated = ChannelIdentityStore(
+        store.crypto,
+        store.control_home,
+        global_home=store.global_home,
+    )
+    with migrated.read() as conn:
+        assert conn.execute(
+            "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
+        ).fetchone()["value"] == "14"
+        assert conn.execute(
+            "SELECT 1 FROM feishu_employee_collaboration_policies WHERE account_id=?",
+            (registered.account_id,),
+        ).fetchone() is None
+    assert resolve_employee_collaboration_policy(
+        migrated, owner=owner, account_id=registered.account_id
+    ).invite_quota == 5
+
+
 def test_employee_profiles_are_encrypted_canonical_and_revision_fenced(store):
     owner = _owner(user_id="owner-a")
     registered = register_managed_feishu_account_for_owner(
@@ -1433,6 +1541,79 @@ def test_employee_profiles_are_encrypted_canonical_and_revision_fenced(store):
             (registered.account_id,),
         ).fetchone()["count"]
     assert current_count == 1
+
+
+def test_collaboration_resolver_keeps_historical_policy_and_rechecks_revocation(
+    store, monkeypatch
+):
+    from hermes_cli.collaboration.resolver import CollaborationEmployeeResolver
+
+    owner = _owner(user_id="owner-a")
+    profile = {
+        "schema_version": 1,
+        "model_registration_id": "registration-a",
+        "system_prompt": "Revision one",
+        "toolsets": [],
+        "skills": [],
+        "mcp_servers": [],
+        "workspace_relative_path": "employees/analyst",
+        "knowledge_relative_paths": [],
+        "max_iterations": 4,
+        "max_tokens": 128,
+    }
+    registered = register_managed_feishu_account_for_owner(
+        store,
+        owner=owner,
+        provider_account_id="resolver-app",
+        external_subject="resolver-actor",
+        conversation_id=None,
+        credentials={"app_id": "resolver-app", "app_secret": "secret"},
+        employee_profile=profile,
+    )
+    first = resolve_employee_profile(
+        store, owner=owner, account_id=registered.account_id, revision=1
+    )
+    update_employee_profile(
+        store,
+        owner=owner,
+        account_id=registered.account_id,
+        profile={**profile, "system_prompt": "Revision two"},
+        expected_revision=1,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.collaboration.resolver.resolve_chat_model_registration",
+        lambda _registration_id: {"provider": "openai", "model": "test-model"},
+    )
+    resolver = CollaborationEmployeeResolver(
+        owner_key=owner.owner_key,
+        control_home=store.control_home,
+        global_home=store.global_home,
+        connector_config={},
+        store=store,
+    )
+
+    resolved = resolver.resolve_pinned(
+        account_id=registered.account_id,
+        profile_revision=1,
+        profile_fingerprint=first.fingerprint,
+    )
+    assert resolved.member.profile_revision == 1
+    assert resolved.employee_policy["system_prompt"] == "Revision one"
+
+    update_employee_collaboration_policy(
+        store,
+        owner=owner,
+        account_id=registered.account_id,
+        may_participate=False,
+        may_create_groups=False,
+        invite_quota=5,
+    )
+    with pytest.raises(RuntimeError, match="participation is revoked"):
+        resolver.resolve_pinned(
+            account_id=registered.account_id,
+            profile_revision=1,
+            profile_fingerprint=first.fingerprint,
+        )
 
 
 def test_managed_feishu_credentials_rotate_and_sessions_roll_over_by_account(store):

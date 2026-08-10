@@ -7,10 +7,21 @@ import { GuiChatSessionSwitchCoordinator } from "./sessionSwitch";
 
 class FakeConnection implements GuiChatConnection {
   readonly close = vi.fn();
-  readonly createOrAttach = vi.fn(
-    (_target: string | null, _generation: number, _signal?: AbortSignal) =>
-      this.results.shift()?.promise ?? Promise.reject(new Error("missing result")),
-  );
+  readonly ensureConnected = vi.fn().mockResolvedValue(undefined);
+  readonly attachOwner = vi.fn().mockResolvedValue(undefined);
+  readonly collaboration = {
+    archiveGroup: vi.fn(),
+    createGroup: vi.fn(),
+    getGroup: vi.fn(),
+    interruptTarget: vi.fn(),
+    listGroups: vi.fn(),
+    onEvent: vi.fn(() => () => undefined),
+    respondToApproval: vi.fn(),
+    submitMessage: vi.fn(),
+    updateMembers: vi.fn(),
+    uploadAttachment: vi.fn(),
+  };
+  readonly createOrAttach = vi.fn<GuiChatConnection["createOrAttach"]>();
   readonly attachImage = vi.fn();
   readonly attachPdf = vi.fn();
   readonly attachFile = vi.fn();
@@ -24,6 +35,12 @@ class FakeConnection implements GuiChatConnection {
   private readonly eventHandlers = new Set<(event: GatewayEvent) => void>();
   private readonly stateHandlers = new Set<(state: ConnectionState) => void>();
   readonly results: Array<ReturnType<typeof deferred<SessionResumeResponse>>> = [];
+
+  constructor() {
+    this.createOrAttach.mockImplementation(() =>
+      this.results.shift()?.promise ?? Promise.reject(new Error("missing result")),
+    );
+  }
 
   readonly client = {
     onEvent: (handler: (event: GatewayEvent) => void) => {
@@ -83,6 +100,21 @@ async function flushPromises(): Promise<void> {
 }
 
 describe("GuiChatSessionSwitchCoordinator", () => {
+  it("forwards trusted employee selection only for new-session creation", async () => {
+    const { connection, coordinator } = createHarness();
+    connection.nextResult();
+
+    coordinator.start(null, undefined, { employeeAccountId: "employee-a" });
+
+    expect(connection.createOrAttach).toHaveBeenCalledWith(
+      null,
+      1,
+      expect.any(AbortSignal),
+      undefined,
+      { employeeAccountId: "employee-a" },
+    );
+  });
+
   it("starts attach immediately and commits matching buffered events", async () => {
     const { commits, connection, coordinator, events } = createHarness();
     const result = connection.nextResult();
@@ -92,6 +124,7 @@ describe("GuiChatSessionSwitchCoordinator", () => {
       "parent-session",
       generation,
       expect.any(AbortSignal),
+      undefined,
       undefined,
     );
 

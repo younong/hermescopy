@@ -3,6 +3,7 @@ import type { GatewayEvent } from "@/lib/gatewayClient";
 import type {
   ApprovalPayload,
   ArtifactFilePayload,
+  CollaborationOriginCardPayload,
   ClarifyRequestPayload,
   ClarifyResolvedPayload,
   ArtifactImagePayload,
@@ -330,6 +331,11 @@ function applyGatewayEvent(state: GuiChatState, event: GatewayEvent): GuiChatSta
         state,
         event.payload as MessageCompletePayload | undefined,
       );
+    case "collaboration.origin.card":
+      return appendCollaborationOriginCard(
+        state,
+        event.payload as CollaborationOriginCardPayload | undefined,
+      );
     case "thinking.delta":
     case "reasoning.delta":
       return appendStatusLine(state, event.payload as StatusPayload | undefined);
@@ -474,6 +480,7 @@ function transcriptToMessageWithArtifacts(
     message: {
       artifactIds: artifacts.map((artifact) => artifact.id),
       attachments: attachments.length > 0 ? attachments : undefined,
+      collaborationCard: collaborationOriginCardState(message.collaboration_card),
       id,
       role: message.role === "user" ? "user" : message.role === "assistant" ? "assistant" : "system",
       text,
@@ -1013,6 +1020,47 @@ function clampToolInput(input: unknown): unknown {
 
 function preserveToolResult(name: string | undefined): boolean {
   return isImageGenerationTool(name);
+}
+
+function collaborationOriginCardState(
+  payload: CollaborationOriginCardPayload | undefined,
+): ChatMessage["collaborationCard"] {
+  if (
+    !payload
+    || (payload.status !== "created" && payload.status !== "completed")
+    || typeof payload.group_id !== "string"
+    || !payload.group_id
+    || typeof payload.title !== "string"
+    || !payload.title
+  ) return undefined;
+  return {
+    groupId: payload.group_id,
+    status: payload.status,
+    taskId: typeof payload.task_id === "string" && payload.task_id ? payload.task_id : undefined,
+    text: payload.status === "completed"
+      ? String(payload.summary ?? payload.text ?? "")
+      : String(payload.brief ?? payload.text ?? ""),
+    title: payload.title,
+  };
+}
+
+function appendCollaborationOriginCard(
+  state: GuiChatState,
+  payload: CollaborationOriginCardPayload | undefined,
+): GuiChatState {
+  const collaborationCard = collaborationOriginCardState(payload);
+  if (!collaborationCard) return state;
+  const id = typeof payload?.card_id === "string" && payload.card_id
+    ? payload.card_id
+    : createClientId("collaboration-card");
+  if (state.messages.some((message) => message.id === id)) return state;
+  return appendMessage(state, {
+    artifactIds: [],
+    collaborationCard,
+    id,
+    role: "system",
+    text: collaborationCard.text,
+  });
 }
 
 function appendMessage(state: GuiChatState, message: ChatMessage): GuiChatState {

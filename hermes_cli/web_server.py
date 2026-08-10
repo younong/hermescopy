@@ -196,6 +196,8 @@ async def _lifespan(app: "FastAPI"):
 
     app.state.owner_cron_dispatch_stop = None
     app.state.owner_cron_dispatch_task = None
+    app.state.owner_collaboration_dispatch_stop = None
+    app.state.owner_collaboration_dispatch_task = None
     owner_supervisor = getattr(app.state, "owner_worker_supervisor", None)
 
     from hermes_cli.channel_connectors.bootstrap import (
@@ -219,13 +221,13 @@ async def _lifespan(app: "FastAPI"):
 
     if getattr(app.state, "auth_required", False) and owner_supervisor is not None:
         from hermes_cli.channel_dispatch import ChannelOutbox
+        from hermes_cli.owner_worker.collaboration_dispatcher import (
+            run_owner_collaboration_dispatcher,
+        )
         from hermes_cli.owner_worker.cron_dispatcher import run_owner_cron_dispatcher
 
-        enqueue_delivery = (
-            ChannelOutbox(connector_runtime.store).enqueue_cron_result
-            if connector_runtime.store is not None
-            else None
-        )
+        outbox = ChannelOutbox(connector_runtime.store) if connector_runtime.store is not None else None
+        enqueue_delivery = outbox.enqueue_cron_result if outbox is not None else None
         app.state.owner_cron_dispatch_stop = asyncio.Event()
         app.state.owner_cron_dispatch_task = asyncio.create_task(
             run_owner_cron_dispatcher(
@@ -233,6 +235,20 @@ async def _lifespan(app: "FastAPI"):
                 owner_supervisor,
                 get_hermes_home(),
                 enqueue_delivery=enqueue_delivery,
+            )
+        )
+        app.state.owner_collaboration_dispatch_stop = asyncio.Event()
+        app.state.owner_collaboration_dispatch_task = asyncio.create_task(
+            run_owner_collaboration_dispatcher(
+                app.state.owner_collaboration_dispatch_stop,
+                owner_supervisor,
+                get_hermes_home(),
+                enqueue_delivery=(
+                    outbox.enqueue_collaboration_origin if outbox is not None else None
+                ),
+                delivery_status=(
+                    outbox.collaboration_delivery_status if outbox is not None else None
+                ),
             )
         )
 
@@ -264,11 +280,21 @@ async def _lifespan(app: "FastAPI"):
     finally:
         owner_cron_stop = getattr(app.state, "owner_cron_dispatch_stop", None)
         owner_cron_task = getattr(app.state, "owner_cron_dispatch_task", None)
+        owner_collaboration_stop = getattr(
+            app.state, "owner_collaboration_dispatch_stop", None
+        )
+        owner_collaboration_task = getattr(
+            app.state, "owner_collaboration_dispatch_task", None
+        )
         if owner_cron_stop is not None:
             owner_cron_stop.set()
-        if owner_cron_task is not None:
+        if owner_collaboration_stop is not None:
+            owner_collaboration_stop.set()
+        for dispatch_task in (owner_cron_task, owner_collaboration_task):
+            if dispatch_task is None:
+                continue
             try:
-                await owner_cron_task
+                await dispatch_task
             except asyncio.CancelledError:
                 pass
         connector_runtime = getattr(app.state, "channel_connector_runtime", None)
@@ -1287,6 +1313,12 @@ class FeishuEmployeeCreate(BaseModel):
 class FeishuEmployeeProfileUpdate(BaseModel):
     expected_revision: int
     profile: Dict[str, Any]
+
+
+class FeishuEmployeeCollaborationPolicyUpdate(BaseModel):
+    may_participate: bool
+    may_create_groups: bool
+    invite_quota: Optional[int] = None
 
 
 class FeishuEmployeeCredentialRotate(BaseModel):
@@ -5457,6 +5489,11 @@ def _feishu_employee_payload(runtime, account, profile) -> dict[str, Any]:
         "profile_revision": profile.revision if profile is not None else None,
         "profile_fingerprint": profile.fingerprint if profile is not None else None,
         "profile": profile.profile if profile is not None else None,
+        "collaboration_policy": {
+            "may_participate": account.collaboration_policy.may_participate,
+            "may_create_groups": account.collaboration_policy.may_create_groups,
+            "invite_quota": account.collaboration_policy.invite_quota,
+        },
     }
 
 
@@ -5663,6 +5700,31 @@ async def update_feishu_employee_profile(
         return _feishu_employee_payload(runtime, account, profile)
     except EmployeeProfileRevisionConflict as exc:
         raise HTTPException(status_code=409, detail="employee_profile_revision_conflict") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.put("/api/messaging/feishu/employees/{account_id}/collaboration-policy")
+async def update_feishu_employee_collaboration_policy(
+    request: Request,
+    account_id: str,
+    body: FeishuEmployeeCollaborationPolicyUpdate,
+):
+    runtime, store, owner = _managed_feishu_context(request)
+    _feishu_employee_or_404(store, owner, account_id)
+    from hermes_cli.channel_identity import update_employee_collaboration_policy
+
+    try:
+        update_employee_collaboration_policy(
+            store,
+            owner=owner,
+            account_id=account_id,
+            may_participate=body.may_participate,
+            may_create_groups=body.may_create_groups,
+            invite_quota=body.invite_quota,
+        )
+        account, profile = _feishu_employee_or_404(store, owner, account_id)
+        return _feishu_employee_payload(runtime, account, profile)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

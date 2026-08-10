@@ -26,6 +26,7 @@ from hermes_cli.channel_dispatch import (
     advance_outbound,
     claim_outbound,
     fail_outbound,
+    mark_outbound_ambiguous,
     recover_stale_outbound,
     release_outbound_claim,
     set_outbound_part_count,
@@ -58,12 +59,19 @@ _RETRYABLE_PROVIDER_CODES = frozenset(
 
 
 class FeishuTransportError(RuntimeError):
-    """A sanitized Feishu delivery error with canonical retry classification."""
+    """A sanitized Feishu delivery error with retry and acceptance certainty."""
 
-    def __init__(self, code: str, *, retryable: bool) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        retryable: bool,
+        acceptance_uncertain: bool = False,
+    ) -> None:
         super().__init__(code)
         self.code = code
         self.retryable = retryable
+        self.acceptance_uncertain = acceptance_uncertain
 
 
 @dataclass(frozen=True)
@@ -585,6 +593,7 @@ class FeishuHTTPTransport:
             headers={"Authorization": f"Bearer {token}"},
             params=params,
             json_body=body,
+            acceptance_uncertain_on_transport=True,
         )
         data = result.get("data")
         message_id = str(data.get("message_id") or "").strip() if isinstance(data, Mapping) else ""
@@ -628,9 +637,13 @@ class FeishuHTTPTransport:
         try:
             response = await self._client.get(url, headers=headers)
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
-            raise FeishuTransportError("network_error", retryable=True) from exc
+            raise FeishuTransportError(
+                "network_error", retryable=True, acceptance_uncertain=True
+            ) from exc
         except httpx.HTTPError as exc:
-            raise FeishuTransportError("http_error", retryable=True) from exc
+            raise FeishuTransportError(
+                "http_error", retryable=True, acceptance_uncertain=True
+            ) from exc
         return self._validated_response(response)
 
     async def _post_json(
@@ -640,6 +653,7 @@ class FeishuHTTPTransport:
         headers: Mapping[str, str] | None,
         params: Mapping[str, str] | None,
         json_body: Mapping[str, Any],
+        acceptance_uncertain_on_transport: bool = False,
     ) -> Mapping[str, Any]:
         try:
             response = await self._client.post(
@@ -649,9 +663,17 @@ class FeishuHTTPTransport:
                 json=json_body,
             )
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
-            raise FeishuTransportError("network_error", retryable=True) from exc
+            raise FeishuTransportError(
+                "network_error",
+                retryable=True,
+                acceptance_uncertain=acceptance_uncertain_on_transport,
+            ) from exc
         except httpx.HTTPError as exc:
-            raise FeishuTransportError("http_error", retryable=True) from exc
+            raise FeishuTransportError(
+                "http_error",
+                retryable=True,
+                acceptance_uncertain=acceptance_uncertain_on_transport,
+            ) from exc
         return self._validated_response(response)
 
     @staticmethod
@@ -758,7 +780,22 @@ class FeishuSender:
             raise
         except Exception as exc:
             retryable = isinstance(exc, FeishuTransportError) and exc.retryable
-            if retryable and claim.delivery.part_attempts < self.max_attempts:
+            collaboration_delivery = claim.delivery.source_kind == "collaboration"
+            acceptance_uncertain = (
+                isinstance(exc, FeishuTransportError)
+                and exc.acceptance_uncertain
+            )
+            if retryable and collaboration_delivery and acceptance_uncertain:
+                # Only transport loss without a provider response leaves the
+                # side effect uncertain. Explicit provider/HTTP rejections prove
+                # non-acceptance and retain the normal bounded retry behavior.
+                mark_outbound_ambiguous(
+                    self.store,
+                    claim.delivery,
+                    holder=holder,
+                    error=f"provider_outcome_uncertain:{exc}",
+                )
+            elif retryable and claim.delivery.part_attempts < self.max_attempts:
                 delay = min(
                     self.retry_max,
                     self.retry_seconds

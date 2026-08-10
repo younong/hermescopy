@@ -34,6 +34,20 @@ def format_display_transcript(
         if role not in {"user", "assistant", "tool", "system"}:
             continue
         content_text = coerce_message_text(row.get("content"))
+        display_card = row.get("_display_card")
+        if isinstance(display_card, dict):
+            message = {
+                "role": "system",
+                "text": str(display_card.get("text") or ""),
+                "collaboration_card": dict(display_card),
+            }
+            card_id = row.get("_display_card_id")
+            if card_id:
+                message["id"] = str(card_id)
+            if row.get("timestamp") is not None:
+                message["timestamp"] = row["timestamp"]
+            messages.append(message)
+            continue
         if role == "assistant" and row.get("tool_calls"):
             for tool_call in row["tool_calls"]:
                 if not isinstance(tool_call, dict):

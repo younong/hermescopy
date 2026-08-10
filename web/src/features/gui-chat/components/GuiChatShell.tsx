@@ -10,24 +10,31 @@ import {
   LogOut,
   Menu,
   MessageSquarePlus,
+  Bot,
   PieChart,
   RefreshCw,
   Search,
   QrCode,
   Radio,
   Settings2,
+  UsersRound,
   SlidersHorizontal,
   Sparkles,
   X,
 } from "lucide-react";
 import { ChatSessionList } from "@/components/ChatSessionList";
+import { CreateGroupDialog } from "@/features/collaboration/components/CreateGroupDialog";
+import { GroupChatView } from "@/features/collaboration/components/GroupChatView";
+import { GroupsSidebar } from "@/features/collaboration/components/GroupsSidebar";
+import { parseChatRoute } from "@/features/collaboration/routing";
+import type { CollaborationGroup } from "@/features/collaboration/types";
 import { ConnectWeChatModal } from "@/features/ilink/ConnectWeChatModal";
 import { PageHeaderContext } from "@/contexts/page-header-context";
 import { GuiChatFilesPane } from "@/features/files/components/GuiChatFilesPane";
 import { useI18n } from "@/i18n";
 import ChannelsPage from "@/pages/ChannelsPage";
 import SessionsPage from "@/pages/SessionsPage";
-import { api } from "@/lib/api";
+import { api, type FeishuEmployee } from "@/lib/api";
 import { JsonRpcGatewayError, type GatewayEvent } from "@/lib/gatewayClient";
 import { emitChatDiagnostic } from "@/lib/chatDiagnostics";
 import { dashboardAuthTransition } from "@/lib/dashboardAuthTransition";
@@ -68,7 +75,9 @@ export function GuiChatShell() {
   const location = useLocation();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
-  const resumeSessionId = searchParams.get("resume");
+  const routeTarget = parseChatRoute(searchParams);
+  const groupId = routeTarget.kind === "group" ? routeTarget.id : null;
+  const resumeSessionId = routeTarget.kind === "direct" ? routeTarget.id : null;
   const mockMode = searchParams.get("mock") === "1";
   const workspacePath = location.pathname.replace(/\/$/, "");
   const statisticsOpen = workspacePath === "/chat/statistics";
@@ -107,11 +116,22 @@ export function GuiChatShell() {
     requestId: number;
   }>>([]);
   const attachmentRequestIdRef = useRef(0);
+  const createGroupAttemptRef = useRef<{
+    accountIds: string[];
+    key: string;
+    name: string;
+  } | null>(null);
   const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false);
   const [sessionQuery, setSessionQuery] = useState("");
   const [sessionListRefreshNonce, setSessionListRefreshNonce] = useState(0);
   const [activeSessionTitle, setActiveSessionTitle] = useState<string | null>(null);
   const [connectWeChatOpen, setConnectWeChatOpen] = useState(false);
+  const [groups, setGroups] = useState<CollaborationGroup[]>([]);
+  const [groupsLoading, setGroupsLoading] = useState(false);
+  const [groupsRefreshNonce, setGroupsRefreshNonce] = useState(0);
+  const [createGroupOpen, setCreateGroupOpen] = useState(false);
+  const [employees, setEmployees] = useState<FeishuEmployee[]>([]);
+  const [employeeChatOpen, setEmployeeChatOpen] = useState(false);
   const { authMe, authRequired, ownerKey, ready: authIdentityReady } = useDashboardAuthIdentity();
   const weChatStatus = authMe?.feature_status?.weixin_ilink_connect;
   const weChatReady = Boolean(authMe?.features?.weixin_ilink_connect);
@@ -191,6 +211,7 @@ export function GuiChatShell() {
         (prev) => {
           const next = new URLSearchParams(prev);
           next.delete("resume");
+          next.delete("group");
           return next;
         },
         { replace: true },
@@ -202,6 +223,39 @@ export function GuiChatShell() {
       dispatch({ type: "session.selected", generation, sessionId: null });
     }
   }, [updateSearchParams]);
+
+  const startEmployeeChat = (accountId: string) => {
+    const employee = employees.find((item) => item.account_id === accountId);
+    if (
+      !employee
+      || employee.lifecycle_status !== "active"
+      || !employee.profile
+      || !employee.collaboration_policy.may_participate
+    ) {
+      dispatch({ type: "error", message: "This employee is unavailable for direct chat." });
+      return;
+    }
+    setEmployeeChatOpen(false);
+    historyAbortRef.current?.abort();
+    setAttachmentsToQueue([]);
+    reconnectLifecycleRef.current?.cancelRecovery();
+    setResumeNotice(null);
+    skipClearedRouteRef.current = true;
+    updateSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete("resume");
+      next.delete("group");
+      return next;
+    }, { replace: true });
+    const coordinator = switchCoordinatorRef.current;
+    if (!coordinator) return;
+    const generation = coordinator.start(
+      null,
+      undefined,
+      { employeeAccountId: employee.account_id },
+    );
+    dispatch({ type: "session.selected", generation, sessionId: null });
+  };
 
   const switchScope = useMemo(() => {
     const connection = mockMode
@@ -286,6 +340,15 @@ export function GuiChatShell() {
   switchCoordinatorRef.current = switchCoordinator;
 
   const connectRoute = useCallback(() => {
+    if (groupId) {
+      historyAbortRef.current?.abort();
+      setAttachmentsToQueue([]);
+      switchCoordinator.cancel();
+      void connectionRef.current?.attachOwner().catch((error: unknown) => {
+        dispatch({ type: "error", message: error instanceof Error ? error.message : String(error) });
+      });
+      return;
+    }
     reconnectLifecycleRef.current?.cancelRecovery();
     setResumeNotice(null);
     historyAbortRef.current?.abort();
@@ -363,7 +426,7 @@ export function GuiChatShell() {
           }
         : undefined,
     );
-  }, [mockMode, resumeSessionId, switchCoordinator, updateSearchParams]);
+  }, [groupId, mockMode, resumeSessionId, switchCoordinator, updateSearchParams]);
 
   const retryConnection = useCallback(() => {
     setResumeNotice(null);
@@ -385,7 +448,7 @@ export function GuiChatShell() {
       return;
     }
     connectRoute();
-  }, [authIdentityReady, connectRoute, resumeSessionId]);
+  }, [authIdentityReady, connectRoute, groupId, resumeSessionId]);
 
   useEffect(
     () => () => {
@@ -403,6 +466,75 @@ export function GuiChatShell() {
     },
     [eventFrameQueue, switchCoordinator, switchScope.reconnectLifecycle],
   );
+
+  const refreshGroups = useCallback(() => setGroupsRefreshNonce((nonce) => nonce + 1), []);
+
+  useEffect(() => {
+    if (!authIdentityReady) return;
+    const connection = connectionRef.current;
+    if (!connection) return;
+    const controller = new AbortController();
+    setGroupsLoading(true);
+    void Promise.all([
+      connection.collaboration.listGroups(true, controller.signal),
+      api.getFeishuEmployees().catch(() => ({ employees: [] })),
+    ]).then(([response, employeeResponse]) => {
+      if (controller.signal.aborted) return;
+      setGroups(response.groups);
+      setEmployees(employeeResponse.employees);
+    }).catch(() => undefined).finally(() => {
+      if (!controller.signal.aborted) setGroupsLoading(false);
+    });
+    return () => controller.abort();
+  }, [authIdentityReady, groupsRefreshNonce, switchScope]);
+
+  useEffect(() => {
+    const connection = connectionRef.current;
+    if (!connection) return;
+    return connection.collaboration.onEvent((event) => {
+      if (event.type === "collaboration.group.changed") refreshGroups();
+    });
+  }, [refreshGroups, switchScope]);
+
+  const pickGroup = useCallback((nextGroupId: string) => {
+    closeMobilePanel();
+    setResumeNotice(null);
+    updateSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete("resume");
+      next.set("group", nextGroupId);
+      return next;
+    });
+  }, [closeMobilePanel, updateSearchParams]);
+
+  const createGroup = useCallback(async (name: string, accountIds: string[]) => {
+    const connection = connectionRef.current;
+    if (!connection) throw new Error("Gateway is not ready");
+    const previousAttempt = createGroupAttemptRef.current;
+    const sameAttempt = previousAttempt?.name === name
+      && previousAttempt.accountIds.length === accountIds.length
+      && previousAttempt.accountIds.every((accountId, index) => accountId === accountIds[index]);
+    const attempt = previousAttempt && sameAttempt
+      ? previousAttempt
+      : { accountIds: [...accountIds], key: crypto.randomUUID(), name };
+    createGroupAttemptRef.current = attempt;
+    const snapshot = await connection.collaboration.createGroup(
+      name,
+      accountIds,
+      attempt.key,
+    );
+    createGroupAttemptRef.current = null;
+    setCreateGroupOpen(false);
+    refreshGroups();
+    pickGroup(snapshot.group.group_id);
+  }, [pickGroup, refreshGroups]);
+
+  const archiveGroup = useCallback(async (targetGroupId: string) => {
+    const connection = connectionRef.current;
+    if (!connection) throw new Error("Gateway is not ready");
+    await connection.collaboration.archiveGroup(targetGroupId);
+    refreshGroups();
+  }, [refreshGroups]);
 
   useEffect(() => {
     const mql = window.matchMedia("(max-width: 1023px)");
@@ -682,8 +814,16 @@ export function GuiChatShell() {
       variant="compact"
     />
   );
-  const conversationTitle = activeSessionTitle ?? (activeSessionId ? "Conversation" : "New chat");
+  const activeGroup = groups.find((group) => group.group_id === groupId);
+  const conversationTitle = groupId
+    ? activeGroup?.name ?? "Group"
+    : activeSessionTitle ?? (activeSessionId ? "Conversation" : "New chat");
   const accountLabel = authMe?.display_name || authMe?.email || "Hermes workspace";
+  const availableDirectEmployees = employees.filter(
+    (employee) => employee.lifecycle_status === "active"
+      && employee.profile !== null
+      && employee.collaboration_policy.may_participate,
+  );
   const handleLogout = () => {
     dashboardAuthTransition.reset();
     void api.logout();
@@ -711,6 +851,33 @@ export function GuiChatShell() {
           <MessageSquarePlus />
           <span>New chat</span>
         </button>
+        <button
+          aria-expanded={employeeChatOpen}
+          aria-label="Start employee chat"
+          className="gui-chat-nav-item"
+          disabled={availableDirectEmployees.length === 0}
+          onClick={() => setEmployeeChatOpen((open) => !open)}
+          type="button"
+        >
+          <Bot />
+          <span>Chat with employee</span>
+        </button>
+        {employeeChatOpen ? (
+          <div className="ml-6 space-y-[3px] border-l border-[#e4e6ea] pl-2">
+            {availableDirectEmployees.map((employee) => (
+              <button
+                className="gui-chat-nav-item"
+                key={employee.account_id}
+                onClick={() => startEmployeeChat(employee.account_id)}
+                type="button"
+              >
+                <span className="min-w-0 truncate">
+                  {employee.profile?.name || employee.app_id}
+                </span>
+              </button>
+            ))}
+          </div>
+        ) : null}
         <button
           aria-current={statisticsOpen ? "page" : undefined}
           aria-label="Message composition statistics"
@@ -787,6 +954,14 @@ export function GuiChatShell() {
           <span>Models</span>
         </button>
       </nav>
+      <GroupsSidebar
+        activeGroupId={groupId}
+        groups={groups}
+        loading={groupsLoading}
+        onCreate={() => setCreateGroupOpen(true)}
+        onPick={pickGroup}
+        query={sessionQuery}
+      />
       <div className="mt-4 flex min-h-0 flex-1 flex-col px-3">
         <div className="gui-chat-section-heading">
           <span>Recent chats</span>
@@ -863,6 +1038,9 @@ export function GuiChatShell() {
   return (
     <div data-gui-chat className="relative z-1 flex h-dvh min-h-0 w-full overflow-hidden bg-white text-[#202124]">
       {mobileSessionPortal}
+      {createGroupOpen ? (
+        <CreateGroupDialog employees={employees} onClose={() => setCreateGroupOpen(false)} onCreate={createGroup} />
+      ) : null}
       {connectWeChatOpen ? (
         <ConnectWeChatModal
           onClose={() => setConnectWeChatOpen(false)}
@@ -908,11 +1086,14 @@ export function GuiChatShell() {
             <p className="truncate text-[0.625rem] text-[#969aa1]">
               {workspacePaneOpen
                 ? "Workspace"
-                : `${state.model ?? "Hermes"}${state.provider ? ` · ${state.provider}` : ""} · ${mockMode ? "mock" : state.connection}`}
+                : groupId
+                  ? `${activeGroup?.status ?? "group"} · ${Object.values(groups).length} groups · ${state.connection}`
+                  : `${state.model ?? "Hermes"}${state.provider ? ` · ${state.provider}` : ""} · ${mockMode ? "mock" : state.connection}`}
             </p>
           </div>
           {!workspacePaneOpen ? (
             <div className="ml-auto flex items-center gap-1">
+              {groupId ? <UsersRound className="mr-1 h-3.5 w-3.5 text-[#777c84]" /> : null}
               {canConnectWeChat ? (
                 <button
                   aria-label="Connect WeChat"
@@ -966,6 +1147,15 @@ export function GuiChatShell() {
             currentModel={state.model}
             currentProvider={state.provider}
             onSwitchChat={switchChatModel}
+          />
+        ) : groupId ? (
+          <GroupChatView
+            api={switchScope.coordinator.collaboration}
+            connection={state.connection}
+            employees={employees}
+            groupId={groupId}
+            onArchive={archiveGroup}
+            onGroupChanged={refreshGroups}
           />
         ) : (
           <>
