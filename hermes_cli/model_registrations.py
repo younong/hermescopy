@@ -98,15 +98,34 @@ def _admin_media_descriptor():
     return policy.descriptor() if policy is not None else None
 
 
+def _deployment_route_kind(route: Any) -> str:
+    """Return the model-plane kind owned by a deployment inference route.
+
+    Deployment routes use the Chat inference transport, but transport is not
+    model ownership. A route for a provider registered as a Code capability
+    must remain a Code registration and must not leak into the Chat surface.
+    """
+    from hermes_cli.model_plane.capability import (
+        ensure_capability_providers,
+        get_capability_provider,
+    )
+
+    ensure_capability_providers()
+    if get_capability_provider(CODE, str(route.provider or "").strip()) is not None:
+        return CODE
+    return "chat"
+
+
 def _admin_registrations() -> dict[str, dict[str, Any]]:
     from hermes_cli.deployment_inference import route_descriptors_from_control_plane
 
     registrations: dict[str, dict[str, Any]] = {}
     for route in route_descriptors_from_control_plane():
-        registration_id = _admin_registration_id("chat", route.provider, route.model)
+        kind = _deployment_route_kind(route)
+        registration_id = _admin_registration_id(kind, route.provider, route.model)
         registrations[registration_id] = {
             "name": route.name or route.model,
-            "kind": "chat",
+            "kind": kind,
             "provider": route.provider,
             "model": route.model,
             "source": "catalog",

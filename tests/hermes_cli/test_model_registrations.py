@@ -144,6 +144,22 @@ def test_default_config_has_optional_registration_mapping():
 
 
 def _deployment_registrations(monkeypatch):
+    from providers.base import ProviderProfile
+
+    capability_module.register_code_provider(
+        ProviderProfile(
+            name="openai-codex",
+            fallback_models=("gpt-5.3-codex",),
+            chat_enabled=False,
+        )
+    )
+    capability_module.register_code_provider(
+        ProviderProfile(
+            name="kimi-coding",
+            fallback_models=("kimi-k2.5",),
+            chat_enabled=False,
+        )
+    )
     monkeypatch.setattr(
         "hermes_cli.deployment_inference.route_descriptors_from_control_plane",
         lambda: (
@@ -248,8 +264,10 @@ def test_payload_merges_admin_descriptors_with_legacy_user_registrations(monkeyp
         "use_gateway": False,
         "credential_configured": None,
     }
+    assert by_name["ChatGPT Codex"]["kind"] == "code"
     assert by_name["ChatGPT Codex"]["scope"] == "admin"
     assert by_name["ChatGPT Codex"]["mutable"] is False
+    assert by_name["Kimi Code"]["kind"] == "code"
     assert by_name["Kimi Code"]["provider"] == "kimi-coding"
     assert by_name["APIYI · nano-banana-2"]["kind"] == "image"
     assert all("owner" not in item for item in payload["registrations"])
@@ -259,21 +277,24 @@ def test_payload_merges_admin_descriptors_with_legacy_user_registrations(monkeyp
 def test_admin_registrations_are_stable_resolvable_and_immutable(monkeypatch):
     _deployment_registrations(monkeypatch)
     payload = model_registrations.get_model_registrations_payload()
-    chat = next(item for item in payload["registrations"] if item["name"] == "Kimi Code")
+    code = next(item for item in payload["registrations"] if item["name"] == "Kimi Code")
     image = next(item for item in payload["registrations"] if item["name"] == "APIYI · nano-banana-2")
 
-    assert chat["id"] == model_registrations._admin_registration_id(
-        "chat", "kimi-coding", "kimi-k2.5"
+    assert code["kind"] == "code"
+    assert code["id"] == model_registrations._admin_registration_id(
+        "code", "kimi-coding", "kimi-k2.5"
     )
-    assert model_registrations.resolve_chat_model_registration(chat["id"]) == {
-        "registration_id": chat["id"],
+    assert model_registrations.resolve_code_model_registration(code["id"]) == {
+        "registration_id": code["id"],
         "provider": "kimi-coding",
         "model": "kimi-k2.5",
         "source": "catalog",
         "selection_source": "deployment",
+        "profile": "coding",
+        "toolset": "coding",
     }
     with pytest.raises(model_registrations.ModelRegistrationImmutable):
-        model_registrations.update_model_registration(chat["id"], {})
+        model_registrations.update_model_registration(code["id"], {})
     with pytest.raises(model_registrations.ModelRegistrationImmutable):
         model_registrations.delete_model_registration(image["id"])
 
@@ -289,24 +310,24 @@ def test_admin_registrations_are_stable_resolvable_and_immutable(monkeypatch):
 
 def test_catalog_registration_cannot_duplicate_admin_target(monkeypatch):
     _deployment_registrations(monkeypatch)
-    monkeypatch.setattr(model_registrations, "_chat_catalog", lambda: [{
-        "slug": "kimi-coding",
-        "name": "Kimi",
-        "models": ["kimi-k2.5"],
-        "authenticated": True,
+    monkeypatch.setattr(model_registrations, "_capability_catalog", lambda: [{
+        "provider": "kimi-coding",
+        "name": "Kimi Code",
+        "models": [{"id": "kimi-k2.5"}],
+        "available": True,
     }])
 
     with pytest.raises(model_registrations.ModelRegistrationConflict):
         model_registrations.create_model_registration({
             "name": "Duplicate Kimi",
-            "kind": "chat",
+            "kind": "code",
             "provider": "kimi-coding",
             "model": "kimi-k2.5",
         })
     with pytest.raises(model_registrations.ModelRegistrationError, match="server-managed"):
         model_registrations.create_model_registration({
             "name": "Forged admin",
-            "kind": "chat",
+            "kind": "code",
             "provider": "kimi-coding",
             "model": "kimi-k2.5",
             "scope": "admin",
