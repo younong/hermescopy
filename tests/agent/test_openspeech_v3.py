@@ -27,7 +27,9 @@ PROVIDER = "volcengine-agent-plan"
 
 def _server_response(payload: dict, sequence: int = -1) -> bytes:
     body = gzip.compress(json.dumps(payload).encode())
-    return bytes((0x11, 0x93, 0x11, 0)) + struct.pack(">iI", sequence, len(body)) + body
+    flags = NEGATIVE_SEQUENCE if sequence < 0 else 0x1
+    header = bytes((0x11, (FULL_SERVER_RESPONSE << 4) | flags, 0x11, 0))
+    return header + struct.pack(">iI", sequence, len(body)) + body
 
 
 def test_full_client_request_is_gzip_json():
@@ -129,16 +131,51 @@ def test_transcription_failure_redacts_key(tmp_path, monkeypatch):
     assert "fake-plan-key" not in result["error"]
 
 
+def test_transcription_returns_text_when_endpoint_closes_cleanly(tmp_path, monkeypatch):
+    """The endpoint answers the final packet and closes with 1000 OK."""
+    monkeypatch.setenv("VOLCENGINE_AGENT_PLAN_API_KEY", "fake-plan-key")
+    from websockets.exceptions import ConnectionClosedOK
+    from websockets.frames import Close
+
+    audio = tmp_path / "input.wav"
+    audio.write_bytes(b"wave")
+    websocket = _FakeWebSocket([_server_response({"result": {"text": "测试"}}, sequence=1)])
+    websocket.recv_exc = ConnectionClosedOK(
+        Close(1000, "finish last sequence"),
+        Close(1000, "finish last sequence"),
+        True,
+    )
+    connect = _FakeConnect(websocket)
+    provider = ProfileTranscriptionProvider(get_provider_profile(PROVIDER))
+
+    with patch("websockets.sync.client.connect", connect):
+        result = provider.transcribe(str(audio))
+
+    assert result == {
+        "success": True,
+        "transcript": "测试",
+        "provider": PROVIDER,
+        "model": "doubao-seed-asr-2.0",
+    }
+
+
 class _FakeWebSocket:
     def __init__(self, received: list[bytes]):
         self.received = iter(received)
         self.sent: list[bytes] = []
+        self.recv_exc: Exception | None = None
 
     def send(self, data: bytes):
         self.sent.append(data)
 
     def recv(self, timeout=None):
-        return next(self.received)
+        try:
+            return next(self.received)
+        except StopIteration:
+            if self.recv_exc is not None:
+                exc, self.recv_exc = self.recv_exc, None
+                raise exc
+            raise
 
 
 class _FakeConnect:

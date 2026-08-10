@@ -113,6 +113,7 @@ class ProfileTranscriptionProvider(TranscriptionProvider):
         }
 
     def _transcribe(self, path: Path, api_key: str) -> str:
+        from websockets.exceptions import ConnectionClosedOK
         from websockets.sync.client import connect
 
         audio_format = _FORMATS.get(path.suffix.lower(), "wav")
@@ -161,7 +162,13 @@ class ProfileTranscriptionProvider(TranscriptionProvider):
                 websocket.send(audio_only_request(b"", sequence, final=True))
 
             while True:
-                raw = websocket.recv(timeout=60)
+                try:
+                    raw = websocket.recv(timeout=60)
+                except ConnectionClosedOK:
+                    # The endpoint answers the final packet with the
+                    # definitive response and then closes the connection
+                    # cleanly; whatever text we have is the result.
+                    break
                 if not isinstance(raw, bytes):
                     raise RuntimeError("ASR endpoint returned a text WebSocket message")
                 frame = parse_frame(raw)
