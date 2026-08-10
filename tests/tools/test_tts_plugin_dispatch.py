@@ -32,7 +32,7 @@ from typing import Optional
 
 import pytest
 
-from agent import tts_registry
+from hermes_cli.model_plane import capability as capability_module
 from agent.tts_provider import TTSProvider
 from tools import tts_tool
 
@@ -73,9 +73,9 @@ class _FakeTTSProvider(TTSProvider):
 
 @pytest.fixture(autouse=True)
 def _reset_registry():
-    tts_registry._reset_for_tests()
+    capability_module._reset_for_tests()
     yield
-    tts_registry._reset_for_tests()
+    capability_module._reset_for_tests()
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +128,7 @@ class TestCommandProviderWins:
     """
 
     def test_command_config_beats_plugin(self):
-        tts_registry.register_provider(_FakeTTSProvider(name="my-tts"))
+        capability_module.register_voice_provider("tts", _FakeTTSProvider(name="my-tts"))
 
         result = tts_tool._dispatch_to_plugin_provider(
             text="hello",
@@ -154,7 +154,7 @@ class TestPluginDispatch:
 
     def test_registered_plugin_called(self):
         provider = _FakeTTSProvider(name="cartesia")
-        tts_registry.register_provider(provider)
+        capability_module.register_voice_provider("tts", provider)
 
         result = tts_tool._dispatch_to_plugin_provider(
             text="hello world",
@@ -178,7 +178,7 @@ class TestPluginDispatch:
 
     def test_voice_model_speed_format_forwarded(self):
         provider = _FakeTTSProvider(name="cartesia")
-        tts_registry.register_provider(provider)
+        capability_module.register_voice_provider("tts", provider)
 
         result = tts_tool._dispatch_to_plugin_provider(
             text="hello",
@@ -202,7 +202,7 @@ class TestPluginDispatch:
         """Empty-string config values are normalized to None so providers can
         fall back to their own defaults (matches the ABC contract)."""
         provider = _FakeTTSProvider(name="cartesia")
-        tts_registry.register_provider(provider)
+        capability_module.register_voice_provider("tts", provider)
 
         tts_tool._dispatch_to_plugin_provider(
             text="hello",
@@ -218,7 +218,7 @@ class TestPluginDispatch:
         """If a provider rewrites the output path (e.g. format-driven extension
         change), the dispatcher returns the new path."""
         provider = _FakeTTSProvider(name="cartesia", return_path="/tmp/rewritten.opus")
-        tts_registry.register_provider(provider)
+        capability_module.register_voice_provider("tts", provider)
 
         result = tts_tool._dispatch_to_plugin_provider(
             text="hi",
@@ -241,7 +241,7 @@ class TestPluginDispatch:
                 return None  # type: ignore[return-value]
 
         provider2 = _ReturnsNone(name="weird")
-        tts_registry.register_provider(provider2)
+        capability_module.register_voice_provider("tts", provider2)
 
         result = tts_tool._dispatch_to_plugin_provider(
             text="hi",
@@ -260,7 +260,7 @@ class TestPluginDispatch:
             name="cartesia",
             raise_exc=RuntimeError("network down"),
         )
-        tts_registry.register_provider(provider)
+        capability_module.register_voice_provider("tts", provider)
 
         with pytest.raises(RuntimeError, match="network down"):
             tts_tool._dispatch_to_plugin_provider(
@@ -278,13 +278,13 @@ class TestPluginDispatch:
 
 class TestVoiceCompatibleHelper:
     def test_voice_compatible_true(self):
-        tts_registry.register_provider(
+        capability_module.register_voice_provider("tts", 
             _FakeTTSProvider(name="cartesia", voice_compat=True)
         )
         assert tts_tool._plugin_provider_is_voice_compatible("cartesia") is True
 
     def test_voice_compatible_false_by_default(self):
-        tts_registry.register_provider(_FakeTTSProvider(name="cartesia"))
+        capability_module.register_voice_provider("tts", _FakeTTSProvider(name="cartesia"))
         assert tts_tool._plugin_provider_is_voice_compatible("cartesia") is False
 
     def test_unregistered_provider_returns_false(self):
@@ -304,7 +304,7 @@ class TestVoiceCompatibleHelper:
         assert tts_tool._plugin_provider_is_voice_compatible(builtin) is False
 
     def test_voice_compatible_case_insensitive(self):
-        tts_registry.register_provider(
+        capability_module.register_voice_provider("tts", 
             _FakeTTSProvider(name="cartesia", voice_compat=True)
         )
         assert tts_tool._plugin_provider_is_voice_compatible("CARTESIA") is True
@@ -319,5 +319,129 @@ class TestVoiceCompatibleHelper:
             def voice_compatible(self) -> bool:
                 raise RuntimeError("boom")
 
-        tts_registry.register_provider(_ExplodingProvider(name="cartesia"))
+        capability_module.register_voice_provider("tts", _ExplodingProvider(name="cartesia"))
         assert tts_tool._plugin_provider_is_voice_compatible("cartesia") is False
+
+
+class TestVoiceToolSelectionOverlay:
+    """``_apply_voice_tool_selection`` — the unified ``voice_gen``
+    model-plane selection wins over the legacy ``tts.provider`` /
+    ``tts.model`` tool config when it names a plugin TTS provider
+    (mirrors the image tool's ``image_gen`` selection rule)."""
+
+    def test_selection_wins_over_legacy_config(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.model_plane.capability.resolve_voice_tool_selection",
+            lambda capability: ("cartesia", "sonic-2"),
+        )
+        provider, config = tts_tool._apply_voice_tool_selection(
+            "edge", {"provider": "edge", "voice": "aria"}
+        )
+        assert provider == "cartesia"
+        assert config["model"] == "sonic-2"
+        assert config["voice"] == "aria"
+
+    def test_no_selection_keeps_legacy_values(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.model_plane.capability.resolve_voice_tool_selection",
+            lambda capability: None,
+        )
+        provider, config = tts_tool._apply_voice_tool_selection(
+            "edge", {"provider": "edge"}
+        )
+        assert provider == "edge"
+        assert "model" not in config
+
+    def test_resolution_failure_never_blocks_legacy_path(self, monkeypatch):
+        def _boom(capability):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(
+            "hermes_cli.model_plane.capability.resolve_voice_tool_selection",
+            _boom,
+        )
+        provider, config = tts_tool._apply_voice_tool_selection(
+            "edge", {"provider": "edge"}
+        )
+        assert provider == "edge"
+        assert config == {"provider": "edge"}
+
+
+class TestDeploymentVoiceSynthesis:
+    """``_synthesize_via_deployment`` — a deployment voice route matching
+    the active selection executes through the worker media relay; without
+    a route (or without the relay client) the call falls through to local
+    dispatch (mirrors the image tool's deployment-route rule)."""
+
+    class _Route:
+        provider = "volcengine-agent-plan"
+
+    class _Relay:
+        def __init__(self, result=None, raise_exc=None):
+            self.last_call = None
+            self._result = result or {"audio_bytes": b"relay-audio"}
+            self._raise_exc = raise_exc
+
+        def execute(self, operation, **kwargs):
+            self.last_call = {"operation": operation, **kwargs}
+            if self._raise_exc is not None:
+                raise self._raise_exc
+            return self._result
+
+    def test_no_route_falls_through(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(tts_tool, "_deployment_voice_route", lambda p, m: None)
+        assert tts_tool._synthesize_via_deployment(
+            "hi", str(tmp_path / "out.mp3"), "volcengine-agent-plan", {"model": "m"},
+        ) is None
+
+    def test_route_without_relay_falls_through(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            tts_tool, "_deployment_voice_route", lambda p, m: self._Route()
+        )
+        monkeypatch.setattr(
+            "hermes_cli.owner_worker.media_dispatch.worker_media_relay",
+            lambda: None,
+        )
+        assert tts_tool._synthesize_via_deployment(
+            "hi", str(tmp_path / "out.mp3"), "volcengine-agent-plan", {"model": "m"},
+        ) is None
+
+    def test_relay_writes_audio_and_forwards_params(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            tts_tool, "_deployment_voice_route", lambda p, m: self._Route()
+        )
+        relay = self._Relay()
+        monkeypatch.setattr(
+            "hermes_cli.owner_worker.media_dispatch.worker_media_relay",
+            lambda: relay,
+        )
+        output = tmp_path / "speech.mp3"
+        written = tts_tool._synthesize_via_deployment(
+            "hello world",
+            str(output),
+            "volcengine-agent-plan",
+            {"model": "doubao-seed-tts-2.0", "voice": "v1", "speed": 1.5},
+        )
+        assert written == str(output)
+        assert output.read_bytes() == b"relay-audio"
+        assert relay.last_call["operation"] == "tts_synthesize"
+        assert relay.last_call["provider"] == "volcengine-agent-plan"
+        assert relay.last_call["model"] == "doubao-seed-tts-2.0"
+        assert relay.last_call["prompt"] == "hello world"
+        assert relay.last_call["params"] == {
+            "voice": "v1", "speed": 1.5, "format": "mp3",
+        }
+
+    def test_relay_failure_raises_for_error_envelope(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            tts_tool, "_deployment_voice_route", lambda p, m: self._Route()
+        )
+        relay = self._Relay(raise_exc=RuntimeError("relay rejected"))
+        monkeypatch.setattr(
+            "hermes_cli.owner_worker.media_dispatch.worker_media_relay",
+            lambda: relay,
+        )
+        with pytest.raises(RuntimeError, match="relay rejected"):
+            tts_tool._synthesize_via_deployment(
+                "hi", str(tmp_path / "out.mp3"), "volcengine-agent-plan", {"model": "m"},
+            )

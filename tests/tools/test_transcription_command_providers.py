@@ -538,9 +538,9 @@ class TestCommandWinsOverPlugin:
 
         # Register a plugin under the SAME name. It must NOT fire.
         from agent.transcription_provider import TranscriptionProvider
-        from agent.transcription_registry import (
+        from hermes_cli.model_plane.capability import (
             _reset_for_tests,
-            register_provider,
+            register_voice_provider,
         )
 
         class FakePlugin(TranscriptionProvider):
@@ -557,7 +557,7 @@ class TestCommandWinsOverPlugin:
 
         _reset_for_tests()
         try:
-            register_provider(FakePlugin())
+            register_voice_provider("asr", FakePlugin())
             with patch("tools.transcription_tools._load_stt_config", return_value=cfg):
                 result = transcribe_audio(str(audio))
         finally:
@@ -571,9 +571,9 @@ class TestCommandWinsOverPlugin:
         cfg = {"provider": "fake-plugin"}
 
         from agent.transcription_provider import TranscriptionProvider
-        from agent.transcription_registry import (
+        from hermes_cli.model_plane.capability import (
             _reset_for_tests,
-            register_provider,
+            register_voice_provider,
         )
 
         class FakePlugin(TranscriptionProvider):
@@ -590,7 +590,7 @@ class TestCommandWinsOverPlugin:
 
         _reset_for_tests()
         try:
-            register_provider(FakePlugin())
+            register_voice_provider("asr", FakePlugin())
             with patch("tools.transcription_tools._load_stt_config", return_value=cfg):
                 result = transcribe_audio(str(audio))
         finally:

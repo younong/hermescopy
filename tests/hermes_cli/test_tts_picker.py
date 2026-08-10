@@ -3,6 +3,9 @@
 Covers ``_plugin_tts_providers()`` and the ``_visible_providers()``
 integration that injects plugin rows into the Text-to-Speech category.
 
+Plugin TTS providers register as ``tts`` voice delegates in the
+model-plane capability registry; the picker reads them from there.
+
 Mirrors the structure of existing image_gen / browser picker tests.
 """
 
@@ -10,9 +13,9 @@ from __future__ import annotations
 
 import pytest
 
-from agent import tts_registry
 from agent.tts_provider import TTSProvider
 from hermes_cli import tools_config
+from hermes_cli.model_plane import capability as capability_module
 
 
 class _FakeTTSProvider(TTSProvider):
@@ -35,13 +38,13 @@ class _FakeTTSProvider(TTSProvider):
 
 @pytest.fixture(autouse=True)
 def _reset_registry(monkeypatch):
-    tts_registry._reset_for_tests()
+    capability_module._reset_for_tests()
     monkeypatch.setattr(
         "hermes_cli.plugins._register_provider_media_capabilities",
         lambda **kwargs: None,
     )
     yield
-    tts_registry._reset_for_tests()
+    capability_module._reset_for_tests()
 
 
 class TestPluginTTSProviders:
@@ -51,7 +54,8 @@ class TestPluginTTSProviders:
         assert tools_config._plugin_tts_providers() == []
 
     def test_returns_row_for_registered_plugin(self):
-        tts_registry.register_provider(
+        capability_module.register_voice_provider(
+            "tts",
             _FakeTTSProvider(
                 name="cartesia",
                 schema={
@@ -63,7 +67,7 @@ class TestPluginTTSProviders:
                          "url": "https://play.cartesia.ai/console"},
                     ],
                 },
-            )
+            ),
         )
         rows = tools_config._plugin_tts_providers()
         assert len(rows) == 1
@@ -78,56 +82,45 @@ class TestPluginTTSProviders:
         assert row["tts_plugin_name"] == "cartesia"
 
     def test_filters_builtin_shadow_defensively(self):
-        """Even if a plugin slipped past the registry's built-in check
-        (e.g. via direct ``agent.tts_registry.register_provider`` rather
-        than the ``ctx.register_tts_provider`` hook), the picker layer
-        filters it out so the picker invariant holds."""
-        # Use lower-level call to bypass the warning + skip in
-        # register_provider (the registry's built-in guard).
+        """Even if a plugin slipped past the voice-registration built-in
+        check (via direct low-level ``register_capability_provider``),
+        the picker layer filters it out so the picker invariant holds."""
+        # Use the low-level call to bypass the warning + skip in
+        # register_voice_provider (the built-in guard).
         # Note: this is intentionally pathological — production code
         # paths go through the hook which catches this first.
-        provider = _FakeTTSProvider(name="edge")
-        tts_registry._providers["edge"] = provider  # type: ignore[index]
-        try:
-            rows = tools_config._plugin_tts_providers()
-            assert rows == [], (
-                "Picker must filter built-in name shadows even when the "
-                "registry has been bypassed."
+        capability_module.register_capability_provider(
+            capability_module.VoiceCapabilityAdapter(
+                "tts", _FakeTTSProvider(name="edge")
             )
-        finally:
-            tts_registry._providers.pop("edge", None)  # type: ignore[arg-type]
+        )
+        rows = tools_config._plugin_tts_providers()
+        assert rows == [], (
+            "Picker must filter built-in name shadows even when the "
+            "registration guard has been bypassed."
+        )
 
-    def test_skips_providers_with_no_name(self):
-        """Defense in depth: a provider with no .name attribute is skipped
-        rather than crashing the picker."""
-
-        class _NoName:
-            display_name = "Bogus"
-            def get_setup_schema(self):
-                return {"name": "Bogus"}
-
-        tts_registry._providers["bogus"] = _NoName()  # type: ignore[assignment]
-        try:
-            rows = tools_config._plugin_tts_providers()
-            # Provider has no .name so the picker filters it out
-            assert all(r.get("tts_plugin_name") != "bogus" for r in rows)
-        finally:
-            tts_registry._providers.pop("bogus", None)  # type: ignore[arg-type]
+    def test_registration_rejects_empty_name(self):
+        """The capability registry enforces non-empty names, so the picker
+        can never see a nameless provider."""
+        provider = _FakeTTSProvider(name="  ")
+        with pytest.raises(ValueError):
+            capability_module.register_voice_provider("tts", provider)
 
     def test_skips_providers_whose_schema_raises(self):
         class _ExplodingSchema(_FakeTTSProvider):
             def get_setup_schema(self):
                 raise RuntimeError("boom")
 
-        tts_registry.register_provider(_ExplodingSchema(name="exploding"))
-        tts_registry.register_provider(_FakeTTSProvider(name="working"))
+        capability_module.register_voice_provider("tts", _ExplodingSchema(name="exploding"))
+        capability_module.register_voice_provider("tts", _FakeTTSProvider(name="working"))
         rows = tools_config._plugin_tts_providers()
         assert [r["tts_plugin_name"] for r in rows] == ["working"]
 
     def test_minimal_schema_uses_display_name(self):
         """A provider with no setup_schema override gets a row built from
         ``display_name`` and ``name`` only."""
-        tts_registry.register_provider(_FakeTTSProvider(name="minimal"))
+        capability_module.register_voice_provider("tts", _FakeTTSProvider(name="minimal"))
         rows = tools_config._plugin_tts_providers()
         assert len(rows) == 1
         assert rows[0]["name"] == "Minimal"  # display_name default
@@ -135,7 +128,8 @@ class TestPluginTTSProviders:
         assert rows[0]["env_vars"] == []
 
     def test_post_setup_passthrough(self):
-        tts_registry.register_provider(
+        capability_module.register_voice_provider(
+            "tts",
             _FakeTTSProvider(
                 name="my-tts",
                 schema={
@@ -143,7 +137,7 @@ class TestPluginTTSProviders:
                     "post_setup": "my_post_install_hook",
                     "env_vars": [],
                 },
-            )
+            ),
         )
         rows = tools_config._plugin_tts_providers()
         assert rows[0].get("post_setup") == "my_post_install_hook"
@@ -154,7 +148,7 @@ class TestVisibleProvidersInjectsTTSPlugins:
     category alongside the hardcoded built-in rows."""
 
     def test_tts_category_includes_plugin_rows(self):
-        tts_registry.register_provider(_FakeTTSProvider(name="cartesia"))
+        capability_module.register_voice_provider("tts", _FakeTTSProvider(name="cartesia"))
 
         tts_cat = tools_config.TOOL_CATEGORIES["tts"]
         visible = tools_config._visible_providers(tts_cat, config={})
@@ -173,7 +167,7 @@ class TestVisibleProvidersInjectsTTSPlugins:
     def test_other_categories_unaffected_by_tts_plugins(self):
         """Registering a TTS plugin must not leak into the Image Generation
         or Browser pickers."""
-        tts_registry.register_provider(_FakeTTSProvider(name="cartesia"))
+        capability_module.register_voice_provider("tts", _FakeTTSProvider(name="cartesia"))
 
         img_cat = tools_config.TOOL_CATEGORIES["image_gen"]
         visible = tools_config._visible_providers(img_cat, config={})

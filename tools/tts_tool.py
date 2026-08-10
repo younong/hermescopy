@@ -350,6 +350,90 @@ def _get_provider(tts_config: Dict[str, Any]) -> str:
     return (tts_config.get("provider") or DEFAULT_PROVIDER).lower().strip()
 
 
+def _apply_voice_tool_selection(
+    provider: str,
+    tts_config: Dict[str, Any],
+) -> tuple[str, Dict[str, Any]]:
+    """Overlay the unified ``voice_gen`` model-plane selection.
+
+    When the activated voice registration names a plugin-registered TTS
+    provider whose TTS catalog includes the activated model, that
+    selection wins over the legacy ``tts.provider`` / ``tts.model`` tool
+    config (same rule as the image tool's ``image_gen`` selection).
+    Otherwise the legacy values apply unchanged.
+    """
+    try:
+        from hermes_cli.model_plane.capability import resolve_voice_tool_selection
+
+        selection = resolve_voice_tool_selection("tts")
+    except Exception:  # noqa: BLE001 — selection is additive, never blocks
+        return provider, tts_config
+    if selection is None:
+        return provider, tts_config
+    name, model = selection
+    overlaid = dict(tts_config) if isinstance(tts_config, dict) else {}
+    overlaid["model"] = model
+    return name, overlaid
+
+
+def _deployment_voice_route(provider: str, model: Any):
+    """Return the deployment voice route matching this provider/model pair."""
+    if not isinstance(provider, str) or not provider.strip():
+        return None
+    if not isinstance(model, str) or not model.strip():
+        return None
+    try:
+        from hermes_cli.deployment_media import deployment_media_route_from_environment
+
+        return deployment_media_route_from_environment(
+            "voice", provider=provider, model=model,
+        )
+    except Exception:  # noqa: BLE001 — deployment routing is additive
+        return None
+
+
+def _synthesize_via_deployment(
+    text: str,
+    output_path: str,
+    provider: str,
+    tts_config: Dict[str, Any],
+) -> Optional[str]:
+    """Execute TTS through the deployment media relay, or return None.
+
+    Returns None when the active selection matches no deployment voice
+    route or the worker relay client is unavailable — the caller falls
+    through to local plugin/built-in dispatch with the user's own key.
+    Relay failures raise so the outer ``text_to_speech_tool`` error
+    envelope reports them (matching plugin dispatch behavior).
+    """
+    model = tts_config.get("model") if isinstance(tts_config, dict) else None
+    route = _deployment_voice_route(provider, model)
+    if route is None:
+        return None
+    from hermes_cli.owner_worker.media_dispatch import worker_media_relay
+
+    relay = worker_media_relay()
+    if relay is None:
+        return None
+    voice = tts_config.get("voice")
+    speed = tts_config.get("speed")
+    fmt = tts_config.get("output_format", DEFAULT_COMMAND_TTS_OUTPUT_FORMAT)
+    result = relay.execute(
+        "tts_synthesize",
+        provider=route.provider,
+        model=model.strip(),
+        prompt=text,
+        params={
+            "voice": voice if isinstance(voice, str) and voice else None,
+            "speed": float(speed) if isinstance(speed, (int, float)) else None,
+            "format": str(fmt).lower() if fmt else "mp3",
+        },
+    )
+    with open(output_path, "wb") as destination:
+        destination.write(result["audio_bytes"])
+    return output_path
+
+
 # ===========================================================================
 # Custom command providers (type: command under tts.providers.<name>)
 # ===========================================================================
@@ -380,19 +464,12 @@ def _get_provider(tts_config: Dict[str, Any]) -> str:
 # (bare / single / double quote), so paths with spaces work transparently.
 
 # Built-in provider names. Any ``tts.provider`` value NOT in this set is
-# interpreted as a reference to ``tts.providers.<name>``.
-BUILTIN_TTS_PROVIDERS = frozenset({
-    "edge",
-    "elevenlabs",
-    "openai",
-    "minimax",
-    "xai",
-    "mistral",
-    "gemini",
-    "neutts",
-    "kittentts",
-    "piper",
-})
+# interpreted as a reference to ``tts.providers.<name>``. The canonical set
+# lives in the model plane (``hermes_cli.model_plane.kinds``) so voice
+# capability registration rejects shadowing names against the same source.
+from hermes_cli.model_plane.kinds import (
+    BUILTIN_TTS_PROVIDER_NAMES as BUILTIN_TTS_PROVIDERS,
+)
 
 DEFAULT_COMMAND_TTS_TIMEOUT_SECONDS = 120
 DEFAULT_COMMAND_TTS_OUTPUT_FORMAT = "mp3"
@@ -506,11 +583,11 @@ def _dispatch_to_plugin_provider(
     if _is_command_provider_config(_get_named_provider_config(tts_config, key)):
         return None
     try:
-        from agent.tts_registry import get_provider
+        from hermes_cli.model_plane.capability import get_voice_delegate
         from hermes_cli.plugins import _ensure_plugins_discovered
 
         _ensure_plugins_discovered()
-        plugin_provider = get_provider(key)
+        plugin_provider = get_voice_delegate(key, "tts")
         if plugin_provider is None:
             # Long-lived sessions may have discovered plugins before the
             # bundled backend was patched in or before config changed.
@@ -518,7 +595,7 @@ def _dispatch_to_plugin_provider(
             # through. Mirrors the image_gen / browser dispatcher
             # recovery pattern.
             _ensure_plugins_discovered(force=True)
-            plugin_provider = get_provider(key)
+            plugin_provider = get_voice_delegate(key, "tts")
     except Exception as exc:  # noqa: BLE001 — discovery failure is non-fatal
         logger.debug("tts plugin dispatch skipped (discovery failed): %s", exc)
         return None
@@ -568,9 +645,9 @@ def _plugin_provider_is_voice_compatible(provider: str) -> bool:
     if key in BUILTIN_TTS_PROVIDERS:
         return False
     try:
-        from agent.tts_registry import get_provider
+        from hermes_cli.model_plane.capability import get_voice_delegate
 
-        plugin_provider = get_provider(key)
+        plugin_provider = get_voice_delegate(key, "tts")
         if plugin_provider is None:
             return False
         return bool(plugin_provider.voice_compatible)
@@ -2156,6 +2233,7 @@ def text_to_speech_tool(
 
     tts_config = _load_tts_config()
     provider = _get_provider(tts_config)
+    provider, tts_config = _apply_voice_tool_selection(provider, tts_config)
 
     # User-declared command provider (type: command under tts.providers.<name>)
     # resolves BEFORE the built-in dispatch. Built-in names short-circuit here
@@ -2236,6 +2314,18 @@ def text_to_speech_tool(
             file_str = _generate_command_tts(
                 text, file_str, provider, command_provider_config, tts_config,
             )
+
+        # Deployment-managed voice route (PR3): when the active voice
+        # selection matches a deployment media route, the Control Plane
+        # holds the credential and synthesizes on the worker's behalf via
+        # the media relay. Mirrors the image tool's deployment-route rule:
+        # a matching route wins over the local plugin/built-in dispatch.
+        elif provider not in BUILTIN_TTS_PROVIDERS and (
+            _deployment_path := _synthesize_via_deployment(
+                text, file_str, provider, tts_config,
+            )
+        ) is not None:
+            file_str = _deployment_path
 
         # Plugin-registered TTS backend (issue #30398). Fires when the
         # configured provider is neither a built-in nor a command-type

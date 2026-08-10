@@ -2120,17 +2120,21 @@ def _plugin_tts_providers() -> list[dict]:
     function only injects PLUGIN-registered providers.
 
     Defensive: plugins whose name collides with a built-in TTS provider
-    are filtered out — even though the registry already rejects them
-    at registration time, a future code path that registers directly
-    via :func:`agent.tts_registry.register_provider` could slip
-    through. Filtering here keeps the picker invariant.
+    are filtered out — even though voice capability registration already
+    rejects them at registration time, filtering here keeps the picker
+    invariant against any future code path that registers directly.
     """
     try:
-        from agent.tts_registry import _BUILTIN_NAMES, list_providers
+        from hermes_cli.model_plane.capability import get_voice_delegate, list_capability_providers
+        from hermes_cli.model_plane.kinds import BUILTIN_TTS_PROVIDER_NAMES
         from hermes_cli.plugins import _ensure_plugins_discovered
 
         _ensure_plugins_discovered()
-        providers = list_providers()
+        providers = [
+            get_voice_delegate(provider.name, "tts")
+            for provider in list_capability_providers("voice")
+        ]
+        providers = [provider for provider in providers if provider is not None]
     except Exception:
         return []
 
@@ -2140,7 +2144,7 @@ def _plugin_tts_providers() -> list[dict]:
         if not name:
             continue
         # Defensive: reject built-in shadowing at the picker layer too.
-        if name.lower().strip() in _BUILTIN_NAMES:
+        if name.lower().strip() in BUILTIN_TTS_PROVIDER_NAMES:
             continue
         try:
             schema = provider.get_setup_schema()

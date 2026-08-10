@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent import transcription_registry
+from hermes_cli.model_plane import capability as capability_module
 from agent.transcription_provider import TranscriptionProvider
 from tools import transcription_tools
 
@@ -61,9 +61,9 @@ class _FakeProvider(TranscriptionProvider):
 
 @pytest.fixture(autouse=True)
 def _reset_registry():
-    transcription_registry._reset_for_tests()
+    capability_module._reset_for_tests()
     yield
-    transcription_registry._reset_for_tests()
+    capability_module._reset_for_tests()
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +121,7 @@ class TestBuiltinAlwaysWins:
 class TestPluginDispatch:
     def test_registered_plugin_called(self):
         provider = _FakeProvider(name="openrouter")
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         result = transcription_tools._dispatch_to_plugin_provider(
             "/tmp/audio.mp3", "openrouter",
@@ -143,7 +143,7 @@ class TestPluginDispatch:
 
     def test_model_kwarg_forwarded(self):
         provider = _FakeProvider(name="openrouter")
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         transcription_tools._dispatch_to_plugin_provider(
             "/tmp/audio.mp3", "openrouter", model="whisper-large-v3",
@@ -152,7 +152,7 @@ class TestPluginDispatch:
 
     def test_language_kwarg_forwarded(self):
         provider = _FakeProvider(name="openrouter")
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         transcription_tools._dispatch_to_plugin_provider(
             "/tmp/audio.mp3", "openrouter", language="en",
@@ -161,7 +161,7 @@ class TestPluginDispatch:
 
     def test_provider_exception_converted_to_error_envelope(self):
         provider = _FakeProvider(name="openrouter", raise_exc=RuntimeError("network down"))
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         result = transcription_tools._dispatch_to_plugin_provider(
             "/tmp/audio.mp3", "openrouter",
@@ -174,7 +174,7 @@ class TestPluginDispatch:
 
     def test_provider_non_dict_result_converted_to_error(self):
         provider = _FakeProvider(name="openrouter", result="weird string")  # type: ignore[arg-type]
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         result = transcription_tools._dispatch_to_plugin_provider(
             "/tmp/audio.mp3", "openrouter",
@@ -191,7 +191,7 @@ class TestPluginDispatch:
             name="openrouter",
             result={"success": True, "transcript": "hi"},  # no provider key
         )
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         result = transcription_tools._dispatch_to_plugin_provider(
             "/tmp/audio.mp3", "openrouter",
@@ -217,7 +217,7 @@ class TestTranscribeAudioE2E:
     def test_unknown_name_with_plugin_dispatches(self):
         from unittest.mock import patch
         provider = _FakeProvider(name="openrouter")
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         with patch("tools.transcription_tools._validate_audio_file", return_value=None), \
              patch("tools.transcription_tools._load_stt_config", return_value={"provider": "openrouter"}), \
@@ -253,7 +253,7 @@ class TestTranscribeAudioE2E:
         # Register a plugin that WOULD respond to 'openrouter' — but
         # we're asking for 'groq', so it shouldn't be called.
         provider = _FakeProvider(name="openrouter")
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         with patch("tools.transcription_tools._validate_audio_file", return_value=None), \
              patch("tools.transcription_tools._load_stt_config", return_value={"provider": "groq"}), \
@@ -286,7 +286,7 @@ class TestAvailabilityGate:
 
     def test_unavailable_plugin_returns_envelope_not_none(self):
         provider = _FakeProvider(name="openrouter", available=False)
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         result = transcription_tools._dispatch_to_plugin_provider(
             "/tmp/audio.mp3", "openrouter",
@@ -304,7 +304,7 @@ class TestAvailabilityGate:
 
     def test_available_plugin_dispatches_normally(self):
         provider = _FakeProvider(name="openrouter", available=True)
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         result = transcription_tools._dispatch_to_plugin_provider(
             "/tmp/audio.mp3", "openrouter",
@@ -319,7 +319,7 @@ class TestAvailabilityGate:
             name="openrouter",
             available_raises=RuntimeError("creds check exploded"),
         )
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         result = transcription_tools._dispatch_to_plugin_provider(
             "/tmp/audio.mp3", "openrouter",
@@ -337,7 +337,7 @@ class TestAvailabilityGate:
         """
         from unittest.mock import patch
         provider = _FakeProvider(name="openrouter", available=False)
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         with patch("tools.transcription_tools._validate_audio_file", return_value=None), \
              patch("tools.transcription_tools._load_stt_config", return_value={"provider": "openrouter"}), \
@@ -369,7 +369,7 @@ class TestLanguageForwardingFromConfig:
         transcribe() call as language='ja'."""
         from unittest.mock import patch
         provider = _FakeProvider(name="openrouter")
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         stt_config = {
             "provider": "openrouter",
@@ -390,7 +390,7 @@ class TestLanguageForwardingFromConfig:
         override."""
         from unittest.mock import patch
         provider = _FakeProvider(name="openrouter")
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         stt_config = {
             "provider": "openrouter",
@@ -409,7 +409,7 @@ class TestLanguageForwardingFromConfig:
         ``stt.<provider>.model`` in config."""
         from unittest.mock import patch
         provider = _FakeProvider(name="openrouter")
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         stt_config = {
             "provider": "openrouter",
@@ -430,7 +430,7 @@ class TestLanguageForwardingFromConfig:
         model falls back to caller arg or None. No crash."""
         from unittest.mock import patch
         provider = _FakeProvider(name="openrouter")
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         with patch("tools.transcription_tools._validate_audio_file", return_value=None), \
              patch("tools.transcription_tools._load_stt_config", return_value={"provider": "openrouter"}), \
@@ -447,7 +447,7 @@ class TestLanguageForwardingFromConfig:
         empty config."""
         from unittest.mock import patch
         provider = _FakeProvider(name="openrouter")
-        transcription_registry.register_provider(provider)
+        capability_module.register_voice_provider("asr", provider)
 
         stt_config = {"provider": "openrouter", "openrouter": "garbage"}
         with patch("tools.transcription_tools._validate_audio_file", return_value=None), \
@@ -460,3 +460,212 @@ class TestLanguageForwardingFromConfig:
         assert result["success"] is True
         assert provider.last_call["kwargs"]["language"] is None
         assert provider.last_call["kwargs"]["model"] is None
+
+
+class TestVoiceToolSelectionOverlay:
+    """The unified ``voice_gen`` model-plane selection wins over the
+    legacy ``stt.provider`` config on the ``transcribe_audio`` path and
+    supplies the activated model (mirrors the image tool's ``image_gen``
+    selection rule)."""
+
+    def _run_transcribe(self, stt_config, model=None):
+        from unittest.mock import patch
+        with patch("tools.transcription_tools._validate_audio_file", return_value=None), \
+             patch("tools.transcription_tools._load_stt_config", return_value=stt_config), \
+             patch("tools.transcription_tools.is_stt_enabled", return_value=True), \
+             patch("tools.transcription_tools._get_provider",
+                   return_value=stt_config.get("provider", "local")):
+            return transcription_tools.transcribe_audio("/tmp/audio.mp3", model=model)
+
+    def test_selection_wins_and_supplies_model(self, monkeypatch):
+        provider = _FakeProvider(name="openrouter")
+        capability_module.register_voice_provider("asr", provider)
+        monkeypatch.setattr(
+            "hermes_cli.model_plane.capability.resolve_voice_tool_selection",
+            lambda capability: ("openrouter", "whisper-x"),
+        )
+
+        result = self._run_transcribe({"provider": "openai"})
+
+        assert result["success"] is True
+        assert provider.last_call["kwargs"]["model"] == "whisper-x"
+
+    def test_caller_model_argument_wins_over_selection(self, monkeypatch):
+        provider = _FakeProvider(name="openrouter")
+        capability_module.register_voice_provider("asr", provider)
+        monkeypatch.setattr(
+            "hermes_cli.model_plane.capability.resolve_voice_tool_selection",
+            lambda capability: ("openrouter", "whisper-x"),
+        )
+
+        result = self._run_transcribe({"provider": "openai"}, model="explicit-model")
+
+        assert result["success"] is True
+        assert provider.last_call["kwargs"]["model"] == "explicit-model"
+
+    def test_no_selection_keeps_legacy_provider(self, monkeypatch):
+        provider = _FakeProvider(name="openrouter")
+        capability_module.register_voice_provider("asr", provider)
+        monkeypatch.setattr(
+            "hermes_cli.model_plane.capability.resolve_voice_tool_selection",
+            lambda capability: None,
+        )
+
+        result = self._run_transcribe({"provider": "openrouter"})
+
+        assert result["success"] is True
+        assert provider.last_call["kwargs"]["model"] is None
+
+    def test_resolution_failure_never_blocks_legacy_path(self, monkeypatch):
+        provider = _FakeProvider(name="openrouter")
+        capability_module.register_voice_provider("asr", provider)
+
+        def _boom(capability):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(
+            "hermes_cli.model_plane.capability.resolve_voice_tool_selection",
+            _boom,
+        )
+
+        result = self._run_transcribe({"provider": "openrouter"})
+
+        assert result["success"] is True
+        assert provider.last_call["kwargs"]["model"] is None
+
+
+class TestDeploymentTranscription:
+    """``_transcribe_via_deployment`` — a deployment voice route matching
+    the active selection transcribes through the worker media relay;
+    without a route (or without the relay client) the call falls through
+    to local dispatch (mirrors the image tool's deployment-route rule)."""
+
+    class _Route:
+        provider = "volcengine-agent-plan"
+        max_reference_bytes = 16
+
+    class _Relay:
+        def __init__(self, result=None, raise_exc=None):
+            self.last_call = None
+            self._result = result or {
+                "text": "relay transcript",
+                "provider": "volcengine-agent-plan",
+                "model": "doubao-seed-asr-2.0",
+            }
+            self._raise_exc = raise_exc
+
+        def execute(self, operation, **kwargs):
+            self.last_call = {"operation": operation, **kwargs}
+            if self._raise_exc is not None:
+                raise self._raise_exc
+            return self._result
+
+    def _patch_route(self, monkeypatch, route, relay):
+        monkeypatch.setattr(
+            transcription_tools, "_deployment_voice_route", lambda p, m: route
+        )
+        monkeypatch.setattr(
+            "hermes_cli.owner_worker.media_dispatch.worker_media_relay",
+            lambda: relay,
+        )
+
+    def test_no_route_falls_through(self, monkeypatch):
+        self._patch_route(monkeypatch, None, self._Relay())
+        assert transcription_tools._transcribe_via_deployment(
+            "/tmp/audio.mp3", "volcengine-agent-plan", "m", {},
+        ) is None
+
+    def test_route_without_relay_falls_through(self, monkeypatch):
+        self._patch_route(monkeypatch, self._Route(), None)
+        assert transcription_tools._transcribe_via_deployment(
+            "/tmp/audio.mp3", "volcengine-agent-plan", "m", {},
+        ) is None
+
+    def test_relay_sends_audio_and_returns_envelope(self, monkeypatch, tmp_path):
+        sample = tmp_path / "voice.mp3"
+        sample.write_bytes(b"mp3-bytes")
+        relay = self._Relay()
+        self._patch_route(monkeypatch, self._Route(), relay)
+
+        result = transcription_tools._transcribe_via_deployment(
+            str(sample),
+            "volcengine-agent-plan",
+            "doubao-seed-asr-2.0",
+            {"volcengine-agent-plan": {"language": "zh"}},
+        )
+
+        assert result == {
+            "success": True,
+            "transcript": "relay transcript",
+            "provider": "volcengine-agent-plan",
+            "model": "doubao-seed-asr-2.0",
+        }
+        call = relay.last_call
+        assert call["operation"] == "transcribe"
+        assert call["provider"] == "volcengine-agent-plan"
+        assert call["model"] == "doubao-seed-asr-2.0"
+        assert call["references"] == [{
+            "name": "voice.mp3", "mime_type": "audio/mpeg", "data": b"mp3-bytes",
+        }]
+        assert call["params"] == {"language": "zh"}
+
+    def test_oversized_audio_returns_error_envelope(self, monkeypatch, tmp_path):
+        sample = tmp_path / "big.wav"
+        sample.write_bytes(b"x" * 17)
+        relay = self._Relay()
+        self._patch_route(monkeypatch, self._Route(), relay)
+
+        result = transcription_tools._transcribe_via_deployment(
+            str(sample), "volcengine-agent-plan", "m", {},
+        )
+
+        assert result["success"] is False
+        assert "too large" in result["error"]
+        assert relay.last_call is None
+
+    def test_relay_failure_returns_error_envelope(self, monkeypatch, tmp_path):
+        sample = tmp_path / "voice.wav"
+        sample.write_bytes(b"wav")
+        relay = self._Relay(raise_exc=RuntimeError("relay rejected"))
+        self._patch_route(monkeypatch, self._Route(), relay)
+
+        result = transcription_tools._transcribe_via_deployment(
+            str(sample), "volcengine-agent-plan", "m", {},
+        )
+
+        assert result["success"] is False
+        assert "Deployment transcription failed" in result["error"]
+        assert result["provider"] == "volcengine-agent-plan"
+
+
+class TestDeploymentTranscriptionE2E:
+    """``transcribe_audio`` prefers the deployment route when the unified
+    voice selection matches one (PR3 deployment-managed ASR)."""
+
+    def test_selection_matching_route_uses_relay(self, monkeypatch, tmp_path):
+        from unittest.mock import patch
+        sample = tmp_path / "voice.wav"
+        sample.write_bytes(b"wav")
+        relay = TestDeploymentTranscription._Relay()
+        monkeypatch.setattr(
+            "hermes_cli.model_plane.capability.resolve_voice_tool_selection",
+            lambda capability: ("volcengine-agent-plan", "doubao-seed-asr-2.0"),
+        )
+        monkeypatch.setattr(
+            transcription_tools,
+            "_deployment_voice_route",
+            lambda p, m: TestDeploymentTranscription._Route(),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.owner_worker.media_dispatch.worker_media_relay",
+            lambda: relay,
+        )
+        with patch("tools.transcription_tools._validate_audio_file", return_value=None), \
+             patch("tools.transcription_tools._load_stt_config", return_value={"provider": "local"}), \
+             patch("tools.transcription_tools.is_stt_enabled", return_value=True), \
+             patch("tools.transcription_tools._get_provider", return_value="local"):
+            result = transcription_tools.transcribe_audio(str(sample))
+
+        assert result["success"] is True
+        assert result["transcript"] == "relay transcript"
+        assert relay.last_call["operation"] == "transcribe"

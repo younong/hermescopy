@@ -1,17 +1,17 @@
 """Control-plane-owned media generation routes for authenticated owner workers.
 
 This is the generation-media counterpart of ``deployment_inference.py``: the
-operator declares routes for the ``image`` and ``video`` kinds, credentials
-stay in the Control Plane, and workers receive only display-safe route
-descriptors plus a private relay connection. See ``docs/model-plane.md`` —
-this module and the media relay are the only deployment-managed credential
-path for generation media.
+operator declares routes for the ``image``, ``video``, ``voice``, and
+``vector`` kinds, credentials stay in the Control Plane, and workers receive
+only display-safe route descriptors plus a private relay connection. See
+``docs/model-plane.md`` — this module and the media relay are the only
+deployment-managed credential path for generation media.
 
 Routes are declared in the Control Plane environment as
 ``HERMES_DEPLOYMENT_MEDIA_ROUTES`` — a JSON array of objects::
 
     {
-        "kind": "image",                     # "image" | "video"
+        "kind": "image",                     # "image" | "video" | "voice" | "vector"
         "provider": "apiyi",                 # capability provider name
         "models": ["gpt-image-2-medium"],    # allowed model ids
         "default_model": "gpt-image-2-medium",
@@ -22,6 +22,14 @@ Routes are declared in the Control Plane environment as
         "text_only_models": [],              # models that reject references
         "limits": {"max_reference_images": 16, ...}
     }
+
+``executor`` is required for image/video routes and rejected for
+voice/vector routes: voice and vector execution always goes through the
+registered capability delegate for the route's provider
+(:func:`hermes_cli.model_plane.capability.get_voice_delegate` /
+:func:`hermes_cli.model_plane.capability.resolve_embedding_capability`), so
+a voice/vector route declares only identity, models, and the credential env.
+A voice route's ``models`` is the union of its TTS and ASR model ids.
 
 When ``HERMES_DEPLOYMENT_MEDIA_ROUTES`` is unset, an ``APIYI_API_KEY`` in the
 Control Plane environment activates the legacy default APIYI image route so
@@ -36,14 +44,20 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 from urllib.parse import urlparse
 
-from hermes_cli.model_plane.kinds import GATEWAY_KINDS
+from hermes_cli.model_plane.kinds import GATEWAY_KINDS, RELAY_KINDS, VECTOR, VOICE
 
 DEFAULT_POLICY_ID = "deployment-media-v1"
 ROUTES_ENV = "HERMES_DEPLOYMENT_MEDIA_ROUTES"
 POLICY_ID_ENV = "HERMES_DEPLOYMENT_MEDIA_POLICY_ID"
 
-OPERATIONS = frozenset({"image_generate", "video_generate"})
-_OPERATION_KINDS = {"image_generate": "image", "video_generate": "video"}
+OPERATIONS = frozenset({"image_generate", "video_generate", "tts_synthesize", "transcribe", "embed"})
+OPERATION_KINDS = {
+    "image_generate": "image",
+    "video_generate": "video",
+    "tts_synthesize": VOICE,
+    "transcribe": VOICE,
+    "embed": VECTOR,
+}
 
 MAX_REFERENCE_IMAGES = 16
 MAX_REFERENCE_BYTES = 16 * 1024 * 1024
@@ -58,6 +72,19 @@ _LIMIT_NAMES = (
 
 IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
 VIDEO_MIME_TYPES = frozenset({"video/mp4", "video/webm", "video/quicktime"})
+# Audio accepted as transcription input and produced by deployment TTS.
+AUDIO_MIME_TYPES = frozenset({"audio/mpeg", "audio/ogg", "audio/opus", "audio/wav", "audio/pcm"})
+TTS_OUTPUT_MIME_TYPES = frozenset({"audio/mpeg", "audio/ogg"})
+_AUDIO_SUFFIXES = {
+    "audio/mpeg": ".mp3",
+    "audio/ogg": ".ogg",
+    "audio/opus": ".opus",
+    "audio/wav": ".wav",
+    "audio/pcm": ".pcm",
+}
+_TTS_FORMAT_MIME_TYPES = {"mp3": "audio/mpeg", "ogg": "audio/ogg", "opus": "audio/ogg"}
+MAX_EMBEDDING_DIMENSIONS = 65536
+MAX_TRANSCRIPT_CHARS = 1_000_000
 
 _DEFAULT_APIYI_MODELS = (
     "gpt-image-2-low",
@@ -117,7 +144,7 @@ class DeploymentMediaRouteDescriptor:
             str(value or "").strip() for value in self.text_only_models
             if str(value or "").strip()
         ))
-        if kind not in GATEWAY_KINDS or not provider:
+        if kind not in RELAY_KINDS or not provider:
             raise DeploymentMediaPolicyInvalid("deployment media route identity is invalid")
         if default_model not in models:
             raise DeploymentMediaPolicyInvalid("deployment media route models are invalid")
@@ -260,10 +287,15 @@ class DeploymentMediaRoute:
     def __post_init__(self) -> None:
         key_env = str(self.key_env or "").strip()
         executor = str(self.executor or "").strip()
-        module_name, separator, attribute = executor.partition(":")
         if not key_env:
             raise DeploymentMediaPolicyInvalid("deployment media route credential is invalid")
-        if not separator or not module_name or not attribute or "." in attribute:
+        if self.descriptor.kind in GATEWAY_KINDS:
+            module_name, separator, attribute = executor.partition(":")
+            if not separator or not module_name or not attribute or "." in attribute:
+                raise DeploymentMediaPolicyInvalid("deployment media route executor is invalid")
+        elif executor or self.base_urls or self.executor_params:
+            # Voice/vector execution goes through the registered capability
+            # delegate for the route's provider — never a declared executor.
             raise DeploymentMediaPolicyInvalid("deployment media route executor is invalid")
         base_urls = dict(self.base_urls or {})
         for name, value in base_urls.items():
@@ -357,13 +389,26 @@ class DeploymentMediaPolicy:
         references: tuple[dict[str, Any], ...] = (),
         params: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        kind = _OPERATION_KINDS.get(str(operation or "").strip())
+        kind = OPERATION_KINDS.get(str(operation or "").strip())
         if kind is None:
             raise DeploymentMediaSelectionRejected("deployment media operation is not allowed")
         route = self.route_for(kind, provider, model)
         if route is None:
             raise DeploymentMediaSelectionRejected("deployment media selection is not allowed")
         descriptor = route.descriptor
+        if kind == VOICE:
+            self._resolve_api_key(route)
+            return self._execute_voice(
+                operation,
+                route,
+                model=model,
+                prompt=prompt,
+                references=references,
+                params=params,
+            )
+        if kind == VECTOR:
+            self._resolve_api_key(route)
+            return self._execute_embed(route, model=model, prompt=prompt, params=params)
         if references and not descriptor.supports_references(model):
             raise DeploymentMediaSelectionRejected(
                 "deployment media model does not accept references"
@@ -390,6 +435,182 @@ class DeploymentMediaPolicy:
             aspect_ratio=aspect_ratio,
             has_references=bool(references),
         )
+
+    def _voice_delegate(self, provider: str, capability: str) -> Any:
+        """Return the registered voice delegate backing a deployment route."""
+        from hermes_cli.model_plane.capability import get_voice_delegate
+        from hermes_cli.plugins import _ensure_plugins_discovered
+
+        _ensure_plugins_discovered()
+        delegate = get_voice_delegate(provider, capability)
+        if delegate is None:
+            raise DeploymentMediaPolicyInvalid("deployment media capability is unavailable")
+        return delegate
+
+    def _execute_voice(
+        self,
+        operation: str,
+        route: DeploymentMediaRoute,
+        *,
+        model: str,
+        prompt: str,
+        references: tuple[dict[str, Any], ...],
+        params: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Run one deployment TTS or transcription call through the delegate."""
+        import tempfile
+
+        descriptor = route.descriptor
+        safe_params = dict(params or {})
+        if operation == "tts_synthesize":
+            if references:
+                raise DeploymentMediaSelectionRejected(
+                    "deployment media references are invalid"
+                )
+            delegate = self._voice_delegate(descriptor.provider, "tts")
+            output_format = str(safe_params.get("format") or "mp3").strip().lower()
+            if output_format not in _TTS_FORMAT_MIME_TYPES:
+                raise DeploymentMediaSelectionRejected("deployment media params are invalid")
+            voice = safe_params.get("voice")
+            if voice is not None and not isinstance(voice, str):
+                raise DeploymentMediaSelectionRejected("deployment media params are invalid")
+            speed = safe_params.get("speed")
+            if speed is not None and (
+                isinstance(speed, bool) or not isinstance(speed, (int, float)) or speed <= 0
+            ):
+                raise DeploymentMediaSelectionRejected("deployment media params are invalid")
+            suffix = _AUDIO_SUFFIXES[_TTS_FORMAT_MIME_TYPES[output_format]]
+            try:
+                with tempfile.TemporaryDirectory(prefix="deployment-tts-") as directory:
+                    output_path = os.path.join(directory, f"speech{suffix}")
+                    delegate.synthesize(
+                        prompt,
+                        output_path,
+                        voice=voice or None,
+                        model=model,
+                        speed=float(speed) if speed is not None else None,
+                        format=output_format,
+                    )
+                    with open(output_path, "rb") as source:
+                        audio = source.read()
+            except (DeploymentMediaSelectionRejected, DeploymentMediaPolicyInvalid):
+                raise
+            except Exception as exc:
+                raise DeploymentMediaPolicyInvalid(
+                    "deployment media generation failed"
+                ) from exc
+            if (
+                not audio
+                or len(audio) > descriptor.max_output_bytes
+            ):
+                raise DeploymentMediaPolicyInvalid("deployment media response is invalid")
+            return {
+                "provider": descriptor.provider,
+                "model": model,
+                "aspect_ratio": "",
+                "modality": "audio",
+                "audio_bytes": audio,
+                "mime_type": _TTS_FORMAT_MIME_TYPES[output_format],
+                "metadata": {},
+            }
+
+        # transcribe: exactly one audio reference carries the input sample.
+        if len(references) != 1:
+            raise DeploymentMediaSelectionRejected(
+                "deployment media references are invalid"
+            )
+        reference = references[0]
+        suffix = _AUDIO_SUFFIXES.get(reference["mime_type"])
+        if suffix is None:
+            raise DeploymentMediaSelectionRejected("deployment media references are invalid")
+        language = safe_params.get("language")
+        if language is not None and not isinstance(language, str):
+            raise DeploymentMediaSelectionRejected("deployment media params are invalid")
+        delegate = self._voice_delegate(descriptor.provider, "asr")
+        try:
+            with tempfile.TemporaryDirectory(prefix="deployment-asr-") as directory:
+                sample_path = os.path.join(directory, f"sample{suffix}")
+                with open(sample_path, "wb") as destination:
+                    destination.write(reference["data"])
+                result = delegate.transcribe(
+                    sample_path,
+                    model=model,
+                    language=language or None,
+                )
+        except (DeploymentMediaSelectionRejected, DeploymentMediaPolicyInvalid):
+            raise
+        except Exception as exc:
+            raise DeploymentMediaPolicyInvalid(
+                "deployment media generation failed"
+            ) from exc
+        if not isinstance(result, Mapping) or result.get("success") is not True:
+            raise DeploymentMediaPolicyInvalid("deployment media generation failed")
+        transcript = result.get("transcript")
+        if not isinstance(transcript, str) or len(transcript) > MAX_TRANSCRIPT_CHARS:
+            raise DeploymentMediaPolicyInvalid("deployment media response is invalid")
+        return {
+            "provider": descriptor.provider,
+            "model": model,
+            "aspect_ratio": "",
+            "modality": "audio",
+            "text": transcript,
+            "metadata": {},
+        }
+
+    def _execute_embed(
+        self,
+        route: DeploymentMediaRoute,
+        *,
+        model: str,
+        prompt: str,
+        params: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Run one deployment embedding call through the vector capability."""
+        from hermes_cli.model_plane.capability import resolve_embedding_capability
+
+        safe_params = dict(params or {})
+        dimensions = safe_params.get("dimensions")
+        if dimensions is not None and (
+            isinstance(dimensions, bool) or not isinstance(dimensions, int) or dimensions < 1
+        ):
+            raise DeploymentMediaSelectionRejected("deployment media params are invalid")
+        instructions = safe_params.get("instructions")
+        if instructions is not None and not isinstance(instructions, str):
+            raise DeploymentMediaSelectionRejected("deployment media params are invalid")
+        try:
+            capability = resolve_embedding_capability(route.descriptor.provider)
+        except Exception as exc:
+            raise DeploymentMediaPolicyInvalid(
+                "deployment media capability is unavailable"
+            ) from exc
+        try:
+            result = capability.embed(
+                text=prompt,
+                dimensions=dimensions,
+                instructions=instructions or None,
+            )
+        except Exception as exc:
+            raise DeploymentMediaPolicyInvalid("deployment media generation failed") from exc
+        embedding = result.get("embedding") if isinstance(result, Mapping) else None
+        if (
+            not isinstance(embedding, list)
+            or not embedding
+            or len(embedding) > MAX_EMBEDDING_DIMENSIONS
+            or any(
+                isinstance(value, bool) or not isinstance(value, (int, float))
+                for value in embedding
+            )
+        ):
+            raise DeploymentMediaPolicyInvalid("deployment media response is invalid")
+        return {
+            "provider": route.descriptor.provider,
+            "model": model,
+            "aspect_ratio": "",
+            "modality": "vector",
+            "embedding": [float(value) for value in embedding],
+            "dimensions": len(embedding),
+            "metadata": {},
+        }
 
     def _normalize_result(
         self,
@@ -459,7 +680,7 @@ def _route_declaration(payload: Mapping[str, Any]) -> DeploymentMediaRoute:
         return DeploymentMediaRoute(
             descriptor=descriptor,
             key_env=payload["key_env"],
-            executor=payload["executor"],
+            executor=str(payload.get("executor") or ""),
             base_urls=payload.get("base_urls") or {},
             executor_params=payload.get("executor_params") or {},
         )

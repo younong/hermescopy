@@ -61,8 +61,8 @@ class TestRegisterTTSProvider:
     def test_accepts_valid_provider(self):
         from hermes_cli.plugins import PluginManager
 
-        from agent import tts_registry
-        tts_registry._reset_for_tests()
+        from hermes_cli.model_plane import capability as capability_module
+        capability_module._reset_for_tests()
 
         hermes_home = Path(os.environ["HERMES_HOME"])
         _write_plugin(
@@ -86,16 +86,16 @@ class TestRegisterTTSProvider:
         assert mgr._plugins["my-tts-plugin"].enabled is True, (
             f"Plugin failed to load: {mgr._plugins['my-tts-plugin'].error}"
         )
-        assert tts_registry.get_provider("fake-tts") is not None
+        assert capability_module.get_voice_delegate("fake-tts", "tts") is not None
 
-        tts_registry._reset_for_tests()
+        capability_module._reset_for_tests()
 
     def test_rejects_non_provider(self, caplog):
         """A plugin that passes a non-TTSProvider gets a warning, no exception."""
         from hermes_cli.plugins import PluginManager
 
-        from agent import tts_registry
-        tts_registry._reset_for_tests()
+        from hermes_cli.model_plane import capability as capability_module
+        capability_module._reset_for_tests()
 
         hermes_home = Path(os.environ["HERMES_HOME"])
         _write_plugin(
@@ -111,11 +111,11 @@ class TestRegisterTTSProvider:
 
         # Plugin loaded (register returned normally), but registry empty.
         assert mgr._plugins["bad-tts-plugin"].enabled is True
-        assert tts_registry.get_provider("not a provider") is None
-        assert tts_registry.list_providers() == []
+        assert capability_module.get_voice_delegate("not a provider", "tts") is None
+        assert capability_module.list_capability_providers("voice") == []
         assert "does not inherit from TTSProvider" in caplog.text
 
-        tts_registry._reset_for_tests()
+        capability_module._reset_for_tests()
 
     def test_rejects_builtin_shadow(self, caplog):
         """A plugin trying to register a name colliding with a built-in is silently
@@ -124,8 +124,8 @@ class TestRegisterTTSProvider:
         """
         from hermes_cli.plugins import PluginManager
 
-        from agent import tts_registry
-        tts_registry._reset_for_tests()
+        from hermes_cli.model_plane import capability as capability_module
+        capability_module._reset_for_tests()
 
         hermes_home = Path(os.environ["HERMES_HOME"])
         _write_plugin(
@@ -150,7 +150,7 @@ class TestRegisterTTSProvider:
         # Plugin still loaded normally — built-in shadowing is a warning,
         # not an exception. The registry rejects the entry though.
         assert mgr._plugins["shadow-tts-plugin"].enabled is True
-        assert tts_registry.get_provider("edge") is None
+        assert capability_module.get_voice_delegate("edge", "tts") is None
         assert "shadows a built-in name" in caplog.text
 
-        tts_registry._reset_for_tests()
+        capability_module._reset_for_tests()

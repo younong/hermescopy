@@ -356,6 +356,7 @@ def create_app(
             if media_relay_fd:
                 try:
                     from hermes_cli.deployment_media import deployment_media_descriptor_from_environment
+                    from hermes_cli.owner_worker.media_dispatch import set_worker_media_relay
                     from hermes_cli.owner_worker.media_relay import OwnerMediaRelayClient
 
                     descriptor = deployment_media_descriptor_from_environment()
@@ -363,6 +364,7 @@ def create_app(
                         raise RuntimeError("deployment media descriptor is unavailable")
                     media_relay = OwnerMediaRelayClient(int(media_relay_fd), descriptor)
                     app.state.deployment_media_relay = media_relay
+                    set_worker_media_relay(media_relay)
                 except Exception as exc:
                     raise RuntimeError("deployment media relay startup failed") from exc
             collaboration_db, collaboration_runtime = _start_collaboration_runtime()
@@ -402,6 +404,9 @@ def create_app(
             if relay is not None:
                 _cleanup(relay.close)
             if media_relay is not None:
+                from hermes_cli.owner_worker.media_dispatch import set_worker_media_relay
+
+                set_worker_media_relay(None)
                 _cleanup(media_relay.close)
             supervisor = getattr(app.state, "tool_executor_supervisor", None)
             if supervisor is not None:

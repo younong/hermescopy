@@ -114,8 +114,13 @@ def test_descriptor_requires_complete_environment():
 def test_route_descriptor_validation():
     with pytest.raises(DeploymentMediaPolicyInvalid):
         DeploymentMediaRouteDescriptor(
-            kind="voice", provider="x", models=("m",), default_model="m"
+            kind="chat", provider="x", models=("m",), default_model="m"
         )
+    for relay_kind in ("image", "video", "voice", "vector"):
+        route = DeploymentMediaRouteDescriptor(
+            kind=relay_kind, provider="x", models=("m",), default_model="m"
+        )
+        assert route.kind == relay_kind
     with pytest.raises(DeploymentMediaPolicyInvalid):
         DeploymentMediaRouteDescriptor(
             kind="image", provider="x", models=("m",), default_model="other"
@@ -216,6 +221,66 @@ def test_control_plane_policy_explicit_routes(monkeypatch):
     assert policy is not None
     assert policy.policy_id == "policy-v2"
     assert [route.descriptor.kind for route in policy.routes] == ["image", "video"]
+
+
+def _voice_route_payload(**overrides):
+    """Voice route declaration: identity, models, credential — no executor."""
+    payload = {
+        "kind": "voice",
+        "provider": "volcengine-agent-plan",
+        "models": ["doubao-seed-tts-2.0", "doubao-seed-asr-2.0"],
+        "default_model": "doubao-seed-tts-2.0",
+        "key_env": "VOLCENGINE_AGENT_PLAN_API_KEY",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _vector_route_payload(**overrides):
+    payload = {
+        "kind": "vector",
+        "provider": "volcengine-agent-plan",
+        "models": ["doubao-embedding-vision"],
+        "default_model": "doubao-embedding-vision",
+        "key_env": "VOLCENGINE_AGENT_PLAN_API_KEY",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_control_plane_policy_voice_and_vector_routes(monkeypatch):
+    monkeypatch.setenv(
+        ROUTES_ENV, json.dumps([_voice_route_payload(), _vector_route_payload()])
+    )
+    monkeypatch.setenv(POLICY_ID_ENV, "policy-v3")
+    policy = policy_from_control_plane_environment()
+    assert policy is not None
+    assert [route.descriptor.kind for route in policy.routes] == ["voice", "vector"]
+    voice = policy.routes[0]
+    assert voice.executor == ""
+    assert voice.descriptor.models == ("doubao-seed-tts-2.0", "doubao-seed-asr-2.0")
+    # The declaration reduces to the worker-safe descriptor (executor and
+    # key_env never cross into the worker payload).
+    descriptor = policy.descriptor()
+    assert [route.kind for route in descriptor.routes] == ["voice", "vector"]
+    round_trip = DeploymentMediaDescriptor.from_payload(descriptor.payload())
+    assert round_trip == descriptor
+    assert "key_env" not in json.dumps(descriptor.payload())
+
+
+def test_voice_and_vector_declarations_reject_executor_fields(monkeypatch):
+    monkeypatch.setenv(
+        ROUTES_ENV,
+        json.dumps([_voice_route_payload(executor="module:attribute")]),
+    )
+    with pytest.raises(DeploymentMediaPolicyInvalid):
+        policy_from_control_plane_environment()
+    monkeypatch.setenv(
+        ROUTES_ENV,
+        json.dumps([_vector_route_payload(executor_params={"quality": "high"})]),
+    )
+    with pytest.raises(DeploymentMediaPolicyInvalid):
+        policy_from_control_plane_environment()
 
 
 def test_policy_execute_image_normalizes_bounded_response(monkeypatch):

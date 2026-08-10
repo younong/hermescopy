@@ -33,8 +33,42 @@ ACTIVATABLE_KINDS = MEDIA_KINDS
 # direct provider call) is meaningful only for generation media.
 GATEWAY_KINDS = (IMAGE, VIDEO)
 
+# Kinds routable through the deployment media relay: the Control Plane holds
+# the credential and executes on behalf of the worker. Generation media run
+# the route's declared executor; voice/vector run the registered capability
+# delegate for the route's provider. Chat has its own inference relay and is
+# not part of the media relay.
+RELAY_KINDS = (IMAGE, VIDEO, VOICE, VECTOR)
+
 # Voice models are tagged with the sub-capability they serve.
 VOICE_CAPABILITIES = ("tts", "asr")
+
+# Names reserved for the native built-in voice backends. The built-in TTS
+# handlers live in ``tools/tts_tool.py`` and the built-in STT handlers in
+# ``tools/transcription_tools.py``; both alias these sets. Voice capability
+# plugins may not register under any of these names — built-ins always win
+# at dispatch time, so a colliding registration would be dead weight.
+BUILTIN_TTS_PROVIDER_NAMES = frozenset({
+    "edge",
+    "elevenlabs",
+    "openai",
+    "minimax",
+    "xai",
+    "mistral",
+    "gemini",
+    "neutts",
+    "kittentts",
+    "piper",
+})
+
+BUILTIN_STT_PROVIDER_NAMES = frozenset({
+    "local",
+    "local_command",
+    "groq",
+    "openai",
+    "mistral",
+    "xai",
+})
 
 # Default provider per kind when nothing is configured and availability alone
 # cannot decide (zero or multiple available providers). Kinds without an entry
