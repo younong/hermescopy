@@ -436,6 +436,11 @@ def test_relay_transcribe_round_trips_audio_reference(tmp_path, _voice_capabilit
 
 def test_relay_embed_returns_vector(tmp_path, _voice_capabilities, monkeypatch):
     embed_double = _EmbedDouble()
+    discovery_calls = []
+    monkeypatch.setattr(
+        "hermes_cli.plugins._ensure_plugins_discovered",
+        lambda *a, **k: discovery_calls.append(1),
+    )
     monkeypatch.setattr(
         "hermes_cli.model_plane.capability.resolve_embedding_capability",
         lambda provider=None: embed_double,
@@ -454,6 +459,8 @@ def test_relay_embed_returns_vector(tmp_path, _voice_capabilities, monkeypatch):
     assert result["dimensions"] == 2
     assert embed_double.last_call["text"] == "embed this"
     assert embed_double.last_call["dimensions"] == 1024
+    # The Control Plane embed path guarantees capability registration ran.
+    assert discovery_calls
     client.close()
     broker.close()
 

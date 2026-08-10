@@ -566,7 +566,10 @@ class DeploymentMediaPolicy:
         params: Mapping[str, Any] | None,
     ) -> dict[str, Any]:
         """Run one deployment embedding call through the vector capability."""
-        from hermes_cli.model_plane.capability import resolve_embedding_capability
+        from hermes_cli.model_plane.capability import (
+            ensure_capability_providers,
+            resolve_embedding_capability,
+        )
 
         safe_params = dict(params or {})
         dimensions = safe_params.get("dimensions")
@@ -577,6 +580,10 @@ class DeploymentMediaPolicy:
         instructions = safe_params.get("instructions")
         if instructions is not None and not isinstance(instructions, str):
             raise DeploymentMediaSelectionRejected("deployment media params are invalid")
+        # Mirror _voice_delegate: guarantee capability registration ran even
+        # when the embed operation is the first capability use in this
+        # Control Plane process.
+        ensure_capability_providers()
         try:
             capability = resolve_embedding_capability(route.descriptor.provider)
         except Exception as exc:
