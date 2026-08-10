@@ -71,22 +71,25 @@ def resolve_connector_account(
     provider: str,
     account_id: str,
     credential_version: int | None = None,
-    require_managed_feishu: bool = False,
+    require_active_employee_binding: bool = False,
 ) -> ResolvedConnectorAccount:
     """Resolve one active account through an exact provider/version fence."""
     exact_provider = str(provider or "").strip()
     exact_account = str(account_id or "").strip()
     if not exact_provider or not exact_account:
         raise ValueError("provider and account_id are required")
-    if require_managed_feishu and exact_provider != "feishu":
-        raise ValueError("managed Feishu resolution requires provider feishu")
-    management_clause = (
+    if require_active_employee_binding and exact_provider != "feishu":
+        raise ValueError("employee-bound resolution requires provider feishu")
+    employee_binding_clause = (
         "AND EXISTS ("
-        "SELECT 1 FROM managed_feishu_accounts m "
-        "JOIN feishu_employee_profiles p ON p.account_id=m.account_id "
+        "SELECT 1 FROM employee_channel_bindings eb "
+        "JOIN employees e ON e.employee_id=eb.employee_id "
+        "JOIN employee_profiles p ON p.employee_id=e.employee_id "
         "AND p.lifecycle_status='active' "
-        "WHERE m.account_id=a.account_id AND m.lifecycle_status='active')"
-        if require_managed_feishu
+        "WHERE eb.connector_account_id=a.account_id "
+        "AND eb.provider='feishu' AND eb.lifecycle_status='active' "
+        "AND e.lifecycle_status='active')"
+        if require_active_employee_binding
         else ""
     )
     with store.read() as conn:
@@ -97,7 +100,7 @@ def resolve_connector_account(
                    a.credential_version
             FROM connector_accounts a
             WHERE a.provider=? AND a.account_id=? AND a.status='active'
-              {management_clause}
+              {employee_binding_clause}
             """,
             (exact_provider, exact_account),
         ).fetchone()

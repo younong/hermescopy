@@ -9,11 +9,11 @@ from hermes_cli.collaboration import CollaborationMemberProfile, CollaborationSt
 from hermes_state import SessionDB
 
 
-def _member(account_id: str, *, revision: int = 1) -> CollaborationMemberProfile:
+def _member(employee_id: str, *, revision: int = 1) -> CollaborationMemberProfile:
     return CollaborationMemberProfile(
-        account_id=account_id,
+        employee_id=employee_id,
         profile_revision=revision,
-        profile_fingerprint=f"fingerprint-{account_id}-r{revision}",
+        profile_fingerprint=f"fingerprint-{employee_id}-r{revision}",
     )
 
 
@@ -32,7 +32,7 @@ def test_group_membership_sequences_and_owner_scope(db):
 
     group = first.create_group("Delivery", members=[_member("employee-a")])
     assert group.creator_kind == "owner"
-    assert group.creator_account_id is None
+    assert group.creator_employee_id is None
     assert group.last_sequence == 2
     pinned = first.snapshot_payload(group.group_id)["memberships"][0]
     assert pinned["profile_revision"] == 1
@@ -62,7 +62,7 @@ def test_group_membership_sequences_and_owner_scope(db):
     with db._lock:
         active = db._conn.execute(
             "SELECT COUNT(*) FROM collaboration_memberships "
-            "WHERE group_id=? AND account_id=? AND leave_sequence IS NULL",
+            "WHERE group_id=? AND employee_id=? AND leave_sequence IS NULL",
             (group.group_id, "employee-a"),
         ).fetchone()[0]
     assert active == 1
@@ -137,7 +137,7 @@ def test_membership_update_rolls_back_complete_delta_when_provisioning_fails(db)
     with pytest.raises(RuntimeError, match="provision failed"):
         store.update_memberships(
             group.group_id,
-            requested_account_ids=["employee-b"],
+            requested_employee_ids=["employee-b"],
             additions={"employee-b": _member("employee-b")},
             provision_member=fail_provision,
         )
@@ -147,17 +147,17 @@ def test_membership_update_rolls_back_complete_delta_when_provisioning_fails(db)
     assert after["events"] == before["events"]
 
 
-def test_employee_creator_requires_account_identity(db):
+def test_employee_creator_requires_employee_identity(db):
     store = CollaborationStore(db, owner_key="owner-a")
-    with pytest.raises(ValueError, match="creator account"):
+    with pytest.raises(ValueError, match="creator employee ID"):
         store.create_group("Employee-created", creator_kind="employee")
     group = store.create_group(
         "Employee-created",
         creator_kind="employee",
-        creator_account_id="employee-a",
+        creator_employee_id="employee-a",
     )
     assert group.creator_kind == "employee"
-    assert group.creator_account_id == "employee-a"
+    assert group.creator_employee_id == "employee-a"
 
 
 def test_collaboration_upload_validation_covers_image_file_pdf_and_limits(monkeypatch):
@@ -255,7 +255,7 @@ def test_mentioned_turn_snapshots_members_and_attachment_grants_atomically(db):
     membership_b = next(
         member
         for member in store.active_memberships(group.group_id)
-        if member.account_id == "employee-b"
+        if member.employee_id == "employee-b"
     )
     submitted = store.submit_owner_message(
         group.group_id,
@@ -270,7 +270,7 @@ def test_mentioned_turn_snapshots_members_and_attachment_grants_atomically(db):
     assert submitted.turn is not None
     assert submitted.turn.status == "queued"
     assert submitted.turn.snapshot_sequence == submitted.event.sequence
-    assert [target.account_id for target in submitted.turn.targets] == ["employee-b"]
+    assert [target.employee_id for target in submitted.turn.targets] == ["employee-b"]
     target = submitted.turn.targets[0]
     assert target.execution_id.startswith("cex_")
     assert target.status == "queued"
@@ -289,7 +289,7 @@ def test_mentioned_turn_snapshots_members_and_attachment_grants_atomically(db):
         group.group_id, text="Everyone respond", mention_all=True
     )
     assert all_submitted.turn is not None
-    assert {target.account_id for target in all_submitted.turn.targets} == {
+    assert {target.employee_id for target in all_submitted.turn.targets} == {
         "employee-a",
         "employee-b",
     }
@@ -442,13 +442,13 @@ def test_employee_events_require_consistent_membership_identity(db):
             group_id=group.group_id,
             event_kind="message.employee",
             actor_kind="employee",
-            actor_account_id="employee-a",
+            actor_employee_id="employee-a",
             actor_membership_id=membership["membership_id"],
             body={"text": "done"},
             now=now,
         )
     event = store._event(row)
-    assert event.actor_account_id == "employee-a"
+    assert event.actor_employee_id == "employee-a"
     assert event.actor_membership_id == membership["membership_id"]
     assert store.list_events_payload(group.group_id)["events"][-1][
         "actor_membership_id"
@@ -461,7 +461,7 @@ def test_employee_events_require_consistent_membership_identity(db):
                 group_id=group.group_id,
                 event_kind="message.employee",
                 actor_kind="employee",
-                actor_account_id="employee-b",
+                actor_employee_id="employee-b",
                 actor_membership_id=membership["membership_id"],
                 body={},
                 now=124.0,
@@ -506,14 +506,14 @@ def test_ai_round_dispatch_is_atomic_bounded_and_idempotent(db):
     first, first_round, first_created = store.dispatch_ai_round(
         created["task_id"],
         instruction="Round one @text-only",
-        target_account_ids=["employee-a"],
+        target_employee_ids=["employee-a"],
         attachment_ids=[transferred_attachment_id],
         idempotency_key="dispatch-a",
     )
     replay, replay_round, replay_created = store.dispatch_ai_round(
         created["task_id"],
         instruction="Round one @text-only",
-        target_account_ids=["employee-a"],
+        target_employee_ids=["employee-a"],
         attachment_ids=[transferred_attachment_id],
         idempotency_key="dispatch-a",
     )
@@ -551,7 +551,7 @@ def test_ai_round_dispatch_is_atomic_bounded_and_idempotent(db):
         store.dispatch_ai_round(
             created["task_id"],
             instruction="different",
-            target_account_ids=["employee-a"],
+            target_employee_ids=["employee-a"],
             attachment_ids=[],
             idempotency_key="dispatch-a",
         )
@@ -566,7 +566,7 @@ def test_ai_round_dispatch_is_atomic_bounded_and_idempotent(db):
         dispatched, actual_round, was_created = store.dispatch_ai_round(
             created["task_id"],
             instruction=f"Round {round_number}",
-            target_account_ids=["employee-a"],
+            target_employee_ids=["employee-a"],
             attachment_ids=[],
             idempotency_key=f"dispatch-{round_number}",
         )
@@ -584,7 +584,7 @@ def test_ai_round_dispatch_is_atomic_bounded_and_idempotent(db):
         store.dispatch_ai_round(
             created["task_id"],
             instruction="Forbidden fourth round",
-            target_account_ids=["employee-a"],
+            target_employee_ids=["employee-a"],
             attachment_ids=[],
             idempotency_key="dispatch-4",
         )

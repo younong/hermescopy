@@ -25,9 +25,9 @@ interface CollaborationRequestClient {
 export interface CollaborationApi {
   listGroups(includeArchived?: boolean, signal?: AbortSignal): Promise<CollaborationGroupsResponse>;
   getGroup(groupId: string, afterSequence?: number, signal?: AbortSignal): Promise<CollaborationSnapshot>;
-  createGroup(name: string, accountIds: string[], clientIdempotencyKey: string): Promise<CollaborationSnapshot>;
+  createGroup(name: string, employeeIds: string[], clientIdempotencyKey: string): Promise<CollaborationSnapshot>;
   archiveGroup(groupId: string): Promise<CollaborationGroupsResponse["groups"][number]>;
-  updateMembers(groupId: string, accountIds: string[]): Promise<CollaborationSnapshot>;
+  updateMembers(groupId: string, employeeIds: string[]): Promise<CollaborationSnapshot>;
   submitMessage(message: CollaborationSubmitMessage): Promise<CollaborationSubmitResponse>;
   uploadAttachment(groupId: string, file: File): Promise<CollaborationAttachmentResponse>;
   respondToApproval(approvalId: string, choice: CollaborationApprovalChoice): Promise<CollaborationApprovalResponse>;
@@ -56,10 +56,10 @@ export function createCollaborationApi(
       );
       return response.group;
     },
-    createGroup: (name, accountIds, clientIdempotencyKey) =>
+    createGroup: (name, employeeIds, clientIdempotencyKey) =>
       request("collaboration.group.create", {
-        account_ids: accountIds,
         client_idempotency_key: clientIdempotencyKey,
+        employee_ids: employeeIds,
         name,
       }),
     getGroup: (groupId, afterSequence, signal) =>
@@ -89,8 +89,8 @@ export function createCollaborationApi(
       request("collaboration.approval.respond", { approval_id: approvalId, choice }),
     submitMessage: (message) =>
       request("collaboration.message.submit", { ...message }),
-    updateMembers: (groupId, accountIds) =>
-      request("collaboration.members.update", { account_ids: accountIds, group_id: groupId }),
+    updateMembers: (groupId, employeeIds) =>
+      request("collaboration.members.update", { employee_ids: employeeIds, group_id: groupId }),
     uploadAttachment: async (groupId, file) => {
       const kind = attachmentKind(file);
       return request(`collaboration.${kind}.attach`, {

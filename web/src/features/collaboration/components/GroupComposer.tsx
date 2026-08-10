@@ -11,7 +11,7 @@ export interface GroupComposerSubmit {
 }
 
 interface GroupComposerProps {
-  accountName(accountId: string): string;
+  employeeName(employeeId: string): string;
   archived: boolean;
   disabled: boolean;
   memberships: CollaborationMembership[];
@@ -20,7 +20,7 @@ interface GroupComposerProps {
 }
 
 export function GroupComposer({
-  accountName,
+  employeeName,
   archived,
   disabled,
   memberships,
@@ -116,7 +116,7 @@ export function GroupComposer({
               <button aria-expanded={pickerOpen} aria-label="Choose employee mentions" className="gui-chat-icon-button" onClick={() => setPickerOpen((value) => !value)} type="button"><AtSign /></button>
               <button aria-label="Attach files" className="gui-chat-icon-button" onClick={() => fileRef.current?.click()} type="button"><Paperclip /></button>
               <input className="hidden" multiple onChange={(event) => void uploadFiles(event.target.files)} ref={fileRef} type="file" />
-              <span className="max-w-64 truncate text-[10px] text-[#777c84]">{recipientLabel(normalized, membershipsById, accountName)}</span>
+              <span className="max-w-64 truncate text-[10px] text-[#777c84]">{recipientLabel(normalized, membershipsById, employeeName)}</span>
               {pickerOpen ? (
                 <div className="absolute bottom-9 left-0 z-20 w-64 rounded-lg border border-[#dfe2e7] bg-white p-2 shadow-xl">
                   <button
@@ -137,7 +137,7 @@ export function GroupComposer({
                     return (
                       <label className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-2 text-xs hover:bg-[#f5f6f8]" key={member.membership_id}>
                         <input checked={checked} disabled={normalized.mentionAll} onChange={() => setSelection({ mentionAll: false, membershipIds: checked ? normalized.membershipIds.filter((id) => id !== member.membership_id) : [...normalized.membershipIds, member.membership_id] })} type="checkbox" />
-                        <span className="truncate">@{accountName(member.account_id)}</span>
+                        <span className="truncate">@{employeeName(member.employee_id)}</span>
                       </label>
                     );
                   })}

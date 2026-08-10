@@ -193,9 +193,12 @@ def register_connector_binding_for_owner(
         account = conn.execute(
             """
             SELECT a.account_id, a.credential_version,
-                   m.canonical_user_id AS managed_canonical_user_id
+                   e.canonical_user_id AS employee_canonical_user_id
             FROM connector_accounts a
-            LEFT JOIN managed_feishu_accounts m ON m.account_id=a.account_id
+            LEFT JOIN employee_channel_bindings eb
+              ON eb.connector_account_id=a.account_id
+             AND eb.lifecycle_status<>'revoked'
+            LEFT JOIN employees e ON e.employee_id=eb.employee_id
             WHERE a.provider=? AND a.provider_account_id=?
               AND a.account_lookup_hash=?
             """,
@@ -233,12 +236,12 @@ def register_connector_binding_for_owner(
             )
         else:
             account_id = str(account["account_id"])
-            managed_owner = account["managed_canonical_user_id"]
-            if managed_owner is not None and not hmac.compare_digest(
-                str(managed_owner), canonical_user_id
+            employee_owner = account["employee_canonical_user_id"]
+            if employee_owner is not None and not hmac.compare_digest(
+                str(employee_owner), canonical_user_id
             ):
                 raise ChannelIdentityOwnershipConflict(
-                    "managed Feishu account belongs to another Owner"
+                    "employee channel account belongs to another Owner"
                 )
             existing_binding = conn.execute(
                 """

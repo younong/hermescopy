@@ -270,7 +270,7 @@ def enqueue_verified_event(
     account_id: str,
     data: Any,
 ) -> InboundCommitResult | None:
-    """Admit and commit one verified Feishu event for an exact managed account."""
+    """Admit and commit one verified Feishu event for an employee-bound account."""
     envelope = normalize_verified_event(data)
     if envelope is None:
         return None
@@ -284,24 +284,28 @@ def enqueue_verified_event(
     with store.read() as conn:
         account = conn.execute(
             """
-            SELECT p.revision, a.provider_account_id
+            SELECT eb.employee_id, p.revision, a.provider_account_id
             FROM connector_accounts a
-            JOIN managed_feishu_accounts m ON m.account_id=a.account_id
-                                              AND m.lifecycle_status='active'
-            JOIN feishu_employee_profiles p ON p.account_id=a.account_id
-                                             AND p.lifecycle_status='active'
+            JOIN employee_channel_bindings eb
+              ON eb.connector_account_id=a.account_id
+             AND eb.provider=a.provider
+             AND eb.lifecycle_status='active'
+            JOIN employees e ON e.employee_id=eb.employee_id
+                            AND e.lifecycle_status='active'
+            JOIN employee_profiles p ON p.employee_id=e.employee_id
+                                    AND p.lifecycle_status='active'
             WHERE a.account_id=? AND a.provider='feishu' AND a.status='active'
             """,
             (account_id,),
         ).fetchone()
     if account is None:
-        envelope = replace(envelope, rejection_reason="managed_account_unavailable")
+        envelope = replace(envelope, rejection_reason="employee_binding_unavailable")
     else:
         resolved = resolve_connector_account(
             store,
             provider=PROVIDER,
             account_id=account_id,
-            require_managed_feishu=True,
+            require_active_employee_binding=True,
         )
         bot_identities = frozenset(
             value.strip()
@@ -395,11 +399,12 @@ def enqueue_verified_event(
             profile_revision=profile_revision,
         )
     if envelope.rejection_reason is None:
-        from hermes_cli.channel_identity import ensure_managed_feishu_conversation_binding
+        from hermes_cli.channel_identity import ensure_employee_feishu_conversation_binding
 
-        ensure_managed_feishu_conversation_binding(
+        ensure_employee_feishu_conversation_binding(
             store,
-            account_id=account_id,
+            employee_id=str(account["employee_id"]),
+            connector_account_id=account_id,
             conversation_id=envelope.conversation_id,
             actor_id=envelope.actor_id,
             conversation_kind=envelope.conversation_kind,
@@ -483,7 +488,7 @@ def claim_feishu_outbound(
             provider=PROVIDER,
             account_id=delivery.account_id,
             credential_version=delivery.credential_version,
-            require_managed_feishu=True,
+            require_active_employee_binding=True,
         )
         _credentials(account)
         parts = _split_text(delivery.payload)
@@ -746,7 +751,7 @@ class FeishuSender:
                 provider=PROVIDER,
                 account_id=claim.delivery.account_id,
                 credential_version=claim.delivery.credential_version,
-                require_managed_feishu=True,
+                require_active_employee_binding=True,
             )
             with self.store.read() as conn:
                 current = conn.execute(
@@ -877,7 +882,7 @@ class FeishuConnector:
             self.store,
             provider=PROVIDER,
             account_id=self.account_id,
-            require_managed_feishu=True,
+            require_active_employee_binding=True,
         )
         app_id, app_secret, domain = _credentials(account)
         cutoff = time.time() - self.claim_timeout

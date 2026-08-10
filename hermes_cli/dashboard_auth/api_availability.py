@@ -27,8 +27,8 @@ CONTROL_PLANE_AUTH_PATHS: frozenset[str] = frozenset({
 })
 CONTROL_PLANE_AUTH_ROUTES: frozenset[tuple[str, str]] = frozenset({
     ("POST", "/api/messaging/webhook/accounts"),
-    ("GET", "/api/messaging/feishu/employees"),
-    ("POST", "/api/messaging/feishu/employees"),
+    ("GET", "/api/employees"),
+    ("POST", "/api/employees"),
 })
 CONTROL_PLANE_AUTH_PREFIXES: tuple[str, ...] = (
     "/api/auth/",
@@ -65,10 +65,22 @@ OWNER_WORKER_ROUTES: frozenset[tuple[str, str]] = frozenset({
     ("POST", "/api/files/upload"),
     ("POST", "/api/files/upload-stream"),
     ("POST", "/api/files/mkdir"),
-    ("GET", "/api/messaging/feishu/catalog"),
+    ("GET", "/api/employees/catalog"),
 })
 # Compatibility export for callers that only need the known path inventory.
 OWNER_WORKER_PATHS: frozenset[str] = frozenset(path for _method, path in OWNER_WORKER_ROUTES)
+_EMPLOYEE_ACTION_METHODS: dict[str, frozenset[str]] = {
+    "avatar": frozenset({"GET", "PUT", "DELETE"}),
+    "profile": frozenset({"PUT"}),
+    "collaboration-policy": frozenset({"PUT"}),
+    "lifecycle": frozenset({"PUT"}),
+    "rollover": frozenset({"POST"}),
+}
+_EMPLOYEE_FEISHU_ACTION_METHODS: dict[str, frozenset[str]] = {
+    "credentials": frozenset({"PUT"}),
+    "lifecycle": frozenset({"PUT"}),
+    "test": frozenset({"POST"}),
+}
 _CRON_ITEM_METHODS: frozenset[str] = frozenset({"GET", "PUT", "DELETE"})
 _CRON_ACTIONS: frozenset[str] = frozenset({"pause", "resume", "trigger"})
 SESSION_READER_ROUTES: frozenset[tuple[str, str]] = frozenset({
@@ -109,29 +121,30 @@ def _session_item_path(path: str) -> bool:
     )
 
 
-def _managed_feishu_route(path: str, method: str) -> bool:
+def _employee_control_plane_route(path: str, method: str) -> bool:
     parts = path.split("/")
-    if len(parts) == 6 and parts[:5] == ["", "api", "messaging", "feishu", "employees"]:
-        return bool(parts[5]) and method == "GET"
+    if len(parts) == 4 and parts[:3] == ["", "api", "employees"]:
+        return bool(parts[3]) and method == "GET"
     if (
-        len(parts) != 7
-        or parts[:5] != ["", "api", "messaging", "feishu", "employees"]
-        or not parts[5]
+        len(parts) == 5
+        and parts[:3] == ["", "api", "employees"]
+        and bool(parts[3])
     ):
-        return False
-    if parts[6] == "avatar":
-        return method in {"GET", "PUT", "DELETE"}
+        return method in _EMPLOYEE_ACTION_METHODS.get(parts[4], frozenset())
+    if (
+        len(parts) == 6
+        and parts[:3] == ["", "api", "employees"]
+        and bool(parts[3])
+        and parts[4:] == ["channels", "feishu"]
+    ):
+        return method == "PUT"
     return (
-        parts[6]
-        in {
-            "profile",
-            "collaboration-policy",
-            "credentials",
-            "lifecycle",
-            "test",
-            "rollover",
-        }
-        and method in {"PUT", "POST"}
+        len(parts) == 7
+        and parts[:3] == ["", "api", "employees"]
+        and bool(parts[3])
+        and parts[4:6] == ["channels", "feishu"]
+        and method
+        in _EMPLOYEE_FEISHU_ACTION_METHODS.get(parts[6], frozenset())
     )
 
 
@@ -177,7 +190,7 @@ def classify_authenticated_api(
         return AuthenticatedApiDecision(bucket, True, bucket.value)
     if (
         (method, path) in CONTROL_PLANE_AUTH_ROUTES
-        or _managed_feishu_route(path, method)
+        or _employee_control_plane_route(path, method)
         or path in CONTROL_PLANE_AUTH_PATHS
         or any(path.startswith(prefix) for prefix in CONTROL_PLANE_AUTH_PREFIXES)
     ):

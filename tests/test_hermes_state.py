@@ -3839,6 +3839,73 @@ class TestListSessionsRich:
         ).fetchone()) == ("web_group", 1)
         reopened.close()
 
+    def test_v24_migration_rebuilds_empty_legacy_collaboration_schema(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        conn = db._conn
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.executescript(
+            "DROP TABLE collaboration_delivery_state; "
+            "DROP TABLE collaboration_agent_receipts; "
+            "DROP TABLE collaboration_tool_receipts; "
+            "DROP TABLE collaboration_approvals; "
+            "DROP TABLE collaboration_attachment_materializations; "
+            "DROP TABLE collaboration_attachment_grants; "
+            "DROP TABLE collaboration_attachments; "
+            "DROP TABLE collaboration_turn_targets; "
+            "DROP TABLE collaboration_turns; "
+            "DROP TABLE collaboration_origins; "
+            "DROP TABLE collaboration_tasks; "
+            "DROP TABLE collaboration_message_receipts; "
+            "DROP TABLE collaboration_group_receipts; "
+            "DROP TABLE collaboration_events; "
+            "DROP TABLE collaboration_memberships; "
+            "DROP TABLE collaboration_groups; "
+            "CREATE TABLE collaboration_memberships ("
+            "membership_id TEXT PRIMARY KEY, account_id TEXT NOT NULL);"
+        )
+        conn.execute("UPDATE schema_version SET version=23")
+        conn.commit()
+        db.close()
+
+        migrated = SessionDB(db_path=db_path)
+        columns = {
+            row[1]
+            for row in migrated._conn.execute(
+                "PRAGMA table_info(collaboration_memberships)"
+            ).fetchall()
+        }
+        assert "employee_id" in columns
+        assert "account_id" not in columns
+        assert migrated._conn.execute(
+            "SELECT version FROM schema_version"
+        ).fetchone()[0] == 24
+        assert migrated._conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        migrated.close()
+
+    def test_v24_migration_rejects_nonempty_legacy_collaboration_data(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        conn = db._conn
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("DROP TABLE collaboration_memberships")
+        conn.execute(
+            "CREATE TABLE collaboration_memberships ("
+            "membership_id TEXT PRIMARY KEY, account_id TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO collaboration_memberships VALUES ('cm-legacy', 'ca-legacy')"
+        )
+        conn.execute("UPDATE schema_version SET version=23")
+        conn.commit()
+        db.close()
+
+        with pytest.raises(
+            RuntimeError,
+            match="session schema v23 contains legacy collaboration employee data",
+        ):
+            SessionDB(db_path=db_path)
+
     def test_v22_migration_removes_legacy_model_visible_origin_markers(self, tmp_path):
         db_path = tmp_path / "state.db"
         db = SessionDB(db_path=db_path)

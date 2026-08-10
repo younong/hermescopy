@@ -2,9 +2,10 @@
 
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { api, type FeishuEmployee } from "@/lib/api";
+import { api, type Employee } from "@/lib/api";
 import ChannelsPage from "./ChannelsPage";
 
 vi.mock("@/lib/useDashboardAuthIdentity", () => ({
@@ -18,21 +19,9 @@ async function renderChannelsPage() {
   document.body.appendChild(container);
   root = createRoot(container);
   await act(async () => {
-    root?.render(<ChannelsPage />);
+    root?.render(<MemoryRouter><ChannelsPage /></MemoryRouter>);
     await Promise.resolve();
     await Promise.resolve();
-  });
-}
-
-function changeValue(element: HTMLInputElement | HTMLTextAreaElement | null, value: string) {
-  if (!element) throw new Error("Expected form control");
-  const prototype = element instanceof HTMLTextAreaElement
-    ? HTMLTextAreaElement.prototype
-    : HTMLInputElement.prototype;
-  const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
-  act(() => {
-    setter?.call(element, value);
-    element.dispatchEvent(new Event("input", { bubbles: true }));
   });
 }
 
@@ -50,166 +39,76 @@ afterEach(async () => {
 });
 
 describe("ChannelsPage", () => {
-  it("shows managed Feishu employees without loading legacy platforms", async () => {
+  it("shows managed channel status and links employee management to the Chat GUI", async () => {
     const getMessagingPlatforms = vi.spyOn(api, "getMessagingPlatforms");
-    vi.spyOn(api, "getFeishuEmployees").mockResolvedValue({ employees: [] });
-    vi.spyOn(api, "getFeishuEmployeeCatalog").mockResolvedValue({
-      knowledge_roots: [],
-      mcp_servers: [],
-      model_registrations: [],
-      skills: [],
-      toolsets: [],
-      workspace: { default: "default", root: "" },
-    });
+    vi.spyOn(api, "getEmployees").mockResolvedValue({ employees: [] });
 
     await renderChannelsPage();
 
     expect(getMessagingPlatforms).not.toHaveBeenCalled();
     expect(document.body.textContent).toContain("Feishu / Lark");
-    expect(document.body.textContent).toContain("AI employees");
-    expect(document.body.textContent).toContain("No managed Feishu employees yet.");
-    expect(document.body.textContent).not.toContain("0 of 0 channels configured");
-
-    const addEmployee = Array.from(document.querySelectorAll("button")).find(
-      (button) => button.textContent === "Add employee",
-    );
-    expect(addEmployee?.className).toContain("bg-midground");
-    expect(addEmployee?.className).toContain("text-background-base");
+    expect(document.body.textContent).toContain("No employee Feishu / Lark bindings are configured.");
+    const link = document.querySelector<HTMLAnchorElement>('a[href="/chat/robots"]');
+    expect(link?.textContent).toBe("Manage employees");
+    expect(document.body.textContent).not.toContain("Add employee");
+    expect(document.body.textContent).not.toContain("May participate");
+    expect(document.body.textContent).not.toContain("Edit profile");
   });
 
-  it("uses catalog options and puts credentials last in the employee form", async () => {
-    vi.spyOn(api, "getFeishuEmployees").mockResolvedValue({ employees: [] });
-    const createdEmployee = {
-      account_id: "ca_test",
-      app_id: "cli_test",
-      avatar_url: null,
-      credential_version: 1,
-      lifecycle_status: "active" as const,
-      runtime_state: "ready",
-      profile_revision: 1,
-      profile_fingerprint: "sha256:test",
-      collaboration_policy: {
-        may_participate: true,
-        may_create_groups: false,
-        invite_quota: 5,
-      },
-      profile: null,
-    };
-    const createFeishuEmployee = vi.spyOn(api, "createFeishuEmployee").mockResolvedValue(createdEmployee);
-    const uploadAvatar = vi.spyOn(api, "uploadFeishuEmployeeAvatar").mockResolvedValue({ avatar_url: "/avatar" });
-    vi.spyOn(api, "getFeishuEmployeeCatalog").mockResolvedValue({
-      knowledge_roots: [],
-      mcp_servers: ["unused-server"],
-      model_registrations: [{ id: "model-1", name: "Model One" }],
-      skills: [{ name: "existing-skill", description: "Existing skill" }],
-      toolsets: [{ name: "terminal", description: "Terminal tools" }],
-      workspace: { default: "default", root: "" },
-    });
+  it("summarizes binding status without duplicating profile or lifecycle controls", async () => {
+    const employees: Employee[] = [
+      employee("employee-a", "active", "running"),
+      employee("employee-b", "suspended", "stopped"),
+    ];
+    vi.spyOn(api, "getEmployees").mockResolvedValue({ employees });
 
     await renderChannelsPage();
 
-    const addButton = [...document.querySelectorAll("button")].find(
-      (button) => button.textContent === "Add employee",
-    );
-    await act(async () => addButton?.click());
-
-    const dialog = document.querySelector('[role="dialog"]');
-    const formText = dialog?.textContent ?? "";
-    expect(formText).toContain("existing-skill");
-    expect(formText).not.toContain("Toolsets");
-    expect(dialog?.querySelectorAll('input[type="checkbox"]')).toHaveLength(1);
-    expect(formText).not.toContain("Workspace relative path");
-    expect(formText).not.toContain("Knowledge relative paths");
-    expect(formText).not.toContain("MCP servers");
-
-    expect(formText.indexOf("Feishu / Lark app credentials")).toBeGreaterThan(
-      formText.indexOf("Max iterations"),
-    );
-
-    const credentialInputs = dialog?.querySelector("fieldset")?.querySelectorAll("input") ?? [];
-    const appId = [...credentialInputs].find((input) => input.type === "text") ?? null;
-    const appSecret = [...credentialInputs].find((input) => input.type === "password") ?? null;
-    changeValue(appId, "cli_test");
-    changeValue(appSecret, "secret");
-    changeValue(dialog?.querySelector("textarea") ?? null, "Help users.");
-    const avatar = new File(["avatar"], "avatar.png", { type: "image/png" });
-    const avatarInput = dialog?.querySelector<HTMLInputElement>('input[type="file"]');
-    Object.defineProperty(avatarInput, "files", { value: [avatar], configurable: true });
-    await act(async () => avatarInput?.dispatchEvent(new Event("change", { bubbles: true })));
-    const saveButton = [...(dialog?.querySelectorAll("button") ?? [])].find(
-      (button) => button.textContent === "Save",
-    );
-    await act(async () => saveButton?.click());
-
-    expect(createFeishuEmployee).toHaveBeenCalledWith(
-      expect.objectContaining({
-        profile: expect.objectContaining({ toolsets: ["terminal"] }),
-      }),
-    );
-    expect(uploadAvatar).toHaveBeenCalledWith("ca_test", avatar);
-  });
-
-  it("renders employee avatars and removes them from profile editing", async () => {
-    const employee: FeishuEmployee = {
-      account_id: "ca_avatar",
-      app_id: "cli_avatar",
-      avatar_url: "/api/messaging/feishu/employees/ca_avatar/avatar",
-      credential_version: 1,
-      lifecycle_status: "active" as const,
-      runtime_state: "ready",
-      profile_revision: 2,
-      profile_fingerprint: "sha256:test",
-      collaboration_policy: {
-        may_participate: true,
-        may_create_groups: false,
-        invite_quota: 5,
-      },
-      profile: {
-        schema_version: 1,
-        name: "Ada",
-        role: "Engineer",
-        model_registration_id: "model-1",
-        system_prompt: "Build carefully.",
-        toolsets: [],
-        skills: [],
-        mcp_servers: [],
-        workspace_relative_path: "employees/ada",
-        knowledge_relative_paths: [],
-        max_iterations: 20,
-      },
-    };
-    vi.spyOn(api, "getFeishuEmployees").mockResolvedValue({ employees: [employee] });
-    vi.spyOn(api, "getFeishuEmployeeCatalog").mockResolvedValue({
-      knowledge_roots: [],
-      mcp_servers: [],
-      model_registrations: [{ id: "model-1", name: "Model One" }],
-      skills: [],
-      toolsets: [{ name: "terminal", description: "Terminal tools" }],
-      workspace: { default: "default", root: "" },
-    });
-    vi.spyOn(api, "updateFeishuEmployeeProfile").mockResolvedValue({ ...employee, profile_revision: 3 });
-    const deleteAvatar = vi.spyOn(api, "deleteFeishuEmployeeAvatar").mockResolvedValue({ ok: true, deleted: true });
-
-    await renderChannelsPage();
-
-    const rowAvatar = document.querySelector<HTMLImageElement>('img[src$="/avatar"]');
-    expect(rowAvatar).not.toBeNull();
-    await act(async () => rowAvatar?.dispatchEvent(new Event("error")));
-    expect(document.body.textContent).toContain("A");
-    const editButton = [...document.querySelectorAll("button")].find(
-      (button) => button.textContent === "Edit policy",
-    );
-    await act(async () => editButton?.click());
-    const dialog = document.querySelector('[role="dialog"]');
-    const removeButton = [...(dialog?.querySelectorAll("button") ?? [])].find(
-      (button) => button.textContent === "Remove",
-    );
-    await act(async () => removeButton?.click());
-    const saveButton = [...(dialog?.querySelectorAll("button") ?? [])].find(
-      (button) => button.textContent === "Save",
-    );
-    await act(async () => saveButton?.click());
-
-    expect(deleteAvatar).toHaveBeenCalledWith("ca_avatar");
+    expect(document.body.textContent).toContain("2 employee bindings: 1 active.");
+    expect(document.body.textContent).not.toContain("Researcher");
+    expect(document.querySelector('button[aria-label="Enable Feishu / Lark"]')).toBeNull();
   });
 });
+
+function employee(
+  employeeId: string,
+  lifecycleStatus: "active" | "suspended",
+  runtimeState: string,
+): Employee {
+  return {
+    avatar_url: null,
+    channels: {
+      feishu: {
+        connector_account_id: `account-${employeeId}`,
+        app_id: `app-${employeeId}`,
+        binding_id: `binding-${employeeId}`,
+        credential_version: 1,
+        lifecycle_status: lifecycleStatus,
+        runtime_state: runtimeState,
+      },
+    },
+    collaboration_policy: {
+      invite_quota: 5,
+      may_create_groups: false,
+      may_participate: true,
+    },
+    employee_id: employeeId,
+    lifecycle_status: "active",
+    profile: {
+      knowledge_relative_paths: [],
+      max_iterations: 20,
+      max_tokens: null,
+      mcp_servers: [],
+      model_registration_id: "model-a",
+      name: "Researcher",
+      role: "Analyst",
+      schema_version: 1,
+      skills: [],
+      system_prompt: "Research carefully.",
+      toolsets: [],
+      workspace_relative_path: "employees/researcher",
+    },
+    profile_fingerprint: "sha256:test",
+    profile_revision: 1,
+  };
+}

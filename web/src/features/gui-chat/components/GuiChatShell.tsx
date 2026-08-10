@@ -32,9 +32,8 @@ import { ConnectWeChatModal } from "@/features/ilink/ConnectWeChatModal";
 import { PageHeaderContext } from "@/contexts/page-header-context";
 import { GuiChatFilesPane } from "@/features/files/components/GuiChatFilesPane";
 import { useI18n } from "@/i18n";
-import ChannelsPage from "@/pages/ChannelsPage";
 import SessionsPage from "@/pages/SessionsPage";
-import { api, type FeishuEmployee } from "@/lib/api";
+import { api, type Employee } from "@/lib/api";
 import { JsonRpcGatewayError, type GatewayEvent } from "@/lib/gatewayClient";
 import { emitChatDiagnostic } from "@/lib/chatDiagnostics";
 import { dashboardAuthTransition } from "@/lib/dashboardAuthTransition";
@@ -58,6 +57,7 @@ import {
   type MessageAttachmentState,
 } from "../types";
 import { Composer } from "./Composer";
+import { EmployeeManagementPane } from "./EmployeeManagementPane";
 import { ComposerModelPicker } from "./ComposerModelPicker";
 import { GuiChatModelsPane } from "./GuiChatModelsPane";
 import { GuiChatScheduledTasksPane } from "./GuiChatScheduledTasksPane";
@@ -117,7 +117,7 @@ export function GuiChatShell() {
   }>>([]);
   const attachmentRequestIdRef = useRef(0);
   const createGroupAttemptRef = useRef<{
-    accountIds: string[];
+    employeeIds: string[];
     key: string;
     name: string;
   } | null>(null);
@@ -130,7 +130,7 @@ export function GuiChatShell() {
   const [groupsLoading, setGroupsLoading] = useState(false);
   const [groupsRefreshNonce, setGroupsRefreshNonce] = useState(0);
   const [createGroupOpen, setCreateGroupOpen] = useState(false);
-  const [employees, setEmployees] = useState<FeishuEmployee[]>([]);
+  const [employees, setEmployees] = useState<Employee[]>([]);
   const [employeeLoadStatus, setEmployeeLoadStatus] = useState<"loading" | "ready" | "error">("loading");
   const [employeeChatOpen, setEmployeeChatOpen] = useState(false);
   const { authMe, authRequired, ownerKey, ready: authIdentityReady } = useDashboardAuthIdentity();
@@ -225,14 +225,9 @@ export function GuiChatShell() {
     }
   }, [updateSearchParams]);
 
-  const startEmployeeChat = (accountId: string) => {
-    const employee = employees.find((item) => item.account_id === accountId);
-    if (
-      !employee
-      || employee.lifecycle_status !== "active"
-      || !employee.profile
-      || !employee.collaboration_policy.may_participate
-    ) {
+  const startEmployeeChat = (employeeId: string) => {
+    const employee = employees.find((item) => item.employee_id === employeeId);
+    if (!employee || employee.lifecycle_status !== "active" || !employee.profile) {
       dispatch({ type: "error", message: "This employee is unavailable for direct chat." });
       return;
     }
@@ -253,7 +248,7 @@ export function GuiChatShell() {
     const generation = coordinator.start(
       null,
       undefined,
-      { employeeAccountId: employee.account_id },
+      { employeeId: employee.employee_id },
     );
     dispatch({ type: "session.selected", generation, sessionId: null });
   };
@@ -482,7 +477,7 @@ export function GuiChatShell() {
       if (!controller.signal.aborted) setGroupsLoading(false);
     });
     setEmployeeLoadStatus("loading");
-    void api.getFeishuEmployees().then((response) => {
+    void api.getEmployees().then((response) => {
       if (controller.signal.aborted) return;
       setEmployees(response.employees);
       setEmployeeLoadStatus("ready");
@@ -513,20 +508,20 @@ export function GuiChatShell() {
     });
   }, [closeMobilePanel, updateSearchParams]);
 
-  const createGroup = useCallback(async (name: string, accountIds: string[]) => {
+  const createGroup = useCallback(async (name: string, employeeIds: string[]) => {
     const connection = connectionRef.current;
     if (!connection) throw new Error("Gateway is not ready");
     const previousAttempt = createGroupAttemptRef.current;
     const sameAttempt = previousAttempt?.name === name
-      && previousAttempt.accountIds.length === accountIds.length
-      && previousAttempt.accountIds.every((accountId, index) => accountId === accountIds[index]);
+      && previousAttempt.employeeIds.length === employeeIds.length
+      && previousAttempt.employeeIds.every((employeeId, index) => employeeId === employeeIds[index]);
     const attempt = previousAttempt && sameAttempt
       ? previousAttempt
-      : { accountIds: [...accountIds], key: crypto.randomUUID(), name };
+      : { employeeIds: [...employeeIds], key: crypto.randomUUID(), name };
     createGroupAttemptRef.current = attempt;
     const snapshot = await connection.collaboration.createGroup(
       name,
-      accountIds,
+      employeeIds,
       attempt.key,
     );
     createGroupAttemptRef.current = null;
@@ -826,9 +821,7 @@ export function GuiChatShell() {
     : activeSessionTitle ?? (activeSessionId ? "Conversation" : "New chat");
   const accountLabel = authMe?.display_name || authMe?.email || "Hermes workspace";
   const availableDirectEmployees = employees.filter(
-    (employee) => employee.lifecycle_status === "active"
-      && employee.profile !== null
-      && employee.collaboration_policy.may_participate,
+    (employee) => employee.lifecycle_status === "active" && employee.profile !== null,
   );
   const employeeChatNotice = employeeLoadStatus === "loading"
     ? "AI employees are loading."
@@ -886,12 +879,12 @@ export function GuiChatShell() {
             {availableDirectEmployees.map((employee) => (
               <button
                 className="gui-chat-nav-item"
-                key={employee.account_id}
-                onClick={() => startEmployeeChat(employee.account_id)}
+                key={employee.employee_id}
+                onClick={() => startEmployeeChat(employee.employee_id)}
                 type="button"
               >
                 <span className="min-w-0 truncate">
-                  {employee.profile?.name || employee.app_id}
+                  {employee.profile?.name || "Unnamed employee"}
                 </span>
               </button>
             ))}
@@ -1150,15 +1143,13 @@ export function GuiChatShell() {
         ) : scheduledTasksOpen ? (
           <GuiChatScheduledTasksPane />
         ) : robotsOpen ? (
-          <PageHeaderContext.Provider value={EMBEDDED_PAGE_HEADER}>
-            <div
-              data-robots-pane
-              data-theme="chat-workspace"
-              className="gui-chat-statistics-pane min-h-0 flex-1 overflow-auto"
-            >
-              <ChannelsPage />
-            </div>
-          </PageHeaderContext.Provider>
+          <div
+            data-robots-pane
+            data-theme="chat-workspace"
+            className="min-h-0 flex-1 overflow-auto"
+          >
+            <EmployeeManagementPane />
+          </div>
         ) : modelsOpen ? (
           <GuiChatModelsPane
             busy={state.isGenerating}

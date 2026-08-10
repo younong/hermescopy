@@ -188,7 +188,7 @@ def get_default_db_path() -> Path:
 
 DEFAULT_DB_PATH = get_default_db_path()
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -841,7 +841,7 @@ CREATE TABLE IF NOT EXISTS collaboration_groups (
     owner_key TEXT NOT NULL,
     name TEXT NOT NULL CHECK(length(trim(name)) > 0),
     creator_kind TEXT NOT NULL CHECK(creator_kind IN ('owner', 'employee')),
-    creator_account_id TEXT,
+    creator_employee_id TEXT,
     status TEXT NOT NULL DEFAULT 'active'
         CHECK(status IN ('active', 'archived')),
     last_sequence INTEGER NOT NULL DEFAULT 0 CHECK(last_sequence >= 0),
@@ -849,8 +849,8 @@ CREATE TABLE IF NOT EXISTS collaboration_groups (
     updated_at REAL NOT NULL,
     archived_at REAL,
     CHECK(
-        (creator_kind = 'owner' AND creator_account_id IS NULL) OR
-        (creator_kind = 'employee' AND length(trim(creator_account_id)) > 0)
+        (creator_kind = 'owner' AND creator_employee_id IS NULL) OR
+        (creator_kind = 'employee' AND length(trim(creator_employee_id)) > 0)
     )
 );
 CREATE TABLE IF NOT EXISTS collaboration_events (
@@ -859,14 +859,14 @@ CREATE TABLE IF NOT EXISTS collaboration_events (
     sequence INTEGER NOT NULL CHECK(sequence >= 1),
     event_kind TEXT NOT NULL CHECK(length(trim(event_kind)) > 0),
     actor_kind TEXT NOT NULL CHECK(actor_kind IN ('owner', 'employee', 'system')),
-    actor_account_id TEXT,
+    actor_employee_id TEXT,
     actor_membership_id TEXT REFERENCES collaboration_memberships(membership_id),
     body_json TEXT NOT NULL DEFAULT '{}'
         CHECK(json_valid(body_json) AND json_type(body_json) = 'object'),
     created_at REAL NOT NULL,
     UNIQUE(group_id, sequence),
     CHECK(
-        (actor_kind = 'employee' AND actor_account_id IS NOT NULL
+        (actor_kind = 'employee' AND actor_employee_id IS NOT NULL
                                  AND actor_membership_id IS NOT NULL) OR
         (actor_kind IN ('owner', 'system') AND actor_membership_id IS NULL)
     )
@@ -901,7 +901,7 @@ CREATE TABLE IF NOT EXISTS collaboration_message_receipts (
 CREATE TABLE IF NOT EXISTS collaboration_memberships (
     membership_id TEXT PRIMARY KEY,
     group_id TEXT NOT NULL REFERENCES collaboration_groups(group_id),
-    account_id TEXT NOT NULL,
+    employee_id TEXT NOT NULL,
     profile_revision INTEGER NOT NULL CHECK(profile_revision >= 1),
     profile_fingerprint TEXT NOT NULL CHECK(length(trim(profile_fingerprint)) > 0),
     hidden_session_id TEXT NOT NULL UNIQUE CHECK(length(trim(hidden_session_id)) > 0),
@@ -913,13 +913,13 @@ CREATE TABLE IF NOT EXISTS collaboration_memberships (
     left_at REAL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_collaboration_membership_active
-ON collaboration_memberships(group_id, account_id) WHERE leave_sequence IS NULL;
+ON collaboration_memberships(group_id, employee_id) WHERE leave_sequence IS NULL;
 CREATE TABLE IF NOT EXISTS collaboration_tasks (
     task_id TEXT PRIMARY KEY,
     group_id TEXT NOT NULL REFERENCES collaboration_groups(group_id),
     created_event_id TEXT NOT NULL REFERENCES collaboration_events(event_id),
-    assigned_account_id TEXT,
-    creator_account_id TEXT,
+    assigned_employee_id TEXT,
+    creator_employee_id TEXT,
     creator_membership_id TEXT REFERENCES collaboration_memberships(membership_id),
     creator_profile_revision INTEGER CHECK(creator_profile_revision IS NULL OR creator_profile_revision >= 1),
     creator_profile_fingerprint TEXT,
@@ -975,7 +975,7 @@ CREATE TABLE IF NOT EXISTS collaboration_turn_targets (
     target_id TEXT PRIMARY KEY,
     execution_id TEXT NOT NULL UNIQUE CHECK(length(trim(execution_id)) > 0),
     turn_id TEXT NOT NULL REFERENCES collaboration_turns(turn_id),
-    account_id TEXT NOT NULL,
+    employee_id TEXT NOT NULL,
     membership_id TEXT NOT NULL REFERENCES collaboration_memberships(membership_id),
     join_sequence INTEGER NOT NULL CHECK(join_sequence >= 1),
     snapshot_sequence INTEGER NOT NULL CHECK(snapshot_sequence >= join_sequence),
@@ -999,7 +999,7 @@ CREATE TABLE IF NOT EXISTS collaboration_turn_targets (
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     completed_at REAL,
-    UNIQUE(turn_id, account_id),
+    UNIQUE(turn_id, employee_id),
     CHECK(worker_generation IS NULL OR worker_generation >= 1),
     CHECK(lease_version IS NULL OR lease_version >= 1),
     CHECK(recovery_generation IS NULL OR recovery_generation >= 0)
@@ -1099,7 +1099,8 @@ CREATE TABLE IF NOT EXISTS collaboration_origins (
     origin_id TEXT PRIMARY KEY,
     group_id TEXT NOT NULL REFERENCES collaboration_groups(group_id),
     provider TEXT NOT NULL CHECK(length(trim(provider)) > 0),
-    account_id TEXT,
+    employee_id TEXT NOT NULL CHECK(length(trim(employee_id)) > 0),
+    connector_account_id TEXT,
     binding_id TEXT,
     conversation_id TEXT NOT NULL CHECK(length(trim(conversation_id)) > 0),
     thread_id TEXT NOT NULL DEFAULT '',
@@ -1116,7 +1117,7 @@ CREATE TABLE IF NOT EXISTS collaboration_origins (
     creation_delivered_at REAL,
     completion_delivered_at REAL,
     created_at REAL NOT NULL,
-    UNIQUE(group_id, provider, account_id, conversation_id, thread_id)
+    UNIQUE(group_id, provider, employee_id, connector_account_id, conversation_id, thread_id)
 );
 CREATE TABLE IF NOT EXISTS collaboration_delivery_state (
     delivery_id TEXT PRIMARY KEY,
@@ -1161,7 +1162,7 @@ CREATE INDEX IF NOT EXISTS idx_collaboration_memberships_group
 CREATE INDEX IF NOT EXISTS idx_collaboration_tasks_group
     ON collaboration_tasks(group_id, status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_collaboration_targets_account
-    ON collaboration_turn_targets(account_id, status, created_at);
+    ON collaboration_turn_targets(employee_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_collaboration_delivery_due
     ON collaboration_delivery_state(status, next_attempt_at);
 CREATE TRIGGER IF NOT EXISTS sessions_kind_visibility_insert
@@ -1916,8 +1917,8 @@ class SessionDB(SessionQueryMixin):
                 task_id TEXT PRIMARY KEY,
                 group_id TEXT NOT NULL REFERENCES collaboration_groups(group_id),
                 created_event_id TEXT NOT NULL REFERENCES collaboration_events(event_id),
-                assigned_account_id TEXT,
-                creator_account_id TEXT,
+                assigned_employee_id TEXT,
+                creator_employee_id TEXT,
                 creator_membership_id TEXT REFERENCES collaboration_memberships(membership_id),
                 creator_profile_revision INTEGER CHECK(creator_profile_revision IS NULL OR creator_profile_revision >= 1),
                 creator_profile_fingerprint TEXT,
@@ -1962,8 +1963,8 @@ class SessionDB(SessionQueryMixin):
         cursor.execute("PRAGMA foreign_keys=OFF")
         cursor.execute(task_sql)
         task_columns = [
-            "task_id", "group_id", "created_event_id", "assigned_account_id",
-            "creator_account_id", "creator_membership_id", "creator_profile_revision",
+            "task_id", "group_id", "created_event_id", "assigned_employee_id",
+            "creator_employee_id", "creator_membership_id", "creator_profile_revision",
             "creator_profile_fingerprint", "title", "description", "source_kind",
             "round", "max_rounds", "depth", "source_event_id", "source_task_id",
             "allowed_attachment_ids_json", "summary_text", "status", "worker_owner_key",
@@ -2102,6 +2103,60 @@ class SessionDB(SessionQueryMixin):
         cursor.execute("DROP TABLE collaboration_origins__v22")
         cursor.execute("PRAGMA foreign_keys=ON")
 
+    @staticmethod
+    def _migrate_v23_to_v24_employee_identity(cursor: sqlite3.Cursor) -> None:
+        """Replace empty account-keyed collaboration tables with employee-keyed tables.
+
+        Collaboration employee IDs used to be overloaded connector account IDs. There
+        is no safe generic translation in the session database, so legacy rows are
+        rejected explicitly rather than copied into the new employee identity domain.
+        """
+        legacy_columns = {
+            row[1] if isinstance(row, (tuple, list)) else row["name"]
+            for row in cursor.execute(
+                "PRAGMA table_info(collaboration_memberships)"
+            ).fetchall()
+        }
+        if "account_id" not in legacy_columns:
+            return
+        tables = (
+            "collaboration_delivery_state",
+            "collaboration_agent_receipts",
+            "collaboration_tool_receipts",
+            "collaboration_approvals",
+            "collaboration_attachment_materializations",
+            "collaboration_attachment_grants",
+            "collaboration_attachments",
+            "collaboration_turn_targets",
+            "collaboration_turns",
+            "collaboration_origins",
+            "collaboration_tasks",
+            "collaboration_message_receipts",
+            "collaboration_group_receipts",
+            "collaboration_events",
+            "collaboration_memberships",
+            "collaboration_groups",
+        )
+        for table in tables:
+            exists = cursor.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()
+            if exists is not None and cursor.execute(
+                f'SELECT 1 FROM "{table}" LIMIT 1'
+            ).fetchone() is not None:
+                raise RuntimeError(
+                    "session schema v23 contains legacy collaboration employee data; "
+                    "remove it before upgrading"
+                )
+        cursor.execute("PRAGMA foreign_keys=OFF")
+        cursor.execute("DROP TRIGGER IF EXISTS collaboration_events_append_only_update")
+        cursor.execute("DROP TRIGGER IF EXISTS collaboration_events_append_only_delete")
+        for table in tables:
+            cursor.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("UPDATE schema_version SET version=24")
+
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
 
@@ -2116,6 +2171,19 @@ class SessionDB(SessionQueryMixin):
         (transforming existing rows) which cannot be handled declaratively.
         """
         cursor = self._conn.cursor()
+        memberships_exists = cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='collaboration_memberships'"
+        ).fetchone() is not None
+        if memberships_exists:
+            legacy_columns = {
+                row[1] if isinstance(row, (tuple, list)) else row["name"]
+                for row in cursor.execute(
+                    "PRAGMA table_info(collaboration_memberships)"
+                ).fetchall()
+            }
+            if "account_id" in legacy_columns:
+                self._migrate_v23_to_v24_employee_identity(cursor)
 
         cursor.executescript(SCHEMA_SQL)
         # The synchronous safety gate supersedes durable background jobs. Drop

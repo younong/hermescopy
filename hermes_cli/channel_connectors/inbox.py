@@ -48,16 +48,22 @@ class CanonicalInbox:
         binding = (
             conn.execute(
                 """
-                SELECT b.binding_id, e.subject_lookup_hash,
-                       CASE WHEN m.account_id IS NULL THEN 0 ELSE 1 END AS managed_feishu
+                SELECT b.binding_id, x.subject_lookup_hash,
+                       CASE WHEN eb.binding_id IS NULL THEN 0 ELSE 1 END
+                         AS employee_bound_feishu
                 FROM channel_bindings b
                 JOIN connector_accounts a ON a.account_id=b.account_id
-                JOIN external_identities e ON e.external_identity_id=b.external_identity_id
-                                          AND e.provider=a.provider
-                LEFT JOIN managed_feishu_accounts m ON m.account_id=a.account_id
-                                                  AND m.lifecycle_status='active'
+                JOIN external_identities x ON x.external_identity_id=b.external_identity_id
+                                          AND x.provider=a.provider
+                LEFT JOIN employee_channel_bindings eb
+                  ON eb.connector_account_id=a.account_id
+                 AND eb.provider='feishu' AND eb.lifecycle_status='active'
+                LEFT JOIN employees e ON e.employee_id=eb.employee_id
+                                     AND e.canonical_user_id=x.canonical_user_id
+                                     AND e.lifecycle_status='active'
                 WHERE b.account_id=? AND b.peer_lookup_hash=? AND a.provider=?
-                  AND b.status='active' AND a.status='active' AND e.status='active'
+                  AND b.status='active' AND a.status='active' AND x.status='active'
+                  AND (eb.binding_id IS NULL OR e.employee_id IS NOT NULL)
                 """,
                 (account_id, peer_hash, self.provider),
             ).fetchone()
@@ -77,8 +83,8 @@ class CanonicalInbox:
                 f"group-admission:{self.provider}:{account_id}",
                 f"{provider_message_id}:{envelope.actor_id.strip()}",
             )
-            if not binding["managed_feishu"]:
-                reason = "group_binding_unmanaged"
+            if not binding["employee_bound_feishu"]:
+                reason = "group_binding_not_employee_bound"
             elif envelope.rejection_reason is not None:
                 reason = envelope.rejection_reason
             elif envelope.group_admission_token != expected_admission:

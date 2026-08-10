@@ -104,14 +104,14 @@ describe("GuiChatSessionSwitchCoordinator", () => {
     const { connection, coordinator } = createHarness();
     connection.nextResult();
 
-    coordinator.start(null, undefined, { employeeAccountId: "employee-a" });
+    coordinator.start(null, undefined, { employeeId: "employee-a" });
 
     expect(connection.createOrAttach).toHaveBeenCalledWith(
       null,
       1,
       expect.any(AbortSignal),
       undefined,
-      { employeeAccountId: "employee-a" },
+      { employeeId: "employee-a" },
     );
   });
 

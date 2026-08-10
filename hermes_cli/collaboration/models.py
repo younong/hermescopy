@@ -10,7 +10,7 @@ from typing import Any
 class CollaborationMemberProfile:
     """Trusted employee profile identity pinned into a membership."""
 
-    account_id: str
+    employee_id: str
     profile_revision: int
     profile_fingerprint: str
 
@@ -21,7 +21,7 @@ class CollaborationGroup:
     owner_key: str
     name: str
     creator_kind: str
-    creator_account_id: str | None
+    creator_employee_id: str | None
     status: str
     last_sequence: int
     created_at: float
@@ -33,7 +33,7 @@ class CollaborationGroup:
 class CollaborationMembership:
     membership_id: str
     group_id: str
-    account_id: str
+    employee_id: str
     profile_revision: int
     profile_fingerprint: str
     hidden_session_id: str
@@ -52,7 +52,7 @@ class CollaborationEvent:
     sequence: int
     event_kind: str
     actor_kind: str
-    actor_account_id: str | None
+    actor_employee_id: str | None
     actor_membership_id: str | None
     body: dict[str, Any]
     created_at: float
@@ -63,7 +63,7 @@ class CollaborationTarget:
     target_id: str
     execution_id: str
     turn_id: str
-    account_id: str
+    employee_id: str
     membership_id: str
     join_sequence: int
     snapshot_sequence: int

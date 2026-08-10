@@ -26,13 +26,13 @@ class _Runtime:
     recovery_generation: int = 4
 
 
-def _policy(account_id: str, revision: int = 1) -> dict:
+def _policy(employee_id: str, revision: int = 1) -> dict:
     return {
         "schema_version": 1,
-        "account_id": account_id,
+        "employee_id": employee_id,
         "profile_revision": revision,
-        "source_profile_fingerprint": f"fingerprint-{account_id}-r{revision}",
-        "system_prompt": f"You are {account_id}.",
+        "source_profile_fingerprint": f"fingerprint-{employee_id}-r{revision}",
+        "system_prompt": f"You are {employee_id}.",
         "model": {"provider": "openai", "model": "test-model"},
         "toolsets": [],
         "skills": [],
@@ -57,34 +57,34 @@ class _Resolver:
         self.allowed = allowed
         self.may_create = may_create
         self.invite_quota = invite_quota
-        self.resolved_accounts: list[str] = []
-        self.pinned_accounts: list[tuple[str, int]] = []
+        self.resolved_employees: list[str] = []
+        self.pinned_employees: list[tuple[str, int]] = []
 
-    def resolve_current(self, account_id: str) -> ResolvedCollaborationEmployee:
-        self.resolved_accounts.append(account_id)
+    def resolve_current(self, employee_id: str) -> ResolvedCollaborationEmployee:
+        self.resolved_employees.append(employee_id)
         member = CollaborationMemberProfile(
-            account_id=account_id,
+            employee_id=employee_id,
             profile_revision=self.revision,
-            profile_fingerprint=f"fingerprint-{account_id}-r{self.revision}",
+            profile_fingerprint=f"fingerprint-{employee_id}-r{self.revision}",
         )
         return ResolvedCollaborationEmployee(
             member=member,
-            employee_policy=_policy(account_id, self.revision),
+            employee_policy=_policy(employee_id, self.revision),
             may_participate=self.allowed,
             may_create_groups=self.may_create,
             invite_quota=self.invite_quota,
         )
 
-    def resolve_pinned(self, *, account_id, profile_revision, profile_fingerprint):
-        self.pinned_accounts.append((account_id, profile_revision))
+    def resolve_pinned(self, *, employee_id, profile_revision, profile_fingerprint):
+        self.pinned_employees.append((employee_id, profile_revision))
         if not self.allowed:
             raise RuntimeError("collaboration participation is revoked")
-        expected = f"fingerprint-{account_id}-r{profile_revision}"
+        expected = f"fingerprint-{employee_id}-r{profile_revision}"
         if profile_fingerprint != expected:
             raise RuntimeError("collaboration member profile fingerprint is inconsistent")
         return ResolvedCollaborationEmployee(
-            member=CollaborationMemberProfile(account_id, profile_revision, expected),
-            employee_policy=_policy(account_id, profile_revision),
+            member=CollaborationMemberProfile(employee_id, profile_revision, expected),
+            employee_policy=_policy(employee_id, profile_revision),
             may_participate=True,
             may_create_groups=self.may_create,
             invite_quota=self.invite_quota,
@@ -176,7 +176,7 @@ def test_agent_tool_contract_rejects_forged_context_and_unknown_arguments():
     unavailable = invoke(
         CollaborationAgentContext(
             service=object(),
-            creator_account_id="employee-a",
+            creator_employee_id="employee-a",
             source_kind="web_direct",
             source_conversation_id="session-a",
         ),
@@ -184,9 +184,9 @@ def test_agent_tool_contract_rejects_forged_context_and_unknown_arguments():
         {
             "title": "Task",
             "brief": "Brief",
-            "invitee_account_ids": ["employee-b"],
+            "invitee_employee_ids": ["employee-b"],
             "origin_attachment_ids": [],
-            "first_round_target_account_ids": ["employee-b"],
+            "first_round_target_employee_ids": ["employee-b"],
             "idempotency_key": "create-a",
             "owner_key": "forged",
         },
@@ -208,7 +208,7 @@ def test_source_context_checks_live_creation_authority_and_quota(db):
         ensure_member_session=lambda **_kwargs: None,
     )
     denied = service.source_agent_context(
-        creator_account_id="creator",
+        creator_employee_id="creator",
         source_kind="web_group",
         source_conversation_id="source-group",
         source_group_id="source-group",
@@ -218,7 +218,7 @@ def test_source_context_checks_live_creation_authority_and_quota(db):
     resolver.may_create = True
     resolver.invite_quota = None
     allowed = service.source_agent_context(
-        creator_account_id="creator",
+        creator_employee_id="creator",
         source_kind="web_group",
         source_conversation_id="source-group",
         source_group_id="source-group",
@@ -238,7 +238,7 @@ def test_create_and_later_actions_recheck_live_permission_and_quota(db):
     )
     service.bind_scheduler(SimpleNamespace(wake=lambda: None))
     context = service.source_agent_context(
-        creator_account_id="creator",
+        creator_employee_id="creator",
         source_kind="web_direct",
         source_conversation_id="origin-session",
     )
@@ -246,9 +246,9 @@ def test_create_and_later_actions_recheck_live_permission_and_quota(db):
         "context": context,
         "title": "Live authority",
         "brief": "Check permissions",
-        "invitee_account_ids": ["employee-a"],
+        "invitee_employee_ids": ["employee-a"],
         "origin_attachment_ids": [],
-        "first_round_target_account_ids": ["employee-a"],
+        "first_round_target_employee_ids": ["employee-a"],
         "idempotency_key": "live-authority",
     }
     with pytest.raises(RuntimeError, match="quota exceeded"):
@@ -258,7 +258,7 @@ def test_create_and_later_actions_recheck_live_permission_and_quota(db):
     created = service.create_internal_group(**request)
     coordinator = CollaborationAgentContext(
         service=service,
-        creator_account_id="creator",
+        creator_employee_id="creator",
         source_kind="web_direct",
         source_conversation_id="origin-session",
         source_depth=1,
@@ -277,7 +277,7 @@ def test_create_and_later_actions_recheck_live_permission_and_quota(db):
         service.dispatch_internal_group_round(
             context=coordinator,
             instruction="Another round",
-            target_account_ids=["employee-a"],
+            target_employee_ids=["employee-a"],
             attachment_ids=[],
             idempotency_key="live-authority-round-2",
         )
@@ -294,7 +294,7 @@ def test_create_and_later_actions_recheck_live_permission_and_quota(db):
         service.dispatch_internal_group_round(
             context=coordinator,
             instruction="Still over quota",
-            target_account_ids=["employee-a"],
+            target_employee_ids=["employee-a"],
             attachment_ids=[],
             idempotency_key="live-authority-round-2-quota",
         )
@@ -313,7 +313,7 @@ def test_create_replay_recovers_initial_dispatch_after_post_create_failure(db, m
     )
     service.bind_scheduler(scheduler)
     context = service.source_agent_context(
-        creator_account_id="creator",
+        creator_employee_id="creator",
         source_kind="web_direct",
         source_conversation_id="origin-session",
     )
@@ -332,9 +332,9 @@ def test_create_replay_recovers_initial_dispatch_after_post_create_failure(db, m
         "context": context,
         "title": "Recoverable review",
         "brief": "Review once",
-        "invitee_account_ids": ["employee-a"],
+        "invitee_employee_ids": ["employee-a"],
         "origin_attachment_ids": [],
-        "first_round_target_account_ids": ["employee-a"],
+        "first_round_target_employee_ids": ["employee-a"],
         "idempotency_key": "recover-create",
     }
     with pytest.raises(RuntimeError, match="post-create failure"):
@@ -366,14 +366,14 @@ def test_service_resolves_profiles_server_side_and_redacts_hidden_ids(db):
 
     payload = service.create_group(
         name="Runtime",
-        account_ids=["employee-a"],
+        employee_ids=["employee-a"],
         client_idempotency_key="runtime-create",
     )
 
-    assert payload["memberships"][0]["account_id"] == "employee-a"
+    assert payload["memberships"][0]["employee_id"] == "employee-a"
     assert "hidden_session_id" not in payload["memberships"][0]
     assert "stored_session_id" not in payload["memberships"][0]
-    assert sessions[0]["employee_policy"]["account_id"] == "employee-a"
+    assert sessions[0]["employee_policy"]["employee_id"] == "employee-a"
     assert emitted[-1][0] == "collaboration.group.changed"
     serialized = json.dumps(payload, sort_keys=True)
     for internal in (
@@ -410,7 +410,7 @@ def test_group_create_retry_repairs_sessions_without_duplicate_group(db):
     )
     request = {
         "name": "Retry",
-        "account_ids": ["employee-a"],
+        "employee_ids": ["employee-a"],
         "client_idempotency_key": "retry-create",
     }
 
@@ -441,19 +441,19 @@ def test_member_update_preserves_existing_pinned_revision(db):
     )
     created = service.create_group(
         name="Runtime",
-        account_ids=["employee-a"],
+        employee_ids=["employee-a"],
         client_idempotency_key="runtime-create",
     )
     original = created["memberships"][0]
     resolver.revision = 2
 
     updated = service.update_members(
-        created["group"]["group_id"], account_ids=["employee-a"]
+        created["group"]["group_id"], employee_ids=["employee-a"]
     )
 
     active = [item for item in updated["memberships"] if item["leave_sequence"] is None]
-    assert resolver.resolved_accounts == ["employee-a"]
-    assert resolver.pinned_accounts == [("employee-a", 1)]
+    assert resolver.resolved_employees == ["employee-a"]
+    assert resolver.pinned_employees == [("employee-a", 1)]
     assert len(active) == 1
     assert active[0]["membership_id"] == original["membership_id"]
     assert active[0]["profile_revision"] == 1
@@ -471,22 +471,22 @@ def test_member_update_resolves_all_additions_before_mutating(db):
     )
     created = service.create_group(
         name="Runtime",
-        account_ids=["employee-a"],
+        employee_ids=["employee-a"],
         client_idempotency_key="runtime-create",
     )
     original = service.get_group(created["group"]["group_id"])
     original_resolve = resolver.resolve_current
 
-    def fail_second(account_id):
-        if account_id == "employee-c":
+    def fail_second(employee_id):
+        if employee_id == "employee-c":
             raise RuntimeError("employee unavailable")
-        return original_resolve(account_id)
+        return original_resolve(employee_id)
 
     resolver.resolve_current = fail_second
     with pytest.raises(RuntimeError, match="employee unavailable"):
         service.update_members(
             created["group"]["group_id"],
-            account_ids=["employee-b", "employee-c"],
+            employee_ids=["employee-b", "employee-c"],
         )
 
     after = service.get_group(created["group"]["group_id"])
@@ -505,7 +505,7 @@ def test_member_update_rechecks_live_authorization_without_repinning(db):
     )
     created = service.create_group(
         name="Runtime",
-        account_ids=["employee-a"],
+        employee_ids=["employee-a"],
         client_idempotency_key="runtime-create",
     )
     resolver.revision = 2
@@ -513,11 +513,11 @@ def test_member_update_rechecks_live_authorization_without_repinning(db):
 
     with pytest.raises(RuntimeError, match="participation is revoked"):
         service.update_members(
-            created["group"]["group_id"], account_ids=["employee-a"]
+            created["group"]["group_id"], employee_ids=["employee-a"]
         )
 
     active = service.get_group(created["group"]["group_id"])["memberships"]
-    assert resolver.pinned_accounts == [("employee-a", 1)]
+    assert resolver.pinned_employees == [("employee-a", 1)]
     assert active[0]["profile_revision"] == 1
     assert active[0]["leave_sequence"] is None
 
@@ -537,10 +537,10 @@ def test_feishu_origin_persists_stable_delivery_intent_before_handoff(db):
     )
     service.bind_scheduler(SimpleNamespace(wake=lambda: None))
     context = service.source_agent_context(
-        creator_account_id="creator",
+        creator_employee_id="creator",
         source_kind="feishu_direct",
         source_provider="feishu",
-        source_account_id="creator",
+        source_connector_account_id="creator",
         source_binding_id="binding-a",
         source_conversation_id="oc_direct",
         source_thread_id="",
@@ -551,9 +551,9 @@ def test_feishu_origin_persists_stable_delivery_intent_before_handoff(db):
         context=context,
         title="Feishu review",
         brief="Only explicit brief",
-        invitee_account_ids=["employee-a"],
+        invitee_employee_ids=["employee-a"],
         origin_attachment_ids=[],
-        first_round_target_account_ids=["employee-a"],
+        first_round_target_employee_ids=["employee-a"],
         idempotency_key="feishu-create",
     )
     pending = service.store.pending_origin_deliveries()
@@ -561,7 +561,8 @@ def test_feishu_origin_persists_stable_delivery_intent_before_handoff(db):
     delivery = pending[0]
     assert delivery["delivery_key"] == f"collaboration:{result['task_id']}:creation"
     assert delivery["provider"] == "feishu"
-    assert delivery["account_id"] == "creator"
+    assert delivery["employee_id"] == "creator"
+    assert delivery["connector_account_id"] == "creator"
     assert delivery["binding_id"] == "binding-a"
     assert delivery["conversation_id"] == "oc_direct"
     assert delivery["thread_id"] == ""
@@ -596,7 +597,7 @@ def test_restart_adopts_pending_and_claimed_delivery_intents_to_exact_fence(db):
         members=[CollaborationMemberProfile("employee-a", 1, "fingerprint-employee-a-r1")],
         source_kind="feishu_direct",
         source_provider="feishu",
-        source_account_id="creator",
+        source_connector_account_id="creator",
         source_binding_id="binding-a",
         source_conversation_id="oc_direct",
         source_thread_id="",
@@ -699,7 +700,8 @@ def test_control_plane_handoff_enqueues_then_acks_without_connector_call(monkeyp
                         "delivery_key": "collaboration:task-a:creation",
                         "payload_text": "created",
                         "provider": "feishu",
-                        "account_id": "employee-a",
+                        "employee_id": "employee-a",
+                        "connector_account_id": "ca-employee-a",
                         "binding_id": "binding-a",
                         "conversation_id": "oc_direct",
                         "thread_id": "",
@@ -725,7 +727,7 @@ def test_control_plane_handoff_enqueues_then_acks_without_connector_call(monkeyp
     assert enqueued == [
         {
             "owner_key": "owner-a",
-            "account_id": "employee-a",
+            "account_id": "ca-employee-a",
             "binding_id": "binding-a",
             "conversation_id": "oc_direct",
             "thread_id": "",
@@ -807,7 +809,7 @@ def test_feishu_origin_can_terminally_record_ambiguous_handoff(db):
         members=[CollaborationMemberProfile("employee-a", 1, "fingerprint-employee-a-r1")],
         source_kind="feishu_direct",
         source_provider="feishu",
-        source_account_id="creator",
+        source_connector_account_id="creator",
         source_binding_id="binding-a",
         source_conversation_id="oc_direct",
         source_thread_id="",
@@ -864,7 +866,7 @@ def test_ai_created_group_prompt_transfers_brief_not_source_transcript(db):
     submitted, _, _ = store.dispatch_ai_round(
         created["task_id"],
         instruction="Only this explicit brief transfers",
-        target_account_ids=["employee-a"],
+        target_employee_ids=["employee-a"],
         attachment_ids=[],
         idempotency_key="transcript-isolation-round",
     )
@@ -915,7 +917,7 @@ def test_ai_task_round_uses_member_context_then_exact_creator_coordinator(db):
     submitted, _, _ = store.dispatch_ai_round(
         created["task_id"],
         instruction="Review @creator literally",
-        target_account_ids=["creator"],
+        target_employee_ids=["creator"],
         attachment_ids=[],
         idempotency_key="round-pinned",
     )
@@ -945,7 +947,7 @@ def test_ai_task_round_uses_member_context_then_exact_creator_coordinator(db):
     assert runner.calls[0]["collaboration_context"].role == "member"
     assert runner.calls[0]["collaboration_context"].source_depth == 1
     assert runner.calls[1]["collaboration_context"].role == "coordinator"
-    assert runner.calls[1]["collaboration_context"].creator_account_id == "creator"
+    assert runner.calls[1]["collaboration_context"].creator_employee_id == "creator"
     assert runner.calls[1]["stored_session_id"] == f"coordinator-{created['task_id']}"
 
 
@@ -990,7 +992,7 @@ def test_finish_summary_with_textual_mentions_does_not_schedule_origin_targets(d
     )
     context = CollaborationAgentContext(
         service=service,
-        creator_account_id="creator",
+        creator_employee_id="creator",
         source_kind="web_group",
         source_conversation_id=source.group_id,
         source_group_id=source.group_id,
@@ -1046,7 +1048,7 @@ def test_creator_coordinator_plain_text_marks_task_and_receipt_ambiguous(db):
     submitted, _, _ = service.store.dispatch_ai_round(
         created["task_id"],
         instruction="Reply once",
-        target_account_ids=["employee-a"],
+        target_employee_ids=["employee-a"],
         attachment_ids=[],
         idempotency_key="dispatch-action-required",
     )
@@ -1352,7 +1354,7 @@ def test_service_archive_best_effort_interrupts_live_sessions(db):
     )
     created = service.create_group(
         name="Interrupt",
-        account_ids=["employee-a"],
+        employee_ids=["employee-a"],
         client_idempotency_key="archive-interrupt",
     )
     membership = service.store.active_memberships(created["group"]["group_id"])[0]

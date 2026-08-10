@@ -12,9 +12,9 @@ from typing import Iterator
 
 from .crypto import ChannelCrypto
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 ACCOUNT_CREDENTIAL_AAD_TABLE = "ilink_accounts"
-EMPLOYEE_PROFILE_AAD_TABLE = "feishu_employee_profiles"
+EMPLOYEE_PROFILE_AAD_TABLE = "employee_profiles"
 _DB_FILENAME = "channel_identities.sqlite3"
 
 _SCHEMA = """
@@ -110,18 +110,23 @@ ON connector_accounts
 BEGIN
     SELECT RAISE(ABORT, 'channel account ownership is immutable');
 END;
-CREATE TABLE IF NOT EXISTS managed_feishu_accounts (
-    account_id TEXT PRIMARY KEY REFERENCES connector_accounts(account_id),
+CREATE TABLE IF NOT EXISTS employees (
+    employee_id TEXT PRIMARY KEY CHECK(employee_id GLOB 'emp_*'),
     canonical_user_id TEXT NOT NULL REFERENCES canonical_users(canonical_user_id),
     lifecycle_status TEXT NOT NULL
         CHECK(lifecycle_status IN ('active', 'suspended', 'revoked')),
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_managed_feishu_owner
-ON managed_feishu_accounts(canonical_user_id, lifecycle_status);
-CREATE TABLE IF NOT EXISTS feishu_employee_collaboration_policies (
-    account_id TEXT PRIMARY KEY REFERENCES managed_feishu_accounts(account_id),
+CREATE INDEX IF NOT EXISTS idx_employees_owner
+ON employees(canonical_user_id, lifecycle_status);
+CREATE TRIGGER IF NOT EXISTS employees_owner_immutable
+BEFORE UPDATE OF employee_id, canonical_user_id ON employees
+BEGIN
+    SELECT RAISE(ABORT, 'employee Owner is immutable');
+END;
+CREATE TABLE IF NOT EXISTS employee_collaboration_policies (
+    employee_id TEXT PRIMARY KEY REFERENCES employees(employee_id),
     may_participate INTEGER NOT NULL DEFAULT 1
         CHECK(may_participate IN (0, 1)),
     may_create_groups INTEGER NOT NULL DEFAULT 0
@@ -132,27 +137,13 @@ CREATE TABLE IF NOT EXISTS feishu_employee_collaboration_policies (
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
-CREATE TRIGGER IF NOT EXISTS feishu_employee_collaboration_policy_identity_immutable
-BEFORE UPDATE OF account_id, created_at ON feishu_employee_collaboration_policies
+CREATE TRIGGER IF NOT EXISTS employee_collaboration_policy_identity_immutable
+BEFORE UPDATE OF employee_id, created_at ON employee_collaboration_policies
 BEGIN
-    SELECT RAISE(ABORT, 'Feishu employee collaboration policy identity is immutable');
+    SELECT RAISE(ABORT, 'employee collaboration policy identity is immutable');
 END;
-CREATE TRIGGER IF NOT EXISTS managed_feishu_accounts_owner_immutable
-BEFORE UPDATE OF account_id, canonical_user_id ON managed_feishu_accounts
-BEGIN
-    SELECT RAISE(ABORT, 'managed Feishu account Owner is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS managed_feishu_accounts_provider_insert
-BEFORE INSERT ON managed_feishu_accounts
-WHEN NOT EXISTS (
-    SELECT 1 FROM connector_accounts a
-    WHERE a.account_id=NEW.account_id AND a.provider='feishu'
-)
-BEGIN
-    SELECT RAISE(ABORT, 'managed Feishu account provider mismatch');
-END;
-CREATE TABLE IF NOT EXISTS feishu_employee_profiles (
-    account_id TEXT NOT NULL REFERENCES managed_feishu_accounts(account_id),
+CREATE TABLE IF NOT EXISTS employee_profiles (
+    employee_id TEXT NOT NULL REFERENCES employees(employee_id),
     revision INTEGER NOT NULL CHECK(revision >= 1),
     profile_ciphertext BLOB NOT NULL,
     profile_key_version INTEGER NOT NULL,
@@ -161,16 +152,47 @@ CREATE TABLE IF NOT EXISTS feishu_employee_profiles (
         CHECK(lifecycle_status IN ('active', 'superseded', 'revoked')),
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
-    PRIMARY KEY(account_id, revision)
+    PRIMARY KEY(employee_id, revision)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_feishu_employee_current
-ON feishu_employee_profiles(account_id) WHERE lifecycle_status='active';
-CREATE TRIGGER IF NOT EXISTS feishu_employee_profiles_identity_immutable
-BEFORE UPDATE OF account_id, revision, profile_ciphertext, profile_key_version,
+CREATE UNIQUE INDEX IF NOT EXISTS idx_employee_current_profile
+ON employee_profiles(employee_id) WHERE lifecycle_status='active';
+CREATE TRIGGER IF NOT EXISTS employee_profiles_identity_immutable
+BEFORE UPDATE OF employee_id, revision, profile_ciphertext, profile_key_version,
                  profile_fingerprint, created_at
-ON feishu_employee_profiles
+ON employee_profiles
 BEGIN
-    SELECT RAISE(ABORT, 'Feishu employee profile revision is immutable');
+    SELECT RAISE(ABORT, 'employee profile revision is immutable');
+END;
+CREATE TABLE IF NOT EXISTS employee_channel_bindings (
+    binding_id TEXT PRIMARY KEY CHECK(binding_id GLOB 'ecb_*'),
+    employee_id TEXT NOT NULL REFERENCES employees(employee_id),
+    provider TEXT NOT NULL CHECK(length(trim(provider)) > 0),
+    connector_account_id TEXT NOT NULL REFERENCES connector_accounts(account_id),
+    lifecycle_status TEXT NOT NULL
+        CHECK(lifecycle_status IN ('active', 'suspended', 'revoked')),
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_employee_current_feishu_binding
+ON employee_channel_bindings(employee_id)
+WHERE provider='feishu' AND lifecycle_status<>'revoked';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_employee_current_feishu_account
+ON employee_channel_bindings(connector_account_id)
+WHERE provider='feishu' AND lifecycle_status<>'revoked';
+CREATE TRIGGER IF NOT EXISTS employee_channel_bindings_identity_immutable
+BEFORE UPDATE OF binding_id, employee_id, provider, connector_account_id, created_at
+ON employee_channel_bindings
+BEGIN
+    SELECT RAISE(ABORT, 'employee channel binding identity is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS employee_channel_bindings_provider_insert
+BEFORE INSERT ON employee_channel_bindings
+WHEN NOT EXISTS (
+    SELECT 1 FROM connector_accounts a
+    WHERE a.account_id=NEW.connector_account_id AND a.provider=NEW.provider
+)
+BEGIN
+    SELECT RAISE(ABORT, 'employee channel binding provider mismatch');
 END;
 CREATE TABLE IF NOT EXISTS channel_bindings (
     binding_id TEXT PRIMARY KEY,
@@ -486,6 +508,9 @@ class ChannelIdentityStore:
                         elif version == 13:
                             self._migrate_v13_to_v14(conn)
                             version = 14
+                        elif version == 14:
+                            self._migrate_v14_to_v15(conn)
+                            version = 15
                         else:
                             raise RuntimeError(
                                 "channel identity database schema is older than supported"
@@ -791,6 +816,7 @@ class ChannelIdentityStore:
 
         conn.execute("DROP TRIGGER IF EXISTS connector_accounts_ownership_immutable")
         conn.execute("DROP TRIGGER IF EXISTS managed_feishu_accounts_provider_insert")
+        conn.execute("DROP TRIGGER IF EXISTS employee_channel_bindings_provider_insert")
         conn.execute("DROP TRIGGER IF EXISTS channel_bindings_identity_consistent_insert")
         conn.execute("DROP TRIGGER IF EXISTS inbound_messages_binding_consistent_insert")
         conn.execute("DROP TRIGGER IF EXISTS outbound_messages_consistent_insert")
@@ -882,6 +908,7 @@ class ChannelIdentityStore:
             raise RuntimeError("connector account schema is inconsistent")
         conn.execute("DROP TRIGGER IF EXISTS connector_accounts_ownership_immutable")
         conn.execute("DROP TRIGGER IF EXISTS managed_feishu_accounts_provider_insert")
+        conn.execute("DROP TRIGGER IF EXISTS employee_channel_bindings_provider_insert")
         conn.execute("DROP TRIGGER IF EXISTS channel_bindings_identity_consistent_insert")
         conn.execute("DROP TRIGGER IF EXISTS outbound_messages_consistent_insert")
         if "external_identity_id" in columns:
@@ -1093,6 +1120,46 @@ class ChannelIdentityStore:
         )
 
     @staticmethod
+    def _migrate_v14_to_v15(conn: sqlite3.Connection) -> None:
+        legacy_tables = (
+            "managed_feishu_accounts",
+            "feishu_employee_profiles",
+            "feishu_employee_collaboration_policies",
+        )
+        for table in legacy_tables:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()
+            if exists is not None:
+                count = conn.execute(
+                    f"SELECT COUNT(*) AS count FROM {table}"
+                ).fetchone()["count"]
+                if count:
+                    raise RuntimeError(
+                        "channel identity schema v14 contains legacy Feishu employee data; "
+                        "remove it before upgrading"
+                    )
+        for trigger in (
+            "feishu_employee_collaboration_policy_identity_immutable",
+            "managed_feishu_accounts_owner_immutable",
+            "managed_feishu_accounts_provider_insert",
+            "feishu_employee_profiles_identity_immutable",
+        ):
+            conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        conn.execute("DROP INDEX IF EXISTS idx_feishu_employee_current")
+        conn.execute("DROP INDEX IF EXISTS idx_managed_feishu_owner")
+        for table in (
+            "feishu_employee_collaboration_policies",
+            "feishu_employee_profiles",
+            "managed_feishu_accounts",
+        ):
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        conn.execute(
+            "UPDATE channel_identity_meta SET value='15' WHERE key='schema_version'"
+        )
+
+    @staticmethod
     def _validate_schema(conn: sqlite3.Connection) -> None:
         foreign_key_errors = conn.execute("PRAGMA foreign_key_check").fetchall()
         if foreign_key_errors:
@@ -1108,6 +1175,14 @@ class ChannelIdentityStore:
             LEFT JOIN external_identities e ON e.external_identity_id=b.external_identity_id
             WHERE a.account_id IS NULL OR e.external_identity_id IS NULL
                OR a.provider<>e.provider
+            UNION ALL
+            SELECT 1
+            FROM employee_channel_bindings eb
+            LEFT JOIN connector_accounts a
+              ON a.account_id=eb.connector_account_id
+            LEFT JOIN employees employee ON employee.employee_id=eb.employee_id
+            WHERE a.account_id IS NULL OR employee.employee_id IS NULL
+               OR a.provider<>eb.provider
             UNION ALL
             SELECT 1
             FROM inbound_messages i
@@ -1148,7 +1223,7 @@ class ChannelIdentityStore:
             ("external_identities", "subject_key_version"),
             ("connector_accounts", "credentials_key_version"),
             ("connector_accounts", "cursor_key_version"),
-            ("feishu_employee_profiles", "profile_key_version"),
+            ("employee_profiles", "profile_key_version"),
             ("channel_bindings", "peer_key_version"),
             ("context_tokens", "token_key_version"),
             ("inbound_messages", "payload_key_version"),

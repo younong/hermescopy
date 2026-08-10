@@ -577,12 +577,16 @@ class ChannelOutbox:
                 "JOIN external_identities e ON e.external_identity_id=b.external_identity_id "
                 "JOIN canonical_users u ON u.canonical_user_id=e.canonical_user_id "
                 "JOIN owner_bindings o ON o.canonical_user_id=u.canonical_user_id "
-                "JOIN managed_feishu_accounts m ON m.account_id=a.account_id "
+                "JOIN employee_channel_bindings eb "
+                "ON eb.connector_account_id=a.account_id AND eb.provider=a.provider "
+                "JOIN employees employee ON employee.employee_id=eb.employee_id "
+                "AND employee.canonical_user_id=u.canonical_user_id "
                 "LEFT JOIN context_tokens ct ON ct.account_id=b.account_id "
                 "AND ct.peer_lookup_hash=b.peer_lookup_hash "
                 "WHERE b.binding_id=? AND b.account_id=? AND b.peer_lookup_hash=? "
                 "AND b.status='active' AND a.provider='feishu' AND a.status='active' "
-                "AND e.status='active' AND u.status='active' AND m.lifecycle_status='active'",
+                "AND e.status='active' AND u.status='active' "
+                "AND eb.lifecycle_status='active' AND employee.lifecycle_status='active'",
                 (exact_binding, exact_account, expected_peer),
             ).fetchone()
             if binding is None:

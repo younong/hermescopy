@@ -9,8 +9,8 @@ from typing import Any
 from hermes_cli.channel_connectors.bootstrap import build_channel_identity_store
 from hermes_cli.channel_identity import (
     ChannelIdentityStore,
+    resolve_employee,
     resolve_employee_profile,
-    resolve_managed_feishu_account,
 )
 from hermes_cli.dashboard_auth.owner_context import owner_context_from_owner_key
 from hermes_cli.employee_policy import canonical_employee_snapshot, normalize_employee_source_policy
@@ -80,7 +80,8 @@ class CollaborationEmployeeResolver:
     def validate_feishu_origin(
         self,
         *,
-        account_id: str,
+        employee_id: str,
+        connector_account_id: str,
         binding_id: str,
         conversation_id: str,
         source_kind: str,
@@ -88,7 +89,8 @@ class CollaborationEmployeeResolver:
         dispatch_scope: str,
     ) -> None:
         """Prove one retained Feishu origin against Control Plane authority."""
-        exact_account = str(account_id or "").strip()
+        exact_employee = str(employee_id or "").strip()
+        exact_connector_account = str(connector_account_id or "").strip()
         exact_binding = str(binding_id or "").strip()
         exact_conversation = str(conversation_id or "").strip()
         exact_source = str(source_kind or "").strip()
@@ -96,7 +98,12 @@ class CollaborationEmployeeResolver:
         exact_scope = str(dispatch_scope or "")
         if exact_source not in {"feishu_direct", "feishu_group"}:
             raise RuntimeError("retained Feishu source kind is invalid")
-        if not exact_account or not exact_binding or not exact_conversation:
+        if (
+            not exact_employee
+            or not exact_connector_account
+            or not exact_binding
+            or not exact_conversation
+        ):
             raise RuntimeError("retained Feishu origin identity is incomplete")
         if exact_source == "feishu_direct" and (exact_thread or exact_scope):
             raise RuntimeError("Feishu direct origin scope is invalid")
@@ -106,24 +113,33 @@ class CollaborationEmployeeResolver:
             row = conn.execute(
                 "SELECT 1 FROM channel_bindings b "
                 "JOIN connector_accounts a ON a.account_id=b.account_id "
-                "JOIN managed_feishu_accounts m ON m.account_id=a.account_id "
-                "JOIN canonical_users u ON u.canonical_user_id=m.canonical_user_id "
-                "JOIN owner_bindings o ON o.canonical_user_id=u.canonical_user_id "
-                "WHERE b.binding_id=? AND b.account_id=? AND b.peer_lookup_hash=? "
+                "JOIN employee_channel_bindings eb "
+                "ON eb.connector_account_id=a.account_id AND eb.provider=a.provider "
+                "JOIN employees e ON e.employee_id=eb.employee_id "
+                "JOIN owner_bindings o ON o.canonical_user_id=e.canonical_user_id "
+                "WHERE b.binding_id=? AND eb.employee_id=? AND b.account_id=? "
+                "AND b.peer_lookup_hash=? "
                 "AND b.status='active' AND a.provider='feishu' AND a.status='active' "
-                "AND m.lifecycle_status='active' AND u.status='active' AND o.owner_key=?",
-                (exact_binding, exact_account, peer_hash, self.owner_key),
+                "AND eb.lifecycle_status='active' AND e.lifecycle_status='active' "
+                "AND o.owner_key=?",
+                (
+                    exact_binding,
+                    exact_employee,
+                    exact_connector_account,
+                    peer_hash,
+                    self.owner_key,
+                ),
             ).fetchone()
         if row is None:
             raise RuntimeError("retained Feishu origin does not match binding authority")
 
-    def resolve_current(self, account_id: str) -> ResolvedCollaborationEmployee:
+    def resolve_current(self, employee_id: str) -> ResolvedCollaborationEmployee:
         """Resolve the active profile and current collaboration authorization."""
-        managed = self._resolve_live_authority(account_id)
+        managed = self._resolve_live_authority(employee_id)
         profile = resolve_employee_profile(
             self._authority_store(),
             owner=self.owner,
-            account_id=managed.account_id,
+            employee_id=managed.employee_id,
         )
         if profile.lifecycle_status != "active":
             raise RuntimeError("employee profile is unavailable")
@@ -132,33 +148,33 @@ class CollaborationEmployeeResolver:
     def resolve_pinned(
         self,
         *,
-        account_id: str,
+        employee_id: str,
         profile_revision: int,
         profile_fingerprint: str,
     ) -> ResolvedCollaborationEmployee:
         """Resolve an immutable profile revision while rechecking live authority."""
-        managed = self._resolve_live_authority(account_id)
+        managed = self._resolve_live_authority(employee_id)
         if not managed.collaboration_policy.may_participate:
             raise RuntimeError("collaboration participation is revoked")
         profile = resolve_employee_profile(
             self._authority_store(),
             owner=self.owner,
-            account_id=managed.account_id,
+            employee_id=managed.employee_id,
             revision=int(profile_revision),
         )
         if profile.fingerprint != str(profile_fingerprint):
             raise RuntimeError("collaboration member profile fingerprint is inconsistent")
         return self._resolved(managed, profile)
 
-    def _resolve_live_authority(self, account_id: str):
-        managed = resolve_managed_feishu_account(
+    def _resolve_live_authority(self, employee_id: str):
+        employee = resolve_employee(
             self._authority_store(),
             owner=self.owner,
-            account_id=account_id,
+            employee_id=employee_id,
         )
-        if managed.account_status != "active" or managed.lifecycle_status != "active":
-            raise RuntimeError("managed employee is unavailable")
-        return managed
+        if employee.lifecycle_status != "active":
+            raise RuntimeError("employee is unavailable")
+        return employee
 
     @staticmethod
     def _resolved(managed, profile) -> ResolvedCollaborationEmployee:
@@ -166,7 +182,7 @@ class CollaborationEmployeeResolver:
         model = resolve_chat_model_registration(source_policy["model_registration_id"])
         snapshot = {
             "schema_version": source_policy["schema_version"],
-            "account_id": managed.account_id,
+            "employee_id": managed.employee_id,
             "profile_revision": profile.revision,
             "source_profile_fingerprint": profile.fingerprint,
             "system_prompt": source_policy["system_prompt"],
@@ -182,7 +198,7 @@ class CollaborationEmployeeResolver:
         employee_policy, _ = canonical_employee_snapshot(snapshot)
         return ResolvedCollaborationEmployee(
             member=CollaborationMemberProfile(
-                account_id=managed.account_id,
+                employee_id=managed.employee_id,
                 profile_revision=profile.revision,
                 profile_fingerprint=profile.fingerprint,
             ),

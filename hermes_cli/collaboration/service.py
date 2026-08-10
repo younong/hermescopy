@@ -89,16 +89,16 @@ class CollaborationService:
         self,
         *,
         name: str,
-        account_ids: Iterable[str] = (),
+        employee_ids: Iterable[str] = (),
         client_idempotency_key: str,
     ) -> dict[str, Any]:
-        resolved = self._resolve_accounts(account_ids)
-        resolved = tuple(sorted(resolved, key=lambda item: item.member.account_id))
-        policies = {item.member.account_id: item.employee_policy for item in resolved}
+        resolved = self._resolve_employees(employee_ids)
+        resolved = tuple(sorted(resolved, key=lambda item: item.member.employee_id))
+        policies = {item.member.employee_id: item.employee_policy for item in resolved}
 
         def _provision(membership, member) -> None:
             policy = collaboration_member_policy(
-                policies[member.account_id], membership.membership_id
+                policies[member.employee_id], membership.membership_id
             )
             if self.provision_member_session is not None:
                 self.provision_member_session(membership, policy)
@@ -111,7 +111,7 @@ class CollaborationService:
         )
         for membership in self.store.active_memberships(group.group_id):
             policy = collaboration_member_policy(
-                policies[membership.account_id], membership.membership_id
+                policies[membership.employee_id], membership.membership_id
             )
             self.ensure_member_session(
                 membership=membership,
@@ -139,49 +139,49 @@ class CollaborationService:
         self,
         group_id: str,
         *,
-        account_ids: Iterable[str],
+        employee_ids: Iterable[str],
     ) -> dict[str, Any]:
-        requested = tuple(dict.fromkeys(self._account_id(value) for value in account_ids))
-        current = {item.account_id: item for item in self.store.active_memberships(group_id)}
+        requested = tuple(dict.fromkeys(self._employee_id(value) for value in employee_ids))
+        current = {item.employee_id: item for item in self.store.active_memberships(group_id)}
         requested_set = set(requested)
         resolved_policies: dict[str, dict[str, Any]] = {}
-        for account_id in requested:
-            membership = current.get(account_id)
+        for employee_id in requested:
+            membership = current.get(employee_id)
             if membership is None:
                 continue
             resolved = self.resolver.resolve_pinned(
-                account_id=membership.account_id,
+                employee_id=membership.employee_id,
                 profile_revision=membership.profile_revision,
                 profile_fingerprint=membership.profile_fingerprint,
             )
             if not resolved.may_participate:
                 raise RuntimeError("collaboration participation is revoked")
-            resolved_policies[account_id] = resolved.employee_policy
+            resolved_policies[employee_id] = resolved.employee_policy
         additions = {
-            item.member.account_id: item
-            for item in self._resolve_accounts(
-                account_id for account_id in requested if account_id not in current
+            item.member.employee_id: item
+            for item in self._resolve_employees(
+                employee_id for employee_id in requested if employee_id not in current
             )
         }
         resolved_policies.update(
-            {account_id: item.employee_policy for account_id, item in additions.items()}
+            {employee_id: item.employee_policy for employee_id, item in additions.items()}
         )
 
         def _provision(membership, member) -> None:
             policy = collaboration_member_policy(
-                resolved_policies[member.account_id], membership.membership_id
+                resolved_policies[member.employee_id], membership.membership_id
             )
             if self.provision_member_session is not None:
                 self.provision_member_session(membership, policy)
 
         memberships = self.store.update_memberships(
             group_id,
-            requested_account_ids=requested,
-            additions={account_id: item.member for account_id, item in additions.items()},
+            requested_employee_ids=requested,
+            additions={employee_id: item.member for employee_id, item in additions.items()},
             provision_member=_provision,
         )
         for membership in memberships:
-            policy = additions.get(membership.account_id)
+            policy = additions.get(membership.employee_id)
             if policy is not None:
                 self.ensure_member_session(
                     membership=membership,
@@ -284,29 +284,30 @@ class CollaborationService:
     def source_agent_context(
         self,
         *,
-        creator_account_id: str,
+        creator_employee_id: str,
         source_kind: str,
         source_conversation_id: str,
         source_provider: str = "web",
-        source_account_id: str | None = None,
+        source_connector_account_id: str | None = None,
         source_binding_id: str | None = None,
         source_thread_id: str = "",
         source_session_id: str | None = None,
         source_group_id: str | None = None,
         source_event_id: str | None = None,
         allowed_origin_attachment_ids: Iterable[str] = (),
+        require_participation: bool = True,
     ) -> CollaborationAgentContext:
         """Build one trusted source context after resolving live authorization."""
-        creator = self.resolver.resolve_current(self._account_id(creator_account_id))
-        if not creator.may_participate:
+        creator = self.resolver.resolve_current(self._employee_id(creator_employee_id))
+        if require_participation and not creator.may_participate:
             raise RuntimeError("collaboration participation is revoked")
         return CollaborationAgentContext(
             service=self,
-            creator_account_id=creator.member.account_id,
+            creator_employee_id=creator.member.employee_id,
             source_kind=str(source_kind),
             source_conversation_id=str(source_conversation_id),
             source_provider=str(source_provider),
-            source_account_id=source_account_id,
+            source_connector_account_id=source_connector_account_id,
             source_binding_id=source_binding_id,
             source_thread_id=str(source_thread_id or ""),
             source_session_id=source_session_id,
@@ -328,9 +329,9 @@ class CollaborationService:
         context: CollaborationAgentContext,
         title: str,
         brief: str,
-        invitee_account_ids: Iterable[str],
+        invitee_employee_ids: Iterable[str],
         origin_attachment_ids: Iterable[str],
-        first_round_target_account_ids: Iterable[str],
+        first_round_target_employee_ids: Iterable[str],
         idempotency_key: str,
         tool_call_id: str | None = None,
     ) -> dict[str, Any]:
@@ -338,16 +339,16 @@ class CollaborationService:
         self._require_bound_context(context, role="source")
         if int(context.source_depth) != 0 or context.source_task_id is not None:
             raise RuntimeError("nested collaboration group creation is unavailable")
-        creator = self.resolver.resolve_current(context.creator_account_id)
+        creator = self.resolver.resolve_current(context.creator_employee_id)
         if not creator.may_participate:
             raise RuntimeError("collaboration participation is revoked")
         if not creator.may_create_groups:
             raise RuntimeError("collaboration group creation is not authorized")
-        invitees = tuple(dict.fromkeys(self._account_id(value) for value in invitee_account_ids))
+        invitees = tuple(dict.fromkeys(self._employee_id(value) for value in invitee_employee_ids))
         if creator.invite_quota is not None and len(invitees) > int(creator.invite_quota):
             raise RuntimeError("collaboration invitation quota exceeded")
         targets = tuple(
-            dict.fromkeys(self._account_id(value) for value in first_round_target_account_ids)
+            dict.fromkeys(self._employee_id(value) for value in first_round_target_employee_ids)
         )
         if not targets or not set(targets) <= set(invitees):
             raise RuntimeError("first-round targets must be invited employees")
@@ -358,7 +359,7 @@ class CollaborationService:
             raise ValueError("origin attachment ID is required")
         if not set(selected_attachments) <= set(context.allowed_origin_attachment_ids):
             raise RuntimeError("origin attachment is not allowed")
-        resolved = self._resolve_accounts(invitees)
+        resolved = self._resolve_employees(invitees)
         result, created = self.store.create_ai_task(
             title=title,
             brief=brief,
@@ -366,7 +367,7 @@ class CollaborationService:
             members=[item.member for item in resolved],
             source_kind=context.source_kind,
             source_provider=context.source_provider,
-            source_account_id=context.source_account_id,
+            source_connector_account_id=context.source_connector_account_id,
             source_binding_id=context.source_binding_id,
             source_conversation_id=context.source_conversation_id,
             source_thread_id=context.source_thread_id,
@@ -380,11 +381,11 @@ class CollaborationService:
         )
         active = self.store.active_memberships(result["group_id"])
         policies = {
-            creator.member.account_id: creator,
-            **{item.member.account_id: item for item in resolved},
+            creator.member.employee_id: creator,
+            **{item.member.employee_id: item for item in resolved},
         }
         for membership in active:
-            item = policies[membership.account_id]
+            item = policies[membership.employee_id]
             self.ensure_member_session(
                 membership=membership,
                 employee_policy=collaboration_member_policy(
@@ -398,11 +399,11 @@ class CollaborationService:
             self.dispatch_internal_group_round(
                 context=CollaborationAgentContext(
                     service=self,
-                    creator_account_id=context.creator_account_id,
+                    creator_employee_id=context.creator_employee_id,
                     source_kind=context.source_kind,
                     source_conversation_id=context.source_conversation_id,
                     source_provider=context.source_provider,
-                    source_account_id=context.source_account_id,
+                    source_connector_account_id=context.source_connector_account_id,
                     source_binding_id=context.source_binding_id,
                     source_thread_id=context.source_thread_id,
                     source_session_id=context.source_session_id,
@@ -415,7 +416,7 @@ class CollaborationService:
                     role="coordinator",
                 ),
                 instruction=brief,
-                target_account_ids=targets,
+                target_employee_ids=targets,
                 attachment_ids=tuple(result["allowed_attachment_ids"]),
                 idempotency_key=f"{idempotency_key}:round:1",
             )
@@ -433,7 +434,7 @@ class CollaborationService:
         *,
         context: CollaborationAgentContext,
         instruction: str,
-        target_account_ids: Iterable[str],
+        target_employee_ids: Iterable[str],
         attachment_ids: Iterable[str],
         idempotency_key: str,
         tool_call_id: str | None = None,
@@ -443,21 +444,21 @@ class CollaborationService:
         task = self.store.ai_task(str(context.task_id or ""))
         self._require_task_creator(task, context)
         self._recheck_creator_authorization(task)
-        target_accounts = tuple(
-            dict.fromkeys(self._account_id(value) for value in target_account_ids)
+        target_employees = tuple(
+            dict.fromkeys(self._employee_id(value) for value in target_employee_ids)
         )
         memberships = {
-            item.account_id: item for item in self.store.active_memberships(task["group_id"])
+            item.employee_id: item for item in self.store.active_memberships(task["group_id"])
         }
-        if not target_accounts or not set(target_accounts) <= set(memberships):
+        if not target_employees or not set(target_employees) <= set(memberships):
             raise RuntimeError("collaboration target is not an active member")
         selected = tuple(dict.fromkeys(str(value or "").strip() for value in attachment_ids))
         if any(not value for value in selected) or not set(selected) <= set(task["allowed_attachment_ids"]):
             raise RuntimeError("collaboration attachment is not allowed for this task")
-        for account_id in target_accounts:
-            membership = memberships[account_id]
+        for employee_id in target_employees:
+            membership = memberships[employee_id]
             resolved = self.resolver.resolve_pinned(
-                account_id=membership.account_id,
+                employee_id=membership.employee_id,
                 profile_revision=membership.profile_revision,
                 profile_fingerprint=membership.profile_fingerprint,
             )
@@ -466,7 +467,7 @@ class CollaborationService:
         submitted, next_round, created = self.store.dispatch_ai_round(
             task["task_id"],
             instruction=instruction,
-            target_account_ids=target_accounts,
+            target_employee_ids=target_employees,
             attachment_ids=selected,
             idempotency_key=idempotency_key,
         )
@@ -524,12 +525,12 @@ class CollaborationService:
 
     @staticmethod
     def _require_task_creator(task: dict[str, Any], context: CollaborationAgentContext) -> None:
-        if task["creator_account_id"] != context.creator_account_id or task["task_id"] != context.task_id:
+        if task["creator_employee_id"] != context.creator_employee_id or task["task_id"] != context.task_id:
             raise RuntimeError("collaboration task creator is inconsistent")
 
     def _recheck_creator_authorization(self, task: dict[str, Any]) -> None:
         resolved = self.resolver.resolve_pinned(
-            account_id=str(task["creator_account_id"]),
+            employee_id=str(task["creator_employee_id"]),
             profile_revision=int(task["creator_profile_revision"]),
             profile_fingerprint=str(task["creator_profile_fingerprint"]),
         )
@@ -582,21 +583,21 @@ class CollaborationService:
             raise RuntimeError("collaboration scheduler is unavailable")
         return {"target": self.scheduler.interrupt(target_id)}
 
-    def _resolve_accounts(self, account_ids: Iterable[str]):
+    def _resolve_employees(self, employee_ids: Iterable[str]):
         resolved = []
-        for account_id in dict.fromkeys(self._account_id(value) for value in account_ids):
-            item = self.resolver.resolve_current(account_id)
+        for employee_id in dict.fromkeys(self._employee_id(value) for value in employee_ids):
+            item = self.resolver.resolve_current(employee_id)
             if not item.may_participate:
                 raise RuntimeError("collaboration participation is revoked")
             resolved.append(item)
         return tuple(resolved)
 
     @staticmethod
-    def _account_id(value: Any) -> str:
-        account_id = str(value or "").strip()
-        if not account_id:
-            raise ValueError("account ID is required")
-        return account_id
+    def _employee_id(value: Any) -> str:
+        employee_id = str(value or "").strip()
+        if not employee_id:
+            raise ValueError("employee ID is required")
+        return employee_id
 
     @classmethod
     def _public_snapshot(cls, snapshot: dict[str, Any]) -> dict[str, Any]:

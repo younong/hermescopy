@@ -39,11 +39,11 @@ describe("collaboration API", () => {
       ["collaboration.groups.list", { include_archived: true }],
       ["collaboration.group.get", { after_sequence: 12, group_id: "group-a" }],
       ["collaboration.group.create", {
-        account_ids: ["account-b", "account-a"],
+        employee_ids: ["account-b", "account-a"],
         client_idempotency_key: "create-key",
         name: "Research",
       }],
-      ["collaboration.members.update", { account_ids: ["account-a"], group_id: "group-a" }],
+      ["collaboration.members.update", { employee_ids: ["account-a"], group_id: "group-a" }],
       ["collaboration.message.submit", {
         attachment_ids: ["attachment-a"],
         client_idempotency_key: "client-key",

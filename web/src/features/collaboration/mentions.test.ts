@@ -5,7 +5,7 @@ import type { CollaborationMembership } from "./types";
 
 const memberships: CollaborationMembership[] = [
   {
-    account_id: "account-a",
+    employee_id: "account-a",
     created_at: 1,
     group_id: "group-a",
     join_sequence: 1,
@@ -17,7 +17,7 @@ const memberships: CollaborationMembership[] = [
     role: "Researcher",
   },
   {
-    account_id: "account-b",
+    employee_id: "account-b",
     created_at: 1,
     group_id: "group-a",
     join_sequence: 1,
