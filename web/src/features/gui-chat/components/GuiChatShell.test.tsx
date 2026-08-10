@@ -30,8 +30,8 @@ const mocks = vi.hoisted(() => ({
   getEmptySessionsCount: vi.fn(),
   getSessionStats: vi.fn(),
   getMessagingPlatforms: vi.fn(),
-  getFeishuEmployees: vi.fn(),
-  getFeishuEmployeeCatalog: vi.fn(),
+  getEmployees: vi.fn(),
+  getEmployeeCatalog: vi.fn(),
 }));
 
 vi.mock("@/lib/api", async (importOriginal) => {
@@ -50,8 +50,8 @@ vi.mock("@/lib/api", async (importOriginal) => {
       getEmptySessionsCount: mocks.getEmptySessionsCount,
       getSessionStats: mocks.getSessionStats,
       getMessagingPlatforms: mocks.getMessagingPlatforms,
-      getFeishuEmployees: mocks.getFeishuEmployees,
-      getFeishuEmployeeCatalog: mocks.getFeishuEmployeeCatalog,
+      getEmployees: mocks.getEmployees,
+      getEmployeeCatalog: mocks.getEmployeeCatalog,
       logout: mocks.logout,
     },
   };
@@ -284,10 +284,10 @@ beforeEach(() => {
     next_action: "continue_in_wechat",
   });
   mocks.getMessagingPlatforms.mockReset();
-  mocks.getFeishuEmployees.mockReset();
-  mocks.getFeishuEmployees.mockResolvedValue({ employees: [] });
-  mocks.getFeishuEmployeeCatalog.mockReset();
-  mocks.getFeishuEmployeeCatalog.mockResolvedValue({
+  mocks.getEmployees.mockReset();
+  mocks.getEmployees.mockResolvedValue({ employees: [] });
+  mocks.getEmployeeCatalog.mockReset();
+  mocks.getEmployeeCatalog.mockResolvedValue({
     knowledge_roots: [],
     mcp_servers: [],
     model_registrations: [],
@@ -383,7 +383,7 @@ describe("GuiChatShell", () => {
     const connection = createConnection();
     mocks.getAuthMe.mockResolvedValue(authIdentity());
     mocks.connectGuiChat.mockReturnValue(connection);
-    mocks.getFeishuEmployees.mockRejectedValue(new Error("Unavailable"));
+    mocks.getEmployees.mockRejectedValue(new Error("Unavailable"));
 
     await renderShell(<GuiChatShell />);
 
@@ -395,21 +395,21 @@ describe("GuiChatShell", () => {
     );
   });
 
-  it("starts a managed employee direct chat with only its account identifier", async () => {
+  it("starts an active employee direct chat even when group participation is disabled", async () => {
     const connection = createConnection();
     mocks.getAuthMe.mockResolvedValue(authIdentity());
     mocks.connectGuiChat.mockReturnValue(connection);
-    mocks.getFeishuEmployees.mockResolvedValue({
+    mocks.getEmployees.mockResolvedValue({
       employees: [
         {
-          account_id: "employee-a",
-          app_id: "app-a",
+          employee_id: "employee-a",
+          avatar_url: null,
+          channels: {},
           collaboration_policy: {
             invite_quota: 5,
             may_create_groups: true,
-            may_participate: true,
+            may_participate: false,
           },
-          credential_version: 1,
           lifecycle_status: "active",
           profile: {
             knowledge_relative_paths: [],
@@ -425,7 +425,6 @@ describe("GuiChatShell", () => {
           },
           profile_fingerprint: "sha256:pinned",
           profile_revision: 3,
-          runtime_state: "running",
         },
       ],
     });
@@ -445,7 +444,7 @@ describe("GuiChatShell", () => {
       expect.any(Number),
       expect.any(AbortSignal),
       undefined,
-      { employeeAccountId: "employee-a" },
+      { employeeId: "employee-a" },
     );
   });
 
@@ -469,19 +468,19 @@ describe("GuiChatShell", () => {
     const robotsPane = document.querySelector("[data-robots-pane]");
     expect(robotsPane).not.toBeNull();
     expect(robotsPane?.getAttribute("data-theme")).toBe("chat-workspace");
-    expect(document.body.textContent).toContain("AI employees");
+    expect(document.body.textContent).toContain("Employees");
     expect(
       robotsPane?.querySelector("button.gui-chat-workspace-primary-button")
         ?.textContent,
     ).toBe("Add employee");
-    expect(robotsPane?.querySelector(".gui-chat-skill-switch")?.getAttribute("role"))
-      .toBe("switch");
+    expect(robotsPane?.querySelector("[data-employee-management-pane]")).not.toBeNull();
     expect(document.querySelector("[data-composer-send]")).toBeNull();
     expect(
       document.querySelector<HTMLButtonElement>('[aria-label="员工管理"]')
         ?.getAttribute("aria-current"),
     ).toBe("page");
     expect(mocks.getMessagingPlatforms).not.toHaveBeenCalled();
+    expect(mocks.getEmployeeCatalog).toHaveBeenCalled();
   });
 
   it("opens message statistics inside the dedicated workspace", async () => {

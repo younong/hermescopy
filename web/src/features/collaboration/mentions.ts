@@ -20,13 +20,13 @@ export function normalizeMentionSelection(
 export function recipientLabel(
   selection: MentionSelection,
   membershipsById: Record<string, CollaborationMembership>,
-  accountName: (accountId: string) => string,
+  employeeName: (employeeId: string) => string,
 ): string {
   if (selection.mentionAll) return "@all";
   if (selection.membershipIds.length === 0) return "No recipients · background only";
   return selection.membershipIds
     .map((id) => membershipsById[id])
     .filter(Boolean)
-    .map((member) => `@${accountName(member.account_id)}`)
+    .map((member) => `@${employeeName(member.employee_id)}`)
     .join(", ");
 }

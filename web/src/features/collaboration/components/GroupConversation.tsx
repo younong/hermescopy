@@ -14,9 +14,9 @@ interface GroupConversationProps {
 
 export function GroupConversation({ employees, onApproval, onStop, state }: GroupConversationProps) {
   const endRef = useRef<HTMLDivElement>(null);
-  const accountName = useMemo(() => {
-    const names = new Map(employees.map((employee) => [employee.accountId, employee.name]));
-    return (accountId: string | null | undefined) => accountId ? names.get(accountId) ?? "Former employee" : "Hermes";
+  const employeeName = useMemo(() => {
+    const names = new Map(employees.map((employee) => [employee.employeeId, employee.name]));
+    return (employeeId: string | null | undefined) => employeeId ? names.get(employeeId) ?? "Former employee" : "Hermes";
   }, [employees]);
   const events = useMemo(
     () => Object.values(state.eventsBySequence).sort((a, b) => a.sequence - b.sequence),
@@ -94,7 +94,7 @@ export function GroupConversation({ employees, onApproval, onStop, state }: Grou
           const text = typeof event.body.text === "string" ? event.body.text : "";
           const attachments = attachmentsByEvent.get(event.event_id) ?? [];
           const targets = targetsByEvent.get(event.event_id) ?? [];
-          const speaker = owner ? "You" : accountName(event.actor_account_id);
+          const speaker = owner ? "You" : employeeName(event.actor_employee_id);
           return (
             <article className={owner ? "ml-auto max-w-[85%]" : "max-w-[92%]"} key={event.event_id}>
               <div className={`mb-1.5 flex items-center gap-2 text-[11px] ${owner ? "justify-end" : ""}`}>
@@ -113,7 +113,7 @@ export function GroupConversation({ employees, onApproval, onStop, state }: Grou
               {targets.length > 0 ? (
                 <div className={`${owner ? "mt-3" : "ml-8 mt-3"} grid gap-2 sm:grid-cols-2`}>
                   {targets.map((target) => (
-                    <TargetCard accountName={accountName} key={target.target_id} onStop={onStop} state={state} target={target} />
+                    <TargetCard employeeName={employeeName} key={target.target_id} onStop={onStop} state={state} target={target} />
                   ))}
                 </div>
               ) : null}
@@ -141,7 +141,7 @@ export function GroupConversation({ employees, onApproval, onStop, state }: Grou
   );
 }
 
-function TargetCard({ accountName, onStop, state, target }: { accountName(accountId: string): string; onStop(targetId: string): void; state: CollaborationState; target: CollaborationTarget }) {
+function TargetCard({ employeeName, onStop, state, target }: { employeeName(employeeId: string): string; onStop(targetId: string): void; state: CollaborationState; target: CollaborationTarget }) {
   const streamed = state.executionsById[target.execution_id] ?? "";
   const finalText = targetResultText(target);
   const status = targetStatus(target.status);
@@ -149,7 +149,7 @@ function TargetCard({ accountName, onStop, state, target }: { accountName(accoun
   return (
     <div className="rounded-xl border border-[#e4e6ea] bg-[#fafbfc] p-3">
       <div className="flex items-center justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-2"><SpeakerAvatar name={accountName(target.account_id)} small /><span className="truncate text-[11px] font-semibold">{accountName(target.account_id)}</span></div>
+        <div className="flex min-w-0 items-center gap-2"><SpeakerAvatar name={employeeName(target.employee_id)} small /><span className="truncate text-[11px] font-semibold">{employeeName(target.employee_id)}</span></div>
         <span className={`inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide ${status.className}`}><Icon className={`h-3 w-3 ${target.status === "running" ? "animate-spin" : ""}`} />{target.status.replace("_", " ")}</span>
       </div>
       {(streamed || finalText) ? <div className="mt-2 max-h-40 overflow-auto text-xs leading-5 text-[#44484f]"><Markdown content={streamed || finalText} /></div> : null}

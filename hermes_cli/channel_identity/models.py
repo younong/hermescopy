@@ -1,4 +1,4 @@
-"""Control Plane channel identity records."""
+"""Control Plane channel identity and employee records."""
 
 from __future__ import annotations
 
@@ -40,29 +40,39 @@ class ResolvedConnectorAccount:
 
 @dataclass(frozen=True)
 class EmployeeCollaborationPolicy:
-    account_id: str
+    employee_id: str
     may_participate: bool = True
     may_create_groups: bool = False
     invite_quota: int | None = 5
 
 
 @dataclass(frozen=True)
-class ManagedFeishuAccount:
-    account_id: str
-    canonical_user_id: str
-    owner_key: str
+class EmployeeChannelBinding:
+    binding_id: str
+    employee_id: str
+    provider: str
+    connector_account_id: str
     provider_account_id: str
     credential_version: int
     account_status: str
     lifecycle_status: str
+
+
+@dataclass(frozen=True)
+class Employee:
+    employee_id: str
+    canonical_user_id: str
+    owner_key: str
+    lifecycle_status: str
     profile_revision: int | None
     profile_fingerprint: str | None
     collaboration_policy: EmployeeCollaborationPolicy
+    feishu_binding: EmployeeChannelBinding | None
 
 
 @dataclass(frozen=True)
 class EmployeeProfile:
-    account_id: str
+    employee_id: str
     revision: int
     fingerprint: str
     lifecycle_status: str

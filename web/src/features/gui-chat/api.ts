@@ -21,7 +21,7 @@ export interface ConnectGuiChatOptions {
 }
 
 export interface GuiChatCreateOptions {
-  employeeAccountId?: string;
+  employeeId?: string;
 }
 
 export interface GuiChatSwitchTiming extends GatewayConnectTiming {
@@ -234,9 +234,7 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
         {
           ...baseParams(timing),
           switch_generation: generation,
-          ...(createOptions?.employeeAccountId
-            ? { employee_account_id: createOptions.employeeAccountId }
-            : {}),
+          ...(createOptions?.employeeId ? { employee_id: createOptions.employeeId } : {}),
         },
         undefined,
         signal,

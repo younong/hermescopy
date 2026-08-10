@@ -1,4 +1,4 @@
-"""Private image storage for managed Feishu employee avatars."""
+"""Private image storage for owner-scoped employee avatars."""
 
 from __future__ import annotations
 
@@ -33,13 +33,13 @@ def _avatar_directory(store: ChannelIdentityStore) -> Path:
     return directory
 
 
-def employee_avatar_path(store: ChannelIdentityStore, account_id: str) -> Path:
-    digest = hashlib.sha256(str(account_id).encode("utf-8")).hexdigest()
+def employee_avatar_path(store: ChannelIdentityStore, employee_id: str) -> Path:
+    digest = hashlib.sha256(str(employee_id).encode("utf-8")).hexdigest()
     return _avatar_directory(store) / f"{digest}.webp"
 
 
-def employee_avatar_exists(store: ChannelIdentityStore, account_id: str) -> bool:
-    target = employee_avatar_path(store, account_id)
+def employee_avatar_exists(store: ChannelIdentityStore, employee_id: str) -> bool:
+    target = employee_avatar_path(store, employee_id)
     return target.is_file() and not target.is_symlink()
 
 
@@ -77,11 +77,11 @@ def normalize_employee_avatar(data: bytes) -> bytes:
 
 def save_employee_avatar(
     store: ChannelIdentityStore,
-    account_id: str,
+    employee_id: str,
     data: bytes,
 ) -> Path:
     normalized = normalize_employee_avatar(data)
-    target = employee_avatar_path(store, account_id)
+    target = employee_avatar_path(store, employee_id)
     fd, temporary_name = tempfile.mkstemp(prefix=".avatar-", dir=target.parent)
     temporary = Path(temporary_name)
     try:
@@ -99,8 +99,8 @@ def save_employee_avatar(
     return target
 
 
-def delete_employee_avatar(store: ChannelIdentityStore, account_id: str) -> bool:
-    target = employee_avatar_path(store, account_id)
+def delete_employee_avatar(store: ChannelIdentityStore, employee_id: str) -> bool:
+    target = employee_avatar_path(store, employee_id)
     if target.is_symlink():
         raise RuntimeError("employee avatar must be a regular file")
     try:

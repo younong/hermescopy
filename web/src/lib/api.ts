@@ -781,83 +781,93 @@ export const api = {
       `/api/messaging/platforms/${encodeURIComponent(id)}/test`,
       { method: "POST" },
     ),
-  getFeishuEmployeeCatalog: () =>
-    fetchJSON<FeishuEmployeeCatalog>("/api/messaging/feishu/catalog"),
-  getFeishuEmployees: () =>
-    fetchJSON<{ employees: FeishuEmployee[] }>("/api/messaging/feishu/employees"),
-  uploadFeishuEmployeeAvatar: (accountId: string, file: File) => {
-    const form = new FormData();
-    form.append("file", file, file.name);
-    return fetchJSON<{ avatar_url: string }>(
-      `/api/messaging/feishu/employees/${encodeURIComponent(accountId)}/avatar`,
-      { method: "PUT", body: form },
-    );
-  },
-  deleteFeishuEmployeeAvatar: (accountId: string) =>
-    fetchJSON<{ ok: boolean; deleted: boolean }>(
-      `/api/messaging/feishu/employees/${encodeURIComponent(accountId)}/avatar`,
-      { method: "DELETE" },
-    ),
-  createFeishuEmployee: (body: FeishuEmployeeCreate) =>
-    fetchJSON<FeishuEmployee>("/api/messaging/feishu/employees", {
+  getEmployeeCatalog: () => fetchJSON<EmployeeCatalog>("/api/employees/catalog"),
+  getEmployees: () => fetchJSON<{ employees: Employee[] }>("/api/employees"),
+  createEmployee: (body: EmployeeCreate) =>
+    fetchJSON<Employee>("/api/employees", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
-  updateFeishuEmployeeCollaborationPolicy: (
-    accountId: string,
-    body: FeishuEmployeeCollaborationPolicy,
+  updateEmployeeProfile: (
+    employeeId: string,
+    body: { expected_revision: number; profile: EmployeePolicy },
   ) =>
-    fetchJSON<FeishuEmployee>(
-      `/api/messaging/feishu/employees/${encodeURIComponent(accountId)}/collaboration-policy`,
+    fetchJSON<Employee>(`/api/employees/${encodeURIComponent(employeeId)}/profile`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  updateEmployeeCollaborationPolicy: (
+    employeeId: string,
+    body: EmployeeCollaborationPolicy,
+  ) =>
+    fetchJSON<Employee>(
+      `/api/employees/${encodeURIComponent(employeeId)}/collaboration-policy`,
       {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       },
     ),
-  updateFeishuEmployeeProfile: (
-    accountId: string,
-    body: { expected_revision: number; profile: FeishuEmployeePolicy },
-  ) =>
-    fetchJSON<FeishuEmployee>(
-      `/api/messaging/feishu/employees/${encodeURIComponent(accountId)}/profile`,
-      {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      },
-    ),
-  rotateFeishuEmployeeCredentials: (
-    accountId: string,
-    body: FeishuCredentialRotate,
-  ) =>
-    fetchJSON<FeishuEmployee>(
-      `/api/messaging/feishu/employees/${encodeURIComponent(accountId)}/credentials`,
-      {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      },
-    ),
-  testFeishuEmployee: (accountId: string) =>
-    fetchJSON<FeishuEmployeeTestResult>(
-      `/api/messaging/feishu/employees/${encodeURIComponent(accountId)}/test`,
+  updateEmployeeLifecycle: (employeeId: string, status: EmployeeLifecycleStatus) =>
+    fetchJSON<Employee>(`/api/employees/${encodeURIComponent(employeeId)}/lifecycle`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status }),
+    }),
+  rolloverEmployeeSessions: (employeeId: string) =>
+    fetchJSON<{ ok: boolean; retired_sessions: number }>(
+      `/api/employees/${encodeURIComponent(employeeId)}/rollover`,
       { method: "POST" },
     ),
-  updateFeishuEmployeeLifecycle: (accountId: string, status: FeishuLifecycleStatus) =>
-    fetchJSON<FeishuEmployee>(
-      `/api/messaging/feishu/employees/${encodeURIComponent(accountId)}/lifecycle`,
+  uploadEmployeeAvatar: (employeeId: string, file: File) => {
+    const form = new FormData();
+    form.append("file", file, file.name);
+    return fetchJSON<{ avatar_url: string }>(
+      `/api/employees/${encodeURIComponent(employeeId)}/avatar`,
+      { method: "PUT", body: form },
+    );
+  },
+  deleteEmployeeAvatar: (employeeId: string) =>
+    fetchJSON<{ ok: boolean; deleted: boolean }>(
+      `/api/employees/${encodeURIComponent(employeeId)}/avatar`,
+      { method: "DELETE" },
+    ),
+  createEmployeeFeishuBinding: (employeeId: string, body: EmployeeFeishuBindingCreate) =>
+    fetchJSON<Employee>(`/api/employees/${encodeURIComponent(employeeId)}/channels/feishu`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  updateEmployeeFeishuBinding: (
+    employeeId: string,
+    body: EmployeeFeishuBindingCredentialUpdate,
+  ) =>
+    fetchJSON<Employee>(
+      `/api/employees/${encodeURIComponent(employeeId)}/channels/feishu/credentials`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
+  testEmployeeFeishuBinding: (employeeId: string) =>
+    fetchJSON<EmployeeFeishuBindingTestResult>(
+      `/api/employees/${encodeURIComponent(employeeId)}/channels/feishu/test`,
+      { method: "POST" },
+    ),
+  updateEmployeeFeishuBindingLifecycle: (
+    employeeId: string,
+    status: EmployeeLifecycleStatus,
+  ) =>
+    fetchJSON<Employee>(
+      `/api/employees/${encodeURIComponent(employeeId)}/channels/feishu/lifecycle`,
       {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ status }),
       },
-    ),
-  rolloverFeishuEmployeeSessions: (accountId: string) =>
-    fetchJSON<{ ok: boolean; retired_sessions: number }>(
-      `/api/messaging/feishu/employees/${encodeURIComponent(accountId)}/rollover`,
-      { method: "POST" },
     ),
   // Update actions
   updateHermes: () =>
@@ -1507,9 +1517,9 @@ export interface MessagingPlatformTestResult {
   message: string;
 }
 
-export type FeishuLifecycleStatus = "active" | "suspended" | "revoked";
+export type EmployeeLifecycleStatus = "active" | "suspended" | "revoked";
 
-export interface FeishuEmployeePolicy {
+export interface EmployeePolicy {
   schema_version: 1;
   name?: string;
   role?: string;
@@ -1521,29 +1531,36 @@ export interface FeishuEmployeePolicy {
   workspace_relative_path: string;
   knowledge_relative_paths: string[];
   max_iterations: number;
-  max_tokens?: number;
+  max_tokens?: number | null;
 }
 
-export interface FeishuEmployeeCollaborationPolicy {
+export interface EmployeeCollaborationPolicy {
   may_participate: boolean;
   may_create_groups: boolean;
   invite_quota: number | null;
 }
 
-export interface FeishuEmployee {
-  account_id: string;
+export interface EmployeeChannelBinding {
+  binding_id: string;
+  connector_account_id: string;
   app_id: string;
-  avatar_url: string | null;
   credential_version: number;
-  lifecycle_status: FeishuLifecycleStatus;
+  lifecycle_status: EmployeeLifecycleStatus;
   runtime_state: string;
-  profile_revision: number | null;
-  profile_fingerprint: string | null;
-  profile: FeishuEmployeePolicy | null;
-  collaboration_policy: FeishuEmployeeCollaborationPolicy;
 }
 
-export interface FeishuEmployeeCatalog {
+export interface Employee {
+  employee_id: string;
+  avatar_url: string | null;
+  lifecycle_status: EmployeeLifecycleStatus;
+  profile_revision: number | null;
+  profile_fingerprint: string | null;
+  profile: EmployeePolicy | null;
+  collaboration_policy: EmployeeCollaborationPolicy;
+  channels: Record<string, EmployeeChannelBinding | undefined>;
+}
+
+export interface EmployeeCatalog {
   model_registrations: Array<{ id: string; name: string; provider?: string; model?: string }>;
   toolsets: Array<{ name: string; description: string }>;
   skills: Array<{ name: string; description: string }>;
@@ -1552,24 +1569,28 @@ export interface FeishuEmployeeCatalog {
   knowledge_roots: Array<{ id: string; relative_path: string }>;
 }
 
-export interface FeishuEmployeeCreate {
+export interface EmployeeCreate {
+  profile: EmployeePolicy;
+  activate?: boolean;
+}
+
+export interface EmployeeFeishuBindingCreate {
   app_id: string;
   app_secret: string;
   domain: "feishu" | "lark";
   encrypt_key?: string;
   verification_token?: string;
-  profile: FeishuEmployeePolicy;
-  activate: boolean;
+  activate?: boolean;
 }
 
-export interface FeishuCredentialRotate {
+export interface EmployeeFeishuBindingCredentialUpdate {
   expected_credential_version: number;
   app_secret: string;
   encrypt_key?: string;
   verification_token?: string;
 }
 
-export interface FeishuEmployeeTestResult {
+export interface EmployeeFeishuBindingTestResult {
   ok: boolean;
   state: string;
   bot_name?: string | null;

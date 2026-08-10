@@ -20,7 +20,7 @@ class _Supervisor:
 
 
 @pytest.mark.anyio
-async def test_disabled_configuration_initializes_control_plane_store(
+async def test_empty_configuration_initializes_control_plane_store(
     monkeypatch,
     tmp_path,
 ):
@@ -35,7 +35,7 @@ async def test_disabled_configuration_initializes_control_plane_store(
     monkeypatch.setattr(connector_bootstrap, "ChannelIdentityStore", create_store)
 
     runtime = await connector_bootstrap.bootstrap_channel_connectors(
-        {"webhook": {"enabled": False}},
+        {},
         auth_required=True,
         supervisor=_Supervisor(tmp_path),
     )

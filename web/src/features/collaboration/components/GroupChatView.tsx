@@ -1,6 +1,6 @@
 import { Archive, RefreshCw, UserRoundCog } from "lucide-react";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
-import type { FeishuEmployee } from "@/lib/api";
+import type { Employee } from "@/lib/api";
 import type { CollaborationApi } from "../api";
 import { collaborationReducer } from "../reducer";
 import { initialCollaborationState, type CollaborationApprovalChoice, type CollaborationEmployeeIdentity } from "../types";
@@ -11,7 +11,7 @@ import { MemberManager } from "./MemberManager";
 interface GroupChatViewProps {
   api: CollaborationApi;
   connection: typeof initialCollaborationState.connection;
-  employees: FeishuEmployee[];
+  employees: Employee[];
   groupId: string;
   onArchive(groupId: string): Promise<void>;
   onGroupChanged(): void;
@@ -70,15 +70,15 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
 
   const identities: CollaborationEmployeeIdentity[] = useMemo(
     () => employees.map((employee) => ({
-      accountId: employee.account_id,
+      employeeId: employee.employee_id,
       available: employee.lifecycle_status === "active" && employee.collaboration_policy.may_participate,
-      name: employee.profile?.name || employee.app_id,
+      name: employee.profile?.name || "Unnamed employee",
       role: employee.profile?.role,
     })),
     [employees],
   );
-  const accountName = useCallback((accountId: string) =>
-    identities.find((employee) => employee.accountId === accountId)?.name ?? "Former employee", [identities]);
+  const employeeName = useCallback((employeeId: string) =>
+    identities.find((employee) => employee.employeeId === employeeId)?.name ?? "Former employee", [identities]);
   const memberships = Object.values(state.membershipsById);
 
   const submit = async ({ attachments, selection, text }: GroupComposerSubmit) => {
@@ -114,8 +114,8 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
           employees={employees}
           memberships={memberships}
           onClose={() => setMemberManagerOpen(false)}
-          onSave={async (accountIds) => {
-            const snapshot = await api.updateMembers(groupId, accountIds);
+          onSave={async (employeeIds) => {
+            const snapshot = await api.updateMembers(groupId, employeeIds);
             dispatch({ type: "snapshot", snapshot });
             setMemberManagerOpen(false);
             onGroupChanged();
@@ -134,7 +134,7 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
       {state.error ? <div className="gui-chat-notice gui-chat-notice-error">{state.error}</div> : null}
       <GroupConversation employees={identities} onApproval={respondToApproval} onStop={stopTarget} state={state} />
       <GroupComposer
-        accountName={accountName}
+        employeeName={employeeName}
         archived={state.group?.status === "archived"}
         disabled={connection !== "open" || state.loading}
         memberships={memberships}

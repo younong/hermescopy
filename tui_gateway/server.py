@@ -2197,8 +2197,8 @@ def _ensure_session_db_row(session: dict) -> None:
         and collaboration_context is not None
         and getattr(collaboration_context, "source_kind", None) == "web_direct"
     ):
-        model_config[_WEB_DIRECT_EMPLOYEE_ACCOUNT_CONFIG_KEY] = str(
-            employee_policy["account_id"]
+        model_config[_WEB_DIRECT_EMPLOYEE_CONFIG_KEY] = str(
+            employee_policy["employee_id"]
         )
     elif (
         employee_policy
@@ -2208,7 +2208,8 @@ def _ensure_session_db_row(session: dict) -> None:
         model_config[_FEISHU_DIRECT_SOURCE_CONFIG_KEY] = {
             "provider": "feishu",
             "source_kind": "feishu_direct",
-            "account_id": collaboration_context.source_account_id,
+            "employee_id": employee_policy["employee_id"],
+            "connector_account_id": collaboration_context.source_connector_account_id,
             "binding_id": collaboration_context.source_binding_id,
             "conversation_id": collaboration_context.source_conversation_id,
             "thread_id": collaboration_context.source_thread_id,
@@ -2732,14 +2733,14 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     employee_policy = model_config.get(_EMPLOYEE_POLICY_CONFIG_KEY)
     if isinstance(employee_policy, dict):
         overrides["employee_policy"] = employee_policy
-    direct_employee_account_id = str(
-        model_config.get(_WEB_DIRECT_EMPLOYEE_ACCOUNT_CONFIG_KEY) or ""
+    direct_employee_id = str(
+        model_config.get(_WEB_DIRECT_EMPLOYEE_CONFIG_KEY) or ""
     ).strip()
-    if direct_employee_account_id:
+    if direct_employee_id:
         if (
             not isinstance(employee_policy, dict)
-            or str(employee_policy.get("account_id") or "").strip()
-            != direct_employee_account_id
+            or str(employee_policy.get("employee_id") or "").strip()
+            != direct_employee_id
         ):
             raise RuntimeError("web direct employee session identity is inconsistent")
         session_key = str(row.get("id") or "").strip()
@@ -2752,15 +2753,18 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         )
     retained_source = model_config.get(_FEISHU_DIRECT_SOURCE_CONFIG_KEY)
     if retained_source is not None:
-        if direct_employee_account_id or not isinstance(employee_policy, dict):
+        if direct_employee_id or not isinstance(employee_policy, dict):
             raise RuntimeError("retained Feishu employee session identity is inconsistent")
         if not isinstance(retained_source, dict) or set(retained_source) != {
-            "provider", "source_kind", "account_id", "binding_id",
-            "conversation_id", "thread_id", "source_session_id",
+            "provider", "source_kind", "employee_id", "connector_account_id",
+            "binding_id", "conversation_id", "thread_id", "source_session_id",
         }:
             raise RuntimeError("retained Feishu source identity is invalid")
         service = _collaboration_service()
-        account_id = str(retained_source["account_id"] or "").strip()
+        employee_id = str(retained_source["employee_id"] or "").strip()
+        connector_account_id = str(
+            retained_source["connector_account_id"] or ""
+        ).strip()
         binding_id = str(retained_source["binding_id"] or "").strip()
         conversation_id = str(retained_source["conversation_id"] or "").strip()
         thread_id = str(retained_source["thread_id"] or "")
@@ -2768,12 +2772,14 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         if (
             retained_source["provider"] != "feishu"
             or retained_source["source_kind"] != "feishu_direct"
-            or account_id != str(employee_policy.get("account_id") or "").strip()
+            or employee_id != str(employee_policy.get("employee_id") or "").strip()
+            or not connector_account_id
             or source_session_id != str(row.get("id") or "").strip()
         ):
             raise RuntimeError("retained Feishu source identity is inconsistent")
         service.resolver.validate_feishu_origin(
-            account_id=account_id,
+            employee_id=employee_id,
+            connector_account_id=connector_account_id,
             binding_id=binding_id,
             conversation_id=conversation_id,
             source_kind="feishu_direct",
@@ -2781,10 +2787,10 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
             dispatch_scope="",
         )
         overrides["collaboration_context"] = service.source_agent_context(
-            creator_account_id=account_id,
+            creator_employee_id=employee_id,
             source_kind="feishu_direct",
             source_provider="feishu",
-            source_account_id=account_id,
+            source_connector_account_id=connector_account_id,
             source_binding_id=binding_id,
             source_conversation_id=conversation_id,
             source_thread_id=thread_id,
@@ -5920,7 +5926,7 @@ def _inflight_snapshot(session: dict) -> dict | None:
 
 
 _EMPLOYEE_POLICY_CONFIG_KEY = "hermes_employee_policy"
-_WEB_DIRECT_EMPLOYEE_ACCOUNT_CONFIG_KEY = "hermes_web_direct_employee_account_id"
+_WEB_DIRECT_EMPLOYEE_CONFIG_KEY = "hermes_web_direct_employee_id"
 _FEISHU_DIRECT_SOURCE_CONFIG_KEY = "hermes_feishu_direct_source"
 
 
@@ -5936,7 +5942,7 @@ def _trusted_employee_policy(params: dict) -> tuple[dict | None, str | None]:
     if str(params.get("source") or "").strip() != "feishu":
         return None, "employee policy requires the Feishu retained source"
     if not isinstance(raw, dict) or set(raw) != {
-        "account_id", "profile_revision", "profile_fingerprint", "source_policy"
+        "employee_id", "profile_revision", "profile_fingerprint", "source_policy"
     }:
         return None, "employee policy is invalid"
     try:
@@ -5945,11 +5951,11 @@ def _trusted_employee_policy(params: dict) -> tuple[dict | None, str | None]:
         from hermes_cli.model_registrations import resolve_chat_model_registration
         from toolsets import validate_toolset
 
-        account_id = str(raw.get("account_id") or "").strip()
+        employee_id = str(raw.get("employee_id") or "").strip()
         fingerprint = str(raw.get("profile_fingerprint") or "").strip()
         revision = int(raw.get("profile_revision"))
         source_policy = normalize_employee_source_policy(raw.get("source_policy"))
-        if not account_id or not fingerprint.startswith("sha256:") or revision < 1:
+        if not employee_id or not fingerprint.startswith("sha256:") or revision < 1:
             raise ValueError("identity is invalid")
         for name in source_policy["toolsets"]:
             if not validate_toolset(name):
@@ -5977,7 +5983,7 @@ def _trusted_employee_policy(params: dict) -> tuple[dict | None, str | None]:
         model = resolve_chat_model_registration(source_policy["model_registration_id"])
         snapshot = {
             "schema_version": source_policy["schema_version"],
-            "account_id": account_id,
+            "employee_id": employee_id,
             "profile_revision": revision,
             "source_profile_fingerprint": fingerprint,
             "system_prompt": source_policy["system_prompt"],
@@ -6017,24 +6023,26 @@ def _trusted_retained_collaboration_context(
     if runtime is None:
         return None, "retained collaboration source requires an owner worker runtime"
     required = {
-        "provider", "source_kind", "account_id", "binding_id",
-        "conversation_id", "thread_id", "dispatch_scope",
+        "provider", "source_kind", "employee_id", "connector_account_id",
+        "binding_id", "conversation_id", "thread_id", "dispatch_scope",
     }
     if not isinstance(raw, dict) or set(raw) != required:
         return None, "retained collaboration source is invalid"
     try:
         provider = str(raw["provider"] or "").strip()
         source_kind = str(raw["source_kind"] or "").strip()
-        account_id = str(raw["account_id"] or "").strip()
+        employee_id = str(raw["employee_id"] or "").strip()
+        connector_account_id = str(raw["connector_account_id"] or "").strip()
         binding_id = str(raw["binding_id"] or "").strip()
         conversation_id = str(raw["conversation_id"] or "").strip()
         thread_id = str(raw["thread_id"] or "")
         dispatch_scope = str(raw["dispatch_scope"] or "")
-        if provider != "feishu" or account_id != str(employee_policy["account_id"]):
-            raise RuntimeError("retained Feishu account is inconsistent")
+        if provider != "feishu" or employee_id != str(employee_policy["employee_id"]):
+            raise RuntimeError("retained Feishu employee is inconsistent")
         service = _collaboration_service()
         service.resolver.validate_feishu_origin(
-            account_id=account_id,
+            employee_id=employee_id,
+            connector_account_id=connector_account_id,
             binding_id=binding_id,
             conversation_id=conversation_id,
             source_kind=source_kind,
@@ -6046,10 +6054,10 @@ def _trusted_retained_collaboration_context(
         if source_kind != "feishu_direct":
             raise RuntimeError("retained Feishu source kind is invalid")
         return service.source_agent_context(
-            creator_account_id=account_id,
+            creator_employee_id=employee_id,
             source_kind="feishu_direct",
             source_provider="feishu",
-            source_account_id=account_id,
+            source_connector_account_id=connector_account_id,
             source_binding_id=binding_id,
             source_conversation_id=conversation_id,
             source_thread_id=thread_id,
@@ -6066,12 +6074,12 @@ def _web_direct_employee(
     source: str,
 ) -> tuple[dict | None, Any | None, str | None]:
     """Resolve one browser-selected employee from Owner Worker authority."""
-    raw_account_id = params.get("employee_account_id")
-    if raw_account_id is None:
+    raw_employee_id = params.get("employee_id")
+    if raw_employee_id is None:
         return None, None, None
-    account_id = str(raw_account_id or "").strip()
-    if not account_id:
-        return None, None, "employee account ID is required"
+    employee_id = str(raw_employee_id or "").strip()
+    if not employee_id:
+        return None, None, "employee ID is required"
     if source != "dashboard-gui":
         return None, None, "employee direct chat requires the dashboard GUI source"
     if _dashboard_attach_transport() is None:
@@ -6080,9 +6088,7 @@ def _web_direct_employee(
         return None, None, "employee direct chat requires an owner worker runtime"
     try:
         service = _collaboration_service()
-        resolved = service.resolver.resolve_current(account_id)
-        if not resolved.may_participate:
-            raise RuntimeError("collaboration participation is revoked")
+        resolved = service.resolver.resolve_current(employee_id)
         return resolved.employee_policy, service, None
     except (TypeError, ValueError, RuntimeError) as exc:
         return None, None, str(exc)
@@ -6095,9 +6101,10 @@ def _web_direct_collaboration_context(
     session_key: str,
 ):
     return service.source_agent_context(
-        creator_account_id=str(employee_policy["account_id"]),
+        creator_employee_id=str(employee_policy["employee_id"]),
         source_kind="web_direct",
         source_conversation_id=session_key,
+        require_participation=False,
     )
 
 
@@ -6141,17 +6148,17 @@ def _collaboration_group_get(rid, params: dict) -> dict:
 
 @method("collaboration.group.create")
 def _collaboration_group_create(rid, params: dict) -> dict:
-    required = {"name", "account_ids", "client_idempotency_key"}
+    required = {"name", "employee_ids", "client_idempotency_key"}
     if set(params) != required:
         return _err(rid, -32602, "collaboration group create params are invalid")
-    account_ids = params.get("account_ids", [])
-    if not isinstance(account_ids, list):
-        return _err(rid, -32602, "account_ids must be an array")
+    employee_ids = params.get("employee_ids", [])
+    if not isinstance(employee_ids, list):
+        return _err(rid, -32602, "employee_ids must be an array")
     return _collaboration_call(
         rid,
         lambda service: service.create_group(
             name=str(params.get("name") or ""),
-            account_ids=account_ids,
+            employee_ids=employee_ids,
             client_idempotency_key=str(params.get("client_idempotency_key") or ""),
         ),
     )
@@ -6168,15 +6175,15 @@ def _collaboration_group_archive(rid, params: dict) -> dict:
 
 @method("collaboration.members.update")
 def _collaboration_members_update(rid, params: dict) -> dict:
-    if set(params) != {"group_id", "account_ids"}:
+    if set(params) != {"group_id", "employee_ids"}:
         return _err(rid, -32602, "collaboration member update params are invalid")
-    account_ids = params.get("account_ids")
-    if not isinstance(account_ids, list):
-        return _err(rid, -32602, "account_ids must be an array")
+    employee_ids = params.get("employee_ids")
+    if not isinstance(employee_ids, list):
+        return _err(rid, -32602, "employee_ids must be an array")
     return _collaboration_call(
         rid,
         lambda service: service.update_members(
-            str(params.get("group_id") or ""), account_ids=account_ids
+            str(params.get("group_id") or ""), employee_ids=employee_ids
         ),
     )
 

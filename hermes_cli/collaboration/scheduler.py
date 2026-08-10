@@ -406,7 +406,7 @@ class CollaborationScheduler:
             targets = self.db._conn.execute(
                 "SELECT tt.*, t.group_id FROM collaboration_turn_targets tt "
                 "JOIN collaboration_turns t ON t.turn_id=tt.turn_id "
-                "WHERE tt.turn_id=? ORDER BY tt.created_at, tt.account_id",
+                "WHERE tt.turn_id=? ORDER BY tt.created_at, tt.employee_id",
                 (turn_id,),
             ).fetchall()
         return {
@@ -435,7 +435,7 @@ class CollaborationScheduler:
     def _claim_next(self) -> dict[str, Any] | None:
         with self.db._lock:
             candidate = self.db._conn.execute(
-                "SELECT tt.target_id, tt.account_id, m.profile_revision, "
+                "SELECT tt.target_id, tt.employee_id, m.profile_revision, "
                 "m.profile_fingerprint FROM collaboration_turn_targets tt "
                 "JOIN collaboration_turns t ON t.turn_id=tt.turn_id "
                 "JOIN collaboration_groups g ON g.group_id=t.group_id "
@@ -451,7 +451,7 @@ class CollaborationScheduler:
             return None
         try:
             resolved = self.resolver.resolve_pinned(
-                account_id=str(candidate["account_id"]),
+                employee_id=str(candidate["employee_id"]),
                 profile_revision=int(candidate["profile_revision"]),
                 profile_fingerprint=str(candidate["profile_fingerprint"]),
             )
@@ -704,7 +704,7 @@ class CollaborationScheduler:
         try:
             with self.db._lock:
                 row = self.db._conn.execute(
-                    "SELECT t.*, o.provider, o.account_id AS origin_account_id, o.binding_id, "
+                    "SELECT t.*, o.provider, o.connector_account_id AS origin_connector_account_id, o.binding_id, "
                     "o.conversation_id, o.thread_id, o.source_session_id, o.source_group_id "
                     "FROM collaboration_tasks t "
                     "JOIN collaboration_origins o ON o.group_id=t.group_id "
@@ -725,7 +725,7 @@ class CollaborationScheduler:
             if before_round < 1:
                 raise RuntimeError("creator coordinator source round is invalid")
             resolved = self.resolver.resolve_pinned(
-                account_id=str(row["creator_account_id"]),
+                employee_id=str(row["creator_employee_id"]),
                 profile_revision=int(row["creator_profile_revision"]),
                 profile_fingerprint=str(row["creator_profile_fingerprint"]),
             )
@@ -735,13 +735,13 @@ class CollaborationScheduler:
 
             context = CollaborationAgentContext(
                 service=getattr(self.runner, "service", None),
-                creator_account_id=str(row["creator_account_id"]),
+                creator_employee_id=str(row["creator_employee_id"]),
                 source_kind=str(row["source_kind"]),
                 source_conversation_id=str(row["conversation_id"]),
                 source_provider=str(row["provider"]),
-                source_account_id=(
-                    str(row["origin_account_id"])
-                    if row["origin_account_id"] is not None
+                source_connector_account_id=(
+                    str(row["origin_connector_account_id"])
+                    if row["origin_connector_account_id"] is not None
                     else None
                 ),
                 source_binding_id=(
@@ -867,9 +867,9 @@ class CollaborationScheduler:
     ) -> str:
         with self.db._lock:
             targets = self.db._conn.execute(
-                "SELECT tt.account_id, tt.status, tt.result_json, tt.error "
+                "SELECT tt.employee_id, tt.status, tt.result_json, tt.error "
                 "FROM collaboration_turn_targets tt WHERE tt.turn_id=? "
-                "ORDER BY tt.created_at, tt.account_id",
+                "ORDER BY tt.created_at, tt.employee_id",
                 (turn_id,),
             ).fetchall()
         results = []
@@ -877,7 +877,7 @@ class CollaborationScheduler:
             result = json.loads(str(target["result_json"])) if target["result_json"] else {}
             results.append(
                 {
-                    "account_id": str(target["account_id"]),
+                    "employee_id": str(target["employee_id"]),
                     "status": str(target["status"]),
                     "text": str(result.get("text") or ""),
                     "error": str(target["error"] or ""),
@@ -889,7 +889,7 @@ class CollaborationScheduler:
             f"Round {task['round']} status: {turn_status}\n"
             f"Explicit target results: {json.dumps(results, ensure_ascii=False)}\n\n"
             "Choose exactly one action. To request another round, call "
-            "dispatch_internal_group_round with explicit target account IDs. To complete "
+            "dispatch_internal_group_round with explicit target employee IDs. To complete "
             "the task, call finish_internal_group_task with the final summary for the "
             "trusted web origin. Textual @ references and ordinary response text never "
             "schedule anyone. Do not merely describe the action: call exactly one tool."
@@ -898,7 +898,7 @@ class CollaborationScheduler:
     def _agent_context(self, claimed: dict[str, Any]):
         with self.db._lock:
             task = self.db._conn.execute(
-                "SELECT t.*, o.provider, o.account_id AS origin_account_id, o.binding_id, "
+                "SELECT t.*, o.provider, o.connector_account_id AS origin_connector_account_id, o.binding_id, "
                 "o.conversation_id, o.thread_id, o.source_session_id, o.source_group_id "
                 "FROM collaboration_tasks t "
                 "JOIN collaboration_origins o ON o.group_id=t.group_id "
@@ -925,7 +925,7 @@ class CollaborationScheduler:
                 return None
             return CollaborationAgentContext(
                 service=getattr(self.runner, "service", None),
-                creator_account_id=str(claimed["account_id"]),
+                creator_employee_id=str(claimed["employee_id"]),
                 source_kind="web_group",
                 source_conversation_id=str(claimed["group_id"]),
                 source_group_id=str(claimed["group_id"]),
@@ -939,13 +939,13 @@ class CollaborationScheduler:
             )
         return CollaborationAgentContext(
             service=getattr(self.runner, "service", None),
-            creator_account_id=str(task["creator_account_id"]),
+            creator_employee_id=str(task["creator_employee_id"]),
             source_kind=str(task["source_kind"]),
             source_conversation_id=str(task["conversation_id"]),
             source_provider=str(task["provider"]),
-            source_account_id=(
-                str(task["origin_account_id"])
-                if task["origin_account_id"] is not None
+            source_connector_account_id=(
+                str(task["origin_connector_account_id"])
+                if task["origin_connector_account_id"] is not None
                 else None
             ),
             source_binding_id=(
@@ -989,7 +989,7 @@ class CollaborationScheduler:
         snapshot = int(claimed["snapshot_sequence"])
         with self.db._lock:
             rows = self.db._conn.execute(
-                "SELECT sequence, event_kind, actor_kind, actor_account_id, body_json "
+                "SELECT sequence, event_kind, actor_kind, actor_employee_id, body_json "
                 "FROM collaboration_events WHERE group_id=? AND sequence BETWEEN ? AND ? "
                 "ORDER BY sequence",
                 (claimed["group_id"], start, snapshot),
@@ -1011,7 +1011,7 @@ class CollaborationScheduler:
         for row in rows:
             body = json.loads(str(row["body_json"]))
             speaker = (
-                f"employee:{row['actor_account_id']}"
+                f"employee:{row['actor_employee_id']}"
                 if row["actor_kind"] == "employee"
                 else str(row["actor_kind"])
             )
@@ -1144,7 +1144,7 @@ class CollaborationScheduler:
                         group_id=str(row["group_id"]),
                         event_kind="message.employee",
                         actor_kind="employee",
-                        actor_account_id=str(row["account_id"]),
+                        actor_employee_id=str(row["employee_id"]),
                         actor_membership_id=str(row["membership_id"]),
                         body={"text": result_text, "target_id": target_id},
                         now=now,
@@ -1176,7 +1176,7 @@ class CollaborationScheduler:
                 group_id=str(row["group_id"]),
                 event_kind="message.employee",
                 actor_kind="employee",
-                actor_account_id=str(row["account_id"]),
+                actor_employee_id=str(row["employee_id"]),
                 actor_membership_id=str(row["membership_id"]),
                 body={"text": result_text, "target_id": target_id},
                 now=now,
@@ -1388,7 +1388,7 @@ class CollaborationScheduler:
             "target_id": str(row["target_id"]),
             "execution_id": str(row["execution_id"]),
             "turn_id": str(row["turn_id"]),
-            "account_id": str(row["account_id"]),
+            "employee_id": str(row["employee_id"]),
             "membership_id": str(row["membership_id"]),
             "snapshot_sequence": int(row["snapshot_sequence"]),
             "status": str(row["status"]),

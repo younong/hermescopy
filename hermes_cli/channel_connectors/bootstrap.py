@@ -152,17 +152,21 @@ def _active_accounts(
     return tuple(str(row["account_id"]) for row in rows)
 
 
-def _active_managed_feishu_accounts(
+def _active_employee_feishu_accounts(
     store: ChannelIdentityStore,
 ) -> tuple[str, ...]:
     with store.read() as conn:
         rows = conn.execute(
             """
             SELECT a.account_id FROM connector_accounts a
-            JOIN managed_feishu_accounts m ON m.account_id=a.account_id
-                                             AND m.lifecycle_status='active'
-            JOIN feishu_employee_profiles p ON p.account_id=a.account_id
-                                            AND p.lifecycle_status='active'
+            JOIN employee_channel_bindings eb
+              ON eb.connector_account_id=a.account_id
+             AND eb.provider='feishu'
+             AND eb.lifecycle_status='active'
+            JOIN employees e ON e.employee_id=eb.employee_id
+                            AND e.lifecycle_status='active'
+            JOIN employee_profiles p ON p.employee_id=e.employee_id
+                                    AND p.lifecycle_status='active'
             WHERE a.provider='feishu' AND a.status='active'
             ORDER BY a.account_id
             """
@@ -199,18 +203,12 @@ async def bootstrap_channel_connectors(
     }
     if not auth_required or supervisor is None:
         if not enabled:
-            return CanonicalConnectorRuntime(
-                ConnectorRuntimeStatus(unsupported)
-            )
+            return CanonicalConnectorRuntime(ConnectorRuntimeStatus(unsupported))
         states = {
             provider: "authenticated_dashboard_required" for provider in enabled
         }
         states.update(unsupported)
         return CanonicalConnectorRuntime(ConnectorRuntimeStatus(states))
-    if not retained:
-        return CanonicalConnectorRuntime(
-            ConnectorRuntimeStatus(unsupported)
-        )
 
     blocked_states: dict[str, str] = {}
     if "weixin_ilink" in enabled and (
@@ -275,7 +273,7 @@ async def bootstrap_channel_connectors(
     if "feishu" in enabled:
         feishu_config = enabled["feishu"]
         runtime.feishu_config = dict(feishu_config)
-        feishu_accounts = _active_managed_feishu_accounts(store)
+        feishu_accounts = _active_employee_feishu_accounts(store)
         for feishu_account_id in feishu_accounts:
             runtime.register_feishu_account(feishu_account_id)
 

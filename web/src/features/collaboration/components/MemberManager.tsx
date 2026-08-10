@@ -2,19 +2,19 @@ import { Button } from "@nous-research/ui/ui/components/button";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { UserRoundCog, X } from "lucide-react";
 import { useMemo, useState } from "react";
-import type { FeishuEmployee } from "@/lib/api";
+import type { Employee } from "@/lib/api";
 import type { CollaborationMembership } from "../types";
 
 interface MemberManagerProps {
-  employees: FeishuEmployee[];
+  employees: Employee[];
   memberships: CollaborationMembership[];
   onClose(): void;
-  onSave(accountIds: string[]): Promise<void>;
+  onSave(employeeIds: string[]): Promise<void>;
 }
 
 export function MemberManager({ employees, memberships, onClose, onSave }: MemberManagerProps) {
   const initial = useMemo(
-    () => memberships.filter((member) => member.leave_sequence === null).map((member) => member.account_id),
+    () => memberships.filter((member) => member.leave_sequence === null).map((member) => member.employee_id),
     [memberships],
   );
   const [selected, setSelected] = useState(initial);
@@ -22,7 +22,7 @@ export function MemberManager({ employees, memberships, onClose, onSave }: Membe
   const [error, setError] = useState<string | null>(null);
   const selectable = employees.filter((employee) =>
     employee.profile !== null &&
-    (employee.collaboration_policy.may_participate || initial.includes(employee.account_id))
+    (employee.collaboration_policy.may_participate || initial.includes(employee.employee_id))
   );
 
   const save = async () => {
@@ -46,20 +46,20 @@ export function MemberManager({ employees, memberships, onClose, onSave }: Membe
         <p className="mt-1 text-[11px] text-[#969aa1]">Adding a member pins its current employee profile. Removing it keeps conversation history.</p>
         <div className="mt-4 max-h-72 space-y-1 overflow-auto">
           {selectable.map((employee) => {
-            const checked = selected.includes(employee.account_id);
+            const checked = selected.includes(employee.employee_id);
             const revoked = !employee.collaboration_policy.may_participate;
             return (
-              <label className="flex cursor-pointer items-center gap-3 rounded-lg px-2 py-2 hover:bg-[#f6f7f9]" key={employee.account_id}>
+              <label className="flex cursor-pointer items-center gap-3 rounded-lg px-2 py-2 hover:bg-[#f6f7f9]" key={employee.employee_id}>
                 <input
                   checked={checked}
                   disabled={revoked && !checked}
                   onChange={() => setSelected((current) => checked
-                    ? current.filter((id) => id !== employee.account_id)
-                    : [...current, employee.account_id])}
+                    ? current.filter((id) => id !== employee.employee_id)
+                    : [...current, employee.employee_id])}
                   type="checkbox"
                 />
                 <span className="min-w-0 flex-1">
-                  <span className="block truncate text-sm font-medium">{employee.profile?.name || employee.app_id}</span>
+                  <span className="block truncate text-sm font-medium">{employee.profile?.name || "Unnamed employee"}</span>
                   <span className="block truncate text-[11px] text-[#969aa1]">{employee.profile?.role || "AI employee"}{revoked ? " · participation revoked" : ""}</span>
                 </span>
               </label>

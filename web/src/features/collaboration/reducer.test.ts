@@ -13,7 +13,7 @@ import { initialCollaborationState } from "./types";
 const group = {
   archived_at: null,
   created_at: 1,
-  creator_account_id: null,
+  creator_employee_id: null,
   creator_kind: "owner" as const,
   group_id: "group-a",
   last_sequence: 0,
@@ -24,7 +24,7 @@ const group = {
 
 function event(sequence: number, eventId = `event-${sequence}`): CollaborationEvent {
   return {
-    actor_account_id: null,
+    actor_employee_id: null,
     actor_kind: "owner",
     actor_membership_id: null,
     body: { text: `message-${sequence}` },
@@ -66,7 +66,7 @@ function gatewayEvent(type: string, payload: Record<string, unknown>): GatewayEv
 
 function target(targetId: string, executionId: string): CollaborationTarget {
   return {
-    account_id: `account-${targetId}`,
+    employee_id: `account-${targetId}`,
     active_seconds: 0,
     attempt: 1,
     error: null,

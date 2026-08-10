@@ -403,26 +403,59 @@ def test_authenticated_employee_avatar_routes_are_control_plane_routes(method):
     )
 
     decision = classify_authenticated_api(
-        "/api/messaging/feishu/employees/account-id/avatar",
+        "/api/employees/emp-id/avatar",
         method=method,
     )
     assert decision.allowed is True
     assert decision.bucket == AuthenticatedApiBucket.CONTROL_PLANE_AUTH
 
 
-def test_authenticated_employee_avatar_routes_are_method_and_path_exact():
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/api/employees"),
+        ("POST", "/api/employees"),
+        ("GET", "/api/employees/emp-id"),
+        ("PUT", "/api/employees/emp-id/profile"),
+        ("PUT", "/api/employees/emp-id/collaboration-policy"),
+        ("PUT", "/api/employees/emp-id/lifecycle"),
+        ("POST", "/api/employees/emp-id/rollover"),
+        ("PUT", "/api/employees/emp-id/channels/feishu"),
+        ("PUT", "/api/employees/emp-id/channels/feishu/credentials"),
+        ("PUT", "/api/employees/emp-id/channels/feishu/lifecycle"),
+        ("POST", "/api/employees/emp-id/channels/feishu/test"),
+    ],
+)
+def test_authenticated_employee_routes_are_control_plane_routes(method, path):
     from hermes_cli.dashboard_auth.api_availability import (
         AuthenticatedApiBucket,
         classify_authenticated_api,
     )
 
-    for method, path in (
-        ("POST", "/api/messaging/feishu/employees/account-id/avatar"),
-        ("GET", "/api/messaging/feishu/employees/account-id/avatar/private"),
-    ):
-        decision = classify_authenticated_api(path, method=method)
-        assert decision.allowed is False
-        assert decision.bucket == AuthenticatedApiBucket.LOCAL_ONLY_OR_UNAVAILABLE
+    decision = classify_authenticated_api(path, method=method)
+    assert decision.allowed is True
+    assert decision.bucket == AuthenticatedApiBucket.CONTROL_PLANE_AUTH
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("POST", "/api/employees/emp-id/avatar"),
+        ("GET", "/api/employees/emp-id/avatar/private"),
+        ("POST", "/api/employees/emp-id/channels/feishu"),
+        ("GET", "/api/employees/emp-id/channels/feishu/credentials"),
+        ("PUT", "/api/employees/emp-id/channels/feishu/test"),
+    ],
+)
+def test_authenticated_employee_routes_are_method_and_path_exact(method, path):
+    from hermes_cli.dashboard_auth.api_availability import (
+        AuthenticatedApiBucket,
+        classify_authenticated_api,
+    )
+
+    decision = classify_authenticated_api(path, method=method)
+    assert decision.allowed is False
+    assert decision.bucket == AuthenticatedApiBucket.LOCAL_ONLY_OR_UNAVAILABLE
 
 
 def test_authenticated_webhook_provisioning_is_exact_control_plane_route():

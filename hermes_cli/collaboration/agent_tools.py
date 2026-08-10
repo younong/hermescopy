@@ -25,7 +25,7 @@ _TOOL_DEFINITIONS = (
                 "properties": {
                     "title": {"type": "string", "minLength": 1},
                     "brief": {"type": "string", "minLength": 1},
-                    "invitee_account_ids": {
+                    "invitee_employee_ids": {
                         "type": "array",
                         "items": {"type": "string", "minLength": 1},
                         "minItems": 1,
@@ -36,7 +36,7 @@ _TOOL_DEFINITIONS = (
                         "items": {"type": "string", "minLength": 1},
                         "uniqueItems": True,
                     },
-                    "first_round_target_account_ids": {
+                    "first_round_target_employee_ids": {
                         "type": "array",
                         "items": {"type": "string", "minLength": 1},
                         "minItems": 1,
@@ -47,9 +47,9 @@ _TOOL_DEFINITIONS = (
                 "required": [
                     "title",
                     "brief",
-                    "invitee_account_ids",
+                    "invitee_employee_ids",
                     "origin_attachment_ids",
-                    "first_round_target_account_ids",
+                    "first_round_target_employee_ids",
                     "idempotency_key",
                 ],
                 "additionalProperties": False,
@@ -62,14 +62,14 @@ _TOOL_DEFINITIONS = (
             "name": _DISPATCH,
             "description": (
                 "Dispatch the next explicit round for the internal collaboration task. "
-                "Every round must name exact target account IDs; response text and @ "
+                "Every round must name exact target employee IDs; response text and @ "
                 "references cannot schedule members."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "instruction": {"type": "string", "minLength": 1},
-                    "target_account_ids": {
+                    "target_employee_ids": {
                         "type": "array",
                         "items": {"type": "string", "minLength": 1},
                         "minItems": 1,
@@ -84,7 +84,7 @@ _TOOL_DEFINITIONS = (
                 },
                 "required": [
                     "instruction",
-                    "target_account_ids",
+                    "target_employee_ids",
                     "attachment_ids",
                     "idempotency_key",
                 ],
@@ -118,14 +118,14 @@ _ALLOWED_ARGS = {
         {
             "title",
             "brief",
-            "invitee_account_ids",
+            "invitee_employee_ids",
             "origin_attachment_ids",
-            "first_round_target_account_ids",
+            "first_round_target_employee_ids",
             "idempotency_key",
         }
     ),
     _DISPATCH: frozenset(
-        {"instruction", "target_account_ids", "attachment_ids", "idempotency_key"}
+        {"instruction", "target_employee_ids", "attachment_ids", "idempotency_key"}
     ),
     _FINISH: frozenset({"summary", "idempotency_key"}),
 }
@@ -136,11 +136,11 @@ class CollaborationAgentContext:
     """Server-created execution context that is never accepted from tool arguments."""
 
     service: Any
-    creator_account_id: str
+    creator_employee_id: str
     source_kind: str
     source_conversation_id: str
     source_provider: str = "web"
-    source_account_id: str | None = None
+    source_connector_account_id: str | None = None
     source_binding_id: str | None = None
     source_thread_id: str = ""
     source_session_id: str | None = None
@@ -189,15 +189,15 @@ def invoke(
                 context=context,
                 title=_required_text(function_args["title"], "title"),
                 brief=_required_text(function_args["brief"], "brief"),
-                invitee_account_ids=_string_list(
-                    function_args["invitee_account_ids"], "invitee account IDs", required=True
+                invitee_employee_ids=_string_list(
+                    function_args["invitee_employee_ids"], "invitee employee IDs", required=True
                 ),
                 origin_attachment_ids=_string_list(
                     function_args["origin_attachment_ids"], "origin attachment IDs"
                 ),
-                first_round_target_account_ids=_string_list(
-                    function_args["first_round_target_account_ids"],
-                    "first-round target account IDs",
+                first_round_target_employee_ids=_string_list(
+                    function_args["first_round_target_employee_ids"],
+                    "first-round target employee IDs",
                     required=True,
                 ),
                 idempotency_key=_required_text(
@@ -209,8 +209,8 @@ def invoke(
             result = context.service.dispatch_internal_group_round(
                 context=context,
                 instruction=_required_text(function_args["instruction"], "instruction"),
-                target_account_ids=_string_list(
-                    function_args["target_account_ids"], "target account IDs", required=True
+                target_employee_ids=_string_list(
+                    function_args["target_employee_ids"], "target employee IDs", required=True
                 ),
                 attachment_ids=_string_list(
                     function_args["attachment_ids"], "attachment IDs"

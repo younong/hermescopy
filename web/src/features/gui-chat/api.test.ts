@@ -75,7 +75,7 @@ describe("connectGuiChat", () => {
     );
   });
 
-  it("sends only the selected employee account ID for a new direct chat", async () => {
+  it("sends only the selected employee ID for a new direct chat", async () => {
     const connection = connectGuiChat({ ownerKey: "owner-a" });
 
     await connection.createOrAttach(
@@ -83,13 +83,13 @@ describe("connectGuiChat", () => {
       1,
       undefined,
       undefined,
-      { employeeAccountId: "employee-a" },
+      { employeeId: "employee-a" },
     );
 
     expect(mocks.gatewayInstances[0].request).toHaveBeenCalledWith(
       "session.create",
       expect.objectContaining({
-        employee_account_id: "employee-a",
+        employee_id: "employee-a",
         source: "dashboard-gui",
         switch_generation: 1,
       }),

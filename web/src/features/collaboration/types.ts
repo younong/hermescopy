@@ -25,7 +25,7 @@ export interface CollaborationGroup {
   group_id: string;
   name: string;
   creator_kind: "owner" | "employee";
-  creator_account_id: string | null;
+  creator_employee_id: string | null;
   status: CollaborationGroupStatus;
   last_sequence: number;
   created_at: number;
@@ -36,7 +36,7 @@ export interface CollaborationGroup {
 export interface CollaborationMembership {
   membership_id: string;
   group_id: string;
-  account_id: string;
+  employee_id: string;
   profile_revision: number;
   profile_fingerprint: string;
   role: string;
@@ -51,7 +51,7 @@ export interface CollaborationEventBody {
   mentions?: string[];
   mention_all?: boolean;
   target_id?: string;
-  account_id?: string;
+  employee_id?: string;
   membership_id?: string;
   name?: string;
   [key: string]: unknown;
@@ -63,7 +63,7 @@ export interface CollaborationEvent {
   sequence: number;
   event_kind: string;
   actor_kind: "owner" | "employee" | "system";
-  actor_account_id: string | null;
+  actor_employee_id: string | null;
   actor_membership_id: string | null;
   body: CollaborationEventBody;
   created_at: number;
@@ -91,7 +91,7 @@ export interface CollaborationTarget {
   target_id: string;
   execution_id: string;
   turn_id: string;
-  account_id: string;
+  employee_id: string;
   membership_id: string;
   join_sequence?: number;
   snapshot_sequence: number;
@@ -199,7 +199,7 @@ export interface CollaborationSubmitMessage {
 }
 
 export interface CollaborationEmployeeIdentity {
-  accountId: string;
+  employeeId: string;
   name: string;
   role?: string;
   available: boolean;

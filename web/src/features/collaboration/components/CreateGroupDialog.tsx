@@ -3,12 +3,12 @@ import { Input } from "@nous-research/ui/ui/components/input";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { X } from "lucide-react";
 import { useMemo, useState } from "react";
-import type { FeishuEmployee } from "@/lib/api";
+import type { Employee } from "@/lib/api";
 
 interface CreateGroupDialogProps {
-  employees: FeishuEmployee[];
+  employees: Employee[];
   onClose(): void;
-  onCreate(name: string, accountIds: string[]): Promise<void>;
+  onCreate(name: string, employeeIds: string[]): Promise<void>;
 }
 
 export function CreateGroupDialog({ employees, onClose, onCreate }: CreateGroupDialogProps) {
@@ -55,18 +55,18 @@ export function CreateGroupDialog({ employees, onClose, onCreate }: CreateGroupD
           {eligible.length === 0 ? (
             <p className="rounded-lg border border-dashed border-[#dfe2e7] p-4 text-center text-xs text-[#969aa1]">No active employees can participate.</p>
           ) : eligible.map((employee) => {
-            const checked = selected.includes(employee.account_id);
+            const checked = selected.includes(employee.employee_id);
             return (
-              <label className="flex cursor-pointer items-center gap-3 rounded-lg px-2 py-2 hover:bg-[#f6f7f9]" key={employee.account_id}>
+              <label className="flex cursor-pointer items-center gap-3 rounded-lg px-2 py-2 hover:bg-[#f6f7f9]" key={employee.employee_id}>
                 <input
                   checked={checked}
                   onChange={() => setSelected((current) => checked
-                    ? current.filter((id) => id !== employee.account_id)
-                    : [...current, employee.account_id])}
+                    ? current.filter((id) => id !== employee.employee_id)
+                    : [...current, employee.employee_id])}
                   type="checkbox"
                 />
                 <span className="min-w-0">
-                  <span className="block truncate text-sm font-medium text-[#303238]">{employee.profile?.name || employee.app_id}</span>
+                  <span className="block truncate text-sm font-medium text-[#303238]">{employee.profile?.name || "Unnamed employee"}</span>
                   <span className="block truncate text-[11px] text-[#969aa1]">{employee.profile?.role || "AI employee"}</span>
                 </span>
               </label>

@@ -107,7 +107,7 @@ def dispatch_owner_collaboration_deliveries(
                     raise RuntimeError("canonical channel outbox is unavailable")
                 outbound_id = enqueue_delivery(
                     owner_key=owner.owner_key,
-                    account_id=str(delivery.get("account_id") or ""),
+                    account_id=str(delivery.get("connector_account_id") or ""),
                     binding_id=str(delivery.get("binding_id") or ""),
                     conversation_id=str(delivery.get("conversation_id") or ""),
                     thread_id=str(delivery.get("thread_id") or ""),

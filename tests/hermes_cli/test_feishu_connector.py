@@ -28,7 +28,9 @@ from hermes_cli.channel_identity import (
     ChannelCrypto,
     ChannelIdentityStore,
     Keyring,
-    register_managed_feishu_account_for_owner,
+    create_employee,
+    ensure_employee_feishu_conversation_binding,
+    register_employee_feishu_binding,
     resolve_connector_account,
 )
 from hermes_cli.dashboard_auth.base import Session
@@ -128,19 +130,11 @@ def _register(
     chat_id="oc_chat",
     provider_account_id="cli_app",
 ):
-    return register_managed_feishu_account_for_owner(
+    owner = _owner(owner_id)
+    employee = create_employee(
         store,
-        owner=_owner(owner_id),
-        provider_account_id=provider_account_id,
-        external_subject=actor_id,
-        conversation_id=chat_id,
-        credentials={
-            "app_id": provider_account_id,
-            "app_secret": "app-secret",
-            "domain": "feishu",
-            "bot_open_id": provider_account_id,
-        },
-        employee_profile={
+        owner=owner,
+        profile={
             "schema_version": 1,
             "name": f"employee-{owner_id}",
             "model_registration_id": "registration-a",
@@ -152,6 +146,26 @@ def _register(
             "knowledge_relative_paths": [],
             "max_iterations": 20,
         },
+    )
+    employee_binding = register_employee_feishu_binding(
+        store,
+        owner=owner,
+        employee_id=employee.employee_id,
+        provider_account_id=provider_account_id,
+        credentials={
+            "app_id": provider_account_id,
+            "app_secret": "app-secret",
+            "domain": "feishu",
+            "bot_open_id": provider_account_id,
+        },
+    )
+    return ensure_employee_feishu_conversation_binding(
+        store,
+        employee_id=employee.employee_id,
+        connector_account_id=employee_binding.connector_account_id,
+        conversation_id=chat_id,
+        actor_id=actor_id,
+        conversation_kind="direct",
     )
 
 
@@ -265,30 +279,14 @@ def test_verified_event_enqueues_through_encrypted_canonical_inbox(store):
 
 
 def test_first_valid_direct_message_binds_human_not_api_verified_bot(store):
-    registered = register_managed_feishu_account_for_owner(
+    registered = _register(
         store,
-        owner=_owner("owner-a"),
-        provider_account_id="cli_app",
-        external_subject="ou_verified_bot",
-        conversation_id=None,
-        credentials={
-            "app_id": "cli_app",
-            "app_secret": "app-secret",
-            "domain": "feishu",
-            "bot_open_id": "ou_verified_bot",
-        },
-        employee_profile={
-            "schema_version": 1,
-            "model_registration_id": "registration-a",
-            "system_prompt": "You are a focused Feishu employee.",
-            "toolsets": [],
-            "skills": [],
-            "mcp_servers": [],
-            "workspace_relative_path": "employees/researcher",
-            "knowledge_relative_paths": [],
-            "max_iterations": 20,
-        },
+        actor_id="ou_verified_bot",
+        chat_id="oc_bootstrap_direct",
     )
+    with store.write() as conn:
+        conn.execute("DELETE FROM channel_bindings WHERE binding_id=?", (registered.binding_id,))
+
 
     accepted = enqueue_verified_event(
         store,
@@ -312,30 +310,14 @@ def test_first_valid_direct_message_binds_human_not_api_verified_bot(store):
 
 
 def test_first_valid_group_message_creates_real_account_owned_binding(store):
-    registered = register_managed_feishu_account_for_owner(
+    registered = _register(
         store,
-        owner=_owner("owner-a"),
-        provider_account_id="cli_app",
-        external_subject="cli_app",
-        conversation_id=None,
-        credentials={
-            "app_id": "cli_app",
-            "app_secret": "app-secret",
-            "domain": "feishu",
-            "bot_open_id": "cli_app",
-        },
-        employee_profile={
-            "schema_version": 1,
-            "model_registration_id": "registration-a",
-            "system_prompt": "You are a focused Feishu employee.",
-            "toolsets": [],
-            "skills": [],
-            "mcp_servers": [],
-            "workspace_relative_path": "employees/researcher",
-            "knowledge_relative_paths": [],
-            "max_iterations": 20,
-        },
+        actor_id="cli_app",
+        chat_id="oc_bootstrap_group",
     )
+    with store.write() as conn:
+        conn.execute("DELETE FROM channel_bindings WHERE binding_id=?", (registered.binding_id,))
+
     mention = SimpleNamespace(key="@_user_1", id=SimpleNamespace(open_id="cli_app"))
 
     accepted = enqueue_verified_event(
@@ -1063,7 +1045,16 @@ async def test_connector_dispatches_inbound_through_exact_owner_worker(store):
     assert create_params["source"] == "feishu"
     assert create_params["title"] == "feishu channel"
     assert create_params["close_on_disconnect"] is False
-    assert create_params["employee_policy"]["account_id"] == registered.account_id
+    with store.read() as conn:
+        employee_id = conn.execute(
+            "SELECT employee_id FROM employee_channel_bindings "
+            "WHERE connector_account_id=?",
+            (registered.account_id,),
+        ).fetchone()["employee_id"]
+    assert create_params["employee_policy"]["employee_id"] == employee_id
+    assert create_params["retained_source_context"]["connector_account_id"] == (
+        registered.account_id
+    )
     assert create_params["employee_policy"]["profile_revision"] == 1
     assert create_params["employee_policy"]["source_policy"]["system_prompt"] == (
         "You are a focused Feishu employee."

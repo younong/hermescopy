@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 
-from hermes_cli.channel_identity.employee_profiles import resolve_employee_profile
+from hermes_cli.channel_identity import resolve_employee_profile
 from hermes_cli.channel_identity.store import ChannelIdentityStore
 from hermes_cli.employee_policy import normalize_employee_source_policy
 
@@ -48,26 +48,35 @@ async def open_binding_session(
                 raise RuntimeError("verified Feishu conversation metadata is required")
             with store.read() as conn:
                 account = conn.execute(
-                    "SELECT b.account_id, b.peer_lookup_hash FROM channel_bindings b "
-                    "JOIN managed_feishu_accounts m ON m.account_id=b.account_id "
+                    "SELECT b.account_id AS connector_account_id, b.peer_lookup_hash, "
+                    "eb.employee_id FROM channel_bindings b "
                     "JOIN connector_accounts a ON a.account_id=b.account_id "
+                    "JOIN employee_channel_bindings eb "
+                    "ON eb.connector_account_id=a.account_id AND eb.provider=a.provider "
+                    "JOIN employees e ON e.employee_id=eb.employee_id "
+                    "JOIN external_identities x "
+                    "ON x.external_identity_id=b.external_identity_id "
+                    "AND x.provider=a.provider AND x.canonical_user_id=e.canonical_user_id "
+                    "JOIN owner_bindings o ON o.canonical_user_id=e.canonical_user_id "
                     "WHERE b.binding_id=? AND b.status='active' AND a.status='active' "
-                    "AND a.provider='feishu' AND m.lifecycle_status='active'",
-                    (binding_id,),
+                    "AND a.provider='feishu' AND eb.lifecycle_status='active' "
+                    "AND e.lifecycle_status='active' AND x.status='active' "
+                    "AND o.owner_key=?",
+                    (binding_id, client.owner.owner_key),
                 ).fetchone()
             if account is None:
-                raise RuntimeError("managed Feishu binding is unavailable")
+                raise RuntimeError("employee Feishu binding is unavailable")
             expected_peer = store.crypto.lookup_hash("conversation:feishu", exact_conversation)
             if account["peer_lookup_hash"] != expected_peer:
                 raise RuntimeError("Feishu conversation does not match binding")
             employee = resolve_employee_profile(
                 store,
                 owner=client.owner,
-                account_id=str(account["account_id"]),
+                employee_id=str(account["employee_id"]),
                 revision=profile_revision,
             )
             create_params["employee_policy"] = {
-                "account_id": employee.account_id,
+                "employee_id": employee.employee_id,
                 "profile_revision": employee.revision,
                 "profile_fingerprint": employee.fingerprint,
                 "source_policy": normalize_employee_source_policy(employee.profile),
@@ -77,7 +86,8 @@ async def open_binding_session(
                 "source_kind": (
                     "feishu_direct" if exact_kind == "direct" else "feishu_group"
                 ),
-                "account_id": employee.account_id,
+                "employee_id": employee.employee_id,
+                "connector_account_id": str(account["connector_account_id"]),
                 "binding_id": binding_id,
                 "conversation_id": exact_conversation,
                 "thread_id": exact_thread,

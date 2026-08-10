@@ -1388,7 +1388,8 @@ def create_app(
                     key: item.get(key)
                     for key in (
                         "delivery_key", "delivery_kind", "payload_text", "provider",
-                        "account_id", "binding_id", "conversation_id", "thread_id",
+                        "employee_id", "connector_account_id", "binding_id",
+                        "conversation_id", "thread_id",
                         "source_session_id", "outbound_id", "worker_owner_key", "worker_id",
                         "worker_generation", "lease_version", "recovery_generation",
                     )
@@ -1721,8 +1722,8 @@ def create_app(
 
         return toolsets_payload()
 
-    @app.get("/api/messaging/feishu/catalog")
-    def get_feishu_employee_catalog(
+    @app.get("/api/employees/catalog")
+    def get_employee_catalog(
         _: None = Depends(_require_owner_token),
     ) -> dict[str, Any]:
         from hermes_cli.employee_catalog import employee_catalog_payload

@@ -99,7 +99,7 @@ class CollaborationStore:
         *,
         members: Iterable[CollaborationMemberProfile] = (),
         creator_kind: str = "owner",
-        creator_account_id: str | None = None,
+        creator_employee_id: str | None = None,
         group_id: str | None = None,
         client_idempotency_key: str | None = None,
         provision_member=None,
@@ -110,17 +110,17 @@ class CollaborationStore:
         if creator_kind not in {"owner", "employee"}:
             raise ValueError("creator kind is invalid")
         if creator_kind == "owner":
-            if creator_account_id is not None:
+            if creator_employee_id is not None:
                 raise ValueError("owner-created groups cannot have a creator account")
         else:
-            creator_account_id = _identifier(creator_account_id, "creator account ID")
+            creator_employee_id = _identifier(creator_employee_id, "creator employee ID")
         pinned_members: list[CollaborationMemberProfile] = []
-        seen_accounts: set[str] = set()
+        seen_employees: set[str] = set()
         for member in members:
             pinned = self._trusted_profile(member)
-            if pinned.account_id in seen_accounts:
+            if pinned.employee_id in seen_employees:
                 continue
-            seen_accounts.add(pinned.account_id)
+            seen_employees.add(pinned.employee_id)
             pinned_members.append(pinned)
         idempotency_key = (
             _identifier(client_idempotency_key, "client idempotency key")
@@ -132,7 +132,7 @@ class CollaborationStore:
                 "name": name,
                 "members": [member.__dict__ for member in pinned_members],
                 "creator_kind": creator_kind,
-                "creator_account_id": creator_account_id,
+                "creator_employee_id": creator_employee_id,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -158,7 +158,7 @@ class CollaborationStore:
             conn.execute(
                 """
                 INSERT INTO collaboration_groups
-                  (group_id, owner_key, name, creator_kind, creator_account_id,
+                  (group_id, owner_key, name, creator_kind, creator_employee_id,
                    status, last_sequence, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, 'active', 0, ?, ?)
                 """,
@@ -167,7 +167,7 @@ class CollaborationStore:
                     self.owner_key,
                     name,
                     creator_kind,
-                    creator_account_id,
+                    creator_employee_id,
                     now,
                     now,
                 ),
@@ -320,17 +320,17 @@ class CollaborationStore:
 
         return self._membership(self.db._execute_write(_write))
 
-    def remove_membership(self, group_id: str, account_id: str) -> CollaborationMembership:
+    def remove_membership(self, group_id: str, employee_id: str) -> CollaborationMembership:
         group_id = _identifier(group_id, "group ID")
-        account_id = _identifier(account_id, "account ID")
+        employee_id = _identifier(employee_id, "employee ID")
         now = time.time()
 
         def _write(conn):
             self._require_active_group(conn, group_id)
             row = conn.execute(
                 "SELECT * FROM collaboration_memberships "
-                "WHERE group_id=? AND account_id=? AND leave_sequence IS NULL",
-                (group_id, account_id),
+                "WHERE group_id=? AND employee_id=? AND leave_sequence IS NULL",
+                (group_id, employee_id),
             ).fetchone()
             if row is None:
                 raise RuntimeError("active collaboration membership is unavailable")
@@ -339,7 +339,7 @@ class CollaborationStore:
                 group_id=group_id,
                 event_kind="membership.left",
                 actor_kind="owner",
-                body={"account_id": account_id, "membership_id": row["membership_id"]},
+                body={"employee_id": employee_id, "membership_id": row["membership_id"]},
                 now=now,
             )
             conn.execute(
@@ -360,7 +360,7 @@ class CollaborationStore:
         self,
         group_id: str,
         *,
-        requested_account_ids: Iterable[str],
+        requested_employee_ids: Iterable[str],
         additions: Mapping[str, CollaborationMemberProfile],
         provision_member=None,
     ) -> tuple[CollaborationMembership, ...]:
@@ -368,13 +368,13 @@ class CollaborationStore:
         group_id = _identifier(group_id, "group ID")
         requested = tuple(
             dict.fromkeys(
-                _identifier(account_id, "account ID")
-                for account_id in requested_account_ids
+                _identifier(employee_id, "employee ID")
+                for employee_id in requested_employee_ids
             )
         )
         trusted_additions = {
-            _identifier(account_id, "account ID"): self._trusted_profile(member)
-            for account_id, member in additions.items()
+            _identifier(employee_id, "employee ID"): self._trusted_profile(member)
+            for employee_id, member in additions.items()
         }
         now = time.time()
 
@@ -385,12 +385,12 @@ class CollaborationStore:
                 "AND leave_sequence IS NULL",
                 (group_id,),
             ).fetchall()
-            current = {str(row["account_id"]): row for row in current_rows}
+            current = {str(row["employee_id"]): row for row in current_rows}
             requested_set = set(requested)
             if set(trusted_additions) != requested_set - set(current):
                 raise RuntimeError("collaboration membership delta is inconsistent")
-            for account_id, row in current.items():
-                if account_id in requested_set:
+            for employee_id, row in current.items():
+                if employee_id in requested_set:
                     continue
                 event = self._append_event(
                     conn,
@@ -398,7 +398,7 @@ class CollaborationStore:
                     event_kind="membership.left",
                     actor_kind="owner",
                     body={
-                        "account_id": account_id,
+                        "employee_id": employee_id,
                         "membership_id": str(row["membership_id"]),
                     },
                     now=now,
@@ -408,8 +408,8 @@ class CollaborationStore:
                     "WHERE membership_id=? AND leave_sequence IS NULL",
                     (event["sequence"], now, row["membership_id"]),
                 )
-            for account_id in requested:
-                member = trusted_additions.get(account_id)
+            for employee_id in requested:
+                member = trusted_additions.get(employee_id)
                 if member is None:
                     continue
                 membership = self._membership(
@@ -425,7 +425,7 @@ class CollaborationStore:
                     provision_member(membership, member)
             rows = conn.execute(
                 "SELECT * FROM collaboration_memberships WHERE group_id=? "
-                "AND leave_sequence IS NULL ORDER BY join_sequence, account_id",
+                "AND leave_sequence IS NULL ORDER BY join_sequence, employee_id",
                 (group_id,),
             ).fetchall()
             return tuple(self._membership(dict(row)) for row in rows)
@@ -641,7 +641,7 @@ class CollaborationStore:
                     )
             active = conn.execute(
                 "SELECT * FROM collaboration_memberships "
-                "WHERE group_id=? AND leave_sequence IS NULL ORDER BY join_sequence, account_id",
+                "WHERE group_id=? AND leave_sequence IS NULL ORDER BY join_sequence, employee_id",
                 (group_id,),
             ).fetchall()
             by_membership = {str(row["membership_id"]): row for row in active}
@@ -713,13 +713,13 @@ class CollaborationStore:
             )
             result_targets = []
             for membership in targets:
-                account_id = str(membership["account_id"])
+                employee_id = str(membership["employee_id"])
                 target_id = f"ctt_{uuid.uuid4().hex}"
                 execution_id = f"cex_{uuid.uuid4().hex}"
                 conn.execute(
                     """
                     INSERT INTO collaboration_turn_targets
-                      (target_id, execution_id, turn_id, account_id, membership_id,
+                      (target_id, execution_id, turn_id, employee_id, membership_id,
                        join_sequence, snapshot_sequence, status, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
                     """,
@@ -727,7 +727,7 @@ class CollaborationStore:
                         target_id,
                         execution_id,
                         turn_id,
-                        account_id,
+                        employee_id,
                         membership["membership_id"],
                         membership["join_sequence"],
                         event.sequence,
@@ -749,7 +749,7 @@ class CollaborationStore:
                         target_id=target_id,
                         execution_id=execution_id,
                         turn_id=turn_id,
-                        account_id=account_id,
+                        employee_id=employee_id,
                         membership_id=str(membership["membership_id"]),
                         join_sequence=int(membership["join_sequence"]),
                         snapshot_sequence=event.sequence,
@@ -785,7 +785,7 @@ class CollaborationStore:
         members: Iterable[CollaborationMemberProfile],
         source_kind: str,
         source_provider: str = "web",
-        source_account_id: str | None = None,
+        source_connector_account_id: str | None = None,
         source_binding_id: str | None = None,
         source_conversation_id: str,
         source_thread_id: str = "",
@@ -808,9 +808,9 @@ class CollaborationStore:
         expected_provider = "feishu" if source_kind == "feishu_direct" else "web"
         if source_provider != expected_provider:
             raise ValueError("collaboration source provider is invalid")
-        source_account_id = (
-            _identifier(source_account_id, "source account ID")
-            if source_account_id is not None
+        source_connector_account_id = (
+            _identifier(source_connector_account_id, "source connector account ID")
+            if source_connector_account_id is not None
             else None
         )
         source_binding_id = (
@@ -828,9 +828,9 @@ class CollaborationStore:
             else None
         )
         if source_kind == "feishu_direct":
-            if source_account_id != creator.account_id or source_binding_id is None or source_session_id is None:
+            if source_connector_account_id is None or source_binding_id is None or source_session_id is None:
                 raise RuntimeError("trusted Feishu origin identity is incomplete")
-        elif source_account_id not in {None, creator.account_id} or source_binding_id is not None:
+        elif source_connector_account_id is not None or source_binding_id is not None:
             raise RuntimeError("web origin identity is invalid")
         source_group_id = (
             _identifier(source_group_id, "source group ID")
@@ -854,12 +854,12 @@ class CollaborationStore:
             dict.fromkeys(_identifier(value, "attachment ID") for value in allowed_attachment_ids)
         )
         pinned_members = [creator]
-        seen = {creator.account_id}
+        seen = {creator.employee_id}
         for member in members:
             pinned = self._trusted_profile(member)
-            if pinned.account_id not in seen:
+            if pinned.employee_id not in seen:
                 pinned_members.append(pinned)
-                seen.add(pinned.account_id)
+                seen.add(pinned.employee_id)
         request_json = json.dumps(
             {
                 "title": title,
@@ -868,7 +868,7 @@ class CollaborationStore:
                 "members": [member.__dict__ for member in pinned_members],
                 "source_kind": source_kind,
                 "source_provider": source_provider,
-                "source_account_id": source_account_id,
+                "source_connector_account_id": source_connector_account_id,
                 "source_binding_id": source_binding_id,
                 "source_conversation_id": source_conversation_id,
                 "source_thread_id": source_thread_id,
@@ -920,17 +920,17 @@ class CollaborationStore:
             group_id = f"cg_{uuid.uuid4().hex}"
             conn.execute(
                 "INSERT INTO collaboration_groups "
-                "(group_id, owner_key, name, creator_kind, creator_account_id, status, "
+                "(group_id, owner_key, name, creator_kind, creator_employee_id, status, "
                 "last_sequence, created_at, updated_at) VALUES "
                 "(?, ?, ?, 'employee', ?, 'active', 0, ?, ?)",
-                (group_id, self.owner_key, title, creator.account_id, now, now),
+                (group_id, self.owner_key, title, creator.employee_id, now, now),
             )
             created = self._append_event(
                 conn,
                 group_id=group_id,
                 event_kind="group.created",
                 actor_kind="system",
-                actor_account_id=creator.account_id,
+                actor_employee_id=creator.employee_id,
                 body={"name": title, "brief": brief, "ai_created": True},
                 now=now,
             )
@@ -942,7 +942,7 @@ class CollaborationStore:
                     member=member,
                     actor_kind="system",
                     now=now,
-                    role="owner" if member.account_id == creator.account_id else "member",
+                    role="owner" if member.employee_id == creator.employee_id else "member",
                 )
                 memberships.append(membership)
             creator_membership = memberships[0]
@@ -971,8 +971,8 @@ class CollaborationStore:
             task_id = f"cat_{uuid.uuid4().hex}"
             conn.execute(
                 "INSERT INTO collaboration_tasks "
-                "(task_id, group_id, created_event_id, assigned_account_id, "
-                "creator_account_id, creator_membership_id, creator_profile_revision, "
+                "(task_id, group_id, created_event_id, assigned_employee_id, "
+                "creator_employee_id, creator_membership_id, creator_profile_revision, "
                 "creator_profile_fingerprint, title, description, source_kind, round, "
                 "max_rounds, depth, source_event_id, source_task_id, "
                 "allowed_attachment_ids_json, status, created_at, updated_at) VALUES "
@@ -981,8 +981,8 @@ class CollaborationStore:
                     task_id,
                     group_id,
                     created["event_id"],
-                    creator.account_id,
-                    creator.account_id,
+                    creator.employee_id,
+                    creator.employee_id,
                     creator_membership["membership_id"],
                     creator.profile_revision,
                     creator.profile_fingerprint,
@@ -1000,15 +1000,16 @@ class CollaborationStore:
             origin_id = f"cao_{uuid.uuid4().hex}"
             conn.execute(
                 "INSERT INTO collaboration_origins "
-                "(origin_id, group_id, provider, account_id, binding_id, conversation_id, "
+                "(origin_id, group_id, provider, employee_id, connector_account_id, binding_id, conversation_id, "
                 "thread_id, source_kind, source_session_id, source_group_id, source_event_id, "
                 "source_task_id, round, depth, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
                 (
                     origin_id,
                     group_id,
                     source_provider,
-                    source_account_id or creator.account_id,
+                    creator.employee_id,
+                    source_connector_account_id,
                     source_binding_id,
                     source_conversation_id,
                     source_thread_id,
@@ -1052,7 +1053,7 @@ class CollaborationStore:
         task_id = _identifier(task_id, "task ID")
         with self.db._lock:
             row = self.db._conn.execute(
-                "SELECT t.*, o.origin_id, o.provider, o.account_id AS origin_account_id, "
+                "SELECT t.*, o.origin_id, o.provider, o.connector_account_id AS origin_connector_account_id, "
                 "o.binding_id, o.conversation_id, o.thread_id, o.source_session_id, "
                 "o.source_group_id, o.creation_delivery_key, o.completion_delivery_key, "
                 "o.creation_delivered_at, o.completion_delivered_at "
@@ -1347,8 +1348,9 @@ class CollaborationStore:
                     ),
                 )
             rows = conn.execute(
-                "SELECT d.*, o.provider, o.account_id, o.binding_id, o.conversation_id, "
-                "o.thread_id, o.source_session_id FROM collaboration_delivery_state d "
+                "SELECT d.*, o.provider, o.employee_id, o.connector_account_id, "
+                "o.binding_id, o.conversation_id, o.thread_id, o.source_session_id "
+                "FROM collaboration_delivery_state d "
                 "JOIN collaboration_origins o ON o.origin_id=d.origin_id "
                 "JOIN collaboration_groups g ON g.group_id=o.group_id "
                 "WHERE g.owner_key=? AND d.status IN ('pending','claimed') "
@@ -1440,7 +1442,7 @@ class CollaborationStore:
         task_id: str,
         *,
         instruction: str,
-        target_account_ids: Iterable[str],
+        target_employee_ids: Iterable[str],
         attachment_ids: Iterable[str],
         idempotency_key: str,
     ) -> tuple[SubmittedOwnerMessage, int, bool]:
@@ -1448,10 +1450,10 @@ class CollaborationStore:
         task_id = _identifier(task_id, "task ID")
         instruction = _identifier(instruction, "instruction")
         targets = tuple(
-            dict.fromkeys(_identifier(value, "target account ID") for value in target_account_ids)
+            dict.fromkeys(_identifier(value, "target employee ID") for value in target_employee_ids)
         )
         if not targets:
-            raise ValueError("target account IDs are required")
+            raise ValueError("target employee IDs are required")
         attachments = tuple(
             dict.fromkeys(_identifier(value, "attachment ID") for value in attachment_ids)
         )
@@ -1460,7 +1462,7 @@ class CollaborationStore:
             {
                 "task_id": task_id,
                 "instruction": instruction,
-                "target_account_ids": list(targets),
+                "target_employee_ids": list(targets),
                 "attachment_ids": list(attachments),
             },
             ensure_ascii=False,
@@ -1519,7 +1521,7 @@ class CollaborationStore:
             if active is not None:
                 raise RuntimeError("collaboration round is still running")
             memberships = {
-                str(row["account_id"]): row
+                str(row["employee_id"]): row
                 for row in conn.execute(
                     "SELECT * FROM collaboration_memberships WHERE group_id=? "
                     "AND leave_sequence IS NULL",
@@ -1553,20 +1555,20 @@ class CollaborationStore:
                 (turn_id, task["group_id"], event.event_id, event.sequence, now, now),
             )
             result_targets = []
-            for account_id in targets:
-                membership = memberships[account_id]
+            for employee_id in targets:
+                membership = memberships[employee_id]
                 target_id = f"ctt_{uuid.uuid4().hex}"
                 execution_id = f"cex_{uuid.uuid4().hex}"
                 conn.execute(
                     "INSERT INTO collaboration_turn_targets "
-                    "(target_id, execution_id, turn_id, account_id, membership_id, "
+                    "(target_id, execution_id, turn_id, employee_id, membership_id, "
                     "join_sequence, snapshot_sequence, status, created_at, updated_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
                     (
                         target_id,
                         execution_id,
                         turn_id,
-                        account_id,
+                        employee_id,
                         membership["membership_id"],
                         membership["join_sequence"],
                         event.sequence,
@@ -1592,7 +1594,7 @@ class CollaborationStore:
                         target_id=target_id,
                         execution_id=execution_id,
                         turn_id=turn_id,
-                        account_id=account_id,
+                        employee_id=employee_id,
                         membership_id=str(membership["membership_id"]),
                         join_sequence=int(membership["join_sequence"]),
                         snapshot_sequence=event.sequence,
@@ -1690,7 +1692,7 @@ class CollaborationStore:
             targets = self.db._conn.execute(
                 "SELECT tt.* FROM collaboration_turn_targets tt "
                 "JOIN collaboration_turns t ON t.turn_id=tt.turn_id "
-                "WHERE t.group_id=? ORDER BY t.created_at, tt.account_id",
+                "WHERE t.group_id=? ORDER BY t.created_at, tt.employee_id",
                 (group.group_id,),
             ).fetchall()
             approvals = self.db._conn.execute(
@@ -1754,7 +1756,7 @@ class CollaborationStore:
     def _turn(self, conn, row: Mapping[str, Any]) -> CollaborationTurn:
         targets = conn.execute(
             "SELECT * FROM collaboration_turn_targets WHERE turn_id=? "
-            "ORDER BY created_at, account_id",
+            "ORDER BY created_at, employee_id",
             (row["turn_id"],),
         ).fetchall()
         return CollaborationTurn(
@@ -1773,7 +1775,7 @@ class CollaborationStore:
             target_id=str(row["target_id"]),
             execution_id=str(row["execution_id"]),
             turn_id=str(row["turn_id"]),
-            account_id=str(row["account_id"]),
+            employee_id=str(row["employee_id"]),
             membership_id=str(row["membership_id"]),
             join_sequence=int(row["join_sequence"]),
             snapshot_sequence=int(row["snapshot_sequence"]),
@@ -1811,26 +1813,26 @@ class CollaborationStore:
         actor_kind: str,
         body: Mapping[str, Any],
         now: float,
-        actor_account_id: str | None = None,
+        actor_employee_id: str | None = None,
         actor_membership_id: str | None = None,
     ) -> dict[str, Any]:
         group = self._owned_group_row(conn, group_id)
         if group is None:
             raise RuntimeError("collaboration group is unavailable")
         if actor_kind == "employee":
-            actor_account_id = _identifier(actor_account_id, "actor account ID")
+            actor_employee_id = _identifier(actor_employee_id, "actor employee ID")
             actor_membership_id = _identifier(
                 actor_membership_id, "actor membership ID"
             )
             actor = conn.execute(
-                "SELECT account_id, group_id FROM collaboration_memberships "
+                "SELECT employee_id, group_id FROM collaboration_memberships "
                 "WHERE membership_id=?",
                 (actor_membership_id,),
             ).fetchone()
             if (
                 actor is None
                 or actor["group_id"] != group_id
-                or actor["account_id"] != actor_account_id
+                or actor["employee_id"] != actor_employee_id
             ):
                 raise RuntimeError("employee event actor membership is inconsistent")
         elif actor_kind in {"owner", "system"}:
@@ -1844,7 +1846,7 @@ class CollaborationStore:
             """
             INSERT INTO collaboration_events
               (event_id, group_id, sequence, event_kind, actor_kind,
-               actor_account_id, actor_membership_id, body_json, created_at)
+               actor_employee_id, actor_membership_id, body_json, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -1853,7 +1855,7 @@ class CollaborationStore:
                 sequence,
                 event_kind,
                 actor_kind,
-                actor_account_id,
+                actor_employee_id,
                 actor_membership_id,
                 _json_object(body),
                 now,
@@ -1880,13 +1882,13 @@ class CollaborationStore:
         now: float,
         role: str = "member",
     ) -> dict[str, Any]:
-        account_id = member.account_id
+        employee_id = member.employee_id
         if role not in {"member", "owner"}:
             raise ValueError("collaboration membership role is invalid")
         if conn.execute(
             "SELECT 1 FROM collaboration_memberships "
-            "WHERE group_id=? AND account_id=? AND leave_sequence IS NULL",
-            (group_id, account_id),
+            "WHERE group_id=? AND employee_id=? AND leave_sequence IS NULL",
+            (group_id, employee_id),
         ).fetchone() is not None:
             raise RuntimeError("collaboration member is already active")
         membership_id = f"cm_{uuid.uuid4().hex}"
@@ -1897,13 +1899,13 @@ class CollaborationStore:
             group_id=group_id,
             event_kind="membership.joined",
             actor_kind=actor_kind,
-            body={"account_id": account_id, "membership_id": membership_id},
+            body={"employee_id": employee_id, "membership_id": membership_id},
             now=now,
         )
         conn.execute(
             """
             INSERT INTO collaboration_memberships
-              (membership_id, group_id, account_id, profile_revision,
+              (membership_id, group_id, employee_id, profile_revision,
                profile_fingerprint, hidden_session_id, stored_session_id,
                role, join_sequence, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1911,7 +1913,7 @@ class CollaborationStore:
             (
                 membership_id,
                 group_id,
-                account_id,
+                employee_id,
                 member.profile_revision,
                 member.profile_fingerprint,
                 hidden_session_id,
@@ -1932,7 +1934,7 @@ class CollaborationStore:
     def _trusted_profile(member: CollaborationMemberProfile) -> CollaborationMemberProfile:
         if not isinstance(member, CollaborationMemberProfile):
             raise TypeError("trusted collaboration member profile is required")
-        account_id = _identifier(member.account_id, "account ID")
+        employee_id = _identifier(member.employee_id, "employee ID")
         if (
             isinstance(member.profile_revision, bool)
             or not isinstance(member.profile_revision, int)
@@ -1943,7 +1945,7 @@ class CollaborationStore:
             member.profile_fingerprint, "profile fingerprint"
         )
         return CollaborationMemberProfile(
-            account_id=account_id,
+            employee_id=employee_id,
             profile_revision=int(member.profile_revision),
             profile_fingerprint=profile_fingerprint,
         )
@@ -1955,9 +1957,9 @@ class CollaborationStore:
             owner_key=str(row["owner_key"]),
             name=str(row["name"]),
             creator_kind=str(row["creator_kind"]),
-            creator_account_id=(
-                str(row["creator_account_id"])
-                if row["creator_account_id"] is not None
+            creator_employee_id=(
+                str(row["creator_employee_id"])
+                if row["creator_employee_id"] is not None
                 else None
             ),
             status=str(row["status"]),
@@ -1972,7 +1974,7 @@ class CollaborationStore:
         return CollaborationMembership(
             membership_id=str(row["membership_id"]),
             group_id=str(row["group_id"]),
-            account_id=str(row["account_id"]),
+            employee_id=str(row["employee_id"]),
             profile_revision=int(row["profile_revision"]),
             profile_fingerprint=str(row["profile_fingerprint"]),
             hidden_session_id=str(row["hidden_session_id"]),
@@ -1993,9 +1995,9 @@ class CollaborationStore:
             sequence=int(row["sequence"]),
             event_kind=str(row["event_kind"]),
             actor_kind=str(row["actor_kind"]),
-            actor_account_id=(
-                str(row["actor_account_id"])
-                if row["actor_account_id"] is not None
+            actor_employee_id=(
+                str(row["actor_employee_id"])
+                if row["actor_employee_id"] is not None
                 else None
             ),
             actor_membership_id=(

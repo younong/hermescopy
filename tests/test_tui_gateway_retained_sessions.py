@@ -250,7 +250,7 @@ def test_employee_policy_accepts_only_retained_channel_and_rejects_runtime_overr
         {
             "source": "feishu",
             "employee_policy": {
-                "account_id": "ca_employee",
+                "employee_id": "ca_employee",
                 "profile_revision": 3,
                 "profile_fingerprint": "sha256:" + "a" * 64,
                 "source_policy": source_policy,
@@ -275,7 +275,7 @@ def test_web_direct_employee_selection_is_server_resolved_and_context_bound(
 
     policy = {
         "schema_version": 1,
-        "account_id": "employee-a",
+        "employee_id": "employee-a",
         "profile_revision": 3,
         "source_profile_fingerprint": "sha256:" + "a" * 64,
         "system_prompt": "Server-authoritative policy",
@@ -290,14 +290,14 @@ def test_web_direct_employee_selection_is_server_resolved_and_context_bound(
     }
 
     class _Resolver:
-        def resolve_current(self, account_id):
-            assert account_id == "employee-a"
+        def resolve_current(self, employee_id):
+            assert employee_id == "employee-a"
             return ResolvedCollaborationEmployee(
                 member=CollaborationMemberProfile(
                     "employee-a", 3, "sha256:" + "a" * 64
                 ),
                 employee_policy=policy,
-                may_participate=True,
+                may_participate=False,
                 may_create_groups=True,
                 invite_quota=5,
             )
@@ -308,11 +308,12 @@ def test_web_direct_employee_selection_is_server_resolved_and_context_bound(
         def source_agent_context(self, **kwargs):
             from hermes_cli.collaboration.agent_tools import CollaborationAgentContext
 
-            assert kwargs["creator_account_id"] == "employee-a"
+            assert kwargs["creator_employee_id"] == "employee-a"
             assert kwargs["source_kind"] == "web_direct"
+            assert kwargs["require_participation"] is False
             return CollaborationAgentContext(
                 service=self,
-                creator_account_id="employee-a",
+                creator_employee_id="employee-a",
                 source_kind="web_direct",
                 source_conversation_id=kwargs["source_conversation_id"],
                 may_create_authorized=True,
@@ -337,7 +338,7 @@ def test_web_direct_employee_selection_is_server_resolved_and_context_bound(
         "session.create",
         {
             "source": "dashboard-gui",
-            "employee_account_id": "employee-a",
+            "employee_id": "employee-a",
             "model": "forged-model",
             "switch_generation": 0,
         },
@@ -353,7 +354,7 @@ def test_web_direct_employee_selection_is_server_resolved_and_context_bound(
         "session.create",
         {
             "source": "dashboard-gui",
-            "employee_account_id": "employee-a",
+            "employee_id": "employee-a",
             "switch_generation": 1,
         },
     )
@@ -362,7 +363,7 @@ def test_web_direct_employee_selection_is_server_resolved_and_context_bound(
     session = runtime.mutable_state.sessions[response["result"]["session_id"]]
     assert session["employee_policy"] == policy
     context = session["collaboration_context"]
-    assert context.creator_account_id == "employee-a"
+    assert context.creator_employee_id == "employee-a"
     assert context.source_kind == "web_direct"
     assert context.source_conversation_id == response["result"]["stored_session_id"]
     assert context.source_depth == 0
@@ -393,14 +394,14 @@ def test_feishu_direct_context_requires_exact_managed_origin_and_group_gets_no_t
     _db, runtime, _workspace_root = owner_gateway
     from hermes_cli.collaboration.agent_tools import CollaborationAgentContext
 
-    policy = {"account_id": "employee-a"}
+    policy = {"employee_id": "employee-a"}
 
     class _Resolver:
         def validate_feishu_origin(self, **kwargs):
-            assert kwargs["account_id"] == "employee-a"
+            assert kwargs["employee_id"] == "employee-a"
             assert kwargs["binding_id"] == "binding-a"
             assert kwargs["conversation_id"] == "oc_direct"
-            if kwargs["account_id"] != "employee-a":
+            if kwargs["employee_id"] != "employee-a":
                 raise RuntimeError("forged account")
 
     class _Service:
@@ -409,11 +410,11 @@ def test_feishu_direct_context_requires_exact_managed_origin_and_group_gets_no_t
         def source_agent_context(self, **kwargs):
             return CollaborationAgentContext(
                 service=self,
-                creator_account_id=kwargs["creator_account_id"],
+                creator_employee_id=kwargs["creator_employee_id"],
                 source_kind=kwargs["source_kind"],
                 source_conversation_id=kwargs["source_conversation_id"],
                 source_provider=kwargs["source_provider"],
-                source_account_id=kwargs["source_account_id"],
+                source_connector_account_id=kwargs["source_connector_account_id"],
                 source_binding_id=kwargs["source_binding_id"],
                 source_session_id=kwargs["source_session_id"],
                 may_create_authorized=True,
@@ -424,7 +425,8 @@ def test_feishu_direct_context_requires_exact_managed_origin_and_group_gets_no_t
     direct = {
         "provider": "feishu",
         "source_kind": "feishu_direct",
-        "account_id": "employee-a",
+        "employee_id": "employee-a",
+        "connector_account_id": "ca-employee-a",
         "binding_id": "binding-a",
         "conversation_id": "oc_direct",
         "thread_id": "",
@@ -460,7 +462,7 @@ def test_feishu_direct_context_requires_exact_managed_origin_and_group_gets_no_t
                 {
                     "retained_source_context": {
                         **direct,
-                        "account_id": "employee-b",
+                        "employee_id": "employee-b",
                     }
                 },
                 employee_policy=policy,
@@ -487,7 +489,7 @@ def test_collaboration_tool_injection_requires_trusted_role_and_creation_authori
 
     base = {
         "service": object(),
-        "creator_account_id": "employee-a",
+        "creator_employee_id": "employee-a",
         "source_kind": "web_direct",
         "source_conversation_id": "session-a",
     }
@@ -522,7 +524,7 @@ def test_web_direct_employee_selection_rejects_policy_and_runtime_forgery(
         "session.create",
         {
             "source": "dashboard-gui",
-            "employee_account_id": "employee-a",
+            "employee_id": "employee-a",
             "employee_policy": {},
             "switch_generation": 1,
         },
@@ -543,7 +545,7 @@ def test_web_direct_employee_selection_requires_dashboard_transport(owner_gatewa
         "session.create",
         {
             "source": "dashboard-gui",
-            "employee_account_id": "employee-a",
+            "employee_id": "employee-a",
             "switch_generation": 1,
         },
     )
@@ -617,7 +619,7 @@ def test_web_direct_resume_rebuilds_live_authority_and_rejects_identity_mismatch
     from hermes_cli.collaboration.resolver import ResolvedCollaborationEmployee
 
     policy = {
-        "account_id": "employee-a",
+        "employee_id": "employee-a",
         "system_prompt": "Pinned policy",
     }
 
@@ -625,8 +627,8 @@ def test_web_direct_resume_rebuilds_live_authority_and_rejects_identity_mismatch
         may_create_groups = False
         may_participate = True
 
-        def resolve_current(self, account_id):
-            assert account_id == "employee-a"
+        def resolve_current(self, employee_id):
+            assert employee_id == "employee-a"
             return ResolvedCollaborationEmployee(
                 member=CollaborationMemberProfile(
                     "employee-a", 1, "sha256:" + "a" * 64
@@ -643,12 +645,12 @@ def test_web_direct_resume_rebuilds_live_authority_and_rejects_identity_mismatch
         def source_agent_context(self, **kwargs):
             from hermes_cli.collaboration.agent_tools import CollaborationAgentContext
 
-            resolved = self.resolver.resolve_current(kwargs["creator_account_id"])
+            resolved = self.resolver.resolve_current(kwargs["creator_employee_id"])
             if not resolved.may_participate:
                 raise RuntimeError("collaboration participation is revoked")
             return CollaborationAgentContext(
                 service=self,
-                creator_account_id=resolved.member.account_id,
+                creator_employee_id=resolved.member.employee_id,
                 source_kind=kwargs["source_kind"],
                 source_conversation_id=kwargs["source_conversation_id"],
                 may_create_authorized=resolved.may_create_groups,
@@ -660,7 +662,7 @@ def test_web_direct_resume_rebuilds_live_authority_and_rejects_identity_mismatch
         "id": "session-a",
         "model_config": {
             server._EMPLOYEE_POLICY_CONFIG_KEY: policy,
-            server._WEB_DIRECT_EMPLOYEE_ACCOUNT_CONFIG_KEY: "employee-a",
+            server._WEB_DIRECT_EMPLOYEE_CONFIG_KEY: "employee-a",
         },
     }
 
@@ -684,7 +686,7 @@ def test_web_direct_resume_rebuilds_live_authority_and_rejects_identity_mismatch
                     **row,
                     "model_config": {
                         **row["model_config"],
-                        server._WEB_DIRECT_EMPLOYEE_ACCOUNT_CONFIG_KEY: "employee-b",
+                        server._WEB_DIRECT_EMPLOYEE_CONFIG_KEY: "employee-b",
                     },
                 }
             )
@@ -908,7 +910,7 @@ def test_collaboration_runner_rebuilds_from_matching_persisted_policy(
     membership = CollaborationMembership(
         membership_id="membership-a",
         group_id="group-a",
-        account_id="employee-a",
+        employee_id="employee-a",
         profile_revision=1,
         profile_fingerprint="fingerprint-a",
         hidden_session_id="hidden-a",
@@ -1250,10 +1252,10 @@ def test_dashboard_owner_attach_allows_collaboration_without_chat_session(
     [
         (
             "collaboration.group.create",
-            {"name": "Group", "account_ids": ["employee-a"], "client_idempotency_key": "create-a"},
+            {"name": "Group", "employee_ids": ["employee-a"], "client_idempotency_key": "create-a"},
             "create_group",
             (),
-            {"name": "Group", "account_ids": ["employee-a"], "client_idempotency_key": "create-a"},
+            {"name": "Group", "employee_ids": ["employee-a"], "client_idempotency_key": "create-a"},
         ),
         (
             "collaboration.group.archive",
@@ -1264,10 +1266,10 @@ def test_dashboard_owner_attach_allows_collaboration_without_chat_session(
         ),
         (
             "collaboration.members.update",
-            {"group_id": "group-a", "account_ids": ["employee-a"]},
+            {"group_id": "group-a", "employee_ids": ["employee-a"]},
             "update_members",
             ("group-a",),
-            {"account_ids": ["employee-a"]},
+            {"employee_ids": ["employee-a"]},
         ),
     ],
 )
@@ -1350,10 +1352,10 @@ def test_collaboration_mutation_uses_dashboard_owner_authorization(owner_gateway
         ("collaboration.group.get", {"group_id": "group-a"}),
         (
             "collaboration.group.create",
-            {"name": "Group", "account_ids": [], "client_idempotency_key": "create-a"},
+            {"name": "Group", "employee_ids": [], "client_idempotency_key": "create-a"},
         ),
         ("collaboration.group.archive", {"group_id": "group-a"}),
-        ("collaboration.members.update", {"group_id": "group-a", "account_ids": []}),
+        ("collaboration.members.update", {"group_id": "group-a", "employee_ids": []}),
     ],
 )
 def test_browser_collaboration_rpcs_reject_retained_channel(
