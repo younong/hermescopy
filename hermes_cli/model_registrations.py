@@ -77,11 +77,28 @@ def _admin_registration_id(kind: str, provider: str, model: str) -> str:
     return f"admin-{kind}-{hashlib.sha256(identity).hexdigest()[:24]}"
 
 
-def _admin_registrations() -> dict[str, dict[str, Any]]:
-    from hermes_cli.deployment_inference import route_descriptors_from_control_plane
+def _admin_media_descriptor():
+    """Return the deployment media descriptor for admin registrations.
+
+    Workers decode the supervisor-injected, secret-free descriptor payload;
+    the Control Plane derives the descriptor from its own route policy —
+    which applies the default policy id and also covers the legacy APIYI
+    auto-route when no routes are declared.
+    """
     from hermes_cli.deployment_media import (
         deployment_media_descriptor_from_environment,
+        policy_from_control_plane_environment,
     )
+    from hermes_cli.owner_runtime import is_owner_worker_env
+
+    if is_owner_worker_env():
+        return deployment_media_descriptor_from_environment()
+    policy = policy_from_control_plane_environment()
+    return policy.descriptor() if policy is not None else None
+
+
+def _admin_registrations() -> dict[str, dict[str, Any]]:
+    from hermes_cli.deployment_inference import route_descriptors_from_control_plane
 
     registrations: dict[str, dict[str, Any]] = {}
     for route in route_descriptors_from_control_plane():
@@ -95,7 +112,7 @@ def _admin_registrations() -> dict[str, dict[str, Any]]:
             "scope": "admin",
         }
 
-    descriptor = deployment_media_descriptor_from_environment()
+    descriptor = _admin_media_descriptor()
     if descriptor is not None:
         for route in descriptor.routes:
             for model in route.models:
