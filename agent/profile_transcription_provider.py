@@ -115,7 +115,8 @@ class ProfileTranscriptionProvider(TranscriptionProvider):
     def _transcribe(self, path: Path, api_key: str) -> str:
         from websockets.sync.client import connect
 
-        audio_format = _FORMATS.get(path.suffix.lower(), "wav")        request = {
+        audio_format = _FORMATS.get(path.suffix.lower(), "wav")
+        request = {
             "user": {"uid": "hermes"},
             "audio": {
                 "format": audio_format,
