@@ -21,8 +21,13 @@ import os
 import sys
 from typing import Any, Dict, Iterable
 
-from agent.image_gen_provider import VALID_ASPECT_RATIOS
-from plugins.image_gen.apiyi import ApiyiImageGenProvider
+from agent.image_gen_provider import (
+    DEFAULT_RESOLUTION,
+    VALID_ASPECT_RATIOS,
+    VALID_RESOLUTIONS,
+    resolve_aspect_ratio,
+)
+from plugins.image_gen.apiyi import ApiyiImageGenProvider, _gpt_image_size
 
 DEFAULT_MODELS = ("gpt-image-2-medium", "nano-banana-2")
 _LEGACY_ASPECT_RATIOS = ("landscape", "square", "portrait")
@@ -36,8 +41,19 @@ def _redact_error(value: Any) -> str:
     return text
 
 
-def _run_model(provider: ApiyiImageGenProvider, model: str, prompt: str, aspect_ratio: str) -> Dict[str, Any]:
-    result = provider.generate(prompt, aspect_ratio=aspect_ratio, model=model)
+def _run_model(
+    provider: ApiyiImageGenProvider,
+    model: str,
+    prompt: str,
+    aspect_ratio: str,
+    resolution: str,
+) -> Dict[str, Any]:
+    result = provider.generate(
+        prompt,
+        aspect_ratio=aspect_ratio,
+        resolution=resolution,
+        model=model,
+    )
     item = {
         "model": model,
         "success": bool(result.get("success")),
@@ -45,20 +61,32 @@ def _run_model(provider: ApiyiImageGenProvider, model: str, prompt: str, aspect_
         "image": result.get("image"),
         "requested_aspect_ratio": result.get("requested_aspect_ratio"),
         "effective_aspect_ratio": result.get("effective_aspect_ratio"),
+        "requested_resolution": result.get("requested_resolution"),
+        "effective_resolution": result.get("effective_resolution"),
+        "quality": result.get("quality"),
         "size": result.get("size"),
         "error_type": result.get("error_type"),
         "error": _redact_error(result.get("error")),
     }
-    if model.startswith("gpt-image-2") and aspect_ratio == "3:4":
-        if (
-            not item["success"]
-            or item["requested_aspect_ratio"] != "3:4"
-            or item["effective_aspect_ratio"] != "3:4"
-            or item["size"] != "768x1024"
-        ):
-            item["success"] = False
-            item["error_type"] = "aspect_ratio_validation"
-            item["error"] = "GPT-Image-2 3:4 validation failed"
+    expected_aspect_ratio = resolve_aspect_ratio(aspect_ratio)
+    expected_size = (
+        _gpt_image_size(expected_aspect_ratio, resolution)[0]
+        if model.startswith("gpt-image-2")
+        else None
+    )
+    if (
+        item["success"]
+        and item["requested_aspect_ratio"] == expected_aspect_ratio
+        and item["effective_aspect_ratio"] == expected_aspect_ratio
+        and item["requested_resolution"] == resolution
+        and item["effective_resolution"] == resolution
+        and (expected_size is None or item["size"] == expected_size)
+    ):
+        return item
+
+    item["success"] = False
+    item["error_type"] = "image_contract_validation"
+    item["error"] = "APIYI aspect ratio or resolution validation failed"
     return item
 
 
@@ -87,6 +115,12 @@ def main() -> int:
         choices=(*VALID_ASPECT_RATIOS, *_LEGACY_ASPECT_RATIOS),
         help="Hermes image aspect ratio (canonical ratio or legacy alias).",
     )
+    parser.add_argument(
+        "--resolution",
+        default=DEFAULT_RESOLUTION,
+        choices=VALID_RESOLUTIONS,
+        help="Hermes image resolution tier.",
+    )
     args = parser.parse_args()
 
     if not os.environ.get("APIYI_API_KEY", "").strip():
@@ -95,7 +129,13 @@ def main() -> int:
 
     provider = ApiyiImageGenProvider()
     results = [
-        _run_model(provider, model, args.prompt, args.aspect_ratio)
+        _run_model(
+            provider,
+            model,
+            args.prompt,
+            args.aspect_ratio,
+            args.resolution,
+        )
         for model in _parse_models(args.models)
     ]
     print(json.dumps(results, ensure_ascii=False, indent=2))
