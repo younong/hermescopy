@@ -24,6 +24,10 @@ def smoke_module():
         sys.modules.pop(spec.name, None)
 
 
+def test_script_adds_repository_root_to_import_path(smoke_module):
+    assert str(ROOT) in sys.path
+
+
 @pytest.mark.parametrize(
     ("resolution", "size"),
     (("1K", "768x1024"), ("2K", "1536x2048"), ("4K", "2480x3312")),

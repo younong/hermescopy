@@ -19,15 +19,23 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Any, Dict, Iterable
 
-from agent.image_gen_provider import (
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from agent.image_gen_provider import (  # noqa: E402
     DEFAULT_RESOLUTION,
     VALID_ASPECT_RATIOS,
     VALID_RESOLUTIONS,
     resolve_aspect_ratio,
 )
-from plugins.image_gen.apiyi import ApiyiImageGenProvider, _gpt_image_size
+from plugins.image_gen.apiyi import (  # noqa: E402
+    ApiyiImageGenProvider,
+    _gpt_image_size,
+)
 
 DEFAULT_MODELS = ("gpt-image-2-medium", "nano-banana-2")
 _LEGACY_ASPECT_RATIOS = ("landscape", "square", "portrait")
