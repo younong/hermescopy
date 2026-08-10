@@ -105,6 +105,13 @@ describe("EmployeeManagementPane", () => {
     expect(list?.querySelectorAll('[role="listitem"]')).toHaveLength(1);
     expect(document.body.textContent).toContain("员工");
     expect(document.body.textContent).not.toContain("Employees");
+    expect(list?.textContent).not.toContain("允许参与协作");
+    expect(list?.textContent).not.toContain("编辑资料");
+    expect(list?.querySelectorAll("button")).toHaveLength(1);
+
+    await act(async () => buttons().find((button) => button.textContent === "管理")?.click());
+    const management = document.querySelector('[aria-label="管理员工：Researcher"]');
+    expect(management?.textContent).toContain("允许参与协作");
 
     await act(async () => buttons().find((button) => button.textContent === "保存权限")?.click());
     expect(updatePolicy).toHaveBeenCalledWith("employee-a", current.collaboration_policy);
@@ -149,6 +156,7 @@ describe("EmployeeManagementPane", () => {
 
     await renderPane();
     const buttons = () => Array.from(document.querySelectorAll<HTMLButtonElement>("button"));
+    await act(async () => buttons().find((button) => button.textContent === "管理")?.click());
     await act(async () => buttons().find((button) => button.textContent === "测试连接")?.click());
     expect(testBinding).toHaveBeenCalledWith("employee-a");
 

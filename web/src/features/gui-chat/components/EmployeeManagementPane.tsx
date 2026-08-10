@@ -87,6 +87,7 @@ export function EmployeeManagementPane() {
   const [catalog, setCatalog] = useState<EmployeeCatalog | null>(null);
   const [loading, setLoading] = useState(true);
   const [editor, setEditor] = useState<EmployeeEditor | null>(null);
+  const [managedEmployeeId, setManagedEmployeeId] = useState<string | null>(null);
   const [bindingEditor, setBindingEditor] = useState<BindingEditor | null>(null);
   const [employeeDraft, setEmployeeDraft] = useState<EmployeeDraft>({ policy: emptyPolicy(null) });
   const [bindingDraft, setBindingDraft] = useState<BindingDraft>(EMPTY_BINDING);
@@ -98,8 +99,10 @@ export function EmployeeManagementPane() {
   const { toast, showToast } = useToast();
 
   const closeEditor = useCallback(() => setEditor(null), []);
+  const closeManagement = useCallback(() => setManagedEmployeeId(null), []);
   const closeBindingEditor = useCallback(() => setBindingEditor(null), []);
   const editorRef = useModalBehavior({ onClose: closeEditor, open: editor !== null });
+  const managementRef = useModalBehavior({ onClose: closeManagement, open: managedEmployeeId !== null });
   const bindingEditorRef = useModalBehavior({
     onClose: closeBindingEditor,
     open: bindingEditor !== null,
@@ -287,6 +290,8 @@ export function EmployeeManagementPane() {
     return <div className="flex min-h-48 items-center justify-center"><Spinner /></div>;
   }
 
+  const managedEmployee = employees.find((employee) => employee.employee_id === managedEmployeeId) ?? null;
+
   return (
     <section data-employee-management-pane className="mx-auto flex w-full max-w-4xl flex-col gap-4 px-4 py-5 sm:px-6">
       <Toast toast={toast} />
@@ -305,26 +310,45 @@ export function EmployeeManagementPane() {
           <p className="mt-1 text-xs text-[#969aa1]">无需连接消息渠道即可添加员工。</p>
         </div>
       ) : (
-        <ul aria-label="员工列表" className="divide-y divide-[#e8eaed] border-y border-[#e1e3e7]" role="list">
-          {employees.map((employee) => (
-            <EmployeeRow
-              busy={busy}
-              collaborationPolicy={collaborationDrafts[employee.employee_id] ?? employee.collaboration_policy}
-              employee={employee}
-              key={employee.employee_id}
-              onBinding={() => openBinding(employee)}
-              onBindingAction={(action) => void runBindingAction(employee, action)}
-              onCollaborationChange={(policy) => setCollaborationDrafts((current) => ({
-                ...current,
-                [employee.employee_id]: policy,
-              }))}
-              onCollaborationSave={() => void saveCollaboration(employee)}
-              onEmployeeAction={(action) => void runEmployeeAction(employee, action)}
-              onProfile={() => openProfile(employee)}
-            />
-          ))}
-        </ul>
+        <div className="overflow-hidden rounded-lg border border-[#e1e3e7] bg-white">
+          <div aria-hidden className="hidden grid-cols-[minmax(0,1fr)_7rem_9rem_5rem] gap-4 border-b border-[#e1e3e7] bg-[#f8f9fa] px-4 py-2 text-[11px] font-medium text-[#777c84] sm:grid">
+            <span>员工</span><span>状态</span><span>飞书 / Lark</span><span className="text-right">操作</span>
+          </div>
+          <ul aria-label="员工列表" className="divide-y divide-[#e8eaed]" role="list">
+            {employees.map((employee) => (
+              <EmployeeListItem employee={employee} key={employee.employee_id} onManage={() => setManagedEmployeeId(employee.employee_id)} />
+            ))}
+          </ul>
+        </div>
       )}
+
+      {managedEmployee ? (
+        <div aria-label={`管理员工：${managedEmployee.profile?.name || "未命名员工"}`} aria-modal="true" className="fixed inset-0 z-[100] flex items-center justify-center bg-black/35 p-4" ref={managementRef} role="dialog">
+          <div className="relative flex max-h-[92vh] w-full max-w-2xl flex-col rounded-xl border border-[#e1e3e7] bg-white shadow-2xl">
+            <button aria-label="关闭" className="gui-chat-icon-button absolute right-3 top-3" onClick={closeManagement} type="button"><X /></button>
+            <div className="border-b border-[#ebecef] px-5 py-4">
+              <h3 className="text-[15px] font-semibold">{managedEmployee.profile?.name || "未命名员工"}</h3>
+              <p className="mt-1 text-[11px] text-[#969aa1]">管理员工资料、协作权限、生命周期和消息渠道。</p>
+            </div>
+            <div className="min-h-0 overflow-y-auto p-5">
+              <EmployeeManagementDetails
+                busy={busy}
+                collaborationPolicy={collaborationDrafts[managedEmployee.employee_id] ?? managedEmployee.collaboration_policy}
+                employee={managedEmployee}
+                onBinding={() => openBinding(managedEmployee)}
+                onBindingAction={(action) => void runBindingAction(managedEmployee, action)}
+                onCollaborationChange={(policy) => setCollaborationDrafts((current) => ({
+                  ...current,
+                  [managedEmployee.employee_id]: policy,
+                }))}
+                onCollaborationSave={() => void saveCollaboration(managedEmployee)}
+                onEmployeeAction={(action) => void runEmployeeAction(managedEmployee, action)}
+                onProfile={() => openProfile(managedEmployee)}
+              />
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {editor ? (
         <div aria-label={editor.mode === "create" ? "添加员工" : "编辑员工"} aria-modal="true" className="fixed inset-0 z-[100] flex items-center justify-center bg-black/35 p-4" ref={editorRef} role="dialog">
@@ -422,7 +446,28 @@ function PolicyEditor({
   );
 }
 
-function EmployeeRow({
+function EmployeeListItem({ employee, onManage }: { employee: Employee; onManage(): void }) {
+  const binding = employee.channels.feishu;
+  return (
+    <li className="grid min-h-16 items-center gap-3 px-4 py-3 sm:grid-cols-[minmax(0,1fr)_7rem_9rem_5rem] sm:gap-4" role="listitem">
+      <div className="flex min-w-0 items-center gap-3">
+        <EmployeeAvatar employee={employee} />
+        <div className="min-w-0">
+          <h3 className="truncate text-sm font-medium">{employee.profile?.name || "未命名员工"}</h3>
+          <p className="truncate text-[11px] text-[#969aa1]">{employee.profile?.role || "AI 员工"} · 资料版本 {employee.profile_revision ?? "—"}</p>
+        </div>
+      </div>
+      <div><StatusPill status={employee.lifecycle_status} /></div>
+      <div className="flex items-center gap-2 text-xs text-[#777c84]">
+        <Link2 className="h-3.5 w-3.5 shrink-0" />
+        <span className="truncate">{binding ? bindingRuntimeLabel(binding.runtime_state) : "未连接"}</span>
+      </div>
+      <div className="sm:text-right"><Button ghost onClick={onManage} size="sm">管理</Button></div>
+    </li>
+  );
+}
+
+function EmployeeManagementDetails({
   busy,
   collaborationPolicy,
   employee,
@@ -447,7 +492,7 @@ function EmployeeRow({
   const disabled = busy?.startsWith(`${employee.employee_id}:`) ?? false;
   const unlimited = collaborationPolicy.invite_quota === null;
   return (
-    <li className="py-4" role="listitem">
+    <div>
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="flex min-w-0 items-center gap-3">
           <EmployeeAvatar employee={employee} />
@@ -477,7 +522,7 @@ function EmployeeRow({
           {binding ? <><Button disabled={disabled || binding.lifecycle_status === "revoked"} ghost onClick={() => onBindingAction("test")} size="sm">测试连接</Button><Button disabled={disabled || binding.lifecycle_status === "revoked"} ghost onClick={onBinding} size="sm">更新凭据</Button>{binding.lifecycle_status === "active" ? <Button disabled={disabled} ghost onClick={() => onBindingAction("suspended")} size="sm">暂停绑定</Button> : binding.lifecycle_status === "suspended" ? <Button disabled={disabled} ghost onClick={() => onBindingAction("active")} size="sm">恢复绑定</Button> : null}<Button disabled={disabled || binding.lifecycle_status === "revoked"} ghost onClick={() => onBindingAction("revoked")} size="sm">撤销绑定</Button></> : <Button disabled={employee.lifecycle_status === "revoked"} ghost onClick={onBinding} size="sm">连接</Button>}
         </div>
       </div>
-    </li>
+    </div>
   );
 }
 
