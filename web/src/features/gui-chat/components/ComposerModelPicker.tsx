@@ -194,14 +194,9 @@ export function ComposerModelPicker({
                 role="option"
                 type="button"
               >
-                <span className="min-w-0">
-                  <span className="block truncate text-[13px] font-medium text-[#26292e]">
-                    {registration.name || registration.model.split("/").pop()}
-                    {switching ? "…" : ""}
-                  </span>
-                  <span className="block truncate text-[11px] text-[#9a9ea5]">
-                    {registration.model}
-                  </span>
+                <span className="min-w-0 truncate text-[13px] font-medium text-[#26292e]">
+                  {registration.model.split("/").pop()}
+                  {switching ? "…" : ""}
                 </span>
                 {isCurrent ? (
                   <Check aria-hidden className="h-3.5 w-3.5 shrink-0 text-[#26292e]" />
