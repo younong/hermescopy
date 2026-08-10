@@ -131,6 +131,7 @@ export function GuiChatShell() {
   const [groupsRefreshNonce, setGroupsRefreshNonce] = useState(0);
   const [createGroupOpen, setCreateGroupOpen] = useState(false);
   const [employees, setEmployees] = useState<FeishuEmployee[]>([]);
+  const [employeeLoadStatus, setEmployeeLoadStatus] = useState<"loading" | "ready" | "error">("loading");
   const [employeeChatOpen, setEmployeeChatOpen] = useState(false);
   const { authMe, authRequired, ownerKey, ready: authIdentityReady } = useDashboardAuthIdentity();
   const weChatStatus = authMe?.feature_status?.weixin_ilink_connect;
@@ -475,15 +476,20 @@ export function GuiChatShell() {
     if (!connection) return;
     const controller = new AbortController();
     setGroupsLoading(true);
-    void Promise.all([
-      connection.collaboration.listGroups(true, controller.signal),
-      api.getFeishuEmployees().catch(() => ({ employees: [] })),
-    ]).then(([response, employeeResponse]) => {
-      if (controller.signal.aborted) return;
-      setGroups(response.groups);
-      setEmployees(employeeResponse.employees);
+    void connection.collaboration.listGroups(true, controller.signal).then((response) => {
+      if (!controller.signal.aborted) setGroups(response.groups);
     }).catch(() => undefined).finally(() => {
       if (!controller.signal.aborted) setGroupsLoading(false);
+    });
+    setEmployeeLoadStatus("loading");
+    void api.getFeishuEmployees().then((response) => {
+      if (controller.signal.aborted) return;
+      setEmployees(response.employees);
+      setEmployeeLoadStatus("ready");
+    }).catch(() => {
+      if (controller.signal.aborted) return;
+      setEmployees([]);
+      setEmployeeLoadStatus("error");
     });
     return () => controller.abort();
   }, [authIdentityReady, groupsRefreshNonce, switchScope]);
@@ -824,6 +830,14 @@ export function GuiChatShell() {
       && employee.profile !== null
       && employee.collaboration_policy.may_participate,
   );
+  const employeeChatNotice = employeeLoadStatus === "loading"
+    ? "AI employees are still loading. Please try again shortly."
+    : employeeLoadStatus === "error"
+      ? "AI employees could not be loaded. Please refresh the page and try again."
+      : availableDirectEmployees.length === 0
+        ? "No AI employees are available for chat. Activate an employee, add its profile, and allow collaboration in 员工管理."
+        : null;
+  const toggleEmployeeChat = () => setEmployeeChatOpen((open) => !open);
   const handleLogout = () => {
     dashboardAuthTransition.reset();
     void api.logout();
@@ -855,14 +869,18 @@ export function GuiChatShell() {
           aria-expanded={employeeChatOpen}
           aria-label="Start employee chat"
           className="gui-chat-nav-item"
-          disabled={availableDirectEmployees.length === 0}
-          onClick={() => setEmployeeChatOpen((open) => !open)}
+          onClick={toggleEmployeeChat}
           type="button"
         >
           <Bot />
           <span>Chat with employee</span>
         </button>
-        {employeeChatOpen ? (
+        {employeeChatOpen && employeeChatNotice ? (
+          <div className="ml-6 border-l border-[#e4e6ea] px-3 py-2 text-xs leading-5 text-black/55" role="status">
+            {employeeChatNotice}
+          </div>
+        ) : null}
+        {employeeChatOpen && !employeeChatNotice ? (
           <div className="ml-6 space-y-[3px] border-l border-[#e4e6ea] pl-2">
             {availableDirectEmployees.map((employee) => (
               <button
