@@ -468,6 +468,9 @@ class AIAgent:
         collaboration_context: Any = None,
         session_kind: str = "conversation",
         session_visibility: str = "visible",
+        model_kind: str = "chat",
+        runtime_profile: str | None = None,
+        runtime_toolset: str | None = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -544,6 +547,9 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            model_kind=model_kind,
+            runtime_profile=runtime_profile,
+            runtime_toolset=runtime_toolset,
         )
         self.employee_policy = employee_policy
         self.collaboration_context = collaboration_context

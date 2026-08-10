@@ -608,6 +608,105 @@ def test_duplicate_type_and_catalog_validation(monkeypatch):
         })
 
 
+def test_code_registration_has_independent_catalog_and_activation(monkeypatch):
+    monkeypatch.setattr(
+        model_registrations,
+        "_capability_catalog",
+        lambda: [{
+            "provider": "openai-codex",
+            "name": "OpenAI Codex",
+            "models": [{"id": "gpt-5.3-codex", "display": "gpt-5.3-codex"}],
+            "available": True,
+            "credential_configured": True,
+            "default_model": "gpt-5.3-codex",
+            "capabilities": {"profile": "coding", "toolset": "coding"},
+            "setup": {"env_vars": []},
+        }],
+    )
+    created = model_registrations.create_model_registration({
+        "name": "Codex",
+        "kind": "code",
+        "provider": "openai-codex",
+        "model": "gpt-5.3-codex",
+    })
+    assert created["kind"] == "code"
+    assert "category" not in created
+
+    activated = model_registrations.activate_model_registration(created["id"])
+    assert activated["kind"] == "code"
+    config = load_config()
+    assert config["code_agent"] == {
+        "provider": "openai-codex",
+        "model": "gpt-5.3-codex",
+    }
+    assert config["model"] == ""
+    assert model_registrations.resolve_code_model_registration(created["id"]) == {
+        "registration_id": created["id"],
+        "provider": "openai-codex",
+        "model": "gpt-5.3-codex",
+        "source": "catalog",
+        "profile": "coding",
+        "toolset": "coding",
+    }
+
+
+def test_legacy_code_registration_migrates_and_preserves_id(monkeypatch):
+    monkeypatch.setattr(
+        model_registrations,
+        "_capability_catalog",
+        lambda: [{
+            "provider": "openai-codex",
+            "models": [{"id": "gpt-5.3-codex"}],
+        }],
+    )
+    config = load_config()
+    config["model_registrations"] = {
+        "legacy-code": {
+            "name": "Legacy Codex",
+            "kind": "chat",
+            "category": "code",
+            "provider": "openai-codex",
+            "model": "gpt-5.3-codex",
+            "source": "catalog",
+        },
+    }
+    save_config(config, preserve_keys={("model_registrations",)})
+
+    payload = model_registrations.get_model_registrations_payload()
+
+    migrated = next(item for item in payload["registrations"] if item["id"] == "legacy-code")
+    assert migrated["kind"] == "code"
+    assert "category" not in migrated
+    assert load_config()["model_registrations"]["legacy-code"]["kind"] == "code"
+    assert model_registrations.resolve_code_model_registration("legacy-code")["profile"] == "coding"
+
+
+def test_unmigratable_legacy_code_registration_is_exposed_and_rejected(monkeypatch):
+    monkeypatch.setattr(model_registrations, "_capability_catalog", lambda: [])
+    config = load_config()
+    config["model_registrations"] = {
+        "legacy-code": {
+            "name": "Missing Codex",
+            "kind": "chat",
+            "category": "code",
+            "provider": "removed-provider",
+            "model": "removed-model",
+            "source": "catalog",
+        },
+    }
+    save_config(config, preserve_keys={("model_registrations",)})
+
+    payload = model_registrations.get_model_registrations_payload()
+
+    migrated = next(item for item in payload["registrations"] if item["id"] == "legacy-code")
+    assert migrated["kind"] == "code"
+    assert migrated["migration_error"] == (
+        "Code provider 'removed-provider' is no longer available"
+    )
+    with pytest.raises(model_registrations.ModelRegistrationError, match="no longer available"):
+        model_registrations.resolve_code_model_registration("legacy-code")
+
+
 def test_chat_catalog_disables_network_discovery(monkeypatch):
     captured: dict[str, Any] = {}
 
@@ -675,6 +774,6 @@ def test_payload_is_lightweight_and_catalog_is_safe(monkeypatch):
     }
     with pytest.raises(
         model_registrations.ModelRegistrationError,
-        match="Only image, video, voice, and vector",
+        match="Only code, image, video, voice, and vector",
     ):
         model_registrations.activate_model_registration(chat["id"])

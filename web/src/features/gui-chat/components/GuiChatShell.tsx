@@ -706,6 +706,31 @@ export function GuiChatShell() {
       .catch((error: Error) => dispatch({ type: "error", message: error.message }));
   }, [state.sessionId]);
 
+  const activateCodeModel = useCallback(
+    async (registration: { model: string; provider: string }) => {
+      const coordinator = switchCoordinatorRef.current;
+      if (!coordinator) throw new Error("Chat connection is not ready");
+      historyAbortRef.current?.abort();
+      setAttachmentsToQueue([]);
+      reconnectLifecycleRef.current?.cancelRecovery();
+      setResumeNotice(null);
+      skipClearedRouteRef.current = true;
+      updateSearchParams((prev) => {
+        const next = new URLSearchParams(prev);
+        next.delete("resume");
+        next.delete("group");
+        return next;
+      }, { replace: true });
+      const generation = coordinator.start(null, undefined, {
+        kind: "code",
+        codeProvider: registration.provider,
+        codeModel: registration.model,
+      });
+      dispatch({ type: "session.selected", generation, sessionId: null });
+    },
+    [updateSearchParams],
+  );
+
   const switchChatModel = useCallback(
     async (
       registration: { model: string; provider: string },
@@ -1156,6 +1181,7 @@ export function GuiChatShell() {
             canSwitchChat={Boolean(state.sessionId && state.connection === "open")}
             currentModel={state.model}
             currentProvider={state.provider}
+            onActivateCode={activateCodeModel}
             onSwitchChat={switchChatModel}
           />
         ) : groupId ? (

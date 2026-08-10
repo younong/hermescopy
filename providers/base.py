@@ -58,6 +58,9 @@ class ProviderProfile:
     base_url: str = ""
     models_url: str = ""  # explicit models endpoint; falls back to {base_url}/models
     auth_type: str = "api_key"   # api_key|oauth_device_code|oauth_external|copilot|aws_sdk
+    # Capability-only profiles still reuse this transport declaration, but must
+    # not be offered by the provider-owned Chat catalog.
+    chat_enabled: bool = True
     supports_model_listing: bool = True  # False → picker uses fallback_models only
     supports_health_check: bool = True  # False → doctor skips /models probe for this provider
 

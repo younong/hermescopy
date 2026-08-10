@@ -9,6 +9,7 @@ This module covers the chat_completions path (/v1 endpoint).
 
 from typing import Any
 
+from hermes_cli.model_plane.capability import register_code_provider
 from providers import register_provider
 from providers.base import OMIT_TEMPERATURE, ProviderProfile
 
@@ -64,6 +65,7 @@ kimi = KimiProfile(
     default_max_tokens=32000,
     default_headers={"User-Agent": "hermes-agent/1.0"},
     default_aux_model="kimi-k2-turbo-preview",
+    chat_enabled=False,
 )
 
 kimi_cn = KimiProfile(
@@ -76,7 +78,10 @@ kimi_cn = KimiProfile(
     default_max_tokens=32000,
     default_headers={"User-Agent": "hermes-agent/1.0"},
     default_aux_model="kimi-k2-turbo-preview",
+    chat_enabled=False,
 )
 
 register_provider(kimi)
 register_provider(kimi_cn)
+register_code_provider(kimi)
+register_code_provider(kimi_cn)

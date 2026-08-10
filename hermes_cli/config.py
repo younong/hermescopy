@@ -895,6 +895,7 @@ def _ensure_hermes_home_managed(home: Path):
 
 DEFAULT_CONFIG = {
     "model": "",
+    "code_agent": {},
     "providers": {},
     "model_registrations": {},
     "fallback_providers": [],

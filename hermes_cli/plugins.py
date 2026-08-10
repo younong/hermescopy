@@ -668,6 +668,26 @@ class PluginContext:
             self.manifest.name, provider.name,
         )
 
+    # -- Code capability provider registration -------------------------------
+
+    def register_code_provider(self, provider) -> None:
+        """Register a provider profile as a Code capability."""
+        from providers.base import ProviderProfile
+        from hermes_cli.model_plane.capability import register_code_provider
+
+        if not isinstance(provider, ProviderProfile):
+            logger.warning(
+                "Plugin '%s' tried to register a Code provider that does not "
+                "inherit from ProviderProfile. Ignoring.",
+                self.manifest.name,
+            )
+            return
+        register_code_provider(provider)
+        logger.info(
+            "Plugin '%s' registered Code provider: %s",
+            self.manifest.name, provider.name,
+        )
+
     # -- dashboard auth provider registration --------------------------------
 
     def register_dashboard_auth_provider(self, provider) -> None:
@@ -2205,6 +2225,7 @@ def _register_provider_media_capabilities(*, force: bool = False) -> None:
     from hermes_cli.model_plane.capability import (
         ProfileEmbeddingCapability,
         register_capability_provider,
+        register_code_provider,
         register_media_generation_provider,
         register_voice_provider,
     )

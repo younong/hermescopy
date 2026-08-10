@@ -322,10 +322,18 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # cache), so the brief tells the model to re-check git before relying on it.
     if agent.valid_tool_names:
         try:
-            from agent.coding_context import coding_system_blocks
+            from agent.coding_context import (
+                coding_system_blocks,
+                explicit_coding_system_blocks,
+            )
 
+            coding_blocks = (
+                explicit_coding_system_blocks
+                if getattr(agent, "model_kind", "chat") == "code"
+                else coding_system_blocks
+            )
             stable_parts.extend(
-                coding_system_blocks(
+                coding_blocks(
                     platform=agent.platform,
                     cwd=resolve_context_cwd(),
                     model=agent.model,

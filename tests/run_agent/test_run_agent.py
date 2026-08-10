@@ -1085,6 +1085,39 @@ class TestInit:
             )
             assert a.valid_tool_names == {"web_search", "terminal"}
 
+    def test_code_kind_forces_coding_runtime_and_toolset_before_request(self):
+        tools = _make_tool_defs("read_file", "write_file")
+        seen = {}
+
+        def _tools(*, enabled_toolsets, disabled_toolsets, quiet_mode):
+            seen["enabled_toolsets"] = enabled_toolsets
+            return tools
+
+        with (
+            patch("run_agent.get_tool_definitions", side_effect=_tools),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                provider="openai-codex",
+                model="gpt-5.3-codex",
+                model_kind="code",
+                runtime_profile="chat",
+                runtime_toolset="web",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        assert a.model_kind == "code"
+        assert a.runtime_profile == "coding"
+        assert a.runtime_toolset == "coding"
+        assert a.enabled_toolsets == ["coding"]
+        assert seen["enabled_toolsets"] == ["coding"]
+        assert a.valid_tool_names == {"read_file", "write_file"}
+
     def test_session_id_auto_generated(self):
         """Session ID should be auto-generated in YYYYMMDD_HHMMSS_<hex6> format."""
         with (

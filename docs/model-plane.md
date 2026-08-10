@@ -1,7 +1,7 @@
 # Model Plane — the only model access architecture
 
-Hermes has exactly five model kinds: `chat`, `image`, `video`, `voice`,
-`vector`. All five converge on **one** architecture — the model plane in
+Hermes has six model kinds: `chat`, `code`, `image`, `video`, `voice`,
+`vector`. All six converge on **one** architecture — the model plane in
 `hermes_cli/model_plane/` — with a single catalog, a single registration
 store, a single activation mechanism, and two credential paths. This document
 is the legislation for how models may be added or changed. Ad-hoc extension
@@ -12,8 +12,9 @@ outside these rules is rejected in review.
 - **Chat models belong to providers.** A provider (`ProviderProfile` or a
   custom provider entry) owns chat model access: identity, endpoints, wire
   protocol, and the model catalog.
-- **Image, video, voice, and vector models belong to capability plugins.**
-  A capability plugin implements the narrow
+- **Code, image, video, voice, and vector models belong to capability plugins.**
+  Code is a non-media capability with the dedicated `code_agent` selection;
+  it does not use Chat switching or media relay. A capability plugin implements the narrow
   `hermes_cli.model_plane.capability.CapabilityProvider` protocol
   (`kind`, `name`, `env_vars`/setup schema, `models`, `is_available`,
   execution) and registers it with the capability registry. Voice models
@@ -31,19 +32,20 @@ catalog  →  registration  →  activation  →  execution
 
 1. **Catalog** — `hermes_cli.model_plane.catalog` returns the selectable
    `(kind, provider, model)` rows. Chat rows come from
-   `hermes_cli/inventory.py`; media rows come from the capability registry.
+   `hermes_cli/inventory.py`; Code and media rows come from the capability registry.
    Rows are credential-safe (availability booleans and setup metadata only).
 2. **Registration** — `hermes_cli/model_registrations.py` stores user picks
-   (and server-managed admin registrations) uniformly for all five kinds.
+   (and server-managed admin registrations) uniformly for all six kinds.
    Every kind is catalog-backed; `source="manual"` survives only as a legacy
    escape hatch for voice/vector records created before the catalog covered
    them.
-3. **Activation** — media kinds activate into their `{kind}_gen` config
-   section via `tools_config.select_media_model`; chat activation stays the
-   `model.default` selection. `use_gateway` exists only for generation media
-   (image/video).
+3. **Activation** — Code activates into `config["code_agent"]`; media kinds
+   activate into their `{kind}_gen` config section via
+   `tools_config.select_media_model`; Chat activation stays the `model.default`
+   selection. `use_gateway` exists only for generation media (image/video).
 4. **Execution** — runtime consumers resolve the active selection and call
-   the owning provider (chat) or capability plugin (media).
+   the owning provider (Chat) or capability plugin (Code/media). Code applies
+   the coding profile and `coding` toolset before its first request.
 
 ## Two credential paths — and only two
 
