@@ -53,6 +53,8 @@ describe("ComposerModelPicker", () => {
     expect(api.getModelRegistrations).toHaveBeenCalledWith();
     expect(listbox()).not.toBeNull();
     expect(listbox().textContent).toContain("Default model");
+    expect(listbox().textContent).toContain("default-model");
+    expect(listbox().textContent).not.toContain("default-provider");
     expect(listbox().textContent).not.toContain("Image model");
 
     const current = optionFor("Current model");

@@ -116,10 +116,7 @@ function getJobMode(job: CronJob): string {
 }
 
 function getModelDisplay(job: CronJob): string {
-  const provider = asText(job.provider);
-  const model = asText(job.model);
-  if (provider && model) return `${provider}/${model}`;
-  return model || provider;
+  return asText(job.model);
 }
 
 const STATUS_TONE: Record<string, "success" | "warning" | "destructive"> = {
@@ -527,7 +524,7 @@ export default function CronPage() {
                     )}
                     {modelDisplay && (
                       <Badge tone="outline" title={modelDisplay}>
-                        model
+                        {modelDisplay}
                       </Badge>
                     )}
                     {toolsets.length > 0 && (

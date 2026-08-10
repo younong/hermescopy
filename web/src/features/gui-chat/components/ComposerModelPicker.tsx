@@ -200,7 +200,7 @@ export function ComposerModelPicker({
                     {switching ? "…" : ""}
                   </span>
                   <span className="block truncate text-[11px] text-[#9a9ea5]">
-                    {registration.provider} · {registration.model}
+                    {registration.model}
                   </span>
                 </span>
                 {isCurrent ? (

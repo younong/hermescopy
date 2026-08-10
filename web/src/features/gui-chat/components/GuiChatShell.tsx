@@ -1088,7 +1088,7 @@ export function GuiChatShell() {
                 ? "Workspace"
                 : groupId
                   ? `${activeGroup?.status ?? "group"} · ${Object.values(groups).length} groups · ${state.connection}`
-                  : `${state.model ?? "Hermes"}${state.provider ? ` · ${state.provider}` : ""} · ${mockMode ? "mock" : state.connection}`}
+                  : `${state.model ?? "Hermes"} · ${mockMode ? "mock" : state.connection}`}
             </p>
           </div>
           {!workspacePaneOpen ? (

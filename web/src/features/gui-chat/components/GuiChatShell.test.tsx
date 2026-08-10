@@ -507,7 +507,8 @@ describe("GuiChatShell", () => {
       });
     });
 
-    expect(document.body.textContent).toContain("next-model · next-provider · open");
+    expect(document.body.textContent).toContain("next-model · open");
+    expect(document.body.textContent).not.toContain("next-provider");
   });
 
   it("hides Retry while a real chat connection is healthy", async () => {
