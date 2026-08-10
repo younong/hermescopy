@@ -172,8 +172,6 @@ def dispatch_deployment_media(
         owner_home=owner_home,
     )
     if kind == "image":
-        # Forward the validated resolution tier; routes whose executor does
-        # not support it (e.g. APIYI) ignore params by contract.
         params = {}
         resolution = arguments.get("resolution")
         if isinstance(resolution, str) and resolution.strip():

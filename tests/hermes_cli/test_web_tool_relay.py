@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.image_gen_provider import VALID_ASPECT_RATIOS
+from agent.image_gen_provider import VALID_ASPECT_RATIOS, VALID_RESOLUTIONS
 from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
 from hermes_cli.controlled_roots import controlled_roots_for
 from hermes_cli.dashboard_auth.authority import OwnerWorkerAuthorityLease, WorkerLeaseState
@@ -518,6 +518,28 @@ def test_owner_relay_accepts_supported_image_aspect_ratios(aspect_ratio):
         broker.close()
 
 
+@pytest.mark.parametrize("resolution", VALID_RESOLUTIONS)
+def test_owner_relay_accepts_supported_image_resolutions(resolution):
+    seen = []
+    broker = OwnerToolRelayBroker(
+        identity_validator=lambda _identity: None,
+        media_dispatcher=lambda _name, args, *_rest: (
+            seen.append(args) or '{"success":true}'
+        ),
+    )
+    try:
+        invocation = _invocation(
+            "image_generate",
+            {"prompt": "draw", "aspect_ratio": "3:4", "resolution": resolution},
+            invocation_id=f"image-{resolution}",
+        )
+        relay_fd = broker.register(invocation)
+        assert dispatch_owner_tool_over_relay(relay_fd, invocation) == '{"success":true}'
+    finally:
+        broker.close()
+    assert seen[0]["resolution"] == resolution
+
+
 def test_owner_relay_falls_back_to_local_dispatcher_without_media_dispatcher():
     """No media dispatcher: image_generate rides the local plugin path."""
     seen = []
@@ -552,6 +574,7 @@ def test_owner_relay_falls_back_to_local_dispatcher_without_media_dispatcher():
         {"prompt": "", "aspect_ratio": "square"},
         {"prompt": "draw", "aspect_ratio": "wide"},
         {"prompt": "draw", "aspect_ratio": "square", "model": "forged"},
+        {"prompt": "draw", "aspect_ratio": "square", "resolution": "8K"},
         {"prompt": "draw", "aspect_ratio": "square", "image_url": "bad\x00path"},
         {"prompt": "draw", "aspect_ratio": "square", "reference_image_urls": ["x.png"] * 17},
     ],

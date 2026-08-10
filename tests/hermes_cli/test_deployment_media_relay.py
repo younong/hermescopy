@@ -72,6 +72,11 @@ def _fake_executor(**kwargs):
         "metadata": {
             "size": "1024x1024",
             "upstream_model": "gpt-image-2",
+            "requested_aspect_ratio": kwargs.get("aspect_ratio"),
+            "effective_aspect_ratio": kwargs.get("aspect_ratio"),
+            "requested_resolution": kwargs.get("params", {}).get("resolution"),
+            "effective_resolution": kwargs.get("params", {}).get("resolution"),
+            "resolution_mode": "native",
             "api_key_backup": "must-not-cross-relay",
             "x-api-key": "must-not-cross-relay",
         },
@@ -121,12 +126,19 @@ def test_relay_requires_active_exact_lease_and_returns_bytes(tmp_path):
         prompt="draw",
         aspect_ratio="3:4",
         references=[],
+        params={"resolution": "4K"},
     )
     assert result["image_bytes"] == b"generated"
     assert result["provider"] == "apiyi"
     assert result["aspect_ratio"] == "3:4"
     assert result["metadata"] == {
-        "size": "1024x1024", "upstream_model": "gpt-image-2",
+        "size": "1024x1024",
+        "upstream_model": "gpt-image-2",
+        "requested_aspect_ratio": "3:4",
+        "effective_aspect_ratio": "3:4",
+        "requested_resolution": "4K",
+        "effective_resolution": "4K",
+        "resolution_mode": "native",
     }
     broker.revoke(active)
     with pytest.raises(DeploymentMediaRelayError):
