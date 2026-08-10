@@ -104,12 +104,22 @@ class _JitterState:
     chars: int = 0
     started_at: float | None = None
 
-# Once a dashboard connection starts using ``session.attach``, session events are
-# a subscription rather than a broadcast: only the committed runtime may reach
-# that socket. These two events are genuinely connection-scoped and remain
-# useful without a session id. Unknown sessionless events are fail-closed so a
-# newly added transcript event cannot accidentally bleed across a switch.
-_DASHBOARD_CONNECTION_EVENT_TYPES = frozenset({"gateway.ready", "skin.changed"})
+# Once a dashboard connection claims an owner scope, session events become a
+# subscription rather than a broadcast: only the committed runtime may reach
+# that socket. The allowlist also carries owner-scoped collaboration events,
+# which intentionally have no chat session id. Unknown sessionless events remain
+# fail-closed so a newly added transcript event cannot bleed across a switch.
+_DASHBOARD_OWNER_EVENT_TYPES = frozenset(
+    {
+        "gateway.ready",
+        "skin.changed",
+        "collaboration.group.changed",
+        "collaboration.event.appended",
+        "collaboration.target.changed",
+        "collaboration.execution.delta",
+        "collaboration.approval.changed",
+    }
+)
 
 
 def _merge_streaming_lines(lines: list[str]) -> list[str]:
@@ -381,6 +391,24 @@ class WSTransport:
                 return "dashboard mutation targets an inactive session"
             return None
 
+    def attach_dashboard_owner_scope(
+        self,
+        *,
+        browser_id: str,
+        profile: str = "",
+    ) -> str | None:
+        """Authorize owner-scoped dashboard RPCs without selecting a chat session."""
+        scope = (browser_id.strip(), profile.strip())
+        if not scope[0]:
+            return "browser_id required"
+        with self._dashboard_lock:
+            if self._closed:
+                return "transport closed"
+            if self._dashboard_scope is not None and self._dashboard_scope != scope:
+                return "dashboard attach scope mismatch"
+            self._dashboard_scope = scope
+        return None
+
     def dashboard_owner_mutation_error(self) -> str | None:
         """Authorize owner-scoped mutations without inventing a chat session ID."""
         with self._dashboard_lock:
@@ -388,8 +416,6 @@ class WSTransport:
                 return "dashboard mutation requires an attached WebSocket"
             if self._dashboard_pending_generation is not None:
                 return "dashboard session switch in progress"
-            if self._dashboard_active_session_id is None:
-                return "dashboard mutation requires an active session"
             return None
 
     def dashboard_attach_is_current(self, generation: int) -> bool:
@@ -433,7 +459,7 @@ class WSTransport:
         session_id = str(params.get("session_id") or "")
         if session_id:
             return bool(active_session_id) and session_id == active_session_id
-        return params.get("type") in _DASHBOARD_CONNECTION_EVENT_TYPES
+        return params.get("type") in _DASHBOARD_OWNER_EVENT_TYPES
 
     def _dashboard_line_allowed(self, line: str) -> bool:
         try:

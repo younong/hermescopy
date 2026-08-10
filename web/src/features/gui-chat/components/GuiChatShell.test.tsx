@@ -769,7 +769,8 @@ describe("GuiChatShell", () => {
     await renderShellAt("/chat?group=group-a");
 
     expect(new Set(mocks.connectGuiChat.mock.results.map((result) => result.value))).toEqual(new Set([connection]));
-    expect(connection.ensureConnected).toHaveBeenCalledOnce();
+    expect(connection.attachOwner).toHaveBeenCalledOnce();
+    expect(connection.attachOwner).toHaveBeenCalledWith();
     expect(connection.createOrAttach).not.toHaveBeenCalled();
     expect(connection.collaboration.listGroups).toHaveBeenCalledOnce();
   });
@@ -1094,6 +1095,7 @@ function createConnection(): TestGuiChatConnection {
   const connection = {
     attachFile: vi.fn(),
     attachImage: vi.fn(),
+    attachOwner: vi.fn().mockResolvedValue(undefined),
     attachPdf: vi.fn(),
     collaboration: {
       archiveGroup: vi.fn(),

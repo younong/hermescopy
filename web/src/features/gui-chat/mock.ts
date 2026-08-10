@@ -71,6 +71,10 @@ export function connectMockGuiChat(): GuiChatConnection {
     async ensureConnected() {
       if (!closed) emitState("open");
     },
+    async attachOwner() {
+      closed = false;
+      emitState("open");
+    },
     async createOrAttach(): Promise<SessionCreateResponse> {
       closed = false;
       emitState("connecting");

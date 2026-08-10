@@ -6804,6 +6804,13 @@ def _dashboard_attach_transport():
     return transport
 
 
+def _dashboard_owner_attach_transport():
+    transport = current_transport()
+    if not callable(getattr(transport, "attach_dashboard_owner_scope", None)):
+        return None
+    return transport
+
+
 def _session_attach_generation(rid, params: dict) -> tuple[int | None, dict | None]:
     try:
         generation = int(params.get("switch_generation"))
@@ -6812,6 +6819,22 @@ def _session_attach_generation(rid, params: dict) -> tuple[int | None, dict | No
     if generation < 0:
         return None, _err(rid, 4002, "switch_generation must be non-negative")
     return generation, None
+
+
+@method("session.owner_attach")
+def _session_owner_attach(rid, params: dict) -> dict:
+    """Attach a dashboard socket to owner-scoped RPCs without a chat session."""
+    if set(params) != {"browser_id"}:
+        return _err(rid, -32602, "session owner attach params are invalid")
+    transport = _dashboard_owner_attach_transport()
+    if transport is None:
+        return _err(rid, 4002, "session.owner_attach requires a dashboard WebSocket")
+    message = transport.attach_dashboard_owner_scope(
+        browser_id=str(params.get("browser_id") or "").strip(),
+    )
+    if message is not None:
+        return _err(rid, 4002, message)
+    return _ok(rid, {"attached": True})
 
 
 def _commit_session_attach(

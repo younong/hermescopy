@@ -96,6 +96,7 @@ export interface GuiChatConnection {
   collaboration: CollaborationApi;
   close(): void;
   ensureConnected(signal?: AbortSignal): Promise<void>;
+  attachOwner(signal?: AbortSignal): Promise<void>;
   createOrAttach(
     targetSessionId: string | null,
     generation: number,
@@ -125,7 +126,13 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
   const client = new GatewayClient();
   const browserId = getHermesBrowserId(options.ownerKey);
   let connectPromise: Promise<void> | null = null;
+  let ownerAttachPromise: Promise<void> | null = null;
+  let ownerAttached = false;
   let attachSupported = true;
+
+  client.onState((state) => {
+    if (state !== "open") ownerAttached = false;
+  });
 
   const ensureConnected = async (
     signal?: AbortSignal,
@@ -158,6 +165,23 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
     collaboration: createCollaborationApi(client, ensureConnected),
     close: () => client.close(),
     ensureConnected,
+    attachOwner: async (signal) => {
+      await ensureConnected(signal);
+      if (ownerAttached) return;
+      if (!ownerAttachPromise) {
+        ownerAttachPromise = client.request(
+          "session.owner_attach",
+          { browser_id: browserId },
+          undefined,
+          signal,
+        ).then(() => {
+          ownerAttached = true;
+        }).finally(() => {
+          ownerAttachPromise = null;
+        });
+      }
+      await ownerAttachPromise;
+    },
     createOrAttach: async (targetSessionId, generation, signal, timing, createOptions) => {
       const reused = client.connectionState === "open";
       await ensureConnected(signal, timing);

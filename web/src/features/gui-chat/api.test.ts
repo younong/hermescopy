@@ -62,6 +62,19 @@ beforeEach(() => {
 });
 
 describe("connectGuiChat", () => {
+  it("attaches owner-scoped routes without creating a chat session", async () => {
+    const connection = connectGuiChat({ ownerKey: "owner-a" });
+
+    await connection.attachOwner();
+
+    expect(mocks.gatewayInstances[0].request).toHaveBeenCalledWith(
+      "session.owner_attach",
+      { browser_id: "browser-test" },
+      undefined,
+      undefined,
+    );
+  });
+
   it("sends only the selected employee account ID for a new direct chat", async () => {
     const connection = connectGuiChat({ ownerKey: "owner-a" });
 

@@ -344,7 +344,7 @@ export function GuiChatShell() {
       historyAbortRef.current?.abort();
       setAttachmentsToQueue([]);
       switchCoordinator.cancel();
-      void connectionRef.current?.ensureConnected().catch((error: unknown) => {
+      void connectionRef.current?.attachOwner().catch((error: unknown) => {
         dispatch({ type: "error", message: error instanceof Error ? error.message : String(error) });
       });
       return;

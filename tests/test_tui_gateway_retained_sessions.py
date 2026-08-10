@@ -1138,6 +1138,56 @@ def test_collaboration_events_use_gateway_payload_shape(owner_gateway):
     ]
 
 
+def test_dashboard_owner_attach_allows_collaboration_without_chat_session(
+    owner_gateway, monkeypatch
+):
+    from tui_gateway import ws as gateway_ws
+
+    _db, runtime, _workspace_root = owner_gateway
+
+    class _Service:
+        def list_groups(self, **_kwargs):
+            return {"groups": []}
+
+    loop = asyncio.new_event_loop()
+    transport = gateway_ws.WSTransport(object(), loop, connection_purpose="interactive")
+    server.bind_collaboration_service(runtime, _Service())
+    monkeypatch.setattr(server, "_required_gateway_transport", lambda: transport)
+    try:
+        attached = server.dispatch(
+            {
+                "id": "attach",
+                "method": "session.owner_attach",
+                "params": {"browser_id": "browser-a"},
+            },
+            transport=transport,
+            runtime=runtime,
+        )
+        groups = server.dispatch(
+            {"id": "groups", "method": "collaboration.groups.list", "params": {}},
+            transport=transport,
+            runtime=runtime,
+        )
+
+        assert attached["result"] == {"attached": True}
+        assert groups["result"] == {"groups": []}
+        assert transport in runtime.mutable_state.collaboration_transports
+        assert transport._dashboard_frame_allowed(
+            {
+                "method": "event",
+                "params": {
+                    "type": "collaboration.event.appended",
+                    "payload": {"group_id": "group-a"},
+                },
+            }
+        )
+        assert not transport._dashboard_frame_allowed(
+            {"method": "event", "params": {"type": "message.delta", "payload": {}}}
+        )
+    finally:
+        loop.close()
+
+
 @pytest.mark.parametrize(
     ("method", "params", "service_method", "expected_args", "expected_kwargs"),
     [

@@ -8,6 +8,7 @@ import { GuiChatSessionSwitchCoordinator } from "./sessionSwitch";
 class FakeConnection implements GuiChatConnection {
   readonly close = vi.fn();
   readonly ensureConnected = vi.fn().mockResolvedValue(undefined);
+  readonly attachOwner = vi.fn().mockResolvedValue(undefined);
   readonly collaboration = {
     archiveGroup: vi.fn(),
     createGroup: vi.fn(),
