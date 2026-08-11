@@ -76,8 +76,6 @@ from agent.image_gen_provider import (
     VALID_ASPECT_RATIOS,
     VALID_RESOLUTIONS,
     resolve_resolution,
-    aspect_ratio_from_dimensions,
-    aspect_ratio_value,
     nearest_aspect_ratio,
     resolve_aspect_ratio,
 )
@@ -840,46 +838,52 @@ def _postprocess_image_generate_result(raw: str, task_id: str | None = None) -> 
 
     changed = False
     try:
-        from PIL import Image
+        from agent.image_size import (
+            ImageAspectRatioMismatch,
+            inspect_image_path,
+            parse_image_size,
+            validate_image_output,
+        )
 
-        with Image.open(Path(image)) as generated:
-            width, height = generated.size
-        if width > 0 and height > 0:
-            actual_aspect = aspect_ratio_from_dimensions(int(width), int(height))
-            payload["width"] = int(width)
-            payload["height"] = int(height)
-            payload["actual_aspect_ratio"] = actual_aspect
-            payload["actual_dimensions"] = {"width": int(width), "height": int(height)}
-            expected_value = payload.get("effective_aspect_ratio") or payload.get(
-                "requested_aspect_ratio"
-            ) or payload.get("aspect_ratio")
-            if expected_value:
-                requested_aspect = resolve_aspect_ratio(
-                    payload.get("requested_aspect_ratio") or expected_value
-                )
-                effective_aspect = resolve_aspect_ratio(
-                    payload.get("effective_aspect_ratio") or expected_value
-                )
-                payload.setdefault("requested_aspect_ratio", requested_aspect)
-                payload.setdefault("effective_aspect_ratio", effective_aspect)
-            else:
-                effective_aspect = None
-            if effective_aspect and abs(
-                aspect_ratio_value(actual_aspect)
-                - aspect_ratio_value(effective_aspect)
-            ) > 0.01:
-                payload.update({
-                    "success": False,
-                    "image": None,
-                    "error": (
-                        f"Generated image has aspect ratio {actual_aspect}, "
-                        f"but the effective requested ratio was {effective_aspect}."
-                    ),
-                    "error_type": "aspect_ratio_mismatch",
-                })
-            changed = True
-    except Exception as exc:  # noqa: BLE001 - image generation still succeeded
-        logger.debug("Could not inspect generated image dimensions: %s", exc)
+        expected_value = payload.get("effective_aspect_ratio") or payload.get(
+            "requested_aspect_ratio"
+        ) or payload.get("aspect_ratio")
+        requested_aspect = (
+            resolve_aspect_ratio(payload.get("requested_aspect_ratio") or expected_value)
+            if expected_value else None
+        )
+        effective_aspect = (
+            resolve_aspect_ratio(payload.get("effective_aspect_ratio") or expected_value)
+            if expected_value else None
+        )
+        actual = inspect_image_path(image)
+        actual = validate_image_output(
+            actual,
+            expected_dimensions=parse_image_size(payload.get("size")),
+            effective_aspect_ratio=effective_aspect,
+        )
+        payload.update(actual.metadata())
+        if requested_aspect:
+            payload.setdefault("requested_aspect_ratio", requested_aspect)
+        if effective_aspect:
+            payload.setdefault("effective_aspect_ratio", effective_aspect)
+        changed = True
+    except Exception as exc:  # noqa: BLE001 - return a stable tool error
+        logger.debug("Generated image artifact validation failed: %s", exc)
+        payload.update({
+            "success": False,
+            "image": None,
+            "error": str(exc),
+            "error_type": (
+                "aspect_ratio_mismatch"
+                if isinstance(exc, ImageAspectRatioMismatch)
+                else "image_artifact_mismatch"
+            ),
+        })
+        changed = True
+
+    if not payload.get("success"):
+        return json.dumps(payload, ensure_ascii=False)
 
     env = _active_terminal_env(task_id)
     agent_path = _agent_visible_cache_path(image, env)

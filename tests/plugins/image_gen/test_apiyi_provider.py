@@ -357,7 +357,7 @@ class TestGenerate:
 
 
 def test_shared_openai_executor_forwards_exact_deployment_model(monkeypatch):
-    from plugins.image_gen import apiyi
+    from plugins.image_gen import openai_compatible
 
     captured = {}
 
@@ -372,11 +372,11 @@ def test_shared_openai_executor_forwards_exact_deployment_model(monkeypatch):
         return Response()
 
     monkeypatch.setattr("requests.post", fake_post)
-    result = apiyi.generate_openai_image_bytes(
+    result = openai_compatible.generate_openai_compatible_image_bytes(
         prompt="draw", aspect_ratio="square", model="gpt-image-2",
         references=[], api_key="trusted",
         openai_base_url="https://codex.example/v1",
-        params={"resolution": "1K"},
+        size_profile="openai-native", params={"resolution": "1K"},
     )
 
     assert result["image_bytes"] == b"png"
@@ -387,7 +387,7 @@ def test_shared_openai_executor_forwards_exact_deployment_model(monkeypatch):
 
 
 def test_shared_openai_executor_supports_json_image_edits(monkeypatch):
-    from plugins.image_gen import apiyi
+    from plugins.image_gen import openai_compatible
 
     captured = {}
 
@@ -402,11 +402,11 @@ def test_shared_openai_executor_supports_json_image_edits(monkeypatch):
         return Response()
 
     monkeypatch.setattr("requests.post", fake_post)
-    result = apiyi.generate_openai_image_bytes(
+    result = openai_compatible.generate_openai_compatible_image_bytes(
         prompt="edit", aspect_ratio="square", model="gpt-image-2",
         references=[{"name": "a.png", "mime_type": "image/png", "data": b"png"}],
         api_key="trusted", openai_base_url="https://codex.example/v1",
-        edit_protocol="json_images",
+        size_profile="openai-native", edit_protocol="json_images",
     )
 
     assert result["image_bytes"] == b"png"

@@ -1,6 +1,8 @@
+import io
 import json
 
 import pytest
+from PIL import Image
 
 from hermes_cli.deployment_media import (
     DEFAULT_POLICY_ID,
@@ -16,6 +18,12 @@ from hermes_cli.deployment_media import (
     deployment_media_route_from_environment,
     policy_from_control_plane_environment,
 )
+
+
+def _png_bytes(size=(32, 32)):
+    output = io.BytesIO()
+    Image.new("RGB", size).save(output, format="PNG")
+    return output.getvalue()
 
 
 def _image_route_payload(**overrides):
@@ -41,9 +49,9 @@ def _codex_image_route_payload(**overrides):
         models=["gpt-image-2"],
         default_model="gpt-image-2",
         key_env="CODEX_IMAGE_KEY",
-        executor="plugins.image_gen.apiyi:generate_openai_image_bytes",
+        executor="plugins.image_gen.openai_compatible:generate_openai_compatible_image_bytes",
         base_urls={"openai_base_url": "https://codex.example.com/v1"},
-        executor_params={"edit_protocol": "json_images"},
+        executor_params={"edit_protocol": "json_images", "size_profile": "openai-native"},
         text_only_models=[],
     )
     payload.update(overrides)
@@ -211,7 +219,7 @@ def test_control_plane_policy_accepts_custom_codex_image_route(monkeypatch):
     route = policy.route_for("image", "custom:codex", "gpt-image-2")
     assert route is not None
     assert route.executor == (
-        "plugins.image_gen.apiyi:generate_openai_image_bytes"
+        "plugins.image_gen.openai_compatible:generate_openai_compatible_image_bytes"
     )
     descriptor = policy.descriptor()
     payload = json.dumps(descriptor.payload())
@@ -338,9 +346,9 @@ def test_policy_execute_image_normalizes_bounded_response(monkeypatch):
     def fake_executor(**kwargs):
         captured.update(kwargs)
         return {
-            "image_bytes": b"png",
+            "image_bytes": _png_bytes(),
             "mime_type": "image/png",
-            "metadata": {"size": "1024x1024"},
+            "metadata": {"effective_aspect_ratio": "1:1"},
         }
 
     monkeypatch.setattr(DeploymentMediaRoute, "load_executor", lambda self: fake_executor)
@@ -351,11 +359,18 @@ def test_policy_execute_image_normalizes_bounded_response(monkeypatch):
         prompt="draw",
         aspect_ratio="square",
     )
-    assert result["image_bytes"] == b"png"
+    assert result["image_bytes"] == _png_bytes()
     assert result["mime_type"] == "image/png"
     assert result["provider"] == "apiyi"
     assert result["modality"] == "text"
-    assert result["metadata"] == {"size": "1024x1024"}
+    assert result["metadata"] == {
+        "effective_aspect_ratio": "1:1",
+        "width": 32,
+        "height": 32,
+        "actual_dimensions": {"width": 32, "height": 32},
+        "actual_aspect_ratio": "1:1",
+        "actual_resolution": None,
+    }
     assert captured["api_key"] == "secret"
     assert captured["openai_base_url"] == "https://api.example.com/v1"
     assert captured["quality"] == "high"
@@ -369,23 +384,43 @@ def test_policy_execute_custom_codex_image_uses_shared_executor(monkeypatch):
             models=("gpt-image-2",), default_model="gpt-image-2",
         ),
         key_env="CODEX_IMAGE_KEY",
-        executor="plugins.image_gen.apiyi:generate_openai_image_bytes",
+        executor="plugins.image_gen.openai_compatible:generate_openai_compatible_image_bytes",
         base_urls={"openai_base_url": "https://codex.example.com/v1"},
+        executor_params={"size_profile": "openai-native"},
     )
     policy = DeploymentMediaPolicy(routes=(route,), policy_id="p")
     monkeypatch.setenv("CODEX_IMAGE_KEY", "secret")
     captured = {}
 
+    from agent.image_size import OPENAI_NATIVE_IMAGE_PROFILE, resolve_image_size
+
     def fake_executor(**kwargs):
         captured.update(kwargs)
-        return {"image_bytes": b"png", "mime_type": "image/png"}
+        return {
+            "image_bytes": _png_bytes((1024, 1024)),
+            "mime_type": "image/png",
+            "metadata": {
+                "size": "forged",
+                "effective_aspect_ratio": "16:9",
+                "effective_resolution": "4K",
+            },
+            "size_plan": resolve_image_size(
+                "1:1", "1K", profile=OPENAI_NATIVE_IMAGE_PROFILE
+            ),
+        }
 
     monkeypatch.setattr(DeploymentMediaRoute, "load_executor", lambda self: fake_executor)
     result = policy.execute(
         "image_generate", provider="custom:codex", model="gpt-image-2", prompt="draw"
     )
 
-    assert result["image_bytes"] == b"png"
+    assert result["metadata"]["actual_dimensions"] == {
+        "width": 1024, "height": 1024,
+    }
+    assert result["metadata"]["actual_resolution"] == "1K"
+    assert result["metadata"]["size"] == "1024x1024"
+    assert result["metadata"]["effective_aspect_ratio"] == "1:1"
+    assert result["metadata"]["effective_resolution"] == "1K"
     assert captured["model"] == "gpt-image-2"
     assert captured["openai_base_url"] == "https://codex.example.com/v1"
     assert captured["api_key"] == "secret"
@@ -451,6 +486,50 @@ def test_policy_execute_rejects_out_of_policy_requests(monkeypatch):
             model="nano-banana-2",
             prompt="x",
             references=({"name": "a.png", "mime_type": "image/png", "data": b"x"},),
+        )
+
+
+def test_policy_execute_rejects_valid_image_with_wrong_dimensions(monkeypatch):
+    route = DeploymentMediaRoute(
+        descriptor=DeploymentMediaRouteDescriptor(
+            kind="image", provider="custom:codex",
+            models=("gpt-image-2",), default_model="gpt-image-2",
+            max_output_bytes=8192,
+        ),
+        key_env="TEST_MEDIA_KEY",
+        executor="plugins.image_gen.openai_compatible:generate_openai_compatible_image_bytes",
+        base_urls={"openai_base_url": "https://codex.example.com/v1"},
+        executor_params={"size_profile": "openai-native"},
+    )
+    policy = DeploymentMediaPolicy(routes=(route,), policy_id="p")
+    monkeypatch.setenv("TEST_MEDIA_KEY", "secret")
+    from agent.image_size import OPENAI_NATIVE_IMAGE_PROFILE, resolve_image_size
+
+    monkeypatch.setattr(
+        DeploymentMediaRoute,
+        "load_executor",
+        lambda self: lambda **kwargs: {
+            "image_bytes": _png_bytes((32, 32)),
+            "mime_type": "image/png",
+            "metadata": {
+                "size": "1024x1536",
+                "effective_aspect_ratio": "2:3",
+                "effective_resolution": "1K",
+            },
+            "size_plan": resolve_image_size(
+                "3:4", "2K", profile=OPENAI_NATIVE_IMAGE_PROFILE
+            ),
+        },
+    )
+
+    with pytest.raises(DeploymentMediaPolicyInvalid):
+        policy.execute(
+            "image_generate",
+            provider="custom:codex",
+            model="gpt-image-2",
+            prompt="portrait",
+            aspect_ratio="3:4",
+            params={"resolution": "2K"},
         )
 
 

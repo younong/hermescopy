@@ -32,13 +32,12 @@ from agent.image_gen_provider import (
     DEFAULT_RESOLUTION,
     ImageGenProvider,
     error_response,
-    nearest_aspect_ratio,
     normalize_reference_images,
     resolve_aspect_ratio,
-    resolve_resolution,
     save_b64_image,
     success_response,
 )
+from agent.image_size import OPENAI_NATIVE_IMAGE_PROFILE, resolve_image_size
 
 logger = logging.getLogger(__name__)
 
@@ -71,12 +70,6 @@ _MODELS: Dict[str, Dict[str, Any]] = {
 }
 
 DEFAULT_MODEL = "gpt-image-2-medium"
-
-_SIZES = {
-    "3:2": "1536x1024",
-    "1:1": "1024x1024",
-    "2:3": "1024x1536",
-}
 
 # Codex Responses surface used for the request. The chat model itself is only
 # the host that calls the ``image_generation`` tool; the actual image work is
@@ -479,7 +472,11 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
     ) -> Dict[str, Any]:
         prompt = (prompt or "").strip()
         aspect = resolve_aspect_ratio(aspect_ratio)
-        requested_resolution = resolve_resolution(resolution)
+        size_plan = resolve_image_size(
+            aspect,
+            resolution,
+            profile=OPENAI_NATIVE_IMAGE_PROFILE,
+        )
 
         if not prompt:
             return error_response(
@@ -511,8 +508,7 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
             )
 
         tier_id, meta = _resolve_model()
-        effective_aspect = nearest_aspect_ratio(aspect, tuple(_SIZES))
-        size = _SIZES[effective_aspect]
+        size = size_plan.size
 
         token = _read_codex_access_token()
         if not token:
@@ -589,14 +585,9 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
             provider="openai-codex",
             modality="image" if input_images else "text",
             extra={
-                "size": size,
+                **size_plan.metadata(),
                 "quality": meta["quality"],
                 "input_image_count": len(input_images),
-                "requested_aspect_ratio": aspect,
-                "effective_aspect_ratio": effective_aspect,
-                "requested_resolution": requested_resolution,
-                "effective_resolution": "1K",
-                "resolution_mode": "mapped",
             },
         )
 
