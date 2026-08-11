@@ -572,7 +572,7 @@ interface ExtractedImageReference {
   end?: number;
   height?: number;
   mimeType?: string;
-  source: "markdown" | "structured" | "url";
+  source: "markdown" | "media" | "structured" | "url";
   start?: number;
   title?: string;
   url: string;
@@ -667,10 +667,15 @@ function positiveImageDimensions(
 function extractImageReferencesFromText(text: string): ExtractedImageReference[] {
   if (!text) return [];
   const codeRanges = rangesForFencedCodeBlocks(text);
+  const mediaRefs = extractMediaImageReferences(text, codeRanges);
+  const mediaRanges = mediaRefs.flatMap((ref) =>
+    ref.start === undefined || ref.end === undefined ? [] : [{ end: ref.end, start: ref.start }]
+  );
   return dedupeImageReferences([
     ...extractMarkdownImageReferences(text, codeRanges),
     ...extractMarkdownLinkImageReferences(text, codeRanges),
-    ...extractBareImageReferences(text, codeRanges),
+    ...mediaRefs,
+    ...extractBareImageReferences(text, [...codeRanges, ...mediaRanges]),
   ]);
 }
 
@@ -757,6 +762,27 @@ function parseMarkdownDestination(
     }
   }
   return null;
+}
+
+function extractMediaImageReferences(
+  text: string,
+  codeRanges: Array<{ end: number; start: number }>,
+): ExtractedImageReference[] {
+  const refs: ExtractedImageReference[] = [];
+  const mediaReferenceRe = /MEDIA:\s*([^\n<>()\x60]+?\.(?:png|jpe?g|gif|webp|svg|avif|bmp|ico)(?:[?#][^\s<>()\x60]+)?)/gi;
+  for (const match of text.matchAll(mediaReferenceRe)) {
+    const start = match.index ?? 0;
+    if (isIndexInRanges(start, codeRanges)) continue;
+    const url = normalizeExtractedImageReference(match[1]);
+    if (!url || !isLikelyImageReference(url)) continue;
+    refs.push({
+      end: start + match[0].length,
+      source: "media",
+      start,
+      url,
+    });
+  }
+  return refs;
 }
 
 function extractBareImageReferences(
