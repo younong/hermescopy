@@ -61,6 +61,7 @@ export interface ImageArtifactState {
   mimeType?: string;
   url: string;
   downloadUrl?: string;
+  sourcePath?: string;
   messageId?: string;
   toolCallId?: string;
   width?: number;
