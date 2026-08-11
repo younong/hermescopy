@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 from urllib.parse import urlparse
 
+from agent.image_size import ImageSizePlan, inspect_image_bytes, validate_image_output
 from hermes_cli.model_plane.kinds import GATEWAY_KINDS, RELAY_KINDS, VECTOR, VOICE
 
 DEFAULT_POLICY_ID = "deployment-media-v1"
@@ -639,15 +640,34 @@ class DeploymentMediaPolicy:
         if descriptor.kind == "image":
             image = result.get("image_bytes")
             mime_type = str(result.get("mime_type") or "").strip().lower()
-            if (
-                not isinstance(image, bytes)
-                or not image
-                or len(image) > descriptor.max_output_bytes
-                or mime_type not in IMAGE_MIME_TYPES
-            ):
+            if not isinstance(image, bytes) or mime_type not in IMAGE_MIME_TYPES:
                 raise DeploymentMediaPolicyInvalid("deployment media response is invalid")
+            plan = result.get("size_plan")
+            trusted_plan = plan if isinstance(plan, ImageSizePlan) else None
+            if trusted_plan is not None:
+                normalized["metadata"].update(trusted_plan.metadata())
+            effective_aspect = normalized["metadata"].get("effective_aspect_ratio")
+            try:
+                actual = inspect_image_bytes(
+                    image,
+                    declared_mime_type=mime_type,
+                    max_output_bytes=descriptor.max_output_bytes,
+                )
+                actual = validate_image_output(
+                    actual,
+                    plan=trusted_plan,
+                    effective_aspect_ratio=(
+                        str(effective_aspect) if effective_aspect else aspect_ratio
+                    ),
+                    require_exact_dimensions=False,
+                )
+            except ValueError as exc:
+                raise DeploymentMediaPolicyInvalid(
+                    "deployment media response is invalid"
+                ) from exc
+            normalized["metadata"].update(actual.metadata())
             normalized["image_bytes"] = image
-            normalized["mime_type"] = mime_type
+            normalized["mime_type"] = actual.mime_type
             return normalized
         video_url = str(result.get("video_url") or "").strip()
         video = result.get("video_bytes")

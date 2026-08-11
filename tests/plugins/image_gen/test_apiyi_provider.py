@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import base64
+import io
 import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import requests
+from PIL import Image
 
 import plugins.image_gen.apiyi as apiyi_plugin
 
@@ -21,8 +23,14 @@ _PNG_HEX = (
 )
 
 
-def _b64_png() -> str:
-    return base64.b64encode(bytes.fromhex(_PNG_HEX)).decode()
+def _png_bytes(size=(2048, 2048)) -> bytes:
+    output = io.BytesIO()
+    Image.new("RGB", size).save(output, format="PNG")
+    return output.getvalue()
+
+
+def _b64_png(size=(2048, 2048)) -> str:
+    return base64.b64encode(_png_bytes(size)).decode()
 
 
 class _Response:
@@ -137,7 +145,10 @@ class TestGenerate:
 
         def fake_post(url, **kwargs):
             calls.append((url, kwargs))
-            return _Response({"data": [{"b64_json": _b64_png(), "revised_prompt": "cat"}]})
+            return _Response({"data": [{
+                "b64_json": _b64_png((2048, 1152)),
+                "revised_prompt": "cat",
+            }]})
 
         monkeypatch.setattr(requests, "post", fake_post)
 
@@ -159,20 +170,20 @@ class TestGenerate:
         url, kwargs = calls[0]
         assert url == "https://api.apiyi.com/v1/images/generations"
         assert kwargs["headers"]["Authorization"] == "Bearer test-key"
-        assert kwargs["json"] == {
-            "model": "gpt-image-2",
-            "prompt": "a cat",
-            "size": "2048x1152",
-            "n": 1,
-            "quality": "medium",
-        }
+        assert kwargs["json"]["model"] == "gpt-image-2"
+        assert kwargs["json"]["size"] == "2048x1152"
+        assert kwargs["json"]["n"] == 1
+        assert kwargs["json"]["quality"] == "medium"
+        assert kwargs["json"]["prompt"].startswith("a cat\n\nOutput requirements:")
+        assert "Aspect ratio: exactly 16:9" in kwargs["json"]["prompt"]
+        assert "Preferred pixel dimensions: 2048x1152" in kwargs["json"]["prompt"]
 
     def test_gpt_3_4_uses_requested_resolution_size(self, provider, monkeypatch):
         calls = []
 
         def fake_post(url, **kwargs):
             calls.append((url, kwargs))
-            return _Response({"data": [{"b64_json": _b64_png()}]})
+            return _Response({"data": [{"b64_json": _b64_png((744, 992))}]})
 
         monkeypatch.setattr(requests, "post", fake_post)
 
@@ -196,7 +207,7 @@ class TestGenerate:
 
         def fake_post(url, **kwargs):
             calls.append((url, kwargs))
-            return _Response({"data": [{"b64_json": _b64_png()}]})
+            return _Response({"data": [{"b64_json": _b64_png((1086, 1448))}]})
 
         monkeypatch.setattr(requests, "post", fake_post)
 
@@ -357,7 +368,7 @@ class TestGenerate:
 
 
 def test_shared_openai_executor_forwards_exact_deployment_model(monkeypatch):
-    from plugins.image_gen import apiyi
+    from plugins.image_gen import openai_compatible
 
     captured = {}
 
@@ -365,21 +376,24 @@ def test_shared_openai_executor_forwards_exact_deployment_model(monkeypatch):
         def raise_for_status(self):
             pass
         def json(self):
-            return {"data": [{"b64_json": "cG5n", "revised_prompt": "done"}]}
+            return {"data": [{
+                "b64_json": _b64_png(),
+                "revised_prompt": "done",
+            }]}
 
     def fake_post(url, **kwargs):
         captured.update({"url": url, "kwargs": kwargs})
         return Response()
 
     monkeypatch.setattr("requests.post", fake_post)
-    result = apiyi.generate_openai_image_bytes(
+    result = openai_compatible.generate_openai_compatible_image_bytes(
         prompt="draw", aspect_ratio="square", model="gpt-image-2",
         references=[], api_key="trusted",
         openai_base_url="https://codex.example/v1",
-        params={"resolution": "1K"},
+        size_profile="gpt-image-2", params={"resolution": "1K"},
     )
 
-    assert result["image_bytes"] == b"png"
+    assert result["image_bytes"] == _png_bytes()
     assert result["mime_type"] == "image/png"
     assert result["metadata"]["upstream_model"] == "gpt-image-2"
     assert captured["url"] == "https://codex.example/v1/images/generations"
@@ -387,7 +401,7 @@ def test_shared_openai_executor_forwards_exact_deployment_model(monkeypatch):
 
 
 def test_shared_openai_executor_supports_json_image_edits(monkeypatch):
-    from plugins.image_gen import apiyi
+    from plugins.image_gen import openai_compatible
 
     captured = {}
 
@@ -395,21 +409,21 @@ def test_shared_openai_executor_supports_json_image_edits(monkeypatch):
         def raise_for_status(self):
             pass
         def json(self):
-            return {"data": [{"b64_json": "cG5n"}]}
+            return {"data": [{"b64_json": _b64_png()}]}
 
     def fake_post(url, **kwargs):
         captured.update({"url": url, "kwargs": kwargs})
         return Response()
 
     monkeypatch.setattr("requests.post", fake_post)
-    result = apiyi.generate_openai_image_bytes(
+    result = openai_compatible.generate_openai_compatible_image_bytes(
         prompt="edit", aspect_ratio="square", model="gpt-image-2",
         references=[{"name": "a.png", "mime_type": "image/png", "data": b"png"}],
         api_key="trusted", openai_base_url="https://codex.example/v1",
-        edit_protocol="json_images",
+        size_profile="gpt-image-2", edit_protocol="json_images",
     )
 
-    assert result["image_bytes"] == b"png"
+    assert result["image_bytes"] == _png_bytes()
     assert captured["kwargs"]["json"]["model"] == "gpt-image-2"
     assert captured["kwargs"]["json"]["images"][0]["image_url"].startswith(
         "data:image/png;base64,"
@@ -431,10 +445,13 @@ def test_explicit_transport_forwards_gpt_resolution(
 
     captured = {}
 
+    width, height = (int(value) for value in size.split("x"))
+
     class Response:
         headers = {}
         def raise_for_status(self): pass
-        def json(self): return {"data": [{"b64_json": "cG5n"}]}
+        def json(self):
+            return {"data": [{"b64_json": _b64_png((width, height))}]}
 
     def fake_post(url, **kwargs):
         captured.update({"url": url, "kwargs": kwargs})
@@ -448,7 +465,7 @@ def test_explicit_transport_forwards_gpt_resolution(
         params={"resolution": resolution},
     )
 
-    assert result["image_bytes"] == b"png"
+    assert result["image_bytes"] == _png_bytes((width, height))
     assert result["metadata"]["requested_aspect_ratio"] == aspect_ratio
     assert result["metadata"]["effective_aspect_ratio"] == aspect_ratio
     assert result["metadata"]["requested_resolution"] == resolution

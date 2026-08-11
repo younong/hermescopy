@@ -32,10 +32,13 @@ from agent.image_gen_provider import (  # noqa: E402
     VALID_RESOLUTIONS,
     resolve_aspect_ratio,
 )
-from plugins.image_gen.apiyi import (  # noqa: E402
-    ApiyiImageGenProvider,
-    _gpt_image_size,
+from agent.image_size import (  # noqa: E402
+    GPT_IMAGE_2_SIZE_PROFILE,
+    inspect_image_path,
+    resolve_image_size,
+    validate_image_output,
 )
+from plugins.image_gen.apiyi import ApiyiImageGenProvider  # noqa: E402
 
 DEFAULT_MODELS = ("gpt-image-2-medium", "nano-banana-2")
 _LEGACY_ASPECT_RATIOS = ("landscape", "square", "portrait")
@@ -77,18 +80,35 @@ def _run_model(
         "error": _redact_error(result.get("error")),
     }
     expected_aspect_ratio = resolve_aspect_ratio(aspect_ratio)
-    expected_size = (
-        _gpt_image_size(expected_aspect_ratio, resolution)[0]
-        if model.startswith("gpt-image-2")
-        else None
+    plan = (
+        resolve_image_size(
+            expected_aspect_ratio,
+            resolution,
+            profile=GPT_IMAGE_2_SIZE_PROFILE,
+        )
+        if model.startswith("gpt-image-2") else None
     )
+    artifact_valid = False
+    if item["success"] and isinstance(item["image"], str):
+        try:
+            actual = inspect_image_path(item["image"])
+            validate_image_output(
+                actual,
+                plan=plan,
+                effective_aspect_ratio=(
+                    None if plan is not None else item["effective_aspect_ratio"]
+                ),
+            )
+            artifact_valid = True
+        except (OSError, ValueError):
+            pass
     if (
-        item["success"]
+        artifact_valid
         and item["requested_aspect_ratio"] == expected_aspect_ratio
         and item["effective_aspect_ratio"] == expected_aspect_ratio
         and item["requested_resolution"] == resolution
         and item["effective_resolution"] == resolution
-        and (expected_size is None or item["size"] == expected_size)
+        and (plan is None or item["size"] == plan.size)
     ):
         return item
 

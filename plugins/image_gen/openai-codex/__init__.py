@@ -32,12 +32,17 @@ from agent.image_gen_provider import (
     DEFAULT_RESOLUTION,
     ImageGenProvider,
     error_response,
-    nearest_aspect_ratio,
     normalize_reference_images,
     resolve_aspect_ratio,
-    resolve_resolution,
-    save_b64_image,
+    save_image_bytes,
     success_response,
+)
+from agent.image_size import (
+    GPT_IMAGE_2_SIZE_PROFILE,
+    image_prompt_with_size_requirements,
+    inspect_image_bytes,
+    resolve_image_size,
+    validate_image_output,
 )
 
 logger = logging.getLogger(__name__)
@@ -71,12 +76,6 @@ _MODELS: Dict[str, Dict[str, Any]] = {
 }
 
 DEFAULT_MODEL = "gpt-image-2-medium"
-
-_SIZES = {
-    "3:2": "1536x1024",
-    "1:1": "1024x1024",
-    "2:3": "1024x1536",
-}
 
 # Codex Responses surface used for the request. The chat model itself is only
 # the host that calls the ``image_generation`` tool; the actual image work is
@@ -479,7 +478,11 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
     ) -> Dict[str, Any]:
         prompt = (prompt or "").strip()
         aspect = resolve_aspect_ratio(aspect_ratio)
-        requested_resolution = resolve_resolution(resolution)
+        size_plan = resolve_image_size(
+            aspect,
+            resolution,
+            profile=GPT_IMAGE_2_SIZE_PROFILE,
+        )
 
         if not prompt:
             return error_response(
@@ -511,8 +514,8 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
             )
 
         tier_id, meta = _resolve_model()
-        effective_aspect = nearest_aspect_ratio(aspect, tuple(_SIZES))
-        size = _SIZES[effective_aspect]
+        size = size_plan.size
+        constrained_prompt = image_prompt_with_size_requirements(prompt, size_plan)
 
         token = _read_codex_access_token()
         if not token:
@@ -543,7 +546,7 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
         try:
             b64 = _collect_image_b64(
                 token,
-                prompt=prompt,
+                prompt=constrained_prompt,
                 size=size,
                 quality=meta["quality"],
                 input_images=input_images or None,
@@ -570,11 +573,23 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
             )
 
         try:
-            saved_path = save_b64_image(b64, prefix=f"openai_codex_{tier_id}")
+            image_bytes = base64.b64decode(b64)
+            actual = validate_image_output(
+                inspect_image_bytes(
+                    image_bytes,
+                    declared_mime_type="image/png",
+                ),
+                plan=size_plan,
+                require_exact_dimensions=False,
+            )
+            saved_path = save_image_bytes(
+                image_bytes,
+                prefix=f"openai_codex_{tier_id}",
+            )
         except Exception as exc:
             return error_response(
-                error=f"Could not save image to cache: {exc}",
-                error_type="io_error",
+                error=f"Codex returned an invalid image artifact: {exc}",
+                error_type="image_artifact_mismatch",
                 provider="openai-codex",
                 model=tier_id,
                 prompt=prompt,
@@ -589,14 +604,10 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
             provider="openai-codex",
             modality="image" if input_images else "text",
             extra={
-                "size": size,
+                **size_plan.metadata(),
+                **actual.metadata(),
                 "quality": meta["quality"],
                 "input_image_count": len(input_images),
-                "requested_aspect_ratio": aspect,
-                "effective_aspect_ratio": effective_aspect,
-                "requested_resolution": requested_resolution,
-                "effective_resolution": "1K",
-                "resolution_mode": "mapped",
             },
         )
 
