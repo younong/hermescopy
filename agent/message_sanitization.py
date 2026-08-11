@@ -789,18 +789,18 @@ def project_provider_history(
     current_turn_index: int,
     protect_last_n: int,
 ) -> list:
-    """Project only old provider history while preserving recent/current rows.
+    """Project provider history while preserving only current-turn attachments.
 
     The boundary is anchored to the current user row, so appending tool-loop rows
     does not move it. Complete old tool episodes become ordinary assistant text;
-    old rich payloads become receipts. Canonical history is never mutated.
+    every rich payload before the current user turn becomes a receipt even inside
+    the protected text tail. Current-turn tool results remain available to the
+    next model iteration. Canonical history is never mutated.
     """
     if not messages or current_turn_index <= 0:
         return messages
     current_turn_index = min(current_turn_index, len(messages) - 1)
     protected_start = max(0, current_turn_index - max(0, protect_last_n))
-    if protected_start <= 0:
-        return messages
 
     projected: list[Any] = []
     changed = False
@@ -840,10 +840,15 @@ def project_provider_history(
         changed = changed or next_message is not message
         index += 1
 
-    if not changed:
-        return messages
-    projected.extend(messages[protected_start:])
-    return projected
+    protected_tail = messages[protected_start:current_turn_index]
+    projected_tail = [project_message_attachments(message) for message in protected_tail]
+    tail_changed = any(
+        next_message is not message
+        for message, next_message in zip(protected_tail, projected_tail)
+    )
+    projected.extend(projected_tail)
+    projected.extend(messages[current_turn_index:])
+    return projected if changed or tail_changed else messages
 
 
 def _strip_images_from_messages(messages: list) -> bool:

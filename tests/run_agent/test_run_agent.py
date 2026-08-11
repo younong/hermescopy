@@ -4167,14 +4167,6 @@ class TestRunConversation:
             },
             {"role": "assistant", "content": "seen"},
         ]
-        history.extend(
-            message
-            for index in range(agent.context_compressor.protect_last_n // 2 + 1)
-            for message in (
-                {"role": "user", "content": f"padding {index}"},
-                {"role": "assistant", "content": "ack"},
-            )
-        )
 
         with (
             patch.object(agent, "_persist_session"),

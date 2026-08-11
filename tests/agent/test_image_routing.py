@@ -476,23 +476,50 @@ class TestBuildNativeContentParts:
 
 
 class TestLargeImageHandling:
-    """Large images attach at native size; shrink is handled reactively at
-    retry time in ``run_agent._try_shrink_image_parts_in_messages`` rather
-    than proactively here.
-    """
-
-    def test_large_image_passes_through_unchanged(self, tmp_path: Path):
-        """A multi-MB image is attached as-is — no resize, no skip."""
+    def test_image_under_two_megabytes_passes_through_unchanged(self, tmp_path: Path):
         from agent import image_routing as _ir
 
         img = tmp_path / "medium.png"
-        # 200 KB of real bytes; not huge but enough to verify no size gate fires.
-        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"X" * 200_000)
-        url = _ir._file_to_data_url(img)
-        assert url is not None
-        assert url.startswith("data:image/png;base64,")
-        # Base64 expansion means output is ~4/3 of input, plus header.
-        assert len(url) > 200_000
+        raw = b"\x89PNG\r\n\x1a\n" + b"X" * 200_000
+        img.write_bytes(raw)
+
+        with patch("tools.vision_tools._resize_image_for_vision") as resize:
+            url = _ir._file_to_data_url(img)
+
+        resize.assert_not_called()
+        assert url == "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+
+    def test_image_over_two_megabytes_is_resized_before_request(self, tmp_path: Path):
+        from agent import image_routing as _ir
+
+        img = tmp_path / "large.png"
+        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"X" * 1_600_000)
+        resized = "data:image/png;base64," + "A" * 1_000_000
+
+        with patch(
+            "tools.vision_tools._resize_image_for_vision", return_value=resized
+        ) as resize:
+            url = _ir._file_to_data_url(img)
+
+        assert url == resized
+        resize.assert_called_once_with(
+            img,
+            mime_type="image/png",
+            max_base64_bytes=2 * 1024 * 1024,
+        )
+        assert len(url.encode("ascii")) <= 2 * 1024 * 1024
+
+    def test_unshrinkable_image_is_not_sent_over_limit(self, tmp_path: Path):
+        from agent import image_routing as _ir
+
+        img = tmp_path / "large.png"
+        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"X" * 1_600_000)
+        still_large = "data:image/png;base64," + "A" * (2 * 1024 * 1024)
+
+        with patch(
+            "tools.vision_tools._resize_image_for_vision", return_value=still_large
+        ):
+            assert _ir._file_to_data_url(img) is None
 
     def test_missing_file_returns_none(self, tmp_path: Path):
         from agent import image_routing as _ir

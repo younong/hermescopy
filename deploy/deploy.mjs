@@ -1086,6 +1086,7 @@ while IFS='|' read -r package expected; do
 done <<<"$powerpoint_package_entries"
 
 lock_hash="$(sha256sum "$release/uv.lock" | cut -d ' ' -f1)"
+pyproject_hash="$(sha256sum "$release/pyproject.toml" | cut -d ' ' -f1)"
 powerpoint_lock_hash="$(sha256sum "$release/deploy/powerpoint-runtime/package-lock.json" | cut -d ' ' -f1)"
 powerpoint_package_hash="$(printf '%b' "$installed_powerpoint_packages" | sort | sha256sum | cut -d ' ' -f1)"
 node_path="$(type -P node || true)"
@@ -1096,7 +1097,7 @@ fi
 node_identity="$(printf '%s\n' "$(node --version)" "$(sha256sum "$node_path" | cut -d ' ' -f1)" | sha256sum | cut -d ' ' -f1)"
 python_version="3.11"
 runtime_dependency_profile="all,anthropic,ddgs,voice"
-runtime_inputs_hash="$(printf '%s\n' "$lock_hash" "$powerpoint_lock_hash" "$powerpoint_package_hash" "$node_identity" "$runtime_dependency_profile" 'sandbox10' | sha256sum | cut -d ' ' -f1)"
+runtime_inputs_hash="$(printf '%s\n' "$lock_hash" "$pyproject_hash" "$powerpoint_lock_hash" "$powerpoint_package_hash" "$node_identity" "$runtime_dependency_profile" 'sandbox10' | sha256sum | cut -d ' ' -f1)"
 runtime_id="py311-${"${"}architecture}-${"${"}runtime_inputs_hash}-sandbox10"
 venv="$runtimes_dir/$runtime_id"
 # One manifest drives both packaging and preflight. Keep it aligned with

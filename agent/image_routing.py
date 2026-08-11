@@ -528,6 +528,7 @@ def _sniff_mime_from_bytes(raw: bytes) -> Optional[str]:
 _UNIVERSALLY_SUPPORTED_MIMES = frozenset({
     "image/png", "image/jpeg", "image/gif", "image/webp",
 })
+PROVIDER_IMAGE_PAYLOAD_LIMIT_BYTES = 2 * 1024 * 1024
 
 
 def _transcode_to_png(raw: bytes) -> Optional[bytes]:
@@ -609,13 +610,12 @@ def _guess_mime(path: Path, raw: Optional[bytes] = None) -> str:
 
 
 def _file_to_data_url(path: Path) -> Optional[str]:
-    """Encode a local image as a base64 data URL at its native size.
+    """Encode a local image as a base64 data URL capped at 2 MiB.
 
-    Size limits are NOT enforced here — the agent retry loop
-    (``run_agent._try_shrink_image_parts_in_messages``) shrinks on the
-    provider's first rejection. Keeping this simple means providers that
-    accept large images (OpenAI 49 MB+, Gemini 100 MB) don't pay a silent
-    quality tax just because one other provider is stricter.
+    Images whose complete data URL already fits are returned byte-for-byte at
+    native size. Larger payloads are resized before the first provider request;
+    the existing rejection-time shrink remains a fallback for stricter provider
+    limits and dimension caps.
 
     Format compatibility IS handled here: if the sniffed MIME isn't one
     of ``_UNIVERSALLY_SUPPORTED_MIMES`` (i.e. it's something like AVIF,
@@ -636,6 +636,7 @@ def _file_to_data_url(path: Path) -> Optional[str]:
         logger.warning("image_routing: failed to read %s — %s", path, exc)
         return None
     mime = _guess_mime(path, raw=raw)
+    transcoded = None
     if mime not in _UNIVERSALLY_SUPPORTED_MIMES:
         transcoded = _transcode_to_png(raw)
         if transcoded is None:
@@ -652,8 +653,57 @@ def _file_to_data_url(path: Path) -> Optional[str]:
         )
         raw = transcoded
         mime = "image/png"
-    b64 = base64.b64encode(raw).decode("ascii")
-    return f"data:{mime};base64,{b64}"
+    header = f"data:{mime};base64,"
+    encoded_size = len(header) + 4 * ((len(raw) + 2) // 3)
+    if encoded_size <= PROVIDER_IMAGE_PAYLOAD_LIMIT_BYTES:
+        return header + base64.b64encode(raw).decode("ascii")
+
+    resize_path = path
+    temporary_path: Optional[Path] = None
+    try:
+        if transcoded is not None:
+            import tempfile
+
+            with tempfile.NamedTemporaryFile(
+                prefix="hermes_provider_image_", suffix=".png", delete=False
+            ) as temporary:
+                temporary.write(raw)
+                temporary_path = Path(temporary.name)
+            resize_path = temporary_path
+
+        from tools.vision_tools import _resize_image_for_vision
+
+        resized = _resize_image_for_vision(
+            resize_path,
+            mime_type=mime,
+            max_base64_bytes=PROVIDER_IMAGE_PAYLOAD_LIMIT_BYTES,
+        )
+    except Exception as exc:
+        logger.warning(
+            "image_routing: failed to resize oversized image %s — %s", path, exc
+        )
+        return None
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    if len(resized) <= PROVIDER_IMAGE_PAYLOAD_LIMIT_BYTES:
+        logger.info(
+            "image_routing: resized %s from %.1f MiB to %.1f MiB before provider request",
+            path.name,
+            encoded_size / (1024 * 1024),
+            len(resized) / (1024 * 1024),
+        )
+        return resized
+
+    logger.warning(
+        "image_routing: skipping %s because best-effort resize remained above the 2 MiB provider payload target",
+        path,
+    )
+    return None
 
 
 def build_native_content_parts(
@@ -685,10 +735,10 @@ def build_native_content_parts(
     ``Runner._enrich_message_with_vision`` (``vision_analyze using image_url:
     <path>``) so behaviour is consistent across both image input modes.
 
-    Images are attached at their native size. If a provider rejects the
-    request because an image is too large (e.g. Anthropic's 5 MB per-image
-    ceiling), the agent's retry loop transparently shrinks and retries
-    once — see ``run_agent._try_shrink_image_parts_in_messages``.
+    Images whose provider-bound data URL is at most 2 MiB are attached at
+    native size. Larger images are resized before the first request. If a
+    provider has a stricter byte or dimension limit, the agent's retry loop
+    can still shrink and retry once.
 
     Returns (content_parts, skipped). Skipped entries are local paths
     that couldn't be read from disk; URLs are never skipped (they're
