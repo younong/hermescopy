@@ -65,6 +65,62 @@ def test_estimator_responses_api_input():
     assert tokens >= 1200, f"Responses API estimator returned {tokens}"
 
 
+def test_estimator_chat_completions_counts_image_without_base64_inflation():
+    from agent.chat_completion_helpers import estimate_request_context_tokens
+
+    def _payload(encoded_size: int):
+        return {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe this image"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "data:image/png;base64," + ("A" * encoded_size)
+                            },
+                        },
+                    ],
+                }
+            ],
+            "tools": [{"type": "function", "function": {"name": "lookup"}}],
+        }
+
+    small = estimate_request_context_tokens(_payload(16))
+    huge = estimate_request_context_tokens(_payload(1_000_000))
+
+    assert 1_500 <= small < 2_000
+    assert huge == small
+
+
+def test_estimator_responses_counts_input_image_without_base64_inflation():
+    from agent.chat_completion_helpers import estimate_request_context_tokens
+
+    def _payload(encoded_size: int):
+        return {
+            "instructions": "inspect",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "describe this image"},
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/jpeg;base64," + ("B" * encoded_size),
+                        },
+                    ],
+                }
+            ],
+        }
+
+    small = estimate_request_context_tokens(_payload(16))
+    huge = estimate_request_context_tokens(_payload(1_000_000))
+
+    assert 1_500 <= small < 2_000
+    assert huge == small
+
+
 def test_estimator_responses_api_long_session_triggers_tier():
     """A real long Codex session (large ``input``) should clear the 50k boundary."""
     from agent.chat_completion_helpers import estimate_request_context_tokens
@@ -149,6 +205,24 @@ def test_very_long_codex_request_bumps_to_100k_tier(monkeypatch, tmp_path):
     agent = _make_agent(tmp_path)
     payload = {"model": "gpt-5.5", "input": "x" * 500_000, "instructions": ""}
     assert agent._compute_non_stream_stale_timeout(payload) >= 240.0
+
+
+def test_canonical_context_tokens_override_payload_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+    _write_config(tmp_path, "")
+
+    agent = _make_agent(tmp_path)
+    huge_payload = {"model": "gpt-5.5", "input": "x" * 500_000}
+
+    assert (
+        agent._compute_non_stream_stale_timeout(
+            huge_payload,
+            context_tokens=20_000,
+        )
+        == 90.0
+    )
 
 
 def test_chat_completions_long_messages_bumps_tier(monkeypatch, tmp_path):

@@ -1462,6 +1462,7 @@ def run_conversation(
                             agent,
                             next_api_kwargs,
                             on_first_delta=_stop_spinner,
+                            context_tokens=prepared_request.accounting.effective_input_tokens,
                             dispatch_metadata=dispatch_metadata,
                         )
                     if "_interruptible_api_call" in getattr(agent, "__dict__", {}):
@@ -1471,6 +1472,7 @@ def run_conversation(
                     return interruptible_api_call(
                         agent,
                         next_api_kwargs,
+                        context_tokens=prepared_request.accounting.effective_input_tokens,
                         dispatch_metadata=dispatch_metadata,
                     )
 
