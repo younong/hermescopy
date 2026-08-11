@@ -31,7 +31,11 @@ from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
 from agent.gemini_native_adapter import is_native_gemini_base_url
-from agent.model_metadata import is_local_endpoint
+from agent.model_metadata import (
+    estimate_messages_tokens_rough,
+    estimate_tokens_rough,
+    is_local_endpoint,
+)
 from agent.runtime_memory import submit_inference
 from agent.message_sanitization import (
     _sanitize_surrogates,
@@ -121,56 +125,45 @@ def _ra():
 
 
 def estimate_request_context_tokens(api_payload: Any) -> int:
-    """Estimate context/load tokens from an API payload, dict or messages list.
+    """Estimate model context tokens from a dispatch-shaped API payload.
 
-    The stale-call detectors historically assumed a Chat Completions request:
-    they pulled ``api_kwargs["messages"]`` and ran a cheap char/4 estimate.
-    Codex / Responses API requests carry the conversational payload in
-    ``input`` (with additional load in ``instructions`` and ``tools``), so the
-    legacy estimator reported ~0 tokens for every Codex turn and the
-    context-tier scaling never fired.
-
-    This helper handles both shapes:
-      - bare list -> treat as Chat Completions ``messages``
-      - dict with ``messages`` -> Chat Completions (+ ``tools`` if present)
-      - dict with ``input`` -> Responses API (+ ``instructions``/``tools``)
-      - any other dict -> fall back to summing string values
+    Chat Completions and Responses requests may embed local images as large
+    base64 data URLs. Those bytes affect HTTP load, but providers decode them
+    into visual tokens instead of feeding the base64 text to the language
+    tokenizer. Reuse the canonical message estimator so image size cannot
+    inflate stale-timeout tiers while text, tool calls, and schemas still count.
     """
 
-    def _chars(value: Any) -> int:
-        if value is None:
+    def _value_tokens(value: Any) -> int:
+        if value is None or value == "" or value == [] or value == {}:
             return 0
-        if isinstance(value, str):
-            return len(value)
-        return len(str(value))
+        return estimate_tokens_rough(value if isinstance(value, str) else str(value))
 
-    def _message_chars(messages: Any) -> int:
-        if not isinstance(messages, list):
-            return _chars(messages)
-        return sum(_chars(item) for item in messages)
+    def _message_tokens(messages: Any) -> int:
+        if isinstance(messages, list) and all(
+            isinstance(message, dict) for message in messages
+        ):
+            return estimate_messages_tokens_rough(messages)
+        return _value_tokens(messages)
 
     if isinstance(api_payload, list):
-        return _message_chars(api_payload) // 4
+        return _message_tokens(api_payload)
 
     if isinstance(api_payload, dict):
         messages = api_payload.get("messages")
         if isinstance(messages, list):
-            total_chars = _message_chars(messages)
-            if "tools" in api_payload:
-                total_chars += _chars(api_payload.get("tools"))
-            return total_chars // 4
+            return _message_tokens(messages) + _value_tokens(api_payload.get("tools"))
 
         if "input" in api_payload:
-            total_chars = (
-                _chars(api_payload.get("input"))
-                + _chars(api_payload.get("instructions"))
-                + _chars(api_payload.get("tools"))
+            return (
+                _message_tokens(api_payload.get("input"))
+                + _value_tokens(api_payload.get("instructions"))
+                + _value_tokens(api_payload.get("tools"))
             )
-            return total_chars // 4
 
-        return sum(_chars(value) for value in api_payload.values()) // 4
+        return sum(_value_tokens(value) for value in api_payload.values())
 
-    return _chars(api_payload) // 4
+    return _value_tokens(api_payload)
 
 
 def _uses_local_inference_timeout_exemption(agent) -> bool:
