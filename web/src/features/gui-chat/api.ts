@@ -8,7 +8,7 @@ import {
 import { getHermesBrowserId } from "@/lib/browserIdentity";
 import type { GuiFrameQueueDiagnostic } from "@/lib/chatDiagnostics";
 import { createCollaborationApi, type CollaborationApi } from "@/features/collaboration/api";
-import { base64FromDataUrl, readFileAsDataUrl } from "./attachments";
+import { base64FromDataUrl, compressImageForUpload, readFileAsDataUrl } from "./attachments";
 import type {
   SessionAttachResponse,
   SessionCreateResponse,
@@ -257,12 +257,13 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
       return response;
     },
     attachImage: async (sessionId, file) => {
-      const dataUrl = await readFileAsDataUrl(file);
+      const uploadFile = await compressImageForUpload(file);
+      const dataUrl = await readFileAsDataUrl(uploadFile);
       const contentBase64 = base64FromDataUrl(dataUrl);
-      if (!contentBase64) throw new Error(`Could not read ${file.name}`);
+      if (!contentBase64) throw new Error(`Could not read ${uploadFile.name}`);
       return client.request<ImageAttachResponse>("image.attach_bytes", {
         content_base64: contentBase64,
-        filename: file.name,
+        filename: uploadFile.name,
         session_id: sessionId,
       });
     },
