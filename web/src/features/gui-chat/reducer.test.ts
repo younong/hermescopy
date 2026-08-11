@@ -575,7 +575,7 @@ describe("guiChatReducer history image restoration", () => {
     expect(Object.keys(state.artifacts)).toEqual(["tool-image-image"]);
   });
 
-  it("creates message-owned image artifacts from final reply references", () => {
+  it("creates message-owned image artifacts without trusting final reply file paths", () => {
     const state = guiChatReducer(initialGuiChatState, {
       event: {
         payload: {
@@ -589,17 +589,12 @@ describe("guiChatReducer history image restoration", () => {
     const artifacts = message.artifactIds.map((id) => state.artifacts[id]);
 
     expect(message.text).toBe("结果如下：\n\n文件路径： `/workspace/report.html`");
-    expect(artifacts).toEqual(expect.arrayContaining([
+    expect(artifacts).toEqual([
       expect.objectContaining({
         messageId: message.id,
         url: "https://example.com/cat.png",
       }),
-      expect.objectContaining({
-        kind: "file",
-        messageId: message.id,
-        sourcePath: "/workspace/report.html",
-      }),
-    ]));
+    ]);
   });
 
   it("keeps image results tool-owned when no assistant reply is active", () => {
@@ -681,15 +676,8 @@ describe("guiChatReducer history image restoration", () => {
         session_id: "stored",
       },
     });
-    const artifactId = history.messages[0].artifactIds[0];
-
-    expect(history.artifacts[artifactId]).toMatchObject({
-      downloadUrl: buildSessionFileDownloadUrl(
-        "公众号数据自动清洗_可直接使用.zip",
-        undefined,
-        "公众号数据自动清洗_可直接使用.zip",
-      ),
-    });
+    expect(history.messages[0].artifactIds).toEqual([]);
+    expect(history.artifacts).toEqual({});
     expect(history.messages[0].attachments?.[0].downloadUrl).toBe(
       buildSessionFileDownloadUrl("使用说明.txt", undefined, "使用说明.txt"),
     );
@@ -704,14 +692,8 @@ describe("guiChatReducer history image restoration", () => {
       },
     });
 
-    expect(state.messages[0].artifactIds).toEqual([artifactId]);
-    expect(state.artifacts[artifactId]).toMatchObject({
-      downloadUrl: buildSessionFileDownloadUrl(
-        "公众号数据自动清洗_可直接使用.zip",
-        "/workspace",
-        "公众号数据自动清洗_可直接使用.zip",
-      ),
-    });
+    expect(state.messages[0].artifactIds).toEqual([]);
+    expect(state.artifacts).toEqual({});
     expect(state.messages[0].attachments?.[0].downloadUrl).toBe(
       buildSessionFileDownloadUrl("使用说明.txt", "/workspace", "使用说明.txt"),
     );
@@ -938,7 +920,7 @@ describe("guiChatReducer history image restoration", () => {
     });
   });
 
-  it("creates a download artifact when a live assistant message completes with a labeled path", () => {
+  it("does not trust a live assistant labeled path without a structured artifact event", () => {
     const withDelta = guiChatReducer(initialGuiChatState, {
       event: {
         payload: { text: "文件路径： `/workspace/crow-drinks-water.html`" },
@@ -954,13 +936,8 @@ describe("guiChatReducer history image restoration", () => {
       type: "event",
     });
 
-    const artifact = state.artifacts[state.messages[0].artifactIds[0]];
-    expect(artifact).toMatchObject({
-      kind: "file",
-      mimeType: "text/html",
-      name: "crow-drinks-water.html",
-      sourcePath: "/workspace/crow-drinks-water.html",
-    });
+    expect(state.messages[0].artifactIds).toEqual([]);
+    expect(state.artifacts).toEqual({});
   });
 
   it("recognizes generated HTML paths returned on a labeled or standalone line", () => {
@@ -1220,6 +1197,43 @@ describe("guiChatReducer history image restoration", () => {
       expect(artifact).not.toMatchObject({ width: expect.any(Number) });
       expect(artifact).not.toMatchObject({ height: expect.any(Number) });
     }
+  });
+
+  it("restores verified assistant file attachments without duplicating text references", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        info: { cwd: "/workspace" },
+        messages: [
+          {
+            attachments: [
+              {
+                kind: "file",
+                mime_type: "application/zip",
+                name: "tool.zip",
+                path: "/workspace/tool.zip",
+                size_bytes: 7,
+              },
+            ],
+            role: "assistant",
+            text: "生成文件：`/workspace/tool.zip`",
+          },
+        ],
+        session_id: "sid",
+      },
+    });
+
+    expect(state.messages[0].attachments).toHaveLength(1);
+    expect(state.messages[0].artifactIds).toEqual([]);
+    expect(state.artifacts).toEqual({});
+    expect(state.messages[0].attachments?.[0]).toMatchObject({
+      downloadUrl:
+        "/api/files/download?path=%2Fworkspace%2Ftool.zip&cwd=%2Fworkspace&filename=tool.zip",
+      kind: "file",
+      mimeType: "application/zip",
+      name: "tool.zip",
+      sourcePath: "/workspace/tool.zip",
+    });
   });
 
   it("restores image, PDF, and file attachment cards from transcript metadata", () => {
@@ -1511,6 +1525,35 @@ describe("guiChatReducer history image restoration", () => {
     expect(imageArtifact(state, "artifact-1").url).toBe(
       "/api/fs/read-data-url?path=outputs%2Fa.png&cwd=%2FUsers%2Fme%2Fproject",
     );
+  });
+
+  it("attaches a pre-completion structured artifact to the current assistant message", () => {
+    const started = guiChatReducer(initialGuiChatState, {
+      event: { type: "message.start" },
+      type: "event",
+    });
+    const withArtifact = guiChatReducer(started, {
+      event: {
+        payload: {
+          id: "artifact-zip-1",
+          mime_type: "application/zip",
+          name: "tool.zip",
+          path: "/workspace/tool.zip",
+        },
+        type: "artifact.created",
+      },
+      type: "event",
+    });
+    const state = guiChatReducer(withArtifact, {
+      event: {
+        payload: { text: "生成文件：`/workspace/tool.zip`" },
+        type: "message.complete",
+      },
+      type: "event",
+    });
+
+    expect(state.messages[0].artifactIds).toEqual(["artifact-zip-1"]);
+    expect(Object.keys(state.artifacts)).toEqual(["artifact-zip-1"]);
   });
 
   it("creates downloadable file artifacts from structured artifact events", () => {

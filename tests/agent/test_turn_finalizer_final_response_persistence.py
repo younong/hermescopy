@@ -112,6 +112,157 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     assert agent.persisted_messages[-1] == {"role": "assistant", "content": "Done."}
 
 
+def test_invalid_declared_artifact_warning_is_persisted(monkeypatch, tmp_path):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    (tmp_path / "project").mkdir()
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "build it"},
+        {"role": "assistant", "content": "生成文件：`project`"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="生成文件：`project`",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="artifact-test",
+        turn_id="turn",
+        user_message="build it",
+        original_user_message="build it",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(stop)",
+    )
+
+    assert result["artifacts"] == []
+    assert "没有生成下载卡片" in result["final_response"]
+    assert agent.persisted_messages[-1]["content"] == result["final_response"]
+    assert result["messages"][-1]["content"] == result["final_response"]
+
+
+def test_transformed_response_is_validated_persisted_and_posted_consistently(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    (tmp_path / "directory").mkdir()
+    posted = []
+
+    def invoke(name, **kwargs):
+        if name == "transform_llm_output":
+            return ["生成文件：`directory`"]
+        if name == "post_llm_call":
+            posted.append(kwargs)
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke)
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "build it"},
+        {"role": "assistant", "content": "Done."},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="Done.",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="artifact-test",
+        turn_id="turn",
+        user_message="build it",
+        original_user_message="build it",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(stop)",
+    )
+
+    assert result["response_transformed"] is True
+    assert result["artifacts"] == []
+    assert "没有生成下载卡片" in result["final_response"]
+    assert agent.persisted_messages[-1]["content"] == result["final_response"]
+    assert posted[0]["assistant_response"] == result["final_response"]
+    assert posted[0]["conversation_history"][-1]["content"] == result["final_response"]
+
+
+def test_unexpected_validation_error_fails_closed(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setattr(
+        "agent.artifact_delivery.validate_declared_artifacts",
+        lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("validator offline")),
+    )
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "build it"},
+        {"role": "assistant", "content": "[下载](tool.zip)"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="[下载](tool.zip)",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="artifact-test",
+        turn_id="turn",
+        user_message="build it",
+        original_user_message="build it",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(stop)",
+    )
+
+    assert result["artifacts"] == []
+    assert "交付校验暂时不可用" in result["final_response"]
+    assert agent.persisted_messages[-1]["content"] == result["final_response"]
+
+
+def test_valid_declared_artifact_is_returned_for_gateway(monkeypatch, tmp_path):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    archive = tmp_path / "tool.zip"
+    archive.write_bytes(b"archive")
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "build it"},
+        {"role": "assistant", "content": "[下载](tool.zip)"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="[下载](tool.zip)",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="artifact-test",
+        turn_id="turn",
+        user_message="build it",
+        original_user_message="build it",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(stop)",
+    )
+
+    assert result["artifacts"][0]["path"] == str(archive)
+    assert result["artifacts"][0]["name"] == "tool.zip"
+    assert result["artifacts"][0]["size_bytes"] == 7
+    assert agent.persisted_messages[-1]["attachments"] == [
+        {
+            "kind": "file",
+            "mime_type": "application/zip",
+            "name": "tool.zip",
+            "path": str(archive),
+            "size_bytes": 7,
+        }
+    ]
+
+
 def test_failed_final_response_is_durable_with_error_metadata(monkeypatch):
     """Terminal provider failures use the same durable finalization path."""
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])

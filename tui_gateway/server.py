@@ -1657,6 +1657,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
+                kw["platform"] = _agent_platform_for_source(_session_source(current))
                 agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
@@ -2064,6 +2065,10 @@ def _session_source(session: dict | None) -> str:
         if source:
             return source
     return "tui"
+
+
+def _agent_platform_for_source(source: str) -> str:
+    return "webui" if str(source or "").strip().lower() == "dashboard-gui" else "tui"
 
 
 def _live_session_is_visible(session: dict) -> bool:
@@ -4876,6 +4881,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
             sid,
             session["session_key"],
             session_id=session["session_key"],
+            platform=_agent_platform_for_source(_session_source(session)),
             **reset_kw,
         )
     finally:
@@ -5041,6 +5047,7 @@ def _make_agent(
     model_kind: str = "chat",
     runtime_profile: str | None = None,
     runtime_toolset: str | None = None,
+    platform: str | None = None,
 ):
     from run_agent import AIAgent
 
@@ -5232,7 +5239,7 @@ def _make_agent(
         provider_sort=_pr.get("sort"),
         provider_require_parameters=_pr.get("require_parameters", False),
         provider_data_collection=_pr.get("data_collection"),
-        platform="tui",
+        platform=platform or _agent_platform_for_source(_session_source(_sessions.get(sid))),
         session_id=session_id or key,
         session_db=session_db if session_db is not None else _get_db(),
         ephemeral_system_prompt=system_prompt or None,
@@ -7511,6 +7518,7 @@ def _session_resume(rid, params: dict) -> dict:
                 target,
                 session_id=target,
                 session_db=db,
+                platform=_agent_platform_for_source(_session_source(found)),
                 **stored_runtime_overrides,
             )
         finally:
@@ -9864,7 +9872,12 @@ def _(rid, params: dict) -> dict:
     try:
         tokens = _set_session_context(new_key)
         try:
-            agent = _make_agent(new_sid, new_key, session_id=new_key)
+            agent = _make_agent(
+                new_sid,
+                new_key,
+                session_id=new_key,
+                platform=_agent_platform_for_source(_session_source(session)),
+            )
         finally:
             _clear_session_context(tokens)
         _init_session(
@@ -10947,6 +10960,12 @@ def _run_prompt_submit(
                 )
 
                 raw = result.get("final_response", "")
+                result_artifacts = result.get("artifacts")
+                artifacts = (
+                    [artifact for artifact in result_artifacts if isinstance(artifact, dict)]
+                    if isinstance(result_artifacts, list)
+                    else []
+                )
                 is_error = bool(
                     result.get("failed")
                     or result.get("partial")
@@ -10970,6 +10989,7 @@ def _run_prompt_submit(
             else:
                 raw = str(result)
                 status = "complete"
+                artifacts = []
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
             if last_reasoning:
@@ -10985,6 +11005,9 @@ def _run_prompt_submit(
                 result_text=str(raw or ""),
                 result_status=status,
             )
+            if status == "complete":
+                for artifact in artifacts:
+                    _emit("artifact.created", sid, artifact)
             _emit("message.complete", sid, payload)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
