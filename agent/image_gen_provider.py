@@ -298,6 +298,20 @@ def _images_cache_dir() -> Path:
     return path
 
 
+def save_image_bytes(
+    image_bytes: bytes,
+    *,
+    prefix: str = "image",
+    extension: str = "png",
+) -> Path:
+    """Write image bytes under ``$HERMES_HOME/cache/images/``."""
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    short = uuid.uuid4().hex[:8]
+    path = _images_cache_dir() / f"{prefix}_{ts}_{short}.{extension}"
+    path.write_bytes(image_bytes)
+    return path
+
+
 def save_b64_image(
     b64_data: str,
     *,
@@ -310,12 +324,9 @@ def save_b64_image(
 
     Filename format: ``<prefix>_<YYYYMMDD_HHMMSS>_<short-uuid>.<ext>``.
     """
-    raw = base64.b64decode(b64_data)
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    short = uuid.uuid4().hex[:8]
-    path = _images_cache_dir() / f"{prefix}_{ts}_{short}.{extension}"
-    path.write_bytes(raw)
-    return path
+    return save_image_bytes(
+        base64.b64decode(b64_data), prefix=prefix, extension=extension
+    )
 
 
 # Extension inference for save_url_image — keep small and explicit.  We don't

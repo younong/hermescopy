@@ -23,6 +23,7 @@ Selection precedence (first hit wins):
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
@@ -33,12 +34,16 @@ from agent.image_gen_provider import (
     ImageGenProvider,
     error_response,
     normalize_reference_images,
-    nearest_aspect_ratio,
     resolve_aspect_ratio,
-    resolve_resolution,
-    save_b64_image,
-    save_url_image,
+    save_image_bytes,
     success_response,
+)
+from agent.image_size import (
+    GPT_IMAGE_2_SIZE_PROFILE,
+    image_prompt_with_size_requirements,
+    inspect_image_bytes,
+    resolve_image_size,
+    validate_image_output,
 )
 
 logger = logging.getLogger(__name__)
@@ -76,12 +81,6 @@ _MODELS: Dict[str, Dict[str, Any]] = {
 }
 
 DEFAULT_MODEL = "gpt-image-2-medium"
-
-_SIZES = {
-    "3:2": "1536x1024",
-    "1:1": "1024x1024",
-    "2:3": "1024x1536",
-}
 
 
 def _load_openai_config() -> Dict[str, Any]:
@@ -227,7 +226,11 @@ class OpenAIImageGenProvider(ImageGenProvider):
     ) -> Dict[str, Any]:
         prompt = (prompt or "").strip()
         aspect = resolve_aspect_ratio(aspect_ratio)
-        requested_resolution = resolve_resolution(resolution)
+        size_plan = resolve_image_size(
+            aspect,
+            resolution,
+            profile=GPT_IMAGE_2_SIZE_PROFILE,
+        )
 
         if not prompt:
             return error_response(
@@ -260,8 +263,8 @@ class OpenAIImageGenProvider(ImageGenProvider):
             )
 
         tier_id, meta = _resolve_model()
-        effective_aspect = nearest_aspect_ratio(aspect, tuple(_SIZES))
-        size = _SIZES[effective_aspect]
+        size = size_plan.size
+        constrained_prompt = image_prompt_with_size_requirements(prompt, size_plan)
 
         # Collect source images (primary + references) for image-to-image.
         sources: List[str] = []
@@ -301,8 +304,8 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 response = client.images.edit(
                     model=API_MODEL,
                     image=files if len(files) > 1 else files[0],
-                    prompt=prompt,
-                    size=size,  # type: ignore[arg-type]  # _SIZES values are valid gpt-image sizes
+                    prompt=constrained_prompt,
+                    size=size,  # type: ignore[arg-type]  # shared profile contains valid sizes
                     quality=meta["quality"],
                     n=1,
                 )
@@ -321,7 +324,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
             # ``response_format`` as an unknown parameter. Don't send it.
             payload: Dict[str, Any] = {
                 "model": API_MODEL,
-                "prompt": prompt,
+                "prompt": constrained_prompt,
                 "size": size,
                 "n": 1,
                 "quality": meta["quality"],
@@ -356,53 +359,56 @@ class OpenAIImageGenProvider(ImageGenProvider):
         url = getattr(first, "url", None)
         revised_prompt = getattr(first, "revised_prompt", None)
 
-        if b64:
-            try:
-                saved_path = save_b64_image(b64, prefix=f"openai_{tier_id}")
-            except Exception as exc:
+        try:
+            if b64:
+                image_bytes = base64.b64decode(b64)
+                declared_mime_type = "image/png"
+            elif url:
+                import requests
+
+                downloaded = requests.get(url, timeout=60)
+                downloaded.raise_for_status()
+                image_bytes = downloaded.content
+                declared_mime_type = downloaded.headers.get(
+                    "Content-Type", "image/png"
+                ).split(";", 1)[0].strip().lower()
+            else:
                 return error_response(
-                    error=f"Could not save image to cache: {exc}",
-                    error_type="io_error",
+                    error="OpenAI response contained neither b64_json nor URL",
+                    error_type="empty_response",
                     provider="openai",
                     model=tier_id,
                     prompt=prompt,
                     aspect_ratio=aspect,
                 )
-            image_ref = str(saved_path)
-        elif url:
-            # Defensive — gpt-image-2 returns b64 today, but OpenAI's API
-            # has previously returned URLs.  Cache the bytes locally so the
-            # gateway never tries to fetch an ephemeral / signed URL after
-            # it expires — same rationale as the xAI provider (#26942).
-            try:
-                saved_path = save_url_image(url, prefix=f"openai_{tier_id}")
-            except Exception as exc:
-                logger.warning(
-                    "OpenAI image URL %s could not be cached (%s); falling back to bare URL.",
-                    url,
-                    exc,
-                )
-                image_ref = url
-            else:
-                image_ref = str(saved_path)
-        else:
+            actual = validate_image_output(
+                inspect_image_bytes(
+                    image_bytes,
+                    declared_mime_type=declared_mime_type,
+                ),
+                plan=size_plan,
+                require_exact_dimensions=False,
+            )
+            saved_path = save_image_bytes(
+                image_bytes,
+                prefix=f"openai_{tier_id}",
+                extension=actual.format.lower().replace("jpeg", "jpg"),
+            )
+        except Exception as exc:
             return error_response(
-                error="OpenAI response contained neither b64_json nor URL",
-                error_type="empty_response",
+                error=f"OpenAI returned an invalid image artifact: {exc}",
+                error_type="image_artifact_mismatch",
                 provider="openai",
                 model=tier_id,
                 prompt=prompt,
                 aspect_ratio=aspect,
             )
+        image_ref = str(saved_path)
 
         extra: Dict[str, Any] = {
-            "size": size,
+            **size_plan.metadata(),
+            **actual.metadata(),
             "quality": meta["quality"],
-            "requested_aspect_ratio": aspect,
-            "effective_aspect_ratio": effective_aspect,
-            "requested_resolution": requested_resolution,
-            "effective_resolution": "1K",
-            "resolution_mode": "mapped",
         }
         if revised_prompt:
             extra["revised_prompt"] = revised_prompt

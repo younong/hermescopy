@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -32,7 +33,12 @@ def test_script_adds_repository_root_to_import_path(smoke_module):
     ("resolution", "size"),
     (("1K", "768x1024"), ("2K", "1536x2048"), ("4K", "2480x3312")),
 )
-def test_gpt_3_4_smoke_validates_resolution_size(smoke_module, resolution, size):
+def test_gpt_3_4_smoke_validates_resolution_size(
+    smoke_module, resolution, size, tmp_path
+):
+    image_path = tmp_path / "result.png"
+    Image.new("RGB", tuple(map(int, size.split("x")))).save(image_path)
+
     class Provider:
         def generate(self, prompt, **kwargs):
             assert prompt == "draw"
@@ -44,7 +50,7 @@ def test_gpt_3_4_smoke_validates_resolution_size(smoke_module, resolution, size)
             return {
                 "success": True,
                 "provider": "apiyi",
-                "image": "/tmp/result.png",
+                "image": str(image_path),
                 "requested_aspect_ratio": "3:4",
                 "effective_aspect_ratio": "3:4",
                 "requested_resolution": resolution,

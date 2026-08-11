@@ -11,7 +11,7 @@ def test_postprocess_adds_agent_visible_image_for_active_ssh_env(monkeypatch, tm
     image_dir = hermes_home / "cache" / "images"
     image_dir.mkdir(parents=True)
     image_path = image_dir / "xai_grok-imagine-image_test.jpg"
-    image_path.write_bytes(b"jpg")
+    Image.new("RGB", (16, 9)).save(image_path, format="JPEG")
 
     sync_calls = []
 
@@ -81,9 +81,7 @@ def test_postprocess_marks_effective_ratio_mismatch(monkeypatch, tmp_path):
 
     assert result["success"] is False
     assert result["error_type"] == "aspect_ratio_mismatch"
-    assert result["actual_aspect_ratio"] == "17:9"
-    assert result["width"] == 17
-    assert result["height"] == 9
+    assert "17:9" in result["error"]
 
 
 def test_postprocess_maps_docker_cache_path_without_active_env(monkeypatch, tmp_path):
@@ -93,7 +91,7 @@ def test_postprocess_maps_docker_cache_path_without_active_env(monkeypatch, tmp_
     image_dir = hermes_home / "cache" / "images"
     image_dir.mkdir(parents=True)
     image_path = image_dir / "generated.png"
-    image_path.write_bytes(b"png")
+    Image.new("RGB", (16, 9)).save(image_path, format="PNG")
 
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setenv("TERMINAL_ENV", "docker")
@@ -113,7 +111,7 @@ def test_postprocess_maps_ssh_cache_path_without_active_env(monkeypatch, tmp_pat
     image_dir = hermes_home / "cache" / "images"
     image_dir.mkdir(parents=True)
     image_path = image_dir / "first-call.png"
-    image_path.write_bytes(b"png")
+    Image.new("RGB", (16, 9)).save(image_path, format="PNG")
 
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setenv("TERMINAL_ENV", "ssh")
@@ -143,7 +141,7 @@ def test_handle_image_generate_postprocesses_plugin_result(monkeypatch, tmp_path
     image_dir = hermes_home / "cache" / "images"
     image_dir.mkdir(parents=True)
     image_path = image_dir / "plugin.png"
-    image_path.write_bytes(b"png")
+    Image.new("RGB", (16, 9)).save(image_path, format="PNG")
 
     env = SimpleNamespace(_remote_home="/home/remote", _sync_manager=None)
 

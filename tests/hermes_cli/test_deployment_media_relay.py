@@ -1,6 +1,12 @@
 import base64
+import io
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from agent.image_gen_provider import VALID_ASPECT_RATIOS
 from agent.transcription_provider import TranscriptionProvider
@@ -10,6 +16,10 @@ from hermes_cli.dashboard_auth.authority import (
     WorkerGenerationState,
     WorkerLeaseState,
 )
+import hermes_cli.controlled_roots as controlled_roots_module
+import hermes_cli.deployment_media as deployment_media_module
+from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
+from hermes_cli.controlled_roots import controlled_roots_for
 from hermes_cli.deployment_media import (
     DeploymentMediaPolicy,
     DeploymentMediaPolicyInvalid,
@@ -17,11 +27,19 @@ from hermes_cli.deployment_media import (
     DeploymentMediaRouteDescriptor,
 )
 from hermes_cli.model_plane import capability as capability_module
+from hermes_cli.owner_runtime import ensure_owner_runtime_dirs, owner_worker_runtime_paths
+from hermes_cli.owner_worker.media_dispatch import dispatch_deployment_media
 from hermes_cli.owner_worker.media_relay import (
     DeploymentMediaBroker,
     DeploymentMediaRelayError,
     OwnerMediaRelayClient,
 )
+
+
+def _png_bytes(size=(300, 400)):
+    output = io.BytesIO()
+    Image.new("RGB", size).save(output, format="PNG")
+    return output.getvalue()
 
 
 def _image_route():
@@ -66,14 +84,21 @@ def _fake_executor(**kwargs):
         if kwargs.get("params", {}).get("return_bytes"):
             return {"video_bytes": b"mp4-bytes", "mime_type": "video/mp4"}
         return {"video_url": "https://cdn.example.com/video.mp4"}
+    aspect = kwargs.get("aspect_ratio")
+    dimensions = {
+        "1:1": (300, 300), "square": (300, 300),
+        "3:4": (300, 400), "portrait": (300, 400),
+        "2:3": (300, 450), "4:3": (400, 300),
+        "3:2": (450, 300), "16:9": (480, 270),
+        "landscape": (480, 270), "9:16": (270, 480),
+    }[aspect]
     return {
-        "image_bytes": b"generated",
+        "image_bytes": _png_bytes(dimensions),
         "mime_type": "image/png",
         "metadata": {
-            "size": "1024x1024",
             "upstream_model": "gpt-image-2",
-            "requested_aspect_ratio": kwargs.get("aspect_ratio"),
-            "effective_aspect_ratio": kwargs.get("aspect_ratio"),
+            "requested_aspect_ratio": aspect,
+            "effective_aspect_ratio": aspect,
             "requested_resolution": kwargs.get("params", {}).get("resolution"),
             "effective_resolution": kwargs.get("params", {}).get("resolution"),
             "resolution_mode": "native",
@@ -84,11 +109,12 @@ def _fake_executor(**kwargs):
 
 
 @pytest.fixture(autouse=True)
-def _executor(monkeypatch):
+def _executor(monkeypatch, request):
     monkeypatch.setenv("TEST_MEDIA_RELAY_KEY", "secret")
-    monkeypatch.setattr(
-        DeploymentMediaRoute, "load_executor", lambda self: _fake_executor
-    )
+    if not request.node.name.startswith("test_custom_codex_real_path_"):
+        monkeypatch.setattr(
+            DeploymentMediaRoute, "load_executor", lambda self: _fake_executor
+        )
 
 
 def _request(policy, **overrides):
@@ -104,6 +130,229 @@ def _request(policy, **overrides):
     }
     request.update(overrides)
     return request
+
+
+class _OpenAIImageHandler(BaseHTTPRequestHandler):
+    image_bytes = _png_bytes((1536, 2048))
+    requests = []
+
+    def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
+        length = int(self.headers.get("Content-Length", "0"))
+        body = json.loads(self.rfile.read(length))
+        type(self).requests.append((self.path, body))
+        payload = json.dumps({
+            "data": [{
+                "b64_json": base64.b64encode(type(self).image_bytes).decode()
+            }]
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *_args):
+        pass
+
+
+@pytest.fixture
+def _openai_image_server():
+    _OpenAIImageHandler.requests = []
+    _OpenAIImageHandler.image_bytes = _png_bytes((1536, 2048))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIImageHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/v1", _OpenAIImageHandler
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
+
+
+def _custom_codex_policy(base_url):
+    return DeploymentMediaPolicy(
+        routes=(DeploymentMediaRoute(
+            descriptor=DeploymentMediaRouteDescriptor(
+                kind="image",
+                provider="custom:codex",
+                models=("gpt-image-2",),
+                default_model="gpt-image-2",
+                max_output_bytes=32 << 20,
+            ),
+            key_env="TEST_MEDIA_RELAY_KEY",
+            executor=(
+                "plugins.image_gen.openai_compatible:"
+                "generate_openai_compatible_image_bytes"
+            ),
+            base_urls={"openai_base_url": base_url},
+            executor_params={
+                "edit_protocol": "json_images",
+                "size_profile": "gpt-image-2",
+            },
+        ),),
+        policy_id="media-policy-v1",
+    )
+
+
+def _dispatch_runtime(tmp_path, policy):
+    owner = tmp_path / "owner"
+    ensure_owner_runtime_dirs(owner)
+    paths = owner_worker_runtime_paths(owner_home=owner, worker_generation=1)
+    roots = controlled_roots_for(paths)
+    store = AuthorityStore(tmp_path / "authority")
+    claim = store.claim_worker_start("owner", worker_id="worker")
+    broker = DeploymentMediaBroker(policy=policy, authority_store=store)
+    fd = broker.register(claim.lease)
+    client = OwnerMediaRelayClient(fd, policy.descriptor())
+    active = store.transition_worker_lease(
+        claim.lease,
+        state=WorkerLeaseState.ACTIVE,
+        generation_state=WorkerGenerationState.ACTIVE,
+    )
+    broker.activate(active)
+    return owner, paths, roots, policy.descriptor().routes[0], broker, client
+
+
+def test_custom_codex_real_path_validates_then_publishes(
+    tmp_path, monkeypatch, _openai_image_server
+):
+    monkeypatch.setenv("TEST_MEDIA_RELAY_KEY", "secret")
+    monkeypatch.setattr(
+        deployment_media_module,
+        "_validate_https_url",
+        lambda value, *, field: value,
+    )
+    monkeypatch.setattr(controlled_roots_module.sys, "platform", "linux")
+    monkeypatch.setattr(controlled_roots_module, "_openat2", lambda *_args: None)
+    base_url, handler = _openai_image_server
+    policy = _custom_codex_policy(base_url)
+    owner, paths, roots, descriptor, broker, client = _dispatch_runtime(
+        tmp_path, policy
+    )
+    try:
+        result = json.loads(dispatch_deployment_media(
+            {
+                "prompt": "draw a portrait",
+                "aspect_ratio": "3:4",
+                "resolution": "2K",
+            },
+            kind="image",
+            model="gpt-image-2",
+            relay_client=client,
+            descriptor=descriptor,
+            workspace_context=AuthenticatedWorkspaceContext(roots),
+            owner_home=owner,
+        ))
+        output = Path(result["image"])
+        assert output.parent == paths.default_workspace / "generated" / "images"
+        assert output.read_bytes() == handler.image_bytes
+        assert len(handler.requests) == 1
+        request_path, request_payload = handler.requests[0]
+        assert request_path == "/v1/images/generations"
+        assert request_payload["model"] == "gpt-image-2"
+        assert request_payload["size"] == "1536x2048"
+        assert request_payload["n"] == 1
+        assert request_payload["quality"] == "medium"
+        assert request_payload["prompt"].startswith(
+            "draw a portrait\n\nOutput requirements:"
+        )
+        assert "Aspect ratio: exactly 3:4" in request_payload["prompt"]
+        assert "Preferred pixel dimensions: 1536x2048" in request_payload["prompt"]
+        assert result["requested_aspect_ratio"] == "3:4"
+        assert result["effective_aspect_ratio"] == "3:4"
+        assert result["actual_aspect_ratio"] == "3:4"
+        assert result["requested_resolution"] == "2K"
+        assert result["effective_resolution"] == "2K"
+        assert result["actual_resolution"] == "2K"
+        assert result["resolution_mode"] == "native"
+        assert result["actual_dimensions"] == {"width": 1536, "height": 2048}
+    finally:
+        client.close()
+        broker.close()
+        roots.close()
+
+
+def test_custom_codex_real_path_accepts_non_native_matching_ratio(
+    tmp_path, monkeypatch, _openai_image_server
+):
+    monkeypatch.setenv("TEST_MEDIA_RELAY_KEY", "secret")
+    monkeypatch.setattr(
+        deployment_media_module,
+        "_validate_https_url",
+        lambda value, *, field: value,
+    )
+    monkeypatch.setattr(controlled_roots_module.sys, "platform", "linux")
+    monkeypatch.setattr(controlled_roots_module, "_openat2", lambda *_args: None)
+    base_url, handler = _openai_image_server
+    handler.image_bytes = _png_bytes((1086, 1448))
+    policy = _custom_codex_policy(base_url)
+    owner, paths, roots, descriptor, broker, client = _dispatch_runtime(
+        tmp_path, policy
+    )
+    try:
+        result = json.loads(dispatch_deployment_media(
+            {
+                "prompt": "draw a portrait",
+                "aspect_ratio": "3:4",
+                "resolution": "2K",
+            },
+            kind="image",
+            model="gpt-image-2",
+            relay_client=client,
+            descriptor=descriptor,
+            workspace_context=AuthenticatedWorkspaceContext(roots),
+            owner_home=owner,
+        ))
+        output = Path(result["image"])
+        assert output.read_bytes() == handler.image_bytes
+        assert result["actual_dimensions"] == {"width": 1086, "height": 1448}
+        assert result["actual_aspect_ratio"] == "3:4"
+        assert result["actual_resolution"] is None
+    finally:
+        client.close()
+        broker.close()
+        roots.close()
+
+
+def test_custom_codex_real_path_rejects_before_publication(
+    tmp_path, monkeypatch, _openai_image_server
+):
+    monkeypatch.setenv("TEST_MEDIA_RELAY_KEY", "secret")
+    monkeypatch.setattr(
+        deployment_media_module,
+        "_validate_https_url",
+        lambda value, *, field: value,
+    )
+    monkeypatch.setattr(controlled_roots_module.sys, "platform", "linux")
+    monkeypatch.setattr(controlled_roots_module, "_openat2", lambda *_args: None)
+    base_url, handler = _openai_image_server
+    handler.image_bytes = _png_bytes((1254, 1254))
+    policy = _custom_codex_policy(base_url)
+    owner, paths, roots, descriptor, broker, client = _dispatch_runtime(
+        tmp_path, policy
+    )
+    try:
+        with pytest.raises(DeploymentMediaRelayError, match="rejected"):
+            dispatch_deployment_media(
+                {
+                    "prompt": "draw a portrait",
+                    "aspect_ratio": "3:4",
+                    "resolution": "2K",
+                },
+                kind="image",
+                model="gpt-image-2",
+                relay_client=client,
+                descriptor=descriptor,
+                workspace_context=AuthenticatedWorkspaceContext(roots),
+                owner_home=owner,
+            )
+        output_dir = paths.default_workspace / "generated" / "images"
+        assert not output_dir.exists() or not tuple(output_dir.iterdir())
+    finally:
+        client.close()
+        broker.close()
+        roots.close()
 
 
 def test_relay_requires_active_exact_lease_and_returns_bytes(tmp_path):
@@ -128,17 +377,21 @@ def test_relay_requires_active_exact_lease_and_returns_bytes(tmp_path):
         references=[],
         params={"resolution": "4K"},
     )
-    assert result["image_bytes"] == b"generated"
+    assert result["image_bytes"] == _png_bytes()
     assert result["provider"] == "apiyi"
     assert result["aspect_ratio"] == "3:4"
     assert result["metadata"] == {
-        "size": "1024x1024",
         "upstream_model": "gpt-image-2",
         "requested_aspect_ratio": "3:4",
         "effective_aspect_ratio": "3:4",
         "requested_resolution": "4K",
         "effective_resolution": "4K",
         "resolution_mode": "native",
+        "width": 300,
+        "height": 400,
+        "actual_dimensions": {"width": 300, "height": 400},
+        "actual_aspect_ratio": "3:4",
+        "actual_resolution": None,
     }
     broker.revoke(active)
     with pytest.raises(DeploymentMediaRelayError):

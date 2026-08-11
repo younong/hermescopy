@@ -9,9 +9,11 @@ endpoint.
 from __future__ import annotations
 
 import importlib
+import io
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 # The plugin directory uses a hyphen, which is not a valid Python identifier
 # for the dotted-import form. Load it via importlib so tests don't need to
@@ -27,9 +29,15 @@ _PNG_HEX = (
 )
 
 
-def _b64_png() -> str:
+def _png_bytes(size=(2048, 2048)) -> bytes:
+    output = io.BytesIO()
+    Image.new("RGB", size).save(output, format="PNG")
+    return output.getvalue()
+
+
+def _b64_png(size=(2048, 2048)) -> str:
     import base64
-    return base64.b64encode(bytes.fromhex(_PNG_HEX)).decode()
+    return base64.b64encode(_png_bytes(size)).decode()
 
 
 @pytest.fixture(autouse=True)
@@ -108,7 +116,11 @@ class TestGenerate:
 
     def test_generate_uses_codex_stream_path(self, provider, monkeypatch, tmp_path):
         monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
-        monkeypatch.setattr(codex_plugin, "_collect_image_b64", lambda *a, **kw: _b64_png())
+        monkeypatch.setattr(
+            codex_plugin,
+            "_collect_image_b64",
+            lambda *a, **kw: _b64_png((2048, 1152)),
+        )
 
         result = provider.generate("a cat", aspect_ratio="landscape")
 
@@ -136,7 +148,7 @@ class TestGenerate:
                 quality=quality,
                 input_images=input_images,
             ))
-            return _b64_png()
+            return _b64_png((1086, 1448))
 
         monkeypatch.setattr(codex_plugin, "_collect_image_b64", _collect)
 
@@ -148,6 +160,10 @@ class TestGenerate:
         assert captured["input"][0]["type"] == "message"
         assert captured["input"][0]["role"] == "user"
         assert captured["input"][0]["content"][0]["type"] == "input_text"
+        constrained_prompt = captured["input"][0]["content"][0]["text"]
+        assert constrained_prompt.startswith("a cat\n\nOutput requirements:")
+        assert "Aspect ratio: exactly 3:4" in constrained_prompt
+        assert "Preferred pixel dimensions: 1536x2048" in constrained_prompt
         assert captured["tool_choice"]["type"] == "allowed_tools"
         assert captured["tool_choice"]["mode"] == "required"
         assert captured["tool_choice"]["tools"] == [{"type": "image_generation"}]
@@ -156,10 +172,30 @@ class TestGenerate:
         assert tool["type"] == "image_generation"
         assert tool["model"] == "gpt-image-2"
         assert tool["quality"] == "medium"
-        assert tool["size"] == "1024x1536"
+        assert tool["size"] == "1536x2048"
         assert tool["output_format"] == "png"
         assert tool["background"] == "opaque"
         assert tool["partial_images"] == 1
+        assert result["actual_dimensions"] == {"width": 1086, "height": 1448}
+        assert result["actual_resolution"] is None
+
+    def test_ratio_mismatch_is_rejected(self, provider, monkeypatch):
+        monkeypatch.setattr(
+            codex_plugin,
+            "_read_codex_access_token",
+            lambda: "codex-token",
+        )
+        monkeypatch.setattr(
+            codex_plugin,
+            "_collect_image_b64",
+            lambda *a, **kw: _b64_png((1254, 1254)),
+        )
+
+        result = provider.generate("a portrait", aspect_ratio="3:4")
+
+        assert result["success"] is False
+        assert result["error_type"] == "image_artifact_mismatch"
+        assert "aspect ratio" in result["error"]
 
     def test_capabilities_advertise_image_inputs(self, provider):
         caps = provider.capabilities()
@@ -180,7 +216,7 @@ class TestGenerate:
                 quality=quality,
                 input_images=input_images,
             ))
-            return _b64_png()
+            return _b64_png((1086, 1448))
 
         monkeypatch.setattr(codex_plugin, "_collect_image_b64", _collect)
 
@@ -196,10 +232,11 @@ class TestGenerate:
         assert result["input_image_count"] == 2
 
         content = captured["input"][0]["content"]
-        assert content[0] == {
-            "type": "input_text",
-            "text": "put this same person in a navy JK uniform",
-        }
+        assert content[0]["type"] == "input_text"
+        assert content[0]["text"].startswith(
+            "put this same person in a navy JK uniform\n\nOutput requirements:"
+        )
+        assert "Aspect ratio: exactly 3:4" in content[0]["text"]
         assert content[1]["type"] == "input_image"
         assert content[1]["image_url"].startswith("data:image/png;base64,")
         assert content[2] == {"type": "input_image", "image_url": "https://example.com/ref.png"}
@@ -210,7 +247,7 @@ class TestGenerate:
 
         def _collect(token, *, prompt, size, quality, input_images=None):
             captured["input_images"] = input_images
-            return _b64_png()
+            return _b64_png((1280, 720))
 
         monkeypatch.setattr(codex_plugin, "_collect_image_b64", _collect)
 

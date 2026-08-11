@@ -29,8 +29,13 @@ from agent.image_gen_provider import (
     resolve_aspect_ratio,
     resolve_resolution,
     save_b64_image,
+    save_image_bytes,
     save_url_image,
     success_response,
+)
+from plugins.image_gen.openai_compatible import (
+    OpenAICompatibleImageEmpty,
+    generate_openai_compatible_image_bytes,
 )
 
 logger = logging.getLogger(__name__)
@@ -75,39 +80,6 @@ _MODELS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-# APIYI's GPT-Image-2 endpoint accepts arbitrary 16-pixel-aligned dimensions
-# within its documented pixel bounds. Each row maps Hermes' unified resolution
-# tier to the closest supported size for that aspect ratio.
-_GPT_SIZES = {
-    "1K": {
-        "16:9": "1280x720",
-        "3:2": "1536x1024",
-        "4:3": "1024x768",
-        "1:1": "1024x1024",
-        "3:4": "768x1024",
-        "2:3": "1024x1536",
-        "9:16": "720x1280",
-    },
-    "2K": {
-        "16:9": "2048x1152",
-        "3:2": "2048x1360",
-        "4:3": "2048x1536",
-        "1:1": "2048x2048",
-        "3:4": "1536x2048",
-        "2:3": "1360x2048",
-        "9:16": "1152x2048",
-    },
-    "4K": {
-        "16:9": "3840x2160",
-        "3:2": "3520x2336",
-        "4:3": "3312x2480",
-        "1:1": "2880x2880",
-        "3:4": "2480x3312",
-        "2:3": "2336x3520",
-        "9:16": "2160x3840",
-    },
-}
-
 _GEMINI_ASPECT_RATIOS = {
     "16:9": "16:9",
     "1:1": "1:1",
@@ -117,12 +89,6 @@ _GEMINI_ASPECT_RATIOS = {
     "3:2": "3:2",
     "9:16": "9:16",
 }
-
-
-def _gpt_image_size(aspect_ratio: str, resolution: str) -> Tuple[str, str]:
-    sizes = _GPT_SIZES[resolve_resolution(resolution)]
-    effective_aspect = nearest_aspect_ratio(aspect_ratio, tuple(sizes))
-    return sizes[effective_aspect], effective_aspect
 
 
 def _load_image_gen_config() -> Dict[str, Any]:
@@ -241,20 +207,6 @@ def _collect_sources(image_url: Optional[str], reference_image_urls: Optional[Li
     return sources
 
 
-def _extract_openai_image(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Return ``(b64, url, revised_prompt)`` from an OpenAI Images response."""
-    data = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(data, list) or not data:
-        return None, None, None
-    first = data[0]
-    if not isinstance(first, dict):
-        return None, None, None
-    b64 = first.get("b64_json") if isinstance(first.get("b64_json"), str) else None
-    url = first.get("url") if isinstance(first.get("url"), str) else None
-    revised = first.get("revised_prompt") if isinstance(first.get("revised_prompt"), str) else None
-    return b64, url, revised
-
-
 def _extract_gemini_images(payload: Dict[str, Any]) -> List[str]:
     """Extract image data/URLs from Gemini-style generateContent responses."""
     images: List[str] = []
@@ -291,119 +243,6 @@ def _save_image_ref(image_ref: str, *, prefix: str) -> str:
     if image_ref.startswith(("http://", "https://")):
         return str(save_url_image(image_ref, prefix=prefix))
     return str(save_b64_image(image_ref, prefix=prefix))
-
-
-def _decode_apiyi_image_payload(payload: Dict[str, Any]) -> Tuple[bytes, str]:
-    b64, url, _ = _extract_openai_image(payload)
-    if b64:
-        return base64.b64decode(b64), "image/png"
-    if url:
-        import requests
-        response = requests.get(url, timeout=60)
-        response.raise_for_status()
-        mime = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-        return response.content, mime if mime.startswith("image/") else "image/png"
-    raise ValueError("APIYI response contained no image data")
-
-
-def generate_openai_image_bytes(
-    *,
-    prompt: str,
-    aspect_ratio: str,
-    model: str,
-    references: List[Dict[str, Any]],
-    api_key: str,
-    openai_base_url: str,
-    params: Optional[Dict[str, Any]] = None,
-    quality: str = "medium",
-    edit_protocol: str = "multipart",
-) -> Dict[str, Any]:
-    """Call an OpenAI Images-compatible endpoint without filesystem writes.
-
-    This is the shared deployment executor for OpenAI Images-compatible routes.
-    Provider-specific model aliases and the APIYI Gemini branch stay in the
-    APIYI wrapper below; deployment routes pass their actual upstream model id.
-    """
-    import requests
-
-    requested_aspect = resolve_aspect_ratio(aspect_ratio)
-    requested_resolution = resolve_resolution(
-        (params or {}).get("resolution", DEFAULT_RESOLUTION)
-    )
-    size, effective_aspect = _gpt_image_size(
-        requested_aspect, requested_resolution
-    )
-    quality = str((params or {}).get("quality") or quality).strip().lower()
-    if quality not in {"low", "medium", "high", "auto"}:
-        raise ValueError("quality must be low, medium, high, or auto")
-    headers = {"Authorization": f"Bearer {api_key}"}
-    if references and edit_protocol == "json_images":
-        response = requests.post(
-            f"{openai_base_url.rstrip('/')}/images/edits",
-            headers={**headers, "Content-Type": "application/json"},
-            json={
-                "model": model,
-                "prompt": prompt,
-                "size": size,
-                "n": 1,
-                "quality": quality,
-                "images": [{
-                    "image_url": (
-                        f"data:{item['mime_type']};base64,"
-                        f"{base64.b64encode(item['data']).decode('ascii')}"
-                    ),
-                } for item in references],
-            },
-            timeout=_REQUEST_TIMEOUT,
-        )
-    elif references:
-        files = [
-            ("image", (item["name"], item["data"], item["mime_type"]))
-            for item in references
-        ]
-        response = requests.post(
-            f"{openai_base_url.rstrip('/')}/images/edits",
-            headers=headers,
-            data={
-                "model": model,
-                "prompt": prompt,
-                "size": size,
-                "n": "1",
-                "quality": quality,
-            },
-            files=files,
-            timeout=_REQUEST_TIMEOUT,
-        )
-    else:
-        response = requests.post(
-            f"{openai_base_url.rstrip('/')}/images/generations",
-            headers={**headers, "Content-Type": "application/json"},
-            json={
-                "model": model,
-                "prompt": prompt,
-                "size": size,
-                "n": 1,
-                "quality": quality,
-            },
-            timeout=_REQUEST_TIMEOUT,
-        )
-    response.raise_for_status()
-    payload = response.json()
-    image_bytes, mime_type = _decode_apiyi_image_payload(payload)
-    _, _, revised_prompt = _extract_openai_image(payload)
-    metadata: Dict[str, Any] = {
-        "size": size,
-        "quality": quality,
-        "upstream_model": model,
-        "requested_aspect_ratio": requested_aspect,
-        "effective_aspect_ratio": effective_aspect,
-        "requested_resolution": requested_resolution,
-        "effective_resolution": requested_resolution,
-        "resolution_mode": "native",
-    }
-    if revised_prompt:
-        metadata["revised_prompt"] = revised_prompt
-    return {"image_bytes": image_bytes, "mime_type": mime_type, "metadata": metadata}
 
 
 def generate_apiyi_image_bytes(
@@ -473,13 +312,14 @@ def generate_apiyi_image_bytes(
                 "resolution_mode": "native",
             },
         }
-    return generate_openai_image_bytes(
+    return generate_openai_compatible_image_bytes(
         prompt=prompt,
         aspect_ratio=aspect_ratio,
         model=_upstream_model(model_id),
         references=references,
         api_key=api_key,
         openai_base_url=openai_base_url,
+        size_profile="gpt-image-2",
         params=params,
         quality=str(meta["quality"]),
     )
@@ -541,6 +381,7 @@ class ApiyiImageGenProvider(ImageGenProvider):
         *,
         image_url: Optional[str] = None,
         reference_image_urls: Optional[List[str]] = None,
+        resolution: str = DEFAULT_RESOLUTION,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         prompt = (prompt or "").strip()
@@ -565,7 +406,7 @@ class ApiyiImageGenProvider(ImageGenProvider):
             )
 
         model_id, meta = _resolve_model(kwargs.get("model"))
-        resolution = resolve_resolution(kwargs.get("resolution"))
+        resolution = resolve_resolution(resolution)
         if model_id == _NANO_MODEL:
             return self._generate_nano(
                 prompt,
@@ -599,107 +440,56 @@ class ApiyiImageGenProvider(ImageGenProvider):
         image_url: Optional[str],
         reference_image_urls: Optional[List[str]],
     ) -> Dict[str, Any]:
-        import requests
-
-        upstream = _upstream_model(model_id)
-        base_url = _openai_base_url()
-        requested_aspect = resolve_aspect_ratio(aspect)
-        requested_resolution = resolve_resolution(resolution)
-        size, effective_aspect = _gpt_image_size(
-            requested_aspect, requested_resolution
-        )
-        sources = _collect_sources(image_url, reference_image_urls)[:_MAX_GPT_REFERENCE_IMAGES]
-        is_edit = bool(sources)
-        headers = {"Authorization": f"Bearer {api_key}"}
-
+        sources = _collect_sources(
+            image_url, reference_image_urls
+        )[:_MAX_GPT_REFERENCE_IMAGES]
         try:
-            if is_edit:
-                files = []
-                for ref in sources:
-                    data, filename, mime = _load_image_bytes(ref)
-                    files.append(("image", (filename, data, mime)))
-                form = {
-                    "model": upstream,
-                    "prompt": prompt,
-                    "size": size,
-                    "n": "1",
-                    "quality": str(meta["quality"]),
-                }
-                response = requests.post(
-                    f"{base_url}/images/edits",
-                    headers=headers,
-                    data=form,
-                    files=files,
-                    timeout=_REQUEST_TIMEOUT,
-                )
-            else:
-                payload = {
-                    "model": upstream,
-                    "prompt": prompt,
-                    "size": size,
-                    "n": 1,
-                    "quality": meta["quality"],
-                }
-                response = requests.post(
-                    f"{base_url}/images/generations",
-                    headers={**headers, "Content-Type": "application/json"},
-                    json=payload,
-                    timeout=_REQUEST_TIMEOUT,
-                )
-            response.raise_for_status()
-        except requests.HTTPError as exc:
-            resp = exc.response
-            status = resp.status_code if resp is not None else 0
-            try:
-                err_msg = resp.json().get("error", {}).get("message", resp.text[:300])
-            except Exception:  # noqa: BLE001
-                err_msg = resp.text[:300] if resp is not None else str(exc)
-            return error_response(
-                error=f"APIYI GPT-Image-2 request failed ({status}): {err_msg}",
-                error_type="api_error",
-                provider=self.name,
-                model=model_id,
+            references = []
+            for ref in sources:
+                data, filename, mime = _load_image_bytes(ref)
+                references.append({"name": filename, "data": data, "mime_type": mime})
+            result = generate_openai_compatible_image_bytes(
                 prompt=prompt,
                 aspect_ratio=aspect,
+                model=_upstream_model(model_id),
+                references=references,
+                api_key=api_key,
+                openai_base_url=_openai_base_url(),
+                size_profile="gpt-image-2",
+                params={"resolution": resolution},
+                quality=str(meta["quality"]),
             )
-        except Exception as exc:  # noqa: BLE001
+        except OpenAICompatibleImageEmpty as exc:
             return error_response(
-                error=f"APIYI GPT-Image-2 request failed: {exc}",
-                error_type="api_error",
-                provider=self.name,
-                model=model_id,
-                prompt=prompt,
-                aspect_ratio=aspect,
-            )
-
-        try:
-            payload = response.json()
-        except Exception as exc:  # noqa: BLE001
-            return error_response(
-                error=f"APIYI GPT-Image-2 returned invalid JSON: {exc}",
-                error_type="invalid_response",
-                provider=self.name,
-                model=model_id,
-                prompt=prompt,
-                aspect_ratio=aspect,
-            )
-
-        b64, url, revised_prompt = _extract_openai_image(payload)
-        if not b64 and not url:
-            return error_response(
-                error="APIYI GPT-Image-2 response contained no image data",
+                error=str(exc),
                 error_type="empty_response",
                 provider=self.name,
                 model=model_id,
                 prompt=prompt,
                 aspect_ratio=aspect,
             )
-
+        except Exception as exc:  # noqa: BLE001
+            details = str(exc)
+            response = getattr(exc, "response", None)
+            if response is not None:
+                try:
+                    details = response.json().get("error", {}).get(
+                        "message", response.text[:300]
+                    )
+                except Exception:  # noqa: BLE001
+                    details = response.text[:300] or details
+            return error_response(
+                error=f"APIYI GPT-Image-2 request failed: {details}",
+                error_type="api_error",
+                provider=self.name,
+                model=model_id,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
         try:
-            if b64:
-                image_ref = str(save_b64_image(b64, prefix=f"apiyi_{model_id}"))
-            else:
-                image_ref = str(save_url_image(url or "", prefix=f"apiyi_{model_id}"))
+            image_ref = str(save_image_bytes(
+                result["image_bytes"], prefix=f"apiyi_{model_id}"
+            ))
         except Exception as exc:  # noqa: BLE001
             return error_response(
                 error=f"Could not save APIYI GPT-Image-2 image: {exc}",
@@ -709,27 +499,14 @@ class ApiyiImageGenProvider(ImageGenProvider):
                 prompt=prompt,
                 aspect_ratio=aspect,
             )
-
-        extra: Dict[str, Any] = {
-            "upstream_model": upstream,
-            "size": size,
-            "quality": meta["quality"],
-            "requested_aspect_ratio": aspect,
-            "effective_aspect_ratio": effective_aspect,
-            "requested_resolution": requested_resolution,
-            "effective_resolution": requested_resolution,
-            "resolution_mode": "native",
-        }
-        if revised_prompt:
-            extra["revised_prompt"] = revised_prompt
         return success_response(
             image=image_ref,
             model=model_id,
             prompt=prompt,
             aspect_ratio=aspect,
             provider=self.name,
-            modality="image" if is_edit else "text",
-            extra=extra,
+            modality="image" if sources else "text",
+            extra=dict(result["metadata"]),
         )
 
     def _generate_nano(

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import io
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from PIL import Image
 
 import plugins.image_gen.openai as openai_plugin
 
@@ -19,9 +21,15 @@ _PNG_HEX = (
 )
 
 
-def _b64_png() -> str:
+def _png_bytes(size=(2048, 2048)) -> bytes:
+    output = io.BytesIO()
+    Image.new("RGB", size).save(output, format="PNG")
+    return output.getvalue()
+
+
+def _b64_png(size=(2048, 2048)) -> str:
     import base64
-    return base64.b64encode(bytes.fromhex(_PNG_HEX)).decode()
+    return base64.b64encode(_png_bytes(size)).decode()
 
 
 def _fake_response(*, b64=None, url=None, revised_prompt=None):
@@ -137,9 +145,11 @@ class TestGenerate:
         assert result["error_type"] == "auth_required"
 
     def test_b64_saves_to_cache(self, provider, tmp_path):
-        png_bytes = bytes.fromhex(_PNG_HEX)
+        png_bytes = _png_bytes((2048, 1152))
         fake_client = MagicMock()
-        fake_client.images.generate.return_value = _fake_response(b64=_b64_png())
+        fake_client.images.generate.return_value = _fake_response(
+            b64=_b64_png((2048, 1152))
+        )
 
         with _patched_openai(fake_client):
             result = provider.generate("a cat", aspect_ratio="landscape")
@@ -148,7 +158,7 @@ class TestGenerate:
         assert result["model"] == "gpt-image-2-medium"
         assert result["aspect_ratio"] == "16:9"
         assert result["requested_aspect_ratio"] == "16:9"
-        assert result["effective_aspect_ratio"] == "3:2"
+        assert result["effective_aspect_ratio"] == "16:9"
         assert result["provider"] == "openai"
         assert result["quality"] == "medium"
 
@@ -161,7 +171,9 @@ class TestGenerate:
         # All tiers hit the single underlying API model.
         assert call_kwargs["model"] == "gpt-image-2"
         assert call_kwargs["quality"] == "medium"
-        assert call_kwargs["size"] == "1536x1024"
+        assert call_kwargs["size"] == "2048x1152"
+        assert call_kwargs["prompt"].startswith("a cat\n\nOutput requirements:")
+        assert "Aspect ratio: exactly 16:9" in call_kwargs["prompt"]
         # gpt-image-2 rejects response_format — we must NOT send it.
         assert "response_format" not in call_kwargs
 
@@ -173,7 +185,9 @@ class TestGenerate:
     def test_tier_maps_to_quality(self, provider, monkeypatch, tier, expected_quality):
         monkeypatch.setenv("OPENAI_IMAGE_MODEL", tier)
         fake_client = MagicMock()
-        fake_client.images.generate.return_value = _fake_response(b64=_b64_png())
+        fake_client.images.generate.return_value = _fake_response(
+            b64=_b64_png((1280, 720))
+        )
 
         with _patched_openai(fake_client):
             result = provider.generate("a cat")
@@ -185,9 +199,13 @@ class TestGenerate:
         assert fake_client.images.generate.call_args.kwargs["model"] == "gpt-image-2"
 
     @pytest.mark.parametrize("aspect,expected_size", [
-        ("3:2", "1536x1024"),
-        ("1:1", "1024x1024"),
-        ("2:3", "1024x1536"),
+        ("16:9", "2048x1152"),
+        ("3:2", "2048x1360"),
+        ("4:3", "2048x1536"),
+        ("1:1", "2048x2048"),
+        ("3:4", "1536x2048"),
+        ("2:3", "1360x2048"),
+        ("9:16", "1152x2048"),
     ])
     def test_aspect_ratio_mapping(self, provider, aspect, expected_size):
         fake_client = MagicMock()
@@ -198,10 +216,37 @@ class TestGenerate:
 
         assert fake_client.images.generate.call_args.kwargs["size"] == expected_size
 
+    def test_non_native_dimensions_are_accepted_when_ratio_matches(self, provider):
+        fake_client = MagicMock()
+        fake_client.images.generate.return_value = _fake_response(
+            b64=_b64_png((1086, 1448))
+        )
+
+        with _patched_openai(fake_client):
+            result = provider.generate("a portrait", aspect_ratio="3:4")
+
+        assert result["success"] is True
+        assert result["actual_dimensions"] == {"width": 1086, "height": 1448}
+        assert result["actual_aspect_ratio"] == "3:4"
+        assert result["actual_resolution"] is None
+
+    def test_ratio_mismatch_is_rejected(self, provider):
+        fake_client = MagicMock()
+        fake_client.images.generate.return_value = _fake_response(
+            b64=_b64_png((1254, 1254))
+        )
+
+        with _patched_openai(fake_client):
+            result = provider.generate("a portrait", aspect_ratio="3:4")
+
+        assert result["success"] is False
+        assert result["error_type"] == "image_artifact_mismatch"
+        assert "aspect ratio" in result["error"]
+
     def test_revised_prompt_passed_through(self, provider):
         fake_client = MagicMock()
         fake_client.images.generate.return_value = _fake_response(
-            b64=_b64_png(), revised_prompt="A photo of a cat",
+            b64=_b64_png((1280, 720)), revised_prompt="A photo of a cat",
         )
 
         with _patched_openai(fake_client):
@@ -230,32 +275,26 @@ class TestGenerate:
         assert result["success"] is False
         assert result["error_type"] == "empty_response"
 
-    def test_url_response_is_cached_locally(self, provider):
-        """OpenAI URL response (if API ever returns one) is cached locally.
-
-        Pre-fix this asserted the bare URL passed through; symmetric to the
-        xAI #26942 fix.  Even though gpt-image-2 returns b64 today, every
-        ``image_gen`` provider must guarantee the gateway gets a stable
-        file path so ephemeral signed URLs can't expire mid-flight.
-        """
+    def test_url_response_is_downloaded_validated_and_cached(self, provider):
         fake_client = MagicMock()
         fake_client.images.generate.return_value = _fake_response(
             b64=None, url="https://example.com/img.png",
         )
+        response = MagicMock()
+        response.content = _png_bytes((1280, 720))
+        response.headers = {"Content-Type": "image/png"}
 
         with _patched_openai(fake_client), patch(
-            "plugins.image_gen.openai.save_url_image",
-            return_value=Path("/tmp/openai_gpt-image-2_20260524_000000_deadbeef.png"),
-        ) as mock_save_url:
+            "requests.get", return_value=response
+        ) as mock_get:
             result = provider.generate("a cat")
 
         assert result["success"] is True
         assert result["image"].startswith("/")
         assert "example.com" not in result["image"]
-        mock_save_url.assert_called_once()
+        mock_get.assert_called_once_with("https://example.com/img.png", timeout=60)
 
-    def test_url_response_falls_back_to_bare_url_when_download_fails(self, provider):
-        """Cache failure must not turn into a tool error — symmetric with xAI."""
+    def test_url_download_failure_returns_artifact_error(self, provider):
         import requests as req_lib
 
         fake_client = MagicMock()
@@ -264,10 +303,9 @@ class TestGenerate:
         )
 
         with _patched_openai(fake_client), patch(
-            "plugins.image_gen.openai.save_url_image",
-            side_effect=req_lib.HTTPError("404 from CDN"),
+            "requests.get", side_effect=req_lib.HTTPError("404 from CDN")
         ):
             result = provider.generate("a cat")
 
-        assert result["success"] is True
-        assert result["image"] == "https://example.com/img.png"
+        assert result["success"] is False
+        assert result["error_type"] == "image_artifact_mismatch"
