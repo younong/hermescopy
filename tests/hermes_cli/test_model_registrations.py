@@ -266,9 +266,9 @@ def test_admin_registrations_expose_custom_codex_image_route(monkeypatch):
             "models": ["gpt-image-2"],
             "default_model": "gpt-image-2",
             "key_env": "CODEX_IMAGE_KEY",
-            "executor": "plugins.image_gen.apiyi:generate_openai_image_bytes",
+            "executor": "plugins.image_gen.openai_compatible:generate_openai_compatible_image_bytes",
             "base_urls": {"openai_base_url": "https://codex.example.com/v1"},
-            "executor_params": {"edit_protocol": "json_images"},
+            "executor_params": {"edit_protocol": "json_images", "size_profile": "openai-native"},
         }]),
     )
     monkeypatch.setattr(

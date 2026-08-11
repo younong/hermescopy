@@ -33,13 +33,12 @@ from agent.image_gen_provider import (
     ImageGenProvider,
     error_response,
     normalize_reference_images,
-    nearest_aspect_ratio,
     resolve_aspect_ratio,
-    resolve_resolution,
     save_b64_image,
     save_url_image,
     success_response,
 )
+from agent.image_size import OPENAI_NATIVE_IMAGE_PROFILE, resolve_image_size
 
 logger = logging.getLogger(__name__)
 
@@ -76,12 +75,6 @@ _MODELS: Dict[str, Dict[str, Any]] = {
 }
 
 DEFAULT_MODEL = "gpt-image-2-medium"
-
-_SIZES = {
-    "3:2": "1536x1024",
-    "1:1": "1024x1024",
-    "2:3": "1024x1536",
-}
 
 
 def _load_openai_config() -> Dict[str, Any]:
@@ -227,7 +220,11 @@ class OpenAIImageGenProvider(ImageGenProvider):
     ) -> Dict[str, Any]:
         prompt = (prompt or "").strip()
         aspect = resolve_aspect_ratio(aspect_ratio)
-        requested_resolution = resolve_resolution(resolution)
+        size_plan = resolve_image_size(
+            aspect,
+            resolution,
+            profile=OPENAI_NATIVE_IMAGE_PROFILE,
+        )
 
         if not prompt:
             return error_response(
@@ -260,8 +257,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
             )
 
         tier_id, meta = _resolve_model()
-        effective_aspect = nearest_aspect_ratio(aspect, tuple(_SIZES))
-        size = _SIZES[effective_aspect]
+        size = size_plan.size
 
         # Collect source images (primary + references) for image-to-image.
         sources: List[str] = []
@@ -302,7 +298,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
                     model=API_MODEL,
                     image=files if len(files) > 1 else files[0],
                     prompt=prompt,
-                    size=size,  # type: ignore[arg-type]  # _SIZES values are valid gpt-image sizes
+                    size=size,  # type: ignore[arg-type]  # shared profile contains valid sizes
                     quality=meta["quality"],
                     n=1,
                 )
@@ -396,13 +392,8 @@ class OpenAIImageGenProvider(ImageGenProvider):
             )
 
         extra: Dict[str, Any] = {
-            "size": size,
+            **size_plan.metadata(),
             "quality": meta["quality"],
-            "requested_aspect_ratio": aspect,
-            "effective_aspect_ratio": effective_aspect,
-            "requested_resolution": requested_resolution,
-            "effective_resolution": "1K",
-            "resolution_mode": "mapped",
         }
         if revised_prompt:
             extra["revised_prompt"] = revised_prompt

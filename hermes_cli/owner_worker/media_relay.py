@@ -39,9 +39,10 @@ from hermes_cli.deployment_media import (
 _MAX_FRAME_BYTES = 96 * 1024 * 1024
 _ALLOWED_MIME_TYPES = IMAGE_MIME_TYPES | VIDEO_MIME_TYPES
 _SAFE_METADATA_KEYS = frozenset({
-    "aspect_ratio_native", "effective_aspect_ratio", "effective_resolution",
-    "output_format", "quality", "requested_aspect_ratio", "requested_resolution",
-    "resolution_mode", "revised_prompt", "size", "upstream_model",
+    "actual_aspect_ratio", "actual_resolution", "aspect_ratio_native",
+    "effective_aspect_ratio", "effective_resolution", "height", "output_format",
+    "quality", "requested_aspect_ratio", "requested_resolution", "resolution_mode",
+    "revised_prompt", "size", "upstream_model", "width",
 })
 _MAX_PARAM_KEY_LENGTH = 64
 _MAX_PARAM_VALUE_LENGTH = 4096
@@ -89,6 +90,15 @@ def _safe_metadata(value: object) -> dict[str, Any]:
     safe: dict[str, Any] = {}
     for key, item in value.items():
         name = str(key)
+        if name == "actual_dimensions" and isinstance(item, dict):
+            width = item.get("width")
+            height = item.get("height")
+            if (
+                isinstance(width, int) and not isinstance(width, bool) and width > 0
+                and isinstance(height, int) and not isinstance(height, bool) and height > 0
+            ):
+                safe[name] = {"width": width, "height": height}
+            continue
         if name not in _SAFE_METADATA_KEYS:
             continue
         if item is None or isinstance(item, (bool, int, float)):
