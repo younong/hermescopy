@@ -156,6 +156,32 @@ def _emit_terminal_post_tool_call(
         pass
 
 
+def _emit_tool_complete_callback(
+    agent,
+    *,
+    tool_call_id: str,
+    function_name: str,
+    function_args: dict,
+    function_result: Any,
+) -> bool:
+    if not agent.tool_complete_callback:
+        return False
+    try:
+        display_args = (
+            _redact_tool_args_for_display(function_name, function_args)
+            or function_args
+        )
+        agent.tool_complete_callback(
+            tool_call_id,
+            function_name,
+            display_args,
+            function_result,
+        )
+    except Exception as cb_err:
+        logging.debug(f"Tool complete callback error: {cb_err}")
+    return True
+
+
 def _cancelled_tool_result(reason: str = "user interrupt") -> str:
     return json.dumps(
         {
@@ -306,8 +332,9 @@ def _run_agent_tool_execution_middleware(
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
     """Execute multiple tool calls concurrently using a thread pool.
 
-    Results are collected in the original tool-call order and appended to
-    messages so the API sees them in the expected sequence.
+    Live completion callbacks fire as each worker finishes, while results are
+    still appended to ``messages`` in original tool-call order so the model sees
+    the sequence it emitted.
     """
     tool_calls = assistant_message.tool_calls
     num_tools = len(tool_calls)
@@ -529,6 +556,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # ── Concurrent execution ─────────────────────────────────────────
     # Each slot holds (function_name, function_args, function_result, duration, error_flag, blocked_flag, middleware_trace)
     results = [None] * num_tools
+    callback_completed = [False] * num_tools
     for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
         if block_result is not None:
             results[i] = (name, args, block_result, 0.0, True, True, middleware_trace)
@@ -609,6 +637,16 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
             results[index] = (function_name, function_args, result, duration, is_error, False, middleware_trace)
         finally:
+            completed_result = results[index]
+            if completed_result is not None and not completed_result[5]:
+                callback_completed[index] = _emit_tool_complete_callback(
+                    agent,
+                    tool_call_id=tool_call.id,
+                    function_name=function_name,
+                    function_args=function_args,
+                    function_result=completed_result[2],
+                )
+
             # Tear down worker-tid tracking.  Clear any interrupt bit we may
             # have set so the next task scheduled onto this recycled tid
             # starts with a clean slate.  This MUST be in a finally block
@@ -906,12 +944,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         agent._current_tool = None
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s)")
 
-        if not blocked and agent.tool_complete_callback:
-            try:
-                display_args = _redact_tool_args_for_display(name, args) or args
-                agent.tool_complete_callback(tc.id, name, display_args, function_result)
-            except Exception as cb_err:
-                logging.debug(f"Tool complete callback error: {cb_err}")
+        if not blocked and not callback_completed[i]:
+            _emit_tool_complete_callback(
+                agent,
+                tool_call_id=tc.id,
+                function_name=name,
+                function_args=args,
+                function_result=function_result,
+            )
 
         function_result = maybe_persist_tool_result(
             content=function_result,
@@ -1568,12 +1608,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _log_result = _multimodal_text_summary(function_result)
             logging.debug(f"Tool result ({len(_log_result)} chars): {_log_result}")
 
-        if not _execution_blocked and agent.tool_complete_callback:
-            try:
-                display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
-                agent.tool_complete_callback(tool_call.id, function_name, display_args, function_result)
-            except Exception as cb_err:
-                logging.debug(f"Tool complete callback error: {cb_err}")
+        if not _execution_blocked:
+            _emit_tool_complete_callback(
+                agent,
+                tool_call_id=tool_call.id,
+                function_name=function_name,
+                function_args=function_args,
+                function_result=function_result,
+            )
 
         function_result = maybe_persist_tool_result(
             content=function_result,

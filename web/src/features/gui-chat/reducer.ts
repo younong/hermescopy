@@ -1871,9 +1871,21 @@ function addImageArtifact(
       : source?.kind === "url" || source?.kind === "artifact"
         ? source.value
         : undefined);
-  const id = String(payload?.id ?? rawUrl ?? createClientId("artifact"));
   if (!rawUrl) return state;
-  const url = looksLikeFilesystemPath(rawUrl)
+  const sourcePath = looksLikeFilesystemPath(rawUrl)
+    ? normalizeSessionFileReference(rawUrl) ?? rawUrl
+    : undefined;
+  const matchingArtifact = sourcePath
+    ? Object.values(state.artifacts).find(
+        (artifact): artifact is ImageArtifactState =>
+          artifact.kind !== "file" &&
+          artifact.sourcePath !== undefined &&
+          canonicalFilesystemPath(artifact.sourcePath, state.cwd) ===
+            canonicalFilesystemPath(sourcePath, state.cwd),
+      )
+    : undefined;
+  const id = matchingArtifact?.id ?? String(payload?.id ?? rawUrl ?? createClientId("artifact"));
+  const url = sourcePath
     ? imagePreviewUrl(rawUrl, state.cwd)
     : rawUrl.startsWith("/api/") ||
         rawUrl.startsWith("http") ||
@@ -1895,6 +1907,7 @@ function addImageArtifact(
     id,
     messageId: messageId ?? existingImage?.messageId,
     mimeType: payload?.mimeType ?? payload?.mime_type ?? existingImage?.mimeType,
+    sourcePath: sourcePath ?? existingImage?.sourcePath,
     title: payload?.title ?? existingImage?.title,
     toolCallId: toolCallId ?? existingImage?.toolCallId,
     url,
@@ -1921,6 +1934,14 @@ function addImageArtifact(
     );
   }
   return { ...state, artifacts: { ...state.artifacts, [id]: artifact }, messages, toolCalls };
+}
+
+function canonicalFilesystemPath(path: string, cwd?: string): string {
+  const normalized = path.replaceAll("\\", "/").replace(/^\.\//, "");
+  if (normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized) || !cwd) {
+    return normalized;
+  }
+  return `${cwd.replaceAll("\\", "/").replace(/\/$/, "")}/${normalized}`;
 }
 
 function applyError(state: GuiChatState, payload: ErrorPayload | undefined): GuiChatState {
