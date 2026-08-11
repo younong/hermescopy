@@ -880,13 +880,19 @@ def _is_internal_file_tool_content(content: str) -> bool:
 
 
 def resolve_delegated_artifact_path(
-    path: str, task_id: str = "default"
-) -> dict[str, str]:
-    """Validate a local artifact before it is exposed to a delegated child.
+    path: str,
+    task_id: str = "default",
+    *,
+    require_workspace: bool = False,
+    maximum_bytes: int | None = None,
+) -> dict[str, str | int]:
+    """Validate a local artifact before exposing it outside the current turn.
 
     Authenticated owner-worker dispatches stay descriptor-bound to the selected
     workspace. Other runtimes use the same authoritative task/session cwd as
-    ordinary file tools and return a canonical absolute path.
+    ordinary file tools. ``require_workspace`` additionally rejects absolute or
+    resolved paths outside that authoritative workspace, as required for user-
+    downloadable artifacts.
     """
     if not isinstance(path, str) or not path.strip() or "\x00" in path:
         raise ValueError("artifact path must be a non-empty string")
@@ -895,19 +901,31 @@ def resolve_delegated_artifact_path(
     file_ops = _authenticated_workspace_file_ops()
     if file_ops is not None:
         try:
-            child_path, diagnostic_path = file_ops.resolve_artifact_path(path)
+            child_path, diagnostic_path, size_bytes = file_ops.resolve_artifact_info(path)
+            if maximum_bytes is not None and size_bytes > maximum_bytes:
+                raise ValueError(f"file exceeds the {maximum_bytes}-byte delivery limit")
         except (OSError, RuntimeError, ValueError) as exc:
             raise ValueError(f"invalid delegated artifact {path!r}: {exc}") from exc
         return {
             "input_path": path,
             "path": child_path,
             "diagnostic_path": diagnostic_path,
+            "size_bytes": size_bytes,
         }
 
     resolved = _resolve_path_for_task(path, task_id)
     try:
+        if require_workspace:
+            workspace = _resolve_base_dir(task_id)
+            try:
+                resolved.relative_to(workspace)
+            except ValueError as exc:
+                raise ValueError("artifact is outside the active workspace") from exc
         if not resolved.is_file():
             raise ValueError("expected a regular file")
+        metadata = resolved.stat()
+        if maximum_bytes is not None and metadata.st_size > maximum_bytes:
+            raise ValueError(f"file exceeds the {maximum_bytes}-byte delivery limit")
         with resolved.open("rb"):
             pass
     except (OSError, ValueError) as exc:
@@ -917,6 +935,7 @@ def resolve_delegated_artifact_path(
         "input_path": path,
         "path": canonical,
         "diagnostic_path": canonical,
+        "size_bytes": metadata.st_size,
     }
 
 

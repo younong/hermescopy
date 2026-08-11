@@ -1916,7 +1916,10 @@ class AIAgent:
                     session_id=self.session_id,
                     role=role,
                     content=content,
-                    attachments=msg.get("attachments") if role == "user" else None,
+                    # Assistant attachments are finalizer-verified local artifacts.
+                    # Provider projection strips this metadata before the next API call,
+                    # while the display transcript uses it for cold-resume cards.
+                    attachments=msg.get("attachments") if role in {"user", "assistant"} else None,
                     tool_name=msg.get("tool_name"),
                     tool_calls=tool_calls_data,
                     tool_call_id=msg.get("tool_call_id"),

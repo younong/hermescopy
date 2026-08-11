@@ -24,6 +24,7 @@ from agent.prompt_builder import (
     _CONTEXT_FILE_DYNAMIC_CEILING,
     DEFAULT_AGENT_IDENTITY,
     RESPONSE_STYLE_GUIDANCE,
+    TASK_COMPLETION_GUIDANCE,
     drain_truncation_warnings,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
@@ -55,6 +56,12 @@ class TestGuidanceConstants:
         assert "concise summary and pointer" in RESPONSE_STYLE_GUIDANCE
         assert "no usable file or artifact mechanism" in RESPONSE_STYLE_GUIDANCE
         assert "correctness, safety, or task completion" in RESPONSE_STYLE_GUIDANCE
+
+    def test_completion_guidance_requires_downloadable_multi_file_delivery(self):
+        lowered = TASK_COMPLETION_GUIDANCE.lower()
+        assert "directory is not a downloadable artifact" in lowered
+        assert "verified regular archive" in lowered
+        assert "explicitly delivering" in lowered
 
     def test_default_identity_has_no_overlapping_verbosity_policy(self):
         assert "useful over being verbose" not in DEFAULT_AGENT_IDENTITY
@@ -1143,6 +1150,14 @@ class TestPromptBuilderConstants:
         assert "MEDIA:" in hint
         assert "Markdown" in hint
         assert "absolute" in hint
+        assert "regular files" in hint
+        assert "Directories are not downloadable" in hint
+
+    def test_tui_hint_does_not_claim_browser_download_delivery(self):
+        hint = PLATFORM_HINTS["tui"]
+        assert "not authenticated browser downloads" in hint
+        assert "Directories are not downloadable" in hint
+        assert "archive multi-file work" in hint
 
 
 # =========================================================================

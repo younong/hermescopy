@@ -548,7 +548,12 @@ class ControlledWorkspaceFileOperations(FileOperations):
         return str(self._context.roots.get(RootKind.WORKSPACE).canonical_path / relative_path)
 
     def resolve_artifact_path(self, path: str) -> tuple[str, str]:
-        """Validate an existing artifact and return child + diagnostic paths.
+        """Validate an existing artifact and return child + diagnostic paths."""
+        child_path, diagnostic_path, _size_bytes = self.resolve_artifact_info(path)
+        return child_path, diagnostic_path
+
+    def resolve_artifact_info(self, path: str) -> tuple[str, str, int]:
+        """Validate an artifact and return descriptor-bound path and size data.
 
         Relative inputs are interpreted inside the authenticated selected
         workspace. Absolute inputs are accepted only when they are exact
@@ -580,10 +585,17 @@ class ControlledWorkspaceFileOperations(FileOperations):
             relative_path,
             expected_type=ExpectedType.REGULAR_FILE,
         )
-        os.close(fd)
-        return child_path, str(
-            self._context.roots.get(RootKind.WORKSPACE).canonical_path
-            / relative_path
+        try:
+            size_bytes = os.fstat(fd).st_size
+        finally:
+            os.close(fd)
+        return (
+            child_path,
+            str(
+                self._context.roots.get(RootKind.WORKSPACE).canonical_path
+                / relative_path
+            ),
+            size_bytes,
         )
 
     @staticmethod

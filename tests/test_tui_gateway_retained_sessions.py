@@ -425,6 +425,7 @@ def test_web_direct_employee_selection_is_server_resolved_and_context_bound(
             "collaboration_context": context,
             "employee_policy": policy,
             "model_override": session["model_override"],
+            "platform": "webui",
         }
     ]
 
@@ -939,6 +940,116 @@ def test_queued_prompt_retains_owner_runtime_for_approval(
     completed = [event["payload"] for event in events if event.get("type") == "message.complete"]
     assert completed[-1]["status"] == "complete"
     assert "denied" in completed[-1]["text"].lower()
+
+
+def test_verified_artifact_emits_before_complete_and_failed_turn_emits_none(
+    owner_gateway, monkeypatch
+):
+    from hermes_cli.controlled_roots import RootKind
+
+    _db, runtime, _workspace_root = owner_gateway
+    transport = _CollaborationTransport()
+    outcomes = [
+        {
+            "artifacts": [
+                {
+                    "id": "artifact-zip",
+                    "mime_type": "application/zip",
+                    "name": "tool.zip",
+                    "path": "/workspace/tool.zip",
+                    "size_bytes": 7,
+                }
+            ],
+            "final_response": "ready",
+            "messages": [{"role": "assistant", "content": "ready"}],
+        },
+        {
+            "artifacts": [
+                {
+                    "id": "must-not-emit",
+                    "name": "bad.zip",
+                    "path": "/workspace/bad.zip",
+                }
+            ],
+            "error": "failed",
+            "failed": True,
+            "final_response": "failed",
+            "messages": [{"role": "assistant", "content": "failed"}],
+        },
+    ]
+
+    class _Agent:
+        model = "test-model"
+        provider = "test-provider"
+        session_id = "stored-artifact"
+
+        def clear_interrupt(self):
+            return None
+
+        def interrupt(self):
+            return None
+
+        def run_conversation(self, *_args, **_kwargs):
+            return outcomes.pop(0)
+
+    agent = _Agent()
+    session = {
+        "agent": agent,
+        "agent_ready": threading.Event(),
+        "session_key": "stored-artifact",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "inflight_turn": None,
+        "running": False,
+        "attached_images": [],
+        "pending_attachments": [],
+        "cwd": str(
+            runtime.filesystem_context.roots.get(RootKind.WORKSPACE).canonical_path
+            / runtime.filesystem_context.workspace_prefix
+        ),
+        "cols": 80,
+        "transport": transport,
+        "source": "dashboard-gui",
+    }
+    session["agent_ready"].set()
+    runtime.mutable_state.sessions["live-artifact"] = session
+    monkeypatch.setattr(server, "_required_gateway_transport", lambda: transport)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_args: None)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *_args: None)
+    monkeypatch.setattr(server, "_complete_prompt_turn_receipt", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    monkeypatch.setattr(server, "_get_usage", lambda *_args: {})
+    monkeypatch.setattr(server, "render_message", lambda *_args: "")
+    monkeypatch.setattr(server, "_voice_tts_enabled", lambda: False)
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry.drain_notifications",
+        lambda: [],
+    )
+
+    try:
+        for text in ("success", "failure"):
+            response = _call(
+                runtime,
+                "prompt.submit",
+                {"session_id": "live-artifact", "text": text},
+                transport=transport,
+            )
+            assert response["result"] == {"status": "streaming"}
+            session["_run_thread"].join(timeout=2)
+            assert not session["_run_thread"].is_alive()
+    finally:
+        runtime.mutable_state.sessions.pop("live-artifact", None)
+
+    events = [frame["params"] for frame in transport.frames if frame.get("method") == "event"]
+    relevant = [
+        event["type"]
+        for event in events
+        if event["type"] in {"artifact.created", "message.complete"}
+    ]
+    assert relevant == ["artifact.created", "message.complete", "message.complete"]
+    artifacts = [event for event in events if event["type"] == "artifact.created"]
+    assert artifacts[0]["payload"]["id"] == "artifact-zip"
 
 
 def test_websocket_teardown_binds_owner_runtime(owner_gateway, monkeypatch):

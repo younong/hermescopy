@@ -104,6 +104,39 @@ class TestIdentityFlush:
             finally:
                 db.close()
 
+    def test_verified_assistant_attachments_survive_cold_resume(self):
+        from hermes_cli.display_transcript import format_display_transcript
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "t.db")
+            try:
+                agent = _make_agent(db)
+                attachment = {
+                    "kind": "file",
+                    "mime_type": "application/zip",
+                    "name": "tool.zip",
+                    "path": "/workspace/tool.zip",
+                    "size_bytes": 7,
+                }
+                messages = [
+                    {"role": "user", "content": "q"},
+                    {
+                        "role": "assistant",
+                        "content": "[下载](tool.zip)",
+                        "attachments": [attachment],
+                    },
+                ]
+
+                agent._flush_messages_to_session_db(messages, [])
+
+                replay = db.get_messages_as_conversation(SESSION_ID)
+                assert replay[-1]["attachments"] == [attachment]
+                display = format_display_transcript(db.get_display_messages(SESSION_ID))
+                assert display[-1]["attachments"] == [attachment]
+            finally:
+                db.close()
+
     def test_repeated_flush_same_turn_writes_once(self):
         """Identity tracking preserves #860 same-turn dedup behavior."""
         from hermes_state import SessionDB

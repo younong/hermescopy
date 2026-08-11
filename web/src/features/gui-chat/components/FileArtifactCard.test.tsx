@@ -37,7 +37,7 @@ describe("FileArtifactCard", () => {
     await act(async () => root.unmount());
   });
 
-  it("downloads a generated file when its card is clicked", async () => {
+  it("downloads a generated ZIP when its card is clicked", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response("generated-bytes", { status: 200 }),
     );
@@ -54,12 +54,12 @@ describe("FileArtifactCard", () => {
       root.render(
         <FileArtifactCard
           artifact={{
-            downloadUrl: "/api/files/download?path=%2Fworkspace%2Freport.html",
-            id: "generated-report",
+            downloadUrl: "/api/files/download?path=%2Fworkspace%2Ftool.zip",
+            id: "generated-tool",
             kind: "file",
-            mimeType: "text/html",
-            name: "report.html",
-            sourcePath: "/workspace/report.html",
+            mimeType: "application/zip",
+            name: "tool.zip",
+            sourcePath: "/workspace/tool.zip",
           }}
         />,
       );
@@ -73,7 +73,7 @@ describe("FileArtifactCard", () => {
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/files/download?path=%2Fworkspace%2Freport.html",
+      "/api/files/download?path=%2Fworkspace%2Ftool.zip",
       expect.objectContaining({ credentials: "include" }),
     );
     expect(click).toHaveBeenCalledOnce();
