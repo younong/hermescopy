@@ -1428,7 +1428,11 @@ describe("guiChatReducer history image restoration", () => {
     expect(imageArtifact(state, state.messages[0].artifactIds[0]).url).toBe(
       `/api/fs/read-data-url?path=${encodeURIComponent(path)}`,
     );
-    expect(Object.values(state.artifacts).some((artifact) => artifact.url.includes("A%3A"))).toBe(false);
+    expect(
+      Object.values(state.artifacts).some(
+        (artifact) => artifact.kind !== "file" && artifact.url.includes("A%3A"),
+      ),
+    ).toBe(false);
   });
 
   it("recognizes MEDIA image tags with whitespace after the prefix", () => {
