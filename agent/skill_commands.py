@@ -116,17 +116,8 @@ def _decode_deferred_descriptor(content: Any) -> Optional[dict[str, Any]]:
     return payload
 
 
-def strip_deferred_skill_descriptor(
-    content: Any,
-    *,
-    active: bool = True,
-) -> Any:
-    """Remove internal deferred scaffolding from a provider-facing copy.
-
-    Active turns keep their invocation header because the full body is attached
-    beside it. Historical turns lose that header as well, so a compact replay
-    cannot falsely claim that absent skill instructions are loaded.
-    """
+def strip_deferred_skill_descriptor(content: Any) -> Any:
+    """Remove internal deferred scaffolding from a provider-facing copy."""
     if not isinstance(content, str):
         return content
     start = content.find(_DEFERRED_SKILL_PREFIX)
@@ -137,11 +128,30 @@ def strip_deferred_skill_descriptor(
         return content
     stripped = content[:start] + content[end + 1:]
     stripped = stripped.replace(f"\n{_DEFERRED_SKILL_NOTE}", "").strip()
-    if active:
-        return stripped
+    return stripped
+
+
+def project_historical_skill_message(content: Any) -> Any:
+    """Reduce generated historical Skill scaffolding to user-visible intent."""
+    if not isinstance(content, str) or not content.startswith(_SKILL_INVOCATION_PREFIX):
+        return content
+
+    descriptor = _decode_deferred_descriptor(content)
+    is_bundle = _BUNDLE_MARKER in content and (
+        _BUNDLE_FIRST_SKILL_BLOCK in content or descriptor
+    )
+    is_single = _SINGLE_SKILL_MARKER in content or bool(descriptor)
+    if not is_bundle and not is_single:
+        return content
 
     instruction = extract_user_instruction_from_skill_message(content)
-    return instruction or "[A skill was invoked for this earlier turn.]"
+    if instruction:
+        return instruction
+
+    match = re.match(r'^\[IMPORTANT: The user has invoked the "([^"]{1,256})"', content)
+    label = match.group(1) if match else "a Skill"
+    kind = "Skill bundle" if is_bundle else "Skill"
+    return f"[Earlier turn invoked the {kind} \"{label}\".]"
 
 
 def build_deferred_skill_context(

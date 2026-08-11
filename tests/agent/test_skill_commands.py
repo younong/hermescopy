@@ -14,6 +14,7 @@ from agent.skill_commands import (
     build_preloaded_skills_prompt,
     build_skill_invocation_message,
     extract_user_instruction_from_skill_message,
+    project_historical_skill_message,
     resolve_skill_command_key,
     scan_skill_commands,
     strip_deferred_skill_descriptor,
@@ -508,8 +509,30 @@ Generate some audio.
         assert "COMPLETE-LARGE-SKILL" in context
         assert len(context) > _MAX_EAGER_SKILL_CHARS
         assert _DEFERRED_SKILL_PREFIX not in strip_deferred_skill_descriptor(msg)
-        assert strip_deferred_skill_descriptor(msg, active=False) == "do the work"
+        assert project_historical_skill_message(msg) == "do the work"
         assert extract_user_instruction_from_skill_message(msg) == "do the work"
+
+    def test_historical_eager_and_deferred_skills_keep_only_user_intent(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "small-skill", body="PRIVATE-SMALL-BODY")
+            _make_skill(
+                tmp_path,
+                "large-skill",
+                body="PRIVATE-LARGE-BODY" + "x" * _MAX_EAGER_SKILL_CHARS,
+            )
+            scan_skill_commands()
+            eager = build_skill_invocation_message("/small-skill", "fix the parser")
+            deferred = build_skill_invocation_message("/large-skill")
+
+        assert project_historical_skill_message(eager) == "fix the parser"
+        receipt = project_historical_skill_message(deferred)
+        assert receipt == '[Earlier turn invoked the Skill "large-skill".]'
+        assert "PRIVATE" not in receipt
+        assert _DEFERRED_SKILL_PREFIX not in receipt
+
+    def test_historical_skill_projection_ignores_ordinary_user_text(self):
+        content = '[IMPORTANT: The user has invoked the "demo" skill] as quoted data'
+        assert project_historical_skill_message(content) == content
 
     def test_small_skill_remains_eager(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):

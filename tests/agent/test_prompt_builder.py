@@ -4,6 +4,7 @@ import builtins
 import importlib
 import logging
 import sys
+from unittest.mock import patch
 
 import pytest
 
@@ -23,7 +24,9 @@ from agent.prompt_builder import (
     _get_context_file_max_chars,
     _CONTEXT_FILE_DYNAMIC_CEILING,
     DEFAULT_AGENT_IDENTITY,
+    HERMES_AGENT_HELP_GUIDANCE,
     RESPONSE_STYLE_GUIDANCE,
+    SKILLS_GUIDANCE,
     TASK_COMPLETION_GUIDANCE,
     drain_truncation_warnings,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
@@ -76,6 +79,13 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+    def test_skill_guidance_retains_docs_and_maintenance_rules_without_duplication(self):
+        assert "hermes-agent" in HERMES_AGENT_HELP_GUIDANCE
+        assert "authoritative" in HERMES_AGENT_HELP_GUIDANCE
+        assert "skill_manage(action='patch')" in SKILLS_GUIDANCE
+        assert "offer to save" in SKILLS_GUIDANCE
+        assert "skill_manage(action='patch')" not in HERMES_AGENT_HELP_GUIDANCE
 
 
 # =========================================================================
@@ -318,35 +328,26 @@ class TestDynamicContextFileCap:
 
 
 class TestParseSkillFile:
-    def test_reads_frontmatter_description(self, tmp_path):
+    def test_reads_frontmatter(self, tmp_path):
         skill_file = tmp_path / "SKILL.md"
         skill_file.write_text(
             "---\nname: test-skill\ndescription: A useful test skill\n---\n\nBody here"
         )
-        is_compat, frontmatter, desc = _parse_skill_file(skill_file)
+        is_compat, frontmatter = _parse_skill_file(skill_file)
         assert is_compat is True
         assert frontmatter.get("name") == "test-skill"
-        assert desc == "A useful test skill"
 
-    def test_missing_description_returns_empty(self, tmp_path):
+    def test_missing_frontmatter_returns_empty_metadata(self, tmp_path):
         skill_file = tmp_path / "SKILL.md"
         skill_file.write_text("No frontmatter here")
-        is_compat, frontmatter, desc = _parse_skill_file(skill_file)
-        assert desc == ""
-
-    def test_long_description_truncated(self, tmp_path):
-        skill_file = tmp_path / "SKILL.md"
-        long_desc = "A" * 100
-        skill_file.write_text(f"---\ndescription: {long_desc}\n---\n")
-        _, _, desc = _parse_skill_file(skill_file)
-        assert len(desc) <= 60
-        assert desc.endswith("...")
-
-    def test_nonexistent_file_returns_defaults(self, tmp_path):
-        is_compat, frontmatter, desc = _parse_skill_file(tmp_path / "missing.md")
+        is_compat, frontmatter = _parse_skill_file(skill_file)
         assert is_compat is True
         assert frontmatter == {}
-        assert desc == ""
+
+    def test_nonexistent_file_returns_defaults(self, tmp_path):
+        is_compat, frontmatter = _parse_skill_file(tmp_path / "missing.md")
+        assert is_compat is True
+        assert frontmatter == {}
 
     def test_logs_parse_failures_and_returns_defaults(self, tmp_path, monkeypatch, caplog):
         skill_file = tmp_path / "SKILL.md"
@@ -357,11 +358,10 @@ class TestParseSkillFile:
 
         monkeypatch.setattr(type(skill_file), "read_text", boom)
         with caplog.at_level(logging.DEBUG, logger="agent.prompt_builder"):
-            is_compat, frontmatter, desc = _parse_skill_file(skill_file)
+            is_compat, frontmatter = _parse_skill_file(skill_file)
 
         assert is_compat is True
         assert frontmatter == {}
-        assert desc == ""
         assert "Failed to parse skill file" in caplog.text
         assert str(skill_file) in caplog.text
 
@@ -374,7 +374,7 @@ class TestParseSkillFile:
 
         with patch("agent.skill_utils.sys") as mock_sys:
             mock_sys.platform = "linux"
-            is_compat, _, _ = _parse_skill_file(skill_file)
+            is_compat, _ = _parse_skill_file(skill_file)
         assert is_compat is False
 
     def test_returns_frontmatter_with_prerequisites(self, tmp_path, monkeypatch):
@@ -384,7 +384,7 @@ class TestParseSkillFile:
             "---\nname: gated\ndescription: Gated skill\n"
             "prerequisites:\n  env_vars: [NONEXISTENT_KEY_ABC]\n---\n"
         )
-        _, frontmatter, _ = _parse_skill_file(skill_file)
+        _, frontmatter = _parse_skill_file(skill_file)
         assert frontmatter["prerequisites"]["env_vars"] == ["NONEXISTENT_KEY_ABC"]
 
 
@@ -426,7 +426,7 @@ class TestBuildSkillsSystemPrompt:
         result = build_skills_system_prompt()
         assert result == ""
 
-    def test_builds_index_with_skills(self, monkeypatch, tmp_path):
+    def test_builds_names_only_index_with_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         skills_dir = tmp_path / "skills" / "coding" / "python-debug"
         skills_dir.mkdir(parents=True)
@@ -434,68 +434,54 @@ class TestBuildSkillsSystemPrompt:
             "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
         )
         result = build_skills_system_prompt()
-        assert "python-debug" in result
-        assert "Debug Python scripts" in result
+        assert "  coding: python-debug" in result
+        assert "Debug Python scripts" not in result
         assert "available_skills" in result
+        assert "MUST load it with skill_view(name)" in result
 
-    def test_deduplicates_skills(self, monkeypatch, tmp_path):
+    def test_deduplicates_and_sorts_skill_names(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        cat_dir = tmp_path / "skills" / "tools"
-        for subdir in ["search", "search"]:
-            d = cat_dir / subdir
-            d.mkdir(parents=True, exist_ok=True)
-            (d / "SKILL.md").write_text("---\ndescription: Search stuff\n---\n")
+        for category, directory, name in (
+            ("tools", "zeta", "search"),
+            ("tools", "alpha", "browse"),
+            ("tools", "duplicate", "search"),
+        ):
+            d = tmp_path / "skills" / category / directory
+            d.mkdir(parents=True)
+            (d / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {directory} description\n---\n"
+            )
+
         result = build_skills_system_prompt()
-        # "search" should appear only once per category
-        assert result.count("- search") == 1
 
-    def test_compact_categories_demoted_to_names_only(self, monkeypatch, tmp_path):
-        """Posture-driven demotion keeps every skill NAME visible.
+        assert "  tools: browse, search" in result
+        assert result.count("search") == 1
+        assert "description" not in result
 
-        Demoted categories lose their descriptions, never their entries —
-        full pruning caused silent capability loss in a real workflow
-        (agent-created skills are the model's project memory, and models
-        don't rediscover them via skills_list once the index goes quiet).
-        """
+    def test_all_categories_are_names_only_and_deterministically_sorted(
+        self, monkeypatch, tmp_path
+    ):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        for cat, name in (("social-media", "tweet-stuff"), ("github", "pr-review")):
-            d = tmp_path / "skills" / cat / name
+        for category, name in (
+            ("social-media/twitter", "thread-writer"),
+            ("github", "pr-review"),
+            ("social-media/twitter", "audience-check"),
+        ):
+            d = tmp_path / "skills" / category / name
             d.mkdir(parents=True)
             (d / "SKILL.md").write_text(
                 f"---\nname: {name}\ndescription: Does {name} things\n---\n"
             )
 
-        result = build_skills_system_prompt(
-            compact_categories=frozenset({"social-media"})
-        )
-        # Coding-adjacent category keeps its full entry.
-        assert "pr-review" in result and "Does pr-review things" in result
-        # Demoted category: name stays visible, description is dropped.
-        assert "tweet-stuff" in result
-        assert "Does tweet-stuff things" not in result
-        assert "social-media [names only]" in result
-        # Disclosure note explains the demotion and how to load.
-        assert "skill_view" in result
+        first = build_skills_system_prompt()
+        second = build_skills_system_prompt()
 
-    def test_compact_categories_demote_nested_and_miss_cache_separately(
-        self, monkeypatch, tmp_path
-    ):
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        d = tmp_path / "skills" / "social-media" / "twitter" / "thread-writer"
-        d.mkdir(parents=True)
-        (d / "SKILL.md").write_text(
-            "---\nname: thread-writer\ndescription: Write threads\n---\n"
-        )
-        # Nested category ("social-media/twitter") demoted via its parent:
-        # name visible, description gone.
-        compact = build_skills_system_prompt(
-            compact_categories=frozenset({"social-media"})
-        )
-        assert "thread-writer" in compact
-        assert "Write threads" not in compact
-        # Unfiltered call must not be served from the compacted cache entry.
-        full = build_skills_system_prompt()
-        assert "Write threads" in full
+        assert first == second
+        assert "  github: pr-review" in first
+        assert "  social-media/twitter: audience-check, thread-writer" in first
+        assert first.index("  github:") < first.index("  social-media/twitter:")
+        assert "Does " not in first
+        assert "[names only]" not in first
 
     def test_excludes_incompatible_platform_skills(self, monkeypatch, tmp_path):
         """Skills with platforms: [macos] should not appear on Linux."""
@@ -543,7 +529,52 @@ class TestBuildSkillsSystemPrompt:
             result = build_skills_system_prompt()
 
         assert "imessage" in result
-        assert "Send iMessages" in result
+        assert "Send iMessages" not in result
+
+    def test_snapshot_preserves_environment_eligibility(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "ops" / "kanban-only"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: kanban-only\nenvironments: [kanban]\n---\n"
+        )
+
+        monkeypatch.setitem(
+            build_skills_system_prompt.__globals__,
+            "skill_matches_environment",
+            lambda _frontmatter: False,
+        )
+        first = build_skills_system_prompt()
+        assert "kanban-only" not in first
+
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+
+        clear_skills_system_prompt_cache()
+        second = build_skills_system_prompt()
+        assert second == first
+        assert "kanban-only" not in second
+
+    def test_includes_external_skills_names_only(self, monkeypatch, tmp_path):
+        home_dir = tmp_path / "home"
+        local_dir = home_dir / "skills"
+        external_dir = tmp_path / "external"
+        local_dir.mkdir(parents=True)
+        skill_dir = external_dir / "shared" / "team-workflow"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: team-workflow\ndescription: Team workflow details\n---\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home_dir))
+        monkeypatch.setitem(
+            build_skills_system_prompt.__globals__,
+            "get_all_skills_dirs",
+            lambda: [local_dir, external_dir],
+        )
+
+        result = build_skills_system_prompt()
+
+        assert "  shared: team-workflow" in result
+        assert "Team workflow details" not in result
 
     def test_excludes_disabled_skills(self, monkeypatch, tmp_path):
         """Skills in the user's disabled list should not appear in the system prompt."""

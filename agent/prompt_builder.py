@@ -18,7 +18,6 @@ from typing import Optional
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
     extract_skill_conditions,
-    extract_skill_description,
     get_all_skills_dirs,
     get_disabled_skill_names,
     iter_skill_index_files,
@@ -149,14 +148,10 @@ DEFAULT_AGENT_INSTRUCTIONS = (
 )
 
 HERMES_AGENT_HELP_GUIDANCE = (
-    "You run on Hermes Agent (by Nous Research). When the user needs help with "
-    "Hermes itself — configuring, setting up, using, extending, or troubleshooting "
-    "it — or when you need to understand your own features, tools, or capabilities, "
-    "the documentation at https://hermes-agent.nousresearch.com/docs is your "
-    "authoritative reference and always holds the latest, most up-to-date "
-    "information. Load the `hermes-agent` skill with skill_view(name='hermes-agent') "
-    "for additional guidance and proven workflows, but treat the docs as the source "
-    "of truth when the two differ."
+    "For help configuring, using, extending, or troubleshooting Hermes Agent, load "
+    "the `hermes-agent` skill with skill_view(name='hermes-agent'). Treat "
+    "https://hermes-agent.nousresearch.com/docs as the authoritative, up-to-date "
+    "reference when the skill and docs differ."
 )
 
 MEMORY_GUIDANCE = (
@@ -189,12 +184,10 @@ SESSION_SEARCH_GUIDANCE = (
 )
 
 SKILLS_GUIDANCE = (
-    "After completing a complex task (5+ tool calls), fixing a tricky error, "
-    "or discovering a non-trivial workflow, save the approach as a "
-    "skill with skill_manage so you can reuse it next time.\n"
-    "When using a skill and finding it outdated, incomplete, or wrong, "
-    "patch it immediately with skill_manage(action='patch') — don't wait to be asked. "
-    "Skills that aren't maintained become liabilities."
+    "Maintain reusable skill knowledge: after a complex task, tricky fix, or useful "
+    "workflow discovery, offer to save the approach with skill_manage. If a loaded "
+    "skill is outdated, incomplete, or wrong, patch it with "
+    "skill_manage(action='patch') before finishing."
 )
 
 KANBAN_GUIDANCE = (
@@ -1284,7 +1277,7 @@ def drain_truncation_warnings() -> list:
 _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-_SKILLS_SNAPSHOT_VERSION = 1
+_SKILLS_SNAPSHOT_VERSION = 2
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1303,15 +1296,14 @@ def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
 
 
 def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
-    """Build an mtime/size manifest of all SKILL.md and DESCRIPTION.md files."""
+    """Build an mtime/size manifest of all indexed SKILL.md files."""
     manifest: dict[str, list[int]] = {}
-    for filename in ("SKILL.md", "DESCRIPTION.md"):
-        for path in iter_skill_index_files(skills_dir, filename):
-            try:
-                st = path.stat()
-            except OSError:
-                continue
-            manifest[str(path.relative_to(skills_dir))] = [st.st_mtime_ns, st.st_size]
+    for path in iter_skill_index_files(skills_dir, "SKILL.md"):
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        manifest[str(path.relative_to(skills_dir))] = [st.st_mtime_ns, st.st_size]
     return manifest
 
 
@@ -1337,14 +1329,12 @@ def _write_skills_snapshot(
     skills_dir: Path,
     manifest: dict[str, list[int]],
     skill_entries: list[dict],
-    category_descriptions: dict[str, str],
 ) -> None:
     """Persist skill metadata to disk for fast cold-start reuse."""
     payload = {
         "version": _SKILLS_SNAPSHOT_VERSION,
         "manifest": manifest,
         "skills": skill_entries,
-        "category_descriptions": category_descriptions,
     }
     try:
         atomic_json_write(_skills_prompt_snapshot_path(), payload)
@@ -1356,7 +1346,6 @@ def _build_snapshot_entry(
     skill_file: Path,
     skills_dir: Path,
     frontmatter: dict,
-    description: str,
 ) -> dict:
     """Build a serialisable metadata dict for one skill."""
     rel_path = skill_file.relative_to(skills_dir)
@@ -1376,8 +1365,8 @@ def _build_snapshot_entry(
         "skill_name": skill_name,
         "category": category,
         "frontmatter_name": str(frontmatter.get("name", skill_name)),
-        "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
+        "environments": frontmatter.get("environments") or [],
         "conditions": extract_skill_conditions(frontmatter),
     }
 
@@ -1386,30 +1375,30 @@ def _build_snapshot_entry(
 # Skills index
 # =========================================================================
 
-def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
-    """Read a SKILL.md once and return platform compatibility, frontmatter, and description.
+def _parse_skill_file(skill_file: Path) -> tuple[bool, dict]:
+    """Read a SKILL.md once and return eligibility plus frontmatter.
 
-    Returns (is_compatible, frontmatter, description). On any error, returns
-    (True, {}, "") to err on the side of showing the skill.
+    On any error, returns ``(True, {})`` to err on the side of showing the
+    skill.
     """
     try:
         raw = skill_file.read_text(encoding="utf-8")
         frontmatter, _ = parse_frontmatter(raw)
 
         if not skill_matches_platform(frontmatter):
-            return False, frontmatter, ""
+            return False, frontmatter
 
         # Environment relevance gate (offer-time only): hide skills tagged for
         # a runtime environment that isn't active (e.g. kanban-only skills for
         # non-kanban users, s6-only skills outside the container). Explicit
         # loads (skill_view / --skills) bypass this — see skill_matches_environment.
         if not skill_matches_environment(frontmatter):
-            return False, frontmatter, ""
+            return False, frontmatter
 
-        return True, frontmatter, extract_skill_description(frontmatter)
+        return True, frontmatter
     except Exception as e:
         logger.warning("Failed to parse skill file %s: %s", skill_file, e)
-        return True, {}, ""
+        return True, {}
 
 
 def _skill_should_show(
@@ -1446,27 +1435,21 @@ def _skill_should_show(
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
-    compact_categories: "frozenset[str] | None" = None,
 ) -> str:
-    """Build a compact skill index for the system prompt.
+    """Build a deterministic names-only eligible skill index.
 
     Two-layer cache:
-      1. In-process LRU dict keyed by (skills_dir, tools, toolsets, hidden)
+      1. In-process LRU dict keyed by skills dirs, tools, toolsets, platform,
+         and disabled skills
       2. Disk snapshot (``.skills_prompt_snapshot.json``) validated by
          mtime/size manifest — survives process restarts
 
     Falls back to a full filesystem scan when both layers miss.
 
     External skill directories (``skills.external_dirs`` in config.yaml) are
-    scanned alongside the local ``~/.hermes/skills/`` directory.  External dirs
+    scanned alongside the local ``~/.hermes/skills/`` directory. External dirs
     are read-only — they appear in the index but new skills are always created
-    in the local dir.  Local skills take precedence when names collide.
-
-    ``compact_categories`` (e.g. from the coding posture — see
-    agent/coding_context.py) demotes whole categories to a names-only line in
-    the rendered index. Nothing is ever hidden: every skill name stays
-    visible and loadable via ``skill_view`` / ``skills_list``; only the
-    descriptions are dropped, and a footer note explains the demotion.
+    in the local dir. Local skills take precedence when names collide.
     """
     skills_dir = get_skills_dir()
     external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
@@ -1491,7 +1474,6 @@ def build_skills_system_prompt(
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
         tuple(sorted(disabled)),
-        tuple(sorted(compact_categories or ())),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1502,8 +1484,7 @@ def build_skills_system_prompt(
     # ── Layer 2: disk snapshot ────────────────────────────────────────
     snapshot = _load_skills_snapshot(skills_dir)
 
-    skills_by_category: dict[str, list[tuple[str, str]]] = {}
-    category_descriptions: dict[str, str] = {}
+    skills_by_category: dict[str, list[str]] = {}
 
     if snapshot is not None:
         # Fast path: use pre-parsed metadata from disk
@@ -1516,6 +1497,10 @@ def build_skills_system_prompt(
             platforms = entry.get("platforms") or []
             if not skill_matches_platform({"platforms": platforms}):
                 continue
+            if not skill_matches_environment(
+                {"environments": entry.get("environments") or []}
+            ):
+                continue
             if frontmatter_name in disabled or skill_name in disabled:
                 continue
             if not _skill_should_show(
@@ -1524,19 +1509,13 @@ def build_skills_system_prompt(
                 available_toolsets,
             ):
                 continue
-            skills_by_category.setdefault(category, []).append(
-                (frontmatter_name, entry.get("description", ""))
-            )
-        category_descriptions = {
-            str(k): str(v)
-            for k, v in (snapshot.get("category_descriptions") or {}).items()
-        }
+            skills_by_category.setdefault(category, []).append(frontmatter_name)
     else:
         # Cold path: full filesystem scan + write snapshot for next time
         skill_entries: list[dict] = []
         for skill_file in iter_skill_index_files(skills_dir, "SKILL.md"):
-            is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
-            entry = _build_snapshot_entry(skill_file, skills_dir, frontmatter, desc)
+            is_compatible, frontmatter = _parse_skill_file(skill_file)
+            entry = _build_snapshot_entry(skill_file, skills_dir, frontmatter)
             skill_entries.append(entry)
             if not is_compatible:
                 continue
@@ -1550,48 +1529,32 @@ def build_skills_system_prompt(
             ):
                 continue
             skills_by_category.setdefault(entry["category"], []).append(
-                (entry["frontmatter_name"], entry["description"])
+                entry["frontmatter_name"]
             )
-
-        # Read category-level DESCRIPTION.md files
-        for desc_file in iter_skill_index_files(skills_dir, "DESCRIPTION.md"):
-            try:
-                content = desc_file.read_text(encoding="utf-8")
-                fm, _ = parse_frontmatter(content)
-                cat_desc = fm.get("description")
-                if not cat_desc:
-                    continue
-                rel = desc_file.relative_to(skills_dir)
-                cat = "/".join(rel.parts[:-1]) if len(rel.parts) > 1 else "general"
-                category_descriptions[cat] = str(cat_desc).strip().strip("'\"")
-            except Exception as e:
-                logger.debug("Could not read skill description %s: %s", desc_file, e)
 
         _write_skills_snapshot(
             skills_dir,
             _build_skills_manifest(skills_dir),
             skill_entries,
-            category_descriptions,
         )
 
     # ── External skill directories ─────────────────────────────────────
     # Scan external dirs directly (no snapshot caching — they're read-only
     # and typically small).  Local skills already in skills_by_category take
     # precedence: we track seen names and skip duplicates from external dirs.
-    seen_skill_names: set[str] = set()
-    for cat_skills in skills_by_category.values():
-        for name, _desc in cat_skills:
-            seen_skill_names.add(name)
+    seen_skill_names = {
+        name for cat_skills in skills_by_category.values() for name in cat_skills
+    }
 
     for ext_dir in external_dirs:
         if not ext_dir.exists():
             continue
         for skill_file in iter_skill_index_files(ext_dir, "SKILL.md"):
             try:
-                is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
+                is_compatible, frontmatter = _parse_skill_file(skill_file)
                 if not is_compatible:
                     continue
-                entry = _build_snapshot_entry(skill_file, ext_dir, frontmatter, desc)
+                entry = _build_snapshot_entry(skill_file, ext_dir, frontmatter)
                 skill_name = entry["skill_name"]
                 frontmatter_name = entry["frontmatter_name"]
                 if frontmatter_name in seen_skill_names:
@@ -1606,100 +1569,27 @@ def build_skills_system_prompt(
                     continue
                 seen_skill_names.add(frontmatter_name)
                 skills_by_category.setdefault(entry["category"], []).append(
-                    (frontmatter_name, entry["description"])
+                    frontmatter_name
                 )
             except Exception as e:
                 logger.debug("Error reading external skill %s: %s", skill_file, e)
 
-        # External category descriptions
-        for desc_file in iter_skill_index_files(ext_dir, "DESCRIPTION.md"):
-            try:
-                content = desc_file.read_text(encoding="utf-8")
-                fm, _ = parse_frontmatter(content)
-                cat_desc = fm.get("description")
-                if not cat_desc:
-                    continue
-                rel = desc_file.relative_to(ext_dir)
-                cat = "/".join(rel.parts[:-1]) if len(rel.parts) > 1 else "general"
-                category_descriptions.setdefault(cat, str(cat_desc).strip().strip("'\""))
-            except Exception as e:
-                logger.debug("Could not read external skill description %s: %s", desc_file, e)
-
-    # Posture-driven category demotion (e.g. non-coding skills while pairing
-    # on code). Demoted categories stay in the index as a single names-only
-    # line — descriptions are dropped to cut noise, but every skill name
-    # remains visible so memory-anchored recall ("load <name>") keeps working.
-    # NEVER remove entries entirely: agent-created skills are the model's
-    # project memory, and models don't reach for skills_list to rediscover
-    # what the index stops showing them. Match on the top-level category
-    # segment so nested categories ("social-media/twitter") are demoted with
-    # their parent.
-    demoted = frozenset(
-        cat for cat in skills_by_category
-        if cat.split("/", 1)[0] in (compact_categories or frozenset())
-    )
-
-    hidden_note = ""
-    if demoted:
-        hidden_note = (
-            "\n(Categories marked [names only] are outside the current coding "
-            "context, so their descriptions are omitted — the skills work "
-            "normally and load with skill_view(name) as usual.)"
-        )
-
     if not skills_by_category:
         result = ""
     else:
-        index_lines = []
-        for category in sorted(skills_by_category.keys()):
-            # Deduplicate and sort skills within each category
-            seen = set()
-            if category in demoted:
-                names = sorted({name for name, _ in skills_by_category[category]})
-                index_lines.append(f"  {category} [names only]: {', '.join(names)}")
-                continue
-            cat_desc = category_descriptions.get(category, "")
-            if cat_desc:
-                index_lines.append(f"  {category}: {cat_desc}")
-            else:
-                index_lines.append(f"  {category}:")
-            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
-                if name in seen:
-                    continue
-                seen.add(name)
-                if desc:
-                    index_lines.append(f"    - {name}: {desc}")
-                else:
-                    index_lines.append(f"    - {name}")
-
+        index_lines = [
+            f"  {category}: {', '.join(sorted(set(skills)))}"
+            for category, skills in sorted(skills_by_category.items())
+        ]
         result = (
             "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
-            "Err on the side of loading — it is always better to have context you don't need "
-            "than to miss critical steps, pitfalls, or established workflows. "
-            "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
-            "and proven workflows that outperform general-purpose approaches. Load the skill "
-            "even if you think you could handle the task with basic tools like web_search or terminal. "
-            "Skills also encode the user's preferred approach, conventions, and quality standards "
-            "for tasks like code review, planning, and testing — load them even for tasks you "
-            "already know how to do, because the skill defines how it should be done here.\n"
-            "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
-            "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
-            "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
-            "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
-            "`hermes setup`) so you don't have to guess or invent workarounds.\n"
-            "If a skill has issues, fix it with skill_manage(action='patch').\n"
-            "After difficult/iterative tasks, offer to save as a skill. "
-            "If a skill you loaded was missing steps, had wrong commands, or needed "
-            "pitfalls you discovered, update it before finishing.\n"
-            "\n"
+            "Before replying, scan this eligible skill index. If a skill matches or "
+            "is even partially relevant, you MUST load it with skill_view(name) and "
+            "follow its instructions. Load relevant skills even when you already know "
+            "the domain; only proceed without one when genuinely none apply.\n\n"
             "<available_skills>\n"
-            + "\n".join(index_lines) + "\n"
-            "</available_skills>\n"
-            "\n"
-            "Only proceed without loading a skill if genuinely none are relevant to the task."
-            + hidden_note
+            + "\n".join(index_lines)
+            + "\n</available_skills>"
         )
 
     # ── Store in LRU cache ────────────────────────────────────────────

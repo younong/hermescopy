@@ -82,6 +82,30 @@ class TestResponseStyleGuidance:
         assert stable.index(custom_soul) < stable.index(RESPONSE_STYLE_GUIDANCE)
 
 
+class TestSkillsPromptWiring:
+    def test_passes_only_eligibility_inputs_to_names_only_builder(self):
+        agent = _make_agent(valid_tool_names={"skill_view", "terminal"})
+
+        with (
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value=""),
+            patch("run_agent.get_toolset_for_tool", return_value="core"),
+            patch(
+                "run_agent.build_skills_system_prompt",
+                return_value="skill index",
+            ) as build_skills,
+        ):
+            stable = build_system_prompt_parts(agent)["stable"]
+
+        assert "skill index" in stable
+        build_skills.assert_called_once_with(
+            available_tools=agent.valid_tool_names,
+            available_toolsets={"core"},
+        )
+
+
 def _init_code_repo(path):
     """A git repo that actually holds code — the coding posture requires a source
     file (or manifest), not a bare ``.git`` (a prose/notes repo stays general)."""

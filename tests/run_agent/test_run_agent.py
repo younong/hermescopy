@@ -2964,6 +2964,7 @@ class TestConcurrentToolExecution:
                 skip_tool_request_middleware=True,
                 enabled_toolsets=agent.enabled_toolsets,
                 disabled_toolsets=agent.disabled_toolsets,
+                employee_policy=None,
                 tool_request_middleware_trace=[],
             )
             assert result == "result"
@@ -4111,6 +4112,94 @@ class TestRunConversation:
         sent_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
         assert all("attachments" not in message for message in sent_messages)
 
+    def test_request_local_tool_selection_does_not_mutate_executable_catalog(
+        self, agent
+    ):
+        self._setup_agent(agent)
+        from tools.tool_search import ToolSearchConfig
+
+        agent.tools = [
+            _make_tool_defs("terminal")[0],
+            _make_tool_defs("read_file")[0],
+            _make_tool_defs("write_file")[0],
+        ]
+        agent.valid_tool_names = {
+            tool["function"]["name"] for tool in agent.tools
+        }
+        original_tools = json.loads(json.dumps(agent.tools))
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Final answer", finish_reason="stop"
+        )
+
+        with (
+            patch(
+                "tools.tool_search.load_config",
+                return_value=ToolSearchConfig.from_raw({
+                    "enabled": "on",
+                    "search_default_limit": 1,
+                }),
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("read the project file")
+
+        advertised = agent.client.chat.completions.create.call_args.kwargs["tools"]
+        advertised_names = [tool["function"]["name"] for tool in advertised]
+        assert advertised_names == [
+            "read_file",
+            "tool_search",
+            "tool_describe",
+            "tool_call",
+        ]
+        assert "terminal" not in advertised_names
+        assert "write_file" not in advertised_names
+        assert agent.tools == original_tools
+        assert agent.valid_tool_names == {"terminal", "read_file", "write_file"}
+        assert result["completed"] is True
+
+    def test_model_returned_bridge_call_is_accepted(self, agent):
+        self._setup_agent(agent)
+        from tools.tool_search import ToolSearchConfig
+
+        agent.tools = [
+            _make_tool_defs("terminal")[0],
+            _make_tool_defs("read_file")[0],
+        ]
+        agent.valid_tool_names = {"terminal", "read_file"}
+        bridge_call = _mock_tool_call(
+            name="tool_search",
+            arguments='{"query":"shell command"}',
+            call_id="bridge-1",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="", finish_reason="tool_calls", tool_calls=[bridge_call]),
+            _mock_response(content="Done", finish_reason="stop"),
+        ]
+
+        with (
+            patch(
+                "tools.tool_search.load_config",
+                return_value=ToolSearchConfig.from_raw({
+                    "enabled": "on",
+                    "search_default_limit": 1,
+                }),
+            ),
+            patch(
+                "run_agent.handle_function_call",
+                return_value='{"results": []}',
+            ) as handle_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("read the project file")
+
+        assert result["final_response"] == "Done"
+        assert handle_call.call_args.args[0] == "tool_search"
+        assert agent._invalid_tool_retries == 0
+
     def test_stop_finish_reason_returns_response(self, agent):
         self._setup_agent(agent)
         resp = _mock_response(content="Final answer", finish_reason="stop")
@@ -4254,6 +4343,8 @@ class TestRunConversation:
         assert "payload omitted" in str(sent)
 
     def test_old_tool_episode_is_projected_only_in_provider_copy(self, agent):
+        from agent.skill_commands import _build_deferred_message
+
         self._setup_agent(agent)
         agent.client.chat.completions.create.return_value = _mock_response(
             content="Done", finish_reason="stop"
@@ -4269,7 +4360,7 @@ class TestRunConversation:
             }
         ]
         history = [
-            {"role": "user", "content": "inspect old.py"},
+            {"role": "user", "content": "inspect the old file"},
             {
                 "role": "assistant",
                 "content": None,
@@ -4279,17 +4370,20 @@ class TestRunConversation:
             {"role": "tool", "tool_call_id": "old-call", "content": "old body"},
             {"role": "assistant", "content": "inspection complete"},
         ]
-        history.extend(
-            message
-            for index in range(agent.context_compressor.protect_last_n // 2 + 1)
-            for message in (
-                {"role": "user", "content": f"padding {index}"},
-                {"role": "assistant", "content": "ack"},
-            )
-        )
         persisted = []
+        current_message = _build_deferred_message(
+            '[IMPORTANT: The user has invoked the "large" skill, indicating they '
+            "want you to follow its instructions. The full skill content is loaded below.]",
+            ["large"],
+            user_instruction="follow up",
+        )
+        attachments = [{"kind": "image", "name": "current.png"}]
 
         with (
+            patch(
+                "agent.skill_commands.build_deferred_skill_context",
+                return_value="CURRENT-SKILL-CONTEXT",
+            ),
             patch.object(
                 agent,
                 "_persist_session",
@@ -4298,10 +4392,31 @@ class TestRunConversation:
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            result = agent.run_conversation("follow up", conversation_history=history)
+            result = agent.run_conversation(
+                current_message,
+                conversation_history=history,
+                persist_user_message="follow up",
+                persist_user_attachments=attachments,
+            )
 
         sent = agent.client.chat.completions.create.call_args.kwargs["messages"]
-        assert "Historical tool episode summary" in str(sent)
+        assert "Historical tool work: 1 call" in str(sent)
+        assert "inspection complete" in str(sent)
+        assert "read_file" not in str(sent)
+        assert "old-call" not in str(sent)
+        assert "old.py" not in str(sent)
+        assert "old body" not in str(sent)
+        assert str(sent).count("CURRENT-SKILL-CONTEXT") == 1
+        current = [message for message in sent if message.get("role") == "user"][-1]
+        assert "follow up" in str(current.get("content"))
+        assert "current.png" in str(current.get("content"))
+        assert "CURRENT-SKILL-CONTEXT" in str(current.get("content"))
+        receipt = next(
+            message for message in sent
+            if "Historical tool work" in str(message.get("content"))
+        )
+        assert "CURRENT-SKILL-CONTEXT" not in str(receipt.get("content"))
+        assert "current.png" not in str(receipt.get("content"))
         assert not any(message.get("role") == "tool" for message in sent)
         assert not any(message.get("tool_calls") for message in sent)
         assert any(message.get("tool_calls") == tool_calls for message in result["messages"])
@@ -5028,11 +5143,12 @@ class TestRunConversation:
         agent.max_tokens = None
         requested_caps = []
 
-        def _fake_build_api_kwargs(api_messages):
-            ephemeral = getattr(agent, "_ephemeral_max_output_tokens", None)
-            if ephemeral is not None:
-                agent._ephemeral_max_output_tokens = None
-            cap = ephemeral if ephemeral is not None else 65536
+        def _fake_build_api_kwargs(
+            api_messages, *, ephemeral_max_output_tokens=None, **_kwargs
+        ):
+            cap = ephemeral_max_output_tokens
+            if cap is None:
+                cap = 65536
             requested_caps.append(cap)
             return {"model": agent.model, "messages": api_messages, "max_tokens": cap}
 
@@ -5773,7 +5889,11 @@ class TestRetryExhaustion:
         """
         self._setup_agent(agent)
         with (
-            patch.object(agent, "_build_api_kwargs", side_effect=ValueError("bad messages")),
+            patch.object(
+                agent,
+                "_build_api_kwargs",
+                side_effect=ValueError("bad messages"),
+            ),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),

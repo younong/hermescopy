@@ -2,9 +2,10 @@
 
 Covers the helper that powers ``/reload-skills`` (CLI + gateway slash command).
 The helper rescans the skills directory and returns a diff of what changed.
-It does NOT invalidate the skills system-prompt cache — skills are invoked
-at runtime via ``/skill-name``, ``skills_list``, or ``skill_view`` and don't
-need to live in the system prompt.
+It does NOT invalidate the skills system-prompt cache. The current session's
+names-only skill index stays byte-stable; runtime loads still work through
+``/skill-name``, ``skills_list``, or ``skill_view``, and a later prompt build
+refreshes from the manifest-validated snapshot.
 
 ``added`` and ``removed`` are lists of ``{"name": str, "description": str}``
 dicts. Descriptions are truncated to 60 chars.
@@ -108,11 +109,11 @@ class TestReloadSkillsHelper:
         assert second["total"] == 0
 
     def test_description_passes_through_verbatim(self, hermes_home):
-        """``description`` must be the full SKILL.md frontmatter string — no
-        truncation. The system prompt renders skills as
-        ``    - name: description`` without a length cap, and the reload
-        note mirrors that format, so truncating here would make the diff
-        render differently from the original catalog."""
+        """Reload diffs retain full descriptions for user-facing change notes.
+
+        The system prompt index is names-only, but reload output remains a
+        separate runtime surface where the complete description is useful.
+        """
         from agent.skill_commands import reload_skills, get_skill_commands
 
         get_skill_commands()  # prime
@@ -139,9 +140,8 @@ class TestReloadSkillsHelper:
     def test_does_not_invalidate_prompt_cache_snapshot(self, hermes_home):
         """reload_skills must NOT delete the skills prompt-cache snapshot.
 
-        Skills are called at runtime — the system prompt doesn't need to
-        mention them for the model to use them — so reloading them should
-        preserve prefix caching.
+        The current session keeps its original names-only index so reloading
+        runtime skill commands must preserve prefix caching.
         """
         from agent.prompt_builder import _skills_prompt_snapshot_path
         from agent.skill_commands import reload_skills
@@ -154,6 +154,5 @@ class TestReloadSkillsHelper:
         reload_skills()
 
         assert snapshot.exists(), (
-            "prompt cache snapshot should be preserved — skills don't live "
-            "in the system prompt so there's no reason to invalidate it"
+            "prompt cache snapshot should be preserved for the current session"
         )

@@ -258,7 +258,6 @@ def _tool_search_scoped_names(agent) -> frozenset:
             enabled_toolsets=enabled,
             disabled_toolsets=disabled,
             quiet_mode=True,
-            skip_tool_search_assembly=True,
         ) or []
         names = _ts.scoped_deferrable_names(scoped_defs)
     except Exception:
