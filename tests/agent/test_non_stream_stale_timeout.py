@@ -207,6 +207,24 @@ def test_very_long_codex_request_bumps_to_100k_tier(monkeypatch, tmp_path):
     assert agent._compute_non_stream_stale_timeout(payload) >= 240.0
 
 
+def test_canonical_context_tokens_override_payload_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+    _write_config(tmp_path, "")
+
+    agent = _make_agent(tmp_path)
+    huge_payload = {"model": "gpt-5.5", "input": "x" * 500_000}
+
+    assert (
+        agent._compute_non_stream_stale_timeout(
+            huge_payload,
+            context_tokens=20_000,
+        )
+        == 90.0
+    )
+
+
 def test_chat_completions_long_messages_bumps_tier(monkeypatch, tmp_path):
     """Chat Completions estimator still works for the legacy messages path."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

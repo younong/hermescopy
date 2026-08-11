@@ -331,6 +331,44 @@ class TestPreparedRequestCompression:
         assert result["final_response"] == "Used prepared fit"
         assert agent._prepared_model_request.payload == agent.client.chat.completions.create.call_args.kwargs
 
+    @pytest.mark.parametrize(
+        ("streaming", "helper_name"),
+        (
+            (False, "interruptible_api_call"),
+            (True, "interruptible_streaming_api_call"),
+        ),
+    )
+    def test_dispatch_passes_prepared_context_pressure_to_transport(
+        self, agent, monkeypatch, streaming, helper_name
+    ):
+        agent.compression_enabled = True
+        response = _mock_response(content="Used canonical accounting", finish_reason="stop")
+        observed = {}
+
+        def _dispatch(_agent, api_kwargs, *, context_tokens=None, **kwargs):
+            observed["payload"] = api_kwargs
+            observed["context_tokens"] = context_tokens
+            return response
+
+        if streaming:
+            agent.stream_delta_callback = lambda _delta: None
+        monkeypatch.setattr(
+            f"agent.chat_completion_helpers.{helper_name}",
+            _dispatch,
+        )
+        monkeypatch.setattr(agent, "_persist_session", lambda *a, **k: None)
+        monkeypatch.setattr(agent, "_save_trajectory", lambda *a, **k: None)
+        monkeypatch.setattr(agent, "_cleanup_task_resources", lambda *a, **k: None)
+
+        result = agent.run_conversation("hello", conversation_history=[])
+
+        assert result["completed"] is True
+        assert observed["payload"] is agent._prepared_model_request.payload
+        assert (
+            observed["context_tokens"]
+            == agent._prepared_model_request.accounting.effective_input_tokens
+        )
+
     def test_no_progress_below_hard_limit_dispatches_prepared_snapshot(self, agent, monkeypatch):
         agent.compression_enabled = True
         agent.context_compressor.context_length = 200_000

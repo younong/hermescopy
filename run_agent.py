@@ -1277,13 +1277,17 @@ class AIAgent:
 
         return 90.0, True
 
-    def _compute_non_stream_stale_timeout(self, api_payload: Any) -> float:
+    def _compute_non_stream_stale_timeout(
+        self,
+        api_payload: Any,
+        *,
+        context_tokens: Optional[int] = None,
+    ) -> float:
         """Compute the effective non-stream stale timeout for this request.
 
-        Accepts either the full ``api_kwargs`` dict (Chat Completions or
-        Responses API) or a legacy ``messages`` list.  Context-size scaling
-        applies the same way to both shapes via
-        :func:`agent.chat_completion_helpers.estimate_request_context_tokens`.
+        Normal dispatch passes canonical prepared-request pressure through
+        ``context_tokens``. Legacy and standalone callers may omit it and use
+        the image-aware payload estimator as a compatibility fallback.
         """
         stale_base, uses_implicit_default = self._resolved_api_call_stale_timeout_base()
         base_url = getattr(self, "_base_url", None) or self.base_url or ""
@@ -1295,8 +1299,11 @@ class AIAgent:
         ):
             return float("inf")
 
-        from agent.chat_completion_helpers import estimate_request_context_tokens
-        est_tokens = estimate_request_context_tokens(api_payload)
+        if context_tokens is None:
+            from agent.chat_completion_helpers import estimate_request_context_tokens
+
+            context_tokens = estimate_request_context_tokens(api_payload)
+        est_tokens = max(0, int(context_tokens or 0))
         if est_tokens > 100_000:
             return max(stale_base, 240.0)
         if est_tokens > 50_000:

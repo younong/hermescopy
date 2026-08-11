@@ -166,6 +166,16 @@ def estimate_request_context_tokens(api_payload: Any) -> int:
     return _value_tokens(api_payload)
 
 
+def _request_context_tokens(
+    api_payload: Any,
+    context_tokens: Optional[int],
+) -> int:
+    """Prefer canonical dispatch pressure; estimate only compatibility calls."""
+    if context_tokens is not None:
+        return max(0, int(context_tokens))
+    return estimate_request_context_tokens(api_payload)
+
+
 def _uses_local_inference_timeout_exemption(agent) -> bool:
     """Return whether the runtime directly serves a local inference model."""
     base_url = getattr(agent, "base_url", None)
@@ -231,7 +241,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def interruptible_api_call(agent, api_kwargs: dict, *, dispatch_metadata=None):
+def interruptible_api_call(
+    agent,
+    api_kwargs: dict,
+    *,
+    context_tokens: Optional[int] = None,
+    dispatch_metadata=None,
+):
     """
     Run the API call in a background thread so the main conversation loop
     can detect interrupts without waiting for the full HTTP round-trip.
@@ -344,7 +360,11 @@ def interruptible_api_call(agent, api_kwargs: dict, *, dispatch_metadata=None):
     # httpx timeout (default 1800s) with zero feedback.  The stale
     # detector kills the connection early so the main retry loop can
     # apply richer recovery (credential rotation, provider fallback).
-    _stale_timeout = agent._compute_non_stream_stale_timeout(api_kwargs)
+    context_tokens = _request_context_tokens(api_kwargs, context_tokens)
+    _stale_timeout = agent._compute_non_stream_stale_timeout(
+        api_kwargs,
+        context_tokens=context_tokens,
+    )
 
     # ── Codex Responses stream watchdogs ────────────────────────────────
     # The chatgpt.com/backend-api/codex endpoint has an intermittent failure
@@ -364,7 +384,7 @@ def interruptible_api_call(agent, api_kwargs: dict, *, dispatch_metadata=None):
     # HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS (0 disables each).
     _codex_watchdog_enabled = agent.api_mode == "codex_responses"
     _openai_codex_backend = _is_openai_codex_backend(agent)
-    _est_tokens_for_codex_watchdog = estimate_request_context_tokens(api_kwargs)
+    _est_tokens_for_codex_watchdog = context_tokens
     if _codex_watchdog_enabled and _openai_codex_backend:
         _codex_floor = openai_codex_stale_timeout_floor(_est_tokens_for_codex_watchdog)
         if _codex_floor:
@@ -553,7 +573,7 @@ def interruptible_api_call(agent, api_kwargs: dict, *, dispatch_metadata=None):
         # Stale-call detector: kill the connection if no response
         # arrives within the configured timeout.
         if _elapsed > _stale_timeout:
-            _est_ctx = estimate_request_context_tokens(api_kwargs)
+            _est_ctx = context_tokens
             _silent_hint: Optional[str] = None
             _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
             if callable(_hint_fn):
@@ -1793,7 +1813,12 @@ def cleanup_task_resources(agent, task_id: str) -> None:
 
 
 def interruptible_streaming_api_call(
-    agent, api_kwargs: dict, *, on_first_delta=None, dispatch_metadata=None
+    agent,
+    api_kwargs: dict,
+    *,
+    on_first_delta=None,
+    context_tokens: Optional[int] = None,
+    dispatch_metadata=None,
 ):
     """Streaming variant of _interruptible_api_call for real-time token delivery.
 
@@ -1821,7 +1846,10 @@ def interruptible_streaming_api_call(
         agent._codex_on_first_delta = on_first_delta
         try:
             return interruptible_api_call(
-                agent, api_kwargs, dispatch_metadata=dispatch_metadata
+                agent,
+                api_kwargs,
+                context_tokens=context_tokens,
+                dispatch_metadata=dispatch_metadata,
             )
         finally:
             agent._codex_on_first_delta = None
@@ -2784,6 +2812,8 @@ def interruptible_streaming_api_call(
         finally:
             request_client_owner.finish("stream_request_complete")
 
+    request_context_tokens: Optional[int] = None
+
     # Provider-configured stale timeout takes priority over env default.
     _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
     if _cfg_stale is not None:
@@ -2800,12 +2830,13 @@ def interruptible_streaming_api_call(
         _stream_stale_timeout = float("inf")
         logger.debug("Local provider detected (%s) — stale stream timeout disabled", agent.base_url)
     else:
+        request_context_tokens = _request_context_tokens(api_kwargs, context_tokens)
         # Scale the stale timeout for large contexts: slow models (like Opus)
         # can legitimately think for minutes before producing the first token
         # when the context is large.  Without this, the stale detector kills
         # healthy connections during the model's thinking phase, producing
         # spurious RemoteProtocolError ("peer closed connection").
-        _est_tokens = estimate_request_context_tokens(api_kwargs)
+        _est_tokens = request_context_tokens
         if _est_tokens > 100_000:
             _stream_stale_timeout = max(_stream_stale_timeout_base, 300.0)
         elif _est_tokens > 50_000:
@@ -2851,7 +2882,11 @@ def interruptible_streaming_api_call(
         # inner retry loop can start a fresh connection.
         _stale_elapsed = time.time() - last_chunk_time["t"]
         if _stale_elapsed > _stream_stale_timeout:
-            _est_ctx = estimate_request_context_tokens(api_kwargs)
+            if request_context_tokens is None:
+                request_context_tokens = _request_context_tokens(
+                    api_kwargs, context_tokens
+                )
+            _est_ctx = request_context_tokens
             logger.warning(
                 "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
                 "model=%s context=~%s tokens. Killing connection.",
