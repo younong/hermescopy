@@ -105,13 +105,12 @@ def _deployment_route_kind(route: Any) -> str:
     model ownership. A route for a provider registered as a Code capability
     must remain a Code registration and must not leak into the Chat surface.
     """
-    from hermes_cli.model_plane.capability import (
-        ensure_capability_providers,
-        get_capability_provider,
-    )
+    from hermes_cli.model_plane.capability import get_code_provider_for_model
 
-    ensure_capability_providers()
-    if get_capability_provider(CODE, str(route.provider or "").strip()) is not None:
+    if get_code_provider_for_model(
+        str(route.provider or "").strip(),
+        str(route.model or "").strip(),
+    ) is not None:
         return CODE
     return "chat"
 

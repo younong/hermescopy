@@ -11,8 +11,9 @@ openai_codex = ProviderProfile(
     env_vars=(),  # OAuth external — no API key
     base_url="https://chatgpt.com/backend-api/codex",
     auth_type="oauth_external",
-    chat_enabled=False,
-    fallback_models=("gpt-5.3-codex",),
+    chat_enabled=True,
+    code_models=("gpt-5.3-codex", "gpt-5.3-codex-spark"),
+    fallback_models=("gpt-5.3-codex", "gpt-5.3-codex-spark"),
 )
 
 register_provider(openai_codex)

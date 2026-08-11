@@ -38,7 +38,8 @@ def _inventory_catalog() -> list[dict[str, Any]]:
 
 
 def chat_catalog() -> list[dict[str, Any]]:
-    """Return the provider-owned Chat catalog without capability rows."""
+    """Return provider-owned Chat models not explicitly owned by Code."""
+    from hermes_cli.model_plane.capability import get_code_provider_for_model
     from providers import get_provider_profile
 
     result: list[dict[str, Any]] = []
@@ -50,10 +51,17 @@ def chat_catalog() -> list[dict[str, Any]]:
             profile = None
         if profile is not None and not getattr(profile, "chat_enabled", True):
             continue
+        models = [
+            str(model)
+            for model in item.get("models") or []
+            if get_code_provider_for_model(slug, str(model)) is None
+        ]
+        if not models:
+            continue
         result.append({
             "slug": slug,
             "name": item.get("name", slug),
-            "models": [str(model) for model in item.get("models") or []],
+            "models": models,
             "authenticated": bool(item.get("authenticated", False)),
             "credential_configured": bool(item.get("authenticated", False)),
             "auth_type": item.get("auth_type", ""),

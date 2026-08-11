@@ -1,5 +1,6 @@
 """Volcengine Ark Agent Plan provider profile."""
 
+from hermes_cli.model_plane.capability import register_code_provider
 from providers import register_provider
 from providers.base import ProviderProfile
 
@@ -16,6 +17,7 @@ volcengine_agent_plan = ProviderProfile(
     supports_model_listing=False,
     supports_health_check=False,
     supports_vision=True,
+    code_models=("ark-code-latest", "kimi-k2.7-code", "doubao-seed-2.0-code"),
     fallback_models=(
         "ark-code-latest",
         "doubao-seed-2.0-mini",
@@ -52,3 +54,4 @@ volcengine_agent_plan = ProviderProfile(
 )
 
 register_provider(volcengine_agent_plan)
+register_code_provider(volcengine_agent_plan)

@@ -17,7 +17,8 @@ alibaba_coding_plan = ProviderProfile(
     env_vars=("ALIBABA_CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY", "ALIBABA_CODING_PLAN_BASE_URL"),
     base_url="https://coding-intl.dashscope.aliyuncs.com/v1",
     auth_type="api_key",
-    chat_enabled=False,
+    chat_enabled=True,
+    code_models=("qwen3-coder-plus", "qwen3-coder-next"),
 )
 
 register_provider(alibaba_coding_plan)

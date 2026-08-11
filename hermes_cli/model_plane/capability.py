@@ -325,10 +325,15 @@ class CodeCapabilityAdapter:
             if model and model.casefold() not in seen:
                 seen.add(model.casefold())
                 model_ids.append(model)
+        code_models = {
+            str(model).strip().casefold()
+            for model in self.profile.code_models
+            if str(model).strip()
+        }
         return [
             CapabilityModel(id=model, display=model)
             for model in model_ids
-            if model
+            if model and model.casefold() in code_models
         ]
 
     def model_entries(self) -> list[dict[str, Any]]:
@@ -365,10 +370,45 @@ class CodeCapabilityAdapter:
             "toolset": self.runtime_toolset,
         }
 
+    def supports_model(self, model: str) -> bool:
+        """Return whether this provider explicitly owns *model* for Code."""
+        candidate = str(model or "").strip().casefold()
+        return bool(candidate) and candidate in {
+            str(item).strip().casefold()
+            for item in self.profile.code_models
+            if str(item).strip()
+        }
+
 
 def register_code_provider(profile: Any) -> None:
     """Register a provider profile as an explicit Code capability."""
     register_capability_provider(CodeCapabilityAdapter(profile))
+
+
+def get_code_provider_for_model(
+    provider_name: str,
+    model: str,
+) -> Optional[CapabilityProvider]:
+    """Resolve explicit Code ownership for a provider/model pair.
+
+    The provider name is preferred when it is registered. Deployment routes may
+    use a custom transport alias, however, so an unambiguous model match across
+    registered Code capabilities is also accepted. No model-name heuristic is
+    used.
+    """
+    ensure_capability_providers()
+    candidate = str(model or "").strip()
+    if not candidate:
+        return None
+    direct = get_capability_provider(CODE, str(provider_name or "").strip())
+    if direct is not None and getattr(direct, "supports_model", lambda _model: False)(candidate):
+        return direct
+    matches = [
+        provider
+        for provider in list_capability_providers(CODE)
+        if getattr(provider, "supports_model", lambda _model: False)(candidate)
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 @dataclass(frozen=True)

@@ -131,6 +131,7 @@ def test_code_capability_adapter_uses_shared_registry(monkeypatch):
         name="code-double",
         display_name="Code Double",
         fallback_models=("code-x",),
+        code_models=("code-x",),
         env_vars=("CODE_DOUBLE_API_KEY",),
     )
     monkeypatch.setattr(
@@ -143,6 +144,8 @@ def test_code_capability_adapter_uses_shared_registry(monkeypatch):
     assert provider is not None
     assert provider.kind == "code"
     assert provider.list_models() == [CapabilityModel(id="code-x", display="code-x")]
+    assert provider.supports_model("code-x") is True
+    assert provider.supports_model("gpt-5.6-sol") is False
     assert provider.capabilities() == {
         "api_mode": "chat_completions",
         "profile": "coding",
@@ -181,6 +184,50 @@ def test_chat_catalog_excludes_code_only_profiles_but_keeps_dual_surface(monkeyp
 
     assert [row["slug"] for row in rows] == ["dual-surface"]
     assert rows[0]["models"] == ["chat-x"]
+
+
+def test_dual_surface_code_catalog_filters_models(monkeypatch):
+    from providers.base import ProviderProfile
+
+    profile = ProviderProfile(
+        name="dual-code",
+        display_name="Dual Code",
+        fallback_models=("gpt-5.6-sol", "code-x"),
+        code_models=("code-x",),
+        chat_enabled=True,
+    )
+    capability_module.register_code_provider(profile)
+    rows = catalog_module.capability_catalog("code")
+    assert rows[0]["models"] == [{"id": "code-x", "display": "code-x"}]
+
+
+def test_dual_surface_chat_catalog_keeps_unowned_models(monkeypatch):
+    from providers.base import ProviderProfile
+
+    profile = ProviderProfile(
+        name="dual-code",
+        display_name="Dual Code",
+        code_models=("code-x",),
+        chat_enabled=True,
+    )
+    capability_module.register_code_provider(profile)
+    monkeypatch.setattr(
+        catalog_module,
+        "_inventory_catalog",
+        lambda: [{
+            "slug": "dual-code",
+            "name": "Dual Code",
+            "models": ["gpt-5.6-sol", "code-x"],
+        }],
+    )
+    monkeypatch.setattr(
+        "providers.get_provider_profile",
+        lambda name: profile if name == "dual-code" else None,
+    )
+
+    rows = catalog_module.chat_catalog()
+
+    assert rows[0]["models"] == ["gpt-5.6-sol"]
 
 
 def test_registry_rejects_invalid_provider():

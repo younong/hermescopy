@@ -65,7 +65,18 @@ kimi = KimiProfile(
     default_max_tokens=32000,
     default_headers={"User-Agent": "hermes-agent/1.0"},
     default_aux_model="kimi-k2-turbo-preview",
-    chat_enabled=False,
+    chat_enabled=True,
+    code_models=("kimi-k2.7-code",),
+    fallback_models=(
+        "kimi-k2.7-code",
+        "kimi-k2.6",
+        "kimi-k2.5",
+        "kimi-for-coding",
+        "kimi-k2-thinking",
+        "kimi-k2-thinking-turbo",
+        "kimi-k2-turbo-preview",
+        "kimi-k2-0905-preview",
+    ),
 )
 
 kimi_cn = KimiProfile(
@@ -78,7 +89,18 @@ kimi_cn = KimiProfile(
     default_max_tokens=32000,
     default_headers={"User-Agent": "hermes-agent/1.0"},
     default_aux_model="kimi-k2-turbo-preview",
-    chat_enabled=False,
+    chat_enabled=True,
+    code_models=("kimi-k2.7-code",),
+    fallback_models=(
+        "kimi-k2.7-code",
+        "kimi-k2.6",
+        "kimi-k2.5",
+        "kimi-for-coding",
+        "kimi-k2-thinking",
+        "kimi-k2-thinking-turbo",
+        "kimi-k2-turbo-preview",
+        "kimi-k2-0905-preview",
+    ),
 )
 
 register_provider(kimi)

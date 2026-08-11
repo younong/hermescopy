@@ -150,14 +150,16 @@ def _deployment_registrations(monkeypatch):
         ProviderProfile(
             name="openai-codex",
             fallback_models=("gpt-5.3-codex",),
-            chat_enabled=False,
+            code_models=("gpt-5.3-codex",),
+            chat_enabled=True,
         )
     )
     capability_module.register_code_provider(
         ProviderProfile(
             name="kimi-coding",
             fallback_models=("kimi-k2.5",),
-            chat_enabled=False,
+            code_models=("kimi-k2.5",),
+            chat_enabled=True,
         )
     )
     monkeypatch.setattr(
@@ -195,6 +197,26 @@ def _deployment_registrations(monkeypatch):
             policy_id="deployment-media",
         ),
     )
+
+
+def test_deployment_route_kind_is_model_scoped(monkeypatch):
+    _deployment_registrations(monkeypatch)
+    from hermes_cli.deployment_inference import DeploymentInferenceRouteDescriptor
+
+    assert model_registrations._deployment_route_kind(
+        DeploymentInferenceRouteDescriptor(
+            provider="openai-codex",
+            model="gpt-5.6-sol",
+            api_mode="chat_completions",
+        )
+    ) == "chat"
+    assert model_registrations._deployment_route_kind(
+        DeploymentInferenceRouteDescriptor(
+            provider="openai-codex",
+            model="gpt-5.3-codex",
+            api_mode="chat_completions",
+        )
+    ) == "code"
 
 
 def test_admin_registrations_control_plane_derives_media_from_policy(monkeypatch):

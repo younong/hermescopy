@@ -61,6 +61,10 @@ class ProviderProfile:
     # Capability-only profiles still reuse this transport declaration, but must
     # not be offered by the provider-owned Chat catalog.
     chat_enabled: bool = True
+    # Explicit model-level Code ownership. An empty tuple means this profile
+    # does not expose Code models; it must never be inferred from the provider
+    # name or transport protocol.
+    code_models: tuple = ()
     supports_model_listing: bool = True  # False → picker uses fallback_models only
     supports_health_check: bool = True  # False → doctor skips /models probe for this provider
 

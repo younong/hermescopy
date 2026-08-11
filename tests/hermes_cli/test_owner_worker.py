@@ -4007,7 +4007,8 @@ def test_worker_admin_registration_is_visible_and_immutable(tmp_path, monkeypatc
         ProviderProfile(
             name="kimi-coding",
             fallback_models=("kimi-k2.5",),
-            chat_enabled=False,
+            code_models=("kimi-k2.5",),
+            chat_enabled=True,
         )
     )
     ensure_owner_runtime_dirs(owner_home)
