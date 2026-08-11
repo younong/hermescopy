@@ -548,7 +548,12 @@ class ControlledWorkspaceFileOperations(FileOperations):
         return str(self._context.roots.get(RootKind.WORKSPACE).canonical_path / relative_path)
 
     def resolve_artifact_path(self, path: str) -> tuple[str, str]:
-        """Validate an existing artifact and return child + diagnostic paths.
+        """Validate an existing artifact and return child + diagnostic paths."""
+        child_path, diagnostic_path, _size_bytes = self.resolve_artifact_info(path)
+        return child_path, diagnostic_path
+
+    def resolve_artifact_info(self, path: str) -> tuple[str, str, int]:
+        """Validate an artifact and return descriptor-bound path and size data.
 
         Relative inputs are interpreted inside the authenticated selected
         workspace. Absolute inputs are accepted only when they are exact
@@ -558,32 +563,38 @@ class ControlledWorkspaceFileOperations(FileOperations):
         if not isinstance(path, str) or not path or "\x00" in path:
             raise ValueError("artifact path must be a non-empty string")
 
-        workspace_root = (
-            self._context.roots.get(RootKind.WORKSPACE).canonical_path
-            / self._context.workspace_prefix
-        )
-        if os.path.isabs(path):
+        if path == "/workspace" or path.startswith("/workspace/"):
+            relative_path = self._context.controlled_workspace_path(path)
+            child_path = self._context.visible_workspace_path(relative_path)
+        elif os.path.isabs(path):
+            workspace_root = self._context.workspace_path
             candidate = Path(path)
             try:
-                relative = candidate.relative_to(workspace_root)
+                child_path = candidate.relative_to(workspace_root).as_posix()
             except ValueError as exc:
                 raise ValueError(
                     "absolute artifact path is outside the authenticated workspace"
                 ) from exc
-            child_path = relative.as_posix()
+            relative_path = self._relative_path(child_path)
         else:
             child_path = path
-
-        relative_path = self._relative_path(child_path)
+            relative_path = self._relative_path(child_path)
         fd = self._context.roots.open_relative(
             RootKind.WORKSPACE,
             relative_path,
             expected_type=ExpectedType.REGULAR_FILE,
         )
-        os.close(fd)
-        return child_path, str(
-            self._context.roots.get(RootKind.WORKSPACE).canonical_path
-            / relative_path
+        try:
+            size_bytes = os.fstat(fd).st_size
+        finally:
+            os.close(fd)
+        return (
+            child_path,
+            str(
+                self._context.roots.get(RootKind.WORKSPACE).canonical_path
+                / relative_path
+            ),
+            size_bytes,
         )
 
     @staticmethod

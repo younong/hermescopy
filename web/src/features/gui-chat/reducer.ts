@@ -432,7 +432,14 @@ function transcriptToMessageWithArtifacts(
   const refs = extractImageReferencesFromTranscriptMessage(message).filter(
     (ref) => !claimedSources.has(normalizeAttachmentSource(ref.url)),
   );
-  const fileRefs = extractGeneratedFileReferences(textFromTranscriptMessage(message)).filter(
+  // Verified assistant file deliverables are persisted as attachments. Preserve
+  // historical text parsing only for rows that predate that backend contract.
+  const hasVerifiedFileAttachment =
+    message.role === "assistant" && attachments.some((attachment) => attachment.kind === "file");
+  const fileRefs = (hasVerifiedFileAttachment
+    ? []
+    : extractGeneratedFileReferences(textFromTranscriptMessage(message))
+  ).filter(
     (ref) =>
       !claimedSources.has(normalizeAttachmentSource(ref.path)) &&
       !refs.some((image) => normalizeAttachmentSource(image.url) === normalizeAttachmentSource(ref.path)),
@@ -1228,7 +1235,9 @@ function completeAssistantMessage(
     current.id,
     imageRefs,
   );
-  return addGeneratedFileArtifacts(withImages, visibleText, { messageId: current.id });
+  // Local file cards are emitted by the backend only after owner-workspace
+  // regular-file validation. Never recreate them from untrusted response text.
+  return withImages;
 }
 
 function normalizeMessageStatus(status: string | undefined): ChatMessage["status"] {
@@ -1765,25 +1774,30 @@ function addCreatedArtifact(
   };
   let messages = state.messages;
   let toolCalls = state.toolCalls;
+  let attached = false;
   if (messageId) {
-    messages = messages.map((message) =>
-      message.id === messageId
-        ? { ...message, artifactIds: appendUnique(message.artifactIds, id) }
-        : message,
-    );
+    messages = messages.map((message) => {
+      if (message.id !== messageId) return message;
+      attached = true;
+      return { ...message, artifactIds: appendUnique(message.artifactIds, id) };
+    });
   } else if (toolCallId && toolCalls[toolCallId]) {
     const tool = toolCalls[toolCallId];
+    attached = true;
     toolCalls = {
       ...toolCalls,
       [toolCallId]: { ...tool, artifactIds: appendUnique(tool.artifactIds, id) },
     };
   } else if (messages.at(-1)?.role === "assistant") {
     const last = messages.length - 1;
+    attached = true;
     messages = messages.map((message, index) =>
       index === last ? { ...message, artifactIds: appendUnique(message.artifactIds, id) } : message,
     );
   }
-  return { ...state, artifacts: { ...state.artifacts, [id]: artifact }, messages, toolCalls };
+  return attached
+    ? { ...state, artifacts: { ...state.artifacts, [id]: artifact }, messages, toolCalls }
+    : { ...state, artifacts: { ...state.artifacts, [id]: artifact } };
 }
 
 function addImageArtifact(

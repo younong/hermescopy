@@ -155,12 +155,17 @@ def test_authenticated_artifact_paths_stay_in_selected_workspace(
         ambient_root = owner_b_workspace.get(RootKind.WORKSPACE).canonical_path
         monkeypatch.setenv("TERMINAL_CWD", str(ambient_root))
         relative = file_tools.resolve_delegated_artifact_path("slides/slide-01.jpg")
+        sandbox = file_tools.resolve_delegated_artifact_path(
+            "/workspace/slides/slide-01.jpg"
+        )
         diagnostic = file_tools.resolve_delegated_artifact_path(
             selected.diagnostic_path("slides/slide-01.jpg")
         )
 
         assert relative["path"] == "slides/slide-01.jpg"
+        assert sandbox["path"] == "slides/slide-01.jpg"
         assert diagnostic["path"] == "slides/slide-01.jpg"
+        assert relative["diagnostic_path"] == sandbox["diagnostic_path"]
         assert relative["diagnostic_path"] == diagnostic["diagnostic_path"]
         assert str(ambient_root) not in relative["diagnostic_path"]
     finally:
@@ -169,7 +174,7 @@ def test_authenticated_artifact_paths_stay_in_selected_workspace(
 
 @pytest.mark.parametrize(
     "bad_path",
-    ["/workspace/slide.jpg", "../outside.jpg", "slides", "/etc/passwd"],
+    ["/workspace/missing.jpg", "../outside.jpg", "slides", "/etc/passwd"],
 )
 def test_authenticated_artifact_paths_fail_closed(
     owner_a_workspace, bad_path

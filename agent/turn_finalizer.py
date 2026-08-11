@@ -163,54 +163,7 @@ def finalize_turn(
         _cleanup_errors.append(f"cleanup_task_resources: {_cleanup_err}")
         logger.error("finalize_turn: _cleanup_task_resources failed: %s", _cleanup_err, exc_info=True)
 
-    # Persist session to both JSON log and SQLite only after private retry
-    # scaffolding has been removed. Otherwise a later user "continue" turn
-    # can replay assistant("(empty)") / recovery nudges and fall into the
-    # same empty-response loop again.
-    try:
-        agent._drop_trailing_empty_response_scaffolding(messages)
-
-        # When the turn was interrupted and the last message is a tool
-        # result, append a synthetic assistant message to close the
-        # tool-call sequence. Without this, the session persists a
-        # ``tool → user`` alternation that strict providers (Gemini,
-        # Claude) reject, causing them to hallucinate a continuation of
-        # the user's message on the next turn (#48879).
-        #
-        # ``_drop_trailing_empty_response_scaffolding`` only rewinds the
-        # tool tail when an empty-response scaffolding flag is present; a
-        # clean ``/stop`` interrupt after a successful tool sets no such
-        # flag, so the tool result survives as the tail and we close it
-        # here instead. On an interrupt ``final_response`` is typically
-        # empty, so fall back to an explicit placeholder rather than
-        # persisting an empty-content assistant turn.
-        if interrupted:
-            from agent.message_sanitization import close_interrupted_tool_sequence
-            close_interrupted_tool_sequence(messages, final_response)
-
-        # Some recovery/fallback paths return a real final_response without
-        # adding a closing assistant message to the transcript (e.g. the
-        # partial-stream and prior-turn-content recovery ``break`` sites in
-        # ``conversation_loop``). If persisted as-is, the durable session can
-        # end at a tool/user message even though the caller — and the gateway
-        # platform — already saw a completed assistant response. The next turn
-        # then replays a user-only backlog and the model re-answers every
-        # "unanswered" message. Close the durable turn at the source, at the
-        # single chokepoint every recovery ``break`` flows through, so the
-        # invariant "delivered final_response ⇒ assistant row in transcript"
-        # holds regardless of which path produced it. (#43849 / #44100)
-        if final_response and not interrupted:
-            try:
-                _tail_role = messages[-1].get("role") if messages else None
-            except Exception:
-                _tail_role = None
-            if _tail_role != "assistant":
-                messages.append({"role": "assistant", "content": final_response})
-
-        agent._persist_session(messages, conversation_history)
-    except Exception as _persist_err:
-        _cleanup_errors.append(f"persist_session: {_persist_err}")
-        logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
+    artifacts = []
 
     # ── Turn-exit diagnostic log ─────────────────────────────────────
     # Always logged at INFO so agent.log captures WHY every turn ended.
@@ -361,10 +314,87 @@ def finalize_turn(
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
 
+    # Validate explicit local-file delivery after every response transform. Files
+    # merely touched during the turn remain private unless this final text offers
+    # them, and validator failures fail closed instead of preserving a false claim.
+    if final_response and not interrupted and not failed:
+        try:
+            from agent.artifact_delivery import (
+                append_artifact_delivery_warning,
+                validate_declared_artifacts,
+            )
+
+            artifacts, _rejected_artifacts = validate_declared_artifacts(
+                final_response,
+                task_id=effective_task_id or "default",
+                artifact_namespace=turn_id,
+            )
+            if _rejected_artifacts:
+                final_response = append_artifact_delivery_warning(
+                    final_response,
+                    _rejected_artifacts,
+                )
+        except Exception as _artifact_err:
+            from agent.artifact_delivery import append_artifact_validation_failure
+
+            artifacts = []
+            final_response = append_artifact_validation_failure(final_response)
+            logger.error(
+                "artifact delivery validation failed: %s",
+                _artifact_err,
+                exc_info=True,
+            )
+
+    # Persist session to both JSON log and SQLite only after private retry
+    # scaffolding, response transforms, and artifact correction are final. This
+    # keeps durable history, plugin callbacks, and the caller byte-identical.
+    try:
+        agent._drop_trailing_empty_response_scaffolding(messages)
+
+        if interrupted:
+            from agent.message_sanitization import close_interrupted_tool_sequence
+
+            close_interrupted_tool_sequence(messages, final_response)
+
+        if final_response and not interrupted:
+            try:
+                _tail_role = messages[-1].get("role") if messages else None
+            except Exception:
+                _tail_role = None
+            if _tail_role != "assistant":
+                messages.append({"role": "assistant", "content": final_response})
+            else:
+                messages[-1]["content"] = final_response
+            existing_attachments = messages[-1].get("attachments")
+            preserved_attachments = [
+                attachment
+                for attachment in (
+                    existing_attachments if isinstance(existing_attachments, list) else []
+                )
+                if isinstance(attachment, dict) and attachment.get("kind") != "file"
+            ]
+            verified_attachments = [
+                {
+                    "kind": "file",
+                    "mime_type": artifact.get("mime_type"),
+                    "name": artifact["name"],
+                    "path": artifact["path"],
+                    "size_bytes": artifact["size_bytes"],
+                }
+                for artifact in artifacts
+            ]
+            if preserved_attachments or verified_attachments:
+                messages[-1]["attachments"] = preserved_attachments + verified_attachments
+            else:
+                messages[-1].pop("attachments", None)
+
+        agent._persist_session(messages, conversation_history)
+    except Exception as _persist_err:
+        _cleanup_errors.append(f"persist_session: {_persist_err}")
+        logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
+
     # Plugin hook: post_llm_call
-    # Fired once per turn after the tool-calling loop completes.
-    # Plugins can use this to persist conversation data (e.g. sync
-    # to an external memory system).
+    # Fired once per turn after the final response has been corrected and persisted.
     if final_response and not interrupted:
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
@@ -418,6 +448,7 @@ def finalize_turn(
         "interrupted": interrupted,
         "response_transformed": _response_transformed,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
+        "artifacts": artifacts,
         "model": agent.model,
         "provider": agent.provider,
         "base_url": agent.base_url,
