@@ -41,7 +41,7 @@ def _old_episode(*, calls=None, results=None, final="done"):
     return messages
 
 
-def test_recent_window_and_current_turn_are_unchanged_by_identity():
+def test_recent_text_window_and_current_turn_are_unchanged_by_identity():
     messages = _old_episode()
 
     projected = project_provider_history(
@@ -169,20 +169,44 @@ def test_boundary_is_stable_when_current_tool_rows_are_appended():
     assert second[-2:] == messages[-2:]
 
 
-def test_old_multimodal_payloads_become_receipts_but_recent_payloads_remain():
+def test_all_historical_multimodal_payloads_become_receipts():
     old_image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,OLD"}}
+    recent_image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,RECENT"}}
     current_image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,NEW"}}
     messages = [
         {"role": "user", "content": [{"type": "text", "text": "old"}, old_image]},
         {"role": "assistant", "content": "seen"},
-        {"role": "user", "content": "padding"},
+        {"role": "user", "content": [{"type": "text", "text": "recent"}, recent_image]},
         {"role": "assistant", "content": "ack"},
         {"role": "user", "content": [{"type": "text", "text": "current"}, current_image]},
     ]
 
-    projected = project_provider_history(messages, current_turn_index=4, protect_last_n=2)
+    projected = project_provider_history(messages, current_turn_index=4, protect_last_n=4)
 
     assert "payload omitted" in str(projected[0]["content"])
+    assert "payload omitted" in str(projected[2]["content"])
     assert "OLD" not in str(projected)
+    assert "RECENT" not in str(projected)
     assert "NEW" in str(projected[4]["content"])
-    assert project_provider_history(projected, current_turn_index=4, protect_last_n=2) is projected
+    assert messages[0]["content"][1] is old_image
+    assert messages[2]["content"][1] is recent_image
+    assert project_provider_history(projected, current_turn_index=4, protect_last_n=4) is projected
+
+
+def test_current_turn_tool_image_remains_available_for_next_iteration():
+    historical_image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,OLD"}}
+    current_image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,NEW"}}
+    tool_image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,TOOL"}}
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "old"}, historical_image]},
+        {"role": "assistant", "content": "seen"},
+        {"role": "user", "content": [{"type": "text", "text": "current"}, current_image]},
+        {"role": "assistant", "content": None, "tool_calls": [_call("vision", "vision_analyze")]},
+        {"role": "tool", "tool_call_id": "vision", "content": [{"type": "text", "text": "result"}, tool_image]},
+    ]
+
+    projected = project_provider_history(messages, current_turn_index=2, protect_last_n=20)
+
+    assert "OLD" not in str(projected)
+    assert "NEW" in str(projected)
+    assert "TOOL" in str(projected)

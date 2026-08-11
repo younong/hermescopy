@@ -430,16 +430,11 @@ def _image_to_base64_data_url(image_path: Path, mime_type: Optional[str] = None)
 # provider accepts the image and we reject outright.
 _MAX_BASE64_BYTES = 20 * 1024 * 1024
 
-# Proactive embed cap (4 MB).  This is the size we resize an image DOWN to
-# before embedding it into conversation history, regardless of the 20 MB hard
-# ceiling.  Anthropic's per-image base64 limit is 5 MB; once an oversized image
-# is baked into history (e.g. a vision tool-result), it is re-sent on every
-# subsequent turn and permanently wedges the session with a 400 that retries
-# can't clear (the bad bytes are immutable history).  Capping at embed time —
-# with headroom under 5 MB — is the only durable fix.  Matches the post-failure
-# shrink target in agent.conversation_compression so behaviour is consistent
-# whether we resize proactively or reactively.
-_EMBED_TARGET_BYTES = 4 * 1024 * 1024
+# Provider-bound inline images are capped at 2 MiB. Payloads already within this
+# limit pass through unchanged; larger payloads are resized before their first
+# request. This covers vision tool-result images embedded in the current turn;
+# native user attachments use the same contract from agent.image_routing.
+_EMBED_TARGET_BYTES = 2 * 1024 * 1024
 
 # Proactive embed dimension cap (px, longest side).  Anthropic enforces an
 # 8000px per-side ceiling INDEPENDENTLY of the 5 MB byte cap — a tall full-page
@@ -878,14 +873,9 @@ async def _vision_analyze_native(
             temp_image_path, mime_type=detected_mime_type,
         )
 
-        # Proactive embed cap: this image gets baked into conversation
-        # history and re-sent on every subsequent turn.  Anthropic rejects
-        # any single base64 image over 5 MB OR over 8000px per side with a
-        # 400, and because history is immutable, an oversized embed
-        # permanently wedges the session — retries can't clear bytes (or
-        # pixels) that are already in the request.  Resize DOWN to the embed
-        # target (4 MB / 7900px, headroom under both ceilings) whenever the
-        # payload exceeds either limit, not just at the 20 MB hard ceiling.
+        # Keep provider-bound inline images within 2 MiB on the first request.
+        # Images already under the threshold pass through unchanged; dimensions
+        # are still capped independently for providers such as Anthropic.
         _over_bytes = len(image_data_url) > _EMBED_TARGET_BYTES
         _over_dims = await _run_encode_on_cpu_executor(
             _image_exceeds_dimension, temp_image_path, _EMBED_MAX_DIMENSION,
