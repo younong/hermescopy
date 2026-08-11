@@ -149,7 +149,9 @@ class TestGenerate:
         assert result["quality"] == "medium"
         assert result["upstream_model"] == "gpt-image-2"
         assert result["requested_aspect_ratio"] == "16:9"
-        assert result["effective_aspect_ratio"] == "3:2"
+        assert result["effective_aspect_ratio"] == "16:9"
+        assert result["requested_resolution"] == "2K"
+        assert result["effective_resolution"] == "2K"
         saved = Path(result["image"])
         assert saved.exists()
         assert saved.parent == tmp_path / "cache" / "images"
@@ -160,12 +162,12 @@ class TestGenerate:
         assert kwargs["json"] == {
             "model": "gpt-image-2",
             "prompt": "a cat",
-            "size": "1536x1024",
+            "size": "2048x1152",
             "n": 1,
             "quality": "medium",
         }
 
-    def test_gpt_3_4_uses_exact_custom_size(self, provider, monkeypatch):
+    def test_gpt_3_4_uses_requested_resolution_size(self, provider, monkeypatch):
         calls = []
 
         def fake_post(url, **kwargs):
@@ -174,15 +176,21 @@ class TestGenerate:
 
         monkeypatch.setattr(requests, "post", fake_post)
 
-        result = provider.generate("a portrait cat", aspect_ratio="3:4")
+        result = provider.generate(
+            "a portrait cat", aspect_ratio="3:4", resolution="4K"
+        )
 
         assert result["success"] is True
         assert result["requested_aspect_ratio"] == "3:4"
         assert result["effective_aspect_ratio"] == "3:4"
-        assert result["size"] == "768x1024"
-        assert calls[0][1]["json"]["size"] == "768x1024"
+        assert result["requested_resolution"] == "4K"
+        assert result["effective_resolution"] == "4K"
+        assert result["resolution_mode"] == "native"
+        assert result["size"] == "2480x3312"
+        assert calls[0][1]["json"]["size"] == "2480x3312"
+        assert calls[0][1]["json"]["quality"] == "medium"
 
-    def test_gpt_edit_3_4_uses_exact_custom_size(self, provider, monkeypatch):
+    def test_gpt_edit_3_4_uses_requested_resolution_size(self, provider, monkeypatch):
         calls = []
         data_url = f"data:image/png;base64,{_b64_png()}"
 
@@ -196,13 +204,17 @@ class TestGenerate:
             "make it portrait",
             image_url=data_url,
             aspect_ratio="3:4",
+            resolution="2K",
         )
 
         assert result["success"] is True
         assert result["requested_aspect_ratio"] == "3:4"
         assert result["effective_aspect_ratio"] == "3:4"
-        assert result["size"] == "768x1024"
-        assert calls[0][1]["data"]["size"] == "768x1024"
+        assert result["requested_resolution"] == "2K"
+        assert result["effective_resolution"] == "2K"
+        assert result["size"] == "1536x2048"
+        assert calls[0][1]["data"]["size"] == "1536x2048"
+        assert calls[0][1]["data"]["quality"] == "medium"
 
     def test_gpt_edit_payload(self, provider, monkeypatch):
         calls = []
@@ -222,7 +234,7 @@ class TestGenerate:
         assert url == "https://api.apiyi.com/v1/images/edits"
         assert kwargs["data"]["model"] == "gpt-image-2"
         assert kwargs["data"]["quality"] == "medium"
-        assert kwargs["data"]["size"] == "1024x1024"
+        assert kwargs["data"]["size"] == "2048x2048"
         assert kwargs["files"][0][0] == "image"
         assert kwargs["files"][0][1][2] == "image/png"
 
@@ -253,7 +265,9 @@ class TestGenerate:
         monkeypatch.setenv("APIYI_IMAGE_MODEL", "nano-banana-2")
         monkeypatch.setattr(requests, "post", fake_post)
 
-        result = provider.generate("a banana astronaut", aspect_ratio="portrait")
+        result = provider.generate(
+            "a banana astronaut", aspect_ratio="portrait", resolution="4K"
+        )
 
         assert result["success"] is True
         assert result["model"] == "nano-banana-2"
@@ -262,6 +276,9 @@ class TestGenerate:
         assert result["requested_aspect_ratio"] == "3:4"
         assert result["effective_aspect_ratio"] == "3:4"
         assert result["aspect_ratio_native"] == "3:4"
+        assert result["requested_resolution"] == "4K"
+        assert result["effective_resolution"] == "4K"
+        assert result["resolution_mode"] == "native"
 
         url, kwargs = calls[0]
         assert url == (
@@ -272,7 +289,10 @@ class TestGenerate:
         payload = kwargs["json"]
         assert payload["contents"][0]["parts"][0] == {"text": "a banana astronaut"}
         assert payload["generationConfig"]["responseModalities"] == ["IMAGE", "TEXT"]
-        assert payload["generationConfig"]["imageConfig"]["aspectRatio"] == "3:4"
+        assert payload["generationConfig"]["imageConfig"] == {
+            "aspectRatio": "3:4",
+            "imageSize": "4K",
+        }
 
     def test_custom_base_urls_and_model_map(self, provider, monkeypatch, tmp_path):
         import yaml
@@ -336,7 +356,17 @@ class TestGenerate:
         assert "bad model" in result["error"]
 
 
-def test_explicit_transport_uses_exact_gpt_3_4_size(monkeypatch):
+@pytest.mark.parametrize(
+    ("model", "aspect_ratio", "resolution", "size", "quality"),
+    [
+        ("gpt-image-2-medium", "9:16", "1K", "720x1280", "medium"),
+        ("gpt-image-2-low", "16:9", "2K", "2048x1152", "low"),
+        ("gpt-image-2-high", "3:4", "4K", "2480x3312", "high"),
+    ],
+)
+def test_explicit_transport_forwards_gpt_resolution(
+    monkeypatch, model, aspect_ratio, resolution, size, quality
+):
     from plugins.image_gen import apiyi
 
     captured = {}
@@ -352,13 +382,54 @@ def test_explicit_transport_uses_exact_gpt_3_4_size(monkeypatch):
 
     monkeypatch.setattr("requests.post", fake_post)
     result = apiyi.generate_apiyi_image_bytes(
-        prompt="draw", aspect_ratio="3:4", model="gpt-image-2-medium", references=[],
-        api_key="trusted", openai_base_url="https://api.example/v1", gemini_base_url="https://api.example/v1beta",
+        prompt="draw", aspect_ratio=aspect_ratio, model=model, references=[],
+        api_key="trusted", openai_base_url="https://api.example/v1",
+        gemini_base_url="https://api.example/v1beta",
+        params={"resolution": resolution},
     )
 
     assert result["image_bytes"] == b"png"
-    assert result["metadata"]["requested_aspect_ratio"] == "3:4"
-    assert result["metadata"]["effective_aspect_ratio"] == "3:4"
-    assert result["metadata"]["size"] == "768x1024"
-    assert captured["kwargs"]["json"]["size"] == "768x1024"
+    assert result["metadata"]["requested_aspect_ratio"] == aspect_ratio
+    assert result["metadata"]["effective_aspect_ratio"] == aspect_ratio
+    assert result["metadata"]["requested_resolution"] == resolution
+    assert result["metadata"]["effective_resolution"] == resolution
+    assert result["metadata"]["resolution_mode"] == "native"
+    assert result["metadata"]["size"] == size
+    assert captured["kwargs"]["json"]["size"] == size
+    assert captured["kwargs"]["json"]["quality"] == quality
     assert "APIYI_API_KEY" not in os.environ
+
+
+def test_explicit_transport_forwards_nano_resolution(monkeypatch):
+    from plugins.image_gen import apiyi
+
+    captured = {}
+
+    class Response:
+        def raise_for_status(self): pass
+        def json(self):
+            return {
+                "candidates": [{
+                    "content": {"parts": [{
+                        "inlineData": {"mimeType": "image/png", "data": "cG5n"}
+                    }]}
+                }]
+            }
+
+    def fake_post(url, **kwargs):
+        captured.update({"url": url, "kwargs": kwargs})
+        return Response()
+
+    monkeypatch.setattr("requests.post", fake_post)
+    result = apiyi.generate_apiyi_image_bytes(
+        prompt="draw", aspect_ratio="3:4", model="nano-banana-2", references=[],
+        api_key="trusted", openai_base_url="https://api.example/v1",
+        gemini_base_url="https://api.example/v1beta",
+        params={"resolution": "4K"},
+    )
+
+    image_config = captured["kwargs"]["json"]["generationConfig"]["imageConfig"]
+    assert image_config == {"aspectRatio": "3:4", "imageSize": "4K"}
+    assert result["metadata"]["requested_resolution"] == "4K"
+    assert result["metadata"]["effective_resolution"] == "4K"
+    assert result["metadata"]["resolution_mode"] == "native"

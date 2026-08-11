@@ -18,6 +18,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any
 
+from agent.image_gen_provider import canonical_aspect_ratio
 from hermes_cli.dashboard_auth.authority import (
     AuthorityStore, AuthorizationRejected, OwnerWorkerAuthorityLease, WorkerLeaseState,
 )
@@ -37,10 +38,10 @@ from hermes_cli.deployment_media import (
 
 _MAX_FRAME_BYTES = 96 * 1024 * 1024
 _ALLOWED_MIME_TYPES = IMAGE_MIME_TYPES | VIDEO_MIME_TYPES
-_ALLOWED_ASPECT_RATIOS = frozenset({"landscape", "square", "portrait"})
 _SAFE_METADATA_KEYS = frozenset({
-    "aspect_ratio_native", "output_format", "quality", "revised_prompt", "size",
-    "upstream_model",
+    "aspect_ratio_native", "effective_aspect_ratio", "effective_resolution",
+    "output_format", "quality", "requested_aspect_ratio", "requested_resolution",
+    "resolution_mode", "revised_prompt", "size", "upstream_model",
 })
 _MAX_PARAM_KEY_LENGTH = 64
 _MAX_PARAM_VALUE_LENGTH = 4096
@@ -245,10 +246,12 @@ class DeploymentMediaBroker:
         if route is None:
             raise DeploymentMediaRelayError("deployment media selection is invalid")
         descriptor = route.descriptor
-        if descriptor.kind == "image" and aspect_ratio not in _ALLOWED_ASPECT_RATIOS:
-            raise DeploymentMediaRelayError("deployment media selection is invalid")
         if not isinstance(aspect_ratio, str) or len(aspect_ratio) > 64:
             raise DeploymentMediaRelayError("deployment media selection is invalid")
+        if descriptor.kind == "image":
+            aspect_ratio = canonical_aspect_ratio(aspect_ratio)
+            if aspect_ratio is None:
+                raise DeploymentMediaRelayError("deployment media selection is invalid")
         if kind == "voice":
             # tts_synthesize carries no input; transcribe carries exactly one
             # audio sample as its single reference.
