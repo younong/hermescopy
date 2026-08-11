@@ -2293,7 +2293,10 @@ export interface ModelInfoResponse {
 
 // ── Model options / assignment types ──────────────────────────────────
 
-export type ModelRegistrationKind = "chat" | "image" | "video" | "voice" | "vector";
+export type ModelRegistrationKind = "chat" | "code" | "image" | "video" | "voice" | "vector";
+
+/** Legacy migration metadata; runtime dispatch uses `kind`. */
+export type ModelRegistrationCategory = "chat" | "code";
 
 export type ModelRegistrationSource = "catalog" | "custom" | "manual";
 
@@ -2303,6 +2306,7 @@ export interface ModelRegistration {
   id: string;
   name: string;
   kind: ModelRegistrationKind;
+  category?: ModelRegistrationCategory;
   provider: string;
   model: string;
   source: ModelRegistrationSource;
@@ -2347,21 +2351,25 @@ export interface ModelRegistrationSetupField {
   url?: string;
 }
 
-export interface ModelRegistrationMediaCatalogProvider {
+export interface ModelRegistrationCapabilityCatalogProvider {
   provider: string;
   name: string;
   available: boolean;
   credential_configured: boolean;
   models: ModelRegistrationMediaCatalogModel[];
-  default_model: string;
+  default_model: string | null;
   capabilities: Record<string, unknown>;
   setup: {
     name?: string;
     badge?: string;
     tag?: string;
+    auth_type?: string;
     env_vars: ModelRegistrationSetupField[];
   };
 }
+
+/** Capability catalog rows are shared by Code and media kinds. */
+export type ModelRegistrationMediaCatalogProvider = ModelRegistrationCapabilityCatalogProvider;
 
 export interface ActiveModelRegistration {
   registration_id: string | null;
@@ -2378,13 +2386,13 @@ export interface ModelRegistrationCatalogResponse {
   kind: ModelRegistrationKind;
   providers:
     | ModelRegistrationChatCatalogProvider[]
-    | ModelRegistrationMediaCatalogProvider[];
+    | ModelRegistrationCapabilityCatalogProvider[];
 }
 
 export interface ModelRegistrationActivation {
   ok: boolean;
   registration_id: string;
-  kind: "image" | "video";
+  kind: ModelRegistrationKind;
   provider: string;
   model: string;
 }

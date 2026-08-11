@@ -1629,6 +1629,10 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 # id — pass it through so the upgrade continues that session
                 # instead of starting a fresh one under the same key.
                 kw = {}
+                if current.get("model_kind") == "code":
+                    kw["model_kind"] = "code"
+                    kw["runtime_profile"] = current.get("runtime_profile") or "coding"
+                    kw["runtime_toolset"] = current.get("runtime_toolset") or "coding"
                 if resume_sid := current.get("resume_session_id"):
                     kw["session_id"] = resume_sid
                 resume_overrides = current.get("resume_runtime_overrides")
@@ -2185,6 +2189,11 @@ def _ensure_session_db_row(session: dict) -> None:
             logger.debug(
                 "custom provider identity recovery failed (db row)", exc_info=True
             )
+    model_kind = str(session.get("model_kind") or "chat").strip().lower()
+    if model_kind == "code":
+        model_config["model_kind"] = "code"
+        model_config["runtime_profile"] = session.get("runtime_profile") or "coding"
+        model_config["runtime_toolset"] = session.get("runtime_toolset") or "coding"
     if (reasoning := session.get("create_reasoning_override")) is not None:
         model_config["reasoning_config"] = reasoning
     if tier := session.get("create_service_tier_override"):
@@ -2607,6 +2616,31 @@ def _config_model_target() -> tuple[str, str]:
     return model, provider
 
 
+def _resolve_code_startup_runtime(params: dict | None = None) -> tuple[str, str | None]:
+    """Resolve the selected Code capability without consulting Chat config."""
+    params = params or {}
+    cfg = _load_cfg()
+    selection = cfg.get("code_agent") if isinstance(cfg, dict) else None
+    selection = selection if isinstance(selection, dict) else {}
+    provider_name = str(params.get("provider") or selection.get("provider") or "").strip()
+    model = str(params.get("model") or selection.get("model") or "").strip()
+    try:
+        from hermes_cli.model_plane.capability import get_capability_provider
+
+        provider = get_capability_provider("code", provider_name) if provider_name else None
+        if provider is None and not provider_name:
+            from hermes_cli.model_plane.capability import resolve_capability_provider
+
+            provider = resolve_capability_provider("code").provider
+        if provider is not None:
+            provider_name = provider.name
+            if not model:
+                model = str(provider.default_model() or "").strip()
+    except Exception:
+        logger.debug("failed to resolve Code capability selection", exc_info=True)
+    return model, provider_name or None
+
+
 def _resolve_startup_runtime() -> tuple[str, str | None]:
     model = _resolve_model()
     explicit_provider = os.environ.get("HERMES_TUI_PROVIDER", "").strip()
@@ -2689,6 +2723,19 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     api_mode = str(model_config.get("api_mode") or "").strip()
     reasoning_config = model_config.get("reasoning_config")
     service_tier = str(model_config.get("service_tier") or "").strip()
+    model_kind = str(model_config.get("model_kind") or "chat").strip().lower()
+    if model_kind not in {"chat", "code"}:
+        model_kind = "chat"
+    runtime_profile = (
+        str(model_config.get("runtime_profile") or "coding").strip()
+        if model_kind == "code"
+        else None
+    )
+    runtime_toolset = (
+        str(model_config.get("runtime_toolset") or "coding").strip()
+        if model_kind == "code"
+        else None
+    )
 
     # Heal a bare ``"custom"`` provider stored by an older build (or any leak
     # site that bypassed _runtime_model_config's normalization). Bare custom is
@@ -2712,6 +2759,10 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
             )
         provider = healed or ("" if not base_url else provider)
 
+    if model_kind == "code":
+        overrides["model_kind"] = "code"
+        overrides["runtime_profile"] = "coding"
+        overrides["runtime_toolset"] = "coding"
     if model:
         # Use the same dict-shaped override that live /model switches use so a
         # DB-restored session can preserve custom endpoint metadata across both
@@ -2865,6 +2916,16 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
         config["service_tier"] = service_tier
     else:
         config.pop("service_tier", None)
+
+    model_kind = str(getattr(agent, "model_kind", "chat") or "chat").strip().lower()
+    if model_kind == "code":
+        config["model_kind"] = "code"
+        config["runtime_profile"] = getattr(agent, "runtime_profile", None) or "coding"
+        config["runtime_toolset"] = getattr(agent, "runtime_toolset", None) or "coding"
+    else:
+        config.pop("model_kind", None)
+        config.pop("runtime_profile", None)
+        config.pop("runtime_toolset", None)
 
     return config
 
@@ -3826,7 +3887,15 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "update_command": "",
         "usage": _get_usage(agent),
         "profile_name": _current_profile_name(),
+        "model_kind": str(
+            getattr(agent, "model_kind", None)
+            or (session or {}).get("model_kind")
+            or "chat"
+        ),
     }
+    if info["model_kind"] == "code":
+        info["runtime_profile"] = getattr(agent, "runtime_profile", None) or "coding"
+        info["runtime_toolset"] = getattr(agent, "runtime_toolset", None) or "coding"
     try:
         from hermes_cli import __version__, __release_date__
 
@@ -4969,6 +5038,9 @@ def _make_agent(
     session_kind: str = "conversation",
     session_visibility: str = "visible",
     agent_callbacks: dict[str, Any] | None = None,
+    model_kind: str = "chat",
+    runtime_profile: str | None = None,
+    runtime_toolset: str | None = None,
 ):
     from run_agent import AIAgent
 
@@ -5083,7 +5155,10 @@ def _make_agent(
         if relay_provider:
             runtime["relay_provider"] = relay_provider
     else:
-        model, requested_provider = _resolve_startup_runtime()
+        if model_kind == "code":
+            model, requested_provider = _resolve_code_startup_runtime()
+        else:
+            model, requested_provider = _resolve_startup_runtime()
         if isinstance(model_override, str) and model_override:
             model = model_override
         if provider_override:
@@ -5094,6 +5169,9 @@ def _make_agent(
         })
     model = str(model or runtime.get("model") or "").strip()
     _pr = _load_provider_routing()
+    if model_kind == "code":
+        runtime_profile = "coding"
+        runtime_toolset = "coding"
     enabled_toolsets = (
         [
             *employee_policy["toolsets"],
@@ -5102,6 +5180,8 @@ def _make_agent(
         if employee_policy is not None
         else _load_enabled_toolsets()
     )
+    if model_kind == "code" and employee_policy is None:
+        enabled_toolsets = [runtime_toolset]
     agent = AIAgent(
         model=model,
         max_iterations=(
@@ -5167,6 +5247,9 @@ def _make_agent(
         collaboration_context=collaboration_context,
         session_kind=session_kind,
         session_visibility=session_visibility,
+        model_kind=model_kind,
+        runtime_profile=runtime_profile,
+        runtime_toolset=runtime_toolset,
         **(agent_callbacks if agent_callbacks is not None else _agent_cbs(sid)),
     )
     if employee_policy is not None:
@@ -5431,6 +5514,9 @@ def _init_session(
             # Honored on rebuild (/new, resume) so a switch in THIS session
             # never leaks into siblings via process-global env vars.
             "model_override": None,
+            "model_kind": str(getattr(agent, "model_kind", "chat") or "chat"),
+            "runtime_profile": getattr(agent, "runtime_profile", None),
+            "runtime_toolset": getattr(agent, "runtime_toolset", None),
             "employee_policy": employee_policy,
             "collaboration_context": collaboration_context,
             # Pin async event emissions to whichever transport created the
@@ -6379,12 +6465,21 @@ def _session_create(rid, params: dict) -> dict:
     resolved_cwd = _completion_cwd(params)
     _enable_gateway_prompts()
 
+    requested_kind = str(params.get("kind") or "chat").strip().lower() or "chat"
+    if requested_kind not in {"chat", "code"}:
+        return _err(rid, 4002, "kind must be chat or code")
+    if requested_kind == "code" and employee_policy is not None:
+        return _err(rid, 4002, "employee policy cannot create Code sessions")
     # The desktop composer owns its model/effort/fast as plain UI state and ships
     # it on every session.create. Honor each as a PER-SESSION override (built into
     # the agent below) — never a global config write, so picking a model/effort
     # for a new chat can't mutate the profile default. provider is optional
     # (resolved at build).
-    create_model = str(params.get("model") or "").strip()
+    create_model, create_provider = (
+        _resolve_code_startup_runtime(params)
+        if requested_kind == "code"
+        else (str(params.get("model") or "").strip(), str(params.get("provider") or "").strip())
+    )
     session_model_override = (
         {
             "model": employee_policy["model"]["model"],
@@ -6394,7 +6489,10 @@ def _session_create(rid, params: dict) -> dict:
         }
         if employee_policy is not None
         else (
-            {"model": create_model, "provider": str(params.get("provider") or "").strip() or None}
+            {
+                "model": create_model,
+                "provider": create_provider or None,
+            }
             if create_model
             else None
         )
@@ -6439,6 +6537,9 @@ def _session_create(rid, params: dict) -> dict:
             "inflight_turn": None,
             "last_active": now,
             "model_override": session_model_override,
+            "model_kind": requested_kind,
+            "runtime_profile": "coding" if requested_kind == "code" else None,
+            "runtime_toolset": "coding" if requested_kind == "code" else None,
             "employee_policy": employee_policy,
             "collaboration_context": collaboration_context,
             "create_reasoning_override": create_reasoning_override,
@@ -6499,6 +6600,12 @@ def _session_create(rid, params: dict) -> dict:
                 "lazy": True,
                 "desktop_contract": DESKTOP_BACKEND_CONTRACT,
                 "profile_name": _current_profile_name(),
+                "model_kind": requested_kind,
+                **(
+                    {"runtime_profile": "coding", "runtime_toolset": "coding"}
+                    if requested_kind == "code"
+                    else {}
+                ),
             },
         },
     )
@@ -6681,7 +6788,13 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"verification": {"status": "unknown", "evidence": None}})
 
 
-def _lazy_resume_info(cwd: str, *, model: str = "", provider: str = "") -> dict:
+def _lazy_resume_info(
+    cwd: str,
+    *,
+    model: str = "",
+    provider: str = "",
+    model_kind: str = "chat",
+) -> dict:
     """session.info for a not-yet-built session (the shape session.create
     returns). tools/skills land later when the deferred build emits session.info."""
     info = {
@@ -6693,7 +6806,11 @@ def _lazy_resume_info(cwd: str, *, model: str = "", provider: str = "") -> dict:
         "lazy": True,
         "desktop_contract": DESKTOP_BACKEND_CONTRACT,
         "profile_name": _current_profile_name(),
+        "model_kind": model_kind,
     }
+    if model_kind == "code":
+        info["runtime_profile"] = "coding"
+        info["runtime_toolset"] = "coding"
     if provider:
         info["provider"] = provider
     return info
@@ -6738,6 +6855,21 @@ def _deferred_session_record(
         "last_active": now,
         "lazy": lazy,
         "model_override": model_override,
+        "model_kind": (
+            resume_runtime_overrides.get("model_kind", "chat")
+            if isinstance(resume_runtime_overrides, dict)
+            else "chat"
+        ),
+        "runtime_profile": (
+            resume_runtime_overrides.get("runtime_profile")
+            if isinstance(resume_runtime_overrides, dict)
+            else None
+        ),
+        "runtime_toolset": (
+            resume_runtime_overrides.get("runtime_toolset")
+            if isinstance(resume_runtime_overrides, dict)
+            else None
+        ),
         "employee_policy": (
             resume_runtime_overrides.get("employee_policy")
             if isinstance(resume_runtime_overrides, dict)
@@ -7114,6 +7246,7 @@ def _session_resume(rid, params: dict) -> dict:
                 lease.release()
             return _err(rid, 5000, f"resume failed: {e}")
         cwd = _resume_fallback_cwd()
+        overrides = _stored_session_runtime_overrides(found) or {}
         record = _deferred_session_record(
             target,
             cols=cols,
@@ -7126,6 +7259,8 @@ def _session_resume(rid, params: dict) -> dict:
                 else str(params.get("source") or "tui").strip() or "tui"
             ),
             close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
+            model_override=overrides.get("model_override"),
+            resume_runtime_overrides=overrides or None,
             lazy=True,
         )
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
@@ -7141,7 +7276,14 @@ def _session_resume(rid, params: dict) -> dict:
                 "resumed": target,
                 "message_count": len(messages),
                 "messages": messages,
-                "info": _lazy_resume_info(cwd),
+                "info": _lazy_resume_info(
+                    cwd,
+                    model=overrides.get("model_override", {}).get("model", "")
+                    if isinstance(overrides.get("model_override"), dict)
+                    else "",
+                    provider=overrides.get("provider_override", ""),
+                    model_kind=overrides.get("model_kind", "chat"),
+                ),
                 "inflight": None,
                 "running": child_running,
                 "session_key": target,
@@ -7288,6 +7430,7 @@ def _session_resume(rid, params: dict) -> dict:
                     cwd,
                     model=model_override.get("model") or "",
                     provider=overrides.get("provider_override") or "",
+                    model_kind=overrides.get("model_kind", "chat"),
                 ),
                 "inflight": None,
                 "running": False,

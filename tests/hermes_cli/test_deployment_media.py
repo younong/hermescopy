@@ -35,6 +35,21 @@ def _image_route_payload(**overrides):
     return payload
 
 
+def _codex_image_route_payload(**overrides):
+    payload = _image_route_payload(
+        provider="custom:codex",
+        models=["gpt-image-2"],
+        default_model="gpt-image-2",
+        key_env="CODEX_IMAGE_KEY",
+        executor="plugins.image_gen.apiyi:generate_openai_image_bytes",
+        base_urls={"openai_base_url": "https://codex.example.com/v1"},
+        executor_params={"edit_protocol": "json_images"},
+        text_only_models=[],
+    )
+    payload.update(overrides)
+    return payload
+
+
 def _video_route_payload(**overrides):
     payload = {
         "kind": "video",
@@ -185,6 +200,27 @@ def test_route_declaration_validation():
         )
 
 
+def test_control_plane_policy_accepts_custom_codex_image_route(monkeypatch):
+    monkeypatch.setenv(ROUTES_ENV, json.dumps([_codex_image_route_payload()]))
+    monkeypatch.setenv(POLICY_ID_ENV, "policy-codex-image")
+    monkeypatch.setenv("CODEX_IMAGE_KEY", "secret-value")
+
+    policy = policy_from_control_plane_environment()
+
+    assert policy is not None
+    route = policy.route_for("image", "custom:codex", "gpt-image-2")
+    assert route is not None
+    assert route.executor == (
+        "plugins.image_gen.apiyi:generate_openai_image_bytes"
+    )
+    descriptor = policy.descriptor()
+    payload = json.dumps(descriptor.payload())
+    assert "custom:codex" in payload
+    assert "gpt-image-2" in payload
+    assert "CODEX_IMAGE_KEY" not in payload
+    assert "generate_openai_image_bytes" not in payload
+
+
 def test_control_plane_policy_auto_activates_apiyi_route(monkeypatch):
     monkeypatch.delenv(ROUTES_ENV, raising=False)
     monkeypatch.delenv(POLICY_ID_ENV, raising=False)
@@ -324,6 +360,35 @@ def test_policy_execute_image_normalizes_bounded_response(monkeypatch):
     assert captured["openai_base_url"] == "https://api.example.com/v1"
     assert captured["quality"] == "high"
     assert captured["params"] == {}
+
+
+def test_policy_execute_custom_codex_image_uses_shared_executor(monkeypatch):
+    route = DeploymentMediaRoute(
+        descriptor=DeploymentMediaRouteDescriptor(
+            kind="image", provider="custom:codex",
+            models=("gpt-image-2",), default_model="gpt-image-2",
+        ),
+        key_env="CODEX_IMAGE_KEY",
+        executor="plugins.image_gen.apiyi:generate_openai_image_bytes",
+        base_urls={"openai_base_url": "https://codex.example.com/v1"},
+    )
+    policy = DeploymentMediaPolicy(routes=(route,), policy_id="p")
+    monkeypatch.setenv("CODEX_IMAGE_KEY", "secret")
+    captured = {}
+
+    def fake_executor(**kwargs):
+        captured.update(kwargs)
+        return {"image_bytes": b"png", "mime_type": "image/png"}
+
+    monkeypatch.setattr(DeploymentMediaRoute, "load_executor", lambda self: fake_executor)
+    result = policy.execute(
+        "image_generate", provider="custom:codex", model="gpt-image-2", prompt="draw"
+    )
+
+    assert result["image_bytes"] == b"png"
+    assert captured["model"] == "gpt-image-2"
+    assert captured["openai_base_url"] == "https://codex.example.com/v1"
+    assert captured["api_key"] == "secret"
 
 
 def test_policy_execute_video_accepts_url_or_bytes(monkeypatch):

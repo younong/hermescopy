@@ -648,6 +648,27 @@ def coding_system_blocks(
     ).system_blocks()
 
 
+def explicit_coding_system_blocks(
+    *,
+    platform: Optional[str] = None,
+    cwd: Optional[str | Path] = None,
+    config: Optional[dict[str, Any]] = None,
+    model: Optional[str] = None,
+) -> list[str]:
+    """Return coding posture blocks for an explicitly Code-kind session.
+
+    Code sessions must not depend on workspace auto-detection to acquire their
+    coding instructions: the model-plane kind already selected that posture.
+    """
+    return RuntimeMode(
+        profile=CODING_PROFILE,
+        surface=platform or "",
+        cwd=_resolve_cwd(cwd),
+        model=model,
+        instructions=_coding_instructions(config),
+    ).system_blocks()
+
+
 def coding_compact_skill_categories(
     *,
     platform: Optional[str] = None,

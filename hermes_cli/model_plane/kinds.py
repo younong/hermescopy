@@ -4,6 +4,7 @@ Every kind in :data:`KINDS` flows through the same catalog → registration →
 activation pipeline. The only per-kind differences live here:
 
 - chat activates through the ``model.default`` selection (owned by providers);
+- code activates into the dedicated ``code_agent`` selection section;
 - media kinds activate into their ``{kind}_gen`` selection section;
 - ``use_gateway`` semantics exist only for generation media (image/video);
 - voice models carry a sub-capability (``tts`` or ``asr``).
@@ -15,19 +16,22 @@ never a parallel registry or catalog.
 from __future__ import annotations
 
 CHAT = "chat"
+CODE = "code"
 IMAGE = "image"
 VIDEO = "video"
 VOICE = "voice"
 VECTOR = "vector"
 
-KINDS = (CHAT, IMAGE, VIDEO, VOICE, VECTOR)
+KINDS = (CHAT, CODE, IMAGE, VIDEO, VOICE, VECTOR)
 
-# Media kinds are owned by capability plugins; chat is owned by providers.
+# Capability kinds are owned by capability plugins; Chat remains owned by
+# ordinary provider profiles. Code is capability-owned but is not media.
+CAPABILITY_KINDS = (CODE, IMAGE, VIDEO, VOICE, VECTOR)
 MEDIA_KINDS = (IMAGE, VIDEO, VOICE, VECTOR)
 
-# Every media kind can be activated into its selection section. Chat stays
-# special: its activation target is the model.default selection.
-ACTIVATABLE_KINDS = MEDIA_KINDS
+# Every capability kind has an independent active selection. Media-only
+# routing still uses MEDIA_KINDS below; Code never enters that path.
+ACTIVATABLE_KINDS = CAPABILITY_KINDS
 
 # ``use_gateway`` (route generation through the gateway proxy instead of a
 # direct provider call) is meaningful only for generation media.
@@ -77,7 +81,9 @@ FALLBACK_CAPABILITY_PROVIDERS = {"image": "fal"}
 
 
 def selection_section(kind: str) -> str:
-    """Config section holding the active selection for a media kind."""
-    if kind not in MEDIA_KINDS:
-        raise ValueError(f"kind must be one of {MEDIA_KINDS}, got {kind!r}")
+    """Return the config section holding the active selection for *kind*."""
+    if kind == CODE:
+        return "code_agent"
+    if kind not in CAPABILITY_KINDS:
+        raise ValueError(f"kind must be one of {CAPABILITY_KINDS}, got {kind!r}")
     return f"{kind}_gen"

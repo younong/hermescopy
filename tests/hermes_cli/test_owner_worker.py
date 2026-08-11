@@ -3999,8 +3999,18 @@ def test_worker_admin_registration_is_visible_and_immutable(tmp_path, monkeypatc
     monkeypatch.setenv("HERMES_CONTROL_HOME", str(control_home))
     from hermes_cli import model_registrations
     from hermes_cli.deployment_inference import DeploymentInferenceRouteDescriptor
+    from hermes_cli.model_plane import capability as capability_module
     from hermes_cli.owner_worker.entrypoint import create_app
+    from providers.base import ProviderProfile
 
+    capability_module.register_code_provider(
+        ProviderProfile(
+            name="kimi-coding",
+            fallback_models=("kimi-k2.5",),
+            code_models=("kimi-k2.5",),
+            chat_enabled=True,
+        )
+    )
     ensure_owner_runtime_dirs(owner_home)
     monkeypatch.setattr(
         "hermes_cli.deployment_inference.route_descriptors_from_control_plane",
@@ -4031,10 +4041,10 @@ def test_worker_admin_registration_is_visible_and_immutable(tmp_path, monkeypatc
     admin = listed.json()["registrations"][0]
     assert admin == {
         "id": model_registrations._admin_registration_id(
-            "chat", "kimi-coding", "kimi-k2.5"
+            "code", "kimi-coding", "kimi-k2.5"
         ),
         "name": "Kimi Code",
-        "kind": "chat",
+        "kind": "code",
         "provider": "kimi-coding",
         "model": "kimi-k2.5",
         "source": "catalog",

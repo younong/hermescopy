@@ -2,6 +2,34 @@ import importlib
 import json
 
 
+def test_deployment_route_exposes_custom_codex_without_user_key(monkeypatch):
+    monkeypatch.setenv("HERMES_OWNER_KEY", "owner")
+    monkeypatch.setenv("HERMES_DEPLOYMENT_MEDIA_POLICY_ID", "policy")
+    monkeypatch.setenv(
+        "HERMES_DEPLOYMENT_MEDIA_ROUTES",
+        json.dumps([{
+            "kind": "image",
+            "provider": "custom:codex",
+            "models": ["gpt-image-2"],
+            "default_model": "gpt-image-2",
+            "text_only_models": [],
+            "max_reference_images": 16,
+            "max_reference_bytes": 16 << 20,
+            "max_total_reference_bytes": 48 << 20,
+            "max_output_bytes": 32 << 20,
+        }]),
+    )
+    monkeypatch.delenv("CODEX_IMAGE_KEY", raising=False)
+    module = importlib.import_module("tools.image_generation_tool")
+
+    assert module.check_image_generation_requirements() is True
+    info = module._active_image_capabilities()
+    assert info["provider"] == "custom:codex"
+    assert info["model"] == "gpt-image-2"
+    assert info["modalities"] == ["text", "image"]
+    assert "CODEX_IMAGE_KEY" not in repr(info)
+
+
 def test_deployment_route_exposes_apiyi_without_user_key(monkeypatch):
     """A declared deployment media route alone satisfies the tool check.
 
