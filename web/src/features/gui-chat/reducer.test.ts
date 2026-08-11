@@ -1446,6 +1446,43 @@ describe("guiChatReducer history image restoration", () => {
     );
   });
 
+  it("renders a prefetched MEDIA image attachment as one image instead of a file plus image", () => {
+    const absolutePath = "/opt/hermes/shared/.hermes/users/owner/workspaces/default/generated/images/custom:codex_dog.png";
+    const relativePath = "generated/images/custom:codex_dog.png";
+    const selected = guiChatReducer(initialGuiChatState, {
+      type: "session.selected",
+      generation: 1,
+      sessionId: "sid",
+    });
+    const state = guiChatReducer(selected, {
+      type: "history.initial.succeeded",
+      generation: 1,
+      requestedSessionId: "sid",
+      response: {
+        history_page: { cursor: null, has_more: false, returned_count: 1 },
+        messages: [{
+          attachments: [{
+            kind: "file",
+            mime_type: "image/png",
+            name: "custom:codex_dog.png",
+            path: relativePath,
+            size_bytes: 1_921_464,
+          }],
+          role: "assistant",
+          text: `已生成小狗图片：\n\nMEDIA:${absolutePath}`,
+        }],
+        session_id: "sid",
+      },
+    });
+
+    expect(state.messages[0].text).toBe("已生成小狗图片：");
+    expect(state.messages[0].attachments).toBeUndefined();
+    expect(state.messages[0].artifactIds).toHaveLength(1);
+    expect(imageArtifact(state, state.messages[0].artifactIds[0]).url).toBe(
+      `/api/fs/read-data-url?path=${encodeURIComponent(absolutePath)}`,
+    );
+  });
+
   it("recognizes local paths with spaces", () => {
     const state = restoreWithMessage("/Users/me/Desktop/my cat.webp");
 

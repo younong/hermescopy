@@ -425,12 +425,21 @@ function transcriptToMessageWithArtifacts(
   }
 
   const id = message.id || `history-${index}`;
-  const attachments = transcriptAttachments(message.attachments, id, cwd);
-  const claimedSources = new Set(
-    (message.attachments ?? []).flatMap(attachmentSourcePaths).map(normalizeAttachmentSource),
+  const imageRefs = extractImageReferencesFromTranscriptMessage(message);
+  const transcriptValues = (message.attachments ?? []).filter(
+    (attachment) =>
+      !(
+        typeof attachment.mime_type === "string" &&
+        attachment.mime_type.startsWith("image/") &&
+        attachmentSourcePaths(attachment).some((path) =>
+          imageRefs.some((ref) => attachmentSourcesMatch(path, ref.url, cwd))
+        )
+      ),
   );
-  const refs = extractImageReferencesFromTranscriptMessage(message).filter(
-    (ref) => !claimedSources.has(normalizeAttachmentSource(ref.url)),
+  const attachments = transcriptAttachments(transcriptValues, id, cwd);
+  const claimedSources = transcriptValues.flatMap(attachmentSourcePaths);
+  const refs = imageRefs.filter(
+    (ref) => !claimedSources.some((source) => attachmentSourcesMatch(source, ref.url, cwd)),
   );
   // Verified assistant file deliverables are persisted as attachments. Preserve
   // historical text parsing only for rows that predate that backend contract.
@@ -441,8 +450,8 @@ function transcriptToMessageWithArtifacts(
     : extractGeneratedFileReferences(textFromTranscriptMessage(message))
   ).filter(
     (ref) =>
-      !claimedSources.has(normalizeAttachmentSource(ref.path)) &&
-      !refs.some((image) => normalizeAttachmentSource(image.url) === normalizeAttachmentSource(ref.path)),
+      !claimedSources.some((source) => attachmentSourcesMatch(source, ref.path, cwd)) &&
+      !refs.some((image) => attachmentSourcesMatch(image.url, ref.path, cwd)),
   );
   const text = clampRenderedText(
     stripAttachmentPromptHints(
@@ -541,8 +550,29 @@ function attachmentSourcePaths(value: GatewayTranscriptAttachment): string[] {
   return paths;
 }
 
-function normalizeAttachmentSource(value: string): string {
-  return value.replace(/^file:\/\//i, "");
+function normalizeAttachmentSource(value: string, cwd?: string): string {
+  const source = value.replace(/^file:\/\//i, "");
+  if (
+    !cwd ||
+    !looksLikeFilesystemPath(source) ||
+    !isRelativeFilesystemPath(source) ||
+    /^[a-z][a-z0-9+.-]*:/i.test(source)
+  ) {
+    return source;
+  }
+  return `${cwd.replace(/[\\/]+$/, "")}/${source.replace(/^\.\//, "")}`;
+}
+
+function attachmentSourcesMatch(left: string, right: string, cwd?: string): boolean {
+  const normalizedLeft = normalizeAttachmentSource(left, cwd);
+  const normalizedRight = normalizeAttachmentSource(right, cwd);
+  if (normalizedLeft === normalizedRight) return true;
+  const leftIsRelative = isRelativeFilesystemPath(left);
+  const rightIsRelative = isRelativeFilesystemPath(right);
+  if (leftIsRelative === rightIsRelative) return false;
+  const relative = normalizeAttachmentSource(leftIsRelative ? left : right);
+  const absolute = leftIsRelative ? normalizedRight : normalizedLeft;
+  return absolute.endsWith(`/${relative.replace(/^\.\//, "")}`);
 }
 
 function stripAttachmentPromptHints(
@@ -550,7 +580,9 @@ function stripAttachmentPromptHints(
   values: GatewayTranscriptAttachment[] | undefined,
 ): string {
   if (!text || !Array.isArray(values) || values.length === 0) return text;
-  const sourcePaths = new Set(values.flatMap(attachmentSourcePaths).map(normalizeAttachmentSource));
+  const sourcePaths = new Set(
+    values.flatMap(attachmentSourcePaths).map((source) => normalizeAttachmentSource(source)),
+  );
   const refTexts = new Set(
     values
       .map((value) => value.ref_text)
