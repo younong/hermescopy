@@ -3,6 +3,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => {
   const gatewayInstances: FakeGatewayClient[] = [];
   const state = { attachMissing: false };
+  const compressImageForUpload = vi.fn(async (file: File) => file);
+  const readFileAsDataUrl = vi.fn(async () => "data:image/jpeg;base64,Y29tcHJlc3NlZA==");
 
   class FakeJsonRpcGatewayError extends Error {
     readonly code?: number;
@@ -42,8 +44,21 @@ const mocks = vi.hoisted(() => {
     }
   }
 
-  return { FakeGatewayClient, FakeJsonRpcGatewayError, gatewayInstances, state };
+  return {
+    compressImageForUpload,
+    FakeGatewayClient,
+    FakeJsonRpcGatewayError,
+    gatewayInstances,
+    readFileAsDataUrl,
+    state,
+  };
 });
+
+vi.mock("./attachments", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./attachments")>()),
+  compressImageForUpload: mocks.compressImageForUpload,
+  readFileAsDataUrl: mocks.readFileAsDataUrl,
+}));
 
 vi.mock("@/lib/gatewayClient", () => ({
   GatewayClient: mocks.FakeGatewayClient,
@@ -59,9 +74,28 @@ import { connectGuiChat } from "./api";
 beforeEach(() => {
   mocks.gatewayInstances.length = 0;
   mocks.state.attachMissing = false;
+  mocks.compressImageForUpload.mockClear();
+  mocks.readFileAsDataUrl.mockClear();
 });
 
 describe("connectGuiChat", () => {
+  it("compresses an oversized image before sending it to the gateway", async () => {
+    const connection = connectGuiChat({ ownerKey: "owner-a" });
+    const original = new File(["original"], "photo.png", { type: "image/png" });
+    const compressed = new File(["compressed"], "photo.jpg", { type: "image/jpeg" });
+    mocks.compressImageForUpload.mockResolvedValueOnce(compressed);
+
+    await connection.attachImage("runtime-a", original);
+
+    expect(mocks.compressImageForUpload).toHaveBeenCalledWith(original);
+    expect(mocks.readFileAsDataUrl).toHaveBeenCalledWith(compressed);
+    expect(mocks.gatewayInstances[0].request).toHaveBeenCalledWith("image.attach_bytes", {
+      content_base64: "Y29tcHJlc3NlZA==",
+      filename: "photo.jpg",
+      session_id: "runtime-a",
+    });
+  });
+
   it("attaches owner-scoped routes without creating a chat session", async () => {
     const connection = connectGuiChat({ ownerKey: "owner-a" });
 

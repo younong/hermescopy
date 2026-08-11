@@ -8,6 +8,11 @@ const BUILD_OUT_DIR = process.env.HERMES_WEB_OUT_DIR ?? "../hermes_cli/web_dist"
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  experimental: {
+    // Runtime-loaded assets such as codec WASM must resolve next to their JS
+    // chunk so reverse-proxy prefixes do not need to be known at build time.
+    renderBuiltUrl: (_filename, { hostType }) => (hostType === "js" ? { relative: true } : undefined),
+  },
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
