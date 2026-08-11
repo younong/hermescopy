@@ -138,21 +138,32 @@ For every task that changes repository files:
 2. Keep all implementation and validation inside that task's worktree.
 3. Run the focused validation required by the **Validation** section below.
    Here, "required validation" means those prescribed local checks for the
-   current change. If a prescribed local check fails, do not publish changes;
-   report the blocker instead. Releases do not wait for GitHub CI or other
-   remote checks; only the prescribed local validation and checks performed by
-   the release procedure itself gate a release.
+   current change. If a check exposes a product failure, do not publish changes;
+   report the blocker instead. If a check is blocked only by a local environment
+   or tooling problem, immediately use the browser fallback described below
+   instead of repeatedly repairing the environment. Releases do not wait for
+   GitHub CI or other remote checks; only the prescribed local validation (or its
+   permitted browser fallback) and checks performed by the release procedure
+   itself gate a release.
 4. Once the task is coherent and validation succeeds, review the final diff and
-   repository status, commit all task changes with the required Claude co-author
-   trailer, push the branch to `origin`, and create a GitHub pull request
-   targeting `main` with a concise summary and test results. If the task already
-   has a PR, push follow-up commits to its branch and update PR metadata only
-   when its summary or reported validation materially changes.
+   repository status, then leave exactly one task commit on top of the branch's
+   merge base with `origin/main`. The commit must include the required Claude
+   co-author trailer. Push the branch to `origin` and create a GitHub pull
+   request targeting `main` with a concise summary and test results. Before each
+   push, verify that the PR branch contains exactly one task commit. If the task
+   already has a PR, amend that commit rather than adding follow-up commits,
+   update it with `--force-with-lease`, and update PR metadata only when its
+   summary or reported validation materially changes. If a task branch already
+   accumulated multiple commits, squash them into that single task commit before
+   the next push.
 5. The repository owner has durably authorized commit, push, and PR creation as
-   the default completion steps for development tasks in this repository. Do
-   not ask for those instructions again. Still request confirmation for force
-   pushes, destructive operations, merging, deployment, release, or publishing
-   anywhere other than the task branch and its PR.
+   the default completion steps for development tasks in this repository. They
+   have also authorized lease-protected rewrites of the current task's own PR
+   branch solely to preserve the single-commit invariant; verify the observed
+   remote tip and use `--force-with-lease`, never an unconditional force push.
+   Do not ask for those instructions again. Still request confirmation for any
+   other force push, destructive operation, merge, deployment, release, or
+   publishing anywhere other than the task branch and its PR.
 6. Documentation-only changes to Claude workflow/configuration follow the same
    lifecycle. Pure research, review, explanation, and read-only verification do
    not require a worktree or PR.
@@ -212,6 +223,19 @@ real-path integration guidance in `AGENTS.md` for configuration propagation,
 security boundaries, session state, file/network I/O, and gateway transport. For
 frontend changes, run the applicable workspace typecheck and build described in
 `AGENTS.md`.
+
+### Browser fallback for environment failures
+
+When a prescribed validation command cannot run because of a local environment
+or tooling problem—such as unavailable dependencies, incompatible host tooling,
+or a broken local test service—do not repeatedly troubleshoot or treat that as a
+product failure. Start the affected application through an available working
+path and immediately validate the same user-visible behavior in a real browser.
+Exercise the changed flow and its closest regression path, record the browser
+steps and result in the PR, and clearly identify which automated command was
+replaced and why. Browser validation is a fallback for environment-only
+blockers; it does not replace a reproducible failing test, type error, build
+error, or other product defect.
 
 ### Dashboard browser authentication
 
