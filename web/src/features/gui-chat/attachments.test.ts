@@ -1,12 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const compressionMocks = vi.hoisted(() => ({
-  fromBlob: vi.fn(),
+  imageCompression: vi.fn(),
   optimisePng: vi.fn(),
 }));
 
 vi.mock("@jsquash/oxipng", () => ({ optimise: compressionMocks.optimisePng }));
-vi.mock("image-resize-compress", () => ({ fromBlob: compressionMocks.fromBlob }));
+vi.mock("browser-image-compression", () => ({ default: compressionMocks.imageCompression }));
 
 import {
   attachmentKindFromFile,
@@ -25,7 +25,7 @@ function file(name: string, type: string, size = 1): File {
 }
 
 beforeEach(() => {
-  compressionMocks.fromBlob.mockReset();
+  compressionMocks.imageCompression.mockReset();
   compressionMocks.optimisePng.mockReset();
 });
 
@@ -53,7 +53,7 @@ describe("gui chat attachment helpers", () => {
 
     await expect(compressImageForUpload(original)).resolves.toBe(original);
     expect(compressionMocks.optimisePng).not.toHaveBeenCalled();
-    expect(compressionMocks.fromBlob).not.toHaveBeenCalled();
+    expect(compressionMocks.imageCompression).not.toHaveBeenCalled();
   });
 
   it("uses lossless PNG optimisation when it reaches the upload target", async () => {
@@ -71,7 +71,7 @@ describe("gui chat attachment helpers", () => {
     expect(compressed.name).toBe("diagram.png");
     expect(compressed.type).toBe("image/png");
     expect(compressed.size).toBe(IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES);
-    expect(compressionMocks.fromBlob).not.toHaveBeenCalled();
+    expect(compressionMocks.imageCompression).not.toHaveBeenCalled();
   });
 
   it("uses third-party lossy compression when lossless optimisation misses the target", async () => {
@@ -79,37 +79,36 @@ describe("gui chat attachment helpers", () => {
     compressionMocks.optimisePng.mockResolvedValue(
       new Uint8Array(IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES + 1).buffer,
     );
-    compressionMocks.fromBlob.mockResolvedValue(
-      new Blob([new Uint8Array(IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES)], { type: "image/jpeg" }),
+    compressionMocks.imageCompression.mockResolvedValue(
+      new File([new Uint8Array(IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES)], "diagram.jpg", {
+        type: "image/jpeg",
+      }),
     );
 
     const compressed = await compressImageForUpload(original);
 
-    expect(compressionMocks.fromBlob).toHaveBeenCalledWith(original, {
-      backgroundColor: "#fff",
-      format: "jpeg",
+    expect(compressionMocks.imageCompression).toHaveBeenCalledWith(original, {
+      fileType: "image/jpeg",
+      maxIteration: 20,
+      maxSizeMB: 2,
       maxWidthOrHeight: 4096,
-      targetSize: IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES,
-      worker: true,
+      useWebWorker: true,
     });
     expect(compressed.name).toBe("diagram.jpg");
     expect(compressed.type).toBe("image/jpeg");
     expect(compressed.size).toBe(IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES);
   });
 
-  it("rejects when the third-party compressor cannot reach the target", async () => {
+  it("uses the lossy result without rejecting the upload", async () => {
     const original = file("photo.jpg", "image/jpeg", IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES + 1);
-    compressionMocks.fromBlob.mockResolvedValue(
-      new Blob([new Uint8Array(IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES + 1)], {
-        type: "image/jpeg",
-      }),
-    );
+    const lossy = new File([new Uint8Array(IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES)], "photo.jpg", {
+      type: "image/jpeg",
+    });
+    compressionMocks.imageCompression.mockResolvedValue(lossy);
 
-    await expect(compressImageForUpload(original)).rejects.toThrow(
-      "Could not compress photo.jpg below 2MB",
-    );
+    await expect(compressImageForUpload(original)).resolves.toBe(lossy);
     expect(compressionMocks.optimisePng).not.toHaveBeenCalled();
-    expect(compressionMocks.fromBlob).toHaveBeenCalledOnce();
+    expect(compressionMocks.imageCompression).toHaveBeenCalledOnce();
   });
 
   it("validates supported file sizes", () => {

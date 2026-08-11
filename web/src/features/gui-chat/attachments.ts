@@ -1,5 +1,5 @@
 import { optimise as optimisePng } from "@jsquash/oxipng";
-import { fromBlob } from "image-resize-compress";
+import imageCompression from "browser-image-compression";
 
 import type { GuiComposerAttachmentKind } from "./types";
 
@@ -40,19 +40,13 @@ export async function compressImageForUpload(file: File): Promise<File> {
     return losslessFile;
   }
 
-  const blob = await fromBlob(file, {
-    backgroundColor: "#fff",
-    format: "jpeg",
+  return imageCompression(file, {
+    fileType: "image/jpeg",
+    maxIteration: 20,
+    maxSizeMB: IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES / (1024 * 1024),
     maxWidthOrHeight: IMAGE_COMPRESSION_MAX_DIMENSION,
-    targetSize: IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES,
-    worker: true,
+    useWebWorker: true,
   });
-  if (blob.size > IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES) {
-    throw new Error(
-      `Could not compress ${file.name} below ${formatBytes(IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES)}`,
-    );
-  }
-  return fileFromBlob(blob, file, ".jpg");
 }
 
 async function optimiseImageLosslessly(file: File): Promise<File | null> {
