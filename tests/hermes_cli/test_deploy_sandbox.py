@@ -19,10 +19,12 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
 
     assert 'runtimes_dir="$remote_root/runtimes/python"' in source
     assert 'runtime_id="py311-${"${"}architecture}-${"${"}runtime_inputs_hash}-sandbox10"' in source
+    assert 'pyproject_hash="$(sha256sum "$release/pyproject.toml"' in source
     assert 'powerpoint_lock_hash="$(sha256sum "$release/deploy/powerpoint-runtime/package-lock.json"' in source
     assert 'powerpoint_package_hash=' in source
     assert 'node_identity=' in source
     assert 'runtime_dependency_profile="all,anthropic,ddgs,voice"' in source
+    assert '"$pyproject_hash"' in source
     assert '"$runtime_dependency_profile"' in source
     powerpoint_packages = {
         package["name"]
