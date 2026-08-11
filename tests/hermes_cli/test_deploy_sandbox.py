@@ -173,6 +173,9 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert '--service hermes-dashboard.service' in powerpoint_launch
     assert '--user "$service_user"' in powerpoint_launch
     assert 'runuser -u "$service_user"' not in powerpoint_launch
+    assert 'if powerpoint_smoke_result="$(' in powerpoint_launch
+    assert 'printf \'%s\\n\' "$powerpoint_smoke_result"' in powerpoint_launch
+    assert 'printf \'%s\\n\' "$powerpoint_smoke_result" >&2' in powerpoint_launch
     preflight_source = (ROOT / "deploy" / "check-executor-cgroup-host.py").read_text(encoding="utf-8")
     assert "service_processes == 0" in preflight_source
     assert "managed_processes == 0" in preflight_source

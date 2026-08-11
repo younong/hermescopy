@@ -1495,20 +1495,25 @@ if "$venv/bin/python" "$release/deploy/check-executor-cgroup-host.py" \
     --timeout 10
   echo "HERMES_DEPLOY_STAGE executor_resource_smoke=passed"
   powerpoint_smoke_owner="$owner_root/.deploy-powerpoint-smoke.$$"
-  if ! env -i \
-    HOME="$shared" \
-    PATH="$venv/bin:/usr/bin:/bin" \
-    PYTHONPATH="$release" \
-    PYTHONNOUSERSITE=1 \
-    "$venv/bin/python" "$release/deploy/run-cgroup-smoke.py" \
-    --managed-root "$cgroup_root" \
-    --service hermes-dashboard.service \
-    --user "$service_user" \
-    -- \
-    "$venv/bin/python" "$release/deploy/smoke-powerpoint-runtime.py" \
-    --owner-home "$powerpoint_smoke_owner" \
-    --policy "$sandbox_policy" \
-    --timeout 45; then
+  if powerpoint_smoke_result="$(
+    env -i \
+      HOME="$shared" \
+      PATH="$venv/bin:/usr/bin:/bin" \
+      PYTHONPATH="$release" \
+      PYTHONNOUSERSITE=1 \
+      "$venv/bin/python" "$release/deploy/run-cgroup-smoke.py" \
+      --managed-root "$cgroup_root" \
+      --service hermes-dashboard.service \
+      --user "$service_user" \
+      -- \
+      "$venv/bin/python" "$release/deploy/smoke-powerpoint-runtime.py" \
+      --owner-home "$powerpoint_smoke_owner" \
+      --policy "$sandbox_policy" \
+      --timeout 45
+  )"; then
+    printf '%s\n' "$powerpoint_smoke_result"
+  else
+    printf '%s\n' "$powerpoint_smoke_result" >&2
     echo "PowerPoint runtime smoke failed" >&2
     rm -rf -- "$powerpoint_smoke_owner"
     exit 1

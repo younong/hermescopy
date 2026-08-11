@@ -2624,6 +2624,28 @@ class TestConcurrentToolExecution:
                 mock_seq.assert_called_once()
                 mock_con.assert_not_called()
 
+    def test_image_batch_uses_concurrent_path(self, agent):
+        """Independent image generations should not wait for earlier images."""
+        tc1 = _mock_tool_call(
+            name="image_generate",
+            arguments='{"prompt":"first"}',
+            call_id="image-1",
+        )
+        tc2 = _mock_tool_call(
+            name="image_generate",
+            arguments='{"prompt":"second"}',
+            call_id="image-2",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+
+        with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
+            with patch.object(agent, "_execute_tool_calls_concurrent") as mock_con:
+                agent._execute_tool_calls(mock_msg, messages, "task-1")
+
+        mock_con.assert_called_once()
+        mock_seq.assert_not_called()
+
     def test_write_batch_forces_sequential(self, agent):
         """File mutations should stay ordered within a turn."""
         tc1 = _mock_tool_call(name="read_file", arguments='{"path":"x.py"}', call_id="c1")
@@ -3005,6 +3027,58 @@ class TestConcurrentToolExecution:
         assert len(completes) == 2
         assert {entry[0] for entry in completes} == {"c1", "c2"}
         assert {entry[3] for entry in completes} == {'{"id":1}', '{"id":2}'}
+
+    def test_concurrent_completion_callback_does_not_wait_for_batch(self, agent):
+        import threading
+
+        slow_release = threading.Event()
+        fast_completed = threading.Event()
+        tc1 = _mock_tool_call(
+            name="image_generate",
+            arguments='{"prompt":"slow"}',
+            call_id="image-slow",
+        )
+        tc2 = _mock_tool_call(
+            name="image_generate",
+            arguments='{"prompt":"fast"}',
+            call_id="image-fast",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+        completes = []
+
+        def fake_handle(name, args, task_id, **kwargs):
+            if args["prompt"] == "slow":
+                slow_release.wait(5)
+            return json.dumps({"success": True, "image": f"{args['prompt']}.png"})
+
+        def on_complete(tool_call_id, function_name, function_args, function_result):
+            completes.append(tool_call_id)
+            if tool_call_id == "image-fast":
+                fast_completed.set()
+
+        agent.tool_complete_callback = on_complete
+        execution = threading.Thread(
+            target=agent._execute_tool_calls_concurrent,
+            args=(mock_msg, messages, "task-1"),
+            daemon=True,
+        )
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            execution.start()
+            try:
+                assert fast_completed.wait(1), "fast image callback waited for slow image"
+                assert execution.is_alive()
+                assert completes == ["image-fast"]
+            finally:
+                slow_release.set()
+                execution.join(2)
+
+        assert not execution.is_alive()
+        assert completes == ["image-fast", "image-slow"]
+        assert [message["tool_call_id"] for message in messages] == [
+            "image-slow",
+            "image-fast",
+        ]
 
     def test_concurrent_browser_type_callbacks_redact_api_key(self, agent):
         secret = "sk-proj-ABCD1234567890EFGH"
