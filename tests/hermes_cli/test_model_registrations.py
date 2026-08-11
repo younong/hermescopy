@@ -257,6 +257,38 @@ def test_admin_registrations_control_plane_derives_media_from_policy(monkeypatch
     assert ("vector", "volcengine-agent-plan", "doubao-embedding-vision") in media
 
 
+def test_admin_registrations_expose_custom_codex_image_route(monkeypatch):
+    monkeypatch.setenv(
+        ROUTES_ENV,
+        json.dumps([{
+            "kind": "image",
+            "provider": "custom:codex",
+            "models": ["gpt-image-2"],
+            "default_model": "gpt-image-2",
+            "key_env": "CODEX_IMAGE_KEY",
+            "executor": "plugins.image_gen.apiyi:generate_openai_image_bytes",
+            "base_urls": {"openai_base_url": "https://codex.example.com/v1"},
+            "executor_params": {"edit_protocol": "json_images"},
+        }]),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.deployment_inference.route_descriptors_from_control_plane",
+        lambda: (),
+    )
+    monkeypatch.delenv("APIYI_API_KEY", raising=False)
+
+    registrations = model_registrations._admin_registrations()
+    matches = [
+        item for item in registrations.values()
+        if item.get("kind") == "image"
+        and item.get("provider") == "custom:codex"
+    ]
+
+    assert [(item["model"], item["use_gateway"]) for item in matches] == [
+        ("gpt-image-2", False)
+    ]
+
+
 def test_payload_merges_admin_descriptors_with_legacy_user_registrations(monkeypatch):
     _deployment_registrations(monkeypatch)
     config = load_config()

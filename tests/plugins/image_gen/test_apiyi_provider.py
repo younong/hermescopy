@@ -356,6 +356,66 @@ class TestGenerate:
         assert "bad model" in result["error"]
 
 
+def test_shared_openai_executor_forwards_exact_deployment_model(monkeypatch):
+    from plugins.image_gen import apiyi
+
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"data": [{"b64_json": "cG5n", "revised_prompt": "done"}]}
+
+    def fake_post(url, **kwargs):
+        captured.update({"url": url, "kwargs": kwargs})
+        return Response()
+
+    monkeypatch.setattr("requests.post", fake_post)
+    result = apiyi.generate_openai_image_bytes(
+        prompt="draw", aspect_ratio="square", model="gpt-image-2",
+        references=[], api_key="trusted",
+        openai_base_url="https://codex.example/v1",
+        params={"resolution": "1K"},
+    )
+
+    assert result["image_bytes"] == b"png"
+    assert result["mime_type"] == "image/png"
+    assert result["metadata"]["upstream_model"] == "gpt-image-2"
+    assert captured["url"] == "https://codex.example/v1/images/generations"
+    assert captured["kwargs"]["json"]["model"] == "gpt-image-2"
+
+
+def test_shared_openai_executor_supports_json_image_edits(monkeypatch):
+    from plugins.image_gen import apiyi
+
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"data": [{"b64_json": "cG5n"}]}
+
+    def fake_post(url, **kwargs):
+        captured.update({"url": url, "kwargs": kwargs})
+        return Response()
+
+    monkeypatch.setattr("requests.post", fake_post)
+    result = apiyi.generate_openai_image_bytes(
+        prompt="edit", aspect_ratio="square", model="gpt-image-2",
+        references=[{"name": "a.png", "mime_type": "image/png", "data": b"png"}],
+        api_key="trusted", openai_base_url="https://codex.example/v1",
+        edit_protocol="json_images",
+    )
+
+    assert result["image_bytes"] == b"png"
+    assert captured["kwargs"]["json"]["model"] == "gpt-image-2"
+    assert captured["kwargs"]["json"]["images"][0]["image_url"].startswith(
+        "data:image/png;base64,"
+    )
+
+
 @pytest.mark.parametrize(
     ("model", "aspect_ratio", "resolution", "size", "quality"),
     [

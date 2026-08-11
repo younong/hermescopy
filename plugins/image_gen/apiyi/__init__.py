@@ -306,6 +306,106 @@ def _decode_apiyi_image_payload(payload: Dict[str, Any]) -> Tuple[bytes, str]:
     raise ValueError("APIYI response contained no image data")
 
 
+def generate_openai_image_bytes(
+    *,
+    prompt: str,
+    aspect_ratio: str,
+    model: str,
+    references: List[Dict[str, Any]],
+    api_key: str,
+    openai_base_url: str,
+    params: Optional[Dict[str, Any]] = None,
+    quality: str = "medium",
+    edit_protocol: str = "multipart",
+) -> Dict[str, Any]:
+    """Call an OpenAI Images-compatible endpoint without filesystem writes.
+
+    This is the shared deployment executor for OpenAI Images-compatible routes.
+    Provider-specific model aliases and the APIYI Gemini branch stay in the
+    APIYI wrapper below; deployment routes pass their actual upstream model id.
+    """
+    import requests
+
+    requested_aspect = resolve_aspect_ratio(aspect_ratio)
+    requested_resolution = resolve_resolution(
+        (params or {}).get("resolution", DEFAULT_RESOLUTION)
+    )
+    size, effective_aspect = _gpt_image_size(
+        requested_aspect, requested_resolution
+    )
+    quality = str((params or {}).get("quality") or quality).strip().lower()
+    if quality not in {"low", "medium", "high", "auto"}:
+        raise ValueError("quality must be low, medium, high, or auto")
+    headers = {"Authorization": f"Bearer {api_key}"}
+    if references and edit_protocol == "json_images":
+        response = requests.post(
+            f"{openai_base_url.rstrip('/')}/images/edits",
+            headers={**headers, "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "prompt": prompt,
+                "size": size,
+                "n": 1,
+                "quality": quality,
+                "images": [{
+                    "image_url": (
+                        f"data:{item['mime_type']};base64,"
+                        f"{base64.b64encode(item['data']).decode('ascii')}"
+                    ),
+                } for item in references],
+            },
+            timeout=_REQUEST_TIMEOUT,
+        )
+    elif references:
+        files = [
+            ("image", (item["name"], item["data"], item["mime_type"]))
+            for item in references
+        ]
+        response = requests.post(
+            f"{openai_base_url.rstrip('/')}/images/edits",
+            headers=headers,
+            data={
+                "model": model,
+                "prompt": prompt,
+                "size": size,
+                "n": "1",
+                "quality": quality,
+            },
+            files=files,
+            timeout=_REQUEST_TIMEOUT,
+        )
+    else:
+        response = requests.post(
+            f"{openai_base_url.rstrip('/')}/images/generations",
+            headers={**headers, "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "prompt": prompt,
+                "size": size,
+                "n": 1,
+                "quality": quality,
+            },
+            timeout=_REQUEST_TIMEOUT,
+        )
+    response.raise_for_status()
+    payload = response.json()
+    image_bytes, mime_type = _decode_apiyi_image_payload(payload)
+    _, _, revised_prompt = _extract_openai_image(payload)
+    metadata: Dict[str, Any] = {
+        "size": size,
+        "quality": quality,
+        "upstream_model": model,
+        "requested_aspect_ratio": requested_aspect,
+        "effective_aspect_ratio": effective_aspect,
+        "requested_resolution": requested_resolution,
+        "effective_resolution": requested_resolution,
+        "resolution_mode": "native",
+    }
+    if revised_prompt:
+        metadata["revised_prompt"] = revised_prompt
+    return {"image_bytes": image_bytes, "mime_type": mime_type, "metadata": metadata}
+
+
 def generate_apiyi_image_bytes(
     *,
     prompt: str,
@@ -373,41 +473,16 @@ def generate_apiyi_image_bytes(
                 "resolution_mode": "native",
             },
         }
-    size, effective_aspect = _gpt_image_size(
-        requested_aspect, requested_resolution
+    return generate_openai_image_bytes(
+        prompt=prompt,
+        aspect_ratio=aspect_ratio,
+        model=_upstream_model(model_id),
+        references=references,
+        api_key=api_key,
+        openai_base_url=openai_base_url,
+        params=params,
+        quality=str(meta["quality"]),
     )
-    headers = {"Authorization": f"Bearer {api_key}"}
-    if references:
-        files = [("image", (item["name"], item["data"], item["mime_type"])) for item in references]
-        response = requests.post(
-            f"{openai_base_url.rstrip('/')}/images/edits", headers=headers,
-            data={"model": _upstream_model(model_id), "prompt": prompt, "size": size, "n": "1", "quality": str(meta["quality"])},
-            files=files, timeout=_REQUEST_TIMEOUT,
-        )
-    else:
-        response = requests.post(
-            f"{openai_base_url.rstrip('/')}/images/generations",
-            headers={**headers, "Content-Type": "application/json"},
-            json={"model": _upstream_model(model_id), "prompt": prompt, "size": size, "n": 1, "quality": meta["quality"]},
-            timeout=_REQUEST_TIMEOUT,
-        )
-    response.raise_for_status()
-    payload = response.json()
-    image_bytes, mime_type = _decode_apiyi_image_payload(payload)
-    _, _, revised_prompt = _extract_openai_image(payload)
-    metadata: Dict[str, Any] = {
-        "size": size,
-        "quality": meta["quality"],
-        "upstream_model": _upstream_model(model_id),
-        "requested_aspect_ratio": requested_aspect,
-        "effective_aspect_ratio": effective_aspect,
-        "requested_resolution": requested_resolution,
-        "effective_resolution": requested_resolution,
-        "resolution_mode": "native",
-    }
-    if revised_prompt:
-        metadata["revised_prompt"] = revised_prompt
-    return {"image_bytes": image_bytes, "mime_type": mime_type, "metadata": metadata}
 
 
 class ApiyiImageGenProvider(ImageGenProvider):
