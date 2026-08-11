@@ -1,3 +1,6 @@
+import { optimise as optimisePng } from "@jsquash/oxipng";
+import { fromBlob } from "image-resize-compress";
+
 import type { GuiComposerAttachmentKind } from "./types";
 
 export const COMPOSER_ATTACHMENT_MAX_COUNT = 10;
@@ -8,10 +11,6 @@ export const FILE_ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024;
 
 const IMAGE_ATTACHMENT_EXTENSIONS = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"];
 const IMAGE_COMPRESSION_MAX_DIMENSION = 4096;
-const IMAGE_COMPRESSION_MIN_QUALITY = 0.26;
-const IMAGE_COMPRESSION_MAX_QUALITY = 0.82;
-const IMAGE_COMPRESSION_QUALITY_ATTEMPTS = 5;
-const IMAGE_COMPRESSION_MAX_RESIZE_ATTEMPTS = 10;
 
 export function base64FromDataUrl(dataUrl: string): string {
   const comma = dataUrl.indexOf(",");
@@ -36,93 +35,43 @@ export function readFileAsDataUrl(file: File): Promise<string> {
 export async function compressImageForUpload(file: File): Promise<File> {
   if (file.size <= IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES) return file;
 
-  const image = await createImageBitmap(file);
-  try {
-    const initialScale = Math.min(
-      1,
-      IMAGE_COMPRESSION_MAX_DIMENSION / Math.max(image.width, image.height),
-    );
-    let width = Math.max(1, Math.round(image.width * initialScale));
-    let height = Math.max(1, Math.round(image.height * initialScale));
-    const canvas = document.createElement("canvas");
-    const context = canvas.getContext("2d");
-    if (!context) throw new Error(`Could not compress ${file.name}`);
-
-    for (
-      let resizeAttempt = 0;
-      resizeAttempt < IMAGE_COMPRESSION_MAX_RESIZE_ATTEMPTS;
-      resizeAttempt += 1
-    ) {
-      canvas.width = width;
-      canvas.height = height;
-      context.fillStyle = "#fff";
-      context.fillRect(0, 0, width, height);
-      context.drawImage(image, 0, 0, width, height);
-
-      const lowestQualityBlob = await canvasToBlob(canvas, IMAGE_COMPRESSION_MIN_QUALITY);
-      if (lowestQualityBlob.size <= IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES) {
-        const blob = await largestFittingImageBlob(canvas, lowestQualityBlob);
-        return new File([blob], jpegFilename(file.name), {
-          lastModified: file.lastModified,
-          type: "image/jpeg",
-        });
-      }
-
-      if (resizeAttempt < IMAGE_COMPRESSION_MAX_RESIZE_ATTEMPTS - 1) {
-        const scale = Math.min(
-          0.8,
-          Math.sqrt(IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES / lowestQualityBlob.size) * 0.95,
-        );
-        width = Math.max(1, Math.round(width * scale));
-        height = Math.max(1, Math.round(height * scale));
-      }
-    }
-  } finally {
-    image.close();
+  const losslessFile = await optimiseImageLosslessly(file);
+  if (losslessFile?.size && losslessFile.size <= IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES) {
+    return losslessFile;
   }
 
-  throw new Error(
-    `Could not compress ${file.name} below ${formatBytes(IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES)}`,
-  );
-}
-
-async function largestFittingImageBlob(
-  canvas: HTMLCanvasElement,
-  fallback: Blob,
-): Promise<Blob> {
-  let best = fallback;
-  let minimum = IMAGE_COMPRESSION_MIN_QUALITY;
-  let maximum = IMAGE_COMPRESSION_MAX_QUALITY;
-
-  for (let attempt = 0; attempt < IMAGE_COMPRESSION_QUALITY_ATTEMPTS; attempt += 1) {
-    const quality = (minimum + maximum) / 2;
-    const candidate = await canvasToBlob(canvas, quality);
-    if (candidate.size <= IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES) {
-      best = candidate;
-      minimum = quality;
-    } else {
-      maximum = quality;
-    }
-  }
-
-  return best;
-}
-
-function canvasToBlob(canvas: HTMLCanvasElement, quality: number): Promise<Blob> {
-  return new Promise((resolve, reject) => {
-    canvas.toBlob((blob) => {
-      if (blob) {
-        resolve(blob);
-        return;
-      }
-      reject(new Error("Could not encode image"));
-    }, "image/jpeg", quality);
+  const blob = await fromBlob(file, {
+    backgroundColor: "#fff",
+    format: "jpeg",
+    maxWidthOrHeight: IMAGE_COMPRESSION_MAX_DIMENSION,
+    targetSize: IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES,
+    worker: true,
   });
+  if (blob.size > IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES) {
+    throw new Error(
+      `Could not compress ${file.name} below ${formatBytes(IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES)}`,
+    );
+  }
+  return fileFromBlob(blob, file, ".jpg");
 }
 
-function jpegFilename(name: string): string {
-  const extension = name.lastIndexOf(".");
-  return `${extension > 0 ? name.slice(0, extension) : name}.jpg`;
+async function optimiseImageLosslessly(file: File): Promise<File | null> {
+  if (file.type !== "image/png" && !file.name.toLowerCase().endsWith(".png")) return null;
+
+  const optimised = await optimisePng(await file.arrayBuffer(), {
+    level: 4,
+    optimiseAlpha: false,
+  });
+  return fileFromBlob(new Blob([optimised], { type: "image/png" }), file, ".png");
+}
+
+function fileFromBlob(blob: Blob, original: File, extension: string): File {
+  const currentExtension = original.name.lastIndexOf(".");
+  const basename = currentExtension > 0 ? original.name.slice(0, currentExtension) : original.name;
+  return new File([blob], `${basename}${extension}`, {
+    lastModified: original.lastModified,
+    type: blob.type,
+  });
 }
 
 export function attachmentKindFromFile(file: File): GuiComposerAttachmentKind | null {

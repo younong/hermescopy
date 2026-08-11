@@ -1,4 +1,12 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const compressionMocks = vi.hoisted(() => ({
+  fromBlob: vi.fn(),
+  optimisePng: vi.fn(),
+}));
+
+vi.mock("@jsquash/oxipng", () => ({ optimise: compressionMocks.optimisePng }));
+vi.mock("image-resize-compress", () => ({ fromBlob: compressionMocks.fromBlob }));
 
 import {
   attachmentKindFromFile,
@@ -16,8 +24,9 @@ function file(name: string, type: string, size = 1): File {
   return new File([new Uint8Array(size)], name, { type });
 }
 
-afterEach(() => {
-  vi.unstubAllGlobals();
+beforeEach(() => {
+  compressionMocks.fromBlob.mockReset();
+  compressionMocks.optimisePng.mockReset();
 });
 
 describe("gui chat attachment helpers", () => {
@@ -41,80 +50,66 @@ describe("gui chat attachment helpers", () => {
 
   it("does not process images at or below 2MB", async () => {
     const original = file("cat.png", "image/png", IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES);
-    const createImageBitmap = vi.fn();
-    vi.stubGlobal("createImageBitmap", createImageBitmap);
 
     await expect(compressImageForUpload(original)).resolves.toBe(original);
-    expect(createImageBitmap).not.toHaveBeenCalled();
+    expect(compressionMocks.optimisePng).not.toHaveBeenCalled();
+    expect(compressionMocks.fromBlob).not.toHaveBeenCalled();
   });
 
-  it("compresses images over 2MB to JPEG before upload", async () => {
-    const original = file("photo.png", "image/png", IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES + 1);
-    const close = vi.fn();
-    vi.stubGlobal("createImageBitmap", vi.fn(async () => ({ width: 3000, height: 2000, close })));
-
-    const drawImage = vi.fn();
-    const toBlob = vi.fn((callback: BlobCallback) => {
-      callback(new Blob([new Uint8Array(IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES - 1)], {
-        type: "image/jpeg",
-      }));
-    });
-    vi.stubGlobal("document", {
-      createElement: vi.fn(() => ({
-        getContext: vi.fn(() => ({
-          drawImage,
-          fillRect: vi.fn(),
-          fillStyle: "",
-        })),
-        height: 0,
-        toBlob,
-        width: 0,
-      })),
-    });
+  it("uses lossless PNG optimisation when it reaches the upload target", async () => {
+    const original = file("diagram.png", "image/png", IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES + 1);
+    compressionMocks.optimisePng.mockResolvedValue(
+      new Uint8Array(IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES).buffer,
+    );
 
     const compressed = await compressImageForUpload(original);
 
-    expect(compressed).not.toBe(original);
-    expect(compressed.name).toBe("photo.jpg");
-    expect(compressed.type).toBe("image/jpeg");
-    expect(compressed.size).toBeLessThanOrEqual(IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES);
-    expect(drawImage).toHaveBeenCalledWith(expect.anything(), 0, 0, 3000, 2000);
-    expect(toBlob).toHaveBeenCalled();
-    expect(close).toHaveBeenCalledOnce();
-  });
-
-  it("reduces image dimensions until the compressed file is below 2MB", async () => {
-    const original = file("photo.png", "image/png", IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES + 1);
-    vi.stubGlobal("createImageBitmap", vi.fn(async () => ({
-      width: 5000,
-      height: 2500,
-      close: vi.fn(),
-    })));
-
-    let calls = 0;
-    const canvas = {
-      getContext: vi.fn(() => ({
-        drawImage: vi.fn(),
-        fillRect: vi.fn(),
-        fillStyle: "",
-      })),
-      height: 0,
-      toBlob: vi.fn((callback: BlobCallback) => {
-        calls += 1;
-        const size = calls === 1
-          ? IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES * 2
-          : IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES;
-        callback(new Blob([new Uint8Array(size)], { type: "image/jpeg" }));
-      }),
-      width: 0,
-    };
-    vi.stubGlobal("document", { createElement: vi.fn(() => canvas) });
-
-    const compressed = await compressImageForUpload(original);
-
+    expect(compressionMocks.optimisePng).toHaveBeenCalledWith(expect.any(ArrayBuffer), {
+      level: 4,
+      optimiseAlpha: false,
+    });
+    expect(compressed.name).toBe("diagram.png");
+    expect(compressed.type).toBe("image/png");
     expect(compressed.size).toBe(IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES);
-    expect(canvas.width).toBeLessThan(4096);
-    expect(canvas.height).toBeLessThan(2048);
+    expect(compressionMocks.fromBlob).not.toHaveBeenCalled();
+  });
+
+  it("uses third-party lossy compression when lossless optimisation misses the target", async () => {
+    const original = file("diagram.png", "image/png", IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES + 1);
+    compressionMocks.optimisePng.mockResolvedValue(
+      new Uint8Array(IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES + 1).buffer,
+    );
+    compressionMocks.fromBlob.mockResolvedValue(
+      new Blob([new Uint8Array(IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES)], { type: "image/jpeg" }),
+    );
+
+    const compressed = await compressImageForUpload(original);
+
+    expect(compressionMocks.fromBlob).toHaveBeenCalledWith(original, {
+      backgroundColor: "#fff",
+      format: "jpeg",
+      maxWidthOrHeight: 4096,
+      targetSize: IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES,
+      worker: true,
+    });
+    expect(compressed.name).toBe("diagram.jpg");
+    expect(compressed.type).toBe("image/jpeg");
+    expect(compressed.size).toBe(IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES);
+  });
+
+  it("rejects when the third-party compressor cannot reach the target", async () => {
+    const original = file("photo.jpg", "image/jpeg", IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES + 1);
+    compressionMocks.fromBlob.mockResolvedValue(
+      new Blob([new Uint8Array(IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES + 1)], {
+        type: "image/jpeg",
+      }),
+    );
+
+    await expect(compressImageForUpload(original)).rejects.toThrow(
+      "Could not compress photo.jpg below 2MB",
+    );
+    expect(compressionMocks.optimisePng).not.toHaveBeenCalled();
+    expect(compressionMocks.fromBlob).toHaveBeenCalledOnce();
   });
 
   it("validates supported file sizes", () => {
