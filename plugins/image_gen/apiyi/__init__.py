@@ -319,7 +319,7 @@ def generate_apiyi_image_bytes(
         references=references,
         api_key=api_key,
         openai_base_url=openai_base_url,
-        size_profile="apiyi-gpt",
+        size_profile="gpt-image-2",
         params=params,
         quality=str(meta["quality"]),
     )
@@ -455,7 +455,7 @@ class ApiyiImageGenProvider(ImageGenProvider):
                 references=references,
                 api_key=api_key,
                 openai_base_url=_openai_base_url(),
-                size_profile="apiyi-gpt",
+                size_profile="gpt-image-2",
                 params={"resolution": resolution},
                 quality=str(meta["quality"]),
             )

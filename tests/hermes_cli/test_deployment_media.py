@@ -51,7 +51,7 @@ def _codex_image_route_payload(**overrides):
         key_env="CODEX_IMAGE_KEY",
         executor="plugins.image_gen.openai_compatible:generate_openai_compatible_image_bytes",
         base_urls={"openai_base_url": "https://codex.example.com/v1"},
-        executor_params={"edit_protocol": "json_images", "size_profile": "openai-native"},
+        executor_params={"edit_protocol": "json_images", "size_profile": "gpt-image-2"},
         text_only_models=[],
     )
     payload.update(overrides)
@@ -386,13 +386,13 @@ def test_policy_execute_custom_codex_image_uses_shared_executor(monkeypatch):
         key_env="CODEX_IMAGE_KEY",
         executor="plugins.image_gen.openai_compatible:generate_openai_compatible_image_bytes",
         base_urls={"openai_base_url": "https://codex.example.com/v1"},
-        executor_params={"size_profile": "openai-native"},
+        executor_params={"size_profile": "gpt-image-2"},
     )
     policy = DeploymentMediaPolicy(routes=(route,), policy_id="p")
     monkeypatch.setenv("CODEX_IMAGE_KEY", "secret")
     captured = {}
 
-    from agent.image_size import OPENAI_NATIVE_IMAGE_PROFILE, resolve_image_size
+    from agent.image_size import GPT_IMAGE_2_SIZE_PROFILE, resolve_image_size
 
     def fake_executor(**kwargs):
         captured.update(kwargs)
@@ -405,7 +405,7 @@ def test_policy_execute_custom_codex_image_uses_shared_executor(monkeypatch):
                 "effective_resolution": "4K",
             },
             "size_plan": resolve_image_size(
-                "1:1", "1K", profile=OPENAI_NATIVE_IMAGE_PROFILE
+                "1:1", "1K", profile=GPT_IMAGE_2_SIZE_PROFILE
             ),
         }
 
@@ -499,11 +499,11 @@ def test_policy_execute_rejects_valid_image_with_wrong_dimensions(monkeypatch):
         key_env="TEST_MEDIA_KEY",
         executor="plugins.image_gen.openai_compatible:generate_openai_compatible_image_bytes",
         base_urls={"openai_base_url": "https://codex.example.com/v1"},
-        executor_params={"size_profile": "openai-native"},
+        executor_params={"size_profile": "gpt-image-2"},
     )
     policy = DeploymentMediaPolicy(routes=(route,), policy_id="p")
     monkeypatch.setenv("TEST_MEDIA_KEY", "secret")
-    from agent.image_size import OPENAI_NATIVE_IMAGE_PROFILE, resolve_image_size
+    from agent.image_size import GPT_IMAGE_2_SIZE_PROFILE, resolve_image_size
 
     monkeypatch.setattr(
         DeploymentMediaRoute,
@@ -512,12 +512,12 @@ def test_policy_execute_rejects_valid_image_with_wrong_dimensions(monkeypatch):
             "image_bytes": _png_bytes((32, 32)),
             "mime_type": "image/png",
             "metadata": {
-                "size": "1024x1536",
-                "effective_aspect_ratio": "2:3",
-                "effective_resolution": "1K",
+                "size": "1536x2048",
+                "effective_aspect_ratio": "3:4",
+                "effective_resolution": "2K",
             },
             "size_plan": resolve_image_size(
-                "3:4", "2K", profile=OPENAI_NATIVE_IMAGE_PROFILE
+                "3:4", "2K", profile=GPT_IMAGE_2_SIZE_PROFILE
             ),
         },
     )

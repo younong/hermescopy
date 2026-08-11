@@ -148,7 +148,7 @@ class TestGenerate:
         assert result["model"] == "gpt-image-2-medium"
         assert result["aspect_ratio"] == "16:9"
         assert result["requested_aspect_ratio"] == "16:9"
-        assert result["effective_aspect_ratio"] == "3:2"
+        assert result["effective_aspect_ratio"] == "16:9"
         assert result["provider"] == "openai"
         assert result["quality"] == "medium"
 
@@ -161,7 +161,7 @@ class TestGenerate:
         # All tiers hit the single underlying API model.
         assert call_kwargs["model"] == "gpt-image-2"
         assert call_kwargs["quality"] == "medium"
-        assert call_kwargs["size"] == "1536x1024"
+        assert call_kwargs["size"] == "2048x1152"
         # gpt-image-2 rejects response_format — we must NOT send it.
         assert "response_format" not in call_kwargs
 
@@ -185,9 +185,13 @@ class TestGenerate:
         assert fake_client.images.generate.call_args.kwargs["model"] == "gpt-image-2"
 
     @pytest.mark.parametrize("aspect,expected_size", [
-        ("3:2", "1536x1024"),
-        ("1:1", "1024x1024"),
-        ("2:3", "1024x1536"),
+        ("16:9", "2048x1152"),
+        ("3:2", "2048x1360"),
+        ("4:3", "2048x1536"),
+        ("1:1", "2048x2048"),
+        ("3:4", "1536x2048"),
+        ("2:3", "1360x2048"),
+        ("9:16", "1152x2048"),
     ])
     def test_aspect_ratio_mapping(self, provider, aspect, expected_size):
         fake_client = MagicMock()

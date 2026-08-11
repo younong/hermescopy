@@ -79,17 +79,8 @@ class ActualImageInfo:
         }
 
 
-OPENAI_NATIVE_IMAGE_PROFILE = ImageSizeProfile(
-    name="openai-native",
-    native_sizes=(
-        ImageNativeSize("3:2", "1K", 1536, 1024),
-        ImageNativeSize("1:1", "1K", 1024, 1024),
-        ImageNativeSize("2:3", "1K", 1024, 1536),
-    ),
-)
-
-APIYI_GPT_IMAGE_PROFILE = ImageSizeProfile(
-    name="apiyi-gpt",
+GPT_IMAGE_2_SIZE_PROFILE = ImageSizeProfile(
+    name="gpt-image-2",
     native_sizes=tuple(
         ImageNativeSize(aspect_ratio, resolution, width, height)
         for resolution, sizes in (
@@ -117,8 +108,7 @@ APIYI_GPT_IMAGE_PROFILE = ImageSizeProfile(
 )
 
 _IMAGE_SIZE_PROFILES = {
-    profile.name: profile
-    for profile in (OPENAI_NATIVE_IMAGE_PROFILE, APIYI_GPT_IMAGE_PROFILE)
+    GPT_IMAGE_2_SIZE_PROFILE.name: GPT_IMAGE_2_SIZE_PROFILE,
 }
 _RESOLUTION_ORDER = {"1K": 1, "2K": 2, "4K": 4}
 _FORMAT_MIME_TYPES = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}

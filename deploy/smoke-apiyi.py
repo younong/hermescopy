@@ -33,7 +33,7 @@ from agent.image_gen_provider import (  # noqa: E402
     resolve_aspect_ratio,
 )
 from agent.image_size import (  # noqa: E402
-    APIYI_GPT_IMAGE_PROFILE,
+    GPT_IMAGE_2_SIZE_PROFILE,
     inspect_image_path,
     resolve_image_size,
     validate_image_output,
@@ -84,7 +84,7 @@ def _run_model(
         resolve_image_size(
             expected_aspect_ratio,
             resolution,
-            profile=APIYI_GPT_IMAGE_PROFILE,
+            profile=GPT_IMAGE_2_SIZE_PROFILE,
         )
         if model.startswith("gpt-image-2") else None
     )

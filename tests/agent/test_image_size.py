@@ -3,9 +3,9 @@ import io
 import pytest
 from PIL import Image
 
+from agent.image_gen_provider import VALID_ASPECT_RATIOS, VALID_RESOLUTIONS
 from agent.image_size import (
-    APIYI_GPT_IMAGE_PROFILE,
-    OPENAI_NATIVE_IMAGE_PROFILE,
+    GPT_IMAGE_2_SIZE_PROFILE,
     inspect_image_bytes,
     resolve_image_size,
     validate_image_output,
@@ -18,22 +18,42 @@ def _image_bytes(size=(16, 12), image_format="PNG"):
     return output.getvalue()
 
 
-def test_openai_native_profile_truthfully_maps_ratio_and_resolution():
+def test_gpt_image_2_profile_preserves_requested_ratio_and_resolution():
     plan = resolve_image_size(
-        "3:4", "2K", profile=OPENAI_NATIVE_IMAGE_PROFILE
+        "3:4", "2K", profile=GPT_IMAGE_2_SIZE_PROFILE
     )
 
     assert plan.requested_aspect_ratio == "3:4"
-    assert plan.effective_aspect_ratio == "2:3"
+    assert plan.effective_aspect_ratio == "3:4"
     assert plan.requested_resolution == "2K"
-    assert plan.effective_resolution == "1K"
-    assert plan.resolution_mode == "mapped"
-    assert plan.size == "1024x1536"
+    assert plan.effective_resolution == "2K"
+    assert plan.resolution_mode == "native"
+    assert plan.size == "1536x2048"
 
 
-def test_apiyi_profile_preserves_exact_native_tier_and_legacy_alias():
+def test_gpt_image_2_profile_covers_all_unified_ratios_and_resolutions():
+    native_pairs = {
+        (size.aspect_ratio, size.resolution)
+        for size in GPT_IMAGE_2_SIZE_PROFILE.native_sizes
+    }
+
+    assert native_pairs == {
+        (aspect_ratio, resolution)
+        for aspect_ratio in VALID_ASPECT_RATIOS
+        for resolution in VALID_RESOLUTIONS
+    }
+    for aspect_ratio, resolution in native_pairs:
+        plan = resolve_image_size(
+            aspect_ratio, resolution, profile=GPT_IMAGE_2_SIZE_PROFILE
+        )
+        assert plan.effective_aspect_ratio == aspect_ratio
+        assert plan.effective_resolution == resolution
+        assert plan.resolution_mode == "native"
+
+
+def test_gpt_image_2_profile_preserves_exact_native_tier_and_legacy_alias():
     plan = resolve_image_size(
-        "portrait", "4k", profile=APIYI_GPT_IMAGE_PROFILE
+        "portrait", "4k", profile=GPT_IMAGE_2_SIZE_PROFILE
     )
 
     assert plan.requested_aspect_ratio == "3:4"
@@ -73,7 +93,7 @@ def test_inspect_image_bytes_rejects_invalid_mime_and_pixels():
 
 def test_validate_image_output_requires_exact_fixed_size():
     plan = resolve_image_size(
-        "1:1", "1K", profile=OPENAI_NATIVE_IMAGE_PROFILE
+        "1:1", "1K", profile=GPT_IMAGE_2_SIZE_PROFILE
     )
     actual = inspect_image_bytes(_image_bytes((512, 512)))
 

@@ -133,7 +133,7 @@ def _request(policy, **overrides):
 
 
 class _OpenAIImageHandler(BaseHTTPRequestHandler):
-    image_bytes = _png_bytes((1024, 1536))
+    image_bytes = _png_bytes((1536, 2048))
     requests = []
 
     def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
@@ -158,7 +158,7 @@ class _OpenAIImageHandler(BaseHTTPRequestHandler):
 @pytest.fixture
 def _openai_image_server():
     _OpenAIImageHandler.requests = []
-    _OpenAIImageHandler.image_bytes = _png_bytes((1024, 1536))
+    _OpenAIImageHandler.image_bytes = _png_bytes((1536, 2048))
     server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIImageHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -188,7 +188,7 @@ def _custom_codex_policy(base_url):
             base_urls={"openai_base_url": base_url},
             executor_params={
                 "edit_protocol": "json_images",
-                "size_profile": "openai-native",
+                "size_profile": "gpt-image-2",
             },
         ),),
         policy_id="media-policy-v1",
@@ -251,18 +251,19 @@ def test_custom_codex_real_path_validates_then_publishes(
             ("/v1/images/generations", {
                 "model": "gpt-image-2",
                 "prompt": "draw a portrait",
-                "size": "1024x1536",
+                "size": "1536x2048",
                 "n": 1,
                 "quality": "medium",
             })
         ]
         assert result["requested_aspect_ratio"] == "3:4"
-        assert result["effective_aspect_ratio"] == "2:3"
-        assert result["actual_aspect_ratio"] == "2:3"
+        assert result["effective_aspect_ratio"] == "3:4"
+        assert result["actual_aspect_ratio"] == "3:4"
         assert result["requested_resolution"] == "2K"
-        assert result["effective_resolution"] == "1K"
-        assert result["actual_resolution"] == "1K"
-        assert result["actual_dimensions"] == {"width": 1024, "height": 1536}
+        assert result["effective_resolution"] == "2K"
+        assert result["actual_resolution"] == "2K"
+        assert result["resolution_mode"] == "native"
+        assert result["actual_dimensions"] == {"width": 1536, "height": 2048}
     finally:
         client.close()
         broker.close()

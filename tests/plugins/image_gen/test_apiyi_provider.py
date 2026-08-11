@@ -376,7 +376,7 @@ def test_shared_openai_executor_forwards_exact_deployment_model(monkeypatch):
         prompt="draw", aspect_ratio="square", model="gpt-image-2",
         references=[], api_key="trusted",
         openai_base_url="https://codex.example/v1",
-        size_profile="openai-native", params={"resolution": "1K"},
+        size_profile="gpt-image-2", params={"resolution": "1K"},
     )
 
     assert result["image_bytes"] == b"png"
@@ -406,7 +406,7 @@ def test_shared_openai_executor_supports_json_image_edits(monkeypatch):
         prompt="edit", aspect_ratio="square", model="gpt-image-2",
         references=[{"name": "a.png", "mime_type": "image/png", "data": b"png"}],
         api_key="trusted", openai_base_url="https://codex.example/v1",
-        size_profile="openai-native", edit_protocol="json_images",
+        size_profile="gpt-image-2", edit_protocol="json_images",
     )
 
     assert result["image_bytes"] == b"png"

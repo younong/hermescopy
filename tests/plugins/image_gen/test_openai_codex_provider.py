@@ -156,7 +156,7 @@ class TestGenerate:
         assert tool["type"] == "image_generation"
         assert tool["model"] == "gpt-image-2"
         assert tool["quality"] == "medium"
-        assert tool["size"] == "1024x1536"
+        assert tool["size"] == "1536x2048"
         assert tool["output_format"] == "png"
         assert tool["background"] == "opaque"
         assert tool["partial_images"] == 1

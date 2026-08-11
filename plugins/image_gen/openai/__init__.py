@@ -38,7 +38,7 @@ from agent.image_gen_provider import (
     save_url_image,
     success_response,
 )
-from agent.image_size import OPENAI_NATIVE_IMAGE_PROFILE, resolve_image_size
+from agent.image_size import GPT_IMAGE_2_SIZE_PROFILE, resolve_image_size
 
 logger = logging.getLogger(__name__)
 
@@ -223,7 +223,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
         size_plan = resolve_image_size(
             aspect,
             resolution,
-            profile=OPENAI_NATIVE_IMAGE_PROFILE,
+            profile=GPT_IMAGE_2_SIZE_PROFILE,
         )
 
         if not prompt:
