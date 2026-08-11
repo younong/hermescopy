@@ -19,9 +19,9 @@ import {
 import {
   api,
   type ModelRegistration,
+  type ModelRegistrationCapabilityCatalogProvider,
   type ModelRegistrationChatCatalogProvider,
   type ModelRegistrationKind,
-  type ModelRegistrationMediaCatalogProvider,
   type ModelRegistrationRequest,
   type ModelRegistrationSource,
   type ModelRegistrationsResponse,
@@ -35,6 +35,7 @@ interface GuiChatModelsPaneProps {
   canSwitchChat: boolean;
   currentModel?: string;
   currentProvider?: string;
+  onActivateCode?: (registration: ModelRegistration) => Promise<void>;
   onSwitchChat(
     registration: ModelRegistration,
     confirmExpensiveModel?: boolean,
@@ -76,6 +77,7 @@ const EMPTY_FORM: RegistrationFormState = {
 
 const KIND_LABELS: Record<ModelRegistrationKind, string> = {
   chat: "Chat",
+  code: "Code",
   image: "Image",
   video: "Video",
   voice: "Voice",
@@ -86,8 +88,12 @@ function hasCatalog(kind: ModelRegistrationKind): boolean {
   return kind in KIND_LABELS;
 }
 
-function isActivatable(kind: ModelRegistrationKind): kind is "image" | "video" | "voice" | "vector" {
-  return kind !== "chat";
+function defaultSource(kind: ModelRegistrationKind): ModelRegistrationSource {
+  return kind === "voice" || kind === "vector" ? "manual" : "catalog";
+}
+
+function isActivatable(kind: ModelRegistrationKind): kind is "image" | "video" {
+  return kind === "image" || kind === "video";
 }
 
 function supportsGateway(kind: ModelRegistrationKind): kind is "image" | "video" {
@@ -125,6 +131,7 @@ export function GuiChatModelsPane({
   canSwitchChat,
   currentModel,
   currentProvider,
+  onActivateCode,
   onSwitchChat,
 }: GuiChatModelsPaneProps) {
   const [data, setData] = useState<ModelRegistrationsResponse | null>(null);
@@ -133,7 +140,7 @@ export function GuiChatModelsPane({
       Record<
         ModelRegistrationKind,
         Array<
-          ModelRegistrationChatCatalogProvider | ModelRegistrationMediaCatalogProvider
+          ModelRegistrationChatCatalogProvider | ModelRegistrationCapabilityCatalogProvider
         >
       >
     >
@@ -193,14 +200,14 @@ export function GuiChatModelsPane({
     if (!hasCatalog(kind) || catalogs[kind] || catalogsLoading[kind]) return;
     setCatalogsLoading((current) => ({ ...current, [kind]: true }));
     try {
-      const response = await api.getModelRegistrationCatalog(kind, );
+      const response = await api.getModelRegistrationCatalog(kind);
       setCatalogs((current) => ({ ...current, [kind]: response.providers }));
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
       setCatalogsLoading((current) => ({ ...current, [kind]: false }));
     }
-  }, [catalogs, catalogsLoading, ]);
+  }, [catalogs, catalogsLoading]);
 
   const visibleRegistrations = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
@@ -222,7 +229,7 @@ export function GuiChatModelsPane({
       );
       return provider?.models.map((id) => ({ id, label: id })) ?? [];
     }
-    const provider = (providers as ModelRegistrationMediaCatalogProvider[]).find(
+    const provider = (providers as ModelRegistrationCapabilityCatalogProvider[]).find(
       (item) => item.provider === form.provider,
     );
     return provider?.models.map((item) => ({
@@ -236,10 +243,10 @@ export function GuiChatModelsPane({
     setForm({
       ...EMPTY_FORM,
       kind: selectedKind,
-      source: "catalog",
+      source: defaultSource(selectedKind),
     });
     setFormOpen(true);
-    void loadCatalog(selectedKind);
+    if (defaultSource(selectedKind) === "catalog") void loadCatalog(selectedKind);
   };
 
   const openEdit = (registration: ModelRegistration) => {
@@ -271,7 +278,7 @@ export function GuiChatModelsPane({
       kind,
       model: "",
       provider: "",
-      source: kind === "chat" ? current.source : "catalog",
+      source: defaultSource(kind),
       useGateway: false,
     }));
   };
@@ -283,8 +290,13 @@ export function GuiChatModelsPane({
 
   const updateProvider = (provider: string) => {
     let model = "";
-    if (isActivatable(form.kind)) {
-      const selected = (providers as ModelRegistrationMediaCatalogProvider[]).find(
+    if (form.kind === "chat") {
+      const selected = (providers as ModelRegistrationChatCatalogProvider[]).find(
+        (item) => item.slug === provider,
+      );
+      model = selected?.models[0] ?? "";
+    } else {
+      const selected = (providers as ModelRegistrationCapabilityCatalogProvider[]).find(
         (item) => item.provider === provider,
       );
       model = selected?.default_model || selected?.models[0]?.id || "";
@@ -354,7 +366,7 @@ export function GuiChatModelsPane({
     setWorkingId(registration.id);
     setError(null);
     try {
-      await api.activateModelRegistration(registration.id, );
+      await api.activateModelRegistration(registration.id);
       await load();
     } catch (cause) {
       setError(errorMessage(cause));
@@ -413,18 +425,19 @@ export function GuiChatModelsPane({
       </div>
 
       <div aria-label="Model type" className="gui-chat-model-tabs" role="tablist">
-        {(Object.keys(KIND_LABELS) as ModelRegistrationKind[]).map((kind) => (
-          <button
-            aria-selected={selectedKind === kind}
-            className={selectedKind === kind ? "is-active" : undefined}
-            key={kind}
-            onClick={() => setSelectedKind(kind)}
-            role="tab"
-            type="button"
-          >
-            {KIND_LABELS[kind]}
-          </button>
-        ))}
+        {(Object.keys(KIND_LABELS) as ModelRegistrationKind[])
+          .map((kind) => (
+            <button
+              aria-selected={selectedKind === kind}
+              className={selectedKind === kind ? "is-active" : undefined}
+              key={kind}
+              onClick={() => setSelectedKind(kind)}
+              role="tab"
+              type="button"
+            >
+              {KIND_LABELS[kind]}
+            </button>
+          ))}
       </div>
 
       {error || busy ? (
@@ -458,7 +471,7 @@ export function GuiChatModelsPane({
                   <ModelBadge>{registration.scope === "admin" ? "Admin" : "Mine"}</ModelBadge>
                   <ModelBadge>{registration.source === "custom" ? "Custom" : registration.source === "manual" ? "Manual" : "Catalog"}</ModelBadge>
                   {current ? <ModelBadge active>Current conversation</ModelBadge> : null}
-                  {registration.kind === "chat" && configured ? <ModelBadge active>Default</ModelBadge> : null}
+                  {(registration.kind === "chat" || registration.kind === "code") && configured ? <ModelBadge active>Default</ModelBadge> : null}
                   {activatable && configured ? <ModelBadge active>Active</ModelBadge> : null}
                   {registration.source === "custom" ? (
                     <ModelBadge warning={!registration.credential_configured}>
@@ -491,6 +504,24 @@ export function GuiChatModelsPane({
                       {configured ? "Default" : "Use as default"}
                     </button>
                   </>
+                ) : registration.kind === "code" ? (
+                  <button
+                    className="gui-chat-model-action"
+                    disabled={working || !onActivateCode}
+                    onClick={() => {
+                      if (!onActivateCode) return;
+                      setWorkingId(registration.id);
+                      setError(null);
+                      void onActivateCode(registration)
+                        .then(() => load())
+                        .catch((cause) => setError(errorMessage(cause)))
+                        .finally(() => setWorkingId(null));
+                    }}
+                    title={!onActivateCode ? "Code sessions are not available in this workspace." : undefined}
+                    type="button"
+                  >
+                    {working ? "Activating…" : configured ? "Default" : "Use as Code model"}
+                  </button>
                 ) : activatable && !configured ? (
                   <button
                     className="gui-chat-model-action"
@@ -630,19 +661,19 @@ function RegistrationDialog({
   onProviderChange(provider: string): void;
   onSourceChange(source: ModelRegistrationSource): void;
   onSubmit(event: FormEvent): void;
-  providers: Array<ModelRegistrationChatCatalogProvider | ModelRegistrationMediaCatalogProvider>;
+  providers: Array<ModelRegistrationChatCatalogProvider | ModelRegistrationCapabilityCatalogProvider>;
   saving: boolean;
   setForm: React.Dispatch<React.SetStateAction<RegistrationFormState>>;
 }) {
   const selectedMediaProvider = form.kind === "chat"
     ? undefined
-    : (providers as ModelRegistrationMediaCatalogProvider[]).find(
+    : (providers as ModelRegistrationCapabilityCatalogProvider[]).find(
       (item) => item.provider === form.provider,
     );
   return (
     <GuiChatWorkspaceDialog
       busy={saving}
-      description={editing ? "Update this registered model." : "Register a chat, image, video, voice, or vector model."}
+      description={editing ? "Update this registered model." : "Register a chat, code, image, video, voice, or vector model."}
       onClose={onClose}
       title={editing ? "Edit model" : "Add model"}
       wide
@@ -672,12 +703,12 @@ function RegistrationDialog({
           <FormField label="Source">
             <select
               aria-label="Model source"
-              disabled={saving || editing !== null || form.kind !== "chat"}
+              disabled={saving || editing !== null || form.kind === "voice" || form.kind === "vector"}
               onChange={(event) => onSourceChange(event.target.value as ModelRegistrationSource)}
               value={form.source}
             >
-              {hasCatalog(form.kind) ? <option value="catalog">Catalog</option> : null}
-              {form.source === "manual" ? <option value="manual">Manual (legacy)</option> : null}
+              {hasCatalog(form.kind) && form.kind !== "voice" && form.kind !== "vector" ? <option value="catalog">Catalog</option> : null}
+              {form.source === "manual" ? <option value="manual">Manual</option> : null}
               {form.kind === "chat" ? <option value="custom">Custom endpoint</option> : null}
             </select>
           </FormField>
@@ -794,6 +825,7 @@ function validateForm(form: RegistrationFormState): string | null {
 function emptyActive(): ModelRegistrationsResponse["active"] {
   return {
     chat: { model: "", provider: "", registration_id: null },
+    code: { model: "", provider: "", registration_id: null },
     image: { model: "", provider: "", registration_id: null },
     video: { model: "", provider: "", registration_id: null },
     voice: { model: "", provider: "", registration_id: null },

@@ -91,14 +91,16 @@ def _clean(monkeypatch):
 
 
 def test_kind_contract_is_single_source():
-    assert kinds.KINDS == ("chat", "image", "video", "voice", "vector")
+    assert kinds.KINDS == ("chat", "code", "image", "video", "voice", "vector")
+    assert kinds.CAPABILITY_KINDS == ("code", "image", "video", "voice", "vector")
     assert kinds.MEDIA_KINDS == ("image", "video", "voice", "vector")
-    assert kinds.ACTIVATABLE_KINDS == kinds.MEDIA_KINDS
+    assert kinds.ACTIVATABLE_KINDS == kinds.CAPABILITY_KINDS
     assert kinds.GATEWAY_KINDS == ("image", "video")
     assert kinds.VOICE_CAPABILITIES == ("tts", "asr")
     assert kinds.FALLBACK_CAPABILITY_PROVIDERS == {"image": "fal"}
     assert kinds.selection_section("voice") == "voice_gen"
     assert kinds.selection_section("vector") == "vector_gen"
+    assert kinds.selection_section("code") == "code_agent"
     with pytest.raises(ValueError):
         kinds.selection_section("chat")
 
@@ -120,6 +122,112 @@ def test_registry_merges_same_name_voice_delegates():
     ]
     assert capability_module.get_capability_provider("image", "voice-double") is None
     assert capability_module.get_capability_provider("voice", "missing") is None
+
+
+def test_code_capability_adapter_uses_shared_registry(monkeypatch):
+    from providers.base import ProviderProfile
+
+    profile = ProviderProfile(
+        name="code-double",
+        display_name="Code Double",
+        fallback_models=("code-x",),
+        code_models=("code-x",),
+        env_vars=("CODE_DOUBLE_API_KEY",),
+    )
+    monkeypatch.setattr(
+        "agent.profile_provider_credentials.resolve_profile_api_key",
+        lambda _profile: "secret",
+    )
+    capability_module.register_code_provider(profile)
+
+    provider = capability_module.get_capability_provider("code", "code-double")
+    assert provider is not None
+    assert provider.kind == "code"
+    assert provider.list_models() == [CapabilityModel(id="code-x", display="code-x")]
+    assert provider.supports_model("code-x") is True
+    assert provider.supports_model("gpt-5.6-sol") is False
+    assert provider.capabilities() == {
+        "api_mode": "chat_completions",
+        "profile": "coding",
+        "toolset": "coding",
+    }
+    assert catalog_module.capability_catalog("code")[0]["provider"] == "code-double"
+    assert capability_module.get_capability_provider("image", "code-double") is None
+
+
+def test_chat_catalog_excludes_code_only_profiles_but_keeps_dual_surface(monkeypatch):
+    from providers.base import ProviderProfile
+
+    code_only = ProviderProfile(
+        name="code-only",
+        display_name="Code Only",
+        chat_enabled=False,
+    )
+    dual_surface = ProviderProfile(
+        name="dual-surface",
+        display_name="Dual Surface",
+        chat_enabled=True,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_plane.catalog._inventory_catalog",
+        lambda: [
+            {"slug": "code-only", "models": ["code-x"]},
+            {"slug": "dual-surface", "models": ["chat-x"]},
+        ],
+    )
+    monkeypatch.setattr(
+        "providers.get_provider_profile",
+        lambda name: {"code-only": code_only, "dual-surface": dual_surface}[name],
+    )
+
+    rows = catalog_module.chat_catalog()
+
+    assert [row["slug"] for row in rows] == ["dual-surface"]
+    assert rows[0]["models"] == ["chat-x"]
+
+
+def test_dual_surface_code_catalog_filters_models(monkeypatch):
+    from providers.base import ProviderProfile
+
+    profile = ProviderProfile(
+        name="dual-code",
+        display_name="Dual Code",
+        fallback_models=("gpt-5.6-sol", "code-x"),
+        code_models=("code-x",),
+        chat_enabled=True,
+    )
+    capability_module.register_code_provider(profile)
+    rows = catalog_module.capability_catalog("code")
+    assert rows[0]["models"] == [{"id": "code-x", "display": "code-x"}]
+
+
+def test_dual_surface_chat_catalog_keeps_unowned_models(monkeypatch):
+    from providers.base import ProviderProfile
+
+    profile = ProviderProfile(
+        name="dual-code",
+        display_name="Dual Code",
+        code_models=("code-x",),
+        chat_enabled=True,
+    )
+    capability_module.register_code_provider(profile)
+    monkeypatch.setattr(
+        catalog_module,
+        "_inventory_catalog",
+        lambda: [{
+            "slug": "dual-code",
+            "name": "Dual Code",
+            "models": ["gpt-5.6-sol", "code-x"],
+        }],
+    )
+    monkeypatch.setattr(
+        "providers.get_provider_profile",
+        lambda name: profile if name == "dual-code" else None,
+    )
+
+    rows = catalog_module.chat_catalog()
+
+    assert rows[0]["models"] == ["gpt-5.6-sol"]
 
 
 def test_registry_rejects_invalid_provider():

@@ -4,6 +4,7 @@ Separate from the standard `alibaba` profile because it hits a different
 endpoint (coding-intl.dashscope.aliyuncs.com) with a dedicated API key tier.
 """
 
+from hermes_cli.model_plane.capability import register_code_provider
 from providers import register_provider
 from providers.base import ProviderProfile
 
@@ -16,6 +17,9 @@ alibaba_coding_plan = ProviderProfile(
     env_vars=("ALIBABA_CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY", "ALIBABA_CODING_PLAN_BASE_URL"),
     base_url="https://coding-intl.dashscope.aliyuncs.com/v1",
     auth_type="api_key",
+    chat_enabled=True,
+    code_models=("qwen3-coder-plus", "qwen3-coder-next"),
 )
 
 register_provider(alibaba_coding_plan)
+register_code_provider(alibaba_coding_plan)

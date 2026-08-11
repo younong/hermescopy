@@ -17,11 +17,13 @@ const payload: ModelRegistrationsResponse = {
     image: { model: "image-v1", provider: "image-provider", registration_id: "image-a" },
     video: { model: "", provider: "", registration_id: null },
     voice: { model: "", provider: "", registration_id: null },
+    code: { model: "gpt-5.3-codex", provider: "openai-codex", registration_id: "code-codex" },
     vector: { model: "", provider: "", registration_id: null },
   },
   registrations: [
     registration("chat-current", "Current model", "chat", "current-provider", "current-model"),
     registration("chat-default", "Default model", "chat", "default-provider", "default-model"),
+    registration("code-codex", "Codex model", "code", "openai-codex", "gpt-5.3-codex"),
     registration("admin-chat", "Admin model", "chat", "admin-provider", "admin-model", "admin"),
     registration("image-a", "Image model", "image", "image-provider", "image-v1"),
     registration("video-a", "Video model", "video", "video-provider", "video-v1"),
@@ -56,13 +58,22 @@ afterEach(async () => {
 });
 
 describe("GuiChatModelsPane", () => {
-  it("renders a Skills-style list with current, default, active, search, and kind filters", async () => {
+  it("renders separate Chat and Code model tabs", async () => {
     await renderPane();
 
     expect(api.getModelRegistrations).toHaveBeenCalledWith();
     expect(document.querySelector("[data-models-pane].gui-chat-workspace-pane")).not.toBeNull();
     expect(document.body.textContent).toContain("Current conversation");
     expect(document.body.textContent).toContain("Default");
+    expect(document.body.textContent).not.toContain("Codex model");
+
+    await clickButton("Code", true);
+    expect(document.body.textContent).toContain("Codex model");
+    expect(document.body.textContent).not.toContain("Current model");
+
+    await clickButton("Chat", true);
+    expect(document.body.textContent).toContain("Current model");
+    expect(document.body.textContent).not.toContain("Codex model");
 
     await clickButton("Image", true);
     expect(document.body.textContent).toContain("Image model");
@@ -74,6 +85,16 @@ describe("GuiChatModelsPane", () => {
       setInput(search, "missing");
     });
     expect(document.body.textContent).toContain("No matching models");
+  });
+
+  it("does not route Code models through the Chat switch callback", async () => {
+    const onSwitchChat = vi.fn();
+    const onActivateCode = vi.fn().mockResolvedValue(undefined);
+    await renderPane({ onSwitchChat, onActivateCode });
+    await clickButton("Code", true);
+    await clickWithin(rowFor("Codex model"), "Default", true);
+    expect(onActivateCode).toHaveBeenCalledWith(expect.objectContaining({ id: "code-codex", kind: "code" }));
+    expect(onSwitchChat).not.toHaveBeenCalled();
   });
 
   it("shows Admin and Mine models while keeping administrator models immutable", async () => {

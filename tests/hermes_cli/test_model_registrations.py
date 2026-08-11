@@ -144,6 +144,24 @@ def test_default_config_has_optional_registration_mapping():
 
 
 def _deployment_registrations(monkeypatch):
+    from providers.base import ProviderProfile
+
+    capability_module.register_code_provider(
+        ProviderProfile(
+            name="openai-codex",
+            fallback_models=("gpt-5.3-codex",),
+            code_models=("gpt-5.3-codex",),
+            chat_enabled=True,
+        )
+    )
+    capability_module.register_code_provider(
+        ProviderProfile(
+            name="kimi-coding",
+            fallback_models=("kimi-k2.5",),
+            code_models=("kimi-k2.5",),
+            chat_enabled=True,
+        )
+    )
     monkeypatch.setattr(
         "hermes_cli.deployment_inference.route_descriptors_from_control_plane",
         lambda: (
@@ -179,6 +197,26 @@ def _deployment_registrations(monkeypatch):
             policy_id="deployment-media",
         ),
     )
+
+
+def test_deployment_route_kind_is_model_scoped(monkeypatch):
+    _deployment_registrations(monkeypatch)
+    from hermes_cli.deployment_inference import DeploymentInferenceRouteDescriptor
+
+    assert model_registrations._deployment_route_kind(
+        DeploymentInferenceRouteDescriptor(
+            provider="openai-codex",
+            model="gpt-5.6-sol",
+            api_mode="chat_completions",
+        )
+    ) == "chat"
+    assert model_registrations._deployment_route_kind(
+        DeploymentInferenceRouteDescriptor(
+            provider="openai-codex",
+            model="gpt-5.3-codex",
+            api_mode="chat_completions",
+        )
+    ) == "code"
 
 
 def test_admin_registrations_control_plane_derives_media_from_policy(monkeypatch):
@@ -219,6 +257,38 @@ def test_admin_registrations_control_plane_derives_media_from_policy(monkeypatch
     assert ("vector", "volcengine-agent-plan", "doubao-embedding-vision") in media
 
 
+def test_admin_registrations_expose_custom_codex_image_route(monkeypatch):
+    monkeypatch.setenv(
+        ROUTES_ENV,
+        json.dumps([{
+            "kind": "image",
+            "provider": "custom:codex",
+            "models": ["gpt-image-2"],
+            "default_model": "gpt-image-2",
+            "key_env": "CODEX_IMAGE_KEY",
+            "executor": "plugins.image_gen.apiyi:generate_openai_image_bytes",
+            "base_urls": {"openai_base_url": "https://codex.example.com/v1"},
+            "executor_params": {"edit_protocol": "json_images"},
+        }]),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.deployment_inference.route_descriptors_from_control_plane",
+        lambda: (),
+    )
+    monkeypatch.delenv("APIYI_API_KEY", raising=False)
+
+    registrations = model_registrations._admin_registrations()
+    matches = [
+        item for item in registrations.values()
+        if item.get("kind") == "image"
+        and item.get("provider") == "custom:codex"
+    ]
+
+    assert [(item["model"], item["use_gateway"]) for item in matches] == [
+        ("gpt-image-2", False)
+    ]
+
+
 def test_payload_merges_admin_descriptors_with_legacy_user_registrations(monkeypatch):
     _deployment_registrations(monkeypatch)
     config = load_config()
@@ -248,8 +318,10 @@ def test_payload_merges_admin_descriptors_with_legacy_user_registrations(monkeyp
         "use_gateway": False,
         "credential_configured": None,
     }
+    assert by_name["ChatGPT Codex"]["kind"] == "code"
     assert by_name["ChatGPT Codex"]["scope"] == "admin"
     assert by_name["ChatGPT Codex"]["mutable"] is False
+    assert by_name["Kimi Code"]["kind"] == "code"
     assert by_name["Kimi Code"]["provider"] == "kimi-coding"
     assert by_name["APIYI · nano-banana-2"]["kind"] == "image"
     assert all("owner" not in item for item in payload["registrations"])
@@ -259,21 +331,24 @@ def test_payload_merges_admin_descriptors_with_legacy_user_registrations(monkeyp
 def test_admin_registrations_are_stable_resolvable_and_immutable(monkeypatch):
     _deployment_registrations(monkeypatch)
     payload = model_registrations.get_model_registrations_payload()
-    chat = next(item for item in payload["registrations"] if item["name"] == "Kimi Code")
+    code = next(item for item in payload["registrations"] if item["name"] == "Kimi Code")
     image = next(item for item in payload["registrations"] if item["name"] == "APIYI · nano-banana-2")
 
-    assert chat["id"] == model_registrations._admin_registration_id(
-        "chat", "kimi-coding", "kimi-k2.5"
+    assert code["kind"] == "code"
+    assert code["id"] == model_registrations._admin_registration_id(
+        "code", "kimi-coding", "kimi-k2.5"
     )
-    assert model_registrations.resolve_chat_model_registration(chat["id"]) == {
-        "registration_id": chat["id"],
+    assert model_registrations.resolve_code_model_registration(code["id"]) == {
+        "registration_id": code["id"],
         "provider": "kimi-coding",
         "model": "kimi-k2.5",
         "source": "catalog",
         "selection_source": "deployment",
+        "profile": "coding",
+        "toolset": "coding",
     }
     with pytest.raises(model_registrations.ModelRegistrationImmutable):
-        model_registrations.update_model_registration(chat["id"], {})
+        model_registrations.update_model_registration(code["id"], {})
     with pytest.raises(model_registrations.ModelRegistrationImmutable):
         model_registrations.delete_model_registration(image["id"])
 
@@ -289,24 +364,24 @@ def test_admin_registrations_are_stable_resolvable_and_immutable(monkeypatch):
 
 def test_catalog_registration_cannot_duplicate_admin_target(monkeypatch):
     _deployment_registrations(monkeypatch)
-    monkeypatch.setattr(model_registrations, "_chat_catalog", lambda: [{
-        "slug": "kimi-coding",
-        "name": "Kimi",
-        "models": ["kimi-k2.5"],
-        "authenticated": True,
+    monkeypatch.setattr(model_registrations, "_capability_catalog", lambda: [{
+        "provider": "kimi-coding",
+        "name": "Kimi Code",
+        "models": [{"id": "kimi-k2.5"}],
+        "available": True,
     }])
 
     with pytest.raises(model_registrations.ModelRegistrationConflict):
         model_registrations.create_model_registration({
             "name": "Duplicate Kimi",
-            "kind": "chat",
+            "kind": "code",
             "provider": "kimi-coding",
             "model": "kimi-k2.5",
         })
     with pytest.raises(model_registrations.ModelRegistrationError, match="server-managed"):
         model_registrations.create_model_registration({
             "name": "Forged admin",
-            "kind": "chat",
+            "kind": "code",
             "provider": "kimi-coding",
             "model": "kimi-k2.5",
             "scope": "admin",
@@ -608,6 +683,105 @@ def test_duplicate_type_and_catalog_validation(monkeypatch):
         })
 
 
+def test_code_registration_has_independent_catalog_and_activation(monkeypatch):
+    monkeypatch.setattr(
+        model_registrations,
+        "_capability_catalog",
+        lambda: [{
+            "provider": "openai-codex",
+            "name": "OpenAI Codex",
+            "models": [{"id": "gpt-5.3-codex", "display": "gpt-5.3-codex"}],
+            "available": True,
+            "credential_configured": True,
+            "default_model": "gpt-5.3-codex",
+            "capabilities": {"profile": "coding", "toolset": "coding"},
+            "setup": {"env_vars": []},
+        }],
+    )
+    created = model_registrations.create_model_registration({
+        "name": "Codex",
+        "kind": "code",
+        "provider": "openai-codex",
+        "model": "gpt-5.3-codex",
+    })
+    assert created["kind"] == "code"
+    assert "category" not in created
+
+    activated = model_registrations.activate_model_registration(created["id"])
+    assert activated["kind"] == "code"
+    config = load_config()
+    assert config["code_agent"] == {
+        "provider": "openai-codex",
+        "model": "gpt-5.3-codex",
+    }
+    assert config["model"] == ""
+    assert model_registrations.resolve_code_model_registration(created["id"]) == {
+        "registration_id": created["id"],
+        "provider": "openai-codex",
+        "model": "gpt-5.3-codex",
+        "source": "catalog",
+        "profile": "coding",
+        "toolset": "coding",
+    }
+
+
+def test_legacy_code_registration_migrates_and_preserves_id(monkeypatch):
+    monkeypatch.setattr(
+        model_registrations,
+        "_capability_catalog",
+        lambda: [{
+            "provider": "openai-codex",
+            "models": [{"id": "gpt-5.3-codex"}],
+        }],
+    )
+    config = load_config()
+    config["model_registrations"] = {
+        "legacy-code": {
+            "name": "Legacy Codex",
+            "kind": "chat",
+            "category": "code",
+            "provider": "openai-codex",
+            "model": "gpt-5.3-codex",
+            "source": "catalog",
+        },
+    }
+    save_config(config, preserve_keys={("model_registrations",)})
+
+    payload = model_registrations.get_model_registrations_payload()
+
+    migrated = next(item for item in payload["registrations"] if item["id"] == "legacy-code")
+    assert migrated["kind"] == "code"
+    assert "category" not in migrated
+    assert load_config()["model_registrations"]["legacy-code"]["kind"] == "code"
+    assert model_registrations.resolve_code_model_registration("legacy-code")["profile"] == "coding"
+
+
+def test_unmigratable_legacy_code_registration_is_exposed_and_rejected(monkeypatch):
+    monkeypatch.setattr(model_registrations, "_capability_catalog", lambda: [])
+    config = load_config()
+    config["model_registrations"] = {
+        "legacy-code": {
+            "name": "Missing Codex",
+            "kind": "chat",
+            "category": "code",
+            "provider": "removed-provider",
+            "model": "removed-model",
+            "source": "catalog",
+        },
+    }
+    save_config(config, preserve_keys={("model_registrations",)})
+
+    payload = model_registrations.get_model_registrations_payload()
+
+    migrated = next(item for item in payload["registrations"] if item["id"] == "legacy-code")
+    assert migrated["kind"] == "code"
+    assert migrated["migration_error"] == (
+        "Code provider 'removed-provider' is no longer available"
+    )
+    with pytest.raises(model_registrations.ModelRegistrationError, match="no longer available"):
+        model_registrations.resolve_code_model_registration("legacy-code")
+
+
 def test_chat_catalog_disables_network_discovery(monkeypatch):
     captured: dict[str, Any] = {}
 
@@ -675,6 +849,6 @@ def test_payload_is_lightweight_and_catalog_is_safe(monkeypatch):
     }
     with pytest.raises(
         model_registrations.ModelRegistrationError,
-        match="Only image, video, voice, and vector",
+        match="Only code, image, video, voice, and vector",
     ):
         model_registrations.activate_model_registration(chat["id"])

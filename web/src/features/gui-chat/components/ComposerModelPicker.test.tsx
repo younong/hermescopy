@@ -14,6 +14,7 @@ import { ComposerModelPicker } from "./ComposerModelPicker";
 const payload: ModelRegistrationsResponse = {
   active: {
     chat: { model: "default-model", provider: "default-provider", registration_id: "chat-default" },
+    code: { model: "", provider: "", registration_id: null },
     image: { model: "image-v1", provider: "image-provider", registration_id: "image-a" },
     video: { model: "", provider: "", registration_id: null },
     voice: { model: "", provider: "", registration_id: null },
