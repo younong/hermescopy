@@ -35,7 +35,7 @@ export function readFileAsDataUrl(file: File): Promise<string> {
 export async function compressImageForUpload(file: File): Promise<File> {
   if (file.size <= IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES) return file;
 
-  const losslessFile = await optimiseImageLosslessly(file);
+  const losslessFile = await optimiseImageLosslessly(file).catch(() => null);
   if (losslessFile?.size && losslessFile.size <= IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES) {
     return losslessFile;
   }

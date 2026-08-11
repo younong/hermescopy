@@ -74,6 +74,24 @@ describe("gui chat attachment helpers", () => {
     expect(compressionMocks.imageCompression).not.toHaveBeenCalled();
   });
 
+  it("uses third-party lossy compression when lossless optimisation fails", async () => {
+    const original = file("diagram.png", "image/png", IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES + 1);
+    const lossy = new File([new Uint8Array(IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES)], "diagram.jpg", {
+      type: "image/jpeg",
+    });
+    compressionMocks.optimisePng.mockRejectedValue(new Error("WASM failed to load"));
+    compressionMocks.imageCompression.mockResolvedValue(lossy);
+
+    await expect(compressImageForUpload(original)).resolves.toBe(lossy);
+    expect(compressionMocks.imageCompression).toHaveBeenCalledWith(original, {
+      fileType: "image/jpeg",
+      maxIteration: 20,
+      maxSizeMB: 2,
+      maxWidthOrHeight: 4096,
+      useWebWorker: true,
+    });
+  });
+
   it("uses third-party lossy compression when lossless optimisation misses the target", async () => {
     const original = file("diagram.png", "image/png", IMAGE_ATTACHMENT_UPLOAD_TARGET_BYTES + 1);
     compressionMocks.optimisePng.mockResolvedValue(
