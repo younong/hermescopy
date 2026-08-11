@@ -123,6 +123,70 @@ class TestIdentityFlush:
             finally:
                 db.close()
 
+    def test_reconstructed_image_tool_history_is_not_rewritten(self):
+        """DB replay provenance survives reconstructed message dictionaries."""
+        from hermes_session_queries import DB_PERSISTED_MARKER
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "t.db")
+            try:
+                agent = _make_agent(db)
+                tool_calls = [{
+                    "id": "call-image-1",
+                    "type": "function",
+                    "function": {
+                        "name": "image_generate",
+                        "arguments": '{"prompt":"draw"}',
+                    },
+                }]
+                result = '{"success":true,"image":"/workspace/generated/result.png"}'
+                db.append_message(
+                    SESSION_ID,
+                    role="assistant",
+                    content="",
+                    tool_calls=tool_calls,
+                )
+                db.append_message(
+                    SESSION_ID,
+                    role="tool",
+                    content=result,
+                    tool_name="image_generate",
+                    tool_call_id="call-image-1",
+                )
+
+                # Independent replay queries reconstruct equal-but-distinct dicts,
+                # as owner-worker cold resume and a later snapshot can do.
+                messages = db.get_messages_as_conversation(SESSION_ID)
+                history = db.get_messages_as_conversation(SESSION_ID)
+                assert messages == history
+                assert all(left is not right for left, right in zip(messages, history))
+                assert all(message[DB_PERSISTED_MARKER] is True for message in messages)
+
+                agent._flush_messages_to_session_db(messages, history)
+
+                rows = db.get_messages(SESSION_ID)
+                assert len(rows) == 2
+                assert rows[0]["tool_calls"] is not None
+                assert rows[1]["tool_call_id"] == "call-image-1"
+
+                # Value-identical messages created by a new execution remain
+                # appendable because deduplication is provenance-, not value-based.
+                repeated = [
+                    {key: value for key, value in message.items()
+                     if key != DB_PERSISTED_MARKER}
+                    for message in messages
+                ]
+                agent._flush_messages_to_session_db(repeated, [])
+
+                rows = db.get_messages(SESSION_ID)
+                assert len(rows) == 4
+                assert [row["tool_call_id"] for row in rows] == [
+                    None, "call-image-1", None, "call-image-1",
+                ]
+            finally:
+                db.close()
+
     def test_cursor_reset_starts_new_turn_identity_window(self):
         """Gateway resets _last_flushed_db_idx=0 before a cached-agent turn."""
         from hermes_state import SessionDB

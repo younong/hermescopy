@@ -209,6 +209,18 @@ class ImageGenProvider(abc.ABC):
 # ---------------------------------------------------------------------------
 
 
+def canonical_aspect_ratio(value: object) -> Optional[str]:
+    """Return the canonical ratio for a supported value, or ``None``."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if normalized in _LEGACY_ASPECT_RATIO_ALIASES:
+        return _LEGACY_ASPECT_RATIO_ALIASES[normalized]
+    if normalized in VALID_ASPECT_RATIOS:
+        return normalized
+    return None
+
+
 def resolve_aspect_ratio(value: Optional[str]) -> str:
     """Return a canonical exact ratio, accepting legacy directional aliases.
 
@@ -217,14 +229,7 @@ def resolve_aspect_ratio(value: Optional[str]) -> str:
     supported; this function must not silently replace one valid ratio with a
     different valid ratio.
     """
-    if not isinstance(value, str):
-        return DEFAULT_ASPECT_RATIO
-    v = value.strip().lower()
-    if v in _LEGACY_ASPECT_RATIO_ALIASES:
-        return _LEGACY_ASPECT_RATIO_ALIASES[v]
-    if v in VALID_ASPECT_RATIOS:
-        return v
-    return DEFAULT_ASPECT_RATIO
+    return canonical_aspect_ratio(value) or DEFAULT_ASPECT_RATIO
 
 
 def aspect_ratio_value(value: str) -> float:

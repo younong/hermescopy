@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 logger = logging.getLogger(__name__)
 MAX_FTS5_QUERY_CHARS = 2_048
+DB_PERSISTED_MARKER = "_db_persisted"
 
 _BACKGROUND_REVIEW_HARNESS_PREFIXES = (
     "Review the conversation above and update the skill library",
@@ -1378,6 +1379,7 @@ class SessionQueryMixin:
         messages: List[Dict[str, Any]] = []
         for row in rows:
             message = self._conversation_message_from_row(row)
+            message[DB_PERSISTED_MARKER] = True
             if include_ancestors and self._is_duplicate_replayed_user_message(
                 messages, message
             ):

@@ -2,6 +2,7 @@ import base64
 
 import pytest
 
+from agent.image_gen_provider import VALID_ASPECT_RATIOS
 from agent.transcription_provider import TranscriptionProvider
 from agent.tts_provider import TTSProvider
 from hermes_cli.dashboard_auth.authority import (
@@ -71,6 +72,11 @@ def _fake_executor(**kwargs):
         "metadata": {
             "size": "1024x1024",
             "upstream_model": "gpt-image-2",
+            "requested_aspect_ratio": kwargs.get("aspect_ratio"),
+            "effective_aspect_ratio": kwargs.get("aspect_ratio"),
+            "requested_resolution": kwargs.get("params", {}).get("resolution"),
+            "effective_resolution": kwargs.get("params", {}).get("resolution"),
+            "resolution_mode": "native",
             "api_key_backup": "must-not-cross-relay",
             "x-api-key": "must-not-cross-relay",
         },
@@ -92,7 +98,7 @@ def _request(policy, **overrides):
         "provider": "apiyi",
         "model": "gpt-image-2-medium",
         "prompt": "draw",
-        "aspect_ratio": "square",
+        "aspect_ratio": "3:4",
         "references": [],
         "params": {},
     }
@@ -118,13 +124,21 @@ def test_relay_requires_active_exact_lease_and_returns_bytes(tmp_path):
         provider="apiyi",
         model="gpt-image-2-medium",
         prompt="draw",
-        aspect_ratio="square",
+        aspect_ratio="3:4",
         references=[],
+        params={"resolution": "4K"},
     )
     assert result["image_bytes"] == b"generated"
     assert result["provider"] == "apiyi"
+    assert result["aspect_ratio"] == "3:4"
     assert result["metadata"] == {
-        "size": "1024x1024", "upstream_model": "gpt-image-2",
+        "size": "1024x1024",
+        "upstream_model": "gpt-image-2",
+        "requested_aspect_ratio": "3:4",
+        "effective_aspect_ratio": "3:4",
+        "requested_resolution": "4K",
+        "effective_resolution": "4K",
+        "resolution_mode": "native",
     }
     broker.revoke(active)
     with pytest.raises(DeploymentMediaRelayError):
@@ -136,6 +150,28 @@ def test_relay_requires_active_exact_lease_and_returns_bytes(tmp_path):
             aspect_ratio="square",
         )
     client.close()
+    broker.close()
+
+
+@pytest.mark.parametrize(
+    "aspect_ratio",
+    [*VALID_ASPECT_RATIOS, "landscape", "square", "portrait"],
+)
+def test_relay_accepts_supported_image_aspect_ratios(tmp_path, aspect_ratio):
+    store = AuthorityStore(tmp_path)
+    claim = store.claim_worker_start("owner", worker_id="worker")
+    policy = _policy()
+    broker = DeploymentMediaBroker(policy=policy, authority_store=store)
+    active = store.transition_worker_lease(
+        claim.lease,
+        state=WorkerLeaseState.ACTIVE,
+        generation_state=WorkerGenerationState.ACTIVE,
+    )
+    result = broker._handle_request(
+        active,
+        _request(policy, aspect_ratio=aspect_ratio),
+    )
+    assert result["aspect_ratio"] in VALID_ASPECT_RATIOS
     broker.close()
 
 

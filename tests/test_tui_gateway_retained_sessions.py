@@ -12,6 +12,7 @@ import pytest
 from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
 from hermes_cli.controlled_roots import controlled_roots_for
 from hermes_cli.owner_runtime import ensure_owner_runtime_dirs, owner_worker_runtime_paths
+from hermes_session_queries import DB_PERSISTED_MARKER
 from hermes_state import SessionDB
 from tui_gateway import server
 
@@ -690,6 +691,49 @@ def test_web_direct_resume_rebuilds_live_authority_and_rejects_identity_mismatch
                     },
                 }
             )
+
+
+def test_owner_worker_resume_marks_reconstructed_history_as_persisted(
+    owner_gateway, monkeypatch
+):
+    db, runtime, workspace_root = owner_gateway
+    _create_owned(db, workspace_root, "retained", source="dashboard-gui", generation=2)
+    db.append_message("retained", "user", "draw an image")
+    tool_calls = [{
+        "id": "call-image-1",
+        "type": "function",
+        "function": {
+            "name": "image_generate",
+            "arguments": '{"prompt":"draw"}',
+        },
+    }]
+    db.append_message(
+        "retained", "assistant", "", tool_calls=tool_calls,
+    )
+    db.append_message(
+        "retained",
+        "tool",
+        '{"success":true,"image":"/workspace/generated/result.png"}',
+        tool_name="image_generate",
+        tool_call_id="call-image-1",
+    )
+    monkeypatch.setattr(server, "_reopen_resume_session", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        server, "_stored_session_runtime_overrides", lambda *_args, **_kwargs: {}
+    )
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_args, **_kwargs: None)
+
+    response = _call(
+        runtime,
+        "session.resume",
+        {"session_id": "retained", "source": "dashboard-gui"},
+    )
+
+    assert "error" not in response
+    live_id = response["result"]["session_id"]
+    history = runtime.mutable_state.sessions[live_id]["history"]
+    assert [message["role"] for message in history] == ["user", "assistant", "tool"]
+    assert all(message[DB_PERSISTED_MARKER] is True for message in history)
 
 
 def test_owner_worker_resume_preserves_retained_stored_source(owner_gateway, monkeypatch):

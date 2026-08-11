@@ -21,11 +21,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
+    DEFAULT_RESOLUTION,
     ImageGenProvider,
     error_response,
     normalize_reference_images,
     nearest_aspect_ratio,
     resolve_aspect_ratio,
+    resolve_resolution,
     save_b64_image,
     save_url_image,
     success_response,
@@ -73,13 +75,37 @@ _MODELS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-# APIYI's regular GPT-Image-2 endpoint accepts these practical sizes. The
-# custom 768x1024 size is an exact 3:4 ratio and uses 16-pixel dimensions.
-_SIZES = {
-    "3:2": "1536x1024",
-    "1:1": "1024x1024",
-    "2:3": "1024x1536",
-    "3:4": "768x1024",
+# APIYI's GPT-Image-2 endpoint accepts arbitrary 16-pixel-aligned dimensions
+# within its documented pixel bounds. Each row maps Hermes' unified resolution
+# tier to the closest supported size for that aspect ratio.
+_GPT_SIZES = {
+    "1K": {
+        "16:9": "1280x720",
+        "3:2": "1536x1024",
+        "4:3": "1024x768",
+        "1:1": "1024x1024",
+        "3:4": "768x1024",
+        "2:3": "1024x1536",
+        "9:16": "720x1280",
+    },
+    "2K": {
+        "16:9": "2048x1152",
+        "3:2": "2048x1360",
+        "4:3": "2048x1536",
+        "1:1": "2048x2048",
+        "3:4": "1536x2048",
+        "2:3": "1360x2048",
+        "9:16": "1152x2048",
+    },
+    "4K": {
+        "16:9": "3840x2160",
+        "3:2": "3520x2336",
+        "4:3": "3312x2480",
+        "1:1": "2880x2880",
+        "3:4": "2480x3312",
+        "2:3": "2336x3520",
+        "9:16": "2160x3840",
+    },
 }
 
 _GEMINI_ASPECT_RATIOS = {
@@ -91,6 +117,12 @@ _GEMINI_ASPECT_RATIOS = {
     "3:2": "3:2",
     "9:16": "9:16",
 }
+
+
+def _gpt_image_size(aspect_ratio: str, resolution: str) -> Tuple[str, str]:
+    sizes = _GPT_SIZES[resolve_resolution(resolution)]
+    effective_aspect = nearest_aspect_ratio(aspect_ratio, tuple(sizes))
+    return sizes[effective_aspect], effective_aspect
 
 
 def _load_image_gen_config() -> Dict[str, Any]:
@@ -285,15 +317,14 @@ def generate_apiyi_image_bytes(
     gemini_base_url: str,
     params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Call APIYI using trusted explicit runtime inputs without filesystem writes.
-
-    ``params`` carries deployment-media relay extras; APIYI has none and
-    ignores it.
-    """
+    """Call APIYI using trusted explicit runtime inputs without filesystem writes."""
     import requests
 
     model_id, meta = _resolve_model(model)
     requested_aspect = resolve_aspect_ratio(aspect_ratio)
+    requested_resolution = resolve_resolution(
+        (params or {}).get("resolution", DEFAULT_RESOLUTION)
+    )
     if model_id == _NANO_MODEL:
         if references:
             raise ValueError("nano-banana-2 does not accept reference images")
@@ -304,7 +335,10 @@ def generate_apiyi_image_bytes(
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
                 "responseModalities": ["IMAGE", "TEXT"],
-                "imageConfig": {"aspectRatio": _GEMINI_ASPECT_RATIOS[effective_aspect]},
+                "imageConfig": {
+                    "aspectRatio": _GEMINI_ASPECT_RATIOS[effective_aspect],
+                    "imageSize": requested_resolution,
+                },
             },
         }
         response = requests.post(
@@ -334,10 +368,14 @@ def generate_apiyi_image_bytes(
                 "upstream_model": _upstream_model(model_id),
                 "requested_aspect_ratio": requested_aspect,
                 "effective_aspect_ratio": effective_aspect,
+                "requested_resolution": requested_resolution,
+                "effective_resolution": requested_resolution,
+                "resolution_mode": "native",
             },
         }
-    effective_aspect = nearest_aspect_ratio(requested_aspect, tuple(_SIZES))
-    size = _SIZES[effective_aspect]
+    size, effective_aspect = _gpt_image_size(
+        requested_aspect, requested_resolution
+    )
     headers = {"Authorization": f"Bearer {api_key}"}
     if references:
         files = [("image", (item["name"], item["data"], item["mime_type"])) for item in references]
@@ -363,6 +401,9 @@ def generate_apiyi_image_bytes(
         "upstream_model": _upstream_model(model_id),
         "requested_aspect_ratio": requested_aspect,
         "effective_aspect_ratio": effective_aspect,
+        "requested_resolution": requested_resolution,
+        "effective_resolution": requested_resolution,
+        "resolution_mode": "native",
     }
     if revised_prompt:
         metadata["revised_prompt"] = revised_prompt
@@ -449,10 +490,12 @@ class ApiyiImageGenProvider(ImageGenProvider):
             )
 
         model_id, meta = _resolve_model(kwargs.get("model"))
+        resolution = resolve_resolution(kwargs.get("resolution"))
         if model_id == _NANO_MODEL:
             return self._generate_nano(
                 prompt,
                 aspect,
+                resolution=resolution,
                 api_key=api_key,
                 model_id=model_id,
                 image_url=image_url,
@@ -461,6 +504,7 @@ class ApiyiImageGenProvider(ImageGenProvider):
         return self._generate_gpt(
             prompt,
             aspect,
+            resolution=resolution,
             api_key=api_key,
             model_id=model_id,
             meta=meta,
@@ -473,6 +517,7 @@ class ApiyiImageGenProvider(ImageGenProvider):
         prompt: str,
         aspect: str,
         *,
+        resolution: str,
         api_key: str,
         model_id: str,
         meta: Dict[str, Any],
@@ -484,8 +529,10 @@ class ApiyiImageGenProvider(ImageGenProvider):
         upstream = _upstream_model(model_id)
         base_url = _openai_base_url()
         requested_aspect = resolve_aspect_ratio(aspect)
-        effective_aspect = nearest_aspect_ratio(requested_aspect, tuple(_SIZES))
-        size = _SIZES[effective_aspect]
+        requested_resolution = resolve_resolution(resolution)
+        size, effective_aspect = _gpt_image_size(
+            requested_aspect, requested_resolution
+        )
         sources = _collect_sources(image_url, reference_image_urls)[:_MAX_GPT_REFERENCE_IMAGES]
         is_edit = bool(sources)
         headers = {"Authorization": f"Bearer {api_key}"}
@@ -594,6 +641,9 @@ class ApiyiImageGenProvider(ImageGenProvider):
             "quality": meta["quality"],
             "requested_aspect_ratio": aspect,
             "effective_aspect_ratio": effective_aspect,
+            "requested_resolution": requested_resolution,
+            "effective_resolution": requested_resolution,
+            "resolution_mode": "native",
         }
         if revised_prompt:
             extra["revised_prompt"] = revised_prompt
@@ -612,6 +662,7 @@ class ApiyiImageGenProvider(ImageGenProvider):
         prompt: str,
         aspect: str,
         *,
+        resolution: str,
         api_key: str,
         model_id: str,
         image_url: Optional[str],
@@ -622,6 +673,7 @@ class ApiyiImageGenProvider(ImageGenProvider):
         upstream = _upstream_model(model_id)
         base_url = _gemini_base_url()
         requested_aspect = resolve_aspect_ratio(aspect)
+        requested_resolution = resolve_resolution(resolution)
         effective_aspect = nearest_aspect_ratio(
             requested_aspect, tuple(_GEMINI_ASPECT_RATIOS)
         )
@@ -645,7 +697,10 @@ class ApiyiImageGenProvider(ImageGenProvider):
             "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {
                 "responseModalities": ["IMAGE", "TEXT"],
-                "imageConfig": {"aspectRatio": _GEMINI_ASPECT_RATIOS[effective_aspect]},
+                "imageConfig": {
+                    "aspectRatio": _GEMINI_ASPECT_RATIOS[effective_aspect],
+                    "imageSize": requested_resolution,
+                },
             },
         }
         headers = {
@@ -731,6 +786,9 @@ class ApiyiImageGenProvider(ImageGenProvider):
                 "aspect_ratio_native": _GEMINI_ASPECT_RATIOS[effective_aspect],
                 "requested_aspect_ratio": requested_aspect,
                 "effective_aspect_ratio": effective_aspect,
+                "requested_resolution": requested_resolution,
+                "effective_resolution": requested_resolution,
+                "resolution_mode": "native",
             },
         )
 
