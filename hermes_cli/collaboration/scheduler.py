@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -523,11 +524,123 @@ class CollaborationScheduler:
             self.emit("collaboration.target.changed", self._public_target(claimed))
         return claimed
 
+    def _coalesce_queued_targets(self, claimed: dict[str, Any]) -> list[dict[str, Any]]:
+        """Fold compatible queued messages into the exact claimed member turn."""
+
+        def _write(conn):
+            primary = self._owned_target(conn, str(claimed["target_id"]))
+            if primary is None or primary["status"] != "running":
+                return []
+            task_or_attachment = conn.execute(
+                "SELECT EXISTS(SELECT 1 FROM collaboration_tasks WHERE group_id=?) "
+                "OR EXISTS(SELECT 1 FROM collaboration_attachment_grants WHERE target_id=?)",
+                (primary["group_id"], primary["target_id"]),
+            ).fetchone()[0]
+            if task_or_attachment:
+                return []
+            rows = conn.execute(
+                "SELECT tt.target_id, tt.execution_id, tt.turn_id, "
+                "tt.snapshot_sequence, EXISTS("
+                "SELECT 1 FROM collaboration_attachment_grants ag "
+                "WHERE ag.target_id=tt.target_id) AS has_attachments "
+                "FROM collaboration_turn_targets tt "
+                "JOIN collaboration_turns t ON t.turn_id=tt.turn_id "
+                "JOIN collaboration_groups g ON g.group_id=t.group_id "
+                "WHERE g.owner_key=? AND g.status='active' AND t.group_id=? "
+                "AND tt.membership_id=? AND tt.status='queued' "
+                "AND tt.snapshot_sequence>? "
+                "ORDER BY tt.snapshot_sequence, tt.target_id",
+                (
+                    self.fence.owner_key,
+                    primary["group_id"],
+                    primary["membership_id"],
+                    primary["snapshot_sequence"],
+                ),
+            ).fetchall()
+            merged = []
+            for row in rows:
+                if row["has_attachments"]:
+                    break
+                merged.append(dict(row))
+            if not merged:
+                return []
+            now = time.time()
+            latest_snapshot = int(merged[-1]["snapshot_sequence"])
+            changed = conn.execute(
+                "UPDATE collaboration_turn_targets SET snapshot_sequence=?, updated_at=? "
+                "WHERE target_id=? AND status='running' AND worker_owner_key=? "
+                "AND worker_id=? AND worker_generation=? AND lease_version=? "
+                "AND recovery_generation=?",
+                (
+                    latest_snapshot,
+                    now,
+                    primary["target_id"],
+                    *self.fence.values(),
+                ),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError(
+                    "collaboration target coalescing fence is no longer valid"
+                )
+            for target in merged:
+                changed = conn.execute(
+                    "UPDATE collaboration_turn_targets SET status='running', "
+                    "active_started_at=?, attempt=attempt+1, worker_owner_key=?, "
+                    "worker_id=?, worker_generation=?, lease_version=?, "
+                    "recovery_generation=?, updated_at=? WHERE target_id=? "
+                    "AND status='queued'",
+                    (now, *self.fence.values(), now, target["target_id"]),
+                ).rowcount
+                if changed != 1:
+                    raise RuntimeError(
+                        "coalesced collaboration target claim is no longer valid"
+                    )
+                conn.execute(
+                    "UPDATE collaboration_turns SET status='running', worker_owner_key=?, "
+                    "worker_id=?, worker_generation=?, lease_version=?, "
+                    "recovery_generation=?, updated_at=? WHERE turn_id=? "
+                    "AND status='queued'",
+                    (*self.fence.values(), now, target["turn_id"]),
+                )
+            return merged
+
+        merged = self.db._execute_write(_write)
+        if merged:
+            claimed["snapshot_sequence"] = int(merged[-1]["snapshot_sequence"])
+        return merged
+
+    def _finish_coalesced(
+        self,
+        targets: list[dict[str, Any]],
+        *,
+        status: str,
+        error: str,
+    ) -> None:
+        for target in targets:
+            self._finish(str(target["target_id"]), status=status, error=error)
+
+    @staticmethod
+    def _receipt_key(
+        claimed: dict[str, Any], merged: list[dict[str, Any]]
+    ) -> str:
+        execution_ids = [
+            str(claimed["execution_id"]),
+            *[str(row["execution_id"]) for row in merged],
+        ]
+        if len(execution_ids) == 1:
+            return f"collaboration:{execution_ids[0]}"
+        digest = hashlib.sha256(
+            "\x00".join(execution_ids).encode("utf-8")
+        ).hexdigest()
+        return f"collaboration-batch:{digest}"
+
     def _execute_claimed(self, claimed: dict[str, Any]) -> None:
         hidden_id = str(claimed["hidden_session_id"])
         target_id = str(claimed["target_id"])
-        receipt_key = f"collaboration:{claimed['execution_id']}"
+        merged: list[dict[str, Any]] = []
         try:
+            merged = self._coalesce_queued_targets(claimed)
+            receipt_key = self._receipt_key(claimed, merged)
             prompt = self._context_prompt(claimed)
             receipt = self.db.begin_external_turn(
                 turn_key=receipt_key,
@@ -536,7 +649,9 @@ class CollaborationScheduler:
                 worker_generation=self.fence.worker_generation,
             )
             if receipt.get("status") == "ambiguous":
-                self._finish(target_id, status="ambiguous", error="external turn outcome is ambiguous")
+                error = "external turn outcome is ambiguous"
+                self._finish(target_id, status="ambiguous", error=error)
+                self._finish_coalesced(merged, status="ambiguous", error=error)
                 return
             if receipt.get("status") == "completed":
                 self._commit_completed(
@@ -544,6 +659,7 @@ class CollaborationScheduler:
                     receipt_key=receipt_key,
                     text=str(receipt.get("result_text") or ""),
                     result_status=str(receipt.get("result_status") or "complete"),
+                    coalesced_targets=merged,
                 )
                 return
             budget_condition = threading.Condition()
@@ -644,6 +760,7 @@ class CollaborationScheduler:
                     receipt_key=receipt_key,
                     text=text,
                     result_status=status,
+                    coalesced_targets=merged,
                 )
             else:
                 self.db.complete_external_turn(
@@ -653,16 +770,21 @@ class CollaborationScheduler:
                     result_text=text,
                     result_status=status,
                 )
+                error = text or status
                 self._finish(
                     target_id,
                     status=target_status,
                     text=text,
                     result_status=status,
-                    error=text or status,
+                    error=error,
+                )
+                self._finish_coalesced(
+                    merged, status=target_status, error=error
                 )
         except Exception as exc:
             _log.warning("collaboration target execution failed", exc_info=True)
             self._finish(target_id, status="failed", error=str(exc))
+            self._finish_coalesced(merged, status="failed", error=str(exc))
         finally:
             with self._active_lock:
                 self._active.pop(target_id, None)
@@ -1122,7 +1244,10 @@ class CollaborationScheduler:
         receipt_key: str,
         text: str,
         result_status: str,
+        coalesced_targets: list[dict[str, Any]] | None = None,
     ) -> None:
+        coalesced_targets = coalesced_targets or []
+
         def _commit(conn, *, result_text, result_status, now, reconcile):
             row = self._owned_target(conn, target_id)
             if row is None:
@@ -1176,6 +1301,26 @@ class CollaborationScheduler:
             ).rowcount
             if changed != 1:
                 raise RuntimeError("collaboration target completion fence is no longer valid")
+            live_coalesced_targets = [
+                current
+                for target in coalesced_targets
+                if (
+                    current := self._owned_target(conn, str(target["target_id"]))
+                )
+                is not None
+                and current["status"] == "running"
+                and tuple(
+                    current[key]
+                    for key in (
+                        "worker_owner_key",
+                        "worker_id",
+                        "worker_generation",
+                        "lease_version",
+                        "recovery_generation",
+                    )
+                )
+                == self.fence.values()
+            ]
             event_row = self.store._append_event(
                 conn,
                 group_id=str(row["group_id"]),
@@ -1183,7 +1328,20 @@ class CollaborationScheduler:
                 actor_kind="employee",
                 actor_employee_id=str(row["employee_id"]),
                 actor_membership_id=str(row["membership_id"]),
-                body={"text": result_text, "target_id": target_id},
+                body={
+                    "text": result_text,
+                    "target_id": target_id,
+                    **(
+                        {
+                            "coalesced_target_ids": [
+                                str(current["target_id"])
+                                for current in live_coalesced_targets
+                            ]
+                        }
+                        if live_coalesced_targets
+                        else {}
+                    ),
+                },
                 now=now,
             )
             result = {"text": result_text, "status": result_status, "event_id": event_row["event_id"]}
@@ -1192,7 +1350,50 @@ class CollaborationScheduler:
                 (json.dumps(result, ensure_ascii=False, separators=(",", ":")), target_id),
             )
             aggregate_collaboration_turn(conn, str(row["turn_id"]), now)
-            return {"row": dict(self._owned_target(conn, target_id)), "event": event_row, "event_id": event_row["event_id"], "event_created": True}
+            coalesced_rows = []
+            for current in live_coalesced_targets:
+                coalesced_result = {
+                    "text": result_text,
+                    "status": "coalesced",
+                    "event_id": event_row["event_id"],
+                    "coalesced_into_target_id": target_id,
+                }
+                elapsed = max(
+                    0.0, now - float(current["active_started_at"] or now)
+                )
+                changed = conn.execute(
+                    "UPDATE collaboration_turn_targets SET status='completed', error=NULL, "
+                    "last_delivered_sequence=snapshot_sequence, "
+                    "active_seconds=active_seconds+?, active_started_at=NULL, "
+                    "result_json=?, completed_at=?, updated_at=? WHERE target_id=? "
+                    "AND status='running' AND worker_owner_key=? AND worker_id=? "
+                    "AND worker_generation=? AND lease_version=? "
+                    "AND recovery_generation=?",
+                    (
+                        elapsed,
+                        json.dumps(
+                            coalesced_result,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        now,
+                        now,
+                        current["target_id"],
+                        *self.fence.values(),
+                    ),
+                ).rowcount
+                if changed == 1:
+                    aggregate_collaboration_turn(conn, str(current["turn_id"]), now)
+                    coalesced_rows.append(
+                        dict(self._owned_target(conn, str(current["target_id"])))
+                    )
+            return {
+                "row": dict(self._owned_target(conn, target_id)),
+                "coalesced_rows": coalesced_rows,
+                "event": event_row,
+                "event_id": event_row["event_id"],
+                "event_created": True,
+            }
 
         outcome = self.db.complete_collaboration_external_turn(
             turn_key=receipt_key,
@@ -1206,6 +1407,8 @@ class CollaborationScheduler:
         if outcome.get("event_created"):
             self.emit("collaboration.event.appended", self.store._event(outcome["event"]).__dict__)
         self.emit("collaboration.target.changed", self._public_target(outcome["row"]))
+        for row in outcome.get("coalesced_rows", []):
+            self.emit("collaboration.target.changed", self._public_target(row))
 
     def _finish(
         self,

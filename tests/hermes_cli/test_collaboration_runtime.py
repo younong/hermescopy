@@ -1463,10 +1463,116 @@ def test_stale_completion_fence_cannot_append_employee_event(db):
     assert employee_events == 0
 
 
-def test_scheduler_serializes_targets_for_one_hidden_member_session(db):
+def test_scheduler_serializes_and_coalesces_queued_messages_for_one_member(db):
     store = CollaborationStore(db, owner_key="owner-a")
     group = store.create_group(
         "Serialized",
+        members=[CollaborationMemberProfile("employee-a", 1, "fingerprint-employee-a-r1")],
+    )
+    membership = store.active_memberships(group.group_id)[0]
+    first = store.submit_owner_message(
+        group.group_id,
+        text="First",
+        mentioned_membership_ids=[membership.membership_id],
+    )
+    block = threading.Event()
+    runner = _Runner(block=block)
+    scheduler = CollaborationScheduler(
+        db,
+        store=store,
+        resolver=_Resolver(),
+        runner=runner,
+        runtime=_Runtime(),
+        emit=lambda *_args: None,
+        capacity=2,
+        poll_seconds=0.02,
+    )
+    try:
+        scheduler.start()
+        assert runner.started.wait(timeout=2)
+        second = store.submit_owner_message(
+            group.group_id,
+            text="Second",
+            mentioned_membership_ids=[membership.membership_id],
+        )
+        third = store.submit_owner_message(
+            group.group_id,
+            text="Third",
+            mentioned_membership_ids=[membership.membership_id],
+        )
+        scheduler.wake()
+        time.sleep(0.1)
+        with db._lock:
+            statuses = [
+                row["status"]
+                for row in db._conn.execute(
+                    "SELECT status FROM collaboration_turn_targets "
+                    "ORDER BY snapshot_sequence"
+                ).fetchall()
+            ]
+        assert statuses == ["running", "queued", "queued"]
+
+        block.set()
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            if scheduler.turn_status(third.turn.turn_id)["status"] == "completed":
+                break
+            time.sleep(0.02)
+        assert scheduler.turn_status(first.turn.turn_id)["status"] == "completed"
+        assert scheduler.turn_status(second.turn.turn_id)["status"] == "completed"
+        assert scheduler.turn_status(third.turn.turn_id)["status"] == "completed"
+    finally:
+        block.set()
+        scheduler.close()
+
+    assert len(runner.calls) == 2
+    merged_prompt = runner.calls[1]["prompt"]
+    assert merged_prompt.index('"text": "Second"') < merged_prompt.index(
+        '"text": "Third"'
+    )
+    with db._lock:
+        owner_events = db._conn.execute(
+            "SELECT COUNT(*) FROM collaboration_events WHERE group_id=? "
+            "AND event_kind='message.owner'",
+            (group.group_id,),
+        ).fetchone()[0]
+        employee_events = db._conn.execute(
+            "SELECT event_id, body_json FROM collaboration_events WHERE group_id=? "
+            "AND event_kind='message.employee' ORDER BY sequence",
+            (group.group_id,),
+        ).fetchall()
+        folded = {
+            row["target_id"]: json.loads(row["result_json"])
+            for row in db._conn.execute(
+                "SELECT target_id, result_json FROM collaboration_turn_targets "
+                "WHERE target_id IN (?, ?)",
+                (second.turn.targets[0].target_id, third.turn.targets[0].target_id),
+            ).fetchall()
+        }
+    assert owner_events == 3
+    assert len(employee_events) == 2
+    merged_body = json.loads(employee_events[1]["body_json"])
+    assert merged_body["coalesced_target_ids"] == [third.turn.targets[0].target_id]
+    second_result = folded[second.turn.targets[0].target_id]
+    third_result = folded[third.turn.targets[0].target_id]
+    assert (
+        second_result["event_id"]
+        == third_result["event_id"]
+        == employee_events[1]["event_id"]
+    )
+    assert second_result["status"] == "complete"
+    assert third_result == {
+        "text": "employee reply",
+        "status": "coalesced",
+        "event_id": employee_events[1]["event_id"],
+        "coalesced_into_target_id": second.turn.targets[0].target_id,
+    }
+
+
+def test_interrupted_coalesced_follower_interrupts_the_shared_member_session(db):
+    store = CollaborationStore(db, owner_key="owner-a")
+    group = store.create_group(
+        "Interrupt batch",
         members=[CollaborationMemberProfile("employee-a", 1, "fingerprint-employee-a-r1")],
     )
     membership = store.active_memberships(group.group_id)[0]
@@ -1480,8 +1586,7 @@ def test_scheduler_serializes_targets_for_one_hidden_member_session(db):
         text="Second",
         mentioned_membership_ids=[membership.membership_id],
     )
-    block = threading.Event()
-    runner = _Runner(block=block)
+    runner = _Runner()
     scheduler = CollaborationScheduler(
         db,
         store=store,
@@ -1489,31 +1594,126 @@ def test_scheduler_serializes_targets_for_one_hidden_member_session(db):
         runner=runner,
         runtime=_Runtime(),
         emit=lambda *_args: None,
-        capacity=2,
+    )
+    claimed = scheduler._claim_next()
+    merged = scheduler._coalesce_queued_targets(claimed)
+    assert [target["target_id"] for target in merged] == [
+        second.turn.targets[0].target_id
+    ]
+
+    interrupted = scheduler.interrupt(second.turn.targets[0].target_id)
+
+    assert interrupted["status"] == "cancelled"
+    assert runner.interrupted == [membership.hidden_session_id]
+    assert scheduler.turn_status(first.turn.turn_id)["status"] == "running"
+    scheduler.close()
+
+
+def test_scheduler_stops_coalescing_at_an_attachment_target(db):
+    store = CollaborationStore(db, owner_key="owner-a")
+    group = store.create_group(
+        "Attachment boundary",
+        members=[CollaborationMemberProfile("employee-a", 1, "fingerprint-employee-a-r1")],
+    )
+    membership = store.active_memberships(group.group_id)[0]
+    first = store.submit_owner_message(
+        group.group_id,
+        text="First",
+        mentioned_membership_ids=[membership.membership_id],
+    )
+    attachment = store.create_attachment(
+        group.group_id,
+        filename="source.txt",
+        media_type="text/plain",
+        size_bytes=6,
+        storage_key=f"collaboration/{group.group_id}/source.txt",
+        content_sha256="a" * 64,
+    )
+    attached = store.submit_owner_message(
+        group.group_id,
+        text="Attached",
+        mentioned_membership_ids=[membership.membership_id],
+        attachment_ids=[attachment["attachment_id"]],
+    )
+    later = store.submit_owner_message(
+        group.group_id,
+        text="Later",
+        mentioned_membership_ids=[membership.membership_id],
+    )
+    scheduler = CollaborationScheduler(
+        db,
+        store=store,
+        resolver=_Resolver(),
+        runner=_Runner(),
+        runtime=_Runtime(),
+        emit=lambda *_args: None,
+    )
+    claimed = scheduler._claim_next()
+    assert claimed["target_id"] == first.turn.targets[0].target_id
+    assert scheduler._coalesce_queued_targets(claimed) == []
+    with db._lock:
+        snapshots = {
+            row["target_id"]: row["snapshot_sequence"]
+            for row in db._conn.execute(
+                "SELECT target_id, snapshot_sequence FROM collaboration_turn_targets"
+            ).fetchall()
+        }
+    scheduler.close()
+    assert snapshots[first.turn.targets[0].target_id] == first.event.sequence
+    assert snapshots[attached.turn.targets[0].target_id] == attached.event.sequence
+    assert snapshots[later.turn.targets[0].target_id] == later.event.sequence
+
+
+def test_recovery_marks_every_running_coalesced_target_ambiguous(db):
+    store = CollaborationStore(db, owner_key="owner-a")
+    group = store.create_group(
+        "Recover batch",
+        members=[CollaborationMemberProfile("employee-a", 1, "fingerprint-employee-a-r1")],
+    )
+    membership = store.active_memberships(group.group_id)[0]
+    first = store.submit_owner_message(
+        group.group_id,
+        text="First",
+        mentioned_membership_ids=[membership.membership_id],
+    )
+    second = store.submit_owner_message(
+        group.group_id,
+        text="Second",
+        mentioned_membership_ids=[membership.membership_id],
+    )
+    scheduler = CollaborationScheduler(
+        db,
+        store=store,
+        resolver=_Resolver(),
+        runner=_Runner(),
+        runtime=_Runtime(),
+        emit=lambda *_args: None,
+    )
+    claimed = scheduler._claim_next()
+    scheduler._coalesce_queued_targets(claimed)
+    scheduler.close()
+    with db._lock:
+        db._conn.execute(
+            "UPDATE collaboration_turn_targets SET worker_id='previous-worker' "
+            "WHERE target_id IN (?, ?)",
+            (first.turn.targets[0].target_id, second.turn.targets[0].target_id),
+        )
+        db._conn.commit()
+
+    recovered = CollaborationScheduler(
+        db,
+        store=store,
+        resolver=_Resolver(),
+        runner=_Runner(),
+        runtime=_Runtime(),
+        emit=lambda *_args: None,
     )
     try:
-        scheduler.start()
-        assert runner.started.wait(timeout=2)
-        time.sleep(0.1)
-        with db._lock:
-            statuses = [
-                row["status"]
-                for row in db._conn.execute(
-                    "SELECT status FROM collaboration_turn_targets ORDER BY created_at"
-                ).fetchall()
-            ]
-        assert statuses == ["running", "queued"]
-        block.set()
-        deadline = time.time() + 3
-        while time.time() < deadline:
-            if scheduler.turn_status(second.turn.turn_id)["status"] == "completed":
-                break
-            time.sleep(0.02)
-        assert scheduler.turn_status(first.turn.turn_id)["status"] == "completed"
-        assert scheduler.turn_status(second.turn.turn_id)["status"] == "completed"
+        recovered.start()
+        assert recovered.turn_status(first.turn.turn_id)["status"] == "ambiguous"
+        assert recovered.turn_status(second.turn.turn_id)["status"] == "ambiguous"
     finally:
-        block.set()
-        scheduler.close()
+        recovered.close()
 
 
 def test_granted_attachment_materializes_under_membership_readonly_prefix(

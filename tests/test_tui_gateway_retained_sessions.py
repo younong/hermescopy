@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from dataclasses import replace
 from pathlib import Path
 import threading
 
@@ -1173,6 +1174,111 @@ def test_collaboration_runner_rebuilds_from_matching_persisted_policy(
             prompt="unsafe",
             target_id="target-c",
             external_receipt_key="receipt-c",
+            on_delta=lambda _text: None,
+            on_approval=lambda _data: None,
+        )
+    runner.close()
+
+
+def test_collaboration_runner_refreshes_dynamic_context_but_pins_identity(
+    owner_gateway, monkeypatch
+):
+    db, runtime, _workspace_root = owner_gateway
+    from hermes_cli.collaboration.agent_tools import CollaborationAgentContext
+    from hermes_cli.collaboration.models import CollaborationMembership
+
+    membership = CollaborationMembership(
+        membership_id="membership-a",
+        group_id="group-a",
+        employee_id="employee-a",
+        profile_revision=1,
+        profile_fingerprint="fingerprint-a",
+        hidden_session_id="hidden-a",
+        stored_session_id="stored-a",
+        role="member",
+        join_sequence=1,
+        leave_sequence=None,
+        created_at=1.0,
+        left_at=None,
+    )
+    policy = {
+        "system_prompt": "Pinned policy",
+        "model": {"provider": "openai", "model": "test-model"},
+        "workspace_relative_path": "employees/analyst",
+        "knowledge_relative_paths": ["collaboration-attachments/membership-a"],
+    }
+    runner = server.CollaborationAgentRunner(db, runtime)
+    runner.ensure_member_session(membership=membership, employee_policy=policy)
+    service = object()
+    first_context = CollaborationAgentContext(
+        service=service,
+        creator_employee_id="employee-a",
+        source_kind="web_group",
+        source_conversation_id="group-a",
+        source_group_id="group-a",
+        source_event_id="event-a",
+        allowed_origin_attachment_ids=("attachment-a",),
+    )
+    contexts = [
+        first_context,
+        replace(
+            first_context,
+            source_event_id="event-b",
+            allowed_origin_attachment_ids=("attachment-b",),
+        ),
+    ]
+
+    class _Agent:
+        def __init__(self, context):
+            self.collaboration_context = context
+            self.observed = []
+
+        def run_conversation(self, *_args, **_kwargs):
+            self.observed.append(self.collaboration_context)
+            return {"final_response": "done"}
+
+        def close(self):
+            return None
+
+        def interrupt(self):
+            return None
+
+    built = []
+
+    def _make_agent(*_args, **kwargs):
+        agent = _Agent(kwargs["collaboration_context"])
+        built.append(agent)
+        return agent
+
+    monkeypatch.setattr(server, "_make_agent", _make_agent)
+    for index, context in enumerate(contexts):
+        result = runner.run(
+            stored_session_id="stored-a",
+            hidden_session_id="hidden-a",
+            employee_policy=policy,
+            prompt=f"message-{index}",
+            target_id=f"target-{index}",
+            external_receipt_key=f"receipt-{index}",
+            collaboration_context=context,
+            on_delta=lambda _text: None,
+            on_approval=lambda _data: None,
+        )
+        assert result["status"] == "complete"
+
+    assert len(built) == 1
+    assert built[0].observed == contexts
+    incompatible = replace(
+        contexts[-1], source_group_id="group-b", source_event_id="event-c"
+    )
+    with pytest.raises(RuntimeError, match="identity is inconsistent"):
+        runner.run(
+            stored_session_id="stored-a",
+            hidden_session_id="hidden-a",
+            employee_policy=policy,
+            prompt="unsafe",
+            target_id="target-c",
+            external_receipt_key="receipt-c",
+            collaboration_context=incompatible,
             on_delta=lambda _text: None,
             on_approval=lambda _data: None,
         )
