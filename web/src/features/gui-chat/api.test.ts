@@ -17,10 +17,14 @@ const mocks = vi.hoisted(() => {
 
   class FakeGatewayClient {
     connectionState: "closed" | "open" = "closed";
+    private readonly stateHandlers = new Set<(state: "closed" | "open") => void>();
     readonly connect = vi.fn(async () => {
       this.connectionState = "open";
     });
-    readonly request = vi.fn(async (method: string, params: Record<string, unknown>) => {
+    readonly request = vi.fn(async (
+      method: string,
+      params: Record<string, unknown>,
+    ): Promise<unknown> => {
       if (method === "session.attach") {
         if (state.attachMissing) throw new FakeJsonRpcGatewayError("Method not found", -32601);
         return {
@@ -37,10 +41,18 @@ const mocks = vi.hoisted(() => {
       this.connectionState = "closed";
     });
     readonly onEvent = vi.fn(() => () => undefined);
-    readonly onState = vi.fn(() => () => undefined);
+    readonly onState = vi.fn((handler: (state: "closed" | "open") => void) => {
+      this.stateHandlers.add(handler);
+      return () => this.stateHandlers.delete(handler);
+    });
 
     constructor() {
       gatewayInstances.push(this);
+    }
+
+    emitState(state: "closed" | "open"): void {
+      this.connectionState = state;
+      for (const handler of this.stateHandlers) handler(state);
     }
   }
 
@@ -104,9 +116,96 @@ describe("connectGuiChat", () => {
     expect(mocks.gatewayInstances[0].request).toHaveBeenCalledWith(
       "session.owner_attach",
       { browser_id: "browser-test" },
-      undefined,
-      undefined,
     );
+  });
+
+  it("attaches the owner before concurrent collaboration requests", async () => {
+    const connection = connectGuiChat({ ownerKey: "owner-a" });
+    const client = mocks.gatewayInstances[0];
+    const ownerAttach = deferred<void>();
+    client.request.mockImplementation(async (method: string) => {
+      if (method === "session.owner_attach") await ownerAttach.promise;
+      return method === "collaboration.groups.list" ? { groups: [] } : {};
+    });
+
+    const groups = connection.collaboration.listGroups();
+    const detail = connection.collaboration.getGroup("group-a");
+    await vi.waitFor(() => {
+      expect(client.request.mock.calls.map((call) => call[0])).toEqual(["session.owner_attach"]);
+    });
+    ownerAttach.resolve();
+    await Promise.all([groups, detail]);
+
+    const collaborationMethods = client.request.mock.calls.map((call) => call[0]);
+    expect(collaborationMethods[0]).toBe("session.owner_attach");
+    expect(new Set(collaborationMethods.slice(1))).toEqual(new Set([
+      "collaboration.groups.list",
+      "collaboration.group.get",
+    ]));
+  });
+
+  it("waits for a direct session switch before collaboration", async () => {
+    const connection = connectGuiChat({ ownerKey: "owner-a" });
+    const client = mocks.gatewayInstances[0];
+    const sessionAttach = deferred<Record<string, unknown>>();
+    client.request.mockImplementation(async (method: string, params: Record<string, unknown>) => {
+      if (method === "session.attach") return sessionAttach.promise;
+      if (method === "collaboration.groups.list") return { groups: [] };
+      return { session_id: "runtime-new", stored_session_id: "stored-new", ...params };
+    });
+
+    const switching = connection.createOrAttach("stored-a", 1);
+    const groups = connection.collaboration.listGroups();
+    await vi.waitFor(() => {
+      expect(client.request.mock.calls.map((call) => call[0])).toEqual(["session.attach"]);
+    });
+    sessionAttach.resolve({
+      resume_kind: "live",
+      resumed: "stored-a",
+      session_id: "runtime-a",
+      session_key: "stored-a",
+      switch_generation: 1,
+    });
+    await Promise.all([switching, groups]);
+
+    expect(client.request.mock.calls.map((call) => call[0])).toEqual([
+      "session.attach",
+      "session.owner_attach",
+      "collaboration.groups.list",
+    ]);
+  });
+
+  it("allows collaboration after a failed direct session switch", async () => {
+    const connection = connectGuiChat({ ownerKey: "owner-a" });
+    const client = mocks.gatewayInstances[0];
+    client.request.mockRejectedValueOnce(new mocks.FakeJsonRpcGatewayError("not found", 4007));
+
+    const switching = connection.createOrAttach("stored-a", 1);
+    const groups = connection.collaboration.listGroups();
+
+    await expect(switching).rejects.toMatchObject({ code: 4007 });
+    await expect(groups).resolves.toEqual({ session_id: "runtime-new", stored_session_id: "stored-new" });
+    expect(client.request.mock.calls.map((call) => call[0])).toEqual([
+      "session.attach",
+      "session.owner_attach",
+      "collaboration.groups.list",
+    ]);
+  });
+
+  it("reattaches the owner before collaboration after reconnect", async () => {
+    const connection = connectGuiChat({ ownerKey: "owner-a" });
+    const client = mocks.gatewayInstances[0];
+
+    await connection.collaboration.listGroups();
+    client.emitState("closed");
+    await connection.collaboration.getGroup("group-a");
+
+    expect(client.request.mock.calls.map((call) => call[0])).toEqual([
+      "session.owner_attach",
+      "collaboration.groups.list",
+      "session.owner_attach",
+      "collaboration.group.get",
+    ]);
   });
 
   it("sends only the selected employee ID for a new direct chat", async () => {
@@ -305,3 +404,11 @@ describe("connectGuiChat", () => {
     );
   });
 });
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}

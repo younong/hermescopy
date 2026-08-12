@@ -145,11 +145,13 @@ export function GuiChatShell() {
   const stateRef = useRef(state);
   const workspacePaneOpenRef = useRef(workspacePaneOpen);
   const navigateRef = useRef(navigate);
+  const groupIdRef = useRef(groupId);
   const resumeSessionIdRef = useRef(resumeSessionId);
   const setSearchParamsRef = useRef(setSearchParams);
   stateRef.current = state;
   workspacePaneOpenRef.current = workspacePaneOpen;
   navigateRef.current = navigate;
+  groupIdRef.current = groupId;
   resumeSessionIdRef.current = resumeSessionId;
   setSearchParamsRef.current = setSearchParams;
   const updateSearchParams = useCallback(
@@ -322,12 +324,16 @@ export function GuiChatShell() {
       : new WebSocketReconnectLifecycle({
           close: () => connection.close(),
           ping: () => connection.ping(),
-          reconnect: () =>
-            coordinator.start(
+          reconnect: () => {
+            if (groupIdRef.current) {
+              return connection.attachOwner().then(() => null);
+            }
+            return coordinator.start(
               coordinator.committedSessionId ??
                 stateRef.current.storedSessionId ??
                 resumeSessionIdRef.current,
-            ),
+            );
+          },
         });
     reconnectLifecycleRef.current = reconnectLifecycle;
     return { coordinator, reconnectLifecycle };
