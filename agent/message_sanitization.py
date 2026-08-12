@@ -742,24 +742,40 @@ def _completed_tool_episode(
     return None
 
 
-def _tool_episode_summary(
+_HISTORICAL_TOOL_RECEIPT_MAX_CHARS = 800
+
+
+def _bounded_historical_tool_receipt(
+    messages: list,
     records: list[tuple[str, str, str, dict[str, Any]]],
+    final_index: int | None,
 ) -> str:
-    """Render a bounded deterministic provider-facing tool-episode summary."""
-    lines = ["[Historical tool episode summary]"]
-    for _, name, arguments, result in records:
-        result_text, omitted_media = _tool_result_text(result.get("content"))
-        receipt = summarize_tool_result(name, arguments, result_text)
-        if len(receipt) > 500:
-            receipt = receipt[:497] + "..."
-        flags = []
-        if result.get("is_error") or result.get("error"):
-            flags.append("error")
-        if omitted_media:
-            flags.append("media_omitted")
-        suffix = f"; flags={','.join(flags)}" if flags else ""
-        lines.append(f"- tool={name[:80]}; result={receipt}{suffix}")
-    return "\n".join(lines)
+    """Render one plain, whole-episode receipt without replaying tool protocol."""
+    errors = sum(
+        1 for _, _, _, result in records
+        if result.get("is_error") or result.get("error")
+    )
+    omitted_media = any(
+        _tool_result_text(result.get("content"))[1]
+        for _, _, _, result in records
+    )
+    details = [f"{len(records)} call{'s' if len(records) != 1 else ''}"]
+    if errors:
+        details.append(f"{errors} error{'s' if errors != 1 else ''}")
+    if omitted_media:
+        details.append("media omitted")
+    status = f"[Historical tool work: {', '.join(details)}.]"
+
+    conclusion = ""
+    if final_index is not None:
+        final = messages[final_index]
+        if isinstance(final, dict):
+            conclusion = flatten_message_text(final.get("content"))
+            conclusion = re.sub(r"\s+", " ", conclusion).strip()
+    receipt = f"{status}\n{conclusion}" if conclusion else status
+    if len(receipt) > _HISTORICAL_TOOL_RECEIPT_MAX_CHARS:
+        receipt = receipt[: _HISTORICAL_TOOL_RECEIPT_MAX_CHARS - 3].rstrip() + "..."
+    return receipt
 
 
 def _collapsed_tool_episode(
@@ -768,44 +784,35 @@ def _collapsed_tool_episode(
     final_index: int | None,
 ) -> dict[str, Any]:
     """Build one ordinary assistant message for a completed old tool episode."""
-    summary = _tool_episode_summary(records)
-    if final_index is None:
-        return {"role": "assistant", "content": summary}
-
-    final = project_message_attachments(messages[final_index])
-    final_content = final.get("content") if isinstance(final, dict) else None
-    if isinstance(final_content, list):
-        content = [{"type": "text", "text": summary}, *final_content]
-    elif isinstance(final_content, str) and final_content.strip():
-        content = f"{summary}\n\n{final_content}"
-    else:
-        content = summary
-    return {"role": "assistant", "content": content}
+    return {
+        "role": "assistant",
+        "content": _bounded_historical_tool_receipt(
+            messages, records, final_index
+        ),
+    }
 
 
 def project_provider_history(
     messages: list,
     *,
     current_turn_index: int,
-    protect_last_n: int,
 ) -> list:
-    """Project provider history while preserving only current-turn attachments.
+    """Project historical messages while preserving current-turn protocol.
 
     The boundary is anchored to the current user row, so appending tool-loop rows
-    does not move it. Complete old tool episodes become ordinary assistant text;
-    every rich payload before the current user turn becomes a receipt even inside
-    the protected text tail. Current-turn tool results remain available to the
-    next model iteration. Canonical history is never mutated.
+    does not move it. Complete historical tool episodes become ordinary assistant
+    text, and every historical rich payload becomes a receipt. Current-turn tool
+    results remain available to the next model iteration. Canonical history is
+    never mutated.
     """
     if not messages or current_turn_index <= 0:
         return messages
     current_turn_index = min(current_turn_index, len(messages) - 1)
-    protected_start = max(0, current_turn_index - max(0, protect_last_n))
 
     projected: list[Any] = []
     changed = False
     index = 0
-    while index < protected_start:
+    while index < current_turn_index:
         message = messages[index]
         is_tool_start = (
             isinstance(message, dict)
@@ -813,7 +820,7 @@ def project_provider_history(
             and bool(message.get("tool_calls"))
         )
         if is_tool_start:
-            episode = _completed_tool_episode(messages, index, protected_start)
+            episode = _completed_tool_episode(messages, index, current_turn_index)
             if episode is not None:
                 end, records, final_index = episode
                 previous_role = messages[index - 1].get("role") if index else None
@@ -840,15 +847,8 @@ def project_provider_history(
         changed = changed or next_message is not message
         index += 1
 
-    protected_tail = messages[protected_start:current_turn_index]
-    projected_tail = [project_message_attachments(message) for message in protected_tail]
-    tail_changed = any(
-        next_message is not message
-        for message, next_message in zip(protected_tail, projected_tail)
-    )
-    projected.extend(projected_tail)
     projected.extend(messages[current_turn_index:])
-    return projected if changed or tail_changed else messages
+    return projected if changed else messages
 
 
 def _strip_images_from_messages(messages: list) -> bool:

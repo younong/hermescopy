@@ -16,6 +16,7 @@ resolved through :func:`_ra` so those patches keep working.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -37,6 +38,7 @@ from agent.turn_retry_state import TurnRetryState
 from agent.memory_manager import build_memory_context_block
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
+    compact_user_attachment_content,
     _repair_tool_call_arguments,
     _sanitize_messages_non_ascii,
     _sanitize_messages_surrogates,
@@ -46,7 +48,6 @@ from agent.message_sanitization import (
     _sanitize_tools_non_ascii,
     _strip_images_from_messages,
     _strip_non_ascii,
-    compact_user_attachment_content,
     project_provider_history,
 )
 from agent.model_metadata import (
@@ -536,35 +537,38 @@ def _project_provider_messages(
     suppress_reasoning_details: bool,
 ) -> tuple[list, str]:
     """Project persisted transcript state into API-only messages."""
-    from agent.skill_commands import strip_deferred_skill_descriptor
-
-    projected_messages = project_provider_history(
-        messages,
-        current_turn_index=current_turn_user_idx,
-        protect_last_n=agent.context_compressor.protect_last_n,
+    from agent.skill_commands import (
+        project_historical_skill_message,
+        strip_deferred_skill_descriptor,
     )
-    api_messages = []
-    for idx, (message, projected_message) in enumerate(
-        zip(messages, projected_messages)
-    ):
-        api_message = projected_message.copy()
-        if (
-            projected_message is not message
-            and idx == current_turn_user_idx
-            and message.get("role") == "user"
-            and message.get("attachments")
+
+    provider_source = []
+    for idx, message in enumerate(messages):
+        if not isinstance(message, dict):
+            provider_source.append(message)
+            continue
+        api_message = copy.deepcopy(message)
+        is_current_user = (
+            idx == current_turn_user_idx and message.get("role") == "user"
+        )
+        if is_current_user and message.get("attachments") and isinstance(
+            api_message.get("content"), str
         ):
             api_message["content"] = compact_user_attachment_content(
-                original_user_message,
-                message.get("attachments"),
-            )
-        if message.get("role") == "user":
-            api_message["content"] = strip_deferred_skill_descriptor(
-                api_message.get("content"),
-                active=(idx == current_turn_user_idx),
+                api_message.get("content"), message.get("attachments")
             )
 
-        if idx == current_turn_user_idx and message.get("role") == "user":
+        if message.get("role") == "user":
+            project_skill_content = (
+                strip_deferred_skill_descriptor
+                if is_current_user
+                else project_historical_skill_message
+            )
+            api_message["content"] = project_skill_content(
+                api_message.get("content")
+            )
+
+        if is_current_user:
             injections = []
             if deferred_skill_context:
                 injections.append(deferred_skill_context)
@@ -588,7 +592,12 @@ def _project_provider_messages(
             agent._sanitize_tool_calls_for_strict_api(api_message, model=agent.model)
         if suppress_reasoning_details:
             api_message.pop("reasoning_details", None)
-        api_messages.append(api_message)
+        provider_source.append(api_message)
+
+    api_messages = project_provider_history(
+        provider_source,
+        current_turn_index=current_turn_user_idx,
+    )
 
     effective_system = active_system_prompt or ""
     if agent.ephemeral_system_prompt:
@@ -698,17 +707,30 @@ def _prepare_provider_request(
     effective_task_id: str,
     turn_id: str,
     api_call_count: int,
+    current_user_text: str,
     ephemeral_max_output_tokens: Optional[int],
 ):
     """Build, rewrite, and account for one exact provider payload."""
-    from agent.chat_completion_helpers import build_api_kwargs
     from agent.prepared_model_request import prepare_model_request_snapshot
     from hermes_cli.middleware import apply_llm_request_middleware
+    from tools.tool_search import request_selector_query, select_request_tool_defs
 
     agent._reapply_reasoning_echo_for_provider(api_messages)
-    payload = build_api_kwargs(
-        agent,
+    full_catalog = list(agent.tools or [])
+    context_compressor = getattr(agent, "context_compressor", None)
+    selection = select_request_tool_defs(
+        full_catalog,
+        query=request_selector_query(
+            api_messages,
+            current_user_text=current_user_text,
+        ),
+        context_length=(
+            getattr(context_compressor, "context_length", 0) or 0
+        ),
+    )
+    payload = agent._build_api_kwargs(
         api_messages,
+        tools_for_api=selection.tool_defs,
         ephemeral_max_output_tokens=ephemeral_max_output_tokens,
     )
     if agent._force_ascii_payload:
@@ -729,7 +751,11 @@ def _prepare_provider_request(
         api_mode=agent.api_mode,
         api_call_count=api_call_count,
     )
-    dispatch_metadata = {}
+    dispatch_metadata = {
+        "executable_tool_count": len(full_catalog),
+        "hidden_tool_count": selection.hidden_count,
+        "tool_search_active": selection.activated,
+    }
     if agent.api_mode == "bedrock_converse":
         dispatch_metadata["bedrock_region"] = (
             getattr(agent, "_bedrock_region", None) or "us-east-1"
@@ -1091,15 +1117,35 @@ def run_conversation(
         if _ephemeral_output_override is not None:
             agent._ephemeral_max_output_tokens = None
 
-        prepared_request = _prepare_provider_request(
-            agent,
-            api_messages,
-            request_id=api_request_id,
-            effective_task_id=effective_task_id,
-            turn_id=turn_id,
-            api_call_count=api_call_count,
-            ephemeral_max_output_tokens=_ephemeral_output_override,
-        )
+        try:
+            prepared_request = _prepare_provider_request(
+                agent,
+                api_messages,
+                request_id=api_request_id,
+                effective_task_id=effective_task_id,
+                turn_id=turn_id,
+                api_call_count=api_call_count,
+                current_user_text=(
+                    original_user_message
+                    if isinstance(original_user_message, str)
+                    else str(original_user_message)
+                ),
+                ephemeral_max_output_tokens=_ephemeral_output_override,
+            )
+        except Exception as request_error:
+            terminal_error = str(request_error)
+            final_response = f"API request preparation failed: {terminal_error}"
+            failed = True
+            terminal_failure_reason = "request_preparation_failed"
+            _turn_exit_reason = "request_preparation_failed"
+            api_call_count -= 1
+            agent._api_call_count = api_call_count
+            try:
+                agent.iteration_budget.refund()
+            except Exception:
+                pass
+            logger.exception("Failed to prepare provider request")
+            break
         accounting = prepared_request.accounting
         approx_request_tokens = accounting.effective_input_tokens
 
@@ -1140,6 +1186,11 @@ def run_conversation(
                 effective_task_id=effective_task_id,
                 turn_id=turn_id,
                 api_call_count=api_call_count,
+                current_user_text=(
+                    original_user_message
+                    if isinstance(original_user_message, str)
+                    else str(original_user_message)
+                ),
                 ephemeral_max_output_tokens=_ephemeral_output_override,
             )
 
@@ -1233,7 +1284,10 @@ def run_conversation(
         if not agent.quiet_mode:
             agent._vprint(f"\n{agent.log_prefix}🔄 Making API call #{api_call_count}/{agent.max_iterations}...")
             agent._vprint(f"{agent.log_prefix}   📊 Request size: {len(api_messages)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)")
-            agent._vprint(f"{agent.log_prefix}   🔧 Available tools: {len(agent.tools) if agent.tools else 0}")
+            agent._vprint(
+                f"{agent.log_prefix}   🔧 Advertised tools: "
+                f"{prepared_request.tool_count}/{len(agent.tools or [])} executable"
+            )
         else:
             # Animated thinking spinner in quiet mode
             face = random.choice(KawaiiSpinner.get_thinking_faces())
@@ -1251,7 +1305,13 @@ def run_conversation(
         
         # Log request details if verbose
         if agent.verbose_logging:
-            logging.debug(f"API Request - Model: {agent.model}, Messages: {len(messages)}, Tools: {len(agent.tools) if agent.tools else 0}")
+            logging.debug(
+                "API Request - Model: %s, Messages: %s, Tools: %s/%s executable",
+                agent.model,
+                len(messages),
+                prepared_request.tool_count,
+                len(agent.tools or []),
+            )
             logging.debug(f"Last message role: {messages[-1]['role'] if messages else 'none'}")
             logging.debug(f"Total message size: ~{approx_tokens:,} tokens")
         
@@ -4479,6 +4539,11 @@ def run_conversation(
             
             # Check for tool calls
             if assistant_message.tool_calls:
+                request_tool_names = set(agent.valid_tool_names)
+                if prepared_request.dispatch_metadata.get("tool_search_active"):
+                    from tools.tool_search import BRIDGE_TOOL_NAMES
+
+                    request_tool_names.update(BRIDGE_TOOL_NAMES)
                 if not agent.quiet_mode:
                     agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")
                 
@@ -4489,21 +4554,21 @@ def run_conversation(
                 # Validate tool call names - detect model hallucinations
                 # Repair mismatched tool names before validating
                 for tc in assistant_message.tool_calls:
-                    if tc.function.name not in agent.valid_tool_names:
+                    if tc.function.name not in request_tool_names:
                         repaired = agent._repair_tool_call(tc.function.name)
                         if repaired:
                             print(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'")
                             tc.function.name = repaired
                 invalid_tool_calls = [
                     tc.function.name for tc in assistant_message.tool_calls
-                    if tc.function.name not in agent.valid_tool_names
+                    if tc.function.name not in request_tool_names
                 ]
                 if invalid_tool_calls:
                     # Track retries for invalid tool calls
                     agent._invalid_tool_retries += 1
 
                     # Return helpful error to model — model can agent-correct next turn
-                    available = ", ".join(sorted(agent.valid_tool_names))
+                    available = ", ".join(sorted(request_tool_names))
                     invalid_name = invalid_tool_calls[0]
                     invalid_preview = invalid_name[:80] + "..." if len(invalid_name) > 80 else invalid_name
                     agent._buffer_vprint(f"⚠️  Unknown tool '{invalid_preview}' — sending error to model for agent-correction ({agent._invalid_tool_retries}/3)")
@@ -4527,7 +4592,7 @@ def run_conversation(
                     messages.append(assistant_msg)
                     for tc in assistant_message.tool_calls:
                         _tc_name = tc.function.name
-                        if _tc_name not in agent.valid_tool_names:
+                        if _tc_name not in request_tool_names:
                             # A blank/whitespace-only name is not a typo the
                             # model can fuzzy-correct toward a real tool — it is
                             # almost always a weak open model echoing tool-call

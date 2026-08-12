@@ -10,6 +10,7 @@ from agent.skill_commands import (
     _MAX_EAGER_SKILL_CHARS,
     build_deferred_skill_context,
     extract_user_instruction_from_skill_message,
+    project_historical_skill_message,
 )
 from agent.skill_bundles import (
     _slugify,
@@ -278,6 +279,25 @@ class TestBuildBundleInvocationMessage:
         assert "A-COMPLETE" in context
         assert "B-COMPLETE" in context
         assert extract_user_instruction_from_skill_message(msg) == "fix it"
+        assert project_historical_skill_message(msg) == "fix it"
+
+    def test_historical_eager_bundle_keeps_only_user_instruction(self, bundles_env):
+        bundles_dir, skills_dir = bundles_env
+        _make_skill(skills_dir, "skill-a", body="PRIVATE-A")
+        _make_skill(skills_dir, "skill-b", body="PRIVATE-B")
+        _make_bundle_yaml(bundles_dir, "combo", ["skill-a", "skill-b"])
+        scan_bundles()
+
+        result = build_bundle_invocation_message(
+            "/combo", user_instruction="fix the bundle"
+        )
+        assert result is not None
+        message, _, _ = result
+
+        projected = project_historical_skill_message(message)
+        assert projected == "fix the bundle"
+        assert "PRIVATE-A" not in projected
+        assert "PRIVATE-B" not in projected
 
     def test_force_eager_keeps_large_bundle_self_contained(self, bundles_env):
         bundles_dir, skills_dir = bundles_env

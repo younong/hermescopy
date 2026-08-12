@@ -1,28 +1,15 @@
-"""Progressive tool disclosure ("tool search") for Hermes Agent.
+"""Request-local tool schema selection and progressive disclosure.
 
-When enabled, MCP and non-core plugin tools are replaced in the model-visible
-tools array by three bridge tools — ``tool_search``, ``tool_describe``,
-``tool_call`` — and surfaced on demand. Core Hermes tools never defer.
+The agent retains its complete, policy-admitted executable catalog. For each
+logical model request this module deterministically pre-exposes the schemas most
+relevant to the current turn and places every other registered capability behind
+``tool_search``, ``tool_describe``, and ``tool_call``. Non-registry injected tools
+and mandatory worker-lifecycle tools remain directly visible.
 
-Design constraints this module is built around (see ``openclaw-tool-search-report``
-for the full rationale):
-
-* Core tools defined in ``toolsets._HERMES_CORE_TOOLS`` are *never* deferred.
-  Always-load means always-load. No exceptions.
-* The threshold gate runs every assembly: when deferrable tools would consume
-  less than ``threshold_pct`` of the model's context window (default 10%),
-  tool search is a no-op and the tools array passes through unchanged.
-* The catalog is stateless across turns and tools-array assemblies. It is
-  rebuilt from the current tool-defs list every time. This is the lesson
-  from OpenClaw's cron regression (openclaw/openclaw#84141): a session-keyed
-  catalog that drifts out of sync with the live tool registry produces
-  silent tool dropouts.
-* Bridge tools route through ``model_tools.handle_function_call`` exactly
-  like a direct call, so guardrails, plugin pre/post hooks, approval flows,
-  and tool-result truncation all fire identically.
-* Display and trajectory unwrap is implemented here so the user (CLI activity
-  feed, gateway, saved trajectories) always sees the underlying tool, not
-  the bridge.
+The catalog is stateless and rebuilt from the current agent snapshot for every
+request. Bridge dispatch still routes through the normal executor so toolset
+scope, authenticated egress policy, middleware, hooks, approvals, and result
+truncation remain authoritative.
 """
 
 from __future__ import annotations
@@ -161,27 +148,14 @@ def _core_tool_names() -> frozenset[str]:
 
 
 def is_deferrable_tool_name(name: str) -> bool:
-    """Return True if a tool with this name is *eligible* for deferral.
-
-    A tool is deferrable iff it is registered with an MCP toolset prefix
-    OR it is not in ``_HERMES_CORE_TOOLS``. Core tools are never deferred
-    even when their toolset is technically plugin-provided (this protects
-    against accidental shadowing).
-    """
+    """Return whether ``name`` is a registered concrete capability."""
     if name in BRIDGE_TOOL_NAMES:
         return False
     if name in _core_tool_names():
-        return False
-    # Check registry toolset for MCP prefix.
+        return True
     try:
         from tools.registry import registry
-        entry = registry.get_entry(name)
-        if entry is None:
-            return False
-        if entry.toolset.startswith("mcp-"):
-            return True
-        # Non-MCP, non-core → plugin tool, eligible.
-        return True
+        return registry.get_entry(name) is not None
     except Exception:
         return False
 
@@ -414,8 +388,143 @@ def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5) -> L
             if ql in entry.name.lower():
                 scored.append((0.1, entry))
 
-    scored.sort(key=lambda x: x[0], reverse=True)
+    order = {id(entry): index for index, entry in enumerate(catalog)}
+    scored.sort(key=lambda item: (-item[0], order[id(item[1])], item[1].name))
     return [e for _, e in scored[:limit]]
+
+
+_MANDATORY_VISIBLE_TOOL_NAMES = frozenset({
+    "kanban_show",
+    "kanban_list",
+    "kanban_complete",
+    "kanban_block",
+    "kanban_heartbeat",
+    "kanban_comment",
+    "kanban_create",
+    "kanban_link",
+    "kanban_unblock",
+})
+_RECENT_PROSE_MAX_CHARS = 6000
+
+
+def request_selector_query(
+    messages: List[Dict[str, Any]],
+    *,
+    current_user_text: str = "",
+) -> str:
+    """Build a bounded query from provider-visible prose and recent tool names.
+
+    Raw arguments, results, IDs, reasoning, media, and historical Skill bodies
+    are deliberately excluded. ``messages`` has already passed provider-history
+    and Skill projection before this helper runs.
+    """
+    from agent.message_content import flatten_message_text
+
+    recent_prose: List[str] = []
+    recent_tool_names: List[str] = []
+    successful_call_ids = {
+        message.get("tool_call_id")
+        for message in messages
+        if isinstance(message, dict)
+        and message.get("role") == "tool"
+        and message.get("tool_call_id")
+        and not message.get("is_error")
+        and not message.get("error")
+    }
+    remaining = _RECENT_PROSE_MAX_CHARS
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role in {"user", "assistant"} and remaining > 0:
+            text = re.sub(
+                r"\s+", " ", flatten_message_text(message.get("content"))
+            ).strip()
+            if text:
+                text = text[-remaining:]
+                recent_prose.append(text)
+                remaining -= len(text)
+        if role == "assistant":
+            for call in message.get("tool_calls") or []:
+                name = ((call.get("function") or {}).get("name")
+                        if isinstance(call, dict) else "")
+                call_id = call.get("id") if isinstance(call, dict) else None
+                if (
+                    call_id in successful_call_ids
+                    and name
+                    and name not in recent_tool_names
+                ):
+                    recent_tool_names.append(name)
+                    if len(recent_tool_names) >= 8:
+                        break
+        if remaining <= 0 and len(recent_tool_names) >= 8:
+            break
+    parts = [str(current_user_text or "").strip()]
+    parts.extend(reversed(recent_prose))
+    parts.extend(recent_tool_names)
+    return "\n".join(part for part in parts if part)
+
+
+@dataclass
+class RequestSelectionResult:
+    """Model-facing subset derived from one full executable catalog snapshot."""
+
+    tool_defs: List[Dict[str, Any]]
+    hidden_count: int = 0
+
+    @property
+    def activated(self) -> bool:
+        return self.hidden_count > 0
+
+
+def select_request_tool_defs(
+    tool_defs: List[Dict[str, Any]],
+    *,
+    query: str,
+    context_length: Optional[int] = None,
+    config: Optional[ToolSearchConfig] = None,
+) -> RequestSelectionResult:
+    """Select request-local schemas while preserving full-catalog order."""
+    if config is None:
+        config = load_config()
+    incoming = [td for td in tool_defs
+                if (td.get("function") or {}).get("name") not in BRIDGE_TOOL_NAMES]
+    _, candidates = classify_tools(incoming)
+    candidate_names = {
+        (candidate.get("function") or {}).get("name", "")
+        for candidate in candidates
+    }
+    candidate_tokens = estimate_tokens_from_schemas(candidates)
+    if not should_activate(config, candidate_tokens, context_length):
+        return RequestSelectionResult(incoming)
+
+    catalog = build_catalog(candidates)
+    relevant = {
+        entry.name
+        for entry in search_catalog(
+            catalog, query, limit=config.search_default_limit
+        )
+    }
+    visible: List[Dict[str, Any]] = []
+    hidden = 0
+    for td in incoming:
+        name = (td.get("function") or {}).get("name", "")
+        if (
+            name not in candidate_names
+            or name in _MANDATORY_VISIBLE_TOOL_NAMES
+            or name in relevant
+        ):
+            visible.append(td)
+        else:
+            hidden += 1
+    if not hidden:
+        return RequestSelectionResult(incoming)
+    visible.extend(bridge_tool_schemas(hidden))
+    logger.info(
+        "tool_search selected %d/%d concrete schemas; %d hidden",
+        len(visible) - len(BRIDGE_TOOL_NAMES), len(incoming), hidden,
+    )
+    return RequestSelectionResult(visible, hidden_count=hidden)
 
 
 # ---------------------------------------------------------------------------
@@ -511,79 +620,6 @@ def bridge_tool_schemas(deferred_count: int) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Public entry point: assemble tool-defs with optional tool search
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class AssemblyResult:
-    """Outcome of one assembly. Useful for tests and observability."""
-
-    tool_defs: List[Dict[str, Any]]
-    activated: bool
-    deferred_count: int = 0
-    deferred_tokens: int = 0
-    threshold_tokens: int = 0
-
-
-def assemble_tool_defs(
-    tool_defs: List[Dict[str, Any]],
-    *,
-    context_length: Optional[int] = None,
-    config: Optional[ToolSearchConfig] = None,
-) -> AssemblyResult:
-    """Return the tool-defs list the model should actually see.
-
-    When tool search is inactive (off, no deferrable tools, or below
-    threshold), this is a passthrough. When active, MCP and plugin tools
-    are stripped from the visible list and replaced with the three bridge
-    tools. Core tools are *never* deferred regardless of config.
-
-    Idempotent: calling with bridge tools already in the input is a no-op
-    (they classify as non-core/non-deferrable but their names are reserved,
-    so they are filtered out of the deferrable set).
-    """
-    if config is None:
-        config = load_config()
-
-    # Defensive: strip any bridge tools that may already be in the list
-    # (e.g. someone called assemble twice).
-    incoming = [td for td in tool_defs
-                if (td.get("function") or {}).get("name") not in BRIDGE_TOOL_NAMES]
-
-    visible, deferrable = classify_tools(incoming)
-    if not deferrable:
-        return AssemblyResult(tool_defs=incoming, activated=False)
-
-    deferrable_tokens = estimate_tokens_from_schemas(deferrable)
-    if not should_activate(config, deferrable_tokens, context_length):
-        return AssemblyResult(
-            tool_defs=incoming,
-            activated=False,
-            deferred_count=len(deferrable),
-            deferred_tokens=deferrable_tokens,
-            threshold_tokens=int((context_length or 0) * (config.threshold_pct / 100.0)),
-        )
-
-    bridge = bridge_tool_schemas(len(deferrable))
-    result = visible + bridge
-    threshold_tokens = int((context_length or 0) * (config.threshold_pct / 100.0))
-
-    logger.info(
-        "tool_search activated: %d core/visible tools kept, %d deferred (~%d tokens, threshold ~%d)",
-        len(visible), len(deferrable), deferrable_tokens, threshold_tokens,
-    )
-
-    return AssemblyResult(
-        tool_defs=result,
-        activated=True,
-        deferred_count=len(deferrable),
-        deferred_tokens=deferrable_tokens,
-        threshold_tokens=threshold_tokens,
-    )
-
-
-# ---------------------------------------------------------------------------
 # Bridge tool dispatch
 # ---------------------------------------------------------------------------
 
@@ -662,8 +698,7 @@ def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
 
     ``tool_defs`` is expected to be the *pre-assembly* tool list for the
     current session's toolset scope (i.e. what
-    ``get_tool_definitions(skip_tool_search_assembly=True)`` returns for the
-    session's enabled/disabled toolsets). The resulting set is the universe of
+    ``get_tool_definitions`` returns for the session's enabled/disabled toolsets). The resulting set is the universe of
     tools the session may legitimately reach through ``tool_call``. Used as a
     scoping gate by both the ``model_tools`` bridge dispatch and the
     ``tool_executor`` unwrap so a restricted-toolset session can never invoke
@@ -717,7 +752,7 @@ __all__ = [
     "BRIDGE_TOOL_NAMES",
     "ToolSearchConfig",
     "CatalogEntry",
-    "AssemblyResult",
+    "RequestSelectionResult",
     "load_config",
     "is_deferrable_tool_name",
     "classify_tools",
@@ -725,8 +760,9 @@ __all__ = [
     "should_activate",
     "build_catalog",
     "search_catalog",
+    "request_selector_query",
+    "select_request_tool_defs",
     "bridge_tool_schemas",
-    "assemble_tool_defs",
     "is_bridge_tool",
     "dispatch_tool_search",
     "dispatch_tool_describe",

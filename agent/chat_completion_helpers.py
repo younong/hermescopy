@@ -649,6 +649,7 @@ def build_api_kwargs(
     agent,
     api_messages: list,
     *,
+    tools_for_api: Optional[list] = None,
     ephemeral_max_output_tokens: Any = _EPHEMERAL_OUTPUT_UNSET,
 ) -> dict:
     """Build provider kwargs for one logical request.
@@ -663,7 +664,8 @@ def build_api_kwargs(
         )
         if ephemeral_max_output_tokens is not None:
             agent._ephemeral_max_output_tokens = None
-    tools_for_api = agent.tools
+    if tools_for_api is None:
+        tools_for_api = agent.tools
 
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()
@@ -726,8 +728,7 @@ def build_api_kwargs(
         #
         # Deep-copy ``tools_for_api`` before sanitizing: the sanitizers
         # mutate in place (documented contract on ``strip_slash_enum`` /
-        # ``strip_pattern_and_format``), and ``tools_for_api`` is a direct
-        # reference to ``agent.tools``.  Without the copy, the first xAI
+        # ``strip_pattern_and_format``). Without the copy, the first xAI
         # request permanently strips constraints from the shared per-agent
         # tool registry — every subsequent non-xAI call from the same
         # agent (auxiliary task routed to Anthropic, OpenRouter fallback,

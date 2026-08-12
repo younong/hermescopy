@@ -84,22 +84,16 @@ class TestConfigParsing:
 
 
 # ---------------------------------------------------------------------------
-# Classification — the hard invariant: core tools NEVER defer.
+# Classification — registered capabilities are request-selectable.
 # ---------------------------------------------------------------------------
 
 
 class TestClassification:
-    def test_core_tools_never_defer(self):
-        """The critical invariant from the OpenClaw report."""
+    def test_registered_core_tools_can_be_selected_request_locally(self):
         from tools.tool_search import is_deferrable_tool_name
-        # Sample of core tools from _HERMES_CORE_TOOLS.
-        for core_name in ["terminal", "read_file", "write_file", "patch",
-                          "search_files", "todo", "memory", "browser_navigate",
-                          "web_search", "session_search", "clarify",
-                          "execute_code", "delegate_task", "send_message"]:
-            assert not is_deferrable_tool_name(core_name), (
-                f"Core tool '{core_name}' must NEVER be deferrable"
-            )
+
+        for core_name in ["terminal", "read_file", "write_file", "patch"]:
+            assert is_deferrable_tool_name(core_name)
 
     def test_bridge_tools_never_defer(self):
         from tools.tool_search import is_deferrable_tool_name, BRIDGE_TOOL_NAMES
@@ -237,46 +231,83 @@ class TestRetrieval:
 # ---------------------------------------------------------------------------
 
 
-class TestAssembly:
-    def test_no_deferrable_returns_unchanged(self):
-        """Pure-core toolset: pass-through, no bridge tools added."""
-        from tools.tool_search import assemble_tool_defs, ToolSearchConfig
-        defs = [_td("terminal", "Run shell"), _td("read_file", "Read a file")]
-        result = assemble_tool_defs(
-            defs,
-            context_length=200_000,
-            config=ToolSearchConfig.from_raw({"enabled": "on"}),
-        )
-        assert not result.activated
-        assert {t["function"]["name"] for t in result.tool_defs} == {"terminal", "read_file"}
+class TestRequestSelection:
+    def test_selection_preserves_catalog_order_and_keeps_injected_tools(self):
+        from tools.tool_search import ToolSearchConfig, select_request_tool_defs
 
-    def test_below_threshold_returns_unchanged(self):
-        """Tiny deferrable surface: don't bother."""
-        from tools.tool_search import assemble_tool_defs, ToolSearchConfig
-        # _td renders to ~80 chars / 20 tokens. 3 of them = ~60 tokens.
-        # 10% of 200K = 20K. Way below.
-        defs = [_td("unknown_tool_a"), _td("unknown_tool_b"), _td("unknown_tool_c")]
-        result = assemble_tool_defs(
+        injected = _td("runtime_memory", "Injected memory provider")
+        defs = [
+            _td("write_file", "Write project files"),
+            injected,
+            _td("read_file", "Read project files"),
+            _td("terminal", "Run shell commands"),
+        ]
+        result = select_request_tool_defs(
             defs,
+            query="read the project source",
             context_length=200_000,
-            config=ToolSearchConfig.from_raw({"enabled": "auto", "threshold_pct": 10}),
+            config=ToolSearchConfig.from_raw({"enabled": "on", "search_default_limit": 1}),
         )
-        assert not result.activated
-        names = {(t.get("function") or {}).get("name") for t in result.tool_defs}
-        assert "tool_search" not in names
+        names = [tool["function"]["name"] for tool in result.tool_defs]
+        assert names[:2] == ["runtime_memory", "read_file"]
+        assert names[-3:] == ["tool_search", "tool_describe", "tool_call"]
+        assert defs[0]["function"]["name"] == "write_file"
 
-    def test_idempotent_when_bridge_already_present(self):
-        from tools.tool_search import assemble_tool_defs, ToolSearchConfig, BRIDGE_TOOL_NAMES
-        defs = [_td("terminal", "Run shell"), _td("tool_search", "old")]
-        result = assemble_tool_defs(
-            defs,
-            context_length=200_000,
-            config=ToolSearchConfig.from_raw({"enabled": "off"}),
+    def test_selector_query_excludes_tool_protocol_payloads(self):
+        from tools.tool_search import request_selector_query
+
+        query = request_selector_query(
+            [
+                {"role": "user", "content": "work on calendar events"},
+                {
+                    "role": "assistant",
+                    "content": "I will continue",
+                    "reasoning": "PRIVATE-REASONING",
+                    "tool_calls": [{
+                        "id": "PRIVATE-ID",
+                        "function": {
+                            "name": "calendar_create_event",
+                            "arguments": '{"secret":"PRIVATE-ARGS"}',
+                        },
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "PRIVATE-ID",
+                    "content": "PRIVATE-RESULT",
+                },
+            ],
+            current_user_text="create a meeting",
         )
-        names = [(t["function"]["name"]) for t in result.tool_defs]
-        # The pre-existing tool_search was stripped (it would be re-injected if
-        # activation happened; here it didn't).
-        assert "tool_search" not in names
+        assert "create a meeting" in query
+        assert "calendar_create_event" in query
+        assert "PRIVATE-REASONING" not in query
+        assert "PRIVATE-ID" not in query
+        assert "PRIVATE-ARGS" not in query
+        assert "PRIVATE-RESULT" not in query
+
+    def test_selector_query_uses_only_successful_tool_names(self):
+        from tools.tool_search import request_selector_query
+
+        query = request_selector_query([
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "ok", "function": {"name": "read_file"}},
+                    {"id": "bad", "function": {"name": "write_file"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "ok", "content": "done"},
+            {
+                "role": "tool",
+                "tool_call_id": "bad",
+                "content": "failed",
+                "is_error": True,
+            },
+        ])
+
+        assert "read_file" in query
+        assert "write_file" not in query
 
 
 # ---------------------------------------------------------------------------
@@ -295,14 +326,13 @@ class TestBridgeDispatch:
         result = dispatch_tool_describe({}, current_tool_defs=[])
         assert "error" in json.loads(result)
 
-    def test_tool_describe_rejects_non_deferrable(self):
-        """If the model asks to describe a core tool, refuse — it's already
-        in the visible list."""
+    def test_tool_describe_supports_hidden_core_tool(self):
         from tools.tool_search import dispatch_tool_describe
+
         result = dispatch_tool_describe(
             {"name": "terminal"}, current_tool_defs=[_td("terminal", "Run shell")],
         )
-        assert "error" in json.loads(result)
+        assert json.loads(result)["name"] == "terminal"
 
     def test_resolve_underlying_call_parses_object_args(self):
         from tools.tool_search import resolve_underlying_call
@@ -377,43 +407,34 @@ class TestRegression_OpenClawCron84141:
     every core tool survives.
     """
 
-    def test_core_tool_survives_alongside_many_mcp_tools(self):
-        from tools.tool_search import (
-            assemble_tool_defs, ToolSearchConfig, BRIDGE_TOOL_NAMES,
-            classify_tools,
-        )
-        # 1 core tool + 50 unknown/MCP-shaped tools (deferrable).
-        defs = [_td("terminal", "Run shell commands")]
-        # Pad with fake "deferrable" tools — without registry registration,
-        # classify_tools puts them in 'visible'. So instead, we just verify
-        # the core-tool side: terminal stays in visible regardless.
-        visible, deferrable = classify_tools(defs)
-        assert any(
-            (td.get("function") or {}).get("name") == "terminal"
-            for td in visible
-        ), "Core tool 'terminal' was wrongly classified as deferrable"
+    def test_relevant_core_tool_is_preexposed(self):
+        from tools.tool_search import ToolSearchConfig, select_request_tool_defs
 
-        # Now force activation and check the resulting tool-defs list.
-        result = assemble_tool_defs(
+        defs = [
+            _td("terminal", "Run shell commands"),
+            _td("read_file", "Read a file"),
+            _td("write_file", "Write a file"),
+        ]
+        result = select_request_tool_defs(
             defs,
+            query="run a shell command",
             context_length=200_000,
-            config=ToolSearchConfig.from_raw({"enabled": "on"}),
+            config=ToolSearchConfig.from_raw({"enabled": "on", "search_default_limit": 1}),
         )
-        names = {(t.get("function") or {}).get("name") for t in result.tool_defs}
-        # terminal must be present; bridges are only added if there are
-        # deferrable tools to put behind them.
-        assert "terminal" in names
+        names = [tool["function"]["name"] for tool in result.tool_defs]
+        assert names[0] == "terminal"
+        assert names[-3:] == ["tool_search", "tool_describe", "tool_call"]
 
-    def test_unwrap_rejects_core_tool_attempt(self):
-        """Even if the model tries to invoke a core tool through tool_call,
-        we reject the call and tell the model to use it directly."""
+    def test_unwrap_accepts_hidden_core_tool(self):
         from tools.tool_search import resolve_underlying_call
-        _, _, err = resolve_underlying_call({
+
+        name, args, err = resolve_underlying_call({
             "name": "terminal",
-            "arguments": {"command": "echo hi"},
+            "arguments": {"command": "printf hi"},
         })
-        assert err is not None
-        assert "not a deferrable" in err
+        assert err is None
+        assert name == "terminal"
+        assert args == {"command": "printf hi"}
 
 
 class TestRegression_ToolsetScoping:
@@ -529,10 +550,8 @@ class TestRegression_ToolsetScoping:
         defs = model_tools.get_tool_definitions(
             enabled_toolsets=["mcp-helper"],
             quiet_mode=True,
-            skip_tool_search_assembly=True,
         )
         names = scoped_deferrable_names(defs)
         assert "mcp_helper_op" in names
-        # core tools are never deferrable
-        assert "terminal" not in names
+        assert "terminal" not in names  # not granted by this restricted toolset
 

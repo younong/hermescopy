@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+from agent.message_sanitization import project_provider_history
 from agent.prepared_model_request import (
     ProviderManagedRequest,
     account_prepared_payload,
@@ -98,6 +99,99 @@ def test_bedrock_accounting_uses_converse_wire_shape():
     assert accounting.output_token_limit == 1024
     assert {"system_prompt", "conversation", "tool_definitions"} <= categories.keys()
     assert "provider_overhead" not in categories
+
+
+def test_optimized_provider_payload_reduces_accounted_history_tools_and_skills():
+    old_calls = [
+        {
+            "id": f"call-{index}",
+            "type": "function",
+            "function": {
+                "name": f"mcp_lookup_{index}",
+                "arguments": "{\"query\":\"" + ("old " * 100) + "\"}",
+            },
+        }
+        for index in range(4)
+    ]
+    old_results = [
+        {
+            "role": "tool",
+            "tool_call_id": f"call-{index}",
+            "content": "historical result " * 300,
+        }
+        for index in range(4)
+    ]
+    full_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": f"mcp_lookup_{index}",
+                "description": "Lookup remote records " * 40,
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        for index in range(20)
+    ]
+    verbose_skills = "\n".join(
+        f"skill-{index}: " + ("long skill description " * 30)
+        for index in range(30)
+    )
+    full_messages = [
+        {
+            "role": "system",
+            "content": f"<available_skills>{verbose_skills}</available_skills>",
+        },
+        {"role": "user", "content": "inspect historical records"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_details": [{"summary": "private reasoning " * 100}],
+            "tool_calls": old_calls,
+        },
+        *old_results,
+        {"role": "assistant", "content": "inspection complete"},
+        {"role": "user", "content": "continue"},
+    ]
+    current_turn_index = len(full_messages) - 1
+    projected_messages = project_provider_history(
+        full_messages,
+        current_turn_index=current_turn_index,
+    )
+    projected_messages[0] = {
+        "role": "system",
+        "content": "<available_skills>general: "
+        + ", ".join(f"skill-{index}" for index in range(30))
+        + "</available_skills>",
+    }
+    full_payload = {"messages": full_messages, "tools": full_tools}
+    optimized_payload = {
+        "messages": projected_messages,
+        "tools": [
+            full_tools[0],
+            {
+                "type": "function",
+                "function": {
+                    "name": "tool_search",
+                    "description": "Search hidden tools",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ],
+    }
+
+    assert projected_messages[2] == {
+        "role": "assistant",
+        "content": "[Historical tool work: 4 calls.]\ninspection complete",
+    }
+    full = _account(full_payload)
+    optimized = _account(optimized_payload)
+    full_categories = {item.id: item.tokens for item in full.categories}
+    optimized_categories = {item.id: item.tokens for item in optimized.categories}
+
+    assert optimized.effective_input_tokens < full.effective_input_tokens
+    assert optimized_categories["conversation"] < full_categories["conversation"]
+    assert optimized_categories["tool_definitions"] < full_categories["mcp"]
+    assert optimized_categories["skills"] < full_categories["skills"]
 
 
 def test_calibration_is_reflected_in_category_sum():

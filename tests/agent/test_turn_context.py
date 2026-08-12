@@ -358,7 +358,7 @@ def test_turn_context_records_phase_activity():
     assert agent._activity == [
         "turn context: system_prompt",
         "turn context: session_persistence",
-        "turn context: preflight_compression",
+        "turn context: tool_payload_compaction",
         "turn context: deferred_skill",
         "turn context: pre_llm_call",
     ]
