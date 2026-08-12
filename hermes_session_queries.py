@@ -370,16 +370,6 @@ class SessionQueryMixin:
         return sanitized.strip()
 
     @staticmethod
-    def _is_cjk_codepoint(cp: int) -> bool:
-        return (0x4E00 <= cp <= 0x9FFF or    # CJK Unified Ideographs
-                0x3400 <= cp <= 0x4DBF or    # CJK Extension A
-                0x20000 <= cp <= 0x2A6DF or  # CJK Extension B
-                0x3000 <= cp <= 0x303F or    # CJK Symbols
-                0x3040 <= cp <= 0x309F or    # Hiragana
-                0x30A0 <= cp <= 0x30FF or    # Katakana
-                0xAC00 <= cp <= 0xD7AF)      # Hangul Syllables
-
-    @staticmethod
     def _contains_cjk(text: str) -> bool:
         """Check if text contains CJK (Chinese, Japanese, Korean) characters."""
         for ch in text:
@@ -393,11 +383,6 @@ class SessionQueryMixin:
                 0xAC00 <= cp <= 0xD7AF):     # Hangul Syllables
                 return True
         return False
-
-    @classmethod
-    def _count_cjk(cls, text: str) -> int:
-        """Count CJK characters in text."""
-        return sum(1 for ch in text if cls._is_cjk_codepoint(ord(ch)))
 
     @staticmethod
     def _recovery_scope_clause(
@@ -1622,6 +1607,7 @@ class SessionQueryMixin:
         sort: str = None,
         include_inactive: bool = False,
         recovery_scope: dict[str, Any] | None = None,
+        include_context: bool = True,
     ) -> List[dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -1632,8 +1618,10 @@ class SessionQueryMixin:
           - Boolean: "docker OR kubernetes", "python NOT java"
           - Prefix: "deploy*"
 
-        Returns matching messages with session metadata, content snippet,
-        and surrounding context (1 message before and after the match).
+        Returns matching messages with session metadata and a content snippet.
+        By default each result also includes the previous and next message from
+        the same session; pass ``include_context=False`` for metadata-only
+        callers that hydrate their own views.
 
         ``sort`` controls temporal ordering:
           - ``None`` (default): FTS5 BM25 relevance only. Time-neutral.
@@ -1722,7 +1710,6 @@ class SessionQueryMixin:
                 m.session_id,
                 m.role,
                 snippet(messages_fts, 0, '>>>', '<<<', '...', 40) AS snippet,
-                m.content,
                 m.timestamp,
                 m.tool_name,
                 s.source,
@@ -1748,26 +1735,27 @@ class SessionQueryMixin:
         is_cjk = self._contains_cjk(query)
         if is_cjk:
             raw_query = query.strip('"').strip()
-            cjk_count = self._count_cjk(raw_query)
-
-            # Per-token CJK length check (#20494): trigram needs >=3 CJK chars
-            # per token. A query like "广西 OR 桂林 OR 漓江" has cjk_count=6
-            # (>=3) but each individual token is only 2 chars — trigram returns 0.
-            # Route to LIKE when any non-operator CJK token is <3 CJK chars.
-            _tokens_for_check = [
-                t for t in raw_query.split()
-                if t.upper() not in {"AND", "OR", "NOT"} and self._contains_cjk(t)
+            tokens = raw_query.split()
+            search_tokens = [
+                token for token in tokens
+                if token.upper() not in {"AND", "OR", "NOT"}
             ]
-            _any_short_cjk = any(
-                self._count_cjk(t) < 3 for t in _tokens_for_check
+
+            # Trigram needs at least three searchable characters in every token.
+            # Count the whole mixed token rather than only its CJK characters so
+            # values such as "Agent通信" use the indexed path, while preserving
+            # the LIKE fallback for pure one- or two-character CJK terms and
+            # OR-combined short terms (#20494).
+            has_short_token = any(
+                sum(character.isalnum() for character in token) < 3
+                for token in search_tokens
             )
 
             _trigram_succeeded = False
-            if cjk_count >= 3 and not _any_short_cjk and self._trigram_available:
+            if search_tokens and not has_short_token and self._trigram_available:
                 # Trigram FTS5 path — quote each non-operator token to handle
                 # FTS5 special chars (%, *, etc.) while preserving boolean
                 # operators (AND, OR, NOT) for multi-term queries.
-                tokens = raw_query.split()
                 parts = []
                 for tok in tokens:
                     if tok.upper() in {"AND", "OR", "NOT"}:
@@ -1800,7 +1788,6 @@ class SessionQueryMixin:
                         m.session_id,
                         m.role,
                         snippet(messages_fts_trigram, 0, '>>>', '<<<', '...', 40) AS snippet,
-                        m.content,
                         m.timestamp,
                         m.tool_name,
                         s.source,
@@ -1829,10 +1816,7 @@ class SessionQueryMixin:
                 # For multi-token OR queries (e.g. "广西 OR 桂林 OR 漓江"),
                 # build one LIKE condition per non-operator token so each term
                 # is matched independently (#20494).
-                non_op_tokens = [
-                    t for t in raw_query.split()
-                    if t.upper() not in {"AND", "OR", "NOT"}
-                ] or [raw_query]
+                non_op_tokens = search_tokens or [raw_query]
                 token_clauses = []
                 like_params: list = []
                 for tok in non_op_tokens:
@@ -1862,7 +1846,7 @@ class SessionQueryMixin:
                            substr(m.content,
                                   max(1, instr(m.content, ?) - 40),
                                   120) AS snippet,
-                           m.content, m.timestamp, m.tool_name,
+                           m.timestamp, m.tool_name,
                            s.source, s.model, s.started_at AS session_started
                     FROM messages m
                     JOIN sessions s ON s.id = m.session_id
@@ -1886,66 +1870,53 @@ class SessionQueryMixin:
                 else:
                     matches = [dict(row) for row in cursor.fetchall()]
 
-        contexts: dict[int, list[dict[str, Any]]] = {
-            int(match["id"]): [] for match in matches
-        }
-        if contexts:
-            values_sql = ",".join("(?)" for _ in contexts)
+        if not include_context:
+            return matches
+
+        for match in matches:
+            context_rows = []
+            session_id = match["session_id"]
+            timestamp = match["timestamp"]
+            message_id = int(match["id"])
             try:
                 with self._lock:
                     context_rows = self._conn.execute(
-                        f"""
-                        WITH targets(target_id) AS (VALUES {values_sql}),
-                        ranked AS (
-                            SELECT t.target_id, m.role, m.content,
-                                   CASE WHEN m.id = t.target_id THEN 1
-                                        WHEN (m.timestamp < target.timestamp)
-                                          OR (m.timestamp = target.timestamp AND m.id < target.id)
-                                        THEN 0 ELSE 2 END AS position,
-                                   ROW_NUMBER() OVER (
-                                       PARTITION BY t.target_id,
-                                           CASE WHEN m.id = t.target_id THEN 1
-                                                WHEN (m.timestamp < target.timestamp)
-                                                  OR (m.timestamp = target.timestamp AND m.id < target.id)
-                                                THEN 0 ELSE 2 END
-                                       ORDER BY CASE WHEN m.id = t.target_id THEN 0
-                                                     WHEN (m.timestamp < target.timestamp)
-                                                       OR (m.timestamp = target.timestamp AND m.id < target.id)
-                                                     THEN -m.timestamp ELSE m.timestamp END,
-                                                CASE WHEN m.id < target.id THEN -m.id ELSE m.id END
-                                   ) AS rank
-                            FROM targets t
-                            JOIN messages target ON target.id = t.target_id
-                            JOIN messages m ON m.session_id = target.session_id
-                            WHERE m.id = t.target_id
-                               OR (m.timestamp < target.timestamp)
-                               OR (m.timestamp = target.timestamp AND m.id < target.id)
-                               OR (m.timestamp > target.timestamp)
-                               OR (m.timestamp = target.timestamp AND m.id > target.id)
+                        """
+                        SELECT role, content, position FROM (
+                            SELECT role, content, 0 AS position FROM messages
+                            WHERE session_id = ?
+                              AND (timestamp < ? OR (timestamp = ? AND id < ?))
+                            ORDER BY timestamp DESC, id DESC
+                            LIMIT 1
                         )
-                        SELECT target_id, role, content FROM ranked
-                        WHERE rank = 1
-                        ORDER BY target_id, position
+                        UNION ALL
+                        SELECT role, content, 1 AS position FROM messages
+                        WHERE session_id = ? AND id = ?
+                        UNION ALL
+                        SELECT role, content, position FROM (
+                            SELECT role, content, 2 AS position FROM messages
+                            WHERE session_id = ?
+                              AND (timestamp > ? OR (timestamp = ? AND id > ?))
+                            ORDER BY timestamp ASC, id ASC
+                            LIMIT 1
+                        )
+                        ORDER BY position
                         """,
-                        tuple(contexts),
+                        (
+                            session_id, timestamp, timestamp, message_id,
+                            session_id, message_id,
+                            session_id, timestamp, timestamp, message_id,
+                        ),
                     ).fetchall()
-                for row in context_rows:
-                    contexts[int(row["target_id"])].append(
-                        {
-                            "role": row["role"],
-                            "content": self._build_message_preview(
-                                row["content"], 200
-                            ),
-                        }
-                    )
             except Exception:
                 pass
-        for match in matches:
-            match["context"] = contexts.get(int(match["id"]), [])
-
-        # Remove full content from result (snippet is enough, saves tokens)
-        for match in matches:
-            match.pop("content", None)
+            match["context"] = [
+                {
+                    "role": row["role"],
+                    "content": self._build_message_preview(row["content"], 200),
+                }
+                for row in context_rows
+            ]
 
         return matches
 

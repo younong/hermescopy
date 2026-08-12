@@ -8,14 +8,59 @@ NOT a regex scan — it's an unconditional architectural mark on every result
 from a known-untrusted source.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 from agent.tool_dispatch_helpers import (
     _extract_file_mutation_targets,
+    _should_parallelize_tool_batch,
     _is_untrusted_tool,
     _maybe_wrap_untrusted,
     make_tool_result_message,
 )
+
+
+def _tool_call(name, arguments="{}"):
+    return SimpleNamespace(
+        function=SimpleNamespace(name=name, arguments=arguments)
+    )
+
+
+class TestParallelToolBatch:
+    def test_session_search_serializes_whole_batch(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.tool_dispatch_helpers.under_cgroup_memory_pressure",
+            lambda: False,
+        )
+
+        assert not _should_parallelize_tool_batch([
+            _tool_call("web_search"),
+            _tool_call("session_search"),
+            _tool_call("web_search"),
+        ])
+
+    def test_memory_pressure_serializes_safe_batch(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.tool_dispatch_helpers.under_cgroup_memory_pressure",
+            lambda: True,
+        )
+
+        assert not _should_parallelize_tool_batch([
+            _tool_call("web_search"),
+            _tool_call("web_extract"),
+        ])
+
+    def test_safe_batch_stays_parallel_below_pressure_threshold(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.tool_dispatch_helpers.under_cgroup_memory_pressure",
+            lambda: False,
+        )
+
+        assert _should_parallelize_tool_batch([
+            _tool_call("web_search"),
+            _tool_call("web_extract"),
+        ])
 
 
 # =========================================================================
