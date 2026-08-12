@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { buildSessionFileDownloadUrl } from "./files";
-import { guiChatReducer } from "./reducer";
+import { guiChatReducer, type GuiChatAction } from "./reducer";
 import {
   initialGuiChatState,
   type FileArtifactState,
@@ -573,6 +573,50 @@ describe("guiChatReducer history image restoration", () => {
     expect(state.messages[0].text).toBe("");
     expect(state.messages[0].artifactIds).toEqual(["tool-image-image"]);
     expect(Object.keys(state.artifacts)).toEqual(["tool-image-image"]);
+  });
+
+  it("reconciles final structured image artifacts with streamed tool images", () => {
+    const cwd = "/workspace";
+    const actions = [
+      { event: { payload: { cwd }, type: "session.info" }, type: "event" },
+      { event: { type: "message.start" }, type: "event" },
+      {
+        event: { payload: { id: "tool-image", name: "image_generate" }, type: "tool.start" },
+        type: "event",
+      },
+      {
+        event: {
+          payload: {
+            id: "tool-image",
+            name: "image_generate",
+            result: { host_image: `${cwd}/generated/images/result.png`, success: true },
+          },
+          type: "tool.complete",
+        },
+        type: "event",
+      },
+    ] satisfies GuiChatAction[];
+    const streamed = actions.reduce(guiChatReducer, initialGuiChatState);
+    const state = guiChatReducer(streamed, {
+      event: {
+        payload: {
+          id: "artifact-result",
+          mime_type: "image/png",
+          path: "generated/images/result.png",
+        },
+        type: "artifact.created",
+      },
+      type: "event",
+    });
+
+    expect(state.messages[0].artifactIds).toEqual(["tool-image-image"]);
+    expect(state.toolCalls["tool-image"].artifactIds).toEqual([]);
+    expect(Object.keys(state.artifacts)).toEqual(["tool-image-image"]);
+    expect(imageArtifact(state, "tool-image-image")).toMatchObject({
+      messageId: state.messages[0].id,
+      sourcePath: "generated/images/result.png",
+      toolCallId: "tool-image",
+    });
   });
 
   it("creates message-owned image artifacts without trusting final reply file paths", () => {

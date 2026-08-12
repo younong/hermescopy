@@ -141,6 +141,10 @@ def test_authenticated_smoke_dispatches_terminal_through_supervisor_source():
     assert 'output_config_home / "config.yaml"' in source
     assert '"tool_output:\\n  max_bytes: 400000\\n"' in source
     assert 'type(exc).__name__ != "ExecutorOutputExceeded"' in source
+    assert "smoke_duration_seconds = min(" in source
+    assert "duration_seconds=smoke_duration_seconds" in source
+    assert "readonly_global_roots=()" in source
+    assert '"timeout": smoke_duration_seconds + 30' in source
     assert "manager.cleanup_owner(self.owner_lease)" in source
     assert "owner_tool_relay=relay" in source
     assert "supervisor.stop_generation()" in source

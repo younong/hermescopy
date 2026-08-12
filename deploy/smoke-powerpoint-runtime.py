@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import functools
 import json
 import os
@@ -274,8 +275,24 @@ def _run_authenticated_executor(
             0,
         )
         deployment_policy = host_sandbox_deployment_policy(policy_path)
-        manager = CgroupV2Manager(
+        smoke_duration_seconds = min(
+            timeout,
+            deployment_policy.resource_policy.executor_limits.duration_seconds,
+        )
+        smoke_resource_policy = replace(
             deployment_policy.resource_policy,
+            executor_limits=replace(
+                deployment_policy.resource_policy.executor_limits,
+                duration_seconds=smoke_duration_seconds,
+            ),
+        )
+        deployment_policy = replace(
+            deployment_policy,
+            readonly_global_roots=(),
+            resource_policy=smoke_resource_policy,
+        )
+        manager = CgroupV2Manager(
+            smoke_resource_policy,
             recover_stale_scopes=False,
         )
         checks["non_destructive_cgroup_attach"] = "passed"
@@ -375,9 +392,11 @@ def _run_authenticated_executor(
                 {
                     "command": (
                         "/opt/hermes/python/bin/python3 -c "
-                        + shlex.quote("import time; time.sleep(180)")
+                        + shlex.quote(
+                            f"import time; time.sleep({smoke_duration_seconds + 30})"
+                        )
                     ),
-                    "timeout": 180,
+                    "timeout": smoke_duration_seconds + 30,
                 },
                 "deadline_enforced",
                 "resource_deadline_exceeded",
