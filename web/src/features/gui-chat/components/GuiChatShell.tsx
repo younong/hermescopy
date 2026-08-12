@@ -1174,7 +1174,7 @@ export function GuiChatShell() {
             data-theme="chat-workspace"
             className="min-h-0 flex-1 overflow-auto"
           >
-            <EmployeeManagementPane />
+            <EmployeeManagementPane onEmployeesChanged={setEmployees} />
           </div>
         ) : modelsOpen ? (
           <GuiChatModelsPane

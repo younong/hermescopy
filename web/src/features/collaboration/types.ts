@@ -202,5 +202,6 @@ export interface CollaborationEmployeeIdentity {
   employeeId: string;
   name: string;
   role?: string;
+  avatarUrl?: string;
   available: boolean;
 }

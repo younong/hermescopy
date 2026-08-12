@@ -73,6 +73,7 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
     () => employees.map((employee) => ({
       employeeId: employee.employee_id,
       available: employee.lifecycle_status === "active" && employee.collaboration_policy.may_participate,
+      avatarUrl: employee.avatar_url ?? undefined,
       name: employee.profile?.name || "Unnamed employee",
       role: employee.profile?.role,
     })),
