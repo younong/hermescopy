@@ -40,7 +40,9 @@ export function GroupConversation({ employees, onApproval, onStop, state }: Grou
     return result;
   }, [state.targetsById, state.turnsById]);
 
-  useEffect(() => endRef.current?.scrollIntoView({ block: "end" }), [events.length, state.executionsById]);
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ block: "end" });
+  }, [events.length, state.executionsById]);
 
   if (state.loading) {
     return <div className="flex flex-1 items-center justify-center gap-2 text-xs text-[#777c84]"><Spinner /> Loading group…</div>;

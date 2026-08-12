@@ -876,6 +876,52 @@ describe("GuiChatShell", () => {
     expect(connection.createOrAttach).not.toHaveBeenCalled();
   });
 
+  it("leaves a group conversation for a workspace pane without an effect cleanup error", async () => {
+    const connection = createConnection();
+    vi.mocked(connection.collaboration.getGroup).mockResolvedValue({
+      approvals: [],
+      attachments: [],
+      events: [],
+      group: {
+        archived_at: null,
+        created_at: 1_700_000_000,
+        creator_employee_id: null,
+        creator_kind: "owner",
+        group_id: "group-a",
+        last_sequence: 0,
+        name: "Group A",
+        status: "active",
+        updated_at: 1_700_000_000,
+      },
+      memberships: [],
+      reconciliation: {
+        after_sequence: 0,
+        last_sequence: 0,
+        next_after_sequence: 0,
+        snapshot_authoritative: true,
+      },
+      targets: [],
+      turns: [],
+    });
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShellAt("/chat?group=group-a");
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(() => {
+      document.querySelector<HTMLButtonElement>("button[aria-label='Message composition statistics']")?.click();
+    }).not.toThrow();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector("[data-statistics-pane]")).not.toBeNull();
+  });
+
   it("connects automatically when the authenticated owner becomes ready", async () => {
     const identity = deferred<AuthIdentity>();
     const firstConnection = createConnection();
