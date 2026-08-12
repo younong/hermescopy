@@ -1010,6 +1010,11 @@ class CollaborationScheduler:
         ]
         for row in rows:
             body = json.loads(str(row["body_json"]))
+            prompt_body = (
+                {"text": body.get("text", "")}
+                if row["event_kind"] == "message.owner"
+                else body
+            )
             speaker = (
                 f"employee:{row['actor_employee_id']}"
                 if row["actor_kind"] == "employee"
@@ -1017,7 +1022,7 @@ class CollaborationScheduler:
             )
             lines.append(
                 f"[{int(row['sequence'])}] {speaker} {row['event_kind']}: "
-                f"{json.dumps(body, ensure_ascii=False, sort_keys=True)}"
+                f"{json.dumps(prompt_body, ensure_ascii=False, sort_keys=True)}"
             )
         if grants:
             references = self._materialize_granted_attachments(claimed, grants)

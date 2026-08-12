@@ -2,8 +2,9 @@ import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { AlertCircle, CheckCircle2, CircleStop, Clock3, FileText, LoaderCircle, ShieldAlert, UsersRound, XCircle } from "lucide-react";
 import { useEffect, useMemo, useRef } from "react";
 import { Markdown } from "@/components/Markdown";
-import type { CollaborationApprovalChoice, CollaborationEmployeeIdentity, CollaborationState, CollaborationTarget } from "../types";
 import { isTerminalTarget } from "../reducer";
+import { mentionLabel } from "../mentions";
+import type { CollaborationApprovalChoice, CollaborationEmployeeIdentity, CollaborationState, CollaborationTarget } from "../types";
 
 interface GroupConversationProps {
   employees: CollaborationEmployeeIdentity[];
@@ -94,6 +95,10 @@ export function GroupConversation({ employees, onApproval, onStop, state }: Grou
           if (!event.event_kind.startsWith("message.")) return null;
           const owner = event.actor_kind === "owner";
           const text = typeof event.body.text === "string" ? event.body.text : "";
+          const mentions = owner ? mentionLabel({
+            mentionAll: event.body.mention_all === true,
+            membershipIds: event.body.mentions ?? [],
+          }, state.membershipsById, employeeName) : "";
           const attachments = attachmentsByEvent.get(event.event_id) ?? [];
           const targets = targetsByEvent.get(event.event_id) ?? [];
           const speaker = owner ? "You" : employeeName(event.actor_employee_id);
@@ -105,6 +110,7 @@ export function GroupConversation({ employees, onApproval, onStop, state }: Grou
                 <span className="text-[#a1a5ac]">{formatTime(event.created_at)}</span>
               </div>
               <div className={owner ? "rounded-2xl rounded-tr-sm bg-[#eef3ff] px-4 py-3 text-[#283f79]" : "pl-8 text-[#25282d]"}>
+                {mentions ? <p className="mb-1 text-xs font-semibold text-[#4d73e6]">{mentions}</p> : null}
                 <Markdown content={text} />
                 {attachments.length > 0 ? (
                   <div className="mt-2 flex flex-wrap gap-1.5">
