@@ -31,6 +31,7 @@ vi.mock("@/i18n", () => ({
       common: {
         cancel: "Cancel",
         loading: "Loading",
+        msgs: "msgs",
         refresh: "Refresh",
         retry: "Retry",
         save: "Save",

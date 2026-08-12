@@ -6,6 +6,7 @@ import {
 } from "react";
 import { Check, ChevronDown, RefreshCw, Settings2 } from "lucide-react";
 
+import { guiChatTranslations, useI18n } from "@/i18n";
 import { api, type ModelRegistration } from "@/lib/api";
 
 import type { GuiChatModelSwitchResponse } from "../api";
@@ -34,6 +35,9 @@ export function ComposerModelPicker({
     confirmExpensiveModel?: boolean,
   ): Promise<GuiChatModelSwitchResponse>;
 }) {
+  const { t } = useI18n();
+  const chatCopy = guiChatTranslations(t);
+  const copy = chatCopy.composer.modelPicker;
   const [open, setOpen] = useState(false);
   const [registrations, setRegistrations] = useState<ModelRegistration[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -90,7 +94,7 @@ export function ComposerModelPicker({
     registration: ModelRegistration,
     confirmExpensiveModel = false,
   ) => {
-    if (switchingId || busy || !canSwitch) return;
+    if (switchingId || (!confirmExpensiveModel && busy) || !canSwitch) return;
     setSwitchingId(registration.id);
     setError(null);
     try {
@@ -100,7 +104,7 @@ export function ComposerModelPicker({
           message:
             result.confirm_message ||
             result.warning ||
-            "This model has unusually high known pricing.",
+            copy.highPriceWarning,
           registration,
         });
         return;
@@ -114,7 +118,7 @@ export function ComposerModelPicker({
   };
 
   const disabled = switchDisabled;
-  const shortName = (currentModel ?? "").split("/").pop() || "Select model";
+  const shortName = (currentModel ?? "").split("/").pop() || copy.selectModel;
 
   const toggleOpen = () => {
     const next = !open;
@@ -128,7 +132,7 @@ export function ComposerModelPicker({
       <button
         aria-expanded={open}
         aria-haspopup="listbox"
-        aria-label="Switch chat model"
+        aria-label={copy.switchModel}
         className="flex h-7 max-w-36 items-center gap-1 rounded-full px-2 text-[0.6875rem] font-medium text-[#686d75] transition hover:bg-[#f0f1f3] disabled:cursor-not-allowed disabled:opacity-60 sm:max-w-48"
         disabled={disabled}
         onClick={toggleOpen}
@@ -141,7 +145,7 @@ export function ComposerModelPicker({
 
       {open ? (
         <div
-          aria-label="Chat models"
+          aria-label={copy.chatModels}
           className="absolute bottom-full right-0 z-20 mb-2 max-h-72 w-64 overflow-y-auto rounded-xl border border-[#c8d2df] bg-white p-1 shadow-[0_8px_28px_rgba(31,41,55,0.12)]"
           role="listbox"
         >
@@ -155,20 +159,20 @@ export function ComposerModelPicker({
                 type="button"
               >
                 <RefreshCw aria-hidden className={`h-3 w-3 ${loading ? "animate-spin" : ""}`} />
-                Retry
+                {t.common.retry}
               </button>
             </div>
           ) : null}
 
           {registrations === null && loading ? (
             <div className="px-2 py-1.5 text-xs text-[#9a9ea5]" role="status">
-              Loading models…
+              {t.common.loading}
             </div>
           ) : null}
 
           {registrations !== null && registrations.length === 0 && !error ? (
             <div className="px-2 py-1.5 text-xs text-[#9a9ea5]">
-              No chat models registered yet.
+              {copy.noModels}
             </div>
           ) : null}
 
@@ -215,7 +219,7 @@ export function ComposerModelPicker({
               type="button"
             >
               <Settings2 aria-hidden className="h-3.5 w-3.5" />
-              Manage models…
+              {chatCopy.shell.manageModels}…
             </button>
           </div>
         </div>
@@ -226,11 +230,11 @@ export function ComposerModelPicker({
           busy={switchingId === pendingConfirm.registration.id}
           description={pendingConfirm.message}
           onClose={() => setPendingConfirm(null)}
-          title="Expensive model warning"
+          title={copy.highPriceWarning}
         >
           <div className="gui-chat-workspace-dialog-actions">
             <button onClick={() => setPendingConfirm(null)} type="button">
-              Cancel
+              {t.common.cancel}
             </button>
             <button
               className="is-destructive"
@@ -241,7 +245,7 @@ export function ComposerModelPicker({
               }}
               type="button"
             >
-              Switch anyway
+              {copy.useModel}
             </button>
           </div>
         </GuiChatWorkspaceDialog>

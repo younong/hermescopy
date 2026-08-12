@@ -23,6 +23,7 @@ import {
   X,
 } from "lucide-react";
 import { ChatSessionList } from "@/components/ChatSessionList";
+import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { CreateGroupDialog } from "@/features/collaboration/components/CreateGroupDialog";
 import { GroupChatView } from "@/features/collaboration/components/GroupChatView";
 import { GroupsSidebar } from "@/features/collaboration/components/GroupsSidebar";
@@ -31,7 +32,7 @@ import type { CollaborationGroup } from "@/features/collaboration/types";
 import { ConnectWeChatModal } from "@/features/ilink/ConnectWeChatModal";
 import { PageHeaderContext } from "@/contexts/page-header-context";
 import { GuiChatFilesPane } from "@/features/files/components/GuiChatFilesPane";
-import { useI18n } from "@/i18n";
+import { guiChatTranslations, useI18n } from "@/i18n";
 import SessionsPage from "@/pages/SessionsPage";
 import { api, type Employee } from "@/lib/api";
 import { JsonRpcGatewayError, type GatewayEvent } from "@/lib/gatewayClient";
@@ -72,6 +73,7 @@ const EMBEDDED_PAGE_HEADER = {
 
 export function GuiChatShell() {
   const { t } = useI18n();
+  const copy = guiChatTranslations(t);
   const location = useLocation();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -141,7 +143,7 @@ export function GuiChatShell() {
   );
   const weChatUnavailableMessage = weChatReady
     ? undefined
-    : weChatStatus?.message ?? "WeChat connection is not available on this server yet.";
+    : weChatStatus?.message ?? copy.shell.weChatUnavailable;
   const stateRef = useRef(state);
   const workspacePaneOpenRef = useRef(workspacePaneOpen);
   const navigateRef = useRef(navigate);
@@ -230,7 +232,7 @@ export function GuiChatShell() {
   const startEmployeeChat = (employeeId: string) => {
     const employee = employees.find((item) => item.employee_id === employeeId);
     if (!employee || employee.lifecycle_status !== "active" || !employee.profile) {
-      dispatch({ type: "error", message: "This employee is unavailable for direct chat." });
+      dispatch({ type: "error", message: copy.shell.employeeUnavailable });
       return;
     }
     setEmployeeChatOpen(false);
@@ -511,7 +513,7 @@ export function GuiChatShell() {
 
   const createGroup = useCallback(async (name: string, employeeIds: string[]) => {
     const connection = connectionRef.current;
-    if (!connection) throw new Error("Gateway is not ready");
+    if (!connection) throw new Error(copy.shell.gatewayNotReady);
     const previousAttempt = createGroupAttemptRef.current;
     const sameAttempt = previousAttempt?.name === name
       && previousAttempt.employeeIds.length === employeeIds.length
@@ -529,14 +531,14 @@ export function GuiChatShell() {
     setCreateGroupOpen(false);
     refreshGroups();
     pickGroup(snapshot.group.group_id);
-  }, [pickGroup, refreshGroups]);
+  }, [copy.shell.gatewayNotReady, pickGroup, refreshGroups]);
 
   const archiveGroup = useCallback(async (targetGroupId: string) => {
     const connection = connectionRef.current;
-    if (!connection) throw new Error("Gateway is not ready");
+    if (!connection) throw new Error(copy.shell.gatewayNotReady);
     await connection.collaboration.archiveGroup(targetGroupId);
     refreshGroups();
-  }, [refreshGroups]);
+  }, [copy.shell.gatewayNotReady, refreshGroups]);
 
   useEffect(() => {
     const mql = window.matchMedia("(max-width: 1023px)");
@@ -600,7 +602,7 @@ export function GuiChatShell() {
             if (attachment.kind === "image") {
               const result = await connection.attachImage(sessionId, attachment.file);
               if (!result.attached) {
-                throw new Error(result.message || `Could not attach ${attachment.name}`);
+                throw new Error(result.message || copy.shell.attachFailed.replace("{name}", attachment.name));
               }
               sentAttachment = {
                 ...attachment,
@@ -615,7 +617,7 @@ export function GuiChatShell() {
             } else if (attachment.kind === "pdf") {
               const result = await connection.attachPdf(sessionId, attachment.file);
               if (!result.attached) {
-                throw new Error(result.message || `Could not attach ${attachment.name}`);
+                throw new Error(result.message || copy.shell.attachFailed.replace("{name}", attachment.name));
               }
               sentAttachment = {
                 ...attachment,
@@ -629,7 +631,7 @@ export function GuiChatShell() {
             } else {
               const result = await connection.attachFile(sessionId, attachment.file);
               if (!result.attached || !result.ref_text) {
-                throw new Error(result.message || `Could not attach ${attachment.name}`);
+                throw new Error(result.message || copy.shell.attachFailed.replace("{name}", attachment.name));
               }
               sentAttachment = {
                 ...attachment,
@@ -649,7 +651,7 @@ export function GuiChatShell() {
           messageAttachments.push(toMessageAttachment(sentAttachment, state.cwd));
         }
 
-        const promptText = appendFileReferences(text, fileRefs);
+        const promptText = appendFileReferences(text, fileRefs, copy.shell.attachmentReferences);
         setSendScrollNonce((n) => n + 1);
         dispatch({
           type: "user.sent",
@@ -667,7 +669,7 @@ export function GuiChatShell() {
         throw error;
       }
     },
-    [state.sessionId],
+    [copy.shell.attachFailed, copy.shell.attachmentReferences, state.cwd, state.sessionId],
   );
 
   const useAttachmentAgain = useCallback(async (attachment: MessageAttachmentState) => {
@@ -710,7 +712,7 @@ export function GuiChatShell() {
   const activateCodeModel = useCallback(
     async (registration: { model: string; provider: string }) => {
       const coordinator = switchCoordinatorRef.current;
-      if (!coordinator) throw new Error("Chat connection is not ready");
+      if (!coordinator) throw new Error(copy.shell.connectionNotReady);
       historyAbortRef.current?.abort();
       setAttachmentsToQueue([]);
       reconnectLifecycleRef.current?.cancelRecovery();
@@ -729,7 +731,7 @@ export function GuiChatShell() {
       });
       dispatch({ type: "session.selected", generation, sessionId: null });
     },
-    [updateSearchParams],
+    [copy.shell.connectionNotReady, updateSearchParams],
   );
 
   const switchChatModel = useCallback(
@@ -740,9 +742,9 @@ export function GuiChatShell() {
     ) => {
       const sessionId = state.sessionId;
       const connection = connectionRef.current;
-      if (!sessionId || !connection) throw new Error("No active conversation");
+      if (!sessionId || !connection) throw new Error(copy.shell.noActiveConversation);
       if (state.isGenerating) {
-        throw new Error("Stop the current response before switching chat models.");
+        throw new Error(copy.shell.stopBeforeSwitchingModels);
       }
       return connection.switchModel(
         sessionId,
@@ -752,7 +754,7 @@ export function GuiChatShell() {
         persistGlobally,
       );
     },
-    [state.isGenerating, state.sessionId],
+    [copy.shell.noActiveConversation, copy.shell.stopBeforeSwitchingModels, state.isGenerating, state.sessionId],
   );
 
   const loadEarlier = useCallback(async () => {
@@ -843,18 +845,18 @@ export function GuiChatShell() {
   );
   const activeGroup = groups.find((group) => group.group_id === groupId);
   const conversationTitle = groupId
-    ? activeGroup?.name ?? "Group"
-    : activeSessionTitle ?? (activeSessionId ? "Conversation" : "New chat");
-  const accountLabel = authMe?.display_name || authMe?.email || "Hermes workspace";
+    ? activeGroup?.name ?? copy.shell.group
+    : activeSessionTitle ?? (activeSessionId ? copy.shell.conversation : copy.shell.newChat);
+  const accountLabel = authMe?.display_name || authMe?.email || copy.shell.workspaceAccount;
   const availableDirectEmployees = employees.filter(
     (employee) => employee.lifecycle_status === "active" && employee.profile !== null,
   );
   const employeeChatNotice = employeeLoadStatus === "loading"
-    ? "AI employees are loading."
+    ? copy.shell.employeesLoading
     : employeeLoadStatus === "error"
-      ? "AI employees could not be loaded. Please refresh the page."
+      ? copy.shell.employeesLoadFailed
       : availableDirectEmployees.length === 0
-        ? "No available AI employees. Please configure one in 员工管理."
+        ? copy.shell.noEmployees
         : null;
   const handleLogout = () => {
     dashboardAuthTransition.reset();
@@ -866,14 +868,14 @@ export function GuiChatShell() {
         <div className="gui-chat-search">
           <Search aria-hidden className="h-3.5 w-3.5 shrink-0" />
           <input
-            aria-label="Search conversations"
+            aria-label={copy.shell.searchConversations}
             onChange={(event) => setSessionQuery(event.target.value)}
-            placeholder="Search"
+            placeholder={copy.shell.search}
             value={sessionQuery}
           />
         </div>
       </div>
-      <nav aria-label="Chat navigation" className="space-y-[3px] px-3">
+      <nav aria-label={copy.shell.chatNavigation} className="space-y-[3px] px-3">
         <button
           aria-current={!workspacePaneOpen && !resumeSessionId ? "page" : undefined}
           className="gui-chat-nav-item"
@@ -881,19 +883,19 @@ export function GuiChatShell() {
           type="button"
         >
           <MessageSquarePlus />
-          <span>New chat</span>
+          <span>{copy.shell.newChat}</span>
         </button>
         <button
           aria-describedby={employeeChatNotice ? "employee-chat-notice" : undefined}
           aria-expanded={employeeChatOpen}
-          aria-label="Start employee chat"
+          aria-label={copy.shell.startEmployeeChat}
           className="gui-chat-nav-item disabled:cursor-not-allowed disabled:opacity-45"
           disabled={employeeChatNotice !== null}
           onClick={() => setEmployeeChatOpen((open) => !open)}
           type="button"
         >
           <Bot />
-          <span>Chat with employee</span>
+          <span>{copy.shell.chatWithEmployee}</span>
         </button>
         {employeeChatNotice ? (
           <p className="ml-6 px-3 pb-1 text-xs leading-5 text-red-600" id="employee-chat-notice" role="status">
@@ -910,7 +912,7 @@ export function GuiChatShell() {
                 type="button"
               >
                 <span className="min-w-0 truncate">
-                  {employee.profile?.name || "Unnamed employee"}
+                  {employee.profile?.name || copy.shell.unnamedEmployee}
                 </span>
               </button>
             ))}
@@ -918,7 +920,7 @@ export function GuiChatShell() {
         ) : null}
         <button
           aria-current={statisticsOpen ? "page" : undefined}
-          aria-label="Message composition statistics"
+          aria-label={copy.shell.messageCompositionStatistics}
           className="gui-chat-nav-item"
           onClick={() => {
             closeMobilePanel();
@@ -927,7 +929,7 @@ export function GuiChatShell() {
           type="button"
         >
           <PieChart />
-          <span>Message statistics</span>
+          <span>{copy.shell.messageStatistics}</span>
         </button>
         <button
           aria-current={filesOpen ? "page" : undefined}
@@ -939,7 +941,7 @@ export function GuiChatShell() {
           type="button"
         >
           <FolderOpen />
-          <span>Files</span>
+          <span>{copy.shell.files}</span>
         </button>
         <button
           aria-current={skillsOpen ? "page" : undefined}
@@ -951,7 +953,7 @@ export function GuiChatShell() {
           type="button"
         >
           <Sparkles />
-          <span>Skills</span>
+          <span>{copy.shell.skills}</span>
         </button>
         <button
           aria-current={scheduledTasksOpen ? "page" : undefined}
@@ -963,11 +965,11 @@ export function GuiChatShell() {
           type="button"
         >
           <CalendarClock />
-          <span>Scheduled Tasks</span>
+          <span>{copy.shell.scheduledTasks}</span>
         </button>
         <button
           aria-current={robotsOpen ? "page" : undefined}
-          aria-label="员工管理"
+          aria-label={copy.shell.employees}
           className="gui-chat-nav-item"
           onClick={() => {
             closeMobilePanel();
@@ -976,11 +978,11 @@ export function GuiChatShell() {
           type="button"
         >
           <Radio />
-          <span>员工管理</span>
+          <span>{copy.shell.employees}</span>
         </button>
         <button
           aria-current={modelsOpen ? "page" : undefined}
-          aria-label="Manage models"
+          aria-label={copy.shell.manageModels}
           className="gui-chat-nav-item"
           onClick={() => {
             closeMobilePanel();
@@ -989,7 +991,7 @@ export function GuiChatShell() {
           type="button"
         >
           <SlidersHorizontal />
-          <span>Models</span>
+          <span>{copy.shell.models}</span>
         </button>
       </nav>
       <GroupsSidebar
@@ -1002,7 +1004,7 @@ export function GuiChatShell() {
       />
       <div className="mt-4 flex min-h-0 flex-1 flex-col px-3">
         <div className="gui-chat-section-heading">
-          <span>Recent chats</span>
+          <span>{copy.shell.recentChats}</span>
           <button
             aria-label={t.common.refresh}
             className="gui-chat-icon-button"
@@ -1022,14 +1024,14 @@ export function GuiChatShell() {
             <Settings2 className="h-3.5 w-3.5 text-[#8a8e95]" />
           </button>
           {authRequired && authMe ? (
-            <button aria-label="Log out" className="gui-chat-logout" onClick={handleLogout} title="Log out" type="button">
+            <button aria-label={copy.shell.logOut} className="gui-chat-logout" onClick={handleLogout} title={copy.shell.logOut} type="button">
               <LogOut />
             </button>
           ) : null}
         </div>
         <button className="gui-chat-nav-item mt-0.5" onClick={() => navigate("/docs")} type="button">
           <CircleHelp />
-          <span>Help</span>
+          <span>{copy.shell.help}</span>
         </button>
       </div>
     </>
@@ -1043,7 +1045,7 @@ export function GuiChatShell() {
         {mobilePanelOpen && (
           <Button
             ghost
-            aria-label="Dismiss session drawer"
+            aria-label={copy.shell.dismissSessionDrawer}
             onClick={closeMobilePanel}
             className="fixed inset-0 z-[55] block bg-black/60 p-0"
           />
@@ -1052,7 +1054,7 @@ export function GuiChatShell() {
         <aside
           data-gui-chat
           id="gui-chat-session-panel"
-          aria-label="Chat workspace"
+          aria-label={copy.shell.chatWorkspace}
           className={cn(
             "gui-chat-mobile-sidebar fixed left-0 top-0 z-[60] flex h-dvh max-h-dvh min-w-0 flex-col shadow-2xl",
             "transition-transform duration-200 ease-out",
@@ -1063,7 +1065,7 @@ export function GuiChatShell() {
         >
           <div className="flex h-11 shrink-0 items-center justify-between px-3">
             <span className="text-sm font-semibold">Hermes</span>
-            <button aria-label="Close sessions" className="gui-chat-icon-button" onClick={closeMobilePanel} type="button">
+            <button aria-label={copy.shell.closeSessions} className="gui-chat-icon-button" onClick={closeMobilePanel} type="button">
               <X className="h-4 w-4" />
             </button>
           </div>
@@ -1086,7 +1088,7 @@ export function GuiChatShell() {
         />
       ) : null}
       {!narrow ? (
-        <aside aria-label="Chat workspace" className="gui-chat-sidebar">
+        <aside aria-label={copy.shell.chatWorkspace} className="gui-chat-sidebar">
           {sidebar}
         </aside>
       ) : null}
@@ -1097,7 +1099,7 @@ export function GuiChatShell() {
             <button
               aria-controls="gui-chat-session-panel"
               aria-expanded={mobilePanelOpen}
-              aria-label="Open sessions"
+              aria-label={copy.shell.openSessions}
               className="gui-chat-icon-button"
               onClick={() => setMobilePanelOpenRaw(true)}
               type="button"
@@ -1108,48 +1110,56 @@ export function GuiChatShell() {
           <div className="pointer-events-none absolute inset-x-20 top-1/2 min-w-0 -translate-y-1/2 text-center">
             <h1 className="truncate text-[14px] font-medium leading-[22px] text-[#25282d]">
               {statisticsOpen
-                ? "Message statistics"
+                ? copy.shell.messageStatistics
                 : filesOpen
-                  ? "Files"
+                  ? copy.shell.files
                 : skillsOpen
-                  ? "Skills"
+                  ? copy.shell.skills
                   : scheduledTasksOpen
-                    ? "Scheduled Tasks"
+                    ? copy.shell.scheduledTasks
                     : robotsOpen
-                      ? "员工管理"
+                      ? copy.shell.employees
                       : modelsOpen
-                        ? "Models"
+                        ? copy.shell.models
                         : conversationTitle}
             </h1>
             <p className="truncate text-[0.625rem] text-[#969aa1]">
               {workspacePaneOpen
-                ? "Workspace"
+                ? copy.shell.workspace
                 : groupId
-                  ? `${activeGroup?.status ?? "group"} · ${Object.values(groups).length} groups · ${state.connection}`
-                  : `${state.model ?? "Hermes"} · ${mockMode ? "mock" : state.connection}`}
+                  ? copy.shell.workspaceSummaryGroup
+                      .replace("{status}", activeGroup?.status ?? copy.shell.group)
+                      .replace("{count}", String(Object.values(groups).length))
+                      .replace("{connection}", state.connection)
+                  : copy.shell.workspaceSummaryChat
+                      .replace("{model}", state.model ?? "Hermes")
+                      .replace("{connection}", mockMode ? copy.shell.mock : state.connection)}
             </p>
           </div>
-          {!workspacePaneOpen ? (
-            <div className="ml-auto flex items-center gap-1">
-              {groupId ? <UsersRound className="mr-1 h-3.5 w-3.5 text-[#777c84]" /> : null}
-              {canConnectWeChat ? (
-                <button
-                  aria-label="Connect WeChat"
-                  className="gui-chat-icon-button"
-                  onClick={() => setConnectWeChatOpen(true)}
-                  title="Connect WeChat"
-                  type="button"
-                >
-                  <QrCode className="h-3.5 w-3.5" />
-                </button>
-              ) : null}
-              {mockMode || state.connection !== "open" ? (
-                <button aria-label={mockMode ? "Replay" : t.common.retry} className="gui-chat-icon-button" onClick={retryConnection} type="button">
-                  <RefreshCw className={cn("h-3.5 w-3.5", state.connection === "connecting" && "animate-spin")} />
-                </button>
-              ) : null}
-            </div>
-          ) : null}
+          <div className="ml-auto flex items-center gap-1">
+            {!workspacePaneOpen ? (
+              <>
+                {groupId ? <UsersRound className="mr-1 h-3.5 w-3.5 text-[#777c84]" /> : null}
+                {canConnectWeChat ? (
+                  <button
+                    aria-label={copy.shell.connectWeChat}
+                    className="gui-chat-icon-button"
+                    onClick={() => setConnectWeChatOpen(true)}
+                    title={copy.shell.connectWeChat}
+                    type="button"
+                  >
+                    <QrCode className="h-3.5 w-3.5" />
+                  </button>
+                ) : null}
+                {mockMode || state.connection !== "open" ? (
+                  <button aria-label={mockMode ? copy.shell.replay : t.common.retry} className="gui-chat-icon-button" onClick={retryConnection} type="button">
+                    <RefreshCw className={cn("h-3.5 w-3.5", state.connection === "connecting" && "animate-spin")} />
+                  </button>
+                ) : null}
+              </>
+            ) : null}
+            <LanguageSwitcher allowedLocales={["en", "zh"]} dropUp />
+          </div>
         </header>
 
         {statisticsOpen ? (
@@ -1297,9 +1307,9 @@ function validImageDimensions(
   return { height, width };
 }
 
-function appendFileReferences(text: string, fileRefs: string[]): string {
+function appendFileReferences(text: string, fileRefs: string[], heading: string): string {
   if (fileRefs.length === 0) return text;
-  return `${text.trim()}\n\n附件：\n${fileRefs.join("\n")}`.trim();
+  return `${text.trim()}\n\n${heading}\n${fileRefs.join("\n")}`.trim();
 }
 
 function createClientId(prefix: string): string {

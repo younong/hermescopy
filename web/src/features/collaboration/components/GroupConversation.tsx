@@ -2,6 +2,8 @@ import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { AlertCircle, CheckCircle2, CircleStop, Clock3, FileText, LoaderCircle, ShieldAlert, UsersRound, XCircle } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Markdown } from "@/components/Markdown";
+import { guiChatTranslations, useI18n } from "@/i18n";
+import type { GuiChatTranslations } from "@/i18n";
 import { withHermesAssetAuth } from "@/lib/api";
 import { isTerminalTarget } from "../reducer";
 import { mentionLabel } from "../mentions";
@@ -15,14 +17,16 @@ interface GroupConversationProps {
 }
 
 export function GroupConversation({ employees, onApproval, onStop, state }: GroupConversationProps) {
+  const { t } = useI18n();
+  const copy = guiChatTranslations(t).collaboration;
   const endRef = useRef<HTMLDivElement>(null);
   const employeeIdentity = useMemo(() => {
     const identities = new Map(employees.map((employee) => [employee.employeeId, employee]));
     return (employeeId: string | null | undefined): CollaborationEmployeeIdentity =>
       employeeId
-        ? identities.get(employeeId) ?? { available: false, employeeId, name: "Former employee" }
+        ? identities.get(employeeId) ?? { available: false, employeeId, name: copy.formerEmployee }
         : { available: false, employeeId: "", name: "Hermes" };
-  }, [employees]);
+  }, [copy.formerEmployee, employees]);
   const employeeName = useMemo(
     () => (employeeId: string | null | undefined) => employeeIdentity(employeeId).name,
     [employeeIdentity],
@@ -54,7 +58,7 @@ export function GroupConversation({ employees, onApproval, onStop, state }: Grou
   }, [events.length, state.executionsById]);
 
   if (state.loading) {
-    return <div className="flex flex-1 items-center justify-center gap-2 text-xs text-[#777c84]"><Spinner /> Loading group…</div>;
+    return <div className="flex flex-1 items-center justify-center gap-2 text-xs text-[#777c84]"><Spinner /> {copy.loadingGroup}</div>;
   }
   if (state.error && events.length === 0) {
     return <div className="flex flex-1 items-center justify-center gap-2 p-6 text-sm text-[#b42318]"><AlertCircle /> {state.error}</div>;
@@ -63,8 +67,8 @@ export function GroupConversation({ employees, onApproval, onStop, state }: Grou
     return (
       <div className="flex flex-1 flex-col items-center justify-center p-8 text-center">
         <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-[#eef3ff] text-[#3867ed]"><UsersRound /></span>
-        <h2 className="mt-4 text-base font-semibold text-[#25282d]">Start the group conversation</h2>
-        <p className="mt-1 max-w-md text-xs leading-5 text-[#969aa1]">Send a message to the first available employee, or use @ to choose someone else.</p>
+        <h2 className="mt-4 text-base font-semibold text-[#25282d]">{copy.startConversation}</h2>
+        <p className="mt-1 max-w-md text-xs leading-5 text-[#969aa1]">{copy.startConversationHint}</p>
       </div>
     );
   }
@@ -76,7 +80,7 @@ export function GroupConversation({ employees, onApproval, onStop, state }: Grou
           if (event.event_kind === "collaboration.origin.card") {
             const status = event.body.status === "completed" ? "completed" : "created";
             const completed = status === "completed";
-            const title = typeof event.body.title === "string" ? event.body.title : "Internal collaboration";
+            const title = typeof event.body.title === "string" ? event.body.title : copy.internalCollaboration;
             const text = typeof event.body.text === "string" ? event.body.text : "";
             const groupId = typeof event.body.group_id === "string" ? event.body.group_id : "";
             const Icon = completed ? CheckCircle2 : UsersRound;
@@ -84,7 +88,7 @@ export function GroupConversation({ employees, onApproval, onStop, state }: Grou
               <article className={`rounded-2xl border p-4 ${completed ? "border-[#cfe7d7] bg-[#f4fbf6]" : "border-[#dce4f7] bg-[#f7f9ff]"}`} key={event.event_id}>
                 <div className="flex items-start gap-3">
                   <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-xl ${completed ? "bg-[#def3e5] text-[#238148]" : "bg-[#e6edff] text-[#3867ed]"}`}><Icon className="h-4 w-4" /></span>
-                  <div className="min-w-0 flex-1"><p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#6f7fa8]">Internal collaboration {status}</p><h3 className="mt-1 text-sm font-semibold text-[#252f4a]">{title}</h3>{text ? <div className="mt-2 text-xs leading-5 text-[#53617f]"><Markdown content={text} /></div> : null}{groupId ? <a className="mt-3 inline-flex text-xs font-semibold text-[#3867ed] hover:text-[#2852c7]" href={`?group=${encodeURIComponent(groupId)}`}>Open group</a> : null}</div>
+                  <div className="min-w-0 flex-1"><p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#6f7fa8]">{copy.internalCollaboration} {copy.status[status]}</p><h3 className="mt-1 text-sm font-semibold text-[#252f4a]">{title}</h3>{text ? <div className="mt-2 text-xs leading-5 text-[#53617f]"><Markdown content={text} /></div> : null}{groupId ? <a className="mt-3 inline-flex text-xs font-semibold text-[#3867ed] hover:text-[#2852c7]" href={`?group=${encodeURIComponent(groupId)}`}>{copy.openGroup}</a> : null}</div>
                 </div>
               </article>
             );
@@ -95,7 +99,7 @@ export function GroupConversation({ employees, onApproval, onStop, state }: Grou
               <article className="rounded-2xl border border-[#cfe7d7] bg-[#f4fbf6] p-4" key={event.event_id}>
                 <div className="flex items-start gap-3">
                   <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[#def3e5] text-[#238148]"><CheckCircle2 className="h-4 w-4" /></span>
-                  <div className="min-w-0"><p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#4f8060]">Internal collaboration completed</p>{summary ? <div className="mt-2 text-sm leading-6 text-[#31563d]"><Markdown content={summary} /></div> : null}</div>
+                  <div className="min-w-0"><p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#4f8060]">{copy.internalCollaboration} {copy.status.completed}</p>{summary ? <div className="mt-2 text-sm leading-6 text-[#31563d]"><Markdown content={summary} /></div> : null}</div>
                 </div>
               </article>
             );
@@ -106,10 +110,10 @@ export function GroupConversation({ employees, onApproval, onStop, state }: Grou
           const mentions = owner ? mentionLabel({
             mentionAll: event.body.mention_all === true,
             membershipIds: event.body.mentions ?? [],
-          }, state.membershipsById, employeeName) : "";
+          }, state.membershipsById, employeeName, { mentionAll: copy.mentionAll }) : "";
           const attachments = attachmentsByEvent.get(event.event_id) ?? [];
           const targets = targetsByEvent.get(event.event_id) ?? [];
-          const speaker = owner ? "You" : employeeName(event.actor_employee_id);
+          const speaker = owner ? copy.you : employeeName(event.actor_employee_id);
           return (
             <article className={owner ? "ml-auto max-w-[85%]" : "max-w-[92%]"} key={event.event_id}>
               <div className={`mb-1.5 flex items-center gap-2 text-[11px] ${owner ? "justify-end" : ""}`}>
@@ -129,7 +133,7 @@ export function GroupConversation({ employees, onApproval, onStop, state }: Grou
               {targets.length > 0 ? (
                 <div className={`${owner ? "mt-3" : "ml-8 mt-3"} grid gap-2 sm:grid-cols-2`}>
                   {targets.map((target) => (
-                    <TargetCard employeeIdentity={employeeIdentity} key={target.target_id} onStop={onStop} state={state} target={target} />
+                    <TargetCard copy={copy} employeeIdentity={employeeIdentity} key={target.target_id} onStop={onStop} state={state} target={target} />
                   ))}
                 </div>
               ) : null}
@@ -137,15 +141,15 @@ export function GroupConversation({ employees, onApproval, onStop, state }: Grou
                 .filter((approval) => targets.some((target) => target.target_id === approval.target_id))
                 .map((approval) => (
                   <div className={`${owner ? "mt-2" : "ml-8 mt-2"} rounded-xl border border-[#f1d6a8] bg-[#fffaf0] p-3`} key={approval.approval_id}>
-                    <div className="flex gap-2"><ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-[#a15c00]" /><div><p className="text-xs font-semibold text-[#704100]">{approval.request?.summary || "Approval required"}</p>{approval.request?.tool_name ? <p className="mt-1 text-[10px] text-[#956300]">Tool: {approval.request.tool_name}</p> : null}</div></div>
+                    <div className="flex gap-2"><ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-[#a15c00]" /><div><p className="text-xs font-semibold text-[#704100]">{approval.request?.summary || copy.approvalRequired}</p>{approval.request?.tool_name ? <p className="mt-1 text-[10px] text-[#956300]">{copy.toolLabel.replace("{name}", approval.request.tool_name)}</p> : null}</div></div>
                     {approval.status === "pending" ? (
                       <div className="mt-3 flex flex-wrap gap-1.5">
-                        <ApprovalButton label="Allow once" onClick={() => onApproval(approval.approval_id, "once")} />
-                        <ApprovalButton label="Allow session" onClick={() => onApproval(approval.approval_id, "session")} />
-                        {approval.request?.allow_permanent ? <ApprovalButton label="Always allow" onClick={() => onApproval(approval.approval_id, "always")} /> : null}
-                        <ApprovalButton destructive label="Deny" onClick={() => onApproval(approval.approval_id, "deny")} />
+                        <ApprovalButton label={copy.allowOnce} onClick={() => onApproval(approval.approval_id, "once")} />
+                        <ApprovalButton label={copy.allowSession} onClick={() => onApproval(approval.approval_id, "session")} />
+                        {approval.request?.allow_permanent ? <ApprovalButton label={copy.alwaysAllow} onClick={() => onApproval(approval.approval_id, "always")} /> : null}
+                        <ApprovalButton destructive label={copy.deny} onClick={() => onApproval(approval.approval_id, "deny")} />
                       </div>
-                    ) : <p className="mt-2 text-[10px] font-medium uppercase tracking-wide text-[#956300]">{approval.status}</p>}
+                    ) : <p className="mt-2 text-[10px] font-medium uppercase tracking-wide text-[#956300]">{approval.status === "approved" ? copy.status.completed : approval.status === "denied" ? copy.deny : approval.status}</p>}
                   </div>
                 ))}
             </article>
@@ -157,7 +161,7 @@ export function GroupConversation({ employees, onApproval, onStop, state }: Grou
   );
 }
 
-function TargetCard({ employeeIdentity, onStop, state, target }: { employeeIdentity(employeeId: string): CollaborationEmployeeIdentity; onStop(targetId: string): void; state: CollaborationState; target: CollaborationTarget }) {
+function TargetCard({ copy, employeeIdentity, onStop, state, target }: { copy: GuiChatTranslations["collaboration"]; employeeIdentity(employeeId: string): CollaborationEmployeeIdentity; onStop(targetId: string): void; state: CollaborationState; target: CollaborationTarget }) {
   const streamed = state.executionsById[target.execution_id] ?? "";
   const finalText = targetResultText(target);
   const status = targetStatus(target.status);
@@ -167,11 +171,11 @@ function TargetCard({ employeeIdentity, onStop, state, target }: { employeeIdent
     <div className="rounded-xl border border-[#e4e6ea] bg-[#fafbfc] p-3">
       <div className="flex items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-2"><SpeakerAvatar employee={employee} small /><span className="truncate text-[11px] font-semibold">{employee.name}</span></div>
-        <span className={`inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide ${status.className}`}><Icon className={`h-3 w-3 ${target.status === "running" ? "animate-spin" : ""}`} />{target.status.replace("_", " ")}</span>
+        <span className={`inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide ${status.className}`}><Icon className={`h-3 w-3 ${target.status === "running" ? "animate-spin" : ""}`} />{targetStatusLabel(target.status, copy)}</span>
       </div>
       {(streamed || finalText) ? <div className="mt-2 max-h-40 overflow-auto text-xs leading-5 text-[#44484f]"><Markdown content={streamed || finalText} /></div> : null}
       {target.error ? <p className="mt-2 text-[10px] text-[#b42318]">{target.error}</p> : null}
-      {!isTerminalTarget(target.status) ? <button className="mt-2 inline-flex items-center gap-1 text-[10px] font-medium text-[#777c84] hover:text-[#b42318]" onClick={() => onStop(target.target_id)} type="button"><CircleStop className="h-3 w-3" /> Stop this employee</button> : null}
+      {!isTerminalTarget(target.status) ? <button className="mt-2 inline-flex items-center gap-1 text-[10px] font-medium text-[#777c84] hover:text-[#b42318]" onClick={() => onStop(target.target_id)} type="button"><CircleStop className="h-3 w-3" /> {copy.stopEmployee}</button> : null}
     </div>
   );
 }
@@ -198,6 +202,15 @@ function AttachmentChip({ name, size }: { name: string; size: number }) {
 
 function ApprovalButton({ destructive = false, label, onClick }: { destructive?: boolean; label: string; onClick(): void }) {
   return <button className={`rounded-md border px-2 py-1 text-[10px] font-medium ${destructive ? "border-[#efc7c2] text-[#b42318] hover:bg-[#fff1ef]" : "border-[#e7c987] text-[#815100] hover:bg-[#fff3d7]"}`} onClick={onClick} type="button">{label}</button>;
+}
+
+function targetStatusLabel(status: CollaborationTarget["status"], copy: GuiChatTranslations["collaboration"]): string {
+  if (status === "completed") return copy.status.completed;
+  if (status === "running") return copy.status.running;
+  if (status === "queued") return copy.status.queued;
+  if (status === "waiting_approval") return copy.status.waitingApproval;
+  if (status === "cancelled") return copy.status.cancelled;
+  return status;
 }
 
 function targetStatus(status: CollaborationTarget["status"]): { className: string; icon: typeof Clock3 } {

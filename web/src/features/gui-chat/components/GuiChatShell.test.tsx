@@ -83,7 +83,7 @@ vi.mock("@/i18n", async (importOriginal) => {
   const { en } = await import("@/i18n/en");
   return {
     ...actual,
-    useI18n: () => ({ t: en }),
+    useI18n: () => ({ locale: "en", setLocale: vi.fn(), t: en }),
   };
 });
 
@@ -354,10 +354,11 @@ describe("GuiChatShell", () => {
     const sidebar = document.querySelector('aside[aria-label="Chat workspace"]');
     expect(sidebar).not.toBeNull();
     expect(sidebar?.querySelector('[aria-label="Manage models"]')?.textContent).toContain("Models");
-    expect(sidebar?.querySelector('[aria-label="员工管理"]')?.textContent).toContain("员工管理");
+    expect(sidebar?.querySelector('[aria-label="Employees"]')?.textContent).toContain("Employees");
     expect(sidebar?.querySelector('[aria-label="Message composition statistics"]')?.textContent).toContain("Message statistics");
     expect(document.querySelector('main header [aria-label="Manage models"]')).toBeNull();
     expect(document.querySelector('[aria-label="Log out"]')).not.toBeNull();
+    expect(document.querySelector('main header [aria-label="Switch language"]')).not.toBeNull();
   });
 
   it("explains how to make an unavailable employee chat available", async () => {
@@ -375,7 +376,7 @@ describe("GuiChatShell", () => {
     expect(document.querySelector('[role="status"]')?.textContent).toContain(
       "No available AI employees",
     );
-    expect(document.querySelector('[role="status"]')?.textContent).toContain("员工管理");
+    expect(document.querySelector('[role="status"]')?.textContent).toContain("Employee management");
     expect(document.querySelector('[role="status"]')?.className).toContain("text-red-600");
   });
 
@@ -460,7 +461,7 @@ describe("GuiChatShell", () => {
       </>,
     );
     await act(async () => {
-      document.querySelector<HTMLButtonElement>('[aria-label="员工管理"]')?.click();
+      document.querySelector<HTMLButtonElement>('[aria-label="Employees"]')?.click();
       await Promise.resolve();
     });
 
@@ -468,15 +469,15 @@ describe("GuiChatShell", () => {
     const robotsPane = document.querySelector("[data-robots-pane]");
     expect(robotsPane).not.toBeNull();
     expect(robotsPane?.getAttribute("data-theme")).toBe("chat-workspace");
-    expect(document.body.textContent).toContain("员工");
+    expect(document.body.textContent).toContain("Employees");
     expect(
       robotsPane?.querySelector("button.gui-chat-workspace-primary-button")
         ?.textContent,
-    ).toBe("添加员工");
+    ).toBe("Add employee");
     expect(robotsPane?.querySelector("[data-employee-management-pane]")).not.toBeNull();
     expect(document.querySelector("[data-composer-send]")).toBeNull();
     expect(
-      document.querySelector<HTMLButtonElement>('[aria-label="员工管理"]')
+      document.querySelector<HTMLButtonElement>('[aria-label="Employees"]')
         ?.getAttribute("aria-current"),
     ).toBe("page");
     expect(mocks.getMessagingPlatforms).not.toHaveBeenCalled();
@@ -517,6 +518,7 @@ describe("GuiChatShell", () => {
     });
 
     expect(document.querySelector("[data-models-pane]")).not.toBeNull();
+    expect(document.querySelector('main header [aria-label="Switch language"]')).not.toBeNull();
     expect(document.querySelector('[role="dialog"]')).toBeNull();
     expect(document.querySelector("[data-composer-send]")).toBeNull();
     expect(Array.from(document.querySelectorAll<HTMLButtonElement>('button[aria-current="page"]'))

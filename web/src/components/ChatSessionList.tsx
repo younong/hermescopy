@@ -103,6 +103,8 @@ export function ChatSessionList({
   // Monotonic request tokens ignore stale list loads and title updates.
   const reqRef = useRef(0);
   const renameReqRef = useRef(0);
+  const loadErrorFallbackRef = useRef(t.sessions.noSessions);
+  loadErrorFallbackRef.current = t.sessions.noSessions;
 
   const load = useCallback(() => {
     const myReq = ++reqRef.current;
@@ -116,7 +118,7 @@ export function ChatSessionList({
       })
       .catch((e: Error) => {
         if (reqRef.current !== myReq) return;
-        setError(e.message || "failed to load sessions");
+        setError(e.message || loadErrorFallbackRef.current);
       })
       .finally(() => {
         if (reqRef.current === myReq) setLoading(false);
@@ -219,7 +221,7 @@ export function ChatSessionList({
           error:
             cause instanceof Error && cause.message
               ? cause.message
-              : (t.sessions.failedToRename ?? "Failed to rename session"),
+              : t.sessions.failedToRename!,
         }));
       } finally {
         if (renameReqRef.current === myReq) {
@@ -291,9 +293,8 @@ export function ChatSessionList({
           const isActive = s.id === activeSessionId;
           const isRenaming = s.id === rename.id;
           const label = rowLabel(s, t.sessions.untitledSession);
-          const renameLabel = t.sessions.renameSession ?? "Rename session";
-          const titlePlaceholder =
-            t.sessions.sessionTitlePlaceholder ?? "Session title";
+          const renameLabel = t.sessions.renameSession!;
+          const titlePlaceholder = t.sessions.sessionTitlePlaceholder!;
 
           if (isRenaming) {
             return (
@@ -406,7 +407,7 @@ export function ChatSessionList({
                     {s.message_count > 0 && (
                       <>
                         <span aria-hidden>·</span>
-                        <span>{s.message_count} msgs</span>
+                        <span>{s.message_count} {t.common.msgs}</span>
                       </>
                     )}
                     {s.source && s.source !== "cli" && (

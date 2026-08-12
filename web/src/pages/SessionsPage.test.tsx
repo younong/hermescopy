@@ -4,6 +4,7 @@ import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { I18nProvider } from "@/i18n";
 import { api } from "@/lib/api";
 import SessionsPage, {
   fetchSessionsOverview,
@@ -22,6 +23,7 @@ beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
     .IS_REACT_ACT_ENVIRONMENT = true;
   document.body.innerHTML = "";
+  localStorage.clear();
 });
 
 afterEach(() => {
@@ -147,12 +149,13 @@ function mockSessionsPageApi() {
   });
 }
 
-async function renderSessionsPage() {
+async function renderSessionsPage(locale: "en" | "zh" = "en") {
   const container = document.createElement("div");
   document.body.appendChild(container);
   const root = createRoot(container);
+  localStorage.setItem("hermes-locale", locale);
   await act(async () => {
-    root.render(<MemoryRouter><SessionsPage /></MemoryRouter>);
+    root.render(<I18nProvider><MemoryRouter><SessionsPage /></MemoryRouter></I18nProvider>);
     await Promise.resolve();
     await Promise.resolve();
   });
@@ -203,6 +206,24 @@ describe("SessionsPage composition flow", () => {
     }
     await act(async () => root.unmount());
   });
+  it("renders Chat-visible store statistics in Chinese", async () => {
+    mockSessionsPageApi();
+    vi.mocked(api.getSessionStats).mockResolvedValue({
+      total: 3,
+      active_store: 1,
+      archived: 1,
+      messages: 8,
+      by_source: {},
+    });
+
+    const { container, root } = await renderSessionsPage("zh");
+    await vi.waitFor(() => expect(container.textContent).toContain("存储中活跃"));
+    expect(container.textContent).toContain("总计");
+    expect(container.textContent).toContain("已归档");
+    expect(container.textContent).toContain("消息");
+    await act(async () => root.unmount());
+  });
+
 });
 
 describe("SessionMessageList", () => {

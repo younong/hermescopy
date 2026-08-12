@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef } from "react";
 import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 
+import { guiChatTranslations, useI18n } from "@/i18n";
 import { api } from "@/lib/api";
 import { cn, themedBody } from "@/lib/utils";
 import { ILinkEnrollmentPanel } from "./ILinkEnrollmentPanel";
@@ -34,6 +35,8 @@ function ReadyEnrollment() {
 }
 
 export function ConnectWeChatModal({ onClose, unavailableMessage }: Props) {
+  const { t } = useI18n();
+  const copy = guiChatTranslations(t).weChat;
   const dialogRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
@@ -67,7 +70,7 @@ export function ConnectWeChatModal({ onClose, unavailableMessage }: Props) {
         ref={dialogRef}
       >
         <button
-          aria-label="Close"
+          aria-label={copy.close}
           className="absolute right-3 top-3 rounded-md p-1 text-muted-foreground hover:text-foreground"
           data-close
           onClick={onClose}
@@ -76,12 +79,12 @@ export function ConnectWeChatModal({ onClose, unavailableMessage }: Props) {
           <X className="h-4 w-4" />
         </button>
         <h2 className="mb-4 pr-8 text-lg font-semibold" id="connect-wechat-title">
-          Connect WeChat
+          {copy.title}
         </h2>
         {unavailableMessage ? (
           <div className="space-y-3 text-sm text-muted-foreground">
             <p>{unavailableMessage}</p>
-            <p>The server administrator must finish the secure connector setup before a QR code can be created.</p>
+            <p>{copy.connectorSetupRequired}</p>
           </div>
         ) : (
           <ReadyEnrollment />

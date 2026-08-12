@@ -14,7 +14,9 @@ import { ArrowUp, Plus, Square } from "lucide-react";
 import {
   COMPOSER_ATTACHMENT_MAX_COUNT,
   validateComposerAttachment,
+  type ComposerAttachmentValidationReason,
 } from "../attachments";
+import { guiChatTranslations, useI18n } from "@/i18n";
 import type { GuiComposerAttachment } from "../types";
 import { ComposerAttachmentCard } from "./ComposerAttachmentCard";
 
@@ -43,6 +45,8 @@ export function Composer({
   ) => Promise<void>;
   onStop: () => void;
 }) {
+  const { t } = useI18n();
+  const copy = guiChatTranslations(t).composer;
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<GuiComposerAttachment[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -106,7 +110,7 @@ export function Composer({
     setLocalError(null);
     setIsSubmitting(true);
     try {
-      await onSend(next || "请查看这些附件。", attachmentsToSend, updateAttachment);
+      await onSend(next || copy.attachmentOnlyMessage, attachmentsToSend, updateAttachment);
       setText("");
       clearAttachments(attachmentsToSend, { revokePreviewUrls: false });
     } catch (error) {
@@ -130,11 +134,11 @@ export function Composer({
     for (const file of Array.from(files)) {
       const validation = validateComposerAttachment(file);
       if (!validation.ok) {
-        errors.push(validation.message);
+        errors.push(attachmentValidationMessage(validation.reason, file.name, copy));
         continue;
       }
       if (nextAttachments.length >= availableSlots) {
-        errors.push(`每条消息最多添加 ${COMPOSER_ATTACHMENT_MAX_COUNT} 个附件。`);
+        errors.push(copy.attachmentLimit.replace("{count}", String(COMPOSER_ATTACHMENT_MAX_COUNT)));
         break;
       }
 
@@ -154,7 +158,7 @@ export function Composer({
       setAttachments((current) => [...current, ...nextAttachments]);
     }
     setLocalError(errors[0] ?? null);
-  }, []);
+  }, [copy]);
 
   useEffect(() => {
     if (!attachmentToQueue) return;
@@ -243,7 +247,7 @@ export function Composer({
       >
         {isDraggingFiles ? (
           <div className="mb-2 px-1 text-sm font-medium text-blue-500" role="status">
-            Drop files to attach
+            {copy.dropFiles}
           </div>
         ) : null}
 
@@ -261,13 +265,13 @@ export function Composer({
         ) : null}
 
         <textarea
-          aria-label="GUI chat message"
+          aria-label={copy.messageAriaLabel}
           className="min-h-11 max-h-40 w-full resize-none bg-transparent px-1 py-0.5 text-[14px] leading-[22px] text-[#26292e] outline-none placeholder:text-[#999da4] disabled:cursor-not-allowed disabled:opacity-70"
           disabled={disabled || isSubmitting}
           onChange={(event) => setText(event.target.value)}
           onKeyDown={onKeyDown}
           onPaste={onPaste}
-          placeholder={disabled ? "Connecting to Hermes…" : "Message Hermes…"}
+          placeholder={disabled ? copy.connectingPlaceholder : copy.messagePlaceholder}
           rows={2}
           value={text}
         />
@@ -278,14 +282,14 @@ export function Composer({
           <div className="flex items-center gap-2">
             <button
               type="button"
-              aria-label="Attach files"
+              aria-label={copy.attachFiles}
               className="flex h-7 w-7 items-center justify-center rounded-full text-[#686d75] transition hover:bg-[#f0f1f3] disabled:cursor-not-allowed disabled:opacity-40"
               disabled={controlsDisabled}
               onClick={() => fileInputRef.current?.click()}
             >
               <Plus className="h-4 w-4" />
             </button>
-            <span className="text-[0.6875rem] text-[#9a9ea5]">Enter to send · Shift+Enter for new line</span>
+            <span className="text-[0.6875rem] text-[#9a9ea5]">{copy.sendHint}</span>
           </div>
 
           <div className="flex items-center gap-2">
@@ -293,7 +297,7 @@ export function Composer({
             {isGenerating ? (
               <button
                 type="button"
-                aria-label="Stop generating"
+                aria-label={copy.stopGenerating}
                 className="flex h-8 w-8 items-center justify-center rounded-full bg-[#2f3338] text-white transition hover:bg-[#191b1e] disabled:opacity-40"
                 onClick={onStop}
                 disabled={disabled}
@@ -304,7 +308,7 @@ export function Composer({
             {!isGenerating || allowSendWhileGenerating ? (
               <button
                 type="submit"
-                aria-label={isSubmitting ? "Sending" : "Send message"}
+                aria-label={isSubmitting ? copy.sending : copy.sendMessage}
                 className="flex h-8 w-8 items-center justify-center rounded-full bg-[#2f3338] text-white transition hover:bg-[#191b1e] disabled:cursor-not-allowed disabled:bg-[#d7d9dc]"
                 disabled={!canSend}
               >
@@ -316,6 +320,21 @@ export function Composer({
       </div>
     </form>
   );
+}
+
+function attachmentValidationMessage(
+  reason: ComposerAttachmentValidationReason,
+  filename: string,
+  copy: ReturnType<typeof guiChatTranslations>["composer"],
+): string {
+  const template = reason === "unsupported"
+    ? copy.unsupportedAttachment
+    : reason === "image_too_large"
+      ? copy.imageTooLarge
+      : reason === "pdf_too_large"
+        ? copy.pdfTooLarge
+        : copy.fileTooLarge;
+  return template.replace("{name}", filename);
 }
 
 function filesFromTransfer(dataTransfer: DataTransfer): File[] {

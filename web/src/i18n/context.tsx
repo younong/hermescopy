@@ -1,8 +1,12 @@
 import { createContext, useContext, useState, useCallback, type ReactNode } from "react";
-import type { Locale, Translations } from "./types";
+import type {
+  GuiChatTranslations,
+  Locale,
+  SessionCompositionTranslations,
+  Translations,
+} from "./types";
 import { en } from "./en";
 import { zh } from "./zh";
-import type { SessionCompositionTranslations } from "./types";
 import { zhHant } from "./zh-hant";
 import { ja } from "./ja";
 import { de } from "./de";
@@ -121,6 +125,12 @@ export function I18nProvider({ children }: { children: ReactNode }) {
 
 export function useI18n() {
   return useContext(I18nContext);
+}
+
+export function guiChatTranslations(
+  translations: Translations,
+): GuiChatTranslations {
+  return translations.guiChat ?? en.guiChat!;
 }
 
 export function sessionCompositionTranslations(

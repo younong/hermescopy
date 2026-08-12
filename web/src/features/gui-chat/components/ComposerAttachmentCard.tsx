@@ -1,6 +1,7 @@
 import { Button } from "@nous-research/ui/ui/components/button";
 import { FileText, Loader2, X } from "lucide-react";
 
+import { guiChatTranslations, useI18n } from "@/i18n";
 import { formatBytes } from "../attachments";
 import type { GuiComposerAttachment } from "../types";
 
@@ -13,10 +14,12 @@ export function ComposerAttachmentCard({
   disabled?: boolean;
   onRemove: (id: string) => void;
 }) {
+  const { t } = useI18n();
+  const copy = guiChatTranslations(t).composer;
   const isPdf = attachment.kind === "pdf";
   const isUploading = attachment.status === "uploading";
   const isError = attachment.status === "error";
-  const typeLabel = attachment.kind === "image" ? "Image" : isPdf ? "PDF" : "File";
+  const typeLabel = attachment.kind === "image" ? copy.image : isPdf ? copy.pdf : copy.file;
   const meta = `${typeLabel} · ${formatBytes(attachment.sizeBytes)}`;
 
   return (
@@ -51,10 +54,10 @@ export function ComposerAttachmentCard({
           {isUploading ? (
             <span className="inline-flex items-center gap-1">
               <Loader2 className="h-3 w-3 animate-spin" />
-              处理中...
+              {copy.processing}
             </span>
           ) : isError ? (
-            attachment.error || "上传失败"
+            attachment.error || copy.uploadFailed
           ) : (
             meta
           )}
@@ -65,7 +68,7 @@ export function ComposerAttachmentCard({
         type="button"
         size="icon"
         ghost
-        aria-label={`Remove ${attachment.name}`}
+        aria-label={copy.removeAttachment.replace("{name}", attachment.name)}
         className="absolute -right-2 -top-2 h-6 w-6 rounded-full border border-current/10 bg-background-base opacity-0 shadow-sm transition group-hover:opacity-100 group-focus-within:opacity-100"
         disabled={disabled || isUploading || attachment.status === "uploaded"}
         onClick={() => onRemove(attachment.id)}

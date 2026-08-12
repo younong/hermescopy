@@ -3,6 +3,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { I18nProvider, type Locale } from "@/i18n";
 import { api, type Employee, type EmployeeCatalog } from "@/lib/api";
 import { EmployeeManagementPane } from "./EmployeeManagementPane";
 
@@ -22,12 +23,16 @@ const catalog: EmployeeCatalog = {
 
 let root: Root | null = null;
 
-async function renderPane(onEmployeesChanged?: (employees: Employee[]) => void) {
+async function renderPane(
+  locale: Locale = "en",
+  onEmployeesChanged?: (employees: Employee[]) => void,
+) {
+  localStorage.setItem("hermes-locale", locale);
   const container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
   await act(async () => {
-    root?.render(<EmployeeManagementPane onEmployeesChanged={onEmployeesChanged} />);
+    root?.render(<I18nProvider><EmployeeManagementPane onEmployeesChanged={onEmployeesChanged} /></I18nProvider>);
     await Promise.resolve();
     await Promise.resolve();
   });
@@ -60,6 +65,18 @@ afterEach(async () => {
 });
 
 describe("EmployeeManagementPane", () => {
+  it("renders the employee workspace in Chinese", async () => {
+    vi.spyOn(api, "getEmployees").mockResolvedValue({ employees: [employee()] });
+
+    await renderPane("zh");
+
+    expect(document.querySelector('[role="list"][aria-label="员工列表"]')).not.toBeNull();
+    expect(document.body.textContent).toContain("创建专注的 AI 员工，用于直接对话和内部协作。");
+    expect(document.body.textContent).toContain("资料版本 1");
+    expect(document.body.textContent).toContain("未连接");
+    expect(document.body.textContent).not.toContain("Employee list");
+  });
+
   it("creates an employee without requesting Feishu credentials", async () => {
     vi.spyOn(api, "getEmployees").mockResolvedValue({ employees: [] });
     const createEmployee = vi.spyOn(api, "createEmployee").mockResolvedValue(employee());
@@ -68,14 +85,14 @@ describe("EmployeeManagementPane", () => {
     await act(async () => document.querySelector<HTMLButtonElement>("button.gui-chat-workspace-primary-button")?.click());
 
     const dialog = document.querySelector('[role="dialog"]');
-    expect(dialog?.textContent).toContain("添加员工");
-    expect(dialog?.textContent).not.toContain("应用密钥");
+    expect(dialog?.textContent).toContain("Add employee");
+    expect(dialog?.textContent).not.toContain("App secret");
     const inputs = Array.from(dialog?.querySelectorAll<HTMLInputElement>("input") ?? [])
       .filter((input) => input.type === "text");
     changeValue(inputs[0] ?? null, "Researcher");
     changeValue(dialog?.querySelector("textarea") ?? null, "Research carefully.");
     const save = Array.from(dialog?.querySelectorAll<HTMLButtonElement>("button") ?? [])
-      .find((button) => button.textContent === "保存");
+      .find((button) => button.textContent === "Save");
     await act(async () => {
       save?.click();
       await Promise.resolve();
@@ -106,29 +123,29 @@ describe("EmployeeManagementPane", () => {
 
     await renderPane();
     const buttons = () => Array.from(document.querySelectorAll<HTMLButtonElement>("button"));
-    const list = document.querySelector('[role="list"][aria-label="员工列表"]');
+    const list = document.querySelector('[role="list"][aria-label="Employee list"]');
     expect(list?.querySelectorAll('[role="listitem"]')).toHaveLength(1);
-    expect(document.body.textContent).toContain("员工");
-    expect(document.body.textContent).not.toContain("Employees");
-    expect(list?.textContent).not.toContain("允许参与协作");
-    expect(list?.textContent).not.toContain("编辑资料");
+    expect(document.body.textContent).toContain("Employees");
+    expect(document.body.textContent).not.toContain("员工");
+    expect(list?.textContent).not.toContain("Allow collaboration");
+    expect(list?.textContent).not.toContain("Edit profile");
     expect(list?.querySelectorAll("button")).toHaveLength(1);
 
-    await act(async () => buttons().find((button) => button.textContent === "管理")?.click());
-    const management = document.querySelector('[aria-label="管理员工：Researcher"]');
-    expect(management?.textContent).toContain("允许参与协作");
+    await act(async () => buttons().find((button) => button.textContent === "Manage")?.click());
+    const management = document.querySelector('[aria-label="Manage employee: Researcher"]');
+    expect(management?.textContent).toContain("Allow collaboration");
 
-    await act(async () => buttons().find((button) => button.textContent === "保存权限")?.click());
+    await act(async () => buttons().find((button) => button.textContent === "Save permissions")?.click());
     expect(updatePolicy).toHaveBeenCalledWith("employee-a", current.collaboration_policy);
 
-    await act(async () => buttons().find((button) => button.textContent === "更新会话")?.click());
+    await act(async () => buttons().find((button) => button.textContent === "Refresh sessions")?.click());
     expect(rollover).toHaveBeenCalledWith("employee-a");
 
-    await act(async () => buttons().find((button) => button.textContent === "暂停")?.click());
+    await act(async () => buttons().find((button) => button.textContent === "Suspend")?.click());
     expect(lifecycle).toHaveBeenCalledWith("employee-a", "suspended");
 
-    await act(async () => buttons().find((button) => button.textContent === "连接")?.click());
-    const dialog = document.querySelector('[aria-label="飞书 / Lark 绑定"]');
+    await act(async () => buttons().find((button) => button.textContent === "Connect")?.click());
+    const dialog = document.querySelector('[aria-label="Feishu / Lark binding"]');
     const textInputs = Array.from(dialog?.querySelectorAll<HTMLInputElement>("input") ?? [])
       .filter((input) => input.type === "text");
     const secret = dialog?.querySelector<HTMLInputElement>('input[type="password"]') ?? null;
@@ -136,7 +153,7 @@ describe("EmployeeManagementPane", () => {
     changeValue(secret, "secret");
     await act(async () => {
       Array.from(dialog?.querySelectorAll<HTMLButtonElement>("button") ?? [])
-        .find((button) => button.textContent === "保存")
+        .find((button) => button.textContent === "Save")
         ?.click();
       await Promise.resolve();
       await Promise.resolve();
@@ -164,7 +181,7 @@ describe("EmployeeManagementPane", () => {
     const onEmployeesChanged = vi.fn();
     vi.spyOn(api, "getEmployees").mockResolvedValue({ employees: [current] });
 
-    await renderPane(onEmployeesChanged);
+    await renderPane("en", onEmployeesChanged);
 
     expect(onEmployeesChanged).toHaveBeenCalledWith([current]);
   });
@@ -182,23 +199,23 @@ describe("EmployeeManagementPane", () => {
 
     await renderPane();
     const buttons = () => Array.from(document.querySelectorAll<HTMLButtonElement>("button"));
-    await act(async () => buttons().find((button) => button.textContent === "管理")?.click());
-    await act(async () => buttons().find((button) => button.textContent === "测试连接")?.click());
+    await act(async () => buttons().find((button) => button.textContent === "Manage")?.click());
+    await act(async () => buttons().find((button) => button.textContent === "Test connection")?.click());
     expect(testBinding).toHaveBeenCalledWith("employee-a");
 
-    await act(async () => buttons().find((button) => button.textContent === "暂停绑定")?.click());
+    await act(async () => buttons().find((button) => button.textContent === "Suspend binding")?.click());
     expect(bindingLifecycle).toHaveBeenCalledWith("employee-a", "suspended");
 
-    await act(async () => buttons().find((button) => button.textContent === "撤销绑定")?.click());
+    await act(async () => buttons().find((button) => button.textContent === "Revoke binding")?.click());
     expect(bindingLifecycle).toHaveBeenCalledWith("employee-a", "revoked");
 
-    await act(async () => buttons().find((button) => button.textContent === "更新凭据")?.click());
-    const dialog = document.querySelector('[aria-label="飞书 / Lark 绑定"]');
+    await act(async () => buttons().find((button) => button.textContent === "Update credentials")?.click());
+    const dialog = document.querySelector('[aria-label="Feishu / Lark binding"]');
     const secret = dialog?.querySelector<HTMLInputElement>('input[type="password"]') ?? null;
     changeValue(secret, "new-secret");
     await act(async () => {
       Array.from(dialog?.querySelectorAll<HTMLButtonElement>("button") ?? [])
-        .find((button) => button.textContent === "保存")
+        .find((button) => button.textContent === "Save")
         ?.click();
       await Promise.resolve();
       await Promise.resolve();

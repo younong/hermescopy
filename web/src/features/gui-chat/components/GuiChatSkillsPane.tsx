@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Plus, RefreshCw, Search, Sparkles, Trash2 } from "lucide-react";
+import { guiChatTranslations, useI18n } from "@/i18n";
 import { api, type SkillInfo } from "@/lib/api";
 import { GuiChatWorkspaceDialog } from "./GuiChatWorkspaceDialog";
 
@@ -14,6 +15,8 @@ Numbered steps, exact commands, and pitfalls go here.
 `;
 
 export function GuiChatSkillsPane() {
+  const { t } = useI18n();
+  const text = guiChatTranslations(t).skills;
   const [skills, setSkills] = useState<SkillInfo[] | null>(null);
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(true);
@@ -99,14 +102,12 @@ export function GuiChatSkillsPane() {
   };
 
   return (
-    <section aria-label="Skills" className="gui-chat-workspace-pane" data-skills-pane>
+    <section aria-label={text.title} className="gui-chat-workspace-pane" data-skills-pane>
       <header className="gui-chat-workspace-toolbar">
         <button className="gui-chat-workspace-primary-button" onClick={() => setCreateOpen(true)} type="button">
-          <Plus aria-hidden />
-          New skill
-        </button>
+          <Plus aria-hidden />{text.newSkill}        </button>
         <button
-          aria-label="Refresh skills"
+          aria-label={text.refresh}
           className="gui-chat-workspace-icon-button"
           disabled={loading}
           onClick={() => void load()}
@@ -118,15 +119,15 @@ export function GuiChatSkillsPane() {
 
       <div className="gui-chat-workspace-heading">
         <div>
-          <h1>Skills</h1>
-          <p>Reusable instructions available to new conversations in this workspace.</p>
+          <h1>{text.title}</h1>
+          <p>{text.description}</p>
         </div>
         <label className="gui-chat-workspace-search">
           <Search aria-hidden />
           <input
-            aria-label="Search skills"
+            aria-label={text.search}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder="Search skills"
+            placeholder={text.search}
             value={query}
           />
         </label>
@@ -136,12 +137,12 @@ export function GuiChatSkillsPane() {
 
       <div className="gui-chat-workspace-list">
         {skills === null && loading ? (
-          <div className="gui-chat-workspace-empty" role="status">Loading skills…</div>
+          <div className="gui-chat-workspace-empty" role="status">{text.loading}</div>
         ) : visibleSkills.length === 0 ? (
           <div className="gui-chat-workspace-empty">
             <Sparkles aria-hidden />
-            <strong>{query.trim() ? "No matching skills" : "No skills yet"}</strong>
-            <span>{query.trim() ? "Try a different search." : "Create a skill to add reusable guidance."}</span>
+            <strong>{query.trim() ? text.noMatching : text.none}</strong>
+            <span>{query.trim() ? text.differentSearch : text.createHint}</span>
           </div>
         ) : (
           visibleSkills.map((skill) => (
@@ -151,12 +152,12 @@ export function GuiChatSkillsPane() {
                   <span>{skill.name}</span>
                   {skill.category ? <span className="gui-chat-workspace-badge">{skill.category}</span> : null}
                 </div>
-                <p>{skill.description || "No description"}</p>
+                <p>{skill.description || text.noDescription}</p>
               </div>
               <div className="gui-chat-workspace-actions">
                 <button
                   aria-checked={skill.enabled}
-                  aria-label={`${skill.enabled ? "Disable" : "Enable"} ${skill.name}`}
+                  aria-label={(skill.enabled ? text.disableNamed : text.enableNamed).replace("{name}", skill.name)}
                   className="gui-chat-skill-switch"
                   disabled={savingSkill === skill.name}
                   onClick={() => void toggleSkill(skill, !skill.enabled)}
@@ -166,7 +167,7 @@ export function GuiChatSkillsPane() {
                   <span />
                 </button>
                 <button
-                  aria-label={`Delete ${skill.name}`}
+                  aria-label={text.deleteNamed.replace("{name}", skill.name)}
                   className="gui-chat-workspace-icon-button is-destructive"
                   disabled={savingSkill === skill.name}
                   onClick={() => setPendingDelete(skill)}
@@ -203,14 +204,14 @@ export function GuiChatSkillsPane() {
       {pendingDelete ? (
         <GuiChatWorkspaceDialog
           busy={savingSkill === pendingDelete.name}
-          description="This permanently removes the skill and its supporting files. This action cannot be undone."
+          description={text.deleteDescription}
           onClose={() => setPendingDelete(null)}
-          title={`Delete ${pendingDelete.name}?`}
+          title={text.deleteTitle.replace("{name}", pendingDelete.name)}
         >
           <div className="gui-chat-workspace-dialog-actions">
-            <button disabled={savingSkill === pendingDelete.name} onClick={() => setPendingDelete(null)} type="button">Cancel</button>
+            <button disabled={savingSkill === pendingDelete.name} onClick={() => setPendingDelete(null)} type="button">{t.common.cancel}</button>
             <button className="is-destructive" disabled={savingSkill === pendingDelete.name} onClick={() => void deleteSkill()} type="button">
-              {savingSkill === pendingDelete.name ? "Deleting…" : "Delete"}
+              {savingSkill === pendingDelete.name ? text.deleting : t.common.delete}
             </button>
           </div>
         </GuiChatWorkspaceDialog>
@@ -228,6 +229,8 @@ function CreateSkillDialog({
   onClose: () => void;
   onCreate: (name: string, category: string, content: string) => Promise<void>;
 }) {
+  const { t } = useI18n();
+  const text = guiChatTranslations(t).skills;
   const [name, setName] = useState("");
   const [category, setCategory] = useState("");
   const [content, setContent] = useState(CREATE_TEMPLATE);
@@ -236,11 +239,11 @@ function CreateSkillDialog({
   const submit = async () => {
     const trimmedName = name.trim();
     if (!trimmedName) {
-      setError("Skill name is required.");
+      setError(text.nameRequired);
       return;
     }
     if (!content.trim()) {
-      setError("SKILL.md content is required.");
+      setError(text.contentRequired);
       return;
     }
     setError(null);
@@ -254,19 +257,19 @@ function CreateSkillDialog({
   return (
     <GuiChatWorkspaceDialog
       busy={busy}
-      description="Add YAML frontmatter and markdown instructions. The skill becomes available to new conversations."
+      description={text.addDescription}
       onClose={onClose}
-      title="New skill"
+      title={text.newSkill}
       wide
     >
       <div className="gui-chat-skills-editor-grid">
         <label>
-          <span>Name</span>
-          <input aria-label="Skill name" autoFocus disabled={busy} onChange={(event) => setName(event.target.value)} placeholder="my-skill" value={name} />
+          <span>{text.name}</span>
+          <input aria-label={text.name} autoFocus disabled={busy} onChange={(event) => setName(event.target.value)} placeholder={text.namePlaceholder} value={name} />
         </label>
         <label>
-          <span>Category (optional)</span>
-          <input aria-label="Skill category" disabled={busy} onChange={(event) => setCategory(event.target.value)} placeholder="productivity" value={category} />
+          <span>{text.categoryOptional}</span>
+          <input aria-label={text.category} disabled={busy} onChange={(event) => setCategory(event.target.value)} placeholder={text.categoryPlaceholder} value={category} />
         </label>
       </div>
       <label className="gui-chat-skills-editor-content">
@@ -275,9 +278,9 @@ function CreateSkillDialog({
       </label>
       {error ? <div className="gui-chat-skills-editor-error" role="alert">{error}</div> : null}
       <div className="gui-chat-workspace-dialog-actions">
-        <button disabled={busy} onClick={onClose} type="button">Cancel</button>
+        <button disabled={busy} onClick={onClose} type="button">{t.common.cancel}</button>
         <button className="is-primary" disabled={busy} onClick={() => void submit()} type="button">
-          {busy ? "Creating…" : "Create skill"}
+          {busy ? text.creating : text.createSkill}
         </button>
       </div>
     </GuiChatWorkspaceDialog>

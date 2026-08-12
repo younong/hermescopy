@@ -129,25 +129,31 @@ describe("gui chat attachment helpers", () => {
     expect(compressionMocks.imageCompression).toHaveBeenCalledOnce();
   });
 
-  it("validates supported file sizes", () => {
-    expect(validateComposerAttachment(file("cat.png", "image/png", IMAGE_ATTACHMENT_MAX_BYTES)).ok).toBe(
-      true,
-    );
-    expect(validateComposerAttachment(file("cat.png", "image/png", IMAGE_ATTACHMENT_MAX_BYTES + 1)).ok).toBe(
-      false,
-    );
-    expect(validateComposerAttachment(file("brief.pdf", "application/pdf", PDF_ATTACHMENT_MAX_BYTES)).ok).toBe(
-      true,
-    );
-    expect(validateComposerAttachment(file("brief.pdf", "application/pdf", PDF_ATTACHMENT_MAX_BYTES + 1)).ok).toBe(
-      false,
-    );
-    expect(validateComposerAttachment(file("data.csv", "text/csv", FILE_ATTACHMENT_MAX_BYTES)).ok).toBe(
-      true,
-    );
-    expect(validateComposerAttachment(file("data.csv", "text/csv", FILE_ATTACHMENT_MAX_BYTES + 1)).ok).toBe(
-      false,
-    );
+  it("validates supported file sizes with typed failure reasons", () => {
+    expect(validateComposerAttachment(file("cat.png", "image/png", IMAGE_ATTACHMENT_MAX_BYTES))).toEqual({
+      kind: "image",
+      ok: true,
+    });
+    expect(validateComposerAttachment(file("cat.png", "image/png", IMAGE_ATTACHMENT_MAX_BYTES + 1))).toEqual({
+      ok: false,
+      reason: "image_too_large",
+    });
+    expect(validateComposerAttachment(file("brief.pdf", "application/pdf", PDF_ATTACHMENT_MAX_BYTES))).toEqual({
+      kind: "pdf",
+      ok: true,
+    });
+    expect(validateComposerAttachment(file("brief.pdf", "application/pdf", PDF_ATTACHMENT_MAX_BYTES + 1))).toEqual({
+      ok: false,
+      reason: "pdf_too_large",
+    });
+    expect(validateComposerAttachment(file("data.csv", "text/csv", FILE_ATTACHMENT_MAX_BYTES))).toEqual({
+      kind: "file",
+      ok: true,
+    });
+    expect(validateComposerAttachment(file("data.csv", "text/csv", FILE_ATTACHMENT_MAX_BYTES + 1))).toEqual({
+      ok: false,
+      reason: "file_too_large",
+    });
   });
 
   it("formats byte sizes for attachment cards", () => {

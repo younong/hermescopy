@@ -4,6 +4,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { I18nProvider } from "@/i18n";
 import {
   api,
   type ModelRegistration,
@@ -37,6 +38,7 @@ let root: Root | null = null;
 beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   document.body.innerHTML = "<div id=\"root\"></div>";
+  localStorage.clear();
   vi.spyOn(api, "getModelRegistrations").mockResolvedValue(payload);
   vi.spyOn(api, "getModelRegistrationCatalog").mockImplementation(async (kind) => ({
     kind,
@@ -152,12 +154,12 @@ describe("GuiChatModelsPane", () => {
     expect(document.body.textContent).toContain("Voice model");
     expect(buttonWithin(rowFor("Voice model"), "Activate", true)).toBeUndefined();
     await clickButton("Add model", true);
-    const sourceSelect = document.querySelector<HTMLSelectElement>('select[aria-label="Model source"]');
+    const sourceSelect = document.querySelector<HTMLSelectElement>('select[aria-label="Source"]');
     expect(sourceSelect?.disabled).toBe(true);
     expect(sourceSelect?.value).toBe("manual");
     expect(sourceSelect?.selectedOptions[0]?.textContent).toBe("Manual");
-    await setLabeledInput("Model name", "New voice model");
-    await setLabeledInput("Model provider", "openai");
+    await setLabeledInput("Name", "New voice model");
+    await setLabeledInput("Provider", "openai");
     await setLabeledInput("Model", "gpt-4o-mini-tts");
     await clickButton("Save model", true);
     expect(api.getModelRegistrationCatalog).not.toHaveBeenCalledWith("voice");
@@ -179,8 +181,8 @@ describe("GuiChatModelsPane", () => {
     await clickButton("Add model", true);
     expect(api.getModelRegistrationCatalog).toHaveBeenCalledWith("chat");
 
-    await setLabeledInput("Model name", "New catalog model");
-    await setLabeledSelect("Model provider", "catalog-provider");
+    await setLabeledInput("Name", "New catalog model");
+    await setLabeledSelect("Provider", "catalog-provider");
     await setLabeledSelect("Model", "catalog-model");
     await clickButton("Save model", true);
 
@@ -203,7 +205,7 @@ describe("GuiChatModelsPane", () => {
 
     await clickWithin(rowFor("Private endpoint"), "Edit Private endpoint", true, "aria-label");
     expect(document.body.textContent).toContain("write-only");
-    await setLabeledInput("Model name", "Private endpoint renamed");
+    await setLabeledInput("Name", "Private endpoint renamed");
     await setLabeledInput("Model", "private-model");
     await setLabeledInput("Base URL", "https://llm.example/v1");
     await clickButton("Save model", true);
@@ -225,21 +227,34 @@ describe("GuiChatModelsPane", () => {
     expect(document.querySelector('[role="alert"]')?.textContent).toContain("Stop the current response");
     expect(onSwitchChat).not.toHaveBeenCalled();
   });
+  it("renders Chinese model chrome while preserving registration names", async () => {
+    await renderPane({}, "zh");
+
+    expect(document.body.textContent).toContain("添加模型");
+    expect(document.body.textContent).toContain("管理模型，并选择用于对话和内容生成的模型。");
+    expect(document.body.textContent).toContain("Current model");
+    expect(document.querySelector('[aria-label="搜索模型"]')).not.toBeNull();
+  });
+
 });
 
-async function renderPane(overrides: Partial<Parameters<typeof GuiChatModelsPane>[0]> = {}) {
+async function renderPane(
+  overrides: Partial<Parameters<typeof GuiChatModelsPane>[0]> = {},
+  locale: "en" | "zh" = "en",
+) {
+  localStorage.setItem("hermes-locale", locale);
   const container = document.getElementById("root");
   root = createRoot(container!);
   await act(async () => {
     root?.render(
-      <GuiChatModelsPane
+      <I18nProvider><GuiChatModelsPane
         busy={false}
         canSwitchChat
         currentModel="current-model"
         currentProvider="current-provider"
         onSwitchChat={vi.fn().mockResolvedValue({ confirm_required: false, value: "default-model" })}
         {...overrides}
-      />,
+      /></I18nProvider>,
     );
     await Promise.resolve();
     await Promise.resolve();

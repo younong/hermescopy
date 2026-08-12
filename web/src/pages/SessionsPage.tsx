@@ -61,7 +61,7 @@ import {
 } from "@nous-research/ui/ui/components/dialog";
 import { useSystemActions } from "@/contexts/useSystemActions";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
-import { sessionCompositionTranslations, useI18n } from "@/i18n";
+import { guiChatTranslations, sessionCompositionTranslations, useI18n } from "@/i18n";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { PluginSlot } from "@/plugins";
 import { useLoadEarlierOnScroll } from "@/hooks/useLoadEarlierOnScroll";
@@ -496,8 +496,8 @@ function SessionRow({
         ghost
         size="icon"
         className="text-muted-foreground hover:text-foreground"
-        aria-label="Rename session"
-        title="Rename session"
+        aria-label={t.sessions.renameSession ?? "Rename session"}
+        title={t.sessions.renameSession ?? "Rename session"}
         onClick={(e) => {
           e.stopPropagation();
           setRenameValue(
@@ -598,7 +598,7 @@ function SessionRow({
                         if (e.key === "Enter") void submitRename();
                         else if (e.key === "Escape") setRenaming(false);
                       }}
-                      placeholder="Session title"
+                      placeholder={t.sessions.sessionTitlePlaceholder ?? "Session title"}
                       className="h-7 min-w-0 flex-1 py-0 text-sm"
                       disabled={renameSaving}
                     />
@@ -880,6 +880,7 @@ export default function SessionsPage() {
   const [pruning, setPruning] = useState(false);
   const { toast, showToast } = useToast();
   const { t } = useI18n();
+  const chatText = guiChatTranslations(t);
   const compositionText = sessionCompositionTranslations(t);
   const { setAfterTitle, setEnd } = usePageHeader();
   const { activeAction, actionStatus, dismissLog } = useSystemActions();
@@ -1516,10 +1517,10 @@ export default function SessionsPage() {
         >
           <div>
             <p className="text-sm font-medium text-warning">
-              Session history is temporarily unavailable
+              {chatText.statistics.unavailableTitle}
             </p>
             <p className="text-xs text-muted-foreground">
-              The last loaded session data is preserved while the Reader recovers.
+              {chatText.statistics.unavailableDescription}
             </p>
           </div>
           <Button
@@ -1531,7 +1532,7 @@ export default function SessionsPage() {
               refreshEmptyCount();
             }}
           >
-            Retry
+            {t.common.retry}
           </Button>
         </div>
       )}
@@ -1542,25 +1543,25 @@ export default function SessionsPage() {
             <span className="text-lg font-semibold tabular-nums leading-none">
               {stats.total}
             </span>
-            <span className="text-xs text-muted-foreground">Total</span>
+            <span className="text-xs text-muted-foreground">{chatText.statistics.total}</span>
           </div>
           <div className="flex flex-col">
             <span className="text-lg font-semibold tabular-nums leading-none text-success">
               {stats.active_store}
             </span>
-            <span className="text-xs text-muted-foreground">Active in store</span>
+            <span className="text-xs text-muted-foreground">{chatText.statistics.activeInStore}</span>
           </div>
           <div className="flex flex-col">
             <span className="text-lg font-semibold tabular-nums leading-none">
               {stats.archived}
             </span>
-            <span className="text-xs text-muted-foreground">Archived</span>
+            <span className="text-xs text-muted-foreground">{chatText.statistics.archived}</span>
           </div>
           <div className="flex flex-col">
             <span className="text-lg font-semibold tabular-nums leading-none">
               {stats.messages}
             </span>
-            <span className="text-xs text-muted-foreground">Messages</span>
+            <span className="text-xs text-muted-foreground">{chatText.statistics.messages}</span>
           </div>
           {Object.keys(stats.by_source).length > 0 && (
             <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">

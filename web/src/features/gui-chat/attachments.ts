@@ -83,24 +83,30 @@ export function attachmentKindFromFile(file: File): GuiComposerAttachmentKind | 
   return "file";
 }
 
+export type ComposerAttachmentValidationReason =
+  | "unsupported"
+  | "image_too_large"
+  | "pdf_too_large"
+  | "file_too_large";
+
 export function validateComposerAttachment(file: File):
   | { ok: true; kind: GuiComposerAttachmentKind }
-  | { ok: false; message: string } {
+  | { ok: false; reason: ComposerAttachmentValidationReason } {
   const kind = attachmentKindFromFile(file);
   if (!kind) {
-    return { ok: false, message: `${file.name} 暂不支持。` };
+    return { ok: false, reason: "unsupported" };
   }
 
   if (kind === "image" && file.size > IMAGE_ATTACHMENT_MAX_BYTES) {
-    return { ok: false, message: `${file.name} 超过 10MB，无法上传。` };
+    return { ok: false, reason: "image_too_large" };
   }
 
   if (kind === "pdf" && file.size > PDF_ATTACHMENT_MAX_BYTES) {
-    return { ok: false, message: `${file.name} 超过 50MB，无法上传。` };
+    return { ok: false, reason: "pdf_too_large" };
   }
 
   if (kind === "file" && file.size > FILE_ATTACHMENT_MAX_BYTES) {
-    return { ok: false, message: `${file.name} 超过 50MB，无法上传。` };
+    return { ok: false, reason: "file_too_large" };
   }
 
   return { ok: true, kind };

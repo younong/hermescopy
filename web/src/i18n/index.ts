@@ -1,7 +1,8 @@
 export {
+  guiChatTranslations,
   I18nProvider,
   LOCALE_META,
   sessionCompositionTranslations,
   useI18n,
 } from "./context";
-export type { Locale, Translations } from "./types";
+export type { GuiChatTranslations, Locale, Translations } from "./types";

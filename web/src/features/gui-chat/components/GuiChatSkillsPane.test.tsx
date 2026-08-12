@@ -4,6 +4,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { I18nProvider } from "@/i18n";
 import type { SkillInfo } from "@/lib/api";
 import { GuiChatSkillsPane } from "./GuiChatSkillsPane";
 
@@ -54,6 +55,7 @@ beforeEach(() => {
   mocks.createSkill.mockResolvedValue({ success: true });
   mocks.deleteSkill.mockResolvedValue({ success: true });
   document.body.innerHTML = "";
+  localStorage.clear();
 });
 
 afterEach(async () => {
@@ -143,14 +145,24 @@ describe("GuiChatSkillsPane", () => {
     expect(container.textContent).toContain("Pinned skills cannot be deleted");
     expect(document.body.querySelector('[role="dialog"]')).not.toBeNull();
   });
+  it("renders Chinese workspace controls while preserving skill content", async () => {
+    const container = await renderPane("zh");
+
+    expect(container.textContent).toContain("新建技能");
+    expect(container.textContent).toContain("可供此工作区中新对话使用的可复用指令。");
+    expect(container.textContent).toContain("Draft release notes");
+    expect(container.querySelector('[aria-label="搜索技能"]')).not.toBeNull();
+  });
+
 });
 
-async function renderPane() {
+async function renderPane(locale: "en" | "zh" = "en") {
   const container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
+  localStorage.setItem("hermes-locale", locale);
   await act(async () => {
-    root?.render(<GuiChatSkillsPane />);
+    root?.render(<I18nProvider><GuiChatSkillsPane /></I18nProvider>);
     await Promise.resolve();
   });
   return container;

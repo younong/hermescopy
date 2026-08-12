@@ -11,6 +11,7 @@ import { Switch } from "@nous-research/ui/ui/components/switch";
 import { Toast } from "@nous-research/ui/ui/components/toast";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
 import { useModalBehavior } from "@/hooks/useModalBehavior";
+import { guiChatTranslations, useI18n } from "@/i18n";
 import { api } from "@/lib/api";
 import type {
   Employee,
@@ -63,6 +64,8 @@ function validateMessagingEnvField(_field: MessagingPlatformEnvVar, _value: stri
 }
 
 export default function ChannelsPage() {
+  const { t } = useI18n();
+  const employeeText = guiChatTranslations(t).employees;
   const { authRequired } = useDashboardAuthIdentity();
   const [platforms, setPlatforms] = useState<MessagingPlatform[]>([]);
   const [employees, setEmployees] = useState<Employee[]>([]);
@@ -104,8 +107,10 @@ export default function ChannelsPage() {
   }, [load, showToast]);
 
   const displayedPlatforms = useMemo(
-    () => authRequired ? [MANAGED_FEISHU_PLATFORM] : platforms,
-    [authRequired, platforms],
+    () => authRequired
+      ? [{ ...MANAGED_FEISHU_PLATFORM, description: employeeText.managedDescription }]
+      : platforms,
+    [authRequired, employeeText.managedDescription, platforms],
   );
   const configured = useMemo(
     () => displayedPlatforms.filter((platform) => platform.configured).length,
@@ -211,7 +216,9 @@ export default function ChannelsPage() {
 
       <div className="grid gap-3">
         {displayedPlatforms.map((platform) => {
-          const badge = stateBadge(platform.state);
+          const badge = platform.state === "managed"
+            ? { label: employeeText.managedState, tone: "success" as const }
+            : stateBadge(platform.state);
           const StateIcon = platform.state === "connected" || platform.state === "managed"
             ? CheckCircle2
             : platform.state === "fatal" || platform.state === "startup_failed"
@@ -224,7 +231,7 @@ export default function ChannelsPage() {
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <div className="flex min-w-0 items-start gap-3"><StateIcon className="mt-0.5 h-5 w-5 shrink-0 text-muted-foreground" /><div><div className="flex items-center gap-2"><span className="font-mondwest text-sm font-medium normal-case">{platform.name}</span><Badge tone={badge.tone}>{badge.label}</Badge></div><span className="text-xs text-muted-foreground">{platform.description}</span></div></div>
                   {isManagedFeishu ? (
-                    <Link className="inline-flex h-8 items-center rounded-md bg-midground px-3 text-xs font-medium text-background-base hover:bg-midground/90" to="/chat/robots">Manage employees</Link>
+                    <Link className="inline-flex h-8 items-center rounded-md bg-midground px-3 text-xs font-medium text-background-base hover:bg-midground/90" to="/chat/robots">{employeeText.manageEmployees}</Link>
                   ) : (
                     <div className="flex items-center gap-2">
                       {togglingId === platform.id ? <Spinner /> : <Switch aria-label={`Enable ${platform.name}`} checked={platform.enabled} onCheckedChange={() => void handleToggle(platform)} />}
@@ -236,8 +243,10 @@ export default function ChannelsPage() {
                 {isManagedFeishu ? (
                   <div className="border-t border-border pt-3 text-xs text-muted-foreground">
                     {feishuBindings.length === 0
-                      ? "No employee Feishu / Lark bindings are configured."
-                      : `${feishuBindings.length} employee binding${feishuBindings.length === 1 ? "" : "s"}: ${feishuBindings.filter((binding) => binding?.lifecycle_status === "active").length} active.`}
+                      ? employeeText.noManagedBindings
+                      : employeeText.managedSummary
+                        .replace("{count}", String(feishuBindings.length))
+                        .replace("{active}", String(feishuBindings.filter((binding) => binding?.lifecycle_status === "active").length))}
                   </div>
                 ) : null}
               </CardContent>

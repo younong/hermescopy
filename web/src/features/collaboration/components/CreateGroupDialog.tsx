@@ -3,6 +3,7 @@ import { Input } from "@nous-research/ui/ui/components/input";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { X } from "lucide-react";
 import { useMemo, useState } from "react";
+import { guiChatTranslations, useI18n } from "@/i18n";
 import type { Employee } from "@/lib/api";
 
 interface CreateGroupDialogProps {
@@ -12,6 +13,8 @@ interface CreateGroupDialogProps {
 }
 
 export function CreateGroupDialog({ employees, onClose, onCreate }: CreateGroupDialogProps) {
+  const { t } = useI18n();
+  const copy = guiChatTranslations(t).collaboration;
   const [name, setName] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
@@ -27,7 +30,7 @@ export function CreateGroupDialog({ employees, onClose, onCreate }: CreateGroupD
 
   const submit = async () => {
     if (!name.trim()) {
-      setError("Group name is required");
+      setError(copy.groupNameRequired);
       return;
     }
     setSaving(true);
@@ -41,19 +44,19 @@ export function CreateGroupDialog({ employees, onClose, onCreate }: CreateGroupD
   };
 
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/35 p-4" role="dialog" aria-modal="true" aria-label="Create group">
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/35 p-4" role="dialog" aria-modal="true" aria-label={copy.createGroup}>
       <div className="w-full max-w-md rounded-xl border border-[#e1e3e7] bg-white p-5 shadow-2xl">
         <div className="flex items-center justify-between">
           <div>
-            <h2 className="text-[15px] font-semibold text-[#25282d]">Create group</h2>
-            <p className="mt-1 text-[11px] text-[#969aa1]">Choose managed employees. Their current profiles are pinned by the server.</p>
+            <h2 className="text-[15px] font-semibold text-[#25282d]">{copy.createGroup}</h2>
+            <p className="mt-1 text-[11px] text-[#969aa1]">{copy.createGroupDescription}</p>
           </div>
-          <button aria-label="Close" className="gui-chat-icon-button" onClick={onClose} type="button"><X /></button>
+          <button aria-label={t.common.close} className="gui-chat-icon-button" onClick={onClose} type="button"><X /></button>
         </div>
-        <Input className="mt-4" aria-label="Group name" placeholder="Group name" value={name} onChange={(event) => setName(event.target.value)} />
+        <Input className="mt-4" aria-label={copy.groupName} placeholder={copy.groupName} value={name} onChange={(event) => setName(event.target.value)} />
         <div className="mt-4 max-h-64 space-y-1 overflow-auto">
           {eligible.length === 0 ? (
-            <p className="rounded-lg border border-dashed border-[#dfe2e7] p-4 text-center text-xs text-[#969aa1]">No active employees can participate.</p>
+            <p className="rounded-lg border border-dashed border-[#dfe2e7] p-4 text-center text-xs text-[#969aa1]">{copy.noEligibleEmployees}</p>
           ) : eligible.map((employee) => {
             const checked = selected.includes(employee.employee_id);
             return (
@@ -66,8 +69,8 @@ export function CreateGroupDialog({ employees, onClose, onCreate }: CreateGroupD
                   type="checkbox"
                 />
                 <span className="min-w-0">
-                  <span className="block truncate text-sm font-medium text-[#303238]">{employee.profile?.name || "Unnamed employee"}</span>
-                  <span className="block truncate text-[11px] text-[#969aa1]">{employee.profile?.role || "AI employee"}</span>
+                  <span className="block truncate text-sm font-medium text-[#303238]">{employee.profile?.name || copy.unnamedEmployee}</span>
+                  <span className="block truncate text-[11px] text-[#969aa1]">{employee.profile?.role || copy.aiEmployee}</span>
                 </span>
               </label>
             );
@@ -75,8 +78,8 @@ export function CreateGroupDialog({ employees, onClose, onCreate }: CreateGroupD
         </div>
         {error ? <p className="mt-3 text-xs text-[#b42318]" role="alert">{error}</p> : null}
         <div className="mt-5 flex justify-end gap-2">
-          <Button ghost size="sm" onClick={onClose}>Cancel</Button>
-          <Button size="sm" disabled={saving} onClick={() => void submit()}>{saving ? <><Spinner /> Creating…</> : "Create"}</Button>
+          <Button ghost size="sm" onClick={onClose}>{t.common.cancel}</Button>
+          <Button size="sm" disabled={saving} onClick={() => void submit()}>{saving ? <><Spinner /> {t.common.creating}</> : t.common.create}</Button>
         </div>
       </div>
     </div>

@@ -4,6 +4,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { I18nProvider } from "@/i18n";
 import type { ManagedFilesResponse } from "@/lib/api";
 import { GuiChatFilesPane } from "./GuiChatFilesPane";
 
@@ -77,6 +78,7 @@ beforeEach(() => {
   mocks.load.mockResolvedValue(undefined);
   mocks.uploadFiles.mockResolvedValue(undefined);
   document.body.innerHTML = "";
+  localStorage.clear();
 });
 
 afterEach(async () => {
@@ -160,14 +162,24 @@ describe("GuiChatFilesPane", () => {
     expect(container.querySelector('input[aria-label="Path"]')).toBeNull();
     expect(container.textContent).toContain("/workspace");
   });
+  it("renders Chinese file controls and explicit Chinese dates", async () => {
+    const container = await renderPane("zh");
+
+    expect(container.textContent).toContain("新建文件夹");
+    expect(container.textContent).toContain("名称大小修改时间");
+    expect(container.textContent).toContain("2023年11月15日");
+    expect(container.querySelector('[aria-label="刷新文件"]')).not.toBeNull();
+  });
+
 });
 
-async function renderPane() {
+async function renderPane(locale: "en" | "zh" = "en") {
   const container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
+  localStorage.setItem("hermes-locale", locale);
   await act(async () => {
-    root?.render(<GuiChatFilesPane />);
+    root?.render(<I18nProvider><GuiChatFilesPane /></I18nProvider>);
     await Promise.resolve();
   });
   return container;

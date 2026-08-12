@@ -1,6 +1,7 @@
 import { Download, LoaderCircle, RotateCcw } from "lucide-react";
 import { useEffect, useState, type MouseEvent } from "react";
 
+import { guiChatTranslations, useI18n } from "@/i18n";
 import { fetchJSON, withHermesAssetAuth } from "@/lib/api";
 import { formatBytes } from "../attachments";
 import { downloadSessionFile } from "../files";
@@ -16,15 +17,19 @@ export function MessageAttachmentCard({
   onUseAgain?: (attachment: MessageAttachmentState) => void;
   variant?: "bubble" | "card";
 }) {
+  const { t } = useI18n();
+  const copy = guiChatTranslations(t);
   const isPdf = attachment.kind === "pdf";
   const previewUrl = useAttachmentPreviewUrl(attachment);
   const [downloading, setDownloading] = useState(false);
   const [downloadError, setDownloadError] = useState<string | null>(null);
-  const typeLabel = attachment.kind === "image" ? "Image" : isPdf ? "PDF" : "File";
+  const typeLabel = attachment.kind === "image" ? copy.composer.image : isPdf ? copy.composer.pdf : copy.composer.file;
   const meta = [
     typeLabel,
     formatBytes(attachment.sizeBytes),
-    isPdf && attachment.pagesAttached ? `${attachment.pagesAttached} pages` : null,
+    isPdf && attachment.pagesAttached
+      ? copy.messages.pages.replace("{count}", String(attachment.pagesAttached))
+      : null,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -34,13 +39,13 @@ export function MessageAttachmentCard({
   );
   const useAgainAction = canUseAgain ? (
     <button
-      aria-label={`Use ${attachment.name} again`}
+      aria-label={copy.messages.useAgainNamed.replace("{name}", attachment.name)}
       className="inline-flex h-7 items-center gap-1 px-2 text-xs text-midground hover:text-primary"
       onClick={() => onUseAgain?.(attachment)}
       type="button"
     >
       <RotateCcw aria-hidden className="h-3.5 w-3.5" />
-      Use again
+      {copy.messages.useAgain}
     </button>
   ) : null;
   const download = (event: MouseEvent<HTMLAnchorElement>) => {
@@ -74,7 +79,7 @@ export function MessageAttachmentCard({
             />
           ) : (
             <div className="flex h-full w-full items-center justify-center px-4 text-center text-xs text-text-secondary">
-              Loading image…
+              {copy.messages.loadingImage}
             </div>
           )}
         </div>
@@ -85,7 +90,7 @@ export function MessageAttachmentCard({
               aria-busy={downloading}
               aria-disabled={downloading}
               aria-describedby={downloadError ? `${attachment.id}-download-error` : undefined}
-              aria-label={`Download ${attachment.name}`}
+              aria-label={copy.messages.downloadNamed.replace("{name}", attachment.name)}
               className="inline-flex h-7 items-center gap-1 px-2 text-xs text-midground hover:text-primary"
               href={withHermesAssetAuth(attachment.downloadUrl)}
               onClick={download}
@@ -95,7 +100,7 @@ export function MessageAttachmentCard({
               ) : (
                 <Download aria-hidden className="h-3.5 w-3.5" />
               )}
-              Download
+              {copy.messages.download}
             </a>
           </div>
         ) : null}
@@ -139,7 +144,7 @@ export function MessageAttachmentCard({
         aria-busy={downloading}
         aria-disabled={downloading}
         aria-describedby={downloadError ? `${attachment.id}-download-error` : undefined}
-        aria-label={`Download ${attachment.name}`}
+        aria-label={copy.messages.downloadNamed.replace("{name}", attachment.name)}
         className={`${className} transition-colors hover:border-primary/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary`}
         href={withHermesAssetAuth(attachment.downloadUrl)}
         onClick={download}
@@ -158,7 +163,7 @@ export function MessageAttachmentCard({
       ) : null}
     </div>
   ) : (
-    <div aria-disabled="true" className={className} title="Original file is unavailable">
+    <div aria-disabled="true" className={className} title={copy.messages.originalFileUnavailable}>
       {content}
     </div>
   );
