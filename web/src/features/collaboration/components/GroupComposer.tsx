@@ -1,6 +1,6 @@
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { AtSign, Paperclip, Send, UsersRound, X } from "lucide-react";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { CollaborationAttachment, CollaborationMembership } from "../types";
 import { normalizeMentionSelection, recipientLabel, type MentionSelection } from "../mentions";
 
@@ -43,7 +43,19 @@ export function GroupComposer({
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const pickerRootRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const normalized = normalizeMentionSelection(selection, activeMembers);
+
+  useEffect(() => {
+    if (!pickerOpen) return;
+
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (!pickerRootRef.current?.contains(event.target as Node)) setPickerOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    return () => document.removeEventListener("pointerdown", closeOnOutsidePointer);
+  }, [pickerOpen]);
 
   const submit = async () => {
     if (!text.trim() || sending || uploading.length > 0) return;
@@ -101,24 +113,39 @@ export function GroupComposer({
             aria-label="Group message"
             className="min-h-20 w-full resize-none bg-transparent px-3 pb-2 pt-3 text-sm outline-none placeholder:text-[#a1a5ac]"
             disabled={disabled || sending}
-            onChange={(event) => setText(event.target.value)}
+            onChange={(event) => {
+              const nextText = event.target.value;
+              setText(nextText);
+              if (nextText.endsWith("@")) setPickerOpen(true);
+            }}
             onKeyDown={(event) => {
+              if (event.key === "Escape" && pickerOpen) {
+                event.preventDefault();
+                setPickerOpen(false);
+                return;
+              }
               if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
                 event.preventDefault();
-                void submit();
+                if (pickerOpen) setPickerOpen(false);
+                else void submit();
               }
             }}
             placeholder="Message the group…"
+            ref={textareaRef}
             value={text}
           />
           <div className="flex items-center justify-between gap-2 px-2 pb-2">
-            <div className="relative flex items-center gap-1">
-              <button aria-expanded={pickerOpen} aria-label="Choose employee mentions" className="gui-chat-icon-button" onClick={() => setPickerOpen((value) => !value)} type="button"><AtSign /></button>
+            <div className="relative flex items-center gap-1" ref={pickerRootRef}>
+              <button aria-expanded={pickerOpen} aria-haspopup="dialog" aria-label="Choose employee mentions" className="gui-chat-icon-button" onClick={() => setPickerOpen((value) => !value)} type="button"><AtSign /></button>
               <button aria-label="Attach files" className="gui-chat-icon-button" onClick={() => fileRef.current?.click()} type="button"><Paperclip /></button>
               <input className="hidden" multiple onChange={(event) => void uploadFiles(event.target.files)} ref={fileRef} type="file" />
               <span className="max-w-64 truncate text-[10px] text-[#777c84]">{recipientLabel(normalized, membershipsById, employeeName)}</span>
               {pickerOpen ? (
-                <div className="absolute bottom-9 left-0 z-20 w-64 rounded-lg border border-[#dfe2e7] bg-white p-2 shadow-xl">
+                <div aria-label="Employee mentions" className="absolute bottom-9 left-0 z-20 w-64 rounded-lg border border-[#dfe2e7] bg-white p-2 shadow-xl" role="dialog">
+                  <div className="mb-1 flex items-center justify-between px-2 py-1">
+                    <span className="text-[10px] font-medium text-[#777c84]">Choose recipients</span>
+                    <button aria-label="Close employee mentions" className="rounded p-0.5 text-[#777c84] hover:bg-[#f1f3f5] hover:text-[#282b30]" onClick={() => { setPickerOpen(false); textareaRef.current?.focus(); }} type="button"><X className="h-3.5 w-3.5" /></button>
+                  </div>
                   <button
                     aria-pressed={normalized.mentionAll}
                     className={`flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-xs ${normalized.mentionAll ? "bg-[#eef3ff] text-[#3867ed]" : "hover:bg-[#f5f6f8]"}`}
@@ -141,6 +168,7 @@ export function GroupComposer({
                       </label>
                     );
                   })}
+                  <p className="px-2 pt-2 text-[10px] text-[#969aa1]">Press Enter to finish selecting</p>
                 </div>
               ) : null}
             </div>
