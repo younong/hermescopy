@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "r
 import type { Employee } from "@/lib/api";
 import type { CollaborationApi } from "../api";
 import { collaborationReducer } from "../reducer";
+import { defaultMentionSelection } from "../mentions";
 import { initialCollaborationState, type CollaborationApprovalChoice, type CollaborationEmployeeIdentity } from "../types";
 import { GroupComposer, type GroupComposerSubmit } from "./GroupComposer";
 import { GroupConversation } from "./GroupConversation";
@@ -79,7 +80,18 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
   );
   const employeeName = useCallback((employeeId: string) =>
     identities.find((employee) => employee.employeeId === employeeId)?.name ?? "Former employee", [identities]);
-  const memberships = Object.values(state.membershipsById);
+  const memberships = useMemo(
+    () => Object.values(state.membershipsById),
+    [state.membershipsById],
+  );
+  const defaultSelection = useMemo(
+    () => defaultMentionSelection(
+      { mentionAll: false, membershipIds: [] },
+      memberships.filter((member) => member.leave_sequence === null),
+      Object.values(state.eventsBySequence),
+    ),
+    [memberships, state.eventsBySequence],
+  );
 
   const submit = async ({ attachments, selection, text }: GroupComposerSubmit) => {
     const result = await api.submitMessage({
@@ -136,6 +148,7 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
       <GroupComposer
         employeeName={employeeName}
         archived={state.group?.status === "archived"}
+        defaultSelection={defaultSelection}
         disabled={connection !== "open" || state.loading}
         memberships={memberships}
         onSubmit={submit}

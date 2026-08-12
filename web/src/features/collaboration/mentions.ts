@@ -1,4 +1,4 @@
-import type { CollaborationMembership } from "./types";
+import type { CollaborationEvent, CollaborationMembership } from "./types";
 
 export interface MentionSelection {
   mentionAll: boolean;
@@ -17,13 +17,45 @@ export function normalizeMentionSelection(
   };
 }
 
+export function defaultMentionSelection(
+  selection: MentionSelection,
+  activeMemberships: CollaborationMembership[],
+  events: CollaborationEvent[],
+): MentionSelection {
+  const normalized = normalizeMentionSelection(selection, activeMemberships);
+  if (normalized.mentionAll || normalized.membershipIds.length > 0) return normalized;
+
+  const activeIds = new Set(activeMemberships.map((member) => member.membership_id));
+  let membershipId: string | undefined;
+  let latestSequence = 0;
+  for (const event of events) {
+    let candidate: string | undefined;
+    if (
+      event.event_kind === "message.employee"
+      && event.actor_membership_id
+      && activeIds.has(event.actor_membership_id)
+    ) {
+      candidate = event.actor_membership_id;
+    } else if (event.event_kind === "message.owner" && !event.body.mention_all) {
+      const mentions = event.body.mentions;
+      if (mentions?.length === 1 && activeIds.has(mentions[0])) candidate = mentions[0];
+    }
+    if (candidate && event.sequence > latestSequence) {
+      membershipId = candidate;
+      latestSequence = event.sequence;
+    }
+  }
+  membershipId ??= activeMemberships[0]?.membership_id;
+  return { mentionAll: false, membershipIds: membershipId ? [membershipId] : [] };
+}
+
 export function recipientLabel(
   selection: MentionSelection,
   membershipsById: Record<string, CollaborationMembership>,
   employeeName: (employeeId: string) => string,
 ): string {
   if (selection.mentionAll) return "@all";
-  if (selection.membershipIds.length === 0) return "No recipients · background only";
+  if (selection.membershipIds.length === 0) return "No available employee";
   return selection.membershipIds
     .map((id) => membershipsById[id])
     .filter(Boolean)

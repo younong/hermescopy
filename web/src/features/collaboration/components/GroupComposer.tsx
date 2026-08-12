@@ -13,6 +13,7 @@ export interface GroupComposerSubmit {
 interface GroupComposerProps {
   employeeName(employeeId: string): string;
   archived: boolean;
+  defaultSelection: MentionSelection;
   disabled: boolean;
   memberships: CollaborationMembership[];
   onSubmit(value: GroupComposerSubmit): Promise<void>;
@@ -22,6 +23,7 @@ interface GroupComposerProps {
 export function GroupComposer({
   employeeName,
   archived,
+  defaultSelection,
   disabled,
   memberships,
   onSubmit,
@@ -44,13 +46,16 @@ export function GroupComposer({
   const [error, setError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const normalized = normalizeMentionSelection(selection, activeMembers);
+  const effectiveSelection = normalized.mentionAll || normalized.membershipIds.length > 0
+    ? normalized
+    : defaultSelection;
 
   const submit = async () => {
     if (!text.trim() || sending || uploading.length > 0) return;
     setSending(true);
     setError(null);
     try {
-      await onSubmit({ attachments, selection: normalized, text: text.trim() });
+      await onSubmit({ attachments, selection: effectiveSelection, text: text.trim() });
       setText("");
       setSelection({ mentionAll: false, membershipIds: [] });
       setAttachments([]);
@@ -116,7 +121,7 @@ export function GroupComposer({
               <button aria-expanded={pickerOpen} aria-label="Choose employee mentions" className="gui-chat-icon-button" onClick={() => setPickerOpen((value) => !value)} type="button"><AtSign /></button>
               <button aria-label="Attach files" className="gui-chat-icon-button" onClick={() => fileRef.current?.click()} type="button"><Paperclip /></button>
               <input className="hidden" multiple onChange={(event) => void uploadFiles(event.target.files)} ref={fileRef} type="file" />
-              <span className="max-w-64 truncate text-[10px] text-[#777c84]">{recipientLabel(normalized, membershipsById, employeeName)}</span>
+              <span className="max-w-64 truncate text-[10px] text-[#777c84]">Replies from {recipientLabel(effectiveSelection, membershipsById, employeeName)}</span>
               {pickerOpen ? (
                 <div className="absolute bottom-9 left-0 z-20 w-64 rounded-lg border border-[#dfe2e7] bg-white p-2 shadow-xl">
                   <button
@@ -125,12 +130,6 @@ export function GroupComposer({
                     onClick={() => setSelection({ mentionAll: !normalized.mentionAll, membershipIds: [] })}
                     type="button"
                   ><UsersRound className="h-3.5 w-3.5" /> @all</button>
-                  <button
-                    aria-pressed={!normalized.mentionAll && normalized.membershipIds.length === 0}
-                    className="mt-1 w-full rounded-md px-2 py-2 text-left text-xs hover:bg-[#f5f6f8]"
-                    onClick={() => setSelection({ mentionAll: false, membershipIds: [] })}
-                    type="button"
-                  >No mention · background only</button>
                   <div className="my-1 border-t border-[#eceef1]" />
                   {activeMembers.map((member) => {
                     const checked = normalized.membershipIds.includes(member.membership_id);
@@ -150,7 +149,7 @@ export function GroupComposer({
           </div>
         </div>
         {error ? <p className="mt-2 text-xs text-[#b42318]" role="alert">{error}</p> : null}
-        <p className="mt-2 text-center text-[10px] text-[#a1a5ac]">Recipients receive this message and its attachments. Employee @ text does not dispatch other employees.</p>
+        <p className="mt-2 text-center text-[10px] text-[#a1a5ac]">Without an @ mention, the current employee replies. Use @ to choose someone else.</p>
       </div>
     </div>
   );

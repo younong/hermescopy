@@ -219,31 +219,77 @@ def test_collaboration_upload_validation_covers_image_file_pdf_and_limits(monkey
         )
 
 
-def test_owner_message_without_mentions_persists_event_and_attachments(db):
+def test_owner_message_without_mentions_targets_first_available_employee(db):
     store = CollaborationStore(db, owner_key="owner-a")
-    group = store.create_group("Quiet", members=[_member("employee-a")])
+    group = store.create_group(
+        "Default reply", members=[_member("employee-a"), _member("employee-b")]
+    )
 
-    attachment = store.create_attachment(
-        group.group_id, filename="kept.txt", media_type="text/plain",
-        size_bytes=4, storage_key="groups/quiet/kept", content_sha256="a" * 64,
+    submitted = store.submit_owner_message(group.group_id, text="Who can help?")
+
+    assert submitted.turn is not None
+    assert [target.employee_id for target in submitted.turn.targets] == ["employee-a"]
+    assert submitted.event.body["mentions"] == [submitted.turn.targets[0].membership_id]
+
+
+def test_owner_message_without_mentions_keeps_explicit_employee_current(db):
+    store = CollaborationStore(db, owner_key="owner-a")
+    group = store.create_group(
+        "Continue explicit", members=[_member("employee-a"), _member("employee-b")]
     )
-    submitted = store.submit_owner_message(
-        group.group_id, text="For awareness",
-        attachment_ids=[attachment["attachment_id"]],
+    membership_b = next(
+        membership
+        for membership in store.active_memberships(group.group_id)
+        if membership.employee_id == "employee-b"
     )
+    store.submit_owner_message(
+        group.group_id,
+        text="Please start",
+        mentioned_membership_ids=[membership_b.membership_id],
+    )
+
+    submitted = store.submit_owner_message(group.group_id, text="Please continue")
+
+    assert submitted.turn is not None
+    assert [target.employee_id for target in submitted.turn.targets] == ["employee-b"]
+
+
+def test_owner_message_without_mentions_targets_latest_replying_employee(db):
+    store = CollaborationStore(db, owner_key="owner-a")
+    group = store.create_group(
+        "Continue reply", members=[_member("employee-a"), _member("employee-b")]
+    )
+    membership_b = next(
+        membership
+        for membership in store.active_memberships(group.group_id)
+        if membership.employee_id == "employee-b"
+    )
+    with db._lock:
+        store._append_event(
+            db._conn,
+            group_id=group.group_id,
+            event_kind="message.employee",
+            actor_kind="employee",
+            actor_employee_id="employee-b",
+            actor_membership_id=membership_b.membership_id,
+            body={"text": "I can help"},
+            now=123.0,
+        )
+
+    submitted = store.submit_owner_message(group.group_id, text="Please continue")
+
+    assert submitted.turn is not None
+    assert [target.employee_id for target in submitted.turn.targets] == ["employee-b"]
+
+
+def test_owner_message_without_available_employees_remains_background_context(db):
+    store = CollaborationStore(db, owner_key="owner-a")
+    group = store.create_group("Quiet")
+
+    submitted = store.submit_owner_message(group.group_id, text="For awareness")
 
     assert submitted.turn is None
-    assert submitted.event.event_kind == "message.owner"
-    with db._lock:
-        assert db._conn.execute("SELECT COUNT(*) FROM collaboration_turns").fetchone()[0] == 0
-        assert db._conn.execute("SELECT COUNT(*) FROM collaboration_turn_targets").fetchone()[0] == 0
-        attachment = db._conn.execute(
-            "SELECT filename, storage_key FROM collaboration_attachments"
-        ).fetchone()
-        assert tuple(attachment) == ("kept.txt", "groups/quiet/kept")
-        assert db._conn.execute(
-            "SELECT COUNT(*) FROM collaboration_attachment_grants"
-        ).fetchone()[0] == 0
+    assert submitted.event.body["mentions"] == []
 
 
 def test_mentioned_turn_snapshots_members_and_attachment_grants_atomically(db):

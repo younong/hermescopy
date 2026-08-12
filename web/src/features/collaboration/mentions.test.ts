@@ -1,7 +1,21 @@
 import { describe, expect, it } from "vitest";
 
-import { normalizeMentionSelection, recipientLabel } from "./mentions";
-import type { CollaborationMembership } from "./types";
+import { defaultMentionSelection, normalizeMentionSelection, recipientLabel } from "./mentions";
+import type { CollaborationEvent, CollaborationMembership } from "./types";
+
+function employeeReply(sequence: number, employeeId: string): CollaborationEvent {
+  return {
+    actor_employee_id: employeeId,
+    actor_kind: "employee",
+    actor_membership_id: employeeId === "account-a" ? "membership-a" : "membership-b",
+    body: { text: "Reply" },
+    created_at: sequence,
+    event_id: `event-${sequence}`,
+    event_kind: "message.employee",
+    group_id: "group-a",
+    sequence,
+  };
+}
 
 const memberships: CollaborationMembership[] = [
   {
@@ -48,9 +62,65 @@ describe("structured collaboration mentions", () => {
     }, memberships)).toEqual({ mentionAll: true, membershipIds: [] });
   });
 
-  it("preserves no-mention background messages", () => {
-    const selection = normalizeMentionSelection({ mentionAll: false, membershipIds: [] }, memberships);
+  it("routes the first unmentioned message to the first available employee", () => {
+    expect(defaultMentionSelection(
+      { mentionAll: false, membershipIds: [] },
+      memberships,
+      [],
+    )).toEqual({ mentionAll: false, membershipIds: ["membership-a"] });
+  });
+
+  it("keeps an explicitly selected employee current", () => {
+    const explicitMessage: CollaborationEvent = {
+      actor_employee_id: null,
+      actor_kind: "owner",
+      actor_membership_id: null,
+      body: { mention_all: false, mentions: ["membership-b"], text: "Start" },
+      created_at: 1,
+      event_id: "event-owner",
+      event_kind: "message.owner",
+      group_id: "group-a",
+      sequence: 1,
+    };
+    expect(defaultMentionSelection(
+      { mentionAll: false, membershipIds: [] },
+      memberships,
+      [explicitMessage],
+    )).toEqual({ mentionAll: false, membershipIds: ["membership-b"] });
+  });
+
+  it("routes later unmentioned messages to the latest employee who replied", () => {
+    const events = [
+      employeeReply(2, "account-b"),
+      employeeReply(3, "account-a"),
+    ];
+    expect(defaultMentionSelection(
+      { mentionAll: false, membershipIds: [] },
+      memberships,
+      events,
+    )).toEqual({ mentionAll: false, membershipIds: ["membership-a"] });
+  });
+
+  it("preserves explicit mentions and @all", () => {
+    expect(defaultMentionSelection(
+      { mentionAll: false, membershipIds: ["membership-b"] },
+      memberships,
+      [],
+    )).toEqual({ mentionAll: false, membershipIds: ["membership-b"] });
+    expect(defaultMentionSelection(
+      { mentionAll: true, membershipIds: ["membership-a"] },
+      memberships,
+      [],
+    )).toEqual({ mentionAll: true, membershipIds: [] });
+  });
+
+  it("reports when no employee is available", () => {
+    const selection = defaultMentionSelection(
+      { mentionAll: false, membershipIds: [] },
+      [],
+      [],
+    );
     expect(selection).toEqual({ mentionAll: false, membershipIds: [] });
-    expect(recipientLabel(selection, {}, () => "ignored")).toBe("No recipients · background only");
+    expect(recipientLabel(selection, {}, () => "ignored")).toBe("No available employee");
   });
 });

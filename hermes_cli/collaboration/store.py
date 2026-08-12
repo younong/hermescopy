@@ -645,7 +645,46 @@ class CollaborationStore:
                 (group_id,),
             ).fetchall()
             by_membership = {str(row["membership_id"]): row for row in active}
-            target_memberships = tuple(by_membership) if mention_all else requested
+            if mention_all:
+                target_memberships = tuple(by_membership)
+            elif requested:
+                target_memberships = requested
+            else:
+                active_by_employee = {
+                    str(row["employee_id"]): str(row["membership_id"])
+                    for row in active
+                }
+                default_membership_id = None
+                recent_messages = conn.execute(
+                    "SELECT event_kind, actor_employee_id, body_json "
+                    "FROM collaboration_events WHERE group_id=? "
+                    "AND event_kind IN ('message.owner', 'message.employee') "
+                    "ORDER BY sequence DESC",
+                    (group_id,),
+                ).fetchall()
+                for message in recent_messages:
+                    if message["event_kind"] == "message.employee":
+                        default_membership_id = active_by_employee.get(
+                            str(message["actor_employee_id"] or "")
+                        )
+                    else:
+                        body = json.loads(message["body_json"])
+                        mentions = body.get("mentions")
+                        if (
+                            not body.get("mention_all")
+                            and isinstance(mentions, list)
+                            and len(mentions) == 1
+                            and str(mentions[0]) in by_membership
+                        ):
+                            default_membership_id = str(mentions[0])
+                    if default_membership_id is not None:
+                        break
+                default_membership_id = default_membership_id or next(
+                    iter(by_membership), None
+                )
+                target_memberships = (
+                    (default_membership_id,) if default_membership_id is not None else ()
+                )
             missing = [
                 membership_id
                 for membership_id in target_memberships
