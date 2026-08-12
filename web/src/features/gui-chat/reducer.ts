@@ -251,6 +251,7 @@ function prependHistoryPage(
     return { ...state, historyLoading: false };
   }
   const history = transcriptToHistoryState(response.messages, state.cwd);
+  const historyMessagesById = new Map(history.messages.map((message) => [message.id, message]));
   const knownIds = new Set(state.messages.map((message) => message.id));
   let older = history.messages.filter((message) => !knownIds.has(message.id));
   const remainingMessages = Math.max(0, MAX_DISPLAY_MESSAGES - state.messages.length);
@@ -264,6 +265,14 @@ function prependHistoryPage(
   });
   const acceptedIds = new Set(older.map((message) => message.id));
   const artifacts = { ...state.artifacts };
+  const messages = state.messages.map((message) => {
+    const historical = historyMessagesById.get(message.id);
+    if (!historical) return message;
+    return {
+      ...message,
+      artifactIds: historical.artifactIds.reduce(appendUnique, message.artifactIds),
+    };
+  });
   const toolCalls = { ...state.toolCalls, ...history.toolCalls };
   const toolOrder = [
     ...history.toolOrder.filter((id) => !state.toolOrder.includes(id)),
@@ -275,7 +284,11 @@ function prependHistoryPage(
   );
   let omittedArtifacts = 0;
   for (const artifact of Object.values(history.artifacts)) {
-    if (artifact.messageId && !acceptedIds.has(artifact.messageId)) continue;
+    if (
+      artifact.messageId &&
+      !acceptedIds.has(artifact.messageId) &&
+      !knownIds.has(artifact.messageId)
+    ) continue;
     if (artifacts[artifact.id]) continue;
     if (remainingArtifacts <= 0) {
       omittedArtifacts += 1;
@@ -295,7 +308,7 @@ function prependHistoryPage(
     historyHasMore: !safeguardReached && !!response.history_page?.has_more,
     historyLoading: false,
     loadedTextChars: state.loadedTextChars + acceptedChars,
-    messages: [...older, ...state.messages],
+    messages: [...older, ...messages],
     safeguardReached,
   };
 }
@@ -382,22 +395,81 @@ function transcriptToHistoryState(
   const messages: ChatMessage[] = [];
   const toolCalls: Record<string, ToolCallState> = {};
   const toolOrder: string[] = [];
+  let pendingToolArtifactIds: string[] = [];
+
+  const claimPendingArtifacts = (message: ChatMessage) => {
+    if (pendingToolArtifactIds.length === 0) return;
+    message.artifactIds = pendingToolArtifactIds.reduce(appendUnique, message.artifactIds);
+    for (const artifactId of pendingToolArtifactIds) {
+      const artifact = artifacts[artifactId];
+      if (artifact) artifacts[artifactId] = { ...artifact, messageId: message.id };
+    }
+    pendingToolArtifactIds = [];
+  };
 
   for (const [index, entry] of transcript.entries()) {
     const converted = transcriptToMessageWithArtifacts(entry, index, cwd);
     if (!converted) continue;
-    if (converted.tool) {
-      toolCalls[converted.tool.id] = converted.tool;
-      toolOrder.push(converted.tool.id);
-    } else if (converted.message) {
-      messages.push(converted.message);
-    }
     for (const artifact of converted.artifacts) {
       artifacts[artifact.id] = artifact;
     }
+    if (converted.tool) {
+      toolCalls[converted.tool.id] = converted.tool;
+      toolOrder.push(converted.tool.id);
+      pendingToolArtifactIds.push(...converted.tool.artifactIds);
+    } else if (converted.message) {
+      const message = converted.message;
+      if (message.role === "assistant") claimPendingArtifacts(message);
+      messages.push(message);
+    }
   }
 
-  return { artifacts, messages, toolCalls, toolOrder };
+  return deduplicateHistoricalFileArtifacts({ artifacts, messages, toolCalls, toolOrder }, cwd);
+}
+
+function deduplicateHistoricalFileArtifacts(
+  history: {
+    artifacts: Record<string, ArtifactState>;
+    messages: ChatMessage[];
+    toolCalls: Record<string, ToolCallState>;
+    toolOrder: string[];
+  },
+  cwd?: string,
+): typeof history {
+  const duplicateIds = new Set<string>();
+  const latestIdByPath = new Map<string, string>();
+  for (const [artifactId, artifact] of Object.entries(history.artifacts)) {
+    if (artifact.kind !== "file") continue;
+    const path = canonicalHistoricalFilePath(artifact.sourcePath, cwd);
+    const previousId = latestIdByPath.get(path);
+    if (previousId) duplicateIds.add(previousId);
+    latestIdByPath.set(path, artifactId);
+  }
+  if (duplicateIds.size === 0) return history;
+
+  const artifacts = Object.fromEntries(
+    Object.entries(history.artifacts).filter(([id]) => !duplicateIds.has(id)),
+  );
+  const messages = history.messages.map((message) => {
+    const artifactIds = withoutIds(message.artifactIds, duplicateIds);
+    return artifactIds === message.artifactIds ? message : { ...message, artifactIds };
+  });
+  const toolCalls = Object.fromEntries(
+    Object.entries(history.toolCalls).map(([id, tool]) => {
+      const artifactIds = withoutIds(tool.artifactIds, duplicateIds);
+      return [id, artifactIds === tool.artifactIds ? tool : { ...tool, artifactIds }];
+    }),
+  );
+  return { ...history, artifacts, messages, toolCalls };
+}
+
+function withoutIds(ids: string[], omitted: ReadonlySet<string>): string[] {
+  return ids.some((id) => omitted.has(id)) ? ids.filter((id) => !omitted.has(id)) : ids;
+}
+
+function canonicalHistoricalFilePath(path: string, cwd?: string): string {
+  const normalized = normalizeSessionFileReference(path) ?? path;
+  return canonicalFilesystemPath(normalized, cwd).replace(/\/+/g, "/");
 }
 
 function transcriptToMessageWithArtifacts(
