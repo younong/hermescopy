@@ -6,6 +6,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { api, type Employee, type EmployeeCatalog } from "@/lib/api";
 import { EmployeeManagementPane } from "./EmployeeManagementPane";
 
+vi.mock("@/lib/api", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/lib/api")>(),
+  withHermesAssetAuth: (url: string) => `/hermes${url}`,
+}));
+
 const catalog: EmployeeCatalog = {
   knowledge_roots: [],
   mcp_servers: [],
@@ -141,6 +146,17 @@ describe("EmployeeManagementPane", () => {
       app_secret: "secret",
       domain: "feishu",
     }));
+  });
+
+  it("renders employee avatar URLs within the dashboard base path", async () => {
+    const current = employee();
+    current.avatar_url = "/api/employees/employee-a/avatar?v=123";
+    vi.spyOn(api, "getEmployees").mockResolvedValue({ employees: [current] });
+
+    await renderPane();
+
+    expect(document.querySelector<HTMLImageElement>('[role="listitem"] img')?.getAttribute("src"))
+      .toBe("/hermes/api/employees/employee-a/avatar?v=123");
   });
 
   it("updates, tests, suspends, and revokes one existing binding", async () => {

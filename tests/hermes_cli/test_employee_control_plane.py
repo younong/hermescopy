@@ -197,12 +197,22 @@ def test_avatar_is_owner_scoped_validated_and_replaceable(authenticated_client, 
         avatar_path,
         files={"file": ("avatar.png", _image_bytes(), "image/png")},
     )
-    assert uploaded.json() == {"avatar_url": avatar_path}
+    first_avatar_url = uploaded.json()["avatar_url"]
+    assert first_avatar_url.startswith(f"{avatar_path}?v=")
     fetched = client.get(avatar_path)
     assert fetched.status_code == 200
     assert fetched.headers["content-type"] == "image/webp"
     assert fetched.headers["cache-control"] == "private, no-cache"
-    assert client.get(f"/api/employees/{employee_id}").json()["avatar_url"] == avatar_path
+    assert client.get(f"/api/employees/{employee_id}").json()["avatar_url"] == first_avatar_url
+
+    replaced = client.put(
+        avatar_path,
+        files={"file": ("avatar.png", _image_bytes(color="blue"), "image/png")},
+    )
+    second_avatar_url = replaced.json()["avatar_url"]
+    assert client.get(f"/api/employees/{employee_id}").json()["avatar_url"] == second_avatar_url
+    assert second_avatar_url.startswith(f"{avatar_path}?v=")
+    assert second_avatar_url != first_avatar_url
 
     if os.name != "nt":
         from hermes_cli.channel_identity.employee_avatars import employee_avatar_path

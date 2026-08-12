@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import stat
 import tempfile
 import warnings
 from pathlib import Path
@@ -38,9 +39,15 @@ def employee_avatar_path(store: ChannelIdentityStore, employee_id: str) -> Path:
     return _avatar_directory(store) / f"{digest}.webp"
 
 
-def employee_avatar_exists(store: ChannelIdentityStore, employee_id: str) -> bool:
+def employee_avatar_version(store: ChannelIdentityStore, employee_id: str) -> int | None:
     target = employee_avatar_path(store, employee_id)
-    return target.is_file() and not target.is_symlink()
+    try:
+        metadata = target.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        return None
+    return metadata.st_mtime_ns
 
 
 def normalize_employee_avatar(data: bytes) -> bytes:

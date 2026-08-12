@@ -5479,9 +5479,15 @@ async def create_webhook_connector_account(
     }
 
 
+def _employee_avatar_url(store, employee_id: str) -> str | None:
+    from hermes_cli.channel_identity.employee_avatars import employee_avatar_version
+
+    version = employee_avatar_version(store, employee_id)
+    return f"/api/employees/{employee_id}/avatar?v={version}" if version is not None else None
+
+
 def _employee_payload(runtime, store, owner, employee) -> dict[str, Any]:
     from hermes_cli.channel_identity import resolve_employee_profile
-    from hermes_cli.channel_identity.employee_avatars import employee_avatar_exists
 
     profile = None
     if employee.profile_revision is not None:
@@ -5491,11 +5497,7 @@ def _employee_payload(runtime, store, owner, employee) -> dict[str, Any]:
             employee_id=employee.employee_id,
             revision=employee.profile_revision,
         )
-    avatar_url = (
-        f"/api/employees/{employee.employee_id}/avatar"
-        if employee_avatar_exists(store, employee.employee_id)
-        else None
-    )
+    avatar_url = _employee_avatar_url(store, employee.employee_id)
     channels: dict[str, Any] = {}
     binding = employee.feishu_binding
     if binding is not None:
@@ -5646,7 +5648,7 @@ async def update_employee_avatar(request: Request, employee_id: str):
         save_employee_avatar(store, employee_id, bytes(data))
     except EmployeeAvatarInvalid as exc:
         raise HTTPException(status_code=400, detail="Employee avatar is invalid") from exc
-    return {"avatar_url": f"/api/employees/{employee_id}/avatar"}
+    return {"avatar_url": _employee_avatar_url(store, employee_id)}
 
 
 @app.delete("/api/employees/{employee_id}/avatar")

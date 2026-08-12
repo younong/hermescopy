@@ -16,6 +16,7 @@ import {
   type EmployeeCollaborationPolicy,
   type EmployeeLifecycleStatus,
   type EmployeePolicy,
+  withHermesAssetAuth,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -532,7 +533,7 @@ function EmployeeAvatar({ employee, large = false }: { employee: Pick<Employee, 
   const label = employee.profile?.name || "E";
   const classes = large ? "h-14 w-14" : "h-10 w-10";
   return employee.avatar_url && !failed
-    ? <img alt="" className={cn("shrink-0 rounded-full border border-[#e1e3e7] object-cover", classes)} onError={() => setFailed(true)} src={employee.avatar_url} />
+    ? <img alt="" className={cn("shrink-0 rounded-full border border-[#e1e3e7] object-cover", classes)} onError={() => setFailed(true)} src={withHermesAssetAuth(employee.avatar_url)} />
     : <span aria-hidden className={cn("flex shrink-0 items-center justify-center rounded-full border border-[#e1e3e7] bg-[#f3f4f6] text-sm font-semibold", classes)}>{label.trim().charAt(0).toUpperCase() || "E"}</span>;
 }
 
