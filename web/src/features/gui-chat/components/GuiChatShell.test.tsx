@@ -795,6 +795,55 @@ describe("GuiChatShell", () => {
     );
   });
 
+  it("opens an archived group from a workspace pane", async () => {
+    const connection = createConnection();
+    vi.mocked(connection.collaboration.listGroups).mockResolvedValue({
+      groups: [{
+        archived_at: 1_700_000_100,
+        created_at: 1_700_000_000,
+        creator_employee_id: null,
+        creator_kind: "owner",
+        group_id: "group-archived",
+        last_sequence: 2,
+        name: "Archived project",
+        status: "archived",
+        updated_at: 1_700_000_100,
+      }],
+    });
+    vi.mocked(connection.collaboration.getGroup).mockImplementation(() => new Promise(() => undefined));
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShellAt(
+      "/chat/files",
+      <>
+        <LocationProbe />
+        <GuiChatShell />
+      </>,
+    );
+    await act(async () => {
+      const archivedButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
+        .find((button) => button.textContent?.includes("Archived (1)"));
+      archivedButton?.click();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      const groupButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
+        .find((button) => button.textContent?.trim() === "Archived project");
+      groupButton?.click();
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector("[data-location]")?.textContent)
+      .toBe("/chat?group=group-archived");
+    expect(document.querySelector("[data-files-pane]")).toBeNull();
+    expect(connection.collaboration.getGroup).toHaveBeenCalledWith(
+      "group-archived",
+      undefined,
+      expect.any(AbortSignal),
+    );
+  });
+
   it("opens a group route on the shared gateway without creating a direct session", async () => {
     const connection = createConnection();
     vi.mocked(connection.collaboration.getGroup).mockImplementation(() => new Promise(() => undefined));
@@ -1098,7 +1147,7 @@ function ReadyProbe() {
 
 function LocationProbe() {
   const location = useLocation();
-  return <span data-location>{location.pathname}</span>;
+  return <span data-location>{`${location.pathname}${location.search}`}</span>;
 }
 
 function NavigationProbe({

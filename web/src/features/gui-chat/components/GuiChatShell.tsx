@@ -26,7 +26,7 @@ import { ChatSessionList } from "@/components/ChatSessionList";
 import { CreateGroupDialog } from "@/features/collaboration/components/CreateGroupDialog";
 import { GroupChatView } from "@/features/collaboration/components/GroupChatView";
 import { GroupsSidebar } from "@/features/collaboration/components/GroupsSidebar";
-import { parseChatRoute } from "@/features/collaboration/routing";
+import { groupChatSearch, parseChatRoute } from "@/features/collaboration/routing";
 import type { CollaborationGroup } from "@/features/collaboration/types";
 import { ConnectWeChatModal } from "@/features/ilink/ConnectWeChatModal";
 import { PageHeaderContext } from "@/contexts/page-header-context";
@@ -500,13 +500,8 @@ export function GuiChatShell() {
   const pickGroup = useCallback((nextGroupId: string) => {
     closeMobilePanel();
     setResumeNotice(null);
-    updateSearchParams((prev) => {
-      const next = new URLSearchParams(prev);
-      next.delete("resume");
-      next.set("group", nextGroupId);
-      return next;
-    });
-  }, [closeMobilePanel, updateSearchParams]);
+    navigate(`/chat${groupChatSearch(nextGroupId)}`);
+  }, [closeMobilePanel, navigate]);
 
   const createGroup = useCallback(async (name: string, employeeIds: string[]) => {
     const connection = connectionRef.current;
