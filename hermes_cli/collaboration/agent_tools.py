@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 import json
 from typing import Any
 
@@ -152,6 +152,17 @@ class CollaborationAgentContext:
     task_id: str | None = None
     role: str = "source"
     may_create_authorized: bool = False
+
+    def same_agent_identity(self, other: object) -> bool:
+        """Compare immutable identity and authority for one persistent Agent."""
+        if not isinstance(other, CollaborationAgentContext):
+            return False
+        dynamic_fields = {"source_event_id", "allowed_origin_attachment_ids"}
+        return all(
+            getattr(self, field.name) == getattr(other, field.name)
+            for field in fields(self)
+            if field.name not in dynamic_fields
+        )
 
 
 def tool_definitions(*, role: str, may_create: bool = False) -> list[dict[str, Any]]:

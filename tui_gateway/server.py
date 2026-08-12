@@ -5435,8 +5435,13 @@ class CollaborationAgentRunner:
                         agent_callbacks={},
                     )
                 self._agents[hidden_session_id] = agent
-            elif getattr(agent, "collaboration_context", None) != collaboration_context:
-                raise RuntimeError("collaboration Agent context is inconsistent")
+            else:
+                existing_context = getattr(agent, "collaboration_context", None)
+                if existing_context is None or not existing_context.same_agent_identity(
+                    collaboration_context
+                ):
+                    raise RuntimeError("collaboration Agent identity is inconsistent")
+                agent.collaboration_context = collaboration_context
         from tools.approval import (
             register_gateway_notify,
             set_current_session_key,
