@@ -55,7 +55,7 @@ export function GroupConversation({ employees, onApproval, onStop, state }: Grou
       <div className="flex flex-1 flex-col items-center justify-center p-8 text-center">
         <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-[#eef3ff] text-[#3867ed]"><UsersRound /></span>
         <h2 className="mt-4 text-base font-semibold text-[#25282d]">Start the group conversation</h2>
-        <p className="mt-1 max-w-md text-xs leading-5 text-[#969aa1]">Select one or more employees, choose @all, or post without a mention for background context only.</p>
+        <p className="mt-1 max-w-md text-xs leading-5 text-[#969aa1]">Send a message to the first available employee, or use @ to choose someone else.</p>
       </div>
     );
   }
