@@ -62,6 +62,11 @@ export function GroupComposer({
     return () => document.removeEventListener("pointerdown", closeOnOutsidePointer);
   }, [pickerOpen]);
 
+  const finishMentionSelection = () => {
+    if (text.endsWith("@")) setText(text.slice(0, -1));
+    setPickerOpen(false);
+  };
+
   const submit = async () => {
     if (!text.trim() || sending || uploading.length > 0) return;
     setSending(true);
@@ -131,7 +136,7 @@ export function GroupComposer({
               }
               if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
                 event.preventDefault();
-                if (pickerOpen) setPickerOpen(false);
+                if (pickerOpen) finishMentionSelection();
                 else void submit();
               }
             }}

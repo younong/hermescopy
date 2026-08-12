@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { defaultMentionSelection, normalizeMentionSelection, recipientLabel } from "./mentions";
+import { defaultMentionSelection, mentionLabel, normalizeMentionSelection, recipientLabel } from "./mentions";
 import type { CollaborationEvent, CollaborationMembership } from "./types";
 
 function employeeReply(sequence: number, employeeId: string): CollaborationEvent {
@@ -60,6 +60,16 @@ describe("structured collaboration mentions", () => {
       mentionAll: true,
       membershipIds: ["membership-a"],
     }, memberships)).toEqual({ mentionAll: true, membershipIds: [] });
+    expect(mentionLabel({ mentionAll: true, membershipIds: [] }, {}, () => "ignored"))
+      .toBe("@all");
+  });
+
+  it("formats selected employees without adding them to message text", () => {
+    expect(mentionLabel({
+      mentionAll: false,
+      membershipIds: ["membership-a", "membership-b"],
+    }, Object.fromEntries(memberships.map((member) => [member.membership_id, member])), (id) => id))
+      .toBe("@account-a, @account-b");
   });
 
   it("routes the first unmentioned message to the first available employee", () => {

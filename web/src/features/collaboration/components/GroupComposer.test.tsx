@@ -65,24 +65,39 @@ describe("GroupComposer mention picker", () => {
     await keyDown(textarea, "Enter");
 
     expect(getPicker(container)).toBeNull();
+    expect(textarea.value).toBe("Please ask ");
+    expect(container.textContent).toContain("@Alice, @Bob");
     expect(onSubmit).not.toHaveBeenCalled();
   });
 
-  it("supports @all and explicit close controls", async () => {
+  it("removes the trigger and keeps @all as structured selection on Enter", async () => {
     const container = renderComposer();
-    const mentionButton = container.querySelector<HTMLButtonElement>(
-      'button[aria-label="Choose employee mentions"]',
-    );
+    const textarea = getTextarea(container);
 
-    await click(mentionButton);
+    await setTextareaValue(textarea, "Ask everyone @");
     const allButton = container.querySelector<HTMLButtonElement>('button[aria-pressed="false"]');
     expect(allButton?.textContent).toContain("@all");
     await click(allButton);
-    expect(allButton?.getAttribute("aria-pressed")).toBe("true");
+    await keyDown(textarea, "Enter");
 
+    expect(textarea.value).toBe("Ask everyone ");
+    expect(container.textContent).toContain("@all");
+    expect(getPicker(container)).toBeNull();
+  });
+
+  it("keeps the literal @ only when selection is explicitly cancelled", async () => {
+    const container = renderComposer();
+    const textarea = getTextarea(container);
+
+    await setTextareaValue(textarea, "Keep this @");
     await click(container.querySelector('button[aria-label="Close employee mentions"]'));
+
+    expect(textarea.value).toBe("Keep this @");
     expect(getPicker(container)).toBeNull();
 
+    const mentionButton = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Choose employee mentions"]',
+    );
     await click(mentionButton);
     await act(async () => document.body.dispatchEvent(new Event("pointerdown", { bubbles: true })));
     expect(getPicker(container)).toBeNull();

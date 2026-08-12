@@ -840,6 +840,40 @@ def test_feishu_origin_can_terminally_record_ambiguous_handoff(db):
     assert store.pending_origin_deliveries() == []
 
 
+def test_member_prompt_excludes_structured_owner_mentions(db):
+    store = CollaborationStore(db, owner_key="owner-a")
+    group = store.create_group(
+        "Mention display",
+        members=[
+            CollaborationMemberProfile(
+                "employee-a", 1, "fingerprint-employee-a-r1"
+            )
+        ],
+    )
+    membership = store.active_memberships(group.group_id)[0]
+    store.submit_owner_message(
+        group.group_id,
+        text="Review this",
+        mentioned_membership_ids=[membership.membership_id],
+    )
+    scheduler = CollaborationScheduler(
+        db,
+        store=store,
+        resolver=_Resolver(),
+        runner=_Runner(),
+        runtime=_Runtime(),
+        emit=lambda *_args: None,
+    )
+    claimed = scheduler._claim_next()
+    prompt = scheduler._context_prompt(claimed)
+    scheduler.close()
+
+    owner_message_line = next(
+        line for line in prompt.splitlines() if "owner message.owner" in line
+    )
+    assert owner_message_line.endswith('{"text": "Review this"}')
+
+
 def test_ai_created_group_prompt_transfers_brief_not_source_transcript(db):
     source_secret = "SOURCE TRANSCRIPT MUST NOT TRANSFER"
     db.create_session("origin-session", "dashboard-gui")

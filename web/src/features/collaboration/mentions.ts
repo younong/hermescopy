@@ -49,16 +49,24 @@ export function defaultMentionSelection(
   return { mentionAll: false, membershipIds: membershipId ? [membershipId] : [] };
 }
 
-export function recipientLabel(
+export function mentionLabel(
   selection: MentionSelection,
   membershipsById: Record<string, CollaborationMembership>,
   employeeName: (employeeId: string) => string,
 ): string {
   if (selection.mentionAll) return "@all";
-  if (selection.membershipIds.length === 0) return "No available employee";
   return selection.membershipIds
     .map((id) => membershipsById[id])
     .filter(Boolean)
     .map((member) => `@${employeeName(member.employee_id)}`)
     .join(", ");
+}
+
+export function recipientLabel(
+  selection: MentionSelection,
+  membershipsById: Record<string, CollaborationMembership>,
+  employeeName: (employeeId: string) => string,
+): string {
+  return mentionLabel(selection, membershipsById, employeeName)
+    || "No available employee";
 }
