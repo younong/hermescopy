@@ -859,6 +859,23 @@ describe("GuiChatShell", () => {
     expect(connection.collaboration.listGroups).toHaveBeenCalledOnce();
   });
 
+  it("reattaches the group owner scope after a transport close", async () => {
+    vi.useFakeTimers();
+    const connection = createConnection();
+    vi.mocked(connection.collaboration.getGroup).mockImplementation(() => new Promise(() => undefined));
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShellAt("/chat?group=group-a");
+    await act(async () => {
+      connection.emitState("closed");
+      await vi.advanceTimersByTimeAsync(1_200);
+    });
+
+    expect(connection.attachOwner).toHaveBeenCalledTimes(2);
+    expect(connection.createOrAttach).not.toHaveBeenCalled();
+  });
+
   it("connects automatically when the authenticated owner becomes ready", async () => {
     const identity = deferred<AuthIdentity>();
     const firstConnection = createConnection();

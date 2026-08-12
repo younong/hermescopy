@@ -132,6 +132,7 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
   let connectPromise: Promise<void> | null = null;
   let ownerAttachPromise: Promise<void> | null = null;
   let ownerAttached = false;
+  let scopeTransitionPromise: Promise<void> | null = null;
   let attachSupported = true;
 
   client.onState((state) => {
@@ -164,98 +165,123 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
     ...(timing?.traceId ? { latency_trace_id: timing.traceId } : {}),
   });
 
-  return {
-    client,
-    collaboration: createCollaborationApi(client, ensureConnected),
-    close: () => client.close(),
-    ensureConnected,
-    attachOwner: async (signal) => {
-      await ensureConnected(signal);
-      if (ownerAttached) return;
-      if (!ownerAttachPromise) {
-        ownerAttachPromise = client.request(
-          "session.owner_attach",
-          { browser_id: browserId },
+  const attachOwner = async (signal?: AbortSignal): Promise<void> => {
+    if (ownerAttached) return;
+    await ensureConnected(signal);
+    if (ownerAttached) return;
+    if (!ownerAttachPromise) {
+      ownerAttachPromise = client.request(
+        "session.owner_attach",
+        { browser_id: browserId },
+      ).then(() => {
+        ownerAttached = true;
+      }).finally(() => {
+        ownerAttachPromise = null;
+      });
+    }
+    await abortable(ownerAttachPromise, signal);
+  };
+
+  const ensureCollaborationReady = async (signal?: AbortSignal): Promise<void> => {
+    if (scopeTransitionPromise) await abortable(scopeTransitionPromise, signal);
+    await attachOwner(signal);
+  };
+
+  const runCreateOrAttach = async (
+    targetSessionId: string | null,
+    generation: number,
+    signal?: AbortSignal,
+    timing?: GuiChatSwitchTiming,
+    createOptions?: GuiChatCreateOptions,
+  ): Promise<SessionCreateResponse | SessionResumeResponse> => {
+    const reused = client.connectionState === "open";
+    await ensureConnected(signal, timing);
+    if (reused) timing?.onSwitchStage?.("connection.reused");
+
+    if (targetSessionId) {
+      timing?.onSwitchStage?.("session.attach.start");
+      try {
+        if (!attachSupported) throw new JsonRpcGatewayError("Method not found", -32601);
+        const response = await client.request<SessionAttachResponse>(
+          "session.attach",
+          {
+            ...baseParams(timing),
+            session_id: targetSessionId,
+            switch_generation: generation,
+          },
           undefined,
           signal,
-        ).then(() => {
-          ownerAttached = true;
-        }).finally(() => {
-          ownerAttachPromise = null;
-        });
+        );
+        timing?.onSwitchStage?.("session.attach.end");
+        timing?.onSwitchStage?.(
+          response.resume_kind === "live" ? "session.attach.live" : "session.attach.cold",
+        );
+        return response;
+      } catch (error) {
+        if (!(error instanceof JsonRpcGatewayError) || error.code !== -32601) throw error;
+        // Mixed-version compatibility only: an older backend does not know
+        // session.attach, so abandon the reusable socket and restore the old
+        // fresh-socket session.resume path. Auth/fence failures never fall back.
+        attachSupported = false;
+        client.close();
+        await ensureConnected(signal, timing);
+        const response = await client.request<SessionResumeResponse>(
+          "session.resume",
+          {
+            ...baseParams(timing),
+            session_id: targetSessionId,
+          },
+          undefined,
+          signal,
+        );
+        timing?.onSwitchStage?.("session.attach.end");
+        return response;
       }
-      await ownerAttachPromise;
-    },
-    createOrAttach: async (targetSessionId, generation, signal, timing, createOptions) => {
-      const reused = client.connectionState === "open";
-      await ensureConnected(signal, timing);
-      if (reused) timing?.onSwitchStage?.("connection.reused");
+    }
 
-      if (targetSessionId) {
-        timing?.onSwitchStage?.("session.attach.start");
-        try {
-          if (!attachSupported) throw new JsonRpcGatewayError("Method not found", -32601);
-          const response = await client.request<SessionAttachResponse>(
-            "session.attach",
-            {
-              ...baseParams(timing),
-              session_id: targetSessionId,
-              switch_generation: generation,
-            },
-            undefined,
-            signal,
-          );
-          timing?.onSwitchStage?.("session.attach.end");
-          timing?.onSwitchStage?.(
-            response.resume_kind === "live" ? "session.attach.live" : "session.attach.cold",
-          );
-          return response;
-        } catch (error) {
-          if (!(error instanceof JsonRpcGatewayError) || error.code !== -32601) throw error;
-          // Mixed-version compatibility only: an older backend does not know
-          // session.attach, so abandon the reusable socket and restore the old
-          // fresh-socket session.resume path. Auth/fence failures never fall back.
-          attachSupported = false;
-          client.close();
-          await ensureConnected(signal, timing);
-          const response = await client.request<SessionResumeResponse>(
-            "session.resume",
-            {
-              ...baseParams(timing),
-              session_id: targetSessionId,
-            },
-            undefined,
-            signal,
-          );
-          timing?.onSwitchStage?.("session.attach.end");
-          return response;
-        }
-      }
+    timing?.onSwitchStage?.("session.create.start");
+    const response = await client.request<SessionCreateResponse>(
+      "session.create",
+      {
+        ...baseParams(timing),
+        switch_generation: generation,
+        ...(createOptions?.employeeId ? { employee_id: createOptions.employeeId } : {}),
+        ...(createOptions?.employeeAccountId
+          ? { employee_account_id: createOptions.employeeAccountId }
+          : {}),
+        ...(createOptions?.kind === "code"
+          ? {
+              kind: "code",
+              ...(createOptions.codeProvider ? { provider: createOptions.codeProvider } : {}),
+              ...(createOptions.codeModel ? { model: createOptions.codeModel } : {}),
+            }
+          : {}),
+      },
+      undefined,
+      signal,
+    );
+    timing?.onSwitchStage?.("session.create.end");
+    return response;
+  };
 
-      timing?.onSwitchStage?.("session.create.start");
-      const response = await client.request<SessionCreateResponse>(
-        "session.create",
-        {
-          ...baseParams(timing),
-          switch_generation: generation,
-          ...(createOptions?.employeeId ? { employee_id: createOptions.employeeId } : {}),
-          ...(createOptions?.employeeAccountId
-            ? { employee_account_id: createOptions.employeeAccountId }
-            : {}),
-          ...(createOptions?.kind === "code"
-            ? {
-                kind: "code",
-                ...(createOptions.codeProvider ? { provider: createOptions.codeProvider } : {}),
-                ...(createOptions.codeModel ? { model: createOptions.codeModel } : {}),
-              }
-            : {}),
-        },
-        undefined,
-        signal,
-      );
-      timing?.onSwitchStage?.("session.create.end");
-      return response;
-    },
+  const createOrAttach: GuiChatConnection["createOrAttach"] = (...args) => {
+    const operation = runCreateOrAttach(...args);
+    let transition: Promise<void>;
+    const settle = () => {
+      if (scopeTransitionPromise === transition) scopeTransitionPromise = null;
+    };
+    transition = operation.then(settle, settle);
+    scopeTransitionPromise = transition;
+    return operation;
+  };
+
+  return {
+    client,
+    collaboration: createCollaborationApi(client, ensureCollaborationReady),
+    close: () => client.close(),
+    ensureConnected,
+    attachOwner,
+    createOrAttach,
     attachImage: async (sessionId, file) => {
       const uploadFile = await compressImageForUpload(file);
       const dataUrl = await readFileAsDataUrl(uploadFile);
