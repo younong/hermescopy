@@ -1,7 +1,8 @@
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { AlertCircle, CheckCircle2, CircleStop, Clock3, FileText, LoaderCircle, ShieldAlert, UsersRound, XCircle } from "lucide-react";
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Markdown } from "@/components/Markdown";
+import { withHermesAssetAuth } from "@/lib/api";
 import { isTerminalTarget } from "../reducer";
 import { mentionLabel } from "../mentions";
 import type { CollaborationApprovalChoice, CollaborationEmployeeIdentity, CollaborationState, CollaborationTarget } from "../types";
@@ -15,10 +16,17 @@ interface GroupConversationProps {
 
 export function GroupConversation({ employees, onApproval, onStop, state }: GroupConversationProps) {
   const endRef = useRef<HTMLDivElement>(null);
-  const employeeName = useMemo(() => {
-    const names = new Map(employees.map((employee) => [employee.employeeId, employee.name]));
-    return (employeeId: string | null | undefined) => employeeId ? names.get(employeeId) ?? "Former employee" : "Hermes";
+  const employeeIdentity = useMemo(() => {
+    const identities = new Map(employees.map((employee) => [employee.employeeId, employee]));
+    return (employeeId: string | null | undefined): CollaborationEmployeeIdentity =>
+      employeeId
+        ? identities.get(employeeId) ?? { available: false, employeeId, name: "Former employee" }
+        : { available: false, employeeId: "", name: "Hermes" };
   }, [employees]);
+  const employeeName = useMemo(
+    () => (employeeId: string | null | undefined) => employeeIdentity(employeeId).name,
+    [employeeIdentity],
+  );
   const events = useMemo(
     () => Object.values(state.eventsBySequence).sort((a, b) => a.sequence - b.sequence),
     [state.eventsBySequence],
@@ -105,7 +113,7 @@ export function GroupConversation({ employees, onApproval, onStop, state }: Grou
           return (
             <article className={owner ? "ml-auto max-w-[85%]" : "max-w-[92%]"} key={event.event_id}>
               <div className={`mb-1.5 flex items-center gap-2 text-[11px] ${owner ? "justify-end" : ""}`}>
-                {!owner ? <SpeakerAvatar name={speaker} /> : null}
+                {!owner ? <SpeakerAvatar employee={employeeIdentity(event.actor_employee_id)} /> : null}
                 <span className="font-semibold text-[#4b4f56]">{speaker}</span>
                 <span className="text-[#a1a5ac]">{formatTime(event.created_at)}</span>
               </div>
@@ -121,7 +129,7 @@ export function GroupConversation({ employees, onApproval, onStop, state }: Grou
               {targets.length > 0 ? (
                 <div className={`${owner ? "mt-3" : "ml-8 mt-3"} grid gap-2 sm:grid-cols-2`}>
                   {targets.map((target) => (
-                    <TargetCard employeeName={employeeName} key={target.target_id} onStop={onStop} state={state} target={target} />
+                    <TargetCard employeeIdentity={employeeIdentity} key={target.target_id} onStop={onStop} state={state} target={target} />
                   ))}
                 </div>
               ) : null}
@@ -149,15 +157,16 @@ export function GroupConversation({ employees, onApproval, onStop, state }: Grou
   );
 }
 
-function TargetCard({ employeeName, onStop, state, target }: { employeeName(employeeId: string): string; onStop(targetId: string): void; state: CollaborationState; target: CollaborationTarget }) {
+function TargetCard({ employeeIdentity, onStop, state, target }: { employeeIdentity(employeeId: string): CollaborationEmployeeIdentity; onStop(targetId: string): void; state: CollaborationState; target: CollaborationTarget }) {
   const streamed = state.executionsById[target.execution_id] ?? "";
   const finalText = targetResultText(target);
   const status = targetStatus(target.status);
   const Icon = status.icon;
+  const employee = employeeIdentity(target.employee_id);
   return (
     <div className="rounded-xl border border-[#e4e6ea] bg-[#fafbfc] p-3">
       <div className="flex items-center justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-2"><SpeakerAvatar name={employeeName(target.employee_id)} small /><span className="truncate text-[11px] font-semibold">{employeeName(target.employee_id)}</span></div>
+        <div className="flex min-w-0 items-center gap-2"><SpeakerAvatar employee={employee} small /><span className="truncate text-[11px] font-semibold">{employee.name}</span></div>
         <span className={`inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide ${status.className}`}><Icon className={`h-3 w-3 ${target.status === "running" ? "animate-spin" : ""}`} />{target.status.replace("_", " ")}</span>
       </div>
       {(streamed || finalText) ? <div className="mt-2 max-h-40 overflow-auto text-xs leading-5 text-[#44484f]"><Markdown content={streamed || finalText} /></div> : null}
@@ -174,8 +183,13 @@ function targetResultText(target: CollaborationTarget): string {
   return "";
 }
 
-function SpeakerAvatar({ name, small = false }: { name: string; small?: boolean }) {
-  return <span className={`inline-flex shrink-0 items-center justify-center rounded-full bg-[#e6ebf9] font-semibold text-[#4665bb] ${small ? "h-5 w-5 text-[9px]" : "h-6 w-6 text-[10px]"}`}>{name.trim().charAt(0).toUpperCase() || "E"}</span>;
+function SpeakerAvatar({ employee, small = false }: { employee: CollaborationEmployeeIdentity; small?: boolean }) {
+  const [failed, setFailed] = useState(false);
+  useEffect(() => setFailed(false), [employee.avatarUrl]);
+  const classes = small ? "h-5 w-5 text-[9px]" : "h-6 w-6 text-[10px]";
+  return employee.avatarUrl && !failed
+    ? <img alt="" className={`shrink-0 rounded-full object-cover ${classes}`} onError={() => setFailed(true)} src={withHermesAssetAuth(employee.avatarUrl)} />
+    : <span className={`inline-flex shrink-0 items-center justify-center rounded-full bg-[#e6ebf9] font-semibold text-[#4665bb] ${classes}`}>{employee.name.trim().charAt(0).toUpperCase() || "E"}</span>;
 }
 
 function AttachmentChip({ name, size }: { name: string; size: number }) {

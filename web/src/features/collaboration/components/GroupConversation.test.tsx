@@ -7,6 +7,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { initialCollaborationState, type CollaborationState } from "../types";
 import { GroupConversation } from "./GroupConversation";
 
+vi.mock("@/lib/api", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/lib/api")>(),
+  withHermesAssetAuth: (url: string) => `/hermes${url}`,
+}));
+
 let root: Root | null = null;
 
 beforeEach(() => {
@@ -81,16 +86,39 @@ describe("GroupConversation owner mentions", () => {
 
     expect(container.textContent).toContain("@all");
   });
+
+  it("renders employee avatars within the dashboard base path", () => {
+    const container = renderConversation({
+      ...initialCollaborationState,
+      loading: false,
+      eventsBySequence: {
+        1: {
+          actor_employee_id: "employee-a",
+          actor_kind: "employee",
+          actor_membership_id: "membership-a",
+          body: { text: "Finished" },
+          created_at: 1,
+          event_id: "event-a",
+          event_kind: "message.employee",
+          group_id: "group-a",
+          sequence: 1,
+        },
+      },
+    }, "/api/employees/employee-a/avatar?v=123");
+
+    expect(container.querySelector("img")?.getAttribute("src"))
+      .toBe("/hermes/api/employees/employee-a/avatar?v=123");
+  });
 });
 
-function renderConversation(state: CollaborationState) {
+function renderConversation(state: CollaborationState, avatarUrl?: string) {
   const container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
   act(() => {
     root?.render(
       <GroupConversation
-        employees={[{ available: true, employeeId: "employee-a", name: "Alice" }]}
+        employees={[{ avatarUrl, available: true, employeeId: "employee-a", name: "Alice" }]}
         onApproval={vi.fn()}
         onStop={vi.fn()}
         state={state}

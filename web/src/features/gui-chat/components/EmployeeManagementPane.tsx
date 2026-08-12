@@ -16,6 +16,7 @@ import {
   type EmployeeCollaborationPolicy,
   type EmployeeLifecycleStatus,
   type EmployeePolicy,
+  withHermesAssetAuth,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -82,7 +83,7 @@ const EMPTY_BINDING: BindingDraft = {
   verificationToken: "",
 };
 
-export function EmployeeManagementPane() {
+export function EmployeeManagementPane({ onEmployeesChanged }: { onEmployeesChanged?(employees: Employee[]): void } = {}) {
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [catalog, setCatalog] = useState<EmployeeCatalog | null>(null);
   const [loading, setLoading] = useState(true);
@@ -119,7 +120,8 @@ export function EmployeeManagementPane() {
     const response = await api.getEmployees();
     setEmployees(response.employees);
     setCollaborationDrafts({});
-  }, []);
+    onEmployeesChanged?.(response.employees);
+  }, [onEmployeesChanged]);
 
   useEffect(() => {
     void Promise.all([refreshEmployees(), api.getEmployeeCatalog().then(setCatalog)])
@@ -532,7 +534,7 @@ function EmployeeAvatar({ employee, large = false }: { employee: Pick<Employee, 
   const label = employee.profile?.name || "E";
   const classes = large ? "h-14 w-14" : "h-10 w-10";
   return employee.avatar_url && !failed
-    ? <img alt="" className={cn("shrink-0 rounded-full border border-[#e1e3e7] object-cover", classes)} onError={() => setFailed(true)} src={employee.avatar_url} />
+    ? <img alt="" className={cn("shrink-0 rounded-full border border-[#e1e3e7] object-cover", classes)} onError={() => setFailed(true)} src={withHermesAssetAuth(employee.avatar_url)} />
     : <span aria-hidden className={cn("flex shrink-0 items-center justify-center rounded-full border border-[#e1e3e7] bg-[#f3f4f6] text-sm font-semibold", classes)}>{label.trim().charAt(0).toUpperCase() || "E"}</span>;
 }
 

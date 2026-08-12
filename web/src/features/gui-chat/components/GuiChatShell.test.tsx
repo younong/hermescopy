@@ -468,11 +468,11 @@ describe("GuiChatShell", () => {
     const robotsPane = document.querySelector("[data-robots-pane]");
     expect(robotsPane).not.toBeNull();
     expect(robotsPane?.getAttribute("data-theme")).toBe("chat-workspace");
-    expect(document.body.textContent).toContain("Employees");
+    expect(document.body.textContent).toContain("员工");
     expect(
       robotsPane?.querySelector("button.gui-chat-workspace-primary-button")
         ?.textContent,
-    ).toBe("Add employee");
+    ).toBe("添加员工");
     expect(robotsPane?.querySelector("[data-employee-management-pane]")).not.toBeNull();
     expect(document.querySelector("[data-composer-send]")).toBeNull();
     expect(
