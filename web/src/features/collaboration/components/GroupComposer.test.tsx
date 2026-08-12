@@ -112,6 +112,7 @@ function renderComposer(onSubmit = vi.fn().mockResolvedValue(undefined)) {
     root?.render(
       <GroupComposer
         archived={false}
+        defaultSelection={{ mentionAll: false, membershipIds: ["membership-a"] }}
         disabled={false}
         employeeName={(employeeId) => employeeId === "employee-a" ? "Alice" : "Bob"}
         memberships={memberships}
