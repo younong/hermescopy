@@ -39,6 +39,71 @@ def test_current_rss_bytes_reads_linux_proc_status(monkeypatch):
     assert runtime_memory.current_rss_bytes() == 1234 * 1024
 
 
+def test_cgroup_memory_pressure_uses_current_usage(monkeypatch):
+    monkeypatch.setattr(runtime_memory.sys, "platform", "linux")
+
+    def read_text(path, **kwargs):
+        values = {
+            "/proc/self/cgroup": "0::/hermes/worker\n",
+            "/sys/fs/cgroup/hermes/worker/memory.max": str(896 * 1024 * 1024),
+            "/sys/fs/cgroup/hermes/worker/memory.current": str(768 * 1024 * 1024),
+        }
+        return values[str(path)]
+
+    monkeypatch.setattr(runtime_memory.Path, "read_text", read_text)
+
+    assert runtime_memory.under_cgroup_memory_pressure() is True
+
+
+def test_cgroup_memory_pressure_is_false_above_headroom_floor(monkeypatch):
+    monkeypatch.setattr(runtime_memory.sys, "platform", "linux")
+
+    def read_text(path, **kwargs):
+        values = {
+            "/proc/self/cgroup": "0::/hermes/worker\n",
+            "/sys/fs/cgroup/hermes/worker/memory.max": str(896 * 1024 * 1024),
+            "/sys/fs/cgroup/hermes/worker/memory.current": str(767 * 1024 * 1024),
+        }
+        return values[str(path)]
+
+    monkeypatch.setattr(runtime_memory.Path, "read_text", read_text)
+
+    assert runtime_memory.under_cgroup_memory_pressure() is False
+
+
+def test_cgroup_memory_pressure_falls_back_to_rss(monkeypatch):
+    monkeypatch.setattr(runtime_memory.sys, "platform", "linux")
+
+    def read_text(path, **kwargs):
+        if str(path) == "/proc/self/cgroup":
+            return "0::/hermes/worker\n"
+        if str(path) == "/sys/fs/cgroup/hermes/worker/memory.max":
+            return str(896 * 1024 * 1024)
+        raise OSError
+
+    monkeypatch.setattr(runtime_memory.Path, "read_text", read_text)
+    monkeypatch.setattr(
+        runtime_memory, "current_rss_bytes", lambda: 700 * 1024 * 1024
+    )
+
+    assert runtime_memory.under_cgroup_memory_pressure() is False
+
+
+def test_cgroup_memory_pressure_fails_open_without_finite_limit(monkeypatch):
+    monkeypatch.setattr(runtime_memory.sys, "platform", "linux")
+    monkeypatch.setattr(
+        runtime_memory.Path,
+        "read_text",
+        lambda path, **kwargs: (
+            "0::/hermes/worker\n"
+            if str(path) == "/proc/self/cgroup"
+            else "max"
+        ),
+    )
+
+    assert runtime_memory.under_cgroup_memory_pressure() is False
+
+
 def test_trim_threshold_uses_half_finite_cgroup_limit(monkeypatch):
     monkeypatch.setattr(runtime_memory.sys, "platform", "linux")
 

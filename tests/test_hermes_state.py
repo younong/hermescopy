@@ -1297,6 +1297,39 @@ class TestFTS5Search:
             "after needle",
         ]
 
+    def test_search_without_context_returns_metadata_only(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="before metadata needle")
+        db.append_message("s1", role="assistant", content="metadata needle match")
+
+        results = db.search_messages('"metadata needle match"', include_context=False)
+
+        assert len(results) == 1
+        assert "context" not in results[0]
+        assert "content" not in results[0]
+        assert "metadata needle match" in results[0]["snippet"]
+
+    def test_search_context_orders_equal_timestamps_by_id(self, db):
+        db.create_session(session_id="s1", source="cli")
+        ids = [
+            db.append_message("s1", role="user", content="same-time before"),
+            db.append_message("s1", role="assistant", content="same-time needle"),
+            db.append_message("s1", role="user", content="same-time after"),
+        ]
+        db._conn.execute(
+            "UPDATE messages SET timestamp = ? WHERE id IN (?, ?, ?)",
+            (100.0, *ids),
+        )
+        db._conn.commit()
+
+        result = db.search_messages('"same-time needle"')[0]
+
+        assert [row["content"] for row in result["context"]] == [
+            "same-time before",
+            "same-time needle",
+            "same-time after",
+        ]
+
     def test_search_special_chars_do_not_crash(self, db):
         """FTS5 special characters in queries must not raise OperationalError."""
         db.create_session(session_id="s1", source="cli")
@@ -1643,14 +1676,33 @@ class TestCJKSearchFallback:
         assert results == []
 
     def test_mixed_cjk_english_query(self, db):
-        """Mixed queries should still fall back to LIKE when FTS5 misses."""
+        """Mixed tokens with three searchable characters use trigram search."""
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="讨论Agent通信协议")
-        # "Agent通信" is CJK+English — FTS5 default tokenizer indexes the
-        # whole CJK run with embedded "agent" as separate tokens; the LIKE
-        # fallback handles the substring correctly.
-        results = db.search_messages("Agent通信")
+        statements = []
+        db._conn.set_trace_callback(statements.append)
+
+        results = db.search_messages("Agent通信", include_context=False)
+
+        db._conn.set_trace_callback(None)
         assert len(results) == 1
+        assert "context" not in results[0]
+        assert "content" not in results[0]
+        assert any("FROM messages_fts_trigram" in sql for sql in statements)
+
+    def test_short_cjk_metadata_search_uses_like_without_full_content(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="今天讨论A2A通信协议的实现")
+        statements = []
+        db._conn.set_trace_callback(statements.append)
+
+        results = db.search_messages("通信", include_context=False)
+
+        db._conn.set_trace_callback(None)
+        assert len(results) == 1
+        assert "context" not in results[0]
+        assert "content" not in results[0]
+        assert any("m.content LIKE" in sql for sql in statements)
 
     def test_cjk_partial_fts5_results_supplemented_by_like(self, db):
         """When FTS5 returns *some* CJK results, LIKE must still find all matches.

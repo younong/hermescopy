@@ -162,6 +162,30 @@ class TestDiscoveryShape:
         assert result["mode"] == "discover"
         assert result["count"] >= 1
 
+    def test_discovery_uses_lean_search_results(self, db, monkeypatch):
+        _seed_modpack_sessions(db)
+        original = db.search_messages
+        calls = []
+
+        def search_messages(*args, **kwargs):
+            calls.append(kwargs)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(db, "search_messages", search_messages)
+
+        result = json.loads(session_search(query="modpack", limit=1, db=db))
+
+        assert result["success"] is True
+        assert calls == [{
+            "query": "modpack",
+            "role_filter": ["user", "assistant"],
+            "exclude_sources": list(_HIDDEN_SESSION_SOURCES),
+            "limit": 300,
+            "offset": 0,
+            "sort": None,
+            "include_context": False,
+        }]
+
     def test_discovery_result_has_bookends_and_window(self, db):
         _seed_modpack_sessions(db)
         result = json.loads(session_search(query="modpack", limit=3, db=db))

@@ -431,6 +431,7 @@ def search_sessions_payload(
         query=" ".join(terms),
         limit=max(safe_limit * 5, 50),
         source_filter=allowed_sources,
+        include_context=False,
         **search_scope,
     )
     candidates: list[tuple[str, dict[str, Any]]] = []

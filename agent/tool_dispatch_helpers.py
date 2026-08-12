@@ -31,15 +31,17 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from agent.runtime_memory import under_cgroup_memory_pressure
 from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
 )
 
 logger = logging.getLogger(__name__)
 
-# Tools that must never run concurrently (interactive / user-facing).
-# When any of these appear in a batch, we fall back to sequential execution.
-_NEVER_PARALLEL_TOOLS = frozenset({"clarify"})
+# Tools that must never run concurrently (interactive/user-facing or capable
+# of transiently consuming substantial local resources). When any appear in a
+# batch, we fall back to sequential execution.
+_NEVER_PARALLEL_TOOLS = frozenset({"clarify", "session_search"})
 
 # Read-only tools with no shared mutable session state.
 _PARALLEL_SAFE_TOOLS = frozenset({
@@ -49,7 +51,6 @@ _PARALLEL_SAFE_TOOLS = frozenset({
     "image_generate",
     "read_file",
     "search_files",
-    "session_search",
     "skill_view",
     "skills_list",
     "vision_analyze",
@@ -145,7 +146,7 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
             if not _is_mcp_tool_parallel_safe(tool_name):
                 return False
 
-    return True
+    return not under_cgroup_memory_pressure()
 
 
 def _extract_parallel_scope_path(tool_name: str, function_args: dict) -> Optional[Path]:

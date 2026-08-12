@@ -21,6 +21,7 @@ _REQUEST_WORKERS = 4
 _TRIM_COOLDOWN_SECONDS = 300.0
 _FALLBACK_TRIM_THRESHOLD_BYTES = 512 * 1024 * 1024
 _MIN_TRIM_THRESHOLD_BYTES = 128 * 1024 * 1024
+_MIN_PARALLEL_HEADROOM_BYTES = 128 * 1024 * 1024
 
 _executor_lock = threading.Lock()
 _executor: DaemonThreadPoolExecutor | None = None
@@ -79,26 +80,52 @@ def current_rss_bytes() -> int | None:
     return None
 
 
-def _cgroup_memory_max_bytes() -> int | None:
+def _cgroup_v2_path() -> Path | None:
     if not sys.platform.startswith("linux"):
         return None
     try:
-        relative = None
         for line in Path("/proc/self/cgroup").read_text(encoding="ascii").splitlines():
             if line.startswith("0::"):
-                relative = line.partition("::")[2].lstrip("/")
-                break
-        if relative is None:
-            return None
-        raw = (Path("/sys/fs/cgroup") / relative / "memory.max").read_text(
-            encoding="ascii"
-        ).strip()
+                return Path("/sys/fs/cgroup") / line.partition("::")[2].lstrip("/")
+    except OSError:
+        return None
+    return None
+
+
+def _read_cgroup_memory_bytes(cgroup: Path, name: str) -> int | None:
+    try:
+        raw = (cgroup / name).read_text(encoding="ascii").strip()
         if raw == "max":
             return None
         value = int(raw)
-        return value if value > 0 else None
+        return value if value >= 0 else None
     except (OSError, ValueError):
         return None
+
+
+def _cgroup_memory_max_bytes() -> int | None:
+    cgroup = _cgroup_v2_path()
+    if cgroup is None:
+        return None
+    value = _read_cgroup_memory_bytes(cgroup, "memory.max")
+    return value if value and value > 0 else None
+
+
+def under_cgroup_memory_pressure() -> bool:
+    """Return whether parallel work would leave too little cgroup headroom."""
+    cgroup = _cgroup_v2_path()
+    if cgroup is None:
+        return False
+    limit = _read_cgroup_memory_bytes(cgroup, "memory.max")
+    if limit is None or limit <= 0:
+        return False
+    current = _read_cgroup_memory_bytes(cgroup, "memory.current")
+    if current is None:
+        current = current_rss_bytes()
+    if current is None:
+        return False
+    minimum_headroom = max(_MIN_PARALLEL_HEADROOM_BYTES, limit // 10)
+    return limit - current <= minimum_headroom
 
 
 def trim_threshold_bytes() -> int:
