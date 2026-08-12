@@ -1056,6 +1056,78 @@ describe("guiChatReducer history image restoration", () => {
     });
   });
 
+  it("places historical tool files in the reply that delivered them", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        info: { cwd: "/workspace" },
+        messages: [
+          { id: "user-1", role: "user", text: "生成报告" },
+          {
+            id: "tool-1",
+            name: "write_file",
+            role: "tool",
+            text: '{"resolved_path":"/workspace/report.html","files_modified":["/workspace/report.html"]}',
+            tool_call_id: "tool-1",
+          },
+          { id: "assistant-1", role: "assistant", text: "报告已生成" },
+          { id: "user-2", role: "user", text: "继续分析" },
+          { id: "assistant-2", role: "assistant", text: "分析完成" },
+        ],
+        session_id: "sid",
+      },
+    });
+
+    expect(state.messages[1].artifactIds).toEqual(["tool-1-file-0"]);
+    expect(state.messages[3].artifactIds).toEqual([]);
+    expect(fileArtifact(state, "tool-1-file-0")).toMatchObject({ messageId: "assistant-1" });
+  });
+
+  it("leaves an undelivered trailing tool file visible as a standalone artifact", () => {
+    const state = restoreWithTool(
+      '{"resolved_path":"/workspace/report.html","files_modified":["/workspace/report.html"]}',
+      { cwd: "/workspace" },
+    );
+
+    expect(state.messages).toEqual([]);
+    expect(fileArtifact(state, "tool-history-1-file-0").messageId).toBeUndefined();
+  });
+
+  it("keeps only the latest historical card for repeated writes to one file", () => {
+    const ownerWorkspace = "/opt/hermes/users/user3/workspaces/default";
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        info: { cwd: ownerWorkspace },
+        messages: [
+          {
+            id: "tool-write-1",
+            name: "write_file",
+            role: "tool",
+            text: `{"resolved_path":"${ownerWorkspace}/report.html","files_modified":["${ownerWorkspace}/report.html"]}`,
+            tool_call_id: "tool-write-1",
+          },
+          { id: "assistant-1", role: "assistant", text: "第一版" },
+          {
+            id: "tool-write-2",
+            name: "patch",
+            role: "tool",
+            text: '{"resolved_path":"report.html","files_modified":["report.html"]}',
+            tool_call_id: "tool-write-2",
+          },
+          { id: "assistant-2", role: "assistant", text: "最终版" },
+        ],
+        session_id: "sid",
+      },
+    });
+
+    expect(state.messages[0].artifactIds).toEqual([]);
+    expect(state.messages[1].artifactIds).toEqual(["tool-write-2-file-0"]);
+    expect(state.toolCalls["tool-write-1"].artifactIds).toEqual([]);
+    expect(state.toolCalls["tool-write-2"].artifactIds).toEqual(["tool-write-2-file-0"]);
+    expect(Object.keys(state.artifacts)).toEqual(["tool-write-2-file-0"]);
+  });
+
   it("only restores saved HTML paths from historical tool output", () => {
     const state = guiChatReducer(initialGuiChatState, {
       type: "session.created",

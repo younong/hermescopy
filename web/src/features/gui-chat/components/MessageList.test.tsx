@@ -140,6 +140,66 @@ describe("MessageList", () => {
     await act(async () => root.unmount());
   });
 
+  it("does not append message-owned tool artifacts after the conversation", async () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(
+        <MessageList
+          onClarifyRespond={() => undefined}
+          onApprovalRespond={() => undefined}
+          state={{
+            ...initialGuiChatState,
+            artifacts: {
+              "generated-report": {
+                downloadUrl: "/api/files/download?path=%2Fworkspace%2Freport.html",
+                id: "generated-report",
+                kind: "file",
+                messageId: "assistant-report",
+                name: "report.html",
+                sourcePath: "/workspace/report.html",
+                toolCallId: "tool-1",
+              },
+            },
+            messages: [
+              {
+                artifactIds: ["generated-report"],
+                id: "assistant-report",
+                role: "assistant",
+                text: "Report ready",
+              },
+              {
+                artifactIds: [],
+                id: "assistant-later",
+                role: "assistant",
+                text: "Later reply",
+              },
+            ],
+            toolCalls: {
+              "tool-1": {
+                artifactIds: ["generated-report"],
+                id: "tool-1",
+                name: "write_file",
+                output: "Created /workspace/report.html",
+                status: "succeeded",
+              },
+            },
+            toolOrder: ["tool-1"],
+          }}
+        />,
+      );
+    });
+
+    expect(container.querySelectorAll('[aria-label="Download report.html"]')).toHaveLength(1);
+    expect(container.textContent?.indexOf("report.html")).toBeLessThan(
+      container.textContent?.indexOf("Later reply") ?? -1,
+    );
+
+    await act(async () => root.unmount());
+  });
+
   it("keeps image history pinned only while the user is at the bottom", async () => {
     const container = document.createElement("div");
     document.body.appendChild(container);

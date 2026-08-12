@@ -82,7 +82,9 @@ export function MessageList({
       const tool = state.toolCalls[id];
       for (const artifactId of tool?.artifactIds ?? []) {
         const artifact = state.artifacts[artifactId];
-        if (artifact) result.push({ artifact, id: `artifact:${artifact.id}`, kind: "artifact" });
+        if (artifact && !artifact.messageId) {
+          result.push({ artifact, id: `artifact:${artifact.id}`, kind: "artifact" });
+        }
       }
     }
     for (const approvalId of state.approvalOrder) {
