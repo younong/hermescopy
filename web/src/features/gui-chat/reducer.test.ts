@@ -51,21 +51,41 @@ describe("guiChatReducer model identity", () => {
     const created = guiChatReducer(initialGuiChatState, {
       type: "session.created",
       response: {
-        info: { model: "model-a", provider: "provider-a" },
+        info: {
+          model: "model-a",
+          provider: "provider-a",
+          reasoning_effort: "high",
+          supported_reasoning_levels: ["high", "xhigh", "max"],
+        },
         session_id: "runtime-a",
       },
     });
     const updated = guiChatReducer(created, {
       type: "event",
       event: {
-        payload: { model: "model-b", provider: "provider-b" },
+        payload: {
+          model: "model-b",
+          provider: "provider-b",
+          reasoning_effort: "max",
+          supported_reasoning_levels: ["high", "max"],
+        },
         session_id: "runtime-a",
         type: "session.info",
       },
     });
 
-    expect(created).toMatchObject({ model: "model-a", provider: "provider-a" });
-    expect(updated).toMatchObject({ model: "model-b", provider: "provider-b" });
+    expect(created).toMatchObject({
+      model: "model-a",
+      provider: "provider-a",
+      reasoningEffort: "high",
+      supportedReasoningLevels: ["high", "xhigh", "max"],
+    });
+    expect(updated).toMatchObject({
+      model: "model-b",
+      provider: "provider-b",
+      reasoningEffort: "max",
+      supportedReasoningLevels: ["high", "max"],
+    });
   });
 });
 

@@ -278,6 +278,16 @@ class TestChatCompletionsBuildKwargs:
         )
         assert kw["extra_body"]["reasoning"] == {"enabled": True, "effort": "medium"}
 
+    def test_reasoning_forwards_selected_max_effort(self, transport):
+        msgs = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol",
+            messages=msgs,
+            supports_reasoning=True,
+            reasoning_config={"enabled": True, "effort": "max"},
+        )
+        assert kw["extra_body"]["reasoning"] == {"enabled": True, "effort": "max"}
+
     def test_nous_omits_disabled_reasoning(self, transport):
         from providers import get_provider_profile
         profile = get_provider_profile("nous")

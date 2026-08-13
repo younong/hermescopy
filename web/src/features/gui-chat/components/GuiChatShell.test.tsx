@@ -1290,6 +1290,7 @@ function createConnection(): TestGuiChatConnection {
     respondToApproval: vi.fn().mockResolvedValue(undefined),
     respondToClarify: vi.fn().mockResolvedValue(undefined),
     send: vi.fn().mockResolvedValue(undefined),
+    setReasoningLevel: vi.fn().mockResolvedValue({ value: "max" }),
     stop: vi.fn(),
     switchModel: vi.fn().mockResolvedValue({ confirm_required: false, value: "next-model" }),
   };

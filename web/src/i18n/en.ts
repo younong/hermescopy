@@ -690,6 +690,10 @@ export const en: Translations = {
         highPriceConfirmation: "Use {model} despite its unusually high known pricing?",
         useModel: "Use model",
       },
+      reasoningPicker: {
+        changeLevel: "Change reasoning level",
+        levels: "Reasoning levels",
+      },
     },
     messages: {
       emptyTitle: "How can I help?",

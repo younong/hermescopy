@@ -321,6 +321,18 @@ describe("connectGuiChat", () => {
     });
   });
 
+  it("sets the current session reasoning level through config.set", async () => {
+    const connection = connectGuiChat({ ownerKey: "owner-a" });
+
+    await connection.setReasoningLevel("runtime-a", "max");
+
+    expect(mocks.gatewayInstances[0].request).toHaveBeenCalledWith("config.set", {
+      key: "reasoning",
+      session_id: "runtime-a",
+      value: "max",
+    });
+  });
+
   it("can persist a model switch for new sessions", async () => {
     const connection = connectGuiChat({ ownerKey: "owner-a" });
 

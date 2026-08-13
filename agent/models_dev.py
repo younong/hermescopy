@@ -519,6 +519,21 @@ def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilit
     )
 
 
+def get_selectable_reasoning_levels(provider: str, model: str) -> Tuple[str, ...]:
+    """Return the generic reasoning levels selectable for one model.
+
+    Known non-reasoning models expose no control. Unknown models retain the
+    permissive Hermes fallback because compatible providers may omit catalog
+    metadata while still accepting generic effort values.
+    """
+    from hermes_constants import SELECTABLE_REASONING_LEVELS
+
+    capabilities = get_model_capabilities(provider, model)
+    if capabilities is not None and not capabilities.supports_reasoning:
+        return ()
+    return SELECTABLE_REASONING_LEVELS
+
+
 def list_provider_models(provider: str) -> List[str]:
     """Return all model IDs for a provider from models.dev.
 

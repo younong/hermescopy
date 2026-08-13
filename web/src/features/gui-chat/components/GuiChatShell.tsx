@@ -34,7 +34,7 @@ import { PageHeaderContext } from "@/contexts/page-header-context";
 import { GuiChatFilesPane } from "@/features/files/components/GuiChatFilesPane";
 import { guiChatTranslations, useI18n } from "@/i18n";
 import SessionsPage from "@/pages/SessionsPage";
-import { api, type Employee } from "@/lib/api";
+import { api, type Employee, type ReasoningLevel } from "@/lib/api";
 import { JsonRpcGatewayError, type GatewayEvent } from "@/lib/gatewayClient";
 import { emitChatDiagnostic } from "@/lib/chatDiagnostics";
 import { dashboardAuthTransition } from "@/lib/dashboardAuthTransition";
@@ -60,6 +60,7 @@ import {
 import { Composer } from "./Composer";
 import { EmployeeManagementPane } from "./EmployeeManagementPane";
 import { ComposerModelPicker } from "./ComposerModelPicker";
+import { ComposerReasoningPicker } from "./ComposerReasoningPicker";
 import { GuiChatModelsPane } from "./GuiChatModelsPane";
 import { GuiChatScheduledTasksPane } from "./GuiChatScheduledTasksPane";
 import { GuiChatSkillsPane } from "./GuiChatSkillsPane";
@@ -1249,6 +1250,17 @@ export function GuiChatShell() {
                     current.filter((request) => request.requestId !== requestId)
                   );
                 }}
+                reasoningPicker={
+                  <ComposerReasoningPicker
+                    busy={state.isGenerating}
+                    currentLevel={state.reasoningEffort}
+                    levels={state.supportedReasoningLevels}
+                    onChange={async (level: ReasoningLevel) => {
+                      if (!state.sessionId) return;
+                      await connectionRef.current?.setReasoningLevel(state.sessionId, level);
+                    }}
+                  />
+                }
                 onSend={send}
                 onStop={stop}
               />

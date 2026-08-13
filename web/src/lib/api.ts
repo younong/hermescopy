@@ -2325,6 +2325,8 @@ export interface ModelRegistration {
   credential_configured: boolean | null;
 }
 
+export type ReasoningLevel = "high" | "xhigh" | "max";
+
 export interface ModelRegistrationRequest {
   name: string;
   kind: ModelRegistrationKind;

@@ -233,6 +233,9 @@ function applySessionResponse(
     messages,
     model: response.info?.model ?? state.model,
     provider: response.info?.provider ?? state.provider,
+    reasoningEffort: response.info?.reasoning_effort ?? state.reasoningEffort,
+    supportedReasoningLevels:
+      response.info?.supported_reasoning_levels ?? state.supportedReasoningLevels,
     sessionId: response.session_id,
     storedSessionId:
       response.stored_session_id ??
@@ -1258,6 +1261,9 @@ function applySessionInfo(
     cwd,
     model: payload.model ?? state.model,
     provider: payload.provider ?? state.provider,
+    reasoningEffort: payload.reasoning_effort ?? state.reasoningEffort,
+    supportedReasoningLevels:
+      payload.supported_reasoning_levels ?? state.supportedReasoningLevels,
   };
   return cwd && cwd !== state.cwd ? refreshFileDownloadContext(next, cwd) : next;
 }

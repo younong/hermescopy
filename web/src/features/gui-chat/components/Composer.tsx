@@ -28,6 +28,7 @@ export function Composer({
   allowSendWhileGenerating = false,
   attachmentToQueue,
   modelPicker,
+  reasoningPicker,
   onAttachmentQueued,
   onSend,
   onStop,
@@ -37,6 +38,7 @@ export function Composer({
   allowSendWhileGenerating?: boolean;
   attachmentToQueue?: { file: File; requestId: number };
   modelPicker?: ReactNode;
+  reasoningPicker?: ReactNode;
   onAttachmentQueued?: (requestId: number) => void;
   onSend: (
     text: string,
@@ -293,6 +295,7 @@ export function Composer({
           </div>
 
           <div className="flex items-center gap-2">
+            {reasoningPicker}
             {modelPicker}
             {isGenerating ? (
               <button
