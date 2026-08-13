@@ -109,6 +109,67 @@ describe("GroupConversation owner mentions", () => {
     expect(container.querySelector("img")?.getAttribute("src"))
       .toBe("/hermes/api/employees/employee-a/avatar?v=123");
   });
+
+  it("does not render target cards below the user message", () => {
+    const container = renderConversation({
+      ...initialCollaborationState,
+      approvalsById: {
+        "approval-a": {
+          approval_id: "approval-a",
+          execution_id: "execution-a",
+          group_id: "group-a",
+          request: { summary: "Allow tool" },
+          status: "pending",
+          target_id: "target-a",
+          turn_id: "turn-a",
+        },
+      },
+      eventsBySequence: {
+        1: {
+          actor_employee_id: null,
+          actor_kind: "owner",
+          actor_membership_id: null,
+          body: { text: "Review this" },
+          created_at: 1,
+          event_id: "event-a",
+          event_kind: "message.owner",
+          group_id: "group-a",
+          sequence: 1,
+        },
+      },
+      executionsById: { "execution-a": "Working draft" },
+      loading: false,
+      targetsById: {
+        "target-a": {
+          active_seconds: 1,
+          attempt: 1,
+          employee_id: "employee-a",
+          error: null,
+          execution_id: "execution-a",
+          membership_id: "membership-a",
+          result: null,
+          snapshot_sequence: 1,
+          status: "waiting_approval",
+          target_id: "target-a",
+          turn_id: "turn-a",
+        },
+      },
+      turnsById: {
+        "turn-a": {
+          event_id: "event-a",
+          group_id: "group-a",
+          snapshot_sequence: 1,
+          status: "running",
+          turn_id: "turn-a",
+        },
+      },
+    });
+
+    expect(container.textContent).toContain("Review this");
+    expect(container.textContent).not.toContain("Alice");
+    expect(container.textContent).not.toContain("Working draft");
+    expect(container.textContent).not.toContain("Allow tool");
+  });
 });
 
 function renderConversation(state: CollaborationState, avatarUrl?: string) {
@@ -119,8 +180,6 @@ function renderConversation(state: CollaborationState, avatarUrl?: string) {
     root?.render(
       <GroupConversation
         employees={[{ avatarUrl, available: true, employeeId: "employee-a", name: "Alice" }]}
-        onApproval={vi.fn()}
-        onStop={vi.fn()}
         state={state}
       />,
     );
