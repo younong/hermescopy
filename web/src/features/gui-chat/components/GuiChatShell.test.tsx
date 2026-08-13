@@ -83,7 +83,7 @@ vi.mock("@/i18n", async (importOriginal) => {
   const { en } = await import("@/i18n/en");
   return {
     ...actual,
-    useI18n: () => ({ locale: "en", setLocale: vi.fn(), t: en }),
+    useI18n: () => ({ locale: "zh", setLocale: vi.fn(), t: en }),
   };
 });
 
@@ -356,9 +356,12 @@ describe("GuiChatShell", () => {
     expect(sidebar?.querySelector('[aria-label="Manage models"]')?.textContent).toContain("Models");
     expect(sidebar?.querySelector('[aria-label="Employees"]')?.textContent).toContain("Employees");
     expect(sidebar?.querySelector('[aria-label="Message composition statistics"]')?.textContent).toContain("Message statistics");
+    const languageSwitcher = sidebar?.querySelector<HTMLButtonElement>('[aria-label="Switch language"]');
+    expect(languageSwitcher?.textContent).toContain("简体中文");
+    expect(languageSwitcher?.className).toContain("gui-chat-language-trigger");
+    expect(document.querySelector('main header [aria-label="Switch language"]')).toBeNull();
     expect(document.querySelector('main header [aria-label="Manage models"]')).toBeNull();
     expect(document.querySelector('[aria-label="Log out"]')).not.toBeNull();
-    expect(document.querySelector('main header [aria-label="Switch language"]')).not.toBeNull();
   });
 
   it("explains how to make an unavailable employee chat available", async () => {
@@ -518,7 +521,7 @@ describe("GuiChatShell", () => {
     });
 
     expect(document.querySelector("[data-models-pane]")).not.toBeNull();
-    expect(document.querySelector('main header [aria-label="Switch language"]')).not.toBeNull();
+    expect(document.querySelector('main header [aria-label="Switch language"]')).toBeNull();
     expect(document.querySelector('[role="dialog"]')).toBeNull();
     expect(document.querySelector("[data-composer-send]")).toBeNull();
     expect(Array.from(document.querySelectorAll<HTMLButtonElement>('button[aria-current="page"]'))

@@ -1,12 +1,11 @@
 import { useState, useRef, useEffect } from "react";
 import { createPortal } from "react-dom";
-import { Check } from "lucide-react";
+import { Check, Languages } from "lucide-react";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { BottomSheet } from "@nous-research/ui/ui/components/bottom-sheet";
 import { Typography } from "@nous-research/ui/ui/components/typography/index";
 import { useBelowBreakpoint } from "@nous-research/ui/hooks/use-below-breakpoint";
-import { useI18n } from "@/i18n/context";
-import { LOCALE_META } from "@/i18n";
+import { LOCALE_META, useI18n } from "@/i18n";
 import type { Locale } from "@/i18n";
 import { cn } from "@/lib/utils";
 
@@ -32,6 +31,7 @@ export function LanguageSwitcher({
   allowedLocales,
   collapsed = false,
   dropUp = false,
+  variant = "default",
 }: LanguageSwitcherProps) {
   const { locale, setLocale, t } = useI18n();
   const [open, setOpen] = useState(false);
@@ -40,7 +40,7 @@ export function LanguageSwitcher({
   const dropdownRef = useRef<HTMLDivElement>(null);
   const initializedRestrictionRef = useRef(false);
   const narrowViewport = useBelowBreakpoint(640);
-  const useMobileSheet = Boolean(dropUp && narrowViewport);
+  const useMobileSheet = Boolean(variant !== "chat" && dropUp && narrowViewport);
   const allLocales = localeOptions(allowedLocales);
   const normalizedLocale = allLocales.some(([code]) => code === locale)
     ? locale
@@ -102,11 +102,18 @@ export function LanguageSwitcher({
         className={cn(
           "px-2 py-1 normal-case tracking-normal font-normal text-xs text-text-secondary hover:text-foreground",
           collapsed && "hover:bg-transparent",
+          variant === "chat" && "gui-chat-language-trigger",
         )}
       >
-        <span className="inline-flex items-center gap-1.5">
+        <span className="inline-flex min-w-0 items-center gap-2">
+          {variant === "chat" ? (
+            <Languages aria-hidden className="h-[18px] w-[18px] shrink-0" />
+          ) : null}
           <Typography
-            className="hidden sm:inline text-display tracking-wide text-xs"
+            className={cn(
+              "text-display tracking-wide text-xs",
+              variant !== "chat" && "hidden sm:inline",
+            )}
           >
             {normalizedLocale === "en" ? "EN" : current.name}
           </Typography>
@@ -139,6 +146,7 @@ export function LanguageSwitcher({
             className={cn(
               "min-w-[10rem] border border-border bg-popover shadow-md py-1 max-h-80 overflow-y-auto",
               dropUp ? "fixed z-[100]" : "absolute z-50 right-0 top-full mt-1",
+              variant === "chat" && "gui-chat-language-menu font-sans",
             )}
             role="listbox"
             style={dropUp ? dropUpPosition : undefined}
@@ -220,4 +228,5 @@ interface LanguageSwitcherProps {
   allowedLocales?: readonly Locale[];
   collapsed?: boolean;
   dropUp?: boolean;
+  variant?: "chat" | "default";
 }
