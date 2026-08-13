@@ -171,7 +171,7 @@ function TargetCard({ copy, employeeIdentity, onStop, state, target }: { copy: G
     <div className="rounded-xl border border-[#e4e6ea] bg-[#fafbfc] p-3">
       <div className="flex items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-2"><SpeakerAvatar employee={employee} small /><span className="truncate text-[11px] font-semibold">{employee.name}</span></div>
-        <span className={`inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide ${status.className}`}><Icon className={`h-3 w-3 ${target.status === "running" ? "animate-spin" : ""}`} />{targetStatusLabel(target.status, copy)}</span>
+        {target.status !== "completed" ? <span className={`inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide ${status.className}`}><Icon className={`h-3 w-3 ${target.status === "running" ? "animate-spin" : ""}`} />{targetStatusLabel(target.status, copy)}</span> : null}
       </div>
       {(streamed || finalText) ? <div className="mt-2 max-h-40 overflow-auto text-xs leading-5 text-[#44484f]"><Markdown content={streamed || finalText} /></div> : null}
       {target.error ? <p className="mt-2 text-[10px] text-[#b42318]">{target.error}</p> : null}

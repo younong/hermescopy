@@ -109,6 +109,54 @@ describe("GroupConversation owner mentions", () => {
     expect(container.querySelector("img")?.getAttribute("src"))
       .toBe("/hermes/api/employees/employee-a/avatar?v=123");
   });
+
+  it("hides completed target status below the user message", () => {
+    const container = renderConversation({
+      ...initialCollaborationState,
+      loading: false,
+      eventsBySequence: {
+        1: {
+          actor_employee_id: null,
+          actor_kind: "owner",
+          actor_membership_id: null,
+          body: { text: "Review this" },
+          created_at: 1,
+          event_id: "event-a",
+          event_kind: "message.owner",
+          group_id: "group-a",
+          sequence: 1,
+        },
+      },
+      targetsById: {
+        "target-a": {
+          active_seconds: 1,
+          attempt: 1,
+          employee_id: "employee-a",
+          error: null,
+          execution_id: "execution-a",
+          membership_id: "membership-a",
+          result: { text: "Finished" },
+          snapshot_sequence: 1,
+          status: "completed",
+          target_id: "target-a",
+          turn_id: "turn-a",
+        },
+      },
+      turnsById: {
+        "turn-a": {
+          event_id: "event-a",
+          group_id: "group-a",
+          snapshot_sequence: 1,
+          status: "completed",
+          turn_id: "turn-a",
+        },
+      },
+    });
+
+    expect(container.textContent).toContain("Finished");
+    expect(container.textContent).not.toContain("已完成");
+    expect(container.querySelector(".lucide-circle-check-big")).toBeNull();
+  });
 });
 
 function renderConversation(state: CollaborationState, avatarUrl?: string) {
