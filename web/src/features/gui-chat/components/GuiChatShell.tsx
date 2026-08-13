@@ -1017,6 +1017,7 @@ export function GuiChatShell() {
         <div className="min-h-0 flex-1 overflow-hidden">{sessionPanel}</div>
       </div>
       <div className="mx-3 border-t border-black/[0.06] py-1.5">
+        <LanguageSwitcher allowedLocales={["en", "zh"]} dropUp variant="chat" />
         <div className="gui-chat-account-row">
           <button className="gui-chat-account" onClick={() => navigate("/system")} type="button">
             <span className="gui-chat-avatar">{accountLabel.trim().charAt(0).toUpperCase() || "H"}</span>
@@ -1136,30 +1137,27 @@ export function GuiChatShell() {
                       .replace("{connection}", mockMode ? copy.shell.mock : state.connection)}
             </p>
           </div>
-          <div className="ml-auto flex items-center gap-1">
-            {!workspacePaneOpen ? (
-              <>
-                {groupId ? <UsersRound className="mr-1 h-3.5 w-3.5 text-[#777c84]" /> : null}
-                {canConnectWeChat ? (
-                  <button
-                    aria-label={copy.shell.connectWeChat}
-                    className="gui-chat-icon-button"
-                    onClick={() => setConnectWeChatOpen(true)}
-                    title={copy.shell.connectWeChat}
-                    type="button"
-                  >
-                    <QrCode className="h-3.5 w-3.5" />
-                  </button>
-                ) : null}
-                {mockMode || state.connection !== "open" ? (
-                  <button aria-label={mockMode ? copy.shell.replay : t.common.retry} className="gui-chat-icon-button" onClick={retryConnection} type="button">
-                    <RefreshCw className={cn("h-3.5 w-3.5", state.connection === "connecting" && "animate-spin")} />
-                  </button>
-                ) : null}
-              </>
-            ) : null}
-            <LanguageSwitcher allowedLocales={["en", "zh"]} dropUp />
-          </div>
+          {!workspacePaneOpen ? (
+            <div className="ml-auto flex items-center gap-1">
+              {groupId ? <UsersRound className="mr-1 h-3.5 w-3.5 text-[#777c84]" /> : null}
+              {canConnectWeChat ? (
+                <button
+                  aria-label={copy.shell.connectWeChat}
+                  className="gui-chat-icon-button"
+                  onClick={() => setConnectWeChatOpen(true)}
+                  title={copy.shell.connectWeChat}
+                  type="button"
+                >
+                  <QrCode className="h-3.5 w-3.5" />
+                </button>
+              ) : null}
+              {mockMode || state.connection !== "open" ? (
+                <button aria-label={mockMode ? copy.shell.replay : t.common.retry} className="gui-chat-icon-button" onClick={retryConnection} type="button">
+                  <RefreshCw className={cn("h-3.5 w-3.5", state.connection === "connecting" && "animate-spin")} />
+                </button>
+              ) : null}
+            </div>
+          ) : null}
         </header>
 
         {statisticsOpen ? (

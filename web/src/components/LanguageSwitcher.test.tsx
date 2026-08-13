@@ -44,6 +44,27 @@ describe("LanguageSwitcher", () => {
     expect(optionLabels()).toEqual(["简体中文", "English"]);
   });
 
+  it("renders the Chat GUI trigger and menu treatment", async () => {
+    await render(
+      <LanguageSwitcher
+        allowedLocales={["en", "zh"]}
+        dropUp
+        variant="chat"
+      />,
+    );
+
+    expect(trigger().parentElement?.className).toContain("w-full");
+    expect(trigger().className).toContain("gui-chat-language-trigger");
+    expect(trigger().querySelector("svg")).not.toBeNull();
+
+    await openSwitcher();
+
+    expect(optionLabels()).toEqual(["English", "简体中文"]);
+    expect(document.querySelector('[role="listbox"]')?.className).toContain(
+      "gui-chat-language-menu",
+    );
+  });
+
   it("persists an allowed selection and restores it after remount", async () => {
     await render(<LanguageSwitcher allowedLocales={["en", "zh"]} />);
     await openSwitcher();
@@ -60,18 +81,21 @@ describe("LanguageSwitcher", () => {
   });
 
   it.each([
-    ["de", "disallowed"],
-    ["not-a-locale", "invalid"],
-  ])("normalizes an %s stored locale to the first allowed locale", async (storedLocale) => {
-    localStorage.setItem("hermes-locale", storedLocale);
+    ["de", "en", "EN", "English"],
+    ["not-a-locale", "zh", "简体中文", "简体中文"],
+  ])(
+    "normalizes an unsupported %s stored locale",
+    async (storedLocale, expectedLocale, triggerLabel, optionLabel) => {
+      localStorage.setItem("hermes-locale", storedLocale);
 
-    await render(<LanguageSwitcher allowedLocales={["en", "zh"]} />);
+      await render(<LanguageSwitcher allowedLocales={["en", "zh"]} />);
 
-    expect(localStorage.getItem("hermes-locale")).toBe("en");
-    expect(trigger().textContent).toContain("EN");
-    await openSwitcher();
-    expect(selectedOption()?.textContent).toContain("English");
-  });
+      expect(localStorage.getItem("hermes-locale")).toBe(expectedLocale);
+      expect(trigger().textContent).toContain(triggerLabel);
+      await openSwitcher();
+      expect(selectedOption()?.textContent).toContain(optionLabel);
+    },
+  );
 
   it("normalizes a newly disallowed current locale", async () => {
     localStorage.setItem("hermes-locale", "zh");

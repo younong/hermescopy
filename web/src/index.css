@@ -305,6 +305,51 @@ code { font-size: 0.875rem; }
   gap: 4px;
 }
 
+[data-gui-chat] .gui-chat-language-trigger {
+  width: 100%;
+  min-height: 36px;
+  justify-content: flex-start;
+  border-radius: 10px;
+  padding: 7px 8px;
+  color: #1f1f1f;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 22px;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+[data-gui-chat] .gui-chat-language-trigger:hover,
+[data-gui-chat] .gui-chat-language-trigger[aria-expanded="true"] {
+  background: rgb(0 0 0 / 4%);
+  color: #000;
+}
+
+.gui-chat-language-menu {
+  width: 256px;
+  border: 1px solid rgb(0 0 0 / 8%);
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: 0 12px 32px rgb(0 0 0 / 12%);
+  color: #1f1f1f;
+}
+
+.gui-chat-language-menu [role="option"] {
+  margin: 2px 4px;
+  width: calc(100% - 8px);
+  border-radius: 8px;
+  color: #5f6368;
+}
+
+.gui-chat-language-menu [role="option"]:hover {
+  background: #f0f1f2;
+  color: #202124;
+}
+
+.gui-chat-language-menu [aria-selected="true"] {
+  background: #f5f6f7;
+  color: #202124;
+}
+
 [data-gui-chat] .gui-chat-account {
   min-width: 0;
 }

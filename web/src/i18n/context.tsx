@@ -1,4 +1,11 @@
-import { createContext, useContext, useState, useCallback, type ReactNode } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useState,
+  type ReactNode,
+} from "react";
 import type {
   GuiChatTranslations,
   Locale,
@@ -83,7 +90,7 @@ function getInitialLocale(): Locale {
   } catch {
     // SSR or privacy mode
   }
-  return "en";
+  return "zh";
 }
 
 interface I18nContextValue {
@@ -100,6 +107,10 @@ const I18nContext = createContext<I18nContextValue>({
 
 export function I18nProvider({ children }: { children: ReactNode }) {
   const [locale, setLocaleState] = useState<Locale>(getInitialLocale);
+
+  useEffect(() => {
+    document.documentElement.lang = locale;
+  }, [locale]);
 
   const setLocale = useCallback((l: Locale) => {
     setLocaleState(l);
