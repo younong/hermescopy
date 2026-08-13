@@ -31,7 +31,7 @@ import { GuiChatWorkspaceDialog } from "@/features/gui-chat/components/GuiChatWo
 import { api, type SessionInfo } from "@/lib/api";
 import { cn, timeAgo } from "@/lib/utils";
 
-const SESSION_LIMIT = 30;
+const SESSION_LIMIT = 10;
 interface RenameState {
   error: string | null;
   id: string | null;
@@ -96,28 +96,36 @@ export function ChatSessionList({
   const navigate = useNavigate();
   const [, setSearchParams] = useSearchParams();
   const [sessions, setSessions] = useState<SessionInfo[] | null>(null);
+  const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [loadMoreError, setLoadMoreError] = useState<string | null>(null);
   const [rename, setRename] = useState<RenameState>(EMPTY_RENAME);
   // Bumped to force a refetch (after switching, on Refresh, on mount).
   const [reloadNonce, setReloadNonce] = useState(0);
 
   // Monotonic request tokens ignore stale list loads and title updates.
   const reqRef = useRef(0);
+  const loadingMoreRef = useRef(false);
   const renameReqRef = useRef(0);
   const loadErrorFallbackRef = useRef(t.sessions.noSessions);
   loadErrorFallbackRef.current = t.sessions.noSessions;
 
   const load = useCallback(() => {
     const myReq = ++reqRef.current;
+    loadingMoreRef.current = false;
     setLoading(true);
+    setLoadingMore(false);
     setError(null);
+    setLoadMoreError(null);
     api
       .getSessions(SESSION_LIMIT, 0, "recent", variant === "compact")
       .then((res) => {
         if (reqRef.current !== myReq) return;
         setSessions(res.sessions);
+        setTotal(res.total);
       })
       .catch((e: Error) => {
         if (reqRef.current !== myReq) return;
@@ -137,6 +145,38 @@ export function ChatSessionList({
   }, [load, refreshNonce, reloadNonce]);
 
   const reload = useCallback(() => setReloadNonce((n) => n + 1), []);
+  const loadMore = useCallback(() => {
+    if (!sessions || loading || loadingMoreRef.current || sessions.length >= total) return;
+    const myReq = reqRef.current;
+    loadingMoreRef.current = true;
+    setLoadingMore(true);
+    setLoadMoreError(null);
+    api
+      .getSessions(SESSION_LIMIT, sessions.length, "recent", variant === "compact")
+      .then((res) => {
+        if (reqRef.current !== myReq) return;
+        setSessions((current) => current ? [...current, ...res.sessions] : res.sessions);
+        setTotal(res.total);
+      })
+      .catch((e: Error) => {
+        if (reqRef.current !== myReq) return;
+        setLoadMoreError(e.message || loadErrorFallbackRef.current);
+      })
+      .finally(() => {
+        loadingMoreRef.current = false;
+        if (reqRef.current === myReq) setLoadingMore(false);
+      });
+  }, [loading, sessions, total, variant]);
+  const handleScroll = useCallback(
+    (event: React.UIEvent<HTMLDivElement>) => {
+      const target = event.currentTarget;
+      if (
+        !loadMoreError
+        && target.scrollHeight - target.scrollTop - target.clientHeight <= 24
+      ) loadMore();
+    },
+    [loadMore, loadMoreError],
+  );
   const filteredSessions = useMemo(() => {
     if (!sessions) return sessions;
     const normalizedQuery = query.trim().toLocaleLowerCase();
@@ -489,6 +529,18 @@ export function ChatSessionList({
             </div>
           );
         })}
+        {loadingMore ? (
+          <div className="flex items-center justify-center py-3 text-text-secondary">
+            <Spinner />
+          </div>
+        ) : loadMoreError ? (
+          <div className="flex flex-col items-center gap-1 py-2 text-xs text-destructive">
+            <span>{loadMoreError}</span>
+            <Button size="sm" outlined onClick={loadMore} prefix={<RefreshCw />}>
+              {t.common.retry}
+            </Button>
+          </div>
+        ) : null}
       </div>
     );
   }, [
@@ -498,6 +550,9 @@ export function ChatSessionList({
     error,
     filteredSessions,
     loading,
+    loadingMore,
+    loadMore,
+    loadMoreError,
     pick,
     reload,
     rename,
@@ -574,7 +629,10 @@ export function ChatSessionList({
           </>
         ) : null}
 
-        <div className={cn("min-h-0 flex-1 overflow-y-auto overflow-x-hidden pb-1", variant === "default" ? "px-1" : "px-0.5")}>
+        <div
+          className={cn("min-h-0 flex-1 overflow-y-auto overflow-x-hidden pb-1", variant === "default" ? "px-1" : "px-0.5")}
+          onScroll={handleScroll}
+        >
           {content}
         </div>
       </aside>

@@ -102,7 +102,7 @@ describe("ChatSessionList", () => {
     expect(container.querySelector('[aria-current="true"]')?.textContent).toContain("UI exploration");
     expect(container.querySelector('[aria-current="true"]')?.className).toContain("bg-white");
     expect(onActiveSessionChange).toHaveBeenLastCalledWith({ id: "beta", label: "UI exploration" });
-    expect(mocks.getSessions).toHaveBeenCalledWith(30, 0, "recent", true);
+    expect(mocks.getSessions).toHaveBeenCalledWith(10, 0, "recent", true);
   });
 
   it("reloads through an external compact-list refresh trigger", async () => {
@@ -144,6 +144,56 @@ describe("ChatSessionList", () => {
       .toBe("/chat?resume=alpha");
   });
 
+  it("loads the next ten sessions when the list reaches the bottom", async () => {
+    const firstPage = sessionPage();
+    const secondPage = [session("session-10", "Session 10", null)];
+    mocks.getSessions
+      .mockResolvedValueOnce({ limit: 10, offset: 0, sessions: firstPage, total: 11 })
+      .mockResolvedValueOnce({ limit: 10, offset: 10, sessions: secondPage, total: 11 });
+    const container = mount();
+
+    await render(
+      <MemoryRouter>
+        <ChatSessionList activeSessionId={null} variant="compact" />
+      </MemoryRouter>,
+    );
+
+    await scrollSessionListToBottom(container);
+
+    expect(mocks.getSessions).toHaveBeenNthCalledWith(2, 10, 10, "recent", true);
+    expect(container.textContent).toContain("Session 0");
+    expect(container.textContent).toContain("Session 10");
+  });
+
+  it("keeps loaded sessions and retries when loading more fails", async () => {
+    const firstPage = sessionPage();
+    mocks.getSessions
+      .mockResolvedValueOnce({ limit: 10, offset: 0, sessions: firstPage, total: 11 })
+      .mockRejectedValueOnce(new Error("more unavailable"))
+      .mockResolvedValueOnce({
+        limit: 10,
+        offset: 10,
+        sessions: [session("session-10", "Session 10", null)],
+        total: 11,
+      });
+    const container = mount();
+
+    await render(
+      <MemoryRouter>
+        <ChatSessionList activeSessionId={null} variant="compact" />
+      </MemoryRouter>,
+    );
+    await scrollSessionListToBottom(container);
+
+    expect(container.textContent).toContain("Session 0");
+    expect(container.textContent).toContain("more unavailable");
+    await scrollSessionListToBottom(container);
+    expect(mocks.getSessions).toHaveBeenCalledTimes(2);
+    await click(buttonWithText(container, "Retry"));
+    expect(mocks.getSessions).toHaveBeenNthCalledWith(3, 10, 10, "recent", true);
+    expect(container.textContent).toContain("Session 10");
+  });
+
   it("keeps the default panel chrome and exposes rename in both variants", async () => {
     mocks.getSessions.mockResolvedValue(sessionList([
       session("alpha", "Release notes", "Published"),
@@ -160,7 +210,7 @@ describe("ChatSessionList", () => {
     expect(container.textContent).toContain("New chat");
     expect(container.textContent).toContain("3 msgs");
     expect(renameButton(container, "Release notes")).toBeTruthy();
-    expect(mocks.getSessions).toHaveBeenCalledWith(30, 0, "recent", false);
+    expect(mocks.getSessions).toHaveBeenCalledWith(10, 0, "recent", false);
   });
 
   it("renames within the current owner without navigating and uses the server title", async () => {
@@ -360,6 +410,21 @@ async function click(button: HTMLButtonElement): Promise<void> {
   });
 }
 
+async function scrollSessionListToBottom(container: HTMLElement): Promise<void> {
+  const scroller = container.querySelector<HTMLDivElement>("div.overflow-y-auto");
+  if (!scroller) throw new Error("Missing session scroller");
+  Object.defineProperties(scroller, {
+    clientHeight: { configurable: true, value: 100 },
+    scrollHeight: { configurable: true, value: 200 },
+    scrollTop: { configurable: true, value: 100, writable: true },
+  });
+  await act(async () => {
+    scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
 async function changeInput(input: HTMLInputElement, value: string): Promise<void> {
   await act(async () => {
     const setter = Object.getOwnPropertyDescriptor(
@@ -422,7 +487,12 @@ function LocationProbe() {
 }
 
 function sessionList(sessions: SessionInfo[]) {
-  return { limit: 30, offset: 0, sessions, total: sessions.length };
+  return { limit: 10, offset: 0, sessions, total: sessions.length };
+}
+
+function sessionPage(): SessionInfo[] {
+  return Array.from({ length: 10 }, (_, index) =>
+    session(`session-${index}`, `Session ${index}`, null));
 }
 
 function session(id: string, title: string | null, preview: string | null): SessionInfo {
