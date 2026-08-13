@@ -1,9 +1,12 @@
 import type { GatewayEvent } from "@/lib/gatewayClient";
+import type { ReasoningLevel } from "@/lib/api";
 
 export interface SessionInfoPayload {
   cwd?: string;
   model?: string;
   provider?: string;
+  reasoning_effort?: string;
+  supported_reasoning_levels?: ReasoningLevel[];
   title?: string;
 }
 

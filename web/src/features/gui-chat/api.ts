@@ -9,6 +9,7 @@ import { getHermesBrowserId } from "@/lib/browserIdentity";
 import type { GuiFrameQueueDiagnostic } from "@/lib/chatDiagnostics";
 import { createCollaborationApi, type CollaborationApi } from "@/features/collaboration/api";
 import { base64FromDataUrl, compressImageForUpload, readFileAsDataUrl } from "./attachments";
+import type { ReasoningLevel } from "@/lib/api";
 import type {
   SessionAttachResponse,
   SessionCreateResponse,
@@ -120,6 +121,7 @@ export interface GuiChatConnection {
     confirmExpensiveModel?: boolean,
     persistGlobally?: boolean,
   ): Promise<GuiChatModelSwitchResponse>;
+  setReasoningLevel(sessionId: string, level: ReasoningLevel): Promise<{ value?: string }>;
   respondToApproval(sessionId: string, request: unknown, approved: boolean): Promise<void>;
   respondToClarify(sessionId: string, requestId: string, answer: string): Promise<void>;
   ping(): Promise<void>;
@@ -337,6 +339,12 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
     stop: async (sessionId) => {
       await client.request("session.interrupt", { session_id: sessionId }, 30_000);
     },
+    setReasoningLevel: (sessionId, level) =>
+      client.request<{ value?: string }>("config.set", {
+        key: "reasoning",
+        session_id: sessionId,
+        value: level,
+      }),
     switchModel: (
       sessionId,
       provider,

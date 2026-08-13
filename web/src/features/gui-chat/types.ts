@@ -1,4 +1,5 @@
 import type { ConnectionState } from "@/lib/gatewayClient";
+import type { ReasoningLevel } from "@/lib/api";
 
 export type GuiChatConnectionState = ConnectionState;
 
@@ -140,6 +141,8 @@ export interface GuiChatState {
   cwd?: string;
   model?: string;
   provider?: string;
+  reasoningEffort?: string;
+  supportedReasoningLevels: ReasoningLevel[];
   messages: ChatMessage[];
   toolCalls: Record<string, ToolCallState>;
   toolOrder: string[];
@@ -174,6 +177,7 @@ export const initialGuiChatState: GuiChatState = {
   messages: [],
   safeguardReached: false,
   statusLines: [],
+  supportedReasoningLevels: [],
   switchGeneration: 0,
   toolCalls: {},
   toolOrder: [],

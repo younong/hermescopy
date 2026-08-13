@@ -410,6 +410,24 @@ class TestGetModelCapabilities:
         assert caps is not None
         assert caps.supports_vision is False
 
+    def test_selectable_reasoning_levels_follow_model_capability(self):
+        from agent.models_dev import get_selectable_reasoning_levels
+
+        registry = {
+            "openai": {"id": "openai", "models": {
+                "gpt-5.6-sol": {"id": "gpt-5.6-sol", "reasoning": True},
+                "plain-model": {"id": "plain-model", "reasoning": False},
+            }},
+        }
+        with patch("agent.models_dev.fetch_models_dev", return_value=registry):
+            assert get_selectable_reasoning_levels("openai", "gpt-5.6-sol") == (
+                "high", "xhigh", "max",
+            )
+            assert get_selectable_reasoning_levels("openai", "plain-model") == ()
+            assert get_selectable_reasoning_levels("openai", "uncatalogued") == (
+                "high", "xhigh", "max",
+            )
+
     def test_model_not_found_returns_none(self):
         """Unknown model should return None."""
         with patch("agent.models_dev.fetch_models_dev", return_value=CAPS_REGISTRY):

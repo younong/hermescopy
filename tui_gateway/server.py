@@ -3850,6 +3850,15 @@ def _session_info(agent, session: dict | None = None) -> dict:
             reasoning_effort = "none"
         else:
             reasoning_effort = str(reasoning_config.get("effort", "") or "")
+    try:
+        from agent.models_dev import get_selectable_reasoning_levels
+
+        supported_reasoning_levels = list(get_selectable_reasoning_levels(
+            str(getattr(agent, "provider", "") or ""),
+            str(getattr(agent, "model", "") or ""),
+        ))
+    except Exception:
+        supported_reasoning_levels = []
     service_tier = getattr(agent, "service_tier", None) or ""
     # Effective approval-bypass state — the same three sources that
     # check_all_command_guards() ORs together: persistent config
@@ -3875,6 +3884,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "model": getattr(agent, "model", ""),
         "provider": getattr(agent, "provider", ""),
         "reasoning_effort": reasoning_effort,
+        "supported_reasoning_levels": supported_reasoning_levels,
         "service_tier": service_tier,
         "fast": service_tier == "priority",
         "yolo": yolo,

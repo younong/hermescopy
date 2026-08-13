@@ -53,7 +53,7 @@ def _build_gemini_thinking_config(model: str, reasoning_config: dict | None) -> 
     if normalized_model.startswith("gemini-2.5-"):
         return thinking_config
 
-    if effort not in {"minimal", "low", "medium", "high", "xhigh"}:
+    if effort not in {"minimal", "low", "medium", "high", "xhigh", "max"}:
         effort = "medium"
 
     # Gemini 3 Flash documents low/medium/high thinking levels; Gemini 3 Pro
@@ -63,13 +63,13 @@ def _build_gemini_thinking_config(model: str, reasoning_config: dict | None) -> 
         if "flash" in normalized_model:
             if effort in {"minimal", "low"}:
                 thinking_config["thinkingLevel"] = "low"
-            elif effort in {"high", "xhigh"}:
+            elif effort in {"high", "xhigh", "max"}:
                 thinking_config["thinkingLevel"] = "high"
             else:
                 thinking_config["thinkingLevel"] = "medium"
         elif "pro" in normalized_model:
             thinking_config["thinkingLevel"] = (
-                "high" if effort in {"high", "xhigh"} else "low"
+                "high" if effort in {"high", "xhigh", "max"} else "low"
             )
 
     return thinking_config
@@ -423,7 +423,17 @@ class ChatCompletionsTransport(ProviderTransport):
                 if gh_reasoning is not None:
                     extra_body["reasoning"] = gh_reasoning
             else:
-                extra_body["reasoning"] = {"enabled": True, "effort": "medium"}
+                reasoning_enabled = not (
+                    isinstance(reasoning_config, dict)
+                    and reasoning_config.get("enabled") is False
+                )
+                if reasoning_enabled:
+                    effort = "medium"
+                    if isinstance(reasoning_config, dict):
+                        effort = str(reasoning_config.get("effort") or effort).strip().lower()
+                    extra_body["reasoning"] = {"enabled": True, "effort": effort}
+                else:
+                    extra_body["reasoning"] = {"enabled": False}
 
         if provider_name == "gemini":
             raw_thinking_config = _build_gemini_thinking_config(model, reasoning_config)

@@ -124,6 +124,10 @@ export interface GuiChatTranslations {
       highPriceConfirmation: string;
       useModel: string;
     };
+    reasoningPicker: {
+      changeLevel: string;
+      levels: string;
+    };
   };
   messages: {
     emptyTitle: string;

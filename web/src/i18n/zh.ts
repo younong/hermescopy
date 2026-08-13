@@ -627,6 +627,10 @@ export const zh: Translations = {
         highPriceConfirmation: "尽管 {model} 的已知价格异常高，仍要使用吗？",
         useModel: "使用模型",
       },
+      reasoningPicker: {
+        changeLevel: "切换思考强度",
+        levels: "思考强度",
+      },
     },
     messages: {
       emptyTitle: "有什么可以帮你？",

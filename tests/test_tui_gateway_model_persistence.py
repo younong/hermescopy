@@ -99,6 +99,63 @@ def test_deferred_code_session_record_preserves_runtime_identity(monkeypatch):
     assert record["runtime_toolset"] == "coding"
 
 
+def test_session_info_reports_selectable_reasoning_levels(monkeypatch):
+    from tui_gateway import server
+
+    monkeypatch.setattr(server, "_display_session_cwd", lambda _session: "")
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "")
+    monkeypatch.setattr(server, "_git_branch_for_cwd", lambda _cwd: "")
+    monkeypatch.setattr(server, "_session_live_title", lambda *_args: "")
+    monkeypatch.setattr(
+        "agent.models_dev.get_selectable_reasoning_levels",
+        lambda provider, model: ("high", "xhigh", "max")
+        if (provider, model) == ("anthropic", "claude-test")
+        else (),
+    )
+
+    info = server._session_info(SimpleNamespace(
+        model="claude-test",
+        provider="anthropic",
+        reasoning_config={"enabled": True, "effort": "max"},
+        service_tier=None,
+    ), {})
+
+    assert info["reasoning_effort"] == "max"
+    assert info["supported_reasoning_levels"] == ["high", "xhigh", "max"]
+
+
+def test_config_set_reasoning_max_updates_live_session(monkeypatch):
+    from tui_gateway import server
+
+    agent = SimpleNamespace(reasoning_config=None)
+    session = {"agent": agent}
+    emitted = []
+    runtime = server.OwnerWorkerGatewayRuntime("owner", 1, "worker", 1, 0)
+    runtime.mutable_state.sessions["runtime-a"] = session
+    monkeypatch.setattr(server, "_persist_live_session_runtime", lambda _session: None)
+    monkeypatch.setattr(server, "_session_info", lambda live_agent, _session: {
+        "reasoning_effort": live_agent.reasoning_config["effort"],
+    })
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+
+    with server.owner_worker_gateway_runtime(runtime):
+        response = server._methods["config.set"]("request", {
+            "key": "reasoning",
+            "session_id": "runtime-a",
+            "value": "max",
+        })
+
+    assert response["result"] == {"key": "reasoning", "value": "max"}
+    assert session["create_reasoning_override"] == {
+        "enabled": True,
+        "effort": "max",
+    }
+    assert agent.reasoning_config == {"enabled": True, "effort": "max"}
+    assert emitted == [("session.info", "runtime-a", {"reasoning_effort": "max"})]
+
+
 def test_persist_model_switch_uses_config_set_value_for_all_model_keys(monkeypatch):
     from hermes_cli import config
     from tui_gateway import server
