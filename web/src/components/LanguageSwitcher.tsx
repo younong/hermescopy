@@ -91,7 +91,10 @@ export function LanguageSwitcher({
   const sheetTitle = t.language.switchTo;
 
   return (
-    <div ref={containerRef} className="relative inline-flex">
+    <div
+      ref={containerRef}
+      className={cn("relative inline-flex", variant === "chat" && "flex w-full")}
+    >
       <Button
         ghost
         onClick={() => setOpen((v) => !v)}

@@ -53,6 +53,7 @@ describe("LanguageSwitcher", () => {
       />,
     );
 
+    expect(trigger().parentElement?.className).toContain("w-full");
     expect(trigger().className).toContain("gui-chat-language-trigger");
     expect(trigger().querySelector("svg")).not.toBeNull();
 
