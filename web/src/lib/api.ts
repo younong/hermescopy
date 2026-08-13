@@ -405,6 +405,15 @@ export const api = {
       `/api/sessions/${encodeURIComponent(id)}/latest-descendant`,
       traceId ? { headers: { "X-Request-ID": traceId } } : undefined,
     ),
+  archiveSession: (id: string) =>
+    fetchJSON<{ archived: boolean; ok: boolean; title: string }>(
+      `/api/sessions/${encodeURIComponent(id)}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ archived: true }),
+      },
+    ),
   deleteSession: (id: string) =>
     fetchJSON<{ ok: boolean }>(
       `/api/sessions/${encodeURIComponent(id)}`,
