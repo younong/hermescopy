@@ -1,6 +1,7 @@
 import { useEffect, useId, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { X } from "lucide-react";
+import { useI18n } from "@/i18n";
 
 export function GuiChatWorkspaceDialog({
   busy,
@@ -18,6 +19,7 @@ export function GuiChatWorkspaceDialog({
   wide?: boolean;
 }) {
   const titleId = useId();
+  const { t } = useI18n();
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -36,7 +38,7 @@ export function GuiChatWorkspaceDialog({
         role="dialog"
       >
         <button
-          aria-label="Close"
+          aria-label={t.common.close}
           className="gui-chat-workspace-dialog-close"
           disabled={busy}
           onClick={onClose}

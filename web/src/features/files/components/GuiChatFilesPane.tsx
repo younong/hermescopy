@@ -12,19 +12,16 @@ import {
 } from "lucide-react";
 import {
   useEffect,
+  useMemo,
   useRef,
   useState,
   type DragEvent as ReactDragEvent,
 } from "react";
 import { createPortal } from "react-dom";
 
+import { guiChatTranslations, useI18n } from "@/i18n";
 import type { ManagedFileEntry } from "@/lib/api";
 import { useManagedFiles } from "../useManagedFiles";
-
-const DATE_FORMAT = new Intl.DateTimeFormat(undefined, {
-  dateStyle: "medium",
-  timeStyle: "short",
-});
 
 function formatBytes(size: number | null): string {
   if (size === null) return "—";
@@ -39,6 +36,15 @@ function transferHasFiles(event: ReactDragEvent<HTMLElement>): boolean {
 }
 
 export function GuiChatFilesPane() {
+  const { locale, t } = useI18n();
+  const text = guiChatTranslations(t).files;
+  const dateFormat = useMemo(
+    () => new Intl.DateTimeFormat(locale === "zh" ? "zh-CN" : "en", {
+      dateStyle: "medium",
+      timeStyle: "short",
+    }),
+    [locale],
+  );
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const pathInputRef = useRef<HTMLInputElement | null>(null);
   const dragDepthRef = useRef(0);
@@ -85,9 +91,9 @@ export function GuiChatFilesPane() {
     setStatusMessage(null);
     try {
       await uploadFiles(files, activePath);
-      reportAction(`${files.length} file${files.length === 1 ? "" : "s"} uploaded`);
+      reportAction(files.length === 1 ? text.uploadedOne : text.uploadedCount.replace("{count}", String(files.length)));
     } catch (nextError) {
-      setActionError(`Upload failed: ${String(nextError)}`);
+      setActionError(text.uploadFailed.replace("{error}", String(nextError)));
     } finally {
       if (fileInputRef.current) fileInputRef.current.value = "";
     }
@@ -100,9 +106,9 @@ export function GuiChatFilesPane() {
       await createDirectory(folderName, activePath);
       setFolderName("");
       setCreateDialogOpen(false);
-      reportAction("Folder created");
+      reportAction(text.folderCreated);
     } catch (nextError) {
-      setActionError(`Create failed: ${String(nextError)}`);
+      setActionError(text.createFailed.replace("{error}", String(nextError)));
     }
   };
 
@@ -112,9 +118,9 @@ export function GuiChatFilesPane() {
     setStatusMessage(null);
     try {
       await downloadFile(entry);
-      reportAction(`${entry.name} downloaded`);
+      reportAction(text.downloaded.replace("{name}", entry.name));
     } catch (nextError) {
-      setActionError(`Download failed: ${String(nextError)}`);
+      setActionError(text.downloadFailed.replace("{error}", String(nextError)));
     }
   };
 
@@ -124,17 +130,17 @@ export function GuiChatFilesPane() {
     setStatusMessage(null);
     try {
       await deleteFile(pendingDelete, activePath);
-      reportAction(`${pendingDelete.name} deleted`);
+      reportAction(text.deleted.replace("{name}", pendingDelete.name));
       setPendingDelete(null);
     } catch (nextError) {
-      setActionError(`Delete failed: ${String(nextError)}`);
+      setActionError(text.deleteFailed.replace("{error}", String(nextError)));
     }
   };
 
   const goToPath = async () => {
     const nextPath = pathInputRef.current?.value.trim() ?? "";
     if (!nextPath) {
-      setActionError("Path required");
+      setActionError(text.pathRequired);
       return;
     }
     await load(nextPath);
@@ -170,7 +176,7 @@ export function GuiChatFilesPane() {
 
   return (
     <section
-      aria-label="Files"
+      aria-label={text.title}
       className="gui-chat-files-pane"
       onDragEnter={handleDragEnter}
       onDragLeave={handleDragLeave}
@@ -178,7 +184,7 @@ export function GuiChatFilesPane() {
       onDrop={handleDrop}
     >
       <input
-        aria-label="Choose files to upload"
+        aria-label={text.chooseUpload}
         className="hidden"
         multiple
         onChange={(event) => void submitUpload(Array.from(event.currentTarget.files ?? []))}
@@ -194,9 +200,7 @@ export function GuiChatFilesPane() {
             onClick={() => setCreateDialogOpen(true)}
             type="button"
           >
-            <FolderPlus aria-hidden />
-            New folder
-          </button>
+            <FolderPlus aria-hidden />{text.newFolder}          </button>
           <button
             className="gui-chat-files-secondary-button"
             disabled={!canUpload}
@@ -204,11 +208,11 @@ export function GuiChatFilesPane() {
             type="button"
           >
             <Upload aria-hidden />
-            {uploading ? "Uploading…" : "Upload"}
+            {uploading ? text.uploading : text.upload}
           </button>
         </div>
         <button
-          aria-label="Refresh files"
+          aria-label={text.refresh}
           className="gui-chat-files-icon-button"
           disabled={loading}
           onClick={() => void load()}
@@ -220,8 +224,8 @@ export function GuiChatFilesPane() {
 
       <div className="gui-chat-files-location">
         <div className="min-w-0">
-          <h1>Files</h1>
-          <p title={activePath}>{activePath || "Loading workspace…"}</p>
+          <h1>{text.title}</h1>
+          <p title={activePath}>{activePath || text.loadingWorkspace}</p>
         </div>
         {canChangePath ? (
           <form
@@ -232,13 +236,13 @@ export function GuiChatFilesPane() {
             }}
           >
             <input
-              aria-label="Path"
+              aria-label={text.path}
               defaultValue={activePath}
               key={activePath}
-              placeholder="Path"
+              placeholder={text.path}
               ref={pathInputRef}
             />
-            <button type="submit">Go</button>
+            <button type="submit">{text.go}</button>
           </form>
         ) : null}
       </div>
@@ -253,12 +257,12 @@ export function GuiChatFilesPane() {
       ) : null}
 
       <div className="gui-chat-files-table-wrap">
-        <div className="gui-chat-files-table" role="table" aria-label="Workspace files">
+        <div className="gui-chat-files-table" role="table" aria-label={text.workspaceFiles}>
           <div className="gui-chat-files-table-header" role="row">
-            <span role="columnheader">Name</span>
-            <span role="columnheader">Size</span>
-            <span role="columnheader">Modified</span>
-            <span aria-label="Actions" role="columnheader" />
+            <span role="columnheader">{text.name}</span>
+            <span role="columnheader">{text.size}</span>
+            <span role="columnheader">{text.modified}</span>
+            <span aria-label={text.actions} role="columnheader" />
           </div>
 
           {listing && listing.parent !== null ? (
@@ -270,7 +274,7 @@ export function GuiChatFilesPane() {
             >
               <span className="gui-chat-files-name" role="cell">
                 <span className="gui-chat-files-type-icon is-folder"><ArrowUp aria-hidden /></span>
-                <span>Parent folder</span>
+                <span>{text.parentFolder}</span>
               </span>
               <span role="cell">—</span>
               <span role="cell">—</span>
@@ -279,9 +283,9 @@ export function GuiChatFilesPane() {
           ) : null}
 
           {loading && !listing ? (
-            <div className="gui-chat-files-empty" role="status">Loading files…</div>
+            <div className="gui-chat-files-empty" role="status">{text.loading}</div>
           ) : listing && listing.entries.length === 0 ? (
-            <div className="gui-chat-files-empty">No files in this folder</div>
+            <div className="gui-chat-files-empty">{text.empty}</div>
           ) : (
             listing?.entries.map((entry) => (
               <div className="gui-chat-files-row" key={entry.path} role="row">
@@ -300,13 +304,13 @@ export function GuiChatFilesPane() {
                 </button>
                 <span className="gui-chat-files-meta" role="cell">{formatBytes(entry.size)}</span>
                 <span className="gui-chat-files-meta" role="cell">
-                  {Number.isFinite(entry.mtime) ? DATE_FORMAT.format(entry.mtime * 1000) : "—"}
+                  {Number.isFinite(entry.mtime) ? dateFormat.format(entry.mtime * 1000) : "—"}
                 </span>
                 <span className="relative flex justify-end" role="cell">
                   <button
                     aria-expanded={openMenuPath === entry.path}
                     aria-haspopup="menu"
-                    aria-label={`Actions for ${entry.name}`}
+                    aria-label={text.actionsFor.replace("{name}", entry.name)}
                     className="gui-chat-files-icon-button"
                     onClick={(event) => {
                       event.stopPropagation();
@@ -324,11 +328,11 @@ export function GuiChatFilesPane() {
                     >
                       {entry.is_directory ? (
                         <button onClick={() => setCurrentPath(entry.path)} role="menuitem" type="button">
-                          <Folder aria-hidden /> Open
+                          <Folder aria-hidden /> {text.open}
                         </button>
                       ) : (
                         <button onClick={() => void submitDownload(entry)} role="menuitem" type="button">
-                          <Download aria-hidden /> Download
+                          <Download aria-hidden /> {text.download}
                         </button>
                       )}
                       <button
@@ -340,7 +344,7 @@ export function GuiChatFilesPane() {
                         role="menuitem"
                         type="button"
                       >
-                        <Trash2 aria-hidden /> Delete
+                        <Trash2 aria-hidden /> {text.delete}
                       </button>
                     </div>
                   ) : null}
@@ -352,7 +356,7 @@ export function GuiChatFilesPane() {
         {draggingFiles ? (
           <div className="gui-chat-files-drop-overlay">
             <Upload aria-hidden />
-            <strong>Drop files to upload</strong>
+            <strong>{text.dropToUpload}</strong>
             <span>{activePath}</span>
           </div>
         ) : null}
@@ -361,16 +365,16 @@ export function GuiChatFilesPane() {
       {createDialogOpen ? (
         <GuiChatFilesDialog
           busy={creating}
-          description={`Create in ${activePath}`}
+          description={text.createIn.replace("{path}", activePath)}
           onClose={() => {
             if (creating) return;
             setCreateDialogOpen(false);
             setFolderName("");
           }}
-          title="New folder"
+          title={text.newFolder}
         >
           <input
-            aria-label="Folder name"
+            aria-label={text.folderName}
             autoFocus
             className="gui-chat-files-dialog-input"
             disabled={creating}
@@ -378,13 +382,13 @@ export function GuiChatFilesPane() {
             onKeyDown={(event) => {
               if (event.key === "Enter") void submitCreate();
             }}
-            placeholder="Folder name"
+            placeholder={text.folderName}
             value={folderName}
           />
           <div className="gui-chat-files-dialog-actions">
-            <button disabled={creating} onClick={() => setCreateDialogOpen(false)} type="button">Cancel</button>
+            <button disabled={creating} onClick={() => setCreateDialogOpen(false)} type="button">{t.common.cancel}</button>
             <button className="is-primary" disabled={creating} onClick={() => void submitCreate()} type="button">
-              {creating ? "Creating…" : "Create"}
+              {creating ? text.creating : t.common.create}
             </button>
           </div>
         </GuiChatFilesDialog>
@@ -394,15 +398,15 @@ export function GuiChatFilesPane() {
         <GuiChatFilesDialog
           busy={deleting}
           description={pendingDelete.is_directory
-            ? "This removes the folder and everything inside it."
-            : "This permanently removes the file."}
+            ? text.deleteFolderDescription
+            : text.deleteFileDescription}
           onClose={() => !deleting && setPendingDelete(null)}
-          title={`Delete ${pendingDelete.name}?`}
+          title={text.deleteTitle.replace("{name}", pendingDelete.name)}
         >
           <div className="gui-chat-files-dialog-actions">
-            <button disabled={deleting} onClick={() => setPendingDelete(null)} type="button">Cancel</button>
+            <button disabled={deleting} onClick={() => setPendingDelete(null)} type="button">{t.common.cancel}</button>
             <button className="is-destructive" disabled={deleting} onClick={() => void confirmDelete()} type="button">
-              {deleting ? "Deleting…" : "Delete"}
+              {deleting ? text.deleting : t.common.delete}
             </button>
           </div>
         </GuiChatFilesDialog>
@@ -424,6 +428,7 @@ function GuiChatFilesDialog({
   onClose: () => void;
   title: string;
 }) {
+  const { t } = useI18n();
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !busy) onClose();
@@ -435,7 +440,7 @@ function GuiChatFilesDialog({
   return createPortal(
     <div className="gui-chat-files-dialog-backdrop" data-gui-chat role="presentation">
       <div aria-labelledby="gui-chat-files-dialog-title" aria-modal="true" className="gui-chat-files-dialog" role="dialog">
-        <button aria-label="Close" className="gui-chat-files-dialog-close" disabled={busy} onClick={onClose} type="button">
+        <button aria-label={t.common.close} className="gui-chat-files-dialog-close" disabled={busy} onClick={onClose} type="button">
           <X aria-hidden />
         </button>
         <h2 id="gui-chat-files-dialog-title">{title}</h2>

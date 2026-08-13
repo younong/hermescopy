@@ -5,6 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { I18nProvider } from "@/i18n";
 import { api, type Employee } from "@/lib/api";
 import ChannelsPage from "./ChannelsPage";
 
@@ -14,12 +15,13 @@ vi.mock("@/lib/useDashboardAuthIdentity", () => ({
 
 let root: Root | null = null;
 
-async function renderChannelsPage() {
+async function renderChannelsPage(locale: "en" | "zh" = "en") {
   const container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
+  localStorage.setItem("hermes-locale", locale);
   await act(async () => {
-    root?.render(<MemoryRouter><ChannelsPage /></MemoryRouter>);
+    root?.render(<I18nProvider><MemoryRouter><ChannelsPage /></MemoryRouter></I18nProvider>);
     await Promise.resolve();
     await Promise.resolve();
   });
@@ -29,6 +31,7 @@ beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
     .IS_REACT_ACT_ENVIRONMENT = true;
   document.body.innerHTML = "";
+  localStorage.clear();
 });
 
 afterEach(async () => {
@@ -68,6 +71,16 @@ describe("ChannelsPage", () => {
     expect(document.body.textContent).not.toContain("Researcher");
     expect(document.querySelector('button[aria-label="Enable Feishu / Lark"]')).toBeNull();
   });
+  it("renders the managed employee support surface in Chinese", async () => {
+    vi.spyOn(api, "getEmployees").mockResolvedValue({ employees: [] });
+
+    await renderChannelsPage("zh");
+
+    expect(document.body.textContent).toContain("按员工管理的飞书和 Lark 连接");
+    expect(document.body.textContent).toContain("尚未配置员工飞书 / Lark 绑定。");
+    expect(document.querySelector<HTMLAnchorElement>('a[href="/chat/robots"]')?.textContent).toBe("管理员工");
+  });
+
 });
 
 function employee(

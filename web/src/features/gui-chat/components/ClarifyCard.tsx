@@ -3,6 +3,7 @@ import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { CircleHelp } from "lucide-react";
 
+import { guiChatTranslations, useI18n } from "@/i18n";
 import type { ClarificationState } from "../types";
 
 export function ClarifyCard({
@@ -14,6 +15,8 @@ export function ClarifyCard({
   disabled?: boolean;
   onRespond: (answer: string) => void;
 }) {
+  const { t } = useI18n();
+  const copy = guiChatTranslations(t).clarification;
   const [customAnswer, setCustomAnswer] = useState("");
   const [showCustom, setShowCustom] = useState(!clarification.choices?.length);
   const [now, setNow] = useState(() => Date.now());
@@ -33,7 +36,7 @@ export function ClarifyCard({
   const locallyExpired = remainingSeconds === 0;
   const controlsDisabled = disabled || submitting || !pending || locallyExpired;
   const statusLabel = locallyExpired && pending
-    ? "timed out"
+    ? copy.timedOut
     : clarification.status.replace("_", " ");
 
   return (
@@ -45,11 +48,11 @@ export function ClarifyCard({
       <div className="mb-2 flex flex-wrap items-center gap-2">
         <CircleHelp className="h-4 w-4 text-warning" />
         <span className="font-display text-sm uppercase tracking-[0.12em] text-warning">
-          Hermes needs your answer
+          {copy.needsAnswer}
         </span>
         <Badge tone={pending && !locallyExpired ? "warning" : "secondary"}>{statusLabel}</Badge>
         {pending && remainingSeconds !== null ? (
-          <span className="text-xs text-text-tertiary">{remainingSeconds}s remaining</span>
+          <span className="text-xs text-text-tertiary">{copy.secondsRemaining.replace("{count}", String(remainingSeconds))}</span>
         ) : null}
       </div>
       <p className="mb-3 whitespace-pre-wrap text-sm text-text-primary">
@@ -76,7 +79,7 @@ export function ClarifyCard({
                 onClick={() => setShowCustom(true)}
                 size="sm"
               >
-                Custom answer
+                {copy.customAnswer}
               </Button>
             </div>
           ) : (
@@ -89,20 +92,20 @@ export function ClarifyCard({
               }}
             >
               <input
-                aria-label="Clarification answer"
+                aria-label={copy.answerAriaLabel}
                 autoFocus={!clarification.choices?.length}
                 className="min-w-0 flex-1 border border-current/20 bg-background-base px-3 py-2 text-sm text-text-primary outline-none focus:border-warning"
                 disabled={controlsDisabled}
                 onChange={(event) => setCustomAnswer(event.target.value)}
-                placeholder="Type your answer…"
+                placeholder={copy.answerPlaceholder}
                 value={customAnswer}
               />
               <Button disabled={controlsDisabled || !customAnswer.trim()} size="sm" type="submit">
-                Answer
+                {copy.answer}
               </Button>
               {clarification.choices?.length ? (
                 <Button ghost onClick={() => setShowCustom(false)} size="sm" type="button">
-                  Back to choices
+                  {copy.backToChoices}
                 </Button>
               ) : null}
             </form>

@@ -1,6 +1,7 @@
 import { LoaderCircle } from "lucide-react";
 import { useState, type MouseEvent, type ReactNode } from "react";
 
+import { guiChatTranslations, useI18n } from "@/i18n";
 import { withHermesAssetAuth } from "@/lib/api";
 import { downloadSessionFile } from "../files";
 import type { FileArtifactState } from "../types";
@@ -13,6 +14,8 @@ export function InlineFileLink({
   artifact: FileArtifactState;
   children: ReactNode;
 }) {
+  const { t } = useI18n();
+  const copy = guiChatTranslations(t).messages;
   const [downloading, setDownloading] = useState(false);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const errorId = `${artifact.id}-inline-download-error`;
@@ -34,7 +37,7 @@ export function InlineFileLink({
         aria-busy={downloading}
         aria-disabled={downloading}
         aria-describedby={downloadError ? errorId : undefined}
-        aria-label={`Download ${artifact.name}`}
+        aria-label={copy.downloadNamed.replace("{name}", artifact.name)}
         className="inline-flex max-w-full items-baseline gap-1 break-words text-primary underline decoration-primary/30 underline-offset-2 transition-colors [overflow-wrap:anywhere] hover:decoration-primary/60"
         href={withHermesAssetAuth(artifact.downloadUrl)}
         onClick={download}

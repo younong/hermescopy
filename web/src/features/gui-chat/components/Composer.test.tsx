@@ -3,6 +3,7 @@
 import { act, type ComponentProps } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { I18nProvider } from "@/i18n";
 
 import {
   COMPOSER_ATTACHMENT_MAX_COUNT,
@@ -190,7 +191,7 @@ describe("Composer attachment transfers", () => {
     await dispatch(getDropTarget(container), transferEvent("drop", transfer([allowed, oversized])));
 
     expect(container.querySelector('[title="allowed.png"]')).not.toBeNull();
-    expect(container.textContent).toContain("too-large.png 超过 10MB，无法上传。");
+    expect(container.textContent).toContain("too-large.png exceeds the 10MB image limit.");
     expect(container.querySelector('[title="too-large.png"]')).toBeNull();
   });
 
@@ -208,7 +209,7 @@ describe("Composer attachment transfers", () => {
     );
     expect(container.querySelector('[title="file-10.txt"]')).not.toBeNull();
     expect(container.querySelector('[title="file-11.txt"]')).toBeNull();
-    expect(container.textContent).toContain("每条消息最多添加 10 个附件。");
+    expect(container.textContent).toContain("You can add up to 10 attachments per message.");
   });
 
   it("limits cumulative additions and allows another attachment after removal", async () => {
@@ -245,7 +246,7 @@ describe("Composer attachment transfers", () => {
     expect(container.querySelectorAll('[aria-label^="Remove "]')).toHaveLength(
       COMPOSER_ATTACHMENT_MAX_COUNT - 1,
     );
-    expect(container.textContent).not.toContain("每条消息最多添加 10 个附件。");
+    expect(container.textContent).not.toContain("You can add up to 10 attachments per message.");
 
     await dispatch(
       dropTarget,
@@ -259,7 +260,7 @@ describe("Composer attachment transfers", () => {
       COMPOSER_ATTACHMENT_MAX_COUNT,
     );
     expect(container.querySelector('[title="replacement.txt"]')).not.toBeNull();
-    expect(container.textContent).not.toContain("每条消息最多添加 10 个附件。");
+    expect(container.textContent).not.toContain("You can add up to 10 attachments per message.");
   });
 });
 
@@ -283,15 +284,17 @@ function renderComposer({
   root = createRoot(container);
   act(() => {
     root?.render(
-      <Composer
-        allowSendWhileGenerating={allowSendWhileGenerating}
-        attachmentToQueue={attachmentToQueue}
-        disabled={disabled}
-        isGenerating={isGenerating}
-        onAttachmentQueued={onAttachmentQueued}
-        onSend={onSend}
-        onStop={vi.fn()}
-      />,
+      <I18nProvider>
+        <Composer
+          allowSendWhileGenerating={allowSendWhileGenerating}
+          attachmentToQueue={attachmentToQueue}
+          disabled={disabled}
+          isGenerating={isGenerating}
+          onAttachmentQueued={onAttachmentQueued}
+          onSend={onSend}
+          onStop={vi.fn()}
+        />
+      </I18nProvider>,
     );
   });
   return container;

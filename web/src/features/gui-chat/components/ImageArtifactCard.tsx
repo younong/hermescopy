@@ -1,5 +1,6 @@
 import { Download, ExternalLink, Image as ImageIcon, LoaderCircle } from "lucide-react";
 import { useEffect, useState, type MouseEvent } from "react";
+import { guiChatTranslations, useI18n } from "@/i18n";
 import { fetchJSON, withHermesAssetAuth } from "@/lib/api";
 import { downloadSessionFile, triggerDownload } from "../files";
 import type { ImageArtifactState } from "../types";
@@ -11,6 +12,8 @@ export function ImageArtifactCard({
   artifact: ImageArtifactState;
   variant?: "bubble" | "card";
 }) {
+  const { t } = useI18n();
+  const copy = guiChatTranslations(t).messages;
   const filename = filenameForArtifact(artifact);
   const [downloading, setDownloading] = useState(false);
   const [downloadError, setDownloadError] = useState<string | null>(null);
@@ -77,7 +80,7 @@ export function ImageArtifactCard({
           {displayUrl ? (
             <a href={openUrl} target="_blank" rel="noreferrer" className="block h-full w-full">
               <img
-                alt={artifact.title ?? "Image artifact"}
+                alt={artifact.title ?? copy.imageArtifact}
                 className={dimensions ? "h-full w-full object-cover" : "max-h-[320px] w-full rounded-3xl object-cover shadow-sm"}
                 height={dimensions?.height}
                 loading="lazy"
@@ -87,7 +90,7 @@ export function ImageArtifactCard({
             </a>
           ) : (
             <div className={dimensions ? "flex h-full w-full items-center justify-center px-4 text-center text-xs text-text-secondary" : "flex h-[220px] w-full items-center justify-center rounded-3xl bg-current/[0.04] px-4 text-center text-xs text-text-secondary"}>
-              {loadError ? "Image preview failed" : "Loading image…"}
+              {loadError ? copy.imagePreviewFailed : copy.loadingImage}
             </div>
           )}
         </div>
@@ -96,7 +99,7 @@ export function ImageArtifactCard({
             aria-busy={downloading}
             aria-disabled={downloading}
             aria-describedby={downloadError ? `${artifact.id}-download-error` : undefined}
-            aria-label={`Download ${filename}`}
+            aria-label={copy.downloadNamed.replace("{name}", filename)}
             className="inline-flex h-7 items-center gap-1 px-2 text-xs text-midground hover:text-primary"
             href={downloadUrl.startsWith("/api/") ? withHermesAssetAuth(downloadUrl) : downloadUrl}
             download={filename}
@@ -107,7 +110,7 @@ export function ImageArtifactCard({
             ) : (
               <Download aria-hidden className="h-3.5 w-3.5" />
             )}
-            Download
+            {copy.download}
           </a>
         </div>
         {downloadError ? (
@@ -135,7 +138,7 @@ export function ImageArtifactCard({
       >
         {displayUrl ? (
           <img
-            alt={artifact.title ?? "Image artifact"}
+            alt={artifact.title ?? copy.imageArtifact}
             className={dimensions ? "h-full w-full object-contain" : "max-h-80 w-full object-contain"}
             height={dimensions?.height}
             loading="lazy"
@@ -144,14 +147,16 @@ export function ImageArtifactCard({
           />
         ) : (
           <div className={dimensions ? "flex h-full w-full items-center justify-center px-4 py-8 text-sm text-text-secondary" : "flex min-h-40 items-center justify-center px-4 py-8 text-sm text-text-secondary"}>
-            {loadError ? `Image preview failed: ${loadError}` : "Loading image preview…"}
+            {loadError
+              ? copy.imagePreviewFailedWithReason.replace("{reason}", loadError)
+              : copy.loadingImagePreview}
           </div>
         )}
       </a>
       <figcaption className="flex flex-wrap items-center gap-2 border-t border-current/10 px-3 py-2 text-xs text-text-secondary">
         <ImageIcon className="h-3.5 w-3.5" />
         <span className="min-w-0 flex-1 truncate">
-          {artifact.title ?? artifact.mimeType ?? "Image artifact"}
+          {artifact.title ?? artifact.mimeType ?? copy.imageArtifact}
           {artifact.width && artifact.height ? ` · ${artifact.width}×${artifact.height}` : ""}
         </span>
         <a
@@ -161,7 +166,7 @@ export function ImageArtifactCard({
           rel="noreferrer"
         >
           <ExternalLink className="h-3.5 w-3.5" />
-          Open
+          {copy.open}
         </a>
         <a
           aria-busy={downloading}

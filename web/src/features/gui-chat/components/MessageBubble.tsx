@@ -3,6 +3,7 @@ import { useDeferredValue, useMemo } from "react";
 import { Link } from "react-router-dom";
 
 import { Markdown, type MarkdownFileLink } from "@/components/Markdown";
+import { guiChatTranslations, useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
 import { normalizeSessionFileReference } from "../files";
 import type { ArtifactState, ChatMessage, MessageAttachmentState } from "../types";
@@ -19,6 +20,8 @@ export function MessageBubble({
   message: ChatMessage;
   onUseAttachmentAgain?: (attachment: MessageAttachmentState) => void;
 }) {
+  const { t } = useI18n();
+  const copy = guiChatTranslations(t).messages;
   const isUser = message.role === "user";
 
   if (message.collaborationCard) {
@@ -34,12 +37,12 @@ export function MessageBubble({
             </span>
             <div className="min-w-0 flex-1">
               <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#6f7fa8]">
-                Internal collaboration {card.status}
+                {copy.collaborationStatus.replace("{status}", card.status)}
               </p>
               <h3 className="mt-1 text-sm font-semibold text-[#252f4a]">{card.title}</h3>
               {card.text ? <div className="mt-2 text-xs leading-5 text-[#53617f]"><Markdown content={card.text} /></div> : null}
               <Link className="mt-3 inline-flex items-center gap-1 text-xs font-semibold text-[#3867ed] hover:text-[#2852c7]" to={`?group=${encodeURIComponent(card.groupId)}`}>
-                Open group <ExternalLink className="h-3 w-3" />
+                {copy.openGroup} <ExternalLink className="h-3 w-3" />
               </Link>
             </div>
           </div>
@@ -99,11 +102,11 @@ export function MessageBubble({
             streaming={message.streaming}
           />
         ) : message.streaming ? (
-          <div className="text-[#8a8f97]">Thinking…</div>
+          <div className="text-[#8a8f97]">{copy.thinking}</div>
         ) : null}
         {message.streaming || message.status === "error" || message.status === "interrupted" ? (
           <div className={cn("mt-3 text-xs text-[#92969d]", message.status === "error" && "text-[#b42318]")}>
-            {message.streaming ? "Writing…" : message.status === "error" ? "Response failed" : "Stopped"}
+            {message.streaming ? copy.writing : message.status === "error" ? copy.responseFailed : copy.stopped}
           </div>
         ) : null}
         {message.attachments?.length ? (

@@ -60,16 +60,21 @@ describe("structured collaboration mentions", () => {
       mentionAll: true,
       membershipIds: ["membership-a"],
     }, memberships)).toEqual({ mentionAll: true, membershipIds: [] });
-    expect(mentionLabel({ mentionAll: true, membershipIds: [] }, {}, () => "ignored"))
-      .toBe("@all");
+    expect(mentionLabel(
+      { mentionAll: true, membershipIds: [] },
+      {},
+      () => "ignored",
+      { mentionAll: "@所有人" },
+    )).toBe("@所有人");
   });
 
   it("formats selected employees without adding them to message text", () => {
-    expect(mentionLabel({
-      mentionAll: false,
-      membershipIds: ["membership-a", "membership-b"],
-    }, Object.fromEntries(memberships.map((member) => [member.membership_id, member])), (id) => id))
-      .toBe("@account-a, @account-b");
+    expect(mentionLabel(
+      { mentionAll: false, membershipIds: ["membership-a", "membership-b"] },
+      Object.fromEntries(memberships.map((member) => [member.membership_id, member])),
+      (id) => id,
+      { mentionAll: "@所有人" },
+    )).toBe("@account-a, @account-b");
   });
 
   it("routes the first unmentioned message to the first available employee", () => {
@@ -124,13 +129,16 @@ describe("structured collaboration mentions", () => {
     )).toEqual({ mentionAll: true, membershipIds: [] });
   });
 
-  it("reports when no employee is available", () => {
+  it("reports when no employee is available using localized labels", () => {
     const selection = defaultMentionSelection(
       { mentionAll: false, membershipIds: [] },
       [],
       [],
     );
     expect(selection).toEqual({ mentionAll: false, membershipIds: [] });
-    expect(recipientLabel(selection, {}, () => "ignored")).toBe("No available employee");
+    expect(recipientLabel(selection, {}, () => "ignored", {
+      mentionAll: "@所有人",
+      noAvailableEmployee: "暂无可用员工",
+    })).toBe("暂无可用员工");
   });
 });

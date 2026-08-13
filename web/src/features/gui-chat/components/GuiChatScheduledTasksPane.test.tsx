@@ -6,6 +6,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CronJob } from "@/lib/api";
 import { GuiChatScheduledTasksPane } from "./GuiChatScheduledTasksPane";
 
+let testLocale: "en" | "zh" = "en";
+
 const mocks = vi.hoisted(() => ({
   createCronJob: vi.fn(),
   deleteCronJob: vi.fn(),
@@ -24,28 +26,15 @@ vi.mock("@/lib/api", async (importOriginal) => {
   return { ...actual, api: { ...actual.api, ...mocks } };
 });
 
-vi.mock("@/i18n", () => ({
-  useI18n: () => ({
-    t: {
-      cron: {
-        nameOptional: "Name (optional)",
-        namePlaceholder: "Name",
-        prompt: "Prompt",
-        promptPlaceholder: "What should Hermes do?",
-        deliverTo: "Deliver to",
-        delivery: { local: "Local" },
-        scheduleMode: "Schedule",
-        scheduleModes: {
-          interval: "Interval", daily: "Daily", weekly: "Weekly", monthly: "Monthly", once: "Once", custom: "Custom",
-          intervalEvery: "Every", intervalUnit: "Unit", unitMinutes: "Minutes", unitHours: "Hours", unitDays: "Days",
-          timeOfDay: "Time", weekdays: "Weekdays", weekdaysShort: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
-          dayOfMonth: "Day", onceAt: "At", customLabel: "Expression", customPlaceholder: "0 9 * * *", customHint: "Cron expression",
-          preview: "Preview", previewEmpty: "Choose a schedule",
-        },
-      },
-    },
-  }),
-}));
+vi.mock("@/i18n", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/i18n")>();
+  const { en } = await import("@/i18n/en");
+  const { zh } = await import("@/i18n/zh");
+  return {
+    ...actual,
+    useI18n: () => ({ locale: testLocale, t: testLocale === "zh" ? zh : en }),
+  };
+});
 
 const jobs: CronJob[] = [
   {
@@ -83,6 +72,7 @@ beforeEach(() => {
   mocks.createCronJob.mockResolvedValue({ ...jobs[0], id: "new-task", name: "New task" });
   mocks.deleteCronJob.mockResolvedValue({ ok: true });
   document.body.innerHTML = "";
+  testLocale = "en";
 });
 
 afterEach(async () => {
@@ -145,6 +135,17 @@ describe("GuiChatScheduledTasksPane", () => {
     expect(container.textContent).toContain("Daily brief");
     expect(document.body.querySelector('[role="dialog"]')).not.toBeNull();
   });
+  it("renders Chinese schedule descriptions and explicit Chinese dates", async () => {
+    testLocale = "zh";
+    const container = await renderPane();
+
+    expect(container.textContent).toContain("新建定时任务");
+    expect(container.textContent).toContain("每天 09:00");
+    expect(container.textContent).toContain("2026/8/1");
+    expect(container.textContent).toContain("Daily brief");
+    expect(container.querySelector('[aria-label="搜索定时任务"]')).not.toBeNull();
+  });
+
 });
 
 async function renderPane() {

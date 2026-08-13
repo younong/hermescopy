@@ -12,8 +12,9 @@ import { cn } from "@/lib/utils";
 
 /**
  * Language picker — shows the current language's endonym, opens a dropdown
- * of all supported locales when clicked.  Persists choice to localStorage via
- * the I18n context.
+ * of all supported locales when clicked. Pass `allowedLocales` to constrain the
+ * options for a product surface. Persists choice to localStorage via the I18n
+ * context.
  *
  * Replaces the older two-state EN↔ZH toggle now that we ship 16 locales
  * (en, zh, zh-hant, ja, de, es, fr, tr, uk, af, ko, it, ga, pt, ru, hu).
@@ -27,13 +28,32 @@ import { cn } from "@/lib/utils";
  * viewport / overflow ancestors. Below the `sm` breakpoint, `dropUp` uses a
  * bottom sheet portaled to `document.body` instead of an anchored dropdown.
  */
-export function LanguageSwitcher({ collapsed = false, dropUp = false }: LanguageSwitcherProps) {
+export function LanguageSwitcher({
+  allowedLocales,
+  collapsed = false,
+  dropUp = false,
+}: LanguageSwitcherProps) {
   const { locale, setLocale, t } = useI18n();
   const [open, setOpen] = useState(false);
+  const [dropUpPosition, setDropUpPosition] = useState<{ bottom: number; left: number }>();
   const containerRef = useRef<HTMLDivElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
+  const initializedRestrictionRef = useRef(false);
   const narrowViewport = useBelowBreakpoint(640);
   const useMobileSheet = Boolean(dropUp && narrowViewport);
+  const allLocales = localeOptions(allowedLocales);
+  const normalizedLocale = allLocales.some(([code]) => code === locale)
+    ? locale
+    : allLocales[0]?.[0] ?? locale;
+
+  useEffect(() => {
+    const shouldPersistInitialRestriction =
+      allowedLocales !== undefined && !initializedRestrictionRef.current;
+    initializedRestrictionRef.current = true;
+    if (shouldPersistInitialRestriction || normalizedLocale !== locale) {
+      setLocale(normalizedLocale);
+    }
+  }, [allowedLocales, locale, normalizedLocale, setLocale]);
 
   useEffect(() => {
     if (!open) return;
@@ -46,6 +66,15 @@ export function LanguageSwitcher({ collapsed = false, dropUp = false }: Language
 
   useEffect(() => {
     if (!open || useMobileSheet) return;
+    if (dropUp) {
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (rect) {
+        setDropUpPosition({
+          bottom: window.innerHeight - rect.top + 4,
+          left: rect.left,
+        });
+      }
+    }
 
     function onPointerDown(e: PointerEvent) {
       const target = e.target as Node;
@@ -56,10 +85,9 @@ export function LanguageSwitcher({ collapsed = false, dropUp = false }: Language
 
     document.addEventListener("pointerdown", onPointerDown);
     return () => document.removeEventListener("pointerdown", onPointerDown);
-  }, [open, useMobileSheet]);
+  }, [dropUp, open, useMobileSheet]);
 
-  const current = LOCALE_META[locale];
-  const allLocales = Object.entries(LOCALE_META) as Array<[Locale, typeof current]>;
+  const current = LOCALE_META[normalizedLocale];
   const sheetTitle = t.language.switchTo;
 
   return (
@@ -80,7 +108,7 @@ export function LanguageSwitcher({ collapsed = false, dropUp = false }: Language
           <Typography
             className="hidden sm:inline text-display tracking-wide text-xs"
           >
-            {locale === "en" ? "EN" : current.name}
+            {normalizedLocale === "en" ? "EN" : current.name}
           </Typography>
         </span>
       </Button>
@@ -95,7 +123,7 @@ export function LanguageSwitcher({ collapsed = false, dropUp = false }: Language
           <div aria-label={sheetTitle} role="listbox">
             <LanguageSwitcherOptions
               allLocales={allLocales}
-              locale={locale}
+              locale={normalizedLocale}
               setLocale={setLocale}
               setOpen={setOpen}
             />
@@ -104,7 +132,6 @@ export function LanguageSwitcher({ collapsed = false, dropUp = false }: Language
       )}
 
       {open && !useMobileSheet && (() => {
-        const rect = containerRef.current?.getBoundingClientRect();
         const dropdown = (
           <div
             ref={dropdownRef}
@@ -114,15 +141,11 @@ export function LanguageSwitcher({ collapsed = false, dropUp = false }: Language
               dropUp ? "fixed z-[100]" : "absolute z-50 right-0 top-full mt-1",
             )}
             role="listbox"
-            style={
-              dropUp && rect
-                ? { bottom: window.innerHeight - rect.top + 4, left: rect.left }
-                : undefined
-            }
+            style={dropUp ? dropUpPosition : undefined}
           >
             <LanguageSwitcherOptions
               allLocales={allLocales}
-              locale={locale}
+              locale={normalizedLocale}
               setLocale={setLocale}
               setOpen={setOpen}
             />
@@ -179,7 +202,22 @@ interface LanguageSwitcherOptionsProps {
   setOpen: (open: boolean) => void;
 }
 
+function localeOptions(
+  allowedLocales?: readonly Locale[],
+): Array<[Locale, (typeof LOCALE_META)[Locale]]> {
+  if (!allowedLocales) {
+    return Object.entries(LOCALE_META) as Array<
+      [Locale, (typeof LOCALE_META)[Locale]]
+    >;
+  }
+
+  return Array.from(new Set(allowedLocales))
+    .filter((locale) => locale in LOCALE_META)
+    .map((locale) => [locale, LOCALE_META[locale]]);
+}
+
 interface LanguageSwitcherProps {
+  allowedLocales?: readonly Locale[];
   collapsed?: boolean;
   dropUp?: boolean;
 }

@@ -1,5 +1,6 @@
 import { Archive, ChevronDown, ChevronRight, Plus, UsersRound } from "lucide-react";
 import { useMemo, useState } from "react";
+import { guiChatTranslations, useI18n } from "@/i18n";
 import type { CollaborationGroup } from "../types";
 
 interface GroupsSidebarProps {
@@ -19,6 +20,8 @@ export function GroupsSidebar({
   onPick,
   query = "",
 }: GroupsSidebarProps) {
+  const { t } = useI18n();
+  const copy = guiChatTranslations(t).collaboration;
   const [archivedOpen, setArchivedOpen] = useState(false);
   const filtered = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
@@ -30,10 +33,10 @@ export function GroupsSidebar({
   const archived = filtered.filter((group) => group.status === "archived");
 
   return (
-    <section aria-label="Groups" className="mt-4 px-3">
+    <section aria-label={copy.groups} className="mt-4 px-3">
       <div className="gui-chat-section-heading">
-        <span>Groups</span>
-        <button aria-label="Create group" className="gui-chat-icon-button" onClick={onCreate} type="button">
+        <span>{copy.groups}</span>
+        <button aria-label={copy.createGroup} className="gui-chat-icon-button" onClick={onCreate} type="button">
           <Plus className="h-3.5 w-3.5" />
         </button>
       </div>
@@ -47,7 +50,7 @@ export function GroupsSidebar({
           />
         ))}
         {!loading && active.length === 0 ? (
-          <p className="px-2 py-2 text-[11px] text-[#969aa1]">No active groups</p>
+          <p className="px-2 py-2 text-[11px] text-[#969aa1]">{copy.noActiveGroups}</p>
         ) : null}
         {archived.length > 0 ? (
           <>
@@ -59,7 +62,7 @@ export function GroupsSidebar({
             >
               {archivedOpen ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
               <Archive className="h-3 w-3" />
-              Archived ({archived.length})
+              {copy.archived} ({archived.length})
             </button>
             {archivedOpen
               ? archived.map((group) => (

@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { ChevronDown, ChevronRight, Wrench } from "lucide-react";
+import { guiChatTranslations, useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
 import type { ArtifactState, ToolCallState } from "../types";
 import { ArtifactCard } from "./ArtifactCard";
@@ -21,6 +22,8 @@ export function ToolCallCard({
   artifacts: ArtifactState[];
   tool: ToolCallState;
 }) {
+  const { t } = useI18n();
+  const copy = guiChatTranslations(t).messages;
   const [open, setOpen] = useState(tool.status !== "succeeded");
   const details = tool.output || tool.error || tool.argsText || stringifyInput(tool.input);
   const displayedDetails = truncateForDisplay(details);
@@ -55,12 +58,12 @@ export function ToolCallCard({
               </pre>
               {detailsTruncated ? (
                 <p className="text-xs text-text-tertiary">
-                  Output truncated in UI after {MAX_TOOL_DETAILS_CHARS.toLocaleString()} characters.
+                  {copy.outputTruncated.replace("{count}", MAX_TOOL_DETAILS_CHARS.toLocaleString())}
                 </p>
               ) : null}
             </>
           ) : (
-            <p className="text-xs text-text-tertiary">No output yet.</p>
+            <p className="text-xs text-text-tertiary">{copy.noOutputYet}</p>
           )}
           {details ? (
             <Button
@@ -69,7 +72,7 @@ export function ToolCallCard({
               className="h-7 px-2 text-xs"
               onClick={() => void navigator.clipboard?.writeText(details)}
             >
-              Copy output
+              {copy.copyOutput}
             </Button>
           ) : null}
           {artifacts.map((artifact) => (

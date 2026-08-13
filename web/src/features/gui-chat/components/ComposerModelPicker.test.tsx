@@ -58,7 +58,7 @@ describe("ComposerModelPicker", () => {
     expect(listbox().textContent).not.toContain("default-provider");
     expect(listbox().textContent).not.toContain("Image model");
 
-    const current = optionFor("Current model");
+    const current = optionFor("current-model");
     expect(current.getAttribute("aria-selected")).toBe("true");
     expect(current.disabled).toBe(true);
   });
@@ -69,7 +69,7 @@ describe("ComposerModelPicker", () => {
     await renderPicker({ currentProvider: "custom" });
     await openPicker();
 
-    const current = optionFor("Current model");
+    const current = optionFor("current-model");
     expect(current.getAttribute("aria-selected")).toBe("true");
     expect(current.disabled).toBe(true);
   });
@@ -85,7 +85,7 @@ describe("ComposerModelPicker", () => {
     await openPicker();
 
     await act(async () => {
-      optionFor("Default model").click();
+      optionFor("default-model").click();
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -105,7 +105,7 @@ describe("ComposerModelPicker", () => {
     await openPicker();
 
     await act(async () => {
-      optionFor("Default model").click();
+      optionFor("default-model").click();
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -113,7 +113,7 @@ describe("ComposerModelPicker", () => {
     expect(document.body.textContent).toContain("High price");
     expect(onSwitchChat).toHaveBeenCalledTimes(1);
 
-    await clickButton("Switch anyway", true);
+    await clickButton("Use model", true);
     expect(onSwitchChat).toHaveBeenLastCalledWith(
       expect.objectContaining({ id: "chat-default" }),
       true,
@@ -139,7 +139,7 @@ describe("ComposerModelPicker", () => {
 
     await clickButton("Retry");
     expect(api.getModelRegistrations).toHaveBeenCalledTimes(2);
-    expect(listbox().textContent).toContain("Default model");
+    expect(listbox().textContent).toContain("default-model");
   });
 
   it("navigates to model management from the popover", async () => {

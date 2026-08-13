@@ -27,6 +27,7 @@ import {
   type ModelRegistrationsResponse,
 } from "@/lib/api";
 
+import { guiChatTranslations, useI18n } from "@/i18n";
 import type { GuiChatModelSwitchResponse } from "../api";
 import { GuiChatWorkspaceDialog } from "./GuiChatWorkspaceDialog";
 
@@ -75,17 +76,8 @@ const EMPTY_FORM: RegistrationFormState = {
   useGateway: false,
 };
 
-const KIND_LABELS: Record<ModelRegistrationKind, string> = {
-  chat: "Chat",
-  code: "Code",
-  image: "Image",
-  video: "Video",
-  voice: "Voice",
-  vector: "Vector",
-};
-
 function hasCatalog(kind: ModelRegistrationKind): boolean {
-  return kind in KIND_LABELS;
+  return ["chat", "code", "image", "video", "voice", "vector"].includes(kind);
 }
 
 function defaultSource(kind: ModelRegistrationKind): ModelRegistrationSource {
@@ -134,6 +126,9 @@ export function GuiChatModelsPane({
   onActivateCode,
   onSwitchChat,
 }: GuiChatModelsPaneProps) {
+  const { t } = useI18n();
+  const text = guiChatTranslations(t).models;
+  const kindLabels = text.kinds;
   const [data, setData] = useState<ModelRegistrationsResponse | null>(null);
   const [catalogs, setCatalogs] = useState<
     Partial<
@@ -306,7 +301,7 @@ export function GuiChatModelsPane({
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
-    const validationError = validateForm(form);
+    const validationError = validateForm(form, text);
     if (validationError) {
       setError(validationError);
       return;
@@ -347,7 +342,7 @@ export function GuiChatModelsPane({
       );
       if (result.confirm_required) {
         setPendingChatSwitch({
-          message: result.confirm_message || result.warning || "This model has unusually high known pricing.",
+          message: result.confirm_message || result.warning || text.expensiveWarning,
           persistGlobally,
           registration,
         });
@@ -391,14 +386,12 @@ export function GuiChatModelsPane({
   };
 
   return (
-    <section aria-label="Models" className="gui-chat-workspace-pane" data-models-pane>
+    <section aria-label={text.title} className="gui-chat-workspace-pane" data-models-pane>
       <header className="gui-chat-workspace-toolbar">
         <button className="gui-chat-workspace-primary-button" onClick={openCreate} type="button">
-          <Plus aria-hidden />
-          Add model
-        </button>
+          <Plus aria-hidden />{text.addModel}        </button>
         <button
-          aria-label="Refresh models"
+          aria-label={text.refresh}
           className="gui-chat-workspace-icon-button"
           disabled={loading}
           onClick={() => void load()}
@@ -410,22 +403,22 @@ export function GuiChatModelsPane({
 
       <div className="gui-chat-workspace-heading">
         <div>
-          <h1>Models</h1>
-          <p>Manage models and choose which ones power conversations and generation.</p>
+          <h1>{text.title}</h1>
+          <p>{text.description}</p>
         </div>
         <label className="gui-chat-workspace-search">
           <Search aria-hidden />
           <input
-            aria-label="Search models"
+            aria-label={text.search}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder="Search models"
+            placeholder={text.search}
             value={query}
           />
         </label>
       </div>
 
-      <div aria-label="Model type" className="gui-chat-model-tabs" role="tablist">
-        {(Object.keys(KIND_LABELS) as ModelRegistrationKind[])
+      <div aria-label={text.modelType} className="gui-chat-model-tabs" role="tablist">
+        {(Object.keys(kindLabels) as ModelRegistrationKind[])
           .map((kind) => (
             <button
               aria-selected={selectedKind === kind}
@@ -435,25 +428,25 @@ export function GuiChatModelsPane({
               role="tab"
               type="button"
             >
-              {KIND_LABELS[kind]}
+              {kindLabels[kind]}
             </button>
           ))}
       </div>
 
       {error || busy ? (
         <div className="gui-chat-workspace-feedback is-error" role="alert">
-          {error ?? "Stop the current response before switching chat models."}
+          {error ?? text.stopBeforeSwitching}
         </div>
       ) : null}
 
       <div className="gui-chat-workspace-list">
         {data === null && loading ? (
-          <div className="gui-chat-workspace-empty" role="status">Loading models…</div>
+          <div className="gui-chat-workspace-empty" role="status">{text.loading}</div>
         ) : visibleRegistrations.length === 0 ? (
           <div className="gui-chat-workspace-empty">
             <Cpu aria-hidden />
-            <strong>{query.trim() ? "No matching models" : `No ${selectedKind} models yet`}</strong>
-            <span>{query.trim() ? "Try a different search." : "Add a model to make it available here."}</span>
+            <strong>{query.trim() ? text.noMatching : text.noModels.replace("{kind}", kindLabels[selectedKind])}</strong>
+            <span>{query.trim() ? text.differentSearch : text.addModelHint}</span>
           </div>
         ) : visibleRegistrations.map((registration) => {
           const current = registration.kind === "chat"
@@ -467,20 +460,20 @@ export function GuiChatModelsPane({
               <div className="gui-chat-workspace-copy">
                 <div className="gui-chat-workspace-title">
                   <span>{registration.name}</span>
-                  <ModelBadge>{KIND_LABELS[registration.kind]}</ModelBadge>
-                  <ModelBadge>{registration.scope === "admin" ? "Admin" : "Mine"}</ModelBadge>
-                  <ModelBadge>{registration.source === "custom" ? "Custom" : registration.source === "manual" ? "Manual" : "Catalog"}</ModelBadge>
-                  {current ? <ModelBadge active>Current conversation</ModelBadge> : null}
-                  {(registration.kind === "chat" || registration.kind === "code") && configured ? <ModelBadge active>Default</ModelBadge> : null}
-                  {activatable && configured ? <ModelBadge active>Active</ModelBadge> : null}
+                  <ModelBadge>{kindLabels[registration.kind]}</ModelBadge>
+                  <ModelBadge>{registration.scope === "admin" ? text.admin : text.mine}</ModelBadge>
+                  <ModelBadge>{registration.source === "custom" ? text.custom : registration.source === "manual" ? text.manual : text.catalog}</ModelBadge>
+                  {current ? <ModelBadge active>{text.currentConversation}</ModelBadge> : null}
+                  {(registration.kind === "chat" || registration.kind === "code") && configured ? <ModelBadge active>{text.default}</ModelBadge> : null}
+                  {activatable && configured ? <ModelBadge active>{text.active}</ModelBadge> : null}
                   {registration.source === "custom" ? (
                     <ModelBadge warning={!registration.credential_configured}>
-                      {registration.credential_configured ? "Credential ready" : "Credential missing"}
+                      {registration.credential_configured ? text.credentialReady : text.credentialMissing}
                     </ModelBadge>
                   ) : null}
                 </div>
                 <p>{registration.provider} · {registration.model}</p>
-                {!registration.mutable ? <p>Managed by your administrator.</p> : null}
+                {!registration.mutable ? <p>{text.managedByAdmin}</p> : null}
               </div>
               <div className="gui-chat-workspace-actions gui-chat-model-actions">
                 {registration.kind === "chat" ? (
@@ -489,19 +482,19 @@ export function GuiChatModelsPane({
                       className="gui-chat-model-action"
                       disabled={!canSwitchChat || busy || working || current}
                       onClick={() => void applyChat(registration, false)}
-                      title={!canSwitchChat ? "Start or open a conversation to switch its model." : undefined}
+                      title={!canSwitchChat ? text.startConversationToSwitch : undefined}
                       type="button"
                     >
-                      {current ? "In use" : "Use"}
+                      {current ? text.inUse : text.use}
                     </button>
                     <button
                       className="gui-chat-model-action"
                       disabled={!canSwitchChat || busy || working || (current && configured)}
                       onClick={() => void applyChat(registration, true)}
-                      title={!canSwitchChat ? "Start or open a conversation to set the default." : undefined}
+                      title={!canSwitchChat ? text.startConversationForDefault : undefined}
                       type="button"
                     >
-                      {configured ? "Default" : "Use as default"}
+                      {configured ? text.default : text.useAsDefault}
                     </button>
                   </>
                 ) : registration.kind === "code" ? (
@@ -517,10 +510,10 @@ export function GuiChatModelsPane({
                         .catch((cause) => setError(errorMessage(cause)))
                         .finally(() => setWorkingId(null));
                     }}
-                    title={!onActivateCode ? "Code sessions are not available in this workspace." : undefined}
+                    title={!onActivateCode ? text.codeUnavailable : undefined}
                     type="button"
                   >
-                    {working ? "Activating…" : configured ? "Default" : "Use as Code model"}
+                    {working ? text.activating : configured ? text.default : text.useAsCodeModel}
                   </button>
                 ) : activatable && !configured ? (
                   <button
@@ -529,13 +522,13 @@ export function GuiChatModelsPane({
                     onClick={() => void activateMedia(registration)}
                     type="button"
                   >
-                    {working ? "Activating…" : "Activate"}
+                    {working ? text.activating : text.activate}
                   </button>
                 ) : null}
                 {registration.mutable ? (
                   <>
                     <button
-                      aria-label={`Edit ${registration.name}`}
+                      aria-label={text.editNamed.replace("{name}", registration.name)}
                       className="gui-chat-workspace-icon-button"
                       disabled={working}
                       onClick={() => openEdit(registration)}
@@ -544,11 +537,11 @@ export function GuiChatModelsPane({
                       <Pencil aria-hidden />
                     </button>
                     <button
-                      aria-label={`Delete ${registration.name}`}
+                      aria-label={text.deleteNamed.replace("{name}", registration.name)}
                       className="gui-chat-workspace-icon-button is-destructive"
                       disabled={working || configured}
                       onClick={() => setPendingDelete(registration)}
-                      title={configured ? "Switch the active model before deleting this registration." : undefined}
+                      title={configured ? text.switchBeforeDelete : undefined}
                       type="button"
                     >
                       <Trash2 aria-hidden />
@@ -575,20 +568,21 @@ export function GuiChatModelsPane({
           providers={providers}
           saving={saving}
           setForm={setForm}
+          text={text}
         />
       ) : null}
 
       {pendingDelete ? (
         <GuiChatWorkspaceDialog
           busy={workingId === pendingDelete.id}
-          description={`This permanently removes ${pendingDelete.name} and its private provider configuration. This action cannot be undone.`}
+          description={text.deleteDescription.replace("{name}", pendingDelete.name)}
           onClose={() => setPendingDelete(null)}
-          title={`Delete ${pendingDelete.name}?`}
+          title={text.deleteTitle.replace("{name}", pendingDelete.name)}
         >
           <div className="gui-chat-workspace-dialog-actions">
-            <button disabled={workingId === pendingDelete.id} onClick={() => setPendingDelete(null)} type="button">Cancel</button>
+            <button disabled={workingId === pendingDelete.id} onClick={() => setPendingDelete(null)} type="button">{t.common.cancel}</button>
             <button className="is-destructive" disabled={workingId === pendingDelete.id} onClick={() => void remove()} type="button">
-              {workingId === pendingDelete.id ? "Deleting…" : "Delete"}
+              {workingId === pendingDelete.id ? text.deleting : t.common.delete}
             </button>
           </div>
         </GuiChatWorkspaceDialog>
@@ -599,10 +593,10 @@ export function GuiChatModelsPane({
           busy={workingId === pendingChatSwitch.registration.id}
           description={pendingChatSwitch.message}
           onClose={() => setPendingChatSwitch(null)}
-          title="Expensive model warning"
+          title={text.expensiveWarningTitle}
         >
           <div className="gui-chat-workspace-dialog-actions">
-            <button onClick={() => setPendingChatSwitch(null)} type="button">Cancel</button>
+            <button onClick={() => setPendingChatSwitch(null)} type="button">{t.common.cancel}</button>
             <button
               className="is-destructive"
               onClick={() => {
@@ -611,9 +605,7 @@ export function GuiChatModelsPane({
                 void applyChat(pending.registration, pending.persistGlobally, true);
               }}
               type="button"
-            >
-              Switch anyway
-            </button>
+            >{text.switchAnyway}            </button>
           </div>
         </GuiChatWorkspaceDialog>
       ) : null}
@@ -651,6 +643,7 @@ function RegistrationDialog({
   providers,
   saving,
   setForm,
+  text,
 }: {
   catalogLoading: boolean;
   editing: ModelRegistration | null;
@@ -664,7 +657,9 @@ function RegistrationDialog({
   providers: Array<ModelRegistrationChatCatalogProvider | ModelRegistrationCapabilityCatalogProvider>;
   saving: boolean;
   setForm: React.Dispatch<React.SetStateAction<RegistrationFormState>>;
+  text: ReturnType<typeof guiChatTranslations>["models"];
 }) {
+  const { t } = useI18n();
   const selectedMediaProvider = form.kind === "chat"
     ? undefined
     : (providers as ModelRegistrationCapabilityCatalogProvider[]).find(
@@ -673,43 +668,43 @@ function RegistrationDialog({
   return (
     <GuiChatWorkspaceDialog
       busy={saving}
-      description={editing ? "Update this registered model." : "Register a chat, code, image, video, voice, or vector model."}
+      description={editing ? text.editDescription : text.addDescription}
       onClose={onClose}
-      title={editing ? "Edit model" : "Add model"}
+      title={editing ? text.editModel : text.addModel}
       wide
     >
       <form className="gui-chat-model-form" onSubmit={onSubmit}>
-        <FormField label="Name">
+        <FormField label={text.name}>
           <input
-            aria-label="Model name"
+            aria-label={text.name}
             autoFocus
             disabled={saving}
             onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))}
-            placeholder="My model"
+            placeholder={text.namePlaceholder}
             value={form.name}
           />
         </FormField>
         <div className="gui-chat-skills-editor-grid">
-          <FormField label="Type">
+          <FormField label={text.type}>
             <select
-              aria-label="Model type"
+              aria-label={text.modelType}
               disabled={saving || editing !== null}
               onChange={(event) => onKindChange(event.target.value as ModelRegistrationKind)}
               value={form.kind}
             >
-              {(Object.keys(KIND_LABELS) as ModelRegistrationKind[]).map((kind) => <option key={kind} value={kind}>{KIND_LABELS[kind]}</option>)}
+              {(Object.keys(text.kinds) as ModelRegistrationKind[]).map((kind) => <option key={kind} value={kind}>{text.kinds[kind]}</option>)}
             </select>
           </FormField>
-          <FormField label="Source">
+          <FormField label={text.source}>
             <select
-              aria-label="Model source"
+              aria-label={text.source}
               disabled={saving || editing !== null || form.kind === "voice" || form.kind === "vector"}
               onChange={(event) => onSourceChange(event.target.value as ModelRegistrationSource)}
               value={form.source}
             >
-              {hasCatalog(form.kind) && form.kind !== "voice" && form.kind !== "vector" ? <option value="catalog">Catalog</option> : null}
-              {form.source === "manual" ? <option value="manual">Manual</option> : null}
-              {form.kind === "chat" ? <option value="custom">Custom endpoint</option> : null}
+              {hasCatalog(form.kind) && form.kind !== "voice" && form.kind !== "vector" ? <option value="catalog">{text.catalog}</option> : null}
+              {form.source === "manual" ? <option value="manual">{text.manual}</option> : null}
+              {form.kind === "chat" ? <option value="custom">{text.customEndpoint}</option> : null}
             </select>
           </FormField>
         </div>
@@ -718,38 +713,38 @@ function RegistrationDialog({
           <>
             {form.source === "manual" ? (
               <>
-                <FormField label="Provider">
-                  <input aria-label="Model provider" disabled={saving} onChange={(event) => setForm((current) => ({ ...current, provider: event.target.value }))} placeholder="openai" value={form.provider} />
+                <FormField label={text.provider}>
+                  <input aria-label={text.provider} disabled={saving} onChange={(event) => setForm((current) => ({ ...current, provider: event.target.value }))} placeholder="openai" value={form.provider} />
                 </FormField>
-                <FormField label="Model">
-                  <input aria-label="Model" disabled={saving} onChange={(event) => setForm((current) => ({ ...current, model: event.target.value }))} placeholder={form.kind === "voice" ? "gpt-4o-mini-tts" : "text-embedding-3-small"} value={form.model} />
+                <FormField label={text.model}>
+                  <input aria-label={text.model} disabled={saving} onChange={(event) => setForm((current) => ({ ...current, model: event.target.value }))} placeholder={form.kind === "voice" ? "gpt-4o-mini-tts" : "text-embedding-3-small"} value={form.model} />
                 </FormField>
               </>
             ) : (
               <>
-                {catalogLoading ? <div className="gui-chat-model-form-note">Loading providers…</div> : null}
-                <FormField label="Provider">
+                {catalogLoading ? <div className="gui-chat-model-form-note">{text.loadingProviders}</div> : null}
+                <FormField label={text.provider}>
                   <select
-                    aria-label="Model provider"
+                    aria-label={text.provider}
                     disabled={saving || catalogLoading}
                     onChange={(event) => onProviderChange(event.target.value)}
                     value={form.provider}
                   >
-                    <option value="">Select a provider</option>
+                    <option value="">{text.selectProvider}</option>
                     {providers.map((provider) => {
                       const id = "slug" in provider ? provider.slug : provider.provider;
                       return <option key={id} value={id}>{provider.name}</option>;
                     })}
                   </select>
                 </FormField>
-                <FormField label="Model">
+                <FormField label={text.model}>
                   <select
-                    aria-label="Model"
+                    aria-label={text.model}
                     disabled={saving || !form.provider}
                     onChange={(event) => setForm((current) => ({ ...current, model: event.target.value }))}
                     value={form.model}
                   >
-                    <option value="">Select a model</option>
+                    <option value="">{text.selectModel}</option>
                     {models.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
                   </select>
                 </FormField>
@@ -763,43 +758,43 @@ function RegistrationDialog({
                   onChange={(event) => setForm((current) => ({ ...current, useGateway: event.target.checked }))}
                   type="checkbox"
                 />
-                <span>Use the configured gateway for this provider</span>
+                <span>{text.useGateway}</span>
               </label>
             ) : null}
             {selectedMediaProvider && !selectedMediaProvider.available ? (
-              <div className="gui-chat-model-form-note is-warning">This provider is missing its required credential.</div>
+              <div className="gui-chat-model-form-note is-warning">{text.credentialMissingForProvider}</div>
             ) : null}
           </>
         ) : (
           <>
             {editing ? (
               <div className="gui-chat-model-form-note is-warning">
-                Custom endpoint URLs and API keys are write-only. Re-enter the endpoint; leave the API key blank to keep the saved credential.
+                {text.customWriteOnly}
               </div>
             ) : null}
-            <FormField label="Model">
-              <input aria-label="Model" disabled={saving} onChange={(event) => setForm((current) => ({ ...current, model: event.target.value }))} placeholder="model-id" value={form.model} />
+            <FormField label={text.model}>
+              <input aria-label={text.model} disabled={saving} onChange={(event) => setForm((current) => ({ ...current, model: event.target.value }))} placeholder="model-id" value={form.model} />
             </FormField>
-            <FormField label="Base URL">
-              <input aria-label="Base URL" disabled={saving} onChange={(event) => setForm((current) => ({ ...current, baseUrl: event.target.value }))} placeholder="https://api.example.com/v1" value={form.baseUrl} />
+            <FormField label={text.baseUrl}>
+              <input aria-label={text.baseUrl} disabled={saving} onChange={(event) => setForm((current) => ({ ...current, baseUrl: event.target.value }))} placeholder="https://api.example.com/v1" value={form.baseUrl} />
             </FormField>
             <div className="gui-chat-skills-editor-grid">
-              <FormField label="API mode">
-                <input aria-label="API mode" disabled={saving} onChange={(event) => setForm((current) => ({ ...current, apiMode: event.target.value }))} value={form.apiMode} />
+              <FormField label={text.apiMode}>
+                <input aria-label={text.apiMode} disabled={saving} onChange={(event) => setForm((current) => ({ ...current, apiMode: event.target.value }))} value={form.apiMode} />
               </FormField>
-              <FormField label="Context length">
-                <input aria-label="Context length" disabled={saving} inputMode="numeric" min="1" onChange={(event) => setForm((current) => ({ ...current, contextLength: event.target.value }))} type="number" value={form.contextLength} />
+              <FormField label={text.contextLength}>
+                <input aria-label={text.contextLength} disabled={saving} inputMode="numeric" min="1" onChange={(event) => setForm((current) => ({ ...current, contextLength: event.target.value }))} type="number" value={form.contextLength} />
               </FormField>
             </div>
-            <FormField label={editing ? "API key (leave blank to keep current)" : "API key (optional)"}>
-              <input aria-label="API key" autoComplete="new-password" disabled={saving} onChange={(event) => setForm((current) => ({ ...current, apiKey: event.target.value }))} type="password" value={form.apiKey} />
+            <FormField label={editing ? text.apiKeyKeep : text.apiKeyOptional}>
+              <input aria-label={editing ? text.apiKeyKeep : text.apiKeyOptional} autoComplete="new-password" disabled={saving} onChange={(event) => setForm((current) => ({ ...current, apiKey: event.target.value }))} type="password" value={form.apiKey} />
             </FormField>
           </>
         )}
 
         <div className="gui-chat-workspace-dialog-actions">
-          <button disabled={saving} onClick={onClose} type="button">Cancel</button>
-          <button className="is-primary" disabled={saving} type="submit">{saving ? "Saving…" : "Save model"}</button>
+          <button disabled={saving} onClick={onClose} type="button">{t.common.cancel}</button>
+          <button className="is-primary" disabled={saving} type="submit">{saving ? text.saving : text.saveModel}</button>
         </div>
       </form>
     </GuiChatWorkspaceDialog>
@@ -810,15 +805,15 @@ function FormField({ children, label }: { children: ReactNode; label: string }) 
   return <label className="gui-chat-model-field"><span>{label}</span>{children}</label>;
 }
 
-function validateForm(form: RegistrationFormState): string | null {
-  if (!form.name.trim()) return "Model name is required.";
+function validateForm(form: RegistrationFormState, text: ReturnType<typeof guiChatTranslations>["models"]): string | null {
+  if (!form.name.trim()) return text.nameRequired;
   if (form.kind === "chat" && form.source === "custom") {
-    if (!form.model.trim()) return "Model is required.";
-    if (!form.baseUrl.trim()) return "Base URL is required.";
+    if (!form.model.trim()) return text.modelRequired;
+    if (!form.baseUrl.trim()) return text.baseUrlRequired;
     return null;
   }
-  if (!form.provider) return "Provider is required.";
-  if (!form.model) return "Model is required.";
+  if (!form.provider) return text.providerRequired;
+  if (!form.model) return text.modelRequired;
   return null;
 }
 

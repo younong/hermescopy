@@ -3,6 +3,7 @@ import { LoaderCircle } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { UIEvent } from "react";
 import { useLoadEarlierOnScroll } from "@/hooks/useLoadEarlierOnScroll";
+import { guiChatTranslations, useI18n } from "@/i18n";
 import type { ArtifactState, GuiChatState, MessageAttachmentState } from "../types";
 import { ApprovalCard } from "./ApprovalCard";
 import { ArtifactCard } from "./ArtifactCard";
@@ -63,6 +64,8 @@ export function MessageList({
   onUseAttachmentAgain?: (attachment: MessageAttachmentState) => void;
   state: GuiChatState;
 }) {
+  const { t } = useI18n();
+  const copy = guiChatTranslations(t).messages;
   const containerRef = useRef<HTMLDivElement | null>(null);
   const followBottomRef = useRef(true);
   const pendingBottomAdjustmentRef = useRef(0);
@@ -209,8 +212,8 @@ export function MessageList({
       <div className="flex min-h-0 flex-1 overflow-y-auto px-5 pb-36 pt-[18vh] sm:px-8">
         <div className="m-auto max-w-lg text-center">
           <div className="mx-auto mb-5 flex h-10 w-10 items-center justify-center rounded-xl bg-[#f2f3f5] text-lg font-semibold text-[#4f555d]">H</div>
-          <h2 className="mb-2 text-xl font-medium tracking-[-0.02em] text-[#25282d]">How can I help?</h2>
-          <p className="text-sm leading-6 text-[#8a8f97]">Start a conversation, attach a file, or continue one of your recent chats.</p>
+          <h2 className="mb-2 text-xl font-medium tracking-[-0.02em] text-[#25282d]">{copy.emptyTitle}</h2>
+          <p className="text-sm leading-6 text-[#8a8f97]">{copy.emptyHint}</p>
         </div>
       </div>
     );
@@ -232,20 +235,20 @@ export function MessageList({
             >
               {row.kind === "history" ? (
                 <div className="flex min-h-9 flex-col items-center justify-center gap-2 text-xs text-text-tertiary">
-                  {state.safeguardReached ? <span>Earlier history remains on the server; this tab stopped loading it to stay responsive.</span> : null}
+                  {state.safeguardReached ? <span>{copy.historySafeguard}</span> : null}
                   {state.historyError ? (
                     <>
                       <span role="alert">{state.historyError}</span>
                       {state.historyHasMore && !state.safeguardReached ? (
                         <button className="border border-current/20 px-3 py-1.5 hover:bg-midground/5 disabled:opacity-50" disabled={state.historyLoading} onClick={retry} type="button">
-                          Retry loading earlier messages
+                          {copy.retryEarlier}
                         </button>
                       ) : null}
                     </>
                   ) : state.historyLoading ? (
-                    <span aria-live="polite" role="status">Loading earlier messages…</span>
+                    <span aria-live="polite" role="status">{copy.loadingEarlier}</span>
                   ) : state.historyHasMore && !state.safeguardReached ? (
-                    <span>Scroll up for earlier messages</span>
+                    <span>{copy.scrollEarlier}</span>
                   ) : null}
                 </div>
               ) : row.kind === "message" ? (() => {

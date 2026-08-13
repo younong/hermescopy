@@ -1,5 +1,6 @@
 import { Archive, RefreshCw, UserRoundCog } from "lucide-react";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { guiChatTranslations, useI18n } from "@/i18n";
 import type { Employee } from "@/lib/api";
 import type { CollaborationApi } from "../api";
 import { collaborationReducer } from "../reducer";
@@ -19,6 +20,8 @@ interface GroupChatViewProps {
 }
 
 export function GroupChatView({ api, connection, employees, groupId, onArchive, onGroupChanged }: GroupChatViewProps) {
+  const { t } = useI18n();
+  const copy = guiChatTranslations(t).collaboration;
   const [state, dispatch] = useReducer(collaborationReducer, initialCollaborationState);
   const [memberManagerOpen, setMemberManagerOpen] = useState(false);
   const loadRef = useRef<AbortController | null>(null);
@@ -74,13 +77,13 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
       employeeId: employee.employee_id,
       available: employee.lifecycle_status === "active" && employee.collaboration_policy.may_participate,
       avatarUrl: employee.avatar_url ?? undefined,
-      name: employee.profile?.name || "Unnamed employee",
+      name: employee.profile?.name || copy.unnamedEmployee,
       role: employee.profile?.role,
     })),
-    [employees],
+    [copy.unnamedEmployee, employees],
   );
   const employeeName = useCallback((employeeId: string) =>
-    identities.find((employee) => employee.employeeId === employeeId)?.name ?? "Former employee", [identities]);
+    identities.find((employee) => employee.employeeId === employeeId)?.name ?? copy.formerEmployee, [copy.formerEmployee, identities]);
   const memberships = useMemo(
     () => Object.values(state.membershipsById),
     [state.membershipsById],
@@ -136,11 +139,11 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
         />
       ) : null}
       <div className="flex h-10 shrink-0 items-center justify-end gap-1 border-b border-[#f0f1f3] px-3">
-        <button aria-label="Refresh group" className="gui-chat-icon-button" onClick={() => void load(true)} type="button"><RefreshCw className={state.reconciling ? "animate-spin" : ""} /></button>
+        <button aria-label={copy.refreshGroup} className="gui-chat-icon-button" onClick={() => void load(true)} type="button"><RefreshCw className={state.reconciling ? "animate-spin" : ""} /></button>
         {state.group?.status === "active" ? (
           <>
-            <button aria-label="Manage group members" className="gui-chat-icon-button" onClick={() => setMemberManagerOpen(true)} type="button"><UserRoundCog /></button>
-            <button aria-label="Archive group" className="gui-chat-icon-button" onClick={() => void onArchive(groupId)} type="button"><Archive /></button>
+            <button aria-label={copy.manageMembers} className="gui-chat-icon-button" onClick={() => setMemberManagerOpen(true)} type="button"><UserRoundCog /></button>
+            <button aria-label={copy.archiveGroup} className="gui-chat-icon-button" onClick={() => void onArchive(groupId)} type="button"><Archive /></button>
           </>
         ) : null}
       </div>

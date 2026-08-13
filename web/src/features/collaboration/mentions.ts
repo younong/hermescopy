@@ -49,12 +49,18 @@ export function defaultMentionSelection(
   return { mentionAll: false, membershipIds: membershipId ? [membershipId] : [] };
 }
 
+interface MentionLabels {
+  mentionAll: string;
+  noAvailableEmployee: string;
+}
+
 export function mentionLabel(
   selection: MentionSelection,
   membershipsById: Record<string, CollaborationMembership>,
   employeeName: (employeeId: string) => string,
+  labels: Pick<MentionLabels, "mentionAll">,
 ): string {
-  if (selection.mentionAll) return "@all";
+  if (selection.mentionAll) return labels.mentionAll;
   return selection.membershipIds
     .map((id) => membershipsById[id])
     .filter(Boolean)
@@ -66,7 +72,8 @@ export function recipientLabel(
   selection: MentionSelection,
   membershipsById: Record<string, CollaborationMembership>,
   employeeName: (employeeId: string) => string,
+  labels: MentionLabels,
 ): string {
-  return mentionLabel(selection, membershipsById, employeeName)
-    || "No available employee";
+  return mentionLabel(selection, membershipsById, employeeName, labels)
+    || labels.noAvailableEmployee;
 }

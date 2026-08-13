@@ -21,6 +21,7 @@ import {
   type CronJobEditorState,
 } from "@/lib/cron-job-editor";
 import { cronJobHasExecutionContent } from "@/lib/cron-job";
+import { guiChatTranslations, useI18n } from "@/i18n";
 import { describeSchedule, englishOrdinal } from "@/lib/schedule";
 import { GuiChatWorkspaceDialog } from "./GuiChatWorkspaceDialog";
 
@@ -36,20 +37,14 @@ const EMPTY_RESOURCES: CronJobFormResources = {
   modelOptions: null,
   deliveryTargets: [LOCAL_DELIVERY],
 };
-const ENGLISH_SCHEDULE_STRINGS = {
-  none: "No schedule",
-  everyMinutes: "Every {n} minute(s)",
-  everyHours: "Every {n} hour(s)",
-  everyDays: "Every {n} day(s)",
-  dailyAt: "Daily at {time}",
-  weeklyAt: "Weekly on {days} at {time}",
-  monthlyAt: "Monthly on the {day} at {time}",
-  onceAt: "Once at {time}",
-  weekdaysShort: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as [string, string, string, string, string, string, string],
-  ordinal: englishOrdinal,
-};
-
 export function GuiChatScheduledTasksPane() {
+  const { locale, t } = useI18n();
+  const text = guiChatTranslations(t).scheduledTasks;
+  const scheduleStrings = {
+    ...t.cron.scheduleDescribe,
+    weekdaysShort: t.cron.scheduleModes.weekdaysShort,
+    ordinal: locale === "en" ? englishOrdinal : String,
+  };
   const [jobs, setJobs] = useState<CronJob[]>([]);
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(true);
@@ -103,10 +98,10 @@ export function GuiChatScheduledTasksPane() {
     const normalized = query.trim().toLowerCase();
     if (!normalized) return jobs;
     return (jobs).filter((job) =>
-      [jobTitle(job), job.prompt, job.script, job.state, job.last_status, job.last_error]
+      [jobTitle(job, text.fallbackTitle), job.prompt, job.script, job.state, job.last_status, job.last_error]
         .some((value) => String(value || "").toLowerCase().includes(normalized)),
     );
-  }, [jobs, query]);
+  }, [jobs, query, text.fallbackTitle]);
 
   const pauseResume = async (job: CronJob) => {
     setBusyJob(job.id);
@@ -127,11 +122,11 @@ export function GuiChatScheduledTasksPane() {
     if (!editor) return;
     const payload = buildCronJobPayloadFromEditor(editor.form);
     if (!payload.schedule || (!payload.no_agent && !cronJobHasExecutionContent(payload))) {
-      setError("Prompt or execution content and schedule are required.");
+      setError(text.validationRequired);
       return;
     }
     if (payload.no_agent && !payload.script) {
-      setError("no_agent jobs require a script.");
+      setError(text.scriptRequired);
       return;
     }
 
@@ -171,7 +166,7 @@ export function GuiChatScheduledTasksPane() {
   };
 
   return (
-    <section aria-label="Scheduled Tasks" className="gui-chat-workspace-pane" data-scheduled-tasks-pane>
+    <section aria-label={text.title} className="gui-chat-workspace-pane" data-scheduled-tasks-pane>
       <header className="gui-chat-workspace-toolbar">
         <button
           className="gui-chat-workspace-primary-button"
@@ -181,11 +176,9 @@ export function GuiChatScheduledTasksPane() {
           }}
           type="button"
         >
-          <Plus aria-hidden />
-          New task
-        </button>
+          <Plus aria-hidden />{text.newTask}        </button>
         <button
-          aria-label="Refresh scheduled tasks"
+          aria-label={text.refresh}
           className="gui-chat-workspace-icon-button"
           disabled={loading}
           onClick={() => void load()}
@@ -197,15 +190,15 @@ export function GuiChatScheduledTasksPane() {
 
       <div className="gui-chat-workspace-heading">
         <div>
-          <h1>Scheduled Tasks</h1>
-          <p>Automations that run in this workspace on a recurring or one-time schedule.</p>
+          <h1>{text.title}</h1>
+          <p>{text.description}</p>
         </div>
         <label className="gui-chat-workspace-search">
           <Search aria-hidden />
           <input
-            aria-label="Search scheduled tasks"
+            aria-label={text.search}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder="Search tasks"
+            placeholder={text.searchPlaceholder}
             value={query}
           />
         </label>
@@ -215,12 +208,12 @@ export function GuiChatScheduledTasksPane() {
 
       <div className="gui-chat-workspace-list">
         {loading && jobs.length === 0 ? (
-          <div className="gui-chat-workspace-empty" role="status">Loading scheduled tasks…</div>
+          <div className="gui-chat-workspace-empty" role="status">{text.loading}</div>
         ) : visibleJobs.length === 0 ? (
           <div className="gui-chat-workspace-empty">
             <CalendarClock aria-hidden />
-            <strong>{query.trim() ? "No matching tasks" : "No scheduled tasks yet"}</strong>
-            <span>{query.trim() ? "Try a different search." : "Create a task to automate recurring work."}</span>
+            <strong>{query.trim() ? text.noMatching : text.none}</strong>
+            <span>{query.trim() ? text.differentSearch : text.createHint}</span>
           </div>
         ) : visibleJobs.map((job) => {
           const state = jobState(job);
@@ -229,14 +222,14 @@ export function GuiChatScheduledTasksPane() {
             <article className="gui-chat-workspace-row gui-chat-scheduled-task-row" key={job.id}>
               <div className="gui-chat-workspace-copy">
                 <div className="gui-chat-workspace-title">
-                  <span>{jobTitle(job)}</span>
+                  <span>{jobTitle(job, text.fallbackTitle)}</span>
                   <span className={`gui-chat-workspace-badge is-${state}`}>{state}</span>
                 </div>
-                <p>{job.prompt || job.script || "No prompt"}</p>
+                <p>{job.prompt || job.script || text.noPrompt}</p>
                 <div className="gui-chat-scheduled-task-meta">
-                  <span>{scheduleDisplay(job)}</span>
-                  <span>Next: {formatTime(job.next_run_at)}</span>
-                  <span>Last: {formatTime(job.last_run_at)}</span>
+                  <span>{scheduleDisplay(job, scheduleStrings)}</span>
+                  <span>{text.next}: {formatTime(job.next_run_at, locale)}</span>
+                  <span>{text.last}: {formatTime(job.last_run_at, locale)}</span>
                 </div>
                 {job.last_error || job.last_delivery_error ? (
                   <div className="gui-chat-scheduled-task-error">
@@ -246,7 +239,7 @@ export function GuiChatScheduledTasksPane() {
               </div>
               <div className="gui-chat-workspace-actions">
                 <button
-                  aria-label={`${paused ? "Resume" : "Pause"} ${jobTitle(job)}`}
+                  aria-label={(paused ? text.resumeNamed : text.pauseNamed).replace("{name}", jobTitle(job, text.fallbackTitle))}
                   className="gui-chat-workspace-icon-button"
                   disabled={busyJob === job.id}
                   onClick={() => void pauseResume(job)}
@@ -255,7 +248,7 @@ export function GuiChatScheduledTasksPane() {
                   {paused ? <Play aria-hidden /> : <Pause aria-hidden />}
                 </button>
                 <button
-                  aria-label={`Edit ${jobTitle(job)}`}
+                  aria-label={text.editNamed.replace("{name}", jobTitle(job, text.fallbackTitle))}
                   className="gui-chat-workspace-icon-button"
                   disabled={busyJob === job.id}
                   onClick={() => {
@@ -267,7 +260,7 @@ export function GuiChatScheduledTasksPane() {
                   <Pencil aria-hidden />
                 </button>
                 <button
-                  aria-label={`Delete ${jobTitle(job)}`}
+                  aria-label={text.deleteNamed.replace("{name}", jobTitle(job, text.fallbackTitle))}
                   className="gui-chat-workspace-icon-button is-destructive"
                   disabled={busyJob === job.id}
                   onClick={() => setPendingDelete(job)}
@@ -284,9 +277,9 @@ export function GuiChatScheduledTasksPane() {
       {editor ? (
         <GuiChatWorkspaceDialog
           busy={busyJob === (editor.job?.id ?? "__create__")}
-          description={editor.job ? "Update the task instructions, schedule, and delivery settings." : "Choose when this task runs and what Hermes should do."}
+          description={editor.job ? text.editDescription : text.createDescription}
           onClose={() => setEditor(null)}
-          title={editor.job ? "Edit scheduled task" : "New scheduled task"}
+          title={editor.job ? text.editTask : text.newTask}
           wide
         >
           <div className="gui-chat-scheduled-task-editor">
@@ -299,9 +292,9 @@ export function GuiChatScheduledTasksPane() {
             />
           </div>
           <div className="gui-chat-workspace-dialog-actions">
-            <button disabled={busyJob !== null} onClick={() => setEditor(null)} type="button">Cancel</button>
+            <button disabled={busyJob !== null} onClick={() => setEditor(null)} type="button">{t.common.cancel}</button>
             <button className="is-primary" disabled={busyJob !== null} onClick={() => void saveEditor()} type="button">
-              {busyJob === (editor.job?.id ?? "__create__") ? "Saving…" : editor.job ? "Save changes" : "Create task"}
+              {busyJob === (editor.job?.id ?? "__create__") ? text.saving : editor.job ? text.saveChanges : text.createTask}
             </button>
           </div>
         </GuiChatWorkspaceDialog>
@@ -310,14 +303,14 @@ export function GuiChatScheduledTasksPane() {
       {pendingDelete ? (
         <GuiChatWorkspaceDialog
           busy={busyJob === pendingDelete.id}
-          description="This permanently removes the scheduled task. This action cannot be undone."
+          description={text.deleteDescription}
           onClose={() => setPendingDelete(null)}
-          title={`Delete ${jobTitle(pendingDelete)}?`}
+          title={text.deleteTitle.replace("{name}", jobTitle(pendingDelete, text.fallbackTitle))}
         >
           <div className="gui-chat-workspace-dialog-actions">
-            <button disabled={busyJob !== null} onClick={() => setPendingDelete(null)} type="button">Cancel</button>
+            <button disabled={busyJob !== null} onClick={() => setPendingDelete(null)} type="button">{t.common.cancel}</button>
             <button className="is-destructive" disabled={busyJob !== null} onClick={() => void deleteJob()} type="button">
-              {busyJob === pendingDelete.id ? "Deleting…" : "Delete"}
+              {busyJob === pendingDelete.id ? text.deleting : t.common.delete}
             </button>
           </div>
         </GuiChatWorkspaceDialog>
@@ -330,24 +323,27 @@ function sortJobs(jobs: CronJob[]): CronJob[] {
   return [...jobs].sort((left, right) => jobTitle(left).localeCompare(jobTitle(right)));
 }
 
-function jobTitle(job: CronJob): string {
-  return String(job.name || job.prompt || job.script || job.id || "Scheduled task").trim();
+function jobTitle(job: CronJob, fallback = ""): string {
+  return String(job.name || job.prompt || job.script || job.id || fallback).trim();
 }
 
 function jobState(job: CronJob): string {
   return String(job.state || (job.enabled === false ? "paused" : "scheduled")).toLowerCase();
 }
 
-function scheduleDisplay(job: CronJob): string {
+function scheduleDisplay(
+  job: CronJob,
+  strings: Parameters<typeof describeSchedule>[2],
+): string {
   return describeSchedule(
     job.schedule,
     String(job.schedule_display || job.schedule?.display || ""),
-    ENGLISH_SCHEDULE_STRINGS,
+    strings,
   );
 }
 
-function formatTime(value?: string | null): string {
-  return value ? new Date(value).toLocaleString() : "—";
+function formatTime(value: string | null | undefined, locale: string): string {
+  return value ? new Date(value).toLocaleString(locale === "zh" ? "zh-CN" : "en") : "—";
 }
 
 function errorMessage(cause: unknown): string {
