@@ -149,3 +149,7 @@ export function sessionCompositionTranslations(
 ): SessionCompositionTranslations {
   return translations.sessions.composition ?? en.sessions.composition!;
 }
+
+export function sessionSoftDeleteMessage(translations: Translations): string {
+  return translations.sessions.softDeleteMessage ?? en.sessions.softDeleteMessage!;
+}

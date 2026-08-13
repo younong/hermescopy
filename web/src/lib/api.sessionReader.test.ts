@@ -148,17 +148,28 @@ describe("fetchSessionReaderJSON", () => {
     expect(searchUrl.searchParams.get("active_before")).toBe("200");
   });
 
-  it("keeps session mutations on the non-retrying JSON path", async () => {
+  it("soft archives session-list removals on the non-retrying JSON path", async () => {
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
-      .mockResolvedValue(
+      .mockResolvedValueOnce(response(200, { archived: true, ok: true, title: "" }))
+      .mockResolvedValueOnce(
         response(503, { error: "session_reader_unavailable" }, "0.1"),
       );
+
+    await api.archiveSession("session/1");
+    const [url, options] = fetchMock.mock.calls[0] ?? [];
+    expect(new URL(String(url), window.location.origin).pathname).toContain(
+      "/api/sessions/session%2F1",
+    );
+    expect(options).toMatchObject({
+      body: JSON.stringify({ archived: true }),
+      method: "PATCH",
+    });
 
     await expect(api.deleteSession("session-1")).rejects.toMatchObject({
       status: 503,
     });
     await vi.runAllTimersAsync();
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });

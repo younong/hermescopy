@@ -154,6 +154,7 @@ export const zh: Translations = {
     renameSession: "修改会话标题",
     sessionTitlePlaceholder: "会话标题",
     failedToRename: "修改会话标题失败",
+    softDeleteMessage: "此操作仅从会话列表中移除对话，所有消息数据都会保留。",
     previousPage: "上一页",
     nextPage: "下一页",
     composition: {

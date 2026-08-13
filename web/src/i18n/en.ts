@@ -171,6 +171,7 @@ export const en: Translations = {
     renameSession: "Rename session",
     sessionTitlePlaceholder: "Session title",
     failedToRename: "Failed to rename session",
+    softDeleteMessage: "This removes the conversation from the list while keeping all stored messages.",
     previousPage: "Previous page",
     nextPage: "Next page",
     composition: {
